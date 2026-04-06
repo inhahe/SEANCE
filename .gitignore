@@ -1,0 +1,27 @@
+# Build artifacts
+cpp/build/
+
+# Downloaded dependencies
+cpp/third_party/*/
+!cpp/third_party/.gitkeep
+
+# User files
+*.ssp
+*.cfg
+*.dat
+*.xml
+soundshop_cache/
+soundshop_recent_*.txt
+soundshop_window.xml
+soundshop_prefs.xml
+recordings/
+
+# Python
+__pycache__/
+*.pyc
+
+# IDE
+.vs/
+.vscode/
+*.user
+imgui.ini

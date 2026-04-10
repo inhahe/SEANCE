@@ -16,6 +16,22 @@ static const float PIN_ROW_HEIGHT = 20.0f;
 static const float PIN_RADIUS = 5.0f;
 static const float HEADER_HEIGHT = 24.0f;
 
+// Central color definitions for each pin/wire kind. Used by both drawPin
+// (dots) and drawLink (cables) so the cable matches the pin it's attached
+// to. Param and Signal are intentionally in the same warm (orange/amber)
+// family because they're conceptually related — Param = block-rate control,
+// Signal = audio-rate control — while Audio (blue) and MIDI (green) are in
+// clearly different hue families.
+static juce::Colour colourForPinKind(PinKind k) {
+    switch (k) {
+        case PinKind::Audio:  return juce::Colour(100, 149, 237); // cornflower blue
+        case PinKind::Midi:   return juce::Colour( 85, 205,  85); // lime green
+        case PinKind::Param:  return juce::Colour(255, 140,  40); // orange (block-rate)
+        case PinKind::Signal: return juce::Colour(255, 205,  55); // amber (audio-rate)
+    }
+    return juce::Colour(200, 200, 200);
+}
+
 NodeGraphComponent::NodeGraphComponent(NodeGraph& g) : graph(g) {
     setWantsKeyboardFocus(true);
 }
@@ -236,10 +252,7 @@ void NodeGraphComponent::drawNode(juce::Graphics& g, Node& node) {
             g.setColour(juce::Colours::white);
             g.drawEllipse(pos.x - r * 1.4f, pos.y - r * 1.4f, r * 2.8f, r * 2.8f, 1.5f);
         } else {
-            g.setColour(pin.kind == PinKind::Midi   ? juce::Colours::limegreen
-                      : pin.kind == PinKind::Param  ? juce::Colours::orange
-                      : pin.kind == PinKind::Signal ? juce::Colours::red
-                      : juce::Colours::cornflowerblue);
+            g.setColour(colourForPinKind(pin.kind));
             g.fillEllipse(pos.x - r, pos.y - r, r * 2, r * 2);
         }
 
@@ -361,11 +374,12 @@ void NodeGraphComponent::drawLink(juce::Graphics& g, Link& link) {
     path.startNewSubPath(start);
     path.cubicTo(start.x + dx, start.y, end.x - dx, end.y, end.x, end.y);
 
-    // All wires are a uniform neutral color. Individual identity and group
-    // membership are shown via the colored circle/diamond tags on the wire,
-    // not by coloring the wire itself.
-    auto linkColour = juce::Colours::cornflowerblue.withAlpha(0.7f);
-    // Dim the cable if gain is very low
+    // Wire color matches the source pin's kind so the user can tell at a
+    // glance which type of data flows through the cable: audio (blue),
+    // MIDI (green), param/block-rate control (orange), signal/audio-rate
+    // control (amber). Param and Signal are close in hue on purpose — they
+    // both carry control data, at different rates.
+    auto linkColour = colourForPinKind(kind).withAlpha(0.8f);
     if (link.gainDb < -10.0f)
         linkColour = linkColour.withAlpha(0.3f);
     g.setColour(linkColour);

@@ -1,0 +1,64 @@
+# Build output
+cpp/build/
+build/
+out/
+*.exe
+*.dll
+*.lib
+*.pdb
+*.obj
+*.ilk
+*.exp
+*.idb
+*.tlog
+*.log
+
+# Visual Studio
+.vs/
+*.suo
+*.user
+*.opensdf
+*.sdf
+*.VC.db
+*.VC.opendb
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+
+# VS Code / JetBrains
+.vscode/
+.idea/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Third-party deps (fetched via setup_dependencies.bat — don't bloat the repo)
+cpp/third_party/
+cpp/src_imgui_backup/
+
+# Plugin scan caches and per-machine config
+soundshop_plugins_cache.dat
+imgui.ini
+SoundShop.node_editor.json
+
+# Ad-hoc / scratch
+*.tmp
+*.bak
+*.orig
+*~
+name.txt
+
+# OS noise
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Claude Code session/memory data — keep private
+.claude/
+
+# Unrelated project sitting in this directory (has its own .git)
+cservice-znc-module/

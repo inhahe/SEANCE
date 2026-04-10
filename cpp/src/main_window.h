@@ -42,8 +42,12 @@ public:
     // File operations
     void newProject();
     void openProject();
-    void saveProject();
-    void saveProjectAs();
+    // onSaved fires after a successful save (sync if a current path exists,
+    // async after the file chooser if not). Cancelled file chooser → never
+    // fires. Used by tryQuit() to defer the actual app exit until the save
+    // round-trip completes.
+    void saveProject(std::function<void()> onSaved = {});
+    void saveProjectAs(std::function<void()> onSaved = {});
     void exportAudio();
     void importModFile();
     void doExportRender(const juce::File& file, const ExportOptions& opts, float maxBeat);

@@ -1929,43 +1929,49 @@ void MainContentComponent::syncCCMappingsFromGraph() {
         am.addCCMapping({m.midiCh, m.ccNum, m.nodeId, m.paramIdx, 0.0f, 1.0f});
 }
 
-void MainContentComponent::saveProject() {
-    if (ProjectFile::currentPath.empty())
-        saveProjectAs();
-    else {
-        syncCCMappingsToGraph();
-
-        // Set cache dir and save node caches to disk
-        auto& cm = audioEngine.getGraphProcessor().getCacheManager();
-        auto projFile = juce::File(ProjectFile::currentPath);
-        cm.setCacheDir(projFile.getParentDirectory()
-            .getChildFile("soundshop_cache").getFullPathName().toStdString());
-        for (auto& n : graph.nodes)
-            if (n.cache.valid && n.cache.numSamples > 0 && !n.cache.left.empty())
-                cm.saveToDisk(n, audioEngine.getSampleRate());
-        cm.cleanupStaleFiles(graph);
-
-        ProjectFile::save(ProjectFile::currentPath, graph, &audioEngine.getGraphProcessor());
-        addToRecentProjects(ProjectFile::currentPath);
-        projectDirty = false;
-        graph.dirty = false;
-        saveFlashFrames = 60; // ~2 seconds at 30Hz
+void MainContentComponent::saveProject(std::function<void()> onSaved) {
+    if (ProjectFile::currentPath.empty()) {
+        // No filename yet — defer to Save As, which will run the file chooser
+        // and call us back through onSaved on success.
+        saveProjectAs(std::move(onSaved));
+        return;
     }
+
+    syncCCMappingsToGraph();
+
+    // Set cache dir and save node caches to disk
+    auto& cm = audioEngine.getGraphProcessor().getCacheManager();
+    auto projFile = juce::File(ProjectFile::currentPath);
+    cm.setCacheDir(projFile.getParentDirectory()
+        .getChildFile("soundshop_cache").getFullPathName().toStdString());
+    for (auto& n : graph.nodes)
+        if (n.cache.valid && n.cache.numSamples > 0 && !n.cache.left.empty())
+            cm.saveToDisk(n, audioEngine.getSampleRate());
+    cm.cleanupStaleFiles(graph);
+
+    ProjectFile::save(ProjectFile::currentPath, graph, &audioEngine.getGraphProcessor());
+    addToRecentProjects(ProjectFile::currentPath);
+    projectDirty = false;
+    graph.dirty = false;
+    saveFlashFrames = 60; // ~2 seconds at 30Hz
+    if (onSaved) onSaved();
 }
 
-void MainContentComponent::saveProjectAs() {
+void MainContentComponent::saveProjectAs(std::function<void()> onSaved) {
     syncCCMappingsToGraph();
     auto chooser = std::make_shared<juce::FileChooser>("Save Project", juce::File(), "*.ssp");
-    chooser->launchAsync(juce::FileBrowserComponent::saveMode, [this, chooser](const juce::FileChooser& fc) {
-        auto file = fc.getResult();
-        if (file != juce::File()) {
-            ProjectFile::save(file.getFullPathName().toStdString(), graph, &audioEngine.getGraphProcessor());
+    chooser->launchAsync(juce::FileBrowserComponent::saveMode,
+        [this, chooser, onSaved = std::move(onSaved)](const juce::FileChooser& fc) {
+            auto file = fc.getResult();
+            if (file == juce::File()) return; // user cancelled — don't fire onSaved
+            ProjectFile::save(file.getFullPathName().toStdString(),
+                              graph, &audioEngine.getGraphProcessor());
             addToRecentProjects(file.getFullPathName());
             projectDirty = false;
             graph.dirty = false;
             saveFlashFrames = 60;
-        }
-    });
+            if (onSaved) onSaved();
+        });
 }
 
 void MainContentComponent::importModFile() {
@@ -2226,17 +2232,32 @@ void MainContentComponent::closeEditor(int nodeId) {
 }
 
 bool MainContentComponent::tryQuit() {
-    if (projectDirty || graph.dirty) {
-        int result = juce::AlertWindow::showYesNoCancelBox(
-            juce::MessageBoxIconType::QuestionIcon,
-            "Unsaved Changes",
-            "You have unsaved changes. Save before quitting?",
-            "Save", "Don't Save", "Cancel");
-        if (result == 1) { saveProject(); return true; }
-        if (result == 2) return true;
-        return false; // cancel
-    }
-    return true;
+    if (!projectDirty && !graph.dirty) return true;
+
+    int result = juce::AlertWindow::showYesNoCancelBox(
+        juce::MessageBoxIconType::QuestionIcon,
+        "Unsaved Changes",
+        "You have unsaved changes. Save before quitting?",
+        "Save", "Don't Save", "Cancel");
+    if (result == 2) return true;       // Don't Save
+    if (result != 1) return false;       // Cancel (or window closed)
+
+    // Save first, then re-request quit on completion. If the project has no
+    // current path the file chooser is async — we must NOT return true here
+    // or the app will exit before the chooser even appears (which is the bug
+    // the user hit: pressed Save, app quit, no file ever written, recent
+    // projects never updated).
+    saveProject([]() {
+        // The save succeeded — ask the app to quit again. This goes through
+        // tryQuit a second time, sees the dirty flags cleared, and returns
+        // true immediately. Defer via callAsync so we're not still inside
+        // the file-chooser callback when we tear down the window.
+        juce::MessageManager::callAsync([]() {
+            if (auto* app = juce::JUCEApplication::getInstance())
+                app->systemRequestedQuit();
+        });
+    });
+    return false; // wait for the async save to drive the next quit attempt
 }
 
 // ==============================================================================

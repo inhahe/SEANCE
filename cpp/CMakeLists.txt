@@ -103,6 +103,8 @@ target_sources(SoundShop2 PRIVATE
     src/audio_crossfader.h
     src/trigger_node.cpp
     src/trigger_node.h
+    src/midi_mod_node.cpp
+    src/midi_mod_node.h
     src/audio_cache.cpp
     src/audio_cache.h
     src/pan_processor.h

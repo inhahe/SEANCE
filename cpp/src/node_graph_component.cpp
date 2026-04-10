@@ -2,6 +2,7 @@
 #include "music_theory.h"
 #include "layered_wave_editor.h"
 #include "trigger_node.h"
+#include "midi_mod_node.h"
 #include "xy_pad.h"
 #include "convolution_processor.h"
 #include "soundfont_processor.h"
@@ -894,7 +895,7 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
     fxMenu.addItem(216, "Arpeggiator");
     fxMenu.addItem(218, "Mixture (organ harmonics)");
     fxMenu.addItem(219, "Trigger (MIDI / signal)");
-    fxMenu.addItem(220, "Velocity Scale (signal -> MIDI)");
+    fxMenu.addItem(220, "MIDI Modulator (signal -> MIDI)");
     fxMenu.addSeparator();
     fxMenu.addItem(217, "3D Spatializer (binaural)");
     menu.addSubMenu("Effects", fxMenu);
@@ -1030,6 +1031,9 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
             // Velocity sensitivity: 0 = ignore velocity (every note at full
             // volume), 1 = linear response (default, v/127 gain).
             n.params.push_back({"Vel Sens", 1.0f,  0.0f,   1.0f});
+            // Mod-wheel vibrato depth (0 = disable the default behavior so
+            // the user can MIDI-Learn CC1 to a different param instead).
+            n.params.push_back({"Vibrato",  1.0f,  0.0f,   1.0f});
             // Wavetable Position — meaningful when there are multiple frames.
             // Looked up by name in TerrainSynthProcessor, so list order is free.
             n.params.push_back({"Position", 0.0f,  0.0f,   1.0f});
@@ -1477,16 +1481,18 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
                     {"Octaves", 1.0f, 1.0f, 4.0f},
                 }, true); break;
             case 220: {
-                // Velocity Scale — MIDI in + Signal in -> MIDI out
-                auto& n = graph.addNode("Vel Scale", NodeType::Effect,
+                // MIDI Modulator — MIDI in + N Signal ins -> MIDI out.
+                // Default: one velocity-scaling rule with one Signal input.
+                // The editor lets the user add more inputs, each targeting
+                // a different MIDI attribute.
+                auto& n = graph.addNode("MIDI Mod", NodeType::Effect,
                     {}, {}, {p.x, p.y});
                 n.pinsIn.clear();
                 n.pinsOut.clear();
-                n.pinsIn.push_back({graph.getNextId(),  "MIDI In",   PinKind::Midi,   true});
-                n.pinsIn.push_back({graph.getNextId(),  "Signal In", PinKind::Signal, true, 1});
-                n.pinsOut.push_back({graph.getNextId(), "MIDI Out",  PinKind::Midi,   false});
-                n.script = "__velscale__";
-                n.params.push_back({"Sensitivity", 0.0f, 0.0f, 2.0f});
+                n.pinsIn.push_back({graph.getNextId(),  "MIDI In",  PinKind::Midi,   true});
+                n.pinsIn.push_back({graph.getNextId(),  "Sig 1",    PinKind::Signal, true, 1});
+                n.pinsOut.push_back({graph.getNextId(), "MIDI Out", PinKind::Midi,   false});
+                n.script = MidiModDoc::defaultDoc().encode();
                 break;
             }
             case 219: {

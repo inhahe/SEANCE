@@ -792,11 +792,19 @@ void TerrainSynthProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mi
                 voices[vi].envTime = 0;
             }
         } else if (msg.isNoteOff()) {
+            int ch = juce::jlimit(1, 16, msg.getChannel());
             for (int i = 0; i < MAX_VOICES; ++i)
                 if (voices[i].active && voices[i].noteNumber == msg.getNoteNumber()
                     && voices[i].envStage != Voice::Release) {
-                    voices[i].envStage = Voice::Release;
-                    voices[i].envTime = 0;
+                    // If sustain pedal is held on this channel, defer the
+                    // release until the pedal comes back up; otherwise
+                    // release immediately.
+                    if (sustainPedal[ch - 1]) {
+                        voices[i].sustainHeld = true;
+                    } else {
+                        voices[i].envStage = Voice::Release;
+                        voices[i].envTime = 0;
+                    }
                 }
         } else if (msg.isPitchWheel()) {
             // Pitch bend: update this channel's bend factor and retune any
@@ -815,6 +823,23 @@ void TerrainSynthProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mi
             // render loop to read.
             int ch = juce::jlimit(1, 16, msg.getChannel());
             modWheel[ch - 1] = (float)msg.getControllerValue() / 127.0f;
+        } else if (msg.isController() && msg.getControllerNumber() == 64) {
+            // Sustain pedal (CC#64): when released, any voices that had
+            // their release deferred (sustainHeld=true) are sent into their
+            // release stage immediately.
+            int ch = juce::jlimit(1, 16, msg.getChannel());
+            bool held = msg.getControllerValue() >= 64;
+            sustainPedal[ch - 1] = held;
+            if (!held) {
+                for (int i = 0; i < MAX_VOICES; ++i) {
+                    if (voices[i].active && voices[i].sustainHeld
+                        && voices[i].midiChannel == ch) {
+                        voices[i].sustainHeld = false;
+                        voices[i].envStage = Voice::Release;
+                        voices[i].envTime = 0;
+                    }
+                }
+            }
         }
     }
 
@@ -974,8 +999,12 @@ void TerrainSynthProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mi
             // Per-voice effective frequency = (base * pitch-bend) * vibrato
             // v.frequency already has the bend factor baked in by the MIDI
             // handler; multiply by the vibrato factor for this sample.
+            // Vibrato Depth param (0..1, default 1) scales the default
+            // mod-wheel vibrato. Set to 0 to disable and MIDI-Learn CC1
+            // to drive something else instead.
             float mwDepth = modWheel[v.midiChannel - 1];
-            float vibSemis = mwDepth * kVibratoMaxSemis * vibratoLfo;
+            float vibAmt  = getParamByName(node, "Vibrato", 1.0f);
+            float vibSemis = mwDepth * vibAmt * kVibratoMaxSemis * vibratoLfo;
             float vibratoFactor = std::pow(2.0f, vibSemis / 12.0f);
             float effFreq = v.frequency * vibratoFactor;
 

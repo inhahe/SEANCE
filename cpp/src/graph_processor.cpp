@@ -13,6 +13,7 @@
 #include "soundfont_processor.h"
 #include "builtin_effects.h"
 #include "trigger_node.h"
+#include "midi_mod_node.h"
 #include "drum_synth.h"
 #include "spatializer_3d.h"
 #include <algorithm>
@@ -495,8 +496,10 @@ void GraphProcessor::rebuildGraph(NodeGraph& graph, Transport& transport) {
             proc = std::make_unique<ArpeggiatorProcessor>(node);
         } else if (node.type == NodeType::Effect && node.script == "__mixture__") {
             proc = std::make_unique<MixtureProcessor>(node);
-        } else if (node.type == NodeType::Effect && node.script == "__velscale__") {
-            proc = std::make_unique<VelocityScaleProcessor>(node);
+        } else if (node.type == NodeType::Effect &&
+                   (node.script == "__velscale__" ||
+                    node.script.rfind("__midimod__:", 0) == 0)) {
+            proc = std::make_unique<MidiModulatorProcessor>(node);
         } else if (node.type == NodeType::Effect &&
                    node.script.rfind("__trigger__:", 0) == 0) {
             proc = std::make_unique<TriggerProcessor>(node, transport);

@@ -214,6 +214,9 @@ private:
         float velocity = 1.0f;
         float phase = 0.0f;
         double startBeat = 0;
+        // Sustain pedal: true if this voice received a note-off while CC64
+        // was down, so release is deferred until the pedal comes back up.
+        bool sustainHeld = false;
 
         // ADSR
         enum Stage { Off, Attack, Decay, Sustain, Release };
@@ -238,6 +241,11 @@ private:
     float vibratoPhase = 0.0f;
     static constexpr float kVibratoRateHz = 6.0f;
     static constexpr float kVibratoMaxSemis = 0.4f; // ±0.4 semis at full mod
+
+    // Per-channel sustain pedal (CC#64) state. While true, note-offs are
+    // captured as sustainHeld instead of immediately releasing.
+    bool sustainPedal[16] = {false,false,false,false,false,false,false,false,
+                              false,false,false,false,false,false,false,false};
 
     // Internal LFOs for modulation
     struct LFO {

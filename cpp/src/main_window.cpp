@@ -3,6 +3,7 @@
 #include "builtin_synth.h"
 #include "layered_wave_editor.h"
 #include "trigger_node.h"
+#include "midi_mod_node.h"
 #include "xy_pad.h"
 #include "spectrum_tap.h"
 #include "convolution_processor.h"
@@ -1350,6 +1351,27 @@ void MainContentComponent::showPluginUI(int nodeId) {
         opts.content.setOwned(pad);
         opts.dialogTitle = "XY Pad";
         opts.dialogBackgroundColour = juce::Colour(25, 25, 32);
+        opts.escapeKeyTriggersCloseButton = true;
+        opts.useNativeTitleBar = true;
+        opts.resizable = true;
+        opts.launchAsync();
+        return;
+    }
+
+    // MIDI Modulator node: open its rule editor. Covers both the new
+    // __midimod__ script marker and the legacy __velscale__ marker so old
+    // projects get the new editor when the node is opened.
+    if (node && node->type == NodeType::Effect
+        && (node->script.rfind("__midimod__:", 0) == 0
+            || node->script == "__velscale__")) {
+        auto* editor = new MidiModEditorComponent(graph, node->id, [this]() {
+            audioEngine.getGraphProcessor().requestRebuild();
+            graphComponent->repaint();
+        });
+        juce::DialogWindow::LaunchOptions opts;
+        opts.content.setOwned(editor);
+        opts.dialogTitle = "MIDI Modulator: " + juce::String(node->name);
+        opts.dialogBackgroundColour = juce::Colour(22, 22, 28);
         opts.escapeKeyTriggersCloseButton = true;
         opts.useNativeTitleBar = true;
         opts.resizable = true;

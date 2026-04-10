@@ -12,6 +12,7 @@
 #include "convolution_processor.h"
 #include "soundfont_processor.h"
 #include "builtin_effects.h"
+#include "trigger_node.h"
 #include "drum_synth.h"
 #include "spatializer_3d.h"
 #include <algorithm>
@@ -494,6 +495,9 @@ void GraphProcessor::rebuildGraph(NodeGraph& graph, Transport& transport) {
             proc = std::make_unique<ArpeggiatorProcessor>(node);
         } else if (node.type == NodeType::Effect && node.script == "__mixture__") {
             proc = std::make_unique<MixtureProcessor>(node);
+        } else if (node.type == NodeType::Effect &&
+                   node.script.rfind("__trigger__:", 0) == 0) {
+            proc = std::make_unique<TriggerProcessor>(node, transport);
         } else if (node.type == NodeType::Effect && node.script == "__spatializer3d__") {
             proc = std::make_unique<Spatializer3DProcessor>(node);
         } else if (node.type == NodeType::Effect && node.script == "__pitchshift__") {

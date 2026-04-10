@@ -2,6 +2,7 @@
 #include "terrain_synth.h"
 #include "builtin_synth.h"
 #include "layered_wave_editor.h"
+#include "trigger_node.h"
 #include "xy_pad.h"
 #include "spectrum_tap.h"
 #include "convolution_processor.h"
@@ -1349,6 +1350,23 @@ void MainContentComponent::showPluginUI(int nodeId) {
         opts.content.setOwned(pad);
         opts.dialogTitle = "XY Pad";
         opts.dialogBackgroundColour = juce::Colour(25, 25, 32);
+        opts.escapeKeyTriggersCloseButton = true;
+        opts.useNativeTitleBar = true;
+        opts.resizable = true;
+        opts.launchAsync();
+        return;
+    }
+
+    // Trigger node: open its rule editor.
+    if (node && node->type == NodeType::Effect
+        && node->script.rfind("__trigger__:", 0) == 0) {
+        auto* editor = new TriggerEditorComponent(graph, node->id, [this]() {
+            audioEngine.getGraphProcessor().requestRebuild();
+        });
+        juce::DialogWindow::LaunchOptions opts;
+        opts.content.setOwned(editor);
+        opts.dialogTitle = "Trigger: " + juce::String(node->name);
+        opts.dialogBackgroundColour = juce::Colour(22, 22, 28);
         opts.escapeKeyTriggersCloseButton = true;
         opts.useNativeTitleBar = true;
         opts.resizable = true;

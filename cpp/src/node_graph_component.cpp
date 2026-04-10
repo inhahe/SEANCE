@@ -1,6 +1,7 @@
 #include "node_graph_component.h"
 #include "music_theory.h"
 #include "layered_wave_editor.h"
+#include "trigger_node.h"
 #include "xy_pad.h"
 #include "convolution_processor.h"
 #include "soundfont_processor.h"
@@ -878,6 +879,7 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
     fxMenu.addSeparator();
     fxMenu.addItem(216, "Arpeggiator");
     fxMenu.addItem(218, "Mixture (organ harmonics)");
+    fxMenu.addItem(219, "Trigger (MIDI / signal)");
     fxMenu.addSeparator();
     fxMenu.addItem(217, "3D Spatializer (binaural)");
     menu.addSubMenu("Effects", fxMenu);
@@ -1454,6 +1456,23 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
                     {"Pattern", 0.0f, 0.0f, 3.0f}, // 0=up, 1=down, 2=updown, 3=random
                     {"Octaves", 1.0f, 1.0f, 4.0f},
                 }, true); break;
+            case 219: {
+                // Trigger node — MIDI in, MIDI out + Signal out.
+                // Uses the Effect node type but has two distinct output pins
+                // (one MIDI, one Signal) rather than the usual MIDI-only or
+                // audio-only effect layout.
+                auto& n = graph.addNode("Trigger", NodeType::Effect,
+                    {}, {}, {p.x, p.y});
+                n.pinsIn.clear();
+                n.pinsOut.clear();
+                n.pinsIn.push_back({graph.getNextId(),  "MIDI In",    PinKind::Midi,   true});
+                n.pinsOut.push_back({graph.getNextId(), "MIDI Out",   PinKind::Midi,   false});
+                n.pinsOut.push_back({graph.getNextId(), "Signal Out", PinKind::Signal, false});
+                // Seed with a sensible default doc so the node does something
+                // on first placement.
+                n.script = TriggerDoc::defaultDoc().encode();
+                break;
+            }
             }
         } else if (result == 217) {
             // 3D Spatializer

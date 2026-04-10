@@ -101,6 +101,8 @@ target_sources(SoundShop2 PRIVATE
     src/signal_shape_node.h
     src/cache_processor.h
     src/audio_crossfader.h
+    src/trigger_node.cpp
+    src/trigger_node.h
     src/audio_cache.cpp
     src/audio_cache.h
     src/pan_processor.h

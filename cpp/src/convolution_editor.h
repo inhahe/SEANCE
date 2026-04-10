@@ -21,8 +21,32 @@ public:
     void mouseDown(const juce::MouseEvent& e) override;
     void mouseDrag(const juce::MouseEvent& e) override;
     void mouseUp(const juce::MouseEvent& e) override;
+    void mouseWheelMove(const juce::MouseEvent& e,
+                        const juce::MouseWheelDetails& w) override;
 
 private:
+    // Drawing modes
+    enum class DrawMode { ControlPoints, Freehand };
+    DrawMode drawMode = DrawMode::ControlPoints;
+    juce::TextButton modePointsBtn { "Points" };
+    juce::TextButton modeFreehandBtn { "Freehand" };
+
+    // Horizontal zoom / scroll into the IR. zoomX = 1 shows the whole IR,
+    // zoomX > 1 shows a subrange. scrollFrac in [0..1] positions the left
+    // edge of the visible window within the IR.
+    float zoomX = 1.0f;
+    float scrollFrac = 0.0f;
+
+    // Freehand drag state
+    int lastDrawSample = -1;
+    float lastDrawValue = 0.0f;
+
+    // Convert a screen x inside irArea back to a (possibly fractional) sample
+    // index, accounting for current zoom/scroll.
+    float screenXToSampleIdx(float x, const juce::Rectangle<float>& irArea) const;
+    // Inverse: sample index -> screen x inside irArea.
+    float sampleIdxToScreenX(float idx, const juce::Rectangle<float>& irArea) const;
+
     NodeGraph& graph;
     int nodeId;
     std::function<void()> onApply;

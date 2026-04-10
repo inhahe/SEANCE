@@ -646,4 +646,75 @@ private:
     Node& node;
 };
 
+// ==============================================================================
+// VELOCITY SCALE — signal+MIDI -> MIDI effect.
+// Multiplies the velocity of every passing note-on by a factor driven by a
+// Signal input. Lets the user modulate incoming MIDI velocity from any
+// signal source (LFO, envelope follower, XY pad, etc).
+//
+// Pins: MIDI in (pin 0) + Signal in (pin 1, audio channel 2) -> MIDI out.
+// Param: Sensitivity (0..2). scale = 1 + sens * signal, so:
+//   sens=0         -> bypass (signal ignored, velocity unchanged)
+//   sens=1, sig=+1 -> double velocity
+//   sens=1, sig=-1 -> silenced (velocity clamped to 1)
+// Signal is sampled at the note-on's exact sample offset so tight-timed
+// modulation (e.g. an envelope follower ducking a vocal) is sample-accurate.
+// ==============================================================================
+class VelocityScaleProcessor : public juce::AudioProcessor {
+public:
+    VelocityScaleProcessor(Node& n) : node(n) {}
+    const juce::String getName() const override { return "Vel Scale"; }
+    void prepareToPlay(double, int) override {}
+    void releaseResources() override {}
+    void processBlock(juce::AudioBuffer<float>& buf, juce::MidiBuffer& midi) override {
+        float sens = paramByName(node, "Sensitivity", 0.0f);
+
+        juce::MidiBuffer output;
+        int numSamples = buf.getNumSamples();
+        int numCh = buf.getNumChannels();
+        bool hasSignal = numCh >= 3; // stereo audio on 0,1; signal starts at 2
+
+        for (auto meta : midi) {
+            auto msg = meta.getMessage();
+            int off = meta.samplePosition;
+            if (msg.isNoteOn()) {
+                float sig = 0.0f;
+                if (hasSignal && off >= 0 && off < numSamples)
+                    sig = buf.getSample(2, off); // signal input
+                float scale = 1.0f + sens * sig;
+                int newVel = juce::jlimit(1, 127,
+                    (int)std::round(msg.getVelocity() * scale));
+                auto m = juce::MidiMessage::noteOn(
+                    msg.getChannel(), msg.getNoteNumber(), (juce::uint8)newVel);
+                output.addEvent(m, off);
+            } else {
+                output.addEvent(msg, off);
+            }
+        }
+        midi.swapWith(output);
+
+        // Audio pass-through: clear stereo out (we don't generate audio)
+        // so downstream doesn't pick up stale signal on channels 0/1.
+        // Leave channels 2+ alone — they were the signal inputs.
+        for (int c = 0; c < std::min(numCh, 2); ++c)
+            for (int s = 0; s < numSamples; ++s)
+                buf.setSample(c, s, 0.0f);
+    }
+    double getTailLengthSeconds() const override { return 0; }
+    bool acceptsMidi() const override { return true; }
+    bool producesMidi() const override { return true; }
+    bool isBusesLayoutSupported(const BusesLayout&) const override { return true; }
+    juce::AudioProcessorEditor* createEditor() override { return nullptr; }
+    bool hasEditor() const override { return false; }
+    int getNumPrograms() override { return 1; }
+    int getCurrentProgram() override { return 0; }
+    void setCurrentProgram(int) override {}
+    const juce::String getProgramName(int) override { return {}; }
+    void changeProgramName(int, const juce::String&) override {}
+    void getStateInformation(juce::MemoryBlock&) override {}
+    void setStateInformation(const void*, int) override {}
+private:
+    Node& node;
+};
+
 } // namespace SoundShop

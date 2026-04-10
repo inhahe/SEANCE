@@ -767,9 +767,16 @@ void TerrainSynthProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mi
                 if (voices[i].envLevel < minLev) { minLev = voices[i].envLevel; vi = i; }
             }
             if (vi >= 0) {
+                int ch = juce::jlimit(1, 16, msg.getChannel());
                 voices[vi].active = true;
                 voices[vi].noteNumber = msg.getNoteNumber();
-                voices[vi].frequency = transport.noteToFreq(msg.getNoteNumber());
+                voices[vi].midiChannel = ch;
+                voices[vi].baseFrequency = transport.noteToFreq(msg.getNoteNumber());
+                // Seed effective frequency with the current bend factor so
+                // notes triggered while the pitch wheel is held start at the
+                // bent pitch rather than the nominal one.
+                voices[vi].frequency =
+                    voices[vi].baseFrequency * pitchBendFactor[ch - 1];
                 // Apply the node's velocity-sensitivity setting: sens=0
                 // collapses everything to full volume, sens=1 is linear.
                 // Default 1.0 preserves prior behavior for older projects.
@@ -791,6 +798,23 @@ void TerrainSynthProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mi
                     voices[i].envStage = Voice::Release;
                     voices[i].envTime = 0;
                 }
+        } else if (msg.isPitchWheel()) {
+            // Pitch bend: update this channel's bend factor and retune any
+            // currently-playing voices on the same channel so sustained
+            // notes bend in real time.
+            int ch = juce::jlimit(1, 16, msg.getChannel());
+            float norm = ((float)msg.getPitchWheelValue() - 8192.0f) / 8192.0f;
+            float semis = norm * kPitchBendRangeSemis;
+            pitchBendFactor[ch - 1] = std::pow(2.0f, semis / 12.0f);
+            for (int i = 0; i < MAX_VOICES; ++i)
+                if (voices[i].active && voices[i].midiChannel == ch)
+                    voices[i].frequency =
+                        voices[i].baseFrequency * pitchBendFactor[ch - 1];
+        } else if (msg.isController() && msg.getControllerNumber() == 1) {
+            // Mod wheel: store per-channel value for the vibrato LFO in the
+            // render loop to read.
+            int ch = juce::jlimit(1, 16, msg.getChannel());
+            modWheel[ch - 1] = (float)msg.getControllerValue() / 127.0f;
         }
     }
 
@@ -933,6 +957,13 @@ void TerrainSynthProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mi
         // Grain size in samples (0 = off)
         int grainSizeSamples = (grainSize > 0) ? std::max(1, (int)(grainSize * sampleRate)) : 0;
 
+        // Advance the shared vibrato LFO once per sample. Each voice scales
+        // its frequency by a per-channel mod-wheel depth. Result: mod wheel
+        // up = audible vibrato on all notes through that synth.
+        vibratoPhase += kVibratoRateHz / (float)sampleRate;
+        if (vibratoPhase > 1.0f) vibratoPhase -= 1.0f;
+        float vibratoLfo = std::sin(vibratoPhase * 2.0f * 3.14159265f);
+
         for (int vi = 0; vi < MAX_VOICES; ++vi) {
             if (!voices[vi].active) continue;
             auto& v = voices[vi];
@@ -940,9 +971,17 @@ void TerrainSynthProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mi
                                       &attackCurve, &decayCurve, &releaseCurve);
             if (!v.active) continue;
 
+            // Per-voice effective frequency = (base * pitch-bend) * vibrato
+            // v.frequency already has the bend factor baked in by the MIDI
+            // handler; multiply by the vibrato factor for this sample.
+            float mwDepth = modWheel[v.midiChannel - 1];
+            float vibSemis = mwDepth * kVibratoMaxSemis * vibratoLfo;
+            float vibratoFactor = std::pow(2.0f, vibSemis / 12.0f);
+            float effFreq = v.frequency * vibratoFactor;
+
             float sample;
             if (mode == TerrainSynthMode::SamplePerPoint) {
-                float pitchScale = v.frequency / 440.0f;
+                float pitchScale = effFreq / 440.0f;
                 auto pitchCoord = coord;
                 if (!pitchCoord.empty())
                     pitchCoord[0] = std::fmod(pitchCoord[0] + v.phase, 1.0f);
@@ -979,7 +1018,7 @@ void TerrainSynthProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mi
                 // advances by pitchScale/sampleRate, where pitchScale is the
                 // transposition factor relative to the base note frequency.
                 if (isWavetable) {
-                    v.phase += v.frequency / (float)sampleRate;
+                    v.phase += effFreq / (float)sampleRate;
                 } else {
                     // Read base note from param (default A4=69 if not set)
                     float baseNote = getParamByName(node, "Base Note", 69.0f);
@@ -987,7 +1026,7 @@ void TerrainSynthProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mi
                     // Base frequency = MIDI note frequency + fine-tune in cents
                     float baseFreq = transport.noteToFreq((int)baseNote) *
                         std::pow(2.0f, fineTune / 1200.0f); // fine-tune in cents
-                    float samplePitchScale = v.frequency / std::max(1.0f, baseFreq);
+                    float samplePitchScale = effFreq / std::max(1.0f, baseFreq);
                     v.phase += samplePitchScale / (float)sampleRate;
                 }
                 if (v.phase > 1.0f) v.phase -= 1.0f;
@@ -995,7 +1034,7 @@ void TerrainSynthProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mi
                 // WaveformPerPoint: terrain value modulates oscillator timbre
                 float terrainVal = terrain.sample(coord);
                 sample = std::sin(v.phase * 2.0f * 3.14159265f) * (0.5f + 0.5f * terrainVal);
-                v.phase += v.frequency / (float)sampleRate;
+                v.phase += effFreq / (float)sampleRate;
                 if (v.phase > 1.0f) v.phase -= 1.0f;
             }
 

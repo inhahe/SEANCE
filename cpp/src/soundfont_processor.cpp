@@ -213,18 +213,25 @@ void SoundFontProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::MidiB
 
     // === SF2 path: use tinysoundfont ===
     if (sf2) {
-        // Process MIDI events
+        // Process MIDI events. Use the channel-aware tsf API so that
+        // pitch bend / CC messages routed per-channel work (MPE etc).
         for (auto metadata : midi) {
             auto msg = metadata.getMessage();
+            int ch = juce::jlimit(1, 16, msg.getChannel()) - 1; // tsf uses 0-based
             if (msg.isNoteOn()) {
                 float raw = msg.getVelocity() / 127.0f;
                 float eff = 1.0f - velSensSF2 * (1.0f - raw);
-                tsf_note_on(sf2, currentPreset, msg.getNoteNumber(), eff);
+                tsf_channel_note_on(sf2, ch, msg.getNoteNumber(), eff);
             }
             else if (msg.isNoteOff())
-                tsf_note_off(sf2, currentPreset, msg.getNoteNumber());
+                tsf_channel_note_off(sf2, ch, msg.getNoteNumber());
             else if (msg.isAllNotesOff())
                 tsf_note_off_all(sf2);
+            else if (msg.isPitchWheel())
+                tsf_channel_set_pitchwheel(sf2, ch, msg.getPitchWheelValue());
+            else if (msg.isController())
+                tsf_channel_midi_control(sf2, ch,
+                    msg.getControllerNumber(), msg.getControllerValue());
         }
 
         // Render audio (TSF outputs interleaved stereo)

@@ -894,6 +894,7 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
     fxMenu.addItem(216, "Arpeggiator");
     fxMenu.addItem(218, "Mixture (organ harmonics)");
     fxMenu.addItem(219, "Trigger (MIDI / signal)");
+    fxMenu.addItem(220, "Velocity Scale (signal -> MIDI)");
     fxMenu.addSeparator();
     fxMenu.addItem(217, "3D Spatializer (binaural)");
     menu.addSubMenu("Effects", fxMenu);
@@ -1475,6 +1476,19 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
                     {"Pattern", 0.0f, 0.0f, 3.0f}, // 0=up, 1=down, 2=updown, 3=random
                     {"Octaves", 1.0f, 1.0f, 4.0f},
                 }, true); break;
+            case 220: {
+                // Velocity Scale — MIDI in + Signal in -> MIDI out
+                auto& n = graph.addNode("Vel Scale", NodeType::Effect,
+                    {}, {}, {p.x, p.y});
+                n.pinsIn.clear();
+                n.pinsOut.clear();
+                n.pinsIn.push_back({graph.getNextId(),  "MIDI In",   PinKind::Midi,   true});
+                n.pinsIn.push_back({graph.getNextId(),  "Signal In", PinKind::Signal, true, 1});
+                n.pinsOut.push_back({graph.getNextId(), "MIDI Out",  PinKind::Midi,   false});
+                n.script = "__velscale__";
+                n.params.push_back({"Sensitivity", 0.0f, 0.0f, 2.0f});
+                break;
+            }
             case 219: {
                 // Trigger node — MIDI in, MIDI out + Signal out.
                 // Uses the Effect node type but has two distinct output pins

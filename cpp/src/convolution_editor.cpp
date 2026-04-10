@@ -51,6 +51,30 @@ ConvolutionEditorComponent::ConvolutionEditorComponent(NodeGraph& g, int nid,
     addAndMakeVisible(loadFileBtn);
     loadFileBtn.onClick = [this]() { loadFromFile(); };
 
+    // Drawing mode toggle: control points (Catmull-Rom smoothed) vs
+    // freehand (per-sample direct drawing). Control points is the default.
+    addAndMakeVisible(modePointsBtn);
+    addAndMakeVisible(modeFreehandBtn);
+    modePointsBtn.setClickingTogglesState(true);
+    modeFreehandBtn.setClickingTogglesState(true);
+    modePointsBtn.setToggleState(true, juce::dontSendNotification);
+    auto updateModeToggles = [this]() {
+        modePointsBtn.setToggleState(drawMode == DrawMode::ControlPoints,
+                                     juce::dontSendNotification);
+        modeFreehandBtn.setToggleState(drawMode == DrawMode::Freehand,
+                                       juce::dontSendNotification);
+    };
+    modePointsBtn.onClick = [this, updateModeToggles]() {
+        drawMode = DrawMode::ControlPoints;
+        updateModeToggles();
+        repaint();
+    };
+    modeFreehandBtn.onClick = [this, updateModeToggles]() {
+        drawMode = DrawMode::Freehand;
+        updateModeToggles();
+        repaint();
+    };
+
     addAndMakeVisible(lengthSlider); addAndMakeVisible(lengthLbl);
     lengthLbl.setText("IR length:", juce::dontSendNotification);
     lengthLbl.setFont(11.0f);
@@ -124,6 +148,57 @@ juce::Rectangle<float> ConvolutionEditorComponent::getFreqArea() const {
     return a.removeFromBottom(a.getHeight() * 0.4f);
 }
 
+// Map a (possibly fractional) sample index to its screen x inside the IR
+// area, taking current zoom/scroll into account. Samples outside the
+// visible window land outside `irArea` horizontally.
+float ConvolutionEditorComponent::sampleIdxToScreenX(float idx,
+                                                     const juce::Rectangle<float>& irArea) const {
+    int n = (int)ir.size();
+    if (n <= 1) return irArea.getX();
+    float visibleSpan = std::max(1.0f, (float)n / std::max(1.0f, zoomX));
+    float firstVisible = scrollFrac * (n - visibleSpan);
+    float frac = (idx - firstVisible) / visibleSpan; // 0..1 across visible
+    return irArea.getX() + frac * irArea.getWidth();
+}
+
+// Inverse: screen x -> sample index.
+float ConvolutionEditorComponent::screenXToSampleIdx(float x,
+                                                     const juce::Rectangle<float>& irArea) const {
+    int n = (int)ir.size();
+    if (n <= 1) return 0.0f;
+    float visibleSpan = std::max(1.0f, (float)n / std::max(1.0f, zoomX));
+    float firstVisible = scrollFrac * (n - visibleSpan);
+    float frac = (x - irArea.getX()) / std::max(1.0f, irArea.getWidth());
+    return firstVisible + frac * visibleSpan;
+}
+
+void ConvolutionEditorComponent::mouseWheelMove(const juce::MouseEvent& e,
+                                                const juce::MouseWheelDetails& w) {
+    auto area = getIRArea();
+    if (!area.contains(e.position)) return;
+
+    if (e.mods.isCtrlDown() || e.mods.isCommandDown()) {
+        // Zoom centered on the mouse x
+        float sampleAtMouse = screenXToSampleIdx(e.position.x, area);
+        float factor = 1.0f + w.deltaY * 0.5f;
+        zoomX = juce::jlimit(1.0f, 128.0f, zoomX * factor);
+        // Re-anchor so the sample under the mouse stays put
+        int n = (int)ir.size();
+        if (n > 1) {
+            float visibleSpan = std::max(1.0f, (float)n / zoomX);
+            float newFirstVisible = sampleAtMouse -
+                ((e.position.x - area.getX()) / area.getWidth()) * visibleSpan;
+            float maxFirst = std::max(0.0f, (float)n - visibleSpan);
+            scrollFrac = juce::jlimit(0.0f, 1.0f,
+                (maxFirst > 0) ? newFirstVisible / maxFirst : 0.0f);
+        }
+    } else {
+        // Pan
+        scrollFrac = juce::jlimit(0.0f, 1.0f, scrollFrac - w.deltaY * 0.1f);
+    }
+    repaint();
+}
+
 void ConvolutionEditorComponent::resized() {
     auto a = getLocalBounds().reduced(10);
     auto top = a.removeFromTop(28);
@@ -132,6 +207,9 @@ void ConvolutionEditorComponent::resized() {
     applyPresetBtn.setBounds(top.removeFromLeft(70).reduced(0, 2));
     top.removeFromLeft(8);
     loadFileBtn.setBounds(top.removeFromLeft(100).reduced(0, 2));
+    top.removeFromLeft(12);
+    modePointsBtn.setBounds(top.removeFromLeft(70).reduced(0, 2));
+    modeFreehandBtn.setBounds(top.removeFromLeft(80).reduced(0, 2));
     closeBtn.setBounds(top.removeFromRight(60).reduced(0, 2));
     top.removeFromRight(4);
     applyBtn.setBounds(top.removeFromRight(60).reduced(0, 2));
@@ -233,8 +311,28 @@ void ConvolutionEditorComponent::mouseDown(const juce::MouseEvent& e) {
     auto area = getIRArea();
     if (!area.contains(e.position)) return;
 
-    float x = (e.position.x - area.getX()) / area.getWidth();
-    float y = 1.0f - 2.0f * (e.position.y - area.getY()) / area.getHeight(); // -1..1
+    // Screen Y -> amplitude -1..1 (used by both modes)
+    float y = 1.0f - 2.0f * (e.position.y - area.getY()) / area.getHeight();
+    y = juce::jlimit(-1.0f, 1.0f, y);
+
+    if (drawMode == DrawMode::Freehand) {
+        // Write directly to the IR sample under the cursor.
+        int n = (int)ir.size();
+        int idx = (int)std::round(screenXToSampleIdx(e.position.x, area));
+        if (idx >= 0 && idx < n) {
+            ir[idx] = y;
+            lastDrawSample = idx;
+            lastDrawValue  = y;
+            updateFreqResponse();
+            repaint();
+        }
+        return;
+    }
+
+    // ControlPoints mode: use a fractional x in [0..1] for the control list.
+    float x = screenXToSampleIdx(e.position.x, area) /
+              std::max(1.0f, (float)(ir.size() - 1));
+    x = juce::jlimit(0.0f, 1.0f, x);
 
     if (e.mods.isRightButtonDown()) {
         // Delete nearest point (keep minimum 2)
@@ -253,8 +351,10 @@ void ConvolutionEditorComponent::mouseDown(const juce::MouseEvent& e) {
         return;
     }
 
-    // Find near existing point to drag
-    int best = -1; float bestD = 0.03f;
+    // Find near existing point to drag (tolerance scales with zoom so it
+    // stays roughly the same pixel distance regardless of zoom level).
+    float pointPickTol = 0.03f / std::max(1.0f, zoomX);
+    int best = -1; float bestD = pointPickTol;
     for (int i = 0; i < (int)controlPoints.size(); ++i) {
         float dist = std::abs(controlPoints[i].first - x);
         if (dist < bestD) { bestD = dist; best = i; }
@@ -262,8 +362,7 @@ void ConvolutionEditorComponent::mouseDown(const juce::MouseEvent& e) {
     if (best >= 0) {
         dragPointIdx = best;
     } else {
-        // Add new point
-        controlPoints.push_back({x, juce::jlimit(-1.0f, 1.0f, y)});
+        controlPoints.push_back({x, y});
         std::sort(controlPoints.begin(), controlPoints.end());
         for (int i = 0; i < (int)controlPoints.size(); ++i)
             if (std::abs(controlPoints[i].first - x) < 0.001f) { dragPointIdx = i; break; }
@@ -273,13 +372,42 @@ void ConvolutionEditorComponent::mouseDown(const juce::MouseEvent& e) {
 }
 
 void ConvolutionEditorComponent::mouseDrag(const juce::MouseEvent& e) {
-    if (dragPointIdx < 0 || dragPointIdx >= (int)controlPoints.size()) return;
     auto area = getIRArea();
-    float x = juce::jlimit(0.0f, 1.0f, (e.position.x - area.getX()) / area.getWidth());
-    float y = juce::jlimit(-1.0f, 1.0f, 1.0f - 2.0f * (e.position.y - area.getY()) / area.getHeight());
+    float y = juce::jlimit(-1.0f, 1.0f,
+        1.0f - 2.0f * (e.position.y - area.getY()) / area.getHeight());
+
+    if (drawMode == DrawMode::Freehand) {
+        // Draw a continuous line by filling every sample between the last
+        // drawn position and the current one — otherwise fast mouse motion
+        // leaves gaps.
+        int n = (int)ir.size();
+        int idx = (int)std::round(screenXToSampleIdx(e.position.x, area));
+        if (idx < 0) idx = 0;
+        if (idx >= n) idx = n - 1;
+        if (n > 0) {
+            if (lastDrawSample < 0) { lastDrawSample = idx; lastDrawValue = y; }
+            int lo = std::min(lastDrawSample, idx);
+            int hi = std::max(lastDrawSample, idx);
+            float v0 = (lo == lastDrawSample) ? lastDrawValue : y;
+            float v1 = (hi == idx)            ? y            : lastDrawValue;
+            for (int i = lo; i <= hi; ++i) {
+                float t = (hi > lo) ? (float)(i - lo) / (float)(hi - lo) : 0.0f;
+                ir[i] = v0 + (v1 - v0) * t;
+            }
+            lastDrawSample = idx;
+            lastDrawValue  = y;
+            updateFreqResponse();
+            repaint();
+        }
+        return;
+    }
+
+    if (dragPointIdx < 0 || dragPointIdx >= (int)controlPoints.size()) return;
+    float x = juce::jlimit(0.0f, 1.0f,
+        screenXToSampleIdx(e.position.x, area) /
+        std::max(1.0f, (float)(ir.size() - 1)));
     controlPoints[dragPointIdx] = {x, y};
     std::sort(controlPoints.begin(), controlPoints.end());
-    // Re-find after sort
     for (int i = 0; i < (int)controlPoints.size(); ++i)
         if (std::abs(controlPoints[i].first - x) < 0.001f &&
             std::abs(controlPoints[i].second - y) < 0.001f) { dragPointIdx = i; break; }
@@ -288,11 +416,15 @@ void ConvolutionEditorComponent::mouseDrag(const juce::MouseEvent& e) {
 }
 
 void ConvolutionEditorComponent::mouseUp(const juce::MouseEvent&) {
-    if (dragPointIdx >= 0) {
+    if (drawMode == DrawMode::Freehand && lastDrawSample >= 0) {
+        commitIR();
+        if (onApply) onApply();
+    } else if (dragPointIdx >= 0) {
         commitIR();
         if (onApply) onApply();
     }
     dragPointIdx = -1;
+    lastDrawSample = -1;
 }
 
 void ConvolutionEditorComponent::renderFromControlPoints() {
@@ -337,33 +469,77 @@ void ConvolutionEditorComponent::paint(juce::Graphics& g) {
     g.setColour(juce::Colours::grey.withAlpha(0.3f));
     g.drawHorizontalLine((int)cy, irArea.getX(), irArea.getRight());
 
-    // Label
+    // Compute the visible sample range under current zoom/scroll
+    int nSamples = (int)ir.size();
+    float visibleSpan = std::max(1.0f, (float)nSamples / std::max(1.0f, zoomX));
+    float firstVisible = scrollFrac * std::max(0.0f, (float)nSamples - visibleSpan);
+    int visLo = (int)std::floor(firstVisible);
+    int visHi = (int)std::ceil(firstVisible + visibleSpan) + 1;
+    visLo = juce::jlimit(0, nSamples - 1, visLo);
+    visHi = juce::jlimit(0, nSamples,     visHi);
+    float pxPerSample = (nSamples > 0) ?
+        irArea.getWidth() / std::max(1.0f, visibleSpan) : 1.0f;
+
+    // Label — shows current zoom + freehand hint when zoomed in enough
     g.setColour(juce::Colours::white.withAlpha(0.6f));
     g.setFont(10.0f);
-    g.drawText("Impulse Response (" + juce::String((int)ir.size()) + " samples)"
-               + "  —  click to add points, drag to move, right-click to delete",
-               irArea.reduced(4, 2).toNearestInt(), juce::Justification::topLeft);
+    juce::String modeStr = (drawMode == DrawMode::Freehand) ? "Freehand" : "Points";
+    juce::String label = "IR: " + juce::String(nSamples) + " samples"
+                       + "  —  " + modeStr
+                       + "  —  Ctrl+wheel to zoom (" + juce::String(zoomX, 1) + "x), wheel to scroll";
+    g.drawText(label, irArea.reduced(4, 2).toNearestInt(), juce::Justification::topLeft);
 
-    // Draw IR curve
+    // Draw sample-boundary grid when zoomed in enough that each sample is
+    // visually distinguishable (≥5 px). Gives the user precise targeting
+    // for freehand per-sample edits.
+    if (pxPerSample >= 5.0f) {
+        g.setColour(juce::Colours::white.withAlpha(0.08f));
+        for (int i = visLo; i < visHi; ++i) {
+            float x = sampleIdxToScreenX((float)i, irArea);
+            g.drawVerticalLine((int)x, irArea.getY(), irArea.getBottom());
+        }
+    }
+
+    // Draw IR curve — only the visible portion, and as discrete stems +
+    // dots when zoomed in enough so individual samples are legible.
     if (!ir.empty()) {
+        bool showSamples = pxPerSample >= 5.0f;
         juce::Path p;
-        for (int i = 0; i < (int)ir.size(); ++i) {
-            float x = irArea.getX() + (float)i / (float)(ir.size() - 1) * irArea.getWidth();
+        bool first = true;
+        for (int i = visLo; i < visHi; ++i) {
+            float x = sampleIdxToScreenX((float)i, irArea);
             float y = cy - ir[i] * irArea.getHeight() * 0.45f;
-            if (i == 0) p.startNewSubPath(x, y); else p.lineTo(x, y);
+            if (first) { p.startNewSubPath(x, y); first = false; }
+            else p.lineTo(x, y);
         }
         g.setColour(juce::Colours::cornflowerblue);
         g.strokePath(p, juce::PathStrokeType(1.5f));
+
+        if (showSamples) {
+            g.setColour(juce::Colours::cornflowerblue.brighter(0.3f));
+            for (int i = visLo; i < visHi; ++i) {
+                float x = sampleIdxToScreenX((float)i, irArea);
+                float y = cy - ir[i] * irArea.getHeight() * 0.45f;
+                // Stem from center line to sample value
+                g.drawVerticalLine((int)x, std::min(y, cy), std::max(y, cy));
+                // Sample dot
+                g.fillEllipse(x - 2, y - 2, 4, 4);
+            }
+        }
     }
 
-    // Control points
-    for (int i = 0; i < (int)controlPoints.size(); ++i) {
-        float x = irArea.getX() + controlPoints[i].first * irArea.getWidth();
-        float y = cy - controlPoints[i].second * irArea.getHeight() * 0.45f;
-        g.setColour(i == dragPointIdx ? juce::Colours::yellow : juce::Colours::white);
-        g.fillEllipse(x - 4, y - 4, 8, 8);
-        g.setColour(juce::Colours::cornflowerblue);
-        g.drawEllipse(x - 4, y - 4, 8, 8, 1.0f);
+    // Control points (only visible in ControlPoints mode)
+    if (drawMode == DrawMode::ControlPoints) {
+        for (int i = 0; i < (int)controlPoints.size(); ++i) {
+            float sampleIdx = controlPoints[i].first * (float)(nSamples - 1);
+            float x = sampleIdxToScreenX(sampleIdx, irArea);
+            if (x < irArea.getX() - 6 || x > irArea.getRight() + 6) continue;
+            float y = cy - controlPoints[i].second * irArea.getHeight() * 0.45f;
+            g.setColour(i == dragPointIdx ? juce::Colours::yellow : juce::Colours::white);
+            g.fillEllipse(x - 4, y - 4, 8, 8);
+            g.setColour(juce::Colours::cornflowerblue);
+            g.drawEllipse(x - 4, y - 4, 8, 8, 1.0f);
+        }
     }
 
     // Frequency response area

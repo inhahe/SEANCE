@@ -208,7 +208,9 @@ private:
     struct Voice {
         bool active = false;
         int noteNumber = -1;
-        float frequency = 440.0f;
+        int midiChannel = 1;       // 1..16, used for per-channel bend / mod wheel
+        float baseFrequency = 440.0f; // frequency before bend, set at note-on
+        float frequency = 440.0f;  // effective frequency (base * bend), used by render
         float velocity = 1.0f;
         float phase = 0.0f;
         double startBeat = 0;
@@ -224,6 +226,18 @@ private:
     };
     static constexpr int MAX_VOICES = 16;
     Voice voices[MAX_VOICES];
+
+    // Per-channel pitch bend factor (1.0 = no bend, 2^(semis/12) otherwise).
+    // Default bend range is ±2 semitones — configurable per-synth later.
+    float pitchBendFactor[16] = {1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1};
+    static constexpr float kPitchBendRangeSemis = 2.0f;
+
+    // Per-channel mod wheel (CC#1) value, normalized 0..1. Drives a default
+    // fixed-rate vibrato on the voice frequency when > 0.
+    float modWheel[16] = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};
+    float vibratoPhase = 0.0f;
+    static constexpr float kVibratoRateHz = 6.0f;
+    static constexpr float kVibratoMaxSemis = 0.4f; // ±0.4 semis at full mod
 
     // Internal LFOs for modulation
     struct LFO {

@@ -551,12 +551,11 @@ void MainContentComponent::timerCallback() {
                 for (auto* node : editorsToOpen)
                     openEditor(*node);
             }
-            // Only fit-all if a project was actually loaded (more than the
-            // default Master Out is present). For a fresh empty project this
-            // would otherwise zoom in on the lone Master Out and re-center it,
-            // defeating its initial position.
-            if ((int)graph.nodes.size() > 1)
-                graphComponent->fitAll();
+            // Note: the initial fit-all happens inside NodeGraphComponent's
+            // first resized()/paint() call, *before* this timer-deferred init
+            // runs, so the user never sees the un-fit default zoom. Don't
+            // re-fit here — that would clobber any manual pan/zoom the user
+            // has already done while audio engine was warming up.
 
             // Force the OS to clear any stale "Not Responding" state
 #ifdef _WIN32

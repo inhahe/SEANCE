@@ -77,6 +77,14 @@ juce::Colour NodeGraphComponent::getNodeColor(const Node& node) const {
 
 void NodeGraphComponent::paint(juce::Graphics& g) {
     g.fillAll(juce::Colour(25, 25, 30));
+
+    // If we somehow paint before resized() (e.g. unusual layout cascade), do
+    // the initial fit here so we never draw nodes at the default zoom/pan.
+    if (pendingInitialFit && getWidth() > 0 && getHeight() > 0) {
+        if (graph.nodes.size() > 1) fitAll();
+        pendingInitialFit = false;
+    }
+
     drawGrid(g);
 
     // Draw parent-child group lines
@@ -781,7 +789,19 @@ void NodeGraphComponent::fitAll() {
     repaint();
 }
 
-void NodeGraphComponent::resized() {}
+void NodeGraphComponent::resized() {
+    // Run the initial fit-all the first time we get a real (non-zero) size,
+    // so the very first paint already shows the graph centered at the right
+    // zoom — no visible zoom-in jitter on project load. Subsequent resizes
+    // (window-resize, panel splits, etc.) leave the user's view alone so we
+    // don't clobber any manual pan/zoom they've done.
+    if (pendingInitialFit && getWidth() > 0 && getHeight() > 0) {
+        if (graph.nodes.size() > 1) {
+            fitAll();
+        }
+        pendingInitialFit = false;
+    }
+}
 
 // ==============================================================================
 // Context menus

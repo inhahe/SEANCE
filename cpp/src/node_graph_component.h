@@ -42,6 +42,12 @@ private:
     float zoom = 1.0f;
     juce::Point<float> panOffset{0, 0};
 
+    // True until the first resized() callback runs fitAll(). Prevents the
+    // user from briefly seeing nodes at the default zoom/pan before the
+    // initial fit, which used to look like a tacky zoom-in animation on
+    // every project load.
+    bool pendingInitialFit = true;
+
     // Interaction state
     enum class DragMode { None, Pan, MoveNode, DragLink, SelectBox, DragParam };
     DragMode dragMode = DragMode::None;

@@ -17,11 +17,15 @@ float TimeGateProcessor::computeWet(float beat) const {
         for (int id : grp.linkIds)
             if (id == linkId) { myGroupIds.push_back(grp.id); break; }
 
-    // Scan effect regions on the source node. A region applies if it
-    // directly references our linkId, or references a group we belong to.
-    for (const auto& region : sourceNode.effectRegions) {
+    // The default crossfade comes from the project-wide setting; a group can
+    // override it with a non-zero crossfadeSec of its own. Hardcoded zero on
+    // a group means "fall through to the global default" (so users can set a
+    // single global value and have it apply everywhere).
+    const float globalDefault = std::max(0.0f, graph.globalCrossfadeSec);
+
+    auto applyRegion = [&](const EffectRegion& region) {
         bool applies = false;
-        float crossfadeSec = 0.05f;
+        float crossfadeSec = globalDefault;
 
         if (region.linkId == linkId && region.linkId >= 0) {
             applies = true;
@@ -29,59 +33,32 @@ float TimeGateProcessor::computeWet(float beat) const {
             for (int gid : myGroupIds) {
                 if (gid == region.groupId) {
                     applies = true;
-                    // Use the group's crossfade duration if available
                     if (auto* grp = graph.findEffectGroup(gid))
-                        crossfadeSec = grp->crossfadeSec;
+                        if (grp->crossfadeSec > 0.0f)
+                            crossfadeSec = grp->crossfadeSec;
                     break;
                 }
             }
         }
-        if (!applies) continue;
+        if (!applies) return;
 
         // Region is active if beat is inside [startBeat, endBeat].
-        // Compute crossfade ramp at both edges.
-        if (beat >= region.startBeat && beat <= region.endBeat) {
-            float crossfadeBeats = crossfadeSec * (transport.bpm / 60.0f);
-            crossfadeBeats = std::max(0.001f, crossfadeBeats);
-            float fadeIn  = (beat - region.startBeat) / crossfadeBeats;
-            float fadeOut = (region.endBeat - beat) / crossfadeBeats;
-            float w = std::min(1.0f, std::min(fadeIn, fadeOut));
-            wet = std::max(wet, w);
-        }
-    }
+        // Crossfade ramps in at the start edge and out at the end edge.
+        if (beat < region.startBeat || beat > region.endBeat) return;
+        float crossfadeBeats = std::max(0.001f,
+            crossfadeSec * (float)(transport.bpm / 60.0));
+        float fadeIn  = (beat - region.startBeat) / crossfadeBeats;
+        float fadeOut = (region.endBeat - beat) / crossfadeBeats;
+        float w = std::min(1.0f, std::min(fadeIn, fadeOut));
+        wet = std::max(wet, w);
+    };
 
-    // Also scan ALL nodes (not just sourceNode) for regions that reference
-    // our link or our groups, in case the region lives on a different track.
-    for (const auto& node : graph.nodes) {
-        if (&node == &sourceNode) continue; // already scanned above
-        for (const auto& region : node.effectRegions) {
-            bool applies = false;
-            float crossfadeSec = 0.05f;
-
-            if (region.linkId == linkId && region.linkId >= 0) {
-                applies = true;
-            } else if (region.groupId >= 0) {
-                for (int gid : myGroupIds) {
-                    if (gid == region.groupId) {
-                        applies = true;
-                        if (auto* grp = graph.findEffectGroup(gid))
-                            crossfadeSec = grp->crossfadeSec;
-                        break;
-                    }
-                }
-            }
-            if (!applies) continue;
-
-            if (beat >= region.startBeat && beat <= region.endBeat) {
-                float crossfadeBeats = crossfadeSec * (transport.bpm / 60.0f);
-                crossfadeBeats = std::max(0.001f, crossfadeBeats);
-                float fadeIn  = (beat - region.startBeat) / crossfadeBeats;
-                float fadeOut = (region.endBeat - beat) / crossfadeBeats;
-                float w = std::min(1.0f, std::min(fadeIn, fadeOut));
-                wet = std::max(wet, w);
-            }
-        }
-    }
+    // Effect regions can live on any node (the source node, or a different
+    // track), so scan the whole graph in one pass. Cheap; the graph is tiny
+    // and `applies` rejects mismatches early.
+    for (const auto& node : graph.nodes)
+        for (const auto& region : node.effectRegions)
+            applyRegion(region);
 
     return wet;
 }

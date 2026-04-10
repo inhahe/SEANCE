@@ -681,6 +681,10 @@ juce::PopupMenu MainContentComponent::getMenuForIndex(int idx, const juce::Strin
             menu.addSubMenu("Concert Pitch (A4 = " + juce::String(graph.concertPitch, 1) + " Hz)", pitchMenu);
         }
         menu.addSeparator();
+        menu.addItem(110, "Crossfade Duration ("
+                    + juce::String((int)std::round(graph.globalCrossfadeSec * 1000.0f))
+                    + " ms)...");
+        menu.addSeparator();
         menu.addItem(50, "Assign Hotkeys...");
         menu.addItem(51, "Capture Room IR...");
     } else if (name == "Plugins") {
@@ -772,6 +776,30 @@ void MainContentComponent::menuItemSelected(int menuItemID, int) {
                         float hz = aw->getTextEditorContents("hz").getFloatValue();
                         if (hz > 200 && hz < 600)
                             graph.concertPitch = hz;
+                    }
+                    delete aw;
+                }), true);
+            break;
+        }
+        case 110: {
+            // Global crossfade duration (ms)
+            auto* aw = new juce::AlertWindow("Crossfade Duration",
+                "How long should crossfades be?\n"
+                "(Used at effect region edges and any other start/stop transition.)",
+                juce::MessageBoxIconType::NoIcon);
+            aw->addTextEditor("ms",
+                juce::String((int)std::round(graph.globalCrossfadeSec * 1000.0f)),
+                "ms:");
+            aw->addButton("OK", 1, juce::KeyPress(juce::KeyPress::returnKey));
+            aw->addButton("Cancel", 0);
+            aw->enterModalState(true, juce::ModalCallbackFunction::create(
+                [this, aw](int res) {
+                    if (res == 1) {
+                        float ms = aw->getTextEditorContents("ms").getFloatValue();
+                        // 0..2000 ms is plenty; 0 means "instant" (you'll hear clicks).
+                        ms = juce::jlimit(0.0f, 2000.0f, ms);
+                        graph.globalCrossfadeSec = ms / 1000.0f;
+                        audioEngine.getGraphProcessor().requestRebuild();
                     }
                     delete aw;
                 }), true);

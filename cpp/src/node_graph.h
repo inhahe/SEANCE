@@ -408,6 +408,13 @@ public:
     TuningSystem tuningSystem = TuningSystem::Equal12;
     float concertPitch = 440.0f; // Hz for A4
 
+    // Global crossfade duration (seconds) used to smooth audio discontinuities
+    // anywhere the engine starts or stops a routing path mid-stream — effect
+    // region edges, mute/solo toggles, plugin bypass, future child-track
+    // entry/exit, etc. Per-feature overrides (e.g. EffectGroup::crossfadeSec)
+    // take precedence when explicitly set.
+    float globalCrossfadeSec = 0.05f;
+
     // Check if a node has any incoming signal/param connections (meaning
     // one or more params may be externally controlled). Used to grey out
     // and lock sliders when a signal is driving them.

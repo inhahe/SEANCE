@@ -98,7 +98,10 @@ struct EffectGroup {
     std::string name;       // optional — empty = identified by color/shape only
     uint32_t color = 0;     // ARGB, auto-assigned from palette if 0
     std::vector<int> linkIds; // which Link IDs belong to this group
-    float crossfadeSec = 0.05f; // crossfade duration at region boundaries
+    // Per-group crossfade override. 0 = inherit NodeGraph::globalCrossfadeSec.
+    // Non-zero overrides the global so a single group can have a longer or
+    // shorter ramp than the rest of the project.
+    float crossfadeSec = 0.0f;
 };
 
 // ==============================================================================

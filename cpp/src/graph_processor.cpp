@@ -204,7 +204,8 @@ void MidiTimelineProcessor::emitExpression(juce::MidiBuffer& midi, int mpeIdx,
 // AudioTimelineProcessor — plays audio file clips
 // ==============================================================================
 
-AudioTimelineProcessor::AudioTimelineProcessor(Node& n, Transport& t) : node(n), transport(t) {
+AudioTimelineProcessor::AudioTimelineProcessor(Node& n, Transport& t, NodeGraph& g)
+    : node(n), transport(t), graph(g) {
     formatManager.registerBasicFormats();
 }
 
@@ -254,6 +255,13 @@ void AudioTimelineProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::M
     double beatsPerSample = transport.bpm / (60.0 * sampleRate);
     double blockEndBeat = currentBeat + numSamples * beatsPerSample;
 
+    // Auto-edge-fade so a clip never starts or ends with a hard sample edge.
+    // The user's fadeIn/fadeOut settings are honored, but we always enforce
+    // at least globalCrossfadeSec worth of fade to prevent clicks. Capped
+    // to half the clip length so very short clips still play.
+    double globalFadeBeats = std::max(0.0,
+        (double)graph.globalCrossfadeSec * (double)transport.bpm / 60.0);
+
     for (auto& clip : node.clips) {
         if (clip.audioFilePath.empty()) continue;
 
@@ -262,6 +270,11 @@ void AudioTimelineProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::M
 
         double clipStart = clip.startBeat;
         double clipEnd = clip.startBeat + clip.lengthBeats;
+        double maxEdgeFade = std::max(0.0, clip.lengthBeats * 0.5);
+        double effFadeIn  = std::min(maxEdgeFade,
+            std::max((double)clip.fadeInBeats,  globalFadeBeats));
+        double effFadeOut = std::min(maxEdgeFade,
+            std::max((double)clip.fadeOutBeats, globalFadeBeats));
 
         // Skip if clip doesn't overlap this block
         if (currentBeat >= clipEnd || blockEndBeat <= clipStart) continue;
@@ -308,15 +321,17 @@ void AudioTimelineProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::M
             int fileSample = (int)(s * fileRatio);
             if (fileSample >= fileSamplesToRead) break;
 
-            // Fade
+            // Fade — uses effective edge-fade durations (max of user setting
+            // and the project-wide globalCrossfadeSec) so clips never start
+            // or end with a hard sample edge.
             float fade = 1.0f;
             double beatPos = currentBeat + outSample * beatsPerSample;
             double beatInC = beatPos - clipStart;
-            if (clip.fadeInBeats > 0 && beatInC < clip.fadeInBeats)
-                fade *= (float)(beatInC / clip.fadeInBeats);
+            if (effFadeIn > 0.0 && beatInC < effFadeIn)
+                fade *= (float)(beatInC / effFadeIn);
             double beatsRemaining = clipEnd - beatPos;
-            if (clip.fadeOutBeats > 0 && beatsRemaining < clip.fadeOutBeats)
-                fade *= (float)(beatsRemaining / clip.fadeOutBeats);
+            if (effFadeOut > 0.0 && beatsRemaining < effFadeOut)
+                fade *= (float)(beatsRemaining / effFadeOut);
 
             float gain = gainLinear * fade;
 
@@ -415,7 +430,7 @@ void GraphProcessor::rebuildGraph(NodeGraph& graph, Transport& transport) {
         if (node.type == NodeType::MidiTimeline) {
             proc = std::make_unique<MidiTimelineProcessor>(node, transport);
         } else if (node.type == NodeType::AudioTimeline) {
-            proc = std::make_unique<AudioTimelineProcessor>(node, transport);
+            proc = std::make_unique<AudioTimelineProcessor>(node, transport, graph);
         } else if (node.type == NodeType::Output) {
             // Our output node maps to the graph's audio output — skip creating a processor
             nodeMap[node.id] = outputNodeId;

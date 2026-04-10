@@ -58,7 +58,7 @@ private:
 // Wraps an audio timeline node — plays audio file clips
 class AudioTimelineProcessor : public juce::AudioProcessor {
 public:
-    AudioTimelineProcessor(Node& node, Transport& transport);
+    AudioTimelineProcessor(Node& node, Transport& transport, NodeGraph& graph);
     const juce::String getName() const override { return node.name; }
     void prepareToPlay(double sr, int bs) override;
     void releaseResources() override {}
@@ -79,6 +79,7 @@ public:
 private:
     Node& node;
     Transport& transport;
+    NodeGraph& graph;
     double sampleRate = 44100;
     int blockSize = 512;
 

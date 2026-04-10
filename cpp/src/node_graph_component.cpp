@@ -220,12 +220,27 @@ void NodeGraphComponent::drawNode(juce::Graphics& g, Node& node) {
         auto pos = canvasToScreen({isInput ? bounds.getX() : bounds.getRight(), pinY + PIN_ROW_HEIGHT / 2});
         float r = PIN_RADIUS * zoom;
 
-        // Pin circle
-        g.setColour(pin.kind == PinKind::Midi   ? juce::Colours::limegreen
-                  : pin.kind == PinKind::Param  ? juce::Colours::orange
-                  : pin.kind == PinKind::Signal ? juce::Colours::red
-                  : juce::Colours::cornflowerblue);
-        g.fillEllipse(pos.x - r, pos.y - r, r * 2, r * 2);
+        // Pin circle. Normally colored by kind; while a wire-drag is in
+        // flight and this pin is the current valid drop target, draw it in
+        // bright yellow with an outer halo so the user knows the cursor is
+        // close enough to drop.
+        bool isHoverDropTarget = (dragMode == DragMode::DragLink)
+                              && (pin.id == dragHoverPinId);
+        if (isHoverDropTarget) {
+            // Outer halo
+            g.setColour(juce::Colours::yellow.withAlpha(0.35f));
+            g.fillEllipse(pos.x - r * 2, pos.y - r * 2, r * 4, r * 4);
+            g.setColour(juce::Colours::yellow);
+            g.fillEllipse(pos.x - r * 1.4f, pos.y - r * 1.4f, r * 2.8f, r * 2.8f);
+            g.setColour(juce::Colours::white);
+            g.drawEllipse(pos.x - r * 1.4f, pos.y - r * 1.4f, r * 2.8f, r * 2.8f, 1.5f);
+        } else {
+            g.setColour(pin.kind == PinKind::Midi   ? juce::Colours::limegreen
+                      : pin.kind == PinKind::Param  ? juce::Colours::orange
+                      : pin.kind == PinKind::Signal ? juce::Colours::red
+                      : juce::Colours::cornflowerblue);
+            g.fillEllipse(pos.x - r, pos.y - r, r * 2, r * 2);
+        }
 
         // Label
         float labelFontSize = std::max(8.0f, 11.0f * zoom);
@@ -662,6 +677,17 @@ void NodeGraphComponent::mouseDrag(const juce::MouseEvent& e) {
         }
     } else if (dragMode == DragMode::DragLink) {
         dragCurrent = e.position;
+        // Track which pin we're hovering over so drawPin() can highlight it.
+        // Only count it as a valid drop target if it's the opposite direction
+        // from the source (output -> input or vice versa) and not the same
+        // pin we started from.
+        auto canvasPos = screenToCanvas(e.position);
+        bool isOut = false;
+        int hovered = pinAtPoint(canvasPos, isOut);
+        if (hovered >= 0 && hovered != dragPinId && isOut != dragPinIsOutput)
+            dragHoverPinId = hovered;
+        else
+            dragHoverPinId = -1;
         repaint();
     } else if (dragMode == DragMode::DragParam) {
         auto* node = graph.findNode(dragNodeId);
@@ -700,6 +726,7 @@ void NodeGraphComponent::mouseUp(const juce::MouseEvent& e) {
     dragMode = DragMode::None;
     dragNodeId = -1;
     dragParamIdx = -1;
+    dragHoverPinId = -1;
     repaint();
 }
 

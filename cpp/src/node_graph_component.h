@@ -54,6 +54,8 @@ private:
     int dragNodeId = -1;
     int dragPinId = -1;       // pin we're dragging a link from
     bool dragPinIsOutput = true;
+    int dragHoverPinId = -1;  // pin currently hovered while dragging a link
+                              //   (drop target if released here, -1 if none)
     int dragParamIdx = -1;    // index into node.params when dragMode == DragParam
     float dragParamStartValue = 0.0f;
     float dragParamLeftX = 0.0f;   // canvas-space left edge of the slider's track

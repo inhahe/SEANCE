@@ -225,8 +225,11 @@ void DrumSynthProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::MidiB
     syncFromParams(); // pick up any param changes from sliders
 
     float volume = 0.5f;
-    for (auto& p : node.params)
-        if (p.name == "Volume") { volume = p.value; break; }
+    float velSens = 1.0f;
+    for (auto& p : node.params) {
+        if (p.name == "Volume")    volume = p.value;
+        else if (p.name == "Vel Sens") velSens = p.value;
+    }
 
     // Process MIDI
     for (auto metadata : midi) {
@@ -243,7 +246,10 @@ void DrumSynthProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::MidiB
                 voices[vi].active = true;
                 voices[vi].soundIdx = si;
                 voices[vi].time = 0;
-                voices[vi].velocity = msg.getVelocity() / 127.0f;
+                {
+                    float raw = msg.getVelocity() / 127.0f;
+                    voices[vi].velocity = 1.0f - velSens * (1.0f - raw);
+                }
                 voices[vi].rng.seed((unsigned)msg.getNoteNumber() * 1234 + (unsigned)(voices[vi].time * 10000));
             }
         }

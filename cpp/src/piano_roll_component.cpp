@@ -98,9 +98,13 @@ PianoRollComponent::PianoRollComponent(NodeGraph& g, Node& n, Transport* t)
     soloBtn.setColour(juce::TextButton::buttonColourId,
         node->soloed ? juce::Colour(180, 180, 50) : juce::Colour(55, 55, 60));
 
-    // Expression / velocity lane buttons
-    addBtn(exprOffBtn); /* Velocity and MPE lanes hidden until interaction bugs are fixed */
+    // Expression / velocity lane buttons.
+    // Velocity lane is now fully working; MPE lanes are still hidden until
+    // their interaction code is audited.
+    addBtn(exprOffBtn);
+    addBtn(exprVelBtn);
     exprOffBtn.onClick   = [this]() { exprLane = ExprNone; repaint(); };
+    exprVelBtn.onClick   = [this]() { exprLane = ExprVelocity; repaint(); };
     exprPBBtn.onClick    = [this]() { exprLane = ExprPitchBend; repaint(); };
     exprSlideBtn.onClick = [this]() { exprLane = ExprSlide; repaint(); };
     exprPressBtn.onClick = [this]() { exprLane = ExprPressure; repaint(); };
@@ -452,12 +456,13 @@ void PianoRollComponent::resized() {
         x += 4;
         place2(snapScaleBtn, 85);
         place2(detectKeyBtn, 70);
-        // Velocity lane is always available; MPE lanes only when MPE enabled
+        // Velocity lane + automation are always available; MPE lanes only
+        // when MPE is enabled on the node.
         x += 8;
         place2(exprOffBtn, 35);
-        // Velocity and MPE expression lane buttons hidden until their
-        // interaction code is fixed. Only automation lane is exposed.
-        exprVelBtn.setVisible(false);
+        place2(exprVelBtn, 35);
+        // MPE expression lane buttons still hidden until their interaction
+        // code is audited.
         exprPBBtn.setVisible(false);
         exprSlideBtn.setVisible(false);
         exprPressBtn.setVisible(false);
@@ -467,6 +472,7 @@ void PianoRollComponent::resized() {
                 exprLane == lane ? juce::Colour(50, 90, 140) : juce::Colour(55, 55, 60));
         };
         styleLane(exprOffBtn, ExprNone);
+        styleLane(exprVelBtn, ExprVelocity);
         x += 4;
         autoParamCombo.setBounds(row2.getX() + x, row2.getY() + 1, 120, rowH - 2);
     }
@@ -891,17 +897,23 @@ void PianoRollComponent::paint(juce::Graphics& g) {
                 auto noteColor = juce::Colour(clip.color).brighter(0.3f);
 
                 if (exprLane == ExprVelocity) {
-                    // Velocity: vertical bar per note
-                    float barWidth = std::max(3.0f, beatToX(noteStartBeat + 0.1f) - nx1);
+                    // Velocity: one vertical bar per note, spanning the
+                    // note's actual duration so it visually lines up with
+                    // the note above. Min 3px wide so very short notes are
+                    // still clickable.
+                    float noteEndBeat = noteStartBeat + note.getDuration();
+                    float nx2 = beatToX(noteEndBeat);
+                    float barWidth = std::max(3.0f, nx2 - nx1);
                     float barHeight = (note.velocity / 127.0f) * exprH;
                     float barY = exprY + exprH - barHeight;
 
-                    if (nx1 >= gridX - barWidth && nx1 <= gridX + gridW) {
-                        g.setColour(isSelected ? noteColor : noteColor.withAlpha(0.7f));
-                        g.fillRect(nx1, barY, barWidth, barHeight);
-                        g.setColour(juce::Colours::white.withAlpha(0.3f));
-                        g.drawRect(juce::Rectangle<float>(nx1, barY, barWidth, barHeight), 1.0f);
-                    }
+                    // Off-screen cull
+                    if (nx2 < gridX || nx1 > gridX + gridW) continue;
+
+                    g.setColour(isSelected ? noteColor : noteColor.withAlpha(0.7f));
+                    g.fillRect(nx1, barY, barWidth, barHeight);
+                    g.setColour(juce::Colours::white.withAlpha(isSelected ? 0.6f : 0.3f));
+                    g.drawRect(juce::Rectangle<float>(nx1, barY, barWidth, barHeight), 1.0f);
                 } else {
                     // MPE expression curves
                     auto& curve = exprLane == ExprPitchBend ? note.expression.pitchBend
@@ -1143,26 +1155,60 @@ void PianoRollComponent::mouseDown(const juce::MouseEvent& e) {
             return;
         }
 
-        // Velocity lane: click to set velocity
+        // Velocity lane: click a note's bar to set its velocity, then drag
+        // vertically to continue tweaking. Hit-test by the note's actual
+        // time span so every note corresponds to exactly one bar. If two
+        // notes overlap in time (polyphony), pick the one whose bar top is
+        // closest to the click y — that way the user can still target the
+        // bar they can actually see.
         if (exprLane == ExprVelocity) {
-            int newVel = juce::jlimit(1, 127, (int)(exVal * 127.0f));
+            // Compute the click's Y within the expr lane in pixels so we can
+            // compare to each bar's top edge for disambiguation.
+            float gridH = getHeight() - toolbarHeight() - SCROLLBAR_SIZE;
+            float exprY = toolbarHeight() + gridH - EXPR_LANE_HEIGHT;
+            float clickY = e.position.y;
+
+            int bestCI = -1, bestNI = -1;
+            float bestDistY = 1e9f;
+
             for (int ci = 0; ci < (int)node->clips.size(); ++ci) {
                 auto& clip = node->clips[ci];
                 for (int ni = 0; ni < (int)clip.notes.size(); ++ni) {
                     auto& note = clip.notes[ni];
                     float noteStart = clip.startBeat + note.getOffset();
-                    if (exBeat >= noteStart - 0.1f && exBeat <= noteStart + 0.2f) {
-                        // Snapshot for undo
-                        dragBeforeSnapshot = {{ci, ni, note.offset, note.duration, note.detune, note.pitch, note.velocity}};
-                        note.velocity = newVel;
-                        dragMode = DragExprPoint;
-                        exprDragCI = ci;
-                        exprDragNI = ni;
-                        graph.dirty = true;
-                        repaint();
-                        return;
+                    float noteEnd   = noteStart + note.getDuration();
+                    // Allow a small slop in beat-space so very short notes
+                    // are still clickable (must be at least ~5px wide).
+                    float minDurBeats = 0.01f;
+                    if (noteEnd < noteStart + minDurBeats)
+                        noteEnd = noteStart + minDurBeats;
+                    if (exBeat < noteStart || exBeat > noteEnd) continue;
+
+                    // Pick the note whose bar-top is closest to click y
+                    // (but always accept any match if nothing better).
+                    float barHeight = (note.velocity / 127.0f) * EXPR_LANE_HEIGHT;
+                    float barTop = exprY + EXPR_LANE_HEIGHT - barHeight;
+                    float d = std::abs(barTop - clickY);
+                    if (d < bestDistY) {
+                        bestDistY = d;
+                        bestCI = ci;
+                        bestNI = ni;
                     }
                 }
+            }
+
+            if (bestCI >= 0) {
+                auto& clip = node->clips[bestCI];
+                auto& note = clip.notes[bestNI];
+                // Snapshot for undo
+                dragBeforeSnapshot = {{bestCI, bestNI, note.offset, note.duration,
+                                       note.detune, note.pitch, note.velocity}};
+                note.velocity = juce::jlimit(1, 127, (int)(exVal * 127.0f));
+                dragMode = DragExprPoint;
+                exprDragCI = bestCI;
+                exprDragNI = bestNI;
+                graph.dirty = true;
+                repaint();
             }
             return;
         }

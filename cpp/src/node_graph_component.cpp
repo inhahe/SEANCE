@@ -1026,6 +1026,9 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
             n.params.push_back({"Release",  0.3f,  0.001f, 5.0f});
             n.params.push_back({"Volume",   0.5f,  0.0f,   1.0f});
             n.params.push_back({"Pan",      0.0f, -1.0f,   1.0f});
+            // Velocity sensitivity: 0 = ignore velocity (every note at full
+            // volume), 1 = linear response (default, v/127 gain).
+            n.params.push_back({"Vel Sens", 1.0f,  0.0f,   1.0f});
             // Wavetable Position — meaningful when there are multiple frames.
             // Looked up by name in TerrainSynthProcessor, so list order is free.
             n.params.push_back({"Position", 0.0f,  0.0f,   1.0f});
@@ -1328,12 +1331,13 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
                         n.script = "__sf2__:" + file.getFullPathName().toStdString();
                     else
                         n.script = "__sfz__:" + file.getFullPathName().toStdString();
-                    n.params.push_back({"Attack",  0.01f, 0.001f, 2.0f});
-                    n.params.push_back({"Decay",   0.1f,  0.001f, 2.0f});
-                    n.params.push_back({"Sustain", 0.7f,  0.0f,   1.0f});
-                    n.params.push_back({"Release", 0.3f,  0.001f, 5.0f});
-                    n.params.push_back({"Volume",  0.5f,  0.0f,   1.0f});
-                    n.params.push_back({"Pan",     0.0f, -1.0f,   1.0f});
+                    n.params.push_back({"Attack",   0.01f, 0.001f, 2.0f});
+                    n.params.push_back({"Decay",    0.1f,  0.001f, 2.0f});
+                    n.params.push_back({"Sustain",  0.7f,  0.0f,   1.0f});
+                    n.params.push_back({"Release",  0.3f,  0.001f, 5.0f});
+                    n.params.push_back({"Volume",   0.5f,  0.0f,   1.0f});
+                    n.params.push_back({"Pan",      0.0f, -1.0f,   1.0f});
+                    n.params.push_back({"Vel Sens", 1.0f,  0.0f,   1.0f});
                     if (result == 104)
                         n.params.push_back({"Preset", 0.0f, 0.0f, 127.0f});
                     repaint();
@@ -1345,8 +1349,9 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
                 {Pin{0, "MIDI", PinKind::Midi, true}},
                 {Pin{0, "Audio", PinKind::Audio, false}}, {p.x, p.y});
             n.script = "__drumsynth__";
-            n.params.push_back({"Volume", 0.5f, 0.0f, 1.0f});
-            n.params.push_back({"Pan", 0.0f, -1.0f, 1.0f});
+            n.params.push_back({"Volume",   0.5f, 0.0f, 1.0f});
+            n.params.push_back({"Pan",      0.0f, -1.0f, 1.0f});
+            n.params.push_back({"Vel Sens", 1.0f, 0.0f, 1.0f});
             // The DrumSynthProcessor will populate per-sound params on construction
         } else if (result == 100 || result == 103) {
             // Piano and Drum Machine: functional defaults that route through

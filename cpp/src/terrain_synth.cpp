@@ -770,7 +770,14 @@ void TerrainSynthProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mi
                 voices[vi].active = true;
                 voices[vi].noteNumber = msg.getNoteNumber();
                 voices[vi].frequency = transport.noteToFreq(msg.getNoteNumber());
-                voices[vi].velocity = msg.getVelocity() / 127.0f;
+                // Apply the node's velocity-sensitivity setting: sens=0
+                // collapses everything to full volume, sens=1 is linear.
+                // Default 1.0 preserves prior behavior for older projects.
+                {
+                    float velSens = getParamByName(node, "Vel Sens", 1.0f);
+                    float raw = msg.getVelocity() / 127.0f;
+                    voices[vi].velocity = 1.0f - velSens * (1.0f - raw);
+                }
                 voices[vi].phase = 0;
                 voices[vi].startBeat = transport.positionBeats();
                 voices[vi].envStage = Voice::Attack;

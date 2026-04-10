@@ -3266,7 +3266,12 @@ bool MainContentComponent::handleKeyboardMidi(const juce::KeyPress& key, bool is
     if (isDown) {
         if (audioEngine.keysDown.count(note)) return true; // key repeat, ignore
         audioEngine.keysDown.insert(note);
-        audioEngine.keyboardNoteOn(note);
+        // Modifier-based velocity zones so a QWERTY keyboard can produce
+        // some dynamic range. Shift = louder, Alt = softer, plain = medium.
+        int velocity = 90;
+        if (key.getModifiers().isShiftDown()) velocity = 120;
+        else if (key.getModifiers().isAltDown()) velocity = 50;
+        audioEngine.keyboardNoteOn(note, velocity);
     } else {
         audioEngine.keysDown.erase(note);
         audioEngine.keyboardNoteOff(note);

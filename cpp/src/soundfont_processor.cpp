@@ -206,14 +206,21 @@ void SoundFontProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::MidiB
     int numChannels = buf.getNumChannels();
     buf.clear();
 
+    // Velocity sensitivity — read from node param (default 1 = linear).
+    float velSensSF2 = 1.0f;
+    for (auto& p : node.params)
+        if (p.name == "Vel Sens") { velSensSF2 = p.value; break; }
+
     // === SF2 path: use tinysoundfont ===
     if (sf2) {
         // Process MIDI events
         for (auto metadata : midi) {
             auto msg = metadata.getMessage();
-            if (msg.isNoteOn())
-                tsf_note_on(sf2, currentPreset, msg.getNoteNumber(),
-                            msg.getVelocity() / 127.0f);
+            if (msg.isNoteOn()) {
+                float raw = msg.getVelocity() / 127.0f;
+                float eff = 1.0f - velSensSF2 * (1.0f - raw);
+                tsf_note_on(sf2, currentPreset, msg.getNoteNumber(), eff);
+            }
             else if (msg.isNoteOff())
                 tsf_note_off(sf2, currentPreset, msg.getNoteNumber());
             else if (msg.isAllNotesOff())
@@ -263,7 +270,8 @@ void SoundFontProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::MidiB
                     v.envStage = SFZVoice::Attack;
                     v.envLevel = 0;
                     v.envTime = 0;
-                    v.velocity = vel / 127.0f;
+                    float raw = vel / 127.0f;
+                    v.velocity = 1.0f - velSensSF2 * (1.0f - raw);
                 }
             }
         } else if (msg.isNoteOff()) {

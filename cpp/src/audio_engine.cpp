@@ -109,7 +109,20 @@ void AudioEngine::audioDeviceIOCallbackWithContext(
     if (multitrackRecorder.isRecording() && numInputChannels > 0)
         multitrackRecorder.processSamples(inputChannelData, numInputChannels, numSamples);
 
-    // Grab incoming MIDI, process CC mappings, and pass through to MPE nodes
+    // Grab incoming MIDI from hardware / computer keyboard and route it.
+    //
+    // Two things happen to each event:
+    //  1. processMidiCC applies any user-learned CC mappings to their
+    //     target params. That's done first and unconditionally — learned
+    //     mappings always fire.
+    //  2. The events are forwarded into the currently-active MIDI
+    //     timeline (graph.activeEditorNodeId, if it points at one) so
+    //     they flow through its MIDI Out pin to whatever synth or plugin
+    //     is wired downstream. CC events that are already mapped (step 1)
+    //     are excluded from this forward — otherwise the mod wheel would
+    //     both move the learned param AND hit the synth's default CC1
+    //     vibrato, double-applying. Notes, pitch bend, aftertouch, and
+    //     unmapped CCs all pass through.
     {
         juce::MidiBuffer midiCopy;
         {
@@ -120,12 +133,34 @@ void AudioEngine::audioDeviceIOCallbackWithContext(
             graphProcessor.getAutomation().processMidiCC(
                 midiCopy, *graphProcessor.getGraph(), graphProcessor.getNodeMap());
 
-            for (auto& node : graph->nodes) {
-                if (node.mpeEnabled && (node.type == NodeType::MidiTimeline)) {
-                    std::lock_guard<std::mutex> lock(*node.mpePassthroughMutex);
-                    for (auto metadata : midiCopy)
-                        node.pendingMpePassthrough.push_back({metadata.samplePosition,
-                                                               metadata.getMessage()});
+            // Snapshot mapped (channel, cc) pairs so we can cheaply check
+            // each incoming CC event without touching the automation mutex
+            // per-event.
+            auto ccMappings = graphProcessor.getAutomation().getCCMappings();
+            auto isCCMapped = [&](int ch, int cc) {
+                for (auto& m : ccMappings)
+                    if (m.midiChannel == ch && m.ccNumber == cc) return true;
+                return false;
+            };
+
+            // Find the active MIDI timeline target.
+            Node* activeMidiNode = nullptr;
+            if (graph->activeEditorNodeId >= 0) {
+                if (auto* n = graph->findNode(graph->activeEditorNodeId))
+                    if (n->type == NodeType::MidiTimeline)
+                        activeMidiNode = n;
+            }
+
+            if (activeMidiNode) {
+                std::lock_guard<std::mutex> lock(*activeMidiNode->mpePassthroughMutex);
+                for (auto metadata : midiCopy) {
+                    auto msg = metadata.getMessage();
+                    // Filter already-trained CC events
+                    if (msg.isController() &&
+                        isCCMapped(msg.getChannel(), msg.getControllerNumber()))
+                        continue;
+                    activeMidiNode->pendingMpePassthrough.push_back(
+                        { metadata.samplePosition, msg });
                 }
             }
         }

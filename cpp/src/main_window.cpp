@@ -276,6 +276,7 @@ MainContentComponent::MainContentComponent() {
     graphComponent->onShowMidiMap = [this](int nodeId) { showMidiMap(nodeId); };
     graphComponent->onFreezeNode = [this](int nodeId) { freezeNode(nodeId); };
     graphComponent->onRunScript = [this](int nodeId) { showScriptConsoleForNode(nodeId); };
+    graphComponent->onOpenHelpDoc = [this](juce::String rel) { openHelpDoc(rel); };
 
     // Load prefs, plugin cache, recent projects (audio engine deferred to timer)
     pluginSettings.load("soundshop_plugins.cfg");
@@ -772,7 +773,7 @@ juce::PopupMenu MainContentComponent::getMenuForIndex(int idx, const juce::Strin
         menu.addSeparator();
         menu.addItem(301, "Getting Started");
         menu.addItem(302, "Graph Basics");
-        menu.addItem(303, "Signals and Pin Kinds");
+        menu.addItem(303, "Pin Kinds (Cable Colors)");
         menu.addSeparator();
         menu.addItem(304, "MIDI Input and Routing");
         menu.addItem(305, "Piano Roll");
@@ -901,12 +902,12 @@ void MainContentComponent::menuItemSelected(int menuItemID, int) {
         case 300: openHelpDoc("index.html"); break;
         case 301: openHelpDoc("getting-started.html"); break;
         case 302: openHelpDoc("graph-basics.html"); break;
-        case 303: openHelpDoc("signals.html"); break;
+        case 303: openHelpDoc("pin-kinds.html"); break;
         case 304: openHelpDoc("midi-input.html"); break;
         case 305: openHelpDoc("piano-roll.html"); break;
         case 306: openHelpDoc("wavetables.html"); break;
         case 307: openHelpDoc("terrain-synth.html"); break;
-        case 308: openHelpDoc("layers.html"); break;
+        case 308: openHelpDoc("layers-and-groups.html"); break;
         case 309: openHelpDoc("trigger-node.html"); break;
         case 310: openHelpDoc("midi-modulator.html"); break;
         case 311: openHelpDoc("convolution.html"); break;

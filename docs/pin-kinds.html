@@ -2,20 +2,20 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<title>Signals &amp; Pin Kinds — SoundShop2</title>
+<title>Pin Kinds — SoundShop2</title>
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
 <div class="wrap">
 <header>
-<h1>Signals &amp; Pin Kinds</h1>
+<h1>Pin Kinds (What the Cable Colors Mean)</h1>
 <nav>
   <a href="index.html">Home</a>
   <a href="graph-basics.html">Graph Basics</a>
 </nav>
 </header>
 
-<p>SoundShop2 has <strong>four kinds of pins</strong>, each carrying a different kind of data between nodes. Each kind has a distinct color so you can see at a glance what kind of data is flowing in a given cable.</p>
+<p>SoundShop2 has <strong>four kinds of pins</strong>, each carrying a different kind of data between nodes. Each kind has a distinct color so you can see at a glance what kind of data is flowing in a given cable. Note that "signal" below is the name of <em>one</em> of these four kinds — not a catch-all word for every kind of data flowing between nodes. Audio and MIDI are their own things, not kinds of signal.</p>
 
 <h2><span class="pink-tag t-audio">Audio</span> &mdash; Cornflower blue</h2>
 <p>Stereo audio signal. Each sample is a number roughly in the range <code>-1.0 .. +1.0</code>. Audio pins carry actual sound — what you hear at the Master Out. Synths produce audio, effects transform it, and the Master Out sends it to your speakers.</p>

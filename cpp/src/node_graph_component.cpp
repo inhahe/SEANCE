@@ -1804,7 +1804,7 @@ void NodeGraphComponent::showLinkMenu(int linkId) {
             graph.dirty = true;
         } else if (result == 31) {
             // Help: Effect Groups → open the docs page
-            if (onOpenHelpDoc) onOpenHelpDoc("layers.html");
+            if (onOpenHelpDoc) onOpenHelpDoc("layers-and-groups.html");
             return;
         } else if (result == 30) {
             // New effect group — prompt for optional name

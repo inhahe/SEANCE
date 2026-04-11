@@ -22,12 +22,15 @@ public:
 
     // Callbacks
     std::function<void(Node&)> onOpenEditor;
+    std::function<void()> onNodeEdited;         // called when a node's data changed; wire to graphProcessor.requestRebuild()
+    std::function<void(int)> onNodeDeleted;     // called with node ID when a node is about to be removed
     std::function<void(int)> onShowPluginUI;    // called with node ID
     std::function<void(int)> onShowPluginInfo;   // called with node ID
     std::function<void(int)> onShowPluginPresets; // called with node ID
     std::function<void(int)> onShowMidiMap;       // called with node ID
     std::function<void(int)> onFreezeNode;        // called with node ID
     std::function<void(int)> onRunScript;         // called with node ID
+    std::function<void(juce::String)> onOpenHelpDoc; // called with docs/<file> relative path
 
     // Convert between screen and canvas coordinates
     juce::Point<float> screenToCanvas(juce::Point<float> screen) const;
@@ -40,12 +43,24 @@ private:
     float zoom = 1.0f;
     juce::Point<float> panOffset{0, 0};
 
+    // True until the first resized() callback runs fitAll(). Prevents the
+    // user from briefly seeing nodes at the default zoom/pan before the
+    // initial fit, which used to look like a tacky zoom-in animation on
+    // every project load.
+    bool pendingInitialFit = true;
+
     // Interaction state
-    enum class DragMode { None, Pan, MoveNode, DragLink, SelectBox };
+    enum class DragMode { None, Pan, MoveNode, DragLink, SelectBox, DragParam };
     DragMode dragMode = DragMode::None;
     int dragNodeId = -1;
     int dragPinId = -1;       // pin we're dragging a link from
     bool dragPinIsOutput = true;
+    int dragHoverPinId = -1;  // pin currently hovered while dragging a link
+                              //   (drop target if released here, -1 if none)
+    int dragParamIdx = -1;    // index into node.params when dragMode == DragParam
+    float dragParamStartValue = 0.0f;
+    float dragParamLeftX = 0.0f;   // canvas-space left edge of the slider's track
+    float dragParamWidth = 1.0f;   // canvas-space width of the slider's track
     juce::Point<float> dragStart;
     juce::Point<float> dragCurrent;
     int selectedNodeId = -1;

@@ -100,6 +100,15 @@ target_sources(SoundShop2 PRIVATE
     src/signal_shape_node.cpp
     src/signal_shape_node.h
     src/cache_processor.h
+    src/audio_crossfader.h
+    src/trigger_node.cpp
+    src/trigger_node.h
+    src/midi_mod_node.cpp
+    src/midi_mod_node.h
+    src/midi_input_node.h
+    src/midi_device_wizard.cpp
+    src/midi_device_wizard.h
+    src/help_utils.h
     src/audio_cache.cpp
     src/audio_cache.h
     src/pan_processor.h
@@ -110,6 +119,42 @@ target_sources(SoundShop2 PRIVATE
     src/audio_export.h
     src/mod_import.cpp
     src/mod_import.h
+    src/fft_util.cpp
+    src/fft_util.h
+    src/layered_wave_editor.cpp
+    src/layered_wave_editor.h
+    src/effect_regions.h
+    src/time_gate_processor.cpp
+    src/time_gate_processor.h
+    src/routing_strip.cpp
+    src/routing_strip.h
+    src/xy_pad.cpp
+    src/xy_pad.h
+    src/spectrum_tap.cpp
+    src/spectrum_tap.h
+    src/convolution_processor.cpp
+    src/convolution_processor.h
+    src/convolution_editor.cpp
+    src/convolution_editor.h
+    src/pitch_detect.h
+    src/sampler_editor.cpp
+    src/sampler_editor.h
+    src/soundfont_processor.cpp
+    src/soundfont_processor.h
+    src/hotkey_manager.cpp
+    src/hotkey_manager.h
+    src/room_ir_capture.cpp
+    src/room_ir_capture.h
+    src/multitrack_recorder.cpp
+    src/multitrack_recorder.h
+    src/builtin_effects.h
+    src/drum_synth.cpp
+    src/drum_synth.h
+    src/spatializer_3d.cpp
+    src/spatializer_3d.h
+    src/hrtf_data.cpp
+    src/hrtf_data.h
+    src/tuning.h
 )
 
 target_link_libraries(SoundShop2 PRIVATE
@@ -119,6 +164,7 @@ target_link_libraries(SoundShop2 PRIVATE
     juce::juce_audio_processors
     juce::juce_audio_utils
     juce::juce_core
+    juce::juce_data_structures
     juce::juce_events
     juce::juce_graphics
     juce::juce_gui_basics
@@ -147,13 +193,14 @@ if(WIN32 AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/libopenmpt_bin/lib/
     target_link_directories(SoundShop2 PRIVATE third_party/libopenmpt_bin/lib/amd64)
     target_link_libraries(SoundShop2 PRIVATE libopenmpt)
     target_compile_definitions(SoundShop2 PRIVATE HAS_LIBOPENMPT=1)
+    # Copy every DLL from the libopenmpt bin directory to the output folder.
+    # libopenmpt ships with several helper DLLs (zlib, mpg123, vorbis, ogg, ...)
+    # and the exact set varies by version, so copying the whole directory is
+    # simpler and more future-proof than listing each one.
     add_custom_command(TARGET SoundShop2 POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            "${CMAKE_CURRENT_SOURCE_DIR}/third_party/libopenmpt_bin/bin/amd64/libopenmpt.dll"
-            "$<TARGET_FILE_DIR:SoundShop2>/libopenmpt.dll"
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            "${CMAKE_CURRENT_SOURCE_DIR}/third_party/libopenmpt_bin/bin/amd64/openmpt-zlib.dll"
-            "$<TARGET_FILE_DIR:SoundShop2>/openmpt-zlib.dll"
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+            "${CMAKE_CURRENT_SOURCE_DIR}/third_party/libopenmpt_bin/bin/amd64"
+            "$<TARGET_FILE_DIR:SoundShop2>"
     )
 else()
     # Linux/macOS: try pkg-config or find_library
@@ -249,7 +296,28 @@ else()
     endif()
 endif()
 
+# On Windows, Python's pyconfig.h auto-links python314_d.lib in Debug builds
+# via #pragma comment(lib,...). Standard Python installs don't ship the debug
+# lib, so tell the linker to ignore it and use the release lib in Debug too.
+# Python is dynamically loaded at runtime, so this is safe.
+if(MSVC)
+    target_link_options(SoundShop2 PRIVATE
+        "$<$<CONFIG:Debug>:/NODEFAULTLIB:python314_d.lib>")
+endif()
+
 # Windows Media Foundation (for M4A/WMA export)
 if(WIN32)
     target_link_libraries(SoundShop2 PRIVATE mfplat mfreadwrite mfuuid)
+endif()
+
+# Copy docs/ folder alongside the built exe so Help menu entries can open
+# them via juce::File::startAsProcess. The docs are plain HTML shipped as
+# files (not embedded) so users can also browse docs/ outside the app and
+# we can update them without a rebuild.
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../docs")
+    add_custom_command(TARGET SoundShop2 POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+            "${CMAKE_CURRENT_SOURCE_DIR}/../docs"
+            "$<TARGET_FILE_DIR:SoundShop2>/docs"
+    )
 endif()

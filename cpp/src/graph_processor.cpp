@@ -7,6 +7,16 @@
 #include "pan_processor.h"
 #include "gain_processor.h"
 #include "pitch_shift_processor.h"
+#include "time_gate_processor.h"
+#include "spectrum_tap.h"
+#include "convolution_processor.h"
+#include "soundfont_processor.h"
+#include "builtin_effects.h"
+#include "trigger_node.h"
+#include "midi_mod_node.h"
+#include "midi_input_node.h"
+#include "drum_synth.h"
+#include "spatializer_3d.h"
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -197,7 +207,8 @@ void MidiTimelineProcessor::emitExpression(juce::MidiBuffer& midi, int mpeIdx,
 // AudioTimelineProcessor — plays audio file clips
 // ==============================================================================
 
-AudioTimelineProcessor::AudioTimelineProcessor(Node& n, Transport& t) : node(n), transport(t) {
+AudioTimelineProcessor::AudioTimelineProcessor(Node& n, Transport& t, NodeGraph& g)
+    : node(n), transport(t), graph(g) {
     formatManager.registerBasicFormats();
 }
 
@@ -247,6 +258,13 @@ void AudioTimelineProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::M
     double beatsPerSample = transport.bpm / (60.0 * sampleRate);
     double blockEndBeat = currentBeat + numSamples * beatsPerSample;
 
+    // Auto-edge-fade so a clip never starts or ends with a hard sample edge.
+    // The user's fadeIn/fadeOut settings are honored, but we always enforce
+    // at least globalCrossfadeSec worth of fade to prevent clicks. Capped
+    // to half the clip length so very short clips still play.
+    double globalFadeBeats = std::max(0.0,
+        (double)graph.globalCrossfadeSec * (double)transport.bpm / 60.0);
+
     for (auto& clip : node.clips) {
         if (clip.audioFilePath.empty()) continue;
 
@@ -255,6 +273,11 @@ void AudioTimelineProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::M
 
         double clipStart = clip.startBeat;
         double clipEnd = clip.startBeat + clip.lengthBeats;
+        double maxEdgeFade = std::max(0.0, clip.lengthBeats * 0.5);
+        double effFadeIn  = std::min(maxEdgeFade,
+            std::max((double)clip.fadeInBeats,  globalFadeBeats));
+        double effFadeOut = std::min(maxEdgeFade,
+            std::max((double)clip.fadeOutBeats, globalFadeBeats));
 
         // Skip if clip doesn't overlap this block
         if (currentBeat >= clipEnd || blockEndBeat <= clipStart) continue;
@@ -301,15 +324,17 @@ void AudioTimelineProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::M
             int fileSample = (int)(s * fileRatio);
             if (fileSample >= fileSamplesToRead) break;
 
-            // Fade
+            // Fade — uses effective edge-fade durations (max of user setting
+            // and the project-wide globalCrossfadeSec) so clips never start
+            // or end with a hard sample edge.
             float fade = 1.0f;
             double beatPos = currentBeat + outSample * beatsPerSample;
             double beatInC = beatPos - clipStart;
-            if (clip.fadeInBeats > 0 && beatInC < clip.fadeInBeats)
-                fade *= (float)(beatInC / clip.fadeInBeats);
+            if (effFadeIn > 0.0 && beatInC < effFadeIn)
+                fade *= (float)(beatInC / effFadeIn);
             double beatsRemaining = clipEnd - beatPos;
-            if (clip.fadeOutBeats > 0 && beatsRemaining < clip.fadeOutBeats)
-                fade *= (float)(beatsRemaining / clip.fadeOutBeats);
+            if (effFadeOut > 0.0 && beatsRemaining < effFadeOut)
+                fade *= (float)(beatsRemaining / effFadeOut);
 
             float gain = gainLinear * fade;
 
@@ -369,6 +394,7 @@ void GraphProcessor::prepare(NodeGraph& graph, double sr, int bs) {
 void GraphProcessor::rebuildGraph(NodeGraph& graph, Transport& transport) {
     processorGraph->clear();
     nodeMap.clear();
+    nodeInputMap.clear();
 
     // Add an audio output node (graph sink)
     auto outNode = processorGraph->addNode(
@@ -396,7 +422,10 @@ void GraphProcessor::rebuildGraph(NodeGraph& graph, Transport& transport) {
             if (proc) {
                 proc->enableAllBuses();
                 auto graphNode = processorGraph->addNode(std::move(proc));
-                if (graphNode) nodeMap[node.id] = graphNode->nodeID;
+                if (graphNode) {
+                    nodeMap[node.id] = graphNode->nodeID;
+                    nodeInputMap[node.id] = graphNode->nodeID;
+                }
             }
             continue;
         }
@@ -404,10 +433,11 @@ void GraphProcessor::rebuildGraph(NodeGraph& graph, Transport& transport) {
         if (node.type == NodeType::MidiTimeline) {
             proc = std::make_unique<MidiTimelineProcessor>(node, transport);
         } else if (node.type == NodeType::AudioTimeline) {
-            proc = std::make_unique<AudioTimelineProcessor>(node, transport);
+            proc = std::make_unique<AudioTimelineProcessor>(node, transport, graph);
         } else if (node.type == NodeType::Output) {
             // Our output node maps to the graph's audio output — skip creating a processor
             nodeMap[node.id] = outputNodeId;
+            nodeInputMap[node.id] = outputNodeId;
             continue;
         } else if (node.type == NodeType::Script && !node.script.empty()) {
             // WASM script node — load .wasm file
@@ -425,16 +455,59 @@ void GraphProcessor::rebuildGraph(NodeGraph& graph, Transport& transport) {
             auto graphNode = processorGraph->addNode(std::move(node.plugin->instance));
             if (graphNode) {
                 nodeMap[node.id] = graphNode->nodeID;
+                nodeInputMap[node.id] = graphNode->nodeID;
                 // Store the graph node ID so we can retrieve the processor later
                 node.plugin->graphNodeId = graphNode->nodeID.uid;
             }
             continue;
+        } else if (node.type == NodeType::Instrument && node.script == "__drumsynth__") {
+            proc = std::make_unique<DrumSynthProcessor>(node);
+        } else if (node.type == NodeType::Instrument &&
+                   (node.script.rfind("__sf2__:", 0) == 0 ||
+                    node.script.rfind("__sfz__:", 0) == 0)) {
+            proc = std::make_unique<SoundFontProcessor>(node);
         } else if (node.type == NodeType::TerrainSynth || node.type == NodeType::Instrument) {
             // Unified synth: TerrainSynthProcessor handles everything
             // 1D waveforms (simple synths) and N-D terrains
             proc = std::make_unique<TerrainSynthProcessor>(node, transport);
         } else if (node.type == NodeType::SignalShape) {
             proc = std::make_unique<SignalShapeProcessor>(node, transport);
+        } else if (node.type == NodeType::MidiInput) {
+            proc = std::make_unique<MidiInputProcessor>(node);
+        } else if (node.type == NodeType::Effect && node.script == "__spectrumtap__") {
+            proc = std::make_unique<SpectrumTapProcessor>(node);
+        } else if (node.type == NodeType::Effect &&
+                   node.script.rfind("__convolution__:", 0) == 0) {
+            proc = std::make_unique<ConvolutionProcessor>(node);
+        } else if (node.type == NodeType::Effect && node.script == "__tremolo__") {
+            proc = std::make_unique<TremoloProcessor>(node);
+        } else if (node.type == NodeType::Effect && node.script == "__vibrato__") {
+            proc = std::make_unique<VibratoProcessor>(node);
+        } else if (node.type == NodeType::Effect && node.script == "__flanger__") {
+            proc = std::make_unique<FlangerProcessor>(node);
+        } else if (node.type == NodeType::Effect && node.script == "__phaser__") {
+            proc = std::make_unique<PhaserProcessor>(node);
+        } else if (node.type == NodeType::Effect && node.script == "__echo__") {
+            proc = std::make_unique<EchoProcessor>(node);
+        } else if (node.type == NodeType::Effect && node.script == "__compressor__") {
+            proc = std::make_unique<CompressorProcessor>(node);
+        } else if (node.type == NodeType::Effect && node.script == "__limiter__") {
+            proc = std::make_unique<LimiterProcessor>(node);
+        } else if (node.type == NodeType::Effect && node.script == "__gate__") {
+            proc = std::make_unique<GateProcessor>(node);
+        } else if (node.type == NodeType::Effect && node.script == "__arpeggiator__") {
+            proc = std::make_unique<ArpeggiatorProcessor>(node);
+        } else if (node.type == NodeType::Effect && node.script == "__mixture__") {
+            proc = std::make_unique<MixtureProcessor>(node);
+        } else if (node.type == NodeType::Effect &&
+                   (node.script == "__velscale__" ||
+                    node.script.rfind("__midimod__:", 0) == 0)) {
+            proc = std::make_unique<MidiModulatorProcessor>(node);
+        } else if (node.type == NodeType::Effect &&
+                   node.script.rfind("__trigger__:", 0) == 0) {
+            proc = std::make_unique<TriggerProcessor>(node, transport);
+        } else if (node.type == NodeType::Effect && node.script == "__spatializer3d__") {
+            proc = std::make_unique<Spatializer3DProcessor>(node);
         } else if (node.type == NodeType::Effect && node.script == "__pitchshift__") {
             proc = std::make_unique<PitchShiftProcessor>(node);
         } else {
@@ -458,12 +531,15 @@ void GraphProcessor::rebuildGraph(NodeGraph& graph, Transport& transport) {
                         processorGraph->addConnection({
                             {graphNode->nodeID, juce::AudioProcessorGraph::midiChannelIndex},
                             {panNode->nodeID, juce::AudioProcessorGraph::midiChannelIndex}});
-                        nodeMap[node.id] = panNode->nodeID; // downstream connects to pan output
+                        nodeMap[node.id] = panNode->nodeID;       // downstream pulls audio from pan
+                        nodeInputMap[node.id] = graphNode->nodeID; // upstream pushes MIDI/audio into the actual processor
                     } else {
                         nodeMap[node.id] = graphNode->nodeID;
+                        nodeInputMap[node.id] = graphNode->nodeID;
                     }
                 } else {
                     nodeMap[node.id] = graphNode->nodeID;
+                    nodeInputMap[node.id] = graphNode->nodeID;
                 }
             }
         }
@@ -497,13 +573,58 @@ void GraphProcessor::rebuildGraph(NodeGraph& graph, Transport& transport) {
         }
 
         if (srcNodeId < 0 || dstNodeId < 0) continue;
-        if (nodeMap.find(srcNodeId) == nodeMap.end() || nodeMap.find(dstNodeId) == nodeMap.end()) continue;
+        if (nodeMap.find(srcNodeId) == nodeMap.end() || nodeInputMap.find(dstNodeId) == nodeInputMap.end()) continue;
 
+        // Source: pull audio FROM the (pan-extended) output side via nodeMap.
+        // Destination: push MIDI/audio INTO the actual processor via
+        // nodeInputMap. Otherwise MIDI events would dead-end at a Pan
+        // processor and never reach the destination synth.
         auto srcGraphId = nodeMap[srcNodeId];
-        auto dstGraphId = nodeMap[dstNodeId];
+        auto dstGraphId = nodeInputMap[dstNodeId];
+
+        // If this link has time-gated effect regions on any node, insert a
+        // TimeGateProcessor that silences audio outside the active regions.
+        auto effectiveSrc = srcGraphId;
+        {
+            bool hasRegions = false;
+            for (auto& node : graph.nodes)
+                for (auto& region : node.effectRegions)
+                    if (region.linkId == link.id ||
+                        (region.groupId >= 0 && graph.findEffectGroup(region.groupId))) {
+                        // Check if this group contains our link
+                        if (region.linkId == link.id) { hasRegions = true; break; }
+                        auto* grp = graph.findEffectGroup(region.groupId);
+                        if (grp) {
+                            for (int lid : grp->linkIds)
+                                if (lid == link.id) { hasRegions = true; break; }
+                        }
+                        if (hasRegions) break;
+                    }
+
+            if (hasRegions) {
+                // Find the source node for the TimeGateProcessor's node reference
+                Node* srcNode = nullptr;
+                for (auto& n : graph.nodes)
+                    if (n.id == srcNodeId) { srcNode = &n; break; }
+
+                if (srcNode) {
+                    auto gateProc = std::make_unique<TimeGateProcessor>(
+                        link.id, *srcNode, graph, transport);
+                    gateProc->enableAllBuses();
+                    auto gateNode = processorGraph->addNode(std::move(gateProc));
+                    if (gateNode) {
+                        processorGraph->addConnection({{effectiveSrc, 0}, {gateNode->nodeID, 0}});
+                        processorGraph->addConnection({{effectiveSrc, 1}, {gateNode->nodeID, 1}});
+                        processorGraph->addConnection({
+                            {effectiveSrc, juce::AudioProcessorGraph::midiChannelIndex},
+                            {gateNode->nodeID, juce::AudioProcessorGraph::midiChannelIndex}});
+                        effectiveSrc = gateNode->nodeID;
+                    }
+                }
+            }
+        }
 
         // If this link has gain != 0 dB, insert a gain processor
-        auto effectiveSrc = srcGraphId;
         if (link.gainDb != 0.0f) {
             auto gainProc = std::make_unique<GainProcessor>(link.gainDb);
             gainProc->enableAllBuses();
@@ -519,18 +640,23 @@ void GraphProcessor::rebuildGraph(NodeGraph& graph, Transport& transport) {
             }
         }
 
-        // Connect based on pin kind
-        if (srcKind == PinKind::Signal) {
-            // Signal: audio-rate mono control signal
-            // Route as audio channel 0 from source to channel 2+ on destination
-            // (channels 0,1 are stereo audio; signal inputs start at channel 2)
-            int signalChIdx = 2; // find which signal input this is
+        // Connect based on pin kind. Param and Signal both flow through the
+        // audio-rate control slot (channels 2+) — they are interchangeable at
+        // the cable level (task #82). The receiver decides per-block vs
+        // per-sample consumption; the channel layout is identical either way.
+        bool srcIsControl = (srcKind == PinKind::Signal || srcKind == PinKind::Param);
+        if (srcIsControl) {
+            // Find which control-input slot this is on the destination — count
+            // Param + Signal pins encountered before the matching pin id.
+            int signalChIdx = 2;
             for (auto& dstNode : graph.nodes) {
+                if (dstNode.id != dstNodeId) continue;
                 int sigCount = 0;
                 for (auto& pin : dstNode.pinsIn) {
                     if (pin.id == link.endPin) { signalChIdx = 2 + sigCount; break; }
-                    if (pin.kind == PinKind::Signal) sigCount++;
+                    if (pin.kind == PinKind::Signal || pin.kind == PinKind::Param) sigCount++;
                 }
+                break;
             }
             processorGraph->addConnection({{effectiveSrc, 0}, {dstGraphId, signalChIdx}});
         } else {
@@ -547,8 +673,30 @@ void GraphProcessor::rebuildGraph(NodeGraph& graph, Transport& transport) {
     lastNodeCount = (int)graph.nodes.size();
     lastLinkCount = (int)graph.links.size();
 
-    fprintf(stderr, "[GraphProcessor] Rebuilt: %d nodes mapped, %d connections\n",
-            (int)nodeMap.size(), (int)processorGraph->getConnections().size());
+    auto dbg = [](const juce::String& s) {
+        // Goes to VS Debug Output window AND stderr (when run from a console).
+        juce::Logger::writeToLog(s);
+    };
+
+    dbg("[GraphProcessor] Rebuilt: " + juce::String((int)nodeMap.size())
+        + " nodes mapped, "
+        + juce::String((int)processorGraph->getConnections().size())
+        + " connections");
+
+    // Diagnostic: dump bus layouts for every node so we can see if a Waveform
+    // Synth is reporting an unexpected channel count.
+    for (auto& kv : nodeMap) {
+        if (auto* gn = processorGraph->getNodeForId(kv.second)) {
+            if (auto* p = gn->getProcessor()) {
+                dbg("  node " + juce::String(kv.first)
+                    + " (" + p->getName() + "): inCh="
+                    + juce::String(p->getTotalNumInputChannels())
+                    + " outCh=" + juce::String(p->getTotalNumOutputChannels())
+                    + " acceptsMidi=" + juce::String((int)p->acceptsMidi())
+                    + " producesMidi=" + juce::String((int)p->producesMidi()));
+            }
+        }
+    }
 }
 
 void GraphProcessor::processBlock(NodeGraph& graph, Transport& transport,

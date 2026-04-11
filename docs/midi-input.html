@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>MIDI Input &amp; Routing — SoundShop2</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="wrap">
+<header>
+<h1>MIDI Input &amp; Routing</h1>
+<nav>
+  <a href="index.html">Home</a>
+  <a href="graph-basics.html">Graph Basics</a>
+  <a href="pin-kinds.html">Signals</a>
+</nav>
+</header>
+
+<p>SoundShop2 treats every input device — the computer keyboard, hardware MIDI keyboards, drum pads, network MIDI clients, virtual ports — as a <strong>node in the graph</strong>. You wire the input node to wherever you want the events to go. There's no hidden routing, no "arm" flag to hunt for; the cable <em>is</em> the routing.</p>
+
+<h2>The Computer Keyboard node</h2>
+
+<p>On a fresh project SoundShop2 automatically creates a <strong>Computer Keyboard</strong> node at the top-left of the graph. This represents the keys on your computer keyboard being used as a MIDI controller. It has a single MIDI output pin, which is pre-wired to the MIDI Track that's also placed by default.</p>
+
+<p>Key mapping:</p>
+<ul>
+  <li><strong>A-L</strong> — white keys</li>
+  <li><strong>W-P</strong> — black keys</li>
+  <li><strong>Z / X</strong> — shift octave down / up</li>
+  <li><strong>Shift + key</strong> — play louder (velocity 120)</li>
+  <li><strong>Alt + key</strong> — play softer (velocity 50)</li>
+  <li><strong>Plain key</strong> — medium velocity (90)</li>
+</ul>
+
+<p>Click the <em>Keyboard MIDI</em> toggle in the main toolbar to enable/disable computer-keyboard input. Disabling is useful when you want to use A-Z for other shortcuts without triggering notes.</p>
+
+<h2>Hardware MIDI devices</h2>
+
+<p>On a new project, SoundShop2 shows a wizard listing every MIDI input device currently detected on your system. Check the ones you want to use and click <em>Add Selected</em> — each checked device becomes its own MIDI Input node in the graph, which you can then wire to a track or synth.</p>
+
+<p>You can re-open this wizard at any time via <strong>Options → Add MIDI Input Device…</strong>, in case you skipped one, want to add a newly-connected device, or deleted an input node and want it back.</p>
+
+<h3>Hotplug</h3>
+
+<p>If you plug in a new MIDI device while SoundShop2 is running, a small dialog will pop up asking if you want to add it to the graph. Click <em>Add</em> to drop a new MIDI Input node for the device at a default position, or <em>Ignore</em> to dismiss. Ignored devices stay ignored until the next restart or until you run the wizard again.</p>
+
+<h2>MIDI Tracks receive live input</h2>
+
+<p>Every MIDI Timeline node has a <strong>MIDI In pin</strong> on its left side. When you wire an input node's MIDI Out to a MIDI Track's MIDI In, the track receives live events alongside its clip playback. Both get merged into the track's MIDI Out, which is then sent to whatever's downstream (usually a synth).</p>
+
+<p>You can skip the MIDI Track entirely and wire the input node directly to a synth if you just want to audition without recording. The Track layer is useful when you want to capture your playing to a clip — see the <a href="piano-roll.html">piano roll</a> docs for editing captured notes.</p>
+
+<h2>CC Learn (MIDI mappings)</h2>
+
+<p>Any CC event from your controller can be mapped to any parameter on any node via <strong>MIDI Learn</strong>. Right-click a knob/slider → <em>MIDI Learn</em> → move your controller's knob → mapping captured. From then on, that physical knob moves that parameter.</p>
+
+<p>Learned CC events are <em>filtered out</em> of the cable routing — if you've mapped CC#1 to a filter cutoff on a specific synth, moving the mod wheel only moves that cutoff. Notes, pitch bend, aftertouch, and unmapped CCs still pass through the cables normally.</p>
+
+<h2>Pitch bend, mod wheel, sustain pedal</h2>
+
+<p>The built-in synths now handle standard controller messages:</p>
+
+<ul>
+  <li><strong>Pitch bend</strong> — ±2 semitones, applies to all sustained notes in real time</li>
+  <li><strong>Mod wheel (CC#1)</strong> — drives a default 6 Hz vibrato whose depth scales with the wheel position. Can be disabled per-synth by setting the <em>Vibrato</em> param to 0, freeing CC#1 to be MIDI-Learned elsewhere.</li>
+  <li><strong>Sustain pedal (CC#64)</strong> — holds notes through their release stage until the pedal comes up. Works on Piano, Waveform, Sampler, Drum Machine, and SoundFont synths.</li>
+  <li><strong>Velocity</strong> — scales per-note volume. Each synth has a <em>Vel Sens</em> param (0..1) that controls how much velocity affects loudness. Set to 0 to ignore velocity entirely.</li>
+</ul>
+
+<h2>What if my keyboard doesn't play?</h2>
+
+<p>Check that:</p>
+<ol>
+  <li>The Computer Keyboard (or device) node is present in the graph</li>
+  <li>A cable runs from its MIDI Out to a MIDI Track or synth</li>
+  <li>That target is wired (directly or through a chain) to the Master Out</li>
+  <li>For computer-keyboard input specifically: the <em>Keyboard MIDI</em> toggle in the main toolbar is enabled, and the main window has keyboard focus (click the graph area)</li>
+</ol>
+
+<footer>
+<a href="index.html">← Back to index</a>
+</footer>
+</div>
+</body>
+</html>

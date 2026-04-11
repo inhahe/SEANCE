@@ -8,6 +8,8 @@
 #include <cstdint>
 #include "music_theory.h"
 #include "piano_roll.h"
+#include "effect_regions.h"
+#include "tuning.h"
 #include "undo.h"
 #include "plugin_host.h"
 
@@ -19,8 +21,28 @@ struct Vec2 {
 };
 
 enum class PinKind { Audio, Midi, Param, Signal }; // Signal = audio-rate control signal (mono)
+
+// Two pin kinds are compatible at the cable level if they're either the same
+// kind, or both control kinds (Param + Signal). Param is conceptually
+// block-rate and Signal is audio-rate, but at the routing layer we treat them
+// as a single "control" family — the conversion is implicit and free, since
+// the audio-graph routing already carries them on the same channel slot. The
+// receiver decides whether to read once per block (Param semantics) or every
+// sample (Signal semantics). See task #82.
+inline bool arePinKindsCompatible(PinKind a, PinKind b) {
+    if (a == b) return true;
+    bool aCtrl = (a == PinKind::Param || a == PinKind::Signal);
+    bool bCtrl = (b == PinKind::Param || b == PinKind::Signal);
+    return aCtrl && bCtrl;
+}
 enum class NodeType {
-    AudioTimeline, MidiTimeline, Instrument, Effect, Mixer, Output, Script, Group, TerrainSynth, SignalShape
+    AudioTimeline, MidiTimeline, Instrument, Effect, Mixer, Output, Script, Group, TerrainSynth, SignalShape,
+    // MidiInput represents a single live MIDI input source (computer keyboard,
+    // hardware MIDI device, network MIDI client, virtual port, etc). It has
+    // no inputs and one MIDI output. The cable wiring from the Input node to
+    // a Timeline or synth IS the live-input routing — no flags, no hidden
+    // state. See project_midi_input_architecture.md.
+    MidiInput
 };
 
 struct Pin {
@@ -41,17 +63,40 @@ struct AutomationPoint {
 struct AutomationLane {
     std::vector<AutomationPoint> points;
 
+    // Evaluate automation value at a given beat using Catmull-Rom
+    // interpolation through the control points. Returns -1 (sentinel)
+    // if no automation points exist. Passes through every point exactly;
+    // curves smoothly between them.
     float evaluate(float beat) const {
         if (points.empty()) return -1.0f; // sentinel: no automation
+        int n = (int)points.size();
+        if (n == 1) return points[0].value;
         if (beat <= points.front().beat) return points.front().value;
         if (beat >= points.back().beat) return points.back().value;
-        for (size_t i = 1; i < points.size(); ++i) {
-            if (beat <= points[i].beat) {
-                float t = (beat - points[i-1].beat) / (points[i].beat - points[i-1].beat);
-                return points[i-1].value + t * (points[i].value - points[i-1].value);
-            }
+
+        // Find the segment [i1, i2] that contains beat
+        int i1 = 0;
+        for (int i = 1; i < n; ++i) {
+            if (beat <= points[i].beat) { i1 = i - 1; break; }
         }
-        return points.back().value;
+        int i0 = (i1 > 0) ? i1 - 1 : i1;
+        int i2 = i1 + 1;
+        int i3 = (i2 < n - 1) ? i2 + 1 : i2;
+
+        float segLen = points[i2].beat - points[i1].beat;
+        float t = (segLen > 1e-6f) ? (beat - points[i1].beat) / segLen : 0.0f;
+
+        float y0 = points[i0].value;
+        float y1 = points[i1].value;
+        float y2 = points[i2].value;
+        float y3 = points[i3].value;
+
+        // Catmull-Rom cubic interpolation
+        float t2 = t * t, t3 = t2 * t;
+        return 0.5f * ((2.0f * y1)
+                     + (-y0 + y2) * t
+                     + (2.0f*y0 - 5.0f*y1 + 4.0f*y2 - y3) * t2
+                     + (-y0 + 3.0f*y1 - 3.0f*y2 + y3) * t3);
     }
 };
 
@@ -62,6 +107,7 @@ struct Param {
     float maxVal;
     std::string format = "%.2f";
     AutomationLane automation; // recorded automation for this param
+    bool autoWriteArmed = false; // when armed, "Write Automation to Selection" includes this param
 };
 
 // Rational fraction for exact beat subdivisions (e.g., triplets)
@@ -222,6 +268,21 @@ struct Node {
     int pluginIndex = -1; // index into PluginHost::availablePlugins, -1 = none
     std::string pendingPluginState; // base64-encoded state to restore after plugin loads
 
+    // Per-plugin dirty tracking for the slow autosave path (#86). When a
+    // plugin's parameters change via host automation, MIDI Learn CC, or
+    // any other host-driven path, this flag is set so the next autosave
+    // re-queries getStateInformation. When clear, the saver reuses the
+    // cached base64 string instead — avoiding the expensive query for
+    // plugins whose state hasn't changed since the last save. Defaults
+    // to true so a freshly loaded plugin gets queried at least once.
+    //
+    // Limitation: changes made by the user inside the plugin's own UI
+    // can't be detected here (no general-purpose API to listen for them
+    // across plugin formats). Mitigation: a periodic "force-dirty all"
+    // tick in the autosave path bounds staleness to a known interval.
+    bool pluginStateDirty = true;
+    std::string cachedPluginStateBase64;
+
     // Group — contains child node IDs
     std::vector<int> childNodeIds;  // IDs of nodes inside this group
     int parentGroupId = -1;         // -1 = top-level (not in any group)
@@ -239,9 +300,18 @@ struct Node {
     std::vector<AuditionEvent> pendingAudition; // written by UI, read by audio thread
     std::shared_ptr<std::mutex> auditionMutex = std::make_shared<std::mutex>();
 
-    // MPE pass-through: raw MIDI messages from controller, preserving channels
+    // MPE pass-through / MidiInput node event queue. Originally used only
+    // for MPE timelines; now also used by MidiInput nodes as the queue the
+    // audio engine writes live events into and the MidiInput processor
+    // drains into its output MIDI buffer.
     std::vector<std::pair<int, juce::MidiMessage>> pendingMpePassthrough; // (sampleOffset, msg)
     std::shared_ptr<std::mutex> mpePassthroughMutex = std::make_shared<std::mutex>();
+
+    // MidiInput node: identifier of the physical (or virtual) input source
+    // this node represents. "keyboard" = the computer keyboard. For hardware
+    // MIDI devices this will be set to the device's JUCE identifier string.
+    // Empty on non-MidiInput nodes.
+    std::string midiInputSourceId;
 
     // Node audio cache (freeze + automatic memoization)
     struct AudioCache {
@@ -267,6 +337,16 @@ struct Node {
         }
     };
     AudioCache cache;
+
+    // Effect regions: time-bounded activation of links/groups on this track.
+    // Drawn as colored bars on the track's timeline. Each region gates either
+    // a single link (linkId >= 0) or an entire effect group (groupId >= 0).
+    std::vector<EffectRegion> effectRegions;
+
+    // Multi-track recording: per-track input assignment
+    int recordInputChannel = -1;  // which audio input channel to record from (-1 = none)
+    bool recordArmed = false;     // armed for recording
+    bool inputMonitor = false;    // pass input through to output in real-time
 };
 
 // Named marker on the project timeline
@@ -306,6 +386,48 @@ public:
     void deleteTime(float fromBeat, float toBeat, int nodeId = -1); // update groupBeatOffset from anchor markers
     Node* findNode(int id);
 
+    // Snapshot automation: write the current value of all armed params as
+    // flat automation across a beat range. Clears any existing automation
+    // points within the range first, then inserts two points (start + end)
+    // at the current value = flat line.
+    void writeAutomationToSelection(float startBeat, float endBeat) {
+        for (auto& node : nodes) {
+            for (auto& p : node.params) {
+                if (!p.autoWriteArmed) continue;
+                // Remove existing points within the range
+                p.automation.points.erase(
+                    std::remove_if(p.automation.points.begin(), p.automation.points.end(),
+                        [startBeat, endBeat](const AutomationPoint& pt) {
+                            return pt.beat >= startBeat && pt.beat <= endBeat;
+                        }),
+                    p.automation.points.end());
+                // Insert flat line: two points at current value
+                p.automation.points.push_back({startBeat, p.value});
+                p.automation.points.push_back({endBeat, p.value});
+                // Keep sorted
+                std::sort(p.automation.points.begin(), p.automation.points.end(),
+                    [](const AutomationPoint& a, const AutomationPoint& b) {
+                        return a.beat < b.beat;
+                    });
+            }
+        }
+        dirty = true;
+    }
+
+    // Arm/disarm all params on all nodes
+    void armAllParams(bool armed) {
+        for (auto& node : nodes)
+            for (auto& p : node.params)
+                p.autoWriteArmed = armed;
+    }
+
+    // Arm/disarm all params on a specific node
+    void armNodeParams(int nodeId, bool armed) {
+        if (auto* nd = findNode(nodeId))
+            for (auto& p : nd->params)
+                p.autoWriteArmed = armed;
+    }
+
     std::vector<Node> nodes;
     std::vector<Link> links;
     std::vector<Node*> openEditors;
@@ -325,6 +447,60 @@ public:
     double loopStartBeat = 0;
     double loopEndBeat = 0;
     double projectSampleRate = 0; // 0 = use device rate
+
+    // Tuning system and concert pitch (project-wide)
+    TuningSystem tuningSystem = TuningSystem::Equal12;
+    float concertPitch = 440.0f; // Hz for A4
+
+    // Global crossfade duration (seconds) used to smooth audio discontinuities
+    // anywhere the engine starts or stops a routing path mid-stream — effect
+    // region edges, mute/solo toggles, plugin bypass, future child-track
+    // entry/exit, etc. Per-feature overrides (e.g. EffectGroup::crossfadeSec)
+    // take precedence when explicitly set.
+    float globalCrossfadeSec = 0.05f;
+
+    // Check if a node has any incoming signal/param connections (meaning
+    // one or more params may be externally controlled). Used to grey out
+    // and lock sliders when a signal is driving them.
+    bool hasSignalInput(int nodeId) const {
+        for (const auto& link : links) {
+            for (const auto& node : nodes) {
+                for (const auto& pin : node.pinsOut) {
+                    if (pin.id == link.startPin &&
+                        (pin.kind == PinKind::Signal || pin.kind == PinKind::Param)) {
+                        // Found a signal/param output pin as the source.
+                        // Check if destination is our node.
+                        for (const auto& dstNode : nodes) {
+                            if (dstNode.id != nodeId) continue;
+                            for (const auto& dstPin : dstNode.pinsIn)
+                                if (dstPin.id == link.endPin) return true;
+                        }
+                    }
+                }
+            }
+        }
+        return false;
+    }
+
+    // Effect groups (bundles of links that activate together as one layer)
+    std::vector<EffectGroup> effectGroups;
+    int nextEffectGroupId = 1;
+
+    EffectGroup& addEffectGroup(const std::string& name = "") {
+        EffectGroup g;
+        g.id = nextEffectGroupId++;
+        g.name = name;
+        // Auto-assign color: fixed palette first, then golden-angle generated
+        g.color = getDistinctColor((int)effectGroups.size());
+        effectGroups.push_back(g);
+        return effectGroups.back();
+    }
+
+    EffectGroup* findEffectGroup(int id) {
+        for (auto& g : effectGroups)
+            if (g.id == id) return &g;
+        return nullptr;
+    }
 
     // Project markers (named beat positions)
     std::vector<Marker> markers;
@@ -366,6 +542,18 @@ public:
     void exec(const std::string& desc, std::function<void()> doFn, std::function<void()> undoFn) {
         exec(std::make_unique<LambdaCommand>(desc, std::move(doFn), std::move(undoFn)));
     }
+
+    // Commit a snapshot of the current graph state to the undo tree as a
+    // new step. The serialization is performed via ProjectFile::serializeForUndo
+    // (graph-only, plugin state excluded). If the resulting text is identical
+    // to the previous step's snapshot — i.e., nothing actually changed — this
+    // is a no-op, so it's safe (and intended) to call defensively from any
+    // mutating function. See CLAUDE.md "Undo Strategy" for the policy on
+    // when to use commitSnapshot vs. exec().
+    //
+    // Defined in node_graph.cpp because the implementation needs project_file.h,
+    // which itself includes node_graph.h.
+    void commitSnapshot(const std::string& description);
 
     std::map<int, PianoRollState> pianoRollStates;
 

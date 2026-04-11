@@ -21,6 +21,9 @@ public:
     void resized() override;
 
     bool compactMode = false;
+
+    // Trigger piano roll actions from external hotkeys
+    void triggerAction(const std::string& action);
     void mouseDown(const juce::MouseEvent& e) override;
     void mouseDrag(const juce::MouseEvent& e) override;
     void mouseUp(const juce::MouseEvent& e) override;
@@ -28,9 +31,15 @@ public:
     void mouseWheelMove(const juce::MouseEvent& e, const juce::MouseWheelDetails& w) override;
     bool keyPressed(const juce::KeyPress& key) override;
 
+    // Refresh the node pointer from the graph. Call at the start of every
+    // public entry point (paint, mouseDown, etc.) because graph.nodes can
+    // reallocate when nodes are added, invalidating old pointers.
+    void refreshNode() { node = graph.findNode(nodeId); }
+
 private:
     NodeGraph& graph;
-    Node& node;
+    int nodeId;
+    Node* node = nullptr;   // refreshed via refreshNode(); never cache across calls
     Transport* transport = nullptr;
     PianoRollState state;
 
@@ -40,7 +49,7 @@ private:
     enum ExprLane { ExprNone, ExprVelocity, ExprPitchBend, ExprSlide, ExprPressure, ExprAutomation };
     ExprLane exprLane = ExprNone;
     static constexpr float EXPR_LANE_HEIGHT = 80.0f;
-    juce::TextButton exprVelBtn{"Vel"}, exprPBBtn{"PB"}, exprSlideBtn{"Slide"}, exprPressBtn{"Press"}, exprOffBtn{"None"};
+    juce::TextButton exprVelBtn{"Vel"}, exprPBBtn{"PB"}, exprSlideBtn{"Slide"}, exprPressBtn{"Press"}, exprOffBtn{"Off"};
     juce::ComboBox autoParamCombo; // select which parameter's automation to view/edit
     int autoParamIndex = -1;       // index into node.params, -1 = none
 
@@ -117,7 +126,7 @@ private:
     juce::ScrollBar hScrollBar{false}; // horizontal
     juce::ScrollBar vScrollBar{true};  // vertical (pitch)
     juce::Slider hZoomSlider;
-    static constexpr int SCROLLBAR_SIZE = 14;
+    static constexpr int SCROLLBAR_SIZE = 20;
 
     // Audition tracking
     std::map<int, double> auditionKeys; // pitch → time started
@@ -126,8 +135,8 @@ private:
     juce::TextButton compactBtn{"--"}, closeBtn{"X"};
     juce::TextButton transpUpOctBtn{"+Octave"}, transpDownOctBtn{"-Octave"};
     juce::TextButton transpUpSemiBtn{"+Semitone"}, transpDownSemiBtn{"-Semitone"};
-    juce::TextButton timeLeftBtn{"<< Time"}, timeRightBtn{"Time >>"};
-    juce::TextButton selectAllBtn{"All"}, deselectBtn{"None"};
+    juce::TextButton timeLeftBtn{"Nudge Left"}, timeRightBtn{"Nudge Right"};
+    juce::TextButton selectAllBtn{"Select All"}, deselectBtn{"Deselect"};
     juce::TextButton dblDurBtn{"x2 Duration"}, halfDurBtn{"/2 Duration"};
     juce::TextButton reverseBtn{"Reverse"};
     juce::TextButton detuneResetBtn{"Reset"};
@@ -138,7 +147,7 @@ private:
     juce::ComboBox rootCombo, keyCombo, modeCombo, scaleCombo;
     juce::Label rootLbl, keyLbl, modeLbl, scaleLbl;
     juce::Label titleLabel, helpLabel;
-    juce::TextButton muteBtn{"M"}, soloBtn{"S"};
+    juce::TextButton muteBtn{"Mute"}, soloBtn{"Solo"};
     juce::Slider panSlider;
     juce::Label panLbl;
     int toolbarHeight() const { return compactMode ? 28 : 82; }

@@ -69,6 +69,12 @@ static ScaleMap s_scales = {
     {"Insen",                 {0, 1, 5, 7, 10}},
     {"Iwato",                 {0, 1, 5, 6, 10}},
     {"Yo",                    {0, 3, 5, 7, 10}},
+    // Ancient Greek tetrachords (4 notes spanning a perfect fourth)
+    {"Tetrachord (Diatonic)",  {0, 2, 4, 5}},           // W-W-H
+    {"Tetrachord (Chromatic)", {0, 1, 3, 5}},            // H-m3-H
+    // Pythagorean — same note selection as Major in 12-TET
+    // (true Pythagorean tuning requires microtuning for the cent offsets)
+    {"Pythagorean",            {0, 2, 4, 5, 7, 9, 11}}, // same as Major/Ionian
 };
 
 const ScaleMap& MusicTheory::keys()   { return s_keys; }

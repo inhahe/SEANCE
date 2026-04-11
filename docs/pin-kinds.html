@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Pin Kinds — SoundShop2</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="wrap">
+<header>
+<h1>Pin Kinds (What the Cable Colors Mean)</h1>
+<nav>
+  <a href="index.html">Home</a>
+  <a href="graph-basics.html">Graph Basics</a>
+</nav>
+</header>
+
+<p>SoundShop2 has <strong>four kinds of pins</strong>, each carrying a different kind of data between nodes. Each kind has a distinct color so you can see at a glance what kind of data is flowing in a given cable. Note that "signal" below is the name of <em>one</em> of these four kinds — not a catch-all word for every kind of data flowing between nodes. Audio and MIDI are their own things, not kinds of signal.</p>
+
+<h2><span class="pink-tag t-audio">Audio</span> &mdash; Cornflower blue</h2>
+<p>Stereo audio signal. Each sample is a number roughly in the range <code>-1.0 .. +1.0</code>. Audio pins carry actual sound — what you hear at the Master Out. Synths produce audio, effects transform it, and the Master Out sends it to your speakers.</p>
+
+<h2><span class="pink-tag t-midi">MIDI</span> &mdash; Lime green</h2>
+<p>MIDI events: notes (on/off with velocity), pitch bend, aftertouch, control change (CC) messages, program changes. MIDI cables carry <em>what to play</em>, not the sound itself. Timelines emit MIDI from their clips; Computer Keyboard and hardware MIDI inputs emit live MIDI; instruments consume MIDI and turn it into audio.</p>
+
+<h2><span class="pink-tag t-param">Param</span> &mdash; Orange (block-rate control)</h2>
+<p>A slow-changing control signal used to modulate parameters on other nodes. "Slow" here means it updates once per audio block (every ~64 samples, roughly 700 times per second at 44.1kHz) rather than once per sample. That's still way faster than you can perceive, but it's faster than automation drawn in a piano roll and slower than audio.</p>
+<p>Param is what you want when you're driving a knob with an LFO, an envelope follower, an XY pad, or a MIDI CC mapping. It's the orange color and lives in the 700Hz range — perfect for the "move this knob smoothly" use case.</p>
+
+<h2><span class="pink-tag t-signal">Signal</span> &mdash; Amber (audio-rate control)</h2>
+<p>Also a control signal, but at <strong>audio rate</strong> — the same resolution as audio itself. A Signal pin carries a value that can change on every single sample, which is what you need for effects like:</p>
+
+<ul>
+  <li>Audio-rate FM (modulating pitch with an audio signal)</li>
+  <li>Audio-rate filter modulation (ring-modulated filter cutoff)</li>
+  <li>Sample-accurate envelope followers driving compression</li>
+  <li>Any modulation whose sound depends on the modulator being fast and smooth</li>
+</ul>
+
+<p>Signal is overkill for most modulation and costs more CPU, but there are things you can only do with it. Think of it as "Param's sample-accurate cousin." It's colored amber — close to Param's orange on purpose, because they're both control signals, just at different rates.</p>
+
+<h2>Which should I use?</h2>
+
+<div class="tip">
+<strong>Rule of thumb:</strong> if you're modulating a knob and you can't hear an audible "zipper" when you move it quickly, <strong>Param</strong> is fine. Use <strong>Signal</strong> when your modulator is itself an oscillator whose waveform matters (FM, ring mod), or when you're doing something where the modulator's timing needs to line up sample-by-sample with audio (transient-aware dynamics, sync'd gating).
+</div>
+
+<h2>Cross-kind connections</h2>
+
+<p>You can only connect pins of matching kinds. Audio doesn't plug into MIDI, MIDI doesn't plug into Param, etc. If you try, SoundShop2 won't make the cable.</p>
+
+<p>There are nodes that act as <em>adapters</em> between kinds — for example, the MIDI Modulator node takes a Signal input and a MIDI stream, and uses the signal to modify MIDI velocities / bend / CCs. That's how you "connect" a signal source to a MIDI flow.</p>
+
+<footer>
+<a href="index.html">← Back to index</a>
+</footer>
+</div>
+</body>
+</html>

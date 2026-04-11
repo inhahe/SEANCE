@@ -1,4 +1,5 @@
 #include "builtin_synth.h"
+#include "fft_util.h"
 #include <cstring>
 #include <cstdio>
 #include <algorithm>
@@ -6,6 +7,7 @@
 #include <sstream>
 #include <stack>
 #include <cctype>
+#include <complex>
 
 namespace SoundShop {
 
@@ -64,6 +66,74 @@ void Wavetable::generateFromExpression(const std::string& expr) {
     initTables();
     tables[0] = WaveExprParser::evaluate(expr, tableSize);
     buildMipmaps();
+}
+
+void Wavetable::generateFromSpectralExpression(const std::string& magExpr,
+                                               const std::string& phaseExpr,
+                                               int fftSize,
+                                               int phaseMode)
+{
+    // Force fftSize to a power of two within sane limits.
+    int n = 2;
+    while (n < fftSize && n < 16384) n <<= 1;
+    setTableSize(n);
+    initTables();
+
+    int halfBins = n / 2 + 1;
+    auto mags = WaveExprParser::evaluateOverBins(magExpr, halfBins);
+
+    std::vector<float> phases(halfBins, 0.0f);
+    std::mt19937 rng(1337);
+    std::uniform_real_distribution<float> udist(-3.14159265f, 3.14159265f);
+    switch (phaseMode) {
+        case 0: // expression
+            phases = WaveExprParser::evaluateOverBins(phaseExpr, halfBins);
+            break;
+        case 1: // random
+            for (auto& p : phases) p = udist(rng);
+            break;
+        case 2: // zero — impulsive, clicky at t=0
+            // already zero
+            break;
+        case 3: // linear — gives a chirp-like shift
+            for (int k = 0; k < halfBins; ++k)
+                phases[k] = -2.0f * 3.14159265f * k * 0.5f;
+            break;
+        default: break;
+    }
+
+    // DC and Nyquist bins must be real for a real-valued output.
+    // Force their imaginary parts to zero.
+    std::vector<std::complex<float>> spectrum(halfBins);
+    for (int k = 0; k < halfBins; ++k) {
+        float m = mags[k];
+        float p = phases[k];
+        if (k == 0 || k == halfBins - 1)
+            spectrum[k] = std::complex<float>(m, 0.0f);
+        else
+            spectrum[k] = std::complex<float>(m * std::cos(p), m * std::sin(p));
+    }
+    // Kill DC — it's almost never wanted and produces a silent offset.
+    spectrum[0] = 0.0f;
+
+    FFT fft(n);
+    std::vector<float> out;
+    fft.inverseReal(spectrum, out);
+
+    // Normalize to peak 1.0
+    float peak = 0.0f;
+    for (float v : out) peak = std::max(peak, std::abs(v));
+    if (peak > 1e-9f) {
+        float inv = 1.0f / peak;
+        for (float& v : out) v *= inv;
+    }
+
+    tables[0] = out;
+    buildMipmaps();
+
+    // Remember this so setTableSize can regenerate. We encode the spectral
+    // flavor by prefixing; a cleaner approach later would be a dedicated field.
+    lastExpression.clear();
 }
 
 void Wavetable::generateFromPoints(const std::vector<std::pair<float, float>>& points) {
@@ -178,144 +248,169 @@ float Wavetable::sample(float phase, float frequencyHz, float sr) const {
 // Supports: sin, cos, abs, sqrt, pow, saw, square, triangle, noise, x, pi, e
 // Operators: + - * / ^ ( )
 
+// File-local reusable parser. Binds both `x` and `f` as free variables so the
+// same expression language works for time-domain ("x in [0, 2pi)") and
+// frequency-domain ("f = bin index") evaluation. Other wave-editor callers
+// pass f=0 and vice versa.
+namespace {
+struct ExprParser {
+    const char* str;
+    const char* pos;
+    float x = 0.0f;
+    float f = 0.0f;
+    std::mt19937 rng{42};
+
+    void skipWS() { while (*pos == ' ' || *pos == '\t') pos++; }
+
+    float parseNumber() {
+        skipWS();
+        const char* start = pos;
+        if (*pos == '-' || *pos == '+') pos++;
+        while (std::isdigit(*pos) || *pos == '.') pos++;
+        if (pos == start) return 0;
+        return std::strtof(start, nullptr);
+    }
+
+    float parseAtom() {
+        skipWS();
+        if (*pos == '(') {
+            pos++;
+            float val = parseExpr();
+            skipWS();
+            if (*pos == ')') pos++;
+            return val;
+        }
+        if (*pos == '-') { pos++; return -parseAtom(); }
+
+        if (strncmp(pos, "sin(", 4) == 0)  { pos += 3; return std::sin(parseAtom()); }
+        if (strncmp(pos, "cos(", 4) == 0)  { pos += 3; return std::cos(parseAtom()); }
+        if (strncmp(pos, "tan(", 4) == 0)  { pos += 3; return std::tan(parseAtom()); }
+        if (strncmp(pos, "abs(", 4) == 0)  { pos += 3; return std::abs(parseAtom()); }
+        if (strncmp(pos, "sqrt(", 5) == 0) { pos += 4; return std::sqrt(std::abs(parseAtom())); }
+        if (strncmp(pos, "exp(", 4) == 0)  { pos += 3; return std::exp(parseAtom()); }
+        if (strncmp(pos, "log(", 4) == 0)  { pos += 3; float v = parseAtom(); return v > 0 ? std::log(v) : 0.0f; }
+        if (strncmp(pos, "pow(", 4) == 0) {
+            pos += 4;
+            float base = parseExpr();
+            skipWS(); if (*pos == ',') pos++;
+            float exp = parseExpr();
+            skipWS(); if (*pos == ')') pos++;
+            return std::pow(base, exp);
+        }
+        if (strncmp(pos, "saw(", 4) == 0) {
+            pos += 3;
+            float v = parseAtom();
+            float t = v / (2.0f * 3.14159265f);
+            return 2.0f * (t - std::floor(t + 0.5f));
+        }
+        if (strncmp(pos, "square(", 7) == 0) {
+            pos += 6;
+            float v = parseAtom();
+            return std::sin(v) >= 0 ? 1.0f : -1.0f;
+        }
+        if (strncmp(pos, "triangle(", 9) == 0) {
+            pos += 8;
+            float v = parseAtom();
+            float t = v / (2.0f * 3.14159265f);
+            return 4.0f * std::abs(t - std::floor(t + 0.5f)) - 1.0f;
+        }
+        if (strncmp(pos, "noise(", 6) == 0) {
+            pos += 5;
+            parseAtom();
+            std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+            return dist(rng);
+        }
+        if (strncmp(pos, "random", 6) == 0 && pos[6] != '(') {
+            // bare `random` => uniform [-pi, pi] (useful for phase expressions)
+            pos += 6;
+            std::uniform_real_distribution<float> dist(-3.14159265f, 3.14159265f);
+            return dist(rng);
+        }
+        if (strncmp(pos, "tanh(", 5) == 0) { pos += 4; return std::tanh(parseAtom()); }
+        if (strncmp(pos, "clamp(", 6) == 0) {
+            pos += 6;
+            float v = parseExpr();
+            skipWS(); if (*pos == ',') pos++;
+            float lo = parseExpr();
+            skipWS(); if (*pos == ',') pos++;
+            float hi = parseExpr();
+            skipWS(); if (*pos == ')') pos++;
+            return std::clamp(v, lo, hi);
+        }
+        if (*pos == 'x' && !std::isalnum(*(pos + 1))) { pos++; return x; }
+        if (*pos == 'f' && !std::isalnum(*(pos + 1))) { pos++; return f; }
+        if (strncmp(pos, "pi", 2) == 0 && !std::isalnum(*(pos + 2))) { pos += 2; return 3.14159265f; }
+        if (*pos == 'e' && !std::isalpha(*(pos + 1))) { pos++; return 2.71828183f; }
+
+        return parseNumber();
+    }
+
+    float parsePow() {
+        float val = parseAtom();
+        skipWS();
+        if (*pos == '^') { pos++; val = std::pow(val, parsePow()); }
+        return val;
+    }
+
+    float parseMulDiv() {
+        float val = parsePow();
+        while (true) {
+            skipWS();
+            if (*pos == '*') { pos++; val *= parsePow(); }
+            else if (*pos == '/') { pos++; float d = parsePow(); val = d != 0 ? val / d : 0; }
+            else break;
+        }
+        return val;
+    }
+
+    float parseExpr() {
+        float val = parseMulDiv();
+        while (true) {
+            skipWS();
+            if (*pos == '+') { pos++; val += parseMulDiv(); }
+            else if (*pos == '-') { pos++; val -= parseMulDiv(); }
+            else break;
+        }
+        return val;
+    }
+
+    float eval(float xVal, float fVal) {
+        x = xVal;
+        f = fVal;
+        pos = str;
+        return parseExpr();
+    }
+};
+} // anonymous namespace
+
 std::vector<float> WaveExprParser::evaluate(const std::string& expr, int tableSize) {
     std::vector<float> result(tableSize);
-
-    // Simple approach: for each sample, substitute x and evaluate
-    // This is not performance-critical (only called when waveform changes)
-
-    struct Parser {
-        const char* str;
-        const char* pos;
-        float x;
-        std::mt19937 rng{42};
-
-        void skipWS() { while (*pos == ' ' || *pos == '\t') pos++; }
-
-        float parseNumber() {
-            skipWS();
-            const char* start = pos;
-            if (*pos == '-' || *pos == '+') pos++;
-            while (std::isdigit(*pos) || *pos == '.') pos++;
-            if (pos == start) return 0;
-            return std::strtof(start, nullptr);
-        }
-
-        float parseAtom() {
-            skipWS();
-            if (*pos == '(') {
-                pos++;
-                float val = parseExpr();
-                skipWS();
-                if (*pos == ')') pos++;
-                return val;
-            }
-            if (*pos == '-') {
-                pos++;
-                return -parseAtom();
-            }
-            // Functions and constants
-            if (strncmp(pos, "sin(", 4) == 0) { pos += 3; return std::sin(parseAtom()); }
-            if (strncmp(pos, "cos(", 4) == 0) { pos += 3; return std::cos(parseAtom()); }
-            if (strncmp(pos, "tan(", 4) == 0) { pos += 3; return std::tan(parseAtom()); }
-            if (strncmp(pos, "abs(", 4) == 0) { pos += 3; return std::abs(parseAtom()); }
-            if (strncmp(pos, "sqrt(", 5) == 0) { pos += 4; return std::sqrt(std::abs(parseAtom())); }
-            if (strncmp(pos, "pow(", 4) == 0) {
-                pos += 4;
-                float base = parseExpr();
-                skipWS();
-                if (*pos == ',') pos++;
-                float exp = parseExpr();
-                skipWS();
-                if (*pos == ')') pos++;
-                return std::pow(base, exp);
-            }
-            if (strncmp(pos, "saw(", 4) == 0) {
-                pos += 3;
-                float v = parseAtom();
-                float t = v / (2.0f * 3.14159265f);
-                return 2.0f * (t - std::floor(t + 0.5f));
-            }
-            if (strncmp(pos, "square(", 7) == 0) {
-                pos += 6;
-                float v = parseAtom();
-                return std::sin(v) >= 0 ? 1.0f : -1.0f;
-            }
-            if (strncmp(pos, "triangle(", 9) == 0) {
-                pos += 8;
-                float v = parseAtom();
-                float t = v / (2.0f * 3.14159265f);
-                return 4.0f * std::abs(t - std::floor(t + 0.5f)) - 1.0f;
-            }
-            if (strncmp(pos, "noise(", 6) == 0) {
-                pos += 5;
-                parseAtom(); // consume arg
-                std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
-                return dist(rng);
-            }
-            if (strncmp(pos, "tanh(", 5) == 0) { pos += 4; return std::tanh(parseAtom()); }
-            if (strncmp(pos, "clamp(", 6) == 0) {
-                pos += 6;
-                float v = parseExpr();
-                skipWS(); if (*pos == ',') pos++;
-                float lo = parseExpr();
-                skipWS(); if (*pos == ',') pos++;
-                float hi = parseExpr();
-                skipWS(); if (*pos == ')') pos++;
-                return std::clamp(v, lo, hi);
-            }
-            if (*pos == 'x') { pos++; return x; }
-            if (strncmp(pos, "pi", 2) == 0) { pos += 2; return 3.14159265f; }
-            if (*pos == 'e' && !std::isalpha(*(pos + 1))) { pos++; return 2.71828183f; }
-
-            return parseNumber();
-        }
-
-        float parsePow() {
-            float val = parseAtom();
-            skipWS();
-            if (*pos == '^') { pos++; val = std::pow(val, parsePow()); }
-            return val;
-        }
-
-        float parseMulDiv() {
-            float val = parsePow();
-            while (true) {
-                skipWS();
-                if (*pos == '*') { pos++; val *= parsePow(); }
-                else if (*pos == '/') { pos++; float d = parsePow(); val = d != 0 ? val / d : 0; }
-                else break;
-            }
-            return val;
-        }
-
-        float parseExpr() {
-            float val = parseMulDiv();
-            while (true) {
-                skipWS();
-                if (*pos == '+') { pos++; val += parseMulDiv(); }
-                else if (*pos == '-') { pos++; val -= parseMulDiv(); }
-                else break;
-            }
-            return val;
-        }
-
-        float eval(float xVal) {
-            x = xVal;
-            pos = str;
-            return parseExpr();
-        }
-    };
-
-    Parser parser;
+    ExprParser parser;
     parser.str = expr.c_str();
 
     for (int i = 0; i < tableSize; ++i) {
         float xVal = 2.0f * 3.14159265f * i / tableSize; // 0 to 2*pi
-        result[i] = juce::jlimit(-1.0f, 1.0f, parser.eval(xVal));
+        result[i] = juce::jlimit(-1.0f, 1.0f, parser.eval(xVal, 0.0f));
     }
-
     return result;
+}
+
+std::vector<float> WaveExprParser::evaluateOverBins(const std::string& expr, int numBins) {
+    std::vector<float> result(numBins);
+    if (expr.empty()) return result; // all zeros
+    ExprParser parser;
+    parser.str = expr.c_str();
+    for (int i = 0; i < numBins; ++i) {
+        result[i] = parser.eval(0.0f, (float)i);
+    }
+    return result;
+}
+
+float WaveExprParser::evaluateAt(const std::string& expr, float x, float f) {
+    if (expr.empty()) return 0.0f;
+    ExprParser parser;
+    parser.str = expr.c_str();
+    return parser.eval(x, f);
 }
 
 // ==============================================================================

@@ -10,14 +10,20 @@ std::string ProjectFile::currentPath;
 
 // Simple text-based project format
 // Sections: [Project], [Node], [Pin], [Clip], [Note], [Link], [Param]
+//
+// All actual I/O goes through the stream-based writeProject/readProject
+// helpers — the path-based save()/load() are thin wrappers that open a file
+// and delegate. The undo system (#84) reuses the same helpers against
+// std::ostringstream / std::istringstream to (de)serialize snapshots in
+// memory.
 
-static void writeStr(std::ofstream& f, const std::string& key, const std::string& val) {
+static void writeStr(std::ostream& f, const std::string& key, const std::string& val) {
     f << key << "=" << val << "\n";
 }
-static void writeInt(std::ofstream& f, const std::string& key, int val) {
+static void writeInt(std::ostream& f, const std::string& key, int val) {
     f << key << "=" << val << "\n";
 }
-static void writeFloat(std::ofstream& f, const std::string& key, float val) {
+static void writeFloat(std::ostream& f, const std::string& key, float val) {
     f << key << "=" << val << "\n";
 }
 
@@ -27,6 +33,15 @@ bool ProjectFile::save(const std::string& path, NodeGraph& graph, GraphProcessor
         fprintf(stderr, "Failed to save project: %s\n", path.c_str());
         return false;
     }
+    bool ok = writeProject(f, graph, gp);
+    if (ok) {
+        currentPath = path;
+        fprintf(stderr, "Project saved: %s\n", path.c_str());
+    }
+    return ok;
+}
+
+bool ProjectFile::writeProject(std::ostream& f, NodeGraph& graph, GraphProcessor* gp) {
 
     f << "[Project]\n";
     writeFloat(f, "bpm", graph.bpm);
@@ -68,6 +83,8 @@ bool ProjectFile::save(const std::string& path, NodeGraph& graph, GraphProcessor
         if (node.muted) writeInt(f, "muted", 1);
         if (node.soloed) writeInt(f, "soloed", 1);
         writeStr(f, "script", node.script);
+        if (!node.midiInputSourceId.empty())
+            writeStr(f, "midiInputSourceId", node.midiInputSourceId);
         if (!node.envAttackCurve.empty()) writeStr(f, "envAttackCurve", node.envAttackCurve);
         if (!node.envDecayCurve.empty()) writeStr(f, "envDecayCurve", node.envDecayCurve);
         if (!node.envReleaseCurve.empty()) writeStr(f, "envReleaseCurve", node.envReleaseCurve);
@@ -79,15 +96,28 @@ bool ProjectFile::save(const std::string& path, NodeGraph& graph, GraphProcessor
         if (node.spatialX != 0.0f) writeFloat(f, "spatialX", node.spatialX);
         if (node.spatialY != 0.0f) writeFloat(f, "spatialY", node.spatialY);
         if (node.spatialZ != 0.0f) writeFloat(f, "spatialZ", node.spatialZ);
-        // Save plugin state as base64
+        // Save plugin state as base64. Per-plugin dirty tracking (#86):
+        // only call getStateInformation when the cache is stale, otherwise
+        // reuse the cached base64 string. This avoids the expensive query
+        // for plugins whose parameters haven't changed since the last
+        // save — typical case is most plugins have nothing to re-query.
+        // ProjectFile::save (the user-facing save path, gp != nullptr) and
+        // the slow autosave path both share this cache.
         if (gp && node.pluginIndex >= 0) {
-            auto* proc = gp->getProcessorForNode(node.id);
-            if (proc) {
-                juce::MemoryBlock stateData;
-                proc->getStateInformation(stateData);
-                if (stateData.getSize() > 0)
-                    writeStr(f, "pluginState", stateData.toBase64Encoding().toStdString());
+            if (node.pluginStateDirty || node.cachedPluginStateBase64.empty()) {
+                auto* proc = gp->getProcessorForNode(node.id);
+                if (proc) {
+                    juce::MemoryBlock stateData;
+                    proc->getStateInformation(stateData);
+                    if (stateData.getSize() > 0) {
+                        node.cachedPluginStateBase64 =
+                            stateData.toBase64Encoding().toStdString();
+                        node.pluginStateDirty = false;
+                    }
+                }
             }
+            if (!node.cachedPluginStateBase64.empty())
+                writeStr(f, "pluginState", node.cachedPluginStateBase64);
         }
         if (node.performanceMode) {
             writeInt(f, "performanceMode", 1);
@@ -271,8 +301,6 @@ bool ProjectFile::save(const std::string& path, NodeGraph& graph, GraphProcessor
     }
 
     f << "\n[End]\n";
-    currentPath = path;
-    fprintf(stderr, "Project saved: %s\n", path.c_str());
     return true;
 }
 
@@ -282,7 +310,16 @@ bool ProjectFile::load(const std::string& path, NodeGraph& graph, PluginHost* pl
         fprintf(stderr, "Failed to load project: %s\n", path.c_str());
         return false;
     }
+    bool ok = readProject(f, graph, pluginHost);
+    if (ok) {
+        currentPath = path;
+        fprintf(stderr, "Project loaded: %s (%d nodes, %d links)\n",
+                path.c_str(), (int)graph.nodes.size(), (int)graph.links.size());
+    }
+    return ok;
+}
 
+bool ProjectFile::readProject(std::istream& f, NodeGraph& graph, PluginHost* pluginHost) {
     // Clear existing
     graph.nodes.clear();
     graph.links.clear();
@@ -380,6 +417,7 @@ bool ProjectFile::load(const std::string& path, NodeGraph& graph, PluginHost* pl
             else if (key == "muted") curNode->muted = (val == "1");
             else if (key == "soloed") curNode->soloed = (val == "1");
             else if (key == "script") curNode->script = val;
+            else if (key == "midiInputSourceId") curNode->midiInputSourceId = val;
             else if (key == "envAttackCurve") curNode->envAttackCurve = val;
             else if (key == "envDecayCurve") curNode->envDecayCurve = val;
             else if (key == "envReleaseCurve") curNode->envReleaseCurve = val;
@@ -603,11 +641,23 @@ bool ProjectFile::load(const std::string& path, NodeGraph& graph, PluginHost* pl
     for (auto& n : graph.nodes)
         n.posSet = false;
 
-    currentPath = path;
     graph.dirty = false;
-    fprintf(stderr, "Project loaded: %s (%d nodes, %d links)\n",
-            path.c_str(), (int)graph.nodes.size(), (int)graph.links.size());
     return true;
+}
+
+std::string ProjectFile::serializeForUndo(NodeGraph& graph) {
+    // Pass nullptr for the GraphProcessor so plugin state is omitted —
+    // that's the expensive part and undo doesn't need it (plugin internal
+    // state is captured separately by the slow autosave path, task #86).
+    std::ostringstream oss;
+    writeProject(oss, graph, nullptr);
+    return oss.str();
+}
+
+bool ProjectFile::loadFromString(const std::string& text, NodeGraph& graph,
+                                 PluginHost* pluginHost) {
+    std::istringstream iss(text);
+    return readProject(iss, graph, pluginHost);
 }
 
 } // namespace SoundShop

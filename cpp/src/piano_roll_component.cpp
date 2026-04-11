@@ -10,14 +10,15 @@ namespace SoundShop {
 std::vector<PianoRollComponent::ClipboardNote> PianoRollComponent::clipboard;
 std::unique_ptr<Clip> PianoRollComponent::clipClipboard;
 
-PianoRollComponent::PianoRollComponent(NodeGraph& g, Node& n, Transport* t) : graph(g), node(n), transport(t) {
+PianoRollComponent::PianoRollComponent(NodeGraph& g, Node& n, Transport* t)
+    : graph(g), nodeId(n.id), node(&n), transport(t) {
     setWantsKeyboardFocus(true);
 
-    bool isMidi = node.type == NodeType::MidiTimeline;
+    bool isMidi = node->type == NodeType::MidiTimeline;
     {
-        juce::String title = node.name + (isMidi ? " [MIDI]" : " [Audio]");
-        if (node.parentGroupId >= 0) {
-            auto* parent = graph.findNode(node.parentGroupId);
+        juce::String title = node->name + (isMidi ? " [MIDI]" : " [Audio]");
+        if (node->parentGroupId >= 0) {
+            auto* parent = graph.findNode(node->parentGroupId);
             if (parent)
                 title += " in " + juce::String(parent->name);
         }
@@ -35,8 +36,8 @@ PianoRollComponent::PianoRollComponent(NodeGraph& g, Node& n, Transport* t) : gr
 
     auto apply = [this](auto fn) {
         for (auto& [ci, ni] : state.selected)
-            if (ci < (int)node.clips.size() && ni < (int)node.clips[ci].notes.size())
-                fn(node.clips[ci].notes[ni]);
+            if (ci < (int)node->clips.size() && ni < (int)node->clips[ci].notes.size())
+                fn(node->clips[ci].notes[ni]);
         repaint();
     };
 
@@ -51,39 +52,86 @@ PianoRollComponent::PianoRollComponent(NodeGraph& g, Node& n, Transport* t) : gr
     addBtn(snap14Btn); addBtn(snap12Btn); addBtn(snap1Btn); addBtn(snapOffBtn);
     addBtn(snapScaleBtn); addBtn(detectKeyBtn);
 
+    // Tooltips: cover the controls whose labels are abbreviated or use
+    // music terminology a non-musician wouldn't necessarily know.
+    // Skip the genuinely self-explanatory ones (Select All, Deselect,
+    // Reverse, X close).
+    compactBtn.setTooltip("Toggle compact mode — hides most toolbar buttons to maximize the note-editing area");
+    transpUpOctBtn.setTooltip("Move every selected note up by one octave (12 semitones)");
+    transpDownOctBtn.setTooltip("Move every selected note down by one octave (12 semitones)");
+    transpUpSemiBtn.setTooltip("Move every selected note up by one semitone (one piano key)");
+    transpDownSemiBtn.setTooltip("Move every selected note down by one semitone (one piano key)");
+    timeLeftBtn.setTooltip("Nudge selected notes earlier in time by one snap unit");
+    timeRightBtn.setTooltip("Nudge selected notes later in time by one snap unit");
+    dblDurBtn.setTooltip("Double the length of every selected note (makes them last twice as long)");
+    halfDurBtn.setTooltip("Halve the length of every selected note (makes them last half as long)");
+    reverseBtn.setTooltip("Reverse the order of selected notes in time, so the last becomes the first");
+    detuneResetBtn.setTooltip("Reset the detune of selected notes back to 0 cents (perfectly in tune)");
+    snap14Btn.setTooltip("Snap notes to quarter-beat positions (1/16th of a 4/4 bar)");
+    snap12Btn.setTooltip("Snap notes to half-beat positions (1/8th of a 4/4 bar)");
+    snap1Btn.setTooltip("Snap notes to whole-beat positions (1/4 of a 4/4 bar)");
+    snapOffBtn.setTooltip("Disable snapping — notes can be placed at any position. Hold Alt while dragging for the same effect.");
+    snapScaleBtn.setTooltip("Snap notes to the chosen Key/Scale, so dragging a note up or down only lands on \"in key\" pitches");
+    detectKeyBtn.setTooltip("Analyze the notes in this clip and guess the key/scale, then set the dropdowns to match");
+
     // Mute / Solo / Pan
     addBtn(muteBtn); addBtn(soloBtn);
-    addAndMakeVisible(panSlider);
-    addAndMakeVisible(panLbl);
+    // "Mute" is universally understood — skip the tooltip. "Solo" is a
+    // DAW term that non-musicians might not know.
+    soloBtn.setTooltip("Solo this track — when any track is soloed, all non-soloed tracks are silenced");
+    // Pan slider only for nodes that produce audio. MIDI Timelines only
+    // output MIDI events — panning them does nothing.
+    bool showPan = (n.type != NodeType::MidiTimeline);
+    if (showPan) {
+        addAndMakeVisible(panSlider);
+        addAndMakeVisible(panLbl);
+    }
     panLbl.setText("Pan:", juce::dontSendNotification);
+    panSlider.setTooltip("Pan this track left or right in the stereo image. Center = both speakers, "
+                         "left = only left speaker, right = only right speaker.");
     panSlider.setRange(-1.0, 1.0, 0.01);
-    panSlider.setValue(node.pan);
+    // Read initial pan from the named param (if it exists) or node->pan
+    {
+        float initPan = node->pan;
+        for (auto& p : node->params)
+            if (p.name == "Pan") { initPan = p.value; break; }
+        panSlider.setValue(initPan);
+    }
     panSlider.setTextBoxStyle(juce::Slider::NoTextBox, false, 0, 0);
     panSlider.setSliderStyle(juce::Slider::LinearHorizontal);
     panSlider.onValueChange = [this]() {
-        node.pan = (float)panSlider.getValue();
+        float val = (float)panSlider.getValue();
+        node->pan = val; // legacy field
+        // Update the named param
+        for (auto& p : node->params)
+            if (p.name == "Pan") { p.value = val; break; }
         graph.dirty = true;
     };
     muteBtn.onClick = [this]() {
-        node.muted = !node.muted;
+        node->muted = !node->muted;
         muteBtn.setColour(juce::TextButton::buttonColourId,
-            node.muted ? juce::Colour(180, 50, 50) : juce::Colour(55, 55, 60));
+            node->muted ? juce::Colour(180, 50, 50) : juce::Colour(55, 55, 60));
         graph.dirty = true;
     };
     soloBtn.onClick = [this]() {
-        node.soloed = !node.soloed;
+        node->soloed = !node->soloed;
         soloBtn.setColour(juce::TextButton::buttonColourId,
-            node.soloed ? juce::Colour(180, 180, 50) : juce::Colour(55, 55, 60));
+            node->soloed ? juce::Colour(180, 180, 50) : juce::Colour(55, 55, 60));
         graph.dirty = true;
     };
     // Set initial colors
     muteBtn.setColour(juce::TextButton::buttonColourId,
-        node.muted ? juce::Colour(180, 50, 50) : juce::Colour(55, 55, 60));
+        node->muted ? juce::Colour(180, 50, 50) : juce::Colour(55, 55, 60));
     soloBtn.setColour(juce::TextButton::buttonColourId,
-        node.soloed ? juce::Colour(180, 180, 50) : juce::Colour(55, 55, 60));
+        node->soloed ? juce::Colour(180, 180, 50) : juce::Colour(55, 55, 60));
 
-    // Expression / velocity lane buttons
-    addBtn(exprOffBtn); addBtn(exprVelBtn); addBtn(exprPBBtn); addBtn(exprSlideBtn); addBtn(exprPressBtn);
+    // Expression / velocity lane buttons.
+    // Velocity lane is now fully working; MPE lanes are still hidden until
+    // their interaction code is audited.
+    addBtn(exprOffBtn);
+    addBtn(exprVelBtn);
+    exprOffBtn.setTooltip("Hide the expression/automation lane below the piano roll");
+    exprVelBtn.setTooltip("Show the velocity lane — drag the bars to change how loud each note plays");
     exprOffBtn.onClick   = [this]() { exprLane = ExprNone; repaint(); };
     exprVelBtn.onClick   = [this]() { exprLane = ExprVelocity; repaint(); };
     exprPBBtn.onClick    = [this]() { exprLane = ExprPitchBend; repaint(); };
@@ -92,9 +140,12 @@ PianoRollComponent::PianoRollComponent(NodeGraph& g, Node& n, Transport* t) : gr
 
     // Automation lane parameter selector
     addAndMakeVisible(autoParamCombo);
-    autoParamCombo.addItem("Auto...", 1);
-    for (int i = 0; i < (int)node.params.size(); ++i)
-        autoParamCombo.addItem(node.params[i].name, i + 2);
+    autoParamCombo.setTooltip("Pick a parameter to automate in the lane below the piano roll. "
+                              "Once shown, click in the lane to add points and drag them to draw a curve "
+                              "that controls the parameter over time.");
+    autoParamCombo.addItem("Automate Param", 1);
+    for (int i = 0; i < (int)node->params.size(); ++i)
+        autoParamCombo.addItem(node->params[i].name, i + 2);
     autoParamCombo.setSelectedItemIndex(0);
     autoParamCombo.onChange = [this]() {
         int idx = autoParamCombo.getSelectedItemIndex();
@@ -120,6 +171,11 @@ PianoRollComponent::PianoRollComponent(NodeGraph& g, Node& n, Transport* t) : gr
     addCombo(keyCombo, keyLbl, "Key:");
     addCombo(modeCombo, modeLbl, "Mode:");
     addCombo(scaleCombo, scaleLbl, "Scale:");
+    rootCombo.setTooltip("Root note — the home pitch of the key/scale (e.g. C for C Major)");
+    keyCombo.setTooltip("Key family — Major sounds happy/bright, Minor sounds sad/dark");
+    modeCombo.setTooltip("Mode — variants of the major scale that change the mood (Dorian, Phrygian, Lydian, etc.)");
+    scaleCombo.setTooltip("Scale — broader categories like Pentatonic, Blues, Whole-Tone, Chromatic. "
+                          "Affects which notes are highlighted as 'in key' on the piano roll.");
 
     // Populate root
     for (int i = 0; i < 12; ++i)
@@ -188,7 +244,7 @@ PianoRollComponent::PianoRollComponent(NodeGraph& g, Node& n, Transport* t) : gr
     vScrollBar.addListener(this);
 
     hZoomSlider.setRange(0.2, 10.0, 0.1);
-    hZoomSlider.setValue(1.0);
+    hZoomSlider.setValue(state.hZoom, juce::dontSendNotification);
     hZoomSlider.setSliderStyle(juce::Slider::LinearHorizontal);
     hZoomSlider.setTextBoxStyle(juce::Slider::NoTextBox, true, 0, 0);
     hZoomSlider.setTooltip("Horizontal zoom");
@@ -204,6 +260,9 @@ PianoRollComponent::PianoRollComponent(NodeGraph& g, Node& n, Transport* t) : gr
     detuneSlider.setRange(-100, 100, 1);
     detuneSlider.setTextBoxStyle(juce::Slider::TextBoxLeft, false, 50, 20);
     detuneSlider.setSliderStyle(juce::Slider::LinearHorizontal);
+    detuneSlider.setTooltip("Fine-tune the pitch of selected notes by cents (-100 to +100). "
+                            "100 cents = 1 semitone. Useful for slightly out-of-tune effects "
+                            "or matching another instrument's tuning.");
     addAndMakeVisible(detuneSlider);
 
     compactBtn.onClick = [this]() {
@@ -211,7 +270,7 @@ PianoRollComponent::PianoRollComponent(NodeGraph& g, Node& n, Transport* t) : gr
         compactBtn.setButtonText(compactMode ? "++" : "--");
         resized(); repaint();
     };
-    closeBtn.onClick = [this]() { if (onClose) onClose(node.id); };
+    closeBtn.onClick = [this]() { if (onClose) onClose(node->id); };
 
     transpDownOctBtn.onClick = [this, apply]() { apply([](MidiNote& n) { n.pitch = std::max(0, n.pitch - 12); }); };
     transpDownSemiBtn.onClick = [this, apply]() { apply([](MidiNote& n) { n.pitch = std::max(0, n.pitch - 1); }); };
@@ -229,8 +288,8 @@ PianoRollComponent::PianoRollComponent(NodeGraph& g, Node& n, Transport* t) : gr
 
     selectAllBtn.onClick = [this]() {
         state.selected.clear();
-        for (int ci = 0; ci < (int)node.clips.size(); ++ci)
-            for (int ni = 0; ni < (int)node.clips[ci].notes.size(); ++ni)
+        for (int ci = 0; ci < (int)node->clips.size(); ++ci)
+            for (int ni = 0; ni < (int)node->clips[ci].notes.size(); ++ni)
                 state.selected.insert({ci, ni});
         repaint();
     };
@@ -242,17 +301,17 @@ PianoRollComponent::PianoRollComponent(NodeGraph& g, Node& n, Transport* t) : gr
         if (state.selected.empty()) return;
         float minOff = 1e9f, maxEnd = 0;
         for (auto& [ci, ni] : state.selected) {
-            if (ci < (int)node.clips.size() && ni < (int)node.clips[ci].notes.size()) {
-                auto& n2 = node.clips[ci].notes[ni];
-                float ab = node.clips[ci].startBeat + n2.offset;
+            if (ci < (int)node->clips.size() && ni < (int)node->clips[ci].notes.size()) {
+                auto& n2 = node->clips[ci].notes[ni];
+                float ab = node->clips[ci].startBeat + n2.offset;
                 minOff = std::min(minOff, ab); maxEnd = std::max(maxEnd, ab + n2.duration);
             }
         }
         for (auto& [ci, ni] : state.selected) {
-            if (ci < (int)node.clips.size() && ni < (int)node.clips[ci].notes.size()) {
-                auto& n2 = node.clips[ci].notes[ni];
-                float ab = node.clips[ci].startBeat + n2.offset;
-                n2.offset = std::max(0.0f, maxEnd - (ab - minOff) - n2.duration - node.clips[ci].startBeat);
+            if (ci < (int)node->clips.size() && ni < (int)node->clips[ci].notes.size()) {
+                auto& n2 = node->clips[ci].notes[ni];
+                float ab = node->clips[ci].startBeat + n2.offset;
+                n2.offset = std::max(0.0f, maxEnd - (ab - minOff) - n2.duration - node->clips[ci].startBeat);
             }
         }
         repaint();
@@ -302,10 +361,10 @@ PianoRollComponent::PianoRollComponent(NodeGraph& g, Node& n, Transport* t) : gr
         std::vector<int> pitches;
         if (!state.selected.empty()) {
             for (auto& [ci, ni] : state.selected)
-                if (ci < (int)node.clips.size() && ni < (int)node.clips[ci].notes.size())
-                    pitches.push_back(node.clips[ci].notes[ni].pitch);
+                if (ci < (int)node->clips.size() && ni < (int)node->clips[ci].notes.size())
+                    pitches.push_back(node->clips[ci].notes[ni].pitch);
         } else {
-            for (auto& clip : node.clips)
+            for (auto& clip : node->clips)
                 for (auto& n2 : clip.notes) pitches.push_back(n2.pitch);
         }
         auto results = MusicTheory::detectKeys(pitches);
@@ -330,6 +389,7 @@ PianoRollComponent::PianoRollComponent(NodeGraph& g, Node& n, Transport* t) : gr
 }
 
 void PianoRollComponent::resized() {
+    refreshNode(); if (!node) return;
     auto area = getLocalBounds();
     int th = toolbarHeight();
     int rowH = 26;
@@ -339,10 +399,12 @@ void PianoRollComponent::resized() {
     titleLabel.setBounds(row0.removeFromLeft(150));
     closeBtn.setBounds(row0.removeFromRight(24).reduced(0, 2));
     compactBtn.setBounds(row0.removeFromRight(24).reduced(0, 2));
-    muteBtn.setBounds(row0.removeFromRight(24).reduced(1, 2));
-    soloBtn.setBounds(row0.removeFromRight(24).reduced(1, 2));
-    panSlider.setBounds(row0.removeFromRight(70).reduced(0, 2));
-    panLbl.setBounds(row0.removeFromRight(28).reduced(0, 2));
+    muteBtn.setBounds(row0.removeFromRight(42).reduced(1, 2));
+    soloBtn.setBounds(row0.removeFromRight(42).reduced(1, 2));
+    if (panSlider.isVisible()) {
+        panSlider.setBounds(row0.removeFromRight(70).reduced(0, 2));
+        panLbl.setBounds(row0.removeFromRight(32).reduced(0, 2));
+    }
     helpLabel.setBounds(row0.reduced(4, 0));
 
     auto allToolbarBtns = {&transpDownOctBtn, &transpDownSemiBtn, &transpUpSemiBtn, &transpUpOctBtn,
@@ -382,11 +444,11 @@ void PianoRollComponent::resized() {
         place(transpUpSemiBtn, 72);
         place(transpUpOctBtn, 65);
         x += 6;
-        place(timeLeftBtn, 60);
-        place(timeRightBtn, 60);
+        place(timeLeftBtn, 70);
+        place(timeRightBtn, 75);
         x += 6;
-        place(selectAllBtn, 30);
-        place(deselectBtn, 42);
+        place(selectAllBtn, 65);
+        place(deselectBtn, 60);
         x += 6;
         place(dblDurBtn, 80);
         place(halfDurBtn, 80);
@@ -434,15 +496,16 @@ void PianoRollComponent::resized() {
         x += 4;
         place2(snapScaleBtn, 85);
         place2(detectKeyBtn, 70);
-        // Velocity lane is always available; MPE lanes only when MPE enabled
+        // Velocity lane + automation are always available; MPE lanes only
+        // when MPE is enabled on the node.
         x += 8;
         place2(exprOffBtn, 35);
-        place2(exprVelBtn, 28);
-        if (node.mpeEnabled) {
-            place2(exprPBBtn, 28);
-            place2(exprSlideBtn, 38);
-            place2(exprPressBtn, 40);
-        }
+        place2(exprVelBtn, 35);
+        // MPE expression lane buttons still hidden until their interaction
+        // code is audited.
+        exprPBBtn.setVisible(false);
+        exprSlideBtn.setVisible(false);
+        exprPressBtn.setVisible(false);
 
         auto styleLane = [&](juce::TextButton& btn, ExprLane lane) {
             btn.setColour(juce::TextButton::buttonColourId,
@@ -450,11 +513,8 @@ void PianoRollComponent::resized() {
         };
         styleLane(exprOffBtn, ExprNone);
         styleLane(exprVelBtn, ExprVelocity);
-        styleLane(exprPBBtn, ExprPitchBend);
-        styleLane(exprSlideBtn, ExprSlide);
-        styleLane(exprPressBtn, ExprPressure);
         x += 4;
-        autoParamCombo.setBounds(area.getX() + x, area.getY() + 1, 90, rowH - 2);
+        autoParamCombo.setBounds(row2.getX() + x, row2.getY() + 1, 120, rowH - 2);
     }
 
     // Visibility
@@ -464,10 +524,10 @@ void PianoRollComponent::resized() {
         autoParamCombo.setVisible(false);
     } else {
         exprOffBtn.setVisible(true); exprVelBtn.setVisible(true);
-        exprPBBtn.setVisible(node.mpeEnabled);
-        exprSlideBtn.setVisible(node.mpeEnabled);
-        exprPressBtn.setVisible(node.mpeEnabled);
-        autoParamCombo.setVisible(!node.params.empty());
+        exprPBBtn.setVisible(node && node->mpeEnabled);
+        exprSlideBtn.setVisible(node && node->mpeEnabled);
+        exprPressBtn.setVisible(node && node->mpeEnabled);
+        autoParamCombo.setVisible(node && !node->params.empty());
     }
 
     // Scrollbars — bottom and right edges of the piano roll area
@@ -475,13 +535,30 @@ void PianoRollComponent::resized() {
     pianoArea.removeFromTop(toolbarHeight());
     vScrollBar.setBounds(pianoArea.removeFromRight(SCROLLBAR_SIZE));
     auto bottomBar = pianoArea.removeFromBottom(SCROLLBAR_SIZE);
-    hZoomSlider.setBounds(bottomBar.removeFromRight(80));
+    // Zoom slider gets a generous width (40% of the bar, min 150px) so it's
+    // easy to grab. The horizontal scrollbar takes the rest.
+    int zoomW = std::max(150, (int)(bottomBar.getWidth() * 0.4f));
+    hZoomSlider.setBounds(bottomBar.removeFromRight(zoomW));
     hScrollBar.setBounds(bottomBar);
 
     updateScrollBars();
 }
 
 void PianoRollComponent::paint(juce::Graphics& g) {
+    refreshNode(); if (!node) return;
+    // Sync pan slider with current param value (tracks automation/signal changes).
+    // Only for nodes that produce audio (pan slider hidden for MIDI timelines).
+    if (panSlider.isVisible() && node) {
+        bool signalLocked = graph.hasSignalInput(node->id);
+        panSlider.setEnabled(!signalLocked);
+        panSlider.setAlpha(signalLocked ? 0.4f : 1.0f);
+        for (auto& p : node->params)
+            if (p.name == "Pan") {
+                panSlider.setValue(p.value, juce::dontSendNotification);
+                break;
+            }
+    }
+
     // Draw toolbar background
     g.setColour(juce::Colour(35, 35, 40));
     g.fillRect(0, 0, getWidth(), toolbarHeight());
@@ -501,12 +578,12 @@ void PianoRollComponent::paint(juce::Graphics& g) {
     int visRange = state.visibleRange;
     int pitchHi = state.scrollPitch + visRange / 2;
     float rowH = gridH / std::max(visRange, 1);
-    float totalBeats = graph.getTimelineBeats(node);
-    float absOffset = node.absoluteBeatOffset; // cascading parent offset
+    float totalBeats = graph.getTimelineBeats(*node);
+    float absOffset = node->absoluteBeatOffset; // cascading parent offset
     float absTotalBeats = totalBeats + absOffset;
 
-    // Horizontal zoom/scroll
-    float visibleBeats = absTotalBeats / std::max(state.hZoom, 0.1f);
+    // Horizontal zoom/scroll — guard against zero visible beats
+    float visibleBeats = std::max(1.0f, absTotalBeats / std::max(state.hZoom, 0.1f));
     float scrollBeat = juce::jlimit(0.0f, std::max(0.0f, absTotalBeats - visibleBeats), state.hScroll);
     state.hScroll = scrollBeat;
 
@@ -609,7 +686,7 @@ void PianoRollComponent::paint(juce::Graphics& g) {
     }
 
     // Clip boundaries
-    for (auto& clip : node.clips) {
+    for (auto& clip : node->clips) {
         float cx1 = beatToX(clip.startBeat);
         float cx2 = beatToX(clip.startBeat + clip.lengthBeats);
         uint8_t cr = (clip.color >> 16) & 0xFF, cg2 = (clip.color >> 8) & 0xFF, cb = clip.color & 0xFF;
@@ -620,8 +697,8 @@ void PianoRollComponent::paint(juce::Graphics& g) {
     }
 
     // Notes
-    for (int ci = 0; ci < (int)node.clips.size(); ++ci) {
-        auto& clip = node.clips[ci];
+    for (int ci = 0; ci < (int)node->clips.size(); ++ci) {
+        auto& clip = node->clips[ci];
         uint8_t cr = (clip.color >> 16) & 0xFF, cg2 = (clip.color >> 8) & 0xFF, cb = clip.color & 0xFF;
         for (int ni = 0; ni < (int)clip.notes.size(); ++ni) {
             auto& note = clip.notes[ni];
@@ -708,6 +785,84 @@ void PianoRollComponent::paint(juce::Graphics& g) {
         }
     }
 
+    // Insert chain layers: flat-edged bars stacked flush at the top of the
+    // grid, representing the track's serial effect chain. Bottom layer
+    // processes first, top layer last. No rounded corners, no gaps — they
+    // look like stackable blocks.
+    if (!node->effectRegions.empty()) {
+        const float barH = 12.0f;
+        const float barY0 = 0.0f; // flush with top
+
+        // Assign each unique (linkId,groupId) pair its own layer row.
+        std::vector<std::pair<int,int>> seenPairs;
+        auto getRow = [&](int lid, int gid) -> int {
+            for (int i = 0; i < (int)seenPairs.size(); ++i)
+                if (seenPairs[i].first == lid && seenPairs[i].second == gid) return i;
+            seenPairs.push_back({lid, gid});
+            return (int)seenPairs.size() - 1;
+        };
+
+        for (const auto& region : node->effectRegions) {
+            float rx1 = beatToX(region.startBeat);
+            float rx2 = beatToX(region.endBeat);
+            if (rx2 < gridX || rx1 > gridX + gridW) continue;
+            rx1 = std::max(rx1, gridX);
+            rx2 = std::min(rx2, gridX + gridW);
+
+            int row = getRow(region.linkId, region.groupId);
+            float ry = barY0 + row * barH; // flush stacking, no gaps
+
+            uint32_t col = region.color;
+            if (col == 0) {
+                if (region.groupId >= 0) {
+                    if (auto* grp = graph.findEffectGroup(region.groupId))
+                        col = grp->color;
+                }
+                if (col == 0 && region.linkId >= 0)
+                    col = getDistinctColor(region.linkId);
+                if (col == 0)
+                    col = 0xFF808080;
+            }
+
+            auto barColor = juce::Colour((uint8_t)((col >> 16) & 0xFF),
+                                         (uint8_t)((col >> 8) & 0xFF),
+                                         (uint8_t)(col & 0xFF));
+
+            // Flat bar body — no rounded corners, stackable
+            g.setColour(barColor.withAlpha(0.70f));
+            g.fillRect(rx1, ry, rx2 - rx1, barH);
+            // Thin top/bottom edge lines for separation
+            g.setColour(barColor.brighter(0.4f));
+            g.drawHorizontalLine((int)ry, rx1, rx2);
+            g.drawHorizontalLine((int)(ry + barH), rx1, rx2);
+
+            // Label: effect name
+            if (rx2 - rx1 > 40.0f) {
+                juce::String label;
+                if (region.groupId >= 0) {
+                    if (auto* grp = graph.findEffectGroup(region.groupId))
+                        label = grp->name.empty() ? "" : juce::String(grp->name);
+                }
+                if (label.isEmpty() && region.linkId >= 0) {
+                    for (auto& link : graph.links) {
+                        if (link.id == region.linkId) {
+                            for (auto& n : graph.nodes)
+                                for (auto& pin : n.pinsIn)
+                                    if (pin.id == link.endPin) { label = n.name; break; }
+                            break;
+                        }
+                    }
+                }
+                if (label.isNotEmpty()) {
+                    g.setColour(juce::Colours::white.withAlpha(0.9f));
+                    g.setFont(juce::Font(std::min(10.0f, barH - 2.0f)));
+                    g.drawText(label, rx1 + 4, (int)ry, (int)(rx2 - rx1 - 8), (int)barH,
+                               juce::Justification::centredLeft, false);
+                }
+            }
+        }
+    }
+
     // Playback cursor (absolute beat, no double-offset)
     if (transport && transport->playing) {
         float cursorBeat = (float)transport->positionBeats();
@@ -719,13 +874,50 @@ void PianoRollComponent::paint(juce::Graphics& g) {
     }
 
     // Expression / velocity / automation lane
-    if (exprLane != ExprNone && (exprLane == ExprVelocity || exprLane == ExprAutomation || node.mpeEnabled)) {
+    if (exprLane != ExprNone && (exprLane == ExprVelocity || exprLane == ExprAutomation || node->mpeEnabled)) {
         float exprY = gridH - EXPR_LANE_HEIGHT;
         float exprH = EXPR_LANE_HEIGHT;
 
         // Background
         g.setColour(juce::Colour(15, 15, 25));
         g.fillRect(gridX, exprY, gridW, exprH);
+
+        // Lane label: explain what this section shows so it's not mysterious.
+        {
+            juce::String laneLabel;
+            juce::String laneHint;
+            switch (exprLane) {
+                case ExprVelocity:
+                    laneLabel = "Velocity (note loudness)";
+                    laneHint = "Drag bars up/down to change how loud each note plays";
+                    break;
+                case ExprAutomation:
+                    if (autoParamIndex >= 0 && autoParamIndex < (int)node->params.size())
+                        laneLabel = "Automation: " + juce::String(node->params[autoParamIndex].name);
+                    else
+                        laneLabel = "Automation";
+                    laneHint = "Click to add points, drag to move, right-click to delete";
+                    break;
+                case ExprPitchBend:  laneLabel = "Pitch Bend"; laneHint = "Per-note pitch curve"; break;
+                case ExprSlide:      laneLabel = "Slide";      laneHint = "Per-note slide (CC74)"; break;
+                case ExprPressure:   laneLabel = "Pressure";   laneHint = "Per-note aftertouch"; break;
+                default: break;
+            }
+            if (laneLabel.isNotEmpty()) {
+                g.setColour(juce::Colours::white.withAlpha(0.7f));
+                g.setFont(juce::Font(11.0f, juce::Font::bold));
+                g.drawText(laneLabel, gridX + 6, (int)exprY + 2, 200, 14,
+                           juce::Justification::centredLeft, false);
+                g.setColour(juce::Colours::grey.withAlpha(0.5f));
+                g.setFont(juce::Font(9.0f));
+                g.drawText(laneHint, gridX + 210, (int)exprY + 2, 350, 14,
+                           juce::Justification::centredLeft, false);
+            }
+        }
+
+        // Divider at top of lane
+        g.setColour(juce::Colour(60, 60, 80));
+        g.drawHorizontalLine((int)exprY, gridX, gridX + gridW);
 
         // Center line for pitch bend
         if (exprLane == ExprPitchBend) {
@@ -734,8 +926,8 @@ void PianoRollComponent::paint(juce::Graphics& g) {
         }
 
         // Draw per-note data
-        for (auto& clip : node.clips) {
-            int ciIdx = (int)(&clip - &node.clips[0]);
+        for (auto& clip : node->clips) {
+            int ciIdx = (int)(&clip - &node->clips[0]);
             for (int ni = 0; ni < (int)clip.notes.size(); ++ni) {
                 auto& note = clip.notes[ni];
                 float noteStartBeat = clip.startBeat + note.getOffset();
@@ -745,17 +937,23 @@ void PianoRollComponent::paint(juce::Graphics& g) {
                 auto noteColor = juce::Colour(clip.color).brighter(0.3f);
 
                 if (exprLane == ExprVelocity) {
-                    // Velocity: vertical bar per note
-                    float barWidth = std::max(3.0f, beatToX(noteStartBeat + 0.1f) - nx1);
+                    // Velocity: one vertical bar per note, spanning the
+                    // note's actual duration so it visually lines up with
+                    // the note above. Min 3px wide so very short notes are
+                    // still clickable.
+                    float noteEndBeat = noteStartBeat + note.getDuration();
+                    float nx2 = beatToX(noteEndBeat);
+                    float barWidth = std::max(3.0f, nx2 - nx1);
                     float barHeight = (note.velocity / 127.0f) * exprH;
                     float barY = exprY + exprH - barHeight;
 
-                    if (nx1 >= gridX - barWidth && nx1 <= gridX + gridW) {
-                        g.setColour(isSelected ? noteColor : noteColor.withAlpha(0.7f));
-                        g.fillRect(nx1, barY, barWidth, barHeight);
-                        g.setColour(juce::Colours::white.withAlpha(0.3f));
-                        g.drawRect(juce::Rectangle<float>(nx1, barY, barWidth, barHeight), 1.0f);
-                    }
+                    // Off-screen cull
+                    if (nx2 < gridX || nx1 > gridX + gridW) continue;
+
+                    g.setColour(isSelected ? noteColor : noteColor.withAlpha(0.7f));
+                    g.fillRect(nx1, barY, barWidth, barHeight);
+                    g.setColour(juce::Colours::white.withAlpha(isSelected ? 0.6f : 0.3f));
+                    g.drawRect(juce::Rectangle<float>(nx1, barY, barWidth, barHeight), 1.0f);
                 } else {
                     // MPE expression curves
                     auto& curve = exprLane == ExprPitchBend ? note.expression.pitchBend
@@ -790,8 +988,8 @@ void PianoRollComponent::paint(juce::Graphics& g) {
 
         // Automation lane: draw automation curve for selected parameter
         if (exprLane == ExprAutomation && autoParamIndex >= 0 &&
-            autoParamIndex < (int)node.params.size()) {
-            auto& param = node.params[autoParamIndex];
+            autoParamIndex < (int)node->params.size()) {
+            auto& param = node->params[autoParamIndex];
             auto& lane = param.automation;
             float pMin = param.minVal, pMax = param.maxVal;
             float pRange = std::max(0.001f, pMax - pMin);
@@ -809,27 +1007,37 @@ void PianoRollComponent::paint(juce::Graphics& g) {
             g.drawHorizontalLine((int)curY, gridX, gridX + gridW);
 
             if (!lane.points.empty()) {
-                // Draw automation curve
+                // Draw automation curve using Catmull-Rom interpolation.
+                // Sample the curve at sub-beat resolution for smoothness.
                 g.setColour(juce::Colours::orange);
                 juce::Path autoPath;
+                float beatStart = scrollBeat;
+                float beatEnd = scrollBeat + visibleBeats;
+                float step = visibleBeats / std::max(1.0f, gridW * 0.5f); // ~2 px per sample
                 bool first = true;
-                for (auto& pt : lane.points) {
-                    float px = gridX + ((pt.beat - scrollBeat) / visibleBeats) * gridW;
-                    float norm = (pt.value - pMin) / pRange;
+                for (float b = beatStart; b <= beatEnd; b += step) {
+                    float val = lane.evaluate(b);
+                    if (val < -0.5f) continue; // sentinel = no data
+                    float px = gridX + ((b - scrollBeat) / visibleBeats) * gridW;
+                    float norm = (val - pMin) / pRange;
                     float py = exprY + exprH * (1.0f - juce::jlimit(0.0f, 1.0f, norm));
                     if (first) { autoPath.startNewSubPath(px, py); first = false; }
                     else autoPath.lineTo(px, py);
                 }
                 g.strokePath(autoPath, juce::PathStrokeType(2.0f));
 
-                // Draw breakpoints
-                for (auto& pt : lane.points) {
+                // Draw control point dots (white fill, orange border)
+                for (int pi = 0; pi < (int)lane.points.size(); ++pi) {
+                    auto& pt = lane.points[pi];
                     float px = gridX + ((pt.beat - scrollBeat) / visibleBeats) * gridW;
                     float norm = (pt.value - pMin) / pRange;
                     float py = exprY + exprH * (1.0f - juce::jlimit(0.0f, 1.0f, norm));
                     if (px >= gridX - 5 && px <= gridX + gridW + 5) {
-                        g.setColour(juce::Colours::orange);
+                        bool isDragged = (exprDragPtIdx == pi && exprDragNI == -2 && dragMode == DragExprPoint);
+                        g.setColour(isDragged ? juce::Colours::yellow : juce::Colours::white);
                         g.fillEllipse(px - 4, py - 4, 8, 8);
+                        g.setColour(juce::Colours::orange);
+                        g.drawEllipse(px - 4, py - 4, 8, 8, 1.5f);
                     }
                 }
             }
@@ -865,8 +1073,8 @@ std::pair<float, int> PianoRollComponent::screenToBeatPitch(juce::Point<float> p
     pos.y -= toolbarHeight();
     int visRange = state.visibleRange;
     int pitchHi = state.scrollPitch + visRange / 2;
-    float totalBeats = graph.getTimelineBeats(node);
-    float absOffset = node.absoluteBeatOffset;
+    float totalBeats = graph.getTimelineBeats(*node);
+    float absOffset = node->absoluteBeatOffset;
     float absTotalBeats = totalBeats + absOffset;
     float rowH = gridH / std::max(visRange, 1);
 
@@ -875,6 +1083,10 @@ std::pair<float, int> PianoRollComponent::screenToBeatPitch(juce::Point<float> p
     float absBeat = state.hScroll + ((pos.x - gridX) / gridW) * visibleBeats;
     float beat = absBeat - absOffset;
     int pitch = pitchHi - (int)std::floor(pos.y / rowH);
+    // Clamp to valid MIDI range and visible pitch range so clicking
+    // below the grid doesn't create notes at inaudible pitches.
+    int pitchLo = pitchHi - visRange;
+    pitch = juce::jlimit(std::max(0, pitchLo), std::min(127, pitchHi), pitch);
     return {beat, pitch};
 }
 
@@ -882,15 +1094,15 @@ PianoRollComponent::NoteHit PianoRollComponent::findNoteAt(juce::Point<float> sc
     auto [beat, pitch] = screenToBeatPitch(screenPos);
     float gridX = KEY_WIDTH;
     float gridW = getWidth() - KEY_WIDTH - SCROLLBAR_SIZE;
-    float totalBeats = graph.getTimelineBeats(node);
-    float absOffset = node.absoluteBeatOffset;
+    float totalBeats = graph.getTimelineBeats(*node);
+    float absOffset = node->absoluteBeatOffset;
     float absTotalBeats = totalBeats + absOffset;
     float visibleBeats = absTotalBeats / std::max(state.hZoom, 0.1f);
     float scrollBeat = state.hScroll;
     auto beatToX = [&](float b) { return gridX + ((b + absOffset - scrollBeat) / visibleBeats) * gridW; };
 
-    for (int ci = 0; ci < (int)node.clips.size(); ++ci) {
-        auto& clip = node.clips[ci];
+    for (int ci = 0; ci < (int)node->clips.size(); ++ci) {
+        auto& clip = node->clips[ci];
         for (int ni = 0; ni < (int)clip.notes.size(); ++ni) {
             auto& n = clip.notes[ni];
             float absBeat = clip.startBeat + n.offset;
@@ -909,6 +1121,7 @@ PianoRollComponent::NoteHit PianoRollComponent::findNoteAt(juce::Point<float> sc
 }
 
 void PianoRollComponent::mouseDown(const juce::MouseEvent& e) {
+    refreshNode(); if (!node) return;
     auto [beat, pitch] = screenToBeatPitch(e.position);
 
     // Expression lane interaction
@@ -917,15 +1130,15 @@ void PianoRollComponent::mouseDown(const juce::MouseEvent& e) {
 
         // Automation lane: click to add/drag/delete points
         if (exprLane == ExprAutomation && autoParamIndex >= 0 &&
-            autoParamIndex < (int)node.params.size()) {
-            auto& param = node.params[autoParamIndex];
+            autoParamIndex < (int)node->params.size()) {
+            auto& param = node->params[autoParamIndex];
             auto& lane = param.automation;
             float pMin = param.minVal, pMax = param.maxVal;
             // Convert screen to beat and normalized value
             float gridW2 = (float)(getWidth() - KEY_WIDTH - SCROLLBAR_SIZE);
             float gridH2 = (float)(getHeight() - toolbarHeight() - SCROLLBAR_SIZE);
             float exprY2 = (float)toolbarHeight() + gridH2 - EXPR_LANE_HEIGHT;
-            float absTotalBeats2 = graph.getTimelineBeats(node) + node.absoluteBeatOffset;
+            float absTotalBeats2 = graph.getTimelineBeats(*node) + node->absoluteBeatOffset;
             float visBeats2 = absTotalBeats2 / std::max(0.1f, state.hZoom);
             float absBeat = state.hScroll + ((e.position.x - KEY_WIDTH) / gridW2) * visBeats2;
             float normVal = 1.0f - (e.position.y - exprY2) / EXPR_LANE_HEIGHT;
@@ -982,26 +1195,60 @@ void PianoRollComponent::mouseDown(const juce::MouseEvent& e) {
             return;
         }
 
-        // Velocity lane: click to set velocity
+        // Velocity lane: click a note's bar to set its velocity, then drag
+        // vertically to continue tweaking. Hit-test by the note's actual
+        // time span so every note corresponds to exactly one bar. If two
+        // notes overlap in time (polyphony), pick the one whose bar top is
+        // closest to the click y — that way the user can still target the
+        // bar they can actually see.
         if (exprLane == ExprVelocity) {
-            int newVel = juce::jlimit(1, 127, (int)(exVal * 127.0f));
-            for (int ci = 0; ci < (int)node.clips.size(); ++ci) {
-                auto& clip = node.clips[ci];
+            // Compute the click's Y within the expr lane in pixels so we can
+            // compare to each bar's top edge for disambiguation.
+            float gridH = getHeight() - toolbarHeight() - SCROLLBAR_SIZE;
+            float exprY = toolbarHeight() + gridH - EXPR_LANE_HEIGHT;
+            float clickY = e.position.y;
+
+            int bestCI = -1, bestNI = -1;
+            float bestDistY = 1e9f;
+
+            for (int ci = 0; ci < (int)node->clips.size(); ++ci) {
+                auto& clip = node->clips[ci];
                 for (int ni = 0; ni < (int)clip.notes.size(); ++ni) {
                     auto& note = clip.notes[ni];
                     float noteStart = clip.startBeat + note.getOffset();
-                    if (exBeat >= noteStart - 0.1f && exBeat <= noteStart + 0.2f) {
-                        // Snapshot for undo
-                        dragBeforeSnapshot = {{ci, ni, note.offset, note.duration, note.detune, note.pitch, note.velocity}};
-                        note.velocity = newVel;
-                        dragMode = DragExprPoint;
-                        exprDragCI = ci;
-                        exprDragNI = ni;
-                        graph.dirty = true;
-                        repaint();
-                        return;
+                    float noteEnd   = noteStart + note.getDuration();
+                    // Allow a small slop in beat-space so very short notes
+                    // are still clickable (must be at least ~5px wide).
+                    float minDurBeats = 0.01f;
+                    if (noteEnd < noteStart + minDurBeats)
+                        noteEnd = noteStart + minDurBeats;
+                    if (exBeat < noteStart || exBeat > noteEnd) continue;
+
+                    // Pick the note whose bar-top is closest to click y
+                    // (but always accept any match if nothing better).
+                    float barHeight = (note.velocity / 127.0f) * EXPR_LANE_HEIGHT;
+                    float barTop = exprY + EXPR_LANE_HEIGHT - barHeight;
+                    float d = std::abs(barTop - clickY);
+                    if (d < bestDistY) {
+                        bestDistY = d;
+                        bestCI = ci;
+                        bestNI = ni;
                     }
                 }
+            }
+
+            if (bestCI >= 0) {
+                auto& clip = node->clips[bestCI];
+                auto& note = clip.notes[bestNI];
+                // Snapshot for undo
+                dragBeforeSnapshot = {{bestCI, bestNI, note.offset, note.duration,
+                                       note.detune, note.pitch, note.velocity}};
+                note.velocity = juce::jlimit(1, 127, (int)(exVal * 127.0f));
+                dragMode = DragExprPoint;
+                exprDragCI = bestCI;
+                exprDragNI = bestNI;
+                graph.dirty = true;
+                repaint();
             }
             return;
         }
@@ -1010,8 +1257,8 @@ void PianoRollComponent::mouseDown(const juce::MouseEvent& e) {
             // Right-click: delete nearest breakpoint
             float bestDist = 10.0f;
             int bestCI = -1, bestNI = -1, bestPt = -1;
-            for (int ci = 0; ci < (int)node.clips.size(); ++ci) {
-                auto& clip = node.clips[ci];
+            for (int ci = 0; ci < (int)node->clips.size(); ++ci) {
+                auto& clip = node->clips[ci];
                 for (int ni = 0; ni < (int)clip.notes.size(); ++ni) {
                     auto& note = clip.notes[ni];
                     auto* curve = const_cast<PianoRollComponent*>(this)->getExprCurve(note);
@@ -1029,7 +1276,7 @@ void PianoRollComponent::mouseDown(const juce::MouseEvent& e) {
                 }
             }
             if (bestPt >= 0) {
-                auto* curve = getExprCurve(node.clips[bestCI].notes[bestNI]);
+                auto* curve = getExprCurve(node->clips[bestCI].notes[bestNI]);
                 if (curve) curve->erase(curve->begin() + bestPt);
                 graph.dirty = true;
                 repaint();
@@ -1040,8 +1287,8 @@ void PianoRollComponent::mouseDown(const juce::MouseEvent& e) {
         // Left-click: find nearest breakpoint to drag, or add new one
         float bestDist = 10.0f;
         int bestCI = -1, bestNI = -1, bestPt = -1;
-        for (int ci = 0; ci < (int)node.clips.size(); ++ci) {
-            auto& clip = node.clips[ci];
+        for (int ci = 0; ci < (int)node->clips.size(); ++ci) {
+            auto& clip = node->clips[ci];
             for (int ni = 0; ni < (int)clip.notes.size(); ++ni) {
                 auto& note = clip.notes[ni];
                 auto* curve = getExprCurve(note);
@@ -1066,8 +1313,8 @@ void PianoRollComponent::mouseDown(const juce::MouseEvent& e) {
         } else {
             // Add new point to the note under the cursor
             // Find which note's time span contains exBeat
-            for (int ci = 0; ci < (int)node.clips.size(); ++ci) {
-                auto& clip = node.clips[ci];
+            for (int ci = 0; ci < (int)node->clips.size(); ++ci) {
+                auto& clip = node->clips[ci];
                 for (int ni = 0; ni < (int)clip.notes.size(); ++ni) {
                     auto& note = clip.notes[ni];
                     float noteStart = clip.startBeat + note.getOffset();
@@ -1136,16 +1383,16 @@ void PianoRollComponent::mouseDown(const juce::MouseEvent& e) {
     } else if (e.position.x < KEY_WIDTH && e.position.y > toolbarHeight()) {
         // Audition
         {
-            std::lock_guard<std::mutex> lock(*node.auditionMutex);
-            node.pendingAudition.push_back({true, pitch, 100});
+            std::lock_guard<std::mutex> lock(*node->auditionMutex);
+            node->pendingAudition.push_back({true, pitch, 100});
         }
         auditionKeys[pitch] = juce::Time::getMillisecondCounterHiRes();
         repaint();
         // Schedule note-off and visual clear
         juce::Timer::callAfterDelay(500, [this, pitch]() {
             {
-                std::lock_guard<std::mutex> lock(*node.auditionMutex);
-                node.pendingAudition.push_back({false, pitch, 0});
+                std::lock_guard<std::mutex> lock(*node->auditionMutex);
+                node->pendingAudition.push_back({false, pitch, 0});
             }
             auditionKeys.erase(pitch);
             repaint();
@@ -1162,6 +1409,7 @@ void PianoRollComponent::mouseDown(const juce::MouseEvent& e) {
 }
 
 void PianoRollComponent::mouseDrag(const juce::MouseEvent& e) {
+    refreshNode(); if (!node) return;
     auto [beat, pitch] = screenToBeatPitch(e.position);
     float snap = state.snap > 0 ? state.snap : 0.0625f;
     bool altHeld = e.mods.isAltDown();
@@ -1177,8 +1425,8 @@ void PianoRollComponent::mouseDrag(const juce::MouseEvent& e) {
         int dp = pitch - dragStartPitch;
         if (db != 0 || dp != 0) {
             for (auto& [ci, ni] : state.selected) {
-                if (ci < (int)node.clips.size() && ni < (int)node.clips[ci].notes.size()) {
-                    auto& n = node.clips[ci].notes[ni];
+                if (ci < (int)node->clips.size() && ni < (int)node->clips[ci].notes.size()) {
+                    auto& n = node->clips[ci].notes[ni];
                     n.offset = std::max(0.0f, n.offset + db);
                     n.pitch = juce::jlimit(0, 127, n.pitch + dp);
                 }
@@ -1187,36 +1435,36 @@ void PianoRollComponent::mouseDrag(const juce::MouseEvent& e) {
             dragStartPitch = pitch;
         }
     } else if (dragMode == DragResizeRight) {
-        if (dragNoteCI >= 0 && dragNoteCI < (int)node.clips.size()
-            && dragNoteNI >= 0 && dragNoteNI < (int)node.clips[dragNoteCI].notes.size()) {
-            auto& n = node.clips[dragNoteCI].notes[dragNoteNI];
-            float absStart = node.clips[dragNoteCI].startBeat + n.offset;
+        if (dragNoteCI >= 0 && dragNoteCI < (int)node->clips.size()
+            && dragNoteNI >= 0 && dragNoteNI < (int)node->clips[dragNoteCI].notes.size()) {
+            auto& n = node->clips[dragNoteCI].notes[dragNoteNI];
+            float absStart = node->clips[dragNoteCI].startBeat + n.offset;
             float newEnd = altHeld ? beat : snapBeat(beat);
             n.duration = std::max(0.03125f, newEnd - absStart);
         }
     } else if (dragMode == DragResizeLeft) {
-        if (dragNoteCI >= 0 && dragNoteCI < (int)node.clips.size()
-            && dragNoteNI >= 0 && dragNoteNI < (int)node.clips[dragNoteCI].notes.size()) {
-            auto& n = node.clips[dragNoteCI].notes[dragNoteNI];
-            float absEnd = node.clips[dragNoteCI].startBeat + n.offset + n.duration;
+        if (dragNoteCI >= 0 && dragNoteCI < (int)node->clips.size()
+            && dragNoteNI >= 0 && dragNoteNI < (int)node->clips[dragNoteCI].notes.size()) {
+            auto& n = node->clips[dragNoteCI].notes[dragNoteNI];
+            float absEnd = node->clips[dragNoteCI].startBeat + n.offset + n.duration;
             float newStart = altHeld ? beat : snapBeat(beat);
             newStart = std::min(newStart, absEnd - 0.03125f);
-            newStart = std::max(node.clips[dragNoteCI].startBeat, newStart);
+            newStart = std::max(node->clips[dragNoteCI].startBeat, newStart);
             n.duration = absEnd - newStart;
-            n.offset = newStart - node.clips[dragNoteCI].startBeat;
+            n.offset = newStart - node->clips[dragNoteCI].startBeat;
         }
     } else if (dragMode == DragBox) {
         dragCurrentScreen = e.position;
     } else if (dragMode == DragExprPoint) {
         // Automation point dragging
-        if (exprDragNI == -2 && exprDragCI >= 0 && exprDragCI < (int)node.params.size()) {
-            auto& param = node.params[exprDragCI];
+        if (exprDragNI == -2 && exprDragCI >= 0 && exprDragCI < (int)node->params.size()) {
+            auto& param = node->params[exprDragCI];
             auto& lane = param.automation;
             if (exprDragPtIdx >= 0 && exprDragPtIdx < (int)lane.points.size()) {
                 float gridW2 = (float)(getWidth() - KEY_WIDTH - SCROLLBAR_SIZE);
                 float gridH2 = (float)(getHeight() - toolbarHeight() - SCROLLBAR_SIZE);
                 float exprY2 = (float)toolbarHeight() + gridH2 - EXPR_LANE_HEIGHT;
-                float absTotalBeats2 = graph.getTimelineBeats(node) + node.absoluteBeatOffset;
+                float absTotalBeats2 = graph.getTimelineBeats(*node) + node->absoluteBeatOffset;
                 float visBeats2 = absTotalBeats2 / std::max(0.1f, state.hZoom);
                 float absBeat = state.hScroll + ((e.position.x - KEY_WIDTH) / gridW2) * visBeats2;
                 float normVal = 1.0f - (e.position.y - exprY2) / EXPR_LANE_HEIGHT;
@@ -1226,9 +1474,9 @@ void PianoRollComponent::mouseDrag(const juce::MouseEvent& e) {
                 graph.dirty = true;
             }
         }
-        else if (exprDragCI >= 0 && exprDragCI < (int)node.clips.size()
-            && exprDragNI >= 0 && exprDragNI < (int)node.clips[exprDragCI].notes.size()) {
-            auto& note = node.clips[exprDragCI].notes[exprDragNI];
+        else if (exprDragCI >= 0 && exprDragCI < (int)node->clips.size()
+            && exprDragNI >= 0 && exprDragNI < (int)node->clips[exprDragCI].notes.size()) {
+            auto& note = node->clips[exprDragCI].notes[exprDragNI];
             if (exprLane == ExprVelocity) {
                 auto [exBeat, exVal] = screenToExprBeatValue(e.position);
                 note.velocity = juce::jlimit(1, 127, (int)(exVal * 127.0f));
@@ -1237,7 +1485,7 @@ void PianoRollComponent::mouseDrag(const juce::MouseEvent& e) {
                 auto* curve = getExprCurve(note);
                 if (curve && exprDragPtIdx >= 0 && exprDragPtIdx < (int)curve->size()) {
                     auto [exBeat, exVal] = screenToExprBeatValue(e.position);
-                    float noteStart = node.clips[exprDragCI].startBeat + note.getOffset();
+                    float noteStart = node->clips[exprDragCI].startBeat + note.getOffset();
                     float timeInNote = juce::jlimit(0.0f, note.getDuration(), exBeat - noteStart);
                     (*curve)[exprDragPtIdx].time = timeInNote;
                     (*curve)[exprDragPtIdx].value = exVal;
@@ -1260,6 +1508,7 @@ void PianoRollComponent::mouseDrag(const juce::MouseEvent& e) {
 }
 
 void PianoRollComponent::mouseUp(const juce::MouseEvent& e) {
+    refreshNode(); if (!node) return;
     if (dragMode == DragBox) {
         auto [b1, p1] = screenToBeatPitch(dragStartScreen);
         auto [b2, p2] = screenToBeatPitch(dragCurrentScreen);
@@ -1273,12 +1522,12 @@ void PianoRollComponent::mouseUp(const juce::MouseEvent& e) {
             float noteDur = snap * 4;
 
             // Remember the current visible beat range so we can preserve it
-            float oldTotalBeats = graph.getTimelineBeats(node);
+            float oldTotalBeats = graph.getTimelineBeats(*node);
             float oldVisibleBeats = oldTotalBeats / std::max(0.1f, state.hZoom);
 
             // Find a clip that contains this beat
             Clip* targetClip = nullptr;
-            for (auto& clip : node.clips) {
+            for (auto& clip : node->clips) {
                 if (clip.startBeat <= sb && sb < clip.startBeat + clip.lengthBeats) {
                     targetClip = &clip;
                     break;
@@ -1287,9 +1536,9 @@ void PianoRollComponent::mouseUp(const juce::MouseEvent& e) {
 
             // If no clip found, extend the nearest clip or create one
             if (!targetClip) {
-                if (!node.clips.empty()) {
-                    Clip* best = &node.clips.back();
-                    for (auto& clip : node.clips) {
+                if (!node->clips.empty()) {
+                    Clip* best = &node->clips.back();
+                    for (auto& clip : node->clips) {
                         if (clip.startBeat <= sb)
                             best = &clip;
                     }
@@ -1298,8 +1547,8 @@ void PianoRollComponent::mouseUp(const juce::MouseEvent& e) {
                     targetClip = best;
                 } else {
                     float len = std::max(4.0f, std::ceil((sb + noteDur) / 4.0f) * 4.0f);
-                    node.clips.push_back({"Clip 1", 0, len, 0xFF4488CC});
-                    targetClip = &node.clips.back();
+                    node->clips.push_back({"Clip 1", 0, len, 0xFF4488CC});
+                    targetClip = &node->clips.back();
                 }
             }
 
@@ -1311,9 +1560,9 @@ void PianoRollComponent::mouseUp(const juce::MouseEvent& e) {
                 targetClip->notes.push_back(nn);
 
                 // Push undo for note placement (already done, use pushDone)
-                int ci = (int)(targetClip - &node.clips[0]);
+                int ci = (int)(targetClip - &node->clips[0]);
                 MidiNote nnCopy = nn;
-                auto* nodePtr = &node;
+                auto* nodePtr = node;
                 graph.undoTree.pushDone(std::make_unique<LambdaCommand>(
                     "Place note",
                     [nodePtr, ci, nnCopy]() {
@@ -1328,7 +1577,7 @@ void PianoRollComponent::mouseUp(const juce::MouseEvent& e) {
             }
 
             // Preserve the visible beat range after clip extension
-            float newTotalBeats = graph.getTimelineBeats(node);
+            float newTotalBeats = graph.getTimelineBeats(*node);
             if (newTotalBeats > oldTotalBeats && oldVisibleBeats > 0) {
                 state.hZoom = newTotalBeats / oldVisibleBeats;
             }
@@ -1336,10 +1585,10 @@ void PianoRollComponent::mouseUp(const juce::MouseEvent& e) {
             // Select notes in box
             float beatMin = std::min(b1, b2), beatMax = std::max(b1, b2);
             int pitchMin = std::min(p1, p2), pitchMax = std::max(p1, p2);
-            for (int ci = 0; ci < (int)node.clips.size(); ++ci) {
-                for (int ni = 0; ni < (int)node.clips[ci].notes.size(); ++ni) {
-                    auto& n = node.clips[ci].notes[ni];
-                    float ab = node.clips[ci].startBeat + n.offset;
+            for (int ci = 0; ci < (int)node->clips.size(); ++ci) {
+                for (int ni = 0; ni < (int)node->clips[ci].notes.size(); ++ni) {
+                    auto& n = node->clips[ci].notes[ni];
+                    float ab = node->clips[ci].startBeat + n.offset;
                     if (ab + n.duration >= beatMin && ab <= beatMax
                         && n.pitch >= pitchMin && n.pitch <= pitchMax)
                         state.selected.insert({ci, ni});
@@ -1349,15 +1598,15 @@ void PianoRollComponent::mouseUp(const juce::MouseEvent& e) {
     }
     if (dragMode == DragExprPoint) {
         // Sort automation points after drag
-        if (exprDragNI == -2 && exprDragCI >= 0 && exprDragCI < (int)node.params.size()) {
-            auto& lane = node.params[exprDragCI].automation;
+        if (exprDragNI == -2 && exprDragCI >= 0 && exprDragCI < (int)node->params.size()) {
+            auto& lane = node->params[exprDragCI].automation;
             std::sort(lane.points.begin(), lane.points.end(),
                 [](auto& a, auto& b) { return a.beat < b.beat; });
         }
         // Sort expression points by time after drag
-        if (exprDragCI >= 0 && exprDragCI < (int)node.clips.size()
-            && exprDragNI >= 0 && exprDragNI < (int)node.clips[exprDragCI].notes.size()) {
-            auto* curve = getExprCurve(node.clips[exprDragCI].notes[exprDragNI]);
+        if (exprDragCI >= 0 && exprDragCI < (int)node->clips.size()
+            && exprDragNI >= 0 && exprDragNI < (int)node->clips[exprDragCI].notes.size()) {
+            auto* curve = getExprCurve(node->clips[exprDragCI].notes[exprDragNI]);
             if (curve)
                 std::sort(curve->begin(), curve->end(),
                     [](auto& a, auto& b) { return a.time < b.time; });
@@ -1387,7 +1636,7 @@ void PianoRollComponent::mouseUp(const juce::MouseEvent& e) {
 
 void PianoRollComponent::scrollBarMoved(juce::ScrollBar* bar, double newRangeStart) {
     if (bar == &hScrollBar) {
-        float totalBeats = graph.getTimelineBeats(node);
+        float totalBeats = graph.getTimelineBeats(*node);
         state.hScroll = (float)(newRangeStart * totalBeats);
     } else if (bar == &vScrollBar) {
         state.scrollPitch = 127 - (int)newRangeStart - state.visibleRange / 2;
@@ -1397,7 +1646,7 @@ void PianoRollComponent::scrollBarMoved(juce::ScrollBar* bar, double newRangeSta
 }
 
 void PianoRollComponent::updateScrollBars() {
-    float totalBeats = graph.getTimelineBeats(node);
+    float totalBeats = graph.getTimelineBeats(*node);
     float visibleBeats = totalBeats / std::max(state.hZoom, 0.1f);
 
     hScrollBar.setRangeLimits(0, 1.0);
@@ -1410,6 +1659,7 @@ void PianoRollComponent::updateScrollBars() {
 }
 
 void PianoRollComponent::mouseMove(const juce::MouseEvent& e) {
+    refreshNode(); if (!node) return;
     auto hit = findNoteAt(e.position);
     if (hit.valid() && (hit.edge == NoteHit::Left || hit.edge == NoteHit::Right))
         setMouseCursor(juce::MouseCursor::LeftRightResizeCursor);
@@ -1419,6 +1669,7 @@ void PianoRollComponent::mouseMove(const juce::MouseEvent& e) {
 
 void PianoRollComponent::mouseWheelMove(const juce::MouseEvent& e,
                                          const juce::MouseWheelDetails& wheel) {
+    refreshNode(); if (!node) return;
     if (e.mods.isCtrlDown()) {
         // Ctrl+scroll: horizontal zoom
         float zoomDelta = wheel.deltaY * 0.3f;
@@ -1426,7 +1677,7 @@ void PianoRollComponent::mouseWheelMove(const juce::MouseEvent& e,
         hZoomSlider.setValue(state.hZoom, juce::dontSendNotification);
     } else if (e.mods.isShiftDown()) {
         // Shift+scroll: horizontal pan
-        float totalBeats = graph.getTimelineBeats(node);
+        float totalBeats = graph.getTimelineBeats(*node);
         float visibleBeats = totalBeats / std::max(state.hZoom, 0.1f);
         state.hScroll -= wheel.deltaY * visibleBeats * 0.1f;
         state.hScroll = juce::jlimit(0.0f, std::max(0.0f, totalBeats - visibleBeats), state.hScroll);
@@ -1441,6 +1692,7 @@ void PianoRollComponent::mouseWheelMove(const juce::MouseEvent& e,
 }
 
 void PianoRollComponent::showNoteMenu() {
+    refreshNode(); if (!node) return;
     juce::PopupMenu menu;
     int numSel = (int)state.selected.size();
     menu.addSectionHeader(juce::String(numSel) + " note" + (numSel != 1 ? "s" : ""));
@@ -1533,8 +1785,8 @@ void PianoRollComponent::showNoteMenu() {
     menu.showMenuAsync(juce::PopupMenu::Options(), [this](int result) {
         auto apply = [&](auto fn) {
             for (auto& [ci, ni] : state.selected)
-                if (ci < (int)node.clips.size() && ni < (int)node.clips[ci].notes.size())
-                    fn(node.clips[ci].notes[ni]);
+                if (ci < (int)node->clips.size() && ni < (int)node->clips[ci].notes.size())
+                    fn(node->clips[ci].notes[ni]);
         };
         // Undo-aware apply: captures before/after snapshots
         auto applyUndo = [&](const std::string& desc, auto fn) {
@@ -1545,8 +1797,8 @@ void PianoRollComponent::showNoteMenu() {
         };
         auto selectAll = [&]() {
             state.selected.clear();
-            for (int ci = 0; ci < (int)node.clips.size(); ++ci)
-                for (int ni = 0; ni < (int)node.clips[ci].notes.size(); ++ni)
+            for (int ci = 0; ci < (int)node->clips.size(); ++ci)
+                for (int ni = 0; ni < (int)node->clips[ci].notes.size(); ++ni)
                     state.selected.insert({ci, ni});
         };
 
@@ -1556,17 +1808,17 @@ void PianoRollComponent::showNoteMenu() {
             case 1: // Delete
                 for (auto it = state.selected.rbegin(); it != state.selected.rend(); ++it) {
                     auto [ci, ni] = *it;
-                    if (ci < (int)node.clips.size() && ni < (int)node.clips[ci].notes.size())
-                        node.clips[ci].notes.erase(node.clips[ci].notes.begin() + ni);
+                    if (ci < (int)node->clips.size() && ni < (int)node->clips[ci].notes.size())
+                        node->clips[ci].notes.erase(node->clips[ci].notes.begin() + ni);
                 }
                 state.selected.clear();
                 break;
             case 2: // Duplicate
                 for (auto& [ci, ni] : state.selected) {
-                    if (ci < (int)node.clips.size() && ni < (int)node.clips[ci].notes.size()) {
-                        auto dup = node.clips[ci].notes[ni];
+                    if (ci < (int)node->clips.size() && ni < (int)node->clips[ci].notes.size()) {
+                        auto dup = node->clips[ci].notes[ni];
                         dup.offset += 0.25f;
-                        node.clips[ci].notes.push_back(dup);
+                        node->clips[ci].notes.push_back(dup);
                     }
                 }
                 break;
@@ -1589,18 +1841,18 @@ void PianoRollComponent::showNoteMenu() {
                 if (!state.selected.empty()) {
                     float minOff = 1e9f, maxEnd = 0;
                     for (auto& [ci, ni] : state.selected) {
-                        if (ci < (int)node.clips.size() && ni < (int)node.clips[ci].notes.size()) {
-                            auto& n = node.clips[ci].notes[ni];
-                            float ab = node.clips[ci].startBeat + n.offset;
+                        if (ci < (int)node->clips.size() && ni < (int)node->clips[ci].notes.size()) {
+                            auto& n = node->clips[ci].notes[ni];
+                            float ab = node->clips[ci].startBeat + n.offset;
                             minOff = std::min(minOff, ab);
                             maxEnd = std::max(maxEnd, ab + n.duration);
                         }
                     }
                     for (auto& [ci, ni] : state.selected) {
-                        if (ci < (int)node.clips.size() && ni < (int)node.clips[ci].notes.size()) {
-                            auto& n = node.clips[ci].notes[ni];
-                            float ab = node.clips[ci].startBeat + n.offset;
-                            n.offset = std::max(0.0f, maxEnd - (ab - minOff) - n.duration - node.clips[ci].startBeat);
+                        if (ci < (int)node->clips.size() && ni < (int)node->clips[ci].notes.size()) {
+                            auto& n = node->clips[ci].notes[ni];
+                            float ab = node->clips[ci].startBeat + n.offset;
+                            n.offset = std::max(0.0f, maxEnd - (ab - minOff) - n.duration - node->clips[ci].startBeat);
                         }
                     }
                 }
@@ -1646,10 +1898,10 @@ void PianoRollComponent::showNoteMenu() {
                 std::vector<int> pitches;
                 if (!state.selected.empty()) {
                     for (auto& [ci, ni] : state.selected)
-                        if (ci < (int)node.clips.size() && ni < (int)node.clips[ci].notes.size())
-                            pitches.push_back(node.clips[ci].notes[ni].pitch);
+                        if (ci < (int)node->clips.size() && ni < (int)node->clips[ci].notes.size())
+                            pitches.push_back(node->clips[ci].notes[ni].pitch);
                 } else {
-                    for (auto& clip : node.clips)
+                    for (auto& clip : node->clips)
                         for (auto& n : clip.notes) pitches.push_back(n.pitch);
                 }
                 auto results = MusicTheory::detectKeys(pitches);
@@ -1695,13 +1947,13 @@ void PianoRollComponent::showNoteMenu() {
                 // If nothing selected, quantize all notes
                 auto targets = state.selected;
                 if (targets.empty()) {
-                    for (int ci2 = 0; ci2 < (int)node.clips.size(); ++ci2)
-                        for (int ni2 = 0; ni2 < (int)node.clips[ci2].notes.size(); ++ni2)
+                    for (int ci2 = 0; ci2 < (int)node->clips.size(); ++ci2)
+                        for (int ni2 = 0; ni2 < (int)node->clips[ci2].notes.size(); ++ni2)
                             targets.insert({ci2, ni2});
                 }
                 for (auto& [ci2, ni2] : targets) {
-                    if (ci2 < (int)node.clips.size() && ni2 < (int)node.clips[ci2].notes.size()) {
-                        auto& n2 = node.clips[ci2].notes[ni2];
+                    if (ci2 < (int)node->clips.size() && ni2 < (int)node->clips[ci2].notes.size()) {
+                        auto& n2 = node->clips[ci2].notes[ni2];
                         float snapped = std::round(n2.offset / grid) * grid;
                         n2.offset += (snapped - n2.offset) * strength;
                         n2.offset = std::max(0.0f, n2.offset);
@@ -1735,6 +1987,7 @@ void PianoRollComponent::showNoteMenu() {
 // ==============================================================================
 
 bool PianoRollComponent::keyPressed(const juce::KeyPress& key) {
+    refreshNode(); if (!node) return false;
     if (key.getModifiers().isCtrlDown()) {
         switch (key.getKeyCode()) {
             case 'C': copySelected(); return true;
@@ -1758,17 +2011,17 @@ void PianoRollComponent::copySelected() {
     // Find the earliest selected note's absolute beat position
     float minBeat = 1e9f;
     for (auto& [ci, ni] : state.selected) {
-        if (ci < (int)node.clips.size() && ni < (int)node.clips[ci].notes.size()) {
-            float absBeat = node.clips[ci].startBeat + node.clips[ci].notes[ni].getOffset();
+        if (ci < (int)node->clips.size() && ni < (int)node->clips[ci].notes.size()) {
+            float absBeat = node->clips[ci].startBeat + node->clips[ci].notes[ni].getOffset();
             minBeat = std::min(minBeat, absBeat);
         }
     }
 
     // Copy notes relative to the earliest
     for (auto& [ci, ni] : state.selected) {
-        if (ci < (int)node.clips.size() && ni < (int)node.clips[ci].notes.size()) {
-            auto& n = node.clips[ci].notes[ni];
-            float absBeat = node.clips[ci].startBeat + n.getOffset();
+        if (ci < (int)node->clips.size() && ni < (int)node->clips[ci].notes.size()) {
+            auto& n = node->clips[ci].notes[ni];
+            float absBeat = node->clips[ci].startBeat + n.getOffset();
             ClipboardNote cn;
             cn.offsetFromFirst = absBeat - minBeat;
             cn.pitch = n.pitch;
@@ -1800,13 +2053,13 @@ void PianoRollComponent::deleteSelected() {
     });
 
     for (auto& [ci, ni] : sorted) {
-        if (ci < (int)node.clips.size() && ni < (int)node.clips[ci].notes.size()) {
-            deleted.push_back({ci, ni, node.clips[ci].notes[ni]});
-            node.clips[ci].notes.erase(node.clips[ci].notes.begin() + ni);
+        if (ci < (int)node->clips.size() && ni < (int)node->clips[ci].notes.size()) {
+            deleted.push_back({ci, ni, node->clips[ci].notes[ni]});
+            node->clips[ci].notes.erase(node->clips[ci].notes.begin() + ni);
         }
     }
 
-    auto* nodePtr = &node;
+    auto* nodePtr = node;
     // Reverse deleted so undo re-inserts in forward order
     std::reverse(deleted.begin(), deleted.end());
     graph.undoTree.pushDone(std::make_unique<LambdaCommand>(
@@ -1843,18 +2096,18 @@ void PianoRollComponent::pasteAtCursor() {
 
     // Find or create a clip that covers the paste range
     Clip* targetClip = nullptr;
-    for (auto& clip : node.clips) {
+    for (auto& clip : node->clips) {
         if (clip.startBeat <= pasteBeat && pasteBeat < clip.startBeat + clip.lengthBeats) {
             targetClip = &clip;
             break;
         }
     }
-    if (!targetClip && !node.clips.empty())
-        targetClip = &node.clips[0];
+    if (!targetClip && !node->clips.empty())
+        targetClip = &node->clips[0];
     if (!targetClip) return;
 
     state.selected.clear();
-    int ci = (int)(targetClip - &node.clips[0]);
+    int ci = (int)(targetClip - &node->clips[0]);
 
     for (auto& cn : clipboard) {
         MidiNote nn;
@@ -1882,8 +2135,8 @@ void PianoRollComponent::pasteAtCursor() {
 
 void PianoRollComponent::selectAll() {
     state.selected.clear();
-    for (int ci = 0; ci < (int)node.clips.size(); ++ci)
-        for (int ni = 0; ni < (int)node.clips[ci].notes.size(); ++ni)
+    for (int ci = 0; ci < (int)node->clips.size(); ++ci)
+        for (int ni = 0; ni < (int)node->clips[ci].notes.size(); ++ni)
             state.selected.insert({ci, ni});
     repaint();
 }
@@ -1895,9 +2148,9 @@ void PianoRollComponent::zoomToSelection() {
     int minPitch = 127, maxPitch = 0;
 
     for (auto& [ci, ni] : state.selected) {
-        if (ci < (int)node.clips.size() && ni < (int)node.clips[ci].notes.size()) {
-            auto& n = node.clips[ci].notes[ni];
-            float ab = node.clips[ci].startBeat + n.getOffset();
+        if (ci < (int)node->clips.size() && ni < (int)node->clips[ci].notes.size()) {
+            auto& n = node->clips[ci].notes[ni];
+            float ab = node->clips[ci].startBeat + n.getOffset();
             minBeat = std::min(minBeat, ab);
             maxBeat = std::max(maxBeat, ab + n.getDuration());
             minPitch = std::min(minPitch, n.pitch);
@@ -1916,7 +2169,7 @@ void PianoRollComponent::zoomToSelection() {
     maxPitch = std::min(127, maxPitch + pitchPad);
 
     // Set horizontal zoom and scroll
-    float totalBeats = graph.getTimelineBeats(node);
+    float totalBeats = graph.getTimelineBeats(*node);
     float visibleBeats = maxBeat - minBeat;
     state.hZoom = std::max(0.1f, totalBeats / visibleBeats);
     state.hScroll = std::max(0.0f, minBeat);
@@ -1930,7 +2183,7 @@ void PianoRollComponent::zoomToSelection() {
 }
 
 void PianoRollComponent::copyClipAtCursor() {
-    for (auto& clip : node.clips) {
+    for (auto& clip : node->clips) {
         if (lastClickBeat >= clip.startBeat && lastClickBeat < clip.startBeat + clip.lengthBeats) {
             clipClipboard = std::make_unique<Clip>(clip);
             return;
@@ -1946,7 +2199,7 @@ void PianoRollComponent::pasteClipAtCursor() {
     Clip pasted = *clipClipboard;
     pasted.startBeat = pasteBeat;
     pasted.name += " (copy)";
-    node.clips.push_back(pasted);
+    node->clips.push_back(pasted);
     graph.dirty = true;
     repaint();
 }
@@ -1958,8 +2211,8 @@ void PianoRollComponent::pasteClipAtCursor() {
 void PianoRollComponent::captureSelectedSnapshot(std::vector<NoteSnapshot>& snap) {
     snap.clear();
     for (auto& [ci, ni] : state.selected) {
-        if (ci < (int)node.clips.size() && ni < (int)node.clips[ci].notes.size()) {
-            auto& n = node.clips[ci].notes[ni];
+        if (ci < (int)node->clips.size() && ni < (int)node->clips[ci].notes.size()) {
+            auto& n = node->clips[ci].notes[ni];
             snap.push_back({ci, ni, n.offset, n.duration, n.detune, n.pitch, n.velocity});
         }
     }
@@ -1987,7 +2240,7 @@ void PianoRollComponent::pushDragUndo(const std::string& desc,
 
     auto beforeCopy = before;
     auto afterCopy = after;
-    auto* nodePtr = &node;
+    auto* nodePtr = node;
 
     graph.undoTree.execute(std::make_unique<LambdaCommand>(
         desc,
@@ -2016,8 +2269,24 @@ void PianoRollComponent::pushDragUndo(const std::string& desc,
 // Expression lane helpers
 // ==============================================================================
 
+void PianoRollComponent::triggerAction(const std::string& action) {
+    if (action == "nudge_left")       timeLeftBtn.triggerClick();
+    else if (action == "nudge_right") timeRightBtn.triggerClick();
+    else if (action == "transpose_up_semi")   transpUpSemiBtn.triggerClick();
+    else if (action == "transpose_down_semi") transpDownSemiBtn.triggerClick();
+    else if (action == "transpose_up_oct")    transpUpOctBtn.triggerClick();
+    else if (action == "transpose_down_oct")  transpDownOctBtn.triggerClick();
+    else if (action == "double_duration")     dblDurBtn.triggerClick();
+    else if (action == "halve_duration")      halfDurBtn.triggerClick();
+    else if (action == "reverse")             reverseBtn.triggerClick();
+    else if (action == "select_all")          selectAllBtn.triggerClick();
+    else if (action == "deselect")            deselectBtn.triggerClick();
+}
+
 bool PianoRollComponent::isInExprLane(juce::Point<float> pos) const {
-    if (!node.mpeEnabled || exprLane == ExprNone) return false;
+    // Any active expression lane (velocity, automation, MPE) should catch
+    // clicks so they don't fall through to note placement below the grid.
+    if (exprLane == ExprNone) return false;
     float gridH = getHeight() - toolbarHeight() - SCROLLBAR_SIZE;
     float exprY = toolbarHeight() + gridH - EXPR_LANE_HEIGHT;
     return pos.y >= exprY && pos.y < exprY + EXPR_LANE_HEIGHT && pos.x >= KEY_WIDTH;
@@ -2028,7 +2297,7 @@ std::pair<float, float> PianoRollComponent::screenToExprBeatValue(juce::Point<fl
     float gridW = getWidth() - KEY_WIDTH - SCROLLBAR_SIZE;
     float gridH = getHeight() - toolbarHeight() - SCROLLBAR_SIZE;
     float exprY = toolbarHeight() + gridH - EXPR_LANE_HEIGHT;
-    float totalBeats = graph.getTimelineBeats(node);
+    float totalBeats = graph.getTimelineBeats(*node);
     float visibleBeats = totalBeats / std::max(state.hZoom, 0.1f);
 
     float beat = state.hScroll + ((pos.x - gridX) / gridW) * visibleBeats;
@@ -2056,6 +2325,7 @@ const std::vector<ExpressionPoint>* PianoRollComponent::getExprCurveConst(const 
 }
 
 void PianoRollComponent::showEmptyMenu() {
+    refreshNode(); if (!node) return;
     juce::PopupMenu menu;
     menu.addItem(1, "Place Note Here");
     menu.addSeparator();
@@ -2127,6 +2397,56 @@ void PianoRollComponent::showEmptyMenu() {
     clipMenu.addItem(97, "Add Marker Here...");
     menu.addSubMenu("Clip", clipMenu);
 
+    // Effect regions: add/delete time-gated effect routing
+    {
+        juce::PopupMenu fxMenu;
+
+        // List groups first
+        for (auto& grp : graph.effectGroups) {
+            auto col = juce::Colour((uint8_t)((grp.color >> 16) & 0xFF),
+                                    (uint8_t)((grp.color >> 8) & 0xFF),
+                                    (uint8_t)(grp.color & 0xFF));
+            juce::String label = grp.name.empty()
+                ? "Group #" + juce::String(grp.id)
+                : juce::String(grp.name);
+            fxMenu.addItem(5000 + grp.id, "Group: " + label);
+        }
+
+        // Then list individual links (showing From → To)
+        if (!graph.effectGroups.empty() && !graph.links.empty())
+            fxMenu.addSeparator();
+        for (auto& link : graph.links) {
+            juce::String src, dst;
+            for (auto& n : graph.nodes) {
+                for (auto& pin : n.pinsOut)
+                    if (pin.id == link.startPin) src = n.name;
+                for (auto& pin : n.pinsIn)
+                    if (pin.id == link.endPin) dst = n.name;
+            }
+            if (src.isEmpty() || dst.isEmpty()) continue;
+            fxMenu.addItem(6000 + link.id, src + " > " + dst);
+        }
+
+        // Delete region option (if cursor is on a region)
+        bool hasRegionAtCursor = false;
+        int regionIdxAtCursor = -1;
+        for (int i = 0; i < (int)node->effectRegions.size(); ++i) {
+            auto& r = node->effectRegions[i];
+            if (lastClickBeat >= r.startBeat && lastClickBeat <= r.endBeat) {
+                hasRegionAtCursor = true;
+                regionIdxAtCursor = i;
+                break;
+            }
+        }
+        if (hasRegionAtCursor) {
+            fxMenu.addSeparator();
+            fxMenu.addItem(5999, "Delete Effect Region at Cursor");
+        }
+
+        if (fxMenu.getNumItems() > 0)
+            menu.addSubMenu("Effect Regions", fxMenu);
+    }
+
     menu.addSeparator();
     menu.addItem(15, "Paste Notes", !clipboard.empty());
     menu.addItem(86, "Paste Clip", clipClipboard != nullptr);
@@ -2144,18 +2464,18 @@ void PianoRollComponent::showEmptyMenu() {
                 float noteDur = snap * 4;
 
                 Clip* target = nullptr;
-                for (auto& clip : node.clips)
+                for (auto& clip : node->clips)
                     if (clip.startBeat <= sb && sb < clip.startBeat + clip.lengthBeats)
                         { target = &clip; break; }
 
-                if (!target && !node.clips.empty()) {
-                    target = &node.clips.back();
+                if (!target && !node->clips.empty()) {
+                    target = &node->clips.back();
                     float needed = sb + noteDur - target->startBeat;
                     target->lengthBeats = std::max(target->lengthBeats, std::ceil(needed / 4.0f) * 4.0f);
                 } else if (!target) {
                     float len = std::max(4.0f, std::ceil((sb + noteDur) / 4.0f) * 4.0f);
-                    node.clips.push_back({"Clip 1", 0, len, 0xFF4488CC});
-                    target = &node.clips.back();
+                    node->clips.push_back({"Clip 1", 0, len, 0xFF4488CC});
+                    target = &node->clips.back();
                 }
 
                 if (target) {
@@ -2169,17 +2489,17 @@ void PianoRollComponent::showEmptyMenu() {
             }
             case 2:
                 state.selected.clear();
-                for (int ci = 0; ci < (int)node.clips.size(); ++ci)
-                    for (int ni = 0; ni < (int)node.clips[ci].notes.size(); ++ni)
+                for (int ci = 0; ci < (int)node->clips.size(); ++ci)
+                    for (int ni = 0; ni < (int)node->clips[ci].notes.size(); ++ni)
                         state.selected.insert({ci, ni});
                 break;
             case 3: state.selected.clear(); break;
-            case 4: if (onClose) onClose(node.id); break;
+            case 4: if (onClose) onClose(node->id); break;
             case 15: pasteAtCursor(); break;
             case 80: { // Split clip at cursor
                 float splitBeat = lastClickBeat;
-                for (int ci = 0; ci < (int)node.clips.size(); ++ci) {
-                    auto& clip = node.clips[ci];
+                for (int ci = 0; ci < (int)node->clips.size(); ++ci) {
+                    auto& clip = node->clips[ci];
                     if (splitBeat > clip.startBeat && splitBeat < clip.startBeat + clip.lengthBeats) {
                         // Create new clip for the right half
                         Clip rightClip;
@@ -2230,7 +2550,7 @@ void PianoRollComponent::showEmptyMenu() {
                         clip.name = clip.name.find(" (R)") == std::string::npos
                             ? clip.name + " (L)" : clip.name;
 
-                        node.clips.push_back(rightClip);
+                        node->clips.push_back(rightClip);
                         graph.dirty = true;
                         break; // only split first matching clip
                     }
@@ -2239,7 +2559,7 @@ void PianoRollComponent::showEmptyMenu() {
             }
             case 81: { // Trim clip start to cursor
                 float trimBeat = lastClickBeat;
-                for (auto& clip : node.clips) {
+                for (auto& clip : node->clips) {
                     if (trimBeat > clip.startBeat && trimBeat < clip.startBeat + clip.lengthBeats) {
                         float offset = trimBeat - clip.startBeat;
                         // Adjust note offsets
@@ -2271,7 +2591,7 @@ void PianoRollComponent::showEmptyMenu() {
             }
             case 82: { // Trim clip end to cursor
                 float trimBeat = lastClickBeat;
-                for (auto& clip : node.clips) {
+                for (auto& clip : node->clips) {
                     if (trimBeat > clip.startBeat && trimBeat < clip.startBeat + clip.lengthBeats) {
                         clip.lengthBeats = trimBeat - clip.startBeat;
                         // Remove notes past the new end
@@ -2296,9 +2616,9 @@ void PianoRollComponent::showEmptyMenu() {
             }
             case 83: { // Delete clip at cursor
                 float beat = lastClickBeat;
-                for (auto it = node.clips.begin(); it != node.clips.end(); ++it) {
+                for (auto it = node->clips.begin(); it != node->clips.end(); ++it) {
                     if (beat >= it->startBeat && beat < it->startBeat + it->lengthBeats) {
-                        node.clips.erase(it);
+                        node->clips.erase(it);
                         state.selected.clear();
                         graph.dirty = true;
                         break;
@@ -2314,7 +2634,7 @@ void PianoRollComponent::showEmptyMenu() {
                     Clip dup = *clipClipboard;
                     dup.startBeat += dup.lengthBeats; // place right after original
                     dup.name += " (dup)";
-                    node.clips.push_back(dup);
+                    node->clips.push_back(dup);
                     graph.dirty = true;
                 }
                 break;
@@ -2331,7 +2651,7 @@ void PianoRollComponent::showEmptyMenu() {
                 aw->getComboBoxComponent("amount")->setSelectedItemIndex(1);
                 aw->addButton("Insert", 1); aw->addButton("Cancel", 0);
                 float clickBeat = lastClickBeat;
-                int nid = node.id;
+                int nid = node->id;
                 float bpbf = (float)bpb;
                 aw->enterModalState(true, juce::ModalCallbackFunction::create(
                     [this, aw, clickBeat, nid, bpbf](int res) {
@@ -2358,7 +2678,7 @@ void PianoRollComponent::showEmptyMenu() {
                 aw->getComboBoxComponent("amount")->setSelectedItemIndex(1);
                 aw->addButton("Delete", 1); aw->addButton("Cancel", 0);
                 float clickBeat = lastClickBeat;
-                int nid = node.id;
+                int nid = node->id;
                 float bpbf = (float)bpb;
                 aw->enterModalState(true, juce::ModalCallbackFunction::create(
                     [this, aw, clickBeat, nid, bpbf](int res) {
@@ -2374,7 +2694,7 @@ void PianoRollComponent::showEmptyMenu() {
                 break;
             }
             case 97: { // Add marker
-                float markerBeat = lastClickBeat + node.absoluteBeatOffset;
+                float markerBeat = lastClickBeat + node->absoluteBeatOffset;
                 auto* aw = new juce::AlertWindow("Add Marker",
                     "At beat " + juce::String(markerBeat, 1),
                     juce::MessageBoxIconType::NoIcon);
@@ -2400,22 +2720,22 @@ void PianoRollComponent::showEmptyMenu() {
                 break;
             }
             case 95: // Set loop start
-                graph.loopStartBeat = lastClickBeat + node.absoluteBeatOffset;
+                graph.loopStartBeat = lastClickBeat + node->absoluteBeatOffset;
                 graph.loopEnabled = true;
                 break;
             case 96: // Set loop end
-                graph.loopEndBeat = lastClickBeat + node.absoluteBeatOffset;
+                graph.loopEndBeat = lastClickBeat + node->absoluteBeatOffset;
                 graph.loopEnabled = true;
                 break;
             case 84: { // Add new clip
                 float snap = state.snap > 0 ? state.snap : 1.0f;
                 float start = std::floor(lastClickBeat / snap) * snap;
                 Clip c;
-                c.name = "Clip " + std::to_string(node.clips.size() + 1);
+                c.name = "Clip " + std::to_string(node->clips.size() + 1);
                 c.startBeat = start;
                 c.lengthBeats = 4.0f;
                 c.color = juce::Colours::cornflowerblue.getARGB();
-                node.clips.push_back(c);
+                node->clips.push_back(c);
                 graph.dirty = true;
                 break;
             }
@@ -2431,7 +2751,7 @@ void PianoRollComponent::showEmptyMenu() {
                     case 76: grid = 0.125f; strength = 1.0f; break;
                     case 77: grid = 1.0f / 3.0f; strength = 1.0f; break;
                 }
-                for (auto& clip : node.clips)
+                for (auto& clip : node->clips)
                     for (auto& n : clip.notes) {
                         float snapped = std::round(n.offset / grid) * grid;
                         n.offset += (snapped - n.offset) * strength;
@@ -2445,7 +2765,7 @@ void PianoRollComponent::showEmptyMenu() {
             case 13: state.snap = 0.0f; break;
             case 14: {
                 std::vector<int> pitches;
-                for (auto& clip : node.clips)
+                for (auto& clip : node->clips)
                     for (auto& n : clip.notes) pitches.push_back(n.pitch);
                 auto results = MusicTheory::detectKeys(pitches);
                 juce::PopupMenu rm;
@@ -2481,6 +2801,41 @@ void PianoRollComponent::showEmptyMenu() {
                     int i = 0; for (auto& [name, _] : MusicTheory::scales()) {
                         if (i++ == result - 400) { state.activeCategory = "scale"; state.scaleName = name; break; }
                     }
+                } else if (result == 5999) {
+                    // Delete effect region at cursor
+                    for (int i = 0; i < (int)node->effectRegions.size(); ++i) {
+                        auto& r = node->effectRegions[i];
+                        if (lastClickBeat >= r.startBeat && lastClickBeat <= r.endBeat) {
+                            node->effectRegions.erase(node->effectRegions.begin() + i);
+                            graph.dirty = true;
+                            break;
+                        }
+                    }
+                } else if (result >= 5000 && result < 5999) {
+                    // Add effect region for a group
+                    int groupId = result - 5000;
+                    float snap = state.snap > 0 ? state.snap : 1.0f;
+                    float beat = std::floor(lastClickBeat / snap) * snap;
+                    EffectRegion region;
+                    region.groupId = groupId;
+                    region.startBeat = beat;
+                    region.endBeat = beat + 4.0f;
+                    if (auto* grp = graph.findEffectGroup(groupId))
+                        region.color = grp->color;
+                    node->effectRegions.push_back(region);
+                    graph.dirty = true;
+                } else if (result >= 6000) {
+                    // Add effect region for an individual link
+                    int linkId = result - 6000;
+                    float snap = state.snap > 0 ? state.snap : 1.0f;
+                    float beat = std::floor(lastClickBeat / snap) * snap;
+                    EffectRegion region;
+                    region.linkId = linkId;
+                    region.startBeat = beat;
+                    region.endBeat = beat + 4.0f;
+                    region.color = getDistinctColor(linkId);
+                    node->effectRegions.push_back(region);
+                    graph.dirty = true;
                 }
                 break;
         }

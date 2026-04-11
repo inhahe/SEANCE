@@ -21,6 +21,15 @@ public:
     // Generate from a math expression like "sin(x) + 0.3*sin(3*x)"
     void generateFromExpression(const std::string& expr);
 
+    // Frequency-domain mode A: evaluate mag(f) and phase(f) over FFT bins,
+    // inverse-FFT to a single-period waveform. fftSize must be a power of two.
+    // phaseMode: 0=expression, 1=random, 2=zero, 3=linear
+    // Result is normalized to peak 1.0.
+    void generateFromSpectralExpression(const std::string& magExpr,
+                                        const std::string& phaseExpr,
+                                        int fftSize,
+                                        int phaseMode);
+
     // Generate from control points (cubic interpolation, enforced periodic)
     void generateFromPoints(const std::vector<std::pair<float, float>>& points);
 
@@ -56,7 +65,16 @@ private:
 // Also: saw(x), square(x), triangle(x), noise()
 class WaveExprParser {
 public:
+    // Evaluate expression using `x` as free variable over [0, 2*pi).
+    // Result size = tableSize. Clamped to [-1, 1].
     static std::vector<float> evaluate(const std::string& expr, int tableSize);
+
+    // Evaluate expression using `f` as free variable over integers [0, numBins).
+    // No clamping (used for spectrum magnitude/phase/ratio).
+    static std::vector<float> evaluateOverBins(const std::string& expr, int numBins);
+
+    // Evaluate a single value with both x and f bound (general helper).
+    static float evaluateAt(const std::string& expr, float x, float f);
 };
 
 // Voice for polyphonic playback

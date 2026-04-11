@@ -5,7 +5,9 @@
 #include "plugin_host.h"
 #include "graph_processor.h"
 #include "recording.h"
+#include "multitrack_recorder.h"
 #include <memory>
+#include <set>
 #include <atomic>
 
 namespace SoundShop {
@@ -33,10 +35,25 @@ public:
     // MidiInputCallback
     void handleIncomingMidiMessage(juce::MidiInput* source, const juce::MidiMessage& msg) override;
 
+    // MIDI device enablement — called when MidiInput nodes are added/removed
+    // so we only keep device callbacks alive for devices the user asked for.
+    // Walks the graph and enables exactly the set of devices with matching
+    // MidiInput nodes, disabling any others that are currently enabled.
+    void syncMidiDeviceEnablement();
+
+    // Return the list of MIDI input devices currently connected to the OS,
+    // used by the device wizard to show the user what's available.
+    struct MidiDeviceEntry {
+        juce::String name;
+        juce::String identifier;
+        bool presentInGraph = false;
+    };
+    std::vector<MidiDeviceEntry> listMidiInputDevices() const;
+
     // Transport
     bool isPlaying() const { return playing.load(); }
     void play() { playing = true; }
-    void stop() { playing = false; positionSamples = 0; }
+    void stop();
     void pause() { playing = false; }
 
     double getBpm() const { return bpm.load(); }
@@ -62,12 +79,15 @@ public:
 
     // Recording
     RecordingManager& getRecordingManager() { return recordingManager; }
+    MultitrackRecorder& getMultitrackRecorder() { return multitrackRecorder; }
 
     // Set the graph and transport to process (called from App)
     void setGraph(NodeGraph* g, Transport* t) {
         graph = g; transport = t;
         if (graph && sampleRate > 0)
             graphProcessor.prepare(*graph, sampleRate, blockSize);
+        // Enable only the devices the loaded graph asks for.
+        syncMidiDeviceEnablement();
     }
 
 private:
@@ -76,6 +96,7 @@ private:
     PluginHost pluginHost;
     GraphProcessor graphProcessor;
     RecordingManager recordingManager;
+    MultitrackRecorder multitrackRecorder;
     NodeGraph* graph = nullptr;
     Transport* transport = nullptr;
 
@@ -91,7 +112,11 @@ private:
     double resamplePhase = 0.0;
 
     // Incoming MIDI from hardware controllers
-    juce::MidiBuffer incomingMidi;
+    // Incoming MIDI from hardware devices, with per-message source device
+    // identifier so the audio thread can look up the matching MidiInput
+    // node and route the event there. Populated by handleIncomingMidiMessage
+    // on the MIDI thread; drained by the audio callback.
+    std::vector<std::pair<juce::String, juce::MidiMessage>> incomingMidiEvents;
     juce::CriticalSection midiLock;
 
     // MIDI Learn state
@@ -130,6 +155,37 @@ public:
 
     // Input monitoring: hear audio input through the output
     std::atomic<bool> inputMonitoring{false};
+
+    // Hotkey MIDI capture: when non-null, MIDI CC/note events are forwarded
+    // here for hotkey assignment instead of being routed to instruments.
+    std::function<void(int type, int channel, int number)> hotkeyMidiCapture;
+
+    // Computer keyboard as MIDI input ("musical typing")
+    std::atomic<bool> keyboardMidiEnabled{false};
+    int keyboardOctave = 4;  // base octave for the keyboard mapping
+    std::set<int> keysDown;  // track which keys are currently held
+
+    // Call from the UI's keyPressed/keyReleased to generate MIDI events
+    void keyboardNoteOn(int midiNote, int velocity = 100);
+    void keyboardNoteOff(int midiNote);
+
+    // Output capture: record the final mix to memory for "Save as Audio Track"
+    // or export. Only the audio thread writes to the buffers (while capturing);
+    // the UI thread reads them only after capture is stopped. No lock needed.
+    std::atomic<bool> outputCaptureEnabled{false};
+    std::vector<float> captureL, captureR;
+    double captureSampleRate = 44100.0;
+    int64_t captureStartSample = 0; // transport position when capture started
+
+    void startOutputCapture();
+    void stopOutputCapture();
+    bool isCapturingOutput() const { return outputCaptureEnabled.load(); }
+
+    // Retrieve the captured audio as a stereo JUCE buffer. Returns empty if
+    // no capture data. Does NOT clear the capture — call clearCapture() for that.
+    juce::AudioBuffer<float> getCaptureBuffer() const;
+    int64_t getCaptureStartSample() const { return captureStartSample; }
+    void clearCapture();
 
     // Record a param change (called from UI when user moves a slider/knob)
     void recordParamChange(int nodeId, int paramIdx, float value);

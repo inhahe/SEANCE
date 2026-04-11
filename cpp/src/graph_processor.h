@@ -58,7 +58,7 @@ private:
 // Wraps an audio timeline node — plays audio file clips
 class AudioTimelineProcessor : public juce::AudioProcessor {
 public:
-    AudioTimelineProcessor(Node& node, Transport& transport);
+    AudioTimelineProcessor(Node& node, Transport& transport, NodeGraph& graph);
     const juce::String getName() const override { return node.name; }
     void prepareToPlay(double sr, int bs) override;
     void releaseResources() override {}
@@ -79,6 +79,7 @@ public:
 private:
     Node& node;
     Transport& transport;
+    NodeGraph& graph;
     double sampleRate = 44100;
     int blockSize = 512;
 
@@ -155,8 +156,16 @@ private:
     double sampleRate = 44100.0;
     int blockSize = 512;
 
-    // Map our node IDs to JUCE graph node IDs
+    // Map our node IDs to JUCE graph node IDs.
+    // nodeMap stores the OUTPUT side: the JUCE node that downstream connections
+    // should pull audio FROM. For nodes with a pan inserted after them, this is
+    // the pan node — pan is where the chain ends.
+    // nodeInputMap stores the INPUT side: the JUCE node that upstream connections
+    // should push audio/MIDI INTO. For nodes with a pan, this is the original
+    // processor (not the pan), so MIDI events actually reach the synth.
+    // For nodes without a pan (Output), both maps point to the same JUCE node.
     std::unordered_map<int, juce::AudioProcessorGraph::NodeID> nodeMap;
+    std::unordered_map<int, juce::AudioProcessorGraph::NodeID> nodeInputMap;
     juce::AudioProcessorGraph::NodeID outputNodeId;
     AutomationManager automation;
     AudioCacheManager cacheManager;

@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Convolution Filter — SoundShop2</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="wrap">
+<header>
+<h1>Convolution Filter</h1>
+<nav>
+  <a href="index.html">Home</a>
+  <a href="graph-basics.html">Graph Basics</a>
+</nav>
+</header>
+
+<p>A convolution filter takes an audio input and combines it with a stored sound called an <strong>impulse response</strong> (IR). The result is the input audio re-shaped by the IR's spectral and temporal character. Convolution is the math under the hood of nearly every "real space" reverb and "real cabinet" guitar amp simulation — record what a clap sounds like in a cathedral, save it as the IR, and any audio you push through the convolution filter sounds like it was played in that cathedral. Same trick works for guitar speaker cabinets, EQ matching, and more.</p>
+
+<p>SoundShop2's convolution node is a small utility version aimed at making custom filters and short impulses, not loading 5-second cathedral reverbs (though you can do that too). Add one from <em>Effects → Convolution Filter</em>, wire your audio through it, and double-click to open the editor.</p>
+
+<h2>Three ways to make an IR</h2>
+
+<p>The editor lets you build the impulse response three different ways: pick a preset and tweak its sliders, draw the IR by hand, or load one from a .wav file.</p>
+
+<h3>Presets</h3>
+
+<p>Pick from the dropdown:</p>
+
+<ul>
+  <li><strong>Lowpass</strong> — keeps low frequencies, attenuates high ones. Cutoff sets where the rolloff begins; Steepness sets how sharp the cutoff is. Higher steepness = brick wall, lower steepness = gentle slope.</li>
+  <li><strong>Highpass</strong> — opposite: keeps high frequencies, attenuates low ones. Same Cutoff and Steepness controls.</li>
+  <li><strong>Bandpass</strong> — keeps a range of frequencies centered on Cutoff with a width of Bandwidth, attenuating everything outside.</li>
+  <li><strong>Echo / Delay</strong> — creates a series of echo taps. Delay sets time between repeats; Feedback sets how loud each repeat is relative to the previous one (0 = single echo, near-1 = many slowly fading echoes); Echoes sets how many repeats.</li>
+</ul>
+
+<p>After tweaking the sliders, click <strong>Apply Preset</strong> to generate the IR from the current settings. This replaces whatever's in the editor's drawing area, so you'll lose hand-drawn edits. The preview updates immediately and you can audition the change live.</p>
+
+<h3>Drawing by hand</h3>
+
+<p>Two drawing modes for editing the IR directly:</p>
+
+<ul>
+  <li><strong>Control points</strong> (default) — drag a small number of control points to shape a smooth curve. The editor uses Catmull-Rom interpolation between points so you get a nice flowing shape from just a few clicks. Good for filter shapes you can't quite get from the presets.</li>
+  <li><strong>Freehand</strong> — draw the IR sample-by-sample with the mouse, no smoothing. Good for sharp transients, surgical per-sample edits, or anything where you need precise control over individual samples (like crafting a custom click impulse).</li>
+</ul>
+
+<p>The drawing area has a frequency-response preview that updates as you draw, so you can see what filter shape your time-domain IR is producing in the frequency domain.</p>
+
+<h3>Loading from a file</h3>
+
+<p>Click <strong>Load File...</strong> and pick a .wav file. The audio is read in and used as the IR directly. Use this for "real space" reverbs, real cabinet IRs, and any other captured impulse you want to apply.</p>
+
+<p>For longer IRs (a few seconds of room reverb), CPU cost goes up — convolution complexity is roughly proportional to the IR length. The IR Length slider sets how many samples of the loaded file get used. Trim it down for shorter, cheaper convolutions if you don't need the full tail.</p>
+
+<h2>Zoom and grid</h2>
+
+<p>Mouse wheel scrolls horizontally; Ctrl+wheel zooms in toward the cursor up to 128×. When zoomed in far enough that each sample is at least 5 pixels wide, the editor switches to a sample-stems view where each individual sample shows as a vertical line with a dot at its tip, and a faint grid marks sample boundaries. This is the precise mode for surgical sample-level editing.</p>
+
+<h2>Capturing real rooms</h2>
+
+<p>SoundShop2 has a built-in tool to capture impulse responses from real spaces — click <em>Tools → Capture Room IR…</em> in the menus. Place your microphone where the listener would sit, point your speakers into the room, and the tool plays a sine sweep through the speakers and records the room's response with the mic. The captured IR is automatically loaded into a new Convolution Filter node ready to use. See the Room IR Capture dialog's tooltips for the recording parameters.</p>
+
+<h2>Common patterns</h2>
+
+<ul>
+  <li><strong>Use a real cab IR for guitars.</strong> Most guitar speaker cabs sound very different miked at different positions. A convolution filter loaded with a cabinet IR turns a clean DI guitar signal into something that sounds like it was recorded through a real amp.</li>
+  <li><strong>Roll off harshness with a gentle lowpass.</strong> A subtle Lowpass at ~10 kHz with low Steepness softens digital harshness on synth outputs without sounding obviously filtered.</li>
+  <li><strong>Build a comb filter with the Echo preset.</strong> Short Delay (1-30 ms) plus high Feedback gives you the metallic comb-filter sound used in flangers and chorus effects — except here it's a fixed convolution rather than a modulated delay line.</li>
+  <li><strong>Match the EQ of a reference track.</strong> Capture the spectrum of a track you want to sound like (using the Spectrum Tap node), and design a convolution filter that matches its EQ curve. This is how "EQ match" plugins in commercial DAWs work under the hood.</li>
+</ul>
+
+<footer>
+<a href="index.html">← Back to index</a>
+</footer>
+</div>
+</body>
+</html>

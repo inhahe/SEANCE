@@ -1,11 +1,15 @@
 #include "terrain_synth.h"
 #include "builtin_synth.h" // for WaveExprParser
+#include "fft_util.h"
+#include "layered_wave_editor.h" // for LayeredWaveform decode/render
 #include <cstring>
 #include <cstdio>
 #include <algorithm>
 #include <random>
 #include <numeric>
 #include <fstream>
+#include <complex>
+#include <cmath>
 
 namespace SoundShop {
 
@@ -200,6 +204,65 @@ void Terrain::smooth(int passes) {
             }
         }
         data = smoothed;
+    }
+}
+
+void Terrain::fillFromSpectralExpression(const std::string& magExpr,
+                                          const std::string& phaseExpr,
+                                          int fftSize,
+                                          int phaseMode)
+{
+    // Round fftSize up to a power of two.
+    int n = 2;
+    while (n < fftSize && n < 16384) n <<= 1;
+
+    // Ensure the terrain is 1D of size n.
+    init({n});
+
+    int halfBins = n / 2 + 1;
+    auto mags = WaveExprParser::evaluateOverBins(magExpr, halfBins);
+
+    std::vector<float> phases(halfBins, 0.0f);
+    std::mt19937 rng(1337);
+    std::uniform_real_distribution<float> udist(-3.14159265f, 3.14159265f);
+    switch (phaseMode) {
+        case 0: phases = WaveExprParser::evaluateOverBins(phaseExpr, halfBins); break;
+        case 1: for (auto& p : phases) p = udist(rng); break;
+        case 2: break; // already zero
+        case 3:
+            for (int k = 0; k < halfBins; ++k)
+                phases[k] = -3.14159265f * (float)k;
+            break;
+        default: break;
+    }
+
+    std::vector<std::complex<float>> spectrum(halfBins);
+    for (int k = 0; k < halfBins; ++k) {
+        float m = mags[k];
+        float p = phases[k];
+        if (k == 0 || k == halfBins - 1)
+            spectrum[k] = std::complex<float>(m, 0.0f);
+        else
+            spectrum[k] = std::complex<float>(m * std::cos(p), m * std::sin(p));
+    }
+    // Kill DC offset — it would produce a silent bias on playback.
+    spectrum[0] = 0.0f;
+
+    FFT fft(n);
+    std::vector<float> timeDomain;
+    fft.inverseReal(spectrum, timeDomain);
+
+    // Normalize to peak 1.0
+    float peak = 0.0f;
+    for (float v : timeDomain) peak = std::max(peak, std::abs(v));
+    if (peak > 1e-9f) {
+        float inv = 1.0f / peak;
+        for (float& v : timeDomain) v *= inv;
+    }
+
+    // Copy into terrain data.
+    if ((int)data.size() == n) {
+        data = std::move(timeDomain);
     }
 }
 
@@ -459,6 +522,137 @@ TerrainSynthProcessor::TerrainSynthProcessor(Node& n, Transport& t) : node(n), t
         terrain.fillFromImage(script.substr(10));
     } else if (script.find("__audio__:") == 0) {
         terrain.fillFromAudioFile(script.substr(10));
+    } else if (script.find("__layered__:") == 0) {
+        // Layered waveform — decode the layer list and sum into a 1D terrain.
+        // This is effectively a single-frame wavetable, so flag it as such so
+        // the render loop uses cycle-based phase advancement instead of the
+        // sample-based formula.
+        LayeredWaveform lw;
+        if (lw.decode(script)) {
+            std::vector<float> samples;
+            lw.render(samples);
+            terrain.init({(int)samples.size()});
+            auto& d = terrain.getData();
+            if ((int)d.size() == (int)samples.size())
+                d = std::move(samples);
+        } else {
+            terrain.init({2048});
+            terrain.fillFromExpression("sin(x)");
+        }
+        traversalParams.mode = TraversalMode::Linear;
+        mode = TerrainSynthMode::SamplePerPoint;
+        isWavetable = true;
+        wtFrameCount = 1;
+    } else if (script.find("__wavetable__:") == 0) {
+        // N-dimensional wavetable — Grid mode builds an (N+1)-D terrain;
+        // Scatter mode keeps frames in a flat list and computes a Wendland
+        // RBF blend each block.
+        WavetableDoc doc;
+        bool decoded = doc.decode(script);
+        if (decoded && doc.mode == WavetableMode::Scatter && !doc.scatterFrames.empty()) {
+            int ts = doc.tableSize;
+            wtScatterFrameSamples.clear();
+            wtScatterFramePositions.clear();
+            for (auto& sf : doc.scatterFrames) {
+                std::vector<float> samples;
+                sf.wave.tableSize = ts;
+                sf.wave.render(samples);
+                if ((int)samples.size() != ts) samples.resize(ts, 0.0f);
+                wtScatterFrameSamples.push_back(std::move(samples));
+                wtScatterFramePositions.push_back(sf.position);
+            }
+            // 1D terrain — the per-block blend writes the active waveform
+            // into terrain.data so the per-sample render path is unchanged.
+            terrain.init({ts});
+            wtScatter = true;
+            wtScatterDims = doc.scatterDims;
+            wtScatterRadius = doc.scatterRadius;
+            isWavetable = true;
+            wtFrameCount = (int)wtScatterFrameSamples.size();
+            wtNumDims = doc.scatterDims;
+            traversalParams.mode = TraversalMode::Linear;
+            mode = TerrainSynthMode::SamplePerPoint;
+        } else if (decoded && !doc.frames.empty()) {
+            int ts = doc.tableSize;
+
+            // Build terrain dimensions: {tableSize, dim0, dim1, ...}
+            std::vector<int> terrainDims = {ts};
+            for (int d : doc.gridDims) terrainDims.push_back(std::max(1, d));
+            terrain.init(terrainDims);
+            auto& data = terrain.getData();
+
+            // Compute stride for each grid dimension to map flat frame index
+            // to the correct position in the N-dimensional terrain.
+            int nf = (int)doc.frames.size();
+            for (int f = 0; f < nf; ++f) {
+                std::vector<float> samples;
+                doc.frames[f].tableSize = ts;
+                doc.frames[f].render(samples);
+
+                // Compute the flat terrain offset for this frame.
+                // The terrain is {ts, dim0, dim1, ...}. Frame f maps to
+                // some (d0, d1, ...) in the grid. We need to compute the
+                // stride for dimension 0 (phase) then write samples there.
+                // Using coordToFlatIndex logic: stride for dim0=ts is last,
+                // so data layout is: outermost dims first, phase last...
+                // Actually: terrain.coordToFlatIndex does:
+                //   flat = sum(indices[d] * stride_d) where stride is
+                //   computed from last dim backwards.
+                // For {ts, dim0}: flat = phase * dim0 + frameIdx
+                // For {ts, d0, d1}: flat = phase * d0*d1 + d0idx * d1 + d1idx
+                // So we need to decompose f into grid coords.
+                std::vector<int> gridCoord;
+                int remaining = f;
+                for (int di = (int)doc.gridDims.size() - 1; di >= 0; --di) {
+                    gridCoord.push_back(remaining % std::max(1, doc.gridDims[di]));
+                    remaining /= std::max(1, doc.gridDims[di]);
+                }
+                std::reverse(gridCoord.begin(), gridCoord.end());
+
+                for (int i = 0; i < ts && i < (int)samples.size(); ++i) {
+                    std::vector<int> fullIdx = {i};
+                    fullIdx.insert(fullIdx.end(), gridCoord.begin(), gridCoord.end());
+                    int flatIdx = terrain.coordToFlatIndex(fullIdx);
+                    if (flatIdx >= 0 && flatIdx < terrain.totalSize())
+                        data[flatIdx] = samples[i];
+                }
+            }
+            isWavetable = true;
+            wtFrameCount = nf;
+            wtNumDims = doc.numDimensions();
+        } else {
+            terrain.init({2048});
+            terrain.fillFromExpression("sin(x)");
+        }
+        traversalParams.mode = TraversalMode::Linear;
+        mode = TerrainSynthMode::SamplePerPoint;
+    } else if (script.find("__spectral__:") == 0) {
+        // Format: __spectral__:<fftSize>:<phaseMode>:<magExpr>|<phaseExpr>
+        std::string rest = script.substr(13);
+        auto c1 = rest.find(':');
+        auto c2 = (c1 != std::string::npos) ? rest.find(':', c1 + 1) : std::string::npos;
+        int fftSize = 2048;
+        int phaseMode = 1; // random
+        std::string magExpr, phaseExpr;
+        if (c1 != std::string::npos && c2 != std::string::npos) {
+            try { fftSize = std::stoi(rest.substr(0, c1)); } catch (...) {}
+            try { phaseMode = std::stoi(rest.substr(c1 + 1, c2 - c1 - 1)); } catch (...) {}
+            std::string body = rest.substr(c2 + 1);
+            auto bar = body.find('|');
+            if (bar != std::string::npos) {
+                magExpr = body.substr(0, bar);
+                phaseExpr = body.substr(bar + 1);
+            } else {
+                magExpr = body;
+            }
+        } else {
+            magExpr = "exp(-f/20)";
+        }
+        terrain.fillFromSpectralExpression(magExpr, phaseExpr, fftSize, phaseMode);
+        traversalParams.mode = TraversalMode::Linear;
+        mode = TerrainSynthMode::SamplePerPoint;
+        isWavetable = true;
+        wtFrameCount = 1;
     } else {
         std::string expr = script.empty() ? "sin(x)" : script;
 
@@ -498,6 +692,13 @@ float TerrainSynthProcessor::getParam(int idx, float def) const {
     return def;
 }
 
+// Look up a parameter by name (for sparse param lists where index doesn't apply).
+static float getParamByName(const Node& node, const std::string& name, float def) {
+    for (const auto& p : node.params)
+        if (p.name == name) return p.value;
+    return def;
+}
+
 void TerrainSynthProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::MidiBuffer& midi) {
     buf.clear();
     int numSamples = buf.getNumSamples();
@@ -510,21 +711,30 @@ void TerrainSynthProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mi
     float release = getParam(3, 0.3f);
     float volume  = getParam(4, 0.5f);
 
-    // Traversal param modulation from node params
-    traversalParams.speed           = getParam(5, 1.0f);
-    traversalParams.radiusX         = getParam(6, 0.3f);
-    traversalParams.radiusY         = getParam(7, 0.3f);
-    traversalParams.centerX         = getParam(8, 0.5f);
-    traversalParams.centerY         = getParam(9, 0.5f);
-    traversalParams.radiusModSpeed  = getParam(10, 0.0f);
-    traversalParams.radiusModAmount = getParam(11, 0.0f);
+    // Traversal param modulation from node params — only override defaults
+    // for nodes that actually have these params. Slimmed synths leave them
+    // at the constructor-set defaults so 1D playback works correctly.
+    if ((int)node.params.size() > 11) {
+        traversalParams.speed           = getParam(5, 1.0f);
+        traversalParams.radiusX         = getParam(6, 0.3f);
+        traversalParams.radiusY         = getParam(7, 0.3f);
+        traversalParams.centerX         = getParam(8, 0.5f);
+        traversalParams.centerY         = getParam(9, 0.5f);
+        traversalParams.radiusModSpeed  = getParam(10, 0.0f);
+        traversalParams.radiusModAmount = getParam(11, 0.0f);
+    }
 
-    // Traversal mode: 0=Orbit, 1=Linear, 2=Lissajous, 3=Physics
-    int modeInt = (int)getParam(12, 0.0f);
-    traversalParams.mode = (modeInt == 1) ? TraversalMode::Linear
-                         : (modeInt == 2) ? TraversalMode::Lissajous
-                         : (modeInt == 3) ? TraversalMode::Physics
-                         : TraversalMode::Orbit;
+    // Traversal mode: read from param if present, otherwise leave alone.
+    // Slimmed-param synths (Waveform, Piano, Drum Machine) don't have a
+    // Traversal param at index 12, so we keep whatever the constructor set
+    // (Linear for 1D layered/wavetable nodes) instead of forcing Orbit.
+    if ((int)node.params.size() > 12) {
+        int modeInt = (int)getParam(12, 0.0f);
+        traversalParams.mode = (modeInt == 1) ? TraversalMode::Linear
+                             : (modeInt == 2) ? TraversalMode::Lissajous
+                             : (modeInt == 3) ? TraversalMode::Physics
+                             : TraversalMode::Orbit;
+    }
 
     // Synth mode: 0=SamplePerPoint, 1=WaveformPerPoint
     mode = ((int)getParam(13, 0.0f) == 1) ? TerrainSynthMode::WaveformPerPoint
@@ -557,10 +767,24 @@ void TerrainSynthProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mi
                 if (voices[i].envLevel < minLev) { minLev = voices[i].envLevel; vi = i; }
             }
             if (vi >= 0) {
+                int ch = juce::jlimit(1, 16, msg.getChannel());
                 voices[vi].active = true;
                 voices[vi].noteNumber = msg.getNoteNumber();
-                voices[vi].frequency = (float)juce::MidiMessage::getMidiNoteInHertz(msg.getNoteNumber());
-                voices[vi].velocity = msg.getVelocity() / 127.0f;
+                voices[vi].midiChannel = ch;
+                voices[vi].baseFrequency = transport.noteToFreq(msg.getNoteNumber());
+                // Seed effective frequency with the current bend factor so
+                // notes triggered while the pitch wheel is held start at the
+                // bent pitch rather than the nominal one.
+                voices[vi].frequency =
+                    voices[vi].baseFrequency * pitchBendFactor[ch - 1];
+                // Apply the node's velocity-sensitivity setting: sens=0
+                // collapses everything to full volume, sens=1 is linear.
+                // Default 1.0 preserves prior behavior for older projects.
+                {
+                    float velSens = getParamByName(node, "Vel Sens", 1.0f);
+                    float raw = msg.getVelocity() / 127.0f;
+                    voices[vi].velocity = 1.0f - velSens * (1.0f - raw);
+                }
                 voices[vi].phase = 0;
                 voices[vi].startBeat = transport.positionBeats();
                 voices[vi].envStage = Voice::Attack;
@@ -568,18 +792,123 @@ void TerrainSynthProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mi
                 voices[vi].envTime = 0;
             }
         } else if (msg.isNoteOff()) {
+            int ch = juce::jlimit(1, 16, msg.getChannel());
             for (int i = 0; i < MAX_VOICES; ++i)
                 if (voices[i].active && voices[i].noteNumber == msg.getNoteNumber()
                     && voices[i].envStage != Voice::Release) {
-                    voices[i].envStage = Voice::Release;
-                    voices[i].envTime = 0;
+                    // If sustain pedal is held on this channel, defer the
+                    // release until the pedal comes back up; otherwise
+                    // release immediately.
+                    if (sustainPedal[ch - 1]) {
+                        voices[i].sustainHeld = true;
+                    } else {
+                        voices[i].envStage = Voice::Release;
+                        voices[i].envTime = 0;
+                    }
                 }
+        } else if (msg.isPitchWheel()) {
+            // Pitch bend: update this channel's bend factor and retune any
+            // currently-playing voices on the same channel so sustained
+            // notes bend in real time.
+            int ch = juce::jlimit(1, 16, msg.getChannel());
+            float norm = ((float)msg.getPitchWheelValue() - 8192.0f) / 8192.0f;
+            float semis = norm * kPitchBendRangeSemis;
+            pitchBendFactor[ch - 1] = std::pow(2.0f, semis / 12.0f);
+            for (int i = 0; i < MAX_VOICES; ++i)
+                if (voices[i].active && voices[i].midiChannel == ch)
+                    voices[i].frequency =
+                        voices[i].baseFrequency * pitchBendFactor[ch - 1];
+        } else if (msg.isController() && msg.getControllerNumber() == 1) {
+            // Mod wheel: store per-channel value for the vibrato LFO in the
+            // render loop to read.
+            int ch = juce::jlimit(1, 16, msg.getChannel());
+            modWheel[ch - 1] = (float)msg.getControllerValue() / 127.0f;
+        } else if (msg.isController() && msg.getControllerNumber() == 64) {
+            // Sustain pedal (CC#64): when released, any voices that had
+            // their release deferred (sustainHeld=true) are sent into their
+            // release stage immediately.
+            int ch = juce::jlimit(1, 16, msg.getChannel());
+            bool held = msg.getControllerValue() >= 64;
+            sustainPedal[ch - 1] = held;
+            if (!held) {
+                for (int i = 0; i < MAX_VOICES; ++i) {
+                    if (voices[i].active && voices[i].sustainHeld
+                        && voices[i].midiChannel == ch) {
+                        voices[i].sustainHeld = false;
+                        voices[i].envStage = Voice::Release;
+                        voices[i].envTime = 0;
+                    }
+                }
+            }
         }
     }
 
     // Detect audio-rate signal inputs (channels 2+ on the buffer)
     int numSignalInputs = std::max(0, numChannels - 2);
     bool hasSignalInputs = numSignalInputs > 0;
+
+    // Scatter wavetable: blend frames into the 1D terrain at block start
+    // using a Wendland C^2 RBF over the current Position. The per-sample
+    // path then reads terrain.sample(phase) unchanged.
+    if (isWavetable && wtScatter && !wtScatterFrameSamples.empty()) {
+        std::vector<float> qpos(wtScatterDims, 0.5f);
+        for (int d = 0; d < wtScatterDims; ++d) {
+            std::string pname = (wtScatterDims == 1)
+                ? std::string("Position")
+                : std::string("Position ") + std::to_string(d + 1);
+            qpos[d] = juce::jlimit(0.0f, 1.0f, getParamByName(node, pname.c_str(), 0.5f));
+        }
+        int nFrames = (int)wtScatterFrameSamples.size();
+        std::vector<float> weights(nFrames, 0.0f);
+        float totalW = 0.0f;
+        float r = std::max(1e-3f, wtScatterRadius);
+        for (int fi = 0; fi < nFrames; ++fi) {
+            const auto& fp = wtScatterFramePositions[fi];
+            float d2 = 0.0f;
+            for (int dim = 0; dim < wtScatterDims; ++dim) {
+                float a = (dim < (int)fp.size()) ? fp[dim] : 0.5f;
+                float dd = a - qpos[dim];
+                d2 += dd * dd;
+            }
+            float dist = std::sqrt(d2);
+            if (dist < r) {
+                float u = dist / r;
+                float v = 1.0f - u;
+                // Wendland phi_{3,1}: (1-u)^4 * (4u + 1)
+                float w = v * v * v * v * (4.0f * u + 1.0f);
+                weights[fi] = w;
+                totalW += w;
+            }
+        }
+        if (totalW < 1e-9f) {
+            // Fall back to nearest frame so we never produce silence.
+            int nearest = 0;
+            float bestD2 = 1e30f;
+            for (int fi = 0; fi < nFrames; ++fi) {
+                const auto& fp = wtScatterFramePositions[fi];
+                float d2 = 0.0f;
+                for (int dim = 0; dim < wtScatterDims; ++dim) {
+                    float a = (dim < (int)fp.size()) ? fp[dim] : 0.5f;
+                    float dd = a - qpos[dim];
+                    d2 += dd * dd;
+                }
+                if (d2 < bestD2) { bestD2 = d2; nearest = fi; }
+            }
+            weights[nearest] = 1.0f;
+            totalW = 1.0f;
+        }
+        float invT = 1.0f / totalW;
+        auto& tdata = terrain.getData();
+        int ts = (int)tdata.size();
+        std::fill(tdata.begin(), tdata.end(), 0.0f);
+        for (int fi = 0; fi < nFrames; ++fi) {
+            if (weights[fi] <= 0.0f) continue;
+            float w = weights[fi] * invT;
+            const auto& src = wtScatterFrameSamples[fi];
+            int n = std::min((int)src.size(), ts);
+            for (int i = 0; i < n; ++i) tdata[i] += w * src[i];
+        }
+    }
 
     // Render
     double beatPos = transport.positionBeats();
@@ -604,6 +933,34 @@ void TerrainSynthProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mi
         auto coord = traversal.evaluate(modParams, nd, currentBeat,
                                          transport.bpm, sampleRate);
 
+        // Wavetable mode: coord[1] is the frame position, driven by a
+        // Position parameter (index 21) rather than the traversal. coord[0]
+        // stays whatever traversal set and is then pitch-swept as usual.
+        if (isWavetable) {
+            // For wavetable playback the traversal must NOT modulate the
+            // phase axis — only v.phase (driven by note pitch) should sweep
+            // the wavetable. Otherwise the Linear traversal's beat-based
+            // motion adds an unwanted slow modulation that sounds like noise.
+            if (!coord.empty()) coord[0] = 0.0f;
+            // Scatter mode: terrain is 1D, blend already happened pre-loop —
+            // nothing to write into coord[d+1] (would crash, no such dim).
+            if (!wtScatter) {
+                // Set each Position dimension from named params.
+                // 1D: "Position" → coord[1]
+                // ND: "Position 1"..."Position N"
+                if (wtNumDims == 1 && nd >= 2) {
+                    coord[1] = juce::jlimit(0.0f, 1.0f, getParamByName(node, "Position", 0.0f));
+                } else {
+                    for (int d = 0; d < wtNumDims && d + 1 < nd; ++d) {
+                        std::string pname = (wtNumDims == 1) ? "Position"
+                            : "Position " + std::to_string(d + 1);
+                        coord[d + 1] = juce::jlimit(0.0f, 1.0f,
+                            getParamByName(node, pname.c_str(), 0.0f));
+                    }
+                }
+            }
+        }
+
         // Override coordinates with audio-rate signal inputs (channels 2+)
         if (hasSignalInputs) {
             for (int si = 0; si < numSignalInputs && si < nd; ++si) {
@@ -620,9 +977,17 @@ void TerrainSynthProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mi
             lastPosition = coord;
 
         float totalSample = 0.0f;
+        int activeVoiceCount = 0;
 
         // Grain size in samples (0 = off)
         int grainSizeSamples = (grainSize > 0) ? std::max(1, (int)(grainSize * sampleRate)) : 0;
+
+        // Advance the shared vibrato LFO once per sample. Each voice scales
+        // its frequency by a per-channel mod-wheel depth. Result: mod wheel
+        // up = audible vibrato on all notes through that synth.
+        vibratoPhase += kVibratoRateHz / (float)sampleRate;
+        if (vibratoPhase > 1.0f) vibratoPhase -= 1.0f;
+        float vibratoLfo = std::sin(vibratoPhase * 2.0f * 3.14159265f);
 
         for (int vi = 0; vi < MAX_VOICES; ++vi) {
             if (!voices[vi].active) continue;
@@ -631,9 +996,21 @@ void TerrainSynthProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mi
                                       &attackCurve, &decayCurve, &releaseCurve);
             if (!v.active) continue;
 
+            // Per-voice effective frequency = (base * pitch-bend) * vibrato
+            // v.frequency already has the bend factor baked in by the MIDI
+            // handler; multiply by the vibrato factor for this sample.
+            // Vibrato Depth param (0..1, default 1) scales the default
+            // mod-wheel vibrato. Set to 0 to disable and MIDI-Learn CC1
+            // to drive something else instead.
+            float mwDepth = modWheel[v.midiChannel - 1];
+            float vibAmt  = getParamByName(node, "Vibrato", 1.0f);
+            float vibSemis = mwDepth * vibAmt * kVibratoMaxSemis * vibratoLfo;
+            float vibratoFactor = std::pow(2.0f, vibSemis / 12.0f);
+            float effFreq = v.frequency * vibratoFactor;
+
             float sample;
             if (mode == TerrainSynthMode::SamplePerPoint) {
-                float pitchScale = v.frequency / 440.0f;
+                float pitchScale = effFreq / 440.0f;
                 auto pitchCoord = coord;
                 if (!pitchCoord.empty())
                     pitchCoord[0] = std::fmod(pitchCoord[0] + v.phase, 1.0f);
@@ -665,19 +1042,40 @@ void TerrainSynthProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mi
                     sample = terrain.sample(pitchCoord);
                 }
 
-                v.phase += pitchScale / (float)sampleRate;
+                // Phase advancement: wavetables (one cycle per period) advance
+                // by frequency/sampleRate; sample-based playback (Sampler etc)
+                // advances by pitchScale/sampleRate, where pitchScale is the
+                // transposition factor relative to the base note frequency.
+                if (isWavetable) {
+                    v.phase += effFreq / (float)sampleRate;
+                } else {
+                    // Read base note from param (default A4=69 if not set)
+                    float baseNote = getParamByName(node, "Base Note", 69.0f);
+                    float fineTune = getParamByName(node, "Fine Tune", 0.0f);
+                    // Base frequency = MIDI note frequency + fine-tune in cents
+                    float baseFreq = transport.noteToFreq((int)baseNote) *
+                        std::pow(2.0f, fineTune / 1200.0f); // fine-tune in cents
+                    float samplePitchScale = effFreq / std::max(1.0f, baseFreq);
+                    v.phase += samplePitchScale / (float)sampleRate;
+                }
                 if (v.phase > 1.0f) v.phase -= 1.0f;
             } else {
                 // WaveformPerPoint: terrain value modulates oscillator timbre
                 float terrainVal = terrain.sample(coord);
                 sample = std::sin(v.phase * 2.0f * 3.14159265f) * (0.5f + 0.5f * terrainVal);
-                v.phase += v.frequency / (float)sampleRate;
+                v.phase += effFreq / (float)sampleRate;
                 if (v.phase > 1.0f) v.phase -= 1.0f;
             }
 
             totalSample += sample * env * v.velocity;
+            activeVoiceCount++;
         }
 
+        // Scale by active voice count to prevent clipping when many notes
+        // play simultaneously. sqrt gives a perceptual balance between
+        // loudness and avoiding distortion (pure 1/N would be too quiet).
+        if (activeVoiceCount > 1)
+            totalSample /= std::sqrt((float)activeVoiceCount);
         totalSample *= volume;
         totalSample = juce::jlimit(-1.0f, 1.0f, totalSample);
 

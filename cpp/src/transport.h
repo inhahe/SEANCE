@@ -2,6 +2,7 @@
 #include <cstdint>
 #include <vector>
 #include <algorithm>
+#include "tuning.h"
 
 namespace SoundShop {
 
@@ -53,7 +54,11 @@ public:
 
     // Convert beats to seconds (integrates tempo)
     double beatsToSeconds(double beats) const {
-        if (points.size() <= 1 && points[0].bpm == points[0].endBpm) {
+        // Defensive: an empty `points` vector can happen briefly during a
+        // setGlobalBpm() race (clear followed by push_back is not atomic).
+        // Treat empty as 120 BPM.
+        if (points.empty()) return beats * 60.0 / 120.0;
+        if (points.size() == 1 && points[0].bpm == points[0].endBpm) {
             // Simple constant tempo
             return beats * 60.0 / points[0].bpm;
         }
@@ -72,7 +77,9 @@ public:
 
     // Convert seconds to beats (inverse of above)
     double secondsToBeats(double seconds) const {
-        if (points.size() <= 1 && points[0].bpm == points[0].endBpm) {
+        // Defensive: see beatsToSeconds for the empty-points race rationale.
+        if (points.empty()) return seconds * 120.0 / 60.0;
+        if (points.size() == 1 && points[0].bpm == points[0].endBpm) {
             return seconds * points[0].bpm / 60.0;
         }
         // Binary search
@@ -106,13 +113,17 @@ public:
     }
 
     void clear() {
-        points.clear();
+        // Push the replacement first so the audio thread never sees an
+        // empty vector mid-mutation, then drop the old entries.
         points.push_back({0, 120.0, 120.0, 0});
+        if (points.size() > 1)
+            points.erase(points.begin(), points.end() - 1);
     }
 
     void setGlobalBpm(double bpm) {
-        points.clear();
         points.push_back({0, bpm, bpm, 0});
+        if (points.size() > 1)
+            points.erase(points.begin(), points.end() - 1);
     }
 
     std::vector<TempoPoint> points;
@@ -201,6 +212,15 @@ struct Transport {
     bool recording = false;
     double bpm = 120.0;     // Current BPM (for display / simple mode)
     double sampleRate = 44100.0;
+
+    // Tuning (synced from NodeGraph each frame)
+    TuningSystem tuningSystem = TuningSystem::Equal12;
+    float concertPitch = 440.0f;
+
+    // Convert MIDI note to frequency using the project's tuning system
+    float noteToFreq(int midiNote) const {
+        return midiNoteToFrequency(midiNote, tuningSystem, concertPitch);
+    }
     int64_t positionSamples = 0;
     TempoMap tempoMap;
     TimeSignatureMap timeSigMap;

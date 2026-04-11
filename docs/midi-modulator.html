@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>MIDI Modulator — SoundShop2</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="wrap">
+<header>
+<h1>MIDI Modulator</h1>
+<nav>
+  <a href="index.html">Home</a>
+  <a href="graph-basics.html">Graph Basics</a>
+  <a href="trigger-node.html">Trigger Node</a>
+  <a href="pin-kinds.html">Pin Kinds</a>
+</nav>
+</header>
+
+<p>The MIDI Modulator takes one MIDI stream and one or more Signal inputs, and uses the signals to modify MIDI events on the way through. Each signal input can be wired to a different rule that controls a different MIDI attribute — note velocity, pitch bend, mod wheel, channel aftertouch, or any specific CC number. The modulation happens on every event in real time.</p>
+
+<p>Use it whenever you want a control signal (LFO, envelope, signal shape, XY pad output, automation curve) to modulate the MIDI <em>data itself</em> rather than a synth's parameters directly. The downstream synth sees a normal MIDI stream with the modulated values baked in.</p>
+
+<p>Add one from <em>Effects → MIDI Modulator</em>, wire your MIDI input into MIDI In, wire the MIDI Out to your synth, and wire whatever Signal sources you want into the Signal In pins. Double-click the node to open the rule editor.</p>
+
+<h2>Rules</h2>
+
+<p>Each row in the editor is one rule, corresponding to one Signal input pin on the node. A rule has three controls:</p>
+
+<ul>
+  <li><strong>Target</strong> — which MIDI attribute this signal modulates. The choices are:
+    <ul>
+      <li><em>Velocity</em> — scales the velocity of every note-on. Sample-accurate, applied at the moment the event passes through.</li>
+      <li><em>Pitch Bend</em> — sets the channel pitch bend value continuously. Replaces any pitch bend coming in.</li>
+      <li><em>Mod Wheel</em> — sends CC#1 (the standard mod wheel controller) at the signal's current value. Most synths map mod wheel to vibrato depth by default, so this is the easy way to get auto-vibrato.</li>
+      <li><em>Aftertouch</em> — sends channel pressure events. Synths that respond to aftertouch (built-in synths and many plugins) react in real time.</li>
+      <li><em>CC#</em> — sends an arbitrary control change number, which you specify in the box that appears next to the target combo. Common useful CCs: 7 (volume), 10 (pan), 11 (expression), 64 (sustain pedal).</li>
+    </ul>
+  </li>
+  <li><strong>Amount</strong> — how strongly the signal affects the target. 1.0 = full effect, 0.5 = half, -1.0 = inverted, 0 = disabled. The Amount also doubles as a polarity switch — flip to negative to invert the modulation direction without rewiring.</li>
+  <li><strong>X</strong> (delete) — removes this rule and its signal input pin.</li>
+</ul>
+
+<p>Click <strong>+ Add Input</strong> to add a new rule. Each new rule adds a new Signal input pin to the node so you can wire a fresh signal source to it. The pins on the node update immediately to reflect the rule list.</p>
+
+<h2>How modulation gets applied</h2>
+
+<p>For continuous controls (pitch bend, mod wheel, aftertouch, CC), the modulator emits an event every audio block when the signal changes — the downstream synth sees a smooth stream of updates instead of one-shot values. For velocity, the modulator scales the velocity of each individual note-on as it passes through using the signal value at that exact sample.</p>
+
+<p>If multiple rules target the same MIDI attribute (e.g. two rules both modulating Mod Wheel), the rules add together. This lets you build composite modulation — for example, a slow LFO plus a per-note envelope both contributing to the mod wheel signal a synth receives.</p>
+
+<h2>Common patterns</h2>
+
+<ul>
+  <li><strong>Vibrato that follows velocity.</strong> Wire a Signal Shape (LFO) into the modulator, set its rule to Mod Wheel. Wire a Trigger node's velocity-follower signal in too, also targeting Mod Wheel. Now harder notes have deeper vibrato.</li>
+  <li><strong>Auto pitch-bend on long notes.</strong> Use an envelope-shaped signal (slow attack) wired to Pitch Bend. Each note triggers the envelope, so held notes slowly bend up.</li>
+  <li><strong>Velocity scaling from an XY pad.</strong> Wire one axis of an XY pad into the modulator, set the rule to Velocity. Drag the pad in real time to attenuate or boost everything you play.</li>
+  <li><strong>Sustain pedal automation.</strong> Wire a step or square LFO into the modulator, set the rule to CC#64 (sustain). Now the sustain pedal pulses on and off in time with the music.</li>
+</ul>
+
+<div class="tip">
+<strong>Tip:</strong> learned MIDI CCs (from <em>MIDI Learn</em> on a control) are filtered out of the cable routing so they only go where they're learned. The MIDI Modulator's CC output is generated fresh and is <em>not</em> filtered, so it can drive any synth downstream that listens for that CC number.
+</div>
+
+<footer>
+<a href="index.html">← Back to index</a>
+</footer>
+</div>
+</body>
+</html>

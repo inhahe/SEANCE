@@ -1,5 +1,17 @@
 #define PY_SSIZE_T_CLEAN
+// Python's pyconfig.h auto-selects python314_d.lib and enables Py_REF_DEBUG
+// refcount tracing (which references debug-only symbols) whenever _DEBUG is
+// defined. Standard Python installs don't ship the debug lib or those
+// symbols, so undefine _DEBUG around the Python.h include and restore it.
+#ifdef _DEBUG
+#  define SOUNDSHOP_RESTORE_DEBUG
+#  undef _DEBUG
+#endif
 #include <Python.h>
+#ifdef SOUNDSHOP_RESTORE_DEBUG
+#  define _DEBUG
+#  undef SOUNDSHOP_RESTORE_DEBUG
+#endif
 #include "scripting.h"
 #include "music_theory.h"
 #include <sstream>
@@ -257,7 +269,8 @@ static PyObject* py_add_midi_track(PyObject*, PyObject* args) {
     if (!g_currentGraph) Py_RETURN_NONE;
 
     auto& n = g_currentGraph->addNode(name, NodeType::MidiTimeline,
-        {}, {Pin{0, "MIDI", PinKind::Midi, false}}, {x, y});
+        {Pin{0, "MIDI In", PinKind::Midi, true}},
+        {Pin{0, "MIDI", PinKind::Midi, false}}, {x, y});
     n.clips.push_back({"Clip 1", 0, 4, 0xFF6688CC});
     g_currentGraph->dirty = true;
     return PyLong_FromLong((long)(g_currentGraph->nodes.size() - 1));

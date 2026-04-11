@@ -34,6 +34,15 @@ public:
     void fillFromExpression(const std::string& expr);   // vars: x, y, z, w...
     void fillFromImage(const std::string& path);         // 2D, pixel brightness
     void fillFromAudioFile(const std::string& path);     // 1D, raw samples
+
+    // Frequency-domain fill (1D only). Evaluates magExpr(f) and phaseExpr(f)
+    // over FFT bins, inverse-FFTs to a real waveform, and fills this terrain
+    // (which should be 1D of size == fftSize). Normalized to peak 1.0.
+    // phaseMode: 0=expression 1=random 2=zero 3=linear
+    void fillFromSpectralExpression(const std::string& magExpr,
+                                    const std::string& phaseExpr,
+                                    int fftSize,
+                                    int phaseMode);
     void fillConstant(float value);
     void fillNoise(unsigned int seed = 42);
     void smooth(int passes = 2);            // Gaussian blur to reduce quantization noise
@@ -42,11 +51,11 @@ public:
     const std::vector<float>& getData() const { return data; }
     std::vector<float>& getData() { return data; }
 
+    int coordToFlatIndex(const std::vector<int>& indices) const;
+
 private:
     std::vector<int> dims;      // size of each dimension
     std::vector<float> data;    // flat array, row-major order
-
-    int coordToFlatIndex(const std::vector<int>& indices) const;
 };
 
 // ==============================================================================
@@ -167,6 +176,23 @@ private:
     TraversalParams traversalParams;
     TerrainSynthMode mode = TerrainSynthMode::SamplePerPoint;
 
+    // Wavetable-synth mode: when true, terrain is a 2D buffer of stacked
+    // frames {tableSize, nFrames}. coord[1] is the frame position and is
+    // driven by the "Position" node param (index 21) rather than traversal.
+    bool isWavetable = false;
+    int  wtFrameCount = 0;
+    int  wtNumDims = 0; // number of Position dimensions (1D, 2D, ...)
+
+    // Scatter wavetable: instead of a rectilinear terrain, frames are stored
+    // explicitly with their N-D positions. Each block we compute a Wendland
+    // RBF blend at the current Position into a 1D terrain so the per-sample
+    // path stays unchanged.
+    bool wtScatter = false;
+    int  wtScatterDims = 0;
+    float wtScatterRadius = 0.45f;
+    std::vector<std::vector<float>> wtScatterFrameSamples; // [frame][sample]
+    std::vector<std::vector<float>> wtScatterFramePositions; // [frame][dim]
+
     // Envelope curve evaluation cache
     struct EnvCurve {
         std::vector<float> table; // 256 samples, maps t(0..1) to amplitude(0..1)
@@ -182,10 +208,15 @@ private:
     struct Voice {
         bool active = false;
         int noteNumber = -1;
-        float frequency = 440.0f;
+        int midiChannel = 1;       // 1..16, used for per-channel bend / mod wheel
+        float baseFrequency = 440.0f; // frequency before bend, set at note-on
+        float frequency = 440.0f;  // effective frequency (base * bend), used by render
         float velocity = 1.0f;
         float phase = 0.0f;
         double startBeat = 0;
+        // Sustain pedal: true if this voice received a note-off while CC64
+        // was down, so release is deferred until the pedal comes back up.
+        bool sustainHeld = false;
 
         // ADSR
         enum Stage { Off, Attack, Decay, Sustain, Release };
@@ -198,6 +229,23 @@ private:
     };
     static constexpr int MAX_VOICES = 16;
     Voice voices[MAX_VOICES];
+
+    // Per-channel pitch bend factor (1.0 = no bend, 2^(semis/12) otherwise).
+    // Default bend range is ±2 semitones — configurable per-synth later.
+    float pitchBendFactor[16] = {1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1};
+    static constexpr float kPitchBendRangeSemis = 2.0f;
+
+    // Per-channel mod wheel (CC#1) value, normalized 0..1. Drives a default
+    // fixed-rate vibrato on the voice frequency when > 0.
+    float modWheel[16] = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};
+    float vibratoPhase = 0.0f;
+    static constexpr float kVibratoRateHz = 6.0f;
+    static constexpr float kVibratoMaxSemis = 0.4f; // ±0.4 semis at full mod
+
+    // Per-channel sustain pedal (CC#64) state. While true, note-offs are
+    // captured as sustainHeld instead of immediately releasing.
+    bool sustainPedal[16] = {false,false,false,false,false,false,false,false,
+                              false,false,false,false,false,false,false,false};
 
     // Internal LFOs for modulation
     struct LFO {

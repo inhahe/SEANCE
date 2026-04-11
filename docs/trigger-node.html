@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Trigger Node — SoundShop2</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="wrap">
+<header>
+<h1>Trigger Node</h1>
+<nav>
+  <a href="index.html">Home</a>
+  <a href="graph-basics.html">Graph Basics</a>
+  <a href="midi-modulator.html">MIDI Modulator</a>
+</nav>
+</header>
+
+<p>A Trigger node sits on a MIDI cable and fires extra events whenever a note passes through. The original note still flows through unchanged — the trigger just <em>adds</em> stuff. Use it for harmonies, octave doubles, chord generation, drum flams, or for kicking off control signals (envelopes, LFO retriggers, ramps) in time with what you play.</p>
+
+<p>Add one from <em>Effects → Trigger</em> in the right-click menu. Wire your MIDI input into its MIDI In, wire the MIDI Out to your synth, and wire the Signal Out to whatever parameter you want envelope-shaped. Double-click the node to open the rule editor.</p>
+
+<h2>Rules</h2>
+
+<p>The editor shows a list of <strong>rules</strong>, each one describing one thing that happens when an incoming note triggers it. Two kinds of rules exist:</p>
+
+<ul>
+  <li><strong>MIDI rules</strong> generate additional MIDI notes. Each one specifies a pitch offset (in semitones, relative to the incoming note), an optional time delay, a velocity scaling, and a duration. Use these for harmonies and chord shapes.</li>
+  <li><strong>Signal rules</strong> generate a control signal on the Signal output. Each one specifies a shape (Step, Envelope, Ramp, or From-Velocity), a duration, and minimum/maximum output values. Wire the Signal Out to a synth parameter to make it pulse, sweep, or step in sync with notes.</li>
+</ul>
+
+<p>Click <strong>+ Add MIDI Rule</strong> or <strong>+ Add Signal Rule</strong> at the top to add a new row. Each row has its own controls and an X button to delete it. The rules all evaluate independently every time a note comes in, so you can stack many at once — e.g., one for a third above, one for a fifth above, one for an octave below, and one signal envelope all triggered by the same note-on.</p>
+
+<h2>Presets</h2>
+
+<p>Five preset buttons load common configurations as starting points. Each preset replaces the current rule list, so use them to get familiar with what rules look like, then tweak.</p>
+
+<ul>
+  <li><strong>+ Octave</strong> — adds one MIDI rule that doubles every note one octave higher. Instant fat sound.</li>
+  <li><strong>Chord</strong> — adds three MIDI rules that build a major triad (root, major third, perfect fifth) from each note. Play a single key, get a chord. Change to minor by editing the third's offset from +4 to +3.</li>
+  <li><strong>Flam</strong> — adds one MIDI rule that re-triggers each note ~30 ms later at slightly lower velocity. Drum-machine "flam" effect on snares; works for any percussive sound.</li>
+  <li><strong>Pluck</strong> — adds one Signal envelope rule that fires a short envelope on every note. Wire its Signal Out to a synth's filter cutoff or amp envelope to add per-note transients independent of the synth's own envelope.</li>
+  <li><strong>Velocity follower</strong> — adds one signal rule whose output value is proportional to the note's velocity. Use to drive parameters from how hard you play, beyond what built-in velocity sensitivity already does.</li>
+</ul>
+
+<h2>Signal shapes</h2>
+
+<p>Signal rules use a shape function to generate their output curve over the rule's duration:</p>
+
+<ul>
+  <li><strong>Step</strong> — jumps to the high value instantly, holds, drops back to low at the end.</li>
+  <li><strong>Envelope</strong> — Wendland-RBF-shaped pulse that rises smoothly, peaks, and decays. Good general-purpose envelope for filter sweeps and pluck transients.</li>
+  <li><strong>Ramp</strong> — linear sweep from low to high (or high to low if you flip Min and Max).</li>
+  <li><strong>From velocity</strong> — outputs a constant value proportional to the triggering note's velocity, held for the rule's duration. Use for "play harder, modulate further."</li>
+</ul>
+
+<h2>How rules combine</h2>
+
+<p>When a note comes in, the trigger walks the rule list and fires each rule independently. MIDI rules each emit one new note (offset, delayed, scaled). Signal rules each schedule one shape on the Signal output. The original incoming note also passes through to MIDI Out.</p>
+
+<p>If you add many rules, the trigger can multiply note traffic significantly — a chord rule sends 3+ notes per incoming note, and chaining multiple triggers compounds further. Watch your synth's voice count if you do this aggressively.</p>
+
+<div class="tip">
+<strong>Tip:</strong> the Trigger is a <em>generator</em>, not a filter. To suppress or mute incoming notes (e.g. a key range gate, an octaver that replaces the original instead of doubling it), use a different effect node — the Trigger always passes the original through.
+</div>
+
+<footer>
+<a href="index.html">← Back to index</a>
+</footer>
+</div>
+</body>
+</html>

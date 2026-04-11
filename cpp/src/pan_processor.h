@@ -1,5 +1,6 @@
 #pragma once
 #include "node_graph.h"
+#include "audio_crossfader.h"
 #include <juce_audio_processors/juce_audio_processors.h>
 #include <cmath>
 
@@ -12,19 +13,34 @@ public:
     PanProcessor(Node& node, NodeGraph& graph) : node(node), graph(graph) {}
 
     const juce::String getName() const override { return "Pan"; }
-    void prepareToPlay(double, int) override {}
+    void prepareToPlay(double sr, int) override {
+        // Initialize the mute/solo crossfader; snap to current state so the
+        // first block doesn't fade in from 0 on graph rebuild.
+        muteFader.prepare(sr, graph.globalCrossfadeSec);
+        muteFader.snapTo(currentlyMuted() ? 0.0f : 1.0f);
+    }
     void releaseResources() override {}
 
     void processBlock(juce::AudioBuffer<float>& buf, juce::MidiBuffer& midi) override {
-        // Mute/Solo check
-        if (node.muted) { buf.clear(); midi.clear(); return; }
-        // If any node is soloed, mute all non-soloed nodes
-        bool anySoloed = false;
-        for (auto& n : graph.nodes) if (n.soloed) { anySoloed = true; break; }
-        if (anySoloed && !node.soloed) { buf.clear(); midi.clear(); return; }
+        // Mute/solo: smooth ramp instead of an instant clear, so toggling
+        // mute or solo during playback fades out over globalCrossfadeSec
+        // and doesn't click.
+        bool muted = currentlyMuted();
+        muteFader.setCrossfadeDuration(graph.globalCrossfadeSec);
+        muteFader.setTarget(muted ? 0.0f : 1.0f);
+        // Drop MIDI as soon as the user mutes — we don't want new note-ons
+        // arriving during the fade-out tail. Audio fades out naturally.
+        if (muted) midi.clear();
+        muteFader.process(buf);
+        if (muteFader.isFullyOff()) return;
 
         if (buf.getNumChannels() < 2) return;
-        float p = juce::jlimit(-1.0f, 1.0f, node.pan);
+        // Read pan from the named param if present, falling back to node.pan
+        float p = node.pan; // legacy fallback
+        for (const auto& param : node.params)
+            if (param.name == "Pan") { p = param.value; break; }
+        p = juce::jlimit(-1.0f, 1.0f, p);
+
         if (p == 0.0f) return; // center = no change
 
         // Equal-power pan law
@@ -67,6 +83,16 @@ public:
 private:
     Node& node;
     NodeGraph& graph;
+    AudioCrossfader muteFader;
+
+    // True iff this node is muted directly OR muted because some other node
+    // is soloed and we're not. Recomputed every block — solo state changes
+    // come from the UI thread, so re-checking is cheap and avoids stale state.
+    bool currentlyMuted() const {
+        if (node.muted) return true;
+        for (auto& n : graph.nodes) if (n.soloed) return !node.soloed;
+        return false;
+    }
 };
 
 } // namespace SoundShop

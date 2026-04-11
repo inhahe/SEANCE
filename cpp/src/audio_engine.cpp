@@ -33,15 +33,14 @@ void AudioEngine::init() {
 
     deviceManager->addAudioCallback(this);
 
-    // Open all available MIDI input devices
-    auto midiDevices = juce::MidiInput::getAvailableDevices();
-    for (auto& dev : midiDevices) {
-        if (deviceManager->isMidiInputDeviceEnabled(dev.identifier))
-            continue;
-        deviceManager->setMidiInputDeviceEnabled(dev.identifier, true);
-        deviceManager->addMidiInputDeviceCallback(dev.identifier, this);
-        fprintf(stderr, "MIDI input: %s\n", dev.name.toRawUTF8());
-    }
+    // Note: we intentionally do NOT auto-enable MIDI input devices here.
+    // The node-based input architecture means MIDI devices are enabled only
+    // if a matching MidiInput node exists in the current graph. Enablement
+    // is driven by syncMidiDeviceEnablement(), which is called after the
+    // graph is loaded/created (see AudioEngine::setGraph).
+    fprintf(stderr, "Detected MIDI inputs:\n");
+    for (auto& dev : juce::MidiInput::getAvailableDevices())
+        fprintf(stderr, "  %s\n", dev.name.toRawUTF8());
 }
 
 void AudioEngine::shutdown() {
@@ -60,6 +59,58 @@ void AudioEngine::setProjectSampleRate(double sr) {
         graphProcessor.prepare(*graph, graphRate, blockSize);
     resamplePhase = 0.0;
     fprintf(stderr, "Project sample rate: %.0f Hz (device: %.0f Hz)\n", graphRate, sampleRate);
+}
+
+void AudioEngine::syncMidiDeviceEnablement() {
+    if (!deviceManager || !graph) return;
+
+    // Collect the set of device identifiers the current graph wants active.
+    std::set<juce::String> wanted;
+    for (auto& n : graph->nodes) {
+        if (n.type != NodeType::MidiInput) continue;
+        // "keyboard" is the internal computer-keyboard source; not a real
+        // hardware device, so skip it here.
+        if (n.midiInputSourceId == "keyboard") continue;
+        if (!n.midiInputSourceId.empty())
+            wanted.insert(juce::String(n.midiInputSourceId));
+    }
+
+    // Enable wanted devices, disable anything else that's currently on.
+    for (auto& dev : juce::MidiInput::getAvailableDevices()) {
+        bool shouldEnable = wanted.count(dev.identifier) > 0;
+        bool isEnabled = deviceManager->isMidiInputDeviceEnabled(dev.identifier);
+        if (shouldEnable && !isEnabled) {
+            deviceManager->setMidiInputDeviceEnabled(dev.identifier, true);
+            deviceManager->addMidiInputDeviceCallback(dev.identifier, this);
+            fprintf(stderr, "MIDI input enabled: %s\n", dev.name.toRawUTF8());
+        } else if (!shouldEnable && isEnabled) {
+            deviceManager->removeMidiInputDeviceCallback(dev.identifier, this);
+            deviceManager->setMidiInputDeviceEnabled(dev.identifier, false);
+            fprintf(stderr, "MIDI input disabled: %s\n", dev.name.toRawUTF8());
+        }
+    }
+}
+
+std::vector<AudioEngine::MidiDeviceEntry> AudioEngine::listMidiInputDevices() const {
+    std::vector<MidiDeviceEntry> out;
+    auto devices = juce::MidiInput::getAvailableDevices();
+    for (auto& dev : devices) {
+        MidiDeviceEntry e;
+        e.name = dev.name;
+        e.identifier = dev.identifier;
+        e.presentInGraph = false;
+        if (graph) {
+            for (auto& n : graph->nodes) {
+                if (n.type == NodeType::MidiInput &&
+                    n.midiInputSourceId == dev.identifier.toStdString()) {
+                    e.presentInGraph = true;
+                    break;
+                }
+            }
+        }
+        out.push_back(std::move(e));
+    }
+    return out;
 }
 
 void AudioEngine::audioDeviceAboutToStart(juce::AudioIODevice* device) {
@@ -109,35 +160,30 @@ void AudioEngine::audioDeviceIOCallbackWithContext(
     if (multitrackRecorder.isRecording() && numInputChannels > 0)
         multitrackRecorder.processSamples(inputChannelData, numInputChannels, numSamples);
 
-    // Grab incoming MIDI from hardware devices and route it.
+    // Grab incoming hardware MIDI events (with per-event source identifier)
+    // and route each one to the matching MidiInput node in the graph.
     //
-    // NOTE on routing model: Phase 1 of the node-based input architecture
-    // (task #75) moved the computer keyboard onto its own MidiInput node,
-    // so keyboardNoteOn now bypasses incomingMidi entirely. Hardware MIDI
-    // still arrives here via handleIncomingMidiMessage and is forwarded
-    // to the active editor's track as a temporary fallback. Phase 2
-    // (task #76) will migrate hardware MIDI to per-device MidiInput nodes
-    // too, at which point this drain loop can be deleted entirely.
-    //
-    // For each event:
-    //  1. processMidiCC applies any user-learned CC mappings to their
-    //     target params. Always runs regardless of forwarding.
-    //  2. The events are forwarded into the currently-active MIDI
-    //     timeline (graph.activeEditorNodeId, if it points at one).
-    //     Already-mapped CCs are filtered out to prevent double-apply.
+    //  1. Apply any user-learned CC mappings to their target params — always
+    //     runs regardless of routing (via processMidiCC on a MidiBuffer copy).
+    //  2. For each event, find the MidiInput node whose midiInputSourceId
+    //     matches the source device's identifier and push the event into
+    //     its queue. Already-mapped CCs are filtered out so they don't
+    //     double-apply (learned target + synth default handler).
+    //  3. Events with no matching node are dropped (user hasn't added an
+    //     Input node for that device yet).
     {
-        juce::MidiBuffer midiCopy;
+        std::vector<std::pair<juce::String, juce::MidiMessage>> events;
         {
             const juce::ScopedLock sl(midiLock);
-            midiCopy.swapWith(incomingMidi);
+            events.swap(incomingMidiEvents);
         }
-        if (!midiCopy.isEmpty()) {
+        if (!events.empty()) {
+            // Apply CC mappings via the existing buffer-based helper.
+            juce::MidiBuffer ccBuf;
+            for (auto& [id, msg] : events) ccBuf.addEvent(msg, 0);
             graphProcessor.getAutomation().processMidiCC(
-                midiCopy, *graphProcessor.getGraph(), graphProcessor.getNodeMap());
+                ccBuf, *graphProcessor.getGraph(), graphProcessor.getNodeMap());
 
-            // Snapshot mapped (channel, cc) pairs so we can cheaply check
-            // each incoming CC event without touching the automation mutex
-            // per-event.
             auto ccMappings = graphProcessor.getAutomation().getCCMappings();
             auto isCCMapped = [&](int ch, int cc) {
                 for (auto& m : ccMappings)
@@ -145,24 +191,22 @@ void AudioEngine::audioDeviceIOCallbackWithContext(
                 return false;
             };
 
-            // Find the active MIDI timeline target.
-            Node* activeMidiNode = nullptr;
-            if (graph->activeEditorNodeId >= 0) {
-                if (auto* n = graph->findNode(graph->activeEditorNodeId))
-                    if (n->type == NodeType::MidiTimeline)
-                        activeMidiNode = n;
-            }
+            for (auto& [id, msg] : events) {
+                // Skip trained CCs — they're already handled by the CC
+                // mapping pass above; forwarding them would double-apply.
+                if (msg.isController() &&
+                    isCCMapped(msg.getChannel(), msg.getControllerNumber()))
+                    continue;
 
-            if (activeMidiNode) {
-                std::lock_guard<std::mutex> lock(*activeMidiNode->mpePassthroughMutex);
-                for (auto metadata : midiCopy) {
-                    auto msg = metadata.getMessage();
-                    // Filter already-trained CC events
-                    if (msg.isController() &&
-                        isCCMapped(msg.getChannel(), msg.getControllerNumber()))
-                        continue;
-                    activeMidiNode->pendingMpePassthrough.push_back(
-                        { metadata.samplePosition, msg });
+                // Find the MidiInput node matching this source device
+                auto sourceIdStd = id.toStdString();
+                for (auto& n : graph->nodes) {
+                    if (n.type == NodeType::MidiInput &&
+                        n.midiInputSourceId == sourceIdStd) {
+                        std::lock_guard<std::mutex> lock(*n.mpePassthroughMutex);
+                        n.pendingMpePassthrough.push_back({0, msg});
+                        break;
+                    }
                 }
             }
         }
@@ -259,7 +303,7 @@ void AudioEngine::audioDeviceIOCallbackWithContext(
     }
 }
 
-void AudioEngine::handleIncomingMidiMessage(juce::MidiInput*, const juce::MidiMessage& msg) {
+void AudioEngine::handleIncomingMidiMessage(juce::MidiInput* source, const juce::MidiMessage& msg) {
     // Hotkey MIDI capture: forward to the hotkey settings dialog if active.
     // Only capture intentional button presses:
     //   - Note On with velocity > 0 (pad/key press)
@@ -384,9 +428,14 @@ void AudioEngine::handleIncomingMidiMessage(juce::MidiInput*, const juce::MidiMe
         }
     }
 
-    // Buffer for audio thread (pass-through to graph)
-    const juce::ScopedLock sl(midiLock);
-    incomingMidi.addEvent(msg, 0);
+    // Buffer the message along with its source device identifier so the
+    // audio thread can route it to the matching MidiInput node safely.
+    // We can't iterate graph->nodes from the MIDI thread — the graph may
+    // be mutated from the UI/audio thread concurrently.
+    if (source) {
+        const juce::ScopedLock sl(midiLock);
+        incomingMidiEvents.emplace_back(source->getIdentifier(), msg);
+    }
 }
 
 void AudioEngine::recordParamChange(int nodeId, int paramIdx, float value) {

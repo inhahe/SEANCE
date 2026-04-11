@@ -4,6 +4,7 @@
 #include "layered_wave_editor.h"
 #include "trigger_node.h"
 #include "midi_mod_node.h"
+#include "midi_device_wizard.h"
 #include "xy_pad.h"
 #include "spectrum_tap.h"
 #include "convolution_processor.h"
@@ -468,6 +469,51 @@ void MainContentComponent::resized() {
 }
 
 void MainContentComponent::timerCallback() {
+    // Hotplug detection: poll the MIDI device list ~once a second (30Hz
+    // timer × 30) and show a confirmation dialog when a new device
+    // appears that isn't already a node in the graph.
+    if (++midiDeviceCheckCounter >= 30) {
+        midiDeviceCheckCounter = 0;
+        auto devices = juce::MidiInput::getAvailableDevices();
+        for (auto& dev : devices) {
+            auto idStd = dev.identifier.toStdString();
+            if (previousMidiDeviceIds.count(idStd) > 0) continue; // already seen
+            previousMidiDeviceIds.insert(idStd);
+            // Skip if already represented as a node in the graph
+            bool inGraph = false;
+            for (auto& n : graph.nodes)
+                if (n.type == NodeType::MidiInput && n.midiInputSourceId == idStd)
+                    { inGraph = true; break; }
+            if (inGraph) continue;
+            // Skip the initial scan — we don't want to nag about devices
+            // that were already there before the app started. Only offer
+            // on NEW device connections after this flag is set.
+            if (!midiDeviceScanInitialized) continue;
+
+            // Offer to add this new device
+            juce::String name = dev.name;
+            juce::String id = dev.identifier;
+            juce::AlertWindow::showAsync(
+                juce::MessageBoxOptions()
+                    .withIconType(juce::MessageBoxIconType::QuestionIcon)
+                    .withTitle("MIDI device connected")
+                    .withMessage("A new MIDI input device was detected:\n\n  " + name
+                                 + "\n\nAdd it to the graph?")
+                    .withButton("Add")
+                    .withButton("Ignore"),
+                [this, name, id](int result) {
+                    if (result != 1) return;
+                    auto& n = graph.addNode(name.toStdString(), NodeType::MidiInput,
+                        {}, {Pin{0, "MIDI Out", PinKind::Midi, false}}, {80, 400});
+                    n.midiInputSourceId = id.toStdString();
+                    audioEngine.syncMidiDeviceEnablement();
+                    audioEngine.getGraphProcessor().requestRebuild();
+                    graphComponent->repaint();
+                });
+        }
+        midiDeviceScanInitialized = true;
+    }
+
     transport.bpm = graph.bpm;
     transport.tuningSystem = graph.tuningSystem;
     transport.concertPitch = graph.concertPitch;
@@ -712,6 +758,7 @@ juce::PopupMenu MainContentComponent::getMenuForIndex(int idx, const juce::Strin
         menu.addItem(110, "Crossfade Duration ("
                     + juce::String((int)std::round(graph.globalCrossfadeSec * 1000.0f))
                     + " ms)...");
+        menu.addItem(111, "Add MIDI Input Device...");
         menu.addSeparator();
         menu.addItem(50, "Assign Hotkeys...");
         menu.addItem(51, "Capture Room IR...");
@@ -833,6 +880,7 @@ void MainContentComponent::menuItemSelected(int menuItemID, int) {
                 }), true);
             break;
         }
+        case 111: showMidiDeviceWizard(); break;
         case 50: openHotkeySettings(); break;
         case 51: {
             auto* comp = new RoomIRCaptureComponent(graph, *audioEngine.getDeviceManager(),
@@ -1877,6 +1925,28 @@ void MainContentComponent::newProject() {
     projectDirty = false;
     graph.dirty = false;
     graphComponent->repaint();
+
+    // Offer the user the list of detected MIDI input devices to add.
+    // Deferred so the dialog opens after the main window is visible.
+    juce::Component::SafePointer<MainContentComponent> safe(this);
+    juce::MessageManager::callAsync([safe]() {
+        if (safe) safe->showMidiDeviceWizard();
+    });
+}
+
+void MainContentComponent::showMidiDeviceWizard() {
+    auto* wizard = new MidiDeviceWizardComponent(graph, audioEngine, [this]() {
+        audioEngine.getGraphProcessor().requestRebuild();
+        graphComponent->repaint();
+    });
+    juce::DialogWindow::LaunchOptions opts;
+    opts.content.setOwned(wizard);
+    opts.dialogTitle = "Add MIDI Input Devices";
+    opts.dialogBackgroundColour = juce::Colour(28, 28, 36);
+    opts.escapeKeyTriggersCloseButton = true;
+    opts.useNativeTitleBar = true;
+    opts.resizable = false;
+    opts.launchAsync();
 }
 
 void MainContentComponent::openProject() {

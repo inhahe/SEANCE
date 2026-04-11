@@ -106,6 +106,8 @@ target_sources(SoundShop2 PRIVATE
     src/midi_mod_node.cpp
     src/midi_mod_node.h
     src/midi_input_node.h
+    src/midi_device_wizard.cpp
+    src/midi_device_wizard.h
     src/audio_cache.cpp
     src/audio_cache.h
     src/pan_processor.h

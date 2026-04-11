@@ -13,6 +13,7 @@
 #include "plugin_window.h"
 #include "audio_export.h"
 #include <juce_gui_basics/juce_gui_basics.h>
+#include <set>
 
 namespace SoundShop {
 
@@ -41,6 +42,7 @@ public:
 
     // File operations
     void newProject();
+    void showMidiDeviceWizard();
     void openProject();
     // onSaved fires after a successful save (sync if a current path exists,
     // async after the file chooser if not). Cancelled file chooser → never
@@ -127,6 +129,14 @@ private:
     void syncCCMappingsFromGraph();
     int startupFrames = 5; // bring to front after this many timer ticks
     int saveFlashFrames = 0; // countdown for "Saved!" title flash
+
+    // Hotplug detection for MIDI input devices. The timer polls
+    // MidiInput::getAvailableDevices() periodically; on seeing a new
+    // identifier we offer to add it to the graph. Only fires after the
+    // first scan completes so we don't nag about devices present at startup.
+    std::set<std::string> previousMidiDeviceIds;
+    int midiDeviceCheckCounter = 0;
+    bool midiDeviceScanInitialized = false;
     void showPluginSettingsDialog();
     void showAudioDeviceSettings();
 

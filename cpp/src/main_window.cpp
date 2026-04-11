@@ -768,7 +768,24 @@ juce::PopupMenu MainContentComponent::getMenuForIndex(int idx, const juce::Strin
         auto& plugins = audioEngine.getPluginHost().getAvailablePlugins();
         menu.addItem(-1, juce::String((int)plugins.size()) + " plugins loaded", false);
     } else if (name == "Help") {
-        menu.addItem(50, "About SoundShop");
+        menu.addItem(300, "User Guide (Home)");
+        menu.addSeparator();
+        menu.addItem(301, "Getting Started");
+        menu.addItem(302, "Graph Basics");
+        menu.addItem(303, "Signals and Pin Kinds");
+        menu.addSeparator();
+        menu.addItem(304, "MIDI Input and Routing");
+        menu.addItem(305, "Piano Roll");
+        menu.addItem(306, "Wavetables and Layered Waveforms");
+        menu.addItem(307, "Terrain Synth");
+        menu.addItem(308, "Layers and Effect Groups");
+        menu.addItem(309, "Trigger Node");
+        menu.addItem(310, "MIDI Modulator");
+        menu.addItem(311, "Convolution Filter");
+        menu.addSeparator();
+        menu.addItem(312, "Keyboard Shortcuts");
+        menu.addSeparator();
+        menu.addItem(320, "About SoundShop");
     }
     return menu;
 }
@@ -881,6 +898,28 @@ void MainContentComponent::menuItemSelected(int menuItemID, int) {
             break;
         }
         case 111: showMidiDeviceWizard(); break;
+        case 300: openHelpDoc("index.html"); break;
+        case 301: openHelpDoc("getting-started.html"); break;
+        case 302: openHelpDoc("graph-basics.html"); break;
+        case 303: openHelpDoc("signals.html"); break;
+        case 304: openHelpDoc("midi-input.html"); break;
+        case 305: openHelpDoc("piano-roll.html"); break;
+        case 306: openHelpDoc("wavetables.html"); break;
+        case 307: openHelpDoc("terrain-synth.html"); break;
+        case 308: openHelpDoc("layers.html"); break;
+        case 309: openHelpDoc("trigger-node.html"); break;
+        case 310: openHelpDoc("midi-modulator.html"); break;
+        case 311: openHelpDoc("convolution.html"); break;
+        case 312: openHelpDoc("keyboard-shortcuts.html"); break;
+        case 320:
+            juce::AlertWindow::showMessageBoxAsync(
+                juce::MessageBoxIconType::InfoIcon,
+                "About SoundShop",
+                "SoundShop2\n\n"
+                "A node-based DAW designed to be intuitive for people "
+                "without a musical background.\n\n"
+                "See Help > User Guide for documentation.");
+            break;
         case 50: openHotkeySettings(); break;
         case 51: {
             auto* comp = new RoomIRCaptureComponent(graph, *audioEngine.getDeviceManager(),
@@ -1932,6 +1971,25 @@ void MainContentComponent::newProject() {
     juce::MessageManager::callAsync([safe]() {
         if (safe) safe->showMidiDeviceWizard();
     });
+}
+
+void MainContentComponent::openHelpDoc(const juce::String& docRelativePath) {
+    auto exeDir = juce::File::getSpecialLocation(juce::File::currentExecutableFile)
+                      .getParentDirectory();
+    auto docFile = exeDir.getChildFile("docs").getChildFile(docRelativePath);
+    if (!docFile.existsAsFile()) {
+        juce::AlertWindow::showMessageBoxAsync(
+            juce::MessageBoxIconType::WarningIcon,
+            "Help file not found",
+            "Couldn't find the docs file:\n\n  " + docFile.getFullPathName()
+            + "\n\nThe docs folder should sit alongside SoundShop.exe. "
+            + "If you built from source, re-run the build to copy the docs, "
+            + "or browse the project's docs/ folder directly.");
+        return;
+    }
+    // startAsProcess opens the file in its default OS handler — for .html
+    // files that's the user's browser.
+    docFile.startAsProcess();
 }
 
 void MainContentComponent::showMidiDeviceWizard() {

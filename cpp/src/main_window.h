@@ -43,6 +43,11 @@ public:
     // File operations
     void newProject();
     void showMidiDeviceWizard();
+    // Open a documentation file (relative path within docs/ folder, e.g.
+    // "layers.html") in the OS's default browser. Resolves the path
+    // relative to the exe's folder, which is where CMake POST_BUILD
+    // copies the docs/ tree.
+    void openHelpDoc(const juce::String& docRelativePath);
     void openProject();
     // onSaved fires after a successful save (sync if a current path exists,
     // async after the file chooser if not). Cancelled file chooser → never

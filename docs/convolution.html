@@ -1,0 +1,21 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Convolution Filter — SoundShop2</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="wrap">
+<header><h1>Convolution Filter</h1><nav><a href="index.html">Home</a></nav></header>
+<p>A convolution filter applies a custom impulse response (IR) to audio passing through. The editor lets you draw the IR as a curve, generate it from a preset (lowpass / highpass / bandpass / echo), or load an IR from a .wav file.</p>
+<p>Two drawing modes:</p>
+<ul>
+<li><strong>Points</strong> — draw a smooth curve via Catmull-Rom control points. Default, good for filter shapes.</li>
+<li><strong>Freehand</strong> — draw individual sample values directly with the mouse. Good for surgical per-sample edits.</li>
+</ul>
+<p>Ctrl+mouse wheel zooms in on the IR up to 128×, plain mouse wheel scrolls. When zoomed in enough that each sample is ≥5 pixels wide, a sample-boundary grid appears and individual samples are shown as stems with dots.</p>
+<footer><a href="index.html">← Back to index</a></footer>
+</div>
+</body>
+</html>

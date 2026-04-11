@@ -308,3 +308,15 @@ endif()
 if(WIN32)
     target_link_libraries(SoundShop2 PRIVATE mfplat mfreadwrite mfuuid)
 endif()
+
+# Copy docs/ folder alongside the built exe so Help menu entries can open
+# them via juce::File::startAsProcess. The docs are plain HTML shipped as
+# files (not embedded) so users can also browse docs/ outside the app and
+# we can update them without a rebuild.
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../docs")
+    add_custom_command(TARGET SoundShop2 POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+            "${CMAKE_CURRENT_SOURCE_DIR}/../docs"
+            "$<TARGET_FILE_DIR:SoundShop2>/docs"
+    )
+endif()

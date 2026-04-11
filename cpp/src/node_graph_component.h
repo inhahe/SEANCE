@@ -30,6 +30,7 @@ public:
     std::function<void(int)> onShowMidiMap;       // called with node ID
     std::function<void(int)> onFreezeNode;        // called with node ID
     std::function<void(int)> onRunScript;         // called with node ID
+    std::function<void(juce::String)> onOpenHelpDoc; // called with docs/<file> relative path
 
     // Convert between screen and canvas coordinates
     juce::Point<float> screenToCanvas(juce::Point<float> screen) const;

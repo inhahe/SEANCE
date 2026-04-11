@@ -1,5 +1,6 @@
 #define _USE_MATH_DEFINES
 #include "layered_wave_editor.h"
+#include "help_utils.h"
 #include <cmath>
 #include <sstream>
 #include <algorithm>
@@ -1324,6 +1325,10 @@ LayeredWaveEditorComponent::LayeredWaveEditorComponent(NodeGraph& g, int nid, st
     addAndMakeVisible(nonProjAxisRow);
     addAndMakeVisible(frameTabsRow);
 
+    addAndMakeVisible(helpBtn);
+    helpBtn.setTooltip("Open the wavetable / layered waveform docs");
+    helpBtn.onClick = []() { openHelpDocFile("wavetables.html"); };
+
     addAndMakeVisible(applyBtn);
     applyBtn.setButtonText("Apply");
     applyBtn.onClick = [this]() {
@@ -1768,6 +1773,8 @@ void LayeredWaveEditorComponent::resized() {
     closeBtn  .setBounds(top.removeFromRight(60));
     top.removeFromRight(4);
     applyBtn  .setBounds(top.removeFromRight(60));
+    top.removeFromRight(4);
+    helpBtn   .setBounds(top.removeFromRight(26));
     top.removeFromRight(6);
     anaglyph3DBtn.setBounds(top.removeFromRight(40));
     top.removeFromRight(4);

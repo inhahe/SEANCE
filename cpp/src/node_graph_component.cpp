@@ -1781,6 +1781,8 @@ void NodeGraphComponent::showLinkMenu(int linkId) {
                 : juce::String(grp.name);
             grpMenu.addItem(100 + grp.id, (inGroup ? "Remove from " : "Add to ") + label);
         }
+        grpMenu.addSeparator();
+        grpMenu.addItem(31, "Help: Effect Groups...");
         menu.addSubMenu("Effect Group", grpMenu);
     }
 
@@ -1800,6 +1802,10 @@ void NodeGraphComponent::showLinkMenu(int linkId) {
             float gains[] = {0, -3, -6, -12, -20, 3, 6};
             lk->gainDb = gains[result - 10];
             graph.dirty = true;
+        } else if (result == 31) {
+            // Help: Effect Groups → open the docs page
+            if (onOpenHelpDoc) onOpenHelpDoc("layers.html");
+            return;
         } else if (result == 30) {
             // New effect group — prompt for optional name
             auto* aw = new juce::AlertWindow("New Effect Group",

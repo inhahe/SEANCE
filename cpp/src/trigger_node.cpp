@@ -1,5 +1,6 @@
 #define _USE_MATH_DEFINES
 #include "trigger_node.h"
+#include "help_utils.h"
 #include <cmath>
 #include <sstream>
 #include <algorithm>
@@ -636,6 +637,10 @@ TriggerEditorComponent::TriggerEditorComponent(NodeGraph& g, int nid, std::funct
     wirePreset(presetPluckBtn,     &TriggerDoc::presetPluckEnvelope);
     wirePreset(presetVelFollowBtn, &TriggerDoc::presetVelocityFollower);
 
+    addAndMakeVisible(helpBtn);
+    helpBtn.setTooltip("Open the Trigger node docs");
+    helpBtn.onClick = []() { openHelpDocFile("trigger-node.html"); };
+
     addAndMakeVisible(applyBtn);
     applyBtn.onClick = [this]() { commitToNode(); if (onApply) onApply(); };
 
@@ -702,6 +707,8 @@ void TriggerEditorComponent::resized() {
     closeBtn.setBounds(top.removeFromRight(60));
     top.removeFromRight(4);
     applyBtn.setBounds(top.removeFromRight(60));
+    top.removeFromRight(4);
+    helpBtn.setBounds(top.removeFromRight(26));
 
     a.removeFromTop(4);
     auto presetRow = a.removeFromTop(24);

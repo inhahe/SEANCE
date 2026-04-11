@@ -189,6 +189,7 @@ private:
     juce::TextButton addSignalBtn { "+ Signal Rule" };
     juce::TextButton applyBtn { "Apply" };
     juce::TextButton closeBtn { "Close" };
+    juce::TextButton helpBtn  { "?" };
 
     // Preset buttons
     juce::TextButton presetOctaveBtn  { "Octave Double" };

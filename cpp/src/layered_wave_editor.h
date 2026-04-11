@@ -164,6 +164,7 @@ private:
     juce::ComboBox   projectionCombo;
     juce::TextButton applyBtn    { "Apply" };
     juce::TextButton closeBtn    { "Close" };
+    juce::TextButton helpBtn     { "?" };
     juce::Viewport   layersViewport;
     juce::Component  layersContainer;
     std::vector<std::unique_ptr<LayerRow>> rows;

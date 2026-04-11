@@ -22,7 +22,13 @@ struct Vec2 {
 
 enum class PinKind { Audio, Midi, Param, Signal }; // Signal = audio-rate control signal (mono)
 enum class NodeType {
-    AudioTimeline, MidiTimeline, Instrument, Effect, Mixer, Output, Script, Group, TerrainSynth, SignalShape
+    AudioTimeline, MidiTimeline, Instrument, Effect, Mixer, Output, Script, Group, TerrainSynth, SignalShape,
+    // MidiInput represents a single live MIDI input source (computer keyboard,
+    // hardware MIDI device, network MIDI client, virtual port, etc). It has
+    // no inputs and one MIDI output. The cable wiring from the Input node to
+    // a Timeline or synth IS the live-input routing — no flags, no hidden
+    // state. See project_midi_input_architecture.md.
+    MidiInput
 };
 
 struct Pin {
@@ -265,9 +271,18 @@ struct Node {
     std::vector<AuditionEvent> pendingAudition; // written by UI, read by audio thread
     std::shared_ptr<std::mutex> auditionMutex = std::make_shared<std::mutex>();
 
-    // MPE pass-through: raw MIDI messages from controller, preserving channels
+    // MPE pass-through / MidiInput node event queue. Originally used only
+    // for MPE timelines; now also used by MidiInput nodes as the queue the
+    // audio engine writes live events into and the MidiInput processor
+    // drains into its output MIDI buffer.
     std::vector<std::pair<int, juce::MidiMessage>> pendingMpePassthrough; // (sampleOffset, msg)
     std::shared_ptr<std::mutex> mpePassthroughMutex = std::make_shared<std::mutex>();
+
+    // MidiInput node: identifier of the physical (or virtual) input source
+    // this node represents. "keyboard" = the computer keyboard. For hardware
+    // MIDI devices this will be set to the device's JUCE identifier string.
+    // Empty on non-MidiInput nodes.
+    std::string midiInputSourceId;
 
     // Node audio cache (freeze + automatic memoization)
     struct AudioCache {

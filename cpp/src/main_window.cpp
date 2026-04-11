@@ -116,7 +116,8 @@ MainContentComponent::MainContentComponent() {
     addMidiBtn.onClick = [this, findPlacement, needsFitAfterPlacement]() {
         auto pos = findPlacement();
         auto& n = graph.addNode("MIDI Track", NodeType::MidiTimeline,
-            {}, {Pin{0, "MIDI", PinKind::Midi, false}}, pos);
+            {Pin{0, "MIDI In", PinKind::Midi, true}},
+            {Pin{0, "MIDI", PinKind::Midi, false}}, pos);
         n.clips.push_back({"Clip 1", 0, 4, juce::Colours::cornflowerblue.getARGB()});
         if (*needsFitAfterPlacement) graphComponent->fitAll();
         graphComponent->repaint();
@@ -291,6 +292,32 @@ MainContentComponent::MainContentComponent() {
     }
     if (!loaded)
         graph.setupDefaultGraph();
+    else {
+        // Upgrade old projects that predate the MidiInput node type:
+        //  - If no "Computer Keyboard" MidiInput node exists, add one so
+        //    typing still reaches synths via the new routing model.
+        //  - Add a MIDI In pin to any MidiTimeline that's missing one, so
+        //    cables from an input node can plug into them.
+        bool hasKbdInput = false;
+        for (auto& n : graph.nodes)
+            if (n.type == NodeType::MidiInput && n.midiInputSourceId == "keyboard") {
+                hasKbdInput = true; break;
+            }
+        if (!hasKbdInput) {
+            auto& keyIn = graph.addNode("Computer Keyboard", NodeType::MidiInput,
+                {}, {Pin{0, "MIDI Out", PinKind::Midi, false}}, {80, 80});
+            keyIn.midiInputSourceId = "keyboard";
+        }
+        for (auto& n : graph.nodes) {
+            if (n.type != NodeType::MidiTimeline) continue;
+            bool hasMidiIn = false;
+            for (auto& p : n.pinsIn)
+                if (p.kind == PinKind::Midi) { hasMidiIn = true; break; }
+            if (!hasMidiIn)
+                n.pinsIn.insert(n.pinsIn.begin(),
+                    {graph.getNextId(), "MIDI In", PinKind::Midi, true});
+        }
+    }
 
     audioEngine.setGraph(&graph, &transport);
 
@@ -1798,7 +1825,8 @@ void MainContentComponent::onRecord() {
     if (!recordNode) {
         // Create a MIDI track
         auto& n = graph.addNode("MIDI Track", NodeType::MidiTimeline,
-            {}, {Pin{0, "MIDI", PinKind::Midi, false}}, {50, 50});
+            {Pin{0, "MIDI In", PinKind::Midi, true}},
+            {Pin{0, "MIDI", PinKind::Midi, false}}, {50, 50});
         n.clips.push_back({"Clip 1", 0, 8, juce::Colours::cornflowerblue.getARGB()});
         recordNode = &n;
         graphComponent->repaint();

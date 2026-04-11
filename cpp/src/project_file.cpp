@@ -68,6 +68,8 @@ bool ProjectFile::save(const std::string& path, NodeGraph& graph, GraphProcessor
         if (node.muted) writeInt(f, "muted", 1);
         if (node.soloed) writeInt(f, "soloed", 1);
         writeStr(f, "script", node.script);
+        if (!node.midiInputSourceId.empty())
+            writeStr(f, "midiInputSourceId", node.midiInputSourceId);
         if (!node.envAttackCurve.empty()) writeStr(f, "envAttackCurve", node.envAttackCurve);
         if (!node.envDecayCurve.empty()) writeStr(f, "envDecayCurve", node.envDecayCurve);
         if (!node.envReleaseCurve.empty()) writeStr(f, "envReleaseCurve", node.envReleaseCurve);
@@ -380,6 +382,7 @@ bool ProjectFile::load(const std::string& path, NodeGraph& graph, PluginHost* pl
             else if (key == "muted") curNode->muted = (val == "1");
             else if (key == "soloed") curNode->soloed = (val == "1");
             else if (key == "script") curNode->script = val;
+            else if (key == "midiInputSourceId") curNode->midiInputSourceId = val;
             else if (key == "envAttackCurve") curNode->envAttackCurve = val;
             else if (key == "envDecayCurve") curNode->envDecayCurve = val;
             else if (key == "envReleaseCurve") curNode->envReleaseCurve = val;

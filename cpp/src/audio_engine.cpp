@@ -109,20 +109,22 @@ void AudioEngine::audioDeviceIOCallbackWithContext(
     if (multitrackRecorder.isRecording() && numInputChannels > 0)
         multitrackRecorder.processSamples(inputChannelData, numInputChannels, numSamples);
 
-    // Grab incoming MIDI from hardware / computer keyboard and route it.
+    // Grab incoming MIDI from hardware devices and route it.
     //
-    // Two things happen to each event:
+    // NOTE on routing model: Phase 1 of the node-based input architecture
+    // (task #75) moved the computer keyboard onto its own MidiInput node,
+    // so keyboardNoteOn now bypasses incomingMidi entirely. Hardware MIDI
+    // still arrives here via handleIncomingMidiMessage and is forwarded
+    // to the active editor's track as a temporary fallback. Phase 2
+    // (task #76) will migrate hardware MIDI to per-device MidiInput nodes
+    // too, at which point this drain loop can be deleted entirely.
+    //
+    // For each event:
     //  1. processMidiCC applies any user-learned CC mappings to their
-    //     target params. That's done first and unconditionally — learned
-    //     mappings always fire.
+    //     target params. Always runs regardless of forwarding.
     //  2. The events are forwarded into the currently-active MIDI
-    //     timeline (graph.activeEditorNodeId, if it points at one) so
-    //     they flow through its MIDI Out pin to whatever synth or plugin
-    //     is wired downstream. CC events that are already mapped (step 1)
-    //     are excluded from this forward — otherwise the mod wheel would
-    //     both move the learned param AND hit the synth's default CC1
-    //     vibrato, double-applying. Notes, pitch bend, aftertouch, and
-    //     unmapped CCs all pass through.
+    //     timeline (graph.activeEditorNodeId, if it points at one).
+    //     Already-mapped CCs are filtered out to prevent double-apply.
     {
         juce::MidiBuffer midiCopy;
         {
@@ -415,18 +417,37 @@ void AudioEngine::recordParamChange(int nodeId, int paramIdx, float value) {
 // Computer Keyboard MIDI ("Musical Typing")
 // ==============================================================================
 
+// Find the "Computer Keyboard" MidiInput node in the graph, if any. Used to
+// push typing-MIDI events into its per-node queue so they flow out through
+// the cable wired from the node — matching the Phase 1 architecture where
+// routing is done purely via graph cables, not flags. Returns nullptr if
+// no such node exists (e.g. on an old project that predates the MidiInput
+// node type — typing events will be silently dropped in that case, and
+// loading the project offers an upgrade path by adding the node manually).
+static Node* findComputerKeyboardInputNode(NodeGraph* g) {
+    if (!g) return nullptr;
+    for (auto& n : g->nodes)
+        if (n.type == NodeType::MidiInput && n.midiInputSourceId == "keyboard")
+            return &n;
+    return nullptr;
+}
+
 void AudioEngine::keyboardNoteOn(int midiNote, int velocity) {
     if (midiNote < 0 || midiNote > 127) return;
+    auto* kb = findComputerKeyboardInputNode(graph);
+    if (!kb) return;
     auto msg = juce::MidiMessage::noteOn(1, midiNote, (juce::uint8)velocity);
-    const juce::ScopedLock sl(midiLock);
-    incomingMidi.addEvent(msg, 0);
+    std::lock_guard<std::mutex> lock(*kb->mpePassthroughMutex);
+    kb->pendingMpePassthrough.push_back({0, msg});
 }
 
 void AudioEngine::keyboardNoteOff(int midiNote) {
     if (midiNote < 0 || midiNote > 127) return;
+    auto* kb = findComputerKeyboardInputNode(graph);
+    if (!kb) return;
     auto msg = juce::MidiMessage::noteOff(1, midiNote);
-    const juce::ScopedLock sl(midiLock);
-    incomingMidi.addEvent(msg, 0);
+    std::lock_guard<std::mutex> lock(*kb->mpePassthroughMutex);
+    kb->pendingMpePassthrough.push_back({0, msg});
 }
 
 // ==============================================================================

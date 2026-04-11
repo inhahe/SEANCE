@@ -269,7 +269,8 @@ static PyObject* py_add_midi_track(PyObject*, PyObject* args) {
     if (!g_currentGraph) Py_RETURN_NONE;
 
     auto& n = g_currentGraph->addNode(name, NodeType::MidiTimeline,
-        {}, {Pin{0, "MIDI", PinKind::Midi, false}}, {x, y});
+        {Pin{0, "MIDI In", PinKind::Midi, true}},
+        {Pin{0, "MIDI", PinKind::Midi, false}}, {x, y});
     n.clips.push_back({"Clip 1", 0, 4, 0xFF6688CC});
     g_currentGraph->dirty = true;
     return PyLong_FromLong((long)(g_currentGraph->nodes.size() - 1));

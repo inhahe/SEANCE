@@ -250,10 +250,32 @@ void NodeGraph::resolveAnchors() {
 
 void NodeGraph::setupDefaultGraph() {
     nodes.reserve(16);
+
+    // Computer Keyboard Input — represents the on-screen / typing input
+    // device. Live MIDI from the computer keyboard is pushed into this
+    // node's output buffer by AudioEngine::keyboardNoteOn. Users wire
+    // this node's MIDI Out to whatever they want to play.
+    auto& keyIn = addNode("Computer Keyboard", NodeType::MidiInput,
+        {}, {Pin{0, "MIDI Out", PinKind::Midi, false}}, {80, 120});
+    keyIn.midiInputSourceId = "keyboard";
+
+    // A starter MIDI Track ready to record into, with its MIDI In pin
+    // pre-wired from the keyboard so typing Just Works on a fresh project.
+    auto& track = addNode("MIDI Track", NodeType::MidiTimeline,
+        {Pin{0, "MIDI In", PinKind::Midi, true}},
+        {Pin{0, "MIDI", PinKind::Midi, false}}, {380, 120});
+    track.clips.push_back({"Clip 1", 0, 4, juce::Colours::cornflowerblue.getARGB()});
+
     // Master Out lives well to the right so freshly-created nodes (which
     // appear near the visible top-left) don't immediately overlap it.
     addNode("Master Out", NodeType::Output,
         {Pin{0, "In", PinKind::Audio, true}}, {}, {1400, 300});
+
+    // Auto-wire Computer Keyboard -> MIDI Track so the user can play the
+    // instant they pick a synth and drop it after the track.
+    if (!keyIn.pinsOut.empty() && !track.pinsIn.empty())
+        addLink(keyIn.pinsOut[0].id, track.pinsIn[0].id);
+
     dirty = false; // don't count initial setup as a change
 }
 

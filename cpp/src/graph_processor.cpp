@@ -14,6 +14,7 @@
 #include "builtin_effects.h"
 #include "trigger_node.h"
 #include "midi_mod_node.h"
+#include "midi_input_node.h"
 #include "drum_synth.h"
 #include "spatializer_3d.h"
 #include <algorithm>
@@ -471,6 +472,8 @@ void GraphProcessor::rebuildGraph(NodeGraph& graph, Transport& transport) {
             proc = std::make_unique<TerrainSynthProcessor>(node, transport);
         } else if (node.type == NodeType::SignalShape) {
             proc = std::make_unique<SignalShapeProcessor>(node, transport);
+        } else if (node.type == NodeType::MidiInput) {
+            proc = std::make_unique<MidiInputProcessor>(node);
         } else if (node.type == NodeType::Effect && node.script == "__spectrumtap__") {
             proc = std::make_unique<SpectrumTapProcessor>(node);
         } else if (node.type == NodeType::Effect &&

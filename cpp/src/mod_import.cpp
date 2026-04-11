@@ -71,7 +71,8 @@ ModImporter::ImportResult ModImporter::import(const std::string& path, NodeGraph
 
         float ny = posY + 60 + ch * 40;
         auto& n = graph.addNode(chName, NodeType::MidiTimeline,
-            {}, {Pin{0, "MIDI", PinKind::Midi, false}}, {posX + 30, ny});
+            {Pin{0, "MIDI In", PinKind::Midi, true}},
+            {Pin{0, "MIDI", PinKind::Midi, false}}, {posX + 30, ny});
         n.clips.push_back({"Pattern", 0, 4, 0xFF6688CC});
         graph.addToGroup(group.id, n.id);
         channelNodeIndices.push_back((int)graph.nodes.size() - 1);

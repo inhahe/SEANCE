@@ -85,6 +85,7 @@ juce::Colour NodeGraphComponent::getNodeColor(const Node& node) const {
         case NodeType::Group:         return juce::Colour(70, 70, 90);
         case NodeType::TerrainSynth:  return juce::Colour(120, 60, 100);
         case NodeType::SignalShape:   return juce::Colour(180, 120, 40);
+        case NodeType::MidiInput:     return juce::Colour(50, 130, 70); // green — matches MIDI wire color
         default:                      return juce::Colour(80, 80, 80);
     }
 }
@@ -965,7 +966,8 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
 
         if (result == 1) {
             auto& n = graph.addNode("MIDI Track", NodeType::MidiTimeline,
-                {}, {Pin{0, "MIDI", PinKind::Midi, false}}, {p.x, p.y});
+                {Pin{0, "MIDI In", PinKind::Midi, true}},
+                {Pin{0, "MIDI", PinKind::Midi, false}}, {p.x, p.y});
             n.clips.push_back({"Clip 1", 0, 4, juce::Colours::cornflowerblue.getARGB()});
         } else if (result == 2) {
             graph.addNode("Audio Track", NodeType::AudioTimeline,

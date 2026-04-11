@@ -102,6 +102,12 @@ private:
     juce::Slider bpmSlider;
     juce::Label bpmLabel;
 
+    // A single TooltipWindow owned by the main component is required for
+    // juce::setTooltip() calls anywhere in the hierarchy to actually
+    // display anything. Without this, every setTooltip call in the
+    // codebase is silently dead code.
+    juce::TooltipWindow tooltipWindow { this, 600 }; // 600ms show delay
+
     // Editor panel (bottom)
     struct EditorPanel {
         int nodeId;

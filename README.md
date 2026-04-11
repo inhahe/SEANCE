@@ -1,35 +1,40 @@
-# seance
+# SEANCE
+
+**SEANCE** stands for **Sound Exploration And Node-based Composition Environment.**
 
 A node-based digital audio workstation (DAW) designed to be intuitive for people without a music background.
 
 > ⚠ **Status — early, untested.** A lot of features have been added since the project was last seriously tested end-to-end. I can't currently say for sure that the build is in a working state, or which features are working and which are broken. This commit exists primarily as an off-site backup so I don't lose work if something happens to my computer. Treat anything you see here as in-development, not as a release. This notice will go away once the project has been re-validated.
 
-Most DAWs are designed by musicians for musicians and are full of cryptic knobs and abbreviations. seance takes a different approach: every building block — instruments, effects, timelines, mixers, MIDI inputs, the speakers themselves — is a **node** in a graph, and you wire them together with **cables** that visibly carry audio, MIDI, parameter, and signal data. Signal flow is never hidden in menus; if it's happening, it's a cable on screen.
+Most DAWs are designed by musicians for musicians and are full of cryptic knobs and abbreviations. SEANCE takes a different approach: every building block — instruments, effects, timelines, mixers, MIDI inputs, the speakers themselves — is a **node** in a graph, and you wire them together with **cables** that visibly carry audio, MIDI, parameter, and signal data. Signal flow between nodes is never hidden in menus or in invisible buses — if a signal goes from one node to another, it does so as a cable on screen.
+
+Intended to be cross-platform: Windows, macOS, and Linux. The codebase uses JUCE 8 + CMake throughout and contains no platform-specific assumptions in the source, but in practice it has only been built and tested on Windows so far. macOS and Linux builds aren't expected to need anything beyond installing the platform compiler and running the build commands in the [Building](#building) section, but they haven't been verified yet.
 
 ## Vision
 
 - **No assumed music knowledge.** Every control has a plain-language label or tooltip; music-theory terminology is explained where it appears.
-- **Signal flow is always visible.** No hidden routing, no "arm" flags to hunt for, no guessing where audio goes.
+- **Signal flow between nodes is always visible.** Cables on the graph are the *only* way one node modulates another. There are no global "modulators by name," no hidden routing flags, no "send to bus 5" magic — if a signal is going from one node to another, you can see the cable. (A node's *internal* state — a piano roll's automation curves on its own track parameters, a plugin's own ADSR envelope on its own filter, etc. — isn't covered by this rule because it isn't flowing anywhere; it's just state on one node mutating itself over time.)
+- **Try things without losing your place.** Linear undo punishes exploration: the moment you back up a few steps and try a different idea, the path you backed away from is gone forever. SEANCE keeps every path you've ever taken in a branching undo tree, navigable indefinitely. Combined with cross-session undo persistence — your history survives quit-and-reopen and even continues past your last saved version — the cost of "let me try a wild idea" drops to near zero.
 - **Simple by default, powerful when needed.** New users see a small graph that already works; advanced users can add as much complexity as they want.
 
 ## Core concepts
 
 ### Signals (the four pin kinds)
 
-seance has four cable kinds, color-coded so you can tell at a glance what's flowing where:
+SEANCE has four cable kinds, color-coded so you can tell at a glance what's flowing where:
 
 - **Audio (blue)** — stereo audio.
 - **MIDI (green)** — MIDI events (notes, CC, pitch bend, aftertouch).
 - **Param (orange)** — *block-rate* control signal, used for modulating knobs and sliders. One value per audio block (~ms granularity). Cheap.
 - **Signal (amber)** — *audio-rate* control signal, used for sample-accurate modulation (audio-rate FM, audio-rate filter modulation, etc.).
 
-Audio→Audio and MIDI→MIDI must connect like-to-like. **Param and Signal are both control kinds and seance treats them as interchangeable** — a Param output can drive a Signal input and vice versa, with automatic conversion. The cable shows the conversion visually: its head segment is the source colour and its tail segment is the destination colour, so you can see where the rate change happens.
+Audio→Audio and MIDI→MIDI must connect like-to-like. **Param and Signal are both control kinds and SEANCE treats them as interchangeable** — a Param output can drive a Signal input and vice versa, with automatic conversion. The cable shows the conversion visually: its head segment is the source colour and its tail segment is the destination colour, so you can see where the rate change happens.
 
 Most users only need Param. Use Signal when you specifically need sample-rate precision (e.g., audio-rate FM through a synth's frequency parameter).
 
 ### Wavetable arrangement
 
-A wavetable is a sequence of single-cycle waveforms that the synth morphs between as you sweep a Position knob. seance arranges wavetables on **three levels of structure**:
+A wavetable is a sequence of single-cycle waveforms that the synth morphs between as you sweep a Position knob. SEANCE arranges wavetables on **three levels of structure**:
 
 1. **Layers within a frame.** Each waveform frame is built by summing layers (sine, saw, square, triangle, noise, or freehand-drawn shapes), each at its own harmonic ratio, phase, and amplitude. Stacking layers at integer harmonic ratios gives organ-like additive sounds; non-integer ratios give bell-like inharmonic textures.
 2. **Frames within an N-dimensional arrangement.** Multiple frames stack into a wavetable that morphs as you change Position. The arrangement is N-dimensional — add an axis to get a second Position knob, add another for a third, etc. Most uses stay at 1D or 2D, but the option goes up to 8 dimensions.
@@ -41,7 +46,7 @@ For 3D-and-higher scatter spaces, the editor includes a red/cyan anaglyph viewpo
 
 ### Waveterrain (Terrain Synth)
 
-Terrain Synth is the underlying engine that powers most of seance's built-in synths. It treats your sound source as an **N-dimensional terrain** of sample values, plus a **traversal** that walks through that terrain over time, reading values to produce audio.
+Terrain Synth is the underlying engine that powers most of SEANCE's built-in synths. It treats your sound source as an **N-dimensional terrain** of sample values, plus a **traversal** that walks through that terrain over time, reading values to produce audio.
 
 A terrain can come from:
 
@@ -62,7 +67,7 @@ The same terrain with different traversals produces wildly different sounds. The
 
 ### Layers (time-gated cables)
 
-Most DAWs treat "which effects are active" as a fixed property of a track. seance lets you make that time-varying: a specific cable can be **on** only during certain beat ranges and **off** otherwise.
+Most DAWs treat "which effects are active" as a fixed property of a track. SEANCE lets you make that time-varying: a specific cable can be **on** only during certain beat ranges and **off** otherwise.
 
 A layer is a colored bar drawn in the routing strip above the piano roll. You drag a region to set the start and end beats. Outside the region, the cable is muted with a smooth crossfade at the edges (configurable globally; default 50 ms) so you never hear a click when a layer turns on or off.
 
@@ -93,7 +98,7 @@ Triggers are generators, not filters — they always pass the original note thro
 
 Convolution is the math under the hood of basically every "real space" reverb and "real cabinet" guitar amp simulation. You take your audio and combine it with a stored sound called an **impulse response** (IR) — and the result is your audio re-shaped by the IR's spectral and temporal character. Record what a clap sounds like in a cathedral, save it as the IR, and any audio you push through the convolution filter sounds like it was played in that cathedral. The same trick works for guitar speaker cabinets, EQ matching, and surgical custom filters.
 
-seance's convolution node has an editor with three ways to build an IR:
+SEANCE's convolution node has an editor with three ways to build an IR:
 
 - **Presets** — pick lowpass / highpass / bandpass / echo from a dropdown, tweak Cutoff / Steepness / Bandwidth / Delay / Feedback / Echo count sliders, click Apply Preset. The IR is generated from the parameters and you can audition immediately.
 - **Drawing** — sculpt the IR by hand. Two modes:
@@ -114,9 +119,24 @@ For capturing real-world impulse responses, the **Room IR Capture** tool (Tools 
 - **Wavetable / Layered Waveform synth.** Build single-cycle waveforms by stacking layers (sine / saw / square / triangle / noise / hand-drawn) at chosen harmonic ratios, phases, and amplitudes. Stack multiple cycles into a wavetable that morphs as you play. See the [Wavetable arrangement](#wavetable-arrangement) concept above for the full structure.
 - **Sampler.** Load any audio file as a pitched sample, with autocorrelation + YIN pitch detection for automatic base-note assignment, fine-tune in cents, and a choice between resample (changes speed and pitch together) or pitch-shift (preserves speed) playback modes.
 - **Drum synth.** Eight analog-style voice algorithms — **Kick** (pitched sine sweep), **Snare** (filtered noise), **Hi-Hat** (FM noise), **Clap**, **Tom**, **Cowbell**, **Rimshot**, **Cymbal** (with crash/ride/bell variants). Each voice gets its own MIDI note assignment via MIDI Learn and a four-knob synthesis row (pitch, decay, tone, level).
-- **SoundFont (SF2 / SFZ).** Load multi-sample patches with full preset / bank navigation. Hundreds of free SF2 packs available online for orchestral, piano, drums, ethnic instruments, etc.
+- **SoundFont (SF2 / SFZ).** Load multi-sample patches with full preset / bank navigation. Hundreds of free SF2 packs available online for orchestral, piano, drums, ethnic instruments, etc. SF2 support is complete; SFZ uses a built-in basic loader, with full SFZ-spec compliance via the sfizz library on the roadmap.
 - **Terrain Synth.** The N-dimensional sample-array engine that powers the wavetable and sampler instruments — see the [Waveterrain](#waveterrain-terrain-synth) concept above. Can also be used directly with image, audio file, or math expression sources.
-- **Plugin hosting.** Load third-party instruments via **VST3** (all platforms), **AU** (macOS), and **LV2 / LADSPA** (Linux), with state persistence, parameter automation, and MIDI Learn for any plugin parameter.
+
+### Supported plugin and instrument formats
+
+| Format | Type | Platforms | Notes |
+|---|---|---|---|
+| **VST3** (64-bit) | Plugin (instrument or effect) | Windows / macOS / Linux | Standard third-party plugin format. Full state persistence, parameter automation, MIDI Learn for any plugin parameter. |
+| **VST3** (32-bit) | Plugin | Windows | Planned, depends on out-of-process plugin sandboxing (roadmap). 32-bit DLLs can't load into a 64-bit host directly, so this requires a child-process plugin host. |
+| **AU** (Audio Units) | Plugin | macOS only | Apple's plugin format. Same hosting infrastructure as VST3. |
+| **LV2** | Plugin | Windows / macOS / Linux | Open-spec plugin format. JUCE 8 supports LV2 hosting on all platforms, not just Linux. |
+| **LADSPA** | Plugin | Linux only | Older Linux audio plugin format. |
+| **SF2** (SoundFont 2) | Instrument file | All platforms | Multi-sample patches with preset/bank navigation. Built into SEANCE, no external library needed. |
+| **SFZ** | Instrument file | All platforms | Basic spec coverage built in; full compliance via the sfizz library is on the roadmap. |
+| **WASM modules** | Custom audio DSP node | All platforms | Write your own audio effects or instruments in C, Rust, Zig, or AssemblyScript, compile to WebAssembly, load as audio nodes with sample-accurate parameter input. Hosted via wasm3. |
+| **VST2** | — | — | Not supported. Steinberg deprecated VST2 and the SDK is no longer freely distributable. |
+
+Loaded plugins are scanned and indexed at startup (cached so subsequent launches are fast); plugin scan directories are configurable via Settings → Plugin Settings, and plugins that crash during scan are automatically blocklisted so the next scan skips them.
 
 ### Built-in effects
 
@@ -176,7 +196,7 @@ All built-in effects can be combined freely with cables — pre-effect, post-eff
 - **Pitch bend, mod wheel vibrato, sustain pedal, channel aftertouch** all handled in the built-in synths.
 - **MIDI Learn** for any node parameter — right-click → MIDI Learn, then move a knob on your controller. Learned CCs are filtered out of the cable routing so they only drive their mapped parameter.
 - **Custom hotkeys.** Bind any keyboard shortcut OR any MIDI controller button to any host action via the Hotkey Settings dialog. Includes per-node shortcuts (toggle mute on this specific track, open this specific editor, etc.).
-- **MOD / S3M / IT / XM tracker file import** for the chiptune-curious.
+- **Tracker file import (MOD / S3M / IT / XM).** Open any tracker module and SEANCE converts it into a fully editable SEANCE project: each tracker channel becomes its own MIDI Track node, all wrapped in an Effect Group named after the file; every note from every pattern in the order list is extracted into the channel tracks (with volume-column-as-velocity); a useful subset of tracker effects is translated into MIDI form (arpeggio expansion, note retrigger, note delay, note cut, speed/tempo changes); the project BPM is set from the module's initial tempo. The imported channels are wired straight to Master Out so you can hear the structure immediately. This unlocks the entire decades-deep demoscene tracker library — thousands of free songs in `.mod` / `.s3m` / `.it` / `.xm` form — as editable starting points for remixing, sampling, learning arrangements, or just exploring how tracker artists thought about composition. *Current limitation: the importer doesn't yet extract the module's samples into Sampler nodes, so the imported MIDI tracks need instruments wired to them before they make sound. Sample extraction is on the roadmap.*
 
 ### Editing
 
@@ -190,9 +210,9 @@ All built-in effects can be combined freely with cables — pre-effect, post-eff
 
 ### Reliability and crash safety
 
-This is one of the things that sets seance apart from typical home DAWs. Three independent layers protect your work:
+This is one of the things that sets SEANCE apart from typical home DAWs. Three independent layers protect your work:
 
-- **Branching undo tree.** Every edit becomes an undo step. Redoing after taking a different branch doesn't destroy the older branch — it creates a new fork. Walk back through the entire tree of "things you tried" with arrow-key navigation.
+- **Branching undo tree (not linear).** Every edit becomes an undo step. *Most* DAWs have linear undo: Ctrl+Z to back up, then any new edit destroys the path you'd backed away from. SEANCE keeps every path. Undo five steps, take a different direction, then walk back to the original branch and continue from where you'd left off — both branches stay alive forever in the tree. Each redo branch shows a chain of descriptions ("+1 octave → Move notes → x2 duration") so you can navigate the full history of "things you tried" without guessing which branch is which.
 - **Cross-session undo persistence.** The full undo tree is saved to disk on every change (event-driven, coalesced per UI frame). Quit the app, reopen the next day, and Ctrl+Z keeps working back through everything you did last session — even past your last saved version.
 - **Two-channel autosave.**
   - **Fast channel:** the undo tree itself, persisted on every gesture endpoint. Effectively zero data loss on a crash for graph edits — notes, cables, parameters, structural changes are all captured at gesture granularity.

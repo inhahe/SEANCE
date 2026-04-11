@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<title>Convolution Filter — SoundShop2</title>
+<title>Convolution Filter — SEANCE</title>
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
@@ -17,7 +17,7 @@
 
 <p>A convolution filter takes an audio input and combines it with a stored sound called an <strong>impulse response</strong> (IR). The result is the input audio re-shaped by the IR's spectral and temporal character. Convolution is the math under the hood of nearly every "real space" reverb and "real cabinet" guitar amp simulation — record what a clap sounds like in a cathedral, save it as the IR, and any audio you push through the convolution filter sounds like it was played in that cathedral. Same trick works for guitar speaker cabinets, EQ matching, and more.</p>
 
-<p>SoundShop2's convolution node is a small utility version aimed at making custom filters and short impulses, not loading 5-second cathedral reverbs (though you can do that too). Add one from <em>Effects → Convolution Filter</em>, wire your audio through it, and double-click to open the editor.</p>
+<p>SEANCE's convolution node is a small utility version aimed at making custom filters and short impulses, not loading 5-second cathedral reverbs (though you can do that too). Add one from <em>Effects → Convolution Filter</em>, wire your audio through it, and double-click to open the editor.</p>
 
 <h2>Three ways to make an IR</h2>
 
@@ -59,7 +59,7 @@
 
 <h2>Capturing real rooms</h2>
 
-<p>SoundShop2 has a built-in tool to capture impulse responses from real spaces — click <em>Tools → Capture Room IR…</em> in the menus. Place your microphone where the listener would sit, point your speakers into the room, and the tool plays a sine sweep through the speakers and records the room's response with the mic. The captured IR is automatically loaded into a new Convolution Filter node ready to use. See the Room IR Capture dialog's tooltips for the recording parameters.</p>
+<p>SEANCE has a built-in tool to capture impulse responses from real spaces — click <em>Tools → Capture Room IR…</em> in the menus. Place your microphone where the listener would sit, point your speakers into the room, and the tool plays a sine sweep through the speakers and records the room's response with the mic. The captured IR is automatically loaded into a new Convolution Filter node ready to use. See the Room IR Capture dialog's tooltips for the recording parameters.</p>
 
 <h2>Common patterns</h2>
 

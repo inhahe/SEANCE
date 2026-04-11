@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<title>MIDI Input &amp; Routing — SoundShop2</title>
+<title>MIDI Input &amp; Routing — SEANCE</title>
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
@@ -16,11 +16,11 @@
 </nav>
 </header>
 
-<p>SoundShop2 treats every input device — the computer keyboard, hardware MIDI keyboards, drum pads, network MIDI clients, virtual ports — as a <strong>node in the graph</strong>. You wire the input node to wherever you want the events to go. There's no hidden routing, no "arm" flag to hunt for; the cable <em>is</em> the routing.</p>
+<p>SEANCE treats every input device — the computer keyboard, hardware MIDI keyboards, drum pads, network MIDI clients, virtual ports — as a <strong>node in the graph</strong>. You wire the input node to wherever you want the events to go. There's no hidden routing, no "arm" flag to hunt for; the cable <em>is</em> the routing.</p>
 
 <h2>The Computer Keyboard node</h2>
 
-<p>On a fresh project SoundShop2 automatically creates a <strong>Computer Keyboard</strong> node at the top-left of the graph. This represents the keys on your computer keyboard being used as a MIDI controller. It has a single MIDI output pin, which is pre-wired to the MIDI Track that's also placed by default.</p>
+<p>On a fresh project SEANCE automatically creates a <strong>Computer Keyboard</strong> node at the top-left of the graph. This represents the keys on your computer keyboard being used as a MIDI controller. It has a single MIDI output pin, which is pre-wired to the MIDI Track that's also placed by default.</p>
 
 <p>Key mapping:</p>
 <ul>
@@ -36,13 +36,13 @@
 
 <h2>Hardware MIDI devices</h2>
 
-<p>On a new project, SoundShop2 shows a wizard listing every MIDI input device currently detected on your system. Check the ones you want to use and click <em>Add Selected</em> — each checked device becomes its own MIDI Input node in the graph, which you can then wire to a track or synth.</p>
+<p>On a new project, SEANCE shows a wizard listing every MIDI input device currently detected on your system. Check the ones you want to use and click <em>Add Selected</em> — each checked device becomes its own MIDI Input node in the graph, which you can then wire to a track or synth.</p>
 
 <p>You can re-open this wizard at any time via <strong>Options → Add MIDI Input Device…</strong>, in case you skipped one, want to add a newly-connected device, or deleted an input node and want it back.</p>
 
 <h3>Hotplug</h3>
 
-<p>If you plug in a new MIDI device while SoundShop2 is running, a small dialog will pop up asking if you want to add it to the graph. Click <em>Add</em> to drop a new MIDI Input node for the device at a default position, or <em>Ignore</em> to dismiss. Ignored devices stay ignored until the next restart or until you run the wizard again.</p>
+<p>If you plug in a new MIDI device while SEANCE is running, a small dialog will pop up asking if you want to add it to the graph. Click <em>Add</em> to drop a new MIDI Input node for the device at a default position, or <em>Ignore</em> to dismiss. Ignored devices stay ignored until the next restart or until you run the wizard again.</p>
 
 <h2>MIDI Tracks receive live input</h2>
 

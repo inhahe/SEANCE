@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<title>Pin Kinds — SoundShop2</title>
+<title>Pin Kinds — SEANCE</title>
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
@@ -15,7 +15,7 @@
 </nav>
 </header>
 
-<p>SoundShop2 has <strong>four kinds of pins</strong>, each carrying a different kind of data between nodes. Each kind has a distinct color so you can see at a glance what kind of data is flowing in a given cable. Note that "signal" below is the name of <em>one</em> of these four kinds — not a catch-all word for every kind of data flowing between nodes. Audio and MIDI are their own things, not kinds of signal.</p>
+<p>SEANCE has <strong>four kinds of pins</strong>, each carrying a different kind of data between nodes. Each kind has a distinct color so you can see at a glance what kind of data is flowing in a given cable. Note that "signal" below is the name of <em>one</em> of these four kinds — not a catch-all word for every kind of data flowing between nodes. Audio and MIDI are their own things, not kinds of signal.</p>
 
 <h2><span class="pink-tag t-audio">Audio</span> &mdash; Cornflower blue</h2>
 <p>Stereo audio signal. Each sample is a number roughly in the range <code>-1.0 .. +1.0</code>. Audio pins carry actual sound — what you hear at the Master Out. Synths produce audio, effects transform it, and the Master Out sends it to your speakers.</p>
@@ -47,7 +47,7 @@
 
 <h2>Cross-kind connections</h2>
 
-<p>You can only connect pins of matching kinds. Audio doesn't plug into MIDI, MIDI doesn't plug into Param, etc. If you try, SoundShop2 won't make the cable.</p>
+<p>You can only connect pins of matching kinds. Audio doesn't plug into MIDI, MIDI doesn't plug into Param, etc. If you try, SEANCE won't make the cable.</p>
 
 <p>There are nodes that act as <em>adapters</em> between kinds — for example, the MIDI Modulator node takes a Signal input and a MIDI stream, and uses the signal to modify MIDI velocities / bend / CCs. That's how you "connect" a signal source to a MIDI flow.</p>
 

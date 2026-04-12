@@ -36,7 +36,7 @@ Most users only need Param. Use Signal when you specifically need sample-rate pr
 
 A wavetable is a sequence of single-cycle waveforms that the synth morphs between as you sweep a Position knob. SEANCE arranges wavetables on **three levels of structure**:
 
-1. **Layers within a frame.** Each waveform frame is built by summing layers (sine, saw, square, triangle, noise, or freehand-drawn shapes), each at its own harmonic ratio, phase, and amplitude. Stacking layers at integer harmonic ratios gives organ-like additive sounds; non-integer ratios give bell-like inharmonic textures.
+1. **Layers within a frame.** Each waveform frame is built by summing layers (sine, saw, square, triangle, noise, or hand-drawn shapes), each at its own harmonic ratio, phase, and amplitude. Drawn layers have two sub-modes: **Points** (place control points; waveform is Catmull-Rom interpolated through them) and **Freehand** (click-and-drag to paint arbitrary per-sample waveform data). Stacking layers at integer harmonic ratios gives organ-like additive sounds; non-integer ratios give bell-like inharmonic textures.
 2. **Frames within an N-dimensional arrangement.** Multiple frames stack into a wavetable that morphs as you change Position. The arrangement is N-dimensional — add an axis to get a second Position knob, add another for a third, etc. Most uses stay at 1D or 2D, but the option goes up to 8 dimensions.
 3. **Two layout modes for the N-D arrangement:**
    - **Grid mode** — frames laid out on a regular N-dimensional grid. Predictable, evenly-spaced morphing across each axis.
@@ -323,7 +323,7 @@ Wavelets give you joint time + frequency resolution that traditional FFT-based e
 ### Editor and workflow
 
 - **Make the layered editor non-modal** — let the wavetable editor stay open while you work elsewhere in the graph.
-- **Points / Freehand toggle for Drawn layers** — switch between control-point editing and per-pixel sample drawing inside a single Drawn layer.
+- ~~**Points / Freehand toggle for Drawn layers**~~ — implemented. Drawn layers now have a Points/Freehand toggle button.
 - **Persist project-wide settings** in `.ssp` (tuning system, concert pitch, crossfade duration, effect group definitions) — currently some of these don't survive save/load.
 
 ### Reliability

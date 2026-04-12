@@ -1754,14 +1754,18 @@ void MainContentComponent::showPluginUI(int nodeId) {
         auto* editor = new LayeredWaveEditorComponent(graph, node->id, [this]() {
             audioEngine.getGraphProcessor().requestRebuild();
         });
-        juce::DialogWindow::LaunchOptions opts;
-        opts.content.setOwned(editor);
-        opts.dialogTitle = "Waveform: " + juce::String(node->name);
-        opts.dialogBackgroundColour = juce::Colour(22, 22, 28);
-        opts.escapeKeyTriggersCloseButton = true;
-        opts.useNativeTitleBar = true;
-        opts.resizable = true;
-        opts.launchAsync();
+        // Non-modal (#17): use launchAsync which creates a non-blocking
+        // window. The user can keep working in the graph while the
+        // waveform editor is open. Closing the window destroys the
+        // editor. Multiple editors for different nodes can coexist.
+        auto* dw = new juce::DialogWindow(
+            "Waveform: " + juce::String(node->name),
+            juce::Colour(22, 22, 28), true);
+        dw->setContentOwned(editor, true);
+        dw->setResizable(true, false);
+        dw->setUsingNativeTitleBar(true);
+        dw->setVisible(true);
+        dw->centreWithSize(editor->getWidth(), editor->getHeight());
         return;
     }
 

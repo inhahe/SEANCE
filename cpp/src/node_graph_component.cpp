@@ -1103,6 +1103,7 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
     fxMenu.addItem(233, "Independent Pitch Shift");
     fxMenu.addItem(234, "Wavelet Complexity");
     fxMenu.addItem(235, "Asymmetric Filter");
+    fxMenu.addItem(236, "Wavelet Pitch Tracker");
     fxMenu.addSeparator();
     fxMenu.addItem(224, "M/S Encode (stereo → mid+side)");
     fxMenu.addItem(225, "M/S Decode (mid+side → stereo)");
@@ -1748,6 +1749,18 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
                     {"B4 Gain", 0.0f, -24.0f, 24.0f},
                     {"B4 Q",    0.707f, 0.1f, 10.0f},
                 }); break;
+                case 236: {
+                    // Pitch Tracker: Audio In → Signal Out (detected pitch)
+                    auto& ptn = graph.addNode("Pitch Tracker", NodeType::Effect,
+                        {Pin{0, "Audio In", PinKind::Audio, true}},
+                        {Pin{0, "Audio Out", PinKind::Audio, false}}, {p.x, p.y});
+                    ptn.pinsOut.push_back({graph.getNextId(), "Pitch Out", PinKind::Signal, false});
+                    ptn.script = "__pitchtracker__";
+                    ptn.params.push_back({"Min Hz",      50.0f,  20.0f, 5000.0f});
+                    ptn.params.push_back({"Max Hz",    2000.0f,  20.0f, 5000.0f});
+                    ptn.params.push_back({"Detected Hz",  0.0f,   0.0f, 5000.0f});
+                    break;
+                }
                 case 235: makeEffect("Asymmetric Filter", "__asymfilter__", {
                     {"Pre-Attack", 20.0f, 0.0f, 100.0f},
                     {"Post-Decay", 50.0f, 0.0f, 200.0f},

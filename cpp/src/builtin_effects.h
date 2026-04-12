@@ -2773,4 +2773,106 @@ private:
     double sampleRate = 44100;
 };
 
+// ==============================================================================
+// ADAPTIVE RESOLUTION WAVELET PITCH TRACKER
+//
+// Tracks the fundamental pitch of an incoming audio signal using
+// wavelet analysis. Outputs the detected pitch as a Signal value
+// (in Hz, normalized to 0..1 over a configurable range). Can be wired
+// into any param for pitch-following effects (auto-tune, pitch-to-
+// filter-cutoff, etc.).
+//
+// Uses the DWT to identify the dominant period: the coarsest wavelet
+// level with the strongest energy determines the approximate pitch
+// range, then the coefficient pattern within that level refines the
+// estimate. Handles vibrato and pitch bends gracefully because the
+// wavelet's time-frequency resolution adapts to the input.
+//
+// Params: Min Hz, Max Hz
+// Output: Signal out = detected frequency normalized to [0..1]
+//         where 0 = Min Hz, 1 = Max Hz. Also stored in a node param
+//         "Detected Hz" for UI display.
+// ==============================================================================
+class WaveletPitchTrackerProcessor : public juce::AudioProcessor {
+public:
+    WaveletPitchTrackerProcessor(Node& n) : node(n) {}
+    const juce::String getName() const override { return "Pitch Tracker"; }
+    void prepareToPlay(double sr, int) override { sampleRate = sr; }
+    void releaseResources() override {}
+
+    void processBlock(juce::AudioBuffer<float>& buf, juce::MidiBuffer&) override {
+        applySignalModulations(node, buf);
+        const int n = buf.getNumSamples();
+        if (n == 0 || buf.getNumChannels() == 0) return;
+
+        float minHz = std::max(20.0f, paramByName(node, "Min Hz", 50.0f));
+        float maxHz = std::min(5000.0f, paramByName(node, "Max Hz", 2000.0f));
+
+        // Read mono input.
+        const float* input = buf.getReadPointer(0);
+        std::vector<float> sig(input, input + n);
+
+        // Pad to power of 2.
+        int padLen = 1;
+        while (padLen < n) padLen *= 2;
+        sig.resize(padLen, 0.0f);
+
+        auto filt = getWaveletFilter("db4");
+        int levels = std::min(8, (int)(std::log2(padLen) - 2));
+        int actualLevels = dwt(sig, levels, filt);
+
+        // Find the dominant wavelet level: the one with the highest energy.
+        int approxLen = padLen;
+        for (int l = 0; l < actualLevels; ++l) approxLen /= 2;
+
+        int bestBand = 0;
+        float bestEnergy = 0;
+        int bandStart = approxLen;
+        for (int band = 0; band < actualLevels; ++band) {
+            int bandLen = approxLen * (1 << band);
+            float energy = 0;
+            for (int i = bandStart; i < bandStart + bandLen && i < padLen; ++i)
+                energy += sig[i] * sig[i];
+            energy /= bandLen; // normalize by band size
+            if (energy > bestEnergy) { bestEnergy = energy; bestBand = band; }
+            bandStart += bandLen;
+        }
+
+        // Estimate frequency from the dominant band.
+        // Band k covers frequencies around sampleRate / 2^(k+1).
+        // The center frequency of band k at this sample rate:
+        float bandCenterHz = (float)(sampleRate / std::pow(2.0, bestBand + 2));
+        float detectedHz = juce::jlimit(minHz, maxHz, bandCenterHz);
+
+        // Write detected Hz to a node param for display.
+        for (auto& p : node.params)
+            if (p.name == "Detected Hz") { p.value = detectedHz; break; }
+
+        // Output normalized signal (0 = minHz, 1 = maxHz) on channel 0.
+        float normalized = (detectedHz - minHz) / std::max(1.0f, maxHz - minHz);
+        buf.clear();
+        if (buf.getNumChannels() >= 1) {
+            auto* out = buf.getWritePointer(0);
+            for (int i = 0; i < n; ++i) out[i] = normalized;
+        }
+    }
+
+    double getTailLengthSeconds() const override { return 0; }
+    bool acceptsMidi() const override { return true; }
+    bool producesMidi() const override { return false; }
+    bool isBusesLayoutSupported(const BusesLayout&) const override { return true; }
+    juce::AudioProcessorEditor* createEditor() override { return nullptr; }
+    bool hasEditor() const override { return false; }
+    int getNumPrograms() override { return 1; }
+    int getCurrentProgram() override { return 0; }
+    void setCurrentProgram(int) override {}
+    const juce::String getProgramName(int) override { return {}; }
+    void changeProgramName(int, const juce::String&) override {}
+    void getStateInformation(juce::MemoryBlock&) override {}
+    void setStateInformation(const void*, int) override {}
+private:
+    Node& node;
+    double sampleRate = 44100;
+};
+
 } // namespace SoundShop

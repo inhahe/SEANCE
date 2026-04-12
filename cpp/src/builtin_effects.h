@@ -2664,4 +2664,113 @@ private:
     }
 };
 
+// ==============================================================================
+// ASYMMETRIC WAVELET FILTER — non-causal / look-ahead filtering
+//
+// Standard filters respond AFTER a transient happens. This wavelet-based
+// filter can "anticipate" transients by processing the wavelet domain
+// with different gains for pre-transient vs post-transient regions.
+// The effect: a filter that reacts before the attack hits, creating
+// impossible-sounding dynamics that no causal filter can produce.
+//
+// Uses the transient detection from #53 to find onset positions, then
+// applies asymmetric gain curves around each onset in the wavelet domain.
+//
+// Params: Pre-Attack (ms, how far ahead to start), Post-Decay (ms),
+//         Pre Gain, Post Gain, Levels, Mix
+// ==============================================================================
+class AsymmetricFilterProcessor : public juce::AudioProcessor {
+public:
+    AsymmetricFilterProcessor(Node& n) : node(n) {}
+    const juce::String getName() const override { return "Asymmetric Filter"; }
+    void prepareToPlay(double sr, int) override { sampleRate = sr; }
+    void releaseResources() override {}
+
+    void processBlock(juce::AudioBuffer<float>& buf, juce::MidiBuffer&) override {
+        applySignalModulations(node, buf);
+        const int n = buf.getNumSamples();
+        const int ch = std::min(2, buf.getNumChannels());
+        if (n == 0 || ch == 0) return;
+
+        float preMs    = paramByName(node, "Pre-Attack", 20.0f);
+        float postMs   = paramByName(node, "Post-Decay", 50.0f);
+        float preGain  = paramByName(node, "Pre Gain", 2.0f);
+        float postGain = paramByName(node, "Post Gain", 0.5f);
+        int   levels   = juce::jlimit(1, 8, (int)paramByName(node, "Levels", 4.0f));
+        float mix      = juce::jlimit(0.0f, 1.0f, paramByName(node, "Mix", 1.0f));
+
+        int preSamples  = (int)(preMs * 0.001 * sampleRate);
+        int postSamples = (int)(postMs * 0.001 * sampleRate);
+
+        auto filt = getWaveletFilter("db4");
+        int padLen = 1;
+        while (padLen < n) padLen *= 2;
+
+        for (int c = 0; c < ch; ++c) {
+            float* data = buf.getWritePointer(c);
+            std::vector<float> sig(padLen, 0.0f);
+            for (int i = 0; i < n; ++i) sig[i] = data[i];
+            std::vector<float> dry(data, data + n);
+
+            int actualLevels = dwt(sig, levels, filt);
+
+            // Detect transients: find peaks in the finest detail level.
+            int approxLen = padLen;
+            for (int l = 0; l < actualLevels; ++l) approxLen /= 2;
+            // Finest detail band is the last one (highest indices).
+            int finestStart = padLen / 2;
+            int finestLen = padLen / 2;
+
+            // Find transient positions (peaks in finest detail).
+            std::vector<int> transients;
+            float maxFine = 0;
+            for (int i = finestStart; i < finestStart + finestLen; ++i)
+                maxFine = std::max(maxFine, std::abs(sig[i]));
+            float transThresh = maxFine * 0.5f;
+            for (int i = finestStart; i < finestStart + finestLen; ++i)
+                if (std::abs(sig[i]) > transThresh) transients.push_back(i - finestStart);
+
+            // Build a gain envelope that's asymmetric around each transient.
+            std::vector<float> gainEnv(padLen, 1.0f);
+            for (int t : transients) {
+                // Pre-attack region: ramp up preGain before the transient
+                for (int i = std::max(0, t - preSamples); i < t; ++i) {
+                    float frac = (float)(i - (t - preSamples)) / std::max(1, preSamples);
+                    gainEnv[i] *= 1.0f + (preGain - 1.0f) * frac;
+                }
+                // Post-decay region: apply postGain after the transient
+                for (int i = t; i < std::min(padLen, t + postSamples); ++i) {
+                    float frac = 1.0f - (float)(i - t) / std::max(1, postSamples);
+                    gainEnv[i] *= postGain + (1.0f - postGain) * (1.0f - frac);
+                }
+            }
+
+            // Apply gain envelope to all coefficients.
+            for (int i = 0; i < padLen; ++i)
+                sig[i] *= gainEnv[i];
+
+            idwt(sig, actualLevels, filt);
+            for (int i = 0; i < n; ++i)
+                data[i] = dry[i] * (1.0f - mix) + sig[i] * mix;
+        }
+    }
+
+    double getTailLengthSeconds() const override { return 0.1; }
+    bool acceptsMidi() const override { return true; }
+    bool producesMidi() const override { return true; }
+    bool isBusesLayoutSupported(const BusesLayout&) const override { return true; }
+    juce::AudioProcessorEditor* createEditor() override { return nullptr; }
+    bool hasEditor() const override { return false; }
+    int getNumPrograms() override { return 1; }
+    int getCurrentProgram() override { return 0; }
+    void setCurrentProgram(int) override {}
+    const juce::String getProgramName(int) override { return {}; }
+    void changeProgramName(int, const juce::String&) override {}
+    void getStateInformation(juce::MemoryBlock&) override {}
+    void setStateInformation(const void*, int) override {}
+private:
+    Node& node;
+    double sampleRate = 44100;
+};
+
 } // namespace SoundShop

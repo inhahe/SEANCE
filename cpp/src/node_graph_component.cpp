@@ -204,6 +204,11 @@ void NodeGraphComponent::drawNode(juce::Graphics& g, Node& node) {
         g.setFont(juce::Font(std::max(8.0f, 10.0f * zoom), juce::Font::bold));
         g.drawText("S", titleArea.removeFromRight(16 * zoom), juce::Justification::centred);
     }
+    if (node.recordArmed) {
+        g.setColour(juce::Colours::red);
+        g.setFont(juce::Font(std::max(8.0f, 10.0f * zoom), juce::Font::bold));
+        g.drawText("R", titleArea.removeFromRight(16 * zoom), juce::Justification::centred);
+    }
 
     // Pan indicator (small bar in title)
     if (node.pan != 0.0f && zoom > 0.4f) {
@@ -1812,6 +1817,11 @@ void NodeGraphComponent::showNodeMenu(Node& node) {
     if (node.type == NodeType::MidiTimeline || node.type == NodeType::AudioTimeline) {
         menu.addItem(3, "Open Editor");
         menu.addItem(9, node.mpeEnabled ? "Disable MPE" : "Enable MPE", true, node.mpeEnabled);
+        // "Record Here" (#77): arm this specific node for recording
+        // so the next Record action captures into it instead of the
+        // default active editor. Toggleable.
+        menu.addItem(163, node.recordArmed ? "Disarm Recording" : "Record Here",
+                     true, node.recordArmed);
     }
     if (node.plugin || node.type == NodeType::Instrument || node.type == NodeType::Effect) {
         menu.addItem(4, "Show Plugin UI");
@@ -1913,6 +1923,10 @@ void NodeGraphComponent::showNodeMenu(Node& node) {
             graph.dirty = true;
         } else if (result == 162) {
             if (onRunScript) onRunScript(nodeId);
+        } else if (result == 163) {
+            // "Record Here" toggle (#77)
+            node->recordArmed = !node->recordArmed;
+            graph.dirty = true;
         } else if (result >= 150 && result <= 154) {
             float pans[] = {-1.0f, -0.5f, 0.0f, 0.5f, 1.0f};
             node->pan = pans[result - 150];

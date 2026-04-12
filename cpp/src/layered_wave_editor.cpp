@@ -14,6 +14,17 @@ namespace SoundShop {
 
 // Seed a fresh Drawn layer with a handful of points arranged like a sine so
 // the user has something visible to grab and move.
+static constexpr int kFreehandSampleCount = 512;
+
+static std::vector<float> defaultFreehandSamples() {
+    std::vector<float> out(kFreehandSampleCount, 0.0f);
+    for (int i = 0; i < kFreehandSampleCount; ++i) {
+        float phase = (float)i / (float)kFreehandSampleCount;
+        out[i] = std::sin(2.0f * (float)M_PI * phase);
+    }
+    return out;
+}
+
 static std::vector<std::pair<float, float>> defaultDrawnPoints() {
     return {
         {0.00f,  0.0f},
@@ -89,9 +100,24 @@ static float sampleDrawnPoints(const std::vector<std::pair<float, float>>& pts,
                  + (-y0 + 3.0f*y1 - 3.0f*y2 + y3) * t3);
 }
 
+// Linear interpolation through a periodic array of per-sample waveform data.
+static float sampleDrawnSamples(const std::vector<float>& samples, float x) {
+    int n = (int)samples.size();
+    if (n == 0) return 0.0f;
+    x = x - std::floor(x);          // wrap to [0, 1)
+    float idx = x * (float)n;
+    int i0 = (int)idx % n;
+    int i1 = (i0 + 1) % n;
+    float frac = idx - std::floor(idx);
+    return samples[i0] * (1.0f - frac) + samples[i1] * frac;
+}
+
 static float sampleLayer(const WaveLayer& layer, float x, std::mt19937& rng) {
-    if (layer.shape == WaveLayer::Drawn)
+    if (layer.shape == WaveLayer::Drawn) {
+        if (layer.freehandMode && !layer.drawnSamples.empty())
+            return sampleDrawnSamples(layer.drawnSamples, x);
         return sampleDrawnPoints(layer.drawnPoints, x);
+    }
     return evalShape(layer.shape, x, rng);
 }
 
@@ -148,9 +174,16 @@ static void encodeLayer(std::ostringstream& o, const WaveLayer& l) {
       << "," << l.phase
       << "," << l.amp;
     if (l.shape == WaveLayer::Drawn) {
-        o << "," << l.drawnPoints.size();
-        for (auto& p : l.drawnPoints)
-            o << "," << p.first << "," << p.second;
+        o << "," << (l.freehandMode ? 1 : 0);
+        if (l.freehandMode) {
+            o << "," << l.drawnSamples.size();
+            for (float s : l.drawnSamples)
+                o << "," << s;
+        } else {
+            o << "," << l.drawnPoints.size();
+            for (auto& p : l.drawnPoints)
+                o << "," << p.first << "," << p.second;
+        }
     }
 }
 
@@ -171,16 +204,50 @@ static bool parseLayer(const std::string& lp, WaveLayer& out) {
     try { out.phase = std::stof(f[2]); } catch (...) { out.phase = 0.0f; }
     try { out.amp   = std::stof(f[3]); } catch (...) { out.amp   = 1.0f; }
     if (out.shape == WaveLayer::Drawn && f.size() > 4) {
-        int count = 0;
-        try { count = std::stoi(f[4]); } catch (...) { count = 0; }
-        for (int k = 0; k < count; ++k) {
-            size_t xi = 5 + (size_t)k * 2;
-            size_t yi = xi + 1;
-            if (yi >= f.size()) break;
-            float x = 0, y = 0;
-            try { x = std::stof(f[xi]); } catch (...) {}
-            try { y = std::stof(f[yi]); } catch (...) {}
-            out.drawnPoints.emplace_back(x, y);
+        // Field 4: freehandMode flag (0 or 1). Legacy data without this flag
+        // will have a point count here instead; detect by checking whether the
+        // total field count matches point-mode layout.
+        int freehandFlag = 0;
+        try { freehandFlag = std::stoi(f[4]); } catch (...) {}
+
+        // Heuristic for legacy data: if f[4] > 1, it must be a legacy point
+        // count (old format had no freehand flag).  New format always has 0 or 1.
+        bool isLegacy = (freehandFlag > 1);
+        if (isLegacy) {
+            out.freehandMode = false;
+            int count = freehandFlag;
+            for (int k = 0; k < count; ++k) {
+                size_t xi = 5 + (size_t)k * 2;
+                size_t yi = xi + 1;
+                if (yi >= f.size()) break;
+                float x = 0, y = 0;
+                try { x = std::stof(f[xi]); } catch (...) {}
+                try { y = std::stof(f[yi]); } catch (...) {}
+                out.drawnPoints.emplace_back(x, y);
+            }
+        } else {
+            out.freehandMode = (freehandFlag != 0);
+            if (f.size() > 5) {
+                int count = 0;
+                try { count = std::stoi(f[5]); } catch (...) {}
+                if (out.freehandMode) {
+                    for (int k = 0; k < count && (size_t)(6 + k) < f.size(); ++k) {
+                        float v = 0.0f;
+                        try { v = std::stof(f[6 + k]); } catch (...) {}
+                        out.drawnSamples.push_back(v);
+                    }
+                } else {
+                    for (int k = 0; k < count; ++k) {
+                        size_t xi = 6 + (size_t)k * 2;
+                        size_t yi = xi + 1;
+                        if (yi >= f.size()) break;
+                        float x = 0, y = 0;
+                        try { x = std::stof(f[xi]); } catch (...) {}
+                        try { y = std::stof(f[yi]); } catch (...) {}
+                        out.drawnPoints.emplace_back(x, y);
+                    }
+                }
+            }
         }
     }
     return true;
@@ -487,6 +554,22 @@ public:
         addShapeBtn(noiseBtn,    "Noise",    WaveLayer::Noise);
         addShapeBtn(drawnBtn,    "Draw",     WaveLayer::Drawn);
 
+        addAndMakeVisible(freehandToggle);
+        freehandToggle.setButtonText("Points");
+        freehandToggle.setTooltip("Toggle between Points mode (click to place control points with smooth interpolation) "
+                                  "and Freehand mode (click and drag to draw the waveform shape directly).");
+        freehandToggle.onClick = [this]() {
+            auto& l = owner.currentLayers()[index];
+            l.freehandMode = !l.freehandMode;
+            freehandToggle.setButtonText(l.freehandMode ? "Freehand" : "Points");
+            // Seed freehand samples if switching to freehand for the first time.
+            if (l.freehandMode && l.drawnSamples.empty())
+                l.drawnSamples = defaultFreehandSamples();
+            refreshPreview();
+            owner.onLayerChanged();
+        };
+        freehandToggle.setVisible(false); // only visible when shape == Drawn
+
         auto setupSlider = [this](juce::Slider& sl, double lo, double hi, double step, const char* suffix) {
             addAndMakeVisible(sl);
             sl.setSliderStyle(juce::Slider::LinearHorizontal);
@@ -539,6 +622,8 @@ public:
         phaseSlider.setValue(l.phase, juce::dontSendNotification);
         ampSlider  .setValue(l.amp,   juce::dontSendNotification);
         updateShapeButtons();
+        freehandToggle.setVisible(l.shape == WaveLayer::Drawn);
+        freehandToggle.setButtonText(l.freehandMode ? "Freehand" : "Points");
         refreshPreview();
     }
 
@@ -549,13 +634,15 @@ public:
     }
 
     void updateShapeButtons() {
-        auto shape = owner.currentLayers()[index].shape;
-        sineBtn    .setToggleState(shape == WaveLayer::Sine,     juce::dontSendNotification);
-        sawBtn     .setToggleState(shape == WaveLayer::Saw,      juce::dontSendNotification);
-        squareBtn  .setToggleState(shape == WaveLayer::Square,   juce::dontSendNotification);
-        triangleBtn.setToggleState(shape == WaveLayer::Triangle, juce::dontSendNotification);
-        noiseBtn   .setToggleState(shape == WaveLayer::Noise,    juce::dontSendNotification);
-        drawnBtn   .setToggleState(shape == WaveLayer::Drawn,    juce::dontSendNotification);
+        auto& l = owner.currentLayers()[index];
+        sineBtn    .setToggleState(l.shape == WaveLayer::Sine,     juce::dontSendNotification);
+        sawBtn     .setToggleState(l.shape == WaveLayer::Saw,      juce::dontSendNotification);
+        squareBtn  .setToggleState(l.shape == WaveLayer::Square,   juce::dontSendNotification);
+        triangleBtn.setToggleState(l.shape == WaveLayer::Triangle, juce::dontSendNotification);
+        noiseBtn   .setToggleState(l.shape == WaveLayer::Noise,    juce::dontSendNotification);
+        drawnBtn   .setToggleState(l.shape == WaveLayer::Drawn,    juce::dontSendNotification);
+        freehandToggle.setVisible(l.shape == WaveLayer::Drawn);
+        freehandToggle.setButtonText(l.freehandMode ? "Freehand" : "Points");
     }
 
     void resized() override {
@@ -573,6 +660,12 @@ public:
         triangleBtn.setBounds(btnRow.removeFromLeft(bw));
         noiseBtn   .setBounds(btnRow.removeFromLeft(bw));
         drawnBtn   .setBounds(btnRow);
+
+        // Freehand/Points toggle — only visible for Drawn layers
+        if (freehandToggle.isVisible()) {
+            auto ftRow = a.removeFromTop(24);
+            freehandToggle.setBounds(ftRow.removeFromLeft(100));
+        }
 
         // Reserve space for the mini preview (bottom of row)
         a.removeFromBottom(previewHeight);
@@ -622,10 +715,10 @@ public:
             g.setColour(juce::Colour(150, 200, 255));
             g.strokePath(p, juce::PathStrokeType(1.3f));
 
-            // For Drawn layers, overlay the control points so the user can
-            // see and grab them.
+            // For Drawn layers in Points mode, overlay the control points so
+            // the user can see and grab them.
             const auto& layer = owner.currentLayers()[index];
-            if (layer.shape == WaveLayer::Drawn) {
+            if (layer.shape == WaveLayer::Drawn && !layer.freehandMode) {
                 for (int i = 0; i < (int)layer.drawnPoints.size(); ++i) {
                     const auto& pt = layer.drawnPoints[i];
                     // Scale y by amp because the preview renders amp*shape,
@@ -643,7 +736,7 @@ public:
     }
 
     static constexpr int previewHeight = 92;
-    static int rowHeight() { return 22 + 24 + 20 * 3 + 12 + previewHeight + 4; }
+    static int rowHeight() { return 22 + 24 + 24 + 20 * 3 + 12 + previewHeight + 4; }
 
     juce::Rectangle<float> getPreviewAreaBounds() const {
         auto bounds = getLocalBounds().reduced(6).toFloat();
@@ -687,11 +780,53 @@ public:
                   });
     }
 
+    // Write freehand sample data at normalized position x with value y,
+    // interpolating between the previous write position and the current one
+    // so there are no gaps when dragging quickly.
+    void writeFreehandSample(float x, float y) {
+        auto& samples = owner.currentLayers()[index].drawnSamples;
+        if (samples.empty()) samples = defaultFreehandSamples();
+        int n = (int)samples.size();
+        int idx = juce::jlimit(0, n - 1, (int)(x * (float)n));
+        if (lastFreehandIdx >= 0 && lastFreehandIdx != idx) {
+            // Interpolate between last and current to avoid gaps.
+            int from = lastFreehandIdx;
+            int to = idx;
+            float fromY = lastFreehandY;
+            float toY = y;
+            int steps = std::abs(to - from);
+            int dir = (to > from) ? 1 : -1;
+            for (int s = 0; s <= steps; ++s) {
+                int si = from + s * dir;
+                if (si < 0 || si >= n) continue;
+                float t = (steps > 0) ? (float)s / (float)steps : 1.0f;
+                samples[si] = fromY + (toY - fromY) * t;
+            }
+        } else {
+            samples[idx] = y;
+        }
+        lastFreehandIdx = idx;
+        lastFreehandY = y;
+    }
+
     void mouseDown(const juce::MouseEvent& e) override {
-        if (owner.currentLayers()[index].shape != WaveLayer::Drawn) return;
+        auto& l = owner.currentLayers()[index];
+        if (l.shape != WaveLayer::Drawn) return;
         float x, y;
         if (!mouseToPointXY(e.position, x, y)) return;
-        auto& pts = owner.currentLayers()[index].drawnPoints;
+
+        if (l.freehandMode) {
+            // Freehand: start drawing samples
+            freehandDrawing = true;
+            lastFreehandIdx = -1;
+            writeFreehandSample(x, y);
+            refreshPreview();
+            owner.onLayerChanged();
+            return;
+        }
+
+        // Points mode (original behavior)
+        auto& pts = l.drawnPoints;
         int hit = findPointNear(x, y);
         if (e.mods.isShiftDown() && hit >= 0) {
             // Shift-click a point to delete it (keep at least 2 points so
@@ -722,9 +857,25 @@ public:
     }
 
     void mouseDrag(const juce::MouseEvent& e) override {
-        if (owner.currentLayers()[index].shape != WaveLayer::Drawn) return;
+        auto& l = owner.currentLayers()[index];
+        if (l.shape != WaveLayer::Drawn) return;
+
+        if (l.freehandMode && freehandDrawing) {
+            auto area = getPreviewAreaBounds();
+            auto cp = e.position;
+            cp.x = juce::jlimit(area.getX(), area.getRight() - 1.0f, cp.x);
+            cp.y = juce::jlimit(area.getY(), area.getBottom(), cp.y);
+            float x, y;
+            mouseToPointXY(cp, x, y);
+            writeFreehandSample(x, y);
+            refreshPreview();
+            owner.onLayerChanged();
+            return;
+        }
+
+        // Points mode
         if (draggingIdx < 0) return;
-        auto& pts = owner.currentLayers()[index].drawnPoints;
+        auto& pts = l.drawnPoints;
         if (draggingIdx >= (int)pts.size()) { draggingIdx = -1; return; }
         float x, y;
         // Use clamped conversion so dragging outside the area still moves the point.
@@ -746,7 +897,11 @@ public:
         owner.onLayerChanged();
     }
 
-    void mouseUp(const juce::MouseEvent&) override { draggingIdx = -1; }
+    void mouseUp(const juce::MouseEvent&) override {
+        draggingIdx = -1;
+        freehandDrawing = false;
+        lastFreehandIdx = -1;
+    }
 
 private:
     LayeredWaveEditorComponent& owner;
@@ -754,11 +909,17 @@ private:
 
     juce::Label label;
     juce::TextButton sineBtn, sawBtn, squareBtn, triangleBtn, noiseBtn, drawnBtn;
+    juce::TextButton freehandToggle;
     juce::Slider ratioSlider, phaseSlider, ampSlider;
     juce::Label  ratioLabel, phaseLabel, ampLabel;
     juce::TextButton deleteBtn;
     std::vector<float> previewSamples;
     int draggingIdx = -1;
+
+    // Freehand drawing state
+    bool freehandDrawing = false;
+    int  lastFreehandIdx = -1;
+    float lastFreehandY = 0.0f;
 };
 
 // ==============================================================================

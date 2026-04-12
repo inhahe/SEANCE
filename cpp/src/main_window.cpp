@@ -2125,14 +2125,25 @@ void MainContentComponent::onStop() {
 }
 
 void MainContentComponent::onRecord() {
-    // Find the active editor node, or first MIDI/audio timeline
+    // Find which node to record into. Priority:
+    //  1. Any node explicitly armed via "Record Here" (#77)
+    //  2. The active editor node (the one whose piano roll is open)
+    //  3. Fallback: first MIDI timeline, then first audio timeline
     Node* recordNode = nullptr;
 
-    // Prefer the active editor node
-    if (graph.activeEditorNodeId >= 0)
+    // 1. Prefer explicitly armed nodes (MIDI timelines).
+    for (auto& n : graph.nodes) {
+        if (n.recordArmed && n.type == NodeType::MidiTimeline) {
+            recordNode = &n;
+            break;
+        }
+    }
+
+    // 2. Active editor node.
+    if (!recordNode && graph.activeEditorNodeId >= 0)
         recordNode = graph.findNode(graph.activeEditorNodeId);
 
-    // Fallback: first MIDI timeline, then audio timeline
+    // 3. Fallback: first MIDI timeline, then audio timeline.
     if (!recordNode) {
         for (auto& n : graph.nodes) {
             if (n.type == NodeType::MidiTimeline) { recordNode = &n; break; }

@@ -346,6 +346,34 @@ void NodeGraphComponent::drawNode(juce::Graphics& g, Node& node) {
             juce::String valueStr = juce::String(p.value, 2);
             g.drawText(valueStr, rowRect.reduced(4, 0), juce::Justification::centredRight, false);
 
+            // Modulation indicators (#29): small colored dots after the
+            // param name showing what's driving this param.
+            if (zoom > 0.4f) {
+                float indX = labelRect.getX() + g.getCurrentFont().getStringWidthFloat(p.name) + 4;
+                float indY = labelRect.getCentreY() - 2;
+                float indSz = 4.0f;
+                // Orange dot = has automation points
+                if (!p.automation.points.empty()) {
+                    g.setColour(juce::Colours::orange);
+                    g.fillEllipse(indX, indY, indSz, indSz);
+                    indX += indSz + 2;
+                }
+                // Cyan dot = signal modulation pin attached
+                if (p.modulated) {
+                    g.setColour(juce::Colours::cyan);
+                    g.fillEllipse(indX, indY, indSz, indSz);
+                    indX += indSz + 2;
+                }
+                // Green dot = MIDI Learn (CC mapping) targets this param
+                for (auto& cc : graph.ccMappings) {
+                    if (cc.nodeId == node.id && cc.paramIdx == pi) {
+                        g.setColour(juce::Colours::limegreen);
+                        g.fillEllipse(indX, indY, indSz, indSz);
+                        break;
+                    }
+                }
+            }
+
             pinY += PIN_ROW_HEIGHT;
         }
     }

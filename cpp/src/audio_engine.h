@@ -52,7 +52,7 @@ public:
 
     // Transport
     bool isPlaying() const { return playing.load(); }
-    void play() { playing = true; }
+    void play() { playing = true; songPlayCount = 0; }
     void stop();
     void pause() { playing = false; }
 
@@ -103,6 +103,15 @@ private:
     std::atomic<bool> playing{false};
     std::atomic<double> bpm{120.0};
     int64_t positionSamples = 0;
+
+    // Counts how many times the song-length endpoint has been reached
+    // since playback started. The song-repeat policy (None/Forever/
+    // NTimes) reads this to decide whether to wrap the playhead or halt.
+    // Reset on play() and on every manual seek from the transport UI.
+    int songPlayCount = 0;
+public:
+    void resetSongPlayCount() { songPlayCount = 0; }
+private:
     double sampleRate = 44100.0;  // device sample rate
     int blockSize = 512;
 

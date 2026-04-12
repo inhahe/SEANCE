@@ -1,4 +1,5 @@
 #include "terrain_synth.h"
+#include "signal_modulation.h"
 #include "builtin_synth.h" // for WaveExprParser
 #include "fft_util.h"
 #include "layered_wave_editor.h" // for LayeredWaveform decode/render
@@ -700,6 +701,7 @@ static float getParamByName(const Node& node, const std::string& name, float def
 }
 
 void TerrainSynthProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::MidiBuffer& midi) {
+    applySignalModulations(node, buf);
     buf.clear();
     int numSamples = buf.getNumSamples();
     int numChannels = buf.getNumChannels();

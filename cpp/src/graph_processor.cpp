@@ -2,6 +2,7 @@
 #include "wasm_script_processor.h"
 #include "builtin_synth.h"
 #include "terrain_synth.h"
+#include "multi_sampler.h"
 #include "signal_shape_node.h"
 #include "cache_processor.h"
 #include "pan_processor.h"
@@ -463,6 +464,9 @@ void GraphProcessor::rebuildGraph(NodeGraph& graph, Transport& transport) {
         } else if (node.type == NodeType::Instrument && node.script == "__drumsynth__") {
             proc = std::make_unique<DrumSynthProcessor>(node);
         } else if (node.type == NodeType::Instrument &&
+                   node.script.rfind(MultiSamplerDoc::kPrefix, 0) == 0) {
+            proc = std::make_unique<MultiSamplerProcessor>(node);
+        } else if (node.type == NodeType::Instrument &&
                    (node.script.rfind("__sf2__:", 0) == 0 ||
                     node.script.rfind("__sfz__:", 0) == 0)) {
             proc = std::make_unique<SoundFontProcessor>(node);
@@ -489,6 +493,8 @@ void GraphProcessor::rebuildGraph(NodeGraph& graph, Transport& transport) {
             proc = std::make_unique<PhaserProcessor>(node);
         } else if (node.type == NodeType::Effect && node.script == "__echo__") {
             proc = std::make_unique<EchoProcessor>(node);
+        } else if (node.type == NodeType::Effect && node.script == "__reverb__") {
+            proc = std::make_unique<ReverbProcessor>(node);
         } else if (node.type == NodeType::Effect && node.script == "__compressor__") {
             proc = std::make_unique<CompressorProcessor>(node);
         } else if (node.type == NodeType::Effect && node.script == "__limiter__") {
@@ -640,18 +646,23 @@ void GraphProcessor::rebuildGraph(NodeGraph& graph, Transport& transport) {
             }
         }
 
-        // Connect based on pin kind
-        if (srcKind == PinKind::Signal) {
-            // Signal: audio-rate mono control signal
-            // Route as audio channel 0 from source to channel 2+ on destination
-            // (channels 0,1 are stereo audio; signal inputs start at channel 2)
-            int signalChIdx = 2; // find which signal input this is
+        // Connect based on pin kind. Param and Signal both flow through the
+        // audio-rate control slot (channels 2+) — they are interchangeable at
+        // the cable level (task #82). The receiver decides per-block vs
+        // per-sample consumption; the channel layout is identical either way.
+        bool srcIsControl = (srcKind == PinKind::Signal || srcKind == PinKind::Param);
+        if (srcIsControl) {
+            // Find which control-input slot this is on the destination — count
+            // Param + Signal pins encountered before the matching pin id.
+            int signalChIdx = 2;
             for (auto& dstNode : graph.nodes) {
+                if (dstNode.id != dstNodeId) continue;
                 int sigCount = 0;
                 for (auto& pin : dstNode.pinsIn) {
                     if (pin.id == link.endPin) { signalChIdx = 2 + sigCount; break; }
-                    if (pin.kind == PinKind::Signal) sigCount++;
+                    if (pin.kind == PinKind::Signal || pin.kind == PinKind::Param) sigCount++;
                 }
+                break;
             }
             processorGraph->addConnection({{effectiveSrc, 0}, {dstGraphId, signalChIdx}});
         } else {

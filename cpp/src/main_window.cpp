@@ -10,18 +10,50 @@
 #include "convolution_processor.h"
 #include "convolution_editor.h"
 #include "sampler_editor.h"
+#include "multi_sampler.h"
+#include "multi_sampler_editor.h"
 #include "room_ir_capture.h"
 #include "drum_synth.h"
 #include "audio_export.h"
 #include "mod_import.h"
 #include <juce_gui_basics/juce_gui_basics.h>
 #include <juce_audio_utils/juce_audio_utils.h>
+#include <fstream>
+#include <sstream>
 #ifdef _WIN32
 #define NOMINMAX
 #include <Windows.h>
 #endif
 
 namespace SoundShop {
+
+// Returns true if this machine has a battery (laptop). JUCE 8.0.12 doesn't
+// wrap battery detection cross-platform, so we touch the OS APIs directly:
+// Win32 GetSystemPowerStatus on Windows, fall through to "no battery"
+// (desktop) on macOS / Linux until #87 adds proper per-platform paths.
+//
+// On Windows, BatteryFlag bit 128 means "no system battery" (desktop).
+// 255 means "unknown" — we treat that as desktop too, since assuming the
+// aggressive interval is the friendlier default for unknown machines.
+static bool machineHasBattery() {
+#ifdef _WIN32
+    SYSTEM_POWER_STATUS sps{};
+    if (GetSystemPowerStatus(&sps))
+        return sps.BatteryFlag != 128 && sps.BatteryFlag != 255;
+    return false;
+#else
+    return false; // #87: implement IOKit (macOS) and UPower / sysfs (Linux)
+#endif
+}
+
+// Pick the default autosave interval based on whether we're on a laptop.
+// Desktop systems get the aggressive 5-second interval; laptops get a more
+// conservative 20s default to save battery. Per task #86, AC vs battery
+// awareness and live transition response is a v2 enhancement (#87); v1
+// treats all laptops as if on battery.
+static int defaultAutosaveIntervalForThisMachine() {
+    return machineHasBattery() ? 20 : 5;
+}
 
 // ==============================================================================
 // MainContentComponent
@@ -59,6 +91,16 @@ MainContentComponent::MainContentComponent() {
     addAndMakeVisible(metroBtn);
     addAndMakeVisible(captureBtn);
 
+    // Play/Stop buttons skip tooltips — labels are self-explanatory and
+    // universally understood. Keeping tooltips would just clutter the
+    // hover layer over the most-used controls.
+    stopBtn.setTooltip("Stop playback and rewind to the start of the loop (or to 0 if loop is off)");
+    recordBtn.setTooltip("Start playback while arming any tracks ready to record audio or MIDI input");
+    fitAllBtn.setTooltip("Zoom and pan the node graph so every node fits in the visible area");
+    metroBtn.setTooltip("Toggle the metronome click during playback and recording");
+    captureBtn.setTooltip("Bounce the current Output node's audio to a new Audio Track. "
+                          "Uses the cached output from the last playback if available, "
+                          "otherwise re-renders the project offline.");
     playBtn.onClick = [this]() { onPlay(); };
     stopBtn.onClick = [this]() { onStop(); };
     recordBtn.onClick = [this]() { onRecord(); };
@@ -172,12 +214,14 @@ MainContentComponent::MainContentComponent() {
     positionLabel.setText("1 : 1.0", juce::dontSendNotification);
     positionLabel.setFont(juce::Font(juce::Font::getDefaultMonospacedFontName(), 14.0f, 0));
     positionLabel.setColour(juce::Label::textColourId, juce::Colours::limegreen);
+    positionLabel.setTooltip("Current transport position, shown as bar : beat");
     addAndMakeVisible(positionLabel);
 
     // Time signature
     timeSigLabel.setText("Time:", juce::dontSendNotification);
     addAndMakeVisible(timeSigLabel);
     addAndMakeVisible(timeSigCombo);
+    timeSigCombo.setTooltip("Project time signature — affects bar length, the metronome accent pattern, and the snap grid");
     timeSigCombo.addItem("4/4", 1);
     timeSigCombo.addItem("3/4", 2);
     timeSigCombo.addItem("6/8", 3);
@@ -198,6 +242,8 @@ MainContentComponent::MainContentComponent() {
     };
 
     addAndMakeVisible(loopBtn);
+    loopBtn.setTooltip("Toggle loop playback. When enabled, playback wraps around between the loop start and end "
+                       "(initially set to the full project length — drag the loop region in the routing strip to adjust).");
     loopBtn.onClick = [this]() {
         if (!graph.loopEnabled) {
             // Enable loop: default to full project length
@@ -216,7 +262,17 @@ MainContentComponent::MainContentComponent() {
             graph.loopEnabled ? juce::Colour(60, 60, 120) : juce::Colour(55, 55, 60));
     };
 
+    addAndMakeVisible(songBtn);
+    songBtn.setTooltip("Project-wide Song Length and Repeat settings. "
+                       "Song Length is where playback auto-stops (in beats); 0 means no explicit end. "
+                       "Repeat mode chooses between None (stop at end), Forever (loop until Stop), "
+                       "or N times (loop a fixed number of times then stop). Tracker imports with "
+                       "whole-song loops use this to preserve the original's looping behavior.");
+    songBtn.onClick = [this]() { showSongSettingsDialog(); };
+
     addAndMakeVisible(monitorBtn);
+    monitorBtn.setTooltip("Toggle input monitoring — when on, audio coming in from any input device is "
+                          "routed straight through to the Output node so you can hear yourself in real time");
     monitorBtn.onClick = [this]() {
         bool on = !audioEngine.inputMonitoring.load();
         audioEngine.inputMonitoring.store(on);
@@ -237,11 +293,15 @@ MainContentComponent::MainContentComponent() {
     bpmSlider.setValue(120);
     bpmSlider.setTextBoxStyle(juce::Slider::TextBoxLeft, false, 50, 20);
     bpmSlider.setSliderStyle(juce::Slider::LinearHorizontal);
+    bpmSlider.setTooltip("Project tempo in beats per minute. Higher = faster. "
+                         "Typical pop/rock is 90–130; dance music 120–140; ballads 60–80.");
     addAndMakeVisible(bpmSlider);
     bpmSlider.onValueChange = [this]() { graph.bpm = (float)bpmSlider.getValue(); };
 
     // Tap tempo
     addAndMakeVisible(tapTempoBtn);
+    tapTempoBtn.setTooltip("Click repeatedly in time with a beat to set the BPM. "
+                           "Averages the last few clicks; resets if you wait more than 2 seconds between clicks.");
     tapTempoBtn.onClick = [this]() {
         double now = juce::Time::getMillisecondCounterHiRes() / 1000.0;
         // Reset if more than 2 seconds since last tap
@@ -282,6 +342,7 @@ MainContentComponent::MainContentComponent() {
     pluginSettings.load("soundshop_plugins.cfg");
     loadRecentProjects();
     loadPreferences();
+    loadKnownHistories();
 
     // Load last project or set up default graph
     bool loaded = false;
@@ -295,41 +356,127 @@ MainContentComponent::MainContentComponent() {
     if (!loaded)
         graph.setupDefaultGraph();
     else {
-        // Upgrade old projects that predate the MidiInput node type:
-        //  - If no "Computer Keyboard" MidiInput node exists, add one so
-        //    typing still reaches synths via the new routing model.
-        //  - Add a MIDI In pin to any MidiTimeline that's missing one, so
-        //    cables from an input node can plug into them.
-        bool hasKbdInput = false;
-        for (auto& n : graph.nodes)
-            if (n.type == NodeType::MidiInput && n.midiInputSourceId == "keyboard") {
-                hasKbdInput = true; break;
-            }
-        if (!hasKbdInput) {
-            auto& keyIn = graph.addNode("Computer Keyboard", NodeType::MidiInput,
-                {}, {Pin{0, "MIDI Out", PinKind::Midi, false}}, {80, 80});
-            keyIn.midiInputSourceId = "keyboard";
-        }
-        for (auto& n : graph.nodes) {
-            if (n.type != NodeType::MidiTimeline) continue;
-            bool hasMidiIn = false;
-            for (auto& p : n.pinsIn)
-                if (p.kind == PinKind::Midi) { hasMidiIn = true; break; }
-            if (!hasMidiIn)
-                n.pinsIn.insert(n.pinsIn.begin(),
-                    {graph.getNextId(), "MIDI In", PinKind::Midi, true});
-        }
+        upgradeLegacyNodes();
     }
 
     audioEngine.setGraph(&graph, &transport);
+
+    // Per-plugin dirty tracking (#86): when AutomationManager pushes a
+    // value into a plugin parameter, mark that node's plugin state cache
+    // stale so the next slow autosave re-queries getStateInformation.
+    // Only fires from the message-thread automation path; processMidiCC
+    // (audio thread) does NOT call this — the periodic force-dirty pass
+    // catches changes that route through MIDI CC mappings.
+    audioEngine.getGraphProcessor().getAutomation().onPluginParamChanged =
+        [this](int nodeId) {
+            if (auto* n = graph.findNode(nodeId))
+                n->pluginStateDirty = true;
+        };
+
+    // Background worker for slow autosave (#86). Runs the disk write
+    // off the UI thread so larger projects don't hiccup during the save.
+    startAutosaveWorker();
+
+    // Wire the snapshot-based undo system (#84). Three pieces:
+    //  1. onLoadSnapshot — when undo/redo lands on a step that has no
+    //     LambdaCommand (a snapshot-only step from commitSnapshot, or any
+    //     step in a session restored from disk where the closures are gone),
+    //     parse the snapshot back into the live graph and rebuild routing.
+    //  2. onTreeChanged — fires after every push/undo/redo. Used to lazily
+    //     fill in the snapshot text for steps pushed via exec()/pushDone()
+    //     (LambdaCommand path) so they're persistable cross-session.
+    //  3. setRootSnapshot below — capture the initial state so the very
+    //     first edit has a state to revert to.
+    graph.undoTree.onLoadSnapshot = [this](const std::string& snap) {
+        ProjectFile::loadFromString(snap, graph, nullptr);
+        // Drop editor panels whose underlying node no longer exists in the
+        // restored state. Surviving panels keep their state and just
+        // re-render the new node data.
+        editorPanels.erase(
+            std::remove_if(editorPanels.begin(), editorPanels.end(),
+                [this](const std::unique_ptr<EditorPanel>& p) {
+                    return graph.findNode(p->nodeId) == nullptr;
+                }),
+            editorPanels.end());
+        audioEngine.getGraphProcessor().requestRebuild();
+        if (graphComponent) graphComponent->repaint();
+        for (auto& panel : editorPanels)
+            if (panel->component) panel->component->repaint();
+    };
+    graph.undoTree.onTreeChanged = [this]() {
+        // Lazy-fill: any step pushed without a snapshot gets one captured
+        // from the post-state right now. Cheap (graph-only serializer,
+        // typically <10 ms) and only fires when the current snapshot slot
+        // is actually empty, so undo/redo navigation skips this entirely.
+        if (graph.undoTree.currentSnapshotIsEmpty())
+            graph.undoTree.setCurrentSnapshot(ProjectFile::serializeForUndo(graph));
+        // Mark for persistence; the next timer tick writes the full tree
+        // to disk. Coalesces any number of mutations within one UI frame
+        // into a single disk write.
+        undoTreeDirty = true;
+    };
+    // Initial state for the root undo node — without this, undoing the
+    // first user edit has nothing to revert to.
+    graph.undoTree.setRootSnapshot(ProjectFile::serializeForUndo(graph));
 
     // Timer for UI updates
     startTimerHz(30);
 
     setSize(1440, 900);
+
+    // If a stale autosave file exists from a previous crash, offer to
+    // recover it. Deferred via callAsync so the dialog opens on top of the
+    // already-visible main window rather than blocking the constructor.
+    juce::Component::SafePointer<MainContentComponent> safe(this);
+    juce::MessageManager::callAsync([safe]() {
+        if (safe) safe->tryRecoverAutosave();
+    });
+
+    // Shared-history prompt for the auto-loaded startup project (#90).
+    // openProjectFile already fires this for user-opened projects, but
+    // the autoload path bypasses it — so do it here. Deferred so the
+    // dialog appears over the visible main window.
+    if (loaded && !ProjectFile::currentPath.empty()) {
+        juce::String startupPath = juce::String(ProjectFile::currentPath);
+        juce::Component::SafePointer<MainContentComponent> safe3(this);
+        juce::MessageManager::callAsync([safe3, startupPath]() {
+            if (safe3) safe3->handleSharedHistoryOnOpen(startupPath);
+        });
+    }
+
+    // Laptop autosave notice (#86): on first launch on a laptop, tell the
+    // user we picked a slower default to save battery and where to change
+    // it. Only shows once — saved in prefs as autosaveLaptopNoticeShown.
+    if (!autosaveLaptopNoticeShown && machineHasBattery()) {
+        juce::Component::SafePointer<MainContentComponent> safe2(this);
+        int interval = autosaveIntervalSeconds;
+        juce::MessageManager::callAsync([safe2, interval]() {
+            if (!safe2) return;
+            juce::AlertWindow::showAsync(
+                juce::MessageBoxOptions()
+                    .withIconType(juce::MessageBoxIconType::InfoIcon)
+                    .withTitle("Autosave on Laptop")
+                    .withMessage(
+                        "Detected a laptop. Autosave is set to " + juce::String(interval) +
+                        " seconds to save battery — frequent disk writes can wake the SSD "
+                        "and shorten unplugged runtime.\n\n"
+                        "Crash recovery still loses at most a few plugin tweaks. Graph "
+                        "edits (notes, cables, parameters) are protected at gesture "
+                        "granularity by a separate, much faster channel.\n\n"
+                        "You can change the interval (or turn autosave off entirely) "
+                        "later from the Options menu.")
+                    .withButton("OK"),
+                [safe2](int) {
+                    if (!safe2) return;
+                    safe2->autosaveLaptopNoticeShown = true;
+                    safe2->savePreferences();
+                });
+        });
+    }
 }
 
 MainContentComponent::~MainContentComponent() {
+    stopAutosaveWorker();
     audioEngine.shutdown();
 }
 
@@ -436,6 +583,7 @@ void MainContentComponent::resized() {
     placeBtn(fitAllBtn, 50);
     placeBtn(metroBtn, 50);
     placeBtn(loopBtn, 42);
+    placeBtn(songBtn, 46);
     placeBtn(monitorBtn, 40);
     placeBtn(captureBtn, 60);
     placeBtn(keyboardMidiBtn, 42);
@@ -528,7 +676,16 @@ void MainContentComponent::timerCallback() {
         transport.timeSigMap.sigs[0].numerator = graph.timeSignatureNum;
         transport.timeSigMap.sigs[0].denominator = graph.timeSignatureDen;
     }
-    transport.playing = audioEngine.isPlaying();
+    // Sync UI with audio engine's playing state. The audio thread may
+    // stop playback internally (e.g., when Song Length + Song Repeat
+    // policy fires), so the button text has to reflect that — otherwise
+    // it stays stuck on "Stop" after the song auto-stops.
+    bool engineIsPlaying = audioEngine.isPlaying();
+    if (transport.playing && !engineIsPlaying) {
+        // Transport just stopped itself — update button label.
+        playBtn.setButtonText("Play");
+    }
+    transport.playing = engineIsPlaying;
 
     // Evaluate Python signals on UI thread and apply to plugin parameters
     if (scriptEngine.isInitialized()) {
@@ -643,6 +800,29 @@ void MainContentComponent::timerCallback() {
                         SetWindowTextW(hwnd, title);
                     }
 #endif
+        }
+    }
+
+    // Undo-tree persistence tick. Coalesces any number of pushes/undos
+    // since the previous tick into one disk write. The serializer is
+    // graph-only (no plugin state) so it stays cheap even for large
+    // sessions, but we still keep the work to once per UI frame to be
+    // friendly to slower disks.
+    if (undoTreeDirty) {
+        undoTreeDirty = false;
+        writeUndoTreePersist();
+    }
+
+    // Autosave tick. Uses hi-res ms counter (monotonic, unaffected by wall
+    // clock changes). First tick seeds lastAutosaveAttemptMs so the first
+    // save fires a full interval after startup, not immediately.
+    if (autosaveEnabled) {
+        double nowMs = juce::Time::getMillisecondCounterHiRes();
+        if (lastAutosaveAttemptMs == 0.0) {
+            lastAutosaveAttemptMs = nowMs;
+        } else if (nowMs - lastAutosaveAttemptMs >= autosaveIntervalSeconds * 1000.0) {
+            lastAutosaveAttemptMs = nowMs;
+            performAutosave();
         }
     }
 
@@ -1065,6 +1245,7 @@ public:
         addAndMakeVisible(drawModeCombo);
 
         clearPathBtn.setButtonText("Clear Path");
+        clearPathBtn.setTooltip("Discard all the points in the current synthesis traversal path");
         clearPathBtn.onClick = [this]() {
             this->proc.getTraversalParams().pathPoints.clear();
             repaint();
@@ -1074,13 +1255,19 @@ public:
         drawModeCombo.addItem("Click Points", 2);
         drawModeCombo.addItem("Freehand", 3);
         drawModeCombo.setSelectedItemIndex(0);
+        drawModeCombo.setTooltip("How to add points to the traversal path. Off = visual only; "
+                                 "Click Points = each click drops a point; Freehand = drag the mouse to draw a continuous path.");
 
         loopModeCombo.addItem("Loop", 1);
         loopModeCombo.addItem("Bounce", 2);
         loopModeCombo.setSelectedItemIndex(0);
+        loopModeCombo.setTooltip("Loop replays the path from start when it reaches the end. "
+                                 "Bounce reverses direction at each end, ping-ponging back and forth.");
 
         addAndMakeVisible(smoothToggle);
         smoothToggle.setButtonText("Smooth");
+        smoothToggle.setTooltip("When on, the traversal interpolates smoothly between points "
+                                "(curved path). When off, it jumps in straight lines from point to point.");
         smoothToggle.setToggleable(true);
         smoothToggle.setClickingTogglesState(true);
         smoothToggle.setToggleState(true, juce::dontSendNotification);
@@ -1414,13 +1601,31 @@ void MainContentComponent::showPluginUI(int nodeId) {
         return;
     }
 
-    // Sampler: open the sampler editor with pitch detection
+    // MultiSampler: open the zone-based sampler editor.
+    if (node && node->type == NodeType::Instrument
+        && node->script.rfind(MultiSamplerDoc::kPrefix, 0) == 0) {
+        auto* editor = new MultiSamplerEditorComponent(graph, node->id, audioEngine);
+        juce::DialogWindow::LaunchOptions opts;
+        opts.content.setOwned(editor);
+        opts.dialogTitle = "Sampler: " + juce::String(node->name);
+        opts.dialogBackgroundColour = juce::Colour(22, 22, 28);
+        opts.escapeKeyTriggersCloseButton = true;
+        opts.useNativeTitleBar = true;
+        opts.resizable = true;
+        opts.launchAsync();
+        return;
+    }
+
+    // Legacy single-sample Sampler editor — still supported for old
+    // projects that haven't been upgraded yet. Normal load path converts
+    // "__audio__:" into "__multisampler__:" so this only fires if
+    // upgradeLegacyNodes() didn't run for some reason.
     if (node && node->type == NodeType::Instrument
         && node->script.rfind("__audio__:", 0) == 0) {
         auto* editor = new SamplerEditorComponent(graph, node->id, audioEngine);
         juce::DialogWindow::LaunchOptions opts;
         opts.content.setOwned(editor);
-        opts.dialogTitle = "Sampler: " + juce::String(node->name);
+        opts.dialogTitle = "Sampler (legacy): " + juce::String(node->name);
         opts.dialogBackgroundColour = juce::Colour(22, 22, 28);
         opts.escapeKeyTriggersCloseButton = true;
         opts.useNativeTitleBar = true;
@@ -1964,6 +2169,14 @@ void MainContentComponent::newProject() {
     ProjectFile::currentPath.clear();
     projectDirty = false;
     graph.dirty = false;
+    // The autosave (if any) represented the *old* graph, which we just
+    // blew away. Clear it so a subsequent crash doesn't offer to recover
+    // a project the user already replaced. Same logic for the undo
+    // history — it described the path through the OLD graph, not the
+    // new one.
+    discardAutosave();
+    discardUndoTreePersist();
+    lastAutosaveAttemptMs = juce::Time::getMillisecondCounterHiRes();
     graphComponent->repaint();
 
     // Offer the user the list of detected MIDI input devices to add.
@@ -2017,9 +2230,107 @@ void MainContentComponent::openProject() {
     });
 }
 
+void MainContentComponent::upgradeLegacyNodes() {
+    // Upgrade legacy-format nodes in place. Runs on every project load
+    // (startup autoload, File → Open, crash recovery) so users always
+    // get the latest behavior even from old .ssp files.
+
+    // MidiInput node type predates the old "keyboard-is-a-flag" model.
+    // If no "Computer Keyboard" MidiInput node exists, add one so
+    // typing still reaches synths via the new routing model.
+    bool hasKbdInput = false;
+    for (auto& n : graph.nodes)
+        if (n.type == NodeType::MidiInput && n.midiInputSourceId == "keyboard") {
+            hasKbdInput = true; break;
+        }
+    if (!hasKbdInput) {
+        auto& keyIn = graph.addNode("Computer Keyboard", NodeType::MidiInput,
+            {}, {Pin{0, "MIDI Out", PinKind::Midi, false}}, {80, 80});
+        keyIn.midiInputSourceId = "keyboard";
+    }
+
+    for (auto& n : graph.nodes) {
+        // Add a MIDI In pin to any MidiTimeline that's missing one.
+        if (n.type == NodeType::MidiTimeline) {
+            bool hasMidiIn = false;
+            for (auto& p : n.pinsIn)
+                if (p.kind == PinKind::Midi) { hasMidiIn = true; break; }
+            if (!hasMidiIn)
+                n.pinsIn.insert(n.pinsIn.begin(),
+                    {graph.getNextId(), "MIDI In", PinKind::Midi, true});
+        }
+
+        // Legacy "Reverb" stub: Effect node with name "Reverb" and no
+        // script. Upgrade to the new algorithmic reverb by attaching the
+        // "__reverb__" script and the default param set so the real DSP
+        // takes over. Preserves the node's ID and position so existing
+        // cables still connect to the right node.
+        if (n.type == NodeType::Effect && n.name == "Reverb" && n.script.empty()) {
+            n.script = "__reverb__";
+            if (n.params.empty()) {
+                n.params.push_back({"Mix",       0.3f,  0.0f, 1.0f});
+                n.params.push_back({"Size",      0.6f,  0.0f, 1.0f});
+                n.params.push_back({"Damping",   0.5f,  0.0f, 1.0f});
+                n.params.push_back({"Width",     1.0f,  0.0f, 1.0f});
+                n.params.push_back({"Pre-Delay", 0.0f,  0.0f, 200.0f});
+            }
+        }
+
+        // Legacy single-sample Sampler (TerrainSynth + "__audio__:" path).
+        // The old Sampler was a subset of MultiSampler's capabilities —
+        // upgrade it in place to a one-zone MultiSampler pointing at the
+        // same WAV file. Preserves the node's ID, position, name, and
+        // existing cables, and picks up the old node's ADSR / Base Note /
+        // Fine Tune settings if present in the param list.
+        if (n.type == NodeType::Instrument
+            && n.script.rfind("__audio__:", 0) == 0) {
+            auto path = n.script.substr(10);
+            MultiSamplerDoc doc;
+            MultiSamplerZone z;
+            z.samplePath = path;
+            z.loNote = 0; z.hiNote = 127;
+            z.loVel = 1; z.hiVel = 127;
+            z.baseNote = 69; // matches old Sampler default (A4)
+            // Salvage structured fields from the old flat param list.
+            float salvagedVolume = 0.5f;
+            float salvagedPan    = 0.0f;
+            bool  foundVolume = false, foundPan = false;
+            for (auto& p : n.params) {
+                if      (p.name == "Base Note") z.baseNote      = (int)p.value;
+                else if (p.name == "Fine Tune") z.fineTuneCents = p.value;
+                else if (p.name == "Volume")    { salvagedVolume = p.value; foundVolume = true; }
+                else if (p.name == "Pan")       { salvagedPan    = p.value; foundPan    = true; }
+                else if (p.name == "Attack")    doc.attack       = p.value;
+                else if (p.name == "Decay")     doc.decay        = p.value;
+                else if (p.name == "Sustain")   doc.sustain      = p.value;
+                else if (p.name == "Release")   doc.release      = p.value;
+            }
+            doc.zones.push_back(z);
+            n.script = doc.encode();
+            // Strip the old flat param list (it mixed TerrainSynth-
+            // specific knobs with the sampler ones we salvaged).
+            n.params.clear();
+            // Keep Volume and Pan as real params — MultiSampler reads
+            // them at block time so automation lanes and Signal cables
+            // work against them.
+            n.params.push_back({"Volume", foundVolume ? salvagedVolume : 0.5f,  0.0f, 1.0f});
+            n.params.push_back({"Pan",    foundPan    ? salvagedPan    : 0.0f, -1.0f, 1.0f});
+            // Also remove the legacy Signal pins the old Sampler had
+            // (Sig X, Sig Y) — MultiSampler uses script-embedded
+            // envelopes instead.
+            n.pinsIn.erase(std::remove_if(n.pinsIn.begin(), n.pinsIn.end(),
+                [](const Pin& p) {
+                    return p.kind == PinKind::Signal &&
+                           (p.name == "Sig X" || p.name == "Sig Y");
+                }), n.pinsIn.end());
+        }
+    }
+}
+
 void MainContentComponent::openProjectFile(const juce::String& path) {
     editorPanels.clear();
     ProjectFile::load(path.toStdString(), graph, &audioEngine.getPluginHost());
+    upgradeLegacyNodes();
 
     auto editorsToOpen = graph.openEditors;
     graph.openEditors.clear();
@@ -2027,8 +2338,20 @@ void MainContentComponent::openProjectFile(const juce::String& path) {
         openEditor(*node);
 
     addToRecentProjects(path);
+    // Loading a clean project on top of whatever was in memory invalidates
+    // any autosave that was tracking the previous state. The undo history
+    // also no longer applies — its snapshots described the old graph.
+    projectDirty = false;
+    graph.dirty = false;
+    discardAutosave();
+    discardUndoTreePersist();
+    lastAutosaveAttemptMs = juce::Time::getMillisecondCounterHiRes();
     graphComponent->fitAll();
     graphComponent->repaint();
+
+    // Shared-history handling (#90): check for a sidecar and, if it
+    // hasn't been seen by this user before, show the 3-option prompt.
+    handleSharedHistoryOnOpen(path);
 }
 
 void MainContentComponent::freezeNode(int nodeId) {
@@ -2150,6 +2473,9 @@ void MainContentComponent::saveProject(std::function<void()> onSaved) {
     projectDirty = false;
     graph.dirty = false;
     saveFlashFrames = 60; // ~2 seconds at 30Hz
+    // Explicit user save supersedes any crash-recovery autosave on disk.
+    discardAutosave();
+    lastAutosaveAttemptMs = juce::Time::getMillisecondCounterHiRes();
     if (onSaved) onSaved();
 }
 
@@ -2166,7 +2492,15 @@ void MainContentComponent::saveProjectAs(std::function<void()> onSaved) {
             projectDirty = false;
             graph.dirty = false;
             saveFlashFrames = 60;
+            discardAutosave();
+            lastAutosaveAttemptMs = juce::Time::getMillisecondCounterHiRes();
             if (onSaved) onSaved();
+            // Shared-history opt-in (#90): only offer the "bundle undo
+            // history" prompt if the project isn't already bound to a
+            // sidecar (which would be the case when Save-As is used to
+            // copy a project that already shipped with shared history).
+            if (graph.historyFilePath.empty())
+                offerSharedHistoryOnSaveAs(file.getFullPathName());
         });
 }
 
@@ -2185,8 +2519,15 @@ void MainContentComponent::importModFile() {
                 msg = "Imported successfully!\n\n"
                     + juce::String(result.numChannels) + " channels\n"
                     + juce::String(result.numPatterns) + " patterns\n"
-                    + juce::String(result.numSamples) + " samples\n"
+                    + juce::String(result.numSamplesExtracted) + " / "
+                    + juce::String(result.numSamples) + " samples extracted\n"
+                    + juce::String(result.numTracks) + " MIDI tracks created\n"
                     + juce::String(result.numNotes) + " notes";
+                if (!result.sampleDir.empty())
+                    msg += "\n\nSamples saved to:\n" + juce::String(result.sampleDir);
+                projectDirty = true;
+                graph.dirty = true;
+                audioEngine.getGraphProcessor().requestRebuild();
                 graphComponent->fitAll();
             } else {
                 msg = "Import failed: " + juce::String(result.error);
@@ -2194,7 +2535,7 @@ void MainContentComponent::importModFile() {
 
             juce::AlertWindow::showMessageBoxAsync(
                 juce::MessageBoxIconType::InfoIcon,
-                "MOD Import", msg);
+                "Tracker Import", msg);
             graphComponent->repaint();
         });
 }
@@ -2428,14 +2769,28 @@ void MainContentComponent::closeEditor(int nodeId) {
 }
 
 bool MainContentComponent::tryQuit() {
-    if (!projectDirty && !graph.dirty) return true;
+    if (!projectDirty && !graph.dirty) {
+        // Clean exit with nothing to save — any leftover autosave is stale
+        // (it would only exist if we crashed on a previous run and the user
+        // already loaded a recent project past it). Sweep it away so the
+        // next startup doesn't re-offer an irrelevant recovery.
+        discardAutosave();
+        return true;
+    }
 
     int result = juce::AlertWindow::showYesNoCancelBox(
         juce::MessageBoxIconType::QuestionIcon,
         "Unsaved Changes",
         "You have unsaved changes. Save before quitting?",
         "Save", "Don't Save", "Cancel");
-    if (result == 2) return true;       // Don't Save
+    if (result == 2) {                   // Don't Save
+        // User explicitly threw their edits away — autosave AND undo
+        // history go with them. (A clean save+quit instead would keep
+        // the undo tree so the next session can continue undoing.)
+        discardAutosave();
+        discardUndoTreePersist();
+        return true;
+    }
     if (result != 1) return false;       // Cancel (or window closed)
 
     // Save first, then re-request quit on completion. If the project has no
@@ -2503,17 +2858,765 @@ static juce::File getPreferencesFile() {
 }
 
 void MainContentComponent::loadPreferences() {
+    int autoDefault = defaultAutosaveIntervalForThisMachine();
     auto file = getPreferencesFile();
-    if (!file.existsAsFile()) return;
+    if (!file.existsAsFile()) {
+        autosaveIntervalSeconds = autoDefault;
+        return;
+    }
     auto xml = juce::parseXML(file);
-    if (!xml || xml->getTagName() != "Preferences") return;
+    if (!xml || xml->getTagName() != "Preferences") {
+        autosaveIntervalSeconds = autoDefault;
+        return;
+    }
     autoLoadLastProject = xml->getBoolAttribute("autoLoadLastProject", true);
+    autosaveEnabled = xml->getBoolAttribute("autosaveEnabled", true);
+    autosaveIntervalSeconds = xml->getIntAttribute("autosaveIntervalSeconds", autoDefault);
+    if (autosaveIntervalSeconds < 1) autosaveIntervalSeconds = 1;
+    autosaveLaptopNoticeShown = xml->getBoolAttribute("autosaveLaptopNoticeShown", false);
 }
 
 void MainContentComponent::savePreferences() {
     auto xml = std::make_unique<juce::XmlElement>("Preferences");
     xml->setAttribute("autoLoadLastProject", autoLoadLastProject);
+    xml->setAttribute("autosaveEnabled", autosaveEnabled);
+    xml->setAttribute("autosaveIntervalSeconds", autosaveIntervalSeconds);
+    xml->setAttribute("autosaveLaptopNoticeShown", autosaveLaptopNoticeShown);
     xml->writeTo(getPreferencesFile());
+}
+
+// ==============================================================================
+// Autosave
+// ==============================================================================
+
+static juce::File getAutosaveDir() {
+    return juce::File::getSpecialLocation(juce::File::userApplicationDataDirectory)
+               .getChildFile("SoundShop");
+}
+static juce::File getAutosaveFile() {
+    return getAutosaveDir().getChildFile("autosave.ssp");
+}
+static juce::File getAutosaveMetaFile() {
+    return getAutosaveDir().getChildFile("autosave.meta.xml");
+}
+static juce::File getUndoTreeFile() {
+    return getAutosaveDir().getChildFile("undo-tree.dat");
+}
+static juce::File getPluginStateFile(int nodeId) {
+    return getAutosaveDir().getChildFile("autosave-plugin-" + juce::String(nodeId) + ".dat");
+}
+
+void MainContentComponent::performAutosave() {
+    if (!autosaveEnabled) return;
+
+    // The slow channel only handles plugin internal state. Everything
+    // else (notes, cables, params, structural changes) is captured at
+    // gesture granularity by the fast undo-tree persistence (#84).
+    //
+    // Two kinds of dirty matter here:
+    //   - Plugin state dirty (per-Node flag set by automation pushes):
+    //     write that plugin's individual file (tiny, overwritten in place)
+    //   - Graph topology dirty (graph.dirty / projectDirty set by general
+    //     mutations): we need to refresh autosave.ssp so its [Node] entries
+    //     reflect the current topology, plus capture any plugin states
+    //     for plugins that may have just been added
+    std::vector<int> dirtyPluginNodeIds;
+    for (auto& n : graph.nodes) {
+        if (n.pluginIndex >= 0 && n.pluginStateDirty)
+            dirtyPluginNodeIds.push_back(n.id);
+    }
+
+    // Full save trigger: autosave.ssp doesn't exist yet, OR a periodic
+    // refresh interval has elapsed (so the main file's graph metadata
+    // catches up to topology changes that happened since the last full
+    // save). Between full saves, only per-plugin files get written.
+    //
+    // We don't trigger Full saves on graph.dirty / projectDirty because
+    // those flags are set by every kind of edit (notes, params, drags)
+    // and would cause Full saves on every tick during normal editing —
+    // defeating the whole point of incremental saves. The fast channel
+    // (#84) is the source of truth for graph state in the recovery flow,
+    // so autosave.ssp's slight staleness between full saves is fine.
+    bool needFullSave = !getAutosaveFile().existsAsFile()
+                     || autosaveTicksSinceFullSave >= kAutosaveTicksBetweenFullSaves;
+
+    if (dirtyPluginNodeIds.empty() && !needFullSave) return;
+
+    auto dir = getAutosaveDir();
+    if (!dir.exists()) dir.createDirectory();
+
+    syncCCMappingsToGraph();
+
+    AutosaveJob job;
+    auto& gp = audioEngine.getGraphProcessor();
+
+    if (needFullSave) {
+        // Full save: rewrite autosave.ssp with graph metadata ONLY
+        // (no inline plugin states). All plugin states live in the
+        // per-plugin files written below. This makes the periodic full
+        // save cheap — same cost as a single fast-channel snapshot —
+        // because we're not duplicating the plugin state data that's
+        // already on disk in the per-plugin files.
+        //
+        // Recovery uses both: load autosave.ssp for graph topology,
+        // then walk per-plugin files for plugin state (via
+        // applyPerPluginOverrides). Plugins whose per-plugin file is
+        // missing fall back to whatever default state the plugin loads
+        // with — same behavior as opening a brand-new project file.
+        auto graphText = ProjectFile::serializeForUndo(graph);
+        if (graphText.empty()) return;
+
+        job.writes.push_back({ getAutosaveFile(), std::move(graphText) });
+        job.metaPath = ProjectFile::currentPath;
+        job.metaTimestamp = juce::Time::getCurrentTime().toISO8601(true).toStdString();
+        job.writeMeta = true;
+        autosaveTicksSinceFullSave = 0;
+    } else {
+        autosaveTicksSinceFullSave++;
+    }
+
+    // Per-plugin files for whichever plugins are flagged dirty. The Full
+    // save above (when one happened) writes graph metadata only — it does
+    // NOT touch the plugin state cache or query getStateInformation. All
+    // plugin state querying happens here, in this loop, exactly once per
+    // dirty plugin. Clean plugins are skipped entirely (their on-disk
+    // file from a previous tick is still correct).
+    for (int nid : dirtyPluginNodeIds) {
+        auto* n = graph.findNode(nid);
+        if (!n || n->pluginIndex < 0) continue;
+        if (n->pluginStateDirty) {
+            // The Full path didn't already query this plugin (or there
+            // was no Full path). Query now and refresh the cache.
+            auto* proc = gp.getProcessorForNode(nid);
+            if (!proc) continue;
+            juce::MemoryBlock stateData;
+            proc->getStateInformation(stateData);
+            if (stateData.getSize() == 0) continue;
+            n->cachedPluginStateBase64 = stateData.toBase64Encoding().toStdString();
+            n->pluginStateDirty = false;
+        }
+        if (!n->cachedPluginStateBase64.empty())
+            job.writes.push_back({ getPluginStateFile(nid), n->cachedPluginStateBase64 });
+    }
+
+    if (job.writes.empty()) return;
+    enqueueAutosaveJob(std::move(job));
+
+    // After a Full save we know autosave.ssp is fully up to date with
+    // the current set of plugins, so any orphan per-plugin files (from
+    // plugins that have been removed since) can be deleted now.
+    if (needFullSave)
+        cleanupOrphanPluginFiles();
+
+    // Note: we do NOT clear projectDirty or graph.dirty here. Autosave is
+    // invisible to normal dirty tracking — only an explicit user save
+    // clears those.
+}
+
+void MainContentComponent::enqueueAutosaveJob(AutosaveJob job) {
+    {
+        std::lock_guard<std::mutex> lk(autosaveWorkerMutex);
+        // Single-slot mailbox with file-keyed coalescing:
+        //
+        //   No pending job: just store.
+        //
+        //   Pending job exists: merge file lists. For each new write,
+        //   if a write to the same file is already pending, replace its
+        //   content (newer wins). Otherwise append to the pending list.
+        //   Sidecar metadata (metaPath/timestamp/writeMeta) takes the
+        //   newer non-empty value.
+        //
+        // The result: at most one pending write per destination file
+        // exists in the mailbox at any time, no matter how many ticks
+        // fire before the worker drains it. Each file's "latest value"
+        // wins.
+        if (!autosaveWorkerHasJob) {
+            autosaveWorkerPending = std::move(job);
+        } else {
+            for (auto& w : job.writes) {
+                bool replaced = false;
+                for (auto& existing : autosaveWorkerPending.writes) {
+                    if (existing.destFile == w.destFile) {
+                        existing.content = std::move(w.content);
+                        replaced = true;
+                        break;
+                    }
+                }
+                if (!replaced)
+                    autosaveWorkerPending.writes.push_back(std::move(w));
+            }
+            if (job.writeMeta) {
+                autosaveWorkerPending.writeMeta = true;
+                autosaveWorkerPending.metaPath = std::move(job.metaPath);
+                autosaveWorkerPending.metaTimestamp = std::move(job.metaTimestamp);
+            }
+        }
+        autosaveWorkerHasJob = true;
+    }
+    autosaveWorkerCv.notify_one();
+}
+
+void MainContentComponent::startAutosaveWorker() {
+    if (autosaveWorkerThread.joinable()) return;
+    autosaveWorkerStop.store(false);
+    autosaveWorkerThread = std::thread([this]() { autosaveWorkerMain(); });
+}
+
+void MainContentComponent::stopAutosaveWorker() {
+    if (!autosaveWorkerThread.joinable()) return;
+    autosaveWorkerStop.store(true);
+    autosaveWorkerCv.notify_all();
+    autosaveWorkerThread.join();
+}
+
+void MainContentComponent::autosaveWorkerMain() {
+    for (;;) {
+        AutosaveJob job;
+        {
+            std::unique_lock<std::mutex> lk(autosaveWorkerMutex);
+            autosaveWorkerCv.wait(lk, [this]() {
+                return autosaveWorkerHasJob || autosaveWorkerStop.load();
+            });
+            if (autosaveWorkerStop.load() && !autosaveWorkerHasJob) return;
+            job = std::move(autosaveWorkerPending);
+            autosaveWorkerHasJob = false;
+        }
+
+        // Walk the file list and write each one atomically via tmp+rename.
+        // Independent files = no ordering constraints; if any single file
+        // fails (e.g. permissions), the others still go through.
+        for (auto& w : job.writes) {
+            auto tmp = w.destFile.getSiblingFile(w.destFile.getFileName() + ".tmp");
+            if (tmp.existsAsFile()) tmp.deleteFile();
+            {
+                juce::FileOutputStream out(tmp);
+                if (out.failedToOpen()) continue;
+                out.write(w.content.data(), w.content.size());
+            }
+            if (w.destFile.existsAsFile()) w.destFile.deleteFile();
+            tmp.moveFileTo(w.destFile);
+        }
+
+        // Sidecar metadata: only updated for Full saves. Per-plugin file
+        // writes don't change the user's idea of "what's being edited."
+        if (job.writeMeta) {
+            auto meta = std::make_unique<juce::XmlElement>("Autosave");
+            meta->setAttribute("originalPath", juce::String(job.metaPath));
+            meta->setAttribute("timestamp", juce::String(job.metaTimestamp));
+            meta->writeTo(getAutosaveMetaFile());
+        }
+    }
+}
+
+void MainContentComponent::discardAutosave() {
+    // Drain any pending worker job first so it doesn't recreate the file
+    // we're about to delete. Cheap — at most one job in flight, and the
+    // worker only does a disk write so it finishes quickly.
+    {
+        std::lock_guard<std::mutex> lk(autosaveWorkerMutex);
+        autosaveWorkerHasJob = false;
+    }
+    auto f = getAutosaveFile();
+    if (f.existsAsFile()) f.deleteFile();
+    auto tmp = f.getSiblingFile(f.getFileName() + ".tmp");
+    if (tmp.existsAsFile()) tmp.deleteFile();
+    auto m = getAutosaveMetaFile();
+    if (m.existsAsFile()) m.deleteFile();
+    // Per-plugin files are part of the autosave too — sweep them all.
+    auto dir = getAutosaveDir();
+    if (dir.exists()) {
+        for (auto& f2 : dir.findChildFiles(juce::File::findFiles, false, "autosave-plugin-*.dat"))
+            f2.deleteFile();
+        for (auto& f2 : dir.findChildFiles(juce::File::findFiles, false, "autosave-plugin-*.dat.tmp"))
+            f2.deleteFile();
+    }
+    // Force the next slow autosave to do a Full save since we just
+    // wiped the autosave.ssp file.
+    autosaveTicksSinceFullSave = kAutosaveTicksBetweenFullSaves;
+    // Note: this deliberately does NOT delete the undo tree. The undo
+    // tree persists across clean save+quit so the next session can
+    // continue undoing past the last save point. It's only thrown away
+    // on explicit "Don't Save" / "Discard" / new project / open project
+    // — those paths call discardUndoTreePersist() separately.
+}
+
+void MainContentComponent::applyPerPluginOverrides() {
+    auto& gp = audioEngine.getGraphProcessor();
+    for (auto& n : graph.nodes) {
+        if (n.pluginIndex < 0) continue;
+        auto file = getPluginStateFile(n.id);
+        if (!file.existsAsFile()) continue;
+        auto base64 = file.loadFileAsString().toStdString();
+        if (base64.empty()) continue;
+
+        // Update the cache so the next slow autosave doesn't redundantly
+        // re-query — the cache is now in sync with what's actually on
+        // the plugin instance.
+        n.cachedPluginStateBase64 = base64;
+        n.pluginStateDirty = false;
+
+        // Push the override into the live plugin instance. The plugin
+        // is already loaded by ProjectFile::load at this point, so we
+        // call setStateInformation on its live instance to override
+        // whatever ProjectFile::load applied from the file's [Node]
+        // pluginState entry.
+        auto* proc = gp.getProcessorForNode(n.id);
+        if (!proc) continue;
+        juce::MemoryBlock stateData;
+        stateData.fromBase64Encoding(base64);
+        if (stateData.getSize() > 0)
+            proc->setStateInformation(stateData.getData(), (int)stateData.getSize());
+    }
+}
+
+void MainContentComponent::cleanupOrphanPluginFiles() {
+    auto dir = getAutosaveDir();
+    if (!dir.exists()) return;
+    auto files = dir.findChildFiles(juce::File::findFiles, false, "autosave-plugin-*.dat");
+    std::set<int> currentPluginNodeIds;
+    for (auto& n : graph.nodes)
+        if (n.pluginIndex >= 0) currentPluginNodeIds.insert(n.id);
+    for (auto& f : files) {
+        // Extract nodeId from filename like "autosave-plugin-42.dat".
+        auto stem = f.getFileNameWithoutExtension();
+        auto prefix = juce::String("autosave-plugin-");
+        if (!stem.startsWith(prefix)) continue;
+        int nodeId = stem.substring(prefix.length()).getIntValue();
+        if (currentPluginNodeIds.find(nodeId) == currentPluginNodeIds.end())
+            f.deleteFile();
+    }
+}
+
+void MainContentComponent::discardUndoTreePersist() {
+    auto u = getUndoTreeFile();
+    if (u.existsAsFile()) u.deleteFile();
+    auto utmp = u.getSiblingFile(u.getFileName() + ".tmp");
+    if (utmp.existsAsFile()) utmp.deleteFile();
+}
+
+void MainContentComponent::writeUndoTreePersist() {
+    auto dir = getAutosaveDir();
+    if (!dir.exists()) dir.createDirectory();
+    auto file = getUndoTreeFile();
+
+    // Serialize via stringstream first, then write atomically by going
+    // through a .tmp file and renaming. Avoids leaving a half-written
+    // tree on disk if the app crashes mid-write.
+    std::ostringstream oss;
+    graph.undoTree.serializeTo(oss);
+    auto text = oss.str();
+
+    // Helper: atomic tmp-then-rename write of `text` to `target`.
+    auto atomicWrite = [&](const juce::File& target) {
+        auto tmp = target.getSiblingFile(target.getFileName() + ".tmp");
+        if (tmp.existsAsFile()) tmp.deleteFile();
+        {
+            juce::FileOutputStream out(tmp);
+            if (out.failedToOpen()) return;
+            out.write(text.data(), text.size());
+        }
+        if (target.existsAsFile()) target.deleteFile();
+        tmp.moveFileTo(target);
+    };
+
+    // Primary destination: user app-data copy (crash recovery, machine-
+    // local, always written).
+    atomicWrite(file);
+
+    // Secondary destination: project-bundled sidecar, if the current
+    // project has one. This is what gets shipped with the .ssp when the
+    // user shares the project, so it needs to stay in sync with the
+    // in-memory undo tree just like the app-data copy does.
+    auto sidecar = currentProjectSidecarFile();
+    if (sidecar != juce::File())
+        atomicWrite(sidecar);
+}
+
+juce::File MainContentComponent::currentProjectSidecarFile() const {
+    if (graph.historyFilePath.empty()) return {};
+    if (ProjectFile::currentPath.empty()) return {};
+    auto projFile = juce::File(ProjectFile::currentPath);
+    return projFile.getParentDirectory().getChildFile(juce::String(graph.historyFilePath));
+}
+
+void MainContentComponent::writeSharedHistorySidecar(const juce::File& sidecarFile) {
+    // One-shot write of the current undo tree to an explicit file path.
+    // Used by save-as opt-in and by the "use a copy" branch of the open
+    // prompt. Updates graph.historyFilePath to the path relative to the
+    // project's .ssp directory, so subsequent writeUndoTreePersist calls
+    // keep the sidecar in sync automatically.
+    auto dir = sidecarFile.getParentDirectory();
+    if (!dir.exists()) dir.createDirectory();
+
+    std::ostringstream oss;
+    graph.undoTree.serializeTo(oss);
+    auto text = oss.str();
+
+    auto tmp = sidecarFile.getSiblingFile(sidecarFile.getFileName() + ".tmp");
+    if (tmp.existsAsFile()) tmp.deleteFile();
+    {
+        juce::FileOutputStream out(tmp);
+        if (out.failedToOpen()) return;
+        out.write(text.data(), text.size());
+    }
+    if (sidecarFile.existsAsFile()) sidecarFile.deleteFile();
+    tmp.moveFileTo(sidecarFile);
+
+    // Update the graph's recorded sidecar path so writeUndoTreePersist
+    // picks it up going forward.
+    if (!ProjectFile::currentPath.empty()) {
+        auto projDir = juce::File(ProjectFile::currentPath).getParentDirectory();
+        auto rel = sidecarFile.getRelativePathFrom(projDir);
+        graph.historyFilePath = rel.toStdString();
+    } else {
+        graph.historyFilePath = sidecarFile.getFullPathName().toStdString();
+    }
+}
+
+// ============================================================================
+// Known-histories preferences (per-user record of decisions per project path)
+// ============================================================================
+
+static juce::File getKnownHistoriesFile() {
+    return getAutosaveDir().getChildFile("known-histories.txt");
+}
+
+void MainContentComponent::loadKnownHistories() {
+    knownHistories.clear();
+    auto file = getKnownHistoriesFile();
+    if (!file.existsAsFile()) return;
+    auto text = file.loadFileAsString();
+    auto lines = juce::StringArray::fromLines(text);
+    for (auto& line : lines) {
+        if (line.isEmpty()) continue;
+        // Format: <project_path>\t<decision>\t<aux>
+        auto parts = juce::StringArray::fromTokens(line, "\t", "");
+        if (parts.size() < 2) continue;
+        HistoryRecord rec;
+        auto decStr = parts[1];
+        if      (decStr == "adopted") rec.decision = HistoryDecision::Adopted;
+        else if (decStr == "copied")  rec.decision = HistoryDecision::Copied;
+        else if (decStr == "ignored") rec.decision = HistoryDecision::Ignored;
+        else continue;
+        if (parts.size() >= 3) rec.copyPath = parts[2].toStdString();
+        knownHistories[parts[0].toStdString()] = rec;
+    }
+}
+
+void MainContentComponent::saveKnownHistories() {
+    auto dir = getAutosaveDir();
+    if (!dir.exists()) dir.createDirectory();
+    juce::String text;
+    for (auto& [path, rec] : knownHistories) {
+        const char* decStr =
+            rec.decision == HistoryDecision::Adopted ? "adopted" :
+            rec.decision == HistoryDecision::Copied  ? "copied"  :
+            rec.decision == HistoryDecision::Ignored ? "ignored" : "";
+        if (*decStr == 0) continue;
+        text += juce::String(path) + "\t" + decStr;
+        if (!rec.copyPath.empty())
+            text += juce::String("\t") + juce::String(rec.copyPath);
+        text += "\n";
+    }
+    getKnownHistoriesFile().replaceWithText(text);
+}
+
+MainContentComponent::HistoryRecord
+MainContentComponent::getHistoryDecision(const juce::String& projectPath) const {
+    auto it = knownHistories.find(projectPath.toStdString());
+    if (it == knownHistories.end()) return {};
+    return it->second;
+}
+
+void MainContentComponent::recordHistoryDecision(const juce::String& projectPath,
+                                                 HistoryDecision d,
+                                                 const std::string& copyPath) {
+    HistoryRecord rec;
+    rec.decision = d;
+    rec.copyPath = copyPath;
+    knownHistories[projectPath.toStdString()] = rec;
+    saveKnownHistories();
+}
+
+// Load an undo tree from a file on disk into the live graph.undoTree,
+// and drive the live graph to the tree's current snapshot. Shared by
+// the "Use it" and "Use a copy" branches of the open prompt. Returns
+// true iff restoration succeeded.
+static bool loadUndoTreeFromFile(const juce::File& file, NodeGraph& graph) {
+    if (!file.existsAsFile()) return false;
+    std::ifstream in(file.getFullPathName().toStdString());
+    if (!in) return false;
+    if (!graph.undoTree.restoreFrom(in)) return false;
+    const auto& snap = graph.undoTree.currentSnapshot();
+    if (!snap.empty() && graph.undoTree.onLoadSnapshot)
+        graph.undoTree.onLoadSnapshot(snap);
+    return true;
+}
+
+void MainContentComponent::handleSharedHistoryOnOpen(const juce::String& projectAbsPath) {
+    // The project file we just loaded may have had a historyFile= field
+    // pointing at a sidecar. If not, there's nothing to consider — bail.
+    auto sidecar = currentProjectSidecarFile();
+    if (sidecar == juce::File() || !sidecar.existsAsFile()) return;
+
+    // Per-user memory of what the user already decided for this project.
+    // Suppresses the re-prompt on every subsequent open.
+    auto rec = getHistoryDecision(projectAbsPath);
+    juce::Component::SafePointer<MainContentComponent> safe(this);
+    juce::String capturedPath = projectAbsPath;
+
+    auto adoptInPlace = [safe, sidecar]() {
+        if (!safe) return;
+        if (loadUndoTreeFromFile(sidecar, safe->graph)) {
+            safe->undoTreeDirty = false;
+            if (safe->graphComponent) safe->graphComponent->repaint();
+        }
+    };
+
+    switch (rec.decision) {
+        case HistoryDecision::Adopted:
+            adoptInPlace();
+            return;
+        case HistoryDecision::Copied: {
+            // User previously chose to use a private copy. Load from
+            // that copy and leave the sidecar alone. If the copy is
+            // missing (user deleted it), fall through to re-prompt.
+            if (!rec.copyPath.empty()) {
+                juce::File copyFile(juce::String(rec.copyPath));
+                if (copyFile.existsAsFile()) {
+                    if (loadUndoTreeFromFile(copyFile, graph)) {
+                        undoTreeDirty = false;
+                        // Detach the graph from the bundled sidecar: the
+                        // user's edits go to their private copy, not the
+                        // shared file.
+                        graph.historyFilePath.clear();
+                        if (graphComponent) graphComponent->repaint();
+                        return;
+                    }
+                }
+            }
+            // Fall through to re-prompt.
+            break;
+        }
+        case HistoryDecision::Ignored:
+            // Detach from the sidecar so writeUndoTreePersist doesn't
+            // mutate the shared file going forward this session either.
+            graph.historyFilePath.clear();
+            return;
+        case HistoryDecision::NeverSeen:
+        default:
+            break;
+    }
+
+    // Show the 3-option modal. Button indexing:
+    //   1 = Use it (adopt)     — shared tree becomes the live tree
+    //   2 = Use a copy (copy)  — duplicate to a private file, edit that
+    //   0 = Ignore             — leave the sidecar alone, no undo tree
+    juce::String projName = juce::File(projectAbsPath).getFileName();
+    juce::String message =
+        "This project came with a shared undo history.\n\n"
+        "What would you like to do with it?\n\n"
+        "- Use it: your undo/redo will continue from where the sender "
+        "left off, and your future edits will be written back to the "
+        "shared history file bundled with the project.\n\n"
+        "- Use a copy: keep a private copy of the history for yourself. "
+        "The shared file won't be modified.\n\n"
+        "- Ignore: start with a fresh undo history. The shared file "
+        "stays untouched.";
+
+    juce::AlertWindow::showAsync(
+        juce::MessageBoxOptions()
+            .withIconType(juce::MessageBoxIconType::QuestionIcon)
+            .withTitle("Shared Undo History Found")
+            .withMessage(message)
+            .withButton("Use It")
+            .withButton("Use a Copy")
+            .withButton("Ignore"),
+        [safe, sidecar, capturedPath](int result) {
+            if (!safe) return;
+            if (result == 1) {
+                // Adopt: load the sidecar; future writes keep going to it.
+                if (loadUndoTreeFromFile(sidecar, safe->graph)) {
+                    safe->undoTreeDirty = false;
+                    if (safe->graphComponent) safe->graphComponent->repaint();
+                }
+                safe->recordHistoryDecision(capturedPath, HistoryDecision::Adopted);
+            } else if (result == 2) {
+                // Copy: duplicate the sidecar into a private file under
+                // the user's autosave dir, load from it, and detach the
+                // graph from the bundled sidecar so writes go to the copy.
+                auto dir = getAutosaveDir();
+                if (!dir.exists()) dir.createDirectory();
+                auto hashed = juce::String::toHexString(capturedPath.hashCode64());
+                auto copyFile = dir.getChildFile("shared-history-copy-" + hashed + ".dat");
+                sidecar.copyFileTo(copyFile);
+                if (loadUndoTreeFromFile(copyFile, safe->graph)) {
+                    safe->undoTreeDirty = false;
+                    if (safe->graphComponent) safe->graphComponent->repaint();
+                }
+                // Detach: clear historyFilePath so the bundled sidecar
+                // stops receiving writes. The copy is machine-local.
+                safe->graph.historyFilePath.clear();
+                safe->recordHistoryDecision(capturedPath, HistoryDecision::Copied,
+                                            copyFile.getFullPathName().toStdString());
+            } else {
+                // Ignore: detach from the sidecar for this session.
+                safe->graph.historyFilePath.clear();
+                safe->recordHistoryDecision(capturedPath, HistoryDecision::Ignored);
+            }
+        });
+}
+
+void MainContentComponent::offerSharedHistoryOnSaveAs(const juce::String& savedProjectPath) {
+    // Post-save opt-in: after the user saves a project under a new
+    // name, ask whether the undo tree should be bundled alongside the
+    // .ssp. If yes, write the sidecar and record the path in
+    // graph.historyFilePath so future saves keep it in sync. The
+    // historyFile= field gets persisted to the .ssp on the next save.
+    juce::Component::SafePointer<MainContentComponent> safe(this);
+    juce::String capturedPath = savedProjectPath;
+
+    juce::AlertWindow::showAsync(
+        juce::MessageBoxOptions()
+            .withIconType(juce::MessageBoxIconType::QuestionIcon)
+            .withTitle("Include Undo History?")
+            .withMessage(
+                "Would you like to save the undo history alongside "
+                "this project so it travels with the file when you "
+                "share it?\n\n"
+                "This creates a sidecar file next to the .ssp. Anyone "
+                "who opens the project will be offered the history "
+                "(they can adopt it, keep a private copy, or ignore "
+                "it).\n\n"
+                "You can skip this — the undo history will still be "
+                "saved privately on your machine either way.")
+            .withButton("Yes, Include")
+            .withButton("No Thanks"),
+        [safe, capturedPath](int result) {
+            if (!safe) return;
+            if (result != 1) return;
+            // Write the sidecar next to the .ssp using a conventional
+            // name (same stem, .history extension).
+            auto projFile = juce::File(capturedPath);
+            auto sidecar = projFile.getSiblingFile(
+                projFile.getFileNameWithoutExtension() + ".history");
+            safe->writeSharedHistorySidecar(sidecar);
+            // writeSharedHistorySidecar updated graph.historyFilePath;
+            // re-save the project file once so its historyFile= field
+            // reflects the new sidecar association.
+            if (!ProjectFile::currentPath.empty()) {
+                ProjectFile::save(ProjectFile::currentPath,
+                                  safe->graph,
+                                  &safe->audioEngine.getGraphProcessor());
+            }
+            // Remember: on subsequent opens of this project, don't
+            // re-prompt — the user knows their own sidecar.
+            safe->recordHistoryDecision(capturedPath, HistoryDecision::Adopted);
+        });
+}
+
+void MainContentComponent::tryRestoreUndoTree() {
+    auto file = getUndoTreeFile();
+    if (!file.existsAsFile()) return;
+    std::ifstream in(file.getFullPathName().toStdString());
+    if (!in) return;
+    if (!graph.undoTree.restoreFrom(in)) {
+        // Corrupted or incompatible — drop it.
+        in.close();
+        file.deleteFile();
+        return;
+    }
+    // The restored tree's currentNodeId already points at the right step;
+    // load that snapshot into the live graph so the in-memory state matches
+    // what undo/redo will revert to. (Without this, the graph the user sees
+    // is whatever the autosave or last-loaded project says, which may not
+    // line up with the undo position.)
+    const auto& snap = graph.undoTree.currentSnapshot();
+    if (!snap.empty() && graph.undoTree.onLoadSnapshot)
+        graph.undoTree.onLoadSnapshot(snap);
+    // Don't mark dirty for persistence — we just read this from disk.
+    undoTreeDirty = false;
+}
+
+void MainContentComponent::tryRecoverAutosave() {
+    if (autosaveRecoveryOffered) return;
+    autosaveRecoveryOffered = true;
+
+    auto autoFile = getAutosaveFile();
+    if (!autoFile.existsAsFile()) {
+        // No autosave to consider — but we still want to restore the
+        // persisted undo tree if one exists from a clean prior session.
+        tryRestoreUndoTree();
+        return;
+    }
+
+    juce::String originalPath;
+    juce::String timestamp;
+    if (auto meta = juce::parseXML(getAutosaveMetaFile())) {
+        if (meta->getTagName() == "Autosave") {
+            originalPath = meta->getStringAttribute("originalPath");
+            timestamp = meta->getStringAttribute("timestamp");
+        }
+    }
+
+    juce::String what = originalPath.isEmpty()
+        ? juce::String("an unsaved project")
+        : ("\"" + juce::File(originalPath).getFileName() + "\"");
+    juce::String when = timestamp.isEmpty() ? juce::String("earlier")
+                                             : ("at " + timestamp);
+
+    juce::String message =
+        "SoundShop didn't shut down cleanly last time.\n\n"
+        "An autosaved version of " + what + " was saved " + when + ".\n\n"
+        "Recover it? (Discard throws the autosave away and opens "
+        "whatever would normally load at startup.)";
+
+    juce::Component::SafePointer<MainContentComponent> safe(this);
+    juce::String capturedOriginal = originalPath;
+    juce::AlertWindow::showAsync(
+        juce::MessageBoxOptions()
+            .withIconType(juce::MessageBoxIconType::QuestionIcon)
+            .withTitle("Recover Autosaved Version?")
+            .withMessage(message)
+            .withButton("Recover")
+            .withButton("Discard"),
+        [safe, capturedOriginal](int result) {
+            if (!safe) return;
+            if (result != 1) {
+                safe->discardAutosave();
+                safe->discardUndoTreePersist();
+                return;
+            }
+            // Load the autosave blob into the graph, then patch
+            // ProjectFile::currentPath back to the original path so that
+            // Ctrl+S saves to the real file, not the autosave. Leave the
+            // project dirty so the user knows there are unsaved changes.
+            safe->editorPanels.clear();
+            ProjectFile::load(getAutosaveFile().getFullPathName().toStdString(),
+                              safe->graph, &safe->audioEngine.getPluginHost());
+            safe->upgradeLegacyNodes();
+            // Per-plugin override files contain newer plugin state than
+            // the (full but periodically-stale) autosave.ssp. Apply them
+            // on top so the user sees the most recent plugin tweaks.
+            safe->applyPerPluginOverrides();
+            safe->cleanupOrphanPluginFiles();
+            ProjectFile::currentPath = capturedOriginal.toStdString();
+            safe->projectDirty = true;
+            safe->graph.dirty = true;
+
+            auto editorsToOpen = safe->graph.openEditors;
+            safe->graph.openEditors.clear();
+            for (auto* node : editorsToOpen)
+                safe->openEditor(*node);
+
+            safe->graphComponent->fitAll();
+            safe->graphComponent->repaint();
+
+            // After loading the autosave, also restore the undo tree
+            // from disk if one exists. The tree's currentNodeId picks up
+            // wherever the user was in their history before the crash.
+            safe->tryRestoreUndoTree();
+        });
 }
 
 // ==============================================================================
@@ -2855,6 +3958,11 @@ public:
         removeDirBtn.setButtonText("Remove");
         resetDirsBtn.setButtonText("Reset Defaults");
         scanBtn.setButtonText("Scan Now");
+        addDirBtn.setTooltip("Add the path in the text field below to the list of directories scanned for plugins");
+        removeDirBtn.setTooltip("Remove the selected directory from the scan list");
+        resetDirsBtn.setTooltip("Replace the scan list with the OS default plugin directories (Program Files/VST3, /Library/Audio/Plug-Ins, etc.)");
+        scanBtn.setTooltip("Walk the listed directories now and load any new plugins. Plugins that crash during scan are automatically blocklisted.");
+        dirInput.setTooltip("Type or paste a directory path here, then click Add");
         statusLabel.setText(juce::String((int)host.getAvailablePlugins().size()) + " plugins",
                             juce::dontSendNotification);
 
@@ -2898,6 +4006,7 @@ public:
         pluginList.updateContent();
         addAndMakeVisible(addToGraphBtn);
         addToGraphBtn.setButtonText("Add to Graph");
+        addToGraphBtn.setTooltip("Create a new node in the graph for the selected plugin and load it");
         addToGraphBtn.onClick = [this]() {
             int row = pluginList.getSelectedRow();
             auto& plugins = this->host.getAvailablePlugins();
@@ -3211,6 +4320,47 @@ void MainContentComponent::showPluginSettingsDialog() {
     opts.useNativeTitleBar = true;
     opts.resizable = true;
     opts.launchAsync();
+}
+
+void MainContentComponent::showSongSettingsDialog() {
+    // Small modal with three inputs: Song Length (beats), Repeat Mode,
+    // and Repeat Count (used only when mode == N Times).
+    auto* aw = new juce::AlertWindow("Song Length + Repeat",
+        "Song Length is where playback auto-stops (in beats).\n"
+        "0 = no explicit end (transport plays until you press Stop).\n\n"
+        "Repeat Mode:\n"
+        "  None    — stop at Song Length.\n"
+        "  Forever — loop back to beat 0 until Stop is pressed.\n"
+        "  N Times — loop back and play N times total, then stop.",
+        juce::MessageBoxIconType::NoIcon);
+    aw->addTextEditor("length",
+        juce::String(graph.songLengthBeats, 2),
+        "Song Length (beats):");
+    aw->addComboBox("mode", {"None", "Forever (until Stop)", "N Times"}, "Repeat Mode:");
+    aw->getComboBoxComponent("mode")->setSelectedItemIndex((int)graph.songRepeatMode,
+                                                            juce::dontSendNotification);
+    aw->addTextEditor("count",
+        juce::String(graph.songRepeatCount),
+        "Repeat Count (N):");
+    aw->addButton("OK", 1, juce::KeyPress(juce::KeyPress::returnKey));
+    aw->addButton("Cancel", 0);
+    aw->enterModalState(true, juce::ModalCallbackFunction::create(
+        [this, aw](int res) {
+            if (res == 1) {
+                float len = aw->getTextEditorContents("length").getFloatValue();
+                int modeIdx = aw->getComboBoxComponent("mode")->getSelectedItemIndex();
+                int count = aw->getTextEditorContents("count").getIntValue();
+                graph.songLengthBeats = std::max(0.0f, len);
+                graph.songRepeatMode = (modeIdx == 1 ? NodeGraph::SongRepeat::Forever
+                                        : modeIdx == 2 ? NodeGraph::SongRepeat::NTimes
+                                        :                NodeGraph::SongRepeat::None);
+                graph.songRepeatCount = std::max(1, count);
+                projectDirty = true;
+                graph.dirty = true;
+                graph.commitSnapshot("Edit song length / repeat");
+            }
+            delete aw;
+        }), true);
 }
 
 // ==============================================================================

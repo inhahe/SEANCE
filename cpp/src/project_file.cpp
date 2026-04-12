@@ -10,14 +10,20 @@ std::string ProjectFile::currentPath;
 
 // Simple text-based project format
 // Sections: [Project], [Node], [Pin], [Clip], [Note], [Link], [Param]
+//
+// All actual I/O goes through the stream-based writeProject/readProject
+// helpers — the path-based save()/load() are thin wrappers that open a file
+// and delegate. The undo system (#84) reuses the same helpers against
+// std::ostringstream / std::istringstream to (de)serialize snapshots in
+// memory.
 
-static void writeStr(std::ofstream& f, const std::string& key, const std::string& val) {
+static void writeStr(std::ostream& f, const std::string& key, const std::string& val) {
     f << key << "=" << val << "\n";
 }
-static void writeInt(std::ofstream& f, const std::string& key, int val) {
+static void writeInt(std::ostream& f, const std::string& key, int val) {
     f << key << "=" << val << "\n";
 }
-static void writeFloat(std::ofstream& f, const std::string& key, float val) {
+static void writeFloat(std::ostream& f, const std::string& key, float val) {
     f << key << "=" << val << "\n";
 }
 
@@ -27,6 +33,15 @@ bool ProjectFile::save(const std::string& path, NodeGraph& graph, GraphProcessor
         fprintf(stderr, "Failed to save project: %s\n", path.c_str());
         return false;
     }
+    bool ok = writeProject(f, graph, gp);
+    if (ok) {
+        currentPath = path;
+        fprintf(stderr, "Project saved: %s\n", path.c_str());
+    }
+    return ok;
+}
+
+bool ProjectFile::writeProject(std::ostream& f, NodeGraph& graph, GraphProcessor* gp) {
 
     f << "[Project]\n";
     writeFloat(f, "bpm", graph.bpm);
@@ -39,6 +54,14 @@ bool ProjectFile::save(const std::string& path, NodeGraph& graph, GraphProcessor
     }
     if (graph.projectSampleRate > 0)
         writeFloat(f, "projectSampleRate", (float)graph.projectSampleRate);
+    if (graph.songLengthBeats > 0)
+        writeFloat(f, "songLengthBeats", (float)graph.songLengthBeats);
+    if (graph.songRepeatMode != NodeGraph::SongRepeat::None)
+        writeInt(f, "songRepeatMode", (int)graph.songRepeatMode);
+    if (graph.songRepeatCount != 1)
+        writeInt(f, "songRepeatCount", graph.songRepeatCount);
+    if (!graph.historyFilePath.empty())
+        writeStr(f, "historyFile", graph.historyFilePath);
     writeInt(f, "nextId", 0);
     if (!graph.signalScript.empty()) {
         // Encode signal script with line count prefix so we know where it ends
@@ -81,15 +104,28 @@ bool ProjectFile::save(const std::string& path, NodeGraph& graph, GraphProcessor
         if (node.spatialX != 0.0f) writeFloat(f, "spatialX", node.spatialX);
         if (node.spatialY != 0.0f) writeFloat(f, "spatialY", node.spatialY);
         if (node.spatialZ != 0.0f) writeFloat(f, "spatialZ", node.spatialZ);
-        // Save plugin state as base64
+        // Save plugin state as base64. Per-plugin dirty tracking (#86):
+        // only call getStateInformation when the cache is stale, otherwise
+        // reuse the cached base64 string. This avoids the expensive query
+        // for plugins whose parameters haven't changed since the last
+        // save — typical case is most plugins have nothing to re-query.
+        // ProjectFile::save (the user-facing save path, gp != nullptr) and
+        // the slow autosave path both share this cache.
         if (gp && node.pluginIndex >= 0) {
-            auto* proc = gp->getProcessorForNode(node.id);
-            if (proc) {
-                juce::MemoryBlock stateData;
-                proc->getStateInformation(stateData);
-                if (stateData.getSize() > 0)
-                    writeStr(f, "pluginState", stateData.toBase64Encoding().toStdString());
+            if (node.pluginStateDirty || node.cachedPluginStateBase64.empty()) {
+                auto* proc = gp->getProcessorForNode(node.id);
+                if (proc) {
+                    juce::MemoryBlock stateData;
+                    proc->getStateInformation(stateData);
+                    if (stateData.getSize() > 0) {
+                        node.cachedPluginStateBase64 =
+                            stateData.toBase64Encoding().toStdString();
+                        node.pluginStateDirty = false;
+                    }
+                }
             }
+            if (!node.cachedPluginStateBase64.empty())
+                writeStr(f, "pluginState", node.cachedPluginStateBase64);
         }
         if (node.performanceMode) {
             writeInt(f, "performanceMode", 1);
@@ -132,12 +168,19 @@ bool ProjectFile::save(const std::string& path, NodeGraph& graph, GraphProcessor
         for (auto& param : node.params) {
             f << "[Param]\n";
             writeStr(f, "name", param.name);
-            writeFloat(f, "value", param.value);
+            writeFloat(f, "value", param.modulated ? param.baseValue : param.value);
             writeFloat(f, "min", param.minVal);
             writeFloat(f, "max", param.maxVal);
             writeStr(f, "format", param.format);
             for (auto& ap : param.automation.points)
                 f << "auto=" << ap.beat << "," << ap.value << "\n";
+        }
+        // Signal modulation pin bindings (#88). The pins themselves are
+        // already serialized in the [PinIn] block above; the modPin
+        // entries just record which param each one drives.
+        for (auto& mp : node.modPins) {
+            f << "modPin=" << mp.paramIndex << "," << mp.pinId
+              << "," << mp.depth << "\n";
         }
         for (auto& clip : node.clips) {
             f << "[Clip]\n";
@@ -273,8 +316,6 @@ bool ProjectFile::save(const std::string& path, NodeGraph& graph, GraphProcessor
     }
 
     f << "\n[End]\n";
-    currentPath = path;
-    fprintf(stderr, "Project saved: %s\n", path.c_str());
     return true;
 }
 
@@ -284,7 +325,16 @@ bool ProjectFile::load(const std::string& path, NodeGraph& graph, PluginHost* pl
         fprintf(stderr, "Failed to load project: %s\n", path.c_str());
         return false;
     }
+    bool ok = readProject(f, graph, pluginHost);
+    if (ok) {
+        currentPath = path;
+        fprintf(stderr, "Project loaded: %s (%d nodes, %d links)\n",
+                path.c_str(), (int)graph.nodes.size(), (int)graph.links.size());
+    }
+    return ok;
+}
 
+bool ProjectFile::readProject(std::istream& f, NodeGraph& graph, PluginHost* pluginHost) {
     // Clear existing
     graph.nodes.clear();
     graph.links.clear();
@@ -364,6 +414,15 @@ bool ProjectFile::load(const std::string& path, NodeGraph& graph, PluginHost* pl
             else if (key == "loopStart") graph.loopStartBeat = std::stof(val);
             else if (key == "loopEnd") graph.loopEndBeat = std::stof(val);
             else if (key == "projectSampleRate") graph.projectSampleRate = std::stof(val);
+            else if (key == "songLengthBeats") graph.songLengthBeats = std::stof(val);
+            else if (key == "songRepeatMode") {
+                int m = std::stoi(val);
+                graph.songRepeatMode = (m == 1 ? NodeGraph::SongRepeat::Forever
+                                       : m == 2 ? NodeGraph::SongRepeat::NTimes
+                                       :          NodeGraph::SongRepeat::None);
+            }
+            else if (key == "songRepeatCount") graph.songRepeatCount = std::max(1, std::stoi(val));
+            else if (key == "historyFile") graph.historyFilePath = val;
             else if (key == "signalScriptLines") {
                 int numLines = std::stoi(val);
                 graph.signalScript.clear();
@@ -422,6 +481,18 @@ bool ProjectFile::load(const std::string& path, NodeGraph& graph, PluginHost* pl
                 std::string token;
                 while (std::getline(ss, token, ','))
                     if (!token.empty()) curNode->childNodeIds.push_back(std::stoi(token));
+            }
+            // Signal modulation pin bindings (#88): "modPin=paramIdx,pinId,depth"
+            else if (key == "modPin") {
+                Node::ModPin mp;
+                auto c1 = val.find(',');
+                auto c2 = val.find(',', c1 + 1);
+                if (c1 != std::string::npos && c2 != std::string::npos) {
+                    mp.paramIndex = std::stoi(val.substr(0, c1));
+                    mp.pinId      = std::stoi(val.substr(c1 + 1, c2 - c1 - 1));
+                    mp.depth      = std::stof(val.substr(c2 + 1));
+                    curNode->modPins.push_back(mp);
+                }
             }
         }
         else if ((section == "[PinIn]" || section == "[PinOut]") && curNode) {
@@ -606,11 +677,23 @@ bool ProjectFile::load(const std::string& path, NodeGraph& graph, PluginHost* pl
     for (auto& n : graph.nodes)
         n.posSet = false;
 
-    currentPath = path;
     graph.dirty = false;
-    fprintf(stderr, "Project loaded: %s (%d nodes, %d links)\n",
-            path.c_str(), (int)graph.nodes.size(), (int)graph.links.size());
     return true;
+}
+
+std::string ProjectFile::serializeForUndo(NodeGraph& graph) {
+    // Pass nullptr for the GraphProcessor so plugin state is omitted —
+    // that's the expensive part and undo doesn't need it (plugin internal
+    // state is captured separately by the slow autosave path, task #86).
+    std::ostringstream oss;
+    writeProject(oss, graph, nullptr);
+    return oss.str();
+}
+
+bool ProjectFile::loadFromString(const std::string& text, NodeGraph& graph,
+                                 PluginHost* pluginHost) {
+    std::istringstream iss(text);
+    return readProject(iss, graph, pluginHost);
 }
 
 } // namespace SoundShop

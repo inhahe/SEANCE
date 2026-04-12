@@ -14,8 +14,11 @@ public:
         std::string error;
         int numChannels = 0;
         int numPatterns = 0;
-        int numSamples = 0;
+        int numSamples = 0;       // total samples in the module
+        int numSamplesExtracted = 0; // how many were rendered to WAV
+        int numTracks = 0;        // MIDI tracks created (one per channel × sample)
         int numNotes = 0;
+        std::string sampleDir;    // directory that received the WAVs (may be empty)
     };
 
     // Import a tracker module file into the graph

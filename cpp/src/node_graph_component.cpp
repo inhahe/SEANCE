@@ -8,6 +8,7 @@
 #include "soundfont_processor.h"
 #include "builtin_effects.h"
 #include "drum_synth.h"
+#include "multi_sampler.h"
 #include <cmath>
 
 namespace SoundShop {
@@ -346,47 +347,82 @@ void NodeGraphComponent::drawNode(juce::Graphics& g, Node& node) {
 }
 
 void NodeGraphComponent::drawLink(juce::Graphics& g, Link& link) {
-    // Find source and destination pin positions
+    // Find source and destination pin positions, plus their kinds.
+    // The two kinds may differ when an implicit Param↔Signal conversion is
+    // in effect — in that case the wire is drawn in two halves, source
+    // colour up front and destination colour at the tail, so the user can
+    // see the conversion happening visually.
     juce::Point<float> start, end;
-    PinKind kind = PinKind::Audio;
-    bool found = false;
+    PinKind srcKind = PinKind::Audio;
+    PinKind dstKind = PinKind::Audio;
+    bool foundSrc = false, foundDst = false;
 
     for (auto& node : graph.nodes) {
         for (auto& pin : node.pinsOut) {
             if (pin.id == link.startPin) {
                 start = canvasToScreen(getPinPosition(node, pin));
-                kind = pin.kind;
-                found = true;
+                srcKind = pin.kind;
+                foundSrc = true;
                 break;
             }
         }
         for (auto& pin : node.pinsIn) {
             if (pin.id == link.endPin) {
                 end = canvasToScreen(getPinPosition(node, pin));
+                dstKind = pin.kind;
+                foundDst = true;
                 break;
             }
         }
     }
-    if (!found) return;
+    if (!foundSrc || !foundDst) return;
 
-    // Bézier curve
-    juce::Path path;
+    // Bézier curve (cubic) with horizontal handles
     float dx = std::abs(end.x - start.x) * 0.5f;
     dx = std::max(dx, 30.0f * zoom);
-    path.startNewSubPath(start);
-    path.cubicTo(start.x + dx, start.y, end.x - dx, end.y, end.x, end.y);
+    juce::Point<float> ctrl1{start.x + dx, start.y};
+    juce::Point<float> ctrl2{end.x - dx,   end.y};
 
-    // Wire color matches the source pin's kind so the user can tell at a
-    // glance which type of data flows through the cable: audio (blue),
-    // MIDI (green), param/block-rate control (orange), signal/audio-rate
-    // control (amber). Param and Signal are close in hue on purpose — they
-    // both carry control data, at different rates.
-    auto linkColour = colourForPinKind(kind).withAlpha(0.8f);
-    if (link.gainDb < -10.0f)
-        linkColour = linkColour.withAlpha(0.3f);
-    g.setColour(linkColour);
+    juce::Path path;
+    path.startNewSubPath(start);
+    path.cubicTo(ctrl1, ctrl2, end);
+
+    // Base alpha — much dimmer when the link is heavily attenuated.
+    float baseAlpha = (link.gainDb < -10.0f) ? 0.3f : 0.8f;
     float thickness = ((link.id == selectedLinkId) ? 3.0f : 2.0f) * zoom;
-    g.strokePath(path, juce::PathStrokeType(thickness));
+
+    if (srcKind == dstKind) {
+        // Single-kind cable: stroke the full bezier in one colour.
+        g.setColour(colourForPinKind(srcKind).withAlpha(baseAlpha));
+        g.strokePath(path, juce::PathStrokeType(thickness));
+    } else {
+        // Mixed-kind cable (currently only Param↔Signal). Stroke the whole
+        // bezier in the source colour, then re-stroke a polyline that
+        // approximates the tail half in the destination colour. The two
+        // halves meet at the bezier midpoint (t=0.5), giving a clean colour
+        // change without a gradient. We use de Casteljau / direct evaluation
+        // to sample the curve so the polyline tracks the bezier exactly.
+        auto bezAt = [&](float t) -> juce::Point<float> {
+            float u = 1.0f - t;
+            float x = u*u*u*start.x + 3*u*u*t*ctrl1.x + 3*u*t*t*ctrl2.x + t*t*t*end.x;
+            float y = u*u*u*start.y + 3*u*u*t*ctrl1.y + 3*u*t*t*ctrl2.y + t*t*t*end.y;
+            return {x, y};
+        };
+
+        g.setColour(colourForPinKind(srcKind).withAlpha(baseAlpha));
+        g.strokePath(path, juce::PathStrokeType(thickness));
+
+        // Sample the tail half (t in [0.5, 1.0]) as a smooth polyline.
+        const int tailSegments = 20;
+        juce::Path tail;
+        tail.startNewSubPath(bezAt(0.5f));
+        for (int i = 1; i <= tailSegments; ++i) {
+            float t = 0.5f + 0.5f * (float)i / (float)tailSegments;
+            tail.lineTo(bezAt(t));
+        }
+        g.setColour(colourForPinKind(dstKind).withAlpha(baseAlpha));
+        g.strokePath(tail, juce::PathStrokeType(thickness));
+    }
 
     // Show gain label on cable if not unity
     if (link.gainDb != 0.0f && zoom > 0.4f) {
@@ -569,9 +605,19 @@ void NodeGraphComponent::mouseDown(const juce::MouseEvent& e) {
                         pm.addItem(2, "Arm All on This Node");
                         pm.addItem(3, "Disarm All on This Node");
                         pm.addItem(4, "Reset to Default (double-click)");
+                        // Signal modulation pin (#88): offer to add or remove
+                        // a Signal input pin that drives this specific param.
+                        bool hasModPin = false;
+                        for (auto& mp : node->modPins)
+                            if (mp.paramIndex == idx) { hasModPin = true; break; }
+                        pm.addSeparator();
+                        if (hasModPin)
+                            pm.addItem(10, "Remove Modulation Input");
+                        else
+                            pm.addItem(10, "Add Modulation Input");
                         int nodeId = node->id;
                         int paramIdx = idx;
-                        pm.showMenuAsync({}, [this, nodeId, paramIdx](int r) {
+                        pm.showMenuAsync({}, [this, nodeId, paramIdx, hasModPin](int r) {
                             auto* nd = graph.findNode(nodeId);
                             if (!nd) return;
                             if (r == 1 && paramIdx < (int)nd->params.size())
@@ -583,6 +629,51 @@ void NodeGraphComponent::mouseDown(const juce::MouseEvent& e) {
                             else if (r == 4 && paramIdx < (int)nd->params.size()) {
                                 auto& p2 = nd->params[paramIdx];
                                 p2.value = (p2.minVal + p2.maxVal) * 0.5f;
+                            }
+                            else if (r == 10) {
+                                if (hasModPin) {
+                                    // Remove the modulation pin + binding.
+                                    for (auto it = nd->modPins.begin(); it != nd->modPins.end(); ++it) {
+                                        if (it->paramIndex == paramIdx) {
+                                            int pinId = it->pinId;
+                                            // Remove pin from pinsIn.
+                                            nd->pinsIn.erase(
+                                                std::remove_if(nd->pinsIn.begin(), nd->pinsIn.end(),
+                                                    [pinId](const Pin& p) { return p.id == pinId; }),
+                                                nd->pinsIn.end());
+                                            // Remove any links connected to this pin.
+                                            graph.links.erase(
+                                                std::remove_if(graph.links.begin(), graph.links.end(),
+                                                    [pinId](const auto& lk) { return lk.endPin == pinId; }),
+                                                graph.links.end());
+                                            nd->modPins.erase(it);
+                                            break;
+                                        }
+                                    }
+                                    // Clear modulation state on the param.
+                                    if (paramIdx < (int)nd->params.size()) {
+                                        auto& p2 = nd->params[paramIdx];
+                                        if (p2.modulated) {
+                                            p2.value = p2.baseValue;
+                                            p2.modulated = false;
+                                        }
+                                    }
+                                    graph.dirty = true;
+                                    graph.commitSnapshot("Remove modulation input");
+                                } else {
+                                    // Add a new Signal input pin and bind it to this param.
+                                    if (paramIdx >= (int)nd->params.size()) return;
+                                    std::string pinName = "Mod: " + nd->params[paramIdx].name;
+                                    int newPinId = graph.getNextId();
+                                    nd->pinsIn.push_back({newPinId, pinName, PinKind::Signal, true, 1});
+                                    Node::ModPin mp;
+                                    mp.paramIndex = paramIdx;
+                                    mp.pinId = newPinId;
+                                    mp.depth = 1.0f;
+                                    nd->modPins.push_back(mp);
+                                    graph.dirty = true;
+                                    graph.commitSnapshot("Add modulation input");
+                                }
                             }
                             repaint();
                         });
@@ -695,16 +786,34 @@ void NodeGraphComponent::mouseDrag(const juce::MouseEvent& e) {
     } else if (dragMode == DragMode::DragLink) {
         dragCurrent = e.position;
         // Track which pin we're hovering over so drawPin() can highlight it.
-        // Only count it as a valid drop target if it's the opposite direction
-        // from the source (output -> input or vice versa) and not the same
-        // pin we started from.
+        // Valid drop target requires:
+        //  1. opposite direction from the source (output→input or vice versa)
+        //  2. not the same pin we started dragging from
+        //  3. compatible pin kinds (audio↔audio, MIDI↔MIDI, or any control↔
+        //     control mix; see arePinKindsCompatible). Param↔Signal is
+        //     deliberately treated as compatible — implicit conversion lets
+        //     either control kind drive either control input.
         auto canvasPos = screenToCanvas(e.position);
         bool isOut = false;
         int hovered = pinAtPoint(canvasPos, isOut);
-        if (hovered >= 0 && hovered != dragPinId && isOut != dragPinIsOutput)
-            dragHoverPinId = hovered;
-        else
-            dragHoverPinId = -1;
+        bool valid = false;
+        if (hovered >= 0 && hovered != dragPinId && isOut != dragPinIsOutput) {
+            // Look up both pins' kinds and check compatibility
+            PinKind srcKind = PinKind::Audio, dstKind = PinKind::Audio;
+            bool gotSrc = false, gotDst = false;
+            for (auto& node : graph.nodes) {
+                for (auto& pin : node.pinsIn) {
+                    if (pin.id == dragPinId)  { srcKind = pin.kind; gotSrc = true; }
+                    if (pin.id == hovered)    { dstKind = pin.kind; gotDst = true; }
+                }
+                for (auto& pin : node.pinsOut) {
+                    if (pin.id == dragPinId)  { srcKind = pin.kind; gotSrc = true; }
+                    if (pin.id == hovered)    { dstKind = pin.kind; gotDst = true; }
+                }
+            }
+            valid = gotSrc && gotDst && arePinKindsCompatible(srcKind, dstKind);
+        }
+        dragHoverPinId = valid ? hovered : -1;
         repaint();
     } else if (dragMode == DragMode::DragParam) {
         auto* node = graph.findNode(dragNodeId);
@@ -729,15 +838,30 @@ void NodeGraphComponent::mouseDrag(const juce::MouseEvent& e) {
 
 void NodeGraphComponent::mouseUp(const juce::MouseEvent& e) {
     if (dragMode == DragMode::DragLink) {
-        // Check if dropped on a pin
+        // Check if dropped on a pin. Same compatibility rules as the hover
+        // highlight (mouseDrag): direction must flip, kinds must be
+        // compatible (Param↔Signal counts as compatible).
         auto canvasPos = screenToCanvas(e.position);
         bool isOut;
         int targetPin = pinAtPoint(canvasPos, isOut);
-        if (targetPin >= 0 && isOut != dragPinIsOutput) {
-            // Create link
-            int outPin = dragPinIsOutput ? dragPinId : targetPin;
-            int inPin = dragPinIsOutput ? targetPin : dragPinId;
-            graph.addLink(outPin, inPin);
+        if (targetPin >= 0 && isOut != dragPinIsOutput && targetPin != dragPinId) {
+            PinKind srcKind = PinKind::Audio, dstKind = PinKind::Audio;
+            bool gotSrc = false, gotDst = false;
+            for (auto& node : graph.nodes) {
+                for (auto& pin : node.pinsIn) {
+                    if (pin.id == dragPinId) { srcKind = pin.kind; gotSrc = true; }
+                    if (pin.id == targetPin) { dstKind = pin.kind; gotDst = true; }
+                }
+                for (auto& pin : node.pinsOut) {
+                    if (pin.id == dragPinId) { srcKind = pin.kind; gotSrc = true; }
+                    if (pin.id == targetPin) { dstKind = pin.kind; gotDst = true; }
+                }
+            }
+            if (gotSrc && gotDst && arePinKindsCompatible(srcKind, dstKind)) {
+                int outPin = dragPinIsOutput ? dragPinId : targetPin;
+                int inPin  = dragPinIsOutput ? targetPin : dragPinId;
+                graph.addLink(outPin, inPin);
+            }
         }
     }
     dragMode = DragMode::None;
@@ -882,6 +1006,7 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
     fxMenu.addItem(206, "Pitch Shift / Time Stretch");
     fxMenu.addSeparator();
     fxMenu.addItem(207, "Convolution Filter");
+    fxMenu.addItem(221, "Reverb");
     fxMenu.addSeparator();
     fxMenu.addItem(208, "Tremolo");
     fxMenu.addItem(209, "Vibrato");
@@ -1277,7 +1402,10 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
                 return;
             }
         } else if (result == 102) {
-            // Sampler: load a sound file as a pitched instrument
+            // Sampler: creates a MultiSampler node. The file chooser is
+            // a convenience — if the user picks a file, it becomes the
+            // instrument's first (and only) zone covering the full MIDI
+            // range. The sampler editor can add more zones later.
             auto canvasPos = p;
             auto chooser = std::make_shared<juce::FileChooser>(
                 "Load Sample", juce::File(), "*.wav;*.mp3;*.aiff;*.flac;*.ogg");
@@ -1287,35 +1415,21 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
                     if (!file.existsAsFile()) return;
                     auto name = file.getFileNameWithoutExtension().toStdString();
                     auto& n = graph.addNode(name, NodeType::Instrument,
-                        {Pin{0, "MIDI", PinKind::Midi, true},
-                         Pin{0, "Sig X", PinKind::Signal, true, 1},
-                         Pin{0, "Sig Y", PinKind::Signal, true, 1}},
+                        {Pin{0, "MIDI", PinKind::Midi, true}},
                         {Pin{0, "Audio", PinKind::Audio, false}},
                         {canvasPos.x, canvasPos.y});
-                    n.script = "__audio__:" + file.getFullPathName().toStdString();
-                    // Sampler params (same as unified terrain synth)
-                    n.params.push_back({"Attack",       0.005f, 0.001f, 2.0f});
-                    n.params.push_back({"Decay",        0.05f,  0.001f, 2.0f});
-                    n.params.push_back({"Sustain",      1.0f,   0.0f,   1.0f});
-                    n.params.push_back({"Release",      0.1f,   0.001f, 5.0f});
-                    n.params.push_back({"Volume",       0.5f,   0.0f,   1.0f});
-                    n.params.push_back({"Pan",          0.0f,  -1.0f,   1.0f});
-                    n.params.push_back({"Speed",        1.0f,   0.01f, 20.0f});
-                    n.params.push_back({"Radius X",     0.0f,   0.0f,   0.5f});
-                    n.params.push_back({"Radius Y",     0.0f,   0.0f,   0.5f});
-                    n.params.push_back({"Center X",     0.5f,   0.0f,   1.0f});
-                    n.params.push_back({"Center Y",     0.5f,   0.0f,   1.0f});
-                    n.params.push_back({"Rad Mod Spd",  0.0f,   0.0f,  10.0f});
-                    n.params.push_back({"Rad Mod Amt",  0.0f,   0.0f,   0.3f});
-                    n.params.push_back({"Traversal",    1.0f,   0.0f,   3.0f}); // Linear
-                    n.params.push_back({"Synth Mode",   0.0f,   0.0f,   1.0f}); // SamplePerPoint
-                    n.params.push_back({"LFO1 Rate",    0.5f,   0.01f, 20.0f});
-                    n.params.push_back({"LFO2 Rate",    0.2f,   0.01f, 20.0f});
-                    n.params.push_back({"LFO1 Amount",  0.0f,   0.0f,   1.0f});
-                    n.params.push_back({"LFO2 Amount",  0.0f,   0.0f,   1.0f});
-                    n.params.push_back({"Grain Size",   0.02f,  0.0f,   0.5f}); // sampler default: small grains
-                    n.params.push_back({"Freeze",       0.0f,   0.0f,   1.0f});
-                    n.params.push_back({"Grain Jitter", 0.0f,   0.0f,   1.0f});
+                    MultiSamplerDoc doc;
+                    MultiSamplerZone z;
+                    z.samplePath = file.getFullPathName().toStdString();
+                    z.loNote = 0; z.hiNote = 127;
+                    z.loVel = 1; z.hiVel = 127;
+                    z.baseNote = 60;
+                    doc.zones.push_back(z);
+                    n.script = doc.encode();
+                    // Global Volume/Pan live as real params so automation
+                    // lanes and Signal cables can target them.
+                    n.params.push_back({"Volume", 0.5f,  0.0f, 1.0f});
+                    n.params.push_back({"Pan",    0.0f, -1.0f, 1.0f});
                     repaint();
                 });
             return;
@@ -1454,6 +1568,13 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
                     {"Delay", 300.0f, 10.0f, 2000.0f},
                     {"Feedback", 0.5f, 0.0f, 0.95f},
                     {"Mix", 0.4f, 0.0f, 1.0f},
+                }); break;
+                case 221: makeEffect("Reverb", "__reverb__", {
+                    {"Mix",       0.3f,  0.0f, 1.0f},
+                    {"Size",      0.6f,  0.0f, 1.0f},
+                    {"Damping",   0.5f,  0.0f, 1.0f},
+                    {"Width",     1.0f,  0.0f, 1.0f},
+                    {"Pre-Delay", 0.0f,  0.0f, 200.0f},
                 }); break;
                 case 213: makeEffect("Compressor", "__compressor__", {
                     {"Threshold", -20.0f, -60.0f, 0.0f},

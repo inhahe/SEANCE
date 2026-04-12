@@ -1,5 +1,6 @@
 #pragma once
 #include "node_graph.h"
+#include "signal_modulation.h"
 #include <juce_audio_processors/juce_audio_processors.h>
 #include <cmath>
 #include <vector>
@@ -25,6 +26,7 @@ public:
     void prepareToPlay(double sr, int) override { sampleRate = sr; }
     void releaseResources() override {}
     void processBlock(juce::AudioBuffer<float>& buf, juce::MidiBuffer&) override {
+        applySignalModulations(node, buf);
         float rate  = paramByName(node, "Rate", 4.0f);
         float depth = paramByName(node, "Depth", 0.5f);
         int shape   = (int)paramByName(node, "Shape", 0.0f);
@@ -77,6 +79,7 @@ public:
     }
     void releaseResources() override {}
     void processBlock(juce::AudioBuffer<float>& buf, juce::MidiBuffer&) override {
+        applySignalModulations(node, buf);
         float rate  = paramByName(node, "Rate", 5.0f);
         float depth = paramByName(node, "Depth", 0.3f); // semitones
         float maxDelayMs = depth * 0.5f; // rough mapping
@@ -140,6 +143,7 @@ public:
     }
     void releaseResources() override {}
     void processBlock(juce::AudioBuffer<float>& buf, juce::MidiBuffer&) override {
+        applySignalModulations(node, buf);
         float rate     = paramByName(node, "Rate", 0.3f);
         float depth    = paramByName(node, "Depth", 0.7f);
         float feedback = paramByName(node, "Feedback", 0.5f);
@@ -201,6 +205,7 @@ public:
     }
     void releaseResources() override {}
     void processBlock(juce::AudioBuffer<float>& buf, juce::MidiBuffer&) override {
+        applySignalModulations(node, buf);
         float rate     = paramByName(node, "Rate", 0.5f);
         float depth    = paramByName(node, "Depth", 0.7f);
         float feedback = paramByName(node, "Feedback", 0.3f);
@@ -262,6 +267,7 @@ public:
     void prepareToPlay(double sr, int) override { sampleRate = sr; }
     void releaseResources() override {}
     void processBlock(juce::AudioBuffer<float>& buf, juce::MidiBuffer&) override {
+        applySignalModulations(node, buf);
         float threshold = paramByName(node, "Threshold", -20.0f); // dB
         float ratio     = paramByName(node, "Ratio", 4.0f);
         float attackMs  = paramByName(node, "Attack", 10.0f);
@@ -321,6 +327,7 @@ public:
     void prepareToPlay(double sr, int) override { sampleRate = sr; }
     void releaseResources() override {}
     void processBlock(juce::AudioBuffer<float>& buf, juce::MidiBuffer&) override {
+        applySignalModulations(node, buf);
         float ceilingDb = paramByName(node, "Ceiling", -0.3f);
         float releaseMs = paramByName(node, "Release", 50.0f);
         float ceiling = std::pow(10.0f, ceilingDb / 20.0f);
@@ -369,6 +376,7 @@ public:
     void prepareToPlay(double sr, int) override { sampleRate = sr; }
     void releaseResources() override {}
     void processBlock(juce::AudioBuffer<float>& buf, juce::MidiBuffer&) override {
+        applySignalModulations(node, buf);
         float threshDb  = paramByName(node, "Threshold", -40.0f);
         float attackMs  = paramByName(node, "Attack", 1.0f);
         float releaseMs = paramByName(node, "Release", 50.0f);
@@ -423,6 +431,7 @@ public:
     }
     void releaseResources() override {}
     void processBlock(juce::AudioBuffer<float>& buf, juce::MidiBuffer&) override {
+        applySignalModulations(node, buf);
         float delayMs  = paramByName(node, "Delay", 300.0f);
         float feedback = paramByName(node, "Feedback", 0.5f);
         float mix      = paramByName(node, "Mix", 0.4f);
@@ -649,5 +658,199 @@ private:
 // VelocityScaleProcessor was replaced by the more general
 // MidiModulatorProcessor (see midi_mod_node.h/.cpp). Old projects with
 // __velscale__ scripts are auto-upgraded by that processor.
+
+// ==============================================================================
+// REVERB — algorithmic reverberation (Freeverb / Schroeder topology)
+//
+// Eight parallel lowpass-feedback comb filters per channel with a small
+// stereo spread between left and right tunings, followed by four serial
+// allpass filters. This is the classic Freeverb arrangement — the comb
+// delays simulate the average reflection density in a room, each comb's
+// feedback lowpass dulls successive reflections (so high frequencies
+// decay faster than lows, as real rooms do), and the serial allpasses
+// thicken the tail into a diffuse smear.
+//
+// Params:
+//   Mix      — dry/wet crossfade, 0=dry 1=wet
+//   Size     — room size, 0..1 (controls comb feedback gain; larger = longer tail)
+//   Damping  — high-frequency damping in the feedback path, 0..1
+//   Width    — stereo spread of the wet signal, 0..1 (0=mono, 1=full stereo)
+//   Pre-Delay — delay before reverb kicks in, in ms
+//
+// Delay lengths are the well-known Freeverb tunings (samples at 44.1 kHz).
+// They get scaled if the runtime sample rate differs, so the perceived
+// room size stays consistent across sample rates.
+// ==============================================================================
+class ReverbProcessor : public juce::AudioProcessor {
+public:
+    ReverbProcessor(Node& n) : node(n) {}
+    const juce::String getName() const override { return "Reverb"; }
+
+    void prepareToPlay(double sr, int /*bs*/) override {
+        sampleRate = sr;
+        // Scale factor so delay lengths track sample rate.
+        double scale = sr / 44100.0;
+
+        // Freeverb classic tunings (samples @ 44.1 kHz).
+        static const int kCombL[kNumCombs]    = {1116, 1188, 1277, 1356, 1422, 1491, 1557, 1617};
+        static const int kCombR[kNumCombs]    = {1116+23, 1188+23, 1277+23, 1356+23,
+                                                  1422+23, 1491+23, 1557+23, 1617+23};
+        static const int kAllpassL[kNumAllps] = {556, 441, 341, 225};
+        static const int kAllpassR[kNumAllps] = {556+23, 441+23, 341+23, 225+23};
+
+        for (int i = 0; i < kNumCombs; ++i) {
+            combL[i].setSize((int)std::round(kCombL[i] * scale));
+            combR[i].setSize((int)std::round(kCombR[i] * scale));
+        }
+        for (int i = 0; i < kNumAllps; ++i) {
+            apL[i].setSize((int)std::round(kAllpassL[i] * scale));
+            apR[i].setSize((int)std::round(kAllpassR[i] * scale));
+        }
+
+        int maxPredelay = (int)(sr * 0.2); // up to 200 ms
+        predelayL.assign(std::max(1, maxPredelay), 0.0f);
+        predelayR.assign(std::max(1, maxPredelay), 0.0f);
+        predelayWritePos = 0;
+    }
+    void releaseResources() override {}
+
+    void processBlock(juce::AudioBuffer<float>& buf, juce::MidiBuffer&) override {
+        applySignalModulations(node, buf);
+        const int n = buf.getNumSamples();
+        const int ch = buf.getNumChannels();
+        if (n == 0 || ch == 0) return;
+
+        float mix       = juce::jlimit(0.0f, 1.0f, paramByName(node, "Mix",     0.3f));
+        float size      = juce::jlimit(0.0f, 1.0f, paramByName(node, "Size",    0.6f));
+        float damping   = juce::jlimit(0.0f, 1.0f, paramByName(node, "Damping", 0.5f));
+        float widthRaw  = juce::jlimit(0.0f, 1.0f, paramByName(node, "Width",   1.0f));
+        float preDelMs  = juce::jlimit(0.0f, 200.0f, paramByName(node, "Pre-Delay", 0.0f));
+
+        // Freeverb gain mapping: feedback in [0.28..0.98] gives the usual
+        // "tight room" to "long hall" range. 0.5 of the param maps to the
+        // scaled-roomsize sweet spot.
+        const float feedback = 0.28f + size * 0.70f;
+        // Wet/dry mix as a 0..1 linear crossfade (constant-sum, not power).
+        const float wetGain = mix;
+        const float dryGain = 1.0f - mix;
+        // Stereo width: wet1 feeds same-side, wet2 crosses to opposite.
+        const float wet1 = widthRaw * 0.5f + 0.5f;
+        const float wet2 = (1.0f - widthRaw) * 0.5f;
+
+        const int   preDelSamples = std::min((int)(preDelMs * 0.001 * sampleRate),
+                                               (int)predelayL.size() - 1);
+
+        // Propagate damping/feedback to all comb filters.
+        for (int i = 0; i < kNumCombs; ++i) {
+            combL[i].feedback = feedback;
+            combL[i].damp     = damping;
+            combR[i].feedback = feedback;
+            combR[i].damp     = damping;
+        }
+
+        float* left  = buf.getWritePointer(0);
+        float* right = ch > 1 ? buf.getWritePointer(1) : left;
+
+        for (int s = 0; s < n; ++s) {
+            float inL = left[s];
+            float inR = right[s];
+
+            // Push into pre-delay ring. Read N samples back.
+            predelayL[predelayWritePos] = inL;
+            predelayR[predelayWritePos] = inR;
+            int readPos = predelayWritePos - preDelSamples;
+            if (readPos < 0) readPos += (int)predelayL.size();
+            float wetInL = predelayL[readPos];
+            float wetInR = predelayR[readPos];
+            predelayWritePos++;
+            if (predelayWritePos >= (int)predelayL.size()) predelayWritePos = 0;
+
+            // Average the channels at the reverb input (standard Freeverb
+            // behavior) to avoid cancellation artifacts in the tail, then
+            // restore stereo via the wet1/wet2 spread at output time.
+            float rvIn = (wetInL + wetInR) * 0.5f * 0.015f; // Freeverb input gain
+
+            float outL = 0, outR = 0;
+            for (int i = 0; i < kNumCombs; ++i) {
+                outL += combL[i].process(rvIn);
+                outR += combR[i].process(rvIn);
+            }
+            for (int i = 0; i < kNumAllps; ++i) {
+                outL = apL[i].process(outL);
+                outR = apR[i].process(outR);
+            }
+
+            left[s]  = inL * dryGain + (outL * wet1 + outR * wet2) * wetGain;
+            if (ch > 1)
+                right[s] = inR * dryGain + (outR * wet1 + outL * wet2) * wetGain;
+        }
+    }
+
+    double getTailLengthSeconds() const override { return 6.0; }
+    bool acceptsMidi() const override { return true; }
+    bool producesMidi() const override { return true; }
+    bool isBusesLayoutSupported(const BusesLayout&) const override { return true; }
+    juce::AudioProcessorEditor* createEditor() override { return nullptr; }
+    bool hasEditor() const override { return false; }
+    int getNumPrograms() override { return 1; }
+    int getCurrentProgram() override { return 0; }
+    void setCurrentProgram(int) override {}
+    const juce::String getProgramName(int) override { return {}; }
+    void changeProgramName(int, const juce::String&) override {}
+    void getStateInformation(juce::MemoryBlock&) override {}
+    void setStateInformation(const void*, int) override {}
+
+private:
+    Node& node;
+    double sampleRate = 44100;
+
+    static constexpr int kNumCombs = 8;
+    static constexpr int kNumAllps = 4;
+
+    // Lowpass-feedback comb filter: the filter in the feedback loop is a
+    // one-pole IIR lowpass, so successive echo repetitions get progressively
+    // duller — simulating frequency-dependent absorption in real rooms.
+    struct Comb {
+        std::vector<float> buf;
+        int pos = 0;
+        float feedback = 0.5f;
+        float damp = 0.5f;
+        float lastLP = 0.0f;
+        void setSize(int sz) {
+            buf.assign(std::max(1, sz), 0.0f);
+            pos = 0;
+            lastLP = 0.0f;
+        }
+        float process(float in) {
+            float y = buf[pos];
+            // One-pole LP feedback: (1-damp)*y + damp*lastLP
+            lastLP = y * (1.0f - damp) + lastLP * damp;
+            buf[pos] = in + lastLP * feedback;
+            if (++pos >= (int)buf.size()) pos = 0;
+            return y;
+        }
+    };
+
+    // Schroeder allpass: y = -x + buf[pos]; buf[pos] = x + 0.5*buf[pos].
+    struct Allpass {
+        std::vector<float> buf;
+        int pos = 0;
+        static constexpr float kFeedback = 0.5f;
+        void setSize(int sz) { buf.assign(std::max(1, sz), 0.0f); pos = 0; }
+        float process(float in) {
+            float bufOut = buf[pos];
+            float y = -in + bufOut;
+            buf[pos] = in + bufOut * kFeedback;
+            if (++pos >= (int)buf.size()) pos = 0;
+            return y;
+        }
+    };
+
+    Comb    combL[kNumCombs], combR[kNumCombs];
+    Allpass apL[kNumAllps],   apR[kNumAllps];
+
+    std::vector<float> predelayL, predelayR;
+    int predelayWritePos = 0;
+};
 
 } // namespace SoundShop

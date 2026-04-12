@@ -21,6 +21,20 @@ struct Vec2 {
 };
 
 enum class PinKind { Audio, Midi, Param, Signal }; // Signal = audio-rate control signal (mono)
+
+// Two pin kinds are compatible at the cable level if they're either the same
+// kind, or both control kinds (Param + Signal). Param is conceptually
+// block-rate and Signal is audio-rate, but at the routing layer we treat them
+// as a single "control" family — the conversion is implicit and free, since
+// the audio-graph routing already carries them on the same channel slot. The
+// receiver decides whether to read once per block (Param semantics) or every
+// sample (Signal semantics). See task #82.
+inline bool arePinKindsCompatible(PinKind a, PinKind b) {
+    if (a == b) return true;
+    bool aCtrl = (a == PinKind::Param || a == PinKind::Signal);
+    bool bCtrl = (b == PinKind::Param || b == PinKind::Signal);
+    return aCtrl && bCtrl;
+}
 enum class NodeType {
     AudioTimeline, MidiTimeline, Instrument, Effect, Mixer, Output, Script, Group, TerrainSynth, SignalShape,
     // MidiInput represents a single live MIDI input source (computer keyboard,
@@ -94,6 +108,15 @@ struct Param {
     std::string format = "%.2f";
     AutomationLane automation; // recorded automation for this param
     bool autoWriteArmed = false; // when armed, "Write Automation to Selection" includes this param
+
+    // Signal modulation support (#88). When a Signal cable drives this
+    // param, `baseValue` holds the user's intended setting and `value`
+    // is rewritten each audio block to `baseValue + signal * depth`.
+    // When no modulation is active, baseValue is unused (value is the
+    // source of truth). The `modulated` flag indicates whether
+    // baseValue/value are split or identical this block.
+    float baseValue = 0.0f;
+    bool  modulated = false;
 };
 
 // Rational fraction for exact beat subdivisions (e.g., triplets)
@@ -214,6 +237,21 @@ struct Node {
     bool muted = false;
     bool soloed = false;
     std::vector<Param> params;
+
+    // On-demand signal modulation pins (#88). Each entry binds a
+    // dynamically added Signal input pin to a specific param index.
+    // When a Signal cable is connected to the pin, the processor reads
+    // the signal from audio channel (2 + pin's control-slot index) and
+    // modulates the param each block. The pin lives in pinsIn alongside
+    // the node's static pins — it's serialized as part of the normal
+    // pin list in project_file.cpp. The modPin just records the binding.
+    struct ModPin {
+        int paramIndex = -1;  // index into this node's params[]
+        int pinId = -1;       // matching pin id in pinsIn
+        float depth = 1.0f;   // modulation depth: 0=none, 1=full range
+    };
+    std::vector<ModPin> modPins;
+
     std::vector<Clip> clips;
 
     // Take lanes for comping (audio timelines)
@@ -253,6 +291,21 @@ struct Node {
     std::shared_ptr<PluginHost::LoadedPlugin> plugin; // hosted VST3/AU plugin
     int pluginIndex = -1; // index into PluginHost::availablePlugins, -1 = none
     std::string pendingPluginState; // base64-encoded state to restore after plugin loads
+
+    // Per-plugin dirty tracking for the slow autosave path (#86). When a
+    // plugin's parameters change via host automation, MIDI Learn CC, or
+    // any other host-driven path, this flag is set so the next autosave
+    // re-queries getStateInformation. When clear, the saver reuses the
+    // cached base64 string instead — avoiding the expensive query for
+    // plugins whose state hasn't changed since the last save. Defaults
+    // to true so a freshly loaded plugin gets queried at least once.
+    //
+    // Limitation: changes made by the user inside the plugin's own UI
+    // can't be detected here (no general-purpose API to listen for them
+    // across plugin formats). Mitigation: a periodic "force-dirty all"
+    // tick in the autosave path bounds staleness to a known interval.
+    bool pluginStateDirty = true;
+    std::string cachedPluginStateBase64;
 
     // Group — contains child node IDs
     std::vector<int> childNodeIds;  // IDs of nodes inside this group
@@ -419,6 +472,32 @@ public:
     double loopEndBeat = 0;
     double projectSampleRate = 0; // 0 = use device rate
 
+    // Song length and repeat behavior.
+    //
+    // songLengthBeats = 0 means "no explicit end" — the transport plays
+    // until the user presses Stop, and no repeat logic fires. > 0 marks an
+    // end beat: when the playhead reaches it, the repeat policy decides
+    // what happens next.
+    //
+    // Repeat modes:
+    //   None    — stop at songLengthBeats and halt playback.
+    //   Forever — wrap back to beat 0 and keep playing until Stop.
+    //   NTimes  — wrap back to beat 0, play the song N times total, then
+    //             stop. N = songRepeatCount, where 1 means "play once
+    //             then stop" (same as None), 2 means "play twice", etc.
+    //
+    // The user-region loop (loopEnabled / loopStartBeat / loopEndBeat) is
+    // an inner A-B cycler and takes precedence while active — the song-
+    // length policy only fires when the user loop is disabled or the
+    // playhead is outside the user-loop range.
+    //
+    // Tracker import uses Forever to preserve Bxx song-loop semantics
+    // instead of unrolling the order list in place.
+    enum class SongRepeat : int { None = 0, Forever = 1, NTimes = 2 };
+    double    songLengthBeats = 0;
+    SongRepeat songRepeatMode  = SongRepeat::None;
+    int       songRepeatCount  = 1;   // only used when mode == NTimes
+
     // Tuning system and concert pitch (project-wide)
     TuningSystem tuningSystem = TuningSystem::Equal12;
     float concertPitch = 440.0f; // Hz for A4
@@ -490,6 +569,17 @@ public:
     std::string signalScript;
     UndoTree undoTree;
 
+    // Shared undo history sidecar path. If non-empty, the project is
+    // associated with an external history file (stored alongside the
+    // .ssp so it can travel with the project when shared). The path is
+    // relative to the .ssp file's directory. See task #90 for the full
+    // lifecycle (save-as opt-in, open-prompt with three options, known-
+    // histories preferences).
+    //
+    // Empty string = no sidecar; undo history persists only to the
+    // machine-local userAppData/SEANCE/undo-tree.dat file.
+    std::string historyFilePath;
+
     // Shared waveform library — named waveforms usable by any synth/signal node
     struct WaveformEntry {
         std::string name;
@@ -513,6 +603,18 @@ public:
     void exec(const std::string& desc, std::function<void()> doFn, std::function<void()> undoFn) {
         exec(std::make_unique<LambdaCommand>(desc, std::move(doFn), std::move(undoFn)));
     }
+
+    // Commit a snapshot of the current graph state to the undo tree as a
+    // new step. The serialization is performed via ProjectFile::serializeForUndo
+    // (graph-only, plugin state excluded). If the resulting text is identical
+    // to the previous step's snapshot — i.e., nothing actually changed — this
+    // is a no-op, so it's safe (and intended) to call defensively from any
+    // mutating function. See CLAUDE.md "Undo Strategy" for the policy on
+    // when to use commitSnapshot vs. exec().
+    //
+    // Defined in node_graph.cpp because the implementation needs project_file.h,
+    // which itself includes node_graph.h.
+    void commitSnapshot(const std::string& description);
 
     std::map<int, PianoRollState> pianoRollStates;
 

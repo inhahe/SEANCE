@@ -212,6 +212,41 @@ void AudioEngine::audioDeviceIOCallbackWithContext(
         }
     }
 
+    // Apply the project-wide Song Length + Song Repeat policy. The user-
+    // region loop above takes precedence (it's an inner A-B cycler — the
+    // user's immediate intent to cycle a section), so this branch only
+    // runs when no user loop was applied during this block.
+    auto applySongRepeat = [&]() {
+        if (!graph || !playing.load()) return;
+        if (graph->songLengthBeats <= 0) return;
+        double posBeat = transport->positionBeats();
+        if (posBeat < graph->songLengthBeats) return;
+
+        switch (graph->songRepeatMode) {
+            case NodeGraph::SongRepeat::None:
+                // Clamp at the end and halt.
+                positionSamples = (int64_t)transport->beatsToSamples(graph->songLengthBeats);
+                playing = false;
+                break;
+            case NodeGraph::SongRepeat::Forever:
+                positionSamples = 0;
+                ++songPlayCount;
+                break;
+            case NodeGraph::SongRepeat::NTimes:
+                ++songPlayCount;
+                // songRepeatCount is "play N times total". We just reached
+                // the end of iteration songPlayCount; if we've hit the
+                // total, stop.
+                if (songPlayCount >= std::max(1, graph->songRepeatCount)) {
+                    positionSamples = (int64_t)transport->beatsToSamples(graph->songLengthBeats);
+                    playing = false;
+                } else {
+                    positionSamples = 0;
+                }
+                break;
+        }
+    };
+
     if (!needsResample) {
         // Same rate — no resampling needed
         graphProcessor.processBlock(*graph, *transport,
@@ -219,12 +254,15 @@ void AudioEngine::audioDeviceIOCallbackWithContext(
         if (playing.load()) {
             positionSamples += numSamples;
             // Loop: wrap position back to loop start
+            bool userLoopApplied = false;
             if (transport->loopEnabled && transport->loopEndBeat > transport->loopStartBeat) {
                 double posBeat = transport->positionBeats();
                 if (posBeat >= transport->loopEndBeat) {
                     positionSamples = (int64_t)transport->beatsToSamples(transport->loopStartBeat);
+                    userLoopApplied = true;
                 }
             }
+            if (!userLoopApplied) applySongRepeat();
         }
     } else {
         // Process at project rate, then resample to device rate
@@ -257,14 +295,19 @@ void AudioEngine::audioDeviceIOCallbackWithContext(
         // Track fractional sample position for seamless continuation
         resamplePhase = std::fmod(resamplePhase + numSamples * ratio, (double)projectSamples);
 
-        if (playing.load())
+        if (playing.load()) {
             positionSamples += projectSamples; // advance at project rate
             // Loop wrap
+            bool userLoopApplied = false;
             if (transport->loopEnabled && transport->loopEndBeat > transport->loopStartBeat) {
                 double posBeat = transport->positionBeats();
-                if (posBeat >= transport->loopEndBeat)
+                if (posBeat >= transport->loopEndBeat) {
                     positionSamples = (int64_t)transport->beatsToSamples(transport->loopStartBeat);
+                    userLoopApplied = true;
+                }
             }
+            if (!userLoopApplied) applySongRepeat();
+        }
     }
 
     // Input monitoring: mix audio input directly into output (global toggle)

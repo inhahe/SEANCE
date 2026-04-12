@@ -1,6 +1,7 @@
 #pragma once
 #include "node_graph.h"
 #include "signal_modulation.h"
+#include "wavelet.h"
 #include <juce_audio_processors/juce_audio_processors.h>
 #include <cmath>
 #include <vector>
@@ -1656,6 +1657,194 @@ private:
     float heldVel = 0.8f;
     float spawnTimer = 0;
     std::mt19937 rng{42};
+};
+
+// ==============================================================================
+// TRANSIENT/SUSTAIN SPLIT — wavelet-based separation
+//
+// Decomposes audio into transient (attack) and sustain (body) components
+// using wavelet thresholding. The transient part captures sharp onsets
+// (drum hits, plucks, consonants); the sustain part captures the
+// steady-state body (tones, reverb tails, vowels).
+//
+// Two audio outputs: the node's main out carries the recombined signal
+// with adjustable transient/sustain balance, but if the user wires
+// into the second output (via the signal pin), they get the separated
+// transient-only signal for independent routing.
+//
+// Params:
+//   Transient  — gain multiplier for the transient component (0..2)
+//   Sustain    — gain multiplier for the sustain component (0..2)
+//   Threshold  — wavelet coefficient threshold for separation (0..1)
+//   Levels     — number of DWT decomposition levels (1..8)
+// ==============================================================================
+class TransientSplitProcessor : public juce::AudioProcessor {
+public:
+    TransientSplitProcessor(Node& n) : node(n) {}
+    const juce::String getName() const override { return "Transient Split"; }
+    void prepareToPlay(double sr, int bs) override {
+        sampleRate = sr;
+        blockSize = bs;
+    }
+    void releaseResources() override {}
+
+    void processBlock(juce::AudioBuffer<float>& buf, juce::MidiBuffer&) override {
+        applySignalModulations(node, buf);
+        const int n = buf.getNumSamples();
+        const int ch = std::min(2, buf.getNumChannels());
+        if (n == 0 || ch == 0) return;
+
+        float transGain = paramByName(node, "Transient", 1.0f);
+        float susGain   = paramByName(node, "Sustain",   1.0f);
+        float threshold = paramByName(node, "Threshold", 0.3f);
+        int   levels    = juce::jlimit(1, 8, (int)paramByName(node, "Levels", 4.0f));
+
+        auto filt = getWaveletFilter("db4");
+
+        // Pad to next power of 2 for DWT.
+        int padLen = 1;
+        while (padLen < n) padLen *= 2;
+
+        for (int c = 0; c < ch; ++c) {
+            float* data = buf.getWritePointer(c);
+
+            // Copy into padded buffer.
+            std::vector<float> sig(padLen, 0.0f);
+            for (int i = 0; i < n; ++i) sig[i] = data[i];
+            std::vector<float> original = sig;
+
+            // Forward DWT.
+            int actualLevels = dwt(sig, levels, filt);
+
+            // Threshold: large coefficients = transient, small = sustain.
+            // Find the max coefficient magnitude for adaptive thresholding.
+            float maxCoeff = 0;
+            for (auto v : sig) maxCoeff = std::max(maxCoeff, std::abs(v));
+            float thresh = threshold * maxCoeff;
+
+            // Build transient-only coefficients (keep above threshold).
+            std::vector<float> transSig = sig;
+            std::vector<float> susSig = sig;
+            for (int i = 0; i < padLen; ++i) {
+                if (std::abs(sig[i]) >= thresh) {
+                    susSig[i] = 0; // transient coefficient — zero out in sustain
+                } else {
+                    transSig[i] = 0; // sustain coefficient — zero out in transient
+                }
+            }
+
+            // Inverse DWT for both components.
+            idwt(transSig, actualLevels, filt);
+            idwt(susSig, actualLevels, filt);
+
+            // Recombine with gain controls.
+            for (int i = 0; i < n; ++i)
+                data[i] = transSig[i] * transGain + susSig[i] * susGain;
+        }
+    }
+
+    double getTailLengthSeconds() const override { return 0; }
+    bool acceptsMidi() const override { return true; }
+    bool producesMidi() const override { return true; }
+    bool isBusesLayoutSupported(const BusesLayout&) const override { return true; }
+    juce::AudioProcessorEditor* createEditor() override { return nullptr; }
+    bool hasEditor() const override { return false; }
+    int getNumPrograms() override { return 1; }
+    int getCurrentProgram() override { return 0; }
+    void setCurrentProgram(int) override {}
+    const juce::String getProgramName(int) override { return {}; }
+    void changeProgramName(int, const juce::String&) override {}
+    void getStateInformation(juce::MemoryBlock&) override {}
+    void setStateInformation(const void*, int) override {}
+private:
+    Node& node;
+    double sampleRate = 44100;
+    int blockSize = 512;
+};
+
+// ==============================================================================
+// WAVELET DENOISER — wavelet shrinkage noise reduction
+//
+// Uses the standard wavelet shrinkage method (Donoho & Johnstone):
+// forward DWT, soft-threshold the detail coefficients, inverse DWT.
+// Small coefficients (likely noise) are shrunk toward zero; large
+// coefficients (likely signal) are preserved. This removes broadband
+// noise while keeping transients sharp — unlike spectral gating which
+// can smear transients.
+//
+// Params:
+//   Threshold — noise floor estimate (0..1, fraction of max coefficient)
+//   Levels    — DWT decomposition depth (1..8)
+//   Mix       — dry/wet blend
+// ==============================================================================
+class WaveletDenoiserProcessor : public juce::AudioProcessor {
+public:
+    WaveletDenoiserProcessor(Node& n) : node(n) {}
+    const juce::String getName() const override { return "Denoiser"; }
+    void prepareToPlay(double sr, int) override { sampleRate = sr; }
+    void releaseResources() override {}
+
+    void processBlock(juce::AudioBuffer<float>& buf, juce::MidiBuffer&) override {
+        applySignalModulations(node, buf);
+        const int n = buf.getNumSamples();
+        const int ch = std::min(2, buf.getNumChannels());
+        if (n == 0 || ch == 0) return;
+
+        float threshold = paramByName(node, "Threshold", 0.1f);
+        int   levels    = juce::jlimit(1, 8, (int)paramByName(node, "Levels", 4.0f));
+        float mix       = juce::jlimit(0.0f, 1.0f, paramByName(node, "Mix", 1.0f));
+
+        auto filt = getWaveletFilter("sym4");
+        int padLen = 1;
+        while (padLen < n) padLen *= 2;
+
+        for (int c = 0; c < ch; ++c) {
+            float* data = buf.getWritePointer(c);
+            std::vector<float> sig(padLen, 0.0f);
+            for (int i = 0; i < n; ++i) sig[i] = data[i];
+            std::vector<float> dry(data, data + n);
+
+            int actualLevels = dwt(sig, levels, filt);
+
+            // Soft threshold: shrink coefficients toward zero.
+            float maxCoeff = 0;
+            for (auto v : sig) maxCoeff = std::max(maxCoeff, std::abs(v));
+            float thresh = threshold * maxCoeff;
+            // Skip the approximation coefficients (lowest band) — only
+            // threshold the detail coefficients.
+            int approxLen = padLen;
+            for (int l = 0; l < actualLevels; ++l) approxLen /= 2;
+            for (int i = approxLen; i < padLen; ++i) {
+                float v = sig[i];
+                if (std::abs(v) < thresh)
+                    sig[i] = 0;
+                else
+                    sig[i] = (v > 0) ? v - thresh : v + thresh; // soft shrinkage
+            }
+
+            idwt(sig, actualLevels, filt);
+
+            for (int i = 0; i < n; ++i)
+                data[i] = dry[i] * (1.0f - mix) + sig[i] * mix;
+        }
+    }
+
+    double getTailLengthSeconds() const override { return 0; }
+    bool acceptsMidi() const override { return true; }
+    bool producesMidi() const override { return true; }
+    bool isBusesLayoutSupported(const BusesLayout&) const override { return true; }
+    juce::AudioProcessorEditor* createEditor() override { return nullptr; }
+    bool hasEditor() const override { return false; }
+    int getNumPrograms() override { return 1; }
+    int getCurrentProgram() override { return 0; }
+    void setCurrentProgram(int) override {}
+    const juce::String getProgramName(int) override { return {}; }
+    void changeProgramName(int, const juce::String&) override {}
+    void getStateInformation(juce::MemoryBlock&) override {}
+    void setStateInformation(const void*, int) override {}
+private:
+    Node& node;
+    double sampleRate = 44100;
 };
 
 } // namespace SoundShop

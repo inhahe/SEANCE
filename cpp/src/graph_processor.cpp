@@ -527,6 +527,10 @@ void GraphProcessor::rebuildGraph(NodeGraph& graph, Transport& transport) {
             proc = std::make_unique<TriggerProcessor>(node, transport);
         } else if (node.type == NodeType::Effect && node.script == "__spatializer3d__") {
             proc = std::make_unique<Spatializer3DProcessor>(node);
+        } else if (node.type == NodeType::Effect && node.script == "__denoiser__") {
+            proc = std::make_unique<WaveletDenoiserProcessor>(node);
+        } else if (node.type == NodeType::Effect && node.script == "__transientsplit__") {
+            proc = std::make_unique<TransientSplitProcessor>(node);
         } else if (node.type == NodeType::Effect && node.script == "__pitchshift__") {
             proc = std::make_unique<PitchShiftProcessor>(node);
         } else {

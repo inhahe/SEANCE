@@ -1064,6 +1064,8 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
     fxMenu.addItem(219, "Trigger (MIDI / signal)");
     fxMenu.addItem(220, "MIDI Modulator (signal -> MIDI)");
     fxMenu.addItem(223, "Ring Modulator");
+    fxMenu.addItem(226, "Transient/Sustain Split");
+    fxMenu.addItem(227, "Wavelet Denoiser");
     fxMenu.addSeparator();
     fxMenu.addItem(224, "M/S Encode (stereo → mid+side)");
     fxMenu.addItem(225, "M/S Decode (mid+side → stereo)");
@@ -1692,6 +1694,17 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
                     {"B4 Freq", 8000.0f, 20.0f, 20000.0f},
                     {"B4 Gain", 0.0f, -24.0f, 24.0f},
                     {"B4 Q",    0.707f, 0.1f, 10.0f},
+                }); break;
+                case 227: makeEffect("Denoiser", "__denoiser__", {
+                    {"Threshold", 0.1f, 0.0f, 1.0f},
+                    {"Levels",    4.0f, 1.0f, 8.0f},
+                    {"Mix",       1.0f, 0.0f, 1.0f},
+                }); break;
+                case 226: makeEffect("Transient Split", "__transientsplit__", {
+                    {"Transient", 1.0f, 0.0f, 2.0f},
+                    {"Sustain",   1.0f, 0.0f, 2.0f},
+                    {"Threshold", 0.3f, 0.0f, 1.0f},
+                    {"Levels",    4.0f, 1.0f, 8.0f},
                 }); break;
                 case 223: makeEffect("Ring Mod", "__ringmod__", {
                     {"Mix",       0.5f,   0.0f, 1.0f},

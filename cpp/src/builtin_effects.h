@@ -1847,4 +1847,86 @@ private:
     double sampleRate = 44100;
 };
 
+// ==============================================================================
+// WAVELET BITCRUSH — quantize wavelet coefficients
+//
+// Reduces the precision of wavelet coefficients at selected bands,
+// producing bit-reduction artifacts that only affect the frequencies
+// you choose (unlike traditional bitcrush which hits everything). Low
+// bands = crunchy bass; high bands = sizzly highs; all bands = full
+// lo-fi character.
+//
+// Params: Bits (1..16), Band Lo (lowest band to crush), Band Hi,
+//         Levels, Mix
+// ==============================================================================
+class WaveletBitcrushProcessor : public juce::AudioProcessor {
+public:
+    WaveletBitcrushProcessor(Node& n) : node(n) {}
+    const juce::String getName() const override { return "Wavelet Bitcrush"; }
+    void prepareToPlay(double, int) override {}
+    void releaseResources() override {}
+
+    void processBlock(juce::AudioBuffer<float>& buf, juce::MidiBuffer&) override {
+        applySignalModulations(node, buf);
+        const int n = buf.getNumSamples();
+        const int ch = std::min(2, buf.getNumChannels());
+        if (n == 0 || ch == 0) return;
+
+        int   bits   = juce::jlimit(1, 16, (int)paramByName(node, "Bits", 4.0f));
+        int   bandLo = juce::jlimit(0, 7, (int)paramByName(node, "Band Lo", 0.0f));
+        int   bandHi = juce::jlimit(0, 7, (int)paramByName(node, "Band Hi", 7.0f));
+        int   levels = juce::jlimit(1, 8, (int)paramByName(node, "Levels", 4.0f));
+        float mix    = juce::jlimit(0.0f, 1.0f, paramByName(node, "Mix", 1.0f));
+
+        auto filt = getWaveletFilter("db2");
+        int padLen = 1;
+        while (padLen < n) padLen *= 2;
+
+        float quantStep = 1.0f / (float)(1 << bits);
+
+        for (int c = 0; c < ch; ++c) {
+            float* data = buf.getWritePointer(c);
+            std::vector<float> sig(padLen, 0.0f);
+            for (int i = 0; i < n; ++i) sig[i] = data[i];
+            std::vector<float> dry(data, data + n);
+
+            int actualLevels = dwt(sig, levels, filt);
+
+            // Quantize coefficients in the selected band range.
+            // Band 0 = coarsest detail (lowest freq), actualLevels-1 = finest.
+            int approxLen = padLen;
+            for (int l = 0; l < actualLevels; ++l) approxLen /= 2;
+            int bandStart = approxLen;
+            for (int band = 0; band < actualLevels; ++band) {
+                int bandLen = approxLen * (1 << band);
+                if (band >= bandLo && band <= bandHi) {
+                    for (int i = bandStart; i < bandStart + bandLen && i < padLen; ++i)
+                        sig[i] = std::round(sig[i] / quantStep) * quantStep;
+                }
+                bandStart += bandLen;
+            }
+
+            idwt(sig, actualLevels, filt);
+            for (int i = 0; i < n; ++i)
+                data[i] = dry[i] * (1.0f - mix) + sig[i] * mix;
+        }
+    }
+
+    double getTailLengthSeconds() const override { return 0; }
+    bool acceptsMidi() const override { return true; }
+    bool producesMidi() const override { return true; }
+    bool isBusesLayoutSupported(const BusesLayout&) const override { return true; }
+    juce::AudioProcessorEditor* createEditor() override { return nullptr; }
+    bool hasEditor() const override { return false; }
+    int getNumPrograms() override { return 1; }
+    int getCurrentProgram() override { return 0; }
+    void setCurrentProgram(int) override {}
+    const juce::String getProgramName(int) override { return {}; }
+    void changeProgramName(int, const juce::String&) override {}
+    void getStateInformation(juce::MemoryBlock&) override {}
+    void setStateInformation(const void*, int) override {}
+private:
+    Node& node;
+};
+
 } // namespace SoundShop

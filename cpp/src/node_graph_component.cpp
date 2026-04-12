@@ -1066,6 +1066,7 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
     fxMenu.addItem(223, "Ring Modulator");
     fxMenu.addItem(226, "Transient/Sustain Split");
     fxMenu.addItem(227, "Wavelet Denoiser");
+    fxMenu.addItem(228, "Wavelet Bitcrush");
     fxMenu.addSeparator();
     fxMenu.addItem(224, "M/S Encode (stereo → mid+side)");
     fxMenu.addItem(225, "M/S Decode (mid+side → stereo)");
@@ -1694,6 +1695,13 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
                     {"B4 Freq", 8000.0f, 20.0f, 20000.0f},
                     {"B4 Gain", 0.0f, -24.0f, 24.0f},
                     {"B4 Q",    0.707f, 0.1f, 10.0f},
+                }); break;
+                case 228: makeEffect("Wavelet Bitcrush", "__waveletbitcrush__", {
+                    {"Bits",    4.0f, 1.0f, 16.0f},
+                    {"Band Lo", 0.0f, 0.0f, 7.0f},
+                    {"Band Hi", 7.0f, 0.0f, 7.0f},
+                    {"Levels",  4.0f, 1.0f, 8.0f},
+                    {"Mix",     1.0f, 0.0f, 1.0f},
                 }); break;
                 case 227: makeEffect("Denoiser", "__denoiser__", {
                     {"Threshold", 0.1f, 0.0f, 1.0f},

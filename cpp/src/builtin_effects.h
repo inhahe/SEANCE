@@ -2046,4 +2046,106 @@ private:
     double sampleRate = 44100;
 };
 
+// ==============================================================================
+// WAVELET MULTIBAND COMPRESSOR — per-octave-band dynamics
+//
+// Decomposes audio into octave-wide bands via DWT, applies independent
+// compression to each band's coefficients, then reconstructs. The
+// octave bands are natural wavelet decomposition levels — no crossover
+// filters needed, so the bands sum perfectly without phase artifacts.
+//
+// Params:
+//   Threshold — dB below peak to start compressing (per band, shared)
+//   Ratio     — compression ratio (shared across bands for simplicity)
+//   Levels    — number of octave bands (1..6)
+//   Low Gain  — post-compression gain for the lowest band (dB)
+//   High Gain — post-compression gain for the highest band (dB)
+//   Mix
+// ==============================================================================
+class WaveletMultibandCompProcessor : public juce::AudioProcessor {
+public:
+    WaveletMultibandCompProcessor(Node& n) : node(n) {}
+    const juce::String getName() const override { return "Wavelet MB Comp"; }
+    void prepareToPlay(double sr, int) override { sampleRate = sr; }
+    void releaseResources() override {}
+
+    void processBlock(juce::AudioBuffer<float>& buf, juce::MidiBuffer&) override {
+        applySignalModulations(node, buf);
+        const int n = buf.getNumSamples();
+        const int ch = std::min(2, buf.getNumChannels());
+        if (n == 0 || ch == 0) return;
+
+        float threshDb = paramByName(node, "Threshold", -20.0f);
+        float ratio    = std::max(1.0f, paramByName(node, "Ratio", 4.0f));
+        int   levels   = juce::jlimit(1, 6, (int)paramByName(node, "Levels", 4.0f));
+        float loGainDb = paramByName(node, "Low Gain", 0.0f);
+        float hiGainDb = paramByName(node, "High Gain", 0.0f);
+        float mix      = juce::jlimit(0.0f, 1.0f, paramByName(node, "Mix", 1.0f));
+
+        float threshLin = std::pow(10.0f, threshDb / 20.0f);
+        auto filt = getWaveletFilter("db4");
+        int padLen = 1;
+        while (padLen < n) padLen *= 2;
+
+        for (int c = 0; c < ch; ++c) {
+            float* data = buf.getWritePointer(c);
+            std::vector<float> sig(padLen, 0.0f);
+            for (int i = 0; i < n; ++i) sig[i] = data[i];
+            std::vector<float> dry(data, data + n);
+
+            int actualLevels = dwt(sig, levels, filt);
+
+            // Per-band compression: compute peak of each band, apply gain
+            // reduction if peak exceeds threshold.
+            int approxLen = padLen;
+            for (int l = 0; l < actualLevels; ++l) approxLen /= 2;
+            int bandStart = approxLen;
+            for (int band = 0; band < actualLevels; ++band) {
+                int bandLen = approxLen * (1 << band);
+                // Find peak in this band.
+                float peak = 0;
+                for (int i = bandStart; i < bandStart + bandLen && i < padLen; ++i)
+                    peak = std::max(peak, std::abs(sig[i]));
+                // Compute gain reduction.
+                float gain = 1.0f;
+                if (peak > threshLin) {
+                    float dbOver = 20.0f * std::log10(peak / threshLin);
+                    float dbReduction = dbOver * (1.0f - 1.0f / ratio);
+                    gain = std::pow(10.0f, -dbReduction / 20.0f);
+                }
+                // Per-band tilt: interpolate between loGainDb and hiGainDb.
+                float bandFrac = (float)band / std::max(1.0f, (float)(actualLevels - 1));
+                float tiltDb = loGainDb + (hiGainDb - loGainDb) * bandFrac;
+                float tiltGain = std::pow(10.0f, tiltDb / 20.0f);
+                gain *= tiltGain;
+
+                for (int i = bandStart; i < bandStart + bandLen && i < padLen; ++i)
+                    sig[i] *= gain;
+                bandStart += bandLen;
+            }
+
+            idwt(sig, actualLevels, filt);
+            for (int i = 0; i < n; ++i)
+                data[i] = dry[i] * (1.0f - mix) + sig[i] * mix;
+        }
+    }
+
+    double getTailLengthSeconds() const override { return 0; }
+    bool acceptsMidi() const override { return true; }
+    bool producesMidi() const override { return true; }
+    bool isBusesLayoutSupported(const BusesLayout&) const override { return true; }
+    juce::AudioProcessorEditor* createEditor() override { return nullptr; }
+    bool hasEditor() const override { return false; }
+    int getNumPrograms() override { return 1; }
+    int getCurrentProgram() override { return 0; }
+    void setCurrentProgram(int) override {}
+    const juce::String getProgramName(int) override { return {}; }
+    void changeProgramName(int, const juce::String&) override {}
+    void getStateInformation(juce::MemoryBlock&) override {}
+    void setStateInformation(const void*, int) override {}
+private:
+    Node& node;
+    double sampleRate = 44100;
+};
+
 } // namespace SoundShop

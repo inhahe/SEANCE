@@ -527,6 +527,8 @@ void GraphProcessor::rebuildGraph(NodeGraph& graph, Transport& transport) {
             proc = std::make_unique<TriggerProcessor>(node, transport);
         } else if (node.type == NodeType::Effect && node.script == "__spatializer3d__") {
             proc = std::make_unique<Spatializer3DProcessor>(node);
+        } else if (node.type == NodeType::Effect && node.script == "__octaveshift__") {
+            proc = std::make_unique<OctaveShiftProcessor>(node);
         } else if (node.type == NodeType::Effect && node.script == "__waveletbitcrush__") {
             proc = std::make_unique<WaveletBitcrushProcessor>(node);
         } else if (node.type == NodeType::Effect && node.script == "__denoiser__") {

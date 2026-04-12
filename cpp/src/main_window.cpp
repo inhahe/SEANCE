@@ -46,11 +46,23 @@ static bool machineHasBattery() {
 #endif
 }
 
+// Returns true if the machine is currently on AC power. On desktops
+// (no battery) this always returns true. On laptops, it reads the OS
+// power state: true = plugged in, false = running on battery.
+static bool isOnACPower() {
+#ifdef _WIN32
+    SYSTEM_POWER_STATUS sps{};
+    if (GetSystemPowerStatus(&sps))
+        return sps.ACLineStatus == 1; // 1 = AC online
+    return true; // unknown → assume desktop
+#else
+    return true; // #87: implement for macOS / Linux
+#endif
+}
+
 // Pick the default autosave interval based on whether we're on a laptop.
 // Desktop systems get the aggressive 5-second interval; laptops get a more
-// conservative 20s default to save battery. Per task #86, AC vs battery
-// awareness and live transition response is a v2 enhancement (#87); v1
-// treats all laptops as if on battery.
+// conservative 20s default to save battery.
 static int defaultAutosaveIntervalForThisMachine() {
     return machineHasBattery() ? 20 : 5;
 }
@@ -618,6 +630,24 @@ void MainContentComponent::resized() {
 }
 
 void MainContentComponent::timerCallback() {
+    // Power-state-aware autosave interval (#87): every ~5 seconds
+    // (150 ticks at 30 Hz), check AC vs battery and adjust the
+    // autosave interval. Desktops and AC-powered laptops use the
+    // faster 5s interval; battery-powered laptops use 20s.
+    if (machineHasBattery()) {
+        static int powerCheckCounter = 0;
+        if (++powerCheckCounter >= 150) {
+            powerCheckCounter = 0;
+            bool ac = isOnACPower();
+            int desired = ac ? 5 : 20;
+            if (autosaveIntervalSeconds != desired) {
+                autosaveIntervalSeconds = desired;
+                fprintf(stderr, "Power state changed — autosave interval → %ds\n",
+                        desired);
+            }
+        }
+    }
+
     // Hotplug detection: poll the MIDI device list ~once a second (30Hz
     // timer × 30) and show a confirmation dialog when a new device
     // appears that isn't already a node in the graph.

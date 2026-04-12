@@ -79,6 +79,8 @@ SpectrumTapComponent::SpectrumTapComponent(NodeGraph& g, int nid)
     : graph(g), nodeId(nid)
 {
     addAndMakeVisible(addBinBtn);
+    addBinBtn.setTooltip("Add a new frequency band to monitor. Each bin outputs an amplitude signal you can use "
+                         "to drive other parameters — useful for spectrum-following effects, vocoder-like routing, etc.");
     addBinBtn.onClick = [this]() {
         auto* nd = graph.findNode(nodeId);
         if (!nd) return;

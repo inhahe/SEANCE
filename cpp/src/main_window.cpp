@@ -2265,6 +2265,29 @@ void MainContentComponent::upgradeLegacyNodes() {
         // "__reverb__" script and the default param set so the real DSP
         // takes over. Preserves the node's ID and position so existing
         // cables still connect to the right node.
+        // Legacy "EQ" stub → real parametric EQ.
+        if (n.type == NodeType::Effect && n.name == "EQ" && n.script.empty()) {
+            n.script = "__eq__";
+            if (n.params.empty()) {
+                n.params.push_back({"B1 Type", 3.0f, 0.0f, 4.0f});
+                n.params.push_back({"B1 Freq", 80.0f, 20.0f, 20000.0f});
+                n.params.push_back({"B1 Gain", 0.0f, -24.0f, 24.0f});
+                n.params.push_back({"B1 Q", 0.707f, 0.1f, 10.0f});
+                n.params.push_back({"B2 Type", 0.0f, 0.0f, 4.0f});
+                n.params.push_back({"B2 Freq", 400.0f, 20.0f, 20000.0f});
+                n.params.push_back({"B2 Gain", 0.0f, -24.0f, 24.0f});
+                n.params.push_back({"B2 Q", 0.707f, 0.1f, 10.0f});
+                n.params.push_back({"B3 Type", 0.0f, 0.0f, 4.0f});
+                n.params.push_back({"B3 Freq", 2500.0f, 20.0f, 20000.0f});
+                n.params.push_back({"B3 Gain", 0.0f, -24.0f, 24.0f});
+                n.params.push_back({"B3 Q", 0.707f, 0.1f, 10.0f});
+                n.params.push_back({"B4 Type", 4.0f, 0.0f, 4.0f});
+                n.params.push_back({"B4 Freq", 8000.0f, 20.0f, 20000.0f});
+                n.params.push_back({"B4 Gain", 0.0f, -24.0f, 24.0f});
+                n.params.push_back({"B4 Q", 0.707f, 0.1f, 10.0f});
+            }
+        }
+
         if (n.type == NodeType::Effect && n.name == "Reverb" && n.script.empty()) {
             n.script = "__reverb__";
             if (n.params.empty()) {
@@ -2729,6 +2752,14 @@ void MainContentComponent::doExportRender(const juce::File& file, const ExportOp
             renderBuf.getWritePointer(1, (int)pos)
         };
         offlineGP.processBlock(graph, offlineTransport, outPtrs, numChannels, thisBlock);
+    }
+
+    // Apply TPDF dithering before writing if the target is a PCM format
+    // (WAV or FLAC) and the user hasn't disabled it. Lossy codecs have
+    // their own noise floors so dithering is irrelevant there.
+    if (opts.dither && (opts.format == ExportFormat::WAV
+                        || opts.format == ExportFormat::FLAC)) {
+        applyTPDFDither(renderBuf, opts.bitsPerSample);
     }
 
     if (AudioExporter::exportToFile(file, renderBuf, opts)) {

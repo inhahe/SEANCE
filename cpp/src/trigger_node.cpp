@@ -607,6 +607,8 @@ TriggerEditorComponent::TriggerEditorComponent(NodeGraph& g, int nid, std::funct
         doc = TriggerDoc::defaultDoc();
 
     addAndMakeVisible(addMidiBtn);
+    addMidiBtn.setTooltip("Add a new MIDI rule — sends a MIDI note (transposed by some number of semitones) "
+                          "in response to incoming notes. Use to create harmonies, octave doubles, chords, etc.");
     addMidiBtn.onClick = [this]() {
         TriggerRule r;
         r.label = "MIDI rule";
@@ -617,6 +619,8 @@ TriggerEditorComponent::TriggerEditorComponent(NodeGraph& g, int nid, std::funct
     };
 
     addAndMakeVisible(addSignalBtn);
+    addSignalBtn.setTooltip("Add a new signal rule — generates a control signal (envelope, ramp, step) "
+                            "triggered by incoming MIDI notes. Wire its Signal output into a synth parameter to modulate.");
     addSignalBtn.onClick = [this]() {
         TriggerRule r;
         r.label = "Signal rule";
@@ -636,12 +640,18 @@ TriggerEditorComponent::TriggerEditorComponent(NodeGraph& g, int nid, std::funct
     wirePreset(presetFlamBtn,      &TriggerDoc::presetFlam);
     wirePreset(presetPluckBtn,     &TriggerDoc::presetPluckEnvelope);
     wirePreset(presetVelFollowBtn, &TriggerDoc::presetVelocityFollower);
+    presetOctaveBtn.setTooltip("Load a preset that doubles every incoming note one octave higher");
+    presetChordBtn.setTooltip("Load a preset that turns each incoming note into a major chord (root, third, fifth)");
+    presetFlamBtn.setTooltip("Load a preset that adds a quick echo of each note ~30ms later — drum 'flam' effect");
+    presetPluckBtn.setTooltip("Load a preset that fires a short envelope on every note — useful as a pluck/percussion modulator");
+    presetVelFollowBtn.setTooltip("Load a preset that outputs a signal proportional to each note's velocity — drives parameters from how hard you play");
 
     addAndMakeVisible(helpBtn);
     helpBtn.setTooltip("Open the Trigger node docs");
     helpBtn.onClick = []() { openHelpDocFile("trigger-node.html"); };
 
     addAndMakeVisible(applyBtn);
+    applyBtn.setTooltip("Save the current rule list to the Trigger node without closing this editor");
     applyBtn.onClick = [this]() { commitToNode(); if (onApply) onApply(); };
 
     addAndMakeVisible(closeBtn);

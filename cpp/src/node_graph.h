@@ -29,11 +29,21 @@ enum class PinKind { Audio, Midi, Param, Signal }; // Signal = audio-rate contro
 // the audio-graph routing already carries them on the same channel slot. The
 // receiver decides whether to read once per block (Param semantics) or every
 // sample (Signal semantics). See task #82.
+// Two pin kinds are compatible at the cable level if:
+//   - They're the same kind, OR
+//   - Both are control kinds (Param + Signal), OR
+//   - An Audio output connects to a Signal input (the graph processor
+//     mono-downmixes channel 0 of the source to the signal slot; this
+//     enables sidechain inputs where an audio signal triggers a
+//     control-rate detector).
 inline bool arePinKindsCompatible(PinKind a, PinKind b) {
     if (a == b) return true;
     bool aCtrl = (a == PinKind::Param || a == PinKind::Signal);
     bool bCtrl = (b == PinKind::Param || b == PinKind::Signal);
-    return aCtrl && bCtrl;
+    if (aCtrl && bCtrl) return true;
+    // Audio output → Signal input (mono downmix for sidechain etc.)
+    if (a == PinKind::Audio && b == PinKind::Signal) return true;
+    return false;
 }
 enum class NodeType {
     AudioTimeline, MidiTimeline, Instrument, Effect, Mixer, Output, Script, Group, TerrainSynth, SignalShape,

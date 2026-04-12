@@ -505,6 +505,12 @@ public:
         setupSlider(ratioSlider, 1.0, 16.0, 1.0, "x");
         setupSlider(phaseSlider, 0.0, 1.0, 0.01, "");
         setupSlider(ampSlider,   0.0, 1.0, 0.01, "");
+        ratioSlider.setTooltip("Harmonic ratio: how many times faster this layer cycles than the fundamental. "
+                               "1 = root pitch, 2 = one octave up, 3 = one octave + a fifth, etc. Higher numbers add brighter overtones.");
+        phaseSlider.setTooltip("Phase offset (0 to 1): shifts where in its cycle this layer starts. "
+                               "Affects how layers add up when summed — different phases give different timbres.");
+        ampSlider.setTooltip("Amplitude (0 to 1): how loud this layer is in the final sum. 0 = silent, 1 = full volume. "
+                             "Use to balance layers against each other.");
 
         addAndMakeVisible(ratioLabel);
         addAndMakeVisible(phaseLabel);
@@ -1190,6 +1196,9 @@ LayeredWaveEditorComponent::LayeredWaveEditorComponent(NodeGraph& g, int nid, st
     currentPosition.assign(std::max(1, wave.scatterDims), 0.5f);
 
     addAndMakeVisible(addLayerBtn);
+    addLayerBtn.setTooltip("Add a new harmonic layer to the current waveform frame. "
+                           "Each layer is a sine, saw, square, triangle, noise, or drawn shape "
+                           "that gets summed into the final waveform.");
     addLayerBtn.onClick = [this]() {
         auto& layers = currentLayers();
         WaveLayer l;
@@ -1203,6 +1212,9 @@ LayeredWaveEditorComponent::LayeredWaveEditorComponent(NodeGraph& g, int nid, st
     };
 
     addAndMakeVisible(addFrameBtn);
+    addFrameBtn.setTooltip("Add a new frame to the wavetable. The synth crossfades between frames "
+                           "as you sweep the Position parameter, letting you morph between different "
+                           "waveform shapes during playback.");
     addFrameBtn.onClick = [this]() {
         // Duplicate the current frame so the user has a starting point.
         if (wave.mode == WavetableMode::Grid) {
@@ -1233,10 +1245,14 @@ LayeredWaveEditorComponent::LayeredWaveEditorComponent(NodeGraph& g, int nid, st
 
     // Mode toggle: switch between Grid and Scatter authoring.
     addAndMakeVisible(modeToggleBtn);
+    modeToggleBtn.setTooltip("Toggle between Grid mode (frames laid out on a regular N-D grid) and "
+                             "Scatter mode (frames placed at arbitrary N-D positions, blended via radial basis functions)");
     modeToggleBtn.onClick = [this]() { toggleMode(); };
 
     // Scatter dimensions: + / - to add/remove a Position axis.
     addAndMakeVisible(addDimBtn);
+    addDimBtn.setTooltip("Add a new Position axis (dimension) to the wavetable. Each axis adds a "
+                         "Position knob on the synth node that morphs through the frames along that axis.");
     addDimBtn.onClick = [this]() {
         if (wave.mode == WavetableMode::Scatter) {
             if (wave.scatterDims < 8) wave.scatterDims++;
@@ -1254,6 +1270,7 @@ LayeredWaveEditorComponent::LayeredWaveEditorComponent(NodeGraph& g, int nid, st
         onLayerChanged();
     };
     addAndMakeVisible(removeDimBtn);
+    removeDimBtn.setTooltip("Remove the last Position axis from the wavetable");
     removeDimBtn.onClick = [this]() {
         if (wave.mode == WavetableMode::Scatter) {
             if (wave.scatterDims > 1) {
@@ -1273,9 +1290,13 @@ LayeredWaveEditorComponent::LayeredWaveEditorComponent(NodeGraph& g, int nid, st
     };
 
     addAndMakeVisible(projectionCombo);
+    projectionCombo.setTooltip("Choose which axes are shown in the 2D/3D viewer when the wavetable has more than 2-3 dimensions. "
+                                "Other axes get fixed to a single value (controlled by the per-axis sliders below).");
     projectionCombo.onChange = [this]() { onProjectionChanged(); };
 
     addAndMakeVisible(anaglyph3DBtn);
+    anaglyph3DBtn.setTooltip("Toggle red/cyan anaglyph 3D rendering. Put on red/cyan glasses to see the scatter "
+                             "frames in stereoscopic 3D — useful for visualizing 3+ dimensional wavetables.");
     anaglyph3DBtn.setClickingTogglesState(true);
     anaglyph3DBtn.onClick = [this]() {
         if (scatterView) scatterView->anaglyph3D = anaglyph3DBtn.getToggleState();
@@ -1312,6 +1333,12 @@ LayeredWaveEditorComponent::LayeredWaveEditorComponent(NodeGraph& g, int nid, st
     setupStereoSlider(ipdSlider,   ipdLabel,   "IPD",       50.0, 75.0,  63.0, " mm");
     setupStereoSlider(distSlider,  distLabel,  "View dist", 30.0, 120.0, 60.0, " cm");
     setupStereoSlider(depthSlider, depthLabel, "Depth",     10.0, 200.0, 60.0, " mm");
+    ipdSlider.setTooltip("Interpupillary distance (mm) — the distance between your eyes. "
+                         "Affects the apparent depth of the 3D anaglyph rendering. Adult average is ~63mm.");
+    distSlider.setTooltip("Viewing distance (cm) — how far your eyes are from the screen. "
+                          "Combines with IPD to scale the parallax for accurate 3D.");
+    depthSlider.setTooltip("Depth scale (mm) — how much the 3D effect protrudes from the screen. "
+                           "Increase for a more dramatic effect, decrease for subtler depth.");
     stereoRow.addAndMakeVisible(dpiLabel);
     dpiLabel.setText("DPI " + juce::String((int)scatterView->dpi), juce::dontSendNotification);
     dpiLabel.setFont(11.0f);
@@ -1331,6 +1358,7 @@ LayeredWaveEditorComponent::LayeredWaveEditorComponent(NodeGraph& g, int nid, st
 
     addAndMakeVisible(applyBtn);
     applyBtn.setButtonText("Apply");
+    applyBtn.setTooltip("Save the current waveform edits to the synth without closing this editor");
     applyBtn.onClick = [this]() {
         commitToNode();
         if (onApply) onApply();

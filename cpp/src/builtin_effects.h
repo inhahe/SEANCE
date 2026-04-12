@@ -277,11 +277,18 @@ public:
         float makeup    = std::pow(10.0f, makeupDb / 20.0f);
         float attackCoeff  = std::exp(-1.0f / (float)(attackMs * 0.001 * sampleRate));
         float releaseCoeff = std::exp(-1.0f / (float)(releaseMs * 0.001 * sampleRate));
+        // Sidechain: if a Signal/Audio cable is wired to the "Sidechain"
+        // pin, it arrives on channel 2 (the first control slot). Use
+        // that for detection instead of the main audio input.
+        bool hasSidechain = buf.getNumChannels() > 2;
         for (int s = 0; s < buf.getNumSamples(); ++s) {
-            // Detect peak across all channels
             float peak = 0;
-            for (int c = 0; c < buf.getNumChannels(); ++c)
-                peak = std::max(peak, std::abs(buf.getSample(c, s)));
+            if (hasSidechain) {
+                peak = std::abs(buf.getSample(2, s));
+            } else {
+                for (int c = 0; c < std::min(2, buf.getNumChannels()); ++c)
+                    peak = std::max(peak, std::abs(buf.getSample(c, s)));
+            }
             // Envelope follower
             float coeff = (peak > envLevel) ? attackCoeff : releaseCoeff;
             envLevel = coeff * envLevel + (1.0f - coeff) * peak;
@@ -851,6 +858,283 @@ private:
 
     std::vector<float> predelayL, predelayR;
     int predelayWritePos = 0;
+};
+
+// ==============================================================================
+// PARAMETRIC EQ — 4-band biquad equalizer
+//
+// Each band has its own type (Peak, Low Shelf, High Shelf, High Pass,
+// Low Pass), frequency, gain (dB, relevant for peak/shelf), and Q.
+// Biquad coefficients are computed from the Robert Bristow-Johnson
+// Audio EQ Cookbook. The 4 bands cascade in series per stereo channel.
+//
+// Params (per band, N = 1..4):
+//   BN Type  — 0=Peak, 1=LowShelf, 2=HighShelf, 3=HP, 4=LP
+//   BN Freq  — center/corner frequency in Hz
+//   BN Gain  — boost/cut in dB (peak and shelf only)
+//   BN Q     — bandwidth / resonance (0.1..10)
+// ==============================================================================
+class ParametricEQProcessor : public juce::AudioProcessor {
+public:
+    ParametricEQProcessor(Node& n) : node(n) {}
+    const juce::String getName() const override { return "EQ"; }
+
+    void prepareToPlay(double sr, int) override {
+        sampleRate = sr;
+        for (auto& b : bands) b.reset();
+    }
+    void releaseResources() override {}
+
+    void processBlock(juce::AudioBuffer<float>& buf, juce::MidiBuffer&) override {
+        applySignalModulations(node, buf);
+        updateCoefficients();
+
+        const int n = buf.getNumSamples();
+        const int ch = buf.getNumChannels();
+        for (int b = 0; b < kNumBands; ++b) {
+            for (int c = 0; c < std::min(ch, 2); ++c) {
+                float* data = buf.getWritePointer(c);
+                auto& s = bands[b].state[c];
+                const auto& co = bands[b].co;
+                for (int i = 0; i < n; ++i) {
+                    float x = data[i];
+                    float y = co.b0 * x + co.b1 * s.x1 + co.b2 * s.x2
+                            - co.a1 * s.y1 - co.a2 * s.y2;
+                    s.x2 = s.x1; s.x1 = x;
+                    s.y2 = s.y1; s.y1 = y;
+                    data[i] = y;
+                }
+            }
+        }
+    }
+
+    double getTailLengthSeconds() const override { return 0; }
+    bool acceptsMidi() const override { return true; }
+    bool producesMidi() const override { return true; }
+    bool isBusesLayoutSupported(const BusesLayout&) const override { return true; }
+    juce::AudioProcessorEditor* createEditor() override { return nullptr; }
+    bool hasEditor() const override { return false; }
+    int getNumPrograms() override { return 1; }
+    int getCurrentProgram() override { return 0; }
+    void setCurrentProgram(int) override {}
+    const juce::String getProgramName(int) override { return {}; }
+    void changeProgramName(int, const juce::String&) override {}
+    void getStateInformation(juce::MemoryBlock&) override {}
+    void setStateInformation(const void*, int) override {}
+
+private:
+    Node& node;
+    double sampleRate = 44100;
+    static constexpr int kNumBands = 4;
+
+    struct Coeffs { float b0=1,b1=0,b2=0,a1=0,a2=0; };
+    struct BiquadState { float x1=0,x2=0,y1=0,y2=0; };
+    struct Band {
+        Coeffs co;
+        BiquadState state[2]; // stereo
+        void reset() { state[0] = state[1] = {}; }
+    };
+    Band bands[kNumBands];
+
+    // RBJ cookbook biquad coefficient computation.
+    void updateCoefficients() {
+        const char* bandNames[] = {"B1", "B2", "B3", "B4"};
+        for (int b = 0; b < kNumBands; ++b) {
+            std::string prefix = std::string(bandNames[b]) + " ";
+            int type  = (int)paramByName(node, (prefix + "Type").c_str(),
+                                          b == 0 ? 3.0f : b == 3 ? 4.0f : 0.0f);
+            float freq = paramByName(node, (prefix + "Freq").c_str(),
+                                      b == 0 ? 80.0f : b == 1 ? 400.0f :
+                                      b == 2 ? 2500.0f : 8000.0f);
+            float gain = paramByName(node, (prefix + "Gain").c_str(), 0.0f);
+            float Q    = paramByName(node, (prefix + "Q").c_str(), 0.707f);
+
+            freq = juce::jlimit(20.0f, (float)(sampleRate * 0.49), freq);
+            Q    = juce::jlimit(0.1f, 10.0f, Q);
+
+            const float kPi = 3.14159265358979323846f;
+            float w0 = 2.0f * kPi * freq / (float)sampleRate;
+            float cosw0 = std::cos(w0);
+            float sinw0 = std::sin(w0);
+            float alpha = sinw0 / (2.0f * Q);
+            float A = std::pow(10.0f, gain / 40.0f); // sqrt of linear gain
+
+            float b0=1, b1=0, b2=0, a0=1, a1=0, a2=0;
+
+            switch (type) {
+                case 0: // Peak EQ
+                    b0 = 1.0f + alpha * A;
+                    b1 = -2.0f * cosw0;
+                    b2 = 1.0f - alpha * A;
+                    a0 = 1.0f + alpha / A;
+                    a1 = -2.0f * cosw0;
+                    a2 = 1.0f - alpha / A;
+                    break;
+                case 1: { // Low Shelf
+                    float t = 2.0f * std::sqrt(A) * alpha;
+                    b0 = A * ((A + 1.0f) - (A - 1.0f) * cosw0 + t);
+                    b1 = 2.0f * A * ((A - 1.0f) - (A + 1.0f) * cosw0);
+                    b2 = A * ((A + 1.0f) - (A - 1.0f) * cosw0 - t);
+                    a0 = (A + 1.0f) + (A - 1.0f) * cosw0 + t;
+                    a1 = -2.0f * ((A - 1.0f) + (A + 1.0f) * cosw0);
+                    a2 = (A + 1.0f) + (A - 1.0f) * cosw0 - t;
+                    break;
+                }
+                case 2: { // High Shelf
+                    float t = 2.0f * std::sqrt(A) * alpha;
+                    b0 = A * ((A + 1.0f) + (A - 1.0f) * cosw0 + t);
+                    b1 = -2.0f * A * ((A - 1.0f) + (A + 1.0f) * cosw0);
+                    b2 = A * ((A + 1.0f) + (A - 1.0f) * cosw0 - t);
+                    a0 = (A + 1.0f) - (A - 1.0f) * cosw0 + t;
+                    a1 = 2.0f * ((A - 1.0f) - (A + 1.0f) * cosw0);
+                    a2 = (A + 1.0f) - (A - 1.0f) * cosw0 - t;
+                    break;
+                }
+                case 3: // High Pass
+                    b0 = (1.0f + cosw0) / 2.0f;
+                    b1 = -(1.0f + cosw0);
+                    b2 = (1.0f + cosw0) / 2.0f;
+                    a0 = 1.0f + alpha;
+                    a1 = -2.0f * cosw0;
+                    a2 = 1.0f - alpha;
+                    break;
+                case 4: // Low Pass
+                    b0 = (1.0f - cosw0) / 2.0f;
+                    b1 = 1.0f - cosw0;
+                    b2 = (1.0f - cosw0) / 2.0f;
+                    a0 = 1.0f + alpha;
+                    a1 = -2.0f * cosw0;
+                    a2 = 1.0f - alpha;
+                    break;
+                default: // bypass
+                    b0 = 1; b1 = b2 = a1 = a2 = 0; a0 = 1;
+                    break;
+            }
+            // Normalize by a0.
+            float inv = 1.0f / a0;
+            bands[b].co = {b0*inv, b1*inv, b2*inv, a1*inv, a2*inv};
+        }
+    }
+};
+
+// ==============================================================================
+// RING MODULATOR — multiplies two audio signals
+//
+// Takes two Audio inputs (Carrier + Modulator) and outputs their
+// sample-by-sample product. Produces metallic, bell-like, inharmonic
+// tones. When only one input is connected, the internal oscillator
+// acts as the modulator at a user-set frequency.
+//
+// Params: Mix (dry/wet), Int Freq (internal osc Hz, used when no
+// second input), Int Shape (0=sine, 1=square, 2=triangle).
+// ==============================================================================
+class RingModProcessor : public juce::AudioProcessor {
+public:
+    RingModProcessor(Node& n) : node(n) {}
+    const juce::String getName() const override { return "Ring Mod"; }
+    void prepareToPlay(double sr, int) override { sampleRate = sr; }
+    void releaseResources() override {}
+
+    void processBlock(juce::AudioBuffer<float>& buf, juce::MidiBuffer&) override {
+        applySignalModulations(node, buf);
+        float mix      = paramByName(node, "Mix", 0.5f);
+        float intFreq  = paramByName(node, "Int Freq", 440.0f);
+        int   intShape = (int)paramByName(node, "Int Shape", 0.0f);
+
+        const int n = buf.getNumSamples();
+        const int ch = buf.getNumChannels();
+        // If the node has a second Audio input wired, the graph processor
+        // sums it into channel 0/1 alongside the first input — there's no
+        // separate channel for the modulator in the current routing model.
+        // So for the two-input case we'd need a dedicated routing path.
+        // For now, use the internal oscillator as the modulator source.
+        // (A future enhancement can add a second bus via JUCE's bus API.)
+        for (int s = 0; s < n; ++s) {
+            float mod = 0;
+            float t = (float)(phase * 2.0 * 3.14159265);
+            if (intShape == 0) mod = std::sin(t);
+            else if (intShape == 1) mod = std::sin(t) >= 0 ? 1.0f : -1.0f;
+            else mod = 2.0f * std::abs(2.0f * (float)(phase - std::floor(phase + 0.5))) - 1.0f;
+            phase += intFreq / sampleRate;
+            if (phase > 1.0) phase -= 1.0;
+
+            for (int c = 0; c < ch; ++c) {
+                float dry = buf.getSample(c, s);
+                float wet = dry * mod;
+                buf.setSample(c, s, dry * (1.0f - mix) + wet * mix);
+            }
+        }
+    }
+
+    double getTailLengthSeconds() const override { return 0; }
+    bool acceptsMidi() const override { return true; }
+    bool producesMidi() const override { return true; }
+    bool isBusesLayoutSupported(const BusesLayout&) const override { return true; }
+    juce::AudioProcessorEditor* createEditor() override { return nullptr; }
+    bool hasEditor() const override { return false; }
+    int getNumPrograms() override { return 1; }
+    int getCurrentProgram() override { return 0; }
+    void setCurrentProgram(int) override {}
+    const juce::String getProgramName(int) override { return {}; }
+    void changeProgramName(int, const juce::String&) override {}
+    void getStateInformation(juce::MemoryBlock&) override {}
+    void setStateInformation(const void*, int) override {}
+private:
+    Node& node;
+    double sampleRate = 44100, phase = 0;
+};
+
+// ==============================================================================
+// MID/SIDE ENCODE — splits stereo into Mid + Side on separate channels
+// MID/SIDE DECODE — recombines Mid + Side back into stereo
+//
+// Both are implemented as a single processor that reads a "Mode" param:
+//   0 = Encode (L/R → Mid/Side)
+//   1 = Decode (Mid/Side → L/R)
+// This lets one node type serve both halves of the utility pair.
+// ==============================================================================
+class MidSideProcessor : public juce::AudioProcessor {
+public:
+    MidSideProcessor(Node& n) : node(n) {}
+    const juce::String getName() const override { return "M/S"; }
+    void prepareToPlay(double, int) override {}
+    void releaseResources() override {}
+
+    void processBlock(juce::AudioBuffer<float>& buf, juce::MidiBuffer&) override {
+        applySignalModulations(node, buf);
+        if (buf.getNumChannels() < 2 || buf.getNumSamples() == 0) return;
+        int mode = (int)paramByName(node, "Mode", 0.0f);
+        float* L = buf.getWritePointer(0);
+        float* R = buf.getWritePointer(1);
+        for (int s = 0; s < buf.getNumSamples(); ++s) {
+            float l = L[s], r = R[s];
+            if (mode == 0) {
+                // Encode: Mid = (L+R)/2, Side = (L-R)/2
+                L[s] = (l + r) * 0.5f;
+                R[s] = (l - r) * 0.5f;
+            } else {
+                // Decode: L = Mid+Side, R = Mid-Side
+                L[s] = l + r;
+                R[s] = l - r;
+            }
+        }
+    }
+
+    double getTailLengthSeconds() const override { return 0; }
+    bool acceptsMidi() const override { return true; }
+    bool producesMidi() const override { return true; }
+    bool isBusesLayoutSupported(const BusesLayout&) const override { return true; }
+    juce::AudioProcessorEditor* createEditor() override { return nullptr; }
+    bool hasEditor() const override { return false; }
+    int getNumPrograms() override { return 1; }
+    int getCurrentProgram() override { return 0; }
+    void setCurrentProgram(int) override {}
+    const juce::String getProgramName(int) override { return {}; }
+    void changeProgramName(int, const juce::String&) override {}
+    void getStateInformation(juce::MemoryBlock&) override {}
+    void setStateInformation(const void*, int) override {}
+private:
+    Node& node;
 };
 
 } // namespace SoundShop

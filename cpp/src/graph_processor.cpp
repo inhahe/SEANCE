@@ -495,6 +495,13 @@ void GraphProcessor::rebuildGraph(NodeGraph& graph, Transport& transport) {
             proc = std::make_unique<EchoProcessor>(node);
         } else if (node.type == NodeType::Effect && node.script == "__reverb__") {
             proc = std::make_unique<ReverbProcessor>(node);
+        } else if (node.type == NodeType::Effect && node.script == "__eq__") {
+            proc = std::make_unique<ParametricEQProcessor>(node);
+        } else if (node.type == NodeType::Effect && node.script == "__ringmod__") {
+            proc = std::make_unique<RingModProcessor>(node);
+        } else if (node.type == NodeType::Effect &&
+                   (node.script == "__msencode__" || node.script == "__msdecode__")) {
+            proc = std::make_unique<MidSideProcessor>(node);
         } else if (node.type == NodeType::Effect && node.script == "__compressor__") {
             proc = std::make_unique<CompressorProcessor>(node);
         } else if (node.type == NodeType::Effect && node.script == "__limiter__") {

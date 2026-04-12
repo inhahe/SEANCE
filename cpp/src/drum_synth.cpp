@@ -283,6 +283,8 @@ DrumSynthEditorComponent::DrumSynthEditorComponent(NodeGraph& g, int nid, AudioE
     : graph(g), nodeId(nid), audioEngine(ae)
 {
     addAndMakeVisible(addSoundBtn);
+    addSoundBtn.setTooltip("Add a new drum voice (kick, snare, hi-hat, etc.) — pick the type from the popup. "
+                           "Each voice gets its own MIDI note assignment and a row of params (pitch, decay, tone, level).");
     addSoundBtn.onClick = [this]() {
         juce::PopupMenu menu;
         menu.addItem(1, "Kick");
@@ -406,6 +408,8 @@ void DrumSynthEditorComponent::rebuildRows() {
         row->typeCombo.addItem("Tom", 5); row->typeCombo.addItem("Cowbell", 6);
         row->typeCombo.addItem("Rimshot", 7); row->typeCombo.addItem("Cymbal", 8);
         row->typeCombo.setSelectedId((int)nd->params[pi].value + 1, juce::dontSendNotification);
+        row->typeCombo.setTooltip("Drum sound algorithm. Each type uses different synthesis (e.g. Kick is a "
+                                  "pitched sine sweep, Snare is filtered noise, Hi-Hat is FM noise).");
         int typePI = pi;
         row->typeCombo.onChange = [this, typePI]() {
             if (auto* n = graph.findNode(nodeId))
@@ -421,6 +425,8 @@ void DrumSynthEditorComponent::rebuildRows() {
 
         // Learn button
         scrollContent.addAndMakeVisible(row->learnBtn);
+        row->learnBtn.setTooltip("MIDI Learn: click this button, then press a key on your MIDI controller to "
+                                 "assign that note to this drum voice.");
         int si = soundIdx;
         row->learnBtn.onClick = [this, si]() {
             learnIdx = si;
@@ -448,6 +454,10 @@ void DrumSynthEditorComponent::rebuildRows() {
         setupSlider(row->decaySlider, nd->params[pi+2].value, 0.1f, 4.0f);
         setupSlider(row->toneSlider,  nd->params[pi+3].value, 0.0f, 1.0f);
         setupSlider(row->levelSlider, nd->params[pi+4].value, 0.0f, 1.0f);
+        row->pitchSlider.setTooltip("Pitch multiplier — higher = brighter and 'tighter', lower = deeper and 'fatter'");
+        row->decaySlider.setTooltip("How quickly the sound fades after being struck. Lower = short and percussive, higher = ringing tail");
+        row->toneSlider.setTooltip("Timbre shaping — varies per drum type (filter cutoff, harmonic balance, noise mix, etc.)");
+        row->levelSlider.setTooltip("Output volume of this drum voice");
 
         // Check if this is a cymbal (has Size param)
         DrumType dtype = (DrumType)(int)nd->params[pi].value;

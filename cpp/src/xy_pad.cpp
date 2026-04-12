@@ -9,6 +9,9 @@ XYPadComponent::XYPadComponent(NodeGraph& g, int nid) : graph(g), nodeId(nid) {
     xLabel.setText("X axis (left/right):", juce::dontSendNotification);
     yLabel.setText("Y axis (up/down):", juce::dontSendNotification);
     zLabel.setText("Z axis (scroll wheel):", juce::dontSendNotification);
+    xCombo.setTooltip("Pick which parameter on which node the X axis (horizontal mouse position) controls");
+    yCombo.setTooltip("Pick which parameter on which node the Y axis (vertical mouse position) controls");
+    zCombo.setTooltip("Pick which parameter on which node the Z axis (mouse scroll wheel) controls");
     for (auto* l : {&xLabel, &yLabel, &zLabel}) {
         l->setFont(11.0f);
         l->setJustificationType(juce::Justification::centredRight);

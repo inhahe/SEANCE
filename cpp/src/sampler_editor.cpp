@@ -29,9 +29,12 @@ SamplerEditorComponent::SamplerEditorComponent(NodeGraph& g, int nid, AudioEngin
     titleLabel.setText(nd ? juce::String(nd->name) : "Sampler", juce::dontSendNotification);
 
     addAndMakeVisible(loadBtn);
+    loadBtn.setTooltip("Load an audio file (WAV, MP3, AIFF, FLAC, OGG) as the sample for this instrument");
     loadBtn.onClick = [this]() { loadSample(); };
 
     addAndMakeVisible(analyzeBtn);
+    analyzeBtn.setTooltip("Analyze the loaded sample to detect its pitch using two algorithms (autocorrelation and YIN). "
+                          "Use the results to set the base note so the sample plays at correct pitch when triggered by MIDI.");
     analyzeBtn.onClick = [this]() { runAnalysis(); };
 
     // Detection result labels
@@ -45,6 +48,11 @@ SamplerEditorComponent::SamplerEditorComponent(NodeGraph& g, int nid, AudioEngin
     addAndMakeVisible(playACBtn);  addAndMakeVisible(useACBtn);
     addAndMakeVisible(playYINBtn); addAndMakeVisible(useYINBtn);
     addAndMakeVisible(playSineBtn);
+    playACBtn.setTooltip("Play a sine wave at the autocorrelation-detected pitch so you can compare it to the sample by ear");
+    useACBtn.setTooltip("Set the base note to the autocorrelation-detected pitch");
+    playYINBtn.setTooltip("Play a sine wave at the YIN-detected pitch so you can compare it to the sample by ear");
+    useYINBtn.setTooltip("Set the base note to the YIN-detected pitch (often more accurate for clean tones)");
+    playSineBtn.setTooltip("Play a sine wave at the currently-set base note for comparison");
     playACBtn.onClick = [this]() {
         if (autoCorResult.frequencyHz > 0)
             playPreview(autoCorResult.frequencyHz);
@@ -66,6 +74,9 @@ SamplerEditorComponent::SamplerEditorComponent(NodeGraph& g, int nid, AudioEngin
     addAndMakeVisible(baseNoteCombo); addAndMakeVisible(baseNoteLbl);
     baseNoteLbl.setText("Base note:", juce::dontSendNotification);
     baseNoteLbl.setFont(11.0f);
+    baseNoteCombo.setTooltip("The MIDI note that plays the sample at its original pitch and speed. "
+                             "When you trigger a different MIDI note, the sample is pitch-shifted up or down "
+                             "from this base. Set it to whatever pitch the sample was recorded at.");
     for (int i = 0; i < 128; ++i)
         baseNoteCombo.addItem(midiNoteFullName(i) + " (" + juce::String((int)(440.0 * std::pow(2.0, (i-69)/12.0))) + " Hz)", i + 1);
     baseNoteCombo.setSelectedId(69 + 1); // A4 default
@@ -88,6 +99,8 @@ SamplerEditorComponent::SamplerEditorComponent(NodeGraph& g, int nid, AudioEngin
     fineTuneSlider.setValue(0.0);
     fineTuneSlider.setTextBoxStyle(juce::Slider::TextBoxRight, false, 60, 20);
     fineTuneSlider.setTextValueSuffix(" cents");
+    fineTuneSlider.setTooltip("Fine pitch adjustment in cents (1/100 of a semitone). "
+                              "Use to nudge the sample slightly sharper or flatter so it matches another instrument's tuning.");
     if (nd) {
         for (auto& p : nd->params)
             if (p.name == "Fine Tune")
@@ -95,6 +108,9 @@ SamplerEditorComponent::SamplerEditorComponent(NodeGraph& g, int nid, AudioEngin
     }
 
     addAndMakeVisible(autoTuneToggle);
+    autoTuneToggle.setTooltip("When on, the sample is automatically pitch-corrected during analysis "
+                              "so its detected pitch matches the chosen base note exactly. Useful for samples "
+                              "that are slightly off from a standard musical pitch.");
     autoTuneToggle.setToggleState(false, juce::dontSendNotification);
 
     // Pitch method
@@ -104,6 +120,9 @@ SamplerEditorComponent::SamplerEditorComponent(NodeGraph& g, int nid, AudioEngin
     pitchMethodCombo.addItem("Resample (changes speed + pitch)", 1);
     pitchMethodCombo.addItem("Pitch Shift (preserves speed)", 2);
     pitchMethodCombo.setSelectedId(1);
+    pitchMethodCombo.setTooltip("How to play the sample at different MIDI note pitches. "
+                                "Resample is the classic 'tape speed' method — higher notes also play faster, lower notes play slower. "
+                                "Pitch Shift uses time-stretching to change pitch without affecting playback speed (slower but more natural for melodic samples).");
     if (nd) {
         for (auto& p : nd->params)
             if (p.name == "Pitch Method")

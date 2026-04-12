@@ -214,18 +214,25 @@ public:
         targetCombo.addItem("Mod Wheel",   3);
         targetCombo.addItem("Aftertouch",  4);
         targetCombo.addItem("CC#",         5);
+        targetCombo.setTooltip("Which MIDI message this signal input modulates: "
+                               "Velocity (note loudness), Pitch Bend (note pitch ±2 semitones), "
+                               "Mod Wheel (CC#1, often vibrato depth), Aftertouch (key pressure), "
+                               "or any custom CC number.");
         targetCombo.onChange = [this]() { applyToRule(); };
 
         addAndMakeVisible(ccSlider);
         ccSlider.setSliderStyle(juce::Slider::IncDecButtons);
         ccSlider.setTextBoxStyle(juce::Slider::TextBoxLeft, false, 40, 18);
         ccSlider.setRange(0, 127, 1);
+        ccSlider.setTooltip("CC number (0–127) when target is set to CC#. Common values: 1=mod wheel, 7=volume, 10=pan, 11=expression, 64=sustain pedal");
         ccSlider.onValueChange = [this]() { applyToRule(); };
 
         addAndMakeVisible(amountSlider);
         amountSlider.setSliderStyle(juce::Slider::LinearHorizontal);
         amountSlider.setTextBoxStyle(juce::Slider::TextBoxRight, false, 50, 18);
         amountSlider.setRange(-2.0, 2.0, 0.01);
+        amountSlider.setTooltip("How strongly this signal input affects the target. 1.0 = full effect, "
+                                "0.5 = half effect, -1.0 = inverted, 0 = disabled.");
         amountSlider.onValueChange = [this]() { applyToRule(); };
 
         addAndMakeVisible(deleteBtn);
@@ -303,6 +310,8 @@ MidiModEditorComponent::MidiModEditorComponent(NodeGraph& g, int nid, std::funct
         doc = MidiModDoc::defaultDoc();
 
     addAndMakeVisible(addInputBtn);
+    addInputBtn.setTooltip("Add a new signal input to this MIDI Modulator. Each input adds a Signal pin "
+                           "on the node that can be wired up and routed to a MIDI target.");
     addInputBtn.onClick = [this]() {
         ModRule r;
         r.target = ModTarget::Velocity;
@@ -313,6 +322,7 @@ MidiModEditorComponent::MidiModEditorComponent(NodeGraph& g, int nid, std::funct
     };
 
     addAndMakeVisible(applyBtn);
+    applyBtn.setTooltip("Save the current rule list to the node without closing this editor");
     applyBtn.onClick = [this]() { commitToNode(); if (onApply) onApply(); };
 
     addAndMakeVisible(closeBtn);

@@ -1007,6 +1007,7 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
     fxMenu.addSeparator();
     fxMenu.addItem(207, "Convolution Filter");
     fxMenu.addItem(221, "Reverb");
+    fxMenu.addItem(222, "Parametric EQ");
     fxMenu.addSeparator();
     fxMenu.addItem(208, "Tremolo");
     fxMenu.addItem(209, "Vibrato");
@@ -1022,6 +1023,10 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
     fxMenu.addItem(218, "Mixture (organ harmonics)");
     fxMenu.addItem(219, "Trigger (MIDI / signal)");
     fxMenu.addItem(220, "MIDI Modulator (signal -> MIDI)");
+    fxMenu.addItem(223, "Ring Modulator");
+    fxMenu.addSeparator();
+    fxMenu.addItem(224, "M/S Encode (stereo → mid+side)");
+    fxMenu.addItem(225, "M/S Decode (mid+side → stereo)");
     fxMenu.addSeparator();
     fxMenu.addItem(217, "3D Spatializer (binaural)");
     menu.addSubMenu("Effects", fxMenu);
@@ -1576,13 +1581,55 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
                     {"Width",     1.0f,  0.0f, 1.0f},
                     {"Pre-Delay", 0.0f,  0.0f, 200.0f},
                 }); break;
-                case 213: makeEffect("Compressor", "__compressor__", {
-                    {"Threshold", -20.0f, -60.0f, 0.0f},
-                    {"Ratio", 4.0f, 1.0f, 20.0f},
-                    {"Attack", 10.0f, 0.1f, 100.0f},
-                    {"Release", 100.0f, 10.0f, 1000.0f},
-                    {"Makeup Gain", 0.0f, 0.0f, 30.0f},
+                case 222: makeEffect("EQ", "__eq__", {
+                    // Band 1 defaults to HP at 80 Hz
+                    {"B1 Type", 3.0f, 0.0f, 4.0f},
+                    {"B1 Freq", 80.0f, 20.0f, 20000.0f},
+                    {"B1 Gain", 0.0f, -24.0f, 24.0f},
+                    {"B1 Q",    0.707f, 0.1f, 10.0f},
+                    // Band 2 defaults to Peak at 400 Hz
+                    {"B2 Type", 0.0f, 0.0f, 4.0f},
+                    {"B2 Freq", 400.0f, 20.0f, 20000.0f},
+                    {"B2 Gain", 0.0f, -24.0f, 24.0f},
+                    {"B2 Q",    0.707f, 0.1f, 10.0f},
+                    // Band 3 defaults to Peak at 2500 Hz
+                    {"B3 Type", 0.0f, 0.0f, 4.0f},
+                    {"B3 Freq", 2500.0f, 20.0f, 20000.0f},
+                    {"B3 Gain", 0.0f, -24.0f, 24.0f},
+                    {"B3 Q",    0.707f, 0.1f, 10.0f},
+                    // Band 4 defaults to LP at 8000 Hz
+                    {"B4 Type", 4.0f, 0.0f, 4.0f},
+                    {"B4 Freq", 8000.0f, 20.0f, 20000.0f},
+                    {"B4 Gain", 0.0f, -24.0f, 24.0f},
+                    {"B4 Q",    0.707f, 0.1f, 10.0f},
                 }); break;
+                case 223: makeEffect("Ring Mod", "__ringmod__", {
+                    {"Mix",       0.5f,   0.0f, 1.0f},
+                    {"Int Freq",  440.0f, 20.0f, 20000.0f},
+                    {"Int Shape", 0.0f,   0.0f, 2.0f}, // 0=sine 1=square 2=tri
+                }); break;
+                case 224: makeEffect("M/S Encode", "__msencode__", {
+                    {"Mode", 0.0f, 0.0f, 1.0f}, // 0=encode
+                }); break;
+                case 225: makeEffect("M/S Decode", "__msdecode__", {
+                    {"Mode", 1.0f, 0.0f, 1.0f}, // 1=decode
+                }); break;
+                case 213: {
+                    auto& cn = makeEffect("Compressor", "__compressor__", {
+                        {"Threshold", -20.0f, -60.0f, 0.0f},
+                        {"Ratio", 4.0f, 1.0f, 20.0f},
+                        {"Attack", 10.0f, 0.1f, 100.0f},
+                        {"Release", 100.0f, 10.0f, 1000.0f},
+                        {"Makeup Gain", 0.0f, 0.0f, 30.0f},
+                    });
+                    // Add a Signal input pin for sidechain detection.
+                    // Wire any audio source (kick drum track, etc.) into
+                    // this pin and the compressor's envelope follower
+                    // triggers from that signal instead of the main input.
+                    cn.pinsIn.push_back({graph.getNextId(), "Sidechain",
+                                         PinKind::Signal, true, 1});
+                    break;
+                }
                 case 214: makeEffect("Limiter", "__limiter__", {
                     {"Ceiling", -0.3f, -20.0f, 0.0f},
                     {"Release", 50.0f, 5.0f, 500.0f},

@@ -1,6 +1,6 @@
 @echo off
 echo ============================================
-echo SoundShop2 Dependency Setup
+echo SEANCE Dependency Setup
 echo ============================================
 echo.
 echo This script downloads dependencies that cannot be

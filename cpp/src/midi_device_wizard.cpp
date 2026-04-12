@@ -26,6 +26,8 @@ MidiDeviceWizardComponent::MidiDeviceWizardComponent(NodeGraph& g,
     viewport.setScrollBarsShown(true, false);
 
     addAndMakeVisible(addBtn);
+    addBtn.setTooltip("Add a MIDI Input node to the graph for each device checked above. "
+                      "You can wire those nodes to MIDI tracks or synths to play them live.");
     addBtn.onClick = [this]() {
         // Add a MidiInput node for each checked row that isn't already in.
         int newCount = 0;
@@ -51,6 +53,7 @@ MidiDeviceWizardComponent::MidiDeviceWizardComponent(NodeGraph& g,
     };
 
     addAndMakeVisible(selectAllBtn);
+    selectAllBtn.setTooltip("Check every detected device that isn't already in the graph");
     selectAllBtn.onClick = [this]() {
         for (auto& r : rows)
             if (!r.alreadyAdded)
@@ -58,6 +61,8 @@ MidiDeviceWizardComponent::MidiDeviceWizardComponent(NodeGraph& g,
     };
 
     addAndMakeVisible(skipBtn);
+    skipBtn.setTooltip("Close this dialog without adding any devices. You can re-open it later from "
+                       "the Options menu if you change your mind.");
     skipBtn.onClick = [this]() { closeSelf(); };
 
     rebuildList();

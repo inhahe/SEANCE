@@ -52,8 +52,33 @@ PianoRollComponent::PianoRollComponent(NodeGraph& g, Node& n, Transport* t)
     addBtn(snap14Btn); addBtn(snap12Btn); addBtn(snap1Btn); addBtn(snapOffBtn);
     addBtn(snapScaleBtn); addBtn(detectKeyBtn);
 
+    // Tooltips: cover the controls whose labels are abbreviated or use
+    // music terminology a non-musician wouldn't necessarily know.
+    // Skip the genuinely self-explanatory ones (Select All, Deselect,
+    // Reverse, X close).
+    compactBtn.setTooltip("Toggle compact mode — hides most toolbar buttons to maximize the note-editing area");
+    transpUpOctBtn.setTooltip("Move every selected note up by one octave (12 semitones)");
+    transpDownOctBtn.setTooltip("Move every selected note down by one octave (12 semitones)");
+    transpUpSemiBtn.setTooltip("Move every selected note up by one semitone (one piano key)");
+    transpDownSemiBtn.setTooltip("Move every selected note down by one semitone (one piano key)");
+    timeLeftBtn.setTooltip("Nudge selected notes earlier in time by one snap unit");
+    timeRightBtn.setTooltip("Nudge selected notes later in time by one snap unit");
+    dblDurBtn.setTooltip("Double the length of every selected note (makes them last twice as long)");
+    halfDurBtn.setTooltip("Halve the length of every selected note (makes them last half as long)");
+    reverseBtn.setTooltip("Reverse the order of selected notes in time, so the last becomes the first");
+    detuneResetBtn.setTooltip("Reset the detune of selected notes back to 0 cents (perfectly in tune)");
+    snap14Btn.setTooltip("Snap notes to quarter-beat positions (1/16th of a 4/4 bar)");
+    snap12Btn.setTooltip("Snap notes to half-beat positions (1/8th of a 4/4 bar)");
+    snap1Btn.setTooltip("Snap notes to whole-beat positions (1/4 of a 4/4 bar)");
+    snapOffBtn.setTooltip("Disable snapping — notes can be placed at any position. Hold Alt while dragging for the same effect.");
+    snapScaleBtn.setTooltip("Snap notes to the chosen Key/Scale, so dragging a note up or down only lands on \"in key\" pitches");
+    detectKeyBtn.setTooltip("Analyze the notes in this clip and guess the key/scale, then set the dropdowns to match");
+
     // Mute / Solo / Pan
     addBtn(muteBtn); addBtn(soloBtn);
+    // "Mute" is universally understood — skip the tooltip. "Solo" is a
+    // DAW term that non-musicians might not know.
+    soloBtn.setTooltip("Solo this track — when any track is soloed, all non-soloed tracks are silenced");
     // Pan slider only for nodes that produce audio. MIDI Timelines only
     // output MIDI events — panning them does nothing.
     bool showPan = (n.type != NodeType::MidiTimeline);
@@ -62,6 +87,8 @@ PianoRollComponent::PianoRollComponent(NodeGraph& g, Node& n, Transport* t)
         addAndMakeVisible(panLbl);
     }
     panLbl.setText("Pan:", juce::dontSendNotification);
+    panSlider.setTooltip("Pan this track left or right in the stereo image. Center = both speakers, "
+                         "left = only left speaker, right = only right speaker.");
     panSlider.setRange(-1.0, 1.0, 0.01);
     // Read initial pan from the named param (if it exists) or node->pan
     {
@@ -103,6 +130,8 @@ PianoRollComponent::PianoRollComponent(NodeGraph& g, Node& n, Transport* t)
     // their interaction code is audited.
     addBtn(exprOffBtn);
     addBtn(exprVelBtn);
+    exprOffBtn.setTooltip("Hide the expression/automation lane below the piano roll");
+    exprVelBtn.setTooltip("Show the velocity lane — drag the bars to change how loud each note plays");
     exprOffBtn.onClick   = [this]() { exprLane = ExprNone; repaint(); };
     exprVelBtn.onClick   = [this]() { exprLane = ExprVelocity; repaint(); };
     exprPBBtn.onClick    = [this]() { exprLane = ExprPitchBend; repaint(); };
@@ -111,6 +140,9 @@ PianoRollComponent::PianoRollComponent(NodeGraph& g, Node& n, Transport* t)
 
     // Automation lane parameter selector
     addAndMakeVisible(autoParamCombo);
+    autoParamCombo.setTooltip("Pick a parameter to automate in the lane below the piano roll. "
+                              "Once shown, click in the lane to add points and drag them to draw a curve "
+                              "that controls the parameter over time.");
     autoParamCombo.addItem("Automate Param", 1);
     for (int i = 0; i < (int)node->params.size(); ++i)
         autoParamCombo.addItem(node->params[i].name, i + 2);
@@ -139,6 +171,11 @@ PianoRollComponent::PianoRollComponent(NodeGraph& g, Node& n, Transport* t)
     addCombo(keyCombo, keyLbl, "Key:");
     addCombo(modeCombo, modeLbl, "Mode:");
     addCombo(scaleCombo, scaleLbl, "Scale:");
+    rootCombo.setTooltip("Root note — the home pitch of the key/scale (e.g. C for C Major)");
+    keyCombo.setTooltip("Key family — Major sounds happy/bright, Minor sounds sad/dark");
+    modeCombo.setTooltip("Mode — variants of the major scale that change the mood (Dorian, Phrygian, Lydian, etc.)");
+    scaleCombo.setTooltip("Scale — broader categories like Pentatonic, Blues, Whole-Tone, Chromatic. "
+                          "Affects which notes are highlighted as 'in key' on the piano roll.");
 
     // Populate root
     for (int i = 0; i < 12; ++i)
@@ -223,6 +260,9 @@ PianoRollComponent::PianoRollComponent(NodeGraph& g, Node& n, Transport* t)
     detuneSlider.setRange(-100, 100, 1);
     detuneSlider.setTextBoxStyle(juce::Slider::TextBoxLeft, false, 50, 20);
     detuneSlider.setSliderStyle(juce::Slider::LinearHorizontal);
+    detuneSlider.setTooltip("Fine-tune the pitch of selected notes by cents (-100 to +100). "
+                            "100 cents = 1 semitone. Useful for slightly out-of-tune effects "
+                            "or matching another instrument's tuning.");
     addAndMakeVisible(detuneSlider);
 
     compactBtn.onClick = [this]() {

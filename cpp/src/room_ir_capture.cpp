@@ -174,6 +174,9 @@ RoomIRCaptureComponent::RoomIRCaptureComponent(NodeGraph& g,
     methodCombo.addItem("Sine Sweep (recommended)", 1);
     methodCombo.addItem("Click / Impulse (faster)", 2);
     methodCombo.setSelectedId(1);
+    methodCombo.setTooltip("Sine Sweep slowly sweeps through every audible frequency for cleaner results "
+                            "but is louder and slower. Click/Impulse plays a sharp pop and records the response — "
+                            "faster but more affected by background noise.");
 
     addAndMakeVisible(sweepDurationSlider); addAndMakeVisible(sweepDurLabel);
     sweepDurLabel.setText("Sweep length:", juce::dontSendNotification);
@@ -182,6 +185,8 @@ RoomIRCaptureComponent::RoomIRCaptureComponent(NodeGraph& g,
     sweepDurationSlider.setValue(3.0);
     sweepDurationSlider.setTextBoxStyle(juce::Slider::TextBoxRight, false, 40, 20);
     sweepDurationSlider.setTextValueSuffix("s");
+    sweepDurationSlider.setTooltip("How long the sine sweep test signal plays. Longer sweeps give cleaner "
+                                    "results in noisy environments at the cost of capture time.");
 
     addAndMakeVisible(recordDurationSlider); addAndMakeVisible(recordDurLabel);
     recordDurLabel.setText("Record length:", juce::dontSendNotification);
@@ -190,8 +195,12 @@ RoomIRCaptureComponent::RoomIRCaptureComponent(NodeGraph& g,
     recordDurationSlider.setValue(5.0);
     recordDurationSlider.setTextBoxStyle(juce::Slider::TextBoxRight, false, 40, 20);
     recordDurationSlider.setTextValueSuffix("s");
+    recordDurationSlider.setTooltip("Total recording time. Make this longer than the sweep so the room's "
+                                     "tail (reverb decay) gets fully captured.");
 
     addAndMakeVisible(captureBtn);
+    captureBtn.setTooltip("Begin the capture: play the test signal through your speakers, record the room's response "
+                          "with your microphone, and create a Convolution node loaded with the result");
     captureBtn.onClick = [this]() { startCapture(); };
 
     addAndMakeVisible(closeBtn);

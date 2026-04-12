@@ -24,6 +24,9 @@ ConvolutionEditorComponent::ConvolutionEditorComponent(NodeGraph& g, int nid,
     presetCombo.addItem("Bandpass", 4);
     presetCombo.addItem("Echo / Delay", 5);
     presetCombo.setSelectedId(1);
+    presetCombo.setTooltip("Choose a preset filter type. Lowpass keeps low frequencies, Highpass keeps high frequencies, "
+                           "Bandpass keeps a frequency range. Echo creates a delay effect. "
+                           "Click Apply Preset to generate the impulse response.");
     presetCombo.onChange = [this]() { resized(); repaint(); };
 
     // Preset parameter sliders
@@ -44,17 +47,32 @@ ConvolutionEditorComponent::ConvolutionEditorComponent(NodeGraph& g, int nid,
     setupSlider(delaySlider,     delayLbl,     "Delay:",       1,  2000,  200,  " ms");
     setupSlider(feedbackSlider,  fbLbl,        "Feedback:",    0,  0.99,  0.5,  "");
     setupSlider(echoCountSlider, echoLbl,      "Echoes:",      1,  20,    4,    "");
+    cutoffSlider.setTooltip("Cutoff frequency in Hz — for Lowpass: keeps frequencies below this; "
+                            "for Highpass: keeps frequencies above this; for Bandpass: center frequency");
+    orderSlider.setTooltip("Filter steepness — higher values make the filter cut frequencies more sharply at the cutoff. "
+                           "Low values give a gentle slope, high values give a brick-wall.");
+    bandwidthSlider.setTooltip("Bandwidth in Hz around the center frequency (Bandpass only). Wider = lets through more of the spectrum.");
+    delaySlider.setTooltip("Time between echo repeats in milliseconds (Echo preset only)");
+    feedbackSlider.setTooltip("Strength of each echo relative to the previous one. 0 = single echo, 0.99 = many slowly-fading echoes (Echo preset only)");
+    echoCountSlider.setTooltip("Number of echo repeats to generate (Echo preset only)");
 
     addAndMakeVisible(applyPresetBtn);
+    applyPresetBtn.setTooltip("Generate the impulse response from the preset settings above. Replaces any custom drawing.");
     applyPresetBtn.onClick = [this]() { generateFromPreset(); };
 
     addAndMakeVisible(loadFileBtn);
+    loadFileBtn.setTooltip("Load an audio file as an impulse response. Use a recording of a real space "
+                           "(room, hall, cabinet) to capture its acoustic character and apply it to any audio.");
     loadFileBtn.onClick = [this]() { loadFromFile(); };
 
     // Drawing mode toggle: control points (Catmull-Rom smoothed) vs
     // freehand (per-sample direct drawing). Control points is the default.
     addAndMakeVisible(modePointsBtn);
     addAndMakeVisible(modeFreehandBtn);
+    modePointsBtn.setTooltip("Control points mode — drag a few smooth control points to shape the impulse response. "
+                             "Easier for clean curves; the editor smooths between points.");
+    modeFreehandBtn.setTooltip("Freehand mode — draw the impulse response sample by sample with the mouse. "
+                               "Useful for sharp transients or non-smooth shapes.");
     modePointsBtn.setClickingTogglesState(true);
     modeFreehandBtn.setClickingTogglesState(true);
     modePointsBtn.setToggleState(true, juce::dontSendNotification);
@@ -81,8 +99,11 @@ ConvolutionEditorComponent::ConvolutionEditorComponent(NodeGraph& g, int nid,
     lengthSlider.setRange(1, 4096, 1);
     lengthSlider.setValue(ir.size());
     lengthSlider.setTextBoxStyle(juce::Slider::TextBoxRight, false, 50, 20);
+    lengthSlider.setTooltip("Impulse response length in samples. Longer IRs allow longer reverbs / "
+                            "delays but cost more CPU. ~512 samples = ~12 ms at 44.1 kHz.");
 
     addAndMakeVisible(applyBtn);
+    applyBtn.setTooltip("Save the current impulse response to the convolution node without closing this editor");
     applyBtn.onClick = [this]() { commitIR(); if (onApply) onApply(); };
 
     addAndMakeVisible(closeBtn);

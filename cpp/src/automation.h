@@ -4,6 +4,8 @@
 #include <vector>
 #include <mutex>
 #include <unordered_map>
+#include <atomic>
+#include <functional>
 
 namespace SoundShop {
 
@@ -45,6 +47,18 @@ public:
     // Store latest signal values for UI display
     void setLatestValues(const std::vector<AutomationValue>& values);
     std::vector<AutomationValue> getLatestValues() const;
+
+    // Per-plugin dirty marking hook (#86). Called by applyValues whenever
+    // a parameter is pushed into a plugin, so the app can mark that
+    // plugin's cached state stale. The slow autosave path then knows to
+    // re-query getStateInformation on the next save. Set once at startup
+    // by the application; if unset, dirty marking is skipped.
+    //
+    // Only fires from applyValues (message-thread automation push), NOT
+    // from processMidiCC (audio thread — graph lookups would be unsafe
+    // there). The autosave path's periodic "force-dirty all" pass catches
+    // changes that processMidiCC made between automation passes.
+    std::function<void(int nodeId)> onPluginParamChanged;
 
 private:
     mutable std::mutex ccMutex;

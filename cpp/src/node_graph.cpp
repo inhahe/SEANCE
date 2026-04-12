@@ -1,9 +1,25 @@
 #include "node_graph.h"
+#include "project_file.h"
 #include <algorithm>
 #include <cmath>
 #include <set>
 
 namespace SoundShop {
+
+void NodeGraph::commitSnapshot(const std::string& description) {
+    // Serialize the current graph (graph-only — plugin state excluded).
+    auto text = ProjectFile::serializeForUndo(*this);
+
+    // De-dup against the previous step's snapshot. memcmp on the underlying
+    // strings (length check first, then byte compare with early exit) — fast
+    // for the no-change case, which is the common case for defensive calls.
+    const auto& prev = undoTree.currentSnapshot();
+    if (text.size() == prev.size() && text == prev)
+        return; // nothing changed since the previous step
+
+    undoTree.pushSnapshot(std::move(text), description);
+    dirty = true;
+}
 
 static const char* channelLabel(int ch) {
     switch (ch) {

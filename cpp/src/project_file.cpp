@@ -54,6 +54,15 @@ bool ProjectFile::writeProject(std::ostream& f, NodeGraph& graph, GraphProcessor
     }
     if (graph.projectSampleRate > 0)
         writeFloat(f, "projectSampleRate", (float)graph.projectSampleRate);
+    // Project-wide settings (#66) — tuning, concert pitch, crossfade.
+    if (graph.tuningSystem != TuningSystem::Equal12)
+        writeInt(f, "tuningSystem", (int)graph.tuningSystem);
+    if (std::abs(graph.concertPitch - 440.0f) > 0.01f)
+        writeFloat(f, "concertPitch", graph.concertPitch);
+    if (std::abs(graph.globalCrossfadeSec - 0.05f) > 0.001f)
+        writeFloat(f, "globalCrossfadeSec", graph.globalCrossfadeSec);
+    if (graph.metronomeEnabled)
+        writeInt(f, "metronomeEnabled", 1);
     if (graph.songLengthBeats > 0)
         writeFloat(f, "songLengthBeats", (float)graph.songLengthBeats);
     if (graph.songRepeatMode != NodeGraph::SongRepeat::None)
@@ -414,6 +423,10 @@ bool ProjectFile::readProject(std::istream& f, NodeGraph& graph, PluginHost* plu
             else if (key == "loopStart") graph.loopStartBeat = std::stof(val);
             else if (key == "loopEnd") graph.loopEndBeat = std::stof(val);
             else if (key == "projectSampleRate") graph.projectSampleRate = std::stof(val);
+            else if (key == "tuningSystem") graph.tuningSystem = (TuningSystem)std::stoi(val);
+            else if (key == "concertPitch") graph.concertPitch = std::stof(val);
+            else if (key == "globalCrossfadeSec") graph.globalCrossfadeSec = std::stof(val);
+            else if (key == "metronomeEnabled") graph.metronomeEnabled = (val == "1");
             else if (key == "songLengthBeats") graph.songLengthBeats = std::stof(val);
             else if (key == "songRepeatMode") {
                 int m = std::stoi(val);

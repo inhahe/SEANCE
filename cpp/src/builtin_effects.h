@@ -1215,7 +1215,8 @@ public:
             float out = 0;
             for (auto& v : voices) {
                 if (!v.active) continue;
-                float baseFreq = 440.0f * std::pow(2.0f, (v.note - 69) / 12.0f);
+                // MPE per-note pitch bend (#78)
+                float baseFreq = 440.0f * std::pow(2.0f, (v.note - 69 + v.mpe.pitchBend) / 12.0f);
                 // Compute per-operator envelopes.
                 float env[4];
                 for (int i = 0; i < 4; ++i) {
@@ -1323,7 +1324,9 @@ private:
         int note = 0;
         float vel = 0, time = 0, relTime = 0;
         float phase[4] = {};
-        float fb1 = 0, fb2 = 0; // op4 feedback history
+        float fb1 = 0, fb2 = 0;
+        int mpeChannel = 1;     // MPE per-note channel (#78)
+        MpeVoiceState mpe;
     };
     std::vector<Voice> voices;
     Voice& allocVoice() {
@@ -1387,6 +1390,8 @@ public:
                 v.active = true; v.held = true;
                 v.note = msg.getNoteNumber();
                 v.vel = msg.getVelocity() / 127.0f;
+                v.mpeChannel = msg.getChannel();
+                v.mpe = MpeVoiceState{};
                 v.phase = 0; v.time = 0; v.relTime = 0;
             } else if (msg.isNoteOff()) {
                 for (auto& v : voices)
@@ -1394,6 +1399,8 @@ public:
                         { v.held = false; v.relTime = v.time; }
             }
         }
+        // Distribute MPE per-channel messages to voices (#78)
+        distributeMpeMessages(midi, voices);
 
         float dt = 1.0f / (float)sampleRate;
         const float kPi2 = 6.28318530718f;
@@ -1498,6 +1505,8 @@ private:
         int note = 0;
         float vel = 0, time = 0, relTime = 0;
         double phase = 0;
+        int mpeChannel = 1;
+        MpeVoiceState mpe;
     };
     std::vector<Voice> voices;
     Voice& allocVoice() {
@@ -2577,7 +2586,7 @@ public:
             float out = 0;
             for (auto& v : voices) {
                 if (!v.active) continue;
-                float baseFreq = 440.0f * std::pow(2.0f, (v.note - 69) / 12.0f);
+                float baseFreq = 440.0f * std::pow(2.0f, (v.note - 69 + v.mpe.pitchBend) / 12.0f);
 
                 // ADSR
                 float env;
@@ -2642,6 +2651,8 @@ private:
         int note = 0;
         float vel = 0, time = 0, relTime = 0;
         std::vector<double> phases;
+        int mpeChannel = 1;
+        MpeVoiceState mpe;
     };
     std::vector<Voice> voices;
     Voice& allocVoice() {

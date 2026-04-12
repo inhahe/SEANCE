@@ -80,4 +80,61 @@ inline void clearSignalModulations(Node& node) {
     }
 }
 
+// ==============================================================================
+// MPE voice-level expression (#78)
+//
+// For synths with a Voice struct that has `note`, `active`, and float
+// fields for pitch bend / pressure / timbre, this helper scans a MIDI
+// buffer for per-channel messages and distributes them to the voice
+// whose MIDI channel matches. In non-MPE mode (channel 1 only), the
+// messages apply to ALL active voices.
+//
+// Each synth can call this at the top of processBlock after handling
+// note-on/off, then read v.mpePitchBend / v.mpePressure / v.mpeTimbre
+// inside its per-sample loop.
+// ==============================================================================
+
+struct MpeVoiceState {
+    float pitchBend = 0.0f;   // semitones, ± pitchBendRange
+    float pressure  = 0.0f;   // 0..1 (channel aftertouch)
+    float timbre    = 0.5f;   // 0..1 (CC74)
+};
+
+// Distribute MPE messages from `midi` into a voice array. Each voice
+// must have: bool active, int note, int mpeChannel, MpeVoiceState mpe.
+// `pitchBendRange` is the per-note PB range in semitones (48 default).
+template<typename VoiceArray>
+inline void distributeMpeMessages(const juce::MidiBuffer& midi,
+                                   VoiceArray& voices,
+                                   float pitchBendRange = 48.0f) {
+    for (auto meta : midi) {
+        auto msg = meta.getMessage();
+        int ch = msg.getChannel();
+
+        if (msg.isPitchWheel()) {
+            float pbNorm = (msg.getPitchWheelValue() - 8192) / 8192.0f;
+            float pbSemi = pbNorm * pitchBendRange;
+            for (auto& v : voices) {
+                if (!v.active) continue;
+                if (v.mpeChannel == ch || ch == 1)
+                    v.mpe.pitchBend = pbSemi;
+            }
+        } else if (msg.isChannelPressure()) {
+            float p = msg.getChannelPressureValue() / 127.0f;
+            for (auto& v : voices) {
+                if (!v.active) continue;
+                if (v.mpeChannel == ch || ch == 1)
+                    v.mpe.pressure = p;
+            }
+        } else if (msg.isController() && msg.getControllerNumber() == 74) {
+            float t = msg.getControllerValue() / 127.0f;
+            for (auto& v : voices) {
+                if (!v.active) continue;
+                if (v.mpeChannel == ch || ch == 1)
+                    v.mpe.timbre = t;
+            }
+        }
+    }
+}
+
 } // namespace SoundShop

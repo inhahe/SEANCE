@@ -183,4 +183,138 @@ inline int dwtFull(std::vector<float>& signal, const WaveletFilter& filt) {
     return dwt(signal, maxLevels, filt);
 }
 
+// ==============================================================================
+// Continuous Wavelet Transform (CWT) — for non-dyadic scale operations
+//
+// Unlike the DWT (which decomposes at dyadic scales 2^j only), the CWT
+// can analyze at arbitrary scales, making it suitable for pitch shifting
+// by non-octave intervals, fine-grained spectral analysis, etc.
+//
+// We use the Morlet wavelet (complex sinusoid × Gaussian) which gives
+// good time-frequency resolution. The output is a 2D scalogram:
+// rows = scales, columns = time positions.
+//
+// This is computationally expensive (O(N × S × W) where N = signal
+// length, S = number of scales, W = wavelet width). For real-time use,
+// restrict the signal to one audio block and use few scales.
+// ==============================================================================
+
+struct CWTResult {
+    int numScales = 0;
+    int numSamples = 0;
+    // Scalogram: [scale][sample] = magnitude (real-valued, always >= 0).
+    // Stored as a flat vector in row-major order: index = scale * numSamples + sample.
+    std::vector<float> magnitude;
+    // Phase: [scale][sample] = phase angle in radians (-pi..pi).
+    std::vector<float> phase;
+    // Scale values used (in samples).
+    std::vector<float> scales;
+
+    float mag(int scale, int sample) const {
+        return magnitude[scale * numSamples + sample];
+    }
+    float ph(int scale, int sample) const {
+        return phase[scale * numSamples + sample];
+    }
+};
+
+// Morlet wavelet at a given scale: ψ(t) = exp(-t²/2) * exp(i*ω0*t)
+// where ω0 is the central frequency (typically 6.0 for good resolution).
+// Returns the real and imaginary parts in `realOut` and `imagOut`.
+inline void morletWavelet(std::vector<float>& realOut, std::vector<float>& imagOut,
+                           float scale, float omega0 = 6.0f) {
+    int halfWidth = (int)(scale * 3.0f); // 3σ on each side
+    int width = 2 * halfWidth + 1;
+    realOut.resize(width);
+    imagOut.resize(width);
+    float norm = 1.0f / std::sqrt(scale); // L2 normalization
+    for (int i = 0; i < width; ++i) {
+        float t = (float)(i - halfWidth) / scale;
+        float gauss = std::exp(-0.5f * t * t);
+        realOut[i] = norm * gauss * std::cos(omega0 * t);
+        imagOut[i] = norm * gauss * std::sin(omega0 * t);
+    }
+}
+
+// Forward CWT: convolve the signal with the Morlet wavelet at each scale.
+// `minScale` and `maxScale` define the range; `numScales` logarithmically
+// spaced scales are computed within that range.
+inline CWTResult cwt(const std::vector<float>& signal,
+                      float minScale = 2.0f,
+                      float maxScale = 128.0f,
+                      int numScales = 32,
+                      float omega0 = 6.0f) {
+    CWTResult result;
+    result.numScales = numScales;
+    result.numSamples = (int)signal.size();
+    result.magnitude.resize(numScales * (int)signal.size(), 0.0f);
+    result.phase.resize(numScales * (int)signal.size(), 0.0f);
+    result.scales.resize(numScales);
+
+    // Logarithmically spaced scales.
+    float logMin = std::log(minScale);
+    float logMax = std::log(maxScale);
+    for (int s = 0; s < numScales; ++s)
+        result.scales[s] = std::exp(logMin + (logMax - logMin) * s / std::max(1, numScales - 1));
+
+    int N = (int)signal.size();
+    std::vector<float> wReal, wImag;
+
+    for (int s = 0; s < numScales; ++s) {
+        float scale = result.scales[s];
+        morletWavelet(wReal, wImag, scale, omega0);
+        int halfW = (int)wReal.size() / 2;
+
+        for (int t = 0; t < N; ++t) {
+            float re = 0, im = 0;
+            for (int j = 0; j < (int)wReal.size(); ++j) {
+                int idx = t + j - halfW;
+                if (idx < 0 || idx >= N) continue;
+                re += signal[idx] * wReal[j];
+                im += signal[idx] * wImag[j];
+            }
+            int flat = s * N + t;
+            result.magnitude[flat] = std::sqrt(re * re + im * im);
+            result.phase[flat] = std::atan2(im, re);
+        }
+    }
+    return result;
+}
+
+// Inverse CWT (approximate reconstruction): sum weighted wavelets at
+// each scale. This is the standard admissibility-based reconstruction
+// formula. The result is an approximation — the CWT is redundant, so
+// perfect reconstruction requires additional normalization.
+inline std::vector<float> icwt(const CWTResult& result, float omega0 = 6.0f) {
+    int N = result.numSamples;
+    std::vector<float> output(N, 0.0f);
+    std::vector<float> wReal, wImag;
+    float normFactor = 0;
+
+    for (int s = 0; s < result.numScales; ++s) {
+        float scale = result.scales[s];
+        morletWavelet(wReal, wImag, scale, omega0);
+        int halfW = (int)wReal.size() / 2;
+        float scaleWeight = 1.0f / (scale * scale); // admissibility weight
+
+        for (int t = 0; t < N; ++t) {
+            float mag = result.magnitude[s * N + t];
+            float ph  = result.phase[s * N + t];
+            float re = mag * std::cos(ph);
+            // Reconstruct: add the real part of the wavelet scaled by the coefficient.
+            for (int j = 0; j < (int)wReal.size(); ++j) {
+                int idx = t + j - halfW;
+                if (idx < 0 || idx >= N) continue;
+                output[idx] += re * wReal[j] * scaleWeight;
+            }
+        }
+        normFactor += scaleWeight;
+    }
+
+    // Normalize.
+    if (normFactor > 0)
+        for (auto& v : output) v /= normFactor;
+    return output;
+}
+
 } // namespace SoundShop

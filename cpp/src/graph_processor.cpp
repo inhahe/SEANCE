@@ -465,6 +465,8 @@ void GraphProcessor::rebuildGraph(NodeGraph& graph, Transport& transport) {
             proc = std::make_unique<FMSynthProcessor>(node);
         } else if (node.type == NodeType::Instrument && node.script == "__pdsynth__") {
             proc = std::make_unique<PDSynthProcessor>(node);
+        } else if (node.type == NodeType::Instrument && node.script == "__particlesynth__") {
+            proc = std::make_unique<ParticleSynthProcessor>(node);
         } else if (node.type == NodeType::Instrument && node.script == "__drumsynth__") {
             proc = std::make_unique<DrumSynthProcessor>(node);
         } else if (node.type == NodeType::Instrument &&

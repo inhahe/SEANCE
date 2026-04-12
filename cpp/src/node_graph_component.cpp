@@ -1030,6 +1030,7 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
     instMenu.addItem(102, "Sampler");
     instMenu.addItem(107, "FM Synth");
     instMenu.addItem(108, "Phase Distortion Synth");
+    instMenu.addItem(109, "Particle Cloud Synth");
     instMenu.addItem(104, "SoundFont (.sf2)...");
     instMenu.addItem(105, "SFZ Instrument (.sfz)...");
     instMenu.addItem(103, "Drum Machine");
@@ -1531,6 +1532,20 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
                 n.params.push_back({p2 + "S",     0.7f,  0.0f,   1.0f});
                 n.params.push_back({p2 + "R",     0.3f,  0.001f, 10.0f});
             }
+            repaint();
+        } else if (result == 109) {
+            // Particle Cloud Synth
+            auto& n = graph.addNode("Particle", NodeType::Instrument,
+                {Pin{0, "MIDI", PinKind::Midi, true}},
+                {Pin{0, "Audio", PinKind::Audio, false}}, {p.x, p.y});
+            n.script = "__particlesynth__";
+            n.params.push_back({"Density",    30.0f,  1.0f, 200.0f});
+            n.params.push_back({"Spread",      7.0f,  0.0f,  24.0f});
+            n.params.push_back({"Grain Size", 50.0f,  1.0f, 500.0f});
+            n.params.push_back({"Attack",      0.1f,  0.0f,   1.0f});
+            n.params.push_back({"Release",     0.3f,  0.0f,   1.0f});
+            n.params.push_back({"Shape",       0.0f,  0.0f,   3.0f}); // 0=sine 1=saw 2=sq 3=noise
+            n.params.push_back({"Volume",      0.5f,  0.0f,   1.0f});
             repaint();
         } else if (result == 108) {
             // Phase Distortion Synth

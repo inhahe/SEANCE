@@ -1508,4 +1508,154 @@ private:
     }
 };
 
+// ==============================================================================
+// PARTICLE / GRANULAR CLOUD SYNTH
+//
+// Generates N overlapping short waveform bursts ("particles"), each
+// with its own mini-envelope, frequency, and random spread. The result
+// is a cloud-like texture that can range from ambient pads (dense,
+// slow, narrow spread) to glitchy textures (sparse, fast, wide spread).
+// MIDI note sets the base frequency; velocity sets density.
+//
+// Params:
+//   Density    — particles per second (1..200)
+//   Spread     — frequency randomization range in semitones (0..24)
+//   Grain Size — duration of each particle in ms (1..500)
+//   Attack     — per-particle attack as fraction of grain (0..1)
+//   Release    — per-particle release as fraction of grain (0..1)
+//   Shape      — particle waveform: 0=sine, 1=saw, 2=square, 3=noise
+//   Volume
+// ==============================================================================
+class ParticleSynthProcessor : public juce::AudioProcessor {
+public:
+    ParticleSynthProcessor(Node& n) : node(n) { grains.reserve(128); }
+    const juce::String getName() const override { return "Particle"; }
+    void prepareToPlay(double sr, int) override { sampleRate = sr; }
+    void releaseResources() override {}
+
+    void processBlock(juce::AudioBuffer<float>& buf, juce::MidiBuffer& midi) override {
+        applySignalModulations(node, buf);
+        buf.clear();
+        const int numSamples = buf.getNumSamples();
+        if (numSamples == 0) return;
+
+        float density    = paramByName(node, "Density", 30.0f);
+        float spread     = paramByName(node, "Spread", 7.0f);
+        float grainMs    = paramByName(node, "Grain Size", 50.0f);
+        float attackFrac = paramByName(node, "Attack", 0.1f);
+        float relFrac    = paramByName(node, "Release", 0.3f);
+        int   shape      = (int)paramByName(node, "Shape", 0.0f);
+        float volume     = paramByName(node, "Volume", 0.5f);
+
+        // Handle MIDI
+        for (auto meta : midi) {
+            auto msg = meta.getMessage();
+            if (msg.isNoteOn()) {
+                heldNote = msg.getNoteNumber();
+                heldVel = msg.getVelocity() / 127.0f;
+                noteActive = true;
+            } else if (msg.isNoteOff() && msg.getNoteNumber() == heldNote) {
+                noteActive = false;
+            }
+        }
+
+        float dt = 1.0f / (float)sampleRate;
+        float grainSec = grainMs * 0.001f;
+        float spawnInterval = 1.0f / std::max(1.0f, density);
+        const float kPi2 = 6.28318530718f;
+
+        for (int s = 0; s < numSamples; ++s) {
+            // Spawn new grains when a note is held
+            if (noteActive) {
+                spawnTimer += dt;
+                while (spawnTimer >= spawnInterval) {
+                    spawnTimer -= spawnInterval;
+                    Grain g;
+                    float baseFreq = 440.0f * std::pow(2.0f, (heldNote - 69) / 12.0f);
+                    // Randomize pitch
+                    float semiOff = ((float)rng() / (float)rng.max() - 0.5f) * 2.0f * spread;
+                    g.freq = baseFreq * std::pow(2.0f, semiOff / 12.0f);
+                    g.duration = grainSec;
+                    g.attackTime = grainSec * attackFrac;
+                    g.releaseTime = grainSec * relFrac;
+                    g.phase = 0;
+                    g.age = 0;
+                    g.vel = heldVel;
+                    g.pan = (float)rng() / (float)rng.max() * 2.0f - 1.0f; // random stereo
+                    grains.push_back(g);
+                }
+            }
+
+            float outL = 0, outR = 0;
+            for (auto it = grains.begin(); it != grains.end();) {
+                auto& g = *it;
+                // Per-grain envelope
+                float env = 1.0f;
+                if (g.age < g.attackTime) env = g.age / std::max(0.0001f, g.attackTime);
+                else if (g.age > g.duration - g.releaseTime)
+                    env = std::max(0.0f, (g.duration - g.age) / std::max(0.0001f, g.releaseTime));
+                if (g.age >= g.duration) { it = grains.erase(it); continue; }
+
+                float sample = 0;
+                float ph = (float)std::fmod(g.phase, 1.0);
+                switch (shape) {
+                    case 0: sample = std::sin(ph * kPi2); break;
+                    case 1: sample = ph * 2.0f - 1.0f; break;
+                    case 2: sample = ph < 0.5f ? 1.0f : -1.0f; break;
+                    default: sample = ((float)rng() / (float)rng.max()) * 2.0f - 1.0f; break;
+                }
+                sample *= env * g.vel;
+                float panL = std::cos((g.pan + 1.0f) * 0.25f * 3.14159f);
+                float panR = std::sin((g.pan + 1.0f) * 0.25f * 3.14159f);
+                outL += sample * panL;
+                outR += sample * panR;
+
+                g.phase += g.freq / (float)sampleRate;
+                g.age += dt;
+                ++it;
+            }
+
+            // Scale by sqrt of active grain count to prevent clipping
+            float gc = (float)grains.size();
+            if (gc > 1) { outL /= std::sqrt(gc); outR /= std::sqrt(gc); }
+            outL *= volume; outR *= volume;
+
+            if (buf.getNumChannels() >= 1) buf.addSample(0, s, outL);
+            if (buf.getNumChannels() >= 2) buf.addSample(1, s, outR);
+        }
+
+        // Safety: cap grain count
+        if (grains.size() > 1024) grains.erase(grains.begin(), grains.begin() + 512);
+    }
+
+    double getTailLengthSeconds() const override { return 1.0; }
+    bool acceptsMidi() const override { return true; }
+    bool producesMidi() const override { return false; }
+    bool isBusesLayoutSupported(const BusesLayout&) const override { return true; }
+    juce::AudioProcessorEditor* createEditor() override { return nullptr; }
+    bool hasEditor() const override { return false; }
+    int getNumPrograms() override { return 1; }
+    int getCurrentProgram() override { return 0; }
+    void setCurrentProgram(int) override {}
+    const juce::String getProgramName(int) override { return {}; }
+    void changeProgramName(int, const juce::String&) override {}
+    void getStateInformation(juce::MemoryBlock&) override {}
+    void setStateInformation(const void*, int) override {}
+
+private:
+    Node& node;
+    double sampleRate = 44100;
+    struct Grain {
+        float freq, duration, attackTime, releaseTime;
+        double phase;
+        float age, vel, pan;
+    };
+    std::vector<Grain> grains;
+    bool noteActive = false;
+    int heldNote = 60;
+    float heldVel = 0.8f;
+    float spawnTimer = 0;
+    std::mt19937 rng{42};
+};
+
 } // namespace SoundShop

@@ -2432,4 +2432,80 @@ private:
     double sampleRate = 44100;
 };
 
+// ==============================================================================
+// WAVELET COMPLEXITY KNOB — coefficient sparsification
+//
+// Smoothly simplifies audio by keeping only the N largest wavelet
+// coefficients and zeroing the rest, then reconstructing. At 100%
+// complexity the signal is unchanged; at 0% only the single largest
+// coefficient survives (a near-silence or pure tone). In between you
+// get progressive detail reduction — like an audio "resolution" dial.
+//
+// Params: Complexity (0..1), Levels, Mix
+// ==============================================================================
+class WaveletComplexityProcessor : public juce::AudioProcessor {
+public:
+    WaveletComplexityProcessor(Node& n) : node(n) {}
+    const juce::String getName() const override { return "Complexity"; }
+    void prepareToPlay(double, int) override {}
+    void releaseResources() override {}
+
+    void processBlock(juce::AudioBuffer<float>& buf, juce::MidiBuffer&) override {
+        applySignalModulations(node, buf);
+        const int n = buf.getNumSamples();
+        const int ch = std::min(2, buf.getNumChannels());
+        if (n == 0 || ch == 0) return;
+
+        float complexity = juce::jlimit(0.0f, 1.0f, paramByName(node, "Complexity", 0.5f));
+        int   levels     = juce::jlimit(1, 8, (int)paramByName(node, "Levels", 4.0f));
+        float mix        = juce::jlimit(0.0f, 1.0f, paramByName(node, "Mix", 1.0f));
+
+        auto filt = getWaveletFilter("db4");
+        int padLen = 1;
+        while (padLen < n) padLen *= 2;
+
+        for (int c = 0; c < ch; ++c) {
+            float* data = buf.getWritePointer(c);
+            std::vector<float> sig(padLen, 0.0f);
+            for (int i = 0; i < n; ++i) sig[i] = data[i];
+            std::vector<float> dry(data, data + n);
+
+            int actualLevels = dwt(sig, levels, filt);
+
+            // Sort coefficients by magnitude and zero out the smallest.
+            int keep = std::max(1, (int)(padLen * complexity));
+            std::vector<std::pair<float, int>> coeffs(padLen);
+            for (int i = 0; i < padLen; ++i)
+                coeffs[i] = {std::abs(sig[i]), i};
+            std::partial_sort(coeffs.begin(), coeffs.begin() + keep, coeffs.end(),
+                [](auto& a, auto& b) { return a.first > b.first; });
+            // Zero everything not in the top-keep set.
+            std::vector<bool> kept(padLen, false);
+            for (int i = 0; i < keep; ++i) kept[coeffs[i].second] = true;
+            for (int i = 0; i < padLen; ++i)
+                if (!kept[i]) sig[i] = 0;
+
+            idwt(sig, actualLevels, filt);
+            for (int i = 0; i < n; ++i)
+                data[i] = dry[i] * (1.0f - mix) + sig[i] * mix;
+        }
+    }
+
+    double getTailLengthSeconds() const override { return 0; }
+    bool acceptsMidi() const override { return true; }
+    bool producesMidi() const override { return true; }
+    bool isBusesLayoutSupported(const BusesLayout&) const override { return true; }
+    juce::AudioProcessorEditor* createEditor() override { return nullptr; }
+    bool hasEditor() const override { return false; }
+    int getNumPrograms() override { return 1; }
+    int getCurrentProgram() override { return 0; }
+    void setCurrentProgram(int) override {}
+    const juce::String getProgramName(int) override { return {}; }
+    void changeProgramName(int, const juce::String&) override {}
+    void getStateInformation(juce::MemoryBlock&) override {}
+    void setStateInformation(const void*, int) override {}
+private:
+    Node& node;
+};
+
 } // namespace SoundShop

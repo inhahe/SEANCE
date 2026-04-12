@@ -34,6 +34,29 @@ public:
         muteFader.process(buf);
         if (muteFader.isFullyOff()) return;
 
+        // Peak metering (#99): scan the post-mute buffer for this block's
+        // peak and write it atomically. The UI reads these at 30 Hz to
+        // draw meter bars. We capture at PanProcessor because it's the
+        // last processor in the per-node chain before routing — so the
+        // meter shows exactly what leaves the node after pan and mute.
+        {
+            float pkL = 0, pkR = 0;
+            if (buf.getNumChannels() >= 1) {
+                auto* data = buf.getReadPointer(0);
+                for (int i = 0; i < buf.getNumSamples(); ++i)
+                    pkL = std::max(pkL, std::abs(data[i]));
+            }
+            if (buf.getNumChannels() >= 2) {
+                auto* data = buf.getReadPointer(1);
+                for (int i = 0; i < buf.getNumSamples(); ++i)
+                    pkR = std::max(pkR, std::abs(data[i]));
+            } else {
+                pkR = pkL; // mono: both channels show the same level
+            }
+            node.meterPeakL = pkL;
+            node.meterPeakR = pkR;
+        }
+
         if (buf.getNumChannels() < 2) return;
         // Read pan from the named param if present, falling back to node.pan
         float p = node.pan; // legacy fallback
@@ -64,6 +87,7 @@ public:
             left[i] = l * gainL;
             right[i] = r * gainR;
         }
+
     }
 
     double getTailLengthSeconds() const override { return 0; }

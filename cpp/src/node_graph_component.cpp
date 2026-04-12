@@ -344,6 +344,38 @@ void NodeGraphComponent::drawNode(juce::Graphics& g, Node& node) {
             pinY += PIN_ROW_HEIGHT;
         }
     }
+
+    // Peak meter bars (#99) — two thin horizontal bars (L/R) at the
+    // bottom of the node, showing the current audio level. Green
+    // below -6 dB, yellow up to -1 dB, red above. Only drawn when
+    // there's actually signal flowing (peak > 0.001) and zoom > 0.35.
+    if (zoom > 0.35f) {
+        float pkL = node.meterPeakL;
+        float pkR = node.meterPeakR;
+        if (pkL > 0.001f || pkR > 0.001f) {
+            auto meterBounds = getNodeBounds(node);
+            auto sb = juce::Rectangle<float>(
+                canvasToScreen(meterBounds.getBottomLeft()),
+                canvasToScreen(meterBounds.getBottomRight() + juce::Point<float>(0, 6)));
+            float mw = sb.getWidth();
+            float mh = sb.getHeight() * 0.45f;
+            float my = sb.getY();
+
+            auto drawBar = [&](float peak, float y) {
+                float db = 20.0f * std::log10(std::max(1e-6f, peak));
+                float frac = juce::jlimit(0.0f, 1.0f, (db + 60.0f) / 60.0f); // -60..0 dB → 0..1
+                auto col = (db > -1.0f) ? juce::Colours::red
+                         : (db > -6.0f) ? juce::Colours::yellow
+                         : juce::Colours::limegreen;
+                g.setColour(juce::Colour(30, 30, 35));
+                g.fillRect(sb.getX(), y, mw, mh);
+                g.setColour(col.withAlpha(0.8f));
+                g.fillRect(sb.getX(), y, mw * frac, mh);
+            };
+            drawBar(pkL, my);
+            drawBar(pkR, my + mh + 1);
+        }
+    }
 }
 
 void NodeGraphComponent::drawLink(juce::Graphics& g, Link& link) {

@@ -246,6 +246,15 @@ struct Node {
     bool posSet = false;
     bool muted = false;
     bool soloed = false;
+
+    // Peak level metering (#99). Updated by the audio thread each block
+    // (via PanProcessor which runs after every audio-producing node).
+    // Read by the UI thread at 30 Hz for drawing meter bars. Plain
+    // floats (not atomic) because Node must be copyable for std::vector.
+    // The audio thread writes, the UI thread reads — a torn read is at
+    // worst a meter glitch, never a crash. Decay is applied UI-side.
+    float meterPeakL = 0.0f;
+    float meterPeakR = 0.0f;
     std::vector<Param> params;
 
     // On-demand signal modulation pins (#88). Each entry binds a

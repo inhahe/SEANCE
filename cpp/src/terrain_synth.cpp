@@ -516,8 +516,29 @@ float TerrainSynthProcessor::Voice::advanceEnv(float sr, float a, float d, float
 // TerrainSynthProcessor
 // ==============================================================================
 
+void TerrainSynthProcessor::reloadIfScriptChanged() {
+    if (node.script == cachedScript) return;
+    cachedScript = node.script;
+
+    // For now, only re-parse __layered__ scripts at runtime — other
+    // script types (audio, image, wavetable) load files and don't
+    // change during a session.
+    if (node.script.find("__layered__:") == 0) {
+        LayeredWaveform lw;
+        if (lw.decode(node.script)) {
+            std::vector<float> samples;
+            lw.render(samples);
+            terrain.init({(int)samples.size()});
+            auto& d = terrain.getData();
+            if ((int)d.size() == (int)samples.size())
+                d = std::move(samples);
+        }
+    }
+}
+
 TerrainSynthProcessor::TerrainSynthProcessor(Node& n, Transport& t) : node(n), transport(t) {
     auto& script = node.script;
+    cachedScript = script;
 
     if (script.find("__image__:") == 0) {
         terrain.fillFromImage(script.substr(10));
@@ -702,6 +723,7 @@ static float getParamByName(const Node& node, const std::string& name, float def
 
 void TerrainSynthProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::MidiBuffer& midi) {
     applySignalModulations(node, buf);
+    reloadIfScriptChanged();
     buf.clear();
     int numSamples = buf.getNumSamples();
     int numChannels = buf.getNumChannels();

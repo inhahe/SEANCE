@@ -166,10 +166,19 @@ public:
     // Get the current traversal position (for visualization)
     std::vector<float> getCurrentPosition() const { return lastPosition; }
 
+    // Check if node.script changed since last processBlock and re-parse
+    // the terrain data if so. This lets the layered editor commit changes
+    // to node.script without triggering a full graph rebuild (#23).
+    void reloadIfScriptChanged();
+
 private:
     Node& node;
     Transport& transport;
     double sampleRate = 44100;
+
+    // Cached copy of node.script from the last parse. When processBlock
+    // detects that node.script differs, it triggers a re-parse.
+    std::string cachedScript;
 
     Terrain terrain;
     Traversal traversal;

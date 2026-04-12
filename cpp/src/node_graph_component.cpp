@@ -1097,6 +1097,7 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
     fxMenu.addItem(228, "Wavelet Bitcrush");
     fxMenu.addItem(229, "Octave Shift (wavelet)");
     fxMenu.addItem(230, "Wavelet Multiband Comp");
+    fxMenu.addItem(231, "Wavelet Pitch Shift");
     fxMenu.addSeparator();
     fxMenu.addItem(224, "M/S Encode (stereo → mid+side)");
     fxMenu.addItem(225, "M/S Decode (mid+side → stereo)");
@@ -1725,6 +1726,10 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
                     {"B4 Freq", 8000.0f, 20.0f, 20000.0f},
                     {"B4 Gain", 0.0f, -24.0f, 24.0f},
                     {"B4 Q",    0.707f, 0.1f, 10.0f},
+                }); break;
+                case 231: makeEffect("Wavelet Pitch", "__waveletpitch__", {
+                    {"Semitones", 0.0f, -24.0f, 24.0f},
+                    {"Mix",       1.0f,   0.0f,  1.0f},
                 }); break;
                 case 230: makeEffect("Wavelet MB Comp", "__waveletmbcomp__", {
                     {"Threshold", -20.0f, -60.0f, 0.0f},

@@ -2148,4 +2148,93 @@ private:
     double sampleRate = 44100;
 };
 
+// ==============================================================================
+// WAVELET SCALE-SHIFT PITCH SHIFTER
+//
+// Shifts pitch by modifying the CWT scalogram: shift all scales by a
+// factor corresponding to the desired pitch ratio, then reconstruct
+// via inverse CWT. Unlike time-domain pitch shifting (which introduces
+// time artifacts) or FFT-based shifting (which smears transients), the
+// wavelet approach preserves transient sharpness because the wavelet
+// basis naturally adapts its window size to frequency content.
+//
+// Params: Semitones (-24..+24), Mix
+// ==============================================================================
+class WaveletPitchShiftProcessor : public juce::AudioProcessor {
+public:
+    WaveletPitchShiftProcessor(Node& n) : node(n) {}
+    const juce::String getName() const override { return "Wavelet Pitch"; }
+    void prepareToPlay(double sr, int) override { sampleRate = sr; }
+    void releaseResources() override {}
+
+    void processBlock(juce::AudioBuffer<float>& buf, juce::MidiBuffer&) override {
+        applySignalModulations(node, buf);
+        const int n = buf.getNumSamples();
+        const int ch = std::min(2, buf.getNumChannels());
+        if (n == 0 || ch == 0) return;
+
+        float semitones = paramByName(node, "Semitones", 0.0f);
+        float mix       = juce::jlimit(0.0f, 1.0f, paramByName(node, "Mix", 1.0f));
+        if (std::abs(semitones) < 0.01f) return; // no shift
+
+        float ratio = std::pow(2.0f, semitones / 12.0f);
+
+        for (int c = 0; c < ch; ++c) {
+            float* data = buf.getWritePointer(c);
+            std::vector<float> sig(data, data + n);
+            std::vector<float> dry(data, data + n);
+
+            // Forward CWT.
+            auto result = cwt(sig, 2.0f, 64.0f, 24);
+
+            // Shift scales: multiply each scale value by 1/ratio so
+            // higher pitch = smaller scales. Rebuild the scalogram with
+            // shifted scale assignments.
+            CWTResult shifted = result;
+            std::fill(shifted.magnitude.begin(), shifted.magnitude.end(), 0.0f);
+            std::fill(shifted.phase.begin(), shifted.phase.end(), 0.0f);
+
+            for (int s = 0; s < result.numScales; ++s) {
+                // Target scale index after shift.
+                float targetScale = result.scales[s] / ratio;
+                // Find nearest scale in the grid.
+                int bestIdx = 0;
+                float bestDist = 1e9f;
+                for (int ss = 0; ss < result.numScales; ++ss) {
+                    float dist = std::abs(result.scales[ss] - targetScale);
+                    if (dist < bestDist) { bestDist = dist; bestIdx = ss; }
+                }
+                // Copy this scale's coefficients to the target position.
+                for (int t = 0; t < result.numSamples; ++t) {
+                    shifted.magnitude[bestIdx * n + t] += result.magnitude[s * n + t];
+                    shifted.phase[bestIdx * n + t] = result.phase[s * n + t];
+                }
+            }
+
+            // Inverse CWT.
+            auto recon = icwt(shifted);
+
+            for (int i = 0; i < n && i < (int)recon.size(); ++i)
+                data[i] = dry[i] * (1.0f - mix) + recon[i] * mix;
+        }
+    }
+
+    double getTailLengthSeconds() const override { return 0; }
+    bool acceptsMidi() const override { return true; }
+    bool producesMidi() const override { return true; }
+    bool isBusesLayoutSupported(const BusesLayout&) const override { return true; }
+    juce::AudioProcessorEditor* createEditor() override { return nullptr; }
+    bool hasEditor() const override { return false; }
+    int getNumPrograms() override { return 1; }
+    int getCurrentProgram() override { return 0; }
+    void setCurrentProgram(int) override {}
+    const juce::String getProgramName(int) override { return {}; }
+    void changeProgramName(int, const juce::String&) override {}
+    void getStateInformation(juce::MemoryBlock&) override {}
+    void setStateInformation(const void*, int) override {}
+private:
+    Node& node;
+    double sampleRate = 44100;
+};
+
 } // namespace SoundShop

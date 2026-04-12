@@ -996,6 +996,7 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
     instMenu.addSeparator();
     instMenu.addItem(100, "Piano");
     instMenu.addItem(102, "Sampler");
+    instMenu.addItem(107, "FM Synth");
     instMenu.addItem(104, "SoundFont (.sf2)...");
     instMenu.addItem(105, "SFZ Instrument (.sfz)...");
     instMenu.addItem(103, "Drum Machine");
@@ -1479,6 +1480,25 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
             n.params.push_back({"Pan",      0.0f, -1.0f, 1.0f});
             n.params.push_back({"Vel Sens", 1.0f, 0.0f, 1.0f});
             // The DrumSynthProcessor will populate per-sound params on construction
+        } else if (result == 107) {
+            // FM Synth: 4-operator FM synthesis
+            auto& n = graph.addNode("FM Synth", NodeType::Instrument,
+                {Pin{0, "MIDI", PinKind::Midi, true}},
+                {Pin{0, "Audio", PinKind::Audio, false}}, {p.x, p.y});
+            n.script = "__fmsynth__";
+            n.params.push_back({"Algorithm",  0.0f, 0.0f, 7.0f});
+            n.params.push_back({"Feedback",   0.3f, 0.0f, 1.0f});
+            n.params.push_back({"Volume",     0.5f, 0.0f, 1.0f});
+            for (int i = 1; i <= 4; ++i) {
+                auto p2 = "Op" + std::to_string(i) + " ";
+                n.params.push_back({p2 + "Ratio", (float)i, 0.1f, 16.0f});
+                n.params.push_back({p2 + "Level", i == 1 ? 1.0f : 0.5f, 0.0f, 1.0f});
+                n.params.push_back({p2 + "A",     0.01f, 0.001f, 2.0f});
+                n.params.push_back({p2 + "D",     0.1f,  0.001f, 5.0f});
+                n.params.push_back({p2 + "S",     0.7f,  0.0f,   1.0f});
+                n.params.push_back({p2 + "R",     0.3f,  0.001f, 10.0f});
+            }
+            repaint();
         } else if (result == 100 || result == 103) {
             // Piano and Drum Machine: functional defaults that route through
             // TerrainSynthProcessor, so they don't crash and give the user

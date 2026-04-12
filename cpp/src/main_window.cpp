@@ -670,12 +670,10 @@ void MainContentComponent::timerCallback() {
     transport.loopStartBeat = graph.loopStartBeat;
     transport.loopEndBeat = graph.loopEndBeat;
     graph.resolveAnchors();
-    if (transport.tempoMap.points.size() == 1)
+    if (transport.tempoMap.getPoints().size() == 1)
         transport.tempoMap.setGlobalBpm(graph.bpm);
-    if (transport.timeSigMap.sigs.size() == 1) {
-        transport.timeSigMap.sigs[0].numerator = graph.timeSignatureNum;
-        transport.timeSigMap.sigs[0].denominator = graph.timeSignatureDen;
-    }
+    if (transport.timeSigMap.sigs.size() == 1)
+        transport.timeSigMap.setGlobal(graph.timeSignatureNum, graph.timeSignatureDen);
     // Sync UI with audio engine's playing state. The audio thread may
     // stop playback internally (e.g., when Song Length + Song Repeat
     // policy fires), so the button text has to reflect that — otherwise
@@ -1895,7 +1893,8 @@ public:
         if (!proc) { setSize(300, 100); return; }
 
         auto& params = proc->getParameters();
-        for (int i = 0; i < (int)params.size(); ++i) {
+        constexpr int kMaxDisplayParams = 256;
+        for (int i = 0; i < std::min((int)params.size(), kMaxDisplayParams); ++i) {
             auto name = params[i]->getName(128);
             if (name.isEmpty()) name = "Param " + juce::String(i);
             paramNames.push_back(name);

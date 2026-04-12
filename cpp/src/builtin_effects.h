@@ -1137,4 +1137,201 @@ private:
     Node& node;
 };
 
+// ==============================================================================
+// FM SYNTHESIS — 4-operator frequency modulation synthesizer
+//
+// Each operator is a sine oscillator with its own frequency ratio
+// (relative to the MIDI note), level, and ADSR envelope. "Algorithm"
+// selects the routing: which operators modulate which, and which go
+// directly to the output. Op4 can self-modulate (feedback) for richer
+// harmonics.
+//
+// 8 algorithms (classic 4-op patterns):
+//   0: 4→3→2→1→out                (full series chain)
+//   1: (3+4)→2→1→out              (two mods into one carrier stack)
+//   2: 4→3→out, 2→1→out           (two independent mod→carrier pairs)
+//   3: 4→(1+2+3)→out              (one mod into three carriers)
+//   4: (4→3)→out, 2→out, 1→out    (one pair + two additive)
+//   5: (4→3)→out, (4→2)→out, 1→out (shared mod)
+//   6: 4→3→2→out, 1→out           (3-chain + additive)
+//   7: 1+2+3+4→out                (pure additive, no FM)
+// ==============================================================================
+class FMSynthProcessor : public juce::AudioProcessor {
+public:
+    FMSynthProcessor(Node& n) : node(n) { voices.resize(16); }
+    const juce::String getName() const override { return "FM Synth"; }
+    void prepareToPlay(double sr, int) override { sampleRate = sr; }
+    void releaseResources() override {}
+
+    void processBlock(juce::AudioBuffer<float>& buf, juce::MidiBuffer& midi) override {
+        applySignalModulations(node, buf);
+        buf.clear();
+        const int numSamples = buf.getNumSamples();
+        if (numSamples == 0) return;
+
+        int algo    = (int)paramByName(node, "Algorithm", 0.0f);
+        float fbAmt = paramByName(node, "Feedback", 0.3f);
+
+        // Per-operator params.
+        struct OpParams { float ratio, level, a, d, s, r; };
+        OpParams ops[4];
+        const char* opNames[] = {"Op1","Op2","Op3","Op4"};
+        for (int i = 0; i < 4; ++i) {
+            std::string p(opNames[i]);
+            ops[i].ratio = paramByName(node, (p+" Ratio").c_str(), (float)(i+1));
+            ops[i].level = paramByName(node, (p+" Level").c_str(), i==0?1.0f:0.5f);
+            ops[i].a     = std::max(0.001f, paramByName(node, (p+" A").c_str(), 0.01f));
+            ops[i].d     = std::max(0.001f, paramByName(node, (p+" D").c_str(), 0.1f));
+            ops[i].s     = paramByName(node, (p+" S").c_str(), 0.7f);
+            ops[i].r     = std::max(0.001f, paramByName(node, (p+" R").c_str(), 0.3f));
+        }
+
+        // Handle MIDI.
+        for (auto meta : midi) {
+            auto msg = meta.getMessage();
+            if (msg.isNoteOn()) {
+                auto& v = allocVoice();
+                v.active = true;
+                v.note = msg.getNoteNumber();
+                v.vel = msg.getVelocity() / 127.0f;
+                v.held = true;
+                v.time = 0;
+                v.relTime = 0;
+                for (int i = 0; i < 4; ++i) v.phase[i] = 0;
+                v.fb1 = v.fb2 = 0;
+            } else if (msg.isNoteOff()) {
+                for (auto& v : voices)
+                    if (v.active && v.held && v.note == msg.getNoteNumber())
+                        { v.held = false; v.relTime = v.time; }
+            }
+        }
+
+        const float kPi2 = 6.28318530718f;
+        float volume = paramByName(node, "Volume", 0.5f);
+        float dt = 1.0f / (float)sampleRate;
+
+        for (int s = 0; s < numSamples; ++s) {
+            float out = 0;
+            for (auto& v : voices) {
+                if (!v.active) continue;
+                float baseFreq = 440.0f * std::pow(2.0f, (v.note - 69) / 12.0f);
+                // Compute per-operator envelopes.
+                float env[4];
+                for (int i = 0; i < 4; ++i) {
+                    float t = v.time;
+                    if (v.held) {
+                        if (t < ops[i].a) env[i] = t / ops[i].a;
+                        else if (t < ops[i].a + ops[i].d)
+                            env[i] = 1.0f + (ops[i].s - 1.0f) * ((t - ops[i].a) / ops[i].d);
+                        else env[i] = ops[i].s;
+                    } else {
+                        float envAtRel = ops[i].s;
+                        float rt = v.time - v.relTime;
+                        env[i] = envAtRel * std::max(0.0f, 1.0f - rt / ops[i].r);
+                        if (rt >= ops[i].r) env[i] = 0;
+                    }
+                    env[i] *= ops[i].level;
+                }
+                // Check if all envelopes are done.
+                if (!v.held) {
+                    bool allDone = true;
+                    for (int i = 0; i < 4; ++i)
+                        if (env[i] > 0.0001f) { allDone = false; break; }
+                    if (allDone) { v.active = false; continue; }
+                }
+                // Compute operators with algorithm routing.
+                // Op4 with feedback.
+                float fb = (v.fb1 + v.fb2) * 0.5f * fbAmt;
+                float o4 = std::sin(v.phase[3] * kPi2 + fb) * env[3];
+                v.fb2 = v.fb1; v.fb1 = o4;
+                float o3, o2, o1;
+                switch (algo) {
+                    case 0: // 4→3→2→1→out
+                        o3 = std::sin(v.phase[2]*kPi2 + o4*kPi2) * env[2];
+                        o2 = std::sin(v.phase[1]*kPi2 + o3*kPi2) * env[1];
+                        o1 = std::sin(v.phase[0]*kPi2 + o2*kPi2) * env[0];
+                        out += o1; break;
+                    case 1: // (3+4)→2→1→out
+                        o3 = std::sin(v.phase[2]*kPi2 + o4*kPi2) * env[2];
+                        o2 = std::sin(v.phase[1]*kPi2 + (o3+o4)*0.5f*kPi2) * env[1];
+                        o1 = std::sin(v.phase[0]*kPi2 + o2*kPi2) * env[0];
+                        out += o1; break;
+                    case 2: // 4→3→out, 2→1→out
+                        o3 = std::sin(v.phase[2]*kPi2 + o4*kPi2) * env[2];
+                        o2 = std::sin(v.phase[1]*kPi2) * env[1];
+                        o1 = std::sin(v.phase[0]*kPi2 + o2*kPi2) * env[0];
+                        out += (o3 + o1) * 0.5f; break;
+                    case 3: // 4→(1+2+3)→out
+                        o3 = std::sin(v.phase[2]*kPi2 + o4*kPi2) * env[2];
+                        o2 = std::sin(v.phase[1]*kPi2 + o4*kPi2) * env[1];
+                        o1 = std::sin(v.phase[0]*kPi2 + o4*kPi2) * env[0];
+                        out += (o1 + o2 + o3) * 0.33f; break;
+                    case 4: // (4→3)→out, 2→out, 1→out
+                        o3 = std::sin(v.phase[2]*kPi2 + o4*kPi2) * env[2];
+                        o2 = std::sin(v.phase[1]*kPi2) * env[1];
+                        o1 = std::sin(v.phase[0]*kPi2) * env[0];
+                        out += (o1 + o2 + o3) * 0.33f; break;
+                    case 5: // (4→3)→out, (4→2)→out, 1→out
+                        o3 = std::sin(v.phase[2]*kPi2 + o4*kPi2) * env[2];
+                        o2 = std::sin(v.phase[1]*kPi2 + o4*kPi2) * env[1];
+                        o1 = std::sin(v.phase[0]*kPi2) * env[0];
+                        out += (o1 + o2 + o3) * 0.33f; break;
+                    case 6: // 4→3→2→out, 1→out
+                        o3 = std::sin(v.phase[2]*kPi2 + o4*kPi2) * env[2];
+                        o2 = std::sin(v.phase[1]*kPi2 + o3*kPi2) * env[1];
+                        o1 = std::sin(v.phase[0]*kPi2) * env[0];
+                        out += (o1 + o2) * 0.5f; break;
+                    default: // 7: all additive
+                        o3 = std::sin(v.phase[2]*kPi2) * env[2];
+                        o2 = std::sin(v.phase[1]*kPi2) * env[1];
+                        o1 = std::sin(v.phase[0]*kPi2) * env[0];
+                        out += (o1 + o2 + o3 + o4) * 0.25f; break;
+                }
+                // Advance phases.
+                for (int i = 0; i < 4; ++i)
+                    v.phase[i] += (baseFreq * ops[i].ratio) / (float)sampleRate;
+                v.time += dt;
+                out *= v.vel;
+            }
+            out *= volume;
+            out = juce::jlimit(-1.0f, 1.0f, out);
+            for (int c = 0; c < buf.getNumChannels(); ++c)
+                buf.addSample(c, s, out);
+        }
+    }
+
+    double getTailLengthSeconds() const override { return 5.0; }
+    bool acceptsMidi() const override { return true; }
+    bool producesMidi() const override { return false; }
+    bool isBusesLayoutSupported(const BusesLayout&) const override { return true; }
+    juce::AudioProcessorEditor* createEditor() override { return nullptr; }
+    bool hasEditor() const override { return false; }
+    int getNumPrograms() override { return 1; }
+    int getCurrentProgram() override { return 0; }
+    void setCurrentProgram(int) override {}
+    const juce::String getProgramName(int) override { return {}; }
+    void changeProgramName(int, const juce::String&) override {}
+    void getStateInformation(juce::MemoryBlock&) override {}
+    void setStateInformation(const void*, int) override {}
+
+private:
+    Node& node;
+    double sampleRate = 44100;
+    struct Voice {
+        bool active = false, held = false;
+        int note = 0;
+        float vel = 0, time = 0, relTime = 0;
+        float phase[4] = {};
+        float fb1 = 0, fb2 = 0; // op4 feedback history
+    };
+    std::vector<Voice> voices;
+    Voice& allocVoice() {
+        for (auto& v : voices) if (!v.active) return v;
+        float oldest = -1; int idx = 0;
+        for (int i = 0; i < (int)voices.size(); ++i)
+            if (voices[i].time > oldest) { oldest = voices[i].time; idx = i; }
+        return voices[idx];
+    }
+};
+
 } // namespace SoundShop

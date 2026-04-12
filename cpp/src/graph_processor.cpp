@@ -461,6 +461,8 @@ void GraphProcessor::rebuildGraph(NodeGraph& graph, Transport& transport) {
                 node.plugin->graphNodeId = graphNode->nodeID.uid;
             }
             continue;
+        } else if (node.type == NodeType::Instrument && node.script == "__fmsynth__") {
+            proc = std::make_unique<FMSynthProcessor>(node);
         } else if (node.type == NodeType::Instrument && node.script == "__drumsynth__") {
             proc = std::make_unique<DrumSynthProcessor>(node);
         } else if (node.type == NodeType::Instrument &&

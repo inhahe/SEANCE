@@ -1334,4 +1334,178 @@ private:
     }
 };
 
+// ==============================================================================
+// PHASE DISTORTION SYNTHESIS — Casio CZ-style instrument
+//
+// Warps a sine wave's phase with a modulator function controlled by a
+// "depth" parameter to produce subtractive-like sounds. When depth=0,
+// output is a pure sine. At depth=1, the waveform matches the selected
+// shape (saw, square, pulse, or resonant). The depth can change over
+// time (via an internal "DCW envelope") to create filter-sweep-like
+// timbral motion without an actual filter.
+//
+// Waveform types:
+//   0=Sawtooth — phase is compressed into the first half cycle
+//   1=Square   — phase holds then snaps
+//   2=Pulse    — ultra-narrow phase concentration
+//   3=Resonant — multiplied phase creates harmonic bursts
+//
+// Params: Waveform, Depth, DCW Attack, DCW Decay, DCW Sustain,
+//         Attack, Decay, Sustain, Release, Volume
+// ==============================================================================
+class PDSynthProcessor : public juce::AudioProcessor {
+public:
+    PDSynthProcessor(Node& n) : node(n) { voices.resize(12); }
+    const juce::String getName() const override { return "PD Synth"; }
+    void prepareToPlay(double sr, int) override { sampleRate = sr; }
+    void releaseResources() override {}
+
+    void processBlock(juce::AudioBuffer<float>& buf, juce::MidiBuffer& midi) override {
+        applySignalModulations(node, buf);
+        buf.clear();
+        const int numSamples = buf.getNumSamples();
+        if (numSamples == 0) return;
+
+        int waveform   = (int)paramByName(node, "Waveform", 0.0f);
+        float maxDepth = paramByName(node, "Depth", 0.8f);
+        // DCW envelope: controls depth over time (like CZ's DCW)
+        float dcwA     = std::max(0.001f, paramByName(node, "DCW Attack", 0.01f));
+        float dcwD     = std::max(0.001f, paramByName(node, "DCW Decay", 0.3f));
+        float dcwS     = paramByName(node, "DCW Sustain", 0.3f);
+        // Amplitude ADSR
+        float aA       = std::max(0.001f, paramByName(node, "Attack", 0.005f));
+        float aD       = std::max(0.001f, paramByName(node, "Decay", 0.1f));
+        float aS       = paramByName(node, "Sustain", 0.7f);
+        float aR       = std::max(0.001f, paramByName(node, "Release", 0.3f));
+        float volume   = paramByName(node, "Volume", 0.5f);
+
+        for (auto meta : midi) {
+            auto msg = meta.getMessage();
+            if (msg.isNoteOn()) {
+                auto& v = allocVoice();
+                v.active = true; v.held = true;
+                v.note = msg.getNoteNumber();
+                v.vel = msg.getVelocity() / 127.0f;
+                v.phase = 0; v.time = 0; v.relTime = 0;
+            } else if (msg.isNoteOff()) {
+                for (auto& v : voices)
+                    if (v.active && v.held && v.note == msg.getNoteNumber())
+                        { v.held = false; v.relTime = v.time; }
+            }
+        }
+
+        float dt = 1.0f / (float)sampleRate;
+        const float kPi2 = 6.28318530718f;
+
+        for (int s = 0; s < numSamples; ++s) {
+            float out = 0;
+            for (auto& v : voices) {
+                if (!v.active) continue;
+                float freq = 440.0f * std::pow(2.0f, (v.note - 69) / 12.0f);
+
+                // Amplitude ADSR
+                float ampEnv = 0;
+                if (v.held) {
+                    if (v.time < aA) ampEnv = v.time / aA;
+                    else if (v.time < aA + aD) ampEnv = 1.0f + (aS - 1.0f) * ((v.time - aA) / aD);
+                    else ampEnv = aS;
+                } else {
+                    float rt = v.time - v.relTime;
+                    ampEnv = aS * std::max(0.0f, 1.0f - rt / aR);
+                    if (rt >= aR) { v.active = false; continue; }
+                }
+
+                // DCW envelope (drives depth): attack → decay → sustain level × maxDepth
+                float dcwEnv = 0;
+                if (v.time < dcwA) dcwEnv = v.time / dcwA;
+                else if (v.time < dcwA + dcwD) dcwEnv = 1.0f + (dcwS - 1.0f) * ((v.time - dcwA) / dcwD);
+                else dcwEnv = dcwS;
+                float depth = maxDepth * dcwEnv;
+
+                // Phase distortion
+                float p = (float)std::fmod(v.phase, 1.0);
+                if (p < 0) p += 1.0f;
+                float distorted = p; // identity = sine
+
+                switch (waveform) {
+                    case 0: { // Sawtooth: compress first half, stretch second
+                        float split = 0.5f - depth * 0.45f;
+                        if (split < 0.05f) split = 0.05f;
+                        if (p < split) distorted = (p / split) * 0.5f;
+                        else distorted = 0.5f + ((p - split) / (1.0f - split)) * 0.5f;
+                        break;
+                    }
+                    case 1: { // Square: hold at top, snap down
+                        float hold = 0.5f + depth * 0.45f;
+                        if (p < hold) distorted = (p / hold) * 0.5f;
+                        else distorted = 0.5f + ((p - hold) / (1.0f - hold)) * 0.5f;
+                        break;
+                    }
+                    case 2: { // Pulse: narrow spike
+                        float w = 0.5f - depth * 0.48f;
+                        if (w < 0.02f) w = 0.02f;
+                        if (p < w) distorted = (p / w) * 0.5f;
+                        else if (p < w * 2) distorted = 0.5f + ((p - w) / w) * 0.5f;
+                        else distorted = 0.0f;
+                        break;
+                    }
+                    case 3: { // Resonant: multiply phase for harmonic ringing
+                        int mult = 1 + (int)(depth * 7.0f);
+                        distorted = std::fmod(p * mult, 1.0f);
+                        // Window with original phase to create decay
+                        float window = 1.0f - p;
+                        distorted = std::sin(distorted * kPi2) * window;
+                        // Skip the sin() below — we already computed the output
+                        out += distorted * ampEnv * v.vel;
+                        v.phase += freq / (float)sampleRate;
+                        v.time += dt;
+                        goto nextVoice;
+                    }
+                }
+
+                out += std::sin(distorted * kPi2) * ampEnv * v.vel;
+                v.phase += freq / (float)sampleRate;
+                v.time += dt;
+                nextVoice:;
+            }
+            out *= volume;
+            out = juce::jlimit(-1.0f, 1.0f, out);
+            for (int c = 0; c < buf.getNumChannels(); ++c)
+                buf.addSample(c, s, out);
+        }
+    }
+
+    double getTailLengthSeconds() const override { return 5.0; }
+    bool acceptsMidi() const override { return true; }
+    bool producesMidi() const override { return false; }
+    bool isBusesLayoutSupported(const BusesLayout&) const override { return true; }
+    juce::AudioProcessorEditor* createEditor() override { return nullptr; }
+    bool hasEditor() const override { return false; }
+    int getNumPrograms() override { return 1; }
+    int getCurrentProgram() override { return 0; }
+    void setCurrentProgram(int) override {}
+    const juce::String getProgramName(int) override { return {}; }
+    void changeProgramName(int, const juce::String&) override {}
+    void getStateInformation(juce::MemoryBlock&) override {}
+    void setStateInformation(const void*, int) override {}
+
+private:
+    Node& node;
+    double sampleRate = 44100;
+    struct Voice {
+        bool active = false, held = false;
+        int note = 0;
+        float vel = 0, time = 0, relTime = 0;
+        double phase = 0;
+    };
+    std::vector<Voice> voices;
+    Voice& allocVoice() {
+        for (auto& v : voices) if (!v.active) return v;
+        float oldest = -1; int idx = 0;
+        for (int i = 0; i < (int)voices.size(); ++i)
+            if (voices[i].time > oldest) { oldest = voices[i].time; idx = i; }
+        return voices[idx];
+    }
+};
+
 } // namespace SoundShop

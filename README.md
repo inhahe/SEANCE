@@ -116,7 +116,7 @@ For capturing real-world impulse responses, the **Room IR Capture** tool (Tools 
 
 ### Built-in instruments
 
-- **Wavetable / Layered Waveform synth.** Build single-cycle waveforms by stacking layers (sine / saw / square / triangle / noise / hand-drawn) at chosen harmonic ratios, phases, and amplitudes. Stack multiple cycles into a wavetable that morphs as you play. See the [Wavetable arrangement](#wavetable-arrangement) concept above for the full structure.
+- **Wavetable / Layered Waveform synth.** Build single-cycle waveforms by stacking layers (sine / saw / square / triangle / noise / hand-drawn) at chosen harmonic ratios, phases, and amplitudes. Hand-drawn layers support two editing modes: **Points** (Catmull-Rom control points) and **Freehand** (click-and-drag per-sample painting). Stack multiple cycles into a wavetable that morphs as you play. See the [Wavetable arrangement](#wavetable-arrangement) concept above for the full structure.
 - **Sampler.** Load any audio file as a pitched sample, with autocorrelation + YIN pitch detection for automatic base-note assignment, fine-tune in cents, and a choice between resample (changes speed and pitch together) or pitch-shift (preserves speed) playback modes.
 - **Drum synth.** Eight analog-style voice algorithms — **Kick** (pitched sine sweep), **Snare** (filtered noise), **Hi-Hat** (FM noise), **Clap**, **Tom**, **Cowbell**, **Rimshot**, **Cymbal** (with crash/ride/bell variants). Each voice gets its own MIDI note assignment via MIDI Learn and a four-knob synthesis row (pitch, decay, tone, level).
 - **SoundFont (SF2 / SFZ).** Load multi-sample patches with full preset / bank navigation. Hundreds of free SF2 packs available online for orchestral, piano, drums, ethnic instruments, etc. SF2 support is complete; SFZ uses a built-in basic loader, with full SFZ-spec compliance via the sfizz library on the roadmap.
@@ -323,7 +323,6 @@ Wavelets give you joint time + frequency resolution that traditional FFT-based e
 ### Editor and workflow
 
 - **Make the layered editor non-modal** — let the wavetable editor stay open while you work elsewhere in the graph.
-- ~~**Points / Freehand toggle for Drawn layers**~~ — implemented. Drawn layers now have a Points/Freehand toggle button.
 - **Persist project-wide settings** in `.ssp` (tuning system, concert pitch, crossfade duration, effect group definitions) — currently some of these don't survive save/load.
 
 ### Reliability

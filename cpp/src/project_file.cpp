@@ -71,6 +71,23 @@ bool ProjectFile::writeProject(std::ostream& f, NodeGraph& graph, GraphProcessor
         writeInt(f, "songRepeatCount", graph.songRepeatCount);
     if (!graph.historyFilePath.empty())
         writeStr(f, "historyFile", graph.historyFilePath);
+    // Effect group definitions (#66). Each group is a named bundle of
+    // link IDs with an optional per-group crossfade override.
+    for (auto& eg : graph.effectGroups) {
+        f << "[EffectGroup]\n";
+        writeInt(f, "id", eg.id);
+        writeStr(f, "name", eg.name);
+        writeInt(f, "color", (int)eg.color);
+        if (eg.crossfadeSec > 0)
+            writeFloat(f, "crossfadeSec", eg.crossfadeSec);
+        std::string ids;
+        for (int lid : eg.linkIds) {
+            if (!ids.empty()) ids += ",";
+            ids += std::to_string(lid);
+        }
+        if (!ids.empty()) writeStr(f, "linkIds", ids);
+    }
+
     writeInt(f, "nextId", 0);
     if (!graph.signalScript.empty()) {
         // Encode signal script with line count prefix so we know where it ends
@@ -408,6 +425,8 @@ bool ProjectFile::readProject(std::istream& f, NodeGraph& graph, PluginHost* plu
                 graph.ccMappings.push_back({});
             } else if (section == "[Waveform]") {
                 graph.waveformLibrary.push_back({});
+            } else if (section == "[EffectGroup]") {
+                graph.effectGroups.push_back({});
             }
             continue;
         }
@@ -624,6 +643,19 @@ bool ProjectFile::readProject(std::istream& f, NodeGraph& graph, PluginHost* plu
             else if (key == "ccNum") m.ccNum = std::stoi(val);
             else if (key == "nodeId") m.nodeId = std::stoi(val);
             else if (key == "paramIdx") m.paramIdx = std::stoi(val);
+        }
+        else if (section == "[EffectGroup]" && !graph.effectGroups.empty()) {
+            auto& eg = graph.effectGroups.back();
+            if (key == "id") { eg.id = std::stoi(val); graph.nextEffectGroupId = std::max(graph.nextEffectGroupId, eg.id + 1); }
+            else if (key == "name") eg.name = val;
+            else if (key == "color") eg.color = (uint32_t)std::stoul(val);
+            else if (key == "crossfadeSec") eg.crossfadeSec = std::stof(val);
+            else if (key == "linkIds") {
+                std::istringstream ss(val);
+                std::string token;
+                while (std::getline(ss, token, ','))
+                    if (!token.empty()) eg.linkIds.push_back(std::stoi(token));
+            }
         }
         else if (section == "[Waveform]" && !graph.waveformLibrary.empty()) {
             auto& wf = graph.waveformLibrary.back();

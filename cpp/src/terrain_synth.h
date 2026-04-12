@@ -35,6 +35,13 @@ public:
     void fillFromImage(const std::string& path);         // 2D, pixel brightness
     void fillFromAudioFile(const std::string& path);     // 1D, raw samples
 
+    // Fractal / self-similar fill (#51): build a 1D waveform from recursive
+    // wavelet coefficient patterns. The base pattern is a short seed
+    // waveform; at each DWT level, the detail coefficients are scaled
+    // copies of the seed. The 1/f-ish spectrum produces rich, organic
+    // waveforms. `iterations` = number of self-similar recursion levels.
+    void fillFractal(int size, int iterations = 5, float decay = 0.7f);
+
     // Frequency-domain fill (1D only). Evaluates magExpr(f) and phaseExpr(f)
     // over FFT bins, inverse-FFTs to a real waveform, and fills this terrain
     // (which should be 1D of size == fftSize). Normalized to peak 1.0.

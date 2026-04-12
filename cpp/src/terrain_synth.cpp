@@ -1,5 +1,6 @@
 #include "terrain_synth.h"
 #include "signal_modulation.h"
+#include "wavelet.h"
 #include "builtin_synth.h" // for WaveExprParser
 #include "fft_util.h"
 #include "layered_wave_editor.h" // for LayeredWaveform decode/render
@@ -285,6 +286,50 @@ void Terrain::fillFromAudioFile(const std::string& path) {
 
     delete reader;
     fprintf(stderr, "Terrain loaded from audio: %d samples\n", numSamples);
+}
+
+void Terrain::fillFractal(int size, int iterations, float decay) {
+    init({size});
+    // Seed: a simple sine wave as the base pattern.
+    for (int i = 0; i < size; ++i)
+        data[i] = std::sin(2.0f * 3.14159265f * (float)i / (float)size);
+
+    auto filt = getWaveletFilter("db4");
+
+    // Forward DWT to get coefficients.
+    std::vector<float> sig = data;
+    int levels = dwt(sig, iterations, filt);
+
+    // Replace each detail level's coefficients with a scaled, self-similar
+    // copy of the approximation level — creating fractal repetition across
+    // scales. Each level decays by `decay` to produce a 1/f-like spectrum.
+    int approxLen = size;
+    for (int l = 0; l < levels; ++l) approxLen /= 2;
+
+    int bandStart = approxLen;
+    for (int band = 0; band < levels; ++band) {
+        int bandLen = approxLen * (1 << band);
+        float scale = std::pow(decay, (float)(band + 1));
+        // Fill this band with a stretched copy of the approximation × scale.
+        for (int i = 0; i < bandLen; ++i) {
+            int srcIdx = (i * approxLen) / bandLen; // stretch
+            if (srcIdx < approxLen)
+                sig[bandStart + i] = sig[srcIdx] * scale;
+        }
+        bandStart += bandLen;
+    }
+
+    // Inverse DWT to get the fractal waveform.
+    idwt(sig, levels, filt);
+
+    // Normalize to [-1, 1].
+    float maxAbs = 0;
+    for (auto v : sig) maxAbs = std::max(maxAbs, std::abs(v));
+    if (maxAbs > 0) {
+        for (int i = 0; i < size; ++i) data[i] = sig[i] / maxAbs;
+    }
+
+    fprintf(stderr, "Terrain fractal fill: %d samples, %d iterations\n", size, iterations);
 }
 
 // ==============================================================================

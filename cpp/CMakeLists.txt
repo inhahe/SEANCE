@@ -106,6 +106,7 @@ target_sources(SEANCE PRIVATE
     src/signal_shape_node.cpp
     src/signal_shape_node.h
     src/signal_modulation.h
+    src/wavelet.h
     src/cache_processor.h
     src/audio_crossfader.h
     src/trigger_node.cpp

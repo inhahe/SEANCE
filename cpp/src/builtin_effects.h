@@ -2237,4 +2237,199 @@ private:
     double sampleRate = 44100;
 };
 
+// ==============================================================================
+// SELF-SIMILAR / 1/f WAVELET REVERB
+//
+// Creates a fractal-like reverb tail by scaling wavelet coefficients
+// with a 1/f power law across decomposition levels. Coarser levels
+// (lower frequencies) get more energy, finer levels (higher freq)
+// decay faster — mimicking the natural 1/f spectrum of real acoustic
+// spaces. The result is a diffuse, organic-sounding tail that's
+// quite different from algorithmic or convolution reverbs.
+//
+// Params: Decay (overall tail length), Color (1/f exponent: 0=white,
+//         1=pink, 2=brown), Levels, Mix
+// ==============================================================================
+class WaveletReverbProcessor : public juce::AudioProcessor {
+public:
+    WaveletReverbProcessor(Node& n) : node(n) {
+        tailBufL.resize(8192, 0.0f);
+        tailBufR.resize(8192, 0.0f);
+    }
+    const juce::String getName() const override { return "Wavelet Reverb"; }
+    void prepareToPlay(double sr, int) override { sampleRate = sr; }
+    void releaseResources() override {}
+
+    void processBlock(juce::AudioBuffer<float>& buf, juce::MidiBuffer&) override {
+        applySignalModulations(node, buf);
+        const int n = buf.getNumSamples();
+        const int ch = std::min(2, buf.getNumChannels());
+        if (n == 0 || ch == 0) return;
+
+        float decay  = juce::jlimit(0.0f, 1.0f, paramByName(node, "Decay", 0.7f));
+        float color  = juce::jlimit(0.0f, 3.0f, paramByName(node, "Color", 1.0f));
+        int   levels = juce::jlimit(1, 8, (int)paramByName(node, "Levels", 5.0f));
+        float mix    = juce::jlimit(0.0f, 1.0f, paramByName(node, "Mix", 0.3f));
+
+        auto filt = getWaveletFilter("db4");
+        int tailLen = (int)tailBufL.size();
+
+        for (int c = 0; c < ch; ++c) {
+            float* data = buf.getWritePointer(c);
+            auto& tail = (c == 0) ? tailBufL : tailBufR;
+
+            // Add new input to the tail buffer (shift + accumulate).
+            // Shift existing tail left by n samples and add new input.
+            for (int i = 0; i < tailLen - n; ++i)
+                tail[i] = tail[i + n] * decay;
+            for (int i = 0; i < n && (tailLen - n + i) >= 0; ++i)
+                tail[tailLen - n + i] = data[i];
+
+            // DWT the tail buffer.
+            std::vector<float> sig = tail;
+            int actualLevels = dwt(sig, levels, filt);
+
+            // Apply 1/f weighting: each band's gain = 1 / (band+1)^color
+            int approxLen = tailLen;
+            for (int l = 0; l < actualLevels; ++l) approxLen /= 2;
+            int bandStart = approxLen;
+            for (int band = 0; band < actualLevels; ++band) {
+                int bandLen = approxLen * (1 << band);
+                float weight = 1.0f / std::pow((float)(band + 1), color);
+                for (int i = bandStart; i < bandStart + bandLen && i < tailLen; ++i)
+                    sig[i] *= weight;
+                bandStart += bandLen;
+            }
+
+            // IDWT to get the reverb tail.
+            idwt(sig, actualLevels, filt);
+
+            // Mix into output.
+            for (int i = 0; i < n; ++i)
+                data[i] = data[i] * (1.0f - mix) + sig[tailLen - n + i] * mix;
+        }
+    }
+
+    double getTailLengthSeconds() const override { return 4.0; }
+    bool acceptsMidi() const override { return true; }
+    bool producesMidi() const override { return true; }
+    bool isBusesLayoutSupported(const BusesLayout&) const override { return true; }
+    juce::AudioProcessorEditor* createEditor() override { return nullptr; }
+    bool hasEditor() const override { return false; }
+    int getNumPrograms() override { return 1; }
+    int getCurrentProgram() override { return 0; }
+    void setCurrentProgram(int) override {}
+    const juce::String getProgramName(int) override { return {}; }
+    void changeProgramName(int, const juce::String&) override {}
+    void getStateInformation(juce::MemoryBlock&) override {}
+    void setStateInformation(const void*, int) override {}
+private:
+    Node& node;
+    double sampleRate = 44100;
+    std::vector<float> tailBufL, tailBufR;
+};
+
+// ==============================================================================
+// INDEPENDENT TRANSIENT + TONAL PITCH SHIFTING
+//
+// Separates audio into transient and tonal components via wavelet
+// thresholding, pitch-shifts only the tonal part, then recombines.
+// The transients (drum hits, plucks) keep their original pitch and
+// timing — only the sustained tonal content gets shifted. This gives
+// pitch shifting that preserves drum punch and percussive attacks.
+//
+// Params: Semitones (-24..+24), Threshold (transient/tonal separation),
+//         Trans Gain (0..2, keep or boost transients), Levels, Mix
+// ==============================================================================
+class IndependentPitchShiftProcessor : public juce::AudioProcessor {
+public:
+    IndependentPitchShiftProcessor(Node& n) : node(n) {}
+    const juce::String getName() const override { return "Ind. Pitch Shift"; }
+    void prepareToPlay(double sr, int) override { sampleRate = sr; }
+    void releaseResources() override {}
+
+    void processBlock(juce::AudioBuffer<float>& buf, juce::MidiBuffer&) override {
+        applySignalModulations(node, buf);
+        const int n = buf.getNumSamples();
+        const int ch = std::min(2, buf.getNumChannels());
+        if (n == 0 || ch == 0) return;
+
+        float semitones = paramByName(node, "Semitones", 0.0f);
+        float threshold = paramByName(node, "Threshold", 0.3f);
+        float transGain = paramByName(node, "Trans Gain", 1.0f);
+        int   levels    = juce::jlimit(1, 8, (int)paramByName(node, "Levels", 4.0f));
+        float mix       = juce::jlimit(0.0f, 1.0f, paramByName(node, "Mix", 1.0f));
+
+        if (std::abs(semitones) < 0.01f) return;
+        float ratio = std::pow(2.0f, semitones / 12.0f);
+
+        auto filt = getWaveletFilter("db4");
+        int padLen = 1;
+        while (padLen < n) padLen *= 2;
+
+        for (int c = 0; c < ch; ++c) {
+            float* data = buf.getWritePointer(c);
+            std::vector<float> sig(padLen, 0.0f);
+            for (int i = 0; i < n; ++i) sig[i] = data[i];
+            std::vector<float> dry(data, data + n);
+
+            int actualLevels = dwt(sig, levels, filt);
+
+            // Separate: threshold-based split into transient + tonal.
+            float maxCoeff = 0;
+            for (auto v : sig) maxCoeff = std::max(maxCoeff, std::abs(v));
+            float thresh = threshold * maxCoeff;
+
+            std::vector<float> transSig(padLen, 0.0f);
+            std::vector<float> tonalSig(padLen, 0.0f);
+            int approxLen = padLen;
+            for (int l = 0; l < actualLevels; ++l) approxLen /= 2;
+            // Keep approximation in tonal.
+            for (int i = 0; i < approxLen; ++i) tonalSig[i] = sig[i];
+            // Split detail bands.
+            for (int i = approxLen; i < padLen; ++i) {
+                if (std::abs(sig[i]) >= thresh) transSig[i] = sig[i];
+                else tonalSig[i] = sig[i];
+            }
+
+            // Reconstruct tonal, pitch-shift it via resampling.
+            idwt(tonalSig, actualLevels, filt);
+            // Simple pitch shift via resampling (linear interp).
+            std::vector<float> shifted(n, 0.0f);
+            for (int i = 0; i < n; ++i) {
+                float srcPos = (float)i * ratio;
+                int i0 = (int)srcPos;
+                float frac = srcPos - i0;
+                if (i0 + 1 < n) shifted[i] = tonalSig[i0] * (1.0f - frac) + tonalSig[i0 + 1] * frac;
+                else if (i0 < n) shifted[i] = tonalSig[i0];
+            }
+
+            // Reconstruct transients (unshifted).
+            idwt(transSig, actualLevels, filt);
+
+            // Recombine.
+            for (int i = 0; i < n; ++i)
+                data[i] = dry[i] * (1.0f - mix) +
+                          (shifted[i] + transSig[i] * transGain) * mix;
+        }
+    }
+
+    double getTailLengthSeconds() const override { return 0; }
+    bool acceptsMidi() const override { return true; }
+    bool producesMidi() const override { return true; }
+    bool isBusesLayoutSupported(const BusesLayout&) const override { return true; }
+    juce::AudioProcessorEditor* createEditor() override { return nullptr; }
+    bool hasEditor() const override { return false; }
+    int getNumPrograms() override { return 1; }
+    int getCurrentProgram() override { return 0; }
+    void setCurrentProgram(int) override {}
+    const juce::String getProgramName(int) override { return {}; }
+    void changeProgramName(int, const juce::String&) override {}
+    void getStateInformation(juce::MemoryBlock&) override {}
+    void setStateInformation(const void*, int) override {}
+private:
+    Node& node;
+    double sampleRate = 44100;
+};
+
 } // namespace SoundShop

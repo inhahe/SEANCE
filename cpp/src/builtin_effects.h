@@ -2508,4 +2508,149 @@ private:
     Node& node;
 };
 
+// ==============================================================================
+// ADDITIVE BANK SYNTH — per-partial sine oscillator synthesis
+//
+// Sums N harmonic sine oscillators per voice. Each partial runs at
+// `fundamental × ratio_n` where ratio_n defaults to the harmonic
+// series (1, 2, 3, ...) but can be shifted toward inharmonic spacing
+// via the Stretch param. Amplitude per partial follows a 1/n^rolloff
+// law controlled by Brightness — 0 = all partials equal (organ),
+// 1 = natural rolloff (strings), 2+ = mellow (flute-like).
+//
+// Params: Partials (1..64), Stretch (harmonic→inharmonic, 0..2),
+//         Brightness (amplitude rolloff exponent, 0..3),
+//         Attack, Decay, Sustain, Release, Volume
+// ==============================================================================
+class AdditiveSynthProcessor : public juce::AudioProcessor {
+public:
+    AdditiveSynthProcessor(Node& n) : node(n) { voices.resize(12); }
+    const juce::String getName() const override { return "Additive"; }
+    void prepareToPlay(double sr, int) override { sampleRate = sr; }
+    void releaseResources() override {}
+
+    void processBlock(juce::AudioBuffer<float>& buf, juce::MidiBuffer& midi) override {
+        applySignalModulations(node, buf);
+        buf.clear();
+        const int numSamples = buf.getNumSamples();
+        if (numSamples == 0) return;
+
+        int   numPartials = juce::jlimit(1, 64, (int)paramByName(node, "Partials", 16.0f));
+        float stretch     = paramByName(node, "Stretch", 0.0f);
+        float brightness  = std::max(0.0f, paramByName(node, "Brightness", 1.0f));
+        // Inharmonic presets (#8): override stretch/brightness for
+        // common timbres. 0=Custom (use manual values).
+        int preset = (int)paramByName(node, "Preset", 0.0f);
+        switch (preset) {
+            case 1: stretch = 0.12f; brightness = 0.8f; break; // Bell (slightly inharmonic)
+            case 2: stretch = 0.25f; brightness = 2.0f; break; // Drum (inharmonic + mellow)
+            case 3: stretch = 0.01f; brightness = 0.5f; break; // Stretched Piano (subtle)
+            case 4: stretch = 0.0f;  brightness = 0.0f; break; // Organ (all equal)
+            default: break; // Custom — use manual Stretch/Brightness
+        }
+        float aA = std::max(0.001f, paramByName(node, "Attack", 0.01f));
+        float aD = std::max(0.001f, paramByName(node, "Decay", 0.1f));
+        float aS = paramByName(node, "Sustain", 0.7f);
+        float aR = std::max(0.001f, paramByName(node, "Release", 0.3f));
+        float volume = paramByName(node, "Volume", 0.5f);
+
+        for (auto meta : midi) {
+            auto msg = meta.getMessage();
+            if (msg.isNoteOn()) {
+                auto& v = allocVoice();
+                v.active = true; v.held = true;
+                v.note = msg.getNoteNumber();
+                v.vel = msg.getVelocity() / 127.0f;
+                v.time = 0; v.relTime = 0;
+                v.phases.assign(64, 0.0);
+            } else if (msg.isNoteOff()) {
+                for (auto& v : voices)
+                    if (v.active && v.held && v.note == msg.getNoteNumber())
+                        { v.held = false; v.relTime = v.time; }
+            }
+        }
+
+        const float kPi2 = 6.28318530718f;
+        float dt = 1.0f / (float)sampleRate;
+
+        for (int s = 0; s < numSamples; ++s) {
+            float out = 0;
+            for (auto& v : voices) {
+                if (!v.active) continue;
+                float baseFreq = 440.0f * std::pow(2.0f, (v.note - 69) / 12.0f);
+
+                // ADSR
+                float env;
+                if (v.held) {
+                    if (v.time < aA) env = v.time / aA;
+                    else if (v.time < aA + aD) env = 1.0f + (aS - 1.0f) * ((v.time - aA) / aD);
+                    else env = aS;
+                } else {
+                    float rt = v.time - v.relTime;
+                    env = aS * std::max(0.0f, 1.0f - rt / aR);
+                    if (rt >= aR) { v.active = false; continue; }
+                }
+
+                // Sum partials
+                float voiceOut = 0;
+                for (int p = 0; p < numPartials; ++p) {
+                    // Ratio: harmonic = (p+1), stretched = (p+1)^(1+stretch)
+                    float ratio = std::pow((float)(p + 1), 1.0f + stretch);
+                    float freq = baseFreq * ratio;
+                    if (freq > sampleRate * 0.49) break; // anti-alias
+
+                    // Amplitude rolloff
+                    float amp = 1.0f / std::pow((float)(p + 1), brightness);
+                    voiceOut += std::sin((float)v.phases[p] * kPi2) * amp;
+                    v.phases[p] += freq / sampleRate;
+                    if (v.phases[p] > 1.0) v.phases[p] -= 1.0;
+                }
+
+                out += voiceOut * env * v.vel;
+                v.time += dt;
+            }
+
+            // Normalize by sqrt of partial count
+            if (numPartials > 1)
+                out /= std::sqrt((float)numPartials);
+            out *= volume;
+            out = juce::jlimit(-1.0f, 1.0f, out);
+            for (int c = 0; c < buf.getNumChannels(); ++c)
+                buf.addSample(c, s, out);
+        }
+    }
+
+    double getTailLengthSeconds() const override { return 5.0; }
+    bool acceptsMidi() const override { return true; }
+    bool producesMidi() const override { return false; }
+    bool isBusesLayoutSupported(const BusesLayout&) const override { return true; }
+    juce::AudioProcessorEditor* createEditor() override { return nullptr; }
+    bool hasEditor() const override { return false; }
+    int getNumPrograms() override { return 1; }
+    int getCurrentProgram() override { return 0; }
+    void setCurrentProgram(int) override {}
+    const juce::String getProgramName(int) override { return {}; }
+    void changeProgramName(int, const juce::String&) override {}
+    void getStateInformation(juce::MemoryBlock&) override {}
+    void setStateInformation(const void*, int) override {}
+
+private:
+    Node& node;
+    double sampleRate = 44100;
+    struct Voice {
+        bool active = false, held = false;
+        int note = 0;
+        float vel = 0, time = 0, relTime = 0;
+        std::vector<double> phases;
+    };
+    std::vector<Voice> voices;
+    Voice& allocVoice() {
+        for (auto& v : voices) if (!v.active) return v;
+        float oldest = -1; int idx = 0;
+        for (int i = 0; i < (int)voices.size(); ++i)
+            if (voices[i].time > oldest) { oldest = voices[i].time; idx = i; }
+        return voices[idx];
+    }
+};
+
 } // namespace SoundShop

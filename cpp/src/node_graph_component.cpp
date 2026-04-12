@@ -1064,6 +1064,7 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
     instMenu.addItem(107, "FM Synth");
     instMenu.addItem(108, "Phase Distortion Synth");
     instMenu.addItem(109, "Particle Cloud Synth");
+    instMenu.addItem(110, "Additive Synth");
     instMenu.addItem(104, "SoundFont (.sf2)...");
     instMenu.addItem(105, "SFZ Instrument (.sfz)...");
     instMenu.addItem(103, "Drum Machine");
@@ -1574,6 +1575,22 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
                 n.params.push_back({p2 + "S",     0.7f,  0.0f,   1.0f});
                 n.params.push_back({p2 + "R",     0.3f,  0.001f, 10.0f});
             }
+            repaint();
+        } else if (result == 110) {
+            // Additive Synth
+            auto& n = graph.addNode("Additive", NodeType::Instrument,
+                {Pin{0, "MIDI", PinKind::Midi, true}},
+                {Pin{0, "Audio", PinKind::Audio, false}}, {p.x, p.y});
+            n.script = "__additivesynth__";
+            n.params.push_back({"Preset",      0.0f, 0.0f,  4.0f}); // 0=Custom 1=Bell 2=Drum 3=Piano 4=Organ
+            n.params.push_back({"Partials",   16.0f, 1.0f, 64.0f});
+            n.params.push_back({"Stretch",     0.0f, 0.0f,  2.0f});
+            n.params.push_back({"Brightness",  1.0f, 0.0f,  3.0f});
+            n.params.push_back({"Attack",      0.01f, 0.001f, 2.0f});
+            n.params.push_back({"Decay",       0.1f, 0.001f, 5.0f});
+            n.params.push_back({"Sustain",     0.7f, 0.0f, 1.0f});
+            n.params.push_back({"Release",     0.3f, 0.001f, 10.0f});
+            n.params.push_back({"Volume",      0.5f, 0.0f, 1.0f});
             repaint();
         } else if (result == 109) {
             // Particle Cloud Synth

@@ -610,6 +610,102 @@ static PyMethodDef soundshopMethods[] = {
     {"get_tuning", [](PyObject*, PyObject*) -> PyObject* {
         return PyFloat_FromDouble(MusicTheory::referencePitch);
     }, METH_NOARGS, "Get current reference pitch in Hz"},
+    // Extended bindings (#11): instrument-specific and project-level APIs.
+    {"set_param", [](PyObject*, PyObject* args) -> PyObject* {
+        int nodeIdx, paramIdx; float val;
+        if (!PyArg_ParseTuple(args, "iif", &nodeIdx, &paramIdx, &val)) return nullptr;
+        if (!g_currentGraph || nodeIdx < 0 || nodeIdx >= (int)g_currentGraph->nodes.size()) {
+            PyErr_SetString(PyExc_IndexError, "Node index out of range"); return nullptr;
+        }
+        auto& node = g_currentGraph->nodes[nodeIdx];
+        if (paramIdx >= 0 && paramIdx < (int)node.params.size())
+            node.params[paramIdx].value = val;
+        Py_RETURN_NONE;
+    }, METH_VARARGS, "Set param value: (node_idx, param_idx, value)"},
+    {"get_param", [](PyObject*, PyObject* args) -> PyObject* {
+        int nodeIdx, paramIdx;
+        if (!PyArg_ParseTuple(args, "ii", &nodeIdx, &paramIdx)) return nullptr;
+        if (!g_currentGraph || nodeIdx < 0 || nodeIdx >= (int)g_currentGraph->nodes.size()) {
+            PyErr_SetString(PyExc_IndexError, "Node index out of range"); return nullptr;
+        }
+        auto& node = g_currentGraph->nodes[nodeIdx];
+        if (paramIdx >= 0 && paramIdx < (int)node.params.size())
+            return PyFloat_FromDouble(node.params[paramIdx].value);
+        Py_RETURN_NONE;
+    }, METH_VARARGS, "Get param value: (node_idx, param_idx) -> float"},
+    {"get_param_count", [](PyObject*, PyObject* args) -> PyObject* {
+        int nodeIdx;
+        if (!PyArg_ParseTuple(args, "i", &nodeIdx)) return nullptr;
+        if (!g_currentGraph || nodeIdx < 0 || nodeIdx >= (int)g_currentGraph->nodes.size()) {
+            PyErr_SetString(PyExc_IndexError, "Node index out of range"); return nullptr;
+        }
+        return PyLong_FromLong((int)g_currentGraph->nodes[nodeIdx].params.size());
+    }, METH_VARARGS, "Get param count: (node_idx) -> int"},
+    {"get_param_name", [](PyObject*, PyObject* args) -> PyObject* {
+        int nodeIdx, paramIdx;
+        if (!PyArg_ParseTuple(args, "ii", &nodeIdx, &paramIdx)) return nullptr;
+        if (!g_currentGraph || nodeIdx < 0 || nodeIdx >= (int)g_currentGraph->nodes.size()) {
+            PyErr_SetString(PyExc_IndexError, "Node index out of range"); return nullptr;
+        }
+        auto& node = g_currentGraph->nodes[nodeIdx];
+        if (paramIdx >= 0 && paramIdx < (int)node.params.size())
+            return PyUnicode_FromString(node.params[paramIdx].name.c_str());
+        Py_RETURN_NONE;
+    }, METH_VARARGS, "Get param name: (node_idx, param_idx) -> str"},
+    {"set_script", [](PyObject*, PyObject* args) -> PyObject* {
+        int nodeIdx; const char* script;
+        if (!PyArg_ParseTuple(args, "is", &nodeIdx, &script)) return nullptr;
+        if (!g_currentGraph || nodeIdx < 0 || nodeIdx >= (int)g_currentGraph->nodes.size()) {
+            PyErr_SetString(PyExc_IndexError, "Node index out of range"); return nullptr;
+        }
+        g_currentGraph->nodes[nodeIdx].script = script;
+        Py_RETURN_NONE;
+    }, METH_VARARGS, "Set node script: (node_idx, script_text)"},
+    {"get_script", [](PyObject*, PyObject* args) -> PyObject* {
+        int nodeIdx;
+        if (!PyArg_ParseTuple(args, "i", &nodeIdx)) return nullptr;
+        if (!g_currentGraph || nodeIdx < 0 || nodeIdx >= (int)g_currentGraph->nodes.size()) {
+            PyErr_SetString(PyExc_IndexError, "Node index out of range"); return nullptr;
+        }
+        return PyUnicode_FromString(g_currentGraph->nodes[nodeIdx].script.c_str());
+    }, METH_VARARGS, "Get node script: (node_idx) -> str"},
+    {"remove_node", [](PyObject*, PyObject* args) -> PyObject* {
+        int nodeIdx;
+        if (!PyArg_ParseTuple(args, "i", &nodeIdx)) return nullptr;
+        if (!g_currentGraph || nodeIdx < 0 || nodeIdx >= (int)g_currentGraph->nodes.size()) {
+            PyErr_SetString(PyExc_IndexError, "Node index out of range"); return nullptr;
+        }
+        int nodeId = g_currentGraph->nodes[nodeIdx].id;
+        // Remove links connected to this node's pins.
+        auto& nodes = g_currentGraph->nodes;
+        auto& links = g_currentGraph->links;
+        std::vector<int> pinIds;
+        for (auto& p : nodes[nodeIdx].pinsIn) pinIds.push_back(p.id);
+        for (auto& p : nodes[nodeIdx].pinsOut) pinIds.push_back(p.id);
+        links.erase(std::remove_if(links.begin(), links.end(),
+            [&pinIds](const Link& l) {
+                for (int pid : pinIds) if (l.startPin == pid || l.endPin == pid) return true;
+                return false;
+            }), links.end());
+        nodes.erase(nodes.begin() + nodeIdx);
+        (void)nodeId;
+        Py_RETURN_NONE;
+    }, METH_VARARGS, "Remove node: (node_idx)"},
+    {"set_song_length", [](PyObject*, PyObject* args) -> PyObject* {
+        float beats;
+        if (!PyArg_ParseTuple(args, "f", &beats)) return nullptr;
+        if (g_currentGraph) g_currentGraph->songLengthBeats = beats;
+        Py_RETURN_NONE;
+    }, METH_VARARGS, "Set song length in beats"},
+    {"set_song_repeat", [](PyObject*, PyObject* args) -> PyObject* {
+        int mode, count = 1;
+        if (!PyArg_ParseTuple(args, "i|i", &mode, &count)) return nullptr;
+        if (g_currentGraph) {
+            g_currentGraph->songRepeatMode = (NodeGraph::SongRepeat)mode;
+            g_currentGraph->songRepeatCount = count;
+        }
+        Py_RETURN_NONE;
+    }, METH_VARARGS, "Set repeat mode: (mode, [count]). mode: 0=None, 1=Forever, 2=NTimes"},
     {nullptr, nullptr, 0, nullptr}
 };
 

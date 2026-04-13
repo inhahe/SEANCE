@@ -2006,6 +2006,26 @@ void NodeGraphComponent::showNodeMenu(Node& node) {
             juce::String((int)(node.cache.numSamples / std::max(1.0, node.cache.sampleRate))) +
             "s)", false);
 
+    // Convolution auto-merge (#33): offer to merge with downstream convolution.
+    if (node.script.rfind("__convolution__:", 0) == 0) {
+        // Find a downstream convolution node (connected via this node's output).
+        int downstreamConvId = -1;
+        for (auto& link : graph.links) {
+            for (auto& pin : node.pinsOut) {
+                if (pin.id == link.startPin) {
+                    for (auto& other : graph.nodes) {
+                        if (other.id == node.id) continue;
+                        for (auto& dstPin : other.pinsIn)
+                            if (dstPin.id == link.endPin && other.script.rfind("__convolution__:", 0) == 0)
+                                downstreamConvId = other.id;
+                    }
+                }
+            }
+        }
+        if (downstreamConvId >= 0)
+            menu.addItem(170, "Merge with downstream convolution");
+    }
+
     int nodeId = node.id;
     menu.showMenuAsync(juce::PopupMenu::Options(), [this, nodeId](int result) {
         auto* node = graph.findNode(nodeId);
@@ -2074,6 +2094,58 @@ void NodeGraphComponent::showNodeMenu(Node& node) {
             // "Record Here" toggle (#77)
             node->recordArmed = !node->recordArmed;
             graph.dirty = true;
+        } else if (result == 170) {
+            // Convolution auto-merge (#33): convolve this node's IR with
+            // the downstream convolution's IR, put the result in this node,
+            // and remove the downstream node + link.
+            if (node->script.rfind("__convolution__:", 0) == 0) {
+                // Find the downstream convolution node.
+                int downId = -1;
+                for (auto& link : graph.links) {
+                    for (auto& pin : node->pinsOut)
+                        if (pin.id == link.startPin) {
+                            for (auto& other : graph.nodes) {
+                                if (other.id == nodeId) continue;
+                                for (auto& dp : other.pinsIn)
+                                    if (dp.id == link.endPin &&
+                                        other.script.rfind("__convolution__:", 0) == 0)
+                                        downId = other.id;
+                            }
+                        }
+                }
+                if (downId >= 0) {
+                    auto irA = ConvolutionProcessor::decodeIR(node->script);
+                    auto* downNode = graph.findNode(downId);
+                    if (downNode) {
+                        auto irB = ConvolutionProcessor::decodeIR(downNode->script);
+                        if (!irA.empty() && !irB.empty()) {
+                            auto merged = ConvolutionProcessor::convolveIRs(irA, irB);
+                            node->script = ConvolutionProcessor::encodeIR(merged);
+                            // Rewire downstream's outputs to this node's output.
+                            for (auto& link : graph.links)
+                                for (auto& dp : downNode->pinsOut)
+                                    if (dp.id == link.startPin)
+                                        for (auto& myOut : node->pinsOut)
+                                            link.startPin = myOut.id;
+                            // Remove the downstream node + its links.
+                            // Collect pin IDs first, then erase.
+                            std::vector<int> downPinIds;
+                            for (auto& p : downNode->pinsIn)  downPinIds.push_back(p.id);
+                            for (auto& p : downNode->pinsOut) downPinIds.push_back(p.id);
+                            graph.links.erase(std::remove_if(graph.links.begin(), graph.links.end(),
+                                [&downPinIds](const Link& l) {
+                                    for (int pid : downPinIds)
+                                        if (l.startPin == pid || l.endPin == pid) return true;
+                                    return false;
+                                }), graph.links.end());
+                            graph.nodes.erase(std::remove_if(graph.nodes.begin(), graph.nodes.end(),
+                                [downId](const Node& nn) { return nn.id == downId; }), graph.nodes.end());
+                            graph.dirty = true;
+                            graph.commitSnapshot("Merge convolutions");
+                        }
+                    }
+                }
+            }
         } else if (result >= 150 && result <= 154) {
             float pans[] = {-1.0f, -0.5f, 0.0f, 0.5f, 1.0f};
             node->pan = pans[result - 150];

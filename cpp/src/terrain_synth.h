@@ -52,6 +52,18 @@ public:
     void fromWaveletBasis(int levels = 4);
     bool isWaveletBasis = false;
 
+    // Wavetable mipmap pyramid (#48): for anti-aliased pitch-up.
+    // Each level is a half-resolution version of the previous, created
+    // by DWT → drop finest detail → IDWT. Higher-pitched playback uses
+    // smaller mipmaps to avoid aliasing. Call buildMipmaps() after
+    // filling the terrain with a 1D wavetable. The playback code picks
+    // the level based on the current pitch ratio.
+    std::vector<std::vector<float>> mipmaps; // [0] = original, [1] = half, etc.
+    void buildMipmaps(int maxLevels = 6);
+    // Sample from the appropriate mipmap level for a given pitch ratio.
+    // pitchRatio = playback_freq / base_freq. Higher ratio → smaller mipmap.
+    float sampleMipmap(float phase01, float pitchRatio) const;
+
     // Frequency-domain fill (1D only). Evaluates magExpr(f) and phaseExpr(f)
     // over FFT bins, inverse-FFTs to a real waveform, and fills this terrain
     // (which should be 1D of size == fftSize). Normalized to peak 1.0.

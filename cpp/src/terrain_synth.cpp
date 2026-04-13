@@ -332,6 +332,54 @@ void Terrain::fillFractal(int size, int iterations, float decay) {
     fprintf(stderr, "Terrain fractal fill: %d samples, %d iterations\n", size, iterations);
 }
 
+void Terrain::buildMipmaps(int maxLevels) {
+    mipmaps.clear();
+    if (data.empty() || numDimensions() != 1) return;
+    int n = (int)data.size();
+    if ((n & (n - 1)) != 0) return; // must be power of 2
+
+    auto filt = getWaveletFilter("db4");
+    mipmaps.push_back(data); // level 0 = original
+
+    std::vector<float> current = data;
+    for (int l = 0; l < maxLevels && n >= (int)filt.h0.size() * 2; ++l) {
+        // One DWT step: splits into approximation (half) + detail (half).
+        dwtStep(current, n, filt);
+        n /= 2;
+        // The approximation is the first half — it's the low-pass filtered,
+        // downsampled version (fewer harmonics, shorter table).
+        std::vector<float> mip(current.begin(), current.begin() + n);
+        // IDWT step to get the actual waveform (not coefficients).
+        // We need to reconstruct from just the approximation (zero detail).
+        std::vector<float> reconBuf(n * 2, 0.0f);
+        for (int i = 0; i < n; ++i) reconBuf[i] = mip[i];
+        idwtStep(reconBuf, n * 2, filt);
+        // The reconstructed waveform is in reconBuf[0..n*2-1] but we want
+        // it at half-resolution (n samples). Downsample by 2.
+        std::vector<float> downsampled(n);
+        for (int i = 0; i < n; ++i)
+            downsampled[i] = reconBuf[std::min(i * 2, n * 2 - 1)];
+        mipmaps.push_back(downsampled);
+    }
+}
+
+float Terrain::sampleMipmap(float phase01, float pitchRatio) const {
+    if (mipmaps.empty()) return sample({phase01}); // fallback
+    // Pick level: log2(pitchRatio) rounded down, clamped to available levels.
+    int level = 0;
+    if (pitchRatio > 1.0f)
+        level = std::min((int)std::floor(std::log2(pitchRatio)),
+                         (int)mipmaps.size() - 1);
+    const auto& mip = mipmaps[level];
+    int n = (int)mip.size();
+    if (n == 0) return 0;
+    float idx = phase01 * n;
+    int i0 = ((int)idx) % n;
+    int i1 = (i0 + 1) % n;
+    float frac = idx - (int)idx;
+    return mip[i0] + (mip[i1] - mip[i0]) * frac;
+}
+
 void Terrain::toWaveletBasis(int levels) {
     if (isWaveletBasis) return;
     if (data.empty()) return;

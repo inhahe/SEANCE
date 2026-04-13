@@ -73,6 +73,27 @@ private:
     float convHistoryL[CONV_HISTORY_SIZE] = {};
     float convHistoryR[CONV_HISTORY_SIZE] = {};
     int convWritePos = 0;
+
+    // Measured HRTF dataset (#44). If loaded, overrides the synthetic
+    // model. Each entry is an (azimuth, elevation) → (left IR, right IR)
+    // pair. The processor interpolates between the nearest entries.
+    struct HrtfEntry {
+        float azimuth = 0;    // degrees, -180..180
+        float elevation = 0;  // degrees, -90..90
+        std::vector<float> irL, irR; // impulse response per ear
+    };
+    std::vector<HrtfEntry> measuredHrtfs;
+    bool hasMeasuredHrtf = false;
+
+    // Load HRTF dataset from a directory of WAV files. Expected naming:
+    //   hrtf_az{N}_el{M}_L.wav / hrtf_az{N}_el{M}_R.wav
+    // where N is azimuth and M is elevation in degrees.
+    // Returns the number of entries loaded.
+    int loadHrtfDirectory(const std::string& dirPath);
+
+    // Find the nearest measured HRTF for a given azimuth/elevation
+    // and copy its IRs into currentIR_L / currentIR_R.
+    void selectMeasuredHrtf(float azimuth, float elevation);
 };
 
 } // namespace SoundShop

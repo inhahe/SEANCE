@@ -463,6 +463,9 @@ void GraphProcessor::rebuildGraph(NodeGraph& graph, Transport& transport) {
             continue;
         } else if (node.type == NodeType::Instrument && node.script == "__fmsynth__") {
             proc = std::make_unique<FMSynthProcessor>(node);
+        } else if (node.type == NodeType::Instrument &&
+                   node.script.rfind("__spectralgrain__:", 0) == 0) {
+            proc = std::make_unique<SpectralGrainProcessor>(node);
         } else if (node.type == NodeType::Instrument && node.script == "__additivesynth__") {
             proc = std::make_unique<AdditiveSynthProcessor>(node);
         } else if (node.type == NodeType::Instrument && node.script == "__pdsynth__") {

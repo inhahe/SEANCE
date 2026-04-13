@@ -2,10 +2,13 @@
 #include "node_graph.h"
 #include "signal_modulation.h"
 #include "wavelet.h"
+#include "fft_util.h"
+#include "builtin_synth.h"
 #include <juce_audio_processors/juce_audio_processors.h>
 #include <cmath>
 #include <vector>
 #include <random>
+#include <complex>
 
 namespace SoundShop {
 
@@ -3106,6 +3109,213 @@ public:
 private:
     Node& node;
     double sampleRate = 44100;
+};
+
+// ==============================================================================
+// SPECTRAL GRAIN SYNTH — Mode C: IFFT-to-windowed-grain playback
+//
+// Defines a spectrum via magnitude expression (same as the wavetable
+// spectral mode), but instead of playing a single IFFT cycle, it
+// generates a bank of short grains (each an IFFT with different random
+// phases) and overlap-adds them at a controllable rate. This produces
+// evolving, shimmering textures from a static spectral definition.
+//
+// Params: Partials (FFT size / 2), Density (grains/sec), Grain Size (ms),
+//         Spread (phase randomness 0..1), Attack, Decay, Sustain, Release,
+//         Volume. The magnitude expression is in node.script after the
+//         "__spectralgrain__:" prefix.
+// ==============================================================================
+class SpectralGrainProcessor : public juce::AudioProcessor {
+public:
+    SpectralGrainProcessor(Node& n) : node(n) { voices.resize(8); }
+    const juce::String getName() const override { return "Spectral Grain"; }
+
+    void prepareToPlay(double sr, int) override {
+        sampleRate = sr;
+        regenerateGrains();
+    }
+    void releaseResources() override {}
+
+    void processBlock(juce::AudioBuffer<float>& buf, juce::MidiBuffer& midi) override {
+        applySignalModulations(node, buf);
+        buf.clear();
+        const int numSamples = buf.getNumSamples();
+        if (numSamples == 0 || grainBank.empty()) return;
+
+        float density   = std::max(1.0f, paramByName(node, "Density", 20.0f));
+        float grainMs   = std::max(1.0f, paramByName(node, "Grain Size", 40.0f));
+        float aA = std::max(0.001f, paramByName(node, "Attack", 0.01f));
+        float aD = std::max(0.001f, paramByName(node, "Decay", 0.1f));
+        float aS = paramByName(node, "Sustain", 0.7f);
+        float aR = std::max(0.001f, paramByName(node, "Release", 0.3f));
+        float volume = paramByName(node, "Volume", 0.5f);
+
+        int grainSizeSamples = (int)(grainMs * 0.001f * (float)sampleRate);
+        grainSizeSamples = std::min(grainSizeSamples, (int)grainBank[0].size());
+        float spawnInterval = 1.0f / density;
+        float dt = 1.0f / (float)sampleRate;
+
+        for (auto meta : midi) {
+            auto msg = meta.getMessage();
+            if (msg.isNoteOn()) {
+                auto& v = allocVoice();
+                v.active = true; v.held = true;
+                v.note = msg.getNoteNumber();
+                v.vel = msg.getVelocity() / 127.0f;
+                v.time = 0; v.relTime = 0;
+                v.spawnTimer = 0;
+            } else if (msg.isNoteOff()) {
+                for (auto& v : voices)
+                    if (v.active && v.held && v.note == msg.getNoteNumber())
+                        { v.held = false; v.relTime = v.time; }
+            }
+        }
+
+        for (int s = 0; s < numSamples; ++s) {
+            float out = 0;
+            for (auto& v : voices) {
+                if (!v.active) continue;
+
+                // ADSR
+                float env;
+                if (v.held) {
+                    if (v.time < aA) env = v.time / aA;
+                    else if (v.time < aA + aD) env = 1.0f + (aS - 1.0f) * ((v.time - aA) / aD);
+                    else env = aS;
+                } else {
+                    float rt = v.time - v.relTime;
+                    env = aS * std::max(0.0f, 1.0f - rt / aR);
+                    if (rt >= aR) { v.active = false; continue; }
+                }
+
+                // Spawn grains
+                v.spawnTimer += dt;
+                while (v.spawnTimer >= spawnInterval && v.held) {
+                    v.spawnTimer -= spawnInterval;
+                    ActiveGrain g;
+                    g.grainIdx = rng() % grainBank.size();
+                    g.pos = 0;
+                    g.len = grainSizeSamples;
+                    float baseFreq = 440.0f * std::pow(2.0f, (v.note - 69) / 12.0f);
+                    g.rate = baseFreq / 440.0f; // pitch ratio relative to A4
+                    activeGrains.push_back(g);
+                }
+
+                v.time += dt;
+
+                // Sum active grains for this voice
+                float voiceOut = 0;
+                for (auto it = activeGrains.begin(); it != activeGrains.end();) {
+                    auto& g = *it;
+                    int idx = (int)g.pos;
+                    if (idx >= g.len || idx >= (int)grainBank[g.grainIdx].size()) {
+                        it = activeGrains.erase(it);
+                        continue;
+                    }
+                    // Hann window
+                    float w = 0.5f * (1.0f - std::cos(6.28318f * g.pos / g.len));
+                    voiceOut += grainBank[g.grainIdx][idx] * w;
+                    g.pos += g.rate;
+                    ++it;
+                }
+                out += voiceOut * env * v.vel;
+            }
+
+            if (activeGrains.size() > 1)
+                out /= std::sqrt((float)activeGrains.size());
+            out *= volume;
+            out = juce::jlimit(-1.0f, 1.0f, out);
+            for (int c = 0; c < buf.getNumChannels(); ++c)
+                buf.addSample(c, s, out);
+        }
+
+        if (activeGrains.size() > 2048)
+            activeGrains.erase(activeGrains.begin(), activeGrains.begin() + 1024);
+    }
+
+    double getTailLengthSeconds() const override { return 3.0; }
+    bool acceptsMidi() const override { return true; }
+    bool producesMidi() const override { return false; }
+    bool isBusesLayoutSupported(const BusesLayout&) const override { return true; }
+    juce::AudioProcessorEditor* createEditor() override { return nullptr; }
+    bool hasEditor() const override { return false; }
+    int getNumPrograms() override { return 1; }
+    int getCurrentProgram() override { return 0; }
+    void setCurrentProgram(int) override {}
+    const juce::String getProgramName(int) override { return {}; }
+    void changeProgramName(int, const juce::String&) override {}
+    void getStateInformation(juce::MemoryBlock&) override {}
+    void setStateInformation(const void*, int) override {}
+
+private:
+    Node& node;
+    double sampleRate = 44100;
+
+    // Pre-generated grain bank: N short waveforms, each an IFFT of the
+    // same magnitude spectrum with different random phases.
+    std::vector<std::vector<float>> grainBank;
+    static constexpr int kNumGrains = 16;
+    static constexpr int kGrainFFTSize = 1024;
+
+    void regenerateGrains() {
+        grainBank.clear();
+        grainBank.resize(kNumGrains);
+
+        // Parse magnitude expression from script.
+        std::string magExpr = "exp(-f/10)"; // default
+        auto& script = node.script;
+        if (script.rfind("__spectralgrain__:", 0) == 0) {
+            magExpr = script.substr(18);
+            if (magExpr.empty()) magExpr = "exp(-f/10)";
+        }
+
+        int halfBins = kGrainFFTSize / 2 + 1;
+        auto mags = WaveExprParser::evaluateOverBins(magExpr, halfBins);
+
+        std::mt19937 rngLocal(42);
+        std::uniform_real_distribution<float> phaseDist(-3.14159f, 3.14159f);
+
+        FFT fft(kGrainFFTSize);
+        for (int g = 0; g < kNumGrains; ++g) {
+            // Random phases for each grain.
+            std::vector<std::complex<float>> spectrum(halfBins);
+            for (int k = 0; k < halfBins; ++k) {
+                float ph = phaseDist(rngLocal);
+                spectrum[k] = std::complex<float>(mags[k] * std::cos(ph),
+                                                   mags[k] * std::sin(ph));
+            }
+            spectrum[0] = 0; // no DC
+            fft.inverseReal(spectrum, grainBank[g]);
+            // Normalize
+            float peak = 0;
+            for (float v : grainBank[g]) peak = std::max(peak, std::abs(v));
+            if (peak > 1e-6f) for (float& v : grainBank[g]) v /= peak;
+        }
+    }
+
+    struct Voice {
+        bool active = false, held = false;
+        int note = 0;
+        float vel = 0, time = 0, relTime = 0;
+        float spawnTimer = 0;
+    };
+    std::vector<Voice> voices;
+    Voice& allocVoice() {
+        for (auto& v : voices) if (!v.active) return v;
+        float oldest = -1; int idx = 0;
+        for (int i = 0; i < (int)voices.size(); ++i)
+            if (voices[i].time > oldest) { oldest = voices[i].time; idx = i; }
+        return voices[idx];
+    }
+
+    struct ActiveGrain {
+        int grainIdx = 0;
+        float pos = 0;
+        int len = 0;
+        float rate = 1.0f;
+    };
+    std::vector<ActiveGrain> activeGrains;
+    std::mt19937 rng{1234};
 };
 
 } // namespace SoundShop

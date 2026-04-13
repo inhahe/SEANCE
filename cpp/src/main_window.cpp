@@ -366,9 +366,33 @@ MainContentComponent::MainContentComponent() {
             loaded = true;
         }
     }
-    if (!loaded)
+    if (!loaded) {
         graph.setupDefaultGraph();
-    else {
+        // Auto-create MidiInput nodes for all connected hardware devices
+        // so a fresh install sees the user's controller immediately.
+        auto devices = juce::MidiInput::getAvailableDevices();
+        Node* defaultTrack = nullptr;
+        for (auto& n : graph.nodes)
+            if (n.type == NodeType::MidiTimeline) { defaultTrack = &n; break; }
+        float yPos = 200;
+        for (auto& dev : devices) {
+            bool exists = false;
+            for (auto& n : graph.nodes)
+                if (n.type == NodeType::MidiInput && n.midiInputSourceId == dev.identifier.toStdString())
+                    { exists = true; break; }
+            if (exists) continue;
+            auto& n = graph.addNode(dev.name.toStdString(), NodeType::MidiInput,
+                {}, {Pin{0, "MIDI Out", PinKind::Midi, false}}, {80, yPos});
+            n.midiInputSourceId = dev.identifier.toStdString();
+            if (defaultTrack && !n.pinsOut.empty())
+                for (auto& pin : defaultTrack->pinsIn)
+                    if (pin.kind == PinKind::Midi) {
+                        graph.addLink(n.pinsOut[0].id, pin.id);
+                        break;
+                    }
+            yPos += 50;
+        }
+    } else {
         upgradeLegacyNodes();
     }
 
@@ -2224,25 +2248,54 @@ void MainContentComponent::newProject() {
     graph.links.clear();
     graph.openEditors.clear();
     graph.setupDefaultGraph();
+
+    // Auto-create MidiInput nodes for all currently connected hardware
+    // MIDI devices — so the user's controller is immediately wired and
+    // ready on a fresh project without needing a wizard. The Computer
+    // Keyboard node is already created by setupDefaultGraph(); this
+    // adds hardware devices alongside it.
+    {
+        auto devices = juce::MidiInput::getAvailableDevices();
+        // Find the default MIDI track to wire to (the one setupDefaultGraph made).
+        Node* defaultTrack = nullptr;
+        for (auto& n : graph.nodes)
+            if (n.type == NodeType::MidiTimeline) { defaultTrack = &n; break; }
+
+        float yPos = 200; // stagger below the Computer Keyboard node
+        for (auto& dev : devices) {
+            // Skip if this identifier is already in the graph (shouldn't
+            // happen on a fresh project, but defensive).
+            bool exists = false;
+            for (auto& n : graph.nodes)
+                if (n.type == NodeType::MidiInput && n.midiInputSourceId == dev.identifier.toStdString())
+                    { exists = true; break; }
+            if (exists) continue;
+
+            auto& n = graph.addNode(dev.name.toStdString(), NodeType::MidiInput,
+                {}, {Pin{0, "MIDI Out", PinKind::Midi, false}}, {80, yPos});
+            n.midiInputSourceId = dev.identifier.toStdString();
+
+            // Wire to the default track so the device plays immediately.
+            if (defaultTrack && !n.pinsOut.empty()) {
+                for (auto& pin : defaultTrack->pinsIn) {
+                    if (pin.kind == PinKind::Midi) {
+                        graph.addLink(n.pinsOut[0].id, pin.id);
+                        break;
+                    }
+                }
+            }
+            yPos += 50;
+        }
+    }
+
     ProjectFile::currentPath.clear();
     projectDirty = false;
     graph.dirty = false;
-    // The autosave (if any) represented the *old* graph, which we just
-    // blew away. Clear it so a subsequent crash doesn't offer to recover
-    // a project the user already replaced. Same logic for the undo
-    // history — it described the path through the OLD graph, not the
-    // new one.
     discardAutosave();
     discardUndoTreePersist();
     lastAutosaveAttemptMs = juce::Time::getMillisecondCounterHiRes();
+    graphComponent->fitAll();
     graphComponent->repaint();
-
-    // Offer the user the list of detected MIDI input devices to add.
-    // Deferred so the dialog opens after the main window is visible.
-    juce::Component::SafePointer<MainContentComponent> safe(this);
-    juce::MessageManager::callAsync([safe]() {
-        if (safe) safe->showMidiDeviceWizard();
-    });
 }
 
 void MainContentComponent::openHelpDoc(const juce::String& docRelativePath) {

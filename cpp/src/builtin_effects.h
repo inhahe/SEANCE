@@ -2875,4 +2875,237 @@ private:
     double sampleRate = 44100;
 };
 
+// ==============================================================================
+// WAVELET-BAND VOCODER
+//
+// Classic vocoder effect using wavelet octave bands instead of fixed
+// FFT bins. Two inputs: carrier (typically a synth pad) and modulator
+// (typically a voice). The modulator's per-band envelope shapes the
+// carrier's per-band amplitude, producing the "talking synth" effect.
+//
+// Since the node graph sums all audio inputs into channels 0/1, we
+// use channel 2 (a Signal input pin) for the modulator signal. The
+// carrier comes in on channels 0/1 as the normal audio input.
+//
+// Params: Bands (decomposition levels), Mix
+// ==============================================================================
+class WaveletVocoderProcessor : public juce::AudioProcessor {
+public:
+    WaveletVocoderProcessor(Node& n) : node(n) {}
+    const juce::String getName() const override { return "Wavelet Vocoder"; }
+    void prepareToPlay(double sr, int) override { sampleRate = sr; }
+    void releaseResources() override {}
+
+    void processBlock(juce::AudioBuffer<float>& buf, juce::MidiBuffer&) override {
+        applySignalModulations(node, buf);
+        const int n = buf.getNumSamples();
+        if (n == 0 || buf.getNumChannels() < 1) return;
+
+        int bands = juce::jlimit(1, 8, (int)paramByName(node, "Bands", 5.0f));
+        float mix = juce::jlimit(0.0f, 1.0f, paramByName(node, "Mix", 1.0f));
+
+        // Carrier = channel 0 (main audio in).
+        // Modulator = channel 2 (Signal input, if connected).
+        bool hasModulator = buf.getNumChannels() > 2;
+        if (!hasModulator) return; // no modulator → passthrough
+
+        auto filt = getWaveletFilter("db4");
+        int padLen = 1;
+        while (padLen < n) padLen *= 2;
+
+        float* carrierData = buf.getWritePointer(0);
+        const float* modData = buf.getReadPointer(2);
+        std::vector<float> dry(carrierData, carrierData + n);
+
+        // Pad and DWT both signals.
+        std::vector<float> carrier(padLen, 0.0f), modulator(padLen, 0.0f);
+        for (int i = 0; i < n; ++i) { carrier[i] = carrierData[i]; modulator[i] = modData[i]; }
+
+        int actualLevels = dwt(carrier, bands, filt);
+        dwt(modulator, bands, filt);
+
+        // For each band: compute the modulator's energy, compute the
+        // carrier's energy, scale carrier by modulator/carrier ratio.
+        int approxLen = padLen;
+        for (int l = 0; l < actualLevels; ++l) approxLen /= 2;
+        // Scale approximation too.
+        {
+            float modE = 0, carE = 0;
+            for (int i = 0; i < approxLen; ++i) {
+                modE += modulator[i] * modulator[i];
+                carE += carrier[i] * carrier[i];
+            }
+            float scale = (carE > 1e-9f) ? std::sqrt(modE / carE) : 0.0f;
+            for (int i = 0; i < approxLen; ++i) carrier[i] *= scale;
+        }
+        int bandStart = approxLen;
+        for (int band = 0; band < actualLevels; ++band) {
+            int bandLen = approxLen * (1 << band);
+            float modE = 0, carE = 0;
+            for (int i = bandStart; i < bandStart + bandLen && i < padLen; ++i) {
+                modE += modulator[i] * modulator[i];
+                carE += carrier[i] * carrier[i];
+            }
+            float scale = (carE > 1e-9f) ? std::sqrt(modE / carE) : 0.0f;
+            scale = std::min(scale, 10.0f); // prevent blowup
+            for (int i = bandStart; i < bandStart + bandLen && i < padLen; ++i)
+                carrier[i] *= scale;
+            bandStart += bandLen;
+        }
+
+        idwt(carrier, actualLevels, filt);
+
+        for (int i = 0; i < n; ++i)
+            carrierData[i] = dry[i] * (1.0f - mix) + carrier[i] * mix;
+        // Copy to right channel if stereo.
+        if (buf.getNumChannels() >= 2)
+            std::memcpy(buf.getWritePointer(1), carrierData, n * sizeof(float));
+    }
+
+    double getTailLengthSeconds() const override { return 0; }
+    bool acceptsMidi() const override { return true; }
+    bool producesMidi() const override { return true; }
+    bool isBusesLayoutSupported(const BusesLayout&) const override { return true; }
+    juce::AudioProcessorEditor* createEditor() override { return nullptr; }
+    bool hasEditor() const override { return false; }
+    int getNumPrograms() override { return 1; }
+    int getCurrentProgram() override { return 0; }
+    void setCurrentProgram(int) override {}
+    const juce::String getProgramName(int) override { return {}; }
+    void changeProgramName(int, const juce::String&) override {}
+    void getStateInformation(juce::MemoryBlock&) override {}
+    void setStateInformation(const void*, int) override {}
+private:
+    Node& node;
+    double sampleRate = 44100;
+};
+
+// ==============================================================================
+// FORMANT-PRESERVING PITCH SHIFT — wavelet packet approach
+//
+// Pitch-shifts audio while preserving formants (the resonant
+// frequencies that make a voice sound like THAT voice, not a chipmunk).
+// Method: decompose into wavelet bands, pitch-shift each band via
+// resampling, but keep the spectral envelope (formant shape) by
+// scaling band gains back to their original levels after the shift.
+//
+// Params: Semitones (-24..+24), Formant Lock (0..1, how much formant
+//         to preserve — 0=no preservation, 1=full), Levels, Mix
+// ==============================================================================
+class FormantPitchShiftProcessor : public juce::AudioProcessor {
+public:
+    FormantPitchShiftProcessor(Node& n) : node(n) {}
+    const juce::String getName() const override { return "Formant Pitch"; }
+    void prepareToPlay(double sr, int) override { sampleRate = sr; }
+    void releaseResources() override {}
+
+    void processBlock(juce::AudioBuffer<float>& buf, juce::MidiBuffer&) override {
+        applySignalModulations(node, buf);
+        const int n = buf.getNumSamples();
+        const int ch = std::min(2, buf.getNumChannels());
+        if (n == 0 || ch == 0) return;
+
+        float semitones  = paramByName(node, "Semitones", 0.0f);
+        float formantLock = juce::jlimit(0.0f, 1.0f, paramByName(node, "Formant Lock", 0.8f));
+        int   levels     = juce::jlimit(1, 8, (int)paramByName(node, "Levels", 5.0f));
+        float mix        = juce::jlimit(0.0f, 1.0f, paramByName(node, "Mix", 1.0f));
+
+        if (std::abs(semitones) < 0.01f) return;
+        float ratio = std::pow(2.0f, semitones / 12.0f);
+
+        auto filt = getWaveletFilter("db4");
+        int padLen = 1;
+        while (padLen < n) padLen *= 2;
+
+        for (int c = 0; c < ch; ++c) {
+            float* data = buf.getWritePointer(c);
+            std::vector<float> sig(padLen, 0.0f);
+            for (int i = 0; i < n; ++i) sig[i] = data[i];
+            std::vector<float> dry(data, data + n);
+
+            // 1. Measure per-band energy before shift (= formant envelope).
+            int actualLevels = dwt(sig, levels, filt);
+            int approxLen = padLen;
+            for (int l = 0; l < actualLevels; ++l) approxLen /= 2;
+
+            std::vector<float> origEnergy(actualLevels + 1);
+            float aE = 0;
+            for (int i = 0; i < approxLen; ++i) aE += sig[i] * sig[i];
+            origEnergy[0] = aE / std::max(1, approxLen);
+            int bandStart = approxLen;
+            for (int band = 0; band < actualLevels; ++band) {
+                int bandLen = approxLen * (1 << band);
+                float e = 0;
+                for (int i = bandStart; i < bandStart + bandLen && i < padLen; ++i)
+                    e += sig[i] * sig[i];
+                origEnergy[band + 1] = e / std::max(1, bandLen);
+                bandStart += bandLen;
+            }
+
+            // 2. Reconstruct and pitch-shift via resampling.
+            idwt(sig, actualLevels, filt);
+            std::vector<float> shifted(n, 0.0f);
+            for (int i = 0; i < n; ++i) {
+                float srcPos = (float)i * ratio;
+                int i0 = (int)srcPos;
+                float frac = srcPos - i0;
+                if (i0 + 1 < n) shifted[i] = sig[i0] * (1.0f - frac) + sig[i0 + 1] * frac;
+                else if (i0 < n) shifted[i] = sig[i0];
+            }
+
+            // 3. Re-decompose the shifted signal and adjust band gains
+            //    to match the original formant envelope.
+            std::vector<float> shiftPad(padLen, 0.0f);
+            for (int i = 0; i < n; ++i) shiftPad[i] = shifted[i];
+            dwt(shiftPad, levels, filt);
+
+            // Scale each band to match original energy (= formant restoration).
+            {
+                float shiftE = 0;
+                for (int i = 0; i < approxLen; ++i) shiftE += shiftPad[i] * shiftPad[i];
+                shiftE /= std::max(1, approxLen);
+                float scale = (shiftE > 1e-12f) ? std::sqrt(origEnergy[0] / shiftE) : 1.0f;
+                scale = 1.0f + (scale - 1.0f) * formantLock;
+                for (int i = 0; i < approxLen; ++i) shiftPad[i] *= scale;
+            }
+            bandStart = approxLen;
+            for (int band = 0; band < actualLevels; ++band) {
+                int bandLen = approxLen * (1 << band);
+                float shiftE = 0;
+                for (int i = bandStart; i < bandStart + bandLen && i < padLen; ++i)
+                    shiftE += shiftPad[i] * shiftPad[i];
+                shiftE /= std::max(1, bandLen);
+                float scale = (shiftE > 1e-12f) ? std::sqrt(origEnergy[band + 1] / shiftE) : 1.0f;
+                scale = std::min(scale, 10.0f);
+                scale = 1.0f + (scale - 1.0f) * formantLock;
+                for (int i = bandStart; i < bandStart + bandLen && i < padLen; ++i)
+                    shiftPad[i] *= scale;
+                bandStart += bandLen;
+            }
+
+            idwt(shiftPad, actualLevels, filt);
+
+            for (int i = 0; i < n; ++i)
+                data[i] = dry[i] * (1.0f - mix) + shiftPad[i] * mix;
+        }
+    }
+
+    double getTailLengthSeconds() const override { return 0; }
+    bool acceptsMidi() const override { return true; }
+    bool producesMidi() const override { return true; }
+    bool isBusesLayoutSupported(const BusesLayout&) const override { return true; }
+    juce::AudioProcessorEditor* createEditor() override { return nullptr; }
+    bool hasEditor() const override { return false; }
+    int getNumPrograms() override { return 1; }
+    int getCurrentProgram() override { return 0; }
+    void setCurrentProgram(int) override {}
+    const juce::String getProgramName(int) override { return {}; }
+    void changeProgramName(int, const juce::String&) override {}
+    void getStateInformation(juce::MemoryBlock&) override {}
+    void setStateInformation(const void*, int) override {}
+private:
+    Node& node;
+    double sampleRate = 44100;
+};
+
 } // namespace SoundShop

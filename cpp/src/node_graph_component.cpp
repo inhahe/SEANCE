@@ -1104,6 +1104,8 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
     fxMenu.addItem(234, "Wavelet Complexity");
     fxMenu.addItem(235, "Asymmetric Filter");
     fxMenu.addItem(236, "Wavelet Pitch Tracker");
+    fxMenu.addItem(237, "Wavelet Vocoder");
+    fxMenu.addItem(238, "Formant Pitch Shift");
     fxMenu.addSeparator();
     fxMenu.addItem(224, "M/S Encode (stereo → mid+side)");
     fxMenu.addItem(225, "M/S Decode (mid+side → stereo)");
@@ -1749,6 +1751,23 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
                     {"B4 Gain", 0.0f, -24.0f, 24.0f},
                     {"B4 Q",    0.707f, 0.1f, 10.0f},
                 }); break;
+                case 238: makeEffect("Formant Pitch", "__formantpitch__", {
+                    {"Semitones",    0.0f, -24.0f, 24.0f},
+                    {"Formant Lock", 0.8f,   0.0f,  1.0f},
+                    {"Levels",       5.0f,   1.0f,  8.0f},
+                    {"Mix",          1.0f,   0.0f,  1.0f},
+                }); break;
+                case 237: {
+                    // Wavelet Vocoder: carrier (Audio In) + modulator (Signal In)
+                    auto& vcn = graph.addNode("Vocoder", NodeType::Effect,
+                        {Pin{0, "Audio In", PinKind::Audio, true}},
+                        {Pin{0, "Audio Out", PinKind::Audio, false}}, {p.x, p.y});
+                    vcn.pinsIn.push_back({graph.getNextId(), "Modulator", PinKind::Signal, true, 1});
+                    vcn.script = "__waveletvocoder__";
+                    vcn.params.push_back({"Bands", 5.0f, 1.0f, 8.0f});
+                    vcn.params.push_back({"Mix",   1.0f, 0.0f, 1.0f});
+                    break;
+                }
                 case 236: {
                     // Pitch Tracker: Audio In → Signal Out (detected pitch)
                     auto& ptn = graph.addNode("Pitch Tracker", NodeType::Effect,

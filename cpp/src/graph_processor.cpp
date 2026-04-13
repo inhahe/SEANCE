@@ -531,6 +531,10 @@ void GraphProcessor::rebuildGraph(NodeGraph& graph, Transport& transport) {
             proc = std::make_unique<Spatializer3DProcessor>(node);
         } else if (node.type == NodeType::Effect && node.script == "__waveletmbcomp__") {
             proc = std::make_unique<WaveletMultibandCompProcessor>(node);
+        } else if (node.type == NodeType::Effect && node.script == "__formantpitch__") {
+            proc = std::make_unique<FormantPitchShiftProcessor>(node);
+        } else if (node.type == NodeType::Effect && node.script == "__waveletvocoder__") {
+            proc = std::make_unique<WaveletVocoderProcessor>(node);
         } else if (node.type == NodeType::Effect && node.script == "__pitchtracker__") {
             proc = std::make_unique<WaveletPitchTrackerProcessor>(node);
         } else if (node.type == NodeType::Effect && node.script == "__asymfilter__") {

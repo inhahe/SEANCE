@@ -12,6 +12,7 @@
 #include "sampler_editor.h"
 #include "multi_sampler.h"
 #include "multi_sampler_editor.h"
+#include "spectrum_visualizer.h"
 #include "room_ir_capture.h"
 #include "drum_synth.h"
 #include "audio_export.h"
@@ -930,6 +931,7 @@ juce::PopupMenu MainContentComponent::getMenuForIndex(int idx, const juce::Strin
         menu.addItem(92, "Clear Recent Scripts");
     } else if (name == "View") {
         menu.addItem(30, "Fit All");
+        menu.addItem(400, "Spectrum Analyzer");
     } else if (name == "Settings") {
         menu.addItem(39, "Audio Device...");
         juce::PopupMenu srMenu;
@@ -1107,6 +1109,18 @@ void MainContentComponent::menuItemSelected(int menuItemID, int) {
             break;
         }
         case 111: showMidiDeviceWizard(); break;
+        case 400: {
+            // Spectrum Analyzer (#10): open a floating non-modal window.
+            auto* viz = new SpectrumVisualizerComponent(audioEngine);
+            auto* dw = new juce::DialogWindow(
+                "Spectrum Analyzer", juce::Colour(18, 20, 28), true);
+            dw->setContentOwned(viz, true);
+            dw->setResizable(true, false);
+            dw->setUsingNativeTitleBar(true);
+            dw->setVisible(true);
+            dw->centreWithSize(viz->getWidth(), viz->getHeight());
+            break;
+        }
         case 300: openHelpDoc("index.html"); break;
         case 301: openHelpDoc("getting-started.html"); break;
         case 302: openHelpDoc("graph-basics.html"); break;

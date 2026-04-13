@@ -324,6 +324,13 @@ void AudioEngine::audioDeviceIOCallbackWithContext(
                                               outputChannelData, numOutputChannels,
                                               numSamples, *graph);
 
+    // Spectrum analyzer ring buffer (#10): write latest output samples.
+    for (int s = 0; s < numSamples; ++s) {
+        spectrumBufL[spectrumWritePos] = (numOutputChannels > 0) ? outputChannelData[0][s] : 0.0f;
+        spectrumBufR[spectrumWritePos] = (numOutputChannels > 1) ? outputChannelData[1][s] : 0.0f;
+        spectrumWritePos = (spectrumWritePos + 1) % kSpectrumBufSize;
+    }
+
     // Always-on output capture: every playback is captured so the Output
     // node's cache can be populated on Stop. The buffer auto-clears when a
     // new playback starts (captureL is empty → fresh start). Only appends

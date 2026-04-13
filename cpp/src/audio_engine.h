@@ -178,6 +178,22 @@ public:
     void keyboardNoteOn(int midiNote, int velocity = 100);
     void keyboardNoteOff(int midiNote);
 
+    // Spectrum analyzer ring buffer (#10). The audio thread writes the last
+    // N output samples; the UI reads a snapshot for FFT display. Small
+    // enough that a torn read is just a visual glitch, never a crash.
+    static constexpr int kSpectrumBufSize = 2048;
+    float spectrumBufL[kSpectrumBufSize] = {};
+    float spectrumBufR[kSpectrumBufSize] = {};
+    int spectrumWritePos = 0;
+    // UI calls this to grab a snapshot for FFT analysis.
+    void getSpectrumSnapshot(std::vector<float>& out, int channel = 0) const {
+        out.resize(kSpectrumBufSize);
+        const float* src = (channel == 0) ? spectrumBufL : spectrumBufR;
+        int wp = spectrumWritePos;
+        for (int i = 0; i < kSpectrumBufSize; ++i)
+            out[i] = src[(wp + i) % kSpectrumBufSize];
+    }
+
     // Output capture: record the final mix to memory for "Save as Audio Track"
     // or export. Only the audio thread writes to the buffers (while capturing);
     // the UI thread reads them only after capture is stopped. No lock needed.

@@ -109,6 +109,7 @@ target_sources(SEANCE PRIVATE
     src/wavelet.h
     src/spectrum_visualizer.h
     src/wavelet_painter.h
+    src/sfizz_processor.h
     src/cache_processor.h
     src/audio_crossfader.h
     src/trigger_node.cpp
@@ -222,6 +223,19 @@ else()
         target_compile_definitions(SEANCE PRIVATE HAS_LIBOPENMPT=1)
         message(STATUS "libopenmpt: system library found")
     endif()
+endif()
+
+# sfizz (for full SFZ compliance, task #37)
+# If sfizz is cloned into third_party/sfizz, build and link it.
+# Otherwise, the SfizzProcessor compiles as a stub that logs "sfizz not available".
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/sfizz/CMakeLists.txt")
+    message(STATUS "  sfizz: FOUND")
+    add_subdirectory(third_party/sfizz EXCLUDE_FROM_ALL)
+    target_link_libraries(SEANCE PRIVATE sfizz::sfizz)
+    target_compile_definitions(SEANCE PRIVATE HAS_SFIZZ=1)
+else()
+    message(STATUS "  sfizz: NOT FOUND (full SFZ compliance disabled)")
+    message(STATUS "         Clone: git clone https://github.com/sfztools/sfizz third_party/sfizz")
 endif()
 
 # libogg + libopus (for Opus export)

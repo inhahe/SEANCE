@@ -3,6 +3,7 @@
 #include "builtin_synth.h"
 #include "terrain_synth.h"
 #include "multi_sampler.h"
+#include "sfizz_processor.h"
 #include "signal_shape_node.h"
 #include "cache_processor.h"
 #include "pan_processor.h"
@@ -477,6 +478,9 @@ void GraphProcessor::rebuildGraph(NodeGraph& graph, Transport& transport) {
         } else if (node.type == NodeType::Instrument &&
                    node.script.rfind(MultiSamplerDoc::kPrefix, 0) == 0) {
             proc = std::make_unique<MultiSamplerProcessor>(node);
+        } else if (node.type == NodeType::Instrument &&
+                   node.script.rfind("__sfizz__:", 0) == 0) {
+            proc = std::make_unique<SfizzProcessor>(node);
         } else if (node.type == NodeType::Instrument &&
                    (node.script.rfind("__sf2__:", 0) == 0 ||
                     node.script.rfind("__sfz__:", 0) == 0)) {

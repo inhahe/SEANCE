@@ -126,6 +126,23 @@ if exist "%BASE%third_party\ogg\include\ogg\ogg.h" (
 echo.
 
 :: ============================================
+:: sfizz (full SFZ compliance)
+:: ============================================
+if exist "%BASE%third_party\sfizz\CMakeLists.txt" (
+    echo [OK] sfizz: Already downloaded
+) else (
+    echo [..] Downloading sfizz...
+    git clone --depth 1 --recurse-submodules https://github.com/sfztools/sfizz.git "%BASE%third_party\sfizz" 2>nul
+    if exist "%BASE%third_party\sfizz\CMakeLists.txt" (
+        echo [OK] sfizz: Downloaded
+    ) else (
+        echo [SKIP] sfizz: Download failed. Full SFZ compliance will be disabled.
+        echo        Clone manually: git clone --recurse-submodules https://github.com/sfztools/sfizz third_party/sfizz
+    )
+)
+echo.
+
+:: ============================================
 :: Summary
 :: ============================================
 echo ============================================

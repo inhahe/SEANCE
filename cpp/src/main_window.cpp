@@ -68,6 +68,27 @@ static int defaultAutosaveIntervalForThisMachine() {
     return machineHasBattery() ? 20 : 5;
 }
 
+// Returns true if a MIDI device name looks like a virtual or control-surface
+// port that shouldn't be auto-created as a musical MidiInput node. These
+// are drivers that install system-wide virtual ports for DAW control
+// protocols, not for playing notes. Checked case-insensitively.
+static bool isVirtualOrControlPort(const juce::String& name) {
+    auto lower = name.toLowerCase();
+    // SSL 360° control surface driver (UF8, UF1, UC1)
+    if (lower.contains("ssl v-midi") || lower.contains("ssl vmidi")) return true;
+    // Mackie/HUI control surface protocols
+    if (lower.contains("mackie control") || lower.contains("hui")) return true;
+    // Common virtual MIDI loopback drivers (user creates these intentionally
+    // and can add them via the wizard — don't auto-create)
+    if (lower.contains("loopmidi") || lower.contains("loop midi")) return true;
+    // Windows built-in "Microsoft GS Wavetable Synth" (output only but
+    // sometimes appears in input lists on some drivers)
+    if (lower.contains("microsoft gs")) return true;
+    // Avid/Pro Tools control surfaces
+    if (lower.contains("eucon") || lower.contains("avid control")) return true;
+    return false;
+}
+
 // ==============================================================================
 // MainContentComponent
 // ==============================================================================
@@ -376,6 +397,7 @@ MainContentComponent::MainContentComponent() {
             if (n.type == NodeType::MidiTimeline) { defaultTrack = &n; break; }
         float yPos = 200;
         for (auto& dev : devices) {
+            if (isVirtualOrControlPort(dev.name)) continue;
             bool exists = false;
             for (auto& n : graph.nodes)
                 if (n.type == NodeType::MidiInput && n.midiInputSourceId == dev.identifier.toStdString())
@@ -2263,8 +2285,10 @@ void MainContentComponent::newProject() {
 
         float yPos = 200; // stagger below the Computer Keyboard node
         for (auto& dev : devices) {
-            // Skip if this identifier is already in the graph (shouldn't
-            // happen on a fresh project, but defensive).
+            // Skip virtual / control-surface ports (SSL V-MIDI, Mackie, etc.)
+            if (isVirtualOrControlPort(dev.name)) continue;
+
+            // Skip if this identifier is already in the graph.
             bool exists = false;
             for (auto& n : graph.nodes)
                 if (n.type == NodeType::MidiInput && n.midiInputSourceId == dev.identifier.toStdString())

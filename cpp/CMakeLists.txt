@@ -110,6 +110,8 @@ target_sources(SEANCE PRIVATE
     src/spectrum_visualizer.h
     src/wavelet_painter.h
     src/sfizz_processor.h
+    src/plugin_sandbox.h
+    src/plugin_sandbox.cpp
     src/cache_processor.h
     src/audio_crossfader.h
     src/trigger_node.cpp

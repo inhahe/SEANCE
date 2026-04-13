@@ -42,6 +42,16 @@ public:
     // waveforms. `iterations` = number of self-similar recursion levels.
     void fillFractal(int size, int iterations = 5, float decay = 0.7f);
 
+    // Wavelet-basis storage (#49): convert terrain data to/from DWT
+    // coefficient representation. When stored as coefficients,
+    // interpolation between frames happens in the wavelet domain
+    // (smoother than time-domain averaging), and reconstruction is
+    // a single IDWT per block. Call toWaveletBasis() after filling
+    // the terrain to convert; fromWaveletBasis() to reconstruct.
+    void toWaveletBasis(int levels = 4);
+    void fromWaveletBasis(int levels = 4);
+    bool isWaveletBasis = false;
+
     // Frequency-domain fill (1D only). Evaluates magExpr(f) and phaseExpr(f)
     // over FFT bins, inverse-FFTs to a real waveform, and fills this terrain
     // (which should be 1D of size == fftSize). Normalized to peak 1.0.

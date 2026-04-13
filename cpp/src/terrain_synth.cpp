@@ -332,6 +332,24 @@ void Terrain::fillFractal(int size, int iterations, float decay) {
     fprintf(stderr, "Terrain fractal fill: %d samples, %d iterations\n", size, iterations);
 }
 
+void Terrain::toWaveletBasis(int levels) {
+    if (isWaveletBasis) return;
+    if (data.empty()) return;
+    int n = (int)data.size();
+    if ((n & (n - 1)) != 0) return; // must be power of 2
+    auto filt = getWaveletFilter("db4");
+    dwt(data, levels, filt);
+    isWaveletBasis = true;
+}
+
+void Terrain::fromWaveletBasis(int levels) {
+    if (!isWaveletBasis) return;
+    if (data.empty()) return;
+    auto filt = getWaveletFilter("db4");
+    idwt(data, levels, filt);
+    isWaveletBasis = false;
+}
+
 // ==============================================================================
 // Traversal — maps time to N-dimensional coordinate
 // ==============================================================================
@@ -969,13 +987,43 @@ void TerrainSynthProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mi
         float invT = 1.0f / totalW;
         auto& tdata = terrain.getData();
         int ts = (int)tdata.size();
-        std::fill(tdata.begin(), tdata.end(), 0.0f);
-        for (int fi = 0; fi < nFrames; ++fi) {
-            if (weights[fi] <= 0.0f) continue;
-            float w = weights[fi] * invT;
-            const auto& src = wtScatterFrameSamples[fi];
-            int n = std::min((int)src.size(), ts);
-            for (int i = 0; i < n; ++i) tdata[i] += w * src[i];
+
+        // Wavelet-domain morphing (#52): instead of blending raw samples
+        // (which can cause spectral smearing), decompose each contributing
+        // frame via DWT, blend the wavelet coefficients with the same
+        // Wendland weights, then reconstruct a single blended waveform.
+        // Falls back to time-domain blend if the table size isn't a power
+        // of 2 or if wavelet decomposition fails.
+        bool useWaveletMorph = (ts >= 8) && ((ts & (ts - 1)) == 0);
+        if (useWaveletMorph) {
+            auto filt = getWaveletFilter("db2");
+            int maxLevels = 4;
+
+            // Accumulate weighted wavelet coefficients.
+            std::vector<float> blended(ts, 0.0f);
+            for (int fi = 0; fi < nFrames; ++fi) {
+                if (weights[fi] <= 0.0f) continue;
+                float w = weights[fi] * invT;
+                const auto& src = wtScatterFrameSamples[fi];
+                std::vector<float> coeffs(ts, 0.0f);
+                int n = std::min((int)src.size(), ts);
+                for (int i = 0; i < n; ++i) coeffs[i] = src[i];
+                dwt(coeffs, maxLevels, filt);
+                for (int i = 0; i < ts; ++i) blended[i] += w * coeffs[i];
+            }
+            // Inverse DWT to get the blended waveform.
+            idwt(blended, maxLevels, filt);
+            for (int i = 0; i < ts; ++i) tdata[i] = blended[i];
+        } else {
+            // Time-domain fallback (original behavior).
+            std::fill(tdata.begin(), tdata.end(), 0.0f);
+            for (int fi = 0; fi < nFrames; ++fi) {
+                if (weights[fi] <= 0.0f) continue;
+                float w = weights[fi] * invT;
+                const auto& src = wtScatterFrameSamples[fi];
+                int n = std::min((int)src.size(), ts);
+                for (int i = 0; i < n; ++i) tdata[i] += w * src[i];
+            }
         }
     }
 

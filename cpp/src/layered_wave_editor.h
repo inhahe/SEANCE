@@ -173,6 +173,9 @@ private:
     juce::TextButton applyBtn    { "Apply" };
     juce::TextButton closeBtn    { "Close" };
     juce::TextButton helpBtn     { "?" };
+    // A/B Compare (#9): switch between render modes to hear the difference
+    juce::TextButton compareABtn { "A: Wavetable" };
+    juce::TextButton compareBBtn { "B: Additive" };
     juce::Viewport   layersViewport;
     juce::Component  layersContainer;
     std::vector<std::unique_ptr<LayerRow>> rows;

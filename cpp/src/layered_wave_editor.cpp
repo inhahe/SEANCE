@@ -1517,6 +1517,29 @@ LayeredWaveEditorComponent::LayeredWaveEditorComponent(NodeGraph& g, int nid, st
     helpBtn.setTooltip("Open the wavetable / layered waveform docs");
     helpBtn.onClick = []() { openHelpDocFile("wavetables.html"); };
 
+    // A/B Compare (#9): toggle between render modes for the same waveform.
+    addAndMakeVisible(compareABtn);
+    addAndMakeVisible(compareBBtn);
+    compareABtn.setTooltip("Preview this waveform as a wavetable (Mode A — IFFT to single cycle)");
+    compareBBtn.setTooltip("Preview this waveform through the additive synth (Mode B — per-partial sine bank)");
+    compareABtn.onClick = [this]() {
+        // Mode A = SamplePerPoint (wavetable playback).
+        if (auto* nd = graph.findNode(nodeId))
+            for (auto& p : nd->params)
+                if (p.name == "Synth Mode") { p.value = 0.0f; break; }
+        compareABtn.setColour(juce::TextButton::buttonColourId, juce::Colour(60, 100, 60));
+        compareBBtn.setColour(juce::TextButton::buttonColourId, juce::Colour(55, 55, 60));
+    };
+    compareBBtn.onClick = [this]() {
+        // Mode B = WaveformPerPoint (each terrain value modulates the oscillator timbre).
+        if (auto* nd = graph.findNode(nodeId))
+            for (auto& p : nd->params)
+                if (p.name == "Synth Mode") { p.value = 1.0f; break; }
+        compareBBtn.setColour(juce::TextButton::buttonColourId, juce::Colour(60, 60, 100));
+        compareABtn.setColour(juce::TextButton::buttonColourId, juce::Colour(55, 55, 60));
+    };
+    compareABtn.setColour(juce::TextButton::buttonColourId, juce::Colour(60, 100, 60));
+
     addAndMakeVisible(applyBtn);
     applyBtn.setButtonText("Apply");
     applyBtn.setTooltip("Save the current waveform edits to the synth without closing this editor");
@@ -1962,6 +1985,10 @@ void LayeredWaveEditorComponent::resized() {
     closeBtn  .setBounds(top.removeFromRight(60));
     top.removeFromRight(4);
     applyBtn  .setBounds(top.removeFromRight(60));
+    top.removeFromRight(4);
+    compareBBtn.setBounds(top.removeFromRight(80));
+    top.removeFromRight(2);
+    compareABtn.setBounds(top.removeFromRight(90));
     top.removeFromRight(4);
     helpBtn   .setBounds(top.removeFromRight(26));
     top.removeFromRight(6);

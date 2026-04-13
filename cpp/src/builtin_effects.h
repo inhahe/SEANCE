@@ -3318,4 +3318,125 @@ private:
     std::mt19937 rng{1234};
 };
 
+// ==============================================================================
+// SPECTRAL MODELING SYNTHESIS (SMS) — deterministic/stochastic split
+//
+// Decomposes audio into two components:
+//   - Deterministic (harmonic): detected spectral peaks, resynthesized
+//     as sine oscillators. The "clean" tonal part.
+//   - Stochastic (noise): the residual after subtracting the harmonic
+//     part. Represents breath, bow noise, consonants, etc.
+//
+// Each component gets its own gain control so you can independently
+// boost or cut the tonal vs noisy parts of any sound.
+//
+// Uses short-time FFT: window the input, FFT, find peaks above a
+// threshold (= deterministic), inverse-FFT only the peaks to get the
+// harmonic part, subtract from the original to get the residual.
+//
+// Params: Threshold (peak detection, 0..1), Harmonic Gain, Noise Gain,
+//         FFT Size (as a power-of-2 exponent), Mix
+// ==============================================================================
+class SMSProcessor : public juce::AudioProcessor {
+public:
+    SMSProcessor(Node& n) : node(n) {}
+    const juce::String getName() const override { return "SMS"; }
+    void prepareToPlay(double sr, int) override { sampleRate = sr; }
+    void releaseResources() override {}
+
+    void processBlock(juce::AudioBuffer<float>& buf, juce::MidiBuffer&) override {
+        applySignalModulations(node, buf);
+        const int n = buf.getNumSamples();
+        const int ch = std::min(2, buf.getNumChannels());
+        if (n == 0 || ch == 0) return;
+
+        float threshold   = juce::jlimit(0.0f, 1.0f, paramByName(node, "Threshold", 0.1f));
+        float harmonicGain = paramByName(node, "Harmonic Gain", 1.0f);
+        float noiseGain    = paramByName(node, "Noise Gain", 1.0f);
+        int   fftExp       = juce::jlimit(8, 12, (int)paramByName(node, "FFT Size", 10.0f));
+        float mix          = juce::jlimit(0.0f, 1.0f, paramByName(node, "Mix", 1.0f));
+
+        int fftSize = 1 << fftExp;
+        if (fftSize > n) fftSize = n; // can't exceed block size
+        // Round down to power of 2 that fits.
+        while (fftSize > n) fftSize /= 2;
+        if (fftSize < 4) return;
+
+        int halfBins = fftSize / 2 + 1;
+        FFT fft(fftSize);
+
+        for (int c = 0; c < ch; ++c) {
+            float* data = buf.getWritePointer(c);
+            std::vector<float> dry(data, data + n);
+
+            // Process in overlapping frames (hop = fftSize/2).
+            std::vector<float> output(n, 0.0f);
+            std::vector<float> window(fftSize);
+            for (int i = 0; i < fftSize; ++i)
+                window[i] = 0.5f * (1.0f - std::cos(6.28318f * i / fftSize)); // Hann
+
+            int hop = fftSize / 2;
+            for (int frame = 0; frame + fftSize <= n; frame += hop) {
+                // Window the input.
+                std::vector<float> windowed(fftSize);
+                for (int i = 0; i < fftSize; ++i)
+                    windowed[i] = data[frame + i] * window[i];
+
+                // Forward FFT.
+                std::vector<std::complex<float>> spectrum;
+                fft.forwardReal(windowed, spectrum);
+
+                // Find magnitude peaks.
+                float maxMag = 0;
+                std::vector<float> mags(halfBins);
+                for (int k = 0; k < halfBins; ++k) {
+                    mags[k] = std::abs(spectrum[k]);
+                    maxMag = std::max(maxMag, mags[k]);
+                }
+                float thresh = threshold * maxMag;
+
+                // Separate: peaks above threshold = deterministic.
+                std::vector<std::complex<float>> harmSpectrum(halfBins, {0,0});
+                for (int k = 0; k < halfBins; ++k) {
+                    if (mags[k] >= thresh)
+                        harmSpectrum[k] = spectrum[k];
+                }
+
+                // IFFT harmonic part.
+                std::vector<float> harmonic;
+                fft.inverseReal(harmSpectrum, harmonic);
+
+                // Residual = original windowed - harmonic.
+                // Overlap-add both parts with gains.
+                for (int i = 0; i < fftSize && (frame + i) < n; ++i) {
+                    float h = harmonic[i] * harmonicGain;
+                    float r = (windowed[i] - harmonic[i]) * noiseGain;
+                    output[frame + i] += (h + r) * window[i]; // re-window for OLA
+                }
+            }
+
+            // Normalize OLA (Hann + 50% overlap = constant 1.0 after normalization).
+            for (int i = 0; i < n; ++i)
+                data[i] = dry[i] * (1.0f - mix) + output[i] * mix;
+        }
+    }
+
+    double getTailLengthSeconds() const override { return 0; }
+    bool acceptsMidi() const override { return true; }
+    bool producesMidi() const override { return true; }
+    bool isBusesLayoutSupported(const BusesLayout&) const override { return true; }
+    juce::AudioProcessorEditor* createEditor() override { return nullptr; }
+    bool hasEditor() const override { return false; }
+    int getNumPrograms() override { return 1; }
+    int getCurrentProgram() override { return 0; }
+    void setCurrentProgram(int) override {}
+    const juce::String getProgramName(int) override { return {}; }
+    void changeProgramName(int, const juce::String&) override {}
+    void getStateInformation(juce::MemoryBlock&) override {}
+    void setStateInformation(const void*, int) override {}
+private:
+    Node& node;
+    double sampleRate = 44100;
+};
+
 } // namespace SoundShop

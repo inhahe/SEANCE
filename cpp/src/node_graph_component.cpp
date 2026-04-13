@@ -1107,6 +1107,7 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
     fxMenu.addItem(236, "Wavelet Pitch Tracker");
     fxMenu.addItem(237, "Wavelet Vocoder");
     fxMenu.addItem(238, "Formant Pitch Shift");
+    fxMenu.addItem(239, "SMS (harmonic/noise split)");
     fxMenu.addSeparator();
     fxMenu.addItem(224, "M/S Encode (stereo → mid+side)");
     fxMenu.addItem(225, "M/S Decode (mid+side → stereo)");
@@ -1765,6 +1766,13 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
                     {"B4 Freq", 8000.0f, 20.0f, 20000.0f},
                     {"B4 Gain", 0.0f, -24.0f, 24.0f},
                     {"B4 Q",    0.707f, 0.1f, 10.0f},
+                }); break;
+                case 239: makeEffect("SMS", "__sms__", {
+                    {"Threshold",     0.1f, 0.0f,  1.0f},
+                    {"Harmonic Gain", 1.0f, 0.0f,  3.0f},
+                    {"Noise Gain",    1.0f, 0.0f,  3.0f},
+                    {"FFT Size",     10.0f, 8.0f, 12.0f}, // 2^10=1024
+                    {"Mix",           1.0f, 0.0f,  1.0f},
                 }); break;
                 case 238: makeEffect("Formant Pitch", "__formantpitch__", {
                     {"Semitones",    0.0f, -24.0f, 24.0f},

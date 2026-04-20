@@ -1,0 +1,6 @@
+numpy
+numba
+pyvista
+pyvistaqt
+matplotlib
+PyQt6

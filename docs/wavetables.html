@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Wavetables &amp; Layered Waveforms — SEANCE</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="wrap">
+<header>
+<h1>Wavetables &amp; Layered Waveforms</h1>
+<nav>
+  <a href="index.html">Home</a>
+  <a href="graph-basics.html">Graph Basics</a>
+</nav>
+</header>
+
+<p>The Layered Waveform editor is where you build sounds for the Waveform synth. Instead of picking a single wave shape (sine, saw, square) like a basic oscillator, you stack multiple shapes together as <em>layers</em>, each tuned and balanced however you like, and the editor sums them into a single playable cycle. Stack several of those cycles into a <em>wavetable</em> and you get a sound that morphs as the synth plays.</p>
+
+<p>Open it by double-clicking any Waveform synth node, or by adding a new one (right-click empty graph → Instruments → Waveform).</p>
+
+<h2>Layers</h2>
+
+<p>A layer is one shape with three knobs:</p>
+
+<ul>
+  <li><strong>Shape</strong> — Sine, Saw, Square, Triangle, Noise, or Drawn (freehand). Pick from the row of buttons at the top of each layer row.</li>
+  <li><strong>Harmonic</strong> — what multiple of the root pitch this layer cycles at. 1 means the same as the played note (the fundamental); 2 is one octave up; 3 is one octave + a fifth; higher numbers add brighter overtones. This is how you sculpt timbre — sine layers stacked at integer harmonics give organ-like additive sounds; non-integer harmonics give bell-like inharmonic textures.</li>
+  <li><strong>Phase</strong> — where in its cycle the layer starts (0 to 1). Doesn't matter for a single sine but affects how layers add up — two sines at the same pitch but opposite phase cancel completely; phase shifts between layers reshape the combined waveform.</li>
+  <li><strong>Amplitude</strong> — how loud this layer is in the sum (0 to 1). Use to balance layers against each other.</li>
+</ul>
+
+<p>Click <strong>+ Add Layer</strong> to stack more on top. Each new layer defaults to the next harmonic (1, 2, 3, …). Click the <strong>X</strong> on a layer to remove it. The waveform preview at the top updates live as you tweak.</p>
+
+<h3>The Drawn shape</h3>
+
+<p>Pick <em>Drawn</em> on a layer to switch its shape from a math curve to a freehand canvas — drag in the layer's preview to draw the shape directly with the mouse. Useful when you want a specific transient or asymmetry that no math primitive gives you.</p>
+
+<h2>Multi-frame wavetables</h2>
+
+<p>One layered cycle gives you a single timbre. Click <strong>+ Add Frame</strong> to stack several distinct cycles into a wavetable. The synth gets a <em>Position</em> knob that crossfades between frames as you sweep it — automate Position over the course of a note and the timbre morphs in real time. Modulate it from an LFO for cyclic timbre wobble, or from velocity for "play harder = brighter."</p>
+
+<p>Each frame has its own layer stack, edited independently. The frame tabs along the top let you switch between them; adding a new frame duplicates whichever frame was active so you have a starting point instead of a blank canvas.</p>
+
+<h2>N-dimensional grids</h2>
+
+<p>One Position knob gives you a 1D morph through frames. Click <strong>+ Dim</strong> to add a second axis, and the synth gains a second Position knob — now your frames form a 2D grid you can sweep through with two parameters at once. Add more dimensions for 3D, 4D, even higher. Each axis is independent, so you can wire them up to different modulation sources for orthogonal control over different aspects of the sound.</p>
+
+<p>Most users won't go past 2D, but the option is there for ambitious sound design where you want, say, brightness on one axis and detune-spread on another.</p>
+
+<h2>Scatter mode</h2>
+
+<p>The default Grid mode lays your frames out on a regular N-dimensional grid. That's the obvious way, and it's what you want when your morph axes have a clear evenly-spaced meaning. But sometimes you have a few frames that don't fit a grid neatly — three frames at the corners of a triangle, or a cluster of frames in 3D space that morph into one another based on proximity rather than position-on-an-axis.</p>
+
+<p>Click <strong>Mode: Grid</strong> in the toolbar to switch to <strong>Mode: Scatter</strong>. Now each frame has a free position vector (X, Y, optionally Z, and beyond), and you can drag the frames around in the viewport. The synth interpolates between frames based on the current Position values using a Wendland radial basis function — frames near the current position blend in, frames far away contribute less. The result is a smoother and more organic morph than grid interpolation, especially when frames don't sit at grid intersections.</p>
+
+<p>Use the per-frame coordinate sliders below the viewport to numerically place frames if dragging doesn't get you the precision you want.</p>
+
+<h3>The 3D anaglyph viewport</h3>
+
+<p>For 3D scatter spaces (or higher, with the projection combo controlling which axes are shown), there's an optional anaglyph 3D rendering mode. Toggle <strong>3D</strong> in the toolbar, put on red/cyan glasses, and the frame positions appear in stereoscopic depth. This is mostly useful as a visualization aid when you're trying to keep track of where many scatter frames sit relative to each other in a 3D-or-higher space.</p>
+
+<p>The IPD, viewing distance, and depth sliders let you tune the stereo for your eyes and screen — average IPD is around 63 mm, typical viewing distance ~60 cm. Adjust depth for more or less dramatic 3D protrusion.</p>
+
+<h2>Workflow tips</h2>
+
+<ul>
+  <li><strong>Start with one layer, build up.</strong> Hit Add Layer only when the current sound is missing something specific. Stacking too many layers makes it hard to hear what each one contributes.</li>
+  <li><strong>Use harmonic ratios to sculpt timbre.</strong> Pure integer harmonics (1, 2, 3, 4…) give pitched, organ-like sounds. Non-integer ratios (1.5, 2.7, …) sound bell-like or metallic. Lots of layers at integer harmonics with carefully chosen amplitudes can imitate real instruments via additive synthesis.</li>
+  <li><strong>Frames don't have to be wildly different.</strong> Subtle frame-to-frame variation gives you a smooth, alive timbre that doesn't sound like crossfading between two different instruments. Big jumps between frames give you dramatic morphs better suited for sweeping pads.</li>
+  <li><strong>Wire Position to a Signal Shape (LFO/envelope).</strong> A slow LFO on Position turns any wavetable into an evolving pad. An envelope on Position gives you per-note timbre evolution — bright at the start, mellower at the end.</li>
+</ul>
+
+<footer>
+<a href="index.html">← Back to index</a>
+</footer>
+</div>
+</body>
+</html>

@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Terrain Synth — SEANCE</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="wrap">
+<header>
+<h1>Terrain Synth</h1>
+<nav>
+  <a href="index.html">Home</a>
+  <a href="graph-basics.html">Graph Basics</a>
+  <a href="wavetables.html">Wavetables</a>
+</nav>
+</header>
+
+<p>Terrain Synth is the underlying engine that all of SEANCE's built-in synths use. It treats your sound source as an N-dimensional <em>terrain</em> — an array of sample values arranged in 1D, 2D, 3D, or higher — and a <em>traversal</em> that walks through that terrain over time, reading out values to produce audio. Different combinations of terrain and traversal give you wildly different synth behaviors with the same underlying machinery.</p>
+
+<p>You don't usually create a Terrain Synth node directly. Instead, the Waveform synth, sampler, and other built-in instruments are all configurations of Terrain Synth under the hood. This page explains the model so you understand what those instruments are doing internally and what knobs are available to you.</p>
+
+<h2>The terrain</h2>
+
+<p>A terrain is a multi-dimensional array of sample values. The synth can build one from any of these sources:</p>
+
+<ul>
+  <li><strong>1D waveform</strong> — a single cycle of audio, like the output of the Layered Waveform editor. The terrain is a 1D array of sample values, one cycle long.</li>
+  <li><strong>1D audio file</strong> — a recorded sample of any length. The terrain is the entire audio file as a 1D array.</li>
+  <li><strong>2D image</strong> — a grayscale image where pixel brightness becomes sample amplitude. Wide images give you a long sound; tall images give you more vertical "headroom" for traversals to wander through.</li>
+  <li><strong>N-dimensional wavetable</strong> — multiple frames stacked into a grid (Grid mode) or scattered freely in N-D space (Scatter mode), produced by the Layered Waveform editor's wavetable feature.</li>
+  <li><strong>Math expression</strong> — generated procedurally from a function like <code>sin(x*y)</code> or <code>cos(x)*exp(-y)</code>, evaluated at every grid coordinate.</li>
+</ul>
+
+<p>Whatever source you pick, the result is the same kind of N-dimensional sample array. The traversal doesn't care where it came from.</p>
+
+<h2>Traversal modes</h2>
+
+<p>The traversal is what reads samples out of the terrain to produce audio. It maps time → coordinate, so as the synth advances through samples, the coordinate moves around the terrain and the value at that coordinate becomes the next audio sample. Several traversal modes ship built-in:</p>
+
+<ul>
+  <li><strong>Linear</strong> — sweeps a single axis at constant speed. For a 1D waveform terrain this is the standard wavetable behavior: cycle through one full waveform per played note pitch. For a 1D audio file it's a sample player. For 2D, it sweeps in a straight line at an angle.</li>
+  <li><strong>Orbit</strong> — circles around a center point in 2D (or higher). The radius and speed are knobs. Produces evolving pad-like sounds where the traversal periodically revisits each region of the terrain.</li>
+  <li><strong>Lissajous</strong> — two-dimensional patterns formed by independent X and Y oscillators with different rates. Standard Lissajous figures (figure-8, lemniscate, etc.) drawn through the terrain. Produces complex periodic timbres.</li>
+  <li><strong>Path</strong> — user-defined polyline through 2D-or-higher space. Click points in the terrain visualizer to define the path; the traversal interpolates between them at a chosen speed. Two playback modes: Loop (jumps back to the start at the end) or Bounce (reverses direction at each end, ping-ponging).</li>
+</ul>
+
+<p>The terrain visualizer (the colored grid in the synth editor) shows you the 2D slice of the terrain you're currently working with, and overlays the traversal path on top. Drawing a path: pick the draw mode in the dropdown (Click Points or Freehand) and click/drag in the visualizer.</p>
+
+<h2>How playing a note interacts with all this</h2>
+
+<p>When MIDI sends a note-on, the synth allocates a voice and starts a traversal. The note's pitch determines how fast the traversal advances through the terrain — higher notes traverse faster (so you hear the sound "speeded up", which for a 1D waveform terrain means you cycle through it more times per second, which is the same as playing the same waveform at higher pitch). Velocity affects amplitude through the Vel Sens parameter (0 = ignore velocity, 1 = full velocity sensitivity).</p>
+
+<p>Multiple voices traverse independently — playing a chord runs three traversals at three different speeds simultaneously, summing their outputs.</p>
+
+<h2>Position knobs (wavetable terrains)</h2>
+
+<p>If the terrain is a wavetable (multiple frames stacked), each axis of the wavetable becomes a <strong>Position</strong> parameter on the synth. Sweeping Position morphs through the frames, so the timbre changes as you move it. With multi-axis wavetables, each Position axis is independent — one might control brightness while another controls "bell-like vs. organ-like" if you set up your frames that way.</p>
+
+<p>Position parameters can be automated, modulated by signal sources (LFOs, envelopes, XY pads), or driven by velocity-aware Trigger signals. See the <a href="wavetables.html">Wavetables</a> page for how to build wavetable terrains.</p>
+
+<h2>MIDI controller behavior</h2>
+
+<p>Terrain Synth voices respond to standard MIDI controller messages:</p>
+
+<ul>
+  <li><strong>Pitch bend</strong> — ±2 semitones by default, applies smoothly to all sustained voices in real time</li>
+  <li><strong>Mod wheel (CC#1)</strong> — drives a default 6 Hz vibrato whose depth scales with the wheel position. Disable per-synth by setting the <em>Vibrato</em> param to 0, freeing CC#1 to be MIDI-Learned to other parameters.</li>
+  <li><strong>Sustain pedal (CC#64)</strong> — holds notes through their release stage until the pedal comes up</li>
+  <li><strong>Velocity</strong> — scales per-note volume; the <em>Vel Sens</em> param controls how much</li>
+</ul>
+
+<h2>Audio-rate signal modulation</h2>
+
+<p>For wavetable terrains, you can wire audio-rate Signal cables into Position pins on the synth instead of using the slider/automation route. This lets you modulate Position at audio rate — useful for FM-style timbral effects where another oscillator's waveform drives the wavetable position sample-by-sample. Param-rate (block-rate) modulation works too via the same pin; the synth reads whatever you give it. See <a href="pin-kinds.html">Pin Kinds</a> for the difference between Param and Signal.</p>
+
+<footer>
+<a href="index.html">← Back to index</a>
+</footer>
+</div>
+</body>
+</html>

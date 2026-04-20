@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Graph Basics — SEANCE</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="wrap">
+<header>
+<h1>Graph Basics</h1>
+<nav>
+  <a href="index.html">Home</a>
+  <a href="pin-kinds.html">Signals</a>
+  <a href="midi-input.html">MIDI Input</a>
+</nav>
+</header>
+
+<p>SEANCE's main view is a <strong>node graph</strong>. Each box is a node — a thing that does something. Cables between nodes carry data from one to another. The direction of data flow is always from a node's <strong>output pin</strong> (right side) to another node's <strong>input pin</strong> (left side).</p>
+
+<h2>Nodes</h2>
+
+<p>Nodes come in a few different categories, color-coded:</p>
+
+<ul>
+  <li><strong>Input</strong> — a source of data. Computer Keyboard, MIDI devices, audio inputs, XY pads. Has only output pins.</li>
+  <li><strong>Timeline</strong> — stores notes or audio clips over time. MIDI Timeline, Audio Timeline. Playback is driven by the transport.</li>
+  <li><strong>Instrument</strong> — turns MIDI into audio. Built-in synths, sampled instruments (SF2/SFZ), drum synths.</li>
+  <li><strong>Effect</strong> — transforms audio or MIDI as it passes through. Reverb, filter, compressor, trigger, MIDI modulator, etc.</li>
+  <li><strong>Signal shape</strong> — generates control signals (LFOs, envelopes, XY pads). These modulate params on other nodes.</li>
+  <li><strong>Output</strong> — where audio leaves SEANCE (speakers, Master Out).</li>
+</ul>
+
+<h2>Pins and cables</h2>
+
+<p>Each node has pins on its left (inputs) and right (outputs). Pins are color-coded by the kind of data they carry, and cables match the pin they attach to:</p>
+
+<ul>
+  <li><span class="pink-tag t-audio">Audio</span> <strong>Cornflower blue</strong> — stereo audio signal</li>
+  <li><span class="pink-tag t-midi">MIDI</span> <strong>Lime green</strong> — MIDI events (notes, CC, pitch bend, etc.)</li>
+  <li><span class="pink-tag t-param">Param</span> <strong>Orange</strong> — block-rate control signal (for modulating knobs)</li>
+  <li><span class="pink-tag t-signal">Signal</span> <strong>Amber</strong> — audio-rate control signal (sample-accurate modulation)</li>
+</ul>
+
+<p>You can only connect pins of matching kinds — an audio output won't plug into a MIDI input. Param and Signal are both for modulation, the difference being how fine-grained the modulation is. Most uses just need Param; Signal is for when you want sample-rate precision (e.g., audio-rate FM or audio-rate filter modulation).</p>
+
+<p>See <a href="pin-kinds.html">Signals &amp; Pin Kinds</a> for a deeper explanation of when to use each kind.</p>
+
+<h2>Making a cable</h2>
+
+<p>Click and drag from an output pin to an input pin. While you're dragging, valid drop targets (pins of the matching kind on other nodes) light up bright yellow. Release the mouse button over a yellow pin to make the connection. Release over empty space or an invalid pin to cancel.</p>
+
+<h2>Moving around</h2>
+
+<ul>
+  <li><strong>Pan</strong>: middle-click drag, or hold space and drag</li>
+  <li><strong>Zoom</strong>: mouse wheel (zooms toward the cursor)</li>
+  <li><strong>Fit all</strong>: the "Fit" button in the toolbar, or the Fit All hotkey</li>
+  <li><strong>Select a node</strong>: click it</li>
+  <li><strong>Box-select</strong>: click empty space and drag</li>
+  <li><strong>Delete selected</strong>: <code>Delete</code> key</li>
+</ul>
+
+<h2>Adding nodes</h2>
+
+<p>Right-click an empty area of the graph for the node creation menu. The menu is organized by category (Instruments, Effects, Signal Shape, etc.). Some nodes open an editor immediately on creation (like the Waveform synth).</p>
+
+<h2>Node params</h2>
+
+<p>Most nodes have knobs and sliders that appear directly on the node as horizontal bars with labels. Drag them to change values, double-click to reset to default. If a param has an automation lane recorded, or is driven by an incoming Param/Signal cable, it appears locked and greyed out — the cable or automation is in control until you remove it.</p>
+
+<footer>
+<a href="index.html">← Back to index</a>
+</footer>
+</div>
+</body>
+</html>

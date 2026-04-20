@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Getting Started — SEANCE</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="wrap">
+<header>
+<h1>Getting Started</h1>
+<nav>
+  <a href="index.html">Home</a>
+  <a href="graph-basics.html">Graph Basics</a>
+  <a href="pin-kinds.html">Signals</a>
+  <a href="midi-input.html">MIDI Input</a>
+</nav>
+</header>
+
+<p>This is the fastest way to make a sound in SEANCE.</p>
+
+<h2>1. Your first project</h2>
+<p>When SEANCE opens, you'll see a <strong>node graph</strong> with a few nodes already placed: a <em>Computer Keyboard</em> input, a <em>MIDI Track</em>, and a <em>Master Out</em>. On a new project, a wizard may also pop up asking which hardware MIDI devices to add — you can skip it for now.</p>
+
+<p>Everything in SEANCE is a node. Cables between nodes carry data. What's already wired for you: the Computer Keyboard's MIDI output connects to the MIDI Track's input, so anything you type on your keyboard will land in that track.</p>
+
+<h2>2. Add an instrument</h2>
+<p>Right-click an empty area of the graph → <strong>Instruments → Built-in Synth → Waveform</strong>. A new synth node appears, and its waveform editor opens automatically. Close it for now (you can reopen it by double-clicking the node).</p>
+
+<h2>3. Wire it up</h2>
+<p>Drag from the MIDI Track's <strong>MIDI</strong> output pin (right side of the node) to the new synth's <strong>MIDI In</strong> pin. Then drag from the synth's <strong>Audio</strong> output to the Master Out's <strong>In</strong> pin.</p>
+
+<p>The signal flow is now: <code>Computer Keyboard → MIDI Track → Synth → Master Out</code>. Each cable is colored by the type of data it carries (green for MIDI, blue for audio).</p>
+
+<h2>4. Play</h2>
+<p>Click anywhere in the graph area to make sure it has keyboard focus, then press keys on the home row. The keys A through L are white keys; W through P are black keys; Z and X shift the octave down and up.</p>
+
+<p>If you have a hardware MIDI keyboard connected and added via the wizard, wire its node to the MIDI Track the same way, and playing it works too.</p>
+
+<div class="tip">
+<strong>Tip:</strong> <code>Shift+key</code> plays louder, <code>Alt+key</code> plays softer. That gives typed notes some dynamic range.
+</div>
+
+<h2>What next?</h2>
+<ul>
+  <li>Read <a href="graph-basics.html">Graph Basics</a> to understand the different kinds of cables</li>
+  <li>Open the synth's waveform editor (double-click) to shape the sound — see <a href="wavetables.html">Wavetables</a></li>
+  <li>Double-click the MIDI Track to open its <a href="piano-roll.html">piano roll</a> and write a melody instead of typing it live</li>
+  <li>Right-click an empty area and explore the menus — add effects, signal sources, or more tracks</li>
+</ul>
+
+<footer>
+<a href="index.html">← Back to index</a>
+</footer>
+</div>
+</body>
+</html>

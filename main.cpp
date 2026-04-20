@@ -661,8 +661,8 @@ static void ensureFbo(FboState& fb, int w, int h) {
 
 static void drawUI(AppState& s, int winW, int winH) {
     (void)winH;
-    ImGui::SetNextWindowPos(ImVec2((float)winW - 220.0f, 10.0f), ImGuiCond_Always);
-    ImGui::SetNextWindowSize(ImVec2(210.0f, 0.0f));
+    ImGui::SetNextWindowPos(ImVec2((float)winW - 250.0f, 10.0f), ImGuiCond_Always);
+    ImGui::SetNextWindowSize(ImVec2(240.0f, 0.0f));
     ImGui::Begin("Controls", nullptr,
         ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse);
 
@@ -674,9 +674,9 @@ static void drawUI(AppState& s, int winW, int winH) {
 
     // --- FRACTAL TYPE ---
     ImGui::SeparatorText("Fractal Type");
-    ImGui::RadioButton("Complex (z\xc2\xb2+c)", &s.fracType, 0);
+    ImGui::RadioButton("Complex z\xc2\xb2+c", &s.fracType, 0);
     ImGui::SameLine();
-    ImGui::RadioButton("Quaternion",  &s.fracType, 1);
+    ImGui::RadioButton("Quat q\xc2\xb2+c",  &s.fracType, 1);
     if (s.fracType == 1) {
         ImGui::TextColored(ImVec4(0.5f,0.5f,0.6f,1), "q\xc2\xb2+c, c constant:");
         ImGui::PushItemWidth(-1);

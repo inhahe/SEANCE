@@ -71,6 +71,19 @@ void MidiTimelineProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mi
         node.pendingMpePassthrough.clear();
     }
 
+    // On stop: send all-notes-off on every channel so sustained notes
+    // don't keep ringing through downstream synths/plugins.
+    // Only CC 123 (all-notes-off) — CC 120 (all-sound-off) is more
+    // aggressive and some synths handle it by resetting internal state
+    // in ways that can interfere with subsequent playback.
+    if (wasPlaying && !transport.playing) {
+        for (int ch = 1; ch <= 16; ++ch)
+            midi.addEvent(juce::MidiMessage::allNotesOff(ch), 0);
+        // Clear MPE channel state
+        for (auto& mc : mpeChannels) mc = {};
+    }
+    wasPlaying = transport.playing;
+
     // Generate MIDI from timeline clips when playing
     if (transport.playing) {
         double startBeat = transport.positionBeats();

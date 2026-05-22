@@ -48,6 +48,8 @@ private:
     MpeChannel mpeChannels[kMpeChannels];
     int nextMpeChannel = 0;
 
+    bool wasPlaying = false;   // detects playing→stopped transition for note-off
+
     int allocMpeChannel(int ci, int ni, int pitch);
     void freeMpeChannel(int ci, int ni);
     int findMpeChannel(int ci, int ni) const;

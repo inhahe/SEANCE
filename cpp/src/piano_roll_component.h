@@ -49,7 +49,7 @@ private:
     enum ExprLane { ExprNone, ExprVelocity, ExprPitchBend, ExprSlide, ExprPressure, ExprAutomation };
     ExprLane exprLane = ExprNone;
     static constexpr float EXPR_LANE_HEIGHT = 80.0f;
-    juce::TextButton exprVelBtn{"Vel"}, exprPBBtn{"PB"}, exprSlideBtn{"Slide"}, exprPressBtn{"Press"}, exprOffBtn{"Off"};
+    juce::TextButton exprPBBtn{"PB"}, exprSlideBtn{"Slide"}, exprPressBtn{"Press"};
     juce::ComboBox autoParamCombo; // select which parameter's automation to view/edit
     int autoParamIndex = -1;       // index into node.params, -1 = none
 
@@ -86,6 +86,7 @@ public:
 
 private:
     // Helpers
+    void updateExprLaneButtonStyles();
     std::pair<float, int> screenToBeatPitch(juce::Point<float> pos) const;
 
     struct NoteHit {
@@ -142,6 +143,9 @@ private:
     juce::TextButton detuneResetBtn{"Reset"};
     juce::Slider detuneSlider;
     juce::Label detuneLbl;
+    juce::TextButton quantizeBtn{"Quantize"};
+    juce::Slider quantizeStrSlider;
+    juce::Label  quantizeStrLbl;
     juce::TextButton snap14Btn{"1/4"}, snap12Btn{"1/2"}, snap1Btn{"1"}, snapOffBtn{"Off"};
     juce::TextButton snapScaleBtn{"Snap to Scale"}, detectKeyBtn{"Detect Key"};
     juce::ComboBox rootCombo, keyCombo, modeCombo, scaleCombo;

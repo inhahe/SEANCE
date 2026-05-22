@@ -975,6 +975,17 @@ void TerrainSynthProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mi
                     }
                 }
             }
+        } else if (msg.isAllNotesOff()) {
+            for (int i = 0; i < MAX_VOICES; ++i) {
+                if (voices[i].active && voices[i].envStage != Voice::Release) {
+                    voices[i].sustainHeld = false;
+                    voices[i].envStage = Voice::Release;
+                    voices[i].envTime = 0;
+                }
+            }
+        } else if (msg.isAllSoundOff()) {
+            for (int i = 0; i < MAX_VOICES; ++i)
+                voices[i] = {};
         }
     }
 

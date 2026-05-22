@@ -328,7 +328,8 @@ endif()
 # Python is dynamically loaded at runtime, so this is safe.
 if(MSVC)
     target_link_options(SEANCE PRIVATE
-        "$<$<CONFIG:Debug>:/NODEFAULTLIB:python314_d.lib>")
+        "$<$<CONFIG:Debug>:/NODEFAULTLIB:python314_d.lib>"
+        "/SUBSYSTEM:WINDOWS")
 endif()
 
 # Windows Media Foundation (for M4A/WMA export)

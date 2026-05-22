@@ -335,7 +335,7 @@ bool ProjectFile::writeProject(std::ostream& f, NodeGraph& graph, GraphProcessor
         std::string ids;
         for (int i = 0; i < (int)graph.openEditors.size(); ++i) {
             if (i > 0) ids += ",";
-            ids += std::to_string(graph.openEditors[i]->id);
+            ids += std::to_string(graph.openEditors[i]);
         }
         writeStr(f, "openEditors", ids);
         writeInt(f, "activeEditor", graph.activeEditorNodeId);
@@ -685,11 +685,11 @@ bool ProjectFile::readProject(std::istream& f, NodeGraph& graph, PluginHost* plu
     // Restore nextId so new IDs don't conflict
     graph.setNextId(maxId + 1);
 
-    // Restore open editors
+    // Restore open editors (store IDs only — never store Node*)
     graph.openEditors.clear();
     for (int id : pendingEditorIds) {
-        auto* node = graph.findNode(id);
-        if (node) graph.openEditors.push_back(node);
+        if (graph.findNode(id))
+            graph.openEditors.push_back(id);
     }
     graph.activeEditorNodeId = pendingActiveEditorId;
 

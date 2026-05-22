@@ -473,7 +473,7 @@ public:
 
     std::vector<Node> nodes;
     std::vector<Link> links;
-    std::vector<Node*> openEditors;
+    std::vector<int> openEditors;  // node IDs — never store Node*
 
     float editorPanelHeight = 250.0f;
     int activeEditorNodeId = -1; // node ID of the currently focused editor

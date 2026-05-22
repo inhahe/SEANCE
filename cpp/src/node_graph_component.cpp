@@ -985,10 +985,10 @@ void NodeGraphComponent::mouseDoubleClick(const juce::MouseEvent& e) {
     if (node->type == NodeType::MidiTimeline || node->type == NodeType::AudioTimeline) {
         // Open piano roll editor
         bool already = false;
-        for (auto* ed : graph.openEditors)
-            if (ed->id == node->id) { already = true; break; }
+        for (int edId : graph.openEditors)
+            if (edId == node->id) { already = true; break; }
         if (!already)
-            graph.openEditors.insert(graph.openEditors.begin(), node);
+            graph.openEditors.insert(graph.openEditors.begin(), node->id);
         graph.activeEditorNodeId = node->id;
         if (onOpenEditor) onOpenEditor(*node);
     } else if (node->plugin || node->type == NodeType::Instrument || node->type == NodeType::Effect) {
@@ -1266,7 +1266,7 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
                 opts.dialogTitle = "Waveform: " + juce::String(n.name);
                 opts.dialogBackgroundColour = juce::Colour(22, 22, 28);
                 opts.escapeKeyTriggersCloseButton = true;
-                opts.useNativeTitleBar = true;
+                opts.useNativeTitleBar = false;
                 opts.resizable = true;
                 opts.launchAsync();
                 (void)nodeId;
@@ -1338,7 +1338,7 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
                 opts.dialogTitle = "XY Pad";
                 opts.dialogBackgroundColour = juce::Colour(25, 25, 32);
                 opts.escapeKeyTriggersCloseButton = true;
-                opts.useNativeTitleBar = true;
+                opts.useNativeTitleBar = false;
                 opts.resizable = true;
                 opts.launchAsync();
             }
@@ -2064,7 +2064,7 @@ void NodeGraphComponent::showNodeMenu(Node& node) {
                 graph.links.end());
             if (onNodeDeleted) onNodeDeleted(nodeId);
             graph.openEditors.erase(std::remove_if(graph.openEditors.begin(), graph.openEditors.end(),
-                [nodeId](auto* e) { return e->id == nodeId; }), graph.openEditors.end());
+                [nodeId](int id) { return id == nodeId; }), graph.openEditors.end());
             graph.nodes.erase(std::remove_if(graph.nodes.begin(), graph.nodes.end(),
                 [nodeId](auto& n) { return n.id == nodeId; }), graph.nodes.end());
             graph.dirty = true;
@@ -2077,10 +2077,10 @@ void NodeGraphComponent::showNodeMenu(Node& node) {
             dup.clips = node->clips;
         } else if (result == 3) {
             bool already = false;
-            for (auto* e : graph.openEditors)
-                if (e->id == nodeId) { already = true; break; }
+            for (int edId : graph.openEditors)
+                if (edId == nodeId) { already = true; break; }
             if (!already)
-                graph.openEditors.insert(graph.openEditors.begin(), node);
+                graph.openEditors.insert(graph.openEditors.begin(), nodeId);
             graph.activeEditorNodeId = nodeId;
         } else if (result == 4) {
             if (onShowPluginUI) onShowPluginUI(nodeId);
@@ -2242,7 +2242,7 @@ void NodeGraphComponent::deleteSelectedNode() {
 
     // Remove from open editors
     graph.openEditors.erase(std::remove_if(graph.openEditors.begin(), graph.openEditors.end(),
-        [nid](auto* e) { return e->id == nid; }), graph.openEditors.end());
+        [nid](int id) { return id == nid; }), graph.openEditors.end());
 
     // Remove node
     graph.nodes.erase(std::remove_if(graph.nodes.begin(), graph.nodes.end(),

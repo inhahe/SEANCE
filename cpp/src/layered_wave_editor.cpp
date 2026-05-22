@@ -513,7 +513,10 @@ static void renderSingleLayer(const WaveLayer& layer, int tableSize,
 {
     out.assign(tableSize, 0.0f);
     std::mt19937 rng(1234u + (unsigned)layer.ratio * 31u + (unsigned)layer.shape * 7u);
-    int r = std::max(1, layer.ratio);
+    // For Drawn shapes, show one cycle in the preview so the control
+    // points line up with the curve. The harmonic ratio still applies
+    // in the final multi-layer render (LayeredWaveform::render).
+    int r = (layer.shape == WaveLayer::Drawn) ? 1 : std::max(1, layer.ratio);
     for (int i = 0; i < tableSize; ++i) {
         float phase = (float)i / (float)tableSize;
         float x = phase * (float)r + layer.phase;
@@ -1412,8 +1415,10 @@ LayeredWaveEditorComponent::LayeredWaveEditorComponent(NodeGraph& g, int nid, st
 
     // Scatter dimensions: + / - to add/remove a Position axis.
     addAndMakeVisible(addDimBtn);
-    addDimBtn.setTooltip("Add a new Position axis (dimension) to the wavetable. Each axis adds a "
-                         "Position knob on the synth node that morphs through the frames along that axis.");
+    addDimBtn.setTooltip("Add a dimension axis. In Grid mode, this adds a new axis to the frame grid "
+                         "-- use the + Frame button to add frames along the new axis, then each Position "
+                         "knob on the synth node morphs through frames along that axis. In Scatter mode, "
+                         "each frame gets an extra coordinate you can set in the scatter view.");
     addDimBtn.onClick = [this]() {
         if (wave.mode == WavetableMode::Scatter) {
             if (wave.scatterDims < 8) wave.scatterDims++;
@@ -1426,6 +1431,8 @@ LayeredWaveEditorComponent::LayeredWaveEditorComponent(NodeGraph& g, int nid, st
             // Grid mode: add a new dimension of size 1
             if ((int)wave.gridDims.size() < 8) wave.gridDims.push_back(1);
         }
+        addDimBtn.setButtonText("+ Dim (" + juce::String(wave.numDimensions()) + "D)");
+        removeDimBtn.setButtonText("- Dim");
         rebuildScatterUI();
         syncPositionParams();
         onLayerChanged();
@@ -1445,6 +1452,9 @@ LayeredWaveEditorComponent::LayeredWaveEditorComponent(NodeGraph& g, int nid, st
         } else {
             if (wave.gridDims.size() > 1) wave.gridDims.pop_back();
         }
+        int nd = wave.numDimensions();
+        addDimBtn.setButtonText(nd > 1 ? ("+ Dim (" + juce::String(nd) + "D)") : juce::String("+ Dim"));
+        removeDimBtn.setButtonText("- Dim");
         rebuildScatterUI();
         syncPositionParams();
         onLayerChanged();
@@ -1570,6 +1580,10 @@ LayeredWaveEditorComponent::LayeredWaveEditorComponent(NodeGraph& g, int nid, st
     layersViewport.setScrollBarsShown(true, false);
 
     modeToggleBtn.setButtonText(wave.mode == WavetableMode::Grid ? "Mode: Grid" : "Mode: Scatter");
+    {
+        int nd = wave.numDimensions();
+        if (nd > 1) addDimBtn.setButtonText("+ Dim (" + juce::String(nd) + "D)");
+    }
     rebuildFrameTabs();
     rebuildScatterUI();
     rebuildRows();
@@ -2013,14 +2027,18 @@ void LayeredWaveEditorComponent::resized() {
                 x += xw + gap;
             }
         }
-        // Hide scatter view
+        // Hide scatter-only controls
         if (scatterView) scatterView->setVisible(false);
         nonProjAxisRow.setVisible(false);
+        anaglyph3DBtn.setVisible(false);
+        projectionCombo.setVisible(false);
     } else {
         frameTabsRow.setBounds({});
         // Scatter mode: viewport + coord entry + non-projected sliders + (3D settings)
         if (scatterView) scatterView->setVisible(true);
         nonProjAxisRow.setVisible(true);
+        anaglyph3DBtn.setVisible(true);
+        projectionCombo.setVisible(true);
 
         int viewH = 260;
         auto viewArea = a.removeFromTop(viewH);

@@ -56,6 +56,8 @@ A terrain can come from:
 - An N-D wavetable (each axis becomes a Position knob on the synth node).
 - A math expression like `sin(x*y)` evaluated over a grid.
 
+The terrain visualizer has **+ Dim / - Dim** buttons to add or remove dimension axes at runtime (up to 8D). Each dimension adds a signal input pin and Center/Radius parameter knobs on the synth node. When the terrain has more than 2 dimensions, a projection combo lets you choose which two axes to view in the heatmap.
+
 Traversal modes:
 
 - **Linear** — sweep a single axis at constant speed. The standard wavetable / sample-player behavior.
@@ -234,6 +236,7 @@ All built-in effects can be combined freely with cables — pre-effect, post-eff
 - **Piano roll** with click-to-place, drag-to-move, edge-to-resize, box-select, copy / cut / paste, alt-for-no-snap. Velocity lane (drag bar heights), automation lanes (Catmull-Rom curves on any parameter).
 - **Music theory helpers** — Root / Key / Mode / Scale dropdowns highlight in-key pitches on the piano roll, with **Snap to Scale** mode and **Detect Key** auto-analysis.
 - **Note transformations** — transpose by octaves or semitones, nudge in time, double or halve duration, reverse, fine-tune detune in cents.
+- **Quantize** — snap notes toward the nearest grid position with a user-adjustable strength slider (1-100%). At 100% notes land exactly on the grid; lower values move notes only partway, keeping a natural feel. Available as a toolbar button and via the right-click context menu.
 - **MIDI Note Degree System.** Each note stores its scale degree (1st-7th), octave, and chromatic offset, so you can change key/scale and have the melody automatically re-pitch to fit (Major to Minor, Ionian to Dorian, etc.).
 - **Audio timeline** with clip move/resize, fade in/out, slip offset, gain, snapping.
 - **Multi-track recording** with simultaneous input routing for hardware-controller workflows.

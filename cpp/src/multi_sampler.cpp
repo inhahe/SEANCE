@@ -376,7 +376,17 @@ void MultiSamplerProcessor::processBlock(juce::AudioBuffer<float>& buf,
                     v.releasedAtTime = v.timeHeld;
                 }
             }
-        } else if (msg.isAllNotesOff() || msg.isAllSoundOff()) {
+        } else if (msg.isAllNotesOff()) {
+            // Release all held notes (let them fade through their release
+            // envelope) rather than killing them instantly.
+            for (auto& v : voices) {
+                if (v.active && v.noteHeld) {
+                    v.noteHeld = false;
+                    v.releasedAtTime = v.timeHeld;
+                }
+            }
+        } else if (msg.isAllSoundOff()) {
+            // CC 120 = instant silence — kill everything immediately.
             for (auto& v : voices) v.active = false;
         }
     }

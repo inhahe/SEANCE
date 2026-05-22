@@ -6,6 +6,77 @@
 
 namespace SoundShop {
 
+// ---------------------------------------------------------------------------
+// SliderMenuItem — horizontal slider + preset buttons for use inside a
+// PopupMenu.  Used by the note right-click menu for Velocity and Detune.
+// ---------------------------------------------------------------------------
+class SliderMenuItem : public juce::PopupMenu::CustomComponent {
+public:
+    SliderMenuItem(const juce::String& label,
+                   double minVal, double maxVal, double currentVal, double step,
+                   const juce::String& suffix,
+                   const std::vector<std::pair<double, juce::String>>& presets,
+                   std::function<void(double)> onChangeCallback)
+        : juce::PopupMenu::CustomComponent(false),
+          onChange(std::move(onChangeCallback))
+    {
+        titleLabel.setText(label, juce::dontSendNotification);
+        titleLabel.setColour(juce::Label::textColourId, juce::Colours::white);
+        titleLabel.setFont(juce::Font(13.0f));
+        addAndMakeVisible(titleLabel);
+
+        slider.setRange(minVal, maxVal, step);
+        slider.setValue(currentVal, juce::dontSendNotification);
+        slider.setTextBoxStyle(juce::Slider::TextBoxRight, false, 45, 20);
+        slider.setTextValueSuffix(suffix);
+        slider.setColour(juce::Slider::textBoxTextColourId, juce::Colours::white);
+        slider.setColour(juce::Slider::thumbColourId, juce::Colour(80, 140, 210));
+        slider.setColour(juce::Slider::trackColourId, juce::Colour(50, 90, 140));
+        slider.setColour(juce::Slider::backgroundColourId, juce::Colour(35, 35, 45));
+        slider.onValueChange = [this]() {
+            if (onChange) onChange(slider.getValue());
+        };
+        addAndMakeVisible(slider);
+
+        for (auto& [val, name] : presets) {
+            auto* btn = presetButtons.add(new juce::TextButton(name));
+            btn->setColour(juce::TextButton::buttonColourId, juce::Colour(45, 45, 55));
+            btn->setColour(juce::TextButton::textColourOnId, juce::Colours::white);
+            btn->setColour(juce::TextButton::textColourOffId, juce::Colour(200, 200, 210));
+            btn->onClick = [this, val]() {
+                slider.setValue(val, juce::sendNotification);
+            };
+            addAndMakeVisible(btn);
+        }
+    }
+
+    void getIdealSize(int& idealWidth, int& idealHeight) override {
+        idealWidth = 280;
+        idealHeight = 66;
+    }
+
+    void resized() override {
+        auto area = getLocalBounds().reduced(8, 4);
+        auto topRow = area.removeFromTop(22);
+        titleLabel.setBounds(topRow.removeFromLeft(60));
+        slider.setBounds(topRow);
+        area.removeFromTop(4);
+        auto btnRow = area.removeFromTop(20);
+        int numBtns = presetButtons.size();
+        if (numBtns > 0) {
+            int btnW = btnRow.getWidth() / numBtns;
+            for (int i = 0; i < numBtns; ++i)
+                presetButtons[i]->setBounds(btnRow.removeFromLeft(btnW).reduced(1, 0));
+        }
+    }
+
+private:
+    juce::Label titleLabel;
+    juce::Slider slider;
+    juce::OwnedArray<juce::TextButton> presetButtons;
+    std::function<void(double)> onChange;
+};
+
 // Static clipboards shared across all piano roll instances
 std::vector<PianoRollComponent::ClipboardNote> PianoRollComponent::clipboard;
 std::unique_ptr<Clip> PianoRollComponent::clipClipboard;
@@ -49,6 +120,7 @@ PianoRollComponent::PianoRollComponent(NodeGraph& g, Node& n, Transport* t)
     addBtn(selectAllBtn); addBtn(deselectBtn);
     addBtn(dblDurBtn); addBtn(halfDurBtn); addBtn(reverseBtn);
     addBtn(detuneResetBtn);
+    addBtn(quantizeBtn);
     addBtn(snap14Btn); addBtn(snap12Btn); addBtn(snap1Btn); addBtn(snapOffBtn);
     addBtn(snapScaleBtn); addBtn(detectKeyBtn);
 
@@ -73,6 +145,44 @@ PianoRollComponent::PianoRollComponent(NodeGraph& g, Node& n, Transport* t)
     snapOffBtn.setTooltip("Disable snapping — notes can be placed at any position. Hold Alt while dragging for the same effect.");
     snapScaleBtn.setTooltip("Snap notes to the chosen Key/Scale, so dragging a note up or down only lands on \"in key\" pitches");
     detectKeyBtn.setTooltip("Analyze the notes in this clip and guess the key/scale, then set the dropdowns to match");
+
+    // Quantize button + strength slider
+    quantizeBtn.setTooltip("Quantize selected notes (or all notes if none are selected) toward the nearest "
+                           "snap-grid position by the percentage shown on the slider. 100% = perfectly on grid, "
+                           "50% = halfway between original and grid, etc.");
+    addAndMakeVisible(quantizeStrSlider);
+    addAndMakeVisible(quantizeStrLbl);
+    quantizeStrLbl.setText("Q:", juce::dontSendNotification);
+    quantizeStrLbl.setFont(juce::Font(11.0f));
+    quantizeStrLbl.setJustificationType(juce::Justification::centredRight);
+    quantizeStrSlider.setRange(1.0, 100.0, 1.0);
+    quantizeStrSlider.setValue(100.0, juce::dontSendNotification);
+    quantizeStrSlider.setTextBoxStyle(juce::Slider::TextBoxRight, false, 38, 18);
+    quantizeStrSlider.setTextValueSuffix("%");
+    quantizeStrSlider.setSliderStyle(juce::Slider::LinearHorizontal);
+    quantizeStrSlider.setTooltip("Quantize strength — 100% snaps notes exactly to the grid, lower values "
+                                 "move notes only partway toward the grid (sounds more human)");
+    quantizeBtn.onClick = [this, apply]() {
+        float grid = state.snap > 0.0f ? state.snap : 0.25f;
+        float strength = (float)quantizeStrSlider.getValue() / 100.0f;
+        // Quantize selected, or all if nothing selected
+        auto targets = state.selected;
+        if (targets.empty()) {
+            for (int ci2 = 0; ci2 < (int)node->clips.size(); ++ci2)
+                for (int ni2 = 0; ni2 < (int)node->clips[ci2].notes.size(); ++ni2)
+                    targets.insert({ci2, ni2});
+        }
+        graph.commitSnapshot("Quantize notes");
+        for (auto& [ci2, ni2] : targets) {
+            if (ci2 < (int)node->clips.size() && ni2 < (int)node->clips[ci2].notes.size()) {
+                auto& n2 = node->clips[ci2].notes[ni2];
+                float snapped = std::round(n2.offset / grid) * grid;
+                n2.offset += (snapped - n2.offset) * strength;
+                n2.offset = std::max(0.0f, n2.offset);
+            }
+        }
+        repaint();
+    };
 
     // Mute / Solo / Pan
     addBtn(muteBtn); addBtn(soloBtn);
@@ -125,18 +235,11 @@ PianoRollComponent::PianoRollComponent(NodeGraph& g, Node& n, Transport* t)
     soloBtn.setColour(juce::TextButton::buttonColourId,
         node->soloed ? juce::Colour(180, 180, 50) : juce::Colour(55, 55, 60));
 
-    // Expression / velocity lane buttons.
-    // Velocity lane is now fully working; MPE lanes are still hidden until
-    // their interaction code is audited.
-    addBtn(exprOffBtn);
-    addBtn(exprVelBtn);
-    exprOffBtn.setTooltip("Hide the expression/automation lane below the piano roll");
-    exprVelBtn.setTooltip("Show the velocity lane — drag the bars to change how loud each note plays");
-    exprOffBtn.onClick   = [this]() { exprLane = ExprNone; repaint(); };
-    exprVelBtn.onClick   = [this]() { exprLane = ExprVelocity; repaint(); };
-    exprPBBtn.onClick    = [this]() { exprLane = ExprPitchBend; repaint(); };
-    exprSlideBtn.onClick = [this]() { exprLane = ExprSlide; repaint(); };
-    exprPressBtn.onClick = [this]() { exprLane = ExprPressure; repaint(); };
+    // MPE expression lane buttons — hidden until their interaction code is
+    // audited.  Velocity is now in the note right-click menu.
+    exprPBBtn.onClick    = [this]() { exprLane = ExprPitchBend; updateExprLaneButtonStyles(); repaint(); };
+    exprSlideBtn.onClick = [this]() { exprLane = ExprSlide; updateExprLaneButtonStyles(); repaint(); };
+    exprPressBtn.onClick = [this]() { exprLane = ExprPressure; updateExprLaneButtonStyles(); repaint(); };
 
     // Automation lane parameter selector
     addAndMakeVisible(autoParamCombo);
@@ -156,6 +259,7 @@ PianoRollComponent::PianoRollComponent(NodeGraph& g, Node& n, Transport* t)
             exprLane = ExprAutomation;
             autoParamIndex = idx - 1;
         }
+        updateExprLaneButtonStyles();
         repaint();
     };
 
@@ -410,6 +514,7 @@ void PianoRollComponent::resized() {
     auto allToolbarBtns = {&transpDownOctBtn, &transpDownSemiBtn, &transpUpSemiBtn, &transpUpOctBtn,
         &timeLeftBtn, &timeRightBtn, &selectAllBtn, &deselectBtn,
         &dblDurBtn, &halfDurBtn, &reverseBtn, &detuneResetBtn,
+        &quantizeBtn,
         &snap14Btn, &snap12Btn, &snap1Btn, &snapOffBtn,
         &snapScaleBtn, &detectKeyBtn};
 
@@ -417,6 +522,8 @@ void PianoRollComponent::resized() {
         for (auto* b : allToolbarBtns) b->setVisible(false);
         detuneLbl.setVisible(false);
         detuneSlider.setVisible(false);
+        quantizeStrSlider.setVisible(false);
+        quantizeStrLbl.setVisible(false);
         helpLabel.setVisible(false);
         rootCombo.setVisible(false); rootLbl.setVisible(false);
         keyCombo.setVisible(false); keyLbl.setVisible(false);
@@ -426,6 +533,8 @@ void PianoRollComponent::resized() {
         for (auto* b : allToolbarBtns) b->setVisible(true);
         detuneLbl.setVisible(true);
         detuneSlider.setVisible(true);
+        quantizeStrSlider.setVisible(true);
+        quantizeStrLbl.setVisible(true);
         helpLabel.setVisible(true);
         rootCombo.setVisible(true); rootLbl.setVisible(true);
         keyCombo.setVisible(true); keyLbl.setVisible(true);
@@ -459,6 +568,12 @@ void PianoRollComponent::resized() {
         detuneSlider.setBounds(row1.getX() + x, row1.getY() + 1, 100, rowH - 2);
         x += 102;
         place(detuneResetBtn, 42);
+        x += 6;
+        quantizeStrLbl.setBounds(row1.getX() + x, row1.getY() + 1, 20, rowH - 2);
+        x += 22;
+        quantizeStrSlider.setBounds(row1.getX() + x, row1.getY() + 1, 80, rowH - 2);
+        x += 82;
+        place(quantizeBtn, 58);
 
         // Row 2: snap + Root/Key/Mode/Scale + scale operations
         auto row2 = area.removeFromTop(rowH);
@@ -466,6 +581,12 @@ void PianoRollComponent::resized() {
         auto place2 = [&](juce::Component& c, int w) {
             c.setBounds(row2.getX() + x, row2.getY() + 1, w, rowH - 2);
             x += w + 2;
+        };
+        // Like place2 but measures the button text to determine width.
+        auto placeBtn = [&](juce::TextButton& btn, int pad = 16) {
+            auto font = btn.getLookAndFeel().getTextButtonFont(btn, rowH - 2);
+            int w = font.getStringWidth(btn.getButtonText()) + pad;
+            place2(btn, w);
         };
         auto placeLblCombo = [&](juce::Label& lbl, int lw, juce::ComboBox& cb, int cw) {
             lbl.setBounds(row2.getX() + x, row2.getY() + 1, lw, rowH - 2);
@@ -496,34 +617,22 @@ void PianoRollComponent::resized() {
         x += 4;
         place2(snapScaleBtn, 85);
         place2(detectKeyBtn, 70);
-        // Velocity lane + automation are always available; MPE lanes only
-        // when MPE is enabled on the node.
-        x += 8;
-        place2(exprOffBtn, 35);
-        place2(exprVelBtn, 35);
-        // MPE expression lane buttons still hidden until their interaction
-        // code is audited.
+        // MPE expression lane buttons — still hidden until audited.
+        // Velocity editing is now in the note right-click menu.
         exprPBBtn.setVisible(false);
         exprSlideBtn.setVisible(false);
         exprPressBtn.setVisible(false);
 
-        auto styleLane = [&](juce::TextButton& btn, ExprLane lane) {
-            btn.setColour(juce::TextButton::buttonColourId,
-                exprLane == lane ? juce::Colour(50, 90, 140) : juce::Colour(55, 55, 60));
-        };
-        styleLane(exprOffBtn, ExprNone);
-        styleLane(exprVelBtn, ExprVelocity);
-        x += 4;
+        updateExprLaneButtonStyles();
+        x += 8;
         autoParamCombo.setBounds(row2.getX() + x, row2.getY() + 1, 120, rowH - 2);
     }
 
     // Visibility
     if (compactMode) {
-        exprOffBtn.setVisible(false); exprVelBtn.setVisible(false);
         exprPBBtn.setVisible(false); exprSlideBtn.setVisible(false); exprPressBtn.setVisible(false);
         autoParamCombo.setVisible(false);
     } else {
-        exprOffBtn.setVisible(true); exprVelBtn.setVisible(true);
         exprPBBtn.setVisible(node && node->mpeEnabled);
         exprSlideBtn.setVisible(node && node->mpeEnabled);
         exprPressBtn.setVisible(node && node->mpeEnabled);
@@ -873,8 +982,8 @@ void PianoRollComponent::paint(juce::Graphics& g) {
         }
     }
 
-    // Expression / velocity / automation lane
-    if (exprLane != ExprNone && (exprLane == ExprVelocity || exprLane == ExprAutomation || node->mpeEnabled)) {
+    // Expression / automation lane
+    if (exprLane != ExprNone && (exprLane == ExprAutomation || node->mpeEnabled)) {
         float exprY = gridH - EXPR_LANE_HEIGHT;
         float exprH = EXPR_LANE_HEIGHT;
 
@@ -887,10 +996,6 @@ void PianoRollComponent::paint(juce::Graphics& g) {
             juce::String laneLabel;
             juce::String laneHint;
             switch (exprLane) {
-                case ExprVelocity:
-                    laneLabel = "Velocity (note loudness)";
-                    laneHint = "Drag bars up/down to change how loud each note plays";
-                    break;
                 case ExprAutomation:
                     if (autoParamIndex >= 0 && autoParamIndex < (int)node->params.size())
                         laneLabel = "Automation: " + juce::String(node->params[autoParamIndex].name);
@@ -936,25 +1041,7 @@ void PianoRollComponent::paint(juce::Graphics& g) {
                 bool isSelected = state.selected.count({ciIdx, ni}) > 0;
                 auto noteColor = juce::Colour(clip.color).brighter(0.3f);
 
-                if (exprLane == ExprVelocity) {
-                    // Velocity: one vertical bar per note, spanning the
-                    // note's actual duration so it visually lines up with
-                    // the note above. Min 3px wide so very short notes are
-                    // still clickable.
-                    float noteEndBeat = noteStartBeat + note.getDuration();
-                    float nx2 = beatToX(noteEndBeat);
-                    float barWidth = std::max(3.0f, nx2 - nx1);
-                    float barHeight = (note.velocity / 127.0f) * exprH;
-                    float barY = exprY + exprH - barHeight;
-
-                    // Off-screen cull
-                    if (nx2 < gridX || nx1 > gridX + gridW) continue;
-
-                    g.setColour(isSelected ? noteColor : noteColor.withAlpha(0.7f));
-                    g.fillRect(nx1, barY, barWidth, barHeight);
-                    g.setColour(juce::Colours::white.withAlpha(isSelected ? 0.6f : 0.3f));
-                    g.drawRect(juce::Rectangle<float>(nx1, barY, barWidth, barHeight), 1.0f);
-                } else {
+                {
                     // MPE expression curves
                     auto& curve = exprLane == ExprPitchBend ? note.expression.pitchBend
                                 : exprLane == ExprSlide     ? note.expression.slide
@@ -1063,6 +1150,16 @@ void PianoRollComponent::paint(juce::Graphics& g) {
     }
 
     g.restoreState();
+}
+
+void PianoRollComponent::updateExprLaneButtonStyles() {
+    auto style = [&](juce::TextButton& btn, ExprLane lane) {
+        btn.setColour(juce::TextButton::buttonColourId,
+            exprLane == lane ? juce::Colour(50, 90, 140) : juce::Colour(55, 55, 60));
+    };
+    style(exprPBBtn,  ExprPitchBend);
+    style(exprSlideBtn, ExprSlide);
+    style(exprPressBtn, ExprPressure);
 }
 
 // Helper: convert screen pos to beat/pitch
@@ -1192,64 +1289,6 @@ void PianoRollComponent::mouseDown(const juce::MouseEvent& e) {
                 }
             }
             repaint();
-            return;
-        }
-
-        // Velocity lane: click a note's bar to set its velocity, then drag
-        // vertically to continue tweaking. Hit-test by the note's actual
-        // time span so every note corresponds to exactly one bar. If two
-        // notes overlap in time (polyphony), pick the one whose bar top is
-        // closest to the click y — that way the user can still target the
-        // bar they can actually see.
-        if (exprLane == ExprVelocity) {
-            // Compute the click's Y within the expr lane in pixels so we can
-            // compare to each bar's top edge for disambiguation.
-            float gridH = getHeight() - toolbarHeight() - SCROLLBAR_SIZE;
-            float exprY = toolbarHeight() + gridH - EXPR_LANE_HEIGHT;
-            float clickY = e.position.y;
-
-            int bestCI = -1, bestNI = -1;
-            float bestDistY = 1e9f;
-
-            for (int ci = 0; ci < (int)node->clips.size(); ++ci) {
-                auto& clip = node->clips[ci];
-                for (int ni = 0; ni < (int)clip.notes.size(); ++ni) {
-                    auto& note = clip.notes[ni];
-                    float noteStart = clip.startBeat + note.getOffset();
-                    float noteEnd   = noteStart + note.getDuration();
-                    // Allow a small slop in beat-space so very short notes
-                    // are still clickable (must be at least ~5px wide).
-                    float minDurBeats = 0.01f;
-                    if (noteEnd < noteStart + minDurBeats)
-                        noteEnd = noteStart + minDurBeats;
-                    if (exBeat < noteStart || exBeat > noteEnd) continue;
-
-                    // Pick the note whose bar-top is closest to click y
-                    // (but always accept any match if nothing better).
-                    float barHeight = (note.velocity / 127.0f) * EXPR_LANE_HEIGHT;
-                    float barTop = exprY + EXPR_LANE_HEIGHT - barHeight;
-                    float d = std::abs(barTop - clickY);
-                    if (d < bestDistY) {
-                        bestDistY = d;
-                        bestCI = ci;
-                        bestNI = ni;
-                    }
-                }
-            }
-
-            if (bestCI >= 0) {
-                auto& clip = node->clips[bestCI];
-                auto& note = clip.notes[bestNI];
-                // Snapshot for undo
-                dragBeforeSnapshot = {{bestCI, bestNI, note.offset, note.duration,
-                                       note.detune, note.pitch, note.velocity}};
-                note.velocity = juce::jlimit(1, 127, (int)(exVal * 127.0f));
-                dragMode = DragExprPoint;
-                exprDragCI = bestCI;
-                exprDragNI = bestNI;
-                graph.dirty = true;
-                repaint();
-            }
             return;
         }
 
@@ -1477,11 +1516,7 @@ void PianoRollComponent::mouseDrag(const juce::MouseEvent& e) {
         else if (exprDragCI >= 0 && exprDragCI < (int)node->clips.size()
             && exprDragNI >= 0 && exprDragNI < (int)node->clips[exprDragCI].notes.size()) {
             auto& note = node->clips[exprDragCI].notes[exprDragNI];
-            if (exprLane == ExprVelocity) {
-                auto [exBeat, exVal] = screenToExprBeatValue(e.position);
-                note.velocity = juce::jlimit(1, 127, (int)(exVal * 127.0f));
-                graph.dirty = true;
-            } else {
+            {
                 auto* curve = getExprCurve(note);
                 if (curve && exprDragPtIdx >= 0 && exprDragPtIdx < (int)curve->size()) {
                     auto [exBeat, exVal] = screenToExprBeatValue(e.position);
@@ -1620,12 +1655,6 @@ void PianoRollComponent::mouseUp(const juce::MouseEvent& e) {
                              : (dragMode == DragResizeLeft) ? "Resize note (left)"
                              : "Resize note (right)";
             pushDragUndo(desc, dragBeforeSnapshot);
-        } else if (dragMode == DragExprPoint && exprLane == ExprVelocity) {
-            // Velocity drag undo
-            if (exprDragCI >= 0 && exprDragNI >= 0) {
-                state.selected = {{exprDragCI, exprDragNI}};
-                pushDragUndo("Change velocity", dragBeforeSnapshot);
-            }
         }
         dragBeforeSnapshot.clear();
     }
@@ -1727,15 +1756,68 @@ void PianoRollComponent::showNoteMenu() {
     timeShift.addItem(31, "Shift Right");
     menu.addSubMenu("Time Shift", timeShift);
 
-    menu.addItem(32, "Reverse");
+    menu.addItem(32, "Reverse", numSel > 1);
+    menu.addSeparator();
 
-    juce::PopupMenu detune;
-    detune.addItem(40, "Reset to 0");
-    detune.addItem(41, "-50 cents");
-    detune.addItem(42, "-25 cents");
-    detune.addItem(43, "+25 cents");
-    detune.addItem(44, "+50 cents");
-    menu.addSubMenu("Detune", detune);
+    // Shared undo state — the slider callbacks modify notes directly while
+    // the menu is open; we push a single undo step when the menu closes.
+    struct SliderUndo {
+        bool changed = false;
+        std::vector<NoteSnapshot> before;
+    };
+    auto sliderUndo = std::make_shared<SliderUndo>();
+    captureSelectedSnapshot(sliderUndo->before);
+
+    // Current value from first selected note (for slider initial position)
+    int initVel = 100;
+    float initDetune = 0;
+    if (!state.selected.empty()) {
+        auto [ci, ni] = *state.selected.begin();
+        if (ci < (int)node->clips.size() && ni < (int)node->clips[ci].notes.size()) {
+            initVel = node->clips[ci].notes[ni].velocity;
+            initDetune = node->clips[ci].notes[ni].detune;
+        }
+    }
+    int initVelPct = (int)(initVel / 127.0 * 100.0 + 0.5);
+
+    // Velocity submenu (slider + presets)
+    {
+        juce::PopupMenu velSub;
+        velSub.addCustomItem(-1, std::make_unique<SliderMenuItem>(
+            "Velocity", 0, 100, initVelPct, 1, "%",
+            std::vector<std::pair<double, juce::String>>{
+                {0, "0%"}, {25, "25%"}, {50, "50%"}, {75, "75%"}, {100, "100%"}},
+            [this, sliderUndo](double pct) {
+                int vel = std::max(0, (int)(pct / 100.0 * 127.0 + 0.5));
+                for (auto& [ci, ni] : state.selected)
+                    if (ci < (int)node->clips.size() && ni < (int)node->clips[ci].notes.size())
+                        node->clips[ci].notes[ni].velocity = vel;
+                sliderUndo->changed = true;
+                graph.dirty = true;
+                repaint();
+            }));
+        menu.addSubMenu("Velocity", velSub);
+    }
+
+    // Detune submenu (slider + presets)
+    {
+        juce::PopupMenu detSub;
+        detSub.addCustomItem(-2, std::make_unique<SliderMenuItem>(
+            "Detune", -100, 100, initDetune, 1, " ct",
+            std::vector<std::pair<double, juce::String>>{
+                {-75, "-75"}, {-50, "-50"}, {-25, "-25"}, {0, "0"},
+                {25, "+25"}, {50, "+50"}, {75, "+75"}},
+            [this, sliderUndo](double cents) {
+                float d = (float)cents;
+                for (auto& [ci, ni] : state.selected)
+                    if (ci < (int)node->clips.size() && ni < (int)node->clips[ci].notes.size())
+                        node->clips[ci].notes[ni].detune = d;
+                sliderUndo->changed = true;
+                graph.dirty = true;
+                repaint();
+            }));
+        menu.addSubMenu("Detune", detSub);
+    }
 
     menu.addSeparator();
 
@@ -1782,7 +1864,14 @@ void PianoRollComponent::showNoteMenu() {
     menu.addItem(3, "Select All");
     menu.addItem(4, "Deselect All");
 
-    menu.showMenuAsync(juce::PopupMenu::Options(), [this](int result) {
+    menu.showMenuAsync(juce::PopupMenu::Options(), [this, sliderUndo](int result) {
+        // Commit slider changes (velocity/detune) as an undo step before
+        // handling any regular menu item, so the undo order is correct.
+        if (sliderUndo->changed) {
+            pushDragUndo("Change velocity/detune", sliderUndo->before);
+            sliderUndo->changed = false;
+        }
+
         auto apply = [&](auto fn) {
             for (auto& [ci, ni] : state.selected)
                 if (ci < (int)node->clips.size() && ni < (int)node->clips[ci].notes.size())
@@ -1858,11 +1947,8 @@ void PianoRollComponent::showNoteMenu() {
                 }
                 break;
             }
-            case 40: applyUndo("Reset detune", [](MidiNote& n) { n.detune = 0; }); break;
-            case 41: applyUndo("Detune -50c", [](MidiNote& n) { n.detune = -50; }); break;
-            case 42: applyUndo("Detune -25c", [](MidiNote& n) { n.detune = -25; }); break;
-            case 43: applyUndo("Detune +25c", [](MidiNote& n) { n.detune = 25; }); break;
-            case 44: applyUndo("Detune +50c", [](MidiNote& n) { n.detune = 50; }); break;
+            // Detune and velocity are now handled by inline slider
+            // components — no case IDs needed.
             case 50: { // Snap to Scale
                 auto getIntervals = [&]() -> std::vector<int> {
                     const ScaleMap* table = nullptr;

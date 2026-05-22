@@ -215,12 +215,14 @@ ModImporter::ImportResult ModImporter::import(const std::string& path, NodeGraph
     result.numPatterns = numPatterns;
     result.numSamples  = numSamples;
 
-    float bpm = std::max(60.0f, (float)initialTempo);
+    // Tracker effective BPM = 6 * tempo / speed. At the standard defaults
+    // (T=125, S=6) this gives 125 BPM. At S=3 it's 250, at S=12 it's 62.5.
+    float initialSpeedF = (float)std::max(1, initialSpeed);
+    float bpm = std::max(60.0f, 6.0f * (float)initialTempo / initialSpeedF);
     graph.bpm = bpm;
 
-    float ticksPerRow = (float)std::max(1, initialSpeed);
-    constexpr float rowsPerBeat = 4.0f;
-    float beatsPerRow = 1.0f / rowsPerBeat;
+    float ticksPerRow = initialSpeedF;
+    float beatsPerRow = 1.0f / 4.0f; // baseline: 4 rows per beat at initial speed
 
     // Current playhead beat for the pattern walk. Declared here (before
     // the effect-helper lambdas) so the lambdas can capture it by
@@ -240,7 +242,10 @@ ModImporter::ImportResult ModImporter::import(const std::string& path, NodeGraph
         sampleDir = makeSampleDir(path);
         if (!sampleDir.empty()) {
             // Stop song playback so reads only render the interactive note.
-            openmpt_module_set_repeat_count(mod, 0);
+            // Use repeat_count = -1 (infinite) so the module keeps rendering
+            // audio frames even after reaching the end — otherwise
+            // read_float_stereo returns 0 immediately and we capture silence.
+            openmpt_module_set_repeat_count(mod, -1);
             openmpt_module_set_position_seconds(mod, 1.0e9);
             openmpt_module_set_render_param(
                 mod, OPENMPT_MODULE_RENDER_INTERPOLATIONFILTER_LENGTH, 1);
@@ -256,6 +261,7 @@ ModImporter::ImportResult ModImporter::import(const std::string& path, NodeGraph
         }
     }
 
+    openmpt_module_set_repeat_count(mod, 0);
     openmpt_module_set_position_order_row(mod, 0, 0);
 
     // ------------------------------------------------------------------
@@ -1055,7 +1061,7 @@ ModImporter::ImportResult ModImporter::import(const std::string& path, NodeGraph
                 if (param < 32)
                     speedSet = param;
                 else {
-                    graph.bpm = (float)param;
+                    graph.bpm = 6.0f * (float)param / initialSpeedF;
                     tempoSetThisRow = true;
                 }
                 break;
@@ -1097,7 +1103,7 @@ ModImporter::ImportResult ModImporter::import(const std::string& path, NodeGraph
             case 'R': applyTremolo(ch, param); break;
             case 'S': handleSxxExtended(ch, param, currentSpeed_); break;
             case 'T': // set tempo (BPM)
-                graph.bpm = (float)param;
+                graph.bpm = 6.0f * (float)param / initialSpeedF;
                 tempoSetThisRow = true;
                 break;
             case 'U': applyVibrato(ch, param); break; // fine vibrato — same code, smaller depth in real engine
@@ -1150,7 +1156,7 @@ ModImporter::ImportResult ModImporter::import(const std::string& path, NodeGraph
             case 'E': handleMODExtended(ch, param, currentSpeed_); break;
             case 'F':
                 if (param < 32) speedSet = param;
-                else { graph.bpm = (float)param; tempoSetThisRow = true; }
+                else { graph.bpm = 6.0f * (float)param / initialSpeedF; tempoSetThisRow = true; }
                 break;
             // XM extensions
             case 'G': // set global volume (0..64)
@@ -1393,8 +1399,13 @@ ModImporter::ImportResult ModImporter::import(const std::string& path, NodeGraph
             } // for ch
 
             // Apply this row's speed change before computing row duration.
-            if (speedSet >= 0)
+            // Speed affects how fast rows advance: fewer ticks = faster rows.
+            // Scale beatsPerRow so notes are placed at the correct wall-clock
+            // positions relative to the fixed transport BPM.
+            if (speedSet >= 0) {
                 currentSpeed = (float)speedSet;
+                beatsPerRow = currentSpeed / (4.0f * initialSpeedF);
+            }
 
             // Advance the wall-clock by one row, plus any pattern delay.
             currentBeat += beatsPerRow * (1 + patternDelayRows);

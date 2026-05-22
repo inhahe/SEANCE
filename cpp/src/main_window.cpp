@@ -854,10 +854,11 @@ void MainContentComponent::timerCallback() {
 
             // Restore editor panels from loaded project (deferred until UI is ready)
             if (!graph.openEditors.empty()) {
-                auto editorsToOpen = graph.openEditors;
+                auto editorIds = graph.openEditors;
                 graph.openEditors.clear();
-                for (auto* node : editorsToOpen)
-                    openEditor(*node);
+                for (int id : editorIds)
+                    if (auto* node = graph.findNode(id))
+                        openEditor(*node);
             }
             // Note: the initial fit-all happens inside NodeGraphComponent's
             // first resized()/paint() call, *before* this timer-deferred init
@@ -1201,7 +1202,7 @@ void MainContentComponent::menuItemSelected(int menuItemID, int) {
             opts.dialogTitle = "Capture Room Impulse Response";
             opts.dialogBackgroundColour = juce::Colour(22, 22, 28);
             opts.escapeKeyTriggersCloseButton = true;
-            opts.useNativeTitleBar = true;
+            opts.useNativeTitleBar = false;
             opts.resizable = true;
             opts.launchAsync();
             break;
@@ -1360,6 +1361,24 @@ public:
         smoothToggle.setClickingTogglesState(true);
         smoothToggle.setToggleState(true, juce::dontSendNotification);
 
+        addAndMakeVisible(addDimBtn);
+        addAndMakeVisible(removeDimBtn);
+        addDimBtn.setButtonText("+ Dim");
+        removeDimBtn.setButtonText("- Dim");
+        addDimBtn.setTooltip("Add a terrain dimension. Adds a new Sig input pin and Position "
+                             "knobs (Center/Radius) on the synth node. The terrain extends into "
+                             "the new axis — fill it with an expression using x, y, z, w variables.");
+        removeDimBtn.setTooltip("Remove the last terrain dimension");
+        addDimBtn.onClick = [this]() { changeDimCount(1); };
+        removeDimBtn.onClick = [this]() { changeDimCount(-1); };
+        updateDimLabel();
+
+        addAndMakeVisible(projCombo);
+        projCombo.setTooltip("Choose which two axes to display in the heatmap when the terrain "
+                             "has more than 2 dimensions.");
+        projCombo.onChange = [this]() { repaint(); };
+        rebuildProjCombo();
+
         setSize(450, 480);
     }
 
@@ -1374,6 +1393,14 @@ public:
         loopModeCombo.setBounds(bottom.removeFromLeft(70));
         bottom.removeFromLeft(4);
         clearPathBtn.setBounds(bottom.removeFromLeft(65));
+        bottom.removeFromLeft(8);
+        addDimBtn.setBounds(bottom.removeFromLeft(70));
+        bottom.removeFromLeft(2);
+        removeDimBtn.setBounds(bottom.removeFromLeft(48));
+        if (projCombo.isVisible()) {
+            bottom.removeFromLeft(4);
+            projCombo.setBounds(bottom.removeFromLeft(60));
+        }
     }
 
     void mouseDown(const juce::MouseEvent& e) override {
@@ -1649,11 +1676,111 @@ public:
                     0, getHeight() - 48, getWidth(), 16, juce::Justification::centred);
     }
 
+    void changeDimCount(int delta) {
+        static const char* axisNames[] = {"X", "Y", "Z", "W", "V", "U", "S", "T"};
+        int curDims = 0;
+        for (auto& pin : node.pinsIn)
+            if (pin.kind == PinKind::Signal) ++curDims;
+        int newDims = juce::jlimit(1, 8, curDims + delta);
+        if (newDims == curDims) return;
+
+        if (newDims > curDims) {
+            // Add signal pin + Center/Radius params
+            for (int d = curDims; d < newDims; ++d) {
+                std::string axis = (d < 8) ? axisNames[d] : std::to_string(d);
+                node.pinsIn.push_back(Pin{0, "Sig " + axis, PinKind::Signal, true, 1});
+                // Assign unique pin ID
+                int maxId = 0;
+                for (auto& p : node.pinsIn)  maxId = std::max(maxId, p.id);
+                for (auto& p : node.pinsOut) maxId = std::max(maxId, p.id);
+                node.pinsIn.back().id = maxId + 1;
+                node.params.push_back({"Center " + axis, 0.5f, 0.0f, 1.0f});
+                node.params.push_back({"Radius " + axis, 0.3f, 0.0f, 0.5f});
+            }
+        } else {
+            // Remove from the end
+            for (int d = curDims; d > newDims; --d) {
+                std::string axis = (d - 1 < 8) ? axisNames[d - 1] : std::to_string(d - 1);
+                // Remove signal pin
+                for (int i = (int)node.pinsIn.size() - 1; i >= 0; --i) {
+                    if (node.pinsIn[i].kind == PinKind::Signal &&
+                        node.pinsIn[i].name == "Sig " + axis) {
+                        node.pinsIn.erase(node.pinsIn.begin() + i);
+                        break;
+                    }
+                }
+                // Remove Center/Radius params
+                auto removeParam = [&](const std::string& name) {
+                    for (int i = (int)node.params.size() - 1; i >= 0; --i)
+                        if (node.params[i].name == name)
+                            { node.params.erase(node.params.begin() + i); break; }
+                };
+                removeParam("Center " + axis);
+                removeParam("Radius " + axis);
+            }
+        }
+        // Rebuild the terrain dimensions
+        std::vector<int> dims(newDims, 64);
+        proc.getTerrain().init(dims);
+        // Re-evaluate expression
+        if (!node.script.empty())
+            proc.getTerrain().fillFromExpression(node.script);
+        updateDimLabel();
+        rebuildProjCombo();
+        repaint();
+    }
+
+    void updateDimLabel() {
+        int dims = 0;
+        for (auto& pin : node.pinsIn)
+            if (pin.kind == PinKind::Signal) ++dims;
+        addDimBtn.setButtonText(dims > 2
+            ? ("+ Dim (" + juce::String(dims) + "D)")
+            : juce::String("+ Dim"));
+    }
+
+    void rebuildProjCombo() {
+        static const char* axisNames[] = {"X", "Y", "Z", "W", "V", "U", "S", "T"};
+        projCombo.clear(juce::dontSendNotification);
+        int dims = 0;
+        for (auto& pin : node.pinsIn)
+            if (pin.kind == PinKind::Signal) ++dims;
+        if (dims <= 2) {
+            projCombo.setVisible(false);
+            return;
+        }
+        projCombo.setVisible(true);
+        int id = 1;
+        for (int a = 0; a < dims; ++a)
+            for (int b = a + 1; b < dims; ++b) {
+                juce::String label = juce::String(axisNames[a]) + "-" + axisNames[b];
+                projCombo.addItem(label, id++);
+            }
+        projCombo.setSelectedItemIndex(0, juce::dontSendNotification);
+    }
+
+    // Get the two projected axis indices from the projection combo selection.
+    std::pair<int, int> projAxes() const {
+        int dims = 0;
+        for (auto& pin : node.pinsIn)
+            if (pin.kind == PinKind::Signal) ++dims;
+        if (dims <= 2) return {0, 1};
+        int sel = projCombo.getSelectedItemIndex();
+        int idx = 0;
+        for (int a = 0; a < dims; ++a)
+            for (int b = a + 1; b < dims; ++b) {
+                if (idx == sel) return {a, b};
+                ++idx;
+            }
+        return {0, 1};
+    }
+
 private:
     TerrainSynthProcessor& proc;
     Node& node;
     juce::TextButton clearPathBtn, smoothToggle;
-    juce::ComboBox loopModeCombo, drawModeCombo;
+    juce::TextButton addDimBtn, removeDimBtn;
+    juce::ComboBox loopModeCombo, drawModeCombo, projCombo;
     float mapOx = 0, mapOy = 0, mapSize_ = 100;
     bool drawing = false;
 
@@ -1683,7 +1810,7 @@ void MainContentComponent::showPluginUI(int nodeId) {
         opts.dialogTitle = "Drum Synth: " + juce::String(node->name);
         opts.dialogBackgroundColour = juce::Colour(22, 22, 28);
         opts.escapeKeyTriggersCloseButton = true;
-        opts.useNativeTitleBar = true;
+        opts.useNativeTitleBar = false;
         opts.resizable = true;
         opts.launchAsync();
         return;
@@ -1698,7 +1825,7 @@ void MainContentComponent::showPluginUI(int nodeId) {
         opts.dialogTitle = "Sampler: " + juce::String(node->name);
         opts.dialogBackgroundColour = juce::Colour(22, 22, 28);
         opts.escapeKeyTriggersCloseButton = true;
-        opts.useNativeTitleBar = true;
+        opts.useNativeTitleBar = false;
         opts.resizable = true;
         opts.launchAsync();
         return;
@@ -1716,7 +1843,7 @@ void MainContentComponent::showPluginUI(int nodeId) {
         opts.dialogTitle = "Sampler (legacy): " + juce::String(node->name);
         opts.dialogBackgroundColour = juce::Colour(22, 22, 28);
         opts.escapeKeyTriggersCloseButton = true;
-        opts.useNativeTitleBar = true;
+        opts.useNativeTitleBar = false;
         opts.resizable = true;
         opts.launchAsync();
         return;
@@ -1732,7 +1859,7 @@ void MainContentComponent::showPluginUI(int nodeId) {
         opts.dialogTitle = "Convolution: " + juce::String(node->name);
         opts.dialogBackgroundColour = juce::Colour(22, 22, 28);
         opts.escapeKeyTriggersCloseButton = true;
-        opts.useNativeTitleBar = true;
+        opts.useNativeTitleBar = false;
         opts.resizable = true;
         opts.launchAsync();
         return;
@@ -1746,7 +1873,7 @@ void MainContentComponent::showPluginUI(int nodeId) {
         opts.dialogTitle = "Spectrum Tap: " + juce::String(node->name);
         opts.dialogBackgroundColour = juce::Colour(22, 22, 28);
         opts.escapeKeyTriggersCloseButton = true;
-        opts.useNativeTitleBar = true;
+        opts.useNativeTitleBar = false;
         opts.resizable = true;
         opts.launchAsync();
         return;
@@ -1760,7 +1887,7 @@ void MainContentComponent::showPluginUI(int nodeId) {
         opts.dialogTitle = "XY Pad";
         opts.dialogBackgroundColour = juce::Colour(25, 25, 32);
         opts.escapeKeyTriggersCloseButton = true;
-        opts.useNativeTitleBar = true;
+        opts.useNativeTitleBar = false;
         opts.resizable = true;
         opts.launchAsync();
         return;
@@ -1781,7 +1908,7 @@ void MainContentComponent::showPluginUI(int nodeId) {
         opts.dialogTitle = "MIDI Modulator: " + juce::String(node->name);
         opts.dialogBackgroundColour = juce::Colour(22, 22, 28);
         opts.escapeKeyTriggersCloseButton = true;
-        opts.useNativeTitleBar = true;
+        opts.useNativeTitleBar = false;
         opts.resizable = true;
         opts.launchAsync();
         return;
@@ -1798,7 +1925,7 @@ void MainContentComponent::showPluginUI(int nodeId) {
         opts.dialogTitle = "Trigger: " + juce::String(node->name);
         opts.dialogBackgroundColour = juce::Colour(22, 22, 28);
         opts.escapeKeyTriggersCloseButton = true;
-        opts.useNativeTitleBar = true;
+        opts.useNativeTitleBar = false;
         opts.resizable = true;
         opts.launchAsync();
         return;
@@ -1841,7 +1968,7 @@ void MainContentComponent::showPluginUI(int nodeId) {
             opts.dialogTitle = "Terrain: " + juce::String(node->name);
             opts.dialogBackgroundColour = juce::Colour(25, 25, 30);
             opts.escapeKeyTriggersCloseButton = true;
-            opts.useNativeTitleBar = true;
+            opts.useNativeTitleBar = false;
             opts.resizable = true;
             opts.launchAsync();
         }
@@ -1943,7 +2070,7 @@ void MainContentComponent::showPluginInfo(int nodeId) {
     opts.dialogTitle = "Plugin Info: " + juce::String(info.name);
     opts.dialogBackgroundColour = juce::Colour(40, 40, 45);
     opts.escapeKeyTriggersCloseButton = true;
-    opts.useNativeTitleBar = true;
+    opts.useNativeTitleBar = false;
     opts.resizable = true;
     opts.launchAsync();
 }
@@ -2149,7 +2276,7 @@ void MainContentComponent::showMidiMap(int nodeId) {
     opts.dialogTitle = "MIDI Map: " + juce::String(node ? node->name : "Plugin");
     opts.dialogBackgroundColour = juce::Colour(40, 40, 45);
     opts.escapeKeyTriggersCloseButton = true;
-    opts.useNativeTitleBar = true;
+    opts.useNativeTitleBar = false;
     opts.resizable = true;
     opts.launchAsync();
 }
@@ -2266,6 +2393,8 @@ void MainContentComponent::onRecord() {
 }
 
 void MainContentComponent::newProject() {
+    editorPanels.clear();
+    editorPanelHeight = 250;
     graph.nodes.clear();
     graph.links.clear();
     graph.openEditors.clear();
@@ -2318,6 +2447,7 @@ void MainContentComponent::newProject() {
     discardAutosave();
     discardUndoTreePersist();
     lastAutosaveAttemptMs = juce::Time::getMillisecondCounterHiRes();
+    resized();
     graphComponent->fitAll();
     graphComponent->repaint();
 }
@@ -2351,7 +2481,7 @@ void MainContentComponent::showMidiDeviceWizard() {
     opts.dialogTitle = "Add MIDI Input Devices";
     opts.dialogBackgroundColour = juce::Colour(28, 28, 36);
     opts.escapeKeyTriggersCloseButton = true;
-    opts.useNativeTitleBar = true;
+    opts.useNativeTitleBar = false;
     opts.resizable = false;
     opts.launchAsync();
 }
@@ -2490,10 +2620,11 @@ void MainContentComponent::openProjectFile(const juce::String& path) {
     ProjectFile::load(path.toStdString(), graph, &audioEngine.getPluginHost());
     upgradeLegacyNodes();
 
-    auto editorsToOpen = graph.openEditors;
+    auto editorIds = graph.openEditors;
     graph.openEditors.clear();
-    for (auto* node : editorsToOpen)
-        openEditor(*node);
+    for (int id : editorIds)
+        if (auto* node = graph.findNode(id))
+            openEditor(*node);
 
     addToRecentProjects(path);
     // Loading a clean project on top of whatever was in memory invalidates
@@ -2922,7 +3053,7 @@ void MainContentComponent::openEditor(Node& node) {
     editorPanels.push_back(std::move(panel));
 
     graph.activeEditorNodeId = node.id;
-    editorPanelHeight = std::max(editorPanelHeight, (int)editorPanels.size() * 200);
+    editorPanelHeight = (int)editorPanels.size() * 200;
     resized();
 }
 
@@ -2931,6 +3062,8 @@ void MainContentComponent::closeEditor(int nodeId) {
         std::remove_if(editorPanels.begin(), editorPanels.end(),
             [nodeId](auto& p) { return p->nodeId == nodeId; }),
         editorPanels.end());
+    editorPanelHeight = editorPanels.empty() ? 250
+        : (int)editorPanels.size() * 200;
     resized();
 }
 
@@ -3770,10 +3903,11 @@ void MainContentComponent::tryRecoverAutosave() {
             safe->projectDirty = true;
             safe->graph.dirty = true;
 
-            auto editorsToOpen = safe->graph.openEditors;
+            auto editorIds = safe->graph.openEditors;
             safe->graph.openEditors.clear();
-            for (auto* node : editorsToOpen)
-                safe->openEditor(*node);
+            for (int id : editorIds)
+                if (auto* node = safe->graph.findNode(id))
+                    safe->openEditor(*node);
 
             safe->graphComponent->fitAll();
             safe->graphComponent->repaint();
@@ -4092,7 +4226,7 @@ void MainContentComponent::showScriptConsoleForNode(int nodeId) {
     opts.dialogTitle = node ? "Script: " + juce::String(node->name) : "Script Console";
     opts.dialogBackgroundColour = juce::Colour(40, 40, 45);
     opts.escapeKeyTriggersCloseButton = true;
-    opts.useNativeTitleBar = true;
+    opts.useNativeTitleBar = false;
     opts.resizable = true;
     opts.launchAsync();
 }
@@ -4329,7 +4463,7 @@ void MainContentComponent::showAudioDeviceSettings() {
     opts.dialogTitle = "Audio Device Settings";
     opts.dialogBackgroundColour = juce::Colour(40, 40, 45);
     opts.escapeKeyTriggersCloseButton = true;
-    opts.useNativeTitleBar = true;
+    opts.useNativeTitleBar = false;
     opts.resizable = true;
     opts.launchAsync();
     return;
@@ -4469,7 +4603,7 @@ void MainContentComponent::showAudioDeviceSettings() {
     opts.dialogTitle = "Audio Device Settings";
     opts.dialogBackgroundColour = juce::Colour(40, 40, 45);
     opts.escapeKeyTriggersCloseButton = true;
-    opts.useNativeTitleBar = true;
+    opts.useNativeTitleBar = false;
     opts.resizable = true;
     opts.launchAsync();
 #endif
@@ -4483,7 +4617,7 @@ void MainContentComponent::showPluginSettingsDialog() {
     opts.dialogTitle = "Plugin Settings";
     opts.dialogBackgroundColour = juce::Colour(40, 40, 45);
     opts.escapeKeyTriggersCloseButton = true;
-    opts.useNativeTitleBar = true;
+    opts.useNativeTitleBar = false;
     opts.resizable = true;
     opts.launchAsync();
 }
@@ -4670,7 +4804,7 @@ void MainContentComponent::openHotkeySettings() {
     opts.dialogTitle = "Assign Hotkeys";
     opts.dialogBackgroundColour = juce::Colour(22, 22, 28);
     opts.escapeKeyTriggersCloseButton = false; // escape is used for canceling capture
-    opts.useNativeTitleBar = true;
+    opts.useNativeTitleBar = false;
     opts.resizable = true;
     opts.launchAsync();
 }

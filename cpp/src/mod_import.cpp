@@ -252,12 +252,27 @@ ModImporter::ImportResult ModImporter::import(const std::string& path, NodeGraph
     if (hasInteractive && numSamples > 0) {
         sampleDir = makeSampleDir(path);
         if (!sampleDir.empty()) {
-            // Stop song playback so reads only render the interactive note.
-            // Use repeat_count = -1 (infinite) so the module keeps rendering
-            // audio frames even after reaching the end — otherwise
-            // read_float_stereo returns 0 immediately and we capture silence.
+            // Silence the song so each extracted WAV captures only the
+            // interactive note we trigger via play_note. play_note allocates
+            // a channel outside the module's pattern-channel range, so muting
+            // every pattern channel leaves the interactive note audible.
+            //
+            // CRITICAL: without muting, the song's pattern playback bleeds
+            // into every sample WAV. When MultiSampler later plays back
+            // those contaminated WAVs at varying pitches, the embedded
+            // song fragments get pitch-shifted along with the actual sample
+            // content — producing phantom notes at wrong pitches in the
+            // rendered output. The previous "set_position_seconds(1e9)
+            // + repeat_count(-1)" approach was meant to skip past song
+            // playback but in practice just looped the song endlessly, so
+            // every read_float_stereo call captured live pattern audio.
+            for (int ch = 0; ch < numChannels; ++ch)
+                interactive.set_channel_mute_status(modExt, ch, 1);
+            // Repeat -1 keeps the module producing audio frames so the
+            // interactive note continues rendering even if the (silent)
+            // song internally reaches its end.
             openmpt_module_set_repeat_count(mod, -1);
-            openmpt_module_set_position_seconds(mod, 1.0e9);
+            openmpt_module_set_position_seconds(mod, 0);
             // Use default (0) interpolation so the extracted WAVs
             // include the tracker's high-quality sinc resampling.
             // The old setting of 1 (no interpolation) caused harsh
@@ -273,6 +288,12 @@ ModImporter::ImportResult ModImporter::import(const std::string& path, NodeGraph
                 samplePaths[s] = extractSampleToWav(modExt, interactive, mod,
                                                      s, name, sampleDir);
             }
+
+            // Restore channel mute state — the pattern walk below reads
+            // pattern data (not audio) so this isn't strictly needed for
+            // correctness, but leaves the module in a clean state.
+            for (int ch = 0; ch < numChannels; ++ch)
+                interactive.set_channel_mute_status(modExt, ch, 0);
         }
     }
 

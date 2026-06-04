@@ -421,15 +421,27 @@ void GraphProcessor::rebuildGraph(NodeGraph& graph, Transport& transport) {
     for (auto& node : graph.nodes) {
         std::unique_ptr<juce::AudioProcessor> proc;
 
-        // Check cache: manual freeze or auto-cache
+        // Check cache: manual freeze or auto-cache.
+        // NEVER cache Output nodes. Output is a graph sink, not a source —
+        // its job is to forward audio to outputNodeId (the AudioGraphIO sink
+        // added at the top of rebuildGraph). Replacing it with a
+        // CachePlaybackProcessor would route nodeMap[Output] to the cache
+        // processor instead of outputNodeId, leaving the real sink dangling
+        // (nothing wired to it) and silencing the entire render. The Output
+        // node's cache IS populated on every Play→Stop (AudioEngine::stop
+        // dumps the live capture into it) so on offline export after any
+        // live playback this branch would otherwise fire and the WAV would
+        // come out silent — see the tracker-import export-silence bug.
         bool useCache = false;
-        if (node.cache.enabled && node.cache.valid) {
-            useCache = true;
-        } else if (node.cache.autoCache && cacheManager.isCacheValid(node, graph)) {
-            // Auto-cache hit — try loading from disk if needed
-            if (node.cache.useDisk && node.cache.left.empty())
-                cacheManager.loadFromDisk(node);
-            useCache = node.cache.hasCachedAudio();
+        if (node.type != NodeType::Output) {
+            if (node.cache.enabled && node.cache.valid) {
+                useCache = true;
+            } else if (node.cache.autoCache && cacheManager.isCacheValid(node, graph)) {
+                // Auto-cache hit — try loading from disk if needed
+                if (node.cache.useDisk && node.cache.left.empty())
+                    cacheManager.loadFromDisk(node);
+                useCache = node.cache.hasCachedAudio();
+            }
         }
 
         if (useCache) {

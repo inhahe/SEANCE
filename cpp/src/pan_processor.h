@@ -68,16 +68,31 @@ public:
 
         float gainL, gainR;
         if (node.panLaw == PanLaw::Linear) {
-            // Linear pan law — matches tracker (MOD/IT/S3M/XM) behavior.
-            // p=-1 → L=1 R=0, p=0 → L=0.5 R=0.5, p=+1 → L=0 R=1.
-            // Normalized so center is unity (L and R each get 1.0).
-            gainL = 1.0f - (p + 1.0f) * 0.5f; // (1 - pan) / 2, then *2 for unity at center
-            gainR =        (p + 1.0f) * 0.5f;
-            // Normalize: at center, gainL = gainR = 0.5.  Scale by 2
-            // so center = unity, hard-panned = 2x (matches tracker behavior
-            // where centre is -6dB relative to hard-panned).
-            gainL *= 2.0f;
-            gainR *= 2.0f;
+            // Linear pan law — used by tracker imports (MOD/IT/S3M/XM)
+            // where per-channel default pans are typically hard L/R and
+            // the level reference is "channel at full amplitude when
+            // hard-panned, half on each when centered".
+            //
+            // Normalized to match the EqualPower path at hard-pan so
+            // tracker output level stays parity with the historical
+            // (EqualPower) rendering:
+            //
+            //   p=-1 → L=sqrt(2)  R=0          (hard L, matches EqualPower)
+            //   p= 0 → L=0.707    R=0.707      (center, -3 dB per channel)
+            //   p=+1 → L=0        R=sqrt(2)    (hard R, matches EqualPower)
+            //
+            // An earlier version of this code scaled by 2 so that center
+            // came out unity; that pushed hard-pan to +6 dB and made MOD
+            // imports clip on export. Subsequent attempt scaled by 1
+            // (hard-pan = 1.0); that was -3 dB too quiet vs the historical
+            // rendering. Matching EqualPower at hard-pan is the right
+            // calibration: it keeps tracker imports at parity with the
+            // pre-PanLaw split while still making the pan curve linear
+            // in level (the part that actually distinguishes the two
+            // laws perceptually).
+            constexpr float kHardPanGain = 1.41421356f; // sqrt(2)
+            gainL = (1.0f - (p + 1.0f) * 0.5f) * kHardPanGain;
+            gainR =        ((p + 1.0f) * 0.5f) * kHardPanGain;
         } else {
             // Equal-power pan law (industry standard for DAWs).
             // theta = 0 (full left) to pi/2 (full right), pi/4 = center

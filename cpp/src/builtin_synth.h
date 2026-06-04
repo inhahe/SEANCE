@@ -104,7 +104,10 @@ public:
     void prepareToPlay(double sr, int bs) override;
     void releaseResources() override {}
     void processBlock(juce::AudioBuffer<float>& buf, juce::MidiBuffer& midi) override;
-    double getTailLengthSeconds() const override { return 2.0; }
+    // Tail = the ADSR release time (param idx 3), the only source of
+    // post-note-off audio in this synth.  No magic constant — reads the
+    // live param value so changing release shrinks/extends the tail.
+    double getTailLengthSeconds() const override { return (double) getParam(3, 0.3f); }
     bool acceptsMidi() const override { return true; }
     bool producesMidi() const override { return false; }
     bool isBusesLayoutSupported(const BusesLayout&) const override { return true; }

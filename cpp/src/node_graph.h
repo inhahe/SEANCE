@@ -29,12 +29,26 @@ enum class PinKind { Audio, Midi, Param, Signal }; // Signal = audio-rate contro
 // the audio-graph routing already carries them on the same channel slot. The
 // receiver decides whether to read once per block (Param semantics) or every
 // sample (Signal semantics). See task #82.
+// Two pin kinds are compatible at the cable level if:
+//   - They're the same kind, OR
+//   - Both are control kinds (Param + Signal), OR
+//   - An Audio output connects to a Signal input (the graph processor
+//     mono-downmixes channel 0 of the source to the signal slot; this
+//     enables sidechain inputs where an audio signal triggers a
+//     control-rate detector).
 inline bool arePinKindsCompatible(PinKind a, PinKind b) {
     if (a == b) return true;
     bool aCtrl = (a == PinKind::Param || a == PinKind::Signal);
     bool bCtrl = (b == PinKind::Param || b == PinKind::Signal);
-    return aCtrl && bCtrl;
+    if (aCtrl && bCtrl) return true;
+    // Audio output → Signal input (mono downmix for sidechain etc.)
+    if (a == PinKind::Audio && b == PinKind::Signal) return true;
+    return false;
 }
+// Panning law applied by PanProcessor.  EqualPower is the industry
+// standard for DAWs; Linear matches tracker behavior (MOD/IT/S3M/XM).
+enum class PanLaw { EqualPower, Linear };
+
 enum class NodeType {
     AudioTimeline, MidiTimeline, Instrument, Effect, Mixer, Output, Script, Group, TerrainSynth, SignalShape,
     // MidiInput represents a single live MIDI input source (computer keyboard,
@@ -108,6 +122,15 @@ struct Param {
     std::string format = "%.2f";
     AutomationLane automation; // recorded automation for this param
     bool autoWriteArmed = false; // when armed, "Write Automation to Selection" includes this param
+
+    // Signal modulation support (#88). When a Signal cable drives this
+    // param, `baseValue` holds the user's intended setting and `value`
+    // is rewritten each audio block to `baseValue + signal * depth`.
+    // When no modulation is active, baseValue is unused (value is the
+    // source of truth). The `modulated` flag indicates whether
+    // baseValue/value are split or identical this block.
+    float baseValue = 0.0f;
+    bool  modulated = false;
 };
 
 // Rational fraction for exact beat subdivisions (e.g., triplets)
@@ -227,7 +250,31 @@ struct Node {
     bool posSet = false;
     bool muted = false;
     bool soloed = false;
+
+    // Peak level metering (#99). Updated by the audio thread each block
+    // (via PanProcessor which runs after every audio-producing node).
+    // Read by the UI thread at 30 Hz for drawing meter bars. Plain
+    // floats (not atomic) because Node must be copyable for std::vector.
+    // The audio thread writes, the UI thread reads — a torn read is at
+    // worst a meter glitch, never a crash. Decay is applied UI-side.
+    float meterPeakL = 0.0f;
+    float meterPeakR = 0.0f;
     std::vector<Param> params;
+
+    // On-demand signal modulation pins (#88). Each entry binds a
+    // dynamically added Signal input pin to a specific param index.
+    // When a Signal cable is connected to the pin, the processor reads
+    // the signal from audio channel (2 + pin's control-slot index) and
+    // modulates the param each block. The pin lives in pinsIn alongside
+    // the node's static pins — it's serialized as part of the normal
+    // pin list in project_file.cpp. The modPin just records the binding.
+    struct ModPin {
+        int paramIndex = -1;  // index into this node's params[]
+        int pinId = -1;       // matching pin id in pinsIn
+        float depth = 1.0f;   // modulation depth: 0=none, 1=full range
+    };
+    std::vector<ModPin> modPins;
+
     std::vector<Clip> clips;
 
     // Take lanes for comping (audio timelines)
@@ -256,6 +303,7 @@ struct Node {
     std::vector<std::pair<float, float>> envReleasePoints;
 
     // Panning and spatial positioning
+    PanLaw panLaw = PanLaw::EqualPower; // panning law for PanProcessor
     float pan = 0.0f;            // stereo pan: -1.0 (full left) to 1.0 (full right), 0 = center
     float spatialX = 0.0f;       // surround: front-back (-1 = back, 1 = front)
     float spatialY = 0.0f;       // surround: left-right (-1 = left, 1 = right)
@@ -430,7 +478,7 @@ public:
 
     std::vector<Node> nodes;
     std::vector<Link> links;
-    std::vector<Node*> openEditors;
+    std::vector<int> openEditors;  // node IDs — never store Node*
 
     float editorPanelHeight = 250.0f;
     int activeEditorNodeId = -1; // node ID of the currently focused editor
@@ -447,6 +495,42 @@ public:
     double loopStartBeat = 0;
     double loopEndBeat = 0;
     double projectSampleRate = 0; // 0 = use device rate
+
+    // Song length and repeat behavior.
+    //
+    // songLengthBeats = 0 means "auto" — derive the effective end from the
+    // last clip across all timeline nodes (see effectiveSongLengthBeats()).
+    // > 0 marks an explicit end beat that overrides the auto-derived value.
+    // When the playhead reaches the effective end, the repeat policy
+    // decides what happens next.
+    //
+    // Repeat modes:
+    //   None    — stop at the song end and halt playback.
+    //   Forever — wrap back to beat 0 and keep playing until Stop.
+    //   NTimes  — wrap back to beat 0, play the song N times total, then
+    //             stop. N = songRepeatCount, where 1 means "play once
+    //             then stop" (same as None), 2 means "play twice", etc.
+    //
+    // The user-region loop (loopEnabled / loopStartBeat / loopEndBeat) is
+    // an inner A-B cycler and takes precedence while active — the song-
+    // length policy only fires when the user loop is disabled or the
+    // playhead is outside the user-loop range.
+    //
+    // Tracker import uses Forever to preserve Bxx song-loop semantics
+    // instead of unrolling the order list in place.
+    enum class SongRepeat : int { None = 0, Forever = 1, NTimes = 2 };
+    double    songLengthBeats = 0;
+    SongRepeat songRepeatMode  = SongRepeat::None;
+    int       songRepeatCount  = 1;   // only used when mode == NTimes
+
+    // Returns the effective song-end beat used by the transport.  If
+    // songLengthBeats was set explicitly (> 0), that value wins. Otherwise
+    // walks all AudioTimeline / MidiTimeline nodes and returns the largest
+    // getTimelineBeats() across them — i.e. the end of the last clip,
+    // rounded up to the next 4-beat bar. Returns 0 if there are no
+    // timelines with clips (in which case the engine treats the song as
+    // having no end and just plays until the user presses Stop).
+    double effectiveSongLengthBeats() const;
 
     // Tuning system and concert pitch (project-wide)
     TuningSystem tuningSystem = TuningSystem::Equal12;
@@ -518,6 +602,17 @@ public:
     // Re-executed when project is loaded
     std::string signalScript;
     UndoTree undoTree;
+
+    // Shared undo history sidecar path. If non-empty, the project is
+    // associated with an external history file (stored alongside the
+    // .ssp so it can travel with the project when shared). The path is
+    // relative to the .ssp file's directory. See task #90 for the full
+    // lifecycle (save-as opt-in, open-prompt with three options, known-
+    // histories preferences).
+    //
+    // Empty string = no sidecar; undo history persists only to the
+    // machine-local userAppData/SEANCE/undo-tree.dat file.
+    std::string historyFilePath;
 
     // Shared waveform library — named waveforms usable by any synth/signal node
     struct WaveformEntry {

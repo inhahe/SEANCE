@@ -2,6 +2,8 @@
 #include "wasm_script_processor.h"
 #include "builtin_synth.h"
 #include "terrain_synth.h"
+#include "multi_sampler.h"
+#include "sfizz_processor.h"
 #include "signal_shape_node.h"
 #include "cache_processor.h"
 #include "pan_processor.h"
@@ -68,6 +70,19 @@ void MidiTimelineProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mi
             midi.addEvent(msg, offset);
         node.pendingMpePassthrough.clear();
     }
+
+    // On stop: send all-notes-off on every channel so sustained notes
+    // don't keep ringing through downstream synths/plugins.
+    // Only CC 123 (all-notes-off) — CC 120 (all-sound-off) is more
+    // aggressive and some synths handle it by resetting internal state
+    // in ways that can interfere with subsequent playback.
+    if (wasPlaying && !transport.playing) {
+        for (int ch = 1; ch <= 16; ++ch)
+            midi.addEvent(juce::MidiMessage::allNotesOff(ch), 0);
+        // Clear MPE channel state
+        for (auto& mc : mpeChannels) mc = {};
+    }
+    wasPlaying = transport.playing;
 
     // Generate MIDI from timeline clips when playing
     if (transport.playing) {
@@ -460,8 +475,25 @@ void GraphProcessor::rebuildGraph(NodeGraph& graph, Transport& transport) {
                 node.plugin->graphNodeId = graphNode->nodeID.uid;
             }
             continue;
+        } else if (node.type == NodeType::Instrument && node.script == "__fmsynth__") {
+            proc = std::make_unique<FMSynthProcessor>(node);
+        } else if (node.type == NodeType::Instrument &&
+                   node.script.rfind("__spectralgrain__:", 0) == 0) {
+            proc = std::make_unique<SpectralGrainProcessor>(node);
+        } else if (node.type == NodeType::Instrument && node.script == "__additivesynth__") {
+            proc = std::make_unique<AdditiveSynthProcessor>(node);
+        } else if (node.type == NodeType::Instrument && node.script == "__pdsynth__") {
+            proc = std::make_unique<PDSynthProcessor>(node);
+        } else if (node.type == NodeType::Instrument && node.script == "__particlesynth__") {
+            proc = std::make_unique<ParticleSynthProcessor>(node);
         } else if (node.type == NodeType::Instrument && node.script == "__drumsynth__") {
             proc = std::make_unique<DrumSynthProcessor>(node);
+        } else if (node.type == NodeType::Instrument &&
+                   node.script.rfind(MultiSamplerDoc::kPrefix, 0) == 0) {
+            proc = std::make_unique<MultiSamplerProcessor>(node);
+        } else if (node.type == NodeType::Instrument &&
+                   node.script.rfind("__sfizz__:", 0) == 0) {
+            proc = std::make_unique<SfizzProcessor>(node);
         } else if (node.type == NodeType::Instrument &&
                    (node.script.rfind("__sf2__:", 0) == 0 ||
                     node.script.rfind("__sfz__:", 0) == 0)) {
@@ -489,6 +521,15 @@ void GraphProcessor::rebuildGraph(NodeGraph& graph, Transport& transport) {
             proc = std::make_unique<PhaserProcessor>(node);
         } else if (node.type == NodeType::Effect && node.script == "__echo__") {
             proc = std::make_unique<EchoProcessor>(node);
+        } else if (node.type == NodeType::Effect && node.script == "__reverb__") {
+            proc = std::make_unique<ReverbProcessor>(node);
+        } else if (node.type == NodeType::Effect && node.script == "__eq__") {
+            proc = std::make_unique<ParametricEQProcessor>(node);
+        } else if (node.type == NodeType::Effect && node.script == "__ringmod__") {
+            proc = std::make_unique<RingModProcessor>(node);
+        } else if (node.type == NodeType::Effect &&
+                   (node.script == "__msencode__" || node.script == "__msdecode__")) {
+            proc = std::make_unique<MidSideProcessor>(node);
         } else if (node.type == NodeType::Effect && node.script == "__compressor__") {
             proc = std::make_unique<CompressorProcessor>(node);
         } else if (node.type == NodeType::Effect && node.script == "__limiter__") {
@@ -508,6 +549,34 @@ void GraphProcessor::rebuildGraph(NodeGraph& graph, Transport& transport) {
             proc = std::make_unique<TriggerProcessor>(node, transport);
         } else if (node.type == NodeType::Effect && node.script == "__spatializer3d__") {
             proc = std::make_unique<Spatializer3DProcessor>(node);
+        } else if (node.type == NodeType::Effect && node.script == "__waveletmbcomp__") {
+            proc = std::make_unique<WaveletMultibandCompProcessor>(node);
+        } else if (node.type == NodeType::Effect && node.script == "__sms__") {
+            proc = std::make_unique<SMSProcessor>(node);
+        } else if (node.type == NodeType::Effect && node.script == "__formantpitch__") {
+            proc = std::make_unique<FormantPitchShiftProcessor>(node);
+        } else if (node.type == NodeType::Effect && node.script == "__waveletvocoder__") {
+            proc = std::make_unique<WaveletVocoderProcessor>(node);
+        } else if (node.type == NodeType::Effect && node.script == "__pitchtracker__") {
+            proc = std::make_unique<WaveletPitchTrackerProcessor>(node);
+        } else if (node.type == NodeType::Effect && node.script == "__asymfilter__") {
+            proc = std::make_unique<AsymmetricFilterProcessor>(node);
+        } else if (node.type == NodeType::Effect && node.script == "__waveletcomplexity__") {
+            proc = std::make_unique<WaveletComplexityProcessor>(node);
+        } else if (node.type == NodeType::Effect && node.script == "__indpitchshift__") {
+            proc = std::make_unique<IndependentPitchShiftProcessor>(node);
+        } else if (node.type == NodeType::Effect && node.script == "__waveletreverb__") {
+            proc = std::make_unique<WaveletReverbProcessor>(node);
+        } else if (node.type == NodeType::Effect && node.script == "__waveletpitch__") {
+            proc = std::make_unique<WaveletPitchShiftProcessor>(node);
+        } else if (node.type == NodeType::Effect && node.script == "__octaveshift__") {
+            proc = std::make_unique<OctaveShiftProcessor>(node);
+        } else if (node.type == NodeType::Effect && node.script == "__waveletbitcrush__") {
+            proc = std::make_unique<WaveletBitcrushProcessor>(node);
+        } else if (node.type == NodeType::Effect && node.script == "__denoiser__") {
+            proc = std::make_unique<WaveletDenoiserProcessor>(node);
+        } else if (node.type == NodeType::Effect && node.script == "__transientsplit__") {
+            proc = std::make_unique<TransientSplitProcessor>(node);
         } else if (node.type == NodeType::Effect && node.script == "__pitchshift__") {
             proc = std::make_unique<PitchShiftProcessor>(node);
         } else {

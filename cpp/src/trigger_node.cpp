@@ -254,6 +254,42 @@ TriggerProcessor::TriggerProcessor(Node& n, Transport& t)
         doc = TriggerDoc::defaultDoc();
 }
 
+double TriggerProcessor::getTailLengthSeconds() const {
+    // Worst-case time after the last input event that this node can keep
+    // producing output: max(delay + lengthBeats) for MIDI rules,
+    // max(shape duration) for Signal rules.  Beats convert via current BPM.
+    const double secsPerBeat = 60.0 / std::max(1.0, transport.bpm);
+    double worst = 0.0;
+    for (const auto& r : doc.rules) {
+        if (r.target == TriggerTarget::Midi) {
+            double t = (double)(r.delayBeats + r.lengthBeats) * secsPerBeat;
+            worst = std::max(worst, t);
+        } else { // Signal
+            double t = 0;
+            switch (r.shape) {
+                case TriggerShape::Step:
+                    t = (double)(r.holdMs + r.releaseMs) * 0.001;
+                    break;
+                case TriggerShape::Envelope:
+                    t = (double)(r.attackMs + r.decayMs + r.releaseMs) * 0.001;
+                    break;
+                case TriggerShape::Ramp:
+                    t = (double) r.rampDurationMs * 0.001;
+                    break;
+                case TriggerShape::FromVelocity:
+                    t = 0;  // instant value, no tail
+                    break;
+                case TriggerShape::Curve:
+                    if (!r.curvePoints.empty())
+                        t = (double) r.curvePoints.back().timeMs * 0.001;
+                    break;
+            }
+            worst = std::max(worst, t);
+        }
+    }
+    return worst;
+}
+
 void TriggerProcessor::rereadDocIfChanged() {
     if (node.script != cachedScript) {
         cachedScript = node.script;
@@ -302,6 +338,8 @@ void TriggerProcessor::scheduleRule(const TriggerRule& r,
         s.velocityNorm = (float)trig.getVelocity() / 127.0f;
         s.velocityScale = r.velocityScale;
         s.velocityOffset = r.velocityOffset;
+        if (r.shape == TriggerShape::Curve)
+            s.curvePoints = r.curvePoints;
         activeShapes.push_back(s);
     }
 }
@@ -360,6 +398,24 @@ float TriggerProcessor::evalShape(const ActiveShape& s, int64_t nowSample, bool&
             expired = true;
             return s.restValue;
         }
+        case TriggerShape::Curve: {
+            // Play through the curve points (time in ms → samples).
+            if (s.curvePoints.empty()) { expired = true; return s.restValue; }
+            float tMs = t / (float)(sampleRate * 0.001);
+            if (tMs <= s.curvePoints.front().timeMs) return s.curvePoints.front().value;
+            if (tMs >= s.curvePoints.back().timeMs) { expired = true; return s.curvePoints.back().value; }
+            for (size_t i = 0; i + 1 < s.curvePoints.size(); ++i) {
+                auto& a = s.curvePoints[i];
+                auto& b = s.curvePoints[i + 1];
+                if (tMs >= a.timeMs && tMs <= b.timeMs) {
+                    float span = b.timeMs - a.timeMs;
+                    float frac = (span > 0.001f) ? (tMs - a.timeMs) / span : 1.0f;
+                    return a.value + (b.value - a.value) * frac;
+                }
+            }
+            expired = true;
+            return s.curvePoints.back().value;
+        }
     }
     expired = true;
     return s.restValue;
@@ -372,6 +428,33 @@ void TriggerProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::MidiBuf
     int64_t blockStart = absSampleTime;
     int64_t blockEnd = blockStart + numSamples;
 
+    // 0. Audio-threshold triggers (#109): scan the audio input for level
+    //    crossings and fire matching rules. The input audio arrives on
+    //    channel 0 (the MIDI In pin carries MIDI, but if an Audio→Signal
+    //    cable is wired to an input it arrives on channel 2+; for
+    //    threshold we read channel 0 which carries any summed audio).
+    {
+        float threshLinLast = lastThreshLevel;
+        for (auto& r : doc.rules) {
+            if (r.event != TriggerEvent::AudioThreshold) continue;
+            float threshLin = std::pow(10.0f, r.thresholdDb / 20.0f);
+            int retrigSamples = std::max(1, (int)(r.retriggerMs * 0.001 * sampleRate));
+            for (int s = 0; s < numSamples; ++s) {
+                float level = 0;
+                for (int c = 0; c < std::min(2, buf.getNumChannels()); ++c)
+                    level = std::max(level, std::abs(buf.getSample(c, s)));
+                if (level >= threshLin && threshLinLast < threshLin
+                    && (blockStart + s - lastThreshFireSample) >= retrigSamples) {
+                    lastThreshFireSample = blockStart + s;
+                    auto synth = juce::MidiMessage::noteOn(1, 60, (juce::uint8)100);
+                    scheduleRule(r, synth, blockStart + s);
+                }
+                threshLinLast = level;
+            }
+        }
+        lastThreshLevel = threshLinLast;
+    }
+
     // 1. Pass through input MIDI AND evaluate rules on note-ons.
     juce::MidiBuffer output;
     for (auto meta : midi) {
@@ -381,10 +464,12 @@ void TriggerProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::MidiBuf
 
         output.addEvent(msg, sampleOffset);
 
+        // Note-on triggers.
         if (msg.isNoteOn()) {
             int pitch = msg.getNoteNumber();
             int vel = msg.getVelocity();
             for (auto& r : doc.rules) {
+                if (r.event != TriggerEvent::NoteOn) continue;
                 if (pitch < r.minPitch || pitch > r.maxPitch) continue;
                 if (vel < r.minVel || vel > r.maxVel) continue;
                 if (r.probability < 1.0f) {
@@ -392,6 +477,24 @@ void TriggerProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::MidiBuf
                     if (u > r.probability) continue;
                 }
                 scheduleRule(r, msg, trigSample);
+            }
+        }
+        // Note-off triggers (#109).
+        if (msg.isNoteOff()) {
+            int pitch = msg.getNoteNumber();
+            for (auto& r : doc.rules) {
+                if (r.event != TriggerEvent::NoteOff) continue;
+                if (pitch < r.minPitch || pitch > r.maxPitch) continue;
+                if (r.probability < 1.0f) {
+                    float u = (float)rng() / (float)rng.max();
+                    if (u > r.probability) continue;
+                }
+                // Synthesize a note-on from the note-off so scheduleRule
+                // has valid pitch/velocity data. Velocity = 80 (default
+                // for note-off triggers since MIDI note-off vel is often 0).
+                auto synth = juce::MidiMessage::noteOn(
+                    msg.getChannel(), pitch, (juce::uint8)80);
+                scheduleRule(r, synth, trigSample);
             }
         }
     }

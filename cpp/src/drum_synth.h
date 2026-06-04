@@ -57,7 +57,10 @@ public:
     void prepareToPlay(double sr, int) override { sampleRate = sr; }
     void releaseResources() override {}
     void processBlock(juce::AudioBuffer<float>& buf, juce::MidiBuffer& midi) override;
-    double getTailLengthSeconds() const override { return 2.0; }
+    // Tail = max(per-voice effective exponential decay) × kInaudible.
+    // Defined in drum_synth.cpp so the decay constants don't drift away
+    // from the matching ones in renderDrumSample().
+    double getTailLengthSeconds() const override;
     bool acceptsMidi() const override { return true; }
     bool producesMidi() const override { return false; }
     bool isBusesLayoutSupported(const BusesLayout&) const override { return true; }

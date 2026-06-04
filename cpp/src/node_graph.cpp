@@ -41,6 +41,25 @@ float NodeGraph::getTimelineBeats(const Node& node) const {
     return std::max(4.0f, std::ceil(end / 4.0f) * 4.0f);
 }
 
+double NodeGraph::effectiveSongLengthBeats() const {
+    // Explicit override wins.
+    if (songLengthBeats > 0) return songLengthBeats;
+
+    // Auto-derive: max getTimelineBeats() across all timeline nodes that
+    // actually have clips. getTimelineBeats() returns 4.0 for empty
+    // timelines, which would falsely make an empty project "4 beats long";
+    // skip them so a project with no clips at all returns 0 (= no end).
+    double maxEnd = 0.0;
+    for (const auto& n : nodes) {
+        if (n.type != NodeType::AudioTimeline &&
+            n.type != NodeType::MidiTimeline) continue;
+        if (n.clips.empty()) continue;
+        double e = (double) getTimelineBeats(n);
+        if (e > maxEnd) maxEnd = e;
+    }
+    return maxEnd;
+}
+
 Node& NodeGraph::addNode(const std::string& name, NodeType type,
                           std::vector<Pin> ins, std::vector<Pin> outs,
                           Vec2 pos) {
@@ -266,6 +285,15 @@ void NodeGraph::resolveAnchors() {
 
 void NodeGraph::setupDefaultGraph() {
     nodes.reserve(16);
+
+    // Reset song-end / repeat state to defaults. Without this, switching
+    // from a loaded project (e.g. a MOD import with songLengthBeats=352
+    // and SongRepeat::Forever) to File → New would leave those values in
+    // place, and the auto-derive from clips would be silently overridden
+    // by a stale explicit value from the previous project.
+    songLengthBeats = 0;                  // 0 = auto-derive from clips
+    songRepeatMode  = SongRepeat::None;   // halt at song end by default
+    songRepeatCount = 1;
 
     // Computer Keyboard Input — represents the on-screen / typing input
     // device. Live MIDI from the computer keyboard is pushed into this

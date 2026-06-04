@@ -17,12 +17,20 @@ struct WaveLayer {
     float phase = 0.0f;   // 0..1 (one full cycle)
     float amp   = 1.0f;   // 0..1
 
-    // For Drawn shape: free control points over one cycle.
+    // For Drawn shape: two sub-modes.
+    //
+    // Points mode (freehandMode == false): free control points over one cycle.
     // Each point is (phase 0..1, amplitude -1..1). Waveform is evaluated
     // by Catmull-Rom interpolation through the points, wrapped periodically.
     // Empty list = flat zero; a fresh Drawn layer is seeded with a few
     // points so the user has something to grab.
+    //
+    // Freehand mode (freehandMode == true): per-sample waveform data stored
+    // in drawnSamples (512 floats, each in -1..1, covering one cycle).
+    // Linearly interpolated to any output table size during render.
+    bool freehandMode = false;
     std::vector<std::pair<float, float>> drawnPoints;
+    std::vector<float> drawnSamples;  // 512 samples for freehand mode
 };
 
 struct LayeredWaveform {
@@ -165,6 +173,9 @@ private:
     juce::TextButton applyBtn    { "Apply" };
     juce::TextButton closeBtn    { "Close" };
     juce::TextButton helpBtn     { "?" };
+    // A/B Compare (#9): switch between render modes to hear the difference
+    juce::TextButton compareABtn { "A: Wavetable" };
+    juce::TextButton compareBBtn { "B: Additive" };
     juce::Viewport   layersViewport;
     juce::Component  layersContainer;
     std::vector<std::unique_ptr<LayerRow>> rows;

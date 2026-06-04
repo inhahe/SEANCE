@@ -14,6 +14,7 @@
 #include "audio_export.h"
 #include <juce_gui_basics/juce_gui_basics.h>
 #include <set>
+#include <unordered_map>
 #include <atomic>
 #include <mutex>
 #include <condition_variable>
@@ -74,6 +75,12 @@ public:
     void setupHotkeyCallbacks();
     void openHotkeySettings();
 
+    // Upgrade any legacy-format nodes in the graph in place. Shared by
+    // startup autoload and openProjectFile so both paths pick up fixes
+    // for old projects (e.g. stub "Reverb" nodes getting a script +
+    // param set, MidiTimeline nodes missing MIDI In pins, etc.).
+    void upgradeLegacyNodes();
+
 private:
     std::unique_ptr<juce::MenuBarComponent> menuBar;
     std::unique_ptr<NodeGraphComponent> graphComponent;
@@ -85,6 +92,7 @@ private:
     juce::TextButton fitAllBtn{"Fit All"};
     juce::TextButton metroBtn{"Metro"};
     juce::TextButton loopBtn{"Loop"};
+    juce::TextButton songBtn{"Song"};
     juce::TextButton monitorBtn{"Mon"};
     juce::ComboBox timeSigCombo;
     juce::Label timeSigLabel;
@@ -153,6 +161,7 @@ private:
     int midiDeviceCheckCounter = 0;
     bool midiDeviceScanInitialized = false;
     void showPluginSettingsDialog();
+    void showSongSettingsDialog();
     void showAudioDeviceSettings();
 
     // Recent projects
@@ -240,6 +249,53 @@ private:
     void discardUndoTreePersist();  // delete the on-disk undo tree
     void tryRestoreUndoTree();      // called once at startup, after the
                                     // graph state and audio engine are ready
+
+    // Shared undo history sidecar (#90). When a project has an associated
+    // sidecar file (graph.historyFilePath is set), writeUndoTreePersist
+    // also updates it alongside the machine-local undo-tree.dat. Save-As
+    // offers to create one on demand. Opening a project with an unseen
+    // sidecar triggers the 3-option prompt (adopt / copy / ignore).
+    //
+    // Known-histories preferences: a per-user record of which decision
+    // the user made for each project path, so repeat opens don't re-
+    // prompt. Keyed by absolute project path.
+    enum class HistoryDecision { NeverSeen, Adopted, Copied, Ignored };
+    struct HistoryRecord {
+        HistoryDecision decision = HistoryDecision::NeverSeen;
+        std::string copyPath;   // populated when decision == Copied
+    };
+    std::unordered_map<std::string, HistoryRecord> knownHistories;
+    void loadKnownHistories();
+    void saveKnownHistories();
+    HistoryRecord getHistoryDecision(const juce::String& projectPath) const;
+    void recordHistoryDecision(const juce::String& projectPath,
+                               HistoryDecision d,
+                               const std::string& copyPath = {});
+
+    // Runs after openProjectFile to check for a sidecar and prompt if
+    // unseen. Takes the absolute path of the project file that was just
+    // loaded so it can look up the sidecar's location and the user's
+    // past decision.
+    void handleSharedHistoryOnOpen(const juce::String& projectAbsPath);
+
+    // After a successful Save As, optionally write a sidecar alongside
+    // the .ssp file (if the user confirmed "include undo history"). The
+    // function takes the same path the save was written to so it can
+    // determine the sidecar location.
+    void offerSharedHistoryOnSaveAs(const juce::String& savedProjectPath);
+
+    // Write the current undo tree to an explicit sidecar path (used by
+    // the save-as opt-in path and by the "use a copy" branch of the
+    // open prompt). Updates graph.historyFilePath to the relative path
+    // (relative to the project's .ssp location) so future writes go to
+    // the same sidecar.
+    void writeSharedHistorySidecar(const juce::File& sidecarFile);
+
+    // Returns the absolute path of the sidecar associated with the
+    // currently-loaded project, or an empty File if none. If the .ssp
+    // file's historyFile field is set, uses that (resolved relative to
+    // the .ssp). Otherwise returns empty.
+    juce::File currentProjectSidecarFile() const;
 
     // After loading the autosave file (which sets each plugin's state via
     // [Node] pluginState= entries), apply any per-plugin override files

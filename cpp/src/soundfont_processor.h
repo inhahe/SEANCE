@@ -62,7 +62,23 @@ public:
     void prepareToPlay(double sr, int bs) override;
     void releaseResources() override;
     void processBlock(juce::AudioBuffer<float>& buf, juce::MidiBuffer& midi) override;
-    double getTailLengthSeconds() const override { return 2.0; }
+    // Tail: SFZ is data-driven (max ampegRelease across loaded regions);
+    // SF2 envelope state is opaque inside tinysoundfont, so we fall back
+    // to a named upper bound that covers typical SF2 instrument releases.
+    double getTailLengthSeconds() const override {
+        if (!sfz.regions.empty()) {
+            double t = 0;
+            for (const auto& r : sfz.regions)
+                if (r.ampegRelease > t) t = r.ampegRelease;
+            return t;
+        }
+        // SF2: tinysoundfont doesn't surface per-preset env data.  This
+        // matches the longest release commonly seen in GM SoundFonts
+        // (pads, strings).  If a future TSF version exposes envelope
+        // data, replace this with a per-preset query.
+        static constexpr double kSf2MaxReleaseSeconds = 2.0;
+        return kSf2MaxReleaseSeconds;
+    }
     bool acceptsMidi() const override { return true; }
     bool producesMidi() const override { return false; }
     bool isBusesLayoutSupported(const BusesLayout&) const override { return true; }

@@ -165,17 +165,33 @@ PluginHost::PluginDetail PluginHost::getPluginDetail(int pluginIndex) {
         }
     }
 
-    // Parameters
-    auto& params = instance->getParameters();
-    for (auto* p : params) {
-        PluginDetail::ParamInfo pi;
-        pi.name = p->getName(128).toStdString();
-        pi.label = p->getLabel().toStdString();
-        pi.defaultValue = p->getDefaultValue();
-        pi.numSteps = p->getNumSteps();
-        pi.isAutomatable = p->isAutomatable();
-        pi.isDiscrete = p->isDiscrete();
-        detail.params.push_back(pi);
+    // Parameters — cap at 256 to protect against badly-behaved plugins
+    // that report thousands of params (one per input combination, etc.).
+    // Also skip params with nonsensical ranges (max < min) since those
+    // would crash or confuse the automation and MIDI Learn systems.
+    {
+        auto& params = instance->getParameters();
+        constexpr int kMaxParams = 256;
+        int count = 0;
+        for (auto* p : params) {
+            if (count >= kMaxParams) break;
+            PluginDetail::ParamInfo pi;
+            pi.name = p->getName(128).toStdString();
+            pi.label = p->getLabel().toStdString();
+            pi.defaultValue = p->getDefaultValue();
+            pi.numSteps = p->getNumSteps();
+            pi.isAutomatable = p->isAutomatable();
+            pi.isDiscrete = p->isDiscrete();
+            // Skip params with invalid default values (outside 0..1 JUCE range)
+            // or obviously-broken names (empty or all whitespace).
+            if (pi.name.empty() || pi.defaultValue < -0.01f || pi.defaultValue > 1.01f)
+                continue;
+            detail.params.push_back(pi);
+            ++count;
+        }
+        if ((int)params.size() > kMaxParams)
+            fprintf(stderr, "Plugin '%s' reports %d params; capped at %d\n",
+                    detail.info.name.c_str(), (int)params.size(), kMaxParams);
     }
 
     // Presets

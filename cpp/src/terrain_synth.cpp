@@ -1,4 +1,6 @@
 #include "terrain_synth.h"
+#include "signal_modulation.h"
+#include "wavelet.h"
 #include "builtin_synth.h" // for WaveExprParser
 #include "fft_util.h"
 #include "layered_wave_editor.h" // for LayeredWaveform decode/render
@@ -286,6 +288,116 @@ void Terrain::fillFromAudioFile(const std::string& path) {
     fprintf(stderr, "Terrain loaded from audio: %d samples\n", numSamples);
 }
 
+void Terrain::fillFractal(int size, int iterations, float decay) {
+    init({size});
+    // Seed: a simple sine wave as the base pattern.
+    for (int i = 0; i < size; ++i)
+        data[i] = std::sin(2.0f * 3.14159265f * (float)i / (float)size);
+
+    auto filt = getWaveletFilter("db4");
+
+    // Forward DWT to get coefficients.
+    std::vector<float> sig = data;
+    int levels = dwt(sig, iterations, filt);
+
+    // Replace each detail level's coefficients with a scaled, self-similar
+    // copy of the approximation level — creating fractal repetition across
+    // scales. Each level decays by `decay` to produce a 1/f-like spectrum.
+    int approxLen = size;
+    for (int l = 0; l < levels; ++l) approxLen /= 2;
+
+    int bandStart = approxLen;
+    for (int band = 0; band < levels; ++band) {
+        int bandLen = approxLen * (1 << band);
+        float scale = std::pow(decay, (float)(band + 1));
+        // Fill this band with a stretched copy of the approximation × scale.
+        for (int i = 0; i < bandLen; ++i) {
+            int srcIdx = (i * approxLen) / bandLen; // stretch
+            if (srcIdx < approxLen)
+                sig[bandStart + i] = sig[srcIdx] * scale;
+        }
+        bandStart += bandLen;
+    }
+
+    // Inverse DWT to get the fractal waveform.
+    idwt(sig, levels, filt);
+
+    // Normalize to [-1, 1].
+    float maxAbs = 0;
+    for (auto v : sig) maxAbs = std::max(maxAbs, std::abs(v));
+    if (maxAbs > 0) {
+        for (int i = 0; i < size; ++i) data[i] = sig[i] / maxAbs;
+    }
+
+    fprintf(stderr, "Terrain fractal fill: %d samples, %d iterations\n", size, iterations);
+}
+
+void Terrain::buildMipmaps(int maxLevels) {
+    mipmaps.clear();
+    if (data.empty() || numDimensions() != 1) return;
+    int n = (int)data.size();
+    if ((n & (n - 1)) != 0) return; // must be power of 2
+
+    auto filt = getWaveletFilter("db4");
+    mipmaps.push_back(data); // level 0 = original
+
+    std::vector<float> current = data;
+    for (int l = 0; l < maxLevels && n >= (int)filt.h0.size() * 2; ++l) {
+        // One DWT step: splits into approximation (half) + detail (half).
+        dwtStep(current, n, filt);
+        n /= 2;
+        // The approximation is the first half — it's the low-pass filtered,
+        // downsampled version (fewer harmonics, shorter table).
+        std::vector<float> mip(current.begin(), current.begin() + n);
+        // IDWT step to get the actual waveform (not coefficients).
+        // We need to reconstruct from just the approximation (zero detail).
+        std::vector<float> reconBuf(n * 2, 0.0f);
+        for (int i = 0; i < n; ++i) reconBuf[i] = mip[i];
+        idwtStep(reconBuf, n * 2, filt);
+        // The reconstructed waveform is in reconBuf[0..n*2-1] but we want
+        // it at half-resolution (n samples). Downsample by 2.
+        std::vector<float> downsampled(n);
+        for (int i = 0; i < n; ++i)
+            downsampled[i] = reconBuf[std::min(i * 2, n * 2 - 1)];
+        mipmaps.push_back(downsampled);
+    }
+}
+
+float Terrain::sampleMipmap(float phase01, float pitchRatio) const {
+    if (mipmaps.empty()) return sample({phase01}); // fallback
+    // Pick level: log2(pitchRatio) rounded down, clamped to available levels.
+    int level = 0;
+    if (pitchRatio > 1.0f)
+        level = std::min((int)std::floor(std::log2(pitchRatio)),
+                         (int)mipmaps.size() - 1);
+    const auto& mip = mipmaps[level];
+    int n = (int)mip.size();
+    if (n == 0) return 0;
+    float idx = phase01 * n;
+    int i0 = ((int)idx) % n;
+    int i1 = (i0 + 1) % n;
+    float frac = idx - (int)idx;
+    return mip[i0] + (mip[i1] - mip[i0]) * frac;
+}
+
+void Terrain::toWaveletBasis(int levels) {
+    if (isWaveletBasis) return;
+    if (data.empty()) return;
+    int n = (int)data.size();
+    if ((n & (n - 1)) != 0) return; // must be power of 2
+    auto filt = getWaveletFilter("db4");
+    dwt(data, levels, filt);
+    isWaveletBasis = true;
+}
+
+void Terrain::fromWaveletBasis(int levels) {
+    if (!isWaveletBasis) return;
+    if (data.empty()) return;
+    auto filt = getWaveletFilter("db4");
+    idwt(data, levels, filt);
+    isWaveletBasis = false;
+}
+
 // ==============================================================================
 // Traversal — maps time to N-dimensional coordinate
 // ==============================================================================
@@ -515,8 +627,29 @@ float TerrainSynthProcessor::Voice::advanceEnv(float sr, float a, float d, float
 // TerrainSynthProcessor
 // ==============================================================================
 
+void TerrainSynthProcessor::reloadIfScriptChanged() {
+    if (node.script == cachedScript) return;
+    cachedScript = node.script;
+
+    // For now, only re-parse __layered__ scripts at runtime — other
+    // script types (audio, image, wavetable) load files and don't
+    // change during a session.
+    if (node.script.find("__layered__:") == 0) {
+        LayeredWaveform lw;
+        if (lw.decode(node.script)) {
+            std::vector<float> samples;
+            lw.render(samples);
+            terrain.init({(int)samples.size()});
+            auto& d = terrain.getData();
+            if ((int)d.size() == (int)samples.size())
+                d = std::move(samples);
+        }
+    }
+}
+
 TerrainSynthProcessor::TerrainSynthProcessor(Node& n, Transport& t) : node(n), transport(t) {
     auto& script = node.script;
+    cachedScript = script;
 
     if (script.find("__image__:") == 0) {
         terrain.fillFromImage(script.substr(10));
@@ -700,6 +833,8 @@ static float getParamByName(const Node& node, const std::string& name, float def
 }
 
 void TerrainSynthProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::MidiBuffer& midi) {
+    applySignalModulations(node, buf);
+    reloadIfScriptChanged();
     buf.clear();
     int numSamples = buf.getNumSamples();
     int numChannels = buf.getNumChannels();
@@ -840,6 +975,17 @@ void TerrainSynthProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mi
                     }
                 }
             }
+        } else if (msg.isAllNotesOff()) {
+            for (int i = 0; i < MAX_VOICES; ++i) {
+                if (voices[i].active && voices[i].envStage != Voice::Release) {
+                    voices[i].sustainHeld = false;
+                    voices[i].envStage = Voice::Release;
+                    voices[i].envTime = 0;
+                }
+            }
+        } else if (msg.isAllSoundOff()) {
+            for (int i = 0; i < MAX_VOICES; ++i)
+                voices[i] = {};
         }
     }
 
@@ -900,13 +1046,43 @@ void TerrainSynthProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mi
         float invT = 1.0f / totalW;
         auto& tdata = terrain.getData();
         int ts = (int)tdata.size();
-        std::fill(tdata.begin(), tdata.end(), 0.0f);
-        for (int fi = 0; fi < nFrames; ++fi) {
-            if (weights[fi] <= 0.0f) continue;
-            float w = weights[fi] * invT;
-            const auto& src = wtScatterFrameSamples[fi];
-            int n = std::min((int)src.size(), ts);
-            for (int i = 0; i < n; ++i) tdata[i] += w * src[i];
+
+        // Wavelet-domain morphing (#52): instead of blending raw samples
+        // (which can cause spectral smearing), decompose each contributing
+        // frame via DWT, blend the wavelet coefficients with the same
+        // Wendland weights, then reconstruct a single blended waveform.
+        // Falls back to time-domain blend if the table size isn't a power
+        // of 2 or if wavelet decomposition fails.
+        bool useWaveletMorph = (ts >= 8) && ((ts & (ts - 1)) == 0);
+        if (useWaveletMorph) {
+            auto filt = getWaveletFilter("db2");
+            int maxLevels = 4;
+
+            // Accumulate weighted wavelet coefficients.
+            std::vector<float> blended(ts, 0.0f);
+            for (int fi = 0; fi < nFrames; ++fi) {
+                if (weights[fi] <= 0.0f) continue;
+                float w = weights[fi] * invT;
+                const auto& src = wtScatterFrameSamples[fi];
+                std::vector<float> coeffs(ts, 0.0f);
+                int n = std::min((int)src.size(), ts);
+                for (int i = 0; i < n; ++i) coeffs[i] = src[i];
+                dwt(coeffs, maxLevels, filt);
+                for (int i = 0; i < ts; ++i) blended[i] += w * coeffs[i];
+            }
+            // Inverse DWT to get the blended waveform.
+            idwt(blended, maxLevels, filt);
+            for (int i = 0; i < ts; ++i) tdata[i] = blended[i];
+        } else {
+            // Time-domain fallback (original behavior).
+            std::fill(tdata.begin(), tdata.end(), 0.0f);
+            for (int fi = 0; fi < nFrames; ++fi) {
+                if (weights[fi] <= 0.0f) continue;
+                float w = weights[fi] * invT;
+                const auto& src = wtScatterFrameSamples[fi];
+                int n = std::min((int)src.size(), ts);
+                for (int i = 0; i < n; ++i) tdata[i] += w * src[i];
+            }
         }
     }
 

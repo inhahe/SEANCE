@@ -1,6 +1,12 @@
 #pragma once
+// Silence MSVC C++20 deprecation of std::atomic_load/store for shared_ptr.
+// We use these for the lock-free TempoMap swap (#22); replacing them with
+// std::atomic<shared_ptr> would require C++20 library support that not all
+// toolchains ship yet.
+#define _SILENCE_CXX20_OLD_SHARED_PTR_ATOMIC_SUPPORT_DEPRECATION_WARNING
 #include <cstdint>
 #include <vector>
+#include <memory>
 #include <algorithm>
 #include "tuning.h"
 
@@ -28,23 +34,36 @@ struct TempoPoint {
 };
 
 // Tempo map — supports multiple tempo changes over time
+// Lock-free TempoMap via shared_ptr swap (#22). The UI thread builds a
+// new immutable vector and atomically publishes it. The audio thread
+// grabs a snapshot via atomic_load and reads it without locking. No
+// iterator-invalidation races, no empty-vector windows.
 class TempoMap {
 public:
+    using Points = std::vector<TempoPoint>;
+    // Not const-qualified because MSVC's std::atomic_store can't resolve
+    // the const/non-const shared_ptr overload. The vector is treated as
+    // immutable by convention — once published, nobody mutates it.
+    using PointsPtr = std::shared_ptr<Points>;
+
     TempoMap() {
-        // Default: single constant tempo
-        points.push_back({0, 120.0, 120.0, 0});
+        auto p = std::make_shared<Points>();
+        p->push_back({0, 120.0, 120.0, 0});
+        std::atomic_store(&pts, std::move(p));
     }
 
-    // Get BPM at a given beat position
-    double bpmAtBeat(double beat) const {
-        if (points.empty()) return 120.0;
-        // Find the last point at or before this beat
-        const TempoPoint* active = &points[0];
-        for (auto& p : points)
-            if (p.beatPosition <= beat) active = &p;
+    // Snapshot accessor — audio thread calls this once per block and
+    // reads through the returned shared_ptr for the rest of the block.
+    PointsPtr snapshot() const { return std::atomic_load(&pts); }
 
+    // Get BPM at a given beat position.
+    double bpmAtBeat(double beat) const {
+        auto sp = snapshot();
+        if (!sp || sp->empty()) return 120.0;
+        const TempoPoint* active = &(*sp)[0];
+        for (auto& p : *sp)
+            if (p.beatPosition <= beat) active = &p;
         if (active->endBpm != active->bpm && active->endBeat > active->beatPosition) {
-            // Linear ramp
             double frac = (beat - active->beatPosition) / (active->endBeat - active->beatPosition);
             frac = std::clamp(frac, 0.0, 1.0);
             return active->bpm + (active->endBpm - active->bpm) * frac;
@@ -52,38 +71,27 @@ public:
         return active->bpm;
     }
 
-    // Convert beats to seconds (integrates tempo)
     double beatsToSeconds(double beats) const {
-        // Defensive: an empty `points` vector can happen briefly during a
-        // setGlobalBpm() race (clear followed by push_back is not atomic).
-        // Treat empty as 120 BPM.
-        if (points.empty()) return beats * 60.0 / 120.0;
-        if (points.size() == 1 && points[0].bpm == points[0].endBpm) {
-            // Simple constant tempo
-            return beats * 60.0 / points[0].bpm;
-        }
-        // Numerical integration for variable tempo
-        double seconds = 0;
-        double currentBeat = 0;
-        double step = 0.25; // quarter-beat steps
+        auto sp = snapshot();
+        if (!sp || sp->empty()) return beats * 60.0 / 120.0;
+        if (sp->size() == 1 && (*sp)[0].bpm == (*sp)[0].endBpm)
+            return beats * 60.0 / (*sp)[0].bpm;
+        double seconds = 0, currentBeat = 0, step = 0.25;
         while (currentBeat < beats) {
             double dt = std::min(step, beats - currentBeat);
-            double bpm = bpmAtBeat(currentBeat + dt * 0.5); // midpoint
+            double bpm = bpmAtBeat(currentBeat + dt * 0.5);
             seconds += dt * 60.0 / bpm;
             currentBeat += dt;
         }
         return seconds;
     }
 
-    // Convert seconds to beats (inverse of above)
     double secondsToBeats(double seconds) const {
-        // Defensive: see beatsToSeconds for the empty-points race rationale.
-        if (points.empty()) return seconds * 120.0 / 60.0;
-        if (points.size() == 1 && points[0].bpm == points[0].endBpm) {
-            return seconds * points[0].bpm / 60.0;
-        }
-        // Binary search
-        double lo = 0, hi = seconds * 300.0 / 60.0; // generous upper bound
+        auto sp = snapshot();
+        if (!sp || sp->empty()) return seconds * 120.0 / 60.0;
+        if (sp->size() == 1 && (*sp)[0].bpm == (*sp)[0].endBpm)
+            return seconds * (*sp)[0].bpm / 60.0;
+        double lo = 0, hi = seconds * 300.0 / 60.0;
         for (int i = 0; i < 50; ++i) {
             double mid = (lo + hi) / 2;
             if (beatsToSeconds(mid) < seconds) lo = mid; else hi = mid;
@@ -91,42 +99,55 @@ public:
         return (lo + hi) / 2;
     }
 
-    // Convert beats to samples
     double beatsToSamples(double beats, double sampleRate) const {
         return beatsToSeconds(beats) * sampleRate;
     }
-
     double samplesToBeats(int64_t samples, double sampleRate) const {
         return secondsToBeats(samples / sampleRate);
     }
 
+    // Mutators — UI thread only. Each builds a new vector and
+    // atomically replaces the shared pointer.
     void addTempoChange(double beat, double bpm) {
-        points.push_back({beat, bpm, bpm, 0});
-        std::sort(points.begin(), points.end(),
+        auto old = snapshot();
+        auto nv = std::make_shared<Points>(old ? *old : Points{{0,120,120,0}});
+        nv->push_back({beat, bpm, bpm, 0});
+        std::sort(nv->begin(), nv->end(),
                   [](auto& a, auto& b) { return a.beatPosition < b.beatPosition; });
+        std::atomic_store(&pts, PointsPtr(std::move(nv)));
     }
 
     void addTempoRamp(double startBeat, double endBeat, double startBpm, double endBpm) {
-        points.push_back({startBeat, startBpm, endBpm, endBeat});
-        std::sort(points.begin(), points.end(),
+        auto old = snapshot();
+        auto nv = std::make_shared<Points>(old ? *old : Points{{0,120,120,0}});
+        nv->push_back({startBeat, startBpm, endBpm, endBeat});
+        std::sort(nv->begin(), nv->end(),
                   [](auto& a, auto& b) { return a.beatPosition < b.beatPosition; });
+        std::atomic_store(&pts, PointsPtr(std::move(nv)));
     }
 
     void clear() {
-        // Push the replacement first so the audio thread never sees an
-        // empty vector mid-mutation, then drop the old entries.
-        points.push_back({0, 120.0, 120.0, 0});
-        if (points.size() > 1)
-            points.erase(points.begin(), points.end() - 1);
+        auto nv = std::make_shared<Points>();
+        nv->push_back({0, 120.0, 120.0, 0});
+        std::atomic_store(&pts, PointsPtr(std::move(nv)));
     }
 
     void setGlobalBpm(double bpm) {
-        points.push_back({0, bpm, bpm, 0});
-        if (points.size() > 1)
-            points.erase(points.begin(), points.end() - 1);
+        auto nv = std::make_shared<Points>();
+        nv->push_back({0, bpm, bpm, 0});
+        std::atomic_store(&pts, PointsPtr(std::move(nv)));
     }
 
-    std::vector<TempoPoint> points;
+    // Legacy accessor kept for code that reads `tempoMap.points` directly
+    // (e.g. timerCallback sync checks). Returns a copy of the current
+    // snapshot. Safe but not lock-free — UI thread only.
+    Points getPoints() const {
+        auto sp = snapshot();
+        return sp ? *sp : Points{{0, 120.0, 120.0, 0}};
+    }
+
+private:
+    PointsPtr pts;
 };
 
 // Time signature map — supports changes over time

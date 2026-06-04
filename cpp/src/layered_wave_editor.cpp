@@ -14,6 +14,17 @@ namespace SoundShop {
 
 // Seed a fresh Drawn layer with a handful of points arranged like a sine so
 // the user has something visible to grab and move.
+static constexpr int kFreehandSampleCount = 512;
+
+static std::vector<float> defaultFreehandSamples() {
+    std::vector<float> out(kFreehandSampleCount, 0.0f);
+    for (int i = 0; i < kFreehandSampleCount; ++i) {
+        float phase = (float)i / (float)kFreehandSampleCount;
+        out[i] = std::sin(2.0f * (float)M_PI * phase);
+    }
+    return out;
+}
+
 static std::vector<std::pair<float, float>> defaultDrawnPoints() {
     return {
         {0.00f,  0.0f},
@@ -89,9 +100,24 @@ static float sampleDrawnPoints(const std::vector<std::pair<float, float>>& pts,
                  + (-y0 + 3.0f*y1 - 3.0f*y2 + y3) * t3);
 }
 
+// Linear interpolation through a periodic array of per-sample waveform data.
+static float sampleDrawnSamples(const std::vector<float>& samples, float x) {
+    int n = (int)samples.size();
+    if (n == 0) return 0.0f;
+    x = x - std::floor(x);          // wrap to [0, 1)
+    float idx = x * (float)n;
+    int i0 = (int)idx % n;
+    int i1 = (i0 + 1) % n;
+    float frac = idx - std::floor(idx);
+    return samples[i0] * (1.0f - frac) + samples[i1] * frac;
+}
+
 static float sampleLayer(const WaveLayer& layer, float x, std::mt19937& rng) {
-    if (layer.shape == WaveLayer::Drawn)
+    if (layer.shape == WaveLayer::Drawn) {
+        if (layer.freehandMode && !layer.drawnSamples.empty())
+            return sampleDrawnSamples(layer.drawnSamples, x);
         return sampleDrawnPoints(layer.drawnPoints, x);
+    }
     return evalShape(layer.shape, x, rng);
 }
 
@@ -148,9 +174,16 @@ static void encodeLayer(std::ostringstream& o, const WaveLayer& l) {
       << "," << l.phase
       << "," << l.amp;
     if (l.shape == WaveLayer::Drawn) {
-        o << "," << l.drawnPoints.size();
-        for (auto& p : l.drawnPoints)
-            o << "," << p.first << "," << p.second;
+        o << "," << (l.freehandMode ? 1 : 0);
+        if (l.freehandMode) {
+            o << "," << l.drawnSamples.size();
+            for (float s : l.drawnSamples)
+                o << "," << s;
+        } else {
+            o << "," << l.drawnPoints.size();
+            for (auto& p : l.drawnPoints)
+                o << "," << p.first << "," << p.second;
+        }
     }
 }
 
@@ -171,16 +204,50 @@ static bool parseLayer(const std::string& lp, WaveLayer& out) {
     try { out.phase = std::stof(f[2]); } catch (...) { out.phase = 0.0f; }
     try { out.amp   = std::stof(f[3]); } catch (...) { out.amp   = 1.0f; }
     if (out.shape == WaveLayer::Drawn && f.size() > 4) {
-        int count = 0;
-        try { count = std::stoi(f[4]); } catch (...) { count = 0; }
-        for (int k = 0; k < count; ++k) {
-            size_t xi = 5 + (size_t)k * 2;
-            size_t yi = xi + 1;
-            if (yi >= f.size()) break;
-            float x = 0, y = 0;
-            try { x = std::stof(f[xi]); } catch (...) {}
-            try { y = std::stof(f[yi]); } catch (...) {}
-            out.drawnPoints.emplace_back(x, y);
+        // Field 4: freehandMode flag (0 or 1). Legacy data without this flag
+        // will have a point count here instead; detect by checking whether the
+        // total field count matches point-mode layout.
+        int freehandFlag = 0;
+        try { freehandFlag = std::stoi(f[4]); } catch (...) {}
+
+        // Heuristic for legacy data: if f[4] > 1, it must be a legacy point
+        // count (old format had no freehand flag).  New format always has 0 or 1.
+        bool isLegacy = (freehandFlag > 1);
+        if (isLegacy) {
+            out.freehandMode = false;
+            int count = freehandFlag;
+            for (int k = 0; k < count; ++k) {
+                size_t xi = 5 + (size_t)k * 2;
+                size_t yi = xi + 1;
+                if (yi >= f.size()) break;
+                float x = 0, y = 0;
+                try { x = std::stof(f[xi]); } catch (...) {}
+                try { y = std::stof(f[yi]); } catch (...) {}
+                out.drawnPoints.emplace_back(x, y);
+            }
+        } else {
+            out.freehandMode = (freehandFlag != 0);
+            if (f.size() > 5) {
+                int count = 0;
+                try { count = std::stoi(f[5]); } catch (...) {}
+                if (out.freehandMode) {
+                    for (int k = 0; k < count && (size_t)(6 + k) < f.size(); ++k) {
+                        float v = 0.0f;
+                        try { v = std::stof(f[6 + k]); } catch (...) {}
+                        out.drawnSamples.push_back(v);
+                    }
+                } else {
+                    for (int k = 0; k < count; ++k) {
+                        size_t xi = 6 + (size_t)k * 2;
+                        size_t yi = xi + 1;
+                        if (yi >= f.size()) break;
+                        float x = 0, y = 0;
+                        try { x = std::stof(f[xi]); } catch (...) {}
+                        try { y = std::stof(f[yi]); } catch (...) {}
+                        out.drawnPoints.emplace_back(x, y);
+                    }
+                }
+            }
         }
     }
     return true;
@@ -446,7 +513,10 @@ static void renderSingleLayer(const WaveLayer& layer, int tableSize,
 {
     out.assign(tableSize, 0.0f);
     std::mt19937 rng(1234u + (unsigned)layer.ratio * 31u + (unsigned)layer.shape * 7u);
-    int r = std::max(1, layer.ratio);
+    // For Drawn shapes, show one cycle in the preview so the control
+    // points line up with the curve. The harmonic ratio still applies
+    // in the final multi-layer render (LayeredWaveform::render).
+    int r = (layer.shape == WaveLayer::Drawn) ? 1 : std::max(1, layer.ratio);
     for (int i = 0; i < tableSize; ++i) {
         float phase = (float)i / (float)tableSize;
         float x = phase * (float)r + layer.phase;
@@ -486,6 +556,22 @@ public:
         addShapeBtn(triangleBtn, "Triangle", WaveLayer::Triangle);
         addShapeBtn(noiseBtn,    "Noise",    WaveLayer::Noise);
         addShapeBtn(drawnBtn,    "Draw",     WaveLayer::Drawn);
+
+        addAndMakeVisible(freehandToggle);
+        freehandToggle.setButtonText("Points");
+        freehandToggle.setTooltip("Toggle between Points mode (click to place control points with smooth interpolation) "
+                                  "and Freehand mode (click and drag to draw the waveform shape directly).");
+        freehandToggle.onClick = [this]() {
+            auto& l = owner.currentLayers()[index];
+            l.freehandMode = !l.freehandMode;
+            freehandToggle.setButtonText(l.freehandMode ? "Freehand" : "Points");
+            // Seed freehand samples if switching to freehand for the first time.
+            if (l.freehandMode && l.drawnSamples.empty())
+                l.drawnSamples = defaultFreehandSamples();
+            refreshPreview();
+            owner.onLayerChanged();
+        };
+        freehandToggle.setVisible(false); // only visible when shape == Drawn
 
         auto setupSlider = [this](juce::Slider& sl, double lo, double hi, double step, const char* suffix) {
             addAndMakeVisible(sl);
@@ -539,6 +625,8 @@ public:
         phaseSlider.setValue(l.phase, juce::dontSendNotification);
         ampSlider  .setValue(l.amp,   juce::dontSendNotification);
         updateShapeButtons();
+        freehandToggle.setVisible(l.shape == WaveLayer::Drawn);
+        freehandToggle.setButtonText(l.freehandMode ? "Freehand" : "Points");
         refreshPreview();
     }
 
@@ -549,13 +637,15 @@ public:
     }
 
     void updateShapeButtons() {
-        auto shape = owner.currentLayers()[index].shape;
-        sineBtn    .setToggleState(shape == WaveLayer::Sine,     juce::dontSendNotification);
-        sawBtn     .setToggleState(shape == WaveLayer::Saw,      juce::dontSendNotification);
-        squareBtn  .setToggleState(shape == WaveLayer::Square,   juce::dontSendNotification);
-        triangleBtn.setToggleState(shape == WaveLayer::Triangle, juce::dontSendNotification);
-        noiseBtn   .setToggleState(shape == WaveLayer::Noise,    juce::dontSendNotification);
-        drawnBtn   .setToggleState(shape == WaveLayer::Drawn,    juce::dontSendNotification);
+        auto& l = owner.currentLayers()[index];
+        sineBtn    .setToggleState(l.shape == WaveLayer::Sine,     juce::dontSendNotification);
+        sawBtn     .setToggleState(l.shape == WaveLayer::Saw,      juce::dontSendNotification);
+        squareBtn  .setToggleState(l.shape == WaveLayer::Square,   juce::dontSendNotification);
+        triangleBtn.setToggleState(l.shape == WaveLayer::Triangle, juce::dontSendNotification);
+        noiseBtn   .setToggleState(l.shape == WaveLayer::Noise,    juce::dontSendNotification);
+        drawnBtn   .setToggleState(l.shape == WaveLayer::Drawn,    juce::dontSendNotification);
+        freehandToggle.setVisible(l.shape == WaveLayer::Drawn);
+        freehandToggle.setButtonText(l.freehandMode ? "Freehand" : "Points");
     }
 
     void resized() override {
@@ -573,6 +663,12 @@ public:
         triangleBtn.setBounds(btnRow.removeFromLeft(bw));
         noiseBtn   .setBounds(btnRow.removeFromLeft(bw));
         drawnBtn   .setBounds(btnRow);
+
+        // Freehand/Points toggle — only visible for Drawn layers
+        if (freehandToggle.isVisible()) {
+            auto ftRow = a.removeFromTop(24);
+            freehandToggle.setBounds(ftRow.removeFromLeft(100));
+        }
 
         // Reserve space for the mini preview (bottom of row)
         a.removeFromBottom(previewHeight);
@@ -622,10 +718,10 @@ public:
             g.setColour(juce::Colour(150, 200, 255));
             g.strokePath(p, juce::PathStrokeType(1.3f));
 
-            // For Drawn layers, overlay the control points so the user can
-            // see and grab them.
+            // For Drawn layers in Points mode, overlay the control points so
+            // the user can see and grab them.
             const auto& layer = owner.currentLayers()[index];
-            if (layer.shape == WaveLayer::Drawn) {
+            if (layer.shape == WaveLayer::Drawn && !layer.freehandMode) {
                 for (int i = 0; i < (int)layer.drawnPoints.size(); ++i) {
                     const auto& pt = layer.drawnPoints[i];
                     // Scale y by amp because the preview renders amp*shape,
@@ -643,7 +739,7 @@ public:
     }
 
     static constexpr int previewHeight = 92;
-    static int rowHeight() { return 22 + 24 + 20 * 3 + 12 + previewHeight + 4; }
+    static int rowHeight() { return 22 + 24 + 24 + 20 * 3 + 12 + previewHeight + 4; }
 
     juce::Rectangle<float> getPreviewAreaBounds() const {
         auto bounds = getLocalBounds().reduced(6).toFloat();
@@ -687,11 +783,53 @@ public:
                   });
     }
 
+    // Write freehand sample data at normalized position x with value y,
+    // interpolating between the previous write position and the current one
+    // so there are no gaps when dragging quickly.
+    void writeFreehandSample(float x, float y) {
+        auto& samples = owner.currentLayers()[index].drawnSamples;
+        if (samples.empty()) samples = defaultFreehandSamples();
+        int n = (int)samples.size();
+        int idx = juce::jlimit(0, n - 1, (int)(x * (float)n));
+        if (lastFreehandIdx >= 0 && lastFreehandIdx != idx) {
+            // Interpolate between last and current to avoid gaps.
+            int from = lastFreehandIdx;
+            int to = idx;
+            float fromY = lastFreehandY;
+            float toY = y;
+            int steps = std::abs(to - from);
+            int dir = (to > from) ? 1 : -1;
+            for (int s = 0; s <= steps; ++s) {
+                int si = from + s * dir;
+                if (si < 0 || si >= n) continue;
+                float t = (steps > 0) ? (float)s / (float)steps : 1.0f;
+                samples[si] = fromY + (toY - fromY) * t;
+            }
+        } else {
+            samples[idx] = y;
+        }
+        lastFreehandIdx = idx;
+        lastFreehandY = y;
+    }
+
     void mouseDown(const juce::MouseEvent& e) override {
-        if (owner.currentLayers()[index].shape != WaveLayer::Drawn) return;
+        auto& l = owner.currentLayers()[index];
+        if (l.shape != WaveLayer::Drawn) return;
         float x, y;
         if (!mouseToPointXY(e.position, x, y)) return;
-        auto& pts = owner.currentLayers()[index].drawnPoints;
+
+        if (l.freehandMode) {
+            // Freehand: start drawing samples
+            freehandDrawing = true;
+            lastFreehandIdx = -1;
+            writeFreehandSample(x, y);
+            refreshPreview();
+            owner.onLayerChanged();
+            return;
+        }
+
+        // Points mode (original behavior)
+        auto& pts = l.drawnPoints;
         int hit = findPointNear(x, y);
         if (e.mods.isShiftDown() && hit >= 0) {
             // Shift-click a point to delete it (keep at least 2 points so
@@ -722,9 +860,25 @@ public:
     }
 
     void mouseDrag(const juce::MouseEvent& e) override {
-        if (owner.currentLayers()[index].shape != WaveLayer::Drawn) return;
+        auto& l = owner.currentLayers()[index];
+        if (l.shape != WaveLayer::Drawn) return;
+
+        if (l.freehandMode && freehandDrawing) {
+            auto area = getPreviewAreaBounds();
+            auto cp = e.position;
+            cp.x = juce::jlimit(area.getX(), area.getRight() - 1.0f, cp.x);
+            cp.y = juce::jlimit(area.getY(), area.getBottom(), cp.y);
+            float x, y;
+            mouseToPointXY(cp, x, y);
+            writeFreehandSample(x, y);
+            refreshPreview();
+            owner.onLayerChanged();
+            return;
+        }
+
+        // Points mode
         if (draggingIdx < 0) return;
-        auto& pts = owner.currentLayers()[index].drawnPoints;
+        auto& pts = l.drawnPoints;
         if (draggingIdx >= (int)pts.size()) { draggingIdx = -1; return; }
         float x, y;
         // Use clamped conversion so dragging outside the area still moves the point.
@@ -746,7 +900,11 @@ public:
         owner.onLayerChanged();
     }
 
-    void mouseUp(const juce::MouseEvent&) override { draggingIdx = -1; }
+    void mouseUp(const juce::MouseEvent&) override {
+        draggingIdx = -1;
+        freehandDrawing = false;
+        lastFreehandIdx = -1;
+    }
 
 private:
     LayeredWaveEditorComponent& owner;
@@ -754,11 +912,17 @@ private:
 
     juce::Label label;
     juce::TextButton sineBtn, sawBtn, squareBtn, triangleBtn, noiseBtn, drawnBtn;
+    juce::TextButton freehandToggle;
     juce::Slider ratioSlider, phaseSlider, ampSlider;
     juce::Label  ratioLabel, phaseLabel, ampLabel;
     juce::TextButton deleteBtn;
     std::vector<float> previewSamples;
     int draggingIdx = -1;
+
+    // Freehand drawing state
+    bool freehandDrawing = false;
+    int  lastFreehandIdx = -1;
+    float lastFreehandY = 0.0f;
 };
 
 // ==============================================================================
@@ -1251,8 +1415,10 @@ LayeredWaveEditorComponent::LayeredWaveEditorComponent(NodeGraph& g, int nid, st
 
     // Scatter dimensions: + / - to add/remove a Position axis.
     addAndMakeVisible(addDimBtn);
-    addDimBtn.setTooltip("Add a new Position axis (dimension) to the wavetable. Each axis adds a "
-                         "Position knob on the synth node that morphs through the frames along that axis.");
+    addDimBtn.setTooltip("Add a dimension axis. In Grid mode, this adds a new axis to the frame grid "
+                         "-- use the + Frame button to add frames along the new axis, then each Position "
+                         "knob on the synth node morphs through frames along that axis. In Scatter mode, "
+                         "each frame gets an extra coordinate you can set in the scatter view.");
     addDimBtn.onClick = [this]() {
         if (wave.mode == WavetableMode::Scatter) {
             if (wave.scatterDims < 8) wave.scatterDims++;
@@ -1265,6 +1431,8 @@ LayeredWaveEditorComponent::LayeredWaveEditorComponent(NodeGraph& g, int nid, st
             // Grid mode: add a new dimension of size 1
             if ((int)wave.gridDims.size() < 8) wave.gridDims.push_back(1);
         }
+        addDimBtn.setButtonText("+ Dim (" + juce::String(wave.numDimensions()) + "D)");
+        removeDimBtn.setButtonText("- Dim");
         rebuildScatterUI();
         syncPositionParams();
         onLayerChanged();
@@ -1284,6 +1452,9 @@ LayeredWaveEditorComponent::LayeredWaveEditorComponent(NodeGraph& g, int nid, st
         } else {
             if (wave.gridDims.size() > 1) wave.gridDims.pop_back();
         }
+        int nd = wave.numDimensions();
+        addDimBtn.setButtonText(nd > 1 ? ("+ Dim (" + juce::String(nd) + "D)") : juce::String("+ Dim"));
+        removeDimBtn.setButtonText("- Dim");
         rebuildScatterUI();
         syncPositionParams();
         onLayerChanged();
@@ -1356,6 +1527,29 @@ LayeredWaveEditorComponent::LayeredWaveEditorComponent(NodeGraph& g, int nid, st
     helpBtn.setTooltip("Open the wavetable / layered waveform docs");
     helpBtn.onClick = []() { openHelpDocFile("wavetables.html"); };
 
+    // A/B Compare (#9): toggle between render modes for the same waveform.
+    addAndMakeVisible(compareABtn);
+    addAndMakeVisible(compareBBtn);
+    compareABtn.setTooltip("Preview this waveform as a wavetable (Mode A — IFFT to single cycle)");
+    compareBBtn.setTooltip("Preview this waveform through the additive synth (Mode B — per-partial sine bank)");
+    compareABtn.onClick = [this]() {
+        // Mode A = SamplePerPoint (wavetable playback).
+        if (auto* nd = graph.findNode(nodeId))
+            for (auto& p : nd->params)
+                if (p.name == "Synth Mode") { p.value = 0.0f; break; }
+        compareABtn.setColour(juce::TextButton::buttonColourId, juce::Colour(60, 100, 60));
+        compareBBtn.setColour(juce::TextButton::buttonColourId, juce::Colour(55, 55, 60));
+    };
+    compareBBtn.onClick = [this]() {
+        // Mode B = WaveformPerPoint (each terrain value modulates the oscillator timbre).
+        if (auto* nd = graph.findNode(nodeId))
+            for (auto& p : nd->params)
+                if (p.name == "Synth Mode") { p.value = 1.0f; break; }
+        compareBBtn.setColour(juce::TextButton::buttonColourId, juce::Colour(60, 60, 100));
+        compareABtn.setColour(juce::TextButton::buttonColourId, juce::Colour(55, 55, 60));
+    };
+    compareABtn.setColour(juce::TextButton::buttonColourId, juce::Colour(60, 100, 60));
+
     addAndMakeVisible(applyBtn);
     applyBtn.setButtonText("Apply");
     applyBtn.setTooltip("Save the current waveform edits to the synth without closing this editor");
@@ -1386,6 +1580,10 @@ LayeredWaveEditorComponent::LayeredWaveEditorComponent(NodeGraph& g, int nid, st
     layersViewport.setScrollBarsShown(true, false);
 
     modeToggleBtn.setButtonText(wave.mode == WavetableMode::Grid ? "Mode: Grid" : "Mode: Scatter");
+    {
+        int nd = wave.numDimensions();
+        if (nd > 1) addDimBtn.setButtonText("+ Dim (" + juce::String(nd) + "D)");
+    }
     rebuildFrameTabs();
     rebuildScatterUI();
     rebuildRows();
@@ -1802,6 +2000,10 @@ void LayeredWaveEditorComponent::resized() {
     top.removeFromRight(4);
     applyBtn  .setBounds(top.removeFromRight(60));
     top.removeFromRight(4);
+    compareBBtn.setBounds(top.removeFromRight(80));
+    top.removeFromRight(2);
+    compareABtn.setBounds(top.removeFromRight(90));
+    top.removeFromRight(4);
     helpBtn   .setBounds(top.removeFromRight(26));
     top.removeFromRight(6);
     anaglyph3DBtn.setBounds(top.removeFromRight(40));
@@ -1825,14 +2027,18 @@ void LayeredWaveEditorComponent::resized() {
                 x += xw + gap;
             }
         }
-        // Hide scatter view
+        // Hide scatter-only controls
         if (scatterView) scatterView->setVisible(false);
         nonProjAxisRow.setVisible(false);
+        anaglyph3DBtn.setVisible(false);
+        projectionCombo.setVisible(false);
     } else {
         frameTabsRow.setBounds({});
         // Scatter mode: viewport + coord entry + non-projected sliders + (3D settings)
         if (scatterView) scatterView->setVisible(true);
         nonProjAxisRow.setVisible(true);
+        anaglyph3DBtn.setVisible(true);
+        projectionCombo.setVisible(true);
 
         int viewH = 260;
         auto viewArea = a.removeFromTop(viewH);
@@ -1950,12 +2156,23 @@ void LayeredWaveEditorComponent::paint(juce::Graphics& g) {
                previewArea.reduced(6, 2).toNearestInt(),
                juce::Justification::topLeft, true);
 
+    // Reserve a strip at the bottom of the preview for the X-axis labels
+    // and duration anchor.  Without this, the curve sat on a 0..1 phase
+    // axis with no indication of what time it actually represents — a
+    // wavetable synth reads one cycle per played-note period, so one
+    // cycle's duration is literally 1/note_freq seconds.  We show the
+    // duration at common reference pitches so the user can see "this
+    // sub-cycle wiggle = ~0.5 ms".
+    const float axisStripH = 28.0f;
+    auto curveArea = previewArea.reduced(4.0f, 14.0f);
+    curveArea.removeFromBottom(axisStripH - 4.0f);
+
     // Waveform curve
     if (!previewSamples.empty()) {
-        float cx = previewArea.getX() + 4;
-        float cy = previewArea.getCentreY();
-        float w  = previewArea.getWidth() - 8;
-        float h  = previewArea.getHeight() - 8;
+        float cx = curveArea.getX();
+        float cy = curveArea.getCentreY();
+        float w  = curveArea.getWidth();
+        float h  = curveArea.getHeight();
 
         g.setColour(juce::Colours::grey.withAlpha(0.3f));
         g.drawHorizontalLine((int)cy, cx, cx + w);
@@ -1970,6 +2187,56 @@ void LayeredWaveEditorComponent::paint(juce::Graphics& g) {
         }
         g.setColour(juce::Colours::cornflowerblue);
         g.strokePath(p, juce::PathStrokeType(1.5f));
+
+        // Phase tick marks at 0, 1/4, 1/2, 3/4, 1.  Anchors the curve to
+        // a clear "one full cycle" mental model — without these, the
+        // user has no way to gauge how wide a feature is relative to the
+        // whole cycle.
+        float tickTop    = cy + h * 0.45f + 2.0f;
+        float tickBot    = curveArea.getBottom() + 2.0f;
+        float labelY     = curveArea.getBottom() + 4.0f;
+        float labelH     = 11.0f;
+        g.setColour(juce::Colours::grey.withAlpha(0.5f));
+        g.setFont(9.5f);
+        const char* phaseLabels[] = {"0", "1/4", "1/2", "3/4", "1 cycle"};
+        for (int i = 0; i < 5; ++i) {
+            float t = (float)i / 4.0f;
+            float x = cx + t * w;
+            g.drawVerticalLine((int)x, tickTop, tickBot);
+            auto justification = (i == 0)              ? juce::Justification::centredLeft
+                              : (i == 4)              ? juce::Justification::centredRight
+                                                       : juce::Justification::centred;
+            juce::Rectangle<float> lbl(x - 30, labelY, 60, labelH);
+            if (i == 0)      lbl.setX(x);
+            else if (i == 4) lbl.setX(x - 60);
+            g.drawText(phaseLabels[i], lbl.toNearestInt(), justification, false);
+        }
+
+        // Duration anchor: a wavetable synth's cycle plays at the played
+        // note's frequency, so 1 cycle = 1/freq seconds.  We anchor with
+        // two common reference pitches so the user can ballpark how
+        // wide their features are in real time.  We don't tie this to
+        // the actual playing note (which can change per keystroke) —
+        // fixed anchors are more legible.
+        const float a4Hz = 440.0f;
+        const float c4Hz = 261.626f;
+        auto fmtMs = [](float ms) {
+            return ms >= 10.0f ? juce::String(ms, 1) + " ms"
+                              : juce::String(ms, 2) + " ms";
+        };
+        juce::String anchor = "1 cycle = " + fmtMs(1000.0f / a4Hz)
+                            + " at A4 (440 Hz)   |   "
+                            + fmtMs(1000.0f / c4Hz)
+                            + " at C4 (262 Hz)";
+        g.setColour(juce::Colours::grey.withAlpha(0.85f));
+        g.setFont(10.0f);
+        juce::Rectangle<float> anchorR(
+            curveArea.getX(),
+            labelY + labelH + 1.0f,
+            curveArea.getWidth(),
+            12.0f);
+        g.drawText(anchor, anchorR.toNearestInt(),
+                   juce::Justification::centred, false);
     }
 }
 

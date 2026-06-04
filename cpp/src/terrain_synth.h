@@ -35,6 +35,35 @@ public:
     void fillFromImage(const std::string& path);         // 2D, pixel brightness
     void fillFromAudioFile(const std::string& path);     // 1D, raw samples
 
+    // Fractal / self-similar fill (#51): build a 1D waveform from recursive
+    // wavelet coefficient patterns. The base pattern is a short seed
+    // waveform; at each DWT level, the detail coefficients are scaled
+    // copies of the seed. The 1/f-ish spectrum produces rich, organic
+    // waveforms. `iterations` = number of self-similar recursion levels.
+    void fillFractal(int size, int iterations = 5, float decay = 0.7f);
+
+    // Wavelet-basis storage (#49): convert terrain data to/from DWT
+    // coefficient representation. When stored as coefficients,
+    // interpolation between frames happens in the wavelet domain
+    // (smoother than time-domain averaging), and reconstruction is
+    // a single IDWT per block. Call toWaveletBasis() after filling
+    // the terrain to convert; fromWaveletBasis() to reconstruct.
+    void toWaveletBasis(int levels = 4);
+    void fromWaveletBasis(int levels = 4);
+    bool isWaveletBasis = false;
+
+    // Wavetable mipmap pyramid (#48): for anti-aliased pitch-up.
+    // Each level is a half-resolution version of the previous, created
+    // by DWT → drop finest detail → IDWT. Higher-pitched playback uses
+    // smaller mipmaps to avoid aliasing. Call buildMipmaps() after
+    // filling the terrain with a 1D wavetable. The playback code picks
+    // the level based on the current pitch ratio.
+    std::vector<std::vector<float>> mipmaps; // [0] = original, [1] = half, etc.
+    void buildMipmaps(int maxLevels = 6);
+    // Sample from the appropriate mipmap level for a given pitch ratio.
+    // pitchRatio = playback_freq / base_freq. Higher ratio → smaller mipmap.
+    float sampleMipmap(float phase01, float pitchRatio) const;
+
     // Frequency-domain fill (1D only). Evaluates magExpr(f) and phaseExpr(f)
     // over FFT bins, inverse-FFTs to a real waveform, and fills this terrain
     // (which should be 1D of size == fftSize). Normalized to peak 1.0.
@@ -143,7 +172,9 @@ public:
     void prepareToPlay(double sr, int bs) override;
     void releaseResources() override {}
     void processBlock(juce::AudioBuffer<float>& buf, juce::MidiBuffer& midi) override;
-    double getTailLengthSeconds() const override { return 2.0; }
+    // Tail = ADSR release (param idx 3).  No magic constant — reads the
+    // live param value so changing release shrinks/extends the tail.
+    double getTailLengthSeconds() const override { return (double) getParam(3, 0.3f); }
     bool acceptsMidi() const override { return true; }
     bool producesMidi() const override { return false; }
     bool isBusesLayoutSupported(const BusesLayout&) const override { return true; }
@@ -166,10 +197,19 @@ public:
     // Get the current traversal position (for visualization)
     std::vector<float> getCurrentPosition() const { return lastPosition; }
 
+    // Check if node.script changed since last processBlock and re-parse
+    // the terrain data if so. This lets the layered editor commit changes
+    // to node.script without triggering a full graph rebuild (#23).
+    void reloadIfScriptChanged();
+
 private:
     Node& node;
     Transport& transport;
     double sampleRate = 44100;
+
+    // Cached copy of node.script from the last parse. When processBlock
+    // detects that node.script differs, it triggers a re-parse.
+    std::string cachedScript;
 
     Terrain terrain;
     Traversal traversal;

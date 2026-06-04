@@ -36,7 +36,7 @@ Most users only need Param. Use Signal when you specifically need sample-rate pr
 
 A wavetable is a sequence of single-cycle waveforms that the synth morphs between as you sweep a Position knob. SEANCE arranges wavetables on **three levels of structure**:
 
-1. **Layers within a frame.** Each waveform frame is built by summing layers (sine, saw, square, triangle, noise, or freehand-drawn shapes), each at its own harmonic ratio, phase, and amplitude. Stacking layers at integer harmonic ratios gives organ-like additive sounds; non-integer ratios give bell-like inharmonic textures.
+1. **Layers within a frame.** Each waveform frame is built by summing layers (sine, saw, square, triangle, noise, or hand-drawn shapes), each at its own harmonic ratio, phase, and amplitude. Drawn layers have two sub-modes: **Points** (place control points; waveform is Catmull-Rom interpolated through them) and **Freehand** (click-and-drag to paint arbitrary per-sample waveform data). Stacking layers at integer harmonic ratios gives organ-like additive sounds; non-integer ratios give bell-like inharmonic textures.
 2. **Frames within an N-dimensional arrangement.** Multiple frames stack into a wavetable that morphs as you change Position. The arrangement is N-dimensional — add an axis to get a second Position knob, add another for a third, etc. Most uses stay at 1D or 2D, but the option goes up to 8 dimensions.
 3. **Two layout modes for the N-D arrangement:**
    - **Grid mode** — frames laid out on a regular N-dimensional grid. Predictable, evenly-spaced morphing across each axis.
@@ -55,6 +55,8 @@ A terrain can come from:
 - A 2D image (pixel brightness becomes amplitude).
 - An N-D wavetable (each axis becomes a Position knob on the synth node).
 - A math expression like `sin(x*y)` evaluated over a grid.
+
+The terrain visualizer has **+ Dim / - Dim** buttons to add or remove dimension axes at runtime (up to 8D). Each dimension adds a signal input pin and Center/Radius parameter knobs on the synth node. When the terrain has more than 2 dimensions, a projection combo lets you choose which two axes to view in the heatmap.
 
 Traversal modes:
 
@@ -116,8 +118,11 @@ For capturing real-world impulse responses, the **Room IR Capture** tool (Tools 
 
 ### Built-in instruments
 
-- **Wavetable / Layered Waveform synth.** Build single-cycle waveforms by stacking layers (sine / saw / square / triangle / noise / hand-drawn) at chosen harmonic ratios, phases, and amplitudes. Stack multiple cycles into a wavetable that morphs as you play. See the [Wavetable arrangement](#wavetable-arrangement) concept above for the full structure.
-- **Sampler.** Load any audio file as a pitched sample, with autocorrelation + YIN pitch detection for automatic base-note assignment, fine-tune in cents, and a choice between resample (changes speed and pitch together) or pitch-shift (preserves speed) playback modes.
+- **Wavetable / Layered Waveform synth.** Build single-cycle waveforms by stacking layers (sine / saw / square / triangle / noise / hand-drawn) at chosen harmonic ratios, phases, and amplitudes. Hand-drawn layers support two editing modes: **Points** (Catmull-Rom control points) and **Freehand** (click-and-drag per-sample painting). Stack multiple cycles into a wavetable that morphs as you play. See the [Wavetable arrangement](#wavetable-arrangement) concept above for the full structure.
+- **MultiSampler.** Zone-based sampling instrument with N sample slots, each with configurable key range (low/high note), velocity range (low/high velocity), base note, fine-tune, gain, and pan. Multi-point linear envelopes for volume, pan, pitch, and filter with sustain/loop markers. Built-in state-variable filter (lowpass / highpass / bandpass) with envelope modulation. Replaces the old single-file Sampler — a one-zone MultiSampler covering 0-127 is exactly the old workflow, while multi-zone configs give you velocity-layered and key-split instruments. Legacy `__audio__:` projects auto-upgrade on load.
+- **FM Synth.** 4-operator frequency modulation synthesis with 8 selectable algorithms, per-operator frequency ratios, levels, and ADSR envelopes, and operator-4 self-feedback. Produces electric pianos, bells, metallic basses, evolving pads, and everything in between.
+- **Phase Distortion Synth.** Casio CZ-style synthesis: warps a sine wave's phase with a modulator function to produce subtractive-like sounds (sawtooth, square, pulse, resonant) without a traditional filter. "Depth" parameter + DCW envelope shape the harmonic content over time for filter-sweep-like timbral motion.
+- **Particle Cloud Synth.** Granular texture instrument that generates many overlapping short waveform bursts ("particles") with per-grain frequency randomization, stereo scatter, and mini-envelopes. Produces ambient pads, evolving textures, and glitchy effects. Controls: density, frequency spread, grain size, per-grain attack/release, waveform shape (sine/saw/square/noise).
 - **Drum synth.** Eight analog-style voice algorithms — **Kick** (pitched sine sweep), **Snare** (filtered noise), **Hi-Hat** (FM noise), **Clap**, **Tom**, **Cowbell**, **Rimshot**, **Cymbal** (with crash/ride/bell variants). Each voice gets its own MIDI note assignment via MIDI Learn and a four-knob synthesis row (pitch, decay, tone, level).
 - **SoundFont (SF2 / SFZ).** Load multi-sample patches with full preset / bank navigation. Hundreds of free SF2 packs available online for orchestral, piano, drums, ethnic instruments, etc. SF2 support is complete; SFZ uses a built-in basic loader, with full SFZ-spec compliance via the sfizz library on the roadmap.
 - **Terrain Synth.** The N-dimensional sample-array engine that powers the wavetable and sampler instruments — see the [Waveterrain](#waveterrain-terrain-synth) concept above. Can also be used directly with image, audio file, or math expression sources.
@@ -155,11 +160,21 @@ All built-in effects can be combined freely with cables — pre-effect, post-eff
 - **Convolution filter** — apply any impulse response (preset, hand-drawn, or loaded .wav) to any audio. Used for filters, real-room reverbs, guitar cabinet sims, EQ matching. See the [Convolution](#convolution) concept above.
 - **Pitch Shifter** — change pitch independently of speed via Rubber Band. Drop your vocals down an octave without slowing them down, or pitch up a sample without speeding it up.
 
+**Reverb and spatial**
+
+- **Reverb** — algorithmic Freeverb: 8 parallel lowpass-feedback comb filters + 4 serial allpass filters per channel. Controls: mix, room size, damping, stereo width, pre-delay. High-frequency decay simulates real-room absorption.
+- **Parametric EQ** — 4-band biquad EQ. Each band has selectable type (peak / low shelf / high shelf / highpass / lowpass), frequency, gain (dB), and Q. Uses the standard RBJ Audio EQ Cookbook coefficients.
+
 **Dynamics**
 
-- **Compressor** — reduces dynamic range above a threshold. Threshold, ratio, attack, release. Used to even out levels, add punch to drums, glue mixes together.
+- **Compressor** — reduces dynamic range above a threshold. Threshold, ratio, attack, release, makeup gain. **Sidechain input**: wire any audio source (e.g., kick drum) into the Signal "Sidechain" pin and the compressor's envelope follower triggers from that signal instead of the main input.
 - **Limiter** — hard ceiling on output level. Prevents clipping no matter what's coming in. Use as a final stage before the Master Out.
 - **Gate** — silences the signal when it falls below a threshold. Used to clean up noisy tracks, tighten drums, or as a creative rhythmic gate.
+
+**Creative / utility**
+
+- **Ring Modulator** — multiplies the input audio with an internal oscillator (sine, square, or triangle) to produce metallic, bell-like, inharmonic tones. Classic Dalek-voice / sci-fi sound design tool.
+- **Mid/Side Encode + Decode** — utility pair for mastering. Encode splits stereo into Mid (center) + Side (width); Decode recombines them. Wire EQ or compression between them to process mid and side independently.
 
 **MIDI processors**
 
@@ -174,6 +189,7 @@ All built-in effects can be combined freely with cables — pre-effect, post-eff
 - **XY Pad** — two-axis click-and-drag controller, mapped to any combination of node parameters. Great for live performance.
 - **Spectrum Tap** — analyzes audio and outputs amplitude signals for configurable frequency bands. Wire those bands to other parameters for spectrum-following effects, vocoder-like routing, or visualizers.
 - **Mixture** — sums multiple audio inputs into one output. Basic mixer node for combining several signal paths.
+- **Peak Metering** — every node in the graph shows live green/yellow/red peak meter bars at its bottom edge during playback, captured from the post-pan audio each block. No separate meter node needed — the meters are always-on visual feedback built into the graph view.
 
 ### Capture and analysis tools
 
@@ -195,14 +211,35 @@ All built-in effects can be combined freely with cables — pre-effect, post-eff
 - **Hotplug detection.** New MIDI devices plugged in mid-session prompt to be added to the graph automatically.
 - **Pitch bend, mod wheel vibrato, sustain pedal, channel aftertouch** all handled in the built-in synths.
 - **MIDI Learn** for any node parameter — right-click → MIDI Learn, then move a knob on your controller. Learned CCs are filtered out of the cable routing so they only drive their mapped parameter.
+- **Signal modulation for any parameter.** Right-click any param row on any node → "Add Modulation Input" → a new Signal pin appears. Wire an LFO, XY Pad, Envelope, or any signal source into it and the parameter wobbles in real time. The signal cable and automation lane coexist — automation sets the base value, signal modulation adds on top.
+- **Song Length and Repeat.** Set a project-wide end beat and a repeat policy (None / Loop Forever / N Times) via the transport bar's "Song" button. Leave the length at 0 and the engine auto-derives it from the last clip across all timelines — pressing Play on a fresh project stops at the end of the music instead of running forever. At the end, playback enters a short "tail grace" period equal to the longest per-node tail (reverb, delay feedback, instrument release) so ringing sounds finish naturally instead of being cut off mid-decay. Tracker imports with whole-song loops wire this automatically.
+- **TPDF dithering on export.** When exporting to WAV or FLAC at 16-bit (or any lower bit depth), triangular-PDF dither noise is applied so quantization artifacts become inaudible hiss instead of correlated distortion.
 - **Custom hotkeys.** Bind any keyboard shortcut OR any MIDI controller button to any host action via the Hotkey Settings dialog. Includes per-node shortcuts (toggle mute on this specific track, open this specific editor, etc.).
-- **Tracker file import (MOD / S3M / IT / XM).** Open any tracker module and SEANCE converts it into a fully editable SEANCE project: each tracker channel becomes its own MIDI Track node, all wrapped in an Effect Group named after the file; every note from every pattern in the order list is extracted into the channel tracks (with volume-column-as-velocity); a useful subset of tracker effects is translated into MIDI form (arpeggio expansion, note retrigger, note delay, note cut, speed/tempo changes); the project BPM is set from the module's initial tempo. The imported channels are wired straight to Master Out so you can hear the structure immediately. This unlocks the entire decades-deep demoscene tracker library — thousands of free songs in `.mod` / `.s3m` / `.it` / `.xm` form — as editable starting points for remixing, sampling, learning arrangements, or just exploring how tracker artists thought about composition. *Current limitation: the importer doesn't yet extract the module's samples into Sampler nodes, so the imported MIDI tracks need instruments wired to them before they make sound. Sample extraction is on the roadmap.*
+- **Tracker file import (MOD / S3M / IT / XM) — unlock any tracker song into a full DAW workflow.** The whole point of this feature is that tracker files (.mod, .s3m, .it, .xm) are a decades-deep library of freely available music — thousands of songs from the demoscene and the broader tracker community — but they're trapped in a format that only tracker players can open. SEANCE breaks them out: import a tracker file and it becomes a standard SEANCE project that you can edit with all the tools of a modern DAW, then export as WAV, MP3, FLAC, or Opus. Every note is editable in the piano roll, every sample is a standalone WAV you can swap or process, and the full signal chain is visible as nodes and cables on the graph. You're not "playing back a tracker file" — you're working in a DAW that happens to have started from tracker data.
+
+  What the importer does under the hood:
+
+  - **Sample extraction.** Every sample in the module is rendered to a standalone WAV file (via libopenmpt's interactive playback interface) and saved to a `<song>_samples/` folder next to the source file. Each sample becomes a zone-based MultiSampler instrument node.
+  - **Instrument mode (IT / XM).** When the module uses instruments (a layer above raw samples with key splits, envelopes, and per-instrument settings), SEANCE parses the raw file bytes to extract note-sample keymaps, volume / pan / pitch / filter envelopes, NNA (new-note action) defaults, fadeout rates, default pan, and initial filter settings. Each instrument becomes a single MultiSampler node with multiple zones covering its keymap — so a multisampled piano stays as one instrument, not N separate nodes.
+  - **Per-format effect dispatch.** MOD, S3M, IT, and XM each have different effect-letter conventions. The importer detects the format and dispatches through format-specific handlers so the same underlying effect (e.g., "volume slide") is decoded correctly regardless of which tracker wrote the file.
+  - **Comprehensive effect translation.** Arpeggio, portamento (up/down/tone), vibrato (with per-channel waveform: sine/ramp/square/random), tremolo, volume slides (coarse and fine), set volume, set panning (as Sampler pan-param automation), sample offset, retrigger, note cut, note delay, pattern delay, position jump, pattern break, pattern loops (unrolled inline as duplicated note data), set speed/tempo, global volume (baked into note velocities), panbrello (as pan automation curves), finetune, glissando control, vibrato/tremolo waveform selection, and combo effects (tone+vol slide, vibrato+vol slide).
+  - **NNA (new-note action).** Per-channel NNA state (Cut / Continue / Off / Fade) is tracked through the pattern walk. Channels set to Continue or Off leave previous notes ringing through the Sampler's release envelope instead of hard-cutting them.
+  - **Sound control (S9x).** When the module uses reverb-enable/disable commands (S98/S99), the importer inserts a real algorithmic Reverb node into the graph as a parallel wet send, gated by effect regions at the exact beats where the commands toggle — so the reverb fades in and out at the right moments during playback.
+  - **MIDI macros (Zxx).** IT files can define arbitrary MIDI macro templates in their header. The importer parses the raw file bytes to read the macro table, then expands each Zxx command by substituting its parameter into the template and emitting the result as MIDI CC events on the track. The common default macro (filter cutoff sweep) maps to CC74 automatically.
+  - **Song-loop detection.** If the order list contains a position-jump (Bxx) back to an earlier order, the importer sets the project's Song Length and Repeat Mode to "Forever" so the transport loops the song automatically — matching the tracker's intended playback behavior without unrolling the entire order list into a flat timeline.
+  - **Per-channel stereo panning.** Classic MOD files use LRRL channel panning (channels 0,3 hard-left, channels 1,2 hard-right); S3M uses alternating L/R. The importer creates separate track/sampler pairs for each pan position so the original stereo image is preserved. Instruments with their own default pan (IT) override the channel pan. Tracker-imported nodes use linear panning law (matching tracker behavior) rather than the equal-power law used by normal DAW instruments.
+  - **Selectable interpolation.** Tracker-imported samplers default to linear interpolation (authentic tracker sound). The interpolation mode can be changed per instrument: Linear (2-point, characteristic tracker grit), Cubic (4-point Catmull-Rom), or Sinc (8-point Lanczos-4, highest quality). New non-tracker instruments default to Sinc.
+  - **Amiga reconstruction-filter emulation.** MOD and S3M imports route the sampler's post-mix output through a 4-pole Butterworth lowpass at ~5.5 kHz, emulating the analog reconstruction filter the Amiga PAULA chip applied to all module-era audio. Without it, naive sample-pitch playback produces broadband aliasing the reference (Winamp / OpenMPT) output doesn't have — audible as a brighter, harsher "texture". The filter is per-instrument and serialized with the project; IT and XM imports leave it off because those formats targeted PC sound cards with no equivalent analog stage.
+  - **One MIDI track per (instrument, pan-group).** Notes from tracker channels that play the same instrument at the same pan position share a track. Channels with different panning get separate tracks so the stereo field is preserved. Per-channel monophony (a new note on a channel cuts that channel's previous note) is preserved even when multiple channels share a track.
+
+  After import, hit Play — the song plays back through the extracted samples and the graph you can see. From there you can edit notes in the piano roll, swap samples, add effects (EQ, compression, delay, your own plugins), restructure the arrangement, change the tempo, re-export as a modern audio file, or use the imported material as a starting point for something new. That's the workflow: tracker file in, DAW project out.
 
 ### Editing
 
 - **Piano roll** with click-to-place, drag-to-move, edge-to-resize, box-select, copy / cut / paste, alt-for-no-snap. Velocity lane (drag bar heights), automation lanes (Catmull-Rom curves on any parameter).
 - **Music theory helpers** — Root / Key / Mode / Scale dropdowns highlight in-key pitches on the piano roll, with **Snap to Scale** mode and **Detect Key** auto-analysis.
 - **Note transformations** — transpose by octaves or semitones, nudge in time, double or halve duration, reverse, fine-tune detune in cents.
+- **Quantize** — snap notes toward the nearest grid position with a user-adjustable strength slider (1-100%). At 100% notes land exactly on the grid; lower values move notes only partway, keeping a natural feel. Available as a toolbar button and via the right-click context menu.
 - **MIDI Note Degree System.** Each note stores its scale degree (1st-7th), octave, and chromatic offset, so you can change key/scale and have the melody automatically re-pitch to fit (Major to Minor, Ionian to Dorian, etc.).
 - **Audio timeline** with clip move/resize, fade in/out, slip offset, gain, snapping.
 - **Multi-track recording** with simultaneous input routing for hardware-controller workflows.
@@ -231,7 +268,7 @@ This is one of the things that sets SEANCE apart from typical home DAWs. Three i
 ### Audio I/O
 
 - **VST3 plugin hosting** on all platforms; **AU** on macOS; **LV2 / LADSPA** on Linux.
-- **Export to WAV, FLAC, OGG, Opus, M4A, WMA.**
+- **Export to WAV, FLAC, OGG, Opus, M4A, WMA.** Choose format, channels (mono/stereo), sample rate, and format-specific options (bit depth, quality, or bitrate) upfront, then pick a filename.
 - **Pitch shifting / time stretching** via Rubber Band.
 - **ASIO support** on Windows for low-latency hardware audio.
 - **Configurable project sample rate** with internal resampling.
@@ -270,19 +307,33 @@ Wavelets give you joint time + frequency resolution that traditional FFT-based e
 - **Wavelet-band vocoder** — vocoder using wavelet bands instead of fixed FFT bins.
 - **Drawing in wavelet space** — paint directly on a scales × time grid to design sounds.
 
-### Spectral synthesis
+### Synthesis
 
+- **FM Synthesis instrument** — DX7-style multi-operator FM synth with selectable algorithms, per-operator frequency ratios, modulation indices, and envelopes. Produces electric pianos, bells, metallic basses, evolving pads. The most-requested synthesis type after subtractive and wavetable.
+- **Phase Distortion Synthesis instrument** — Casio CZ-style PD: warps a carrier sine's phase with a modulator shape to produce subtractive-like sounds (brass, filtered pads) through a fundamentally different mechanism. Niche but differentiating — most DAWs don't offer it.
+- **Spectral Modeling Synthesis (SMS)** — decomposes any sound into harmonic peaks (deterministic sinusoids) and noise (stochastic residual), then lets you manipulate each independently. Make a voice breathier without changing pitch, isolate transients, cross-synthesize tonal and noisy components from different sources. Builds on the existing FFT infrastructure.
+- **Particle / granular cloud synth** — a dedicated texture instrument that generates many overlapping short waveform bursts ("particles"), each with its own mini-envelope, frequency, and harmonic parameter. Produces ambient pads, evolving textures, and glitchy effects. Based on the iMS-20 particle generator concept.
 - **Spectral grain mode** — IFFT-to-windowed-grain spectral grain synthesis as a third Wavetable mode (Mode A is wavetable, B will be additive).
 - **Additive bank mode** — per-partial sine oscillator bank for high-quality additive synthesis.
 - **Inharmonic presets and ratio expression** — Bell, Drum, Stretched Piano starting points plus a custom `ratio(f)` expression for designing your own inharmonic series.
 - **Spectral visualizer pane** — live spectrum + resulting grain waveform.
 - **Compare buttons (A/B preview)** — A/B audition of the same spectrum through different render modes.
 
+### Mixing and mastering
+
+- **Real parametric EQ** — multi-band parametric EQ replacing the current stub: low shelf, high shelf, 2-4 peak bands, HP/LP filters, each with freq/gain/Q/type controls. Essential for mixing.
+- **Metering** — per-node peak meters, master LUFS loudness metering (broadcast standard), and a spectrum analyzer. You can't mix properly without visual level feedback.
+- **Sidechain compression** — add a sidechain audio input to the existing Compressor node so a kick drum can duck the bass (or any other source can trigger compression on another signal).
+- **Mid/Side processing** — a utility node pair (M/S Encode + M/S Decode) that splits stereo into Mid (center) and Side (width) for independent processing. Wire EQ, compression, or saturation between them. Standard mastering technique.
+- **Dithering on export** — triangular PDF dither with optional noise shaping for bit-depth reduction (24→16 bit). Turns quantization distortion into inaudible hiss. Applied at the export stage only.
+- **Ring Modulator effect** — multiplies two audio signals sample-by-sample, producing metallic, bell-like, inharmonic tones. Two audio inputs (carrier + modulator). Classic Dalek-voice / sci-fi sound design tool.
+
 ### MIDI and recording
 
 - **Per-node recording** ("Record Here" mark) — arm individual nodes for MIDI capture instead of arming whole tracks, so anything in the graph can be recorded into.
 - **Proper MPE controller support** — full MIDI Polyphonic Expression handling for pitch slide, pressure, and timbre per note from MPE controllers like the Seaboard, Linnstrument, Osmose.
 - **Trigger node v2** — multiple MIDI/Signal output pins, per-rule output assignment, signal-rule delay support, beats/ms unit picker.
+- **Trigger node enhancements** — note-off triggers (actions fire on note release, not just note-on), free-drawn Curve shape, and a threshold-trigger input (audio level → trigger bridge so loud audio events can fire triggers without MIDI).
 
 ### Plugin / sample library support
 
@@ -290,11 +341,11 @@ Wavelets give you joint time + frequency resolution that traditional FFT-based e
 - **sfizz integration** — full SFZ specification compliance for the SFZ instrument format (currently we have a limited internal SFZ loader).
 - **Measured HRTF datasets (SOFA / WAV)** — load published HRTF measurements for the 3D Spatializer instead of using the built-in synthetic head model.
 - **Plugin UI modulation indicators** — show on the host's plugin window which parameters are currently being modulated by automation, signal cables, or MIDI Learn.
+- **Plugin parameter sanitization** — cap visible param count and fix invalid min/max ranges for badly-behaved plugins that report thousands of parameters or nonsensical ranges. Prevents UI lockups.
 
 ### Editor and workflow
 
 - **Make the layered editor non-modal** — let the wavetable editor stay open while you work elsewhere in the graph.
-- **Points / Freehand toggle for Drawn layers** — switch between control-point editing and per-pixel sample drawing inside a single Drawn layer.
 - **Persist project-wide settings** in `.ssp` (tuning system, concert pitch, crossfade duration, effect group definitions) — currently some of these don't survive save/load.
 
 ### Reliability

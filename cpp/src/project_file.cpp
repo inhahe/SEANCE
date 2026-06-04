@@ -54,6 +54,40 @@ bool ProjectFile::writeProject(std::ostream& f, NodeGraph& graph, GraphProcessor
     }
     if (graph.projectSampleRate > 0)
         writeFloat(f, "projectSampleRate", (float)graph.projectSampleRate);
+    // Project-wide settings (#66) — tuning, concert pitch, crossfade.
+    if (graph.tuningSystem != TuningSystem::Equal12)
+        writeInt(f, "tuningSystem", (int)graph.tuningSystem);
+    if (std::abs(graph.concertPitch - 440.0f) > 0.01f)
+        writeFloat(f, "concertPitch", graph.concertPitch);
+    if (std::abs(graph.globalCrossfadeSec - 0.05f) > 0.001f)
+        writeFloat(f, "globalCrossfadeSec", graph.globalCrossfadeSec);
+    if (graph.metronomeEnabled)
+        writeInt(f, "metronomeEnabled", 1);
+    if (graph.songLengthBeats > 0)
+        writeFloat(f, "songLengthBeats", (float)graph.songLengthBeats);
+    if (graph.songRepeatMode != NodeGraph::SongRepeat::None)
+        writeInt(f, "songRepeatMode", (int)graph.songRepeatMode);
+    if (graph.songRepeatCount != 1)
+        writeInt(f, "songRepeatCount", graph.songRepeatCount);
+    if (!graph.historyFilePath.empty())
+        writeStr(f, "historyFile", graph.historyFilePath);
+    // Effect group definitions (#66). Each group is a named bundle of
+    // link IDs with an optional per-group crossfade override.
+    for (auto& eg : graph.effectGroups) {
+        f << "[EffectGroup]\n";
+        writeInt(f, "id", eg.id);
+        writeStr(f, "name", eg.name);
+        writeInt(f, "color", (int)eg.color);
+        if (eg.crossfadeSec > 0)
+            writeFloat(f, "crossfadeSec", eg.crossfadeSec);
+        std::string ids;
+        for (int lid : eg.linkIds) {
+            if (!ids.empty()) ids += ",";
+            ids += std::to_string(lid);
+        }
+        if (!ids.empty()) writeStr(f, "linkIds", ids);
+    }
+
     writeInt(f, "nextId", 0);
     if (!graph.signalScript.empty()) {
         // Encode signal script with line count prefix so we know where it ends
@@ -92,6 +126,7 @@ bool ProjectFile::writeProject(std::ostream& f, NodeGraph& graph, GraphProcessor
         for (auto& pt : node.envDecayPoints) f << "envDecPt=" << pt.first << "," << pt.second << "\n";
         for (auto& pt : node.envReleasePoints) f << "envRelPt=" << pt.first << "," << pt.second << "\n";
         writeInt(f, "pluginIndex", node.pluginIndex);
+        if (node.panLaw != PanLaw::EqualPower) writeInt(f, "panLaw", (int)node.panLaw);
         if (node.pan != 0.0f) writeFloat(f, "pan", node.pan);
         if (node.spatialX != 0.0f) writeFloat(f, "spatialX", node.spatialX);
         if (node.spatialY != 0.0f) writeFloat(f, "spatialY", node.spatialY);
@@ -160,12 +195,19 @@ bool ProjectFile::writeProject(std::ostream& f, NodeGraph& graph, GraphProcessor
         for (auto& param : node.params) {
             f << "[Param]\n";
             writeStr(f, "name", param.name);
-            writeFloat(f, "value", param.value);
+            writeFloat(f, "value", param.modulated ? param.baseValue : param.value);
             writeFloat(f, "min", param.minVal);
             writeFloat(f, "max", param.maxVal);
             writeStr(f, "format", param.format);
             for (auto& ap : param.automation.points)
                 f << "auto=" << ap.beat << "," << ap.value << "\n";
+        }
+        // Signal modulation pin bindings (#88). The pins themselves are
+        // already serialized in the [PinIn] block above; the modPin
+        // entries just record which param each one drives.
+        for (auto& mp : node.modPins) {
+            f << "modPin=" << mp.paramIndex << "," << mp.pinId
+              << "," << mp.depth << "\n";
         }
         for (auto& clip : node.clips) {
             f << "[Clip]\n";
@@ -294,7 +336,7 @@ bool ProjectFile::writeProject(std::ostream& f, NodeGraph& graph, GraphProcessor
         std::string ids;
         for (int i = 0; i < (int)graph.openEditors.size(); ++i) {
             if (i > 0) ids += ",";
-            ids += std::to_string(graph.openEditors[i]->id);
+            ids += std::to_string(graph.openEditors[i]);
         }
         writeStr(f, "openEditors", ids);
         writeInt(f, "activeEditor", graph.activeEditorNodeId);
@@ -384,6 +426,8 @@ bool ProjectFile::readProject(std::istream& f, NodeGraph& graph, PluginHost* plu
                 graph.ccMappings.push_back({});
             } else if (section == "[Waveform]") {
                 graph.waveformLibrary.push_back({});
+            } else if (section == "[EffectGroup]") {
+                graph.effectGroups.push_back({});
             }
             continue;
         }
@@ -399,6 +443,19 @@ bool ProjectFile::readProject(std::istream& f, NodeGraph& graph, PluginHost* plu
             else if (key == "loopStart") graph.loopStartBeat = std::stof(val);
             else if (key == "loopEnd") graph.loopEndBeat = std::stof(val);
             else if (key == "projectSampleRate") graph.projectSampleRate = std::stof(val);
+            else if (key == "tuningSystem") graph.tuningSystem = (TuningSystem)std::stoi(val);
+            else if (key == "concertPitch") graph.concertPitch = std::stof(val);
+            else if (key == "globalCrossfadeSec") graph.globalCrossfadeSec = std::stof(val);
+            else if (key == "metronomeEnabled") graph.metronomeEnabled = (val == "1");
+            else if (key == "songLengthBeats") graph.songLengthBeats = std::stof(val);
+            else if (key == "songRepeatMode") {
+                int m = std::stoi(val);
+                graph.songRepeatMode = (m == 1 ? NodeGraph::SongRepeat::Forever
+                                       : m == 2 ? NodeGraph::SongRepeat::NTimes
+                                       :          NodeGraph::SongRepeat::None);
+            }
+            else if (key == "songRepeatCount") graph.songRepeatCount = std::max(1, std::stoi(val));
+            else if (key == "historyFile") graph.historyFilePath = val;
             else if (key == "signalScriptLines") {
                 int numLines = std::stoi(val);
                 graph.signalScript.clear();
@@ -438,6 +495,7 @@ bool ProjectFile::readProject(std::istream& f, NodeGraph& graph, PluginHost* plu
             }
             else if (key == "pluginIndex") curNode->pluginIndex = std::stoi(val);
             else if (key == "pluginState") curNode->pendingPluginState = val;
+            else if (key == "panLaw") curNode->panLaw = (PanLaw)std::stoi(val);
             else if (key == "pan") curNode->pan = std::stof(val);
             else if (key == "spatialX") curNode->spatialX = std::stof(val);
             else if (key == "spatialY") curNode->spatialY = std::stof(val);
@@ -457,6 +515,18 @@ bool ProjectFile::readProject(std::istream& f, NodeGraph& graph, PluginHost* plu
                 std::string token;
                 while (std::getline(ss, token, ','))
                     if (!token.empty()) curNode->childNodeIds.push_back(std::stoi(token));
+            }
+            // Signal modulation pin bindings (#88): "modPin=paramIdx,pinId,depth"
+            else if (key == "modPin") {
+                Node::ModPin mp;
+                auto c1 = val.find(',');
+                auto c2 = val.find(',', c1 + 1);
+                if (c1 != std::string::npos && c2 != std::string::npos) {
+                    mp.paramIndex = std::stoi(val.substr(0, c1));
+                    mp.pinId      = std::stoi(val.substr(c1 + 1, c2 - c1 - 1));
+                    mp.depth      = std::stof(val.substr(c2 + 1));
+                    curNode->modPins.push_back(mp);
+                }
             }
         }
         else if ((section == "[PinIn]" || section == "[PinOut]") && curNode) {
@@ -576,6 +646,19 @@ bool ProjectFile::readProject(std::istream& f, NodeGraph& graph, PluginHost* plu
             else if (key == "nodeId") m.nodeId = std::stoi(val);
             else if (key == "paramIdx") m.paramIdx = std::stoi(val);
         }
+        else if (section == "[EffectGroup]" && !graph.effectGroups.empty()) {
+            auto& eg = graph.effectGroups.back();
+            if (key == "id") { eg.id = std::stoi(val); graph.nextEffectGroupId = std::max(graph.nextEffectGroupId, eg.id + 1); }
+            else if (key == "name") eg.name = val;
+            else if (key == "color") eg.color = (uint32_t)std::stoul(val);
+            else if (key == "crossfadeSec") eg.crossfadeSec = std::stof(val);
+            else if (key == "linkIds") {
+                std::istringstream ss(val);
+                std::string token;
+                while (std::getline(ss, token, ','))
+                    if (!token.empty()) eg.linkIds.push_back(std::stoi(token));
+            }
+        }
         else if (section == "[Waveform]" && !graph.waveformLibrary.empty()) {
             auto& wf = graph.waveformLibrary.back();
             if (key == "name") wf.name = val;
@@ -604,11 +687,11 @@ bool ProjectFile::readProject(std::istream& f, NodeGraph& graph, PluginHost* plu
     // Restore nextId so new IDs don't conflict
     graph.setNextId(maxId + 1);
 
-    // Restore open editors
+    // Restore open editors (store IDs only — never store Node*)
     graph.openEditors.clear();
     for (int id : pendingEditorIds) {
-        auto* node = graph.findNode(id);
-        if (node) graph.openEditors.push_back(node);
+        if (graph.findNode(id))
+            graph.openEditors.push_back(id);
     }
     graph.activeEditorNodeId = pendingActiveEditorId;
 

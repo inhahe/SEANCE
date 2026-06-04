@@ -34,6 +34,29 @@ public:
         muteFader.process(buf);
         if (muteFader.isFullyOff()) return;
 
+        // Peak metering (#99): scan the post-mute buffer for this block's
+        // peak and write it atomically. The UI reads these at 30 Hz to
+        // draw meter bars. We capture at PanProcessor because it's the
+        // last processor in the per-node chain before routing — so the
+        // meter shows exactly what leaves the node after pan and mute.
+        {
+            float pkL = 0, pkR = 0;
+            if (buf.getNumChannels() >= 1) {
+                auto* data = buf.getReadPointer(0);
+                for (int i = 0; i < buf.getNumSamples(); ++i)
+                    pkL = std::max(pkL, std::abs(data[i]));
+            }
+            if (buf.getNumChannels() >= 2) {
+                auto* data = buf.getReadPointer(1);
+                for (int i = 0; i < buf.getNumSamples(); ++i)
+                    pkR = std::max(pkR, std::abs(data[i]));
+            } else {
+                pkR = pkL; // mono: both channels show the same level
+            }
+            node.meterPeakL = pkL;
+            node.meterPeakR = pkR;
+        }
+
         if (buf.getNumChannels() < 2) return;
         // Read pan from the named param if present, falling back to node.pan
         float p = node.pan; // legacy fallback
@@ -43,16 +66,30 @@ public:
 
         if (p == 0.0f) return; // center = no change
 
-        // Equal-power pan law
-        // theta = 0 (full left) to pi/2 (full right), pi/4 = center
-        float theta = (p + 1.0f) * 0.25f * juce::MathConstants<float>::pi;
-        float gainL = std::cos(theta);
-        float gainR = std::sin(theta);
+        float gainL, gainR;
+        if (node.panLaw == PanLaw::Linear) {
+            // Linear pan law — matches tracker (MOD/IT/S3M/XM) behavior.
+            // p=-1 → L=1 R=0, p=0 → L=0.5 R=0.5, p=+1 → L=0 R=1.
+            // Normalized so center is unity (L and R each get 1.0).
+            gainL = 1.0f - (p + 1.0f) * 0.5f; // (1 - pan) / 2, then *2 for unity at center
+            gainR =        (p + 1.0f) * 0.5f;
+            // Normalize: at center, gainL = gainR = 0.5.  Scale by 2
+            // so center = unity, hard-panned = 2x (matches tracker behavior
+            // where centre is -6dB relative to hard-panned).
+            gainL *= 2.0f;
+            gainR *= 2.0f;
+        } else {
+            // Equal-power pan law (industry standard for DAWs).
+            // theta = 0 (full left) to pi/2 (full right), pi/4 = center
+            float theta = (p + 1.0f) * 0.25f * juce::MathConstants<float>::pi;
+            gainL = std::cos(theta);
+            gainR = std::sin(theta);
 
-        // Normalize so center is unity (cos(pi/4) = sin(pi/4) ≈ 0.707)
-        static const float centerGain = std::cos(juce::MathConstants<float>::pi * 0.25f);
-        gainL /= centerGain;
-        gainR /= centerGain;
+            // Normalize so center is unity (cos(pi/4) = sin(pi/4) ~ 0.707)
+            static const float centerGain = std::cos(juce::MathConstants<float>::pi * 0.25f);
+            gainL /= centerGain;
+            gainR /= centerGain;
+        }
 
         auto* left = buf.getWritePointer(0);
         auto* right = buf.getWritePointer(1);
@@ -64,6 +101,7 @@ public:
             left[i] = l * gainL;
             right[i] = r * gainR;
         }
+
     }
 
     double getTailLengthSeconds() const override { return 0; }

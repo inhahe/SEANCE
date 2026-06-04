@@ -10,6 +10,9 @@
 #include "convolution_processor.h"
 #include "convolution_editor.h"
 #include "sampler_editor.h"
+#include "multi_sampler.h"
+#include "multi_sampler_editor.h"
+#include "spectrum_visualizer.h"
 #include "room_ir_capture.h"
 #include "drum_synth.h"
 #include "audio_export.h"
@@ -44,13 +47,46 @@ static bool machineHasBattery() {
 #endif
 }
 
+// Returns true if the machine is currently on AC power. On desktops
+// (no battery) this always returns true. On laptops, it reads the OS
+// power state: true = plugged in, false = running on battery.
+static bool isOnACPower() {
+#ifdef _WIN32
+    SYSTEM_POWER_STATUS sps{};
+    if (GetSystemPowerStatus(&sps))
+        return sps.ACLineStatus == 1; // 1 = AC online
+    return true; // unknown → assume desktop
+#else
+    return true; // #87: implement for macOS / Linux
+#endif
+}
+
 // Pick the default autosave interval based on whether we're on a laptop.
 // Desktop systems get the aggressive 5-second interval; laptops get a more
-// conservative 20s default to save battery. Per task #86, AC vs battery
-// awareness and live transition response is a v2 enhancement (#87); v1
-// treats all laptops as if on battery.
+// conservative 20s default to save battery.
 static int defaultAutosaveIntervalForThisMachine() {
     return machineHasBattery() ? 20 : 5;
+}
+
+// Returns true if a MIDI device name looks like a virtual or control-surface
+// port that shouldn't be auto-created as a musical MidiInput node. These
+// are drivers that install system-wide virtual ports for DAW control
+// protocols, not for playing notes. Checked case-insensitively.
+static bool isVirtualOrControlPort(const juce::String& name) {
+    auto lower = name.toLowerCase();
+    // SSL 360° control surface driver (UF8, UF1, UC1)
+    if (lower.contains("ssl v-midi") || lower.contains("ssl vmidi")) return true;
+    // Mackie/HUI control surface protocols
+    if (lower.contains("mackie control") || lower.contains("hui")) return true;
+    // Common virtual MIDI loopback drivers (user creates these intentionally
+    // and can add them via the wizard — don't auto-create)
+    if (lower.contains("loopmidi") || lower.contains("loop midi")) return true;
+    // Windows built-in "Microsoft GS Wavetable Synth" (output only but
+    // sometimes appears in input lists on some drivers)
+    if (lower.contains("microsoft gs")) return true;
+    // Avid/Pro Tools control surfaces
+    if (lower.contains("eucon") || lower.contains("avid control")) return true;
+    return false;
 }
 
 // ==============================================================================
@@ -260,6 +296,14 @@ MainContentComponent::MainContentComponent() {
             graph.loopEnabled ? juce::Colour(60, 60, 120) : juce::Colour(55, 55, 60));
     };
 
+    addAndMakeVisible(songBtn);
+    songBtn.setTooltip("Project-wide Song Length and Repeat settings. "
+                       "Song Length is where playback auto-stops (in beats); 0 means no explicit end. "
+                       "Repeat mode chooses between None (stop at end), Forever (loop until Stop), "
+                       "or N times (loop a fixed number of times then stop). Tracker imports with "
+                       "whole-song loops use this to preserve the original's looping behavior.");
+    songBtn.onClick = [this]() { showSongSettingsDialog(); };
+
     addAndMakeVisible(monitorBtn);
     monitorBtn.setTooltip("Toggle input monitoring — when on, audio coming in from any input device is "
                           "routed straight through to the Output node so you can hear yourself in real time");
@@ -332,6 +376,7 @@ MainContentComponent::MainContentComponent() {
     pluginSettings.load("soundshop_plugins.cfg");
     loadRecentProjects();
     loadPreferences();
+    loadKnownHistories();
 
     // Load last project or set up default graph
     bool loaded = false;
@@ -342,33 +387,35 @@ MainContentComponent::MainContentComponent() {
             loaded = true;
         }
     }
-    if (!loaded)
+    if (!loaded) {
         graph.setupDefaultGraph();
-    else {
-        // Upgrade old projects that predate the MidiInput node type:
-        //  - If no "Computer Keyboard" MidiInput node exists, add one so
-        //    typing still reaches synths via the new routing model.
-        //  - Add a MIDI In pin to any MidiTimeline that's missing one, so
-        //    cables from an input node can plug into them.
-        bool hasKbdInput = false;
+        // Auto-create MidiInput nodes for all connected hardware devices
+        // so a fresh install sees the user's controller immediately.
+        auto devices = juce::MidiInput::getAvailableDevices();
+        Node* defaultTrack = nullptr;
         for (auto& n : graph.nodes)
-            if (n.type == NodeType::MidiInput && n.midiInputSourceId == "keyboard") {
-                hasKbdInput = true; break;
-            }
-        if (!hasKbdInput) {
-            auto& keyIn = graph.addNode("Computer Keyboard", NodeType::MidiInput,
-                {}, {Pin{0, "MIDI Out", PinKind::Midi, false}}, {80, 80});
-            keyIn.midiInputSourceId = "keyboard";
+            if (n.type == NodeType::MidiTimeline) { defaultTrack = &n; break; }
+        float yPos = 200;
+        for (auto& dev : devices) {
+            if (isVirtualOrControlPort(dev.name)) continue;
+            bool exists = false;
+            for (auto& n : graph.nodes)
+                if (n.type == NodeType::MidiInput && n.midiInputSourceId == dev.identifier.toStdString())
+                    { exists = true; break; }
+            if (exists) continue;
+            auto& n = graph.addNode(dev.name.toStdString(), NodeType::MidiInput,
+                {}, {Pin{0, "MIDI Out", PinKind::Midi, false}}, {80, yPos});
+            n.midiInputSourceId = dev.identifier.toStdString();
+            if (defaultTrack && !n.pinsOut.empty())
+                for (auto& pin : defaultTrack->pinsIn)
+                    if (pin.kind == PinKind::Midi) {
+                        graph.addLink(n.pinsOut[0].id, pin.id);
+                        break;
+                    }
+            yPos += 50;
         }
-        for (auto& n : graph.nodes) {
-            if (n.type != NodeType::MidiTimeline) continue;
-            bool hasMidiIn = false;
-            for (auto& p : n.pinsIn)
-                if (p.kind == PinKind::Midi) { hasMidiIn = true; break; }
-            if (!hasMidiIn)
-                n.pinsIn.insert(n.pinsIn.begin(),
-                    {graph.getNextId(), "MIDI In", PinKind::Midi, true});
-        }
+    } else {
+        upgradeLegacyNodes();
     }
 
     audioEngine.setGraph(&graph, &transport);
@@ -443,6 +490,18 @@ MainContentComponent::MainContentComponent() {
     juce::MessageManager::callAsync([safe]() {
         if (safe) safe->tryRecoverAutosave();
     });
+
+    // Shared-history prompt for the auto-loaded startup project (#90).
+    // openProjectFile already fires this for user-opened projects, but
+    // the autoload path bypasses it — so do it here. Deferred so the
+    // dialog appears over the visible main window.
+    if (loaded && !ProjectFile::currentPath.empty()) {
+        juce::String startupPath = juce::String(ProjectFile::currentPath);
+        juce::Component::SafePointer<MainContentComponent> safe3(this);
+        juce::MessageManager::callAsync([safe3, startupPath]() {
+            if (safe3) safe3->handleSharedHistoryOnOpen(startupPath);
+        });
+    }
 
     // Laptop autosave notice (#86): on first launch on a laptop, tell the
     // user we picked a slower default to save battery and where to change
@@ -583,6 +642,7 @@ void MainContentComponent::resized() {
     placeBtn(fitAllBtn, 50);
     placeBtn(metroBtn, 50);
     placeBtn(loopBtn, 42);
+    placeBtn(songBtn, 46);
     placeBtn(monitorBtn, 40);
     placeBtn(captureBtn, 60);
     placeBtn(keyboardMidiBtn, 42);
@@ -617,6 +677,24 @@ void MainContentComponent::resized() {
 }
 
 void MainContentComponent::timerCallback() {
+    // Power-state-aware autosave interval (#87): every ~5 seconds
+    // (150 ticks at 30 Hz), check AC vs battery and adjust the
+    // autosave interval. Desktops and AC-powered laptops use the
+    // faster 5s interval; battery-powered laptops use 20s.
+    if (machineHasBattery()) {
+        static int powerCheckCounter = 0;
+        if (++powerCheckCounter >= 150) {
+            powerCheckCounter = 0;
+            bool ac = isOnACPower();
+            int desired = ac ? 5 : 20;
+            if (autosaveIntervalSeconds != desired) {
+                autosaveIntervalSeconds = desired;
+                fprintf(stderr, "Power state changed — autosave interval → %ds\n",
+                        desired);
+            }
+        }
+    }
+
     // Hotplug detection: poll the MIDI device list ~once a second (30Hz
     // timer × 30) and show a confirmation dialog when a new device
     // appears that isn't already a node in the graph.
@@ -669,13 +747,20 @@ void MainContentComponent::timerCallback() {
     transport.loopStartBeat = graph.loopStartBeat;
     transport.loopEndBeat = graph.loopEndBeat;
     graph.resolveAnchors();
-    if (transport.tempoMap.points.size() == 1)
+    if (transport.tempoMap.getPoints().size() == 1)
         transport.tempoMap.setGlobalBpm(graph.bpm);
-    if (transport.timeSigMap.sigs.size() == 1) {
-        transport.timeSigMap.sigs[0].numerator = graph.timeSignatureNum;
-        transport.timeSigMap.sigs[0].denominator = graph.timeSignatureDen;
+    if (transport.timeSigMap.sigs.size() == 1)
+        transport.timeSigMap.setGlobal(graph.timeSignatureNum, graph.timeSignatureDen);
+    // Sync UI with audio engine's playing state. The audio thread may
+    // stop playback internally (e.g., when Song Length + Song Repeat
+    // policy fires), so the button text has to reflect that — otherwise
+    // it stays stuck on "Stop" after the song auto-stops.
+    bool engineIsPlaying = audioEngine.isPlaying();
+    if (transport.playing && !engineIsPlaying) {
+        // Transport just stopped itself — update button label.
+        playBtn.setButtonText("Play");
     }
-    transport.playing = audioEngine.isPlaying();
+    transport.playing = engineIsPlaying;
 
     // Evaluate Python signals on UI thread and apply to plugin parameters
     if (scriptEngine.isInitialized()) {
@@ -769,10 +854,11 @@ void MainContentComponent::timerCallback() {
 
             // Restore editor panels from loaded project (deferred until UI is ready)
             if (!graph.openEditors.empty()) {
-                auto editorsToOpen = graph.openEditors;
+                auto editorIds = graph.openEditors;
                 graph.openEditors.clear();
-                for (auto* node : editorsToOpen)
-                    openEditor(*node);
+                for (int id : editorIds)
+                    if (auto* node = graph.findNode(id))
+                        openEditor(*node);
             }
             // Note: the initial fit-all happens inside NodeGraphComponent's
             // first resized()/paint() call, *before* this timer-deferred init
@@ -892,6 +978,7 @@ juce::PopupMenu MainContentComponent::getMenuForIndex(int idx, const juce::Strin
         menu.addItem(92, "Clear Recent Scripts");
     } else if (name == "View") {
         menu.addItem(30, "Fit All");
+        menu.addItem(400, "Spectrum Analyzer");
     } else if (name == "Settings") {
         menu.addItem(39, "Audio Device...");
         juce::PopupMenu srMenu;
@@ -1069,6 +1156,18 @@ void MainContentComponent::menuItemSelected(int menuItemID, int) {
             break;
         }
         case 111: showMidiDeviceWizard(); break;
+        case 400: {
+            // Spectrum Analyzer (#10): open a floating non-modal window.
+            auto* viz = new SpectrumVisualizerComponent(audioEngine);
+            auto* dw = new juce::DialogWindow(
+                "Spectrum Analyzer", juce::Colour(18, 20, 28), true);
+            dw->setContentOwned(viz, true);
+            dw->setResizable(true, false);
+            dw->setUsingNativeTitleBar(true);
+            dw->setVisible(true);
+            dw->centreWithSize(viz->getWidth(), viz->getHeight());
+            break;
+        }
         case 300: openHelpDoc("index.html"); break;
         case 301: openHelpDoc("getting-started.html"); break;
         case 302: openHelpDoc("graph-basics.html"); break;
@@ -1103,7 +1202,7 @@ void MainContentComponent::menuItemSelected(int menuItemID, int) {
             opts.dialogTitle = "Capture Room Impulse Response";
             opts.dialogBackgroundColour = juce::Colour(22, 22, 28);
             opts.escapeKeyTriggersCloseButton = true;
-            opts.useNativeTitleBar = true;
+            opts.useNativeTitleBar = false;
             opts.resizable = true;
             opts.launchAsync();
             break;
@@ -1262,6 +1361,24 @@ public:
         smoothToggle.setClickingTogglesState(true);
         smoothToggle.setToggleState(true, juce::dontSendNotification);
 
+        addAndMakeVisible(addDimBtn);
+        addAndMakeVisible(removeDimBtn);
+        addDimBtn.setButtonText("+ Dim");
+        removeDimBtn.setButtonText("- Dim");
+        addDimBtn.setTooltip("Add a terrain dimension. Adds a new Sig input pin and Position "
+                             "knobs (Center/Radius) on the synth node. The terrain extends into "
+                             "the new axis — fill it with an expression using x, y, z, w variables.");
+        removeDimBtn.setTooltip("Remove the last terrain dimension");
+        addDimBtn.onClick = [this]() { changeDimCount(1); };
+        removeDimBtn.onClick = [this]() { changeDimCount(-1); };
+        updateDimLabel();
+
+        addAndMakeVisible(projCombo);
+        projCombo.setTooltip("Choose which two axes to display in the heatmap when the terrain "
+                             "has more than 2 dimensions.");
+        projCombo.onChange = [this]() { repaint(); };
+        rebuildProjCombo();
+
         setSize(450, 480);
     }
 
@@ -1276,6 +1393,14 @@ public:
         loopModeCombo.setBounds(bottom.removeFromLeft(70));
         bottom.removeFromLeft(4);
         clearPathBtn.setBounds(bottom.removeFromLeft(65));
+        bottom.removeFromLeft(8);
+        addDimBtn.setBounds(bottom.removeFromLeft(70));
+        bottom.removeFromLeft(2);
+        removeDimBtn.setBounds(bottom.removeFromLeft(48));
+        if (projCombo.isVisible()) {
+            bottom.removeFromLeft(4);
+            projCombo.setBounds(bottom.removeFromLeft(60));
+        }
     }
 
     void mouseDown(const juce::MouseEvent& e) override {
@@ -1551,11 +1676,111 @@ public:
                     0, getHeight() - 48, getWidth(), 16, juce::Justification::centred);
     }
 
+    void changeDimCount(int delta) {
+        static const char* axisNames[] = {"X", "Y", "Z", "W", "V", "U", "S", "T"};
+        int curDims = 0;
+        for (auto& pin : node.pinsIn)
+            if (pin.kind == PinKind::Signal) ++curDims;
+        int newDims = juce::jlimit(1, 8, curDims + delta);
+        if (newDims == curDims) return;
+
+        if (newDims > curDims) {
+            // Add signal pin + Center/Radius params
+            for (int d = curDims; d < newDims; ++d) {
+                std::string axis = (d < 8) ? axisNames[d] : std::to_string(d);
+                node.pinsIn.push_back(Pin{0, "Sig " + axis, PinKind::Signal, true, 1});
+                // Assign unique pin ID
+                int maxId = 0;
+                for (auto& p : node.pinsIn)  maxId = std::max(maxId, p.id);
+                for (auto& p : node.pinsOut) maxId = std::max(maxId, p.id);
+                node.pinsIn.back().id = maxId + 1;
+                node.params.push_back({"Center " + axis, 0.5f, 0.0f, 1.0f});
+                node.params.push_back({"Radius " + axis, 0.3f, 0.0f, 0.5f});
+            }
+        } else {
+            // Remove from the end
+            for (int d = curDims; d > newDims; --d) {
+                std::string axis = (d - 1 < 8) ? axisNames[d - 1] : std::to_string(d - 1);
+                // Remove signal pin
+                for (int i = (int)node.pinsIn.size() - 1; i >= 0; --i) {
+                    if (node.pinsIn[i].kind == PinKind::Signal &&
+                        node.pinsIn[i].name == "Sig " + axis) {
+                        node.pinsIn.erase(node.pinsIn.begin() + i);
+                        break;
+                    }
+                }
+                // Remove Center/Radius params
+                auto removeParam = [&](const std::string& name) {
+                    for (int i = (int)node.params.size() - 1; i >= 0; --i)
+                        if (node.params[i].name == name)
+                            { node.params.erase(node.params.begin() + i); break; }
+                };
+                removeParam("Center " + axis);
+                removeParam("Radius " + axis);
+            }
+        }
+        // Rebuild the terrain dimensions
+        std::vector<int> dims(newDims, 64);
+        proc.getTerrain().init(dims);
+        // Re-evaluate expression
+        if (!node.script.empty())
+            proc.getTerrain().fillFromExpression(node.script);
+        updateDimLabel();
+        rebuildProjCombo();
+        repaint();
+    }
+
+    void updateDimLabel() {
+        int dims = 0;
+        for (auto& pin : node.pinsIn)
+            if (pin.kind == PinKind::Signal) ++dims;
+        addDimBtn.setButtonText(dims > 2
+            ? ("+ Dim (" + juce::String(dims) + "D)")
+            : juce::String("+ Dim"));
+    }
+
+    void rebuildProjCombo() {
+        static const char* axisNames[] = {"X", "Y", "Z", "W", "V", "U", "S", "T"};
+        projCombo.clear(juce::dontSendNotification);
+        int dims = 0;
+        for (auto& pin : node.pinsIn)
+            if (pin.kind == PinKind::Signal) ++dims;
+        if (dims <= 2) {
+            projCombo.setVisible(false);
+            return;
+        }
+        projCombo.setVisible(true);
+        int id = 1;
+        for (int a = 0; a < dims; ++a)
+            for (int b = a + 1; b < dims; ++b) {
+                juce::String label = juce::String(axisNames[a]) + "-" + axisNames[b];
+                projCombo.addItem(label, id++);
+            }
+        projCombo.setSelectedItemIndex(0, juce::dontSendNotification);
+    }
+
+    // Get the two projected axis indices from the projection combo selection.
+    std::pair<int, int> projAxes() const {
+        int dims = 0;
+        for (auto& pin : node.pinsIn)
+            if (pin.kind == PinKind::Signal) ++dims;
+        if (dims <= 2) return {0, 1};
+        int sel = projCombo.getSelectedItemIndex();
+        int idx = 0;
+        for (int a = 0; a < dims; ++a)
+            for (int b = a + 1; b < dims; ++b) {
+                if (idx == sel) return {a, b};
+                ++idx;
+            }
+        return {0, 1};
+    }
+
 private:
     TerrainSynthProcessor& proc;
     Node& node;
     juce::TextButton clearPathBtn, smoothToggle;
-    juce::ComboBox loopModeCombo, drawModeCombo;
+    juce::TextButton addDimBtn, removeDimBtn;
+    juce::ComboBox loopModeCombo, drawModeCombo, projCombo;
     float mapOx = 0, mapOy = 0, mapSize_ = 100;
     bool drawing = false;
 
@@ -1585,22 +1810,40 @@ void MainContentComponent::showPluginUI(int nodeId) {
         opts.dialogTitle = "Drum Synth: " + juce::String(node->name);
         opts.dialogBackgroundColour = juce::Colour(22, 22, 28);
         opts.escapeKeyTriggersCloseButton = true;
-        opts.useNativeTitleBar = true;
+        opts.useNativeTitleBar = false;
         opts.resizable = true;
         opts.launchAsync();
         return;
     }
 
-    // Sampler: open the sampler editor with pitch detection
+    // MultiSampler: open the zone-based sampler editor.
     if (node && node->type == NodeType::Instrument
-        && node->script.rfind("__audio__:", 0) == 0) {
-        auto* editor = new SamplerEditorComponent(graph, node->id, audioEngine);
+        && node->script.rfind(MultiSamplerDoc::kPrefix, 0) == 0) {
+        auto* editor = new MultiSamplerEditorComponent(graph, node->id, audioEngine);
         juce::DialogWindow::LaunchOptions opts;
         opts.content.setOwned(editor);
         opts.dialogTitle = "Sampler: " + juce::String(node->name);
         opts.dialogBackgroundColour = juce::Colour(22, 22, 28);
         opts.escapeKeyTriggersCloseButton = true;
-        opts.useNativeTitleBar = true;
+        opts.useNativeTitleBar = false;
+        opts.resizable = true;
+        opts.launchAsync();
+        return;
+    }
+
+    // Legacy single-sample Sampler editor — still supported for old
+    // projects that haven't been upgraded yet. Normal load path converts
+    // "__audio__:" into "__multisampler__:" so this only fires if
+    // upgradeLegacyNodes() didn't run for some reason.
+    if (node && node->type == NodeType::Instrument
+        && node->script.rfind("__audio__:", 0) == 0) {
+        auto* editor = new SamplerEditorComponent(graph, node->id, audioEngine);
+        juce::DialogWindow::LaunchOptions opts;
+        opts.content.setOwned(editor);
+        opts.dialogTitle = "Sampler (legacy): " + juce::String(node->name);
+        opts.dialogBackgroundColour = juce::Colour(22, 22, 28);
+        opts.escapeKeyTriggersCloseButton = true;
+        opts.useNativeTitleBar = false;
         opts.resizable = true;
         opts.launchAsync();
         return;
@@ -1616,7 +1859,7 @@ void MainContentComponent::showPluginUI(int nodeId) {
         opts.dialogTitle = "Convolution: " + juce::String(node->name);
         opts.dialogBackgroundColour = juce::Colour(22, 22, 28);
         opts.escapeKeyTriggersCloseButton = true;
-        opts.useNativeTitleBar = true;
+        opts.useNativeTitleBar = false;
         opts.resizable = true;
         opts.launchAsync();
         return;
@@ -1630,7 +1873,7 @@ void MainContentComponent::showPluginUI(int nodeId) {
         opts.dialogTitle = "Spectrum Tap: " + juce::String(node->name);
         opts.dialogBackgroundColour = juce::Colour(22, 22, 28);
         opts.escapeKeyTriggersCloseButton = true;
-        opts.useNativeTitleBar = true;
+        opts.useNativeTitleBar = false;
         opts.resizable = true;
         opts.launchAsync();
         return;
@@ -1644,7 +1887,7 @@ void MainContentComponent::showPluginUI(int nodeId) {
         opts.dialogTitle = "XY Pad";
         opts.dialogBackgroundColour = juce::Colour(25, 25, 32);
         opts.escapeKeyTriggersCloseButton = true;
-        opts.useNativeTitleBar = true;
+        opts.useNativeTitleBar = false;
         opts.resizable = true;
         opts.launchAsync();
         return;
@@ -1665,7 +1908,7 @@ void MainContentComponent::showPluginUI(int nodeId) {
         opts.dialogTitle = "MIDI Modulator: " + juce::String(node->name);
         opts.dialogBackgroundColour = juce::Colour(22, 22, 28);
         opts.escapeKeyTriggersCloseButton = true;
-        opts.useNativeTitleBar = true;
+        opts.useNativeTitleBar = false;
         opts.resizable = true;
         opts.launchAsync();
         return;
@@ -1682,7 +1925,7 @@ void MainContentComponent::showPluginUI(int nodeId) {
         opts.dialogTitle = "Trigger: " + juce::String(node->name);
         opts.dialogBackgroundColour = juce::Colour(22, 22, 28);
         opts.escapeKeyTriggersCloseButton = true;
-        opts.useNativeTitleBar = true;
+        opts.useNativeTitleBar = false;
         opts.resizable = true;
         opts.launchAsync();
         return;
@@ -1698,14 +1941,18 @@ void MainContentComponent::showPluginUI(int nodeId) {
         auto* editor = new LayeredWaveEditorComponent(graph, node->id, [this]() {
             audioEngine.getGraphProcessor().requestRebuild();
         });
-        juce::DialogWindow::LaunchOptions opts;
-        opts.content.setOwned(editor);
-        opts.dialogTitle = "Waveform: " + juce::String(node->name);
-        opts.dialogBackgroundColour = juce::Colour(22, 22, 28);
-        opts.escapeKeyTriggersCloseButton = true;
-        opts.useNativeTitleBar = true;
-        opts.resizable = true;
-        opts.launchAsync();
+        // Non-modal (#17): use launchAsync which creates a non-blocking
+        // window. The user can keep working in the graph while the
+        // waveform editor is open. Closing the window destroys the
+        // editor. Multiple editors for different nodes can coexist.
+        auto* dw = new juce::DialogWindow(
+            "Waveform: " + juce::String(node->name),
+            juce::Colour(22, 22, 28), true);
+        dw->setContentOwned(editor, true);
+        dw->setResizable(true, false);
+        dw->setUsingNativeTitleBar(true);
+        dw->setVisible(true);
+        dw->centreWithSize(editor->getWidth(), editor->getHeight());
         return;
     }
 
@@ -1721,7 +1968,7 @@ void MainContentComponent::showPluginUI(int nodeId) {
             opts.dialogTitle = "Terrain: " + juce::String(node->name);
             opts.dialogBackgroundColour = juce::Colour(25, 25, 30);
             opts.escapeKeyTriggersCloseButton = true;
-            opts.useNativeTitleBar = true;
+            opts.useNativeTitleBar = false;
             opts.resizable = true;
             opts.launchAsync();
         }
@@ -1823,7 +2070,7 @@ void MainContentComponent::showPluginInfo(int nodeId) {
     opts.dialogTitle = "Plugin Info: " + juce::String(info.name);
     opts.dialogBackgroundColour = juce::Colour(40, 40, 45);
     opts.escapeKeyTriggersCloseButton = true;
-    opts.useNativeTitleBar = true;
+    opts.useNativeTitleBar = false;
     opts.resizable = true;
     opts.launchAsync();
 }
@@ -1867,7 +2114,8 @@ public:
         if (!proc) { setSize(300, 100); return; }
 
         auto& params = proc->getParameters();
-        for (int i = 0; i < (int)params.size(); ++i) {
+        constexpr int kMaxDisplayParams = 256;
+        for (int i = 0; i < std::min((int)params.size(), kMaxDisplayParams); ++i) {
             auto name = params[i]->getName(128);
             if (name.isEmpty()) name = "Param " + juce::String(i);
             paramNames.push_back(name);
@@ -2028,7 +2276,7 @@ void MainContentComponent::showMidiMap(int nodeId) {
     opts.dialogTitle = "MIDI Map: " + juce::String(node ? node->name : "Plugin");
     opts.dialogBackgroundColour = juce::Colour(40, 40, 45);
     opts.escapeKeyTriggersCloseButton = true;
-    opts.useNativeTitleBar = true;
+    opts.useNativeTitleBar = false;
     opts.resizable = true;
     opts.launchAsync();
 }
@@ -2068,14 +2316,25 @@ void MainContentComponent::onStop() {
 }
 
 void MainContentComponent::onRecord() {
-    // Find the active editor node, or first MIDI/audio timeline
+    // Find which node to record into. Priority:
+    //  1. Any node explicitly armed via "Record Here" (#77)
+    //  2. The active editor node (the one whose piano roll is open)
+    //  3. Fallback: first MIDI timeline, then first audio timeline
     Node* recordNode = nullptr;
 
-    // Prefer the active editor node
-    if (graph.activeEditorNodeId >= 0)
+    // 1. Prefer explicitly armed nodes (MIDI timelines).
+    for (auto& n : graph.nodes) {
+        if (n.recordArmed && n.type == NodeType::MidiTimeline) {
+            recordNode = &n;
+            break;
+        }
+    }
+
+    // 2. Active editor node.
+    if (!recordNode && graph.activeEditorNodeId >= 0)
         recordNode = graph.findNode(graph.activeEditorNodeId);
 
-    // Fallback: first MIDI timeline, then audio timeline
+    // 3. Fallback: first MIDI timeline, then audio timeline.
     if (!recordNode) {
         for (auto& n : graph.nodes) {
             if (n.type == NodeType::MidiTimeline) { recordNode = &n; break; }
@@ -2134,29 +2393,63 @@ void MainContentComponent::onRecord() {
 }
 
 void MainContentComponent::newProject() {
+    editorPanels.clear();
+    editorPanelHeight = 250;
     graph.nodes.clear();
     graph.links.clear();
     graph.openEditors.clear();
     graph.setupDefaultGraph();
+
+    // Auto-create MidiInput nodes for all currently connected hardware
+    // MIDI devices — so the user's controller is immediately wired and
+    // ready on a fresh project without needing a wizard. The Computer
+    // Keyboard node is already created by setupDefaultGraph(); this
+    // adds hardware devices alongside it.
+    {
+        auto devices = juce::MidiInput::getAvailableDevices();
+        // Find the default MIDI track to wire to (the one setupDefaultGraph made).
+        Node* defaultTrack = nullptr;
+        for (auto& n : graph.nodes)
+            if (n.type == NodeType::MidiTimeline) { defaultTrack = &n; break; }
+
+        float yPos = 200; // stagger below the Computer Keyboard node
+        for (auto& dev : devices) {
+            // Skip virtual / control-surface ports (SSL V-MIDI, Mackie, etc.)
+            if (isVirtualOrControlPort(dev.name)) continue;
+
+            // Skip if this identifier is already in the graph.
+            bool exists = false;
+            for (auto& n : graph.nodes)
+                if (n.type == NodeType::MidiInput && n.midiInputSourceId == dev.identifier.toStdString())
+                    { exists = true; break; }
+            if (exists) continue;
+
+            auto& n = graph.addNode(dev.name.toStdString(), NodeType::MidiInput,
+                {}, {Pin{0, "MIDI Out", PinKind::Midi, false}}, {80, yPos});
+            n.midiInputSourceId = dev.identifier.toStdString();
+
+            // Wire to the default track so the device plays immediately.
+            if (defaultTrack && !n.pinsOut.empty()) {
+                for (auto& pin : defaultTrack->pinsIn) {
+                    if (pin.kind == PinKind::Midi) {
+                        graph.addLink(n.pinsOut[0].id, pin.id);
+                        break;
+                    }
+                }
+            }
+            yPos += 50;
+        }
+    }
+
     ProjectFile::currentPath.clear();
     projectDirty = false;
     graph.dirty = false;
-    // The autosave (if any) represented the *old* graph, which we just
-    // blew away. Clear it so a subsequent crash doesn't offer to recover
-    // a project the user already replaced. Same logic for the undo
-    // history — it described the path through the OLD graph, not the
-    // new one.
     discardAutosave();
     discardUndoTreePersist();
     lastAutosaveAttemptMs = juce::Time::getMillisecondCounterHiRes();
+    resized();
+    graphComponent->fitAll();
     graphComponent->repaint();
-
-    // Offer the user the list of detected MIDI input devices to add.
-    // Deferred so the dialog opens after the main window is visible.
-    juce::Component::SafePointer<MainContentComponent> safe(this);
-    juce::MessageManager::callAsync([safe]() {
-        if (safe) safe->showMidiDeviceWizard();
-    });
 }
 
 void MainContentComponent::openHelpDoc(const juce::String& docRelativePath) {
@@ -2188,7 +2481,7 @@ void MainContentComponent::showMidiDeviceWizard() {
     opts.dialogTitle = "Add MIDI Input Devices";
     opts.dialogBackgroundColour = juce::Colour(28, 28, 36);
     opts.escapeKeyTriggersCloseButton = true;
-    opts.useNativeTitleBar = true;
+    opts.useNativeTitleBar = false;
     opts.resizable = false;
     opts.launchAsync();
 }
@@ -2202,14 +2495,136 @@ void MainContentComponent::openProject() {
     });
 }
 
+void MainContentComponent::upgradeLegacyNodes() {
+    // Upgrade legacy-format nodes in place. Runs on every project load
+    // (startup autoload, File → Open, crash recovery) so users always
+    // get the latest behavior even from old .ssp files.
+
+    // MidiInput node type predates the old "keyboard-is-a-flag" model.
+    // If no "Computer Keyboard" MidiInput node exists, add one so
+    // typing still reaches synths via the new routing model.
+    bool hasKbdInput = false;
+    for (auto& n : graph.nodes)
+        if (n.type == NodeType::MidiInput && n.midiInputSourceId == "keyboard") {
+            hasKbdInput = true; break;
+        }
+    if (!hasKbdInput) {
+        auto& keyIn = graph.addNode("Computer Keyboard", NodeType::MidiInput,
+            {}, {Pin{0, "MIDI Out", PinKind::Midi, false}}, {80, 80});
+        keyIn.midiInputSourceId = "keyboard";
+    }
+
+    for (auto& n : graph.nodes) {
+        // Add a MIDI In pin to any MidiTimeline that's missing one.
+        if (n.type == NodeType::MidiTimeline) {
+            bool hasMidiIn = false;
+            for (auto& p : n.pinsIn)
+                if (p.kind == PinKind::Midi) { hasMidiIn = true; break; }
+            if (!hasMidiIn)
+                n.pinsIn.insert(n.pinsIn.begin(),
+                    {graph.getNextId(), "MIDI In", PinKind::Midi, true});
+        }
+
+        // Legacy "Reverb" stub: Effect node with name "Reverb" and no
+        // script. Upgrade to the new algorithmic reverb by attaching the
+        // "__reverb__" script and the default param set so the real DSP
+        // takes over. Preserves the node's ID and position so existing
+        // cables still connect to the right node.
+        // Legacy "EQ" stub → real parametric EQ.
+        if (n.type == NodeType::Effect && n.name == "EQ" && n.script.empty()) {
+            n.script = "__eq__";
+            if (n.params.empty()) {
+                n.params.push_back({"B1 Type", 3.0f, 0.0f, 4.0f});
+                n.params.push_back({"B1 Freq", 80.0f, 20.0f, 20000.0f});
+                n.params.push_back({"B1 Gain", 0.0f, -24.0f, 24.0f});
+                n.params.push_back({"B1 Q", 0.707f, 0.1f, 10.0f});
+                n.params.push_back({"B2 Type", 0.0f, 0.0f, 4.0f});
+                n.params.push_back({"B2 Freq", 400.0f, 20.0f, 20000.0f});
+                n.params.push_back({"B2 Gain", 0.0f, -24.0f, 24.0f});
+                n.params.push_back({"B2 Q", 0.707f, 0.1f, 10.0f});
+                n.params.push_back({"B3 Type", 0.0f, 0.0f, 4.0f});
+                n.params.push_back({"B3 Freq", 2500.0f, 20.0f, 20000.0f});
+                n.params.push_back({"B3 Gain", 0.0f, -24.0f, 24.0f});
+                n.params.push_back({"B3 Q", 0.707f, 0.1f, 10.0f});
+                n.params.push_back({"B4 Type", 4.0f, 0.0f, 4.0f});
+                n.params.push_back({"B4 Freq", 8000.0f, 20.0f, 20000.0f});
+                n.params.push_back({"B4 Gain", 0.0f, -24.0f, 24.0f});
+                n.params.push_back({"B4 Q", 0.707f, 0.1f, 10.0f});
+            }
+        }
+
+        if (n.type == NodeType::Effect && n.name == "Reverb" && n.script.empty()) {
+            n.script = "__reverb__";
+            if (n.params.empty()) {
+                n.params.push_back({"Mix",       0.3f,  0.0f, 1.0f});
+                n.params.push_back({"Size",      0.6f,  0.0f, 1.0f});
+                n.params.push_back({"Damping",   0.5f,  0.0f, 1.0f});
+                n.params.push_back({"Width",     1.0f,  0.0f, 1.0f});
+                n.params.push_back({"Pre-Delay", 0.0f,  0.0f, 200.0f});
+            }
+        }
+
+        // Legacy single-sample Sampler (TerrainSynth + "__audio__:" path).
+        // The old Sampler was a subset of MultiSampler's capabilities —
+        // upgrade it in place to a one-zone MultiSampler pointing at the
+        // same WAV file. Preserves the node's ID, position, name, and
+        // existing cables, and picks up the old node's ADSR / Base Note /
+        // Fine Tune settings if present in the param list.
+        if (n.type == NodeType::Instrument
+            && n.script.rfind("__audio__:", 0) == 0) {
+            auto path = n.script.substr(10);
+            MultiSamplerDoc doc;
+            MultiSamplerZone z;
+            z.samplePath = path;
+            z.loNote = 0; z.hiNote = 127;
+            z.loVel = 1; z.hiVel = 127;
+            z.baseNote = 69; // matches old Sampler default (A4)
+            // Salvage structured fields from the old flat param list.
+            float salvagedVolume = 0.5f;
+            float salvagedPan    = 0.0f;
+            bool  foundVolume = false, foundPan = false;
+            for (auto& p : n.params) {
+                if      (p.name == "Base Note") z.baseNote      = (int)p.value;
+                else if (p.name == "Fine Tune") z.fineTuneCents = p.value;
+                else if (p.name == "Volume")    { salvagedVolume = p.value; foundVolume = true; }
+                else if (p.name == "Pan")       { salvagedPan    = p.value; foundPan    = true; }
+                else if (p.name == "Attack")    doc.attack       = p.value;
+                else if (p.name == "Decay")     doc.decay        = p.value;
+                else if (p.name == "Sustain")   doc.sustain      = p.value;
+                else if (p.name == "Release")   doc.release      = p.value;
+            }
+            doc.zones.push_back(z);
+            n.script = doc.encode();
+            // Strip the old flat param list (it mixed TerrainSynth-
+            // specific knobs with the sampler ones we salvaged).
+            n.params.clear();
+            // Keep Volume and Pan as real params — MultiSampler reads
+            // them at block time so automation lanes and Signal cables
+            // work against them.
+            n.params.push_back({"Volume", foundVolume ? salvagedVolume : 0.5f,  0.0f, 1.0f});
+            n.params.push_back({"Pan",    foundPan    ? salvagedPan    : 0.0f, -1.0f, 1.0f});
+            // Also remove the legacy Signal pins the old Sampler had
+            // (Sig X, Sig Y) — MultiSampler uses script-embedded
+            // envelopes instead.
+            n.pinsIn.erase(std::remove_if(n.pinsIn.begin(), n.pinsIn.end(),
+                [](const Pin& p) {
+                    return p.kind == PinKind::Signal &&
+                           (p.name == "Sig X" || p.name == "Sig Y");
+                }), n.pinsIn.end());
+        }
+    }
+}
+
 void MainContentComponent::openProjectFile(const juce::String& path) {
     editorPanels.clear();
     ProjectFile::load(path.toStdString(), graph, &audioEngine.getPluginHost());
+    upgradeLegacyNodes();
 
-    auto editorsToOpen = graph.openEditors;
+    auto editorIds = graph.openEditors;
     graph.openEditors.clear();
-    for (auto* node : editorsToOpen)
-        openEditor(*node);
+    for (int id : editorIds)
+        if (auto* node = graph.findNode(id))
+            openEditor(*node);
 
     addToRecentProjects(path);
     // Loading a clean project on top of whatever was in memory invalidates
@@ -2222,6 +2637,10 @@ void MainContentComponent::openProjectFile(const juce::String& path) {
     lastAutosaveAttemptMs = juce::Time::getMillisecondCounterHiRes();
     graphComponent->fitAll();
     graphComponent->repaint();
+
+    // Shared-history handling (#90): check for a sidecar and, if it
+    // hasn't been seen by this user before, show the 3-option prompt.
+    handleSharedHistoryOnOpen(path);
 }
 
 void MainContentComponent::freezeNode(int nodeId) {
@@ -2365,6 +2784,12 @@ void MainContentComponent::saveProjectAs(std::function<void()> onSaved) {
             discardAutosave();
             lastAutosaveAttemptMs = juce::Time::getMillisecondCounterHiRes();
             if (onSaved) onSaved();
+            // Shared-history opt-in (#90): only offer the "bundle undo
+            // history" prompt if the project isn't already bound to a
+            // sidecar (which would be the case when Save-As is used to
+            // copy a project that already shipped with shared history).
+            if (graph.historyFilePath.empty())
+                offerSharedHistoryOnSaveAs(file.getFullPathName());
         });
 }
 
@@ -2376,6 +2801,10 @@ void MainContentComponent::importModFile() {
             auto file = fc.getResult();
             if (!file.existsAsFile()) return;
 
+            // Stop transport before import so the newly wired graph
+            // doesn't start playing immediately on rebuild.
+            if (transport.playing) onStop();
+
             auto result = ModImporter::import(file.getFullPathName().toStdString(), graph);
 
             juce::String msg;
@@ -2383,8 +2812,15 @@ void MainContentComponent::importModFile() {
                 msg = "Imported successfully!\n\n"
                     + juce::String(result.numChannels) + " channels\n"
                     + juce::String(result.numPatterns) + " patterns\n"
-                    + juce::String(result.numSamples) + " samples\n"
+                    + juce::String(result.numSamplesExtracted) + " / "
+                    + juce::String(result.numSamples) + " samples extracted\n"
+                    + juce::String(result.numTracks) + " MIDI tracks created\n"
                     + juce::String(result.numNotes) + " notes";
+                if (!result.sampleDir.empty())
+                    msg += "\n\nSamples saved to:\n" + juce::String(result.sampleDir);
+                projectDirty = true;
+                graph.dirty = true;
+                audioEngine.getGraphProcessor().requestRebuild();
                 graphComponent->fitAll();
             } else {
                 msg = "Import failed: " + juce::String(result.error);
@@ -2392,7 +2828,7 @@ void MainContentComponent::importModFile() {
 
             juce::AlertWindow::showMessageBoxAsync(
                 juce::MessageBoxIconType::InfoIcon,
-                "MOD Import", msg);
+                "Tracker Import", msg);
             graphComponent->repaint();
         });
 }
@@ -2437,158 +2873,205 @@ void MainContentComponent::exportAudio() {
 }
 
 void MainContentComponent::exportAudioWithBeat(float maxBeat) {
-    auto chooser = std::make_shared<juce::FileChooser>(
-        "Export Audio", juce::File(), AudioExporter::getFileFilter());
-    chooser->launchAsync(juce::FileBrowserComponent::saveMode,
-        [this, chooser, maxBeat](const juce::FileChooser& fc) {
-            auto file = fc.getResult();
-            if (file == juce::File()) return;
+    // Show export options dialog FIRST, then file chooser
+    auto* aw = new juce::AlertWindow("Export Options", "",
+        juce::MessageBoxIconType::NoIcon);
 
-            auto path = file.getFullPathName();
-            auto fmt = AudioExporter::formatFromExtension(path);
-            auto ext = AudioExporter::getExtension(fmt);
-            if (!path.endsWithIgnoreCase(ext))
-                file = juce::File(path + ext);
+    // Format
+    aw->addComboBox("format", {"WAV (lossless)", "FLAC (lossless)",
+                                "OGG Vorbis (lossy)", "Opus (lossy)",
+                                "M4A/AAC (lossy)", "WMA (lossy)"});
+    aw->getComboBoxComponent("format")->setSelectedItemIndex(0);
 
-            // For lossy formats, show options dialog
-            bool isLossy = (fmt == ExportFormat::OggVorbis || fmt == ExportFormat::Opus ||
-                            fmt == ExportFormat::M4A_AAC || fmt == ExportFormat::WMA);
+    // Channels
+    aw->addComboBox("channels", {"Mono", "Stereo"});
+    aw->getComboBoxComponent("channels")->setSelectedItemIndex(1);
 
+    // Sample Rate
+    aw->addComboBox("samplerate", {"44100 Hz", "48000 Hz", "88200 Hz", "96000 Hz", "192000 Hz"});
+    {
+        int srDefault = 1;
+        double projSr = audioEngine.getProjectSampleRate();
+        if (projSr <= 44100) srDefault = 0;
+        else if (projSr <= 48000) srDefault = 1;
+        else if (projSr <= 88200) srDefault = 2;
+        else if (projSr <= 96000) srDefault = 3;
+        else srDefault = 4;
+        aw->getComboBoxComponent("samplerate")->setSelectedItemIndex(srDefault);
+    }
+
+    // Bit depth (for lossless formats)
+    aw->addComboBox("bits", {"16-bit", "24-bit", "32-bit float"});
+    aw->getComboBoxComponent("bits")->setSelectedItemIndex(0);
+
+    // Quality (for OGG Vorbis)
+    aw->addComboBox("quality", {"Low (q3)", "Medium (q5)", "High (q7)", "Very High (q8)", "Maximum (q10)"});
+    aw->getComboBoxComponent("quality")->setSelectedItemIndex(2);
+
+    // Bitrate (for Opus/AAC/WMA)
+    aw->addComboBox("bitrate", {"64 kbps", "96 kbps", "128 kbps", "160 kbps",
+                                 "192 kbps", "256 kbps", "320 kbps"});
+    aw->getComboBoxComponent("bitrate")->setSelectedItemIndex(4);
+
+    // Set initial enabled state: WAV selected → only bit depth enabled
+    aw->getComboBoxComponent("quality")->setEnabled(false);
+    aw->getComboBoxComponent("bitrate")->setEnabled(false);
+
+    // Update enabled state when format changes
+    auto* fmtBox = aw->getComboBoxComponent("format");
+    fmtBox->onChange = [aw]() {
+        int idx = aw->getComboBoxComponent("format")->getSelectedItemIndex();
+        bool isLossless = (idx <= 1);       // WAV, FLAC
+        bool isVorbis   = (idx == 2);       // OGG Vorbis
+        bool isBitrate  = (idx >= 3);       // Opus, M4A, WMA
+        aw->getComboBoxComponent("bits")->setEnabled(isLossless);
+        aw->getComboBoxComponent("quality")->setEnabled(isVorbis);
+        aw->getComboBoxComponent("bitrate")->setEnabled(isBitrate);
+    };
+
+    aw->addButton("Continue", 1, juce::KeyPress(juce::KeyPress::returnKey));
+    aw->addButton("Cancel", 0, juce::KeyPress(juce::KeyPress::escapeKey));
+
+    aw->enterModalState(true, juce::ModalCallbackFunction::create(
+        [this, aw, maxBeat](int result) {
+            if (result != 1) { delete aw; return; }
+
+            ExportOptions opts;
+
+            // Read format
+            ExportFormat formats[] = {ExportFormat::WAV, ExportFormat::FLAC,
+                ExportFormat::OggVorbis, ExportFormat::Opus,
+                ExportFormat::M4A_AAC, ExportFormat::WMA};
+            int fmtIdx = aw->getComboBoxComponent("format")->getSelectedItemIndex();
+            opts.format = formats[juce::jlimit(0, 5, fmtIdx)];
+
+            // Read channels
+            opts.numChannels = aw->getComboBoxComponent("channels")->getSelectedItemIndex() == 0 ? 1 : 2;
+
+            // Read sample rate
+            int srOptions[] = {44100, 48000, 88200, 96000, 192000};
+            int srIdx = aw->getComboBoxComponent("samplerate")->getSelectedItemIndex();
+            opts.sampleRate = srOptions[juce::jlimit(0, 4, srIdx)];
+
+            // Read format-specific options
+            bool isLossy = (opts.format == ExportFormat::OggVorbis || opts.format == ExportFormat::Opus ||
+                            opts.format == ExportFormat::M4A_AAC || opts.format == ExportFormat::WMA);
             if (isLossy) {
-                auto* aw = new juce::AlertWindow("Export Options",
-                    "Format: " + ext.substring(1).toUpperCase(),
-                    juce::MessageBoxIconType::NoIcon);
-
-                aw->addComboBox("samplerate", {"44100 Hz", "48000 Hz", "88200 Hz", "96000 Hz", "192000 Hz"});
-                // Default to project rate
-                int srDefault = 1; // 48000
-                double projSr = audioEngine.getProjectSampleRate();
-                if (projSr <= 44100) srDefault = 0;
-                else if (projSr <= 48000) srDefault = 1;
-                else if (projSr <= 88200) srDefault = 2;
-                else if (projSr <= 96000) srDefault = 3;
-                else srDefault = 4;
-                aw->getComboBoxComponent("samplerate")->setSelectedItemIndex(srDefault);
-
-                if (fmt == ExportFormat::OggVorbis) {
-                    aw->addComboBox("quality", {"Low (q3)", "Medium (q5)", "High (q7)", "Very High (q8)", "Maximum (q10)"});
-                    aw->getComboBoxComponent("quality")->setSelectedItemIndex(2);
-                    aw->addTextBlock("VBR (variable bitrate) — higher quality = larger file");
+                if (opts.format == ExportFormat::OggVorbis) {
+                    float qualities[] = {0.3f, 0.5f, 0.7f, 0.8f, 1.0f};
+                    int idx = aw->getComboBoxComponent("quality")->getSelectedItemIndex();
+                    opts.quality = qualities[juce::jlimit(0, 4, idx)];
                 } else {
-                    aw->addComboBox("bitrate", {"64 kbps", "96 kbps", "128 kbps", "160 kbps",
-                                                 "192 kbps", "256 kbps", "320 kbps"});
-                    aw->getComboBoxComponent("bitrate")->setSelectedItemIndex(4);
-                    if (fmt == ExportFormat::Opus)
-                        aw->addTextBlock("Opus uses VBR by default — bitrate is a target average");
-                    else
-                        aw->addTextBlock("CBR (constant bitrate)");
+                    int bitrates[] = {64, 96, 128, 160, 192, 256, 320};
+                    int idx = aw->getComboBoxComponent("bitrate")->getSelectedItemIndex();
+                    opts.bitrate = bitrates[juce::jlimit(0, 6, idx)];
                 }
-
-                aw->addButton("Export", 1, juce::KeyPress(juce::KeyPress::returnKey));
-                aw->addButton("Cancel", 0, juce::KeyPress(juce::KeyPress::escapeKey));
-
-                auto exportFile = file;
-                auto exportFmt = fmt;
-                auto exportMaxBeat = maxBeat;
-                aw->enterModalState(true, juce::ModalCallbackFunction::create(
-                    [this, aw, exportFile, exportFmt, exportMaxBeat](int result) {
-                        if (result == 1) {
-                            ExportOptions opts;
-                            opts.format = exportFmt;
-                            int srOptions[] = {44100, 48000, 88200, 96000, 192000};
-                            int srIdx = aw->getComboBoxComponent("samplerate")->getSelectedItemIndex();
-                            opts.sampleRate = srOptions[juce::jlimit(0, 4, srIdx)];
-
-                            if (exportFmt == ExportFormat::OggVorbis) {
-                                float qualities[] = {0.3f, 0.5f, 0.7f, 0.8f, 1.0f};
-                                int idx = aw->getComboBoxComponent("quality")->getSelectedItemIndex();
-                                opts.quality = qualities[juce::jlimit(0, 4, idx)];
-                            } else {
-                                int bitrates[] = {64, 96, 128, 160, 192, 256, 320};
-                                int idx = aw->getComboBoxComponent("bitrate")->getSelectedItemIndex();
-                                opts.bitrate = bitrates[juce::jlimit(0, 6, idx)];
-                            }
-
-                            doExportRender(exportFile, opts, exportMaxBeat);
-                        }
-                        delete aw;
-                    }), true);
             } else {
-                // Lossless — show bit depth option
-                auto* aw = new juce::AlertWindow("Export Options",
-                    "Format: " + ext.substring(1).toUpperCase(),
-                    juce::MessageBoxIconType::NoIcon);
-                aw->addComboBox("samplerate", {"44100 Hz", "48000 Hz", "88200 Hz", "96000 Hz", "192000 Hz"});
-                {
-                    int srDef = 1;
-                    double psr = audioEngine.getProjectSampleRate();
-                    if (psr <= 44100) srDef = 0;
-                    else if (psr <= 48000) srDef = 1;
-                    else if (psr <= 88200) srDef = 2;
-                    else if (psr <= 96000) srDef = 3;
-                    else srDef = 4;
-                    aw->getComboBoxComponent("samplerate")->setSelectedItemIndex(srDef);
-                }
-                aw->addComboBox("bits", {"16-bit (standard, smaller)", "24-bit (higher quality)", "32-bit float (maximum)"});
-                aw->getComboBoxComponent("bits")->setSelectedItemIndex(0);
-                aw->addButton("Export", 1, juce::KeyPress(juce::KeyPress::returnKey));
-                aw->addButton("Cancel", 0, juce::KeyPress(juce::KeyPress::escapeKey));
-
-                auto exportFile = file;
-                auto exportFmt = fmt;
-                auto exportMaxBeat = maxBeat;
-                aw->enterModalState(true, juce::ModalCallbackFunction::create(
-                    [this, aw, exportFile, exportFmt, exportMaxBeat](int result) {
-                        if (result == 1) {
-                            ExportOptions opts;
-                            opts.format = exportFmt;
-                            int srOpts[] = {44100, 48000, 88200, 96000, 192000};
-                            int srIdx = aw->getComboBoxComponent("samplerate")->getSelectedItemIndex();
-                            opts.sampleRate = srOpts[juce::jlimit(0, 4, srIdx)];
-                            int bitsOptions[] = {16, 24, 32};
-                            int idx = aw->getComboBoxComponent("bits")->getSelectedItemIndex();
-                            opts.bitsPerSample = bitsOptions[juce::jlimit(0, 2, idx)];
-                            doExportRender(exportFile, opts, exportMaxBeat);
-                        }
-                        delete aw;
-                    }), true);
+                int bitsOptions[] = {16, 24, 32};
+                int idx = aw->getComboBoxComponent("bits")->getSelectedItemIndex();
+                opts.bitsPerSample = bitsOptions[juce::jlimit(0, 2, idx)];
             }
-        });
+
+            delete aw;
+
+            // Now show file chooser with the correct extension filter
+            auto ext = AudioExporter::getExtension(opts.format);
+            auto filter = "*" + ext;
+            auto chooser = std::make_shared<juce::FileChooser>(
+                "Export Audio", juce::File(), filter);
+            chooser->launchAsync(juce::FileBrowserComponent::saveMode,
+                [this, chooser, opts, maxBeat](const juce::FileChooser& fc) {
+                    auto file = fc.getResult();
+                    if (file == juce::File()) return;
+                    auto path = file.getFullPathName();
+                    auto extension = AudioExporter::getExtension(opts.format);
+                    if (!path.endsWithIgnoreCase(extension))
+                        file = juce::File(path + extension);
+                    doExportRender(file, opts, maxBeat);
+                });
+        }), true);
 }
 
 void MainContentComponent::doExportRender(const juce::File& file, const ExportOptions& opts, float maxBeat) {
-    double sr = opts.sampleRate;
-    int blockSize = 512;
-    int numChannels = 2;
+    // Run the entire render + encode on a background thread with a progress
+    // bar so the UI stays responsive and the user can cancel.
+    struct ExportTask : juce::ThreadWithProgressWindow {
+        ExportTask(NodeGraph& g, Transport& liveTransport,
+                   const juce::File& f, const ExportOptions& o, float mb)
+            : ThreadWithProgressWindow("Exporting audio...", true, true),
+              graph(g), file(f), opts(o), maxBeat(mb)
+        {
+            offTransport.bpm = g.bpm;
+            offTransport.tempoMap = liveTransport.tempoMap;
+            offTransport.timeSigMap = liveTransport.timeSigMap;
+            offTransport.sampleRate = o.sampleRate;
+            offTransport.playing = true;
+        }
 
-    double totalSeconds = transport.tempoMap.beatsToSeconds(maxBeat);
-    int64_t totalSamples = (int64_t)(totalSeconds * sr);
+        void run() override {
+            double sr = opts.sampleRate;
+            int blockSize = 512;
+            double totalSeconds = offTransport.tempoMap.beatsToSeconds(maxBeat);
+            int64_t totalSamples = (int64_t)(totalSeconds * sr);
+            if (totalSamples <= 0) return;
 
-    Transport offlineTransport;
-    offlineTransport.bpm = graph.bpm;
-    offlineTransport.tempoMap = transport.tempoMap;
-    offlineTransport.sampleRate = sr;
-    offlineTransport.playing = true;
+            setStatusMessage("Building audio graph...");
 
-    GraphProcessor offlineGP;
-    offlineGP.prepare(graph, sr, blockSize);
-    offlineGP.rebuildGraph(graph, offlineTransport);
-    offlineGP.prepare(graph, sr, blockSize);
+            GraphProcessor offGP;
+            offGP.prepare(graph, sr, blockSize);
+            offGP.rebuildGraph(graph, offTransport);
+            offGP.prepare(graph, sr, blockSize);
 
-    juce::AudioBuffer<float> renderBuf(numChannels, (int)totalSamples);
-    renderBuf.clear();
+            // Always render in stereo — graph processor outputs stereo
+            juce::AudioBuffer<float> renderBuf(2, (int)totalSamples);
+            renderBuf.clear();
 
-    for (int64_t pos = 0; pos < totalSamples; pos += blockSize) {
-        int thisBlock = (int)std::min((int64_t)blockSize, totalSamples - pos);
-        offlineTransport.positionSamples = pos;
-        float* outPtrs[2] = {
-            renderBuf.getWritePointer(0, (int)pos),
-            renderBuf.getWritePointer(1, (int)pos)
-        };
-        offlineGP.processBlock(graph, offlineTransport, outPtrs, numChannels, thisBlock);
-    }
+            setStatusMessage("Rendering audio...");
 
-    if (AudioExporter::exportToFile(file, renderBuf, opts)) {
+            for (int64_t pos = 0; pos < totalSamples; pos += blockSize) {
+                if (threadShouldExit()) return;
+
+                int thisBlock = (int)std::min((int64_t)blockSize, totalSamples - pos);
+                offTransport.positionSamples = pos;
+                float* outPtrs[2] = {
+                    renderBuf.getWritePointer(0, (int)pos),
+                    renderBuf.getWritePointer(1, (int)pos)
+                };
+                offGP.processBlock(graph, offTransport, outPtrs, 2, thisBlock);
+                setProgress((double)pos / (double)totalSamples);
+            }
+
+            // Mix down to mono if requested
+            if (opts.numChannels == 1) {
+                setStatusMessage("Mixing to mono...");
+                juce::AudioBuffer<float> monoBuf(1, (int)totalSamples);
+                monoBuf.copyFrom(0, 0, renderBuf, 0, 0, (int)totalSamples);
+                monoBuf.addFrom(0, 0, renderBuf, 1, 0, (int)totalSamples);
+                monoBuf.applyGain(0.5f);
+                renderBuf = std::move(monoBuf);
+            }
+
+            // Apply TPDF dithering for PCM formats
+            if (opts.dither && (opts.format == ExportFormat::WAV
+                                || opts.format == ExportFormat::FLAC)) {
+                applyTPDFDither(renderBuf, opts.bitsPerSample);
+            }
+
+            setStatusMessage("Writing file...");
+            exportSuccess = AudioExporter::exportToFile(file, renderBuf, opts);
+        }
+
+        NodeGraph& graph;
+        Transport offTransport;
+        juce::File file;
+        ExportOptions opts;
+        float maxBeat;
+        bool exportSuccess = false;
+    };
+
+    ExportTask task(graph, transport, file, opts, maxBeat);
+
+    if (task.runThread() && task.exportSuccess) {
         saveFlashFrames = 90;
         if (auto* win = dynamic_cast<juce::DocumentWindow*>(getTopLevelComponent()))
             win->setName("Exported!");
@@ -2613,7 +3096,7 @@ void MainContentComponent::openEditor(Node& node) {
     editorPanels.push_back(std::move(panel));
 
     graph.activeEditorNodeId = node.id;
-    editorPanelHeight = std::max(editorPanelHeight, (int)editorPanels.size() * 200);
+    editorPanelHeight = (int)editorPanels.size() * 200;
     resized();
 }
 
@@ -2622,6 +3105,8 @@ void MainContentComponent::closeEditor(int nodeId) {
         std::remove_if(editorPanels.begin(), editorPanels.end(),
             [nodeId](auto& p) { return p->nodeId == nodeId; }),
         editorPanels.end());
+    editorPanelHeight = editorPanels.empty() ? 250
+        : (int)editorPanels.size() * 200;
     resized();
 }
 
@@ -3063,15 +3548,313 @@ void MainContentComponent::writeUndoTreePersist() {
     graph.undoTree.serializeTo(oss);
     auto text = oss.str();
 
-    auto tmp = file.getSiblingFile(file.getFileName() + ".tmp");
+    // Helper: atomic tmp-then-rename write of `text` to `target`.
+    auto atomicWrite = [&](const juce::File& target) {
+        auto tmp = target.getSiblingFile(target.getFileName() + ".tmp");
+        if (tmp.existsAsFile()) tmp.deleteFile();
+        {
+            juce::FileOutputStream out(tmp);
+            if (out.failedToOpen()) return;
+            out.write(text.data(), text.size());
+        }
+        if (target.existsAsFile()) target.deleteFile();
+        tmp.moveFileTo(target);
+    };
+
+    // Primary destination: user app-data copy (crash recovery, machine-
+    // local, always written).
+    atomicWrite(file);
+
+    // Secondary destination: project-bundled sidecar, if the current
+    // project has one. This is what gets shipped with the .ssp when the
+    // user shares the project, so it needs to stay in sync with the
+    // in-memory undo tree just like the app-data copy does.
+    auto sidecar = currentProjectSidecarFile();
+    if (sidecar != juce::File())
+        atomicWrite(sidecar);
+}
+
+juce::File MainContentComponent::currentProjectSidecarFile() const {
+    if (graph.historyFilePath.empty()) return {};
+    if (ProjectFile::currentPath.empty()) return {};
+    auto projFile = juce::File(ProjectFile::currentPath);
+    return projFile.getParentDirectory().getChildFile(juce::String(graph.historyFilePath));
+}
+
+void MainContentComponent::writeSharedHistorySidecar(const juce::File& sidecarFile) {
+    // One-shot write of the current undo tree to an explicit file path.
+    // Used by save-as opt-in and by the "use a copy" branch of the open
+    // prompt. Updates graph.historyFilePath to the path relative to the
+    // project's .ssp directory, so subsequent writeUndoTreePersist calls
+    // keep the sidecar in sync automatically.
+    auto dir = sidecarFile.getParentDirectory();
+    if (!dir.exists()) dir.createDirectory();
+
+    std::ostringstream oss;
+    graph.undoTree.serializeTo(oss);
+    auto text = oss.str();
+
+    auto tmp = sidecarFile.getSiblingFile(sidecarFile.getFileName() + ".tmp");
     if (tmp.existsAsFile()) tmp.deleteFile();
     {
         juce::FileOutputStream out(tmp);
         if (out.failedToOpen()) return;
         out.write(text.data(), text.size());
     }
-    if (file.existsAsFile()) file.deleteFile();
-    tmp.moveFileTo(file);
+    if (sidecarFile.existsAsFile()) sidecarFile.deleteFile();
+    tmp.moveFileTo(sidecarFile);
+
+    // Update the graph's recorded sidecar path so writeUndoTreePersist
+    // picks it up going forward.
+    if (!ProjectFile::currentPath.empty()) {
+        auto projDir = juce::File(ProjectFile::currentPath).getParentDirectory();
+        auto rel = sidecarFile.getRelativePathFrom(projDir);
+        graph.historyFilePath = rel.toStdString();
+    } else {
+        graph.historyFilePath = sidecarFile.getFullPathName().toStdString();
+    }
+}
+
+// ============================================================================
+// Known-histories preferences (per-user record of decisions per project path)
+// ============================================================================
+
+static juce::File getKnownHistoriesFile() {
+    return getAutosaveDir().getChildFile("known-histories.txt");
+}
+
+void MainContentComponent::loadKnownHistories() {
+    knownHistories.clear();
+    auto file = getKnownHistoriesFile();
+    if (!file.existsAsFile()) return;
+    auto text = file.loadFileAsString();
+    auto lines = juce::StringArray::fromLines(text);
+    for (auto& line : lines) {
+        if (line.isEmpty()) continue;
+        // Format: <project_path>\t<decision>\t<aux>
+        auto parts = juce::StringArray::fromTokens(line, "\t", "");
+        if (parts.size() < 2) continue;
+        HistoryRecord rec;
+        auto decStr = parts[1];
+        if      (decStr == "adopted") rec.decision = HistoryDecision::Adopted;
+        else if (decStr == "copied")  rec.decision = HistoryDecision::Copied;
+        else if (decStr == "ignored") rec.decision = HistoryDecision::Ignored;
+        else continue;
+        if (parts.size() >= 3) rec.copyPath = parts[2].toStdString();
+        knownHistories[parts[0].toStdString()] = rec;
+    }
+}
+
+void MainContentComponent::saveKnownHistories() {
+    auto dir = getAutosaveDir();
+    if (!dir.exists()) dir.createDirectory();
+    juce::String text;
+    for (auto& [path, rec] : knownHistories) {
+        const char* decStr =
+            rec.decision == HistoryDecision::Adopted ? "adopted" :
+            rec.decision == HistoryDecision::Copied  ? "copied"  :
+            rec.decision == HistoryDecision::Ignored ? "ignored" : "";
+        if (*decStr == 0) continue;
+        text += juce::String(path) + "\t" + decStr;
+        if (!rec.copyPath.empty())
+            text += juce::String("\t") + juce::String(rec.copyPath);
+        text += "\n";
+    }
+    getKnownHistoriesFile().replaceWithText(text);
+}
+
+MainContentComponent::HistoryRecord
+MainContentComponent::getHistoryDecision(const juce::String& projectPath) const {
+    auto it = knownHistories.find(projectPath.toStdString());
+    if (it == knownHistories.end()) return {};
+    return it->second;
+}
+
+void MainContentComponent::recordHistoryDecision(const juce::String& projectPath,
+                                                 HistoryDecision d,
+                                                 const std::string& copyPath) {
+    HistoryRecord rec;
+    rec.decision = d;
+    rec.copyPath = copyPath;
+    knownHistories[projectPath.toStdString()] = rec;
+    saveKnownHistories();
+}
+
+// Load an undo tree from a file on disk into the live graph.undoTree,
+// and drive the live graph to the tree's current snapshot. Shared by
+// the "Use it" and "Use a copy" branches of the open prompt. Returns
+// true iff restoration succeeded.
+static bool loadUndoTreeFromFile(const juce::File& file, NodeGraph& graph) {
+    if (!file.existsAsFile()) return false;
+    std::ifstream in(file.getFullPathName().toStdString());
+    if (!in) return false;
+    if (!graph.undoTree.restoreFrom(in)) return false;
+    const auto& snap = graph.undoTree.currentSnapshot();
+    if (!snap.empty() && graph.undoTree.onLoadSnapshot)
+        graph.undoTree.onLoadSnapshot(snap);
+    return true;
+}
+
+void MainContentComponent::handleSharedHistoryOnOpen(const juce::String& projectAbsPath) {
+    // The project file we just loaded may have had a historyFile= field
+    // pointing at a sidecar. If not, there's nothing to consider — bail.
+    auto sidecar = currentProjectSidecarFile();
+    if (sidecar == juce::File() || !sidecar.existsAsFile()) return;
+
+    // Per-user memory of what the user already decided for this project.
+    // Suppresses the re-prompt on every subsequent open.
+    auto rec = getHistoryDecision(projectAbsPath);
+    juce::Component::SafePointer<MainContentComponent> safe(this);
+    juce::String capturedPath = projectAbsPath;
+
+    auto adoptInPlace = [safe, sidecar]() {
+        if (!safe) return;
+        if (loadUndoTreeFromFile(sidecar, safe->graph)) {
+            safe->undoTreeDirty = false;
+            if (safe->graphComponent) safe->graphComponent->repaint();
+        }
+    };
+
+    switch (rec.decision) {
+        case HistoryDecision::Adopted:
+            adoptInPlace();
+            return;
+        case HistoryDecision::Copied: {
+            // User previously chose to use a private copy. Load from
+            // that copy and leave the sidecar alone. If the copy is
+            // missing (user deleted it), fall through to re-prompt.
+            if (!rec.copyPath.empty()) {
+                juce::File copyFile(juce::String(rec.copyPath));
+                if (copyFile.existsAsFile()) {
+                    if (loadUndoTreeFromFile(copyFile, graph)) {
+                        undoTreeDirty = false;
+                        // Detach the graph from the bundled sidecar: the
+                        // user's edits go to their private copy, not the
+                        // shared file.
+                        graph.historyFilePath.clear();
+                        if (graphComponent) graphComponent->repaint();
+                        return;
+                    }
+                }
+            }
+            // Fall through to re-prompt.
+            break;
+        }
+        case HistoryDecision::Ignored:
+            // Detach from the sidecar so writeUndoTreePersist doesn't
+            // mutate the shared file going forward this session either.
+            graph.historyFilePath.clear();
+            return;
+        case HistoryDecision::NeverSeen:
+        default:
+            break;
+    }
+
+    // Show the 3-option modal. Button indexing:
+    //   1 = Use it (adopt)     — shared tree becomes the live tree
+    //   2 = Use a copy (copy)  — duplicate to a private file, edit that
+    //   0 = Ignore             — leave the sidecar alone, no undo tree
+    juce::String projName = juce::File(projectAbsPath).getFileName();
+    juce::String message =
+        "This project came with a shared undo history.\n\n"
+        "What would you like to do with it?\n\n"
+        "- Use it: your undo/redo will continue from where the sender "
+        "left off, and your future edits will be written back to the "
+        "shared history file bundled with the project.\n\n"
+        "- Use a copy: keep a private copy of the history for yourself. "
+        "The shared file won't be modified.\n\n"
+        "- Ignore: start with a fresh undo history. The shared file "
+        "stays untouched.";
+
+    juce::AlertWindow::showAsync(
+        juce::MessageBoxOptions()
+            .withIconType(juce::MessageBoxIconType::QuestionIcon)
+            .withTitle("Shared Undo History Found")
+            .withMessage(message)
+            .withButton("Use It")
+            .withButton("Use a Copy")
+            .withButton("Ignore"),
+        [safe, sidecar, capturedPath](int result) {
+            if (!safe) return;
+            if (result == 1) {
+                // Adopt: load the sidecar; future writes keep going to it.
+                if (loadUndoTreeFromFile(sidecar, safe->graph)) {
+                    safe->undoTreeDirty = false;
+                    if (safe->graphComponent) safe->graphComponent->repaint();
+                }
+                safe->recordHistoryDecision(capturedPath, HistoryDecision::Adopted);
+            } else if (result == 2) {
+                // Copy: duplicate the sidecar into a private file under
+                // the user's autosave dir, load from it, and detach the
+                // graph from the bundled sidecar so writes go to the copy.
+                auto dir = getAutosaveDir();
+                if (!dir.exists()) dir.createDirectory();
+                auto hashed = juce::String::toHexString(capturedPath.hashCode64());
+                auto copyFile = dir.getChildFile("shared-history-copy-" + hashed + ".dat");
+                sidecar.copyFileTo(copyFile);
+                if (loadUndoTreeFromFile(copyFile, safe->graph)) {
+                    safe->undoTreeDirty = false;
+                    if (safe->graphComponent) safe->graphComponent->repaint();
+                }
+                // Detach: clear historyFilePath so the bundled sidecar
+                // stops receiving writes. The copy is machine-local.
+                safe->graph.historyFilePath.clear();
+                safe->recordHistoryDecision(capturedPath, HistoryDecision::Copied,
+                                            copyFile.getFullPathName().toStdString());
+            } else {
+                // Ignore: detach from the sidecar for this session.
+                safe->graph.historyFilePath.clear();
+                safe->recordHistoryDecision(capturedPath, HistoryDecision::Ignored);
+            }
+        });
+}
+
+void MainContentComponent::offerSharedHistoryOnSaveAs(const juce::String& savedProjectPath) {
+    // Post-save opt-in: after the user saves a project under a new
+    // name, ask whether the undo tree should be bundled alongside the
+    // .ssp. If yes, write the sidecar and record the path in
+    // graph.historyFilePath so future saves keep it in sync. The
+    // historyFile= field gets persisted to the .ssp on the next save.
+    juce::Component::SafePointer<MainContentComponent> safe(this);
+    juce::String capturedPath = savedProjectPath;
+
+    juce::AlertWindow::showAsync(
+        juce::MessageBoxOptions()
+            .withIconType(juce::MessageBoxIconType::QuestionIcon)
+            .withTitle("Include Undo History?")
+            .withMessage(
+                "Would you like to save the undo history alongside "
+                "this project so it travels with the file when you "
+                "share it?\n\n"
+                "This creates a sidecar file next to the .ssp. Anyone "
+                "who opens the project will be offered the history "
+                "(they can adopt it, keep a private copy, or ignore "
+                "it).\n\n"
+                "You can skip this — the undo history will still be "
+                "saved privately on your machine either way.")
+            .withButton("Yes, Include")
+            .withButton("No Thanks"),
+        [safe, capturedPath](int result) {
+            if (!safe) return;
+            if (result != 1) return;
+            // Write the sidecar next to the .ssp using a conventional
+            // name (same stem, .history extension).
+            auto projFile = juce::File(capturedPath);
+            auto sidecar = projFile.getSiblingFile(
+                projFile.getFileNameWithoutExtension() + ".history");
+            safe->writeSharedHistorySidecar(sidecar);
+            // writeSharedHistorySidecar updated graph.historyFilePath;
+            // re-save the project file once so its historyFile= field
+            // reflects the new sidecar association.
+            if (!ProjectFile::currentPath.empty()) {
+                ProjectFile::save(ProjectFile::currentPath,
+                                  safe->graph,
+                                  &safe->audioEngine.getGraphProcessor());
+            }
+            // Remember: on subsequent opens of this project, don't
+            // re-prompt — the user knows their own sidecar.
+            safe->recordHistoryDecision(capturedPath, HistoryDecision::Adopted);
+        });
 }
 
 void MainContentComponent::tryRestoreUndoTree() {
@@ -3153,6 +3936,7 @@ void MainContentComponent::tryRecoverAutosave() {
             safe->editorPanels.clear();
             ProjectFile::load(getAutosaveFile().getFullPathName().toStdString(),
                               safe->graph, &safe->audioEngine.getPluginHost());
+            safe->upgradeLegacyNodes();
             // Per-plugin override files contain newer plugin state than
             // the (full but periodically-stale) autosave.ssp. Apply them
             // on top so the user sees the most recent plugin tweaks.
@@ -3162,10 +3946,11 @@ void MainContentComponent::tryRecoverAutosave() {
             safe->projectDirty = true;
             safe->graph.dirty = true;
 
-            auto editorsToOpen = safe->graph.openEditors;
+            auto editorIds = safe->graph.openEditors;
             safe->graph.openEditors.clear();
-            for (auto* node : editorsToOpen)
-                safe->openEditor(*node);
+            for (int id : editorIds)
+                if (auto* node = safe->graph.findNode(id))
+                    safe->openEditor(*node);
 
             safe->graphComponent->fitAll();
             safe->graphComponent->repaint();
@@ -3484,7 +4269,7 @@ void MainContentComponent::showScriptConsoleForNode(int nodeId) {
     opts.dialogTitle = node ? "Script: " + juce::String(node->name) : "Script Console";
     opts.dialogBackgroundColour = juce::Colour(40, 40, 45);
     opts.escapeKeyTriggersCloseButton = true;
-    opts.useNativeTitleBar = true;
+    opts.useNativeTitleBar = false;
     opts.resizable = true;
     opts.launchAsync();
 }
@@ -3721,7 +4506,7 @@ void MainContentComponent::showAudioDeviceSettings() {
     opts.dialogTitle = "Audio Device Settings";
     opts.dialogBackgroundColour = juce::Colour(40, 40, 45);
     opts.escapeKeyTriggersCloseButton = true;
-    opts.useNativeTitleBar = true;
+    opts.useNativeTitleBar = false;
     opts.resizable = true;
     opts.launchAsync();
     return;
@@ -3861,7 +4646,7 @@ void MainContentComponent::showAudioDeviceSettings() {
     opts.dialogTitle = "Audio Device Settings";
     opts.dialogBackgroundColour = juce::Colour(40, 40, 45);
     opts.escapeKeyTriggersCloseButton = true;
-    opts.useNativeTitleBar = true;
+    opts.useNativeTitleBar = false;
     opts.resizable = true;
     opts.launchAsync();
 #endif
@@ -3875,9 +4660,61 @@ void MainContentComponent::showPluginSettingsDialog() {
     opts.dialogTitle = "Plugin Settings";
     opts.dialogBackgroundColour = juce::Colour(40, 40, 45);
     opts.escapeKeyTriggersCloseButton = true;
-    opts.useNativeTitleBar = true;
+    opts.useNativeTitleBar = false;
     opts.resizable = true;
     opts.launchAsync();
+}
+
+void MainContentComponent::showSongSettingsDialog() {
+    // Small modal with three inputs: Song Length (beats), Repeat Mode,
+    // and Repeat Count (used only when mode == N Times).
+    // Build the explanatory header. If the user hasn't set an explicit
+    // length, show the auto-derived value so they can see what playback
+    // will use without having to guess.
+    juce::String header =
+        "Song Length is where playback auto-stops (in beats).\n"
+        "0 = auto (derived from the last clip across all timelines).\n";
+    if (graph.songLengthBeats <= 0) {
+        double autoEnd = graph.effectiveSongLengthBeats();
+        if (autoEnd > 0)
+            header += "Current auto value: " + juce::String(autoEnd, 2) + " beats.\n";
+        else
+            header += "Current auto value: no clips yet, so playback won't auto-stop.\n";
+    }
+    header += "\nRepeat Mode:\n"
+              "  None    — stop at Song Length.\n"
+              "  Forever — loop back to beat 0 until Stop is pressed.\n"
+              "  N Times — loop back and play N times total, then stop.";
+    auto* aw = new juce::AlertWindow("Song Length + Repeat", header,
+        juce::MessageBoxIconType::NoIcon);
+    aw->addTextEditor("length",
+        juce::String(graph.songLengthBeats, 2),
+        "Song Length (beats, 0 = auto):");
+    aw->addComboBox("mode", {"None", "Forever (until Stop)", "N Times"}, "Repeat Mode:");
+    aw->getComboBoxComponent("mode")->setSelectedItemIndex((int)graph.songRepeatMode,
+                                                            juce::dontSendNotification);
+    aw->addTextEditor("count",
+        juce::String(graph.songRepeatCount),
+        "Repeat Count (N):");
+    aw->addButton("OK", 1, juce::KeyPress(juce::KeyPress::returnKey));
+    aw->addButton("Cancel", 0);
+    aw->enterModalState(true, juce::ModalCallbackFunction::create(
+        [this, aw](int res) {
+            if (res == 1) {
+                float len = aw->getTextEditorContents("length").getFloatValue();
+                int modeIdx = aw->getComboBoxComponent("mode")->getSelectedItemIndex();
+                int count = aw->getTextEditorContents("count").getIntValue();
+                graph.songLengthBeats = std::max(0.0f, len);
+                graph.songRepeatMode = (modeIdx == 1 ? NodeGraph::SongRepeat::Forever
+                                        : modeIdx == 2 ? NodeGraph::SongRepeat::NTimes
+                                        :                NodeGraph::SongRepeat::None);
+                graph.songRepeatCount = std::max(1, count);
+                projectDirty = true;
+                graph.dirty = true;
+                graph.commitSnapshot("Edit song length / repeat");
+            }
+            delete aw;
+        }), true);
 }
 
 // ==============================================================================
@@ -4021,7 +4858,7 @@ void MainContentComponent::openHotkeySettings() {
     opts.dialogTitle = "Assign Hotkeys";
     opts.dialogBackgroundColour = juce::Colour(22, 22, 28);
     opts.escapeKeyTriggersCloseButton = false; // escape is used for canceling capture
-    opts.useNativeTitleBar = true;
+    opts.useNativeTitleBar = false;
     opts.resizable = true;
     opts.launchAsync();
 }

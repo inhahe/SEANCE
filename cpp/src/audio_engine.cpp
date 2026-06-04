@@ -1,7 +1,21 @@
 #include "audio_engine.h"
 #include <cstdio>
+#include <algorithm>
 
 namespace SoundShop {
+
+double AudioEngine::computeMaxGraphTailSeconds() const {
+    if (!graph) return 0.0;
+    double maxTail = 0.0;
+    auto& gp = const_cast<GraphProcessor&>(graphProcessor);
+    for (const auto& n : graph->nodes) {
+        if (auto* p = gp.getProcessorForNode(n.id)) {
+            double t = p->getTailLengthSeconds();
+            if (t > maxTail) maxTail = t;
+        }
+    }
+    return maxTail;
+}
 
 AudioEngine::AudioEngine() = default;
 AudioEngine::~AudioEngine() { shutdown(); }
@@ -212,6 +226,73 @@ void AudioEngine::audioDeviceIOCallbackWithContext(
         }
     }
 
+    // Apply the project-wide Song Length + Song Repeat policy. The user-
+    // region loop above takes precedence (it's an inner A-B cycler — the
+    // user's immediate intent to cycle a section), so this branch only
+    // runs when no user loop was applied during this block.
+    //
+    // For SongRepeat::None and the final iteration of ::NTimes, we don't
+    // halt immediately — that would cut reverbs, delays, and release
+    // tails.  Instead we enter a "tail grace" countdown: keep processing
+    // (the playhead stays at the song end, no new clips trigger) until
+    // the max per-node tail has elapsed, then truly stop.
+    auto applySongRepeat = [&](int blockSamples) {
+        if (!graph || !playing.load()) return;
+        // effectiveSongLengthBeats() returns the explicit songLengthBeats if
+        // set, else auto-derives from the latest clip across all timeline
+        // nodes. 0 means "no end" — project has no clips, just play until
+        // the user hits Stop.
+        double endBeat = graph->effectiveSongLengthBeats();
+        if (endBeat <= 0) return;
+
+        // If we're already inside tail grace, just tick the countdown.
+        if (endTailSamplesRemaining >= 0) {
+            endTailSamplesRemaining -= blockSamples;
+            // Hold the playhead at the song end so no new content triggers.
+            positionSamples = (int64_t)transport->beatsToSamples(endBeat);
+            if (endTailSamplesRemaining <= 0) {
+                playing = false;
+                endTailSamplesRemaining = -1;
+            }
+            return;
+        }
+
+        double posBeat = transport->positionBeats();
+        if (posBeat < endBeat) return;
+
+        auto enterTailGrace = [&]() {
+            // Hold the playhead at the song-end beat; start the countdown.
+            positionSamples = (int64_t)transport->beatsToSamples(endBeat);
+            double tailSec = computeMaxGraphTailSeconds();
+            endTailSamplesRemaining = (int64_t)(tailSec * transport->sampleRate);
+            if (endTailSamplesRemaining <= 0) {
+                // No tail anywhere in the graph — halt now.
+                playing = false;
+                endTailSamplesRemaining = -1;
+            }
+        };
+
+        switch (graph->songRepeatMode) {
+            case NodeGraph::SongRepeat::None:
+                enterTailGrace();
+                break;
+            case NodeGraph::SongRepeat::Forever:
+                positionSamples = 0;
+                ++songPlayCount;
+                break;
+            case NodeGraph::SongRepeat::NTimes:
+                ++songPlayCount;
+                // songRepeatCount is "play N times total". We just reached
+                // the end of iteration songPlayCount; if we've hit the
+                // total, enter tail grace; otherwise wrap.
+                if (songPlayCount >= std::max(1, graph->songRepeatCount))
+                    enterTailGrace();
+                else
+                    positionSamples = 0;
+                break;
+        }
+    };
+
     if (!needsResample) {
         // Same rate — no resampling needed
         graphProcessor.processBlock(*graph, *transport,
@@ -219,12 +300,15 @@ void AudioEngine::audioDeviceIOCallbackWithContext(
         if (playing.load()) {
             positionSamples += numSamples;
             // Loop: wrap position back to loop start
+            bool userLoopApplied = false;
             if (transport->loopEnabled && transport->loopEndBeat > transport->loopStartBeat) {
                 double posBeat = transport->positionBeats();
                 if (posBeat >= transport->loopEndBeat) {
                     positionSamples = (int64_t)transport->beatsToSamples(transport->loopStartBeat);
+                    userLoopApplied = true;
                 }
             }
+            if (!userLoopApplied) applySongRepeat(numSamples);
         }
     } else {
         // Process at project rate, then resample to device rate
@@ -257,14 +341,19 @@ void AudioEngine::audioDeviceIOCallbackWithContext(
         // Track fractional sample position for seamless continuation
         resamplePhase = std::fmod(resamplePhase + numSamples * ratio, (double)projectSamples);
 
-        if (playing.load())
+        if (playing.load()) {
             positionSamples += projectSamples; // advance at project rate
             // Loop wrap
+            bool userLoopApplied = false;
             if (transport->loopEnabled && transport->loopEndBeat > transport->loopStartBeat) {
                 double posBeat = transport->positionBeats();
-                if (posBeat >= transport->loopEndBeat)
+                if (posBeat >= transport->loopEndBeat) {
                     positionSamples = (int64_t)transport->beatsToSamples(transport->loopStartBeat);
+                    userLoopApplied = true;
+                }
             }
+            if (!userLoopApplied) applySongRepeat(projectSamples);
+        }
     }
 
     // Input monitoring: mix audio input directly into output (global toggle)
@@ -280,6 +369,13 @@ void AudioEngine::audioDeviceIOCallbackWithContext(
         multitrackRecorder.processMonitoring(inputChannelData, numInputChannels,
                                               outputChannelData, numOutputChannels,
                                               numSamples, *graph);
+
+    // Spectrum analyzer ring buffer (#10): write latest output samples.
+    for (int s = 0; s < numSamples; ++s) {
+        spectrumBufL[spectrumWritePos] = (numOutputChannels > 0) ? outputChannelData[0][s] : 0.0f;
+        spectrumBufR[spectrumWritePos] = (numOutputChannels > 1) ? outputChannelData[1][s] : 0.0f;
+        spectrumWritePos = (spectrumWritePos + 1) % kSpectrumBufSize;
+    }
 
     // Always-on output capture: every playback is captured so the Output
     // node's cache can be populated on Stop. The buffer auto-clears when a

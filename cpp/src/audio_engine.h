@@ -52,7 +52,7 @@ public:
 
     // Transport
     bool isPlaying() const { return playing.load(); }
-    void play() { playing = true; }
+    void play() { playing = true; songPlayCount = 0; endTailSamplesRemaining = -1; }
     void stop();
     void pause() { playing = false; }
 
@@ -103,6 +103,26 @@ private:
     std::atomic<bool> playing{false};
     std::atomic<double> bpm{120.0};
     int64_t positionSamples = 0;
+
+    // Counts how many times the song-length endpoint has been reached
+    // since playback started. The song-repeat policy (None/Forever/
+    // NTimes) reads this to decide whether to wrap the playhead or halt.
+    // Reset on play() and on every manual seek from the transport UI.
+    int songPlayCount = 0;
+
+    // Tail-grace state for SongRepeat::None: once the playhead crosses
+    // songLengthBeats, instead of halting immediately we keep pumping
+    // silent blocks so per-node tails (reverb, release, delay feedback)
+    // can ring out.  `endTailSamplesRemaining` is the countdown in samples.
+    // -1 means "not in tail grace" (normal playback).
+    int64_t endTailSamplesRemaining = -1;
+
+    // Walk the graph and return max(processor->getTailLengthSeconds())
+    // across every audio processor.  Called when entering tail grace.
+    double computeMaxGraphTailSeconds() const;
+public:
+    void resetSongPlayCount() { songPlayCount = 0; endTailSamplesRemaining = -1; }
+private:
     double sampleRate = 44100.0;  // device sample rate
     int blockSize = 512;
 
@@ -168,6 +188,22 @@ public:
     // Call from the UI's keyPressed/keyReleased to generate MIDI events
     void keyboardNoteOn(int midiNote, int velocity = 100);
     void keyboardNoteOff(int midiNote);
+
+    // Spectrum analyzer ring buffer (#10). The audio thread writes the last
+    // N output samples; the UI reads a snapshot for FFT display. Small
+    // enough that a torn read is just a visual glitch, never a crash.
+    static constexpr int kSpectrumBufSize = 2048;
+    float spectrumBufL[kSpectrumBufSize] = {};
+    float spectrumBufR[kSpectrumBufSize] = {};
+    int spectrumWritePos = 0;
+    // UI calls this to grab a snapshot for FFT analysis.
+    void getSpectrumSnapshot(std::vector<float>& out, int channel = 0) const {
+        out.resize(kSpectrumBufSize);
+        const float* src = (channel == 0) ? spectrumBufL : spectrumBufR;
+        int wp = spectrumWritePos;
+        for (int i = 0; i < kSpectrumBufSize; ++i)
+            out[i] = src[(wp + i) % kSpectrumBufSize];
+    }
 
     // Output capture: record the final mix to memory for "Save as Audio Track"
     // or export. Only the audio thread writes to the buffers (while capturing);

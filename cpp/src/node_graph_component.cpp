@@ -8,6 +8,7 @@
 #include "soundfont_processor.h"
 #include "builtin_effects.h"
 #include "drum_synth.h"
+#include "multi_sampler.h"
 #include <cmath>
 
 namespace SoundShop {
@@ -203,6 +204,11 @@ void NodeGraphComponent::drawNode(juce::Graphics& g, Node& node) {
         g.setFont(juce::Font(std::max(8.0f, 10.0f * zoom), juce::Font::bold));
         g.drawText("S", titleArea.removeFromRight(16 * zoom), juce::Justification::centred);
     }
+    if (node.recordArmed) {
+        g.setColour(juce::Colours::red);
+        g.setFont(juce::Font(std::max(8.0f, 10.0f * zoom), juce::Font::bold));
+        g.drawText("R", titleArea.removeFromRight(16 * zoom), juce::Justification::centred);
+    }
 
     // Pan indicator (small bar in title)
     if (node.pan != 0.0f && zoom > 0.4f) {
@@ -340,7 +346,67 @@ void NodeGraphComponent::drawNode(juce::Graphics& g, Node& node) {
             juce::String valueStr = juce::String(p.value, 2);
             g.drawText(valueStr, rowRect.reduced(4, 0), juce::Justification::centredRight, false);
 
+            // Modulation indicators (#29): small colored dots after the
+            // param name showing what's driving this param.
+            if (zoom > 0.4f) {
+                float indX = labelRect.getX() + g.getCurrentFont().getStringWidthFloat(p.name) + 4;
+                float indY = labelRect.getCentreY() - 2;
+                float indSz = 4.0f;
+                // Orange dot = has automation points
+                if (!p.automation.points.empty()) {
+                    g.setColour(juce::Colours::orange);
+                    g.fillEllipse(indX, indY, indSz, indSz);
+                    indX += indSz + 2;
+                }
+                // Cyan dot = signal modulation pin attached
+                if (p.modulated) {
+                    g.setColour(juce::Colours::cyan);
+                    g.fillEllipse(indX, indY, indSz, indSz);
+                    indX += indSz + 2;
+                }
+                // Green dot = MIDI Learn (CC mapping) targets this param
+                for (auto& cc : graph.ccMappings) {
+                    if (cc.nodeId == node.id && cc.paramIdx == pi) {
+                        g.setColour(juce::Colours::limegreen);
+                        g.fillEllipse(indX, indY, indSz, indSz);
+                        break;
+                    }
+                }
+            }
+
             pinY += PIN_ROW_HEIGHT;
+        }
+    }
+
+    // Peak meter bars (#99) — two thin horizontal bars (L/R) at the
+    // bottom of the node, showing the current audio level. Green
+    // below -6 dB, yellow up to -1 dB, red above. Only drawn when
+    // there's actually signal flowing (peak > 0.001) and zoom > 0.35.
+    if (zoom > 0.35f) {
+        float pkL = node.meterPeakL;
+        float pkR = node.meterPeakR;
+        if (pkL > 0.001f || pkR > 0.001f) {
+            auto meterBounds = getNodeBounds(node);
+            auto sb = juce::Rectangle<float>(
+                canvasToScreen(meterBounds.getBottomLeft()),
+                canvasToScreen(meterBounds.getBottomRight() + juce::Point<float>(0, 6)));
+            float mw = sb.getWidth();
+            float mh = sb.getHeight() * 0.45f;
+            float my = sb.getY();
+
+            auto drawBar = [&](float peak, float y) {
+                float db = 20.0f * std::log10(std::max(1e-6f, peak));
+                float frac = juce::jlimit(0.0f, 1.0f, (db + 60.0f) / 60.0f); // -60..0 dB → 0..1
+                auto col = (db > -1.0f) ? juce::Colours::red
+                         : (db > -6.0f) ? juce::Colours::yellow
+                         : juce::Colours::limegreen;
+                g.setColour(juce::Colour(30, 30, 35));
+                g.fillRect(sb.getX(), y, mw, mh);
+                g.setColour(col.withAlpha(0.8f));
+                g.fillRect(sb.getX(), y, mw * frac, mh);
+            };
+            drawBar(pkL, my);
+            drawBar(pkR, my + mh + 1);
         }
     }
 }
@@ -604,9 +670,19 @@ void NodeGraphComponent::mouseDown(const juce::MouseEvent& e) {
                         pm.addItem(2, "Arm All on This Node");
                         pm.addItem(3, "Disarm All on This Node");
                         pm.addItem(4, "Reset to Default (double-click)");
+                        // Signal modulation pin (#88): offer to add or remove
+                        // a Signal input pin that drives this specific param.
+                        bool hasModPin = false;
+                        for (auto& mp : node->modPins)
+                            if (mp.paramIndex == idx) { hasModPin = true; break; }
+                        pm.addSeparator();
+                        if (hasModPin)
+                            pm.addItem(10, "Remove Modulation Input");
+                        else
+                            pm.addItem(10, "Add Modulation Input");
                         int nodeId = node->id;
                         int paramIdx = idx;
-                        pm.showMenuAsync({}, [this, nodeId, paramIdx](int r) {
+                        pm.showMenuAsync({}, [this, nodeId, paramIdx, hasModPin](int r) {
                             auto* nd = graph.findNode(nodeId);
                             if (!nd) return;
                             if (r == 1 && paramIdx < (int)nd->params.size())
@@ -618,6 +694,51 @@ void NodeGraphComponent::mouseDown(const juce::MouseEvent& e) {
                             else if (r == 4 && paramIdx < (int)nd->params.size()) {
                                 auto& p2 = nd->params[paramIdx];
                                 p2.value = (p2.minVal + p2.maxVal) * 0.5f;
+                            }
+                            else if (r == 10) {
+                                if (hasModPin) {
+                                    // Remove the modulation pin + binding.
+                                    for (auto it = nd->modPins.begin(); it != nd->modPins.end(); ++it) {
+                                        if (it->paramIndex == paramIdx) {
+                                            int pinId = it->pinId;
+                                            // Remove pin from pinsIn.
+                                            nd->pinsIn.erase(
+                                                std::remove_if(nd->pinsIn.begin(), nd->pinsIn.end(),
+                                                    [pinId](const Pin& p) { return p.id == pinId; }),
+                                                nd->pinsIn.end());
+                                            // Remove any links connected to this pin.
+                                            graph.links.erase(
+                                                std::remove_if(graph.links.begin(), graph.links.end(),
+                                                    [pinId](const auto& lk) { return lk.endPin == pinId; }),
+                                                graph.links.end());
+                                            nd->modPins.erase(it);
+                                            break;
+                                        }
+                                    }
+                                    // Clear modulation state on the param.
+                                    if (paramIdx < (int)nd->params.size()) {
+                                        auto& p2 = nd->params[paramIdx];
+                                        if (p2.modulated) {
+                                            p2.value = p2.baseValue;
+                                            p2.modulated = false;
+                                        }
+                                    }
+                                    graph.dirty = true;
+                                    graph.commitSnapshot("Remove modulation input");
+                                } else {
+                                    // Add a new Signal input pin and bind it to this param.
+                                    if (paramIdx >= (int)nd->params.size()) return;
+                                    std::string pinName = "Mod: " + nd->params[paramIdx].name;
+                                    int newPinId = graph.getNextId();
+                                    nd->pinsIn.push_back({newPinId, pinName, PinKind::Signal, true, 1});
+                                    Node::ModPin mp;
+                                    mp.paramIndex = paramIdx;
+                                    mp.pinId = newPinId;
+                                    mp.depth = 1.0f;
+                                    nd->modPins.push_back(mp);
+                                    graph.dirty = true;
+                                    graph.commitSnapshot("Add modulation input");
+                                }
                             }
                             repaint();
                         });
@@ -864,10 +985,10 @@ void NodeGraphComponent::mouseDoubleClick(const juce::MouseEvent& e) {
     if (node->type == NodeType::MidiTimeline || node->type == NodeType::AudioTimeline) {
         // Open piano roll editor
         bool already = false;
-        for (auto* ed : graph.openEditors)
-            if (ed->id == node->id) { already = true; break; }
+        for (int edId : graph.openEditors)
+            if (edId == node->id) { already = true; break; }
         if (!already)
-            graph.openEditors.insert(graph.openEditors.begin(), node);
+            graph.openEditors.insert(graph.openEditors.begin(), node->id);
         graph.activeEditorNodeId = node->id;
         if (onOpenEditor) onOpenEditor(*node);
     } else if (node->plugin || node->type == NodeType::Instrument || node->type == NodeType::Effect) {
@@ -940,6 +1061,11 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
     instMenu.addSeparator();
     instMenu.addItem(100, "Piano");
     instMenu.addItem(102, "Sampler");
+    instMenu.addItem(107, "FM Synth");
+    instMenu.addItem(108, "Phase Distortion Synth");
+    instMenu.addItem(109, "Particle Cloud Synth");
+    instMenu.addItem(110, "Additive Synth");
+    instMenu.addItem(111, "Spectral Grain Synth");
     instMenu.addItem(104, "SoundFont (.sf2)...");
     instMenu.addItem(105, "SFZ Instrument (.sfz)...");
     instMenu.addItem(103, "Drum Machine");
@@ -950,6 +1076,8 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
     fxMenu.addItem(206, "Pitch Shift / Time Stretch");
     fxMenu.addSeparator();
     fxMenu.addItem(207, "Convolution Filter");
+    fxMenu.addItem(221, "Reverb");
+    fxMenu.addItem(222, "Parametric EQ");
     fxMenu.addSeparator();
     fxMenu.addItem(208, "Tremolo");
     fxMenu.addItem(209, "Vibrato");
@@ -965,6 +1093,24 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
     fxMenu.addItem(218, "Mixture (organ harmonics)");
     fxMenu.addItem(219, "Trigger (MIDI / signal)");
     fxMenu.addItem(220, "MIDI Modulator (signal -> MIDI)");
+    fxMenu.addItem(223, "Ring Modulator");
+    fxMenu.addItem(226, "Transient/Sustain Split");
+    fxMenu.addItem(227, "Wavelet Denoiser");
+    fxMenu.addItem(228, "Wavelet Bitcrush");
+    fxMenu.addItem(229, "Octave Shift (wavelet)");
+    fxMenu.addItem(230, "Wavelet Multiband Comp");
+    fxMenu.addItem(231, "Wavelet Pitch Shift");
+    fxMenu.addItem(232, "Wavelet Reverb (1/f)");
+    fxMenu.addItem(233, "Independent Pitch Shift");
+    fxMenu.addItem(234, "Wavelet Complexity");
+    fxMenu.addItem(235, "Asymmetric Filter");
+    fxMenu.addItem(236, "Wavelet Pitch Tracker");
+    fxMenu.addItem(237, "Wavelet Vocoder");
+    fxMenu.addItem(238, "Formant Pitch Shift");
+    fxMenu.addItem(239, "SMS (harmonic/noise split)");
+    fxMenu.addSeparator();
+    fxMenu.addItem(224, "M/S Encode (stereo → mid+side)");
+    fxMenu.addItem(225, "M/S Decode (mid+side → stereo)");
     fxMenu.addSeparator();
     fxMenu.addItem(217, "3D Spatializer (binaural)");
     menu.addSubMenu("Effects", fxMenu);
@@ -1120,7 +1266,7 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
                 opts.dialogTitle = "Waveform: " + juce::String(n.name);
                 opts.dialogBackgroundColour = juce::Colour(22, 22, 28);
                 opts.escapeKeyTriggersCloseButton = true;
-                opts.useNativeTitleBar = true;
+                opts.useNativeTitleBar = false;
                 opts.resizable = true;
                 opts.launchAsync();
                 (void)nodeId;
@@ -1192,7 +1338,7 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
                 opts.dialogTitle = "XY Pad";
                 opts.dialogBackgroundColour = juce::Colour(25, 25, 32);
                 opts.escapeKeyTriggersCloseButton = true;
-                opts.useNativeTitleBar = true;
+                opts.useNativeTitleBar = false;
                 opts.resizable = true;
                 opts.launchAsync();
             }
@@ -1345,7 +1491,10 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
                 return;
             }
         } else if (result == 102) {
-            // Sampler: load a sound file as a pitched instrument
+            // Sampler: creates a MultiSampler node. The file chooser is
+            // a convenience — if the user picks a file, it becomes the
+            // instrument's first (and only) zone covering the full MIDI
+            // range. The sampler editor can add more zones later.
             auto canvasPos = p;
             auto chooser = std::make_shared<juce::FileChooser>(
                 "Load Sample", juce::File(), "*.wav;*.mp3;*.aiff;*.flac;*.ogg");
@@ -1355,35 +1504,21 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
                     if (!file.existsAsFile()) return;
                     auto name = file.getFileNameWithoutExtension().toStdString();
                     auto& n = graph.addNode(name, NodeType::Instrument,
-                        {Pin{0, "MIDI", PinKind::Midi, true},
-                         Pin{0, "Sig X", PinKind::Signal, true, 1},
-                         Pin{0, "Sig Y", PinKind::Signal, true, 1}},
+                        {Pin{0, "MIDI", PinKind::Midi, true}},
                         {Pin{0, "Audio", PinKind::Audio, false}},
                         {canvasPos.x, canvasPos.y});
-                    n.script = "__audio__:" + file.getFullPathName().toStdString();
-                    // Sampler params (same as unified terrain synth)
-                    n.params.push_back({"Attack",       0.005f, 0.001f, 2.0f});
-                    n.params.push_back({"Decay",        0.05f,  0.001f, 2.0f});
-                    n.params.push_back({"Sustain",      1.0f,   0.0f,   1.0f});
-                    n.params.push_back({"Release",      0.1f,   0.001f, 5.0f});
-                    n.params.push_back({"Volume",       0.5f,   0.0f,   1.0f});
-                    n.params.push_back({"Pan",          0.0f,  -1.0f,   1.0f});
-                    n.params.push_back({"Speed",        1.0f,   0.01f, 20.0f});
-                    n.params.push_back({"Radius X",     0.0f,   0.0f,   0.5f});
-                    n.params.push_back({"Radius Y",     0.0f,   0.0f,   0.5f});
-                    n.params.push_back({"Center X",     0.5f,   0.0f,   1.0f});
-                    n.params.push_back({"Center Y",     0.5f,   0.0f,   1.0f});
-                    n.params.push_back({"Rad Mod Spd",  0.0f,   0.0f,  10.0f});
-                    n.params.push_back({"Rad Mod Amt",  0.0f,   0.0f,   0.3f});
-                    n.params.push_back({"Traversal",    1.0f,   0.0f,   3.0f}); // Linear
-                    n.params.push_back({"Synth Mode",   0.0f,   0.0f,   1.0f}); // SamplePerPoint
-                    n.params.push_back({"LFO1 Rate",    0.5f,   0.01f, 20.0f});
-                    n.params.push_back({"LFO2 Rate",    0.2f,   0.01f, 20.0f});
-                    n.params.push_back({"LFO1 Amount",  0.0f,   0.0f,   1.0f});
-                    n.params.push_back({"LFO2 Amount",  0.0f,   0.0f,   1.0f});
-                    n.params.push_back({"Grain Size",   0.02f,  0.0f,   0.5f}); // sampler default: small grains
-                    n.params.push_back({"Freeze",       0.0f,   0.0f,   1.0f});
-                    n.params.push_back({"Grain Jitter", 0.0f,   0.0f,   1.0f});
+                    MultiSamplerDoc doc;
+                    MultiSamplerZone z;
+                    z.samplePath = file.getFullPathName().toStdString();
+                    z.loNote = 0; z.hiNote = 127;
+                    z.loVel = 1; z.hiVel = 127;
+                    z.baseNote = 60;
+                    doc.zones.push_back(z);
+                    n.script = doc.encode();
+                    // Global Volume/Pan live as real params so automation
+                    // lanes and Signal cables can target them.
+                    n.params.push_back({"Volume", 0.5f,  0.0f, 1.0f});
+                    n.params.push_back({"Pan",    0.0f, -1.0f, 1.0f});
                     repaint();
                 });
             return;
@@ -1428,6 +1563,86 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
             n.params.push_back({"Pan",      0.0f, -1.0f, 1.0f});
             n.params.push_back({"Vel Sens", 1.0f, 0.0f, 1.0f});
             // The DrumSynthProcessor will populate per-sound params on construction
+        } else if (result == 107) {
+            // FM Synth: 4-operator FM synthesis
+            auto& n = graph.addNode("FM Synth", NodeType::Instrument,
+                {Pin{0, "MIDI", PinKind::Midi, true}},
+                {Pin{0, "Audio", PinKind::Audio, false}}, {p.x, p.y});
+            n.script = "__fmsynth__";
+            n.params.push_back({"Algorithm",  0.0f, 0.0f, 7.0f});
+            n.params.push_back({"Feedback",   0.3f, 0.0f, 1.0f});
+            n.params.push_back({"Volume",     0.5f, 0.0f, 1.0f});
+            for (int i = 1; i <= 4; ++i) {
+                auto p2 = "Op" + std::to_string(i) + " ";
+                n.params.push_back({p2 + "Ratio", (float)i, 0.1f, 16.0f});
+                n.params.push_back({p2 + "Level", i == 1 ? 1.0f : 0.5f, 0.0f, 1.0f});
+                n.params.push_back({p2 + "A",     0.01f, 0.001f, 2.0f});
+                n.params.push_back({p2 + "D",     0.1f,  0.001f, 5.0f});
+                n.params.push_back({p2 + "S",     0.7f,  0.0f,   1.0f});
+                n.params.push_back({p2 + "R",     0.3f,  0.001f, 10.0f});
+            }
+            repaint();
+        } else if (result == 111) {
+            // Spectral Grain Synth
+            auto& n = graph.addNode("Spectral Grain", NodeType::Instrument,
+                {Pin{0, "MIDI", PinKind::Midi, true}},
+                {Pin{0, "Audio", PinKind::Audio, false}}, {p.x, p.y});
+            n.script = "__spectralgrain__:exp(-f/10)";
+            n.params.push_back({"Density",    20.0f, 1.0f, 200.0f});
+            n.params.push_back({"Grain Size", 40.0f, 1.0f, 200.0f});
+            n.params.push_back({"Attack",      0.01f, 0.001f, 2.0f});
+            n.params.push_back({"Decay",       0.1f, 0.001f, 5.0f});
+            n.params.push_back({"Sustain",     0.7f, 0.0f, 1.0f});
+            n.params.push_back({"Release",     0.3f, 0.001f, 10.0f});
+            n.params.push_back({"Volume",      0.5f, 0.0f, 1.0f});
+            repaint();
+        } else if (result == 110) {
+            // Additive Synth
+            auto& n = graph.addNode("Additive", NodeType::Instrument,
+                {Pin{0, "MIDI", PinKind::Midi, true}},
+                {Pin{0, "Audio", PinKind::Audio, false}}, {p.x, p.y});
+            n.script = "__additivesynth__";
+            n.params.push_back({"Preset",      0.0f, 0.0f,  4.0f}); // 0=Custom 1=Bell 2=Drum 3=Piano 4=Organ
+            n.params.push_back({"Partials",   16.0f, 1.0f, 64.0f});
+            n.params.push_back({"Stretch",     0.0f, 0.0f,  2.0f});
+            n.params.push_back({"Brightness",  1.0f, 0.0f,  3.0f});
+            n.params.push_back({"Attack",      0.01f, 0.001f, 2.0f});
+            n.params.push_back({"Decay",       0.1f, 0.001f, 5.0f});
+            n.params.push_back({"Sustain",     0.7f, 0.0f, 1.0f});
+            n.params.push_back({"Release",     0.3f, 0.001f, 10.0f});
+            n.params.push_back({"Volume",      0.5f, 0.0f, 1.0f});
+            repaint();
+        } else if (result == 109) {
+            // Particle Cloud Synth
+            auto& n = graph.addNode("Particle", NodeType::Instrument,
+                {Pin{0, "MIDI", PinKind::Midi, true}},
+                {Pin{0, "Audio", PinKind::Audio, false}}, {p.x, p.y});
+            n.script = "__particlesynth__";
+            n.params.push_back({"Density",    30.0f,  1.0f, 200.0f});
+            n.params.push_back({"Spread",      7.0f,  0.0f,  24.0f});
+            n.params.push_back({"Grain Size", 50.0f,  1.0f, 500.0f});
+            n.params.push_back({"Attack",      0.1f,  0.0f,   1.0f});
+            n.params.push_back({"Release",     0.3f,  0.0f,   1.0f});
+            n.params.push_back({"Shape",       0.0f,  0.0f,   3.0f}); // 0=sine 1=saw 2=sq 3=noise
+            n.params.push_back({"Volume",      0.5f,  0.0f,   1.0f});
+            repaint();
+        } else if (result == 108) {
+            // Phase Distortion Synth
+            auto& n = graph.addNode("PD Synth", NodeType::Instrument,
+                {Pin{0, "MIDI", PinKind::Midi, true}},
+                {Pin{0, "Audio", PinKind::Audio, false}}, {p.x, p.y});
+            n.script = "__pdsynth__";
+            n.params.push_back({"Waveform",    0.0f, 0.0f, 3.0f}); // 0=saw 1=sq 2=pulse 3=reso
+            n.params.push_back({"Depth",       0.8f, 0.0f, 1.0f});
+            n.params.push_back({"DCW Attack",  0.01f, 0.001f, 2.0f});
+            n.params.push_back({"DCW Decay",   0.3f, 0.001f, 5.0f});
+            n.params.push_back({"DCW Sustain", 0.3f, 0.0f, 1.0f});
+            n.params.push_back({"Attack",      0.005f, 0.001f, 2.0f});
+            n.params.push_back({"Decay",       0.1f, 0.001f, 5.0f});
+            n.params.push_back({"Sustain",     0.7f, 0.0f, 1.0f});
+            n.params.push_back({"Release",     0.3f, 0.001f, 10.0f});
+            n.params.push_back({"Volume",      0.5f, 0.0f, 1.0f});
+            repaint();
         } else if (result == 100 || result == 103) {
             // Piano and Drum Machine: functional defaults that route through
             // TerrainSynthProcessor, so they don't crash and give the user
@@ -1523,13 +1738,158 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
                     {"Feedback", 0.5f, 0.0f, 0.95f},
                     {"Mix", 0.4f, 0.0f, 1.0f},
                 }); break;
-                case 213: makeEffect("Compressor", "__compressor__", {
-                    {"Threshold", -20.0f, -60.0f, 0.0f},
-                    {"Ratio", 4.0f, 1.0f, 20.0f},
-                    {"Attack", 10.0f, 0.1f, 100.0f},
-                    {"Release", 100.0f, 10.0f, 1000.0f},
-                    {"Makeup Gain", 0.0f, 0.0f, 30.0f},
+                case 221: makeEffect("Reverb", "__reverb__", {
+                    {"Mix",       0.3f,  0.0f, 1.0f},
+                    {"Size",      0.6f,  0.0f, 1.0f},
+                    {"Damping",   0.5f,  0.0f, 1.0f},
+                    {"Width",     1.0f,  0.0f, 1.0f},
+                    {"Pre-Delay", 0.0f,  0.0f, 200.0f},
                 }); break;
+                case 222: makeEffect("EQ", "__eq__", {
+                    // Band 1 defaults to HP at 80 Hz
+                    {"B1 Type", 3.0f, 0.0f, 4.0f},
+                    {"B1 Freq", 80.0f, 20.0f, 20000.0f},
+                    {"B1 Gain", 0.0f, -24.0f, 24.0f},
+                    {"B1 Q",    0.707f, 0.1f, 10.0f},
+                    // Band 2 defaults to Peak at 400 Hz
+                    {"B2 Type", 0.0f, 0.0f, 4.0f},
+                    {"B2 Freq", 400.0f, 20.0f, 20000.0f},
+                    {"B2 Gain", 0.0f, -24.0f, 24.0f},
+                    {"B2 Q",    0.707f, 0.1f, 10.0f},
+                    // Band 3 defaults to Peak at 2500 Hz
+                    {"B3 Type", 0.0f, 0.0f, 4.0f},
+                    {"B3 Freq", 2500.0f, 20.0f, 20000.0f},
+                    {"B3 Gain", 0.0f, -24.0f, 24.0f},
+                    {"B3 Q",    0.707f, 0.1f, 10.0f},
+                    // Band 4 defaults to LP at 8000 Hz
+                    {"B4 Type", 4.0f, 0.0f, 4.0f},
+                    {"B4 Freq", 8000.0f, 20.0f, 20000.0f},
+                    {"B4 Gain", 0.0f, -24.0f, 24.0f},
+                    {"B4 Q",    0.707f, 0.1f, 10.0f},
+                }); break;
+                case 239: makeEffect("SMS", "__sms__", {
+                    {"Threshold",     0.1f, 0.0f,  1.0f},
+                    {"Harmonic Gain", 1.0f, 0.0f,  3.0f},
+                    {"Noise Gain",    1.0f, 0.0f,  3.0f},
+                    {"FFT Size",     10.0f, 8.0f, 12.0f}, // 2^10=1024
+                    {"Mix",           1.0f, 0.0f,  1.0f},
+                }); break;
+                case 238: makeEffect("Formant Pitch", "__formantpitch__", {
+                    {"Semitones",    0.0f, -24.0f, 24.0f},
+                    {"Formant Lock", 0.8f,   0.0f,  1.0f},
+                    {"Levels",       5.0f,   1.0f,  8.0f},
+                    {"Mix",          1.0f,   0.0f,  1.0f},
+                }); break;
+                case 237: {
+                    // Wavelet Vocoder: carrier (Audio In) + modulator (Signal In)
+                    auto& vcn = graph.addNode("Vocoder", NodeType::Effect,
+                        {Pin{0, "Audio In", PinKind::Audio, true}},
+                        {Pin{0, "Audio Out", PinKind::Audio, false}}, {p.x, p.y});
+                    vcn.pinsIn.push_back({graph.getNextId(), "Modulator", PinKind::Signal, true, 1});
+                    vcn.script = "__waveletvocoder__";
+                    vcn.params.push_back({"Bands", 5.0f, 1.0f, 8.0f});
+                    vcn.params.push_back({"Mix",   1.0f, 0.0f, 1.0f});
+                    break;
+                }
+                case 236: {
+                    // Pitch Tracker: Audio In → Signal Out (detected pitch)
+                    auto& ptn = graph.addNode("Pitch Tracker", NodeType::Effect,
+                        {Pin{0, "Audio In", PinKind::Audio, true}},
+                        {Pin{0, "Audio Out", PinKind::Audio, false}}, {p.x, p.y});
+                    ptn.pinsOut.push_back({graph.getNextId(), "Pitch Out", PinKind::Signal, false});
+                    ptn.script = "__pitchtracker__";
+                    ptn.params.push_back({"Min Hz",      50.0f,  20.0f, 5000.0f});
+                    ptn.params.push_back({"Max Hz",    2000.0f,  20.0f, 5000.0f});
+                    ptn.params.push_back({"Detected Hz",  0.0f,   0.0f, 5000.0f});
+                    break;
+                }
+                case 235: makeEffect("Asymmetric Filter", "__asymfilter__", {
+                    {"Pre-Attack", 20.0f, 0.0f, 100.0f},
+                    {"Post-Decay", 50.0f, 0.0f, 200.0f},
+                    {"Pre Gain",    2.0f, 0.0f,   4.0f},
+                    {"Post Gain",   0.5f, 0.0f,   2.0f},
+                    {"Levels",      4.0f, 1.0f,   8.0f},
+                    {"Mix",         1.0f, 0.0f,   1.0f},
+                }); break;
+                case 234: makeEffect("Complexity", "__waveletcomplexity__", {
+                    {"Complexity", 0.5f, 0.0f, 1.0f},
+                    {"Levels",     4.0f, 1.0f, 8.0f},
+                    {"Mix",        1.0f, 0.0f, 1.0f},
+                }); break;
+                case 233: makeEffect("Ind. Pitch Shift", "__indpitchshift__", {
+                    {"Semitones",  0.0f, -24.0f, 24.0f},
+                    {"Threshold",  0.3f,   0.0f,  1.0f},
+                    {"Trans Gain", 1.0f,   0.0f,  2.0f},
+                    {"Levels",     4.0f,   1.0f,  8.0f},
+                    {"Mix",        1.0f,   0.0f,  1.0f},
+                }); break;
+                case 232: makeEffect("Wavelet Reverb", "__waveletreverb__", {
+                    {"Decay",  0.7f, 0.0f, 1.0f},
+                    {"Color",  1.0f, 0.0f, 3.0f}, // 0=white 1=pink 2=brown
+                    {"Levels", 5.0f, 1.0f, 8.0f},
+                    {"Mix",    0.3f, 0.0f, 1.0f},
+                }); break;
+                case 231: makeEffect("Wavelet Pitch", "__waveletpitch__", {
+                    {"Semitones", 0.0f, -24.0f, 24.0f},
+                    {"Mix",       1.0f,   0.0f,  1.0f},
+                }); break;
+                case 230: makeEffect("Wavelet MB Comp", "__waveletmbcomp__", {
+                    {"Threshold", -20.0f, -60.0f, 0.0f},
+                    {"Ratio",       4.0f,   1.0f, 20.0f},
+                    {"Levels",      4.0f,   1.0f,  6.0f},
+                    {"Low Gain",    0.0f, -12.0f, 12.0f},
+                    {"High Gain",   0.0f, -12.0f, 12.0f},
+                    {"Mix",         1.0f,   0.0f,  1.0f},
+                }); break;
+                case 229: makeEffect("Octave Shift", "__octaveshift__", {
+                    {"Shift", -1.0f, -2.0f, 2.0f},
+                    {"Mix",    0.5f,  0.0f, 1.0f},
+                }); break;
+                case 228: makeEffect("Wavelet Bitcrush", "__waveletbitcrush__", {
+                    {"Bits",    4.0f, 1.0f, 16.0f},
+                    {"Band Lo", 0.0f, 0.0f, 7.0f},
+                    {"Band Hi", 7.0f, 0.0f, 7.0f},
+                    {"Levels",  4.0f, 1.0f, 8.0f},
+                    {"Mix",     1.0f, 0.0f, 1.0f},
+                }); break;
+                case 227: makeEffect("Denoiser", "__denoiser__", {
+                    {"Threshold", 0.1f, 0.0f, 1.0f},
+                    {"Levels",    4.0f, 1.0f, 8.0f},
+                    {"Mix",       1.0f, 0.0f, 1.0f},
+                }); break;
+                case 226: makeEffect("Transient Split", "__transientsplit__", {
+                    {"Transient", 1.0f, 0.0f, 2.0f},
+                    {"Sustain",   1.0f, 0.0f, 2.0f},
+                    {"Threshold", 0.3f, 0.0f, 1.0f},
+                    {"Levels",    4.0f, 1.0f, 8.0f},
+                }); break;
+                case 223: makeEffect("Ring Mod", "__ringmod__", {
+                    {"Mix",       0.5f,   0.0f, 1.0f},
+                    {"Int Freq",  440.0f, 20.0f, 20000.0f},
+                    {"Int Shape", 0.0f,   0.0f, 2.0f}, // 0=sine 1=square 2=tri
+                }); break;
+                case 224: makeEffect("M/S Encode", "__msencode__", {
+                    {"Mode", 0.0f, 0.0f, 1.0f}, // 0=encode
+                }); break;
+                case 225: makeEffect("M/S Decode", "__msdecode__", {
+                    {"Mode", 1.0f, 0.0f, 1.0f}, // 1=decode
+                }); break;
+                case 213: {
+                    auto& cn = makeEffect("Compressor", "__compressor__", {
+                        {"Threshold", -20.0f, -60.0f, 0.0f},
+                        {"Ratio", 4.0f, 1.0f, 20.0f},
+                        {"Attack", 10.0f, 0.1f, 100.0f},
+                        {"Release", 100.0f, 10.0f, 1000.0f},
+                        {"Makeup Gain", 0.0f, 0.0f, 30.0f},
+                    });
+                    // Add a Signal input pin for sidechain detection.
+                    // Wire any audio source (kick drum track, etc.) into
+                    // this pin and the compressor's envelope follower
+                    // triggers from that signal instead of the main input.
+                    cn.pinsIn.push_back({graph.getNextId(), "Sidechain",
+                                         PinKind::Signal, true, 1});
+                    break;
+                }
                 case 214: makeEffect("Limiter", "__limiter__", {
                     {"Ceiling", -0.3f, -20.0f, 0.0f},
                     {"Release", 50.0f, 5.0f, 500.0f},
@@ -1627,6 +1987,11 @@ void NodeGraphComponent::showNodeMenu(Node& node) {
     if (node.type == NodeType::MidiTimeline || node.type == NodeType::AudioTimeline) {
         menu.addItem(3, "Open Editor");
         menu.addItem(9, node.mpeEnabled ? "Disable MPE" : "Enable MPE", true, node.mpeEnabled);
+        // "Record Here" (#77): arm this specific node for recording
+        // so the next Record action captures into it instead of the
+        // default active editor. Toggleable.
+        menu.addItem(163, node.recordArmed ? "Disarm Recording" : "Record Here",
+                     true, node.recordArmed);
     }
     if (node.plugin || node.type == NodeType::Instrument || node.type == NodeType::Effect) {
         menu.addItem(4, "Show Plugin UI");
@@ -1664,6 +2029,26 @@ void NodeGraphComponent::showNodeMenu(Node& node) {
             juce::String((int)(node.cache.numSamples / std::max(1.0, node.cache.sampleRate))) +
             "s)", false);
 
+    // Convolution auto-merge (#33): offer to merge with downstream convolution.
+    if (node.script.rfind("__convolution__:", 0) == 0) {
+        // Find a downstream convolution node (connected via this node's output).
+        int downstreamConvId = -1;
+        for (auto& link : graph.links) {
+            for (auto& pin : node.pinsOut) {
+                if (pin.id == link.startPin) {
+                    for (auto& other : graph.nodes) {
+                        if (other.id == node.id) continue;
+                        for (auto& dstPin : other.pinsIn)
+                            if (dstPin.id == link.endPin && other.script.rfind("__convolution__:", 0) == 0)
+                                downstreamConvId = other.id;
+                    }
+                }
+            }
+        }
+        if (downstreamConvId >= 0)
+            menu.addItem(170, "Merge with downstream convolution");
+    }
+
     int nodeId = node.id;
     menu.showMenuAsync(juce::PopupMenu::Options(), [this, nodeId](int result) {
         auto* node = graph.findNode(nodeId);
@@ -1679,7 +2064,7 @@ void NodeGraphComponent::showNodeMenu(Node& node) {
                 graph.links.end());
             if (onNodeDeleted) onNodeDeleted(nodeId);
             graph.openEditors.erase(std::remove_if(graph.openEditors.begin(), graph.openEditors.end(),
-                [nodeId](auto* e) { return e->id == nodeId; }), graph.openEditors.end());
+                [nodeId](int id) { return id == nodeId; }), graph.openEditors.end());
             graph.nodes.erase(std::remove_if(graph.nodes.begin(), graph.nodes.end(),
                 [nodeId](auto& n) { return n.id == nodeId; }), graph.nodes.end());
             graph.dirty = true;
@@ -1692,10 +2077,10 @@ void NodeGraphComponent::showNodeMenu(Node& node) {
             dup.clips = node->clips;
         } else if (result == 3) {
             bool already = false;
-            for (auto* e : graph.openEditors)
-                if (e->id == nodeId) { already = true; break; }
+            for (int edId : graph.openEditors)
+                if (edId == nodeId) { already = true; break; }
             if (!already)
-                graph.openEditors.insert(graph.openEditors.begin(), node);
+                graph.openEditors.insert(graph.openEditors.begin(), nodeId);
             graph.activeEditorNodeId = nodeId;
         } else if (result == 4) {
             if (onShowPluginUI) onShowPluginUI(nodeId);
@@ -1728,6 +2113,62 @@ void NodeGraphComponent::showNodeMenu(Node& node) {
             graph.dirty = true;
         } else if (result == 162) {
             if (onRunScript) onRunScript(nodeId);
+        } else if (result == 163) {
+            // "Record Here" toggle (#77)
+            node->recordArmed = !node->recordArmed;
+            graph.dirty = true;
+        } else if (result == 170) {
+            // Convolution auto-merge (#33): convolve this node's IR with
+            // the downstream convolution's IR, put the result in this node,
+            // and remove the downstream node + link.
+            if (node->script.rfind("__convolution__:", 0) == 0) {
+                // Find the downstream convolution node.
+                int downId = -1;
+                for (auto& link : graph.links) {
+                    for (auto& pin : node->pinsOut)
+                        if (pin.id == link.startPin) {
+                            for (auto& other : graph.nodes) {
+                                if (other.id == nodeId) continue;
+                                for (auto& dp : other.pinsIn)
+                                    if (dp.id == link.endPin &&
+                                        other.script.rfind("__convolution__:", 0) == 0)
+                                        downId = other.id;
+                            }
+                        }
+                }
+                if (downId >= 0) {
+                    auto irA = ConvolutionProcessor::decodeIR(node->script);
+                    auto* downNode = graph.findNode(downId);
+                    if (downNode) {
+                        auto irB = ConvolutionProcessor::decodeIR(downNode->script);
+                        if (!irA.empty() && !irB.empty()) {
+                            auto merged = ConvolutionProcessor::convolveIRs(irA, irB);
+                            node->script = ConvolutionProcessor::encodeIR(merged);
+                            // Rewire downstream's outputs to this node's output.
+                            for (auto& link : graph.links)
+                                for (auto& dp : downNode->pinsOut)
+                                    if (dp.id == link.startPin)
+                                        for (auto& myOut : node->pinsOut)
+                                            link.startPin = myOut.id;
+                            // Remove the downstream node + its links.
+                            // Collect pin IDs first, then erase.
+                            std::vector<int> downPinIds;
+                            for (auto& p : downNode->pinsIn)  downPinIds.push_back(p.id);
+                            for (auto& p : downNode->pinsOut) downPinIds.push_back(p.id);
+                            graph.links.erase(std::remove_if(graph.links.begin(), graph.links.end(),
+                                [&downPinIds](const Link& l) {
+                                    for (int pid : downPinIds)
+                                        if (l.startPin == pid || l.endPin == pid) return true;
+                                    return false;
+                                }), graph.links.end());
+                            graph.nodes.erase(std::remove_if(graph.nodes.begin(), graph.nodes.end(),
+                                [downId](const Node& nn) { return nn.id == downId; }), graph.nodes.end());
+                            graph.dirty = true;
+                            graph.commitSnapshot("Merge convolutions");
+                        }
+                    }
+                }
+            }
         } else if (result >= 150 && result <= 154) {
             float pans[] = {-1.0f, -0.5f, 0.0f, 0.5f, 1.0f};
             node->pan = pans[result - 150];
@@ -1801,7 +2242,7 @@ void NodeGraphComponent::deleteSelectedNode() {
 
     // Remove from open editors
     graph.openEditors.erase(std::remove_if(graph.openEditors.begin(), graph.openEditors.end(),
-        [nid](auto* e) { return e->id == nid; }), graph.openEditors.end());
+        [nid](int id) { return id == nid; }), graph.openEditors.end());
 
     // Remove node
     graph.nodes.erase(std::remove_if(graph.nodes.begin(), graph.nodes.end(),

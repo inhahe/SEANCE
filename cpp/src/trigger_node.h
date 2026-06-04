@@ -30,7 +30,15 @@ enum class TriggerShape {
     Step,          // instant jump to target value, hold, then return to rest
     Envelope,      // classic ADSR
     Ramp,          // linear slew from current value to target over duration
-    FromVelocity   // value = velocityScale * (note velocity / 127) + velocityOffset
+    FromVelocity,  // value = velocityScale * (note velocity / 127) + velocityOffset
+    Curve          // user-defined breakpoint curve (curvePoints list)
+};
+
+// When does this rule fire?
+enum class TriggerEvent {
+    NoteOn,        // fires when a matching note-on arrives (default)
+    NoteOff,       // fires when a matching note-off arrives
+    AudioThreshold // fires when the incoming audio exceeds thresholdDb
 };
 
 // A single rule: "when a matching note comes in, fire this action."
@@ -43,6 +51,11 @@ struct TriggerRule {
     float probability = 1.0f; // 0..1, stochastic gate
 
     TriggerTarget target = TriggerTarget::Midi;
+    TriggerEvent  event  = TriggerEvent::NoteOn;
+
+    // --- Audio threshold fields (used when event == AudioThreshold) ---
+    float thresholdDb   = -20.0f;  // dBFS; fires when signal crosses this level
+    float retriggerMs   = 100.0f;  // minimum time between successive fires
 
     // --- MIDI action fields ---
     int   pitchOffset    = 12;     // relative to incoming note (semitones)
@@ -63,6 +76,14 @@ struct TriggerRule {
     float holdMs           = 100.0f; // for Step shape (how long to hold target)
     float velocityScale    = 1.0f;   // for FromVelocity
     float velocityOffset   = 0.0f;
+
+    // --- Curve shape breakpoints (used when shape == Curve) ---
+    // Each point is (time_ms, value). The curve plays from the first
+    // point to the last when the rule fires, then holds the last value.
+    // Linear interpolation between points. An empty list falls through
+    // to Envelope behavior.
+    struct CurvePoint { float timeMs = 0; float value = 0; };
+    std::vector<CurvePoint> curvePoints;
 
     // Label shown in the editor row. Auto-filled by presets, editable.
     std::string label;
@@ -97,7 +118,10 @@ public:
     void prepareToPlay(double sr, int) override { sampleRate = sr; }
     void releaseResources() override {}
     void processBlock(juce::AudioBuffer<float>& buf, juce::MidiBuffer& midi) override;
-    double getTailLengthSeconds() const override { return 2.0; }
+    // Tail = longest possible time any rule can keep producing output
+    // (delayed MIDI events or running signal shapes) after the last
+    // input note.  Computed from the rule list, not a magic constant.
+    double getTailLengthSeconds() const override;
     bool acceptsMidi() const override { return true; }
     bool producesMidi() const override { return true; }
     bool isBusesLayoutSupported(const BusesLayout&) const override { return true; }
@@ -149,10 +173,16 @@ private:
         float velocityNorm;    // for FromVelocity (0..1)
         float velocityScale;
         float velocityOffset;
+        // For Curve shape: snapshot of the rule's curve points.
+        std::vector<TriggerRule::CurvePoint> curvePoints;
     };
     std::vector<ActiveShape> activeShapes;
 
     std::mt19937 rng{1234};
+
+    // Audio threshold trigger state (#109).
+    float lastThreshLevel = 0.0f;
+    int64_t lastThreshFireSample = -(int64_t)1e9;
 
     // Schedule a rule's action against a specific trigger note.
     void scheduleRule(const TriggerRule& r,

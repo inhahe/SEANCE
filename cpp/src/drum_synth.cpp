@@ -89,6 +89,46 @@ int DrumSynthProcessor::findSoundForNote(int midiNote) {
     return -1;
 }
 
+// Worst-case exponential-decay time constant (in seconds) for a drum
+// voice with the given config.  Mirrors the per-type `decayTime` values
+// used in renderDrumSample() — if you change a base decay there, update
+// the matching branch here.  Used by getTailLengthSeconds() and by the
+// voice auto-deactivation cutoff in processBlock().
+static double drumDecayTau(const DrumSound& s) {
+    switch (s.type) {
+        case DrumType::Kick:    return 0.4  * (double) s.decay;
+        case DrumType::Tom:     return 0.4  * (double) s.decay;  // shares Kick branch
+        case DrumType::Snare:   return 0.15 * (double) s.decay;  // noise env dominates
+        case DrumType::HiHat: {
+            double dt = 0.05 + 0.25 * ((double) s.decay - 0.5);
+            return dt * (double) s.decay;
+        }
+        case DrumType::Clap:    return 0.15 * (double) s.decay;
+        case DrumType::Cowbell: return 0.08 * (double) s.decay;
+        case DrumType::Rimshot: return 0.03 * (double) s.decay;
+        case DrumType::Cymbal: {
+            // sizeDecay = 0.3..1.8, baseDecay = 0.5..2.0 (s)
+            double sizeDecay = 0.3 + 1.5 * (double) s.size;
+            double baseDecay = 2.0 - (double) s.tone * 1.5;
+            return baseDecay * sizeDecay * (double) s.decay;
+        }
+    }
+    return 0.1;
+}
+
+// Number of time constants to wait before declaring an exponentially-
+// decaying voice inaudible.  5τ → e^-5 ≈ 0.0067 (≈ -43 dB).
+static constexpr double kInaudibleTimeConstants = 5.0;
+
+double DrumSynthProcessor::getTailLengthSeconds() const {
+    double worst = 0.0;
+    for (const auto& s : sounds) {
+        double tau = drumDecayTau(s);
+        if (tau > worst) worst = tau;
+    }
+    return worst * kInaudibleTimeConstants;
+}
+
 float DrumSynthProcessor::renderDrumSample(int soundIdx, DrumVoice& voice) {
     auto& s = sounds[soundIdx];
     double t = voice.time;
@@ -265,8 +305,16 @@ void DrumSynthProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::MidiB
             float sample = renderDrumSample(voices[vi].soundIdx, voices[vi]);
             total += sample;
             voices[vi].time += 1.0 / sampleRate;
-            // Auto-deactivate after silence
-            if (voices[vi].time > 5.0) voices[vi].active = false;
+            // Auto-deactivate once the voice has decayed below the
+            // inaudibility threshold (≈ -43 dB).  Uses the same per-sound
+            // decay computation as getTailLengthSeconds() so the two stay
+            // in lockstep — no magic 5-second cap.
+            int si = voices[vi].soundIdx;
+            if (si >= 0 && si < (int)sounds.size()) {
+                double tau = drumDecayTau(sounds[si]);
+                if (voices[vi].time > tau * kInaudibleTimeConstants)
+                    voices[vi].active = false;
+            }
         }
         total *= volume;
         total = juce::jlimit(-1.0f, 1.0f, total);

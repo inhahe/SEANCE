@@ -1,11 +1,11 @@
 cmake_minimum_required(VERSION 3.22)
-project(SoundShop2 VERSION 0.1.0 LANGUAGES C CXX)
+project(SEANCE VERSION 0.1.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # Check for optional dependencies and print status
-message(STATUS "=== SoundShop2 Dependency Status ===")
+message(STATUS "=== SEANCE Dependency Status ===")
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/libopenmpt_bin/lib/amd64/libopenmpt.lib")
     message(STATUS "  libopenmpt: FOUND")
 else()
@@ -48,14 +48,14 @@ message(STATUS "JUCE: ${JUCE_DIR}")
 add_subdirectory(${JUCE_DIR} ${CMAKE_BINARY_DIR}/juce)
 
 # ==============================================================================
-# SoundShop2
+# SEANCE
 # ==============================================================================
-juce_add_gui_app(SoundShop2
-    PRODUCT_NAME "SoundShop"
-    COMPANY_NAME "SoundShop"
+juce_add_gui_app(SEANCE
+    PRODUCT_NAME "SEANCE"
+    COMPANY_NAME "SEANCE"
 )
 
-target_sources(SoundShop2 PRIVATE
+target_sources(SEANCE PRIVATE
     src/main.cpp
     src/main_window.cpp
     src/main_window.h
@@ -97,8 +97,21 @@ target_sources(SoundShop2 PRIVATE
     src/builtin_synth.h
     src/terrain_synth.cpp
     src/terrain_synth.h
+    src/multi_sampler.cpp
+    src/multi_sampler.h
+    src/multi_sampler_editor.cpp
+    src/multi_sampler_editor.h
+    src/tracker_file_parser.cpp
+    src/tracker_file_parser.h
     src/signal_shape_node.cpp
     src/signal_shape_node.h
+    src/signal_modulation.h
+    src/wavelet.h
+    src/spectrum_visualizer.h
+    src/wavelet_painter.h
+    src/sfizz_processor.h
+    src/plugin_sandbox.h
+    src/plugin_sandbox.cpp
     src/cache_processor.h
     src/audio_crossfader.h
     src/trigger_node.cpp
@@ -157,7 +170,7 @@ target_sources(SoundShop2 PRIVATE
     src/tuning.h
 )
 
-target_link_libraries(SoundShop2 PRIVATE
+target_link_libraries(SEANCE PRIVATE
     juce::juce_audio_basics
     juce::juce_audio_devices
     juce::juce_audio_formats
@@ -171,7 +184,7 @@ target_link_libraries(SoundShop2 PRIVATE
     juce::juce_gui_extra
 )
 
-target_compile_definitions(SoundShop2 PRIVATE
+target_compile_definitions(SEANCE PRIVATE
     JUCE_STANDALONE_APPLICATION=1
     JUCE_USE_CURL=0
     JUCE_WEB_BROWSER=0
@@ -182,36 +195,49 @@ target_compile_definitions(SoundShop2 PRIVATE
     $<$<BOOL:${LINUX}>:JUCE_PLUGINHOST_LADSPA=1>
     $<$<BOOL:${WIN32}>:JUCE_ASIO=1>
     JUCE_MODAL_LOOPS_PERMITTED=1
-    JUCE_APPLICATION_NAME_STRING="$<TARGET_PROPERTY:SoundShop2,JUCE_PRODUCT_NAME>"
-    JUCE_APPLICATION_VERSION_STRING="$<TARGET_PROPERTY:SoundShop2,JUCE_VERSION>"
+    JUCE_APPLICATION_NAME_STRING="$<TARGET_PROPERTY:SEANCE,JUCE_PRODUCT_NAME>"
+    JUCE_APPLICATION_VERSION_STRING="$<TARGET_PROPERTY:SEANCE,JUCE_VERSION>"
 )
 
 # libopenmpt (for MOD/S3M/IT/XM import)
 # Try prebuilt Windows binaries first, then system package
 if(WIN32 AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/libopenmpt_bin/lib/amd64/libopenmpt.lib")
-    target_include_directories(SoundShop2 PRIVATE third_party/libopenmpt_bin/inc)
-    target_link_directories(SoundShop2 PRIVATE third_party/libopenmpt_bin/lib/amd64)
-    target_link_libraries(SoundShop2 PRIVATE libopenmpt)
-    target_compile_definitions(SoundShop2 PRIVATE HAS_LIBOPENMPT=1)
+    target_include_directories(SEANCE PRIVATE third_party/libopenmpt_bin/inc)
+    target_link_directories(SEANCE PRIVATE third_party/libopenmpt_bin/lib/amd64)
+    target_link_libraries(SEANCE PRIVATE libopenmpt)
+    target_compile_definitions(SEANCE PRIVATE HAS_LIBOPENMPT=1)
     # Copy every DLL from the libopenmpt bin directory to the output folder.
     # libopenmpt ships with several helper DLLs (zlib, mpg123, vorbis, ogg, ...)
     # and the exact set varies by version, so copying the whole directory is
     # simpler and more future-proof than listing each one.
-    add_custom_command(TARGET SoundShop2 POST_BUILD
+    add_custom_command(TARGET SEANCE POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_directory
             "${CMAKE_CURRENT_SOURCE_DIR}/third_party/libopenmpt_bin/bin/amd64"
-            "$<TARGET_FILE_DIR:SoundShop2>"
+            "$<TARGET_FILE_DIR:SEANCE>"
     )
 else()
     # Linux/macOS: try pkg-config or find_library
     find_library(OPENMPT_LIB openmpt)
     find_path(OPENMPT_INC libopenmpt/libopenmpt.h)
     if(OPENMPT_LIB AND OPENMPT_INC)
-        target_include_directories(SoundShop2 PRIVATE ${OPENMPT_INC})
-        target_link_libraries(SoundShop2 PRIVATE ${OPENMPT_LIB})
-        target_compile_definitions(SoundShop2 PRIVATE HAS_LIBOPENMPT=1)
+        target_include_directories(SEANCE PRIVATE ${OPENMPT_INC})
+        target_link_libraries(SEANCE PRIVATE ${OPENMPT_LIB})
+        target_compile_definitions(SEANCE PRIVATE HAS_LIBOPENMPT=1)
         message(STATUS "libopenmpt: system library found")
     endif()
+endif()
+
+# sfizz (for full SFZ compliance, task #37)
+# If sfizz is cloned into third_party/sfizz, build and link it.
+# Otherwise, the SfizzProcessor compiles as a stub that logs "sfizz not available".
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/sfizz/CMakeLists.txt")
+    message(STATUS "  sfizz: FOUND")
+    add_subdirectory(third_party/sfizz EXCLUDE_FROM_ALL)
+    target_link_libraries(SEANCE PRIVATE sfizz::sfizz)
+    target_compile_definitions(SEANCE PRIVATE HAS_SFIZZ=1)
+else()
+    message(STATUS "  sfizz: NOT FOUND (full SFZ compliance disabled)")
+    message(STATUS "         Clone: git clone https://github.com/sfztools/sfizz third_party/sfizz")
 endif()
 
 # libogg + libopus (for Opus export)
@@ -225,8 +251,8 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/opus/CMakeLists.txt")
     set(OPUS_INSTALL_PKG_CONFIG_MODULE OFF CACHE BOOL "" FORCE)
     set(OPUS_INSTALL_CMAKE_CONFIG_MODULE OFF CACHE BOOL "" FORCE)
     add_subdirectory(third_party/opus EXCLUDE_FROM_ALL)
-    target_link_libraries(SoundShop2 PRIVATE opus ogg)
-    target_include_directories(SoundShop2 PRIVATE
+    target_link_libraries(SEANCE PRIVATE opus ogg)
+    target_include_directories(SEANCE PRIVATE
         third_party/opus/include
         third_party/ogg/include
     )
@@ -264,9 +290,9 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/rubberband/src")
         _USE_MATH_DEFINES
         NO_THREADING=1
     )
-    target_link_libraries(SoundShop2 PRIVATE rubberband)
-    target_include_directories(SoundShop2 PRIVATE third_party/rubberband)
-    target_compile_definitions(SoundShop2 PRIVATE HAS_RUBBERBAND=1)
+    target_link_libraries(SEANCE PRIVATE rubberband)
+    target_include_directories(SEANCE PRIVATE third_party/rubberband)
+    target_compile_definitions(SEANCE PRIVATE HAS_RUBBERBAND=1)
 endif()
 
 # wasm3 (optional — builds without it, WASM scripts just won't load)
@@ -274,22 +300,22 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/wasm3/source")
     file(GLOB WASM3_SOURCES third_party/wasm3/source/*.c)
     add_library(wasm3 STATIC ${WASM3_SOURCES})
     target_include_directories(wasm3 PUBLIC third_party/wasm3/source)
-    target_link_libraries(SoundShop2 PRIVATE wasm3)
-    target_include_directories(SoundShop2 PRIVATE third_party/wasm3/source)
+    target_link_libraries(SEANCE PRIVATE wasm3)
+    target_include_directories(SEANCE PRIVATE third_party/wasm3/source)
 endif()
 
 # Python embedding
 find_package(Python3 COMPONENTS Development)
 if(Python3_FOUND)
-    target_include_directories(SoundShop2 PRIVATE src ${Python3_INCLUDE_DIRS})
-    target_link_libraries(SoundShop2 PRIVATE ${Python3_LIBRARIES})
+    target_include_directories(SEANCE PRIVATE src ${Python3_INCLUDE_DIRS})
+    target_link_libraries(SEANCE PRIVATE ${Python3_LIBRARIES})
     message(STATUS "Python: ${Python3_VERSION} at ${Python3_INCLUDE_DIRS}")
 else()
     # Fallback to hardcoded path (Windows dev machine)
     if(EXISTS "D:/python314/Include")
-        target_include_directories(SoundShop2 PRIVATE src D:/python314/Include)
-        target_link_directories(SoundShop2 PRIVATE D:/python314/libs)
-        target_link_libraries(SoundShop2 PRIVATE python314)
+        target_include_directories(SEANCE PRIVATE src D:/python314/Include)
+        target_link_directories(SEANCE PRIVATE D:/python314/libs)
+        target_link_libraries(SEANCE PRIVATE python314)
         message(STATUS "Python: using hardcoded D:/python314")
     else()
         message(WARNING "Python not found. Scripting will be disabled.")
@@ -301,13 +327,14 @@ endif()
 # lib, so tell the linker to ignore it and use the release lib in Debug too.
 # Python is dynamically loaded at runtime, so this is safe.
 if(MSVC)
-    target_link_options(SoundShop2 PRIVATE
-        "$<$<CONFIG:Debug>:/NODEFAULTLIB:python314_d.lib>")
+    target_link_options(SEANCE PRIVATE
+        "$<$<CONFIG:Debug>:/NODEFAULTLIB:python314_d.lib>"
+        "/SUBSYSTEM:WINDOWS")
 endif()
 
 # Windows Media Foundation (for M4A/WMA export)
 if(WIN32)
-    target_link_libraries(SoundShop2 PRIVATE mfplat mfreadwrite mfuuid)
+    target_link_libraries(SEANCE PRIVATE mfplat mfreadwrite mfuuid)
 endif()
 
 # Copy docs/ folder alongside the built exe so Help menu entries can open
@@ -315,9 +342,9 @@ endif()
 # files (not embedded) so users can also browse docs/ outside the app and
 # we can update them without a rebuild.
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../docs")
-    add_custom_command(TARGET SoundShop2 POST_BUILD
+    add_custom_command(TARGET SEANCE POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_directory
             "${CMAKE_CURRENT_SOURCE_DIR}/../docs"
-            "$<TARGET_FILE_DIR:SoundShop2>/docs"
+            "$<TARGET_FILE_DIR:SEANCE>/docs"
     )
 endif()

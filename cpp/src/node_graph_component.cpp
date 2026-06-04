@@ -21,8 +21,8 @@ static const float HEADER_HEIGHT = 24.0f;
 // Central color definitions for each pin/wire kind. Used by both drawPin
 // (dots) and drawLink (cables) so the cable matches the pin it's attached
 // to. Param and Signal are intentionally in the same warm (orange/amber)
-// family because they're conceptually related — Param = block-rate control,
-// Signal = audio-rate control — while Audio (blue) and MIDI (green) are in
+// family because they're conceptually related - Param = block-rate control,
+// Signal = audio-rate control - while Audio (blue) and MIDI (green) are in
 // clearly different hue families.
 static juce::Colour colourForPinKind(PinKind k) {
     switch (k) {
@@ -86,7 +86,7 @@ juce::Colour NodeGraphComponent::getNodeColor(const Node& node) const {
         case NodeType::Group:         return juce::Colour(70, 70, 90);
         case NodeType::TerrainSynth:  return juce::Colour(120, 60, 100);
         case NodeType::SignalShape:   return juce::Colour(180, 120, 40);
-        case NodeType::MidiInput:     return juce::Colour(50, 130, 70); // green — matches MIDI wire color
+        case NodeType::MidiInput:     return juce::Colour(50, 130, 70); // green - matches MIDI wire color
         default:                      return juce::Colour(80, 80, 80);
     }
 }
@@ -378,7 +378,7 @@ void NodeGraphComponent::drawNode(juce::Graphics& g, Node& node) {
         }
     }
 
-    // Peak meter bars (#99) — two thin horizontal bars (L/R) at the
+    // Peak meter bars (#99) - two thin horizontal bars (L/R) at the
     // bottom of the node, showing the current audio level. Green
     // below -6 dB, yellow up to -1 dB, red above. Only drawn when
     // there's actually signal flowing (peak > 0.001) and zoom > 0.35.
@@ -396,7 +396,7 @@ void NodeGraphComponent::drawNode(juce::Graphics& g, Node& node) {
 
             auto drawBar = [&](float peak, float y) {
                 float db = 20.0f * std::log10(std::max(1e-6f, peak));
-                float frac = juce::jlimit(0.0f, 1.0f, (db + 60.0f) / 60.0f); // -60..0 dB → 0..1
+                float frac = juce::jlimit(0.0f, 1.0f, (db + 60.0f) / 60.0f); // -60..0 dB -> 0..1
                 auto col = (db > -1.0f) ? juce::Colours::red
                          : (db > -6.0f) ? juce::Colours::yellow
                          : juce::Colours::limegreen;
@@ -414,7 +414,7 @@ void NodeGraphComponent::drawNode(juce::Graphics& g, Node& node) {
 void NodeGraphComponent::drawLink(juce::Graphics& g, Link& link) {
     // Find source and destination pin positions, plus their kinds.
     // The two kinds may differ when an implicit Param↔Signal conversion is
-    // in effect — in that case the wire is drawn in two halves, source
+    // in effect - in that case the wire is drawn in two halves, source
     // colour up front and destination colour at the tail, so the user can
     // see the conversion happening visually.
     juce::Point<float> start, end;
@@ -452,7 +452,7 @@ void NodeGraphComponent::drawLink(juce::Graphics& g, Link& link) {
     path.startNewSubPath(start);
     path.cubicTo(ctrl1, ctrl2, end);
 
-    // Base alpha — much dimmer when the link is heavily attenuated.
+    // Base alpha - much dimmer when the link is heavily attenuated.
     float baseAlpha = (link.gainDb < -10.0f) ? 0.3f : 0.8f;
     float thickness = ((link.id == selectedLinkId) ? 3.0f : 2.0f) * zoom;
 
@@ -656,7 +656,7 @@ void NodeGraphComponent::mouseDown(const juce::MouseEvent& e) {
         }
         auto* node = nodeAtPoint(canvasPos);
         if (node) {
-            // Check if right-click is on a param row — show arm/disarm menu
+            // Check if right-click is on a param row - show arm/disarm menu
             if (!node->params.empty()) {
                 auto bounds = getNodeBounds(*node);
                 int maxPins = std::max((int)node->pinsIn.size(), (int)node->pinsOut.size());
@@ -776,9 +776,9 @@ void NodeGraphComponent::mouseDown(const juce::MouseEvent& e) {
     // Check node hit
     auto* node = nodeAtPoint(canvasPos);
     if (node) {
-        // Check if click landed on a param row inside the node — if so,
+        // Check if click landed on a param row inside the node - if so,
         // start a horizontal slider interaction (jump-to-click + drag).
-        // Signal-controlled nodes have their params locked — no dragging.
+        // Signal-controlled nodes have their params locked - no dragging.
         if (!node->params.empty() && !graph.hasSignalInput(node->id)) {
             auto bounds = getNodeBounds(*node);
             int maxPins = std::max((int)node->pinsIn.size(), (int)node->pinsOut.size());
@@ -826,7 +826,7 @@ void NodeGraphComponent::mouseDown(const juce::MouseEvent& e) {
         return;
     }
 
-    // Empty space — pan
+    // Empty space - pan
     dragMode = DragMode::Pan;
     dragStart = e.position;
     selectedNodeId = -1;
@@ -852,11 +852,11 @@ void NodeGraphComponent::mouseDrag(const juce::MouseEvent& e) {
         dragCurrent = e.position;
         // Track which pin we're hovering over so drawPin() can highlight it.
         // Valid drop target requires:
-        //  1. opposite direction from the source (output→input or vice versa)
+        //  1. opposite direction from the source (output->input or vice versa)
         //  2. not the same pin we started dragging from
         //  3. compatible pin kinds (audio↔audio, MIDI↔MIDI, or any control↔
         //     control mix; see arePinKindsCompatible). Param↔Signal is
-        //     deliberately treated as compatible — implicit conversion lets
+        //     deliberately treated as compatible - implicit conversion lets
         //     either control kind drive either control input.
         auto canvasPos = screenToCanvas(e.position);
         bool isOut = false;
@@ -892,7 +892,7 @@ void NodeGraphComponent::mouseDrag(const juce::MouseEvent& e) {
                                       (canvasPos.x - dragParamLeftX) / std::max(1.0f, dragParamWidth));
             p.value = p.minVal + frac * (p.maxVal - p.minVal);
             graph.dirty = true;
-            // No graph rebuild here — processBlock reads param values fresh
+            // No graph rebuild here - processBlock reads param values fresh
             // every callback via getParam, so the new value is picked up on
             // the next audio block automatically. Calling requestRebuild on
             // every drag tick races JUCE's async graph rebuild and crashes.
@@ -1025,7 +1025,7 @@ void NodeGraphComponent::fitAll() {
 void NodeGraphComponent::resized() {
     // Run the initial fit-all the first time we get a real (non-zero) size,
     // so the very first paint already shows the graph centered at the right
-    // zoom — no visible zoom-in jitter on project load. Subsequent resizes
+    // zoom - no visible zoom-in jitter on project load. Subsequent resizes
     // (window-resize, panel splits, etc.) leave the user's view alone so we
     // don't clobber any manual pan/zoom they've done.
     if (pendingInitialFit && getWidth() > 0 && getHeight() > 0) {
@@ -1109,8 +1109,8 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
     fxMenu.addItem(238, "Formant Pitch Shift");
     fxMenu.addItem(239, "SMS (harmonic/noise split)");
     fxMenu.addSeparator();
-    fxMenu.addItem(224, "M/S Encode (stereo → mid+side)");
-    fxMenu.addItem(225, "M/S Decode (mid+side → stereo)");
+    fxMenu.addItem(224, "M/S Encode (stereo -> mid+side)");
+    fxMenu.addItem(225, "M/S Decode (mid+side -> stereo)");
     fxMenu.addSeparator();
     fxMenu.addItem(217, "3D Spatializer (binaural)");
     menu.addSubMenu("Effects", fxMenu);
@@ -1196,7 +1196,7 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
         } else if (result == 5) {
             graph.createGroup("Group", {p.x, p.y});
         } else if (result == 6) {
-            // WASM Script — open file chooser
+            // WASM Script - open file chooser
             auto chooser = std::make_shared<juce::FileChooser>(
                 "Load WASM Script", juce::File(), "*.wasm");
             auto canvasPos = p;
@@ -1250,12 +1250,12 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
             // Mod-wheel vibrato depth (0 = disable the default behavior so
             // the user can MIDI-Learn CC1 to a different param instead).
             n.params.push_back({"Vibrato",  1.0f,  0.0f,   1.0f});
-            // Wavetable Position — meaningful when there are multiple frames.
+            // Wavetable Position - meaningful when there are multiple frames.
             // Looked up by name in TerrainSynthProcessor, so list order is free.
             n.params.push_back({"Position", 0.0f,  0.0f,   1.0f});
 
             if (result == 110) {
-                // Waveform — open the layered waveform editor immediately.
+                // Waveform - open the layered waveform editor immediately.
                 auto nodeId = n.id;
                 auto* editor = new LayeredWaveEditorComponent(graph, nodeId, [this]() {
                     if (onNodeEdited) onNodeEdited();
@@ -1272,16 +1272,16 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
                 (void)nodeId;
                 return;
             } else if (result == 115) {
-                // Frequency Domain (spectral) — prompt for mag and phase expressions.
+                // Frequency Domain (spectral) - prompt for mag and phase expressions.
                 auto nodeId = n.id;
                 auto* aw = new juce::AlertWindow("Frequency Domain Synth",
                     "Define the sound's spectrum. `f` is the frequency bin index.\n\n"
                     "Magnitude examples:\n"
-                    "  exp(-f/20)                  — dark, natural decay\n"
-                    "  1/(f+1)                     — sawtooth-like\n"
-                    "  exp(-((f-30)^2)/40)         — single formant bump\n"
-                    "  sin(f*0.3) + 0.5*cos(f*0.1) — layered slow ripples\n\n"
-                    "Phase defaults to random (natural noise-like) — change to `0`\n"
+                    "  exp(-f/20)                  - dark, natural decay\n"
+                    "  1/(f+1)                     - sawtooth-like\n"
+                    "  exp(-((f-30)^2)/40)         - single formant bump\n"
+                    "  sin(f*0.3) + 0.5*cos(f*0.1) - layered slow ripples\n\n"
+                    "Phase defaults to random (natural noise-like) - change to `0`\n"
                     "for an impulsive clicky attack, or write an expression in `f`.\n\n"
                     "Functions: sin, cos, exp, log, sqrt, pow, abs, tanh, clamp, noise",
                     juce::MessageBoxIconType::NoIcon);
@@ -1344,7 +1344,7 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
             }
             return;
         } else if (result == 134) {
-            // Spectrum Tap — insert inline on audio for frequency analysis.
+            // Spectrum Tap - insert inline on audio for frequency analysis.
             // Has audio in/out (passthrough) and user-defined frequency bins.
             auto& n = graph.addNode("Spectrum Tap", NodeType::Effect,
                 {Pin{0, "Audio In", PinKind::Audio, true}},
@@ -1492,7 +1492,7 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
             }
         } else if (result == 102) {
             // Sampler: creates a MultiSampler node. The file chooser is
-            // a convenience — if the user picks a file, it becomes the
+            // a convenience - if the user picks a file, it becomes the
             // instrument's first (and only) zone covering the full MIDI
             // range. The sampler editor can add more zones later.
             auto canvasPos = p;
@@ -1523,7 +1523,7 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
                 });
             return;
         } else if (result == 104 || result == 105) {
-            // SoundFont (.sf2) or SFZ instrument — file chooser
+            // SoundFont (.sf2) or SFZ instrument - file chooser
             juce::String filter = (result == 104) ? "*.sf2" : "*.sfz";
             juce::String title = (result == 104) ? "Load SoundFont (.sf2)" : "Load SFZ Instrument (.sfz)";
             auto canvasPos = p;
@@ -1648,12 +1648,12 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
             // TerrainSynthProcessor, so they don't crash and give the user
             // something playable immediately. Each gets the full param list.
             const char* nodeName = (result == 100) ? "Piano" : "Drum Machine";
-            // 1D layered waveforms — no Sig X/Y (meaningless for 1D).
+            // 1D layered waveforms - no Sig X/Y (meaningless for 1D).
             auto& n = graph.addNode(nodeName, NodeType::Instrument,
                 {Pin{0, "MIDI", PinKind::Midi, true}},
                 {Pin{0, "Audio", PinKind::Audio, false}}, {p.x, p.y});
 
-            // Default scripts — layered waveforms with per-instrument character
+            // Default scripts - layered waveforms with per-instrument character
             if (result == 100) {
                 // Piano: fundamental + a few decaying harmonics for a mellow tone
                 LayeredWaveform lw;
@@ -1792,7 +1792,7 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
                     break;
                 }
                 case 236: {
-                    // Pitch Tracker: Audio In → Signal Out (detected pitch)
+                    // Pitch Tracker: Audio In -> Signal Out (detected pitch)
                     auto& ptn = graph.addNode("Pitch Tracker", NodeType::Effect,
                         {Pin{0, "Audio In", PinKind::Audio, true}},
                         {Pin{0, "Audio Out", PinKind::Audio, false}}, {p.x, p.y});
@@ -1911,7 +1911,7 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
                     {"Octaves", 1.0f, 1.0f, 4.0f},
                 }, true); break;
             case 220: {
-                // MIDI Modulator — MIDI in + N Signal ins -> MIDI out.
+                // MIDI Modulator - MIDI in + N Signal ins -> MIDI out.
                 // Default: one velocity-scaling rule with one Signal input.
                 // The editor lets the user add more inputs, each targeting
                 // a different MIDI attribute.
@@ -1926,7 +1926,7 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
                 break;
             }
             case 219: {
-                // Trigger node — MIDI in, MIDI out + Signal out.
+                // Trigger node - MIDI in, MIDI out + Signal out.
                 // Uses the Effect node type but has two distinct output pins
                 // (one MIDI, one Signal) rather than the usual MIDI-only or
                 // audio-only effect layout.
@@ -2193,7 +2193,7 @@ void NodeGraphComponent::showNodeMenu(Node& node) {
                     delete aw;
                     repaint();
                 }), true);
-            return; // don't repaint yet — modal dialog handles it
+            return; // don't repaint yet - modal dialog handles it
         }
         repaint();
     });
@@ -2312,13 +2312,13 @@ void NodeGraphComponent::showLinkMenu(int linkId) {
             lk->gainDb = gains[result - 10];
             graph.dirty = true;
         } else if (result == 31) {
-            // Help: Effect Groups → open the docs page
+            // Help: Effect Groups -> open the docs page
             if (onOpenHelpDoc) onOpenHelpDoc("layers-and-groups.html");
             return;
         } else if (result == 30) {
-            // New effect group — prompt for optional name
+            // New effect group - prompt for optional name
             auto* aw = new juce::AlertWindow("New Effect Group",
-                "Name is optional — the group is always identified by its colored diamond tag.",
+                "Name is optional - the group is always identified by its colored diamond tag.",
                 juce::MessageBoxIconType::NoIcon);
             aw->addTextEditor("name", "", "Name (optional):");
             aw->addButton("OK", 1, juce::KeyPress(juce::KeyPress::returnKey));

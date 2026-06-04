@@ -15,10 +15,10 @@ public:
     // Start recording on a node (creates a new take lane or clip)
     void startRecording(Node& node, int numChannels, double sampleRate, const std::string& outputDir);
 
-    // Called from audio thread — append samples
+    // Called from audio thread - append samples
     void processSamples(const float* const* inputData, int numChannels, int numSamples);
 
-    // Stop recording — finalizes the audio file and adds a clip
+    // Stop recording - finalizes the audio file and adds a clip
     void stopRecording(Node& node, Transport& transport);
 
     bool isRecording() const { return recording.load(); }

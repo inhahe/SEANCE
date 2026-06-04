@@ -91,7 +91,7 @@ int DrumSynthProcessor::findSoundForNote(int midiNote) {
 
 // Worst-case exponential-decay time constant (in seconds) for a drum
 // voice with the given config.  Mirrors the per-type `decayTime` values
-// used in renderDrumSample() — if you change a base decay there, update
+// used in renderDrumSample() - if you change a base decay there, update
 // the matching branch here.  Used by getTailLengthSeconds() and by the
 // voice auto-deactivation cutoff in processBlock().
 static double drumDecayTau(const DrumSound& s) {
@@ -117,7 +117,7 @@ static double drumDecayTau(const DrumSound& s) {
 }
 
 // Number of time constants to wait before declaring an exponentially-
-// decaying voice inaudible.  5τ → e^-5 ≈ 0.0067 (≈ -43 dB).
+// decaying voice inaudible.  5τ -> e^-5 ≈ 0.0067 (≈ -43 dB).
 static constexpr double kInaudibleTimeConstants = 5.0;
 
 double DrumSynthProcessor::getTailLengthSeconds() const {
@@ -136,7 +136,7 @@ float DrumSynthProcessor::renderDrumSample(int soundIdx, DrumVoice& voice) {
     std::uniform_real_distribution<float> noiseDist(-1.0f, 1.0f);
 
     if (s.type == DrumType::Kick || s.type == DrumType::Tom) {
-        // KICK / TOM — pitch-sweeping sine
+        // KICK / TOM - pitch-sweeping sine
         float baseFreq = (s.type == DrumType::Kick) ? 55.0f : 80.0f;
         baseFreq *= s.pitch;
         float decayTime = 0.4f * s.decay;
@@ -148,7 +148,7 @@ float DrumSynthProcessor::renderDrumSample(int soundIdx, DrumVoice& voice) {
         out = toneOut * s.tone + click * (1.0f - s.tone);
     }
     else if (s.type == DrumType::Snare) {
-        // SNARE — sine + noise
+        // SNARE - sine + noise
         float toneFreq = 180.0f * s.pitch;
         float decayTime = 0.15f * s.decay;
         float toneEnv = std::exp((float)(-t / std::max(0.01, (double)decayTime * 0.7)));
@@ -158,7 +158,7 @@ float DrumSynthProcessor::renderDrumSample(int soundIdx, DrumVoice& voice) {
         out = toneOut * s.tone + noiseOut * (1.0f - s.tone);
     }
     else if (s.type == DrumType::HiHat) {
-        // HI-HAT — metallic noise (decay controls closed vs open)
+        // HI-HAT - metallic noise (decay controls closed vs open)
         float decayTime = 0.05f + 0.25f * (s.decay - 0.5f); // short decay = closed, long = open
         decayTime *= s.decay;
         float env = std::exp((float)(-t / std::max(0.005, (double)decayTime)));
@@ -173,7 +173,7 @@ float DrumSynthProcessor::renderDrumSample(int soundIdx, DrumVoice& voice) {
         out = (metallic * s.tone + noise * (1.0f - s.tone)) * env;
     }
     else if (s.type == DrumType::Clap) {
-        // CLAP — multiple short noise bursts
+        // CLAP - multiple short noise bursts
         float decayTime = 0.15f * s.decay;
         float env = std::exp((float)(-t / std::max(0.01, (double)decayTime)));
         // 4 noise bursts at ~0, 10, 20, 30 ms
@@ -187,7 +187,7 @@ float DrumSynthProcessor::renderDrumSample(int soundIdx, DrumVoice& voice) {
         out = noiseDist(voice.rng) * burstEnv * env;
     }
     else if (s.type == DrumType::Cowbell) {
-        // COWBELL — two square waves at inharmonic frequencies
+        // COWBELL - two square waves at inharmonic frequencies
         float f1 = 540.0f * s.pitch, f2 = 800.0f * s.pitch;
         float decayTime = 0.08f * s.decay;
         float env = std::exp((float)(-t / std::max(0.01, (double)decayTime)));
@@ -196,7 +196,7 @@ float DrumSynthProcessor::renderDrumSample(int soundIdx, DrumVoice& voice) {
         out = (sq1 + sq2) * env * s.tone;
     }
     else if (s.type == DrumType::Rimshot) {
-        // RIMSHOT — short noise + tone
+        // RIMSHOT - short noise + tone
         float freq = 400.0f * s.pitch;
         float decayTime = 0.03f * s.decay;
         float env = std::exp((float)(-t / std::max(0.005, (double)decayTime)));
@@ -205,17 +205,17 @@ float DrumSynthProcessor::renderDrumSample(int soundIdx, DrumVoice& voice) {
         out = (toneOut * s.tone + noiseOut * (1.0f - s.tone)) * env;
     }
     else if (s.type == DrumType::Cymbal) {
-        // CYMBAL — crash / ride / bell controlled by tone slider
+        // CYMBAL - crash / ride / bell controlled by tone slider
         // Size sets the baseline pitch and decay (0=small 8", 0.5=medium 16", 1=large 24")
         // Pitch and Decay sliders are offsets on top of the size-derived values.
         float character = s.tone;
         float sizeVal = s.size;
 
-        // Size → base pitch multiplier: small (2.0x) → large (0.6x)
+        // Size -> base pitch multiplier: small (2.0x) -> large (0.6x)
         float sizePitch = 2.0f - sizeVal * 1.4f;
-        // Size → base decay multiplier: small (0.3x) → large (1.8x)
+        // Size -> base decay multiplier: small (0.3x) -> large (1.8x)
         float sizeDecay = 0.3f + sizeVal * 1.5f;
-        // Size → spectral density: larger cymbals have more partials active
+        // Size -> spectral density: larger cymbals have more partials active
         float sizeDensity = 0.5f + sizeVal * 0.5f; // 0.5 to 1.0
 
         // Combined with user's pitch/decay sliders (multiplicative offset)
@@ -308,7 +308,7 @@ void DrumSynthProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::MidiB
             // Auto-deactivate once the voice has decayed below the
             // inaudibility threshold (≈ -43 dB).  Uses the same per-sound
             // decay computation as getTailLengthSeconds() so the two stay
-            // in lockstep — no magic 5-second cap.
+            // in lockstep - no magic 5-second cap.
             int si = voices[vi].soundIdx;
             if (si >= 0 && si < (int)sounds.size()) {
                 double tau = drumDecayTau(sounds[si]);
@@ -331,7 +331,7 @@ DrumSynthEditorComponent::DrumSynthEditorComponent(NodeGraph& g, int nid, AudioE
     : graph(g), nodeId(nid), audioEngine(ae)
 {
     addAndMakeVisible(addSoundBtn);
-    addSoundBtn.setTooltip("Add a new drum voice (kick, snare, hi-hat, etc.) — pick the type from the popup. "
+    addSoundBtn.setTooltip("Add a new drum voice (kick, snare, hi-hat, etc.) - pick the type from the popup. "
                            "Each voice gets its own MIDI note assignment and a row of params (pitch, decay, tone, level).");
     addSoundBtn.onClick = [this]() {
         juce::PopupMenu menu;
@@ -502,9 +502,9 @@ void DrumSynthEditorComponent::rebuildRows() {
         setupSlider(row->decaySlider, nd->params[pi+2].value, 0.1f, 4.0f);
         setupSlider(row->toneSlider,  nd->params[pi+3].value, 0.0f, 1.0f);
         setupSlider(row->levelSlider, nd->params[pi+4].value, 0.0f, 1.0f);
-        row->pitchSlider.setTooltip("Pitch multiplier — higher = brighter and 'tighter', lower = deeper and 'fatter'");
+        row->pitchSlider.setTooltip("Pitch multiplier - higher = brighter and 'tighter', lower = deeper and 'fatter'");
         row->decaySlider.setTooltip("How quickly the sound fades after being struck. Lower = short and percussive, higher = ringing tail");
-        row->toneSlider.setTooltip("Timbre shaping — varies per drum type (filter cutoff, harmonic balance, noise mix, etc.)");
+        row->toneSlider.setTooltip("Timbre shaping - varies per drum type (filter cutoff, harmonic balance, noise mix, etc.)");
         row->levelSlider.setTooltip("Output volume of this drum voice");
 
         // Check if this is a cymbal (has Size param)

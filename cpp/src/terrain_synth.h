@@ -54,14 +54,14 @@ public:
 
     // Wavetable mipmap pyramid (#48): for anti-aliased pitch-up.
     // Each level is a half-resolution version of the previous, created
-    // by DWT → drop finest detail → IDWT. Higher-pitched playback uses
+    // by DWT -> drop finest detail -> IDWT. Higher-pitched playback uses
     // smaller mipmaps to avoid aliasing. Call buildMipmaps() after
     // filling the terrain with a 1D wavetable. The playback code picks
     // the level based on the current pitch ratio.
     std::vector<std::vector<float>> mipmaps; // [0] = original, [1] = half, etc.
     void buildMipmaps(int maxLevels = 6);
     // Sample from the appropriate mipmap level for a given pitch ratio.
-    // pitchRatio = playback_freq / base_freq. Higher ratio → smaller mipmap.
+    // pitchRatio = playback_freq / base_freq. Higher ratio -> smaller mipmap.
     float sampleMipmap(float phase01, float pitchRatio) const;
 
     // Frequency-domain fill (1D only). Evaluates magExpr(f) and phaseExpr(f)
@@ -172,7 +172,7 @@ public:
     void prepareToPlay(double sr, int bs) override;
     void releaseResources() override {}
     void processBlock(juce::AudioBuffer<float>& buf, juce::MidiBuffer& midi) override;
-    // Tail = ADSR release (param idx 3).  No magic constant — reads the
+    // Tail = ADSR release (param idx 3).  No magic constant - reads the
     // live param value so changing release shrinks/extends the tail.
     double getTailLengthSeconds() const override { return (double) getParam(3, 0.3f); }
     bool acceptsMidi() const override { return true; }
@@ -271,7 +271,7 @@ private:
     Voice voices[MAX_VOICES];
 
     // Per-channel pitch bend factor (1.0 = no bend, 2^(semis/12) otherwise).
-    // Default bend range is ±2 semitones — configurable per-synth later.
+    // Default bend range is +/-2 semitones - configurable per-synth later.
     float pitchBendFactor[16] = {1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1};
     static constexpr float kPitchBendRangeSemis = 2.0f;
 
@@ -280,7 +280,7 @@ private:
     float modWheel[16] = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};
     float vibratoPhase = 0.0f;
     static constexpr float kVibratoRateHz = 6.0f;
-    static constexpr float kVibratoMaxSemis = 0.4f; // ±0.4 semis at full mod
+    static constexpr float kVibratoMaxSemis = 0.4f; // +/-0.4 semis at full mod
 
     // Per-channel sustain pedal (CC#64) state. While true, note-offs are
     // captured as sustainHeld instead of immediately releasing.

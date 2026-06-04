@@ -9,7 +9,7 @@
 namespace SoundShop {
 
 // ==============================================================================
-// LayeredWaveform — data model
+// LayeredWaveform - data model
 // ==============================================================================
 
 // Seed a fresh Drawn layer with a handful of points arranged like a sine so
@@ -55,7 +55,7 @@ static float evalShape(WaveLayer::Shape s, float x /*phase 0..1*/, std::mt19937&
 
 // Catmull-Rom interpolation through a periodic sequence of (x, y) points.
 // `pts` must be sorted by x. x values in [0, 1); we treat the list as
-// cyclic, so p[-1] == p[n-1] and p[n] == p[0] (x-shifted by ±1 accordingly).
+// cyclic, so p[-1] == p[n-1] and p[n] == p[0] (x-shifted by +/-1 accordingly).
 static float sampleDrawnPoints(const std::vector<std::pair<float, float>>& pts,
                                float x)
 {
@@ -366,7 +366,7 @@ bool WavetableDoc::decode(const std::string& s) {
     else
         return false;
 
-    // Split body on ':' → [tableSize, modeAndDims, frameCount, frame0, frame1, ...]
+    // Split body on ':' -> [tableSize, modeAndDims, frameCount, frame0, frame1, ...]
     std::vector<std::string> parts;
     size_t pos = 0;
     while (pos <= body.size()) {
@@ -503,7 +503,7 @@ LayeredWaveform LayeredWaveform::defaultSine() {
 }
 
 // ==============================================================================
-// LayerRow — one row per layer
+// LayerRow - one row per layer
 // ==============================================================================
 
 // Sample one layer's contribution over one cycle (amp-scaled, not normalized).
@@ -594,7 +594,7 @@ public:
         ratioSlider.setTooltip("Harmonic ratio: how many times faster this layer cycles than the fundamental. "
                                "1 = root pitch, 2 = one octave up, 3 = one octave + a fifth, etc. Higher numbers add brighter overtones.");
         phaseSlider.setTooltip("Phase offset (0 to 1): shifts where in its cycle this layer starts. "
-                               "Affects how layers add up when summed — different phases give different timbres.");
+                               "Affects how layers add up when summed - different phases give different timbres.");
         ampSlider.setTooltip("Amplitude (0 to 1): how loud this layer is in the final sum. 0 = silent, 1 = full volume. "
                              "Use to balance layers against each other.");
 
@@ -664,7 +664,7 @@ public:
         noiseBtn   .setBounds(btnRow.removeFromLeft(bw));
         drawnBtn   .setBounds(btnRow);
 
-        // Freehand/Points toggle — only visible for Drawn layers
+        // Freehand/Points toggle - only visible for Drawn layers
         if (freehandToggle.isVisible()) {
             auto ftRow = a.removeFromTop(24);
             freehandToggle.setBounds(ftRow.removeFromLeft(100));
@@ -926,7 +926,7 @@ private:
 };
 
 // ==============================================================================
-// ScatterView — N-D scatter wavetable viewport
+// ScatterView - N-D scatter wavetable viewport
 // ==============================================================================
 //
 // Renders frames as labeled colored dots projected to 2D, with the current
@@ -939,9 +939,9 @@ private:
 //     projection combo
 //   - Toggle 3D anaglyph mode (red/cyan stereo) via the parent's 3D button
 //
-// In 3D anaglyph mode each dot is rendered twice — once with horizontal eye
+// In 3D anaglyph mode each dot is rendered twice - once with horizontal eye
 // offset to the left in the red channel, once to the right in the cyan
-// channel — so red/cyan glasses give true stereo depth.
+// channel - so red/cyan glasses give true stereo depth.
 class LayeredWaveEditorComponent::ScatterView : public juce::Component {
 public:
     explicit ScatterView(LayeredWaveEditorComponent& o) : owner(o) {}
@@ -964,9 +964,9 @@ public:
     // post-rotation depth so applyParallax can compute disparity.
     struct Projected { float x, y; float worldZ; };
 
-    // Project an N-D position to a 2D screen point — without stereo offset.
+    // Project an N-D position to a 2D screen point - without stereo offset.
     // In 3D mode this includes yaw/pitch rotation and perspective scaling
-    // (size only — both eyes get the same shape).
+    // (size only - both eyes get the same shape).
     Projected projectPoint(const std::vector<float>& pos,
                            const juce::Rectangle<float>& area) const
     {
@@ -989,7 +989,7 @@ public:
             float z2 =  sp * y + cp * z1;
             x = x1; y = y2; z = z2;
 
-            // Same perspective (size scaling) for both eyes — parallax is
+            // Same perspective (size scaling) for both eyes - parallax is
             // applied separately so the disparity is purely horizontal.
             float fov = 1.6f;
             float pers = fov / std::max(0.1f, fov - z);
@@ -1009,8 +1009,8 @@ public:
     // Geometry: place the screen plane at z=0, viewer's eyes at -D (mm in
     // front), eye separation = IPD. A point at depth z_mm behind the screen
     // appears at parallax (IPD/2) * z_mm/(D+z_mm) per eye (positive = right
-    // eye image moves right, left eye image moves left → uncrossed disparity
-    // → object fuses behind the screen). For a point in front (z_mm<0) the
+    // eye image moves right, left eye image moves left -> uncrossed disparity
+    // -> object fuses behind the screen). For a point in front (z_mm<0) the
     // formula naturally yields crossed disparity.
     juce::Point<float> applyParallax(const Projected& pp, int eyeSign) const {
         if (!anaglyph3D || eyeSign == 0) return { pp.x, pp.y };
@@ -1041,7 +1041,7 @@ public:
             };
             return palette[sf.colorIdx % 8];
         }
-        // Spectral centroid → hue (low = warm red, high = cool blue)
+        // Spectral centroid -> hue (low = warm red, high = cool blue)
         float centroid = 0.0f, mass = 0.0f;
         for (auto& l : sf.wave.layers) {
             float w = std::abs(l.amp);
@@ -1049,7 +1049,7 @@ public:
             mass += w;
         }
         if (mass < 1e-9f) centroid = 1.0f; else centroid /= mass;
-        // Map centroid 1..16 → hue 0.05 (warm orange) .. 0.66 (blue)
+        // Map centroid 1..16 -> hue 0.05 (warm orange) .. 0.66 (blue)
         float t = juce::jlimit(0.0f, 1.0f, (centroid - 1.0f) / 15.0f);
         float hue = 0.05f + t * 0.61f;
         return juce::Colour::fromHSV(hue, 0.65f, 0.95f, 1.0f);
@@ -1222,7 +1222,7 @@ public:
     // axes (axisX, axisY) of the N-D position. Other axes are left at the
     // current value of `current`. Only meaningful in 2D mode (anaglyph 3D
     // can't be unprojected unambiguously, so dragging is locked to the 2D
-    // projected axes there too — Z stays at the current cursor value).
+    // projected axes there too - Z stays at the current cursor value).
     std::vector<float> screenToPosition(juce::Point<float> p,
                                         juce::Rectangle<float> area,
                                         const std::vector<float>& current) const
@@ -1230,7 +1230,7 @@ public:
         std::vector<float> out = current;
         while ((int)out.size() < owner.wave.scatterDims) out.push_back(0.5f);
         // Undo the centring + scale used in projectToScreen for the 2D path.
-        // (For 3D drag we use the same 2D mapping — close enough.)
+        // (For 3D drag we use the same 2D mapping - close enough.)
         float cx = area.getCentreX();
         float cyc = area.getCentreY();
         float scale = std::min(area.getWidth(), area.getHeight()) * 0.42f;
@@ -1467,7 +1467,7 @@ LayeredWaveEditorComponent::LayeredWaveEditorComponent(NodeGraph& g, int nid, st
 
     addAndMakeVisible(anaglyph3DBtn);
     anaglyph3DBtn.setTooltip("Toggle red/cyan anaglyph 3D rendering. Put on red/cyan glasses to see the scatter "
-                             "frames in stereoscopic 3D — useful for visualizing 3+ dimensional wavetables.");
+                             "frames in stereoscopic 3D - useful for visualizing 3+ dimensional wavetables.");
     anaglyph3DBtn.setClickingTogglesState(true);
     anaglyph3DBtn.onClick = [this]() {
         if (scatterView) scatterView->anaglyph3D = anaglyph3DBtn.getToggleState();
@@ -1486,7 +1486,7 @@ LayeredWaveEditorComponent::LayeredWaveEditorComponent(NodeGraph& g, int nid, st
             scatterView->dpi = (float)main->dpi;
     }
 
-    // Stereo settings sliders — only visible when 3D anaglyph mode is on.
+    // Stereo settings sliders - only visible when 3D anaglyph mode is on.
     addAndMakeVisible(stereoRow);
     auto setupStereoSlider = [this](juce::Slider& s, juce::Label& l, const char* name,
                                     double lo, double hi, double def, const char* suffix) {
@@ -1504,11 +1504,11 @@ LayeredWaveEditorComponent::LayeredWaveEditorComponent(NodeGraph& g, int nid, st
     setupStereoSlider(ipdSlider,   ipdLabel,   "IPD",       50.0, 75.0,  63.0, " mm");
     setupStereoSlider(distSlider,  distLabel,  "View dist", 30.0, 120.0, 60.0, " cm");
     setupStereoSlider(depthSlider, depthLabel, "Depth",     10.0, 200.0, 60.0, " mm");
-    ipdSlider.setTooltip("Interpupillary distance (mm) — the distance between your eyes. "
+    ipdSlider.setTooltip("Interpupillary distance (mm) - the distance between your eyes. "
                          "Affects the apparent depth of the 3D anaglyph rendering. Adult average is ~63mm.");
-    distSlider.setTooltip("Viewing distance (cm) — how far your eyes are from the screen. "
+    distSlider.setTooltip("Viewing distance (cm) - how far your eyes are from the screen. "
                           "Combines with IPD to scale the parallax for accurate 3D.");
-    depthSlider.setTooltip("Depth scale (mm) — how much the 3D effect protrudes from the screen. "
+    depthSlider.setTooltip("Depth scale (mm) - how much the 3D effect protrudes from the screen. "
                            "Increase for a more dramatic effect, decrease for subtler depth.");
     stereoRow.addAndMakeVisible(dpiLabel);
     dpiLabel.setText("DPI " + juce::String((int)scatterView->dpi), juce::dontSendNotification);
@@ -1530,8 +1530,8 @@ LayeredWaveEditorComponent::LayeredWaveEditorComponent(NodeGraph& g, int nid, st
     // A/B Compare (#9): toggle between render modes for the same waveform.
     addAndMakeVisible(compareABtn);
     addAndMakeVisible(compareBBtn);
-    compareABtn.setTooltip("Preview this waveform as a wavetable (Mode A — IFFT to single cycle)");
-    compareBBtn.setTooltip("Preview this waveform through the additive synth (Mode B — per-partial sine bank)");
+    compareABtn.setTooltip("Preview this waveform as a wavetable (Mode A - IFFT to single cycle)");
+    compareBBtn.setTooltip("Preview this waveform through the additive synth (Mode B - per-partial sine bank)");
     compareABtn.onClick = [this]() {
         // Mode A = SamplePerPoint (wavetable playback).
         if (auto* nd = graph.findNode(nodeId))
@@ -1613,7 +1613,7 @@ void LayeredWaveEditorComponent::toggleMode() {
         wave.scatterFrames.clear();
         for (int f = 0; f < nFrames && f < total; ++f) {
             // Decompose flat index f into per-dim coords (row-major: last dim
-            // varies fastest — matches WavetableDoc::gridToFlat).
+            // varies fastest - matches WavetableDoc::gridToFlat).
             std::vector<int> idx(dims.size(), 0);
             int rem = f;
             for (int d = (int)dims.size() - 1; d >= 0; --d) {
@@ -1689,7 +1689,7 @@ void LayeredWaveEditorComponent::rebuildScatterUI() {
     // Populate the projection combo with all C(N,2) axis pairs (or C(N,3)
     // triples if 3D mode is on). When there's only one possible projection
     // (N==2 in 2D, or N<=3 in 3D where rotation already covers it) the
-    // combo is hidden — it would just show one item and be confusing.
+    // combo is hidden - it would just show one item and be confusing.
     projectionCombo.clear(juce::dontSendNotification);
     int n = wave.scatterDims;
     bool is3D = anaglyph3DBtn.getToggleState();
@@ -1765,7 +1765,7 @@ void LayeredWaveEditorComponent::rebuildScatterUI() {
     rebuildCoordRow();
 
     // Stereo settings row visible only when 3D anaglyph is on (and we're in
-    // scatter mode — otherwise the rest of the editor doesn't use it).
+    // scatter mode - otherwise the rest of the editor doesn't use it).
     bool show3DSettings = (wave.mode == WavetableMode::Scatter)
                         && anaglyph3DBtn.getToggleState();
     stereoRow.setVisible(show3DSettings);
@@ -1836,7 +1836,7 @@ void LayeredWaveEditorComponent::syncCoordRowFromSelection() {
 void LayeredWaveEditorComponent::pushStereoSettingsToView() {
     if (!scatterView) return;
     scatterView->ipdMm         = (float)ipdSlider.getValue();
-    scatterView->viewingDistMm = (float)distSlider.getValue() * 10.0f; // cm → mm
+    scatterView->viewingDistMm = (float)distSlider.getValue() * 10.0f; // cm -> mm
     scatterView->sceneDepthMm  = (float)depthSlider.getValue();
     scatterView->repaint();
 }
@@ -2134,7 +2134,7 @@ void LayeredWaveEditorComponent::resized() {
 void LayeredWaveEditorComponent::paint(juce::Graphics& g) {
     g.fillAll(juce::Colour(22, 22, 28));
 
-    // Preview area rectangle — preview always sits at the bottom, so we
+    // Preview area rectangle - preview always sits at the bottom, so we
     // just carve from the bottom regardless of what's above.
     auto a = getLocalBounds().reduced(8);
     int previewH = 170;
@@ -2151,14 +2151,14 @@ void LayeredWaveEditorComponent::paint(juce::Graphics& g) {
     int total = wave.activeFrameCount();
     juce::String title = (wave.mode == WavetableMode::Grid ? "Grid frame " : "Scatter frame ")
                        + juce::String(currentFrameIdx + 1) + "/" + juce::String(total)
-                       + "  —  baked on edit; Position morphs the active blend";
+                       + "  -  baked on edit; Position morphs the active blend";
     g.drawText(title,
                previewArea.reduced(6, 2).toNearestInt(),
                juce::Justification::topLeft, true);
 
     // Reserve a strip at the bottom of the preview for the X-axis labels
     // and duration anchor.  Without this, the curve sat on a 0..1 phase
-    // axis with no indication of what time it actually represents — a
+    // axis with no indication of what time it actually represents - a
     // wavetable synth reads one cycle per played-note period, so one
     // cycle's duration is literally 1/note_freq seconds.  We show the
     // duration at common reference pitches so the user can see "this
@@ -2189,7 +2189,7 @@ void LayeredWaveEditorComponent::paint(juce::Graphics& g) {
         g.strokePath(p, juce::PathStrokeType(1.5f));
 
         // Phase tick marks at 0, 1/4, 1/2, 3/4, 1.  Anchors the curve to
-        // a clear "one full cycle" mental model — without these, the
+        // a clear "one full cycle" mental model - without these, the
         // user has no way to gauge how wide a feature is relative to the
         // whole cycle.
         float tickTop    = cy + h * 0.45f + 2.0f;
@@ -2216,7 +2216,7 @@ void LayeredWaveEditorComponent::paint(juce::Graphics& g) {
         // note's frequency, so 1 cycle = 1/freq seconds.  We anchor with
         // two common reference pitches so the user can ballpark how
         // wide their features are in real time.  We don't tie this to
-        // the actual playing note (which can change per keystroke) —
+        // the actual playing note (which can change per keystroke) -
         // fixed anchors are more legible.
         const float a4Hz = 440.0f;
         const float c4Hz = 261.626f;

@@ -80,7 +80,7 @@ private:
     int convWritePos = 0;
 
     // Measured HRTF dataset (#44). If loaded, overrides the synthetic
-    // model. Each entry is an (azimuth, elevation) → (left IR, right IR)
+    // model. Each entry is an (azimuth, elevation) -> (left IR, right IR)
     // pair. The processor interpolates between the nearest entries.
     struct HrtfEntry {
         float azimuth = 0;    // degrees, -180..180

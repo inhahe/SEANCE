@@ -133,7 +133,7 @@ struct WavetableDoc {
 // every slider tick) to avoid racing JUCE's async graph rebuild.
 //
 // The editor holds a WavetableDoc (one or more frames). Only one frame is
-// editable at a time — the current frame — selected via frame-tab buttons.
+// editable at a time - the current frame - selected via frame-tab buttons.
 class LayeredWaveEditorComponent : public juce::Component, private juce::Timer {
 public:
     LayeredWaveEditorComponent(NodeGraph& graph, int nodeId, std::function<void()> onApply);
@@ -180,7 +180,7 @@ private:
     juce::Component  layersContainer;
     std::vector<std::unique_ptr<LayerRow>> rows;
 
-    // Frame tab buttons — one per frame in Grid mode. Each has an X to delete.
+    // Frame tab buttons - one per frame in Grid mode. Each has an X to delete.
     struct FrameTab {
         std::unique_ptr<juce::TextButton> selectBtn;
         std::unique_ptr<juce::TextButton> deleteBtn;
@@ -203,7 +203,7 @@ private:
     juce::Component coordRow;
     juce::Label     coordRowTitle;
 
-    // Stereo (3D anaglyph) settings — only visible when the 3D toggle is on.
+    // Stereo (3D anaglyph) settings - only visible when the 3D toggle is on.
     // Match real-world geometry so the parallax math comes out correct for
     // the user's actual eyes/screen.
     juce::Slider ipdSlider;       // interpupillary distance, mm (50..75)

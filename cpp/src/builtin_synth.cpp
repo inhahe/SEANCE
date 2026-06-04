@@ -92,10 +92,10 @@ void Wavetable::generateFromSpectralExpression(const std::string& magExpr,
         case 1: // random
             for (auto& p : phases) p = udist(rng);
             break;
-        case 2: // zero — impulsive, clicky at t=0
+        case 2: // zero - impulsive, clicky at t=0
             // already zero
             break;
-        case 3: // linear — gives a chirp-like shift
+        case 3: // linear - gives a chirp-like shift
             for (int k = 0; k < halfBins; ++k)
                 phases[k] = -2.0f * 3.14159265f * k * 0.5f;
             break;
@@ -113,7 +113,7 @@ void Wavetable::generateFromSpectralExpression(const std::string& magExpr,
         else
             spectrum[k] = std::complex<float>(m * std::cos(p), m * std::sin(p));
     }
-    // Kill DC — it's almost never wanted and produces a silent offset.
+    // Kill DC - it's almost never wanted and produces a silent offset.
     spectrum[0] = 0.0f;
 
     FFT fft(n);
@@ -241,7 +241,7 @@ float Wavetable::sample(float phase, float frequencyHz, float sr) const {
 }
 
 // ==============================================================================
-// WaveExprParser — simple math expression evaluator
+// WaveExprParser - simple math expression evaluator
 // ==============================================================================
 
 // Tokenizer + recursive descent parser for waveform expressions

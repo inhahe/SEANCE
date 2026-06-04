@@ -72,7 +72,7 @@ static ScaleMap s_scales = {
     // Ancient Greek tetrachords (4 notes spanning a perfect fourth)
     {"Tetrachord (Diatonic)",  {0, 2, 4, 5}},           // W-W-H
     {"Tetrachord (Chromatic)", {0, 1, 3, 5}},            // H-m3-H
-    // Pythagorean — same note selection as Major in 12-TET
+    // Pythagorean - same note selection as Major in 12-TET
     // (true Pythagorean tuning requires microtuning for the cent offsets)
     {"Pythagorean",            {0, 2, 4, 5, 7, 9, 11}}, // same as Major/Ionian
 };
@@ -167,9 +167,9 @@ std::vector<MusicTheory::KeyMatch> MusicTheory::detectKeys(const std::vector<int
     for (auto& [category, table] : tables) {
         for (auto& [scaleName, intervals] : *table) {
             int scaleSize = (int)intervals.size();
-            // Skip chromatic — everything matches, not useful
+            // Skip chromatic - everything matches, not useful
             if (scaleSize >= 12) continue;
-            // Skip scales smaller than the input — can't contain all notes
+            // Skip scales smaller than the input - can't contain all notes
             if (scaleSize < numInputNotes) continue;
 
             for (int root = 0; root < 12; ++root) {

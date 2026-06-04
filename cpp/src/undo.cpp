@@ -9,7 +9,7 @@ namespace SoundShop {
 static const std::string kEmptyString;
 
 UndoTree::UndoTree() {
-    // Root node (no command, no snapshot yet — populated by setRootSnapshot
+    // Root node (no command, no snapshot yet - populated by setRootSnapshot
     // once the application has set up its initial graph).
     UndoNode root;
     root.id = nextId++;
@@ -38,7 +38,7 @@ void UndoTree::execute(std::unique_ptr<Command> cmd, std::string snapshotText) {
 }
 
 void UndoTree::pushDone(std::unique_ptr<Command> cmd, std::string snapshotText) {
-    // Same as execute but doesn't call cmd->execute() — action was already done
+    // Same as execute but doesn't call cmd->execute() - action was already done
     UndoNode node;
     node.id = nextId++;
     node.parentId = currentNodeId;
@@ -59,7 +59,7 @@ void UndoTree::pushSnapshot(std::string snapshotText, std::string desc) {
     node.id = nextId++;
     node.parentId = currentNodeId;
     node.description = std::move(desc);
-    // No command — undo/redo for this step uses snapshotText only
+    // No command - undo/redo for this step uses snapshotText only
     node.snapshotText = std::move(snapshotText);
 
     int newId = (int)nodes.size();

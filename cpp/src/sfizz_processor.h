@@ -9,7 +9,7 @@
 namespace SoundShop {
 
 // ==============================================================================
-// SfizzProcessor — full SFZ compliance via the sfizz library (#37)
+// SfizzProcessor - full SFZ compliance via the sfizz library (#37)
 //
 // When HAS_SFIZZ is defined (sfizz cloned into third_party/sfizz),
 // this processor uses sfizz::Sfizz to load and play any SFZ instrument
@@ -17,7 +17,7 @@ namespace SoundShop {
 // envelopes, filters, etc.).
 //
 // When HAS_SFIZZ is NOT defined, the processor logs a message and
-// passes audio/MIDI through unchanged — the built-in basic SFZ loader
+// passes audio/MIDI through unchanged - the built-in basic SFZ loader
 // still works for simple patches.
 //
 // Script format: "__sfizz__:<path>" where path is the .sfz file.

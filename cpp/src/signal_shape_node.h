@@ -6,7 +6,7 @@
 
 namespace SoundShop {
 
-// Signal Shape Node — outputs a modulation signal via Param pins.
+// Signal Shape Node - outputs a modulation signal via Param pins.
 // The shape is defined by an expression or control points (same as waveform editor).
 // Modes:
 //   LFO: repeating at a given rate (Hz or beat-synced)

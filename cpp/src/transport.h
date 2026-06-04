@@ -33,7 +33,7 @@ struct TempoPoint {
     double endBeat = 0;       // beat where this segment ends (0 = extends to next point)
 };
 
-// Tempo map — supports multiple tempo changes over time
+// Tempo map - supports multiple tempo changes over time
 // Lock-free TempoMap via shared_ptr swap (#22). The UI thread builds a
 // new immutable vector and atomically publishes it. The audio thread
 // grabs a snapshot via atomic_load and reads it without locking. No
@@ -43,7 +43,7 @@ public:
     using Points = std::vector<TempoPoint>;
     // Not const-qualified because MSVC's std::atomic_store can't resolve
     // the const/non-const shared_ptr overload. The vector is treated as
-    // immutable by convention — once published, nobody mutates it.
+    // immutable by convention - once published, nobody mutates it.
     using PointsPtr = std::shared_ptr<Points>;
 
     TempoMap() {
@@ -52,7 +52,7 @@ public:
         std::atomic_store(&pts, std::move(p));
     }
 
-    // Snapshot accessor — audio thread calls this once per block and
+    // Snapshot accessor - audio thread calls this once per block and
     // reads through the returned shared_ptr for the rest of the block.
     PointsPtr snapshot() const { return std::atomic_load(&pts); }
 
@@ -106,7 +106,7 @@ public:
         return secondsToBeats(samples / sampleRate);
     }
 
-    // Mutators — UI thread only. Each builds a new vector and
+    // Mutators - UI thread only. Each builds a new vector and
     // atomically replaces the shared pointer.
     void addTempoChange(double beat, double bpm) {
         auto old = snapshot();
@@ -140,7 +140,7 @@ public:
 
     // Legacy accessor kept for code that reads `tempoMap.points` directly
     // (e.g. timerCallback sync checks). Returns a copy of the current
-    // snapshot. Safe but not lock-free — UI thread only.
+    // snapshot. Safe but not lock-free - UI thread only.
     Points getPoints() const {
         auto sp = snapshot();
         return sp ? *sp : Points{{0, 120.0, 120.0, 0}};
@@ -150,7 +150,7 @@ private:
     PointsPtr pts;
 };
 
-// Time signature map — supports changes over time
+// Time signature map - supports changes over time
 class TimeSignatureMap {
 public:
     TimeSignatureMap() {

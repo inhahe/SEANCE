@@ -5,10 +5,10 @@
 namespace SoundShop {
 
 // ============================================================================
-// MidiInputProcessor — turns a physical/virtual MIDI input source into a
+// MidiInputProcessor - turns a physical/virtual MIDI input source into a
 // first-class graph node. The audio engine pushes incoming MIDI events
 // into the node's pendingMpePassthrough queue (which is also used by old
-// MPE timelines — same mechanism, repurposed for the new routing model).
+// MPE timelines - same mechanism, repurposed for the new routing model).
 // This processor drains the queue at the start of each block and emits
 // the events on its own MIDI output, so downstream nodes wired to it
 // receive them via normal graph MIDI routing.

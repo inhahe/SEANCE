@@ -8,8 +8,8 @@
 #endif
 
 // Routes juce::Logger::writeToLog() through stderr, which is redirected
-// to the log file at startup.  This keeps every diagnostic message —
-// whether it comes from fprintf(stderr,...) or the JUCE logger — in one
+// to the log file at startup.  This keeps every diagnostic message -
+// whether it comes from fprintf(stderr,...) or the JUCE logger - in one
 // place.
 class StderrLogger : public juce::Logger {
     void logMessage(const juce::String& message) override {
@@ -76,7 +76,7 @@ private:
         // writes to this file instead of the console.
         freopen(logFile.getFullPathName().toRawUTF8(), "w", stderr);
 
-        // Also route juce::Logger through stderr → same file.
+        // Also route juce::Logger through stderr -> same file.
         logger = std::make_unique<StderrLogger>();
         juce::Logger::setCurrentLogger(logger.get());
 
@@ -84,7 +84,7 @@ private:
         std::time_t now = std::time(nullptr);
         char timeBuf[64];
         std::strftime(timeBuf, sizeof(timeBuf), "%Y-%m-%d %H:%M:%S", std::localtime(&now));
-        fprintf(stderr, "SEANCE %s — started %s\n", getApplicationVersion().toRawUTF8(), timeBuf);
+        fprintf(stderr, "SEANCE %s - started %s\n", getApplicationVersion().toRawUTF8(), timeBuf);
         fprintf(stderr, "Log: %s\n\n", logFile.getFullPathName().toRawUTF8());
         fflush(stderr);
     }

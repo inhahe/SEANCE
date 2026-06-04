@@ -30,7 +30,7 @@ public:
     {
         // Initialize a blank coefficient grid: 6 levels, 1024 total samples.
         numLevels = 5;
-        totalSize = 1 << (numLevels + 2); // 128 at level 5 → total = 128 * 2 = 256...
+        totalSize = 1 << (numLevels + 2); // 128 at level 5 -> total = 128 * 2 = 256...
         // Actually for 5 levels of DWT on a 1024-sample signal:
         totalSize = 1024;
         coefficients.assign(totalSize, 0.0f);

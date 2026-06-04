@@ -7,7 +7,7 @@
 namespace SoundShop {
 
 // ---------------------------------------------------------------------------
-// SliderMenuItem — horizontal slider + preset buttons for use inside a
+// SliderMenuItem - horizontal slider + preset buttons for use inside a
 // PopupMenu.  Used by the note right-click menu for Velocity and Detune.
 // ---------------------------------------------------------------------------
 class SliderMenuItem : public juce::PopupMenu::CustomComponent {
@@ -128,7 +128,7 @@ PianoRollComponent::PianoRollComponent(NodeGraph& g, Node& n, Transport* t)
     // music terminology a non-musician wouldn't necessarily know.
     // Skip the genuinely self-explanatory ones (Select All, Deselect,
     // Reverse, X close).
-    compactBtn.setTooltip("Toggle compact mode — hides most toolbar buttons to maximize the note-editing area");
+    compactBtn.setTooltip("Toggle compact mode - hides most toolbar buttons to maximize the note-editing area");
     transpUpOctBtn.setTooltip("Move every selected note up by one octave (12 semitones)");
     transpDownOctBtn.setTooltip("Move every selected note down by one octave (12 semitones)");
     transpUpSemiBtn.setTooltip("Move every selected note up by one semitone (one piano key)");
@@ -142,7 +142,7 @@ PianoRollComponent::PianoRollComponent(NodeGraph& g, Node& n, Transport* t)
     snap14Btn.setTooltip("Snap notes to quarter-beat positions (1/16th of a 4/4 bar)");
     snap12Btn.setTooltip("Snap notes to half-beat positions (1/8th of a 4/4 bar)");
     snap1Btn.setTooltip("Snap notes to whole-beat positions (1/4 of a 4/4 bar)");
-    snapOffBtn.setTooltip("Disable snapping — notes can be placed at any position. Hold Alt while dragging for the same effect.");
+    snapOffBtn.setTooltip("Disable snapping - notes can be placed at any position. Hold Alt while dragging for the same effect.");
     snapScaleBtn.setTooltip("Snap notes to the chosen Key/Scale, so dragging a note up or down only lands on \"in key\" pitches");
     detectKeyBtn.setTooltip("Analyze the notes in this clip and guess the key/scale, then set the dropdowns to match");
 
@@ -160,7 +160,7 @@ PianoRollComponent::PianoRollComponent(NodeGraph& g, Node& n, Transport* t)
     quantizeStrSlider.setTextBoxStyle(juce::Slider::TextBoxRight, false, 38, 18);
     quantizeStrSlider.setTextValueSuffix("%");
     quantizeStrSlider.setSliderStyle(juce::Slider::LinearHorizontal);
-    quantizeStrSlider.setTooltip("Quantize strength — 100% snaps notes exactly to the grid, lower values "
+    quantizeStrSlider.setTooltip("Quantize strength - 100% snaps notes exactly to the grid, lower values "
                                  "move notes only partway toward the grid (sounds more human)");
     quantizeBtn.onClick = [this, apply]() {
         float grid = state.snap > 0.0f ? state.snap : 0.25f;
@@ -186,11 +186,11 @@ PianoRollComponent::PianoRollComponent(NodeGraph& g, Node& n, Transport* t)
 
     // Mute / Solo / Pan
     addBtn(muteBtn); addBtn(soloBtn);
-    // "Mute" is universally understood — skip the tooltip. "Solo" is a
+    // "Mute" is universally understood - skip the tooltip. "Solo" is a
     // DAW term that non-musicians might not know.
-    soloBtn.setTooltip("Solo this track — when any track is soloed, all non-soloed tracks are silenced");
+    soloBtn.setTooltip("Solo this track - when any track is soloed, all non-soloed tracks are silenced");
     // Pan slider only for nodes that produce audio. MIDI Timelines only
-    // output MIDI events — panning them does nothing.
+    // output MIDI events - panning them does nothing.
     bool showPan = (n.type != NodeType::MidiTimeline);
     if (showPan) {
         addAndMakeVisible(panSlider);
@@ -235,7 +235,7 @@ PianoRollComponent::PianoRollComponent(NodeGraph& g, Node& n, Transport* t)
     soloBtn.setColour(juce::TextButton::buttonColourId,
         node->soloed ? juce::Colour(180, 180, 50) : juce::Colour(55, 55, 60));
 
-    // MPE expression lane buttons — hidden until their interaction code is
+    // MPE expression lane buttons - hidden until their interaction code is
     // audited.  Velocity is now in the note right-click menu.
     exprPBBtn.onClick    = [this]() { exprLane = ExprPitchBend; updateExprLaneButtonStyles(); repaint(); };
     exprSlideBtn.onClick = [this]() { exprLane = ExprSlide; updateExprLaneButtonStyles(); repaint(); };
@@ -275,10 +275,10 @@ PianoRollComponent::PianoRollComponent(NodeGraph& g, Node& n, Transport* t)
     addCombo(keyCombo, keyLbl, "Key:");
     addCombo(modeCombo, modeLbl, "Mode:");
     addCombo(scaleCombo, scaleLbl, "Scale:");
-    rootCombo.setTooltip("Root note — the home pitch of the key/scale (e.g. C for C Major)");
-    keyCombo.setTooltip("Key family — Major sounds happy/bright, Minor sounds sad/dark");
-    modeCombo.setTooltip("Mode — variants of the major scale that change the mood (Dorian, Phrygian, Lydian, etc.)");
-    scaleCombo.setTooltip("Scale — broader categories like Pentatonic, Blues, Whole-Tone, Chromatic. "
+    rootCombo.setTooltip("Root note - the home pitch of the key/scale (e.g. C for C Major)");
+    keyCombo.setTooltip("Key family - Major sounds happy/bright, Minor sounds sad/dark");
+    modeCombo.setTooltip("Mode - variants of the major scale that change the mood (Dorian, Phrygian, Lydian, etc.)");
+    scaleCombo.setTooltip("Scale - broader categories like Pentatonic, Blues, Whole-Tone, Chromatic. "
                           "Affects which notes are highlighted as 'in key' on the piano roll.");
 
     // Populate root
@@ -617,7 +617,7 @@ void PianoRollComponent::resized() {
         x += 4;
         place2(snapScaleBtn, 85);
         place2(detectKeyBtn, 70);
-        // MPE expression lane buttons — still hidden until audited.
+        // MPE expression lane buttons - still hidden until audited.
         // Velocity editing is now in the note right-click menu.
         exprPBBtn.setVisible(false);
         exprSlideBtn.setVisible(false);
@@ -639,7 +639,7 @@ void PianoRollComponent::resized() {
         autoParamCombo.setVisible(node && !node->params.empty());
     }
 
-    // Scrollbars — bottom and right edges of the piano roll area
+    // Scrollbars - bottom and right edges of the piano roll area
     auto pianoArea = getLocalBounds();
     pianoArea.removeFromTop(toolbarHeight());
     vScrollBar.setBounds(pianoArea.removeFromRight(SCROLLBAR_SIZE));
@@ -691,7 +691,7 @@ void PianoRollComponent::paint(juce::Graphics& g) {
     float absOffset = node->absoluteBeatOffset; // cascading parent offset
     float absTotalBeats = totalBeats + absOffset;
 
-    // Horizontal zoom/scroll — guard against zero visible beats
+    // Horizontal zoom/scroll - guard against zero visible beats
     float visibleBeats = std::max(1.0f, absTotalBeats / std::max(state.hZoom, 0.1f));
     float scrollBeat = juce::jlimit(0.0f, std::max(0.0f, absTotalBeats - visibleBeats), state.hScroll);
     state.hScroll = scrollBeat;
@@ -896,7 +896,7 @@ void PianoRollComponent::paint(juce::Graphics& g) {
 
     // Insert chain layers: flat-edged bars stacked flush at the top of the
     // grid, representing the track's serial effect chain. Bottom layer
-    // processes first, top layer last. No rounded corners, no gaps — they
+    // processes first, top layer last. No rounded corners, no gaps - they
     // look like stackable blocks.
     if (!node->effectRegions.empty()) {
         const float barH = 12.0f;
@@ -937,7 +937,7 @@ void PianoRollComponent::paint(juce::Graphics& g) {
                                          (uint8_t)((col >> 8) & 0xFF),
                                          (uint8_t)(col & 0xFF));
 
-            // Flat bar body — no rounded corners, stackable
+            // Flat bar body - no rounded corners, stackable
             g.setColour(barColor.withAlpha(0.70f));
             g.fillRect(rx1, ry, rx2 - rx1, barH);
             // Thin top/bottom edge lines for separation
@@ -1550,7 +1550,7 @@ void PianoRollComponent::mouseUp(const juce::MouseEvent& e) {
         float dist = std::abs(b2 - b1) + std::abs((float)(p2 - p1));
 
         if (dist < 0.3f) {
-            // Place a note — find or extend a clip to fit
+            // Place a note - find or extend a clip to fit
             float snap = state.snap > 0 ? state.snap : 0.25f;
             float sb = std::round(lastClickBeat / snap) * snap;
             if (sb < 0) sb = 0;
@@ -1759,7 +1759,7 @@ void PianoRollComponent::showNoteMenu() {
     menu.addItem(32, "Reverse", numSel > 1);
     menu.addSeparator();
 
-    // Shared undo state — the slider callbacks modify notes directly while
+    // Shared undo state - the slider callbacks modify notes directly while
     // the menu is open; we push a single undo step when the menu closes.
     struct SliderUndo {
         bool changed = false;
@@ -1948,7 +1948,7 @@ void PianoRollComponent::showNoteMenu() {
                 break;
             }
             // Detune and velocity are now handled by inline slider
-            // components — no case IDs needed.
+            // components - no case IDs needed.
             case 50: { // Snap to Scale
                 auto getIntervals = [&]() -> std::vector<int> {
                     const ScaleMap* table = nullptr;
@@ -2498,7 +2498,7 @@ void PianoRollComponent::showEmptyMenu() {
             fxMenu.addItem(5000 + grp.id, "Group: " + label);
         }
 
-        // Then list individual links (showing From → To)
+        // Then list individual links (showing From -> To)
         if (!graph.effectGroups.empty() && !graph.links.empty())
             fxMenu.addSeparator();
         for (auto& link : graph.links) {

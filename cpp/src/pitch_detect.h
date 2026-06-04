@@ -89,7 +89,7 @@ inline PitchResult detectPitchAutocorrelation(const float* samples, int numSampl
     return result;
 }
 
-// YIN pitch detection. More robust than autocorrelation — uses a
+// YIN pitch detection. More robust than autocorrelation - uses a
 // cumulative mean normalized difference function that reduces octave
 // errors. Standard algorithm from de Cheveigné & Kawahara (2002).
 inline PitchResult detectPitchYIN(const float* samples, int numSamples,
@@ -128,7 +128,7 @@ inline PitchResult detectPitchYIN(const float* samples, int numSamples,
         cmndf[tau] = (runningSum > 1e-8f) ? diff[tau] * tau / runningSum : 1.0f;
     }
 
-    // Step 3: Absolute threshold — find the first tau where cmndf dips
+    // Step 3: Absolute threshold - find the first tau where cmndf dips
     // below the threshold, then find the local minimum after that dip.
     int bestLag = -1;
     for (int tau = minLag; tau < maxLag; ++tau) {

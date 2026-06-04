@@ -87,7 +87,7 @@ bool WasmScriptProcessor::loadWasm(const std::vector<uint8_t>& wasmBytes) {
     wasmEnv = m3_NewEnvironment();
     if (!wasmEnv) { fprintf(stderr, "[WASM] Failed to create environment\n"); return false; }
 
-    // 4 pages = 256 KB — plenty for audio buffers
+    // 4 pages = 256 KB - plenty for audio buffers
     wasmRuntime = m3_NewRuntime(wasmEnv, 4 * 65536, this);
     if (!wasmRuntime) { fprintf(stderr, "[WASM] Failed to create runtime\n"); return false; }
 
@@ -171,7 +171,7 @@ bool WasmScriptProcessor::loadWasm(const std::vector<uint8_t>& wasmBytes) {
     computeOffsets();
     writeHeader();
 
-    // Call ss_init — script declares parameters here
+    // Call ss_init - script declares parameters here
     result = m3_CallV(fnInit);
     if (result) {
         fprintf(stderr, "[WASM] ss_init error: %s\n", result);
@@ -269,7 +269,7 @@ void WasmScriptProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Midi
     // Call the script's process function
     M3Result result = m3_CallV(fnProcess);
     if (result) {
-        // Script error — mute output
+        // Script error - mute output
         buf.clear();
         midi.clear();
         return;

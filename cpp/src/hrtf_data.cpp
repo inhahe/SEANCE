@@ -8,7 +8,7 @@
 namespace SoundShop {
 
 // ==============================================================================
-// Spherical head diffraction model — generates per-frequency HRTF
+// Spherical head diffraction model - generates per-frequency HRTF
 //
 // Based on the Duda-Martens spherical head model:
 // - ITD from Woodworth formula
@@ -135,7 +135,7 @@ void HRTFTable::generateEntry(float azimuthDeg, float elevationDeg, HRTFEntry& e
     for (int i = 0; i < HRTF_IR_LENGTH; ++i) { sumL += entry.left[i]; sumR += entry.right[i]; }
     float normL = (std::abs(sumL) > 1e-6f) ? 1.0f / sumL : 1.0f;
     float normR = (std::abs(sumR) > 1e-6f) ? 1.0f / sumR : 1.0f;
-    // Don't normalize too aggressively — keep relative level differences
+    // Don't normalize too aggressively - keep relative level differences
     float normMax = std::max(std::abs(normL), std::abs(normR));
     normL /= normMax; normR /= normMax;
     for (int i = 0; i < HRTF_IR_LENGTH; ++i) {

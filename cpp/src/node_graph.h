@@ -25,7 +25,7 @@ enum class PinKind { Audio, Midi, Param, Signal }; // Signal = audio-rate contro
 // Two pin kinds are compatible at the cable level if they're either the same
 // kind, or both control kinds (Param + Signal). Param is conceptually
 // block-rate and Signal is audio-rate, but at the routing layer we treat them
-// as a single "control" family — the conversion is implicit and free, since
+// as a single "control" family - the conversion is implicit and free, since
 // the audio-graph routing already carries them on the same channel slot. The
 // receiver decides whether to read once per block (Param semantics) or every
 // sample (Signal semantics). See task #82.
@@ -41,7 +41,7 @@ inline bool arePinKindsCompatible(PinKind a, PinKind b) {
     bool aCtrl = (a == PinKind::Param || a == PinKind::Signal);
     bool bCtrl = (b == PinKind::Param || b == PinKind::Signal);
     if (aCtrl && bCtrl) return true;
-    // Audio output → Signal input (mono downmix for sidechain etc.)
+    // Audio output -> Signal input (mono downmix for sidechain etc.)
     if (a == PinKind::Audio && b == PinKind::Signal) return true;
     return false;
 }
@@ -54,7 +54,7 @@ enum class NodeType {
     // MidiInput represents a single live MIDI input source (computer keyboard,
     // hardware MIDI device, network MIDI client, virtual port, etc). It has
     // no inputs and one MIDI output. The cable wiring from the Input node to
-    // a Timeline or synth IS the live-input routing — no flags, no hidden
+    // a Timeline or synth IS the live-input routing - no flags, no hidden
     // state. See project_midi_input_architecture.md.
     MidiInput
 };
@@ -255,7 +255,7 @@ struct Node {
     // (via PanProcessor which runs after every audio-producing node).
     // Read by the UI thread at 30 Hz for drawing meter bars. Plain
     // floats (not atomic) because Node must be copyable for std::vector.
-    // The audio thread writes, the UI thread reads — a torn read is at
+    // The audio thread writes, the UI thread reads - a torn read is at
     // worst a meter glitch, never a crash. Decay is applied UI-side.
     float meterPeakL = 0.0f;
     float meterPeakR = 0.0f;
@@ -266,7 +266,7 @@ struct Node {
     // When a Signal cable is connected to the pin, the processor reads
     // the signal from audio channel (2 + pin's control-slot index) and
     // modulates the param each block. The pin lives in pinsIn alongside
-    // the node's static pins — it's serialized as part of the normal
+    // the node's static pins - it's serialized as part of the normal
     // pin list in project_file.cpp. The modPin just records the binding.
     struct ModPin {
         int paramIndex = -1;  // index into this node's params[]
@@ -284,7 +284,7 @@ struct Node {
 
     std::string script;
 
-    // Performance mode — play preset melody by pressing any keys
+    // Performance mode - play preset melody by pressing any keys
     bool performanceMode = false;
     int performanceReleaseMode = 1;   // 0=OnKeyUp, 1=OnNextEvent (legato)
     bool performanceVelocity = true;  // use incoming velocity
@@ -320,7 +320,7 @@ struct Node {
     // plugin's parameters change via host automation, MIDI Learn CC, or
     // any other host-driven path, this flag is set so the next autosave
     // re-queries getStateInformation. When clear, the saver reuses the
-    // cached base64 string instead — avoiding the expensive query for
+    // cached base64 string instead - avoiding the expensive query for
     // plugins whose state hasn't changed since the last save. Defaults
     // to true so a freshly loaded plugin gets queried at least once.
     //
@@ -331,7 +331,7 @@ struct Node {
     bool pluginStateDirty = true;
     std::string cachedPluginStateBase64;
 
-    // Group — contains child node IDs
+    // Group - contains child node IDs
     std::vector<int> childNodeIds;  // IDs of nodes inside this group
     int parentGroupId = -1;         // -1 = top-level (not in any group)
     float groupBeatOffset = 0.0f;   // children's timelines start at this beat in the parent
@@ -478,12 +478,12 @@ public:
 
     std::vector<Node> nodes;
     std::vector<Link> links;
-    std::vector<int> openEditors;  // node IDs — never store Node*
+    std::vector<int> openEditors;  // node IDs - never store Node*
 
     float editorPanelHeight = 250.0f;
     int activeEditorNodeId = -1; // node ID of the currently focused editor
     PluginHost* pluginHost = nullptr; // set by App
-    // Dirty tracking — set on any mutation
+    // Dirty tracking - set on any mutation
     bool dirty = false;
 
     // Transport state
@@ -498,21 +498,21 @@ public:
 
     // Song length and repeat behavior.
     //
-    // songLengthBeats = 0 means "auto" — derive the effective end from the
+    // songLengthBeats = 0 means "auto" - derive the effective end from the
     // last clip across all timeline nodes (see effectiveSongLengthBeats()).
     // > 0 marks an explicit end beat that overrides the auto-derived value.
     // When the playhead reaches the effective end, the repeat policy
     // decides what happens next.
     //
     // Repeat modes:
-    //   None    — stop at the song end and halt playback.
-    //   Forever — wrap back to beat 0 and keep playing until Stop.
-    //   NTimes  — wrap back to beat 0, play the song N times total, then
+    //   None    - stop at the song end and halt playback.
+    //   Forever - wrap back to beat 0 and keep playing until Stop.
+    //   NTimes  - wrap back to beat 0, play the song N times total, then
     //             stop. N = songRepeatCount, where 1 means "play once
     //             then stop" (same as None), 2 means "play twice", etc.
     //
     // The user-region loop (loopEnabled / loopStartBeat / loopEndBeat) is
-    // an inner A-B cycler and takes precedence while active — the song-
+    // an inner A-B cycler and takes precedence while active - the song-
     // length policy only fires when the user loop is disabled or the
     // playhead is outside the user-loop range.
     //
@@ -526,7 +526,7 @@ public:
     // Returns the effective song-end beat used by the transport.  If
     // songLengthBeats was set explicitly (> 0), that value wins. Otherwise
     // walks all AudioTimeline / MidiTimeline nodes and returns the largest
-    // getTimelineBeats() across them — i.e. the end of the last clip,
+    // getTimelineBeats() across them - i.e. the end of the last clip,
     // rounded up to the next 4-beat bar. Returns 0 if there are no
     // timelines with clips (in which case the engine treats the song as
     // having no end and just plays until the user presses Stop).
@@ -537,7 +537,7 @@ public:
     float concertPitch = 440.0f; // Hz for A4
 
     // Global crossfade duration (seconds) used to smooth audio discontinuities
-    // anywhere the engine starts or stops a routing path mid-stream — effect
+    // anywhere the engine starts or stops a routing path mid-stream - effect
     // region edges, mute/solo toggles, plugin bypass, future child-track
     // entry/exit, etc. Per-feature overrides (e.g. EffectGroup::crossfadeSec)
     // take precedence when explicitly set.
@@ -598,7 +598,7 @@ public:
         return m ? m->beat : -1.0f;
     }
 
-    // Signal automation script — Python code that defines signal bindings
+    // Signal automation script - Python code that defines signal bindings
     // Re-executed when project is loaded
     std::string signalScript;
     UndoTree undoTree;
@@ -614,7 +614,7 @@ public:
     // machine-local userAppData/SEANCE/undo-tree.dat file.
     std::string historyFilePath;
 
-    // Shared waveform library — named waveforms usable by any synth/signal node
+    // Shared waveform library - named waveforms usable by any synth/signal node
     struct WaveformEntry {
         std::string name;
         std::string expression;    // source expression (empty if from points)
@@ -641,7 +641,7 @@ public:
     // Commit a snapshot of the current graph state to the undo tree as a
     // new step. The serialization is performed via ProjectFile::serializeForUndo
     // (graph-only, plugin state excluded). If the resulting text is identical
-    // to the previous step's snapshot — i.e., nothing actually changed — this
+    // to the previous step's snapshot - i.e., nothing actually changed - this
     // is a no-op, so it's safe (and intended) to call defensively from any
     // mutating function. See CLAUDE.md "Undo Strategy" for the policy on
     // when to use commitSnapshot vs. exec().

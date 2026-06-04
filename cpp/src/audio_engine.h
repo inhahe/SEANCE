@@ -35,7 +35,7 @@ public:
     // MidiInputCallback
     void handleIncomingMidiMessage(juce::MidiInput* source, const juce::MidiMessage& msg) override;
 
-    // MIDI device enablement — called when MidiInput nodes are added/removed
+    // MIDI device enablement - called when MidiInput nodes are added/removed
     // so we only keep device callbacks alive for devices the user asked for.
     // Walks the graph and enables exactly the set of devices with matching
     // MidiInput nodes, disabling any others that are currently enabled.
@@ -218,7 +218,7 @@ public:
     bool isCapturingOutput() const { return outputCaptureEnabled.load(); }
 
     // Retrieve the captured audio as a stereo JUCE buffer. Returns empty if
-    // no capture data. Does NOT clear the capture — call clearCapture() for that.
+    // no capture data. Does NOT clear the capture - call clearCapture() for that.
     juce::AudioBuffer<float> getCaptureBuffer() const;
     int64_t getCaptureStartSample() const { return captureStartSample; }
     void clearCapture();

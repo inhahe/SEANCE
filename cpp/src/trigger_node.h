@@ -10,7 +10,7 @@
 namespace SoundShop {
 
 // ============================================================================
-// Trigger node — "notes trigger other notes / signals"
+// Trigger node - "notes trigger other notes / signals"
 //
 // Sits on a MIDI path. For each incoming MIDI note-on, every matching rule
 // fires an action: either a generated MIDI note (on the MIDI output pin)
@@ -97,7 +97,7 @@ struct TriggerDoc {
     std::string encode() const;
     bool decode(const std::string& s);
 
-    // Preset rule sets — a one-click starting point.
+    // Preset rule sets - a one-click starting point.
     static TriggerDoc presetOctaveDouble();
     static TriggerDoc presetChordMajor();
     static TriggerDoc presetFlam();
@@ -107,7 +107,7 @@ struct TriggerDoc {
 };
 
 // ============================================================================
-// TriggerProcessor — the audio-thread side.
+// TriggerProcessor - the audio-thread side.
 // ============================================================================
 
 class TriggerProcessor : public juce::AudioProcessor {
@@ -141,7 +141,7 @@ private:
     double sampleRate = 44100.0;
     int64_t absSampleTime = 0; // monotonically increasing sample counter
 
-    // Cached rule list — re-read from node.script at the start of each block
+    // Cached rule list - re-read from node.script at the start of each block
     // only if the script text actually changed (cheap string compare).
     TriggerDoc doc;
     std::string cachedScript;
@@ -195,7 +195,7 @@ private:
 };
 
 // ============================================================================
-// TriggerEditorComponent — a small dialog for editing rules.
+// TriggerEditorComponent - a small dialog for editing rules.
 //
 // MVP scope: a rule list with preset buttons and minimal per-rule editing
 // (target, pitch offset, delay, length, probability for MIDI; shape +

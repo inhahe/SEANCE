@@ -139,7 +139,7 @@ void NodeGraph::drawPianoRoll(Node& node, float areaHeight) {
         int alpha = (pitch % 12 == 0) ? 60 : (inScale ? 25 : 10);
         dl->AddLine(ImVec2(gridX, y), ImVec2(gridX + gridW, y), IM_COL32(255, 255, 255, alpha));
 
-        // Key label — pick font size based on row height, clip to row
+        // Key label - pick font size based on row height, clip to row
         if (i < visRange) {
             // Check if this key is being auditioned
             bool isAuditioned = false;
@@ -240,7 +240,7 @@ void NodeGraph::drawPianoRoll(Node& node, float areaHeight) {
                             IM_COL32(std::min(cr+40,255), std::min(cg+40,255), std::min(cb+40,255), 255), 2.0f);
             }
 
-            // Note label with degree — sized to fit
+            // Note label with degree - sized to fit
             float noteW = nx2 - nx1;
             if (noteW > 14 && rowH > 7) {
                 auto name = MusicTheory::noteName(note.pitch);
@@ -742,7 +742,7 @@ void NodeGraph::drawPianoRoll(Node& node, float areaHeight) {
         ImGui::EndPopup();
     }
 
-    // Piano key column interaction — click to audition
+    // Piano key column interaction - click to audition
     ImGui::SetCursorScreenPos(ImVec2(cursor.x, gridY));
     ImGui::InvisibleButton(("##piano_keys_" + std::to_string(node.id)).c_str(),
                             ImVec2(keyW, gridH));

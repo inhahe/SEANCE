@@ -21,7 +21,7 @@ public:
     void processBlock(juce::AudioBuffer<float>& buf, juce::MidiBuffer& midi) override;
     // Tail = Rubber Band's internal processing latency.  The library
     // doesn't expose a per-call tail query, but its R2 engine buffers
-    // roughly a window-length (≈ 50–100 ms at 44.1 kHz with default
+    // roughly a window-length (≈ 50-100 ms at 44.1 kHz with default
     // settings).  Use a named upper bound here, not a magic constant.
     double getTailLengthSeconds() const override {
         static constexpr double kRubberBandWindowSeconds = 0.1;

@@ -162,7 +162,7 @@ RoomIRCaptureComponent::RoomIRCaptureComponent(NodeGraph& g,
         "and recording the room's response with your microphone.\n\n"
         "1. Place your microphone where the listener would be\n"
         "2. Choose a method (Sine Sweep is more accurate, Click is faster)\n"
-        "3. Click 'Start Capture' — the test signal will play, then the room response is recorded\n"
+        "3. Click 'Start Capture' - the test signal will play, then the room response is recorded\n"
         "4. The captured IR is automatically loaded into a new Convolution Filter node",
         juce::dontSendNotification);
     instructionLabel.setFont(11.0f);
@@ -175,7 +175,7 @@ RoomIRCaptureComponent::RoomIRCaptureComponent(NodeGraph& g,
     methodCombo.addItem("Click / Impulse (faster)", 2);
     methodCombo.setSelectedId(1);
     methodCombo.setTooltip("Sine Sweep slowly sweeps through every audible frequency for cleaner results "
-                            "but is louder and slower. Click/Impulse plays a sharp pop and records the response — "
+                            "but is louder and slower. Click/Impulse plays a sharp pop and records the response - "
                             "faster but more affected by background noise.");
 
     addAndMakeVisible(sweepDurationSlider); addAndMakeVisible(sweepDurLabel);

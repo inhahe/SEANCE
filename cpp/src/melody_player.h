@@ -33,7 +33,7 @@ public:
     // Enable/disable velocity sensitivity
     void setVelocitySensitive(bool v) { velocitySensitive = v; }
 
-    // Process incoming MIDI — replaces pitches with melody events
+    // Process incoming MIDI - replaces pitches with melody events
     // Returns the MIDI buffer to send to the instrument
     void processMidi(const juce::MidiBuffer& input, juce::MidiBuffer& output);
 

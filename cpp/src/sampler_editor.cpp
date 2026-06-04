@@ -121,7 +121,7 @@ SamplerEditorComponent::SamplerEditorComponent(NodeGraph& g, int nid, AudioEngin
     pitchMethodCombo.addItem("Pitch Shift (preserves speed)", 2);
     pitchMethodCombo.setSelectedId(1);
     pitchMethodCombo.setTooltip("How to play the sample at different MIDI note pitches. "
-                                "Resample is the classic 'tape speed' method — higher notes also play faster, lower notes play slower. "
+                                "Resample is the classic 'tape speed' method - higher notes also play faster, lower notes play slower. "
                                 "Pitch Shift uses time-stretching to change pitch without affecting playback speed (slower but more natural for melodic samples).");
     if (nd) {
         for (auto& p : nd->params)
@@ -355,7 +355,7 @@ void SamplerEditorComponent::paint(juce::Graphics& g) {
     } else {
         g.setColour(juce::Colours::grey);
         g.setFont(12.0f);
-        g.drawText("No sample loaded — click 'Load Sample' to import a .wav file",
+        g.drawText("No sample loaded - click 'Load Sample' to import a .wav file",
                    waveArea.toNearestInt(), juce::Justification::centred);
     }
 

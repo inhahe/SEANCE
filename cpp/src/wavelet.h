@@ -107,7 +107,7 @@ inline WaveletFilter getWaveletFilter(const std::string& name) {
 // coefficients at multiple levels.
 //
 // Input:  signal of length N (power of 2)
-// Output: coefficients in place — the vector is reordered so that:
+// Output: coefficients in place - the vector is reordered so that:
 //   [detail_level_L, ..., detail_level_1, approximation_level_L]
 // where L is the number of decomposition levels.
 // ==============================================================================
@@ -184,7 +184,7 @@ inline int dwtFull(std::vector<float>& signal, const WaveletFilter& filt) {
 }
 
 // ==============================================================================
-// Continuous Wavelet Transform (CWT) — for non-dyadic scale operations
+// Continuous Wavelet Transform (CWT) - for non-dyadic scale operations
 //
 // Unlike the DWT (which decomposes at dyadic scales 2^j only), the CWT
 // can analyze at arbitrary scales, making it suitable for pitch shifting
@@ -283,7 +283,7 @@ inline CWTResult cwt(const std::vector<float>& signal,
 
 // Inverse CWT (approximate reconstruction): sum weighted wavelets at
 // each scale. This is the standard admissibility-based reconstruction
-// formula. The result is an approximation — the CWT is redundant, so
+// formula. The result is an approximation - the CWT is redundant, so
 // perfect reconstruction requires additional normalization.
 inline std::vector<float> icwt(const CWTResult& result, float omega0 = 6.0f) {
     int N = result.numSamples;

@@ -399,7 +399,7 @@ float TriggerProcessor::evalShape(const ActiveShape& s, int64_t nowSample, bool&
             return s.restValue;
         }
         case TriggerShape::Curve: {
-            // Play through the curve points (time in ms → samples).
+            // Play through the curve points (time in ms -> samples).
             if (s.curvePoints.empty()) { expired = true; return s.restValue; }
             float tMs = t / (float)(sampleRate * 0.001);
             if (tMs <= s.curvePoints.front().timeMs) return s.curvePoints.front().value;
@@ -430,7 +430,7 @@ void TriggerProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::MidiBuf
 
     // 0. Audio-threshold triggers (#109): scan the audio input for level
     //    crossings and fire matching rules. The input audio arrives on
-    //    channel 0 (the MIDI In pin carries MIDI, but if an Audio→Signal
+    //    channel 0 (the MIDI In pin carries MIDI, but if an Audio->Signal
     //    cable is wired to an input it arrives on channel 2+; for
     //    threshold we read channel 0 which carries any summed audio).
     {
@@ -557,7 +557,7 @@ void TriggerProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::MidiBuf
 }
 
 // ============================================================================
-// TriggerEditorComponent — minimal editor
+// TriggerEditorComponent - minimal editor
 // ============================================================================
 //
 // Each rule row shows: target label + preset params inline + delete button.
@@ -710,7 +710,7 @@ TriggerEditorComponent::TriggerEditorComponent(NodeGraph& g, int nid, std::funct
         doc = TriggerDoc::defaultDoc();
 
     addAndMakeVisible(addMidiBtn);
-    addMidiBtn.setTooltip("Add a new MIDI rule — sends a MIDI note (transposed by some number of semitones) "
+    addMidiBtn.setTooltip("Add a new MIDI rule - sends a MIDI note (transposed by some number of semitones) "
                           "in response to incoming notes. Use to create harmonies, octave doubles, chords, etc.");
     addMidiBtn.onClick = [this]() {
         TriggerRule r;
@@ -722,7 +722,7 @@ TriggerEditorComponent::TriggerEditorComponent(NodeGraph& g, int nid, std::funct
     };
 
     addAndMakeVisible(addSignalBtn);
-    addSignalBtn.setTooltip("Add a new signal rule — generates a control signal (envelope, ramp, step) "
+    addSignalBtn.setTooltip("Add a new signal rule - generates a control signal (envelope, ramp, step) "
                             "triggered by incoming MIDI notes. Wire its Signal output into a synth parameter to modulate.");
     addSignalBtn.onClick = [this]() {
         TriggerRule r;
@@ -745,9 +745,9 @@ TriggerEditorComponent::TriggerEditorComponent(NodeGraph& g, int nid, std::funct
     wirePreset(presetVelFollowBtn, &TriggerDoc::presetVelocityFollower);
     presetOctaveBtn.setTooltip("Load a preset that doubles every incoming note one octave higher");
     presetChordBtn.setTooltip("Load a preset that turns each incoming note into a major chord (root, third, fifth)");
-    presetFlamBtn.setTooltip("Load a preset that adds a quick echo of each note ~30ms later — drum 'flam' effect");
-    presetPluckBtn.setTooltip("Load a preset that fires a short envelope on every note — useful as a pluck/percussion modulator");
-    presetVelFollowBtn.setTooltip("Load a preset that outputs a signal proportional to each note's velocity — drives parameters from how hard you play");
+    presetFlamBtn.setTooltip("Load a preset that adds a quick echo of each note ~30ms later - drum 'flam' effect");
+    presetPluckBtn.setTooltip("Load a preset that fires a short envelope on every note - useful as a pluck/percussion modulator");
+    presetVelFollowBtn.setTooltip("Load a preset that outputs a signal proportional to each note's velocity - drives parameters from how hard you play");
 
     addAndMakeVisible(helpBtn);
     helpBtn.setTooltip("Open the Trigger node docs");

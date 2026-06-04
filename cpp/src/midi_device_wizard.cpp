@@ -83,7 +83,7 @@ void MidiDeviceWizardComponent::rebuildList() {
         r.toggle = std::make_unique<juce::ToggleButton>(
             d.name + (r.alreadyAdded ? juce::String(" (already added)") : juce::String()));
         r.toggle->setEnabled(!r.alreadyAdded);
-        // MIDI devices default to UNCHECKED — a user might have many
+        // MIDI devices default to UNCHECKED - a user might have many
         // controllers plugged in and not want them all populating the
         // graph. They explicitly pick the ones they want.
         // (When audio I/O sections are added in Phase 2b/2c, the OS-
@@ -103,7 +103,7 @@ void MidiDeviceWizardComponent::rebuildList() {
         lbl->setBounds(0, 0, 480, 24);
         content.addAndMakeVisible(lbl);
         y = 30;
-        // leaks — acceptable for this one-shot case; dialog closes fast
+        // leaks - acceptable for this one-shot case; dialog closes fast
     }
     content.setSize(500, std::max(y, 30));
 }

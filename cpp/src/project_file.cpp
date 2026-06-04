@@ -12,7 +12,7 @@ std::string ProjectFile::currentPath;
 // Sections: [Project], [Node], [Pin], [Clip], [Note], [Link], [Param]
 //
 // All actual I/O goes through the stream-based writeProject/readProject
-// helpers — the path-based save()/load() are thin wrappers that open a file
+// helpers - the path-based save()/load() are thin wrappers that open a file
 // and delegate. The undo system (#84) reuses the same helpers against
 // std::ostringstream / std::istringstream to (de)serialize snapshots in
 // memory.
@@ -54,7 +54,7 @@ bool ProjectFile::writeProject(std::ostream& f, NodeGraph& graph, GraphProcessor
     }
     if (graph.projectSampleRate > 0)
         writeFloat(f, "projectSampleRate", (float)graph.projectSampleRate);
-    // Project-wide settings (#66) — tuning, concert pitch, crossfade.
+    // Project-wide settings (#66) - tuning, concert pitch, crossfade.
     if (graph.tuningSystem != TuningSystem::Equal12)
         writeInt(f, "tuningSystem", (int)graph.tuningSystem);
     if (std::abs(graph.concertPitch - 440.0f) > 0.01f)
@@ -135,7 +135,7 @@ bool ProjectFile::writeProject(std::ostream& f, NodeGraph& graph, GraphProcessor
         // only call getStateInformation when the cache is stale, otherwise
         // reuse the cached base64 string. This avoids the expensive query
         // for plugins whose parameters haven't changed since the last
-        // save — typical case is most plugins have nothing to re-query.
+        // save - typical case is most plugins have nothing to re-query.
         // ProjectFile::save (the user-facing save path, gp != nullptr) and
         // the slow autosave path both share this cache.
         if (gp && node.pluginIndex >= 0) {
@@ -687,7 +687,7 @@ bool ProjectFile::readProject(std::istream& f, NodeGraph& graph, PluginHost* plu
     // Restore nextId so new IDs don't conflict
     graph.setNextId(maxId + 1);
 
-    // Restore open editors (store IDs only — never store Node*)
+    // Restore open editors (store IDs only - never store Node*)
     graph.openEditors.clear();
     for (int id : pendingEditorIds) {
         if (graph.findNode(id))
@@ -729,7 +729,7 @@ bool ProjectFile::readProject(std::istream& f, NodeGraph& graph, PluginHost* plu
 }
 
 std::string ProjectFile::serializeForUndo(NodeGraph& graph) {
-    // Pass nullptr for the GraphProcessor so plugin state is omitted —
+    // Pass nullptr for the GraphProcessor so plugin state is omitted -
     // that's the expensive part and undo doesn't need it (plugin internal
     // state is captured separately by the slow autosave path, task #86).
     std::ostringstream oss;

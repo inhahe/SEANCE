@@ -38,7 +38,7 @@ public:
                        juce::AudioProcessorGraph& graph,
                        const std::unordered_map<int, juce::AudioProcessorGraph::NodeID>& nodeMap);
 
-    // CC mappings — thread-safe access
+    // CC mappings - thread-safe access
     void addCCMapping(const CCMapping& mapping);
     void removeCCMapping(int midiChannel, int ccNumber);
     void clearCCMappings();
@@ -55,7 +55,7 @@ public:
     // by the application; if unset, dirty marking is skipped.
     //
     // Only fires from applyValues (message-thread automation push), NOT
-    // from processMidiCC (audio thread — graph lookups would be unsafe
+    // from processMidiCC (audio thread - graph lookups would be unsafe
     // there). The autosave path's periodic "force-dirty all" pass catches
     // changes that processMidiCC made between automation passes.
     std::function<void(int nodeId)> onPluginParamChanged;

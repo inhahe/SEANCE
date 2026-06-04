@@ -16,7 +16,7 @@
 namespace SoundShop {
 
 // ==============================================================================
-// Terrain — N-dimensional sample data
+// Terrain - N-dimensional sample data
 // ==============================================================================
 
 void Terrain::init(const std::vector<int>& dimensions) {
@@ -82,7 +82,7 @@ void Terrain::fillFromExpression(const std::string& expr) {
     if (dims.empty() || data.empty()) return;
     int nd = (int)dims.size();
 
-    // Simple expression evaluator — reuse WaveExprParser approach
+    // Simple expression evaluator - reuse WaveExprParser approach
     // Variables: x (dim 0), y (dim 1), z (dim 2), w (dim 3), all in [0, 2*pi]
     // For higher dims, use numbered vars via the parser
 
@@ -247,7 +247,7 @@ void Terrain::fillFromSpectralExpression(const std::string& magExpr,
         else
             spectrum[k] = std::complex<float>(m * std::cos(p), m * std::sin(p));
     }
-    // Kill DC offset — it would produce a silent bias on playback.
+    // Kill DC offset - it would produce a silent bias on playback.
     spectrum[0] = 0.0f;
 
     FFT fft(n);
@@ -301,7 +301,7 @@ void Terrain::fillFractal(int size, int iterations, float decay) {
     int levels = dwt(sig, iterations, filt);
 
     // Replace each detail level's coefficients with a scaled, self-similar
-    // copy of the approximation level — creating fractal repetition across
+    // copy of the approximation level - creating fractal repetition across
     // scales. Each level decays by `decay` to produce a 1/f-like spectrum.
     int approxLen = size;
     for (int l = 0; l < levels; ++l) approxLen /= 2;
@@ -346,7 +346,7 @@ void Terrain::buildMipmaps(int maxLevels) {
         // One DWT step: splits into approximation (half) + detail (half).
         dwtStep(current, n, filt);
         n /= 2;
-        // The approximation is the first half — it's the low-pass filtered,
+        // The approximation is the first half - it's the low-pass filtered,
         // downsampled version (fewer harmonics, shorter table).
         std::vector<float> mip(current.begin(), current.begin() + n);
         // IDWT step to get the actual waveform (not coefficients).
@@ -399,7 +399,7 @@ void Terrain::fromWaveletBasis(int levels) {
 }
 
 // ==============================================================================
-// Traversal — maps time to N-dimensional coordinate
+// Traversal - maps time to N-dimensional coordinate
 // ==============================================================================
 
 std::vector<float> Traversal::evaluate(const TraversalParams& params, int numDims,
@@ -515,7 +515,7 @@ std::vector<float> Traversal::evaluate(const TraversalParams& params, int numDim
 }
 
 // ==============================================================================
-// EnvCurve — cached envelope shape table
+// EnvCurve - cached envelope shape table
 // ==============================================================================
 
 static constexpr int ENV_TABLE_SIZE = 256;
@@ -631,7 +631,7 @@ void TerrainSynthProcessor::reloadIfScriptChanged() {
     if (node.script == cachedScript) return;
     cachedScript = node.script;
 
-    // For now, only re-parse __layered__ scripts at runtime — other
+    // For now, only re-parse __layered__ scripts at runtime - other
     // script types (audio, image, wavetable) load files and don't
     // change during a session.
     if (node.script.find("__layered__:") == 0) {
@@ -656,7 +656,7 @@ TerrainSynthProcessor::TerrainSynthProcessor(Node& n, Transport& t) : node(n), t
     } else if (script.find("__audio__:") == 0) {
         terrain.fillFromAudioFile(script.substr(10));
     } else if (script.find("__layered__:") == 0) {
-        // Layered waveform — decode the layer list and sum into a 1D terrain.
+        // Layered waveform - decode the layer list and sum into a 1D terrain.
         // This is effectively a single-frame wavetable, so flag it as such so
         // the render loop uses cycle-based phase advancement instead of the
         // sample-based formula.
@@ -677,7 +677,7 @@ TerrainSynthProcessor::TerrainSynthProcessor(Node& n, Transport& t) : node(n), t
         isWavetable = true;
         wtFrameCount = 1;
     } else if (script.find("__wavetable__:") == 0) {
-        // N-dimensional wavetable — Grid mode builds an (N+1)-D terrain;
+        // N-dimensional wavetable - Grid mode builds an (N+1)-D terrain;
         // Scatter mode keeps frames in a flat list and computes a Wendland
         // RBF blend each block.
         WavetableDoc doc;
@@ -694,7 +694,7 @@ TerrainSynthProcessor::TerrainSynthProcessor(Node& n, Transport& t) : node(n), t
                 wtScatterFrameSamples.push_back(std::move(samples));
                 wtScatterFramePositions.push_back(sf.position);
             }
-            // 1D terrain — the per-block blend writes the active waveform
+            // 1D terrain - the per-block blend writes the active waveform
             // into terrain.data so the per-sample render path is unchanged.
             terrain.init({ts});
             wtScatter = true;
@@ -790,7 +790,7 @@ TerrainSynthProcessor::TerrainSynthProcessor(Node& n, Transport& t) : node(n), t
         std::string expr = script.empty() ? "sin(x)" : script;
 
         // Auto-detect dimensions from the expression:
-        // If it uses y, z, w → create higher-dimensional terrain
+        // If it uses y, z, w -> create higher-dimensional terrain
         bool usesY = expr.find('y') != std::string::npos;
         bool usesZ = expr.find('z') != std::string::npos;
         bool usesW = expr.find('w') != std::string::npos;
@@ -846,7 +846,7 @@ void TerrainSynthProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mi
     float release = getParam(3, 0.3f);
     float volume  = getParam(4, 0.5f);
 
-    // Traversal param modulation from node params — only override defaults
+    // Traversal param modulation from node params - only override defaults
     // for nodes that actually have these params. Slimmed synths leave them
     // at the constructor-set defaults so 1D playback works correctly.
     if ((int)node.params.size() > 11) {
@@ -1114,15 +1114,15 @@ void TerrainSynthProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mi
         // stays whatever traversal set and is then pitch-swept as usual.
         if (isWavetable) {
             // For wavetable playback the traversal must NOT modulate the
-            // phase axis — only v.phase (driven by note pitch) should sweep
+            // phase axis - only v.phase (driven by note pitch) should sweep
             // the wavetable. Otherwise the Linear traversal's beat-based
             // motion adds an unwanted slow modulation that sounds like noise.
             if (!coord.empty()) coord[0] = 0.0f;
-            // Scatter mode: terrain is 1D, blend already happened pre-loop —
+            // Scatter mode: terrain is 1D, blend already happened pre-loop -
             // nothing to write into coord[d+1] (would crash, no such dim).
             if (!wtScatter) {
                 // Set each Position dimension from named params.
-                // 1D: "Position" → coord[1]
+                // 1D: "Position" -> coord[1]
                 // ND: "Position 1"..."Position N"
                 if (wtNumDims == 1 && nd >= 2) {
                     coord[1] = juce::jlimit(0.0f, 1.0f, getParamByName(node, "Position", 0.0f));

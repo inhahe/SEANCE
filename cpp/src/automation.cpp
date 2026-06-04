@@ -18,7 +18,7 @@ void AutomationManager::applyValues(const std::vector<AutomationValue>& values,
         if (av.paramIdx >= 0 && av.paramIdx < (int)params.size()) {
             params[av.paramIdx]->setValue(av.value);
             // Mark this node's plugin state cache stale so the next slow
-            // autosave re-queries getStateInformation. Cheap callback —
+            // autosave re-queries getStateInformation. Cheap callback -
             // typically just sets an atomic flag.
             if (onPluginParamChanged) onPluginParamChanged(av.nodeId);
         }

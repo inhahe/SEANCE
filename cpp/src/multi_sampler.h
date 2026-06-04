@@ -24,7 +24,7 @@ namespace SoundShop {
 // Sampler used to do.
 //
 // Playback features:
-//   - Linear-interpolated pitch shift (source rate → triggered pitch)
+//   - Linear-interpolated pitch shift (source rate -> triggered pitch)
 //   - Per-zone loop region (start/end in source samples)
 //   - Polyphonic voice pool with ADSR envelope per voice
 //   - Multi-point volume envelope (if present, replaces ADSR decay)
@@ -50,7 +50,7 @@ struct SamplerEnvelope {
     int   loopEnd   = 0;
 
     // Evaluate at `t` seconds since note-on. `noteHeld` controls whether
-    // sustain/loop clamps are active — once the note is released, the
+    // sustain/loop clamps are active - once the note is released, the
     // envelope runs from its current position to the end without looping.
     float evaluate(float t, bool noteHeld) const;
 
@@ -79,9 +79,9 @@ struct MultiSamplerZone {
 
 // Interpolation quality for sample playback.
 enum class InterpMode {
-    Linear = 0,   // 2-point linear — authentic tracker sound, some aliasing
-    Cubic  = 1,   // 4-point Catmull-Rom — good balance
-    Sinc   = 2,   // 8-point Lanczos-4 — highest quality, least aliasing
+    Linear = 0,   // 2-point linear - authentic tracker sound, some aliasing
+    Cubic  = 1,   // 4-point Catmull-Rom - good balance
+    Sinc   = 2,   // 8-point Lanczos-4 - highest quality, least aliasing
 };
 
 struct MultiSamplerDoc {
@@ -109,7 +109,7 @@ struct MultiSamplerDoc {
     // the authentic tracker sound.
     InterpMode interpMode = InterpMode::Sinc;
 
-    // Amiga-style output lowpass — emulates the PAULA chip's analog
+    // Amiga-style output lowpass - emulates the PAULA chip's analog
     // reconstruction filter that all MOD-era trackers rendered through.
     // When on, a 4-pole Butterworth LP is applied to the post-mix output
     // at amigaFilterHz.  Default is off (modern instruments); MOD/S3M
@@ -117,11 +117,11 @@ struct MultiSamplerDoc {
     // Winamp's reference output spectrum (brick-wall rolloff ~5-7 kHz).
     // Without this filter, sample playback above the source's Nyquist
     // produces aliased high-frequency content that the reference doesn't
-    // have — the audible "texture" mismatch.
+    // have - the audible "texture" mismatch.
     bool  amigaFilter   = false;
     float amigaFilterHz = 5500.0f;
 
-    // NOTE: global Volume and Pan are NOT part of the doc — they live on
+    // NOTE: global Volume and Pan are NOT part of the doc - they live on
     // the node as real Params (node.params) so automation lanes and
     // signal cables can target them. The processor reads them via
     // getParamByName at block time.
@@ -155,7 +155,7 @@ public:
     // note-off.  Derived from the doc, not a magic constant:
     //   - ADSR path: just doc.release.
     //   - Multi-point volumeEnv: time from sustainEnd to last envelope
-    //     point, plus the release fade — matches the voice-kill condition
+    //     point, plus the release fade - matches the voice-kill condition
     //     in processBlock (timeHeld >= points.back().time + doc.release).
     double getTailLengthSeconds() const override {
         double t = (double) doc.release;

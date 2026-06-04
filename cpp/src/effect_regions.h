@@ -16,7 +16,7 @@ namespace SoundShop {
 // Tier 1: 20 maximally distinct (Trubetskoy). Tier 2: 10 less-distinct
 // variants. Beyond that, getDistinctColor() generates deterministic
 // pseudo-random colors using the golden-angle hue walk, so there's never
-// a hard limit — just diminishing distinctiveness.
+// a hard limit - just diminishing distinctiveness.
 inline const uint32_t kFixedPalette[] = {
     // Tier 1: 20 maximally distinct (alpha 0xFF prefix)
     0xFFE6194B, // red
@@ -69,7 +69,7 @@ inline uint32_t getDistinctColor(int index) {
     float sat = (k % 2 == 0) ? 0.7f : 0.5f;
     float lit = (k % 3 == 0) ? 0.55f : (k % 3 == 1) ? 0.40f : 0.70f;
 
-    // HSL → RGB (simplified)
+    // HSL -> RGB (simplified)
     auto hueToRgb = [](float p, float q, float t) -> float {
         if (t < 0.0f) t += 1.0f;
         if (t > 1.0f) t -= 1.0f;
@@ -90,12 +90,12 @@ inline uint32_t getDistinctColor(int index) {
 }
 
 // ==============================================================================
-// Effect Groups — bundles of links that activate/deactivate together
+// Effect Groups - bundles of links that activate/deactivate together
 // ==============================================================================
 
 struct EffectGroup {
     int id = 0;
-    std::string name;       // optional — empty = identified by color/shape only
+    std::string name;       // optional - empty = identified by color/shape only
     uint32_t color = 0;     // ARGB, auto-assigned from palette if 0
     std::vector<int> linkIds; // which Link IDs belong to this group
     // Per-group crossfade override. 0 = inherit NodeGraph::globalCrossfadeSec.
@@ -105,7 +105,7 @@ struct EffectGroup {
 };
 
 // ==============================================================================
-// Effect Regions — time-bounded activation of a link or group on a track
+// Effect Regions - time-bounded activation of a link or group on a track
 // ==============================================================================
 
 struct EffectRegion {

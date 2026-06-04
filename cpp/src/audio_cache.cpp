@@ -151,7 +151,7 @@ bool AudioCacheManager::isCacheValid(Node& node, const NodeGraph& graph) {
     if (node.cache.valid && node.cache.inputHash == newHash)
         return true;
 
-    // Hash changed — invalidate
+    // Hash changed - invalidate
     node.cache.inputHash = newHash;
     node.cache.valid = false;
     return false;

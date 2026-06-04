@@ -37,7 +37,7 @@ struct PianoRollState {
     float emptyClickBeat = 0;
     int emptyClickPitch = 0;
 
-    // Key/mode/scale — each stores its own last-selected value
+    // Key/mode/scale - each stores its own last-selected value
     int keyRoot = 0;
     std::string activeCategory = "key"; // which one is active: "key", "mode", "scale"
     std::string keyName = "Major";
@@ -50,7 +50,7 @@ struct PianoRollState {
         return scaleName;
     }
 
-    // Compact mode — hides toolbar, everything via context menus
+    // Compact mode - hides toolbar, everything via context menus
     bool compactMode = false;
 
     // Focused clip (for per-clip key display and editing)
@@ -60,7 +60,7 @@ struct PianoRollState {
     bool showDetectResults = false;
     std::vector<MusicTheory::KeyMatch> detectResults;
 
-    // Audition — keys being previewed by clicking the piano column
+    // Audition - keys being previewed by clicking the piano column
     struct AuditionNote {
         int pitch = -1;
         double startTime = 0;   // ImGui time when pressed

@@ -28,7 +28,7 @@ public:
         bool muted = currentlyMuted();
         muteFader.setCrossfadeDuration(graph.globalCrossfadeSec);
         muteFader.setTarget(muted ? 0.0f : 1.0f);
-        // Drop MIDI as soon as the user mutes — we don't want new note-ons
+        // Drop MIDI as soon as the user mutes - we don't want new note-ons
         // arriving during the fade-out tail. Audio fades out naturally.
         if (muted) midi.clear();
         muteFader.process(buf);
@@ -37,7 +37,7 @@ public:
         // Peak metering (#99): scan the post-mute buffer for this block's
         // peak and write it atomically. The UI reads these at 30 Hz to
         // draw meter bars. We capture at PanProcessor because it's the
-        // last processor in the per-node chain before routing — so the
+        // last processor in the per-node chain before routing - so the
         // meter shows exactly what leaves the node after pan and mute.
         {
             float pkL = 0, pkR = 0;
@@ -68,7 +68,7 @@ public:
 
         float gainL, gainR;
         if (node.panLaw == PanLaw::Linear) {
-            // Linear pan law — used by tracker imports (MOD/IT/S3M/XM)
+            // Linear pan law - used by tracker imports (MOD/IT/S3M/XM)
             // where per-channel default pans are typically hard L/R and
             // the level reference is "channel at full amplitude when
             // hard-panned, half on each when centered".
@@ -77,9 +77,9 @@ public:
             // tracker output level stays parity with the historical
             // (EqualPower) rendering:
             //
-            //   p=-1 → L=sqrt(2)  R=0          (hard L, matches EqualPower)
-            //   p= 0 → L=0.707    R=0.707      (center, -3 dB per channel)
-            //   p=+1 → L=0        R=sqrt(2)    (hard R, matches EqualPower)
+            //   p=-1 -> L=sqrt(2)  R=0          (hard L, matches EqualPower)
+            //   p= 0 -> L=0.707    R=0.707      (center, -3 dB per channel)
+            //   p=+1 -> L=0        R=sqrt(2)    (hard R, matches EqualPower)
             //
             // An earlier version of this code scaled by 2 so that center
             // came out unity; that pushed hard-pan to +6 dB and made MOD
@@ -139,7 +139,7 @@ private:
     AudioCrossfader muteFader;
 
     // True iff this node is muted directly OR muted because some other node
-    // is soloed and we're not. Recomputed every block — solo state changes
+    // is soloed and we're not. Recomputed every block - solo state changes
     // come from the UI thread, so re-checking is cheap and avoids stale state.
     bool currentlyMuted() const {
         if (node.muted) return true;

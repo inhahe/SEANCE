@@ -49,7 +49,7 @@ static PyObject* py_get_node_names(PyObject*, PyObject*) {
     return list;
 }
 
-// Get node by index or name — returns dict with node info
+// Get node by index or name - returns dict with node info
 static PyObject* py_get_node(PyObject*, PyObject* args) {
     int idx = -1;
 
@@ -220,7 +220,7 @@ static PyObject* py_map_cc(PyObject*, PyObject* args) {
     float minVal = 0.0f, maxVal = 1.0f;
     if (!PyArg_ParseTuple(args, "iiii|ff", &midiCh, &ccNum, &nodeIdx, &paramIdx, &minVal, &maxVal))
         return nullptr;
-    // Store mapping — will be applied through automation manager
+    // Store mapping - will be applied through automation manager
     // For now, print confirmation
     fprintf(stderr, "CC mapping: ch%d cc%d -> node %d param %d [%.2f-%.2f]\n",
             midiCh, ccNum, nodeIdx, paramIdx, minVal, maxVal);
@@ -233,7 +233,7 @@ static PyObject* py_get_bpm(PyObject*, PyObject*) {
     return PyFloat_FromDouble(g_currentGraph->bpm);
 }
 
-// Find node by name — returns index, or list of indices if multiple match
+// Find node by name - returns index, or list of indices if multiple match
 static PyObject* py_find_node(PyObject*, PyObject* args) {
     const char* name;
     if (!PyArg_ParseTuple(args, "s", &name)) return nullptr;

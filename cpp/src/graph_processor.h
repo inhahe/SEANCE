@@ -48,7 +48,7 @@ private:
     MpeChannel mpeChannels[kMpeChannels];
     int nextMpeChannel = 0;
 
-    bool wasPlaying = false;   // detects playing→stopped transition for note-off
+    bool wasPlaying = false;   // detects playing->stopped transition for note-off
 
     int allocMpeChannel(int ci, int ni, int pitch);
     void freeMpeChannel(int ci, int ni);
@@ -57,7 +57,7 @@ private:
                         const NoteExpression& expr, float beatInNote, int sampleOffset);
 };
 
-// Wraps an audio timeline node — plays audio file clips
+// Wraps an audio timeline node - plays audio file clips
 class AudioTimelineProcessor : public juce::AudioProcessor {
 public:
     AudioTimelineProcessor(Node& node, Transport& transport, NodeGraph& graph);
@@ -161,7 +161,7 @@ private:
     // Map our node IDs to JUCE graph node IDs.
     // nodeMap stores the OUTPUT side: the JUCE node that downstream connections
     // should pull audio FROM. For nodes with a pan inserted after them, this is
-    // the pan node — pan is where the chain ends.
+    // the pan node - pan is where the chain ends.
     // nodeInputMap stores the INPUT side: the JUCE node that upstream connections
     // should push audio/MIDI INTO. For nodes with a pan, this is the original
     // processor (not the pan), so MIDI events actually reach the synth.

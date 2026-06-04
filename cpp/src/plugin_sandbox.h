@@ -24,17 +24,17 @@ namespace SoundShop {
 // Architecture:
 //   Host process:
 //     SandboxedPluginProxy (AudioProcessor) ← sits in the JUCE graph
-//       → writes audio+MIDI to shared memory
-//       → reads processed audio from shared memory
-//       → monitors child process health
+//       -> writes audio+MIDI to shared memory
+//       -> reads processed audio from shared memory
+//       -> monitors child process health
 //
 //   Child process (SEANCE.exe --plugin-sandbox <pipe-name>):
 //     PluginSandboxChild
-//       → loads the actual VST3/AU plugin
-//       → reads audio+MIDI from shared memory
-//       → processes through the plugin
-//       → writes output to shared memory
-//       → hosts the plugin's editor window
+//       -> loads the actual VST3/AU plugin
+//       -> reads audio+MIDI from shared memory
+//       -> processes through the plugin
+//       -> writes output to shared memory
+//       -> hosts the plugin's editor window
 //
 // If the child process crashes, the proxy detects it (pipe disconnect
 // or process exit), logs the error, and outputs silence. The user can

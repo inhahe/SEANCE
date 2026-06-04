@@ -32,7 +32,7 @@ void AudioEngine::init() {
     auto result = deviceManager->initialiseWithDefaultDevices(1, 2);
     if (result.isNotEmpty()) {
         fprintf(stderr, "Audio device init warning: %s\n", result.toRawUTF8());
-        // Continue anyway — might work with different settings
+        // Continue anyway - might work with different settings
     }
 
     auto* device = deviceManager->getCurrentAudioDevice();
@@ -177,7 +177,7 @@ void AudioEngine::audioDeviceIOCallbackWithContext(
     // Grab incoming hardware MIDI events (with per-event source identifier)
     // and route each one to the matching MidiInput node in the graph.
     //
-    //  1. Apply any user-learned CC mappings to their target params — always
+    //  1. Apply any user-learned CC mappings to their target params - always
     //     runs regardless of routing (via processMidiCC on a MidiBuffer copy).
     //  2. For each event, find the MidiInput node whose midiInputSourceId
     //     matches the source device's identifier and push the event into
@@ -206,7 +206,7 @@ void AudioEngine::audioDeviceIOCallbackWithContext(
             };
 
             for (auto& [id, msg] : events) {
-                // Skip trained CCs — they're already handled by the CC
+                // Skip trained CCs - they're already handled by the CC
                 // mapping pass above; forwarding them would double-apply.
                 if (msg.isController() &&
                     isCCMapped(msg.getChannel(), msg.getControllerNumber()))
@@ -227,12 +227,12 @@ void AudioEngine::audioDeviceIOCallbackWithContext(
     }
 
     // Apply the project-wide Song Length + Song Repeat policy. The user-
-    // region loop above takes precedence (it's an inner A-B cycler — the
+    // region loop above takes precedence (it's an inner A-B cycler - the
     // user's immediate intent to cycle a section), so this branch only
     // runs when no user loop was applied during this block.
     //
     // For SongRepeat::None and the final iteration of ::NTimes, we don't
-    // halt immediately — that would cut reverbs, delays, and release
+    // halt immediately - that would cut reverbs, delays, and release
     // tails.  Instead we enter a "tail grace" countdown: keep processing
     // (the playhead stays at the song end, no new clips trigger) until
     // the max per-node tail has elapsed, then truly stop.
@@ -240,7 +240,7 @@ void AudioEngine::audioDeviceIOCallbackWithContext(
         if (!graph || !playing.load()) return;
         // effectiveSongLengthBeats() returns the explicit songLengthBeats if
         // set, else auto-derives from the latest clip across all timeline
-        // nodes. 0 means "no end" — project has no clips, just play until
+        // nodes. 0 means "no end" - project has no clips, just play until
         // the user hits Stop.
         double endBeat = graph->effectiveSongLengthBeats();
         if (endBeat <= 0) return;
@@ -266,7 +266,7 @@ void AudioEngine::audioDeviceIOCallbackWithContext(
             double tailSec = computeMaxGraphTailSeconds();
             endTailSamplesRemaining = (int64_t)(tailSec * transport->sampleRate);
             if (endTailSamplesRemaining <= 0) {
-                // No tail anywhere in the graph — halt now.
+                // No tail anywhere in the graph - halt now.
                 playing = false;
                 endTailSamplesRemaining = -1;
             }
@@ -294,7 +294,7 @@ void AudioEngine::audioDeviceIOCallbackWithContext(
     };
 
     if (!needsResample) {
-        // Same rate — no resampling needed
+        // Same rate - no resampling needed
         graphProcessor.processBlock(*graph, *transport,
                                      outputChannelData, numOutputChannels, numSamples);
         if (playing.load()) {
@@ -379,7 +379,7 @@ void AudioEngine::audioDeviceIOCallbackWithContext(
 
     // Always-on output capture: every playback is captured so the Output
     // node's cache can be populated on Stop. The buffer auto-clears when a
-    // new playback starts (captureL is empty → fresh start). Only appends
+    // new playback starts (captureL is empty -> fresh start). Only appends
     // while the transport is playing, so there's no dead space.
     {
         bool isPlaying = playing.load();
@@ -526,7 +526,7 @@ void AudioEngine::handleIncomingMidiMessage(juce::MidiInput* source, const juce:
 
     // Buffer the message along with its source device identifier so the
     // audio thread can route it to the matching MidiInput node safely.
-    // We can't iterate graph->nodes from the MIDI thread — the graph may
+    // We can't iterate graph->nodes from the MIDI thread - the graph may
     // be mutated from the UI/audio thread concurrently.
     if (source) {
         const juce::ScopedLock sl(midiLock);
@@ -564,10 +564,10 @@ void AudioEngine::recordParamChange(int nodeId, int paramIdx, float value) {
 
 // Find the "Computer Keyboard" MidiInput node in the graph, if any. Used to
 // push typing-MIDI events into its per-node queue so they flow out through
-// the cable wired from the node — matching the Phase 1 architecture where
+// the cable wired from the node - matching the Phase 1 architecture where
 // routing is done purely via graph cables, not flags. Returns nullptr if
 // no such node exists (e.g. on an old project that predates the MidiInput
-// node type — typing events will be silently dropped in that case, and
+// node type - typing events will be silently dropped in that case, and
 // loading the project offers an upgrade path by adding the node manually).
 static Node* findComputerKeyboardInputNode(NodeGraph* g) {
     if (!g) return nullptr;
@@ -596,7 +596,7 @@ void AudioEngine::keyboardNoteOff(int midiNote) {
 }
 
 // ==============================================================================
-// Output Capture — record the final mix to memory
+// Output Capture - record the final mix to memory
 // ==============================================================================
 
 void AudioEngine::stop() {
@@ -624,8 +624,8 @@ void AudioEngine::stop() {
 }
 
 void AudioEngine::startOutputCapture() {
-    // Arm capture — actual recording starts when transport plays.
-    // Clear previous capture so the next Play→Stop produces a clean buffer.
+    // Arm capture - actual recording starts when transport plays.
+    // Clear previous capture so the next Play->Stop produces a clean buffer.
     captureL.clear();
     captureR.clear();
     // Reserve ~60 seconds to reduce audio-thread reallocs.

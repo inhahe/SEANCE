@@ -47,9 +47,9 @@ ConvolutionEditorComponent::ConvolutionEditorComponent(NodeGraph& g, int nid,
     setupSlider(delaySlider,     delayLbl,     "Delay:",       1,  2000,  200,  " ms");
     setupSlider(feedbackSlider,  fbLbl,        "Feedback:",    0,  0.99,  0.5,  "");
     setupSlider(echoCountSlider, echoLbl,      "Echoes:",      1,  20,    4,    "");
-    cutoffSlider.setTooltip("Cutoff frequency in Hz — for Lowpass: keeps frequencies below this; "
+    cutoffSlider.setTooltip("Cutoff frequency in Hz - for Lowpass: keeps frequencies below this; "
                             "for Highpass: keeps frequencies above this; for Bandpass: center frequency");
-    orderSlider.setTooltip("Filter steepness — higher values make the filter cut frequencies more sharply at the cutoff. "
+    orderSlider.setTooltip("Filter steepness - higher values make the filter cut frequencies more sharply at the cutoff. "
                            "Low values give a gentle slope, high values give a brick-wall.");
     bandwidthSlider.setTooltip("Bandwidth in Hz around the center frequency (Bandpass only). Wider = lets through more of the spectrum.");
     delaySlider.setTooltip("Time between echo repeats in milliseconds (Echo preset only)");
@@ -69,9 +69,9 @@ ConvolutionEditorComponent::ConvolutionEditorComponent(NodeGraph& g, int nid,
     // freehand (per-sample direct drawing). Control points is the default.
     addAndMakeVisible(modePointsBtn);
     addAndMakeVisible(modeFreehandBtn);
-    modePointsBtn.setTooltip("Control points mode — drag a few smooth control points to shape the impulse response. "
+    modePointsBtn.setTooltip("Control points mode - drag a few smooth control points to shape the impulse response. "
                              "Easier for clean curves; the editor smooths between points.");
-    modeFreehandBtn.setTooltip("Freehand mode — draw the impulse response sample by sample with the mouse. "
+    modeFreehandBtn.setTooltip("Freehand mode - draw the impulse response sample by sample with the mouse. "
                                "Useful for sharp transients or non-smooth shapes.");
     modePointsBtn.setClickingTogglesState(true);
     modeFreehandBtn.setClickingTogglesState(true);
@@ -399,7 +399,7 @@ void ConvolutionEditorComponent::mouseDrag(const juce::MouseEvent& e) {
 
     if (drawMode == DrawMode::Freehand) {
         // Draw a continuous line by filling every sample between the last
-        // drawn position and the current one — otherwise fast mouse motion
+        // drawn position and the current one - otherwise fast mouse motion
         // leaves gaps.
         int n = (int)ir.size();
         int idx = (int)std::round(screenXToSampleIdx(e.position.x, area));
@@ -501,13 +501,13 @@ void ConvolutionEditorComponent::paint(juce::Graphics& g) {
     float pxPerSample = (nSamples > 0) ?
         irArea.getWidth() / std::max(1.0f, visibleSpan) : 1.0f;
 
-    // Label — shows current zoom + freehand hint when zoomed in enough
+    // Label - shows current zoom + freehand hint when zoomed in enough
     g.setColour(juce::Colours::white.withAlpha(0.6f));
     g.setFont(10.0f);
     juce::String modeStr = (drawMode == DrawMode::Freehand) ? "Freehand" : "Points";
     juce::String label = "IR: " + juce::String(nSamples) + " samples"
-                       + "  —  " + modeStr
-                       + "  —  Ctrl+wheel to zoom (" + juce::String(zoomX, 1) + "x), wheel to scroll";
+                       + "  -  " + modeStr
+                       + "  -  Ctrl+wheel to zoom (" + juce::String(zoomX, 1) + "x), wheel to scroll";
     g.drawText(label, irArea.reduced(4, 2).toNearestInt(), juce::Justification::topLeft);
 
     // Draw sample-boundary grid when zoomed in enough that each sample is
@@ -521,7 +521,7 @@ void ConvolutionEditorComponent::paint(juce::Graphics& g) {
         }
     }
 
-    // Draw IR curve — only the visible portion, and as discrete stems +
+    // Draw IR curve - only the visible portion, and as discrete stems +
     // dots when zoomed in enough so individual samples are legible.
     if (!ir.empty()) {
         bool showSamples = pxPerSample >= 5.0f;

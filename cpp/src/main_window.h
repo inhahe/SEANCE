@@ -55,7 +55,7 @@ public:
     void openHelpDoc(const juce::String& docRelativePath);
     void openProject();
     // onSaved fires after a successful save (sync if a current path exists,
-    // async after the file chooser if not). Cancelled file chooser → never
+    // async after the file chooser if not). Cancelled file chooser -> never
     // fires. Used by tryQuit() to defer the actual app exit until the save
     // round-trip completes.
     void saveProject(std::function<void()> onSaved = {});
@@ -90,10 +90,10 @@ private:
     // Transport bar components
     juce::TextButton playBtn{"Play"}, stopBtn{"Stop"}, recordBtn{"Play & Record"};
     juce::TextButton fitAllBtn{"Fit All"};
-    juce::TextButton metroBtn{"Metro"};
+    juce::TextButton metroBtn{"Metronome"};
     juce::TextButton loopBtn{"Loop"};
     juce::TextButton songBtn{"Song"};
-    juce::TextButton monitorBtn{"Mon"};
+    juce::TextButton monitorBtn{"Monitor"};
     juce::ComboBox timeSigCombo;
     juce::Label timeSigLabel;
     juce::Label positionLabel;
@@ -104,13 +104,13 @@ private:
     juce::TextButton captureBtn{"Capture"};
     juce::TextButton keyboardMidiBtn{"Keys"};
 
-    // Computer keyboard → MIDI mapping
+    // Computer keyboard -> MIDI mapping
     int keyToMidiNote(int keyCode) const;
     bool handleKeyboardMidi(const juce::KeyPress& key, bool isDown);
 
     // Bounce: offline-render the entire project and create an Audio Timeline node.
     void bounceToAudioTrack();
-    // Create audio track from the Output node's cache (instant — no re-render).
+    // Create audio track from the Output node's cache (instant - no re-render).
     void createAudioTrackFromOutputCache(Node& outputNode);
 
     // Real-time capture helpers (still available for arm-and-capture workflow)
@@ -178,11 +178,11 @@ private:
     // user's app-data folder and gets rewritten every autosaveIntervalSeconds
     // while the project is dirty. On a clean save or "Don't Save" quit the
     // file is deleted. On startup, if the file still exists we offer to
-    // recover it — meaning the app quit uncleanly (crash, power loss, kill).
+    // recover it - meaning the app quit uncleanly (crash, power loss, kill).
     bool autosaveEnabled = true;
     int autosaveIntervalSeconds = 60;
     // juce::Time::getMillisecondCounterHiRes() snapshot of the last attempt.
-    // 0 means "never attempted this session" — first tick defers by the full
+    // 0 means "never attempted this session" - first tick defers by the full
     // interval so we don't autosave within the first second of opening.
     double lastAutosaveAttemptMs = 0.0;
     bool autosaveRecoveryOffered = false; // gate so we only prompt once

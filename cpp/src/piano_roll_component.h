@@ -98,7 +98,7 @@ private:
     void showNoteMenu();
     void showEmptyMenu();
 
-    // Clipboard (static — shared across all piano roll instances)
+    // Clipboard (static - shared across all piano roll instances)
     struct ClipboardNote {
         float offsetFromFirst; // beat offset relative to the earliest copied note
         int pitch;
@@ -109,7 +109,7 @@ private:
     };
     static std::vector<ClipboardNote> clipboard;
 
-    // Clip-level clipboard (static — shared across all piano rolls)
+    // Clip-level clipboard (static - shared across all piano rolls)
     static std::unique_ptr<Clip> clipClipboard;
     void copyClipAtCursor();
     void pasteClipAtCursor();
@@ -130,7 +130,7 @@ private:
     static constexpr int SCROLLBAR_SIZE = 20;
 
     // Audition tracking
-    std::map<int, double> auditionKeys; // pitch → time started
+    std::map<int, double> auditionKeys; // pitch -> time started
 
     // Toolbar
     juce::TextButton compactBtn{"--"}, closeBtn{"X"};

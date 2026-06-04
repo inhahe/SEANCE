@@ -12,7 +12,7 @@ namespace SoundShop {
 // wires to reinforce that they're separate connections.
 //
 // The horizontal axis matches the piano rolls below (same beat range
-// and scroll). Collapsible — hidden when no link gates exist.
+// and scroll). Collapsible - hidden when no link gates exist.
 class RoutingStrip : public juce::Component {
 public:
     RoutingStrip(NodeGraph& graph, Transport& transport);
@@ -25,7 +25,7 @@ public:
     void setHorizontalView(float scrollBeat, float visibleBeats, float totalBeats, float gridX);
 
     // Returns the desired height based on how many gated links exist.
-    // Returns 0 if no link gates → the strip should be hidden.
+    // Returns 0 if no link gates -> the strip should be hidden.
     int getDesiredHeight() const;
 
 private:

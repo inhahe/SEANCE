@@ -17,7 +17,7 @@ public:
     // Generate a single click (impulse)
     static std::vector<float> generateClick(double sampleRate, float durationSec = 0.001f);
 
-    // Generate a logarithmic sine sweep (20 Hz → 20 kHz)
+    // Generate a logarithmic sine sweep (20 Hz -> 20 kHz)
     static std::vector<float> generateSweep(double sampleRate, float durationSec = 3.0f);
 
     // Generate the inverse sweep filter for deconvolution

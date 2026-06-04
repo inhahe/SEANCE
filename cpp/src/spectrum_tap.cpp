@@ -5,7 +5,7 @@
 namespace SoundShop {
 
 // ==============================================================================
-// SpectrumTapProcessor — inline audio passthrough + frequency bin analysis
+// SpectrumTapProcessor - inline audio passthrough + frequency bin analysis
 // ==============================================================================
 
 SpectrumTapProcessor::SpectrumTapProcessor(Node& n) : node(n) {}
@@ -68,11 +68,11 @@ void SpectrumTapProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mid
                 node.params[paramIdx].value = std::min(1.0f, amp * 4.0f); // scale for visibility
         }
     }
-    // Audio passes through unchanged — no modification to buf
+    // Audio passes through unchanged - no modification to buf
 }
 
 // ==============================================================================
-// SpectrumTapComponent — UI for managing bins and viewing levels
+// SpectrumTapComponent - UI for managing bins and viewing levels
 // ==============================================================================
 
 SpectrumTapComponent::SpectrumTapComponent(NodeGraph& g, int nid)
@@ -80,7 +80,7 @@ SpectrumTapComponent::SpectrumTapComponent(NodeGraph& g, int nid)
 {
     addAndMakeVisible(addBinBtn);
     addBinBtn.setTooltip("Add a new frequency band to monitor. Each bin outputs an amplitude signal you can use "
-                         "to drive other parameters — useful for spectrum-following effects, vocoder-like routing, etc.");
+                         "to drive other parameters - useful for spectrum-following effects, vocoder-like routing, etc.");
     addBinBtn.onClick = [this]() {
         auto* nd = graph.findNode(nodeId);
         if (!nd) return;
@@ -108,7 +108,7 @@ juce::Rectangle<float> SpectrumTapComponent::getSpectrumArea() const {
 
 float SpectrumTapComponent::hzToX(float hz) const {
     auto area = getSpectrumArea();
-    // Log scale: 20 Hz → left edge, 20000 Hz → right edge
+    // Log scale: 20 Hz -> left edge, 20000 Hz -> right edge
     float logMin = std::log2(20.0f);
     float logMax = std::log2(20000.0f);
     float logHz = std::log2(std::max(20.0f, hz));
@@ -289,7 +289,7 @@ void SpectrumTapComponent::paint(juce::Graphics& g) {
     // Title
     g.setColour(juce::Colours::white.withAlpha(0.7f));
     g.setFont(12.0f);
-    g.drawText("Spectrum Tap — click to drag bins, right-click to delete, edges to resize",
+    g.drawText("Spectrum Tap - click to drag bins, right-click to delete, edges to resize",
                getLocalBounds().reduced(120, 6).removeFromTop(24),
                juce::Justification::centredLeft);
 }

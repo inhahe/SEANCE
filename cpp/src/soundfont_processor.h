@@ -92,7 +92,7 @@ public:
     void getStateInformation(juce::MemoryBlock&) override {}
     void setStateInformation(const void*, int) override {}
 
-    // Get preset names (SF2 only — SF2 files contain multiple presets)
+    // Get preset names (SF2 only - SF2 files contain multiple presets)
     std::vector<std::string> getPresetNames() const;
     int getCurrentPreset() const { return currentPreset; }
     void setPreset(int idx);

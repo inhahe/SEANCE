@@ -8,7 +8,7 @@
 namespace SoundShop {
 
 // ============================================================================
-// MIDI Modulator — "signal + MIDI -> MIDI" node.
+// MIDI Modulator - "signal + MIDI -> MIDI" node.
 //
 // Takes one MIDI input and N user-configurable Signal inputs; each signal
 // modulates some attribute of the passing MIDI stream. Each input has a
@@ -94,7 +94,7 @@ private:
 };
 
 // ============================================================================
-// Editor — small dialog for configuring rules + signal input count
+// Editor - small dialog for configuring rules + signal input count
 // ============================================================================
 
 class MidiModEditorComponent : public juce::Component {

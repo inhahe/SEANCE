@@ -11,7 +11,7 @@ namespace SoundShop {
 // ==============================================================================
 //
 // Everything in tracker files is little-endian. We work on a std::vector<uint8_t>
-// loaded into memory up front — files are small (a few MB max) so streaming
+// loaded into memory up front - files are small (a few MB max) so streaming
 // isn't worth the complexity.
 
 namespace {
@@ -88,7 +88,7 @@ static std::string trimTrackerString(const char* s, size_t maxLen) {
 // Parse a single IT envelope from the current reader position. IT
 // envelope headers are 82 bytes each:
 //
-//   [0]     flags   — bit0 enabled, bit1 loop, bit2 sustain loop,
+//   [0]     flags   - bit0 enabled, bit1 loop, bit2 sustain loop,
 //                     bit7 (pitch env only) = filter env
 //   [1]     num_nodes
 //   [2]     loop_start
@@ -168,7 +168,7 @@ static bool parseITFile(Reader& r, ParsedTrackerFile& out) {
     for (uint32_t i = 0; i < patNum; ++i) r.u32();
 
     // MIDI macro configuration: present if bit 3 of the "Special" header
-    // field is set. It sits right after the offset tables — i.e. here.
+    // field is set. It sits right after the offset tables - i.e. here.
     // Layout: 16 × 32-byte SF macros + 128 × 32-byte Z macros = 4608 bytes.
     if ((special & 0x08) && r.ok(4608)) {
         out.hasMidiMacros = true;
@@ -346,7 +346,7 @@ static bool parseXMFile(Reader& r, ParsedTrackerFile& out) {
     //   [2]  numSamples
     //   [if numSamples > 0]:
     //       [4] sampleHeaderSize
-    //       [96] sampleMap (note→sample)
+    //       [96] sampleMap (note->sample)
     //       [48] volume envelope
     //       [48] pan envelope
     //       [1] numVolumePoints
@@ -451,7 +451,7 @@ static bool parseXMFile(Reader& r, ParsedTrackerFile& out) {
                 r.seek(r.tell() + sampleLens[s]);
             }
         } else {
-            // No samples — advance past the instrument header block.
+            // No samples - advance past the instrument header block.
             r.seek(instStart + instSize);
         }
 
@@ -473,7 +473,7 @@ ParsedTrackerFile parseTrackerFile(const std::string& path) {
 
     // Dispatch by file signature. IT files begin with "IMPM", XM files
     // with the literal "Extended Module: " string. Other formats (MOD,
-    // S3M, mo3-packed, etc.) aren't supported yet — we return
+    // S3M, mo3-packed, etc.) aren't supported yet - we return
     // format=Unknown so the caller falls back to sample-mode import.
     if (r.compareTag("IMPM", 4)) {
         if (parseITFile(r, out)) return out;

@@ -6,10 +6,10 @@ namespace SoundShop {
 
 // A 2D XY pad performance controller. Each axis (X, Y, Z/scroll) directly
 // controls a parameter on any node in the graph, selected via dropdowns.
-// No graph wiring needed — the pad writes to the target param each frame.
+// No graph wiring needed - the pad writes to the target param each frame.
 //
 // Opened from the menu (not a graph node). Each axis has a dropdown:
-//   "Node: Piano → Param: Pan"
+//   "Node: Piano -> Param: Pan"
 // Dragging the handle or scrolling immediately updates the target param.
 
 struct XYAxisBinding {

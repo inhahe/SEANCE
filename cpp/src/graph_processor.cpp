@@ -27,7 +27,7 @@
 namespace SoundShop {
 
 // ==============================================================================
-// MidiTimelineProcessor — generates MIDI from timeline clips + audition
+// MidiTimelineProcessor - generates MIDI from timeline clips + audition
 // ==============================================================================
 
 MidiTimelineProcessor::MidiTimelineProcessor(Node& n, Transport& t) : node(n), transport(t) {
@@ -43,7 +43,7 @@ MidiTimelineProcessor::MidiTimelineProcessor(Node& n, Transport& t) : node(n), t
 void MidiTimelineProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::MidiBuffer& midi) {
     buf.clear();
 
-    // Performance mode — intercept incoming MIDI, replace with melody
+    // Performance mode - intercept incoming MIDI, replace with melody
     if (node.performanceMode && melodyPlayer.isActive()) {
         juce::MidiBuffer processedMidi;
         melodyPlayer.processMidi(midi, processedMidi);
@@ -73,7 +73,7 @@ void MidiTimelineProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mi
 
     // On stop: send all-notes-off on every channel so sustained notes
     // don't keep ringing through downstream synths/plugins.
-    // Only CC 123 (all-notes-off) — CC 120 (all-sound-off) is more
+    // Only CC 123 (all-notes-off) - CC 120 (all-sound-off) is more
     // aggressive and some synths handle it by resetting internal state
     // in ways that can interfere with subsequent playback.
     if (wasPlaying && !transport.playing) {
@@ -171,7 +171,7 @@ int MidiTimelineProcessor::allocMpeChannel(int ci, int ni, int pitch) {
             return idx + 2; // MIDI channel 2-16
         }
     }
-    // All channels busy — steal the next one
+    // All channels busy - steal the next one
     int idx = nextMpeChannel;
     mpeChannels[idx] = {ci, ni, pitch, true};
     nextMpeChannel = (idx + 1) % kMpeChannels;
@@ -219,7 +219,7 @@ void MidiTimelineProcessor::emitExpression(juce::MidiBuffer& midi, int mpeIdx,
 }
 
 // ==============================================================================
-// AudioTimelineProcessor — plays audio file clips
+// AudioTimelineProcessor - plays audio file clips
 // ==============================================================================
 
 AudioTimelineProcessor::AudioTimelineProcessor(Node& n, Transport& t, NodeGraph& g)
@@ -339,7 +339,7 @@ void AudioTimelineProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::M
             int fileSample = (int)(s * fileRatio);
             if (fileSample >= fileSamplesToRead) break;
 
-            // Fade — uses effective edge-fade durations (max of user setting
+            // Fade - uses effective edge-fade durations (max of user setting
             // and the project-wide globalCrossfadeSec) so clips never start
             // or end with a hard sample edge.
             float fade = 1.0f;
@@ -363,7 +363,7 @@ void AudioTimelineProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::M
 }
 
 // ==============================================================================
-// PassthroughProcessor — for nodes without plugins (test tone on MIDI)
+// PassthroughProcessor - for nodes without plugins (test tone on MIDI)
 // ==============================================================================
 
 PassthroughProcessor::PassthroughProcessor(Node& n) : node(n) {}
@@ -422,22 +422,22 @@ void GraphProcessor::rebuildGraph(NodeGraph& graph, Transport& transport) {
         std::unique_ptr<juce::AudioProcessor> proc;
 
         // Check cache: manual freeze or auto-cache.
-        // NEVER cache Output nodes. Output is a graph sink, not a source —
+        // NEVER cache Output nodes. Output is a graph sink, not a source -
         // its job is to forward audio to outputNodeId (the AudioGraphIO sink
         // added at the top of rebuildGraph). Replacing it with a
         // CachePlaybackProcessor would route nodeMap[Output] to the cache
         // processor instead of outputNodeId, leaving the real sink dangling
         // (nothing wired to it) and silencing the entire render. The Output
-        // node's cache IS populated on every Play→Stop (AudioEngine::stop
+        // node's cache IS populated on every Play->Stop (AudioEngine::stop
         // dumps the live capture into it) so on offline export after any
         // live playback this branch would otherwise fire and the WAV would
-        // come out silent — see the tracker-import export-silence bug.
+        // come out silent - see the tracker-import export-silence bug.
         bool useCache = false;
         if (node.type != NodeType::Output) {
             if (node.cache.enabled && node.cache.valid) {
                 useCache = true;
             } else if (node.cache.autoCache && cacheManager.isCacheValid(node, graph)) {
-                // Auto-cache hit — try loading from disk if needed
+                // Auto-cache hit - try loading from disk if needed
                 if (node.cache.useDisk && node.cache.left.empty())
                     cacheManager.loadFromDisk(node);
                 useCache = node.cache.hasCachedAudio();
@@ -462,12 +462,12 @@ void GraphProcessor::rebuildGraph(NodeGraph& graph, Transport& transport) {
         } else if (node.type == NodeType::AudioTimeline) {
             proc = std::make_unique<AudioTimelineProcessor>(node, transport, graph);
         } else if (node.type == NodeType::Output) {
-            // Our output node maps to the graph's audio output — skip creating a processor
+            // Our output node maps to the graph's audio output - skip creating a processor
             nodeMap[node.id] = outputNodeId;
             nodeInputMap[node.id] = outputNodeId;
             continue;
         } else if (node.type == NodeType::Script && !node.script.empty()) {
-            // WASM script node — load .wasm file
+            // WASM script node - load .wasm file
             auto wasmProc = std::make_unique<WasmScriptProcessor>(node, transport);
             std::ifstream wf(node.script, std::ios::binary);
             if (wf) {
@@ -478,7 +478,7 @@ void GraphProcessor::rebuildGraph(NodeGraph& graph, Transport& transport) {
             }
             proc = std::move(wasmProc);
         } else if (node.plugin && node.plugin->instance) {
-            // Real plugin — transfer ownership to the graph
+            // Real plugin - transfer ownership to the graph
             auto graphNode = processorGraph->addNode(std::move(node.plugin->instance));
             if (graphNode) {
                 nodeMap[node.id] = graphNode->nodeID;
@@ -592,7 +592,7 @@ void GraphProcessor::rebuildGraph(NodeGraph& graph, Transport& transport) {
         } else if (node.type == NodeType::Effect && node.script == "__pitchshift__") {
             proc = std::make_unique<PitchShiftProcessor>(node);
         } else {
-            // No plugin — passthrough
+            // No plugin - passthrough
             proc = std::make_unique<PassthroughProcessor>(node);
         }
 
@@ -722,12 +722,12 @@ void GraphProcessor::rebuildGraph(NodeGraph& graph, Transport& transport) {
         }
 
         // Connect based on pin kind. Param and Signal both flow through the
-        // audio-rate control slot (channels 2+) — they are interchangeable at
+        // audio-rate control slot (channels 2+) - they are interchangeable at
         // the cable level (task #82). The receiver decides per-block vs
         // per-sample consumption; the channel layout is identical either way.
         bool srcIsControl = (srcKind == PinKind::Signal || srcKind == PinKind::Param);
         if (srcIsControl) {
-            // Find which control-input slot this is on the destination — count
+            // Find which control-input slot this is on the destination - count
             // Param + Signal pins encountered before the matching pin id.
             int signalChIdx = 2;
             for (auto& dstNode : graph.nodes) {

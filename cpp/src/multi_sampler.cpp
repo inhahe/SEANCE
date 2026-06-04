@@ -31,7 +31,7 @@ float SamplerEnvelope::evaluate(float t, bool noteHeld) const {
     // Sustain: while the note is held, clamp playback time to the
     // sustainEnd point so the envelope freezes at that value until
     // note-off. This is the simplest interpretation of IT's "sustain
-    // loop" — IT also supports looping between sustainStart and
+    // loop" - IT also supports looping between sustainStart and
     // sustainEnd, which we could add later if needed.
     if (noteHeld && hasSustain
         && sustainEnd >= 0 && sustainEnd < (int)points.size())
@@ -43,7 +43,7 @@ float SamplerEnvelope::evaluate(float t, bool noteHeld) const {
     if (t <= points.front().time) return points.front().value;
     if (t >= points.back().time)  return points.back().value;
 
-    // Linear interpolation between adjacent points — matches
+    // Linear interpolation between adjacent points - matches
     // OpenMPT / Impulse Tracker envelope rendering.
     for (size_t i = 0; i + 1 < points.size(); ++i) {
         const auto& a = points[i];
@@ -110,7 +110,7 @@ static std::string encodeEnv(const SamplerEnvelope& e) {
 static SamplerEnvelope decodeEnv(const std::string& val) {
     SamplerEnvelope e;
     if (val.empty()) return e;
-    // First token is the expected point count (advisory — we trust the
+    // First token is the expected point count (advisory - we trust the
     // actual parsed points rather than the header).
     std::vector<std::string> toks;
     {
@@ -435,7 +435,7 @@ void MultiSamplerProcessor::processBlock(juce::AudioBuffer<float>& buf,
                 }
             }
         } else if (msg.isAllSoundOff()) {
-            // CC 120 = instant silence — kill everything immediately.
+            // CC 120 = instant silence - kill everything immediately.
             for (auto& v : voices) v.active = false;
         }
     }
@@ -546,7 +546,7 @@ void MultiSamplerProcessor::processBlock(juce::AudioBuffer<float>& buf,
 
             switch (doc.interpMode) {
             case InterpMode::Linear: {
-                // 2-point linear — authentic tracker sound.
+                // 2-point linear - authentic tracker sound.
                 int s0 = wrapSample(i0), s1 = wrapSample(i0 + 1);
                 sL = z.dataL[s0] + frac * (z.dataL[s1] - z.dataL[s0]);
                 sR = z.dataR[s0] + frac * (z.dataR[s1] - z.dataR[s0]);
@@ -571,7 +571,7 @@ void MultiSamplerProcessor::processBlock(juce::AudioBuffer<float>& buf,
             }
             default: // InterpMode::Sinc
             case InterpMode::Sinc: {
-                // 8-point Lanczos-4 windowed sinc — highest quality.
+                // 8-point Lanczos-4 windowed sinc - highest quality.
                 for (int k = -3; k <= 4; ++k) {
                     int si = wrapSample(i0 + k);
                     float w = lanczos4(frac - (float)k);
@@ -640,7 +640,7 @@ void MultiSamplerProcessor::processBlock(juce::AudioBuffer<float>& buf,
         }
 
         // ---- global volume ----
-        // Pan is NOT applied here — the PanProcessor in the graph chain
+        // Pan is NOT applied here - the PanProcessor in the graph chain
         // handles it, using the node's Pan param with the correct pan law
         // (equal-power for DAW instruments, linear for tracker imports).
         // Applying it here too would double-apply the panning.

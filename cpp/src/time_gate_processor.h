@@ -14,7 +14,7 @@ namespace SoundShop {
 //
 // The processor reads the Transport for the current beat position each block.
 // Effect regions are read from the source Node's effectRegions vector. This is
-// technically a race with the UI thread, but benign on x86 for v1 — proper
+// technically a race with the UI thread, but benign on x86 for v1 - proper
 // thread safety is a follow-up (atomic shared_ptr swap of the regions list).
 
 class TimeGateProcessor : public juce::AudioProcessor {

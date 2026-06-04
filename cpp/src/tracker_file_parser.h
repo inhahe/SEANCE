@@ -10,11 +10,11 @@ namespace SoundShop {
 //
 // libopenmpt only exposes names for instruments (openmpt_module_get_instrument_name),
 // nothing about their keymap / envelopes / NNA / fadeout / default pan / filter
-// defaults — all of which are essential for importing instrument-mode IT and
+// defaults - all of which are essential for importing instrument-mode IT and
 // XM songs with fidelity. This parser opens the raw file bytes directly and
 // walks the format-specific instrument headers to extract that data.
 //
-// We only parse metadata, not sample PCM — libopenmpt's render-and-capture
+// We only parse metadata, not sample PCM - libopenmpt's render-and-capture
 // path (see mod_import.cpp's extractSampleToWav) handles PCM extraction.
 //
 // Formats currently supported:
@@ -22,7 +22,7 @@ namespace SoundShop {
 //   - XM: FastTracker II .xm files (header tag "Extended Module:")
 //
 // Sample-mode formats (MOD, S3M, or XM/IT with numInstruments == 0) don't
-// have instrument headers at all — the caller falls back to the per-sample
+// have instrument headers at all - the caller falls back to the per-sample
 // tracker-import path for those.
 // ==============================================================================
 
@@ -53,9 +53,9 @@ enum class TrackerNNA : int { Cut = 0, Continue = 1, Off = 2, Fade = 3 };
 struct TrackerInstrument {
     std::string name;
 
-    // 120-entry note→sample map. Index is the raw MIDI note (0..119).
+    // 120-entry note->sample map. Index is the raw MIDI note (0..119).
     // For IT, the map also lets a pattern note be re-mapped to a different
-    // playback note — noteMap[raw].note is the note that actually gets
+    // playback note - noteMap[raw].note is the note that actually gets
     // played back, noteMap[raw].sample is which sample plays it.
     std::vector<TrackerNoteMapEntry> noteMap;
 
@@ -76,7 +76,7 @@ struct TrackerInstrument {
     int defaultVolume = 128;
 
     // Default pan: -1..+1, or a sentinel value (isnan) meaning "no
-    // instrument-level pan override" — pan is then determined by the
+    // instrument-level pan override" - pan is then determined by the
     // playing sample or by channel state.
     bool  hasDefaultPan = false;
     float defaultPan = 0.0f;
@@ -86,7 +86,7 @@ struct TrackerInstrument {
     int randomPan = 0;
 
     // Initial filter cutoff / resonance. For IT, cutoff and resonance each
-    // have a "use" bit — when false the instrument inherits the channel
+    // have a "use" bit - when false the instrument inherits the channel
     // default. Cutoff 0..127, resonance 0..127.
     bool useFilterCutoff = false;
     int  filterCutoff = 127;
@@ -108,7 +108,7 @@ struct TrackerMidiMacros {
 struct ParsedTrackerFile {
     enum class Format { Unknown, IT, XM } format = Format::Unknown;
     int numInstruments = 0;
-    std::vector<TrackerInstrument> instruments; // 1-based indexing — instruments[0] is unused
+    std::vector<TrackerInstrument> instruments; // 1-based indexing - instruments[0] is unused
     TrackerMidiMacros midiMacros;
     bool hasMidiMacros = false;
     std::string errorMessage;   // set when parsing failed; instruments is empty
@@ -117,7 +117,7 @@ struct ParsedTrackerFile {
 // Parse a module file's instrument metadata. Returns a ParsedTrackerFile
 // whose `instruments` list is populated on success. On failure (unknown
 // format, truncated file, corrupt headers) the returned object has
-// format == Unknown and errorMessage set — callers should fall back to
+// format == Unknown and errorMessage set - callers should fall back to
 // sample-mode import.
 ParsedTrackerFile parseTrackerFile(const std::string& path);
 

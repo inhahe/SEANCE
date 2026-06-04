@@ -9,10 +9,10 @@
 
 namespace SoundShop {
 
-class AudioEngine; // forward decl — only used as a pointer in the editor
+class AudioEngine; // forward decl - only used as a pointer in the editor
 
 // ==============================================================================
-// Analog drum synthesis — each sound is a simple oscillator + envelope
+// Analog drum synthesis - each sound is a simple oscillator + envelope
 // ==============================================================================
 
 // The type determines the synthesis algorithm
@@ -24,7 +24,7 @@ enum class DrumType {
     Tom,        // pitch-sweeping sine (like kick but configurable)
     Cowbell,    // dual inharmonic squares
     Rimshot,    // short noise + tone
-    Cymbal,     // crash/ride/bell — tone slider controls character
+    Cymbal,     // crash/ride/bell - tone slider controls character
                 // (0=crash: noisy wash, 0.5=ride: metallic ring, 1=bell: bright ping)
 };
 

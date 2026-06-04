@@ -12,7 +12,7 @@ namespace SoundShop {
 // baseValue as the unmodulated reference.
 //
 // Call this at the TOP of every processor's processBlock. It's safe to
-// call on nodes with no modPins — the function returns immediately.
+// call on nodes with no modPins - the function returns immediately.
 //
 // Modulation model: bipolar additive.
 //   modulated = baseValue + signal * depth * (maxVal - minVal) / 2
@@ -22,7 +22,7 @@ namespace SoundShop {
 //
 // Resolution: block-rate (reads channel at sample 0). For per-sample
 // modulation of time-critical params like filter cutoff, the processor
-// can read the channel directly inside its sample loop — this helper
+// can read the channel directly inside its sample loop - this helper
 // is just the convenient default.
 
 inline void applySignalModulations(Node& node,
@@ -32,12 +32,12 @@ inline void applySignalModulations(Node& node,
     // Build a quick map: for each Signal/Param pin in pinsIn, which
     // control-slot index is it? (matches graph_processor.cpp's routing
     // logic that puts control signals on channels 2, 3, 4, ...)
-    // We only need to iterate once — most nodes have 0-3 modPins.
+    // We only need to iterate once - most nodes have 0-3 modPins.
     for (auto& mp : node.modPins) {
         if (mp.paramIndex < 0 || mp.paramIndex >= (int)node.params.size())
             continue;
 
-        // Find the control-slot index for this pin — count Signal/Param
+        // Find the control-slot index for this pin - count Signal/Param
         // pins in pinsIn that come before the one with id == mp.pinId.
         int slotIdx = -1;
         int sigCount = 0;
@@ -95,7 +95,7 @@ inline void clearSignalModulations(Node& node) {
 // ==============================================================================
 
 struct MpeVoiceState {
-    float pitchBend = 0.0f;   // semitones, ± pitchBendRange
+    float pitchBend = 0.0f;   // semitones, +/- pitchBendRange
     float pressure  = 0.0f;   // 0..1 (channel aftertouch)
     float timbre    = 0.5f;   // 0..1 (CC74)
 };

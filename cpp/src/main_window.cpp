@@ -34,7 +34,7 @@ namespace SoundShop {
 // (desktop) on macOS / Linux until #87 adds proper per-platform paths.
 //
 // On Windows, BatteryFlag bit 128 means "no system battery" (desktop).
-// 255 means "unknown" — we treat that as desktop too, since assuming the
+// 255 means "unknown" - we treat that as desktop too, since assuming the
 // aggressive interval is the friendlier default for unknown machines.
 static bool machineHasBattery() {
 #ifdef _WIN32
@@ -55,7 +55,7 @@ static bool isOnACPower() {
     SYSTEM_POWER_STATUS sps{};
     if (GetSystemPowerStatus(&sps))
         return sps.ACLineStatus == 1; // 1 = AC online
-    return true; // unknown → assume desktop
+    return true; // unknown -> assume desktop
 #else
     return true; // #87: implement for macOS / Linux
 #endif
@@ -79,7 +79,7 @@ static bool isVirtualOrControlPort(const juce::String& name) {
     // Mackie/HUI control surface protocols
     if (lower.contains("mackie control") || lower.contains("hui")) return true;
     // Common virtual MIDI loopback drivers (user creates these intentionally
-    // and can add them via the wizard — don't auto-create)
+    // and can add them via the wizard - don't auto-create)
     if (lower.contains("loopmidi") || lower.contains("loop midi")) return true;
     // Windows built-in "Microsoft GS Wavetable Synth" (output only but
     // sometimes appears in input lists on some drivers)
@@ -125,7 +125,7 @@ MainContentComponent::MainContentComponent() {
     addAndMakeVisible(metroBtn);
     addAndMakeVisible(captureBtn);
 
-    // Play/Stop buttons skip tooltips — labels are self-explanatory and
+    // Play/Stop buttons skip tooltips - labels are self-explanatory and
     // universally understood. Keeping tooltips would just clutter the
     // hover layer over the most-used controls.
     stopBtn.setTooltip("Stop playback and rewind to the start of the loop (or to 0 if loop is off)");
@@ -138,7 +138,7 @@ MainContentComponent::MainContentComponent() {
     playBtn.onClick = [this]() { onPlay(); };
     stopBtn.onClick = [this]() { onStop(); };
     recordBtn.onClick = [this]() { onRecord(); };
-    // Set by findPlacement when the visible area was too crowded — tells the
+    // Set by findPlacement when the visible area was too crowded - tells the
     // caller to fitAll() after the new node has been added so the refit
     // includes it.
     auto needsFitAfterPlacement = std::make_shared<bool>(false);
@@ -225,7 +225,7 @@ MainContentComponent::MainContentComponent() {
     };
 
     captureBtn.onClick = [this]() {
-        // If currently playing, stop first — bouncing while the live graph
+        // If currently playing, stop first - bouncing while the live graph
         // is running races on shared graph data and crashes.
         if (audioEngine.isPlaying()) {
             audioEngine.stop();
@@ -233,7 +233,7 @@ MainContentComponent::MainContentComponent() {
         }
 
         // If the Output node has a valid cache (populated automatically after
-        // the last Play→Stop cycle), save it instantly. Otherwise fall back to
+        // the last Play->Stop cycle), save it instantly. Otherwise fall back to
         // an offline bounce.
         Node* outNode = nullptr;
         for (auto& n : graph.nodes)
@@ -255,7 +255,7 @@ MainContentComponent::MainContentComponent() {
     timeSigLabel.setText("Time:", juce::dontSendNotification);
     addAndMakeVisible(timeSigLabel);
     addAndMakeVisible(timeSigCombo);
-    timeSigCombo.setTooltip("Project time signature — affects bar length, the metronome accent pattern, and the snap grid");
+    timeSigCombo.setTooltip("Project time signature - affects bar length, the metronome accent pattern, and the snap grid");
     timeSigCombo.addItem("4/4", 1);
     timeSigCombo.addItem("3/4", 2);
     timeSigCombo.addItem("6/8", 3);
@@ -277,7 +277,7 @@ MainContentComponent::MainContentComponent() {
 
     addAndMakeVisible(loopBtn);
     loopBtn.setTooltip("Toggle loop playback. When enabled, playback wraps around between the loop start and end "
-                       "(initially set to the full project length — drag the loop region in the routing strip to adjust).");
+                       "(initially set to the full project length - drag the loop region in the routing strip to adjust).");
     loopBtn.onClick = [this]() {
         if (!graph.loopEnabled) {
             // Enable loop: default to full project length
@@ -305,7 +305,7 @@ MainContentComponent::MainContentComponent() {
     songBtn.onClick = [this]() { showSongSettingsDialog(); };
 
     addAndMakeVisible(monitorBtn);
-    monitorBtn.setTooltip("Toggle input monitoring — when on, audio coming in from any input device is "
+    monitorBtn.setTooltip("Toggle input monitoring - when on, audio coming in from any input device is "
                           "routed straight through to the Output node so you can hear yourself in real time");
     monitorBtn.onClick = [this]() {
         bool on = !audioEngine.inputMonitoring.load();
@@ -328,7 +328,7 @@ MainContentComponent::MainContentComponent() {
     bpmSlider.setTextBoxStyle(juce::Slider::TextBoxLeft, false, 50, 20);
     bpmSlider.setSliderStyle(juce::Slider::LinearHorizontal);
     bpmSlider.setTooltip("Project tempo in beats per minute. Higher = faster. "
-                         "Typical pop/rock is 90–130; dance music 120–140; ballads 60–80.");
+                         "Typical pop/rock is 90-130; dance music 120-140; ballads 60-80.");
     addAndMakeVisible(bpmSlider);
     bpmSlider.onValueChange = [this]() { graph.bpm = (float)bpmSlider.getValue(); };
 
@@ -424,7 +424,7 @@ MainContentComponent::MainContentComponent() {
     // value into a plugin parameter, mark that node's plugin state cache
     // stale so the next slow autosave re-queries getStateInformation.
     // Only fires from the message-thread automation path; processMidiCC
-    // (audio thread) does NOT call this — the periodic force-dirty pass
+    // (audio thread) does NOT call this - the periodic force-dirty pass
     // catches changes that route through MIDI CC mappings.
     audioEngine.getGraphProcessor().getAutomation().onPluginParamChanged =
         [this](int nodeId) {
@@ -437,14 +437,14 @@ MainContentComponent::MainContentComponent() {
     startAutosaveWorker();
 
     // Wire the snapshot-based undo system (#84). Three pieces:
-    //  1. onLoadSnapshot — when undo/redo lands on a step that has no
+    //  1. onLoadSnapshot - when undo/redo lands on a step that has no
     //     LambdaCommand (a snapshot-only step from commitSnapshot, or any
     //     step in a session restored from disk where the closures are gone),
     //     parse the snapshot back into the live graph and rebuild routing.
-    //  2. onTreeChanged — fires after every push/undo/redo. Used to lazily
+    //  2. onTreeChanged - fires after every push/undo/redo. Used to lazily
     //     fill in the snapshot text for steps pushed via exec()/pushDone()
     //     (LambdaCommand path) so they're persistable cross-session.
-    //  3. setRootSnapshot below — capture the initial state so the very
+    //  3. setRootSnapshot below - capture the initial state so the very
     //     first edit has a state to revert to.
     graph.undoTree.onLoadSnapshot = [this](const std::string& snap) {
         ProjectFile::loadFromString(snap, graph, nullptr);
@@ -474,7 +474,7 @@ MainContentComponent::MainContentComponent() {
         // into a single disk write.
         undoTreeDirty = true;
     };
-    // Initial state for the root undo node — without this, undoing the
+    // Initial state for the root undo node - without this, undoing the
     // first user edit has nothing to revert to.
     graph.undoTree.setRootSnapshot(ProjectFile::serializeForUndo(graph));
 
@@ -493,7 +493,7 @@ MainContentComponent::MainContentComponent() {
 
     // Shared-history prompt for the auto-loaded startup project (#90).
     // openProjectFile already fires this for user-opened projects, but
-    // the autoload path bypasses it — so do it here. Deferred so the
+    // the autoload path bypasses it - so do it here. Deferred so the
     // dialog appears over the visible main window.
     if (loaded && !ProjectFile::currentPath.empty()) {
         juce::String startupPath = juce::String(ProjectFile::currentPath);
@@ -505,7 +505,7 @@ MainContentComponent::MainContentComponent() {
 
     // Laptop autosave notice (#86): on first launch on a laptop, tell the
     // user we picked a slower default to save battery and where to change
-    // it. Only shows once — saved in prefs as autosaveLaptopNoticeShown.
+    // it. Only shows once - saved in prefs as autosaveLaptopNoticeShown.
     if (!autosaveLaptopNoticeShown && machineHasBattery()) {
         juce::Component::SafePointer<MainContentComponent> safe2(this);
         int interval = autosaveIntervalSeconds;
@@ -517,7 +517,7 @@ MainContentComponent::MainContentComponent() {
                     .withTitle("Autosave on Laptop")
                     .withMessage(
                         "Detected a laptop. Autosave is set to " + juce::String(interval) +
-                        " seconds to save battery — frequent disk writes can wake the SSD "
+                        " seconds to save battery - frequent disk writes can wake the SSD "
                         "and shorten unplugged runtime.\n\n"
                         "Crash recovery still loses at most a few plugin tweaks. Graph "
                         "edits (notes, cables, parameters) are protected at gesture "
@@ -640,17 +640,17 @@ void MainContentComponent::resized() {
     x += 124;
     placeBtn(tapTempoBtn, 38);
     placeBtn(fitAllBtn, 50);
-    placeBtn(metroBtn, 50);
+    placeBtn(metroBtn, 80);
     placeBtn(loopBtn, 42);
     placeBtn(songBtn, 46);
-    placeBtn(monitorBtn, 40);
+    placeBtn(monitorBtn, 64);
     placeBtn(captureBtn, 60);
     placeBtn(keyboardMidiBtn, 42);
     x += 2;
-    // Time signature combo (no label — "4/4" is self-explanatory)
+    // Time signature combo (no label - "4/4" is self-explanatory)
     timeSigLabel.setBounds(0, 0, 0, 0); // hidden
-    timeSigCombo.setBounds(transport.getX() + x, transport.getY() + 4, 55, 24);
-    x += 58;
+    timeSigCombo.setBounds(transport.getX() + x, transport.getY() + 4, 75, 24);
+    x += 78;
     positionLabel.setBounds(transport.getX() + x, transport.getY() + 2, 80, 28);
 
     // Split: graph on top, editors on bottom, routing strip between them
@@ -689,7 +689,7 @@ void MainContentComponent::timerCallback() {
             int desired = ac ? 5 : 20;
             if (autosaveIntervalSeconds != desired) {
                 autosaveIntervalSeconds = desired;
-                fprintf(stderr, "Power state changed — autosave interval → %ds\n",
+                fprintf(stderr, "Power state changed - autosave interval -> %ds\n",
                         desired);
             }
         }
@@ -711,7 +711,7 @@ void MainContentComponent::timerCallback() {
                 if (n.type == NodeType::MidiInput && n.midiInputSourceId == idStd)
                     { inGraph = true; break; }
             if (inGraph) continue;
-            // Skip the initial scan — we don't want to nag about devices
+            // Skip the initial scan - we don't want to nag about devices
             // that were already there before the app started. Only offer
             // on NEW device connections after this flag is set.
             if (!midiDeviceScanInitialized) continue;
@@ -753,11 +753,11 @@ void MainContentComponent::timerCallback() {
         transport.timeSigMap.setGlobal(graph.timeSignatureNum, graph.timeSignatureDen);
     // Sync UI with audio engine's playing state. The audio thread may
     // stop playback internally (e.g., when Song Length + Song Repeat
-    // policy fires), so the button text has to reflect that — otherwise
+    // policy fires), so the button text has to reflect that - otherwise
     // it stays stuck on "Stop" after the song auto-stops.
     bool engineIsPlaying = audioEngine.isPlaying();
     if (transport.playing && !engineIsPlaying) {
-        // Transport just stopped itself — update button label.
+        // Transport just stopped itself - update button label.
         playBtn.setButtonText("Play");
     }
     transport.playing = engineIsPlaying;
@@ -863,7 +863,7 @@ void MainContentComponent::timerCallback() {
             // Note: the initial fit-all happens inside NodeGraphComponent's
             // first resized()/paint() call, *before* this timer-deferred init
             // runs, so the user never sees the un-fit default zoom. Don't
-            // re-fit here — that would clobber any manual pan/zoom the user
+            // re-fit here - that would clobber any manual pan/zoom the user
             // has already done while audio engine was warming up.
 
             // Force the OS to clear any stale "Not Responding" state
@@ -908,7 +908,7 @@ void MainContentComponent::timerCallback() {
         if (!ProjectFile::currentPath.empty())
             title = juce::File(ProjectFile::currentPath).getFileNameWithoutExtension();
         if (saveFlashFrames > 0) {
-            title += " — Saved";
+            title += " - Saved";
             saveFlashFrames--;
         } else if (projectDirty || graph.dirty) {
             title += " *";
@@ -938,7 +938,7 @@ juce::PopupMenu MainContentComponent::getMenuForIndex(int idx, const juce::Strin
         } else {
             for (int i = 0; i < (int)recentProjects.size(); ++i) {
                 auto file = juce::File(recentProjects[i]);
-                recentMenu.addItem(60 + i, file.getFileName() + "  —  " + file.getParentDirectory().getFileName());
+                recentMenu.addItem(60 + i, file.getFileName() + "  -  " + file.getParentDirectory().getFileName());
             }
             recentMenu.addSeparator();
             recentMenu.addItem(59, "Clear Recents");
@@ -969,7 +969,7 @@ juce::PopupMenu MainContentComponent::getMenuForIndex(int idx, const juce::Strin
             for (auto& line : lines) {
                 if (line.isNotEmpty() && ri < 10) {
                     auto f = juce::File(line);
-                    menu.addItem(900 + ri, f.getFileName() + "  —  " + f.getParentDirectory().getFileName());
+                    menu.addItem(900 + ri, f.getFileName() + "  -  " + f.getParentDirectory().getFileName());
                     ri++;
                 }
             }
@@ -1088,7 +1088,7 @@ void MainContentComponent::menuItemSelected(int menuItemID, int) {
         case 10: juce::JUCEApplication::getInstance()->systemRequestedQuit(); break;
         case 20: graph.undoTree.doUndo(); graphComponent->repaint(); break;
         case 22: {
-            // Write Automation to Selection — uses loop region as the range
+            // Write Automation to Selection - uses loop region as the range
             if (graph.loopEnabled && graph.loopEndBeat > graph.loopStartBeat) {
                 graph.writeAutomationToSelection(
                     (float)graph.loopStartBeat, (float)graph.loopEndBeat);
@@ -1367,7 +1367,7 @@ public:
         removeDimBtn.setButtonText("- Dim");
         addDimBtn.setTooltip("Add a terrain dimension. Adds a new Sig input pin and Position "
                              "knobs (Center/Radius) on the synth node. The terrain extends into "
-                             "the new axis — fill it with an expression using x, y, z, w variables.");
+                             "the new axis - fill it with an expression using x, y, z, w variables.");
         removeDimBtn.setTooltip("Remove the last terrain dimension");
         addDimBtn.onClick = [this]() { changeDimCount(1); };
         removeDimBtn.onClick = [this]() { changeDimCount(-1); };
@@ -1831,7 +1831,7 @@ void MainContentComponent::showPluginUI(int nodeId) {
         return;
     }
 
-    // Legacy single-sample Sampler editor — still supported for old
+    // Legacy single-sample Sampler editor - still supported for old
     // projects that haven't been upgraded yet. Normal load path converts
     // "__audio__:" into "__multisampler__:" so this only fires if
     // upgradeLegacyNodes() didn't run for some reason.
@@ -2150,7 +2150,7 @@ public:
             int cc = midiLearn.lastCC.load();
             int ch = midiLearn.lastChannel.load();
             if (cc >= 0 && ch >= 0) {
-                // CC captured — create mapping
+                // CC captured - create mapping
                 midiLearn.active.store(false);
 
                 // Remove any existing mapping for this CC
@@ -2180,7 +2180,7 @@ public:
         }
     }
 
-    // ListBox delegate (inline — small enough)
+    // ListBox delegate (inline - small enough)
     struct ListModel : public juce::ListBoxModel {
         MidiMapComponent* parent = nullptr;
         int getNumRows() override { return parent ? (int)parent->paramNames.size() : 0; }
@@ -2196,7 +2196,7 @@ public:
 
             // Current CC assignment
             auto mappings = parent->automation.getCCMappings();
-            juce::String ccText = "—";
+            juce::String ccText = "-";
             for (auto& m : mappings)
                 if (m.nodeId == parent->nodeId && m.paramIdx == row)
                     ccText = "CC " + juce::String(m.ccNumber) + " (ch " + juce::String(m.midiChannel) + ")";
@@ -2204,7 +2204,7 @@ public:
             if (parent->learningParamIdx == row)
                 ccText = "Waiting...";
 
-            g.setColour(ccText == "—" ? juce::Colours::grey
+            g.setColour(ccText == "-" ? juce::Colours::grey
                         : parent->learningParamIdx == row ? juce::Colours::yellow
                         : juce::Colours::limegreen);
             g.drawText(ccText, w / 2, 0, w / 2 - 80, h, juce::Justification::centredLeft);
@@ -2401,7 +2401,7 @@ void MainContentComponent::newProject() {
     graph.setupDefaultGraph();
 
     // Auto-create MidiInput nodes for all currently connected hardware
-    // MIDI devices — so the user's controller is immediately wired and
+    // MIDI devices - so the user's controller is immediately wired and
     // ready on a fresh project without needing a wizard. The Computer
     // Keyboard node is already created by setupDefaultGraph(); this
     // adds hardware devices alongside it.
@@ -2466,7 +2466,7 @@ void MainContentComponent::openHelpDoc(const juce::String& docRelativePath) {
             + "or browse the project's docs/ folder directly.");
         return;
     }
-    // startAsProcess opens the file in its default OS handler — for .html
+    // startAsProcess opens the file in its default OS handler - for .html
     // files that's the user's browser.
     docFile.startAsProcess();
 }
@@ -2497,7 +2497,7 @@ void MainContentComponent::openProject() {
 
 void MainContentComponent::upgradeLegacyNodes() {
     // Upgrade legacy-format nodes in place. Runs on every project load
-    // (startup autoload, File → Open, crash recovery) so users always
+    // (startup autoload, File -> Open, crash recovery) so users always
     // get the latest behavior even from old .ssp files.
 
     // MidiInput node type predates the old "keyboard-is-a-flag" model.
@@ -2530,7 +2530,7 @@ void MainContentComponent::upgradeLegacyNodes() {
         // "__reverb__" script and the default param set so the real DSP
         // takes over. Preserves the node's ID and position so existing
         // cables still connect to the right node.
-        // Legacy "EQ" stub → real parametric EQ.
+        // Legacy "EQ" stub -> real parametric EQ.
         if (n.type == NodeType::Effect && n.name == "EQ" && n.script.empty()) {
             n.script = "__eq__";
             if (n.params.empty()) {
@@ -2565,7 +2565,7 @@ void MainContentComponent::upgradeLegacyNodes() {
         }
 
         // Legacy single-sample Sampler (TerrainSynth + "__audio__:" path).
-        // The old Sampler was a subset of MultiSampler's capabilities —
+        // The old Sampler was a subset of MultiSampler's capabilities -
         // upgrade it in place to a one-zone MultiSampler pointing at the
         // same WAV file. Preserves the node's ID, position, name, and
         // existing cables, and picks up the old node's ADSR / Base Note /
@@ -2598,13 +2598,13 @@ void MainContentComponent::upgradeLegacyNodes() {
             // Strip the old flat param list (it mixed TerrainSynth-
             // specific knobs with the sampler ones we salvaged).
             n.params.clear();
-            // Keep Volume and Pan as real params — MultiSampler reads
+            // Keep Volume and Pan as real params - MultiSampler reads
             // them at block time so automation lanes and Signal cables
             // work against them.
             n.params.push_back({"Volume", foundVolume ? salvagedVolume : 0.5f,  0.0f, 1.0f});
             n.params.push_back({"Pan",    foundPan    ? salvagedPan    : 0.0f, -1.0f, 1.0f});
             // Also remove the legacy Signal pins the old Sampler had
-            // (Sig X, Sig Y) — MultiSampler uses script-embedded
+            // (Sig X, Sig Y) - MultiSampler uses script-embedded
             // envelopes instead.
             n.pinsIn.erase(std::remove_if(n.pinsIn.begin(), n.pinsIn.end(),
                 [](const Pin& p) {
@@ -2629,7 +2629,7 @@ void MainContentComponent::openProjectFile(const juce::String& path) {
     addToRecentProjects(path);
     // Loading a clean project on top of whatever was in memory invalidates
     // any autosave that was tracking the previous state. The undo history
-    // also no longer applies — its snapshots described the old graph.
+    // also no longer applies - its snapshots described the old graph.
     projectDirty = false;
     graph.dirty = false;
     discardAutosave();
@@ -2686,7 +2686,7 @@ void MainContentComponent::freezeNode(int nodeId) {
 
     // Render full project, capturing from the graph
     // We render the whole graph and then read the node's contribution
-    // For simplicity, render the full mix — the cache represents this node's output
+    // For simplicity, render the full mix - the cache represents this node's output
     for (int64_t pos = 0; pos < totalSamples; pos += blockSize) {
         int thisBlock = (int)std::min((int64_t)blockSize, totalSamples - pos);
         offlineTransport.positionSamples = pos;
@@ -2705,7 +2705,7 @@ void MainContentComponent::freezeNode(int nodeId) {
         if (proc) {
             // The processor already ran as part of the graph.
             // For the cache we store the full mix reaching this node.
-            // This is a simplification — ideally we'd tap the node's output only.
+            // This is a simplification - ideally we'd tap the node's output only.
         }
 
         // Store the mix (this captures everything up to and including this node)
@@ -2739,7 +2739,7 @@ void MainContentComponent::syncCCMappingsFromGraph() {
 
 void MainContentComponent::saveProject(std::function<void()> onSaved) {
     if (ProjectFile::currentPath.empty()) {
-        // No filename yet — defer to Save As, which will run the file chooser
+        // No filename yet - defer to Save As, which will run the file chooser
         // and call us back through onSaved on success.
         saveProjectAs(std::move(onSaved));
         return;
@@ -2774,7 +2774,7 @@ void MainContentComponent::saveProjectAs(std::function<void()> onSaved) {
     chooser->launchAsync(juce::FileBrowserComponent::saveMode,
         [this, chooser, onSaved = std::move(onSaved)](const juce::FileChooser& fc) {
             auto file = fc.getResult();
-            if (file == juce::File()) return; // user cancelled — don't fire onSaved
+            if (file == juce::File()) return; // user cancelled - don't fire onSaved
             ProjectFile::save(file.getFullPathName().toStdString(),
                               graph, &audioEngine.getGraphProcessor());
             addToRecentProjects(file.getFullPathName());
@@ -2913,7 +2913,7 @@ void MainContentComponent::exportAudioWithBeat(float maxBeat) {
                                  "192 kbps", "256 kbps", "320 kbps"});
     aw->getComboBoxComponent("bitrate")->setSelectedItemIndex(4);
 
-    // Set initial enabled state: WAV selected → only bit depth enabled
+    // Set initial enabled state: WAV selected -> only bit depth enabled
     aw->getComboBoxComponent("quality")->setEnabled(false);
     aw->getComboBoxComponent("bitrate")->setEnabled(false);
 
@@ -3022,7 +3022,7 @@ void MainContentComponent::doExportRender(const juce::File& file, const ExportOp
             offGP.rebuildGraph(graph, offTransport);
             offGP.prepare(graph, sr, blockSize);
 
-            // Always render in stereo — graph processor outputs stereo
+            // Always render in stereo - graph processor outputs stereo
             juce::AudioBuffer<float> renderBuf(2, (int)totalSamples);
             renderBuf.clear();
 
@@ -3079,7 +3079,7 @@ void MainContentComponent::doExportRender(const juce::File& file, const ExportOp
 }
 
 void MainContentComponent::openEditor(Node& node) {
-    // Only open piano roll editors for timeline nodes — instruments,
+    // Only open piano roll editors for timeline nodes - instruments,
     // effects, etc. have their own editors (waveform editor, plugin UI).
     if (node.type != NodeType::MidiTimeline && node.type != NodeType::AudioTimeline)
         return;
@@ -3112,7 +3112,7 @@ void MainContentComponent::closeEditor(int nodeId) {
 
 bool MainContentComponent::tryQuit() {
     if (!projectDirty && !graph.dirty) {
-        // Clean exit with nothing to save — any leftover autosave is stale
+        // Clean exit with nothing to save - any leftover autosave is stale
         // (it would only exist if we crashed on a previous run and the user
         // already loaded a recent project past it). Sweep it away so the
         // next startup doesn't re-offer an irrelevant recovery.
@@ -3126,7 +3126,7 @@ bool MainContentComponent::tryQuit() {
         "You have unsaved changes. Save before quitting?",
         "Save", "Don't Save", "Cancel");
     if (result == 2) {                   // Don't Save
-        // User explicitly threw their edits away — autosave AND undo
+        // User explicitly threw their edits away - autosave AND undo
         // history go with them. (A clean save+quit instead would keep
         // the undo tree so the next session can continue undoing.)
         discardAutosave();
@@ -3136,12 +3136,12 @@ bool MainContentComponent::tryQuit() {
     if (result != 1) return false;       // Cancel (or window closed)
 
     // Save first, then re-request quit on completion. If the project has no
-    // current path the file chooser is async — we must NOT return true here
+    // current path the file chooser is async - we must NOT return true here
     // or the app will exit before the chooser even appears (which is the bug
     // the user hit: pressed Save, app quit, no file ever written, recent
     // projects never updated).
     saveProject([]() {
-        // The save succeeded — ask the app to quit again. This goes through
+        // The save succeeded - ask the app to quit again. This goes through
         // tryQuit a second time, sees the dirty flags cleared, and returns
         // true immediately. Defer via callAsync so we're not still inside
         // the file-chooser callback when we tear down the window.
@@ -3275,7 +3275,7 @@ void MainContentComponent::performAutosave() {
     //
     // We don't trigger Full saves on graph.dirty / projectDirty because
     // those flags are set by every kind of edit (notes, params, drags)
-    // and would cause Full saves on every tick during normal editing —
+    // and would cause Full saves on every tick during normal editing -
     // defeating the whole point of incremental saves. The fast channel
     // (#84) is the source of truth for graph state in the recovery flow,
     // so autosave.ssp's slight staleness between full saves is fine.
@@ -3296,7 +3296,7 @@ void MainContentComponent::performAutosave() {
         // Full save: rewrite autosave.ssp with graph metadata ONLY
         // (no inline plugin states). All plugin states live in the
         // per-plugin files written below. This makes the periodic full
-        // save cheap — same cost as a single fast-channel snapshot —
+        // save cheap - same cost as a single fast-channel snapshot -
         // because we're not duplicating the plugin state data that's
         // already on disk in the per-plugin files.
         //
@@ -3304,7 +3304,7 @@ void MainContentComponent::performAutosave() {
         // then walk per-plugin files for plugin state (via
         // applyPerPluginOverrides). Plugins whose per-plugin file is
         // missing fall back to whatever default state the plugin loads
-        // with — same behavior as opening a brand-new project file.
+        // with - same behavior as opening a brand-new project file.
         auto graphText = ProjectFile::serializeForUndo(graph);
         if (graphText.empty()) return;
 
@@ -3318,7 +3318,7 @@ void MainContentComponent::performAutosave() {
     }
 
     // Per-plugin files for whichever plugins are flagged dirty. The Full
-    // save above (when one happened) writes graph metadata only — it does
+    // save above (when one happened) writes graph metadata only - it does
     // NOT touch the plugin state cache or query getStateInformation. All
     // plugin state querying happens here, in this loop, exactly once per
     // dirty plugin. Clean plugins are skipped entirely (their on-disk
@@ -3351,7 +3351,7 @@ void MainContentComponent::performAutosave() {
         cleanupOrphanPluginFiles();
 
     // Note: we do NOT clear projectDirty or graph.dirty here. Autosave is
-    // invisible to normal dirty tracking — only an explicit user save
+    // invisible to normal dirty tracking - only an explicit user save
     // clears those.
 }
 
@@ -3452,7 +3452,7 @@ void MainContentComponent::autosaveWorkerMain() {
 
 void MainContentComponent::discardAutosave() {
     // Drain any pending worker job first so it doesn't recreate the file
-    // we're about to delete. Cheap — at most one job in flight, and the
+    // we're about to delete. Cheap - at most one job in flight, and the
     // worker only does a disk write so it finishes quickly.
     {
         std::lock_guard<std::mutex> lk(autosaveWorkerMutex);
@@ -3464,7 +3464,7 @@ void MainContentComponent::discardAutosave() {
     if (tmp.existsAsFile()) tmp.deleteFile();
     auto m = getAutosaveMetaFile();
     if (m.existsAsFile()) m.deleteFile();
-    // Per-plugin files are part of the autosave too — sweep them all.
+    // Per-plugin files are part of the autosave too - sweep them all.
     auto dir = getAutosaveDir();
     if (dir.exists()) {
         for (auto& f2 : dir.findChildFiles(juce::File::findFiles, false, "autosave-plugin-*.dat"))
@@ -3479,7 +3479,7 @@ void MainContentComponent::discardAutosave() {
     // tree persists across clean save+quit so the next session can
     // continue undoing past the last save point. It's only thrown away
     // on explicit "Don't Save" / "Discard" / new project / open project
-    // — those paths call discardUndoTreePersist() separately.
+    // - those paths call discardUndoTreePersist() separately.
 }
 
 void MainContentComponent::applyPerPluginOverrides() {
@@ -3492,7 +3492,7 @@ void MainContentComponent::applyPerPluginOverrides() {
         if (base64.empty()) continue;
 
         // Update the cache so the next slow autosave doesn't redundantly
-        // re-query — the cache is now in sync with what's actually on
+        // re-query - the cache is now in sync with what's actually on
         // the plugin instance.
         n.cachedPluginStateBase64 = base64;
         n.pluginStateDirty = false;
@@ -3697,7 +3697,7 @@ static bool loadUndoTreeFromFile(const juce::File& file, NodeGraph& graph) {
 
 void MainContentComponent::handleSharedHistoryOnOpen(const juce::String& projectAbsPath) {
     // The project file we just loaded may have had a historyFile= field
-    // pointing at a sidecar. If not, there's nothing to consider — bail.
+    // pointing at a sidecar. If not, there's nothing to consider - bail.
     auto sidecar = currentProjectSidecarFile();
     if (sidecar == juce::File() || !sidecar.existsAsFile()) return;
 
@@ -3751,9 +3751,9 @@ void MainContentComponent::handleSharedHistoryOnOpen(const juce::String& project
     }
 
     // Show the 3-option modal. Button indexing:
-    //   1 = Use it (adopt)     — shared tree becomes the live tree
-    //   2 = Use a copy (copy)  — duplicate to a private file, edit that
-    //   0 = Ignore             — leave the sidecar alone, no undo tree
+    //   1 = Use it (adopt)     - shared tree becomes the live tree
+    //   2 = Use a copy (copy)  - duplicate to a private file, edit that
+    //   0 = Ignore             - leave the sidecar alone, no undo tree
     juce::String projName = juce::File(projectAbsPath).getFileName();
     juce::String message =
         "This project came with a shared undo history.\n\n"
@@ -3830,7 +3830,7 @@ void MainContentComponent::offerSharedHistoryOnSaveAs(const juce::String& savedP
                 "who opens the project will be offered the history "
                 "(they can adopt it, keep a private copy, or ignore "
                 "it).\n\n"
-                "You can skip this — the undo history will still be "
+                "You can skip this - the undo history will still be "
                 "saved privately on your machine either way.")
             .withButton("Yes, Include")
             .withButton("No Thanks"),
@@ -3852,7 +3852,7 @@ void MainContentComponent::offerSharedHistoryOnSaveAs(const juce::String& savedP
                                   &safe->audioEngine.getGraphProcessor());
             }
             // Remember: on subsequent opens of this project, don't
-            // re-prompt — the user knows their own sidecar.
+            // re-prompt - the user knows their own sidecar.
             safe->recordHistoryDecision(capturedPath, HistoryDecision::Adopted);
         });
 }
@@ -3863,7 +3863,7 @@ void MainContentComponent::tryRestoreUndoTree() {
     std::ifstream in(file.getFullPathName().toStdString());
     if (!in) return;
     if (!graph.undoTree.restoreFrom(in)) {
-        // Corrupted or incompatible — drop it.
+        // Corrupted or incompatible - drop it.
         in.close();
         file.deleteFile();
         return;
@@ -3876,7 +3876,7 @@ void MainContentComponent::tryRestoreUndoTree() {
     const auto& snap = graph.undoTree.currentSnapshot();
     if (!snap.empty() && graph.undoTree.onLoadSnapshot)
         graph.undoTree.onLoadSnapshot(snap);
-    // Don't mark dirty for persistence — we just read this from disk.
+    // Don't mark dirty for persistence - we just read this from disk.
     undoTreeDirty = false;
 }
 
@@ -3886,7 +3886,7 @@ void MainContentComponent::tryRecoverAutosave() {
 
     auto autoFile = getAutosaveFile();
     if (!autoFile.existsAsFile()) {
-        // No autosave to consider — but we still want to restore the
+        // No autosave to consider - but we still want to restore the
         // persisted undo tree if one exists from a clean prior session.
         tryRestoreUndoTree();
         return;
@@ -4123,7 +4123,7 @@ public:
         } else {
             for (int i = 0; i < (int)recentScripts.size(); ++i) {
                 auto file = juce::File(recentScripts[i]);
-                menu.addItem(i + 1, file.getFileName() + "  —  " + file.getParentDirectory().getFileName());
+                menu.addItem(i + 1, file.getFileName() + "  -  " + file.getParentDirectory().getFileName());
             }
             menu.addSeparator();
             menu.addItem(999, "Clear Recents");
@@ -4682,9 +4682,9 @@ void MainContentComponent::showSongSettingsDialog() {
             header += "Current auto value: no clips yet, so playback won't auto-stop.\n";
     }
     header += "\nRepeat Mode:\n"
-              "  None    — stop at Song Length.\n"
-              "  Forever — loop back to beat 0 until Stop is pressed.\n"
-              "  N Times — loop back and play N times total, then stop.";
+              "  None    - stop at Song Length.\n"
+              "  Forever - loop back to beat 0 until Stop is pressed.\n"
+              "  N Times - loop back and play N times total, then stop.";
     auto* aw = new juce::AlertWindow("Song Length + Repeat", header,
         juce::MessageBoxIconType::NoIcon);
     aw->addTextEditor("length",
@@ -4808,7 +4808,7 @@ void MainContentComponent::setupHotkeyCallbacks() {
     hotkeyManager.setCallback(HotkeyAction::DisarmAllParams, [this]() {
         graph.armAllParams(false); graphComponent->repaint();
     });
-    // Piano roll actions — forward to the active editor's piano roll
+    // Piano roll actions - forward to the active editor's piano roll
     auto pianoRollAction = [this](const std::string& action) {
         for (auto& panel : editorPanels)
             if (panel->nodeId == graph.activeEditorNodeId && panel->component)
@@ -4892,13 +4892,13 @@ bool MainContentComponent::keyStateChanged(bool isKeyDown) {
 }
 
 // ==============================================================================
-// Computer Keyboard → MIDI ("Musical Typing")
+// Computer Keyboard -> MIDI ("Musical Typing")
 // ==============================================================================
 
 // Maps a key code to a MIDI note offset from C (0-11), or -1 if not a note key.
 // Layout:
-//   W E   T Y U   O P       → C# D#   F# G# A#   C# D#  (black keys)
-//   A S D F G H J K L ; '   → C  D  E  F  G  A  B  C  D  E  F  (white keys)
+//   W E   T Y U   O P       -> C# D#   F# G# A#   C# D#  (black keys)
+//   A S D F G H J K L ; '   -> C  D  E  F  G  A  B  C  D  E  F  (white keys)
 // Z/X = octave down/up
 int MainContentComponent::keyToMidiNote(int keyCode) const {
     int oct = audioEngine.keyboardOctave;
@@ -4969,7 +4969,7 @@ void MainWindow::tryQuit() {
 }
 
 // ==============================================================================
-// Output Capture → Audio Track
+// Output Capture -> Audio Track
 // ==============================================================================
 
 void MainContentComponent::bounceToAudioTrack() {

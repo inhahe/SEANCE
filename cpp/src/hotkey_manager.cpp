@@ -321,7 +321,7 @@ HotkeySettingsComponent::HotkeySettingsComponent(HotkeyManager& mgr, NodeGraph* 
         juce::dontSendNotification);
 
     addAndMakeVisible(addNodeActionBtn);
-    addNodeActionBtn.setTooltip("Add a hotkey binding for a specific node — toggle its mute/solo or open its editor. "
+    addNodeActionBtn.setTooltip("Add a hotkey binding for a specific node - toggle its mute/solo or open its editor. "
                                 "Pick the node and action from the popup, then click the new row to assign a keyboard shortcut.");
     addNodeActionBtn.onClick = [this]() {
         if (!graph) return;

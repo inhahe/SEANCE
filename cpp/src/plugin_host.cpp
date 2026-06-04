@@ -165,7 +165,7 @@ PluginHost::PluginDetail PluginHost::getPluginDetail(int pluginIndex) {
         }
     }
 
-    // Parameters — cap at 256 to protect against badly-behaved plugins
+    // Parameters - cap at 256 to protect against badly-behaved plugins
     // that report thousands of params (one per input combination, etc.).
     // Also skip params with nonsensical ranges (max < min) since those
     // would crash or confuse the automation and MIDI Learn systems.

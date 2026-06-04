@@ -62,14 +62,87 @@ static std::string sanitizeFilename(const std::string& s) {
     return out;
 }
 
-static std::string extractSampleToWav(openmpt_module_ext* modExt,
-                                      openmpt_module_ext_interface_interactive& interactive,
-                                      openmpt_module* mod,
-                                      int sampleId,
-                                      const std::string& sampleName,
-                                      const std::string& destDir) {
+// Output of sample extraction: path to the rendered WAV plus loop points
+// (in rendered-sample units) when the sample sustains forever. loopEnd == 0
+// means "not a looped sample" (one-shot — let it play to end and stop).
+struct ExtractedSample {
+    std::string path;
+    int  loopStart = 0;
+    int  loopEnd   = 0;
+};
+
+// Detect the loop period of a sustained sample by autocorrelating its tail.
+// Looped tracker samples are exactly periodic in their tail (after any
+// initial attack transient), so the autocorrelation has a sharp peak at the
+// loop length. Returns the period in rendered samples, or 0 if no clean
+// periodicity was found.
+static int detectLoopPeriod(const float* L, const float* R, int N) {
+    constexpr int   kRenderRate    = 44100;
+    constexpr float kMinFreqHz     = 30.0f;   // lowest plausible note pitch
+    constexpr float kMaxFreqHz     = 5000.0f; // highest plausible note pitch
+    constexpr float kCorrThresh    = 0.85f;   // require strong periodicity
+    const int lagMin = (int)(kRenderRate / kMaxFreqHz);  // ~9
+    const int lagMax = (int)(kRenderRate / kMinFreqHz);  // ~1470
+
+    // Analyse the last ~1s. The note has long since passed its attack.
+    int winN = std::min(N, kRenderRate);
+    if (winN < 2 * lagMax) return 0;
+    int winStart = N - winN;
+
+    // Use mono mix for analysis.
+    std::vector<float> mono(winN);
+    double meanSq = 0;
+    for (int i = 0; i < winN; ++i) {
+        mono[i] = 0.5f * (L[winStart + i] + R[winStart + i]);
+        meanSq += (double)mono[i] * mono[i];
+    }
+    if (meanSq < 1e-6) return 0;
+
+    // Pitch-detection autocorrelation: find the lag in [lagMin, lagMax]
+    // whose normalised cross-correlation is closest to 1. We use the
+    // normalised form r(tau) = sum(x[i]*x[i+tau]) / sqrt(E0 * Etau) so
+    // peaks scale to ~1 for a perfectly periodic tail regardless of
+    // amplitude drift across the window.
+    int   bestLag  = 0;
+    float bestCorr = 0;
+    for (int lag = lagMin; lag <= lagMax; ++lag) {
+        int M = winN - lag;
+        double sum = 0, e0 = 0, et = 0;
+        for (int i = 0; i < M; ++i) {
+            sum += (double)mono[i] * mono[i + lag];
+            e0  += (double)mono[i] * mono[i];
+            et  += (double)mono[i + lag] * mono[i + lag];
+        }
+        double denom = std::sqrt(e0 * et);
+        if (denom < 1e-12) continue;
+        float corr = (float)(sum / denom);
+        if (corr > bestCorr) { bestCorr = corr; bestLag = lag; }
+    }
+
+    // Reject weak matches — the sample is non-pitched, or its tail
+    // doesn't actually repeat (e.g. a free-running noise generator).
+    if (bestCorr < kCorrThresh || bestLag <= 0) return 0;
+
+    // bestLag is the period in lone sample frames. The loop window
+    // [N - K*bestLag, N] for any positive integer K is seamless; using
+    // K=1 gives the shortest seamless loop, but a longer loop sounds
+    // more natural for samples with subtle drift. Pick K so the loop
+    // is at least 100 ms long.
+    int minLoopLen = kRenderRate / 10;
+    int K = std::max(1, (minLoopLen + bestLag - 1) / bestLag);
+    return K * bestLag;
+}
+
+static ExtractedSample extractSampleToWav(openmpt_module_ext* modExt,
+                                          openmpt_module_ext_interface_interactive& interactive,
+                                          openmpt_module* mod,
+                                          int sampleId,
+                                          const std::string& sampleName,
+                                          const std::string& destDir) {
     constexpr int kRenderRate = 44100;
-    constexpr int kMaxSamples = kRenderRate * 4;
+    // 8s render cap — enough to capture any reasonable held note and
+    // give detectLoopPeriod a clean ~1s analysis window past the attack.
+    constexpr int kMaxSamples = kRenderRate * 8;
     constexpr int kSilenceMs = 250;
     constexpr float kSilenceThresh = 1e-4f;
     constexpr int kChunk = 1024;
@@ -120,6 +193,33 @@ static std::string extractSampleToWav(openmpt_module_ext* modExt,
         --tail;
     if (tail < 32) return {};
 
+    // Detect a loop. If the sample is still ringing at the time cap, the
+    // last block of audio is full-amplitude and periodic — we find the
+    // period and set the MultiSampler zone to loop within it.
+    int loopStart = 0, loopEnd = 0;
+    {
+        // "Still ringing" heuristic: did we hit the time cap without
+        // silence detection trimming us? If so, the sample is sustained.
+        // (For one-shots, kSilenceThresh trims the tail aggressively.)
+        bool hitTimeCap = ((int)left.size() >= kMaxSamples - kChunk);
+        // Tail-energy check too — guards against the case where the
+        // sample faded down past the silence threshold but still ran the
+        // full 8s (e.g., a slow-decaying pad). We only loop if there's
+        // enough signal at the end to anchor the autocorrelation.
+        int tailWin = std::min(tail, kRenderRate / 5); // 200 ms
+        double tailE = 0;
+        for (int i = tail - tailWin; i < tail; ++i)
+            tailE += (double)left[i] * left[i] + (double)right[i] * right[i];
+        float tailRms = (float)std::sqrt(tailE / (2.0 * tailWin));
+        if (hitTimeCap && tailRms > 0.01f) {
+            int period = detectLoopPeriod(left.data(), right.data(), tail);
+            if (period > 0) {
+                loopEnd   = tail;
+                loopStart = tail - period;
+            }
+        }
+    }
+
     char idxBuf[16];
     std::snprintf(idxBuf, sizeof(idxBuf), "%02d_", sampleId);
     auto safeName = sanitizeFilename(sampleName);
@@ -141,7 +241,12 @@ static std::string extractSampleToWav(openmpt_module_ext* modExt,
     std::memcpy(buf.getWritePointer(1), right.data(), sizeof(float) * tail);
     writer->writeFromAudioSampleBuffer(buf, 0, tail);
     writer.reset();
-    return outFile.getFullPathName().toStdString();
+
+    ExtractedSample out;
+    out.path = outFile.getFullPathName().toStdString();
+    out.loopStart = loopStart;
+    out.loopEnd   = loopEnd;
+    return out;
 }
 
 // Create a Sampler node — same param schema as the right-click "Sampler"
@@ -152,7 +257,7 @@ static std::string extractSampleToWav(openmpt_module_ext* modExt,
 // tracker land on the same MIDI scale so the zone's natural playback
 // matches the tracker's pitches.
 static int createSamplerNode(NodeGraph& graph, const std::string& name,
-                              const std::string& wavPath, Vec2 pos,
+                              const ExtractedSample& sample, Vec2 pos,
                               float pan = 0.0f,
                               bool amigaFilter = false) {
     auto& n = graph.addNode(name, NodeType::Instrument,
@@ -166,10 +271,20 @@ static int createSamplerNode(NodeGraph& graph, const std::string& name,
     // audible as a harsher "texture" vs the reference.
     doc.amigaFilter = amigaFilter;
     MultiSamplerZone z;
-    z.samplePath = wavPath;
+    z.samplePath = sample.path;
     z.loNote = 0; z.hiNote = 127;
     z.loVel = 1; z.hiVel = 127;
     z.baseNote = 60;
+    // Sustained (looped) samples: detectLoopPeriod found a clean cycle
+    // at the end of the rendered audio. Setting loopEnabled here makes
+    // MultiSampler wrap [loopStart, loopEnd] while the note is held,
+    // so a tracker-style sustained pad rings for the full note duration
+    // instead of cutting off at the end of the rendered WAV.
+    if (sample.loopEnd > sample.loopStart) {
+        z.loopEnabled = true;
+        z.loopStart   = sample.loopStart;
+        z.loopEnd     = sample.loopEnd;
+    }
     doc.zones.push_back(z);
     n.script = doc.encode();
     n.panLaw = PanLaw::Linear; // tracker uses linear pan law
@@ -245,9 +360,36 @@ ModImporter::ImportResult ModImporter::import(const std::string& path, NodeGraph
     // ------------------------------------------------------------------
     // Pass 1: extract samples to WAV via render-and-capture.
     // ------------------------------------------------------------------
-    std::vector<std::string> samplePaths(numSamples + 1);
+    std::vector<ExtractedSample> samplePaths(numSamples + 1);
     std::vector<std::string> sampleNames(numSamples + 1);
     std::string sampleDir;
+
+    // Determine which sample slots actually contain audio data. Empty
+    // slots (length-zero samples) are common in MOD files — the format
+    // reserves space for 31 sample headers and most modules leave many
+    // unused. Calling libopenmpt's interactive play_note on an empty
+    // sample with all channels muted has been observed to crash, so we
+    // skip empty slots up-front rather than relying on libopenmpt to
+    // handle the degenerate case gracefully.
+    //
+    // For MOD (M.K. and friends), the sample length lives at byte
+    // offset 22-23 of each 30-byte sample header, starting at offset 20
+    // in the file, in big-endian words (length-in-bytes = word * 2).
+    // For S3M/IT/XM we don't parse the header here — the importer falls
+    // back to "extract everything"; those formats haven't been observed
+    // to trigger the same crash but the extra `play_note` calls are
+    // harmless if the slot is empty (the silence-detection break trims
+    // the resulting near-silence quickly).
+    auto sampleHasData = [&](int s) -> bool {
+        if (fmt != Fmt::Mod && fmt != Fmt::Other) return true;
+        // s is 1-based. Need offset 20 + (s-1)*30 + 22 .. +23.
+        size_t hdrOff = 20 + (size_t)(s - 1) * 30;
+        if (hdrOff + 24 > data.size()) return false;
+        unsigned hi = (unsigned char)data[hdrOff + 22];
+        unsigned lo = (unsigned char)data[hdrOff + 23];
+        unsigned lenWords = (hi << 8) | lo;
+        return lenWords > 1;  // MOD: length 0..1 words ≡ "no sample"
+    };
 
     if (hasInteractive && numSamples > 0) {
         sampleDir = makeSampleDir(path);
@@ -285,6 +427,7 @@ ModImporter::ImportResult ModImporter::import(const std::string& path, NodeGraph
                 std::string name = (sn && sn[0]) ? sn : "";
                 if (name.empty()) name = "sample_" + std::to_string(s);
                 sampleNames[s] = name;
+                if (!sampleHasData(s)) continue;  // skip empty slots
                 samplePaths[s] = extractSampleToWav(modExt, interactive, mod,
                                                      s, name, sampleDir);
             }
@@ -435,7 +578,7 @@ ModImporter::ImportResult ModImporter::import(const std::string& path, NodeGraph
         while (start < (int)inst.noteMap.size()) {
             int sample = inst.noteMap[start].sample;
             if (sample <= 0 || sample > numSamples
-                || samplePaths[sample].empty()) {
+                || samplePaths[sample].path.empty()) {
                 ++start;
                 continue;
             }
@@ -444,25 +587,37 @@ ModImporter::ImportResult ModImporter::import(const std::string& path, NodeGraph
                    && inst.noteMap[end + 1].sample == sample) {
                 ++end;
             }
+            const auto& es = samplePaths[sample];
             MultiSamplerZone z;
-            z.samplePath = samplePaths[sample];
+            z.samplePath = es.path;
             z.loNote = start;
             z.hiNote = end;
             z.loVel  = 1;
             z.hiVel  = 127;
             z.baseNote = 60;           // matches extractSampleToWav render note
+            if (es.loopEnd > es.loopStart) {
+                z.loopEnabled = true;
+                z.loopStart   = es.loopStart;
+                z.loopEnd     = es.loopEnd;
+            }
             doc.zones.push_back(z);
             start = end + 1;
         }
         // If the whole map was empty (unused instrument slot), fall
         // back to a full-range zone using sample 1 so the node still
         // makes sound if the pattern references the instrument.
-        if (doc.zones.empty() && numSamples >= 1 && !samplePaths[1].empty()) {
+        if (doc.zones.empty() && numSamples >= 1 && !samplePaths[1].path.empty()) {
+            const auto& es = samplePaths[1];
             MultiSamplerZone z;
-            z.samplePath = samplePaths[1];
+            z.samplePath = es.path;
             z.loNote = 0; z.hiNote = 127;
             z.loVel = 1;  z.hiVel = 127;
             z.baseNote = 60;
+            if (es.loopEnd > es.loopStart) {
+                z.loopEnabled = true;
+                z.loopStart   = es.loopStart;
+                z.loopEnd     = es.loopEnd;
+            }
             doc.zones.push_back(z);
         }
         doc.volumeEnv = envelopeFromTracker(inst.volumeEnv, false, false);
@@ -544,7 +699,7 @@ ModImporter::ImportResult ModImporter::import(const std::string& path, NodeGraph
         }
 
         // Sample mode: one-zone instrument built from the extracted WAV.
-        if (slotId > numSamples || samplePaths[slotId].empty()) return -1;
+        if (slotId > numSamples || samplePaths[slotId].path.empty()) return -1;
         std::string label = sampleNames[slotId].empty()
             ? ("Sample " + std::to_string(slotId))
             : sampleNames[slotId];
@@ -1409,7 +1564,26 @@ ModImporter::ImportResult ModImporter::import(const std::string& path, NodeGraph
                             MidiNote nn;
                             nn.offset = currentBeat - clip.startBeat;
                             nn.pitch = std::min(127, midiPitch);
-                            nn.duration = beatsPerRow;
+                            // Tracker notes have no intrinsic duration: they
+                            // ring until either (a) a new note on the same
+                            // channel arrives and NNA::Cut trims them via
+                            // trimNote(), or (b) the sample plays through
+                            // and the MultiSampler voice naturally goes
+                            // silent past the sample's data length.
+                            //
+                            // Defaulting to beatsPerRow (one row) was
+                            // forcing every note to end after ~0.12 s,
+                            // which prematurely note-offs the voice and
+                            // chops the sample's natural decay. Use a
+                            // generous default and let trimNote() shorten
+                            // notes that have a successor — notes without
+                            // a successor extend silently past their
+                            // audible tail without harm. clip.lengthBeats
+                            // is clamped to songLength after the walk
+                            // (see "Extend each track's clip" block), so
+                            // the extended default doesn't bloat the
+                            // exported timeline.
+                            nn.duration = 64.0f;
                             int rawVel = 127;
                             // Volume column: VOLCMD_VOLUME == 1 (set volume).
                             // Other vol-col commands (slide etc.) are not yet

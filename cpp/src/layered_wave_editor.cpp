@@ -3434,7 +3434,48 @@ public:
         // Cell selection moved - the Assign button's "cell selected" half
         // may have flipped.
         updateAssignButtonEnabled();
+        // The Library row highlight tracks currentLibraryId. switchToFrame
+        // syncs currentLibraryId to whichever entry the clicked cell holds,
+        // so we need to refresh the row toggle states for the highlight to
+        // follow dot clicks / drags (not just direct Library row clicks).
+        refreshLibraryHighlight();
         view->repaint();
+    }
+
+    // Refresh the on/off state of each Library row button so the amber
+    // highlight tracks owner.currentLibraryId. Lightweight: no rebuild,
+    // just toggleState updates. Also scrolls the selected row into view
+    // in the library viewport so the user can see which entry is now
+    // the editor target after a click on a dot or cell.
+    //
+    // Falls back to a full rebuildLibraryList if the row vector got out
+    // of sync with wave.library (only happens if something mutated the
+    // library without going through refreshAfterDocMutation - shouldn't
+    // happen, but the fallback keeps the UI from going stale silently).
+    void refreshLibraryHighlight() {
+        if (libraryRowButtons.size() != owner.wave.library.size()) {
+            rebuildLibraryList();
+            return;
+        }
+        juce::Component* selRow = nullptr;
+        for (size_t i = 0; i < libraryRowButtons.size(); ++i) {
+            const int entryId = owner.wave.library[i].id;
+            const bool selected = (entryId == owner.currentLibraryId);
+            libraryRowButtons[i]->setToggleState(selected,
+                                                 juce::dontSendNotification);
+            if (selected) selRow = libraryRowButtons[i].get();
+        }
+        if (selRow) {
+            // Scroll the selected row into view if it isn't already. Use
+            // getBoundsInParent because the row lives inside
+            // libraryListContainer, which is what the viewport scrolls.
+            auto rowR = selRow->getBoundsInParent();
+            auto vis  = libraryListViewport.getViewArea();
+            if (!vis.contains(rowR.getCentre())) {
+                int targetY = std::max(0, rowR.getY() - 4);
+                libraryListViewport.setViewPosition(0, targetY);
+            }
+        }
     }
 
     // The embedded ScatterView is the editor's one source of truth for

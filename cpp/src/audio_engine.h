@@ -6,6 +6,7 @@
 #include "graph_processor.h"
 #include "recording.h"
 #include "multitrack_recorder.h"
+#include "granular_frame.h"
 #include <memory>
 #include <set>
 #include <atomic>
@@ -20,6 +21,16 @@ public:
 
     void init();
     void shutdown();
+
+    // Process-wide accessor for UI tools that need read access to the
+    // engine (playback-tap ring buffer, transport state, etc.) without
+    // having to be plumbed an AudioEngine& through every component
+    // constructor. There is only ever one AudioEngine in the app
+    // (constructed in MainWindow), so a static pointer is unambiguous;
+    // the constructor / destructor manage it. Returns nullptr if no
+    // engine has been constructed yet (e.g. during early static init
+    // or in unit tests that don't spin up audio).
+    static AudioEngine* getInstance() { return sInstance; }
 
     // AudioIODeviceCallback
     void audioDeviceIOCallbackWithContext(
@@ -81,6 +92,13 @@ public:
     RecordingManager& getRecordingManager() { return recordingManager; }
     MultitrackRecorder& getMultitrackRecorder() { return multitrackRecorder; }
 
+    // Read access to the live graph / transport that this engine is
+    // currently driving. Used by feature dialogs (e.g. the capture-from-
+    // project dialog) that need to spin up a parallel offline render of
+    // the project. May be nullptr before App has wired the engine up.
+    NodeGraph* getGraph() const { return graph; }
+    Transport* getTransport() const { return transport; }
+
     // Set the graph and transport to process (called from App)
     void setGraph(NodeGraph* g, Transport* t) {
         graph = g; transport = t;
@@ -91,6 +109,8 @@ public:
     }
 
 private:
+    static AudioEngine* sInstance;
+
     std::unique_ptr<juce::AudioDeviceManager> deviceManager;
     std::unique_ptr<juce::AudioFormatManager> formatManager;
     PluginHost pluginHost;
@@ -205,6 +225,75 @@ public:
             out[i] = src[(wp + i) % kSpectrumBufSize];
     }
 
+    // Playback-tap ring buffer for the wavetable capture-from-playback
+    // feature. Always-on (~1 MB per channel at the device rate, ~30 s of
+    // audio at typical sample rates). The audio thread writes mono-mixed
+    // output samples here after the graph processes each block; the UI
+    // thread snapshots a window of recent samples for the capture dialog
+    // to display and to slice into wavetable frames. Torn reads are
+    // acceptable - the worst case is a visual glitch on the dialog's
+    // waveform display, and grain capture happens on the UI thread after
+    // a complete snapshot is taken.
+    static constexpr int kPlaybackTapBufSize = 1 << 21;  // ~2M samples, ~43 s at 48 kHz
+    std::vector<float> playbackTapBuf;                   // mono-summed (L+R)*0.5
+    std::atomic<int>   playbackTapWritePos{0};
+    std::atomic<double> playbackTapSampleRate{44100.0};
+
+    // UI calls this to grab the most recent N samples (in *device* sample
+    // rate) into `out`, oldest-first. Returns the device sample rate the
+    // samples were captured at (or 0 if the buffer has never been written).
+    // out is resized to numSamples (which is clamped to kPlaybackTapBufSize).
+    double getPlaybackTapSnapshot(std::vector<float>& out, int numSamples) const {
+        if (playbackTapBuf.size() != (size_t)kPlaybackTapBufSize) {
+            out.clear();
+            return 0.0;
+        }
+        int n = std::min(numSamples, (int)kPlaybackTapBufSize);
+        out.resize((size_t)n);
+        int wp = playbackTapWritePos.load(std::memory_order_acquire);
+        // wp points to the NEXT slot to be written, so the last written
+        // sample is at (wp - 1). Walk back n samples from there.
+        for (int i = 0; i < n; ++i) {
+            int src = ((wp - n + i) % kPlaybackTapBufSize + kPlaybackTapBufSize) % kPlaybackTapBufSize;
+            out[(size_t)i] = playbackTapBuf[(size_t)src];
+        }
+        return playbackTapSampleRate.load(std::memory_order_acquire);
+    }
+
+    // Mic-input tap ring buffer (#captureDialog). Always-on parallel to
+    // playbackTapBuf, but reads from inputChannelData in the audio
+    // callback instead of outputChannelData. Same size and contract;
+    // mono-summed across all input channels. Lets the capture dialog
+    // pull a live "what's at the mic right now" snapshot without
+    // requiring an explicit Arm/Record gesture (matches the symmetric
+    // experience the playback tap offers).
+    static constexpr int kMicTapBufSize = kPlaybackTapBufSize;
+    std::vector<float> micTapBuf;
+    std::atomic<int>   micTapWritePos{0};
+    std::atomic<double> micTapSampleRate{44100.0};
+    // Latched true the first time any non-zero sample arrives on input,
+    // so the dialog can distinguish "no mic plugged in / muted" from
+    // "mic exists but the user hasn't made any sound yet". Reset on
+    // device start so plugging/unplugging midway through a session
+    // re-evaluates the flag.
+    std::atomic<bool>  micTapHasSignal{false};
+
+    double getMicTapSnapshot(std::vector<float>& out, int numSamples) const {
+        if (micTapBuf.size() != (size_t)kMicTapBufSize) {
+            out.clear();
+            return 0.0;
+        }
+        int n = std::min(numSamples, (int)kMicTapBufSize);
+        out.resize((size_t)n);
+        int wp = micTapWritePos.load(std::memory_order_acquire);
+        for (int i = 0; i < n; ++i) {
+            int src = ((wp - n + i) % kMicTapBufSize + kMicTapBufSize) % kMicTapBufSize;
+            out[(size_t)i] = micTapBuf[(size_t)src];
+        }
+        return micTapSampleRate.load(std::memory_order_acquire);
+    }
+    bool hasMicSignal() const { return micTapHasSignal.load(std::memory_order_acquire); }
+
     // Output capture: record the final mix to memory for "Save as Audio Track"
     // or export. Only the audio thread writes to the buffers (while capturing);
     // the UI thread reads them only after capture is stopped. No lock needed.
@@ -225,6 +314,184 @@ public:
 
     // Record a param change (called from UI when user moves a slider/knob)
     void recordParamChange(int nodeId, int paramIdx, float value);
+
+    // ============================================================
+    // Preview audio for the "Capture from project" dialog (#capV2).
+    // ============================================================
+    // The dialog pre-renders the whole song to mono PCM once on open,
+    // then drives this engine to either (a) play the rendered song from
+    // the marker position at full fidelity (Playing state) or (b) loop
+    // a small grain extracted around the marker (Paused / Scrubbing
+    // state). The audio thread mixes whichever mode is active on top of
+    // the live graph output so the user can audition while picking the
+    // capture spot without touching the live transport.
+    //
+    // Thread safety:
+    //   - songPcm and grainBuf are std::shared_ptr published via
+    //     std::atomic. The audio thread loads once per block and reads
+    //     from the locked-in pointer for the whole block.
+    //   - previewMode / previewSongPosSamples are plain atomics.
+    //   - On mode change, the audio thread runs a ~10 ms linear
+    //     crossfade between the previous and new modes so transport
+    //     state transitions don't click.
+    enum class PreviewMode { Off = 0, SongPlay = 1, GrainLoop = 2 };
+
+    // GrainFreezeMode picks which "freeze the marker spot" algorithm runs in
+    // GrainLoop preview. Each has its own sonic character; see audio_engine.h
+    // private section for the full rundown. Aliased to GranularFreezeMode
+    // from granular_frame.h so the dialog auditions with the same algorithm
+    // it bakes into the saved frame and there's only one wire enum to keep
+    // stable.
+    using GrainFreezeMode = GranularFreezeMode;
+    void setGrainFreezeMode(GrainFreezeMode m) {
+        grainFreezeMode.store((int)m, std::memory_order_release);
+    }
+    GrainFreezeMode getGrainFreezeMode() const {
+        return (GrainFreezeMode)grainFreezeMode.load(std::memory_order_acquire);
+    }
+
+    // Install / replace the song PCM (mono, at the device sample rate).
+    // Pass nullptr to clear. Safe to call from any thread.
+    void setPreviewSongPcm(std::shared_ptr<std::vector<float>> pcm) {
+        previewSongPcm.store(std::move(pcm));
+    }
+    // Install / replace the grain source buffer (mono, at the device sample
+    // rate). This is the source material the granular voices read from -
+    // typically a window of the song several times longer than the grain
+    // length, so voices can pick jittered start positions inside it. Pass
+    // nullptr to clear. Safe to call from any thread.
+    void setPreviewGrainBuffer(std::shared_ptr<std::vector<float>> grain) {
+        previewGrainBuf.store(std::move(grain));
+    }
+    // Set the grain length N (in samples). This is the envelope length of
+    // each Hann-windowed grain in the OLA stream, NOT the size of the
+    // source buffer (which is typically several times larger). Safe to
+    // call from any thread; audio thread re-initialises voice phases on
+    // the next block if the value changed.
+    void setPreviewGrainLength(int n) {
+        previewGrainLenSamples.store(n, std::memory_order_release);
+    }
+    int  getPreviewGrainLength() const {
+        return previewGrainLenSamples.load(std::memory_order_acquire);
+    }
+    // Set the crossfade length in samples for the CrossfadeLoop freeze
+    // mode. The audio thread snapshots this per block and clamps to
+    // [0, grainLen/2] -- bigger than L/2 would overlap the two ramps and
+    // collapse the loop. 0 disables the crossfade (clicks at every seam,
+    // but a useful debug option). Safe to call from any thread.
+    void setPreviewCrossfadeLength(int n) {
+        previewCrossfadeSamples.store(std::max(0, n), std::memory_order_release);
+    }
+    int  getPreviewCrossfadeLength() const {
+        return previewCrossfadeSamples.load(std::memory_order_acquire);
+    }
+    void setPreviewMode(PreviewMode m) {
+        previewMode.store((int)m, std::memory_order_release);
+    }
+    PreviewMode getPreviewMode() const {
+        return (PreviewMode)previewMode.load(std::memory_order_acquire);
+    }
+    // Seek the song-play playhead (UI thread). The audio thread advances
+    // this on each block while in SongPlay mode.
+    void setPreviewSongPosSamples(int64_t s) {
+        previewSongPosSamples.store(s, std::memory_order_release);
+    }
+    int64_t getPreviewSongPosSamples() const {
+        return previewSongPosSamples.load(std::memory_order_acquire);
+    }
+    // Clears all preview state. Use on dialog close. Sets mode=Off, drops
+    // both buffers, zeroes the position.
+    void clearPreview() {
+        setPreviewMode(PreviewMode::Off);
+        setPreviewSongPcm(nullptr);
+        setPreviewGrainBuffer(nullptr);
+        previewGrainLenSamples.store(0, std::memory_order_release);
+        previewCrossfadeSamples.store(0, std::memory_order_release);
+        previewSongPosSamples.store(0, std::memory_order_release);
+    }
+
+private:
+    std::atomic<int>      previewMode { 0 };
+    std::atomic<int64_t>  previewSongPosSamples { 0 };
+    std::atomic<int>      previewGrainLenSamples { 0 };
+    std::atomic<int>      previewCrossfadeSamples { 0 };
+    std::atomic<std::shared_ptr<std::vector<float>>> previewSongPcm;
+    std::atomic<std::shared_ptr<std::vector<float>>> previewGrainBuf;
+    // Audio-thread-only crossfade state.
+    //   currAppliedPreviewMode  - the mode we are currently bleeding in
+    //                             (matches previewMode after the most
+    //                             recent transition is observed).
+    //   outgoingPreviewMode     - the mode we are bleeding out (0 = none).
+    //   previewFadeCounter      - samples remaining in the fade. Reaches 0
+    //                             once outgoing is fully muted.
+    //   prevSongPosForFade      - song-play read position for the outgoing
+    //                             mode (when outgoing=SongPlay). The dying
+    //                             stream keeps advancing through the song
+    //                             while it fades out.
+    //
+    // Grain freeze (GrainLoop mode) - the engine continuously plays back the
+    // marker spot so the user can audition it before committing to a Capture.
+    // The dialog publishes a multi-second source PCM window centered on the
+    // marker; the engine picks an L-sample loop inside that window (L =
+    // previewGrainLenSamples) and plays it on repeat. There are four
+    // algorithmic variants, all reaching for "sustain the marker spot
+    // smoothly" but each with its own character:
+    //   CrossfadeLoop    - faithful tape loop with a short Hann crossfade
+    //                      at the seam (no click). Default / "what does
+    //                      this spot literally sound like."
+    //   AsyncGranular    - many short grains at randomised positions in a
+    //                      small range near the marker. "Frozen blur"
+    //                      texture, like GRM Freeze.
+    //   PitchSyncGrains  - grain hop locked to the detected pitch period,
+    //                      so the loop is one cycle and the output is a
+    //                      true sustained tone at that pitch. Requires a
+    //                      pitch-detected source.
+    //   SpectralFreeze   - FFT a window at the marker, keep magnitudes,
+    //                      regenerate phases per frame, IFFT. Ethereal
+    //                      pad-like sustain.
+    // The mode the dialog wants is in grainFreezeMode (atomic, set by the
+    // GUI thread). The audio thread snapshots it once per block. State that
+    // each algorithm needs is held alongside the mode dispatcher below;
+    // currently only CrossfadeLoop is implemented and the others fall back
+    // to it until their separate stages land.
+    //
+    // CrossfadeLoop state
+    //   grainAnchor         - source-buffer offset where the loop window
+    //                         starts. Loop range is [anchor, anchor + L).
+    //                         The crossfade reads `xfade` samples *past*
+    //                         the loop end (from anchor + L to
+    //                         anchor + L + xfade) and blends them with
+    //                         the loop's start. xfade is the live value
+    //                         in previewCrossfadeSamples, clamped to
+    //                         [0, L/2]. So the dialog needs to publish a
+    //                         source buffer with at least
+    //                         anchor + L + L/2 samples available to leave
+    //                         room for the largest xfade the user can
+    //                         pick; the init clamps anchor accordingly.
+    //   grainPhase          - current position within the loop, in [0, L).
+    //                         Increments by 1 per sample, wraps at L.
+    //   grainLastAppliedLen - L the state was initialised for. If the UI
+    //                         changes L, we reset.
+    //   grainLastAppliedSrcPtr - last source buffer ptr; new buffer triggers
+    //                         re-init (so the marker move auditions the
+    //                         new spot).
+    //   grainNeedsReinit    - set on mode-entry into GrainLoop so the next
+    //                         block re-anchors.
+    int     currAppliedPreviewMode = 0;
+    int     outgoingPreviewMode = 0;
+    int     previewFadeCounter = 0;
+    int64_t prevSongPosForFade = 0;
+    int     grainAnchor            = 0;
+    int     grainPhase             = 0;
+    int     grainLastAppliedLen    = 0;
+    const float* grainLastAppliedSrcPtr = nullptr;
+    bool    grainNeedsReinit       = false;
+    // Atomic mode pick. 0 = CrossfadeLoop (default), 1 = AsyncGranular,
+    // 2 = PitchSyncGrains, 3 = SpectralFreeze. Stored as int so the
+    // atomic is trivially copyable and lock-free.
+    std::atomic<int> grainFreezeMode { 0 };
+    static constexpr int kPreviewCrossfadeSamples = 480;  // ~10 ms @ 48 kHz
+public:
 
     // MPE recording: captures per-note expression from hardware MPE controllers
     struct MpeRecordNote {

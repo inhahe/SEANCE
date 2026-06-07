@@ -1,9 +1,5 @@
 #pragma once
-// Silence MSVC C++20 deprecation of std::atomic_load/store for shared_ptr.
-// We use these for the lock-free TempoMap swap (#22); replacing them with
-// std::atomic<shared_ptr> would require C++20 library support that not all
-// toolchains ship yet.
-#define _SILENCE_CXX20_OLD_SHARED_PTR_ATOMIC_SUPPORT_DEPRECATION_WARNING
+#include <atomic>
 #include <cstdint>
 #include <vector>
 #include <memory>
@@ -34,27 +30,57 @@ struct TempoPoint {
 };
 
 // Tempo map - supports multiple tempo changes over time
-// Lock-free TempoMap via shared_ptr swap (#22). The UI thread builds a
-// new immutable vector and atomically publishes it. The audio thread
-// grabs a snapshot via atomic_load and reads it without locking. No
-// iterator-invalidation races, no empty-vector windows.
+// Wait-free-for-readers TempoMap via shared_ptr swap (#22). The UI
+// thread builds a new immutable vector and atomically publishes it.
+// The audio thread grabs a snapshot via .load() and reads it without
+// locking. No iterator-invalidation races, no empty-vector windows.
+//
+// Uses C++20 std::atomic<std::shared_ptr<T>> (the specialization, not
+// the deprecated free std::atomic_load / atomic_store overloads). Two
+// concrete robustness wins over the old API:
+//   1. The atomicity is in the type, not the call. A bare
+//      `pts = newPts` is now also atomic, so a careless future edit
+//      can't silently introduce a race with the audio thread.
+//   2. The shared_ptr is to const Points, so readers literally can
+//      not mutate the published vector through the snapshot - the
+//      "immutable by convention" comment becomes a type rule.
 class TempoMap {
 public:
     using Points = std::vector<TempoPoint>;
-    // Not const-qualified because MSVC's std::atomic_store can't resolve
-    // the const/non-const shared_ptr overload. The vector is treated as
-    // immutable by convention - once published, nobody mutates it.
-    using PointsPtr = std::shared_ptr<Points>;
+    using PointsPtr = std::shared_ptr<const Points>;
 
     TempoMap() {
         auto p = std::make_shared<Points>();
         p->push_back({0, 120.0, 120.0, 0});
-        std::atomic_store(&pts, std::move(p));
+        pts.store(std::move(p));
+    }
+
+    // std::atomic<...> is non-copyable, which would delete TempoMap's
+    // implicit copy/move (and therefore Transport's too). Restore them
+    // explicitly via snapshot-and-publish: take an atomic snapshot of
+    // the source's pts and store it into ours. Cheap because we're
+    // just bumping the shared_ptr refcount, not copying the vector.
+    // Safe to call while the source is being concurrently written - we
+    // get whichever value was published at the moment of the load.
+    TempoMap(const TempoMap& other) {
+        pts.store(other.pts.load());
+    }
+    TempoMap& operator=(const TempoMap& other) {
+        if (this != &other) pts.store(other.pts.load());
+        return *this;
+    }
+    // Move is the same operation as copy for our purposes (shared_ptr
+    // copy + atomic store); there's no advantage to a destructive
+    // move when the underlying handle is shared. Default to copy
+    // semantics by forwarding to the copy operators.
+    TempoMap(TempoMap&& other) noexcept : TempoMap(static_cast<const TempoMap&>(other)) {}
+    TempoMap& operator=(TempoMap&& other) noexcept {
+        return *this = static_cast<const TempoMap&>(other);
     }
 
     // Snapshot accessor - audio thread calls this once per block and
     // reads through the returned shared_ptr for the rest of the block.
-    PointsPtr snapshot() const { return std::atomic_load(&pts); }
+    PointsPtr snapshot() const { return pts.load(); }
 
     // Get BPM at a given beat position.
     double bpmAtBeat(double beat) const {
@@ -114,7 +140,8 @@ public:
         nv->push_back({beat, bpm, bpm, 0});
         std::sort(nv->begin(), nv->end(),
                   [](auto& a, auto& b) { return a.beatPosition < b.beatPosition; });
-        std::atomic_store(&pts, PointsPtr(std::move(nv)));
+        // shared_ptr<Points> implicitly converts to shared_ptr<const Points>.
+        pts.store(std::move(nv));
     }
 
     void addTempoRamp(double startBeat, double endBeat, double startBpm, double endBpm) {
@@ -123,19 +150,19 @@ public:
         nv->push_back({startBeat, startBpm, endBpm, endBeat});
         std::sort(nv->begin(), nv->end(),
                   [](auto& a, auto& b) { return a.beatPosition < b.beatPosition; });
-        std::atomic_store(&pts, PointsPtr(std::move(nv)));
+        pts.store(std::move(nv));
     }
 
     void clear() {
         auto nv = std::make_shared<Points>();
         nv->push_back({0, 120.0, 120.0, 0});
-        std::atomic_store(&pts, PointsPtr(std::move(nv)));
+        pts.store(std::move(nv));
     }
 
     void setGlobalBpm(double bpm) {
         auto nv = std::make_shared<Points>();
         nv->push_back({0, bpm, bpm, 0});
-        std::atomic_store(&pts, PointsPtr(std::move(nv)));
+        pts.store(std::move(nv));
     }
 
     // Legacy accessor kept for code that reads `tempoMap.points` directly
@@ -147,7 +174,7 @@ public:
     }
 
 private:
-    PointsPtr pts;
+    std::atomic<PointsPtr> pts;
 };
 
 // Time signature map - supports changes over time

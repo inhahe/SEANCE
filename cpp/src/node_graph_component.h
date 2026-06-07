@@ -20,6 +20,14 @@ public:
 
     void fitAll();
 
+    // After a project load (or any external mutation of graph.viewZoom),
+    // re-evaluate which view to show: restore the saved pan/zoom if one was
+    // persisted (graph.viewZoom > 0), otherwise fit-all. Called by
+    // main_window after ProjectFile::load. Sets pendingInitialFit so the
+    // decision actually applies on the next paint/resized once we have a
+    // real size.
+    void notifyProjectLoaded();
+
     // Callbacks
     std::function<void(Node&)> onOpenEditor;
     std::function<void()> onNodeEdited;         // called when a node's data changed; wire to graphProcessor.requestRebuild()
@@ -43,11 +51,21 @@ private:
     float zoom = 1.0f;
     juce::Point<float> panOffset{0, 0};
 
-    // True until the first resized() callback runs fitAll(). Prevents the
-    // user from briefly seeing nodes at the default zoom/pan before the
-    // initial fit, which used to look like a tacky zoom-in animation on
-    // every project load.
+    // True until the first resized()/paint() callback applies the initial
+    // view (either restoring the saved pan/zoom from graph.viewZoom/PanX/PanY
+    // or running fitAll() as a fallback). Prevents the user from briefly
+    // seeing nodes at the default zoom/pan before that decision, which used
+    // to look like a tacky zoom-in animation on every project load. Reset
+    // to true by notifyProjectLoaded() so a mid-session "Load Project"
+    // reapplies the saved view from the newly-loaded graph.
     bool pendingInitialFit = true;
+
+    // Push the live zoom/panOffset back into graph.viewZoom/PanX/PanY so
+    // the next project save records the user's current view. Called after
+    // any interaction that mutates the view (wheel zoom, pan drag,
+    // fitAll). NodeGraph itself owns the saved view; the component just
+    // mirrors its own working values into the graph as they change.
+    void publishViewState();
 
     // Interaction state
     enum class DragMode { None, Pan, MoveNode, DragLink, SelectBox, DragParam };
@@ -88,6 +106,17 @@ private:
     // Helpers
     void deleteSelectedLink();
     void deleteSelectedNode();
+
+    // Build a TerrainSynth node with the requested name, script, and
+    // dimensionality (1..8). Creates MIDI + N Signal input pins, an Audio
+    // output pin, and the standard envelope/volume/pan/traversal/grain
+    // params plus per-axis Radius/Center pairs. Used by both the
+    // synchronous menu paths (sin*cos, noise, image, audio) and the
+    // async N-D custom-expression dialog callback.
+    Node& makeTerrainNode(const std::string& name,
+                          const std::string& script,
+                          juce::Point<float> canvasPos,
+                          int numDims = 2);
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(NodeGraphComponent)
 };

@@ -1,4 +1,5 @@
 #include "audio_engine.h"
+#include "audio_cache.h"
 #include <cstdio>
 #include <algorithm>
 
@@ -17,8 +18,20 @@ double AudioEngine::computeMaxGraphTailSeconds() const {
     return maxTail;
 }
 
-AudioEngine::AudioEngine() = default;
-AudioEngine::~AudioEngine() { shutdown(); }
+AudioEngine* AudioEngine::sInstance = nullptr;
+
+AudioEngine::AudioEngine() {
+    // Last-one-wins on the off chance two are ever constructed (shouldn't
+    // happen in production - MainWindow holds the only AudioEngine - but
+    // this keeps the invariant simple to reason about). Destructor below
+    // clears the slot only if we're still the registered instance, so
+    // teardown of a transient engine in a test won't null out a real one.
+    sInstance = this;
+}
+AudioEngine::~AudioEngine() {
+    shutdown();
+    if (sInstance == this) sInstance = nullptr;
+}
 
 void AudioEngine::init() {
     formatManager = std::make_unique<juce::AudioFormatManager>();
@@ -140,6 +153,26 @@ void AudioEngine::audioDeviceAboutToStart(juce::AudioIODevice* device) {
     resampleBufL.resize(maxProjectSamples, 0.0f);
     resampleBufR.resize(maxProjectSamples, 0.0f);
     resamplePhase = 0.0;
+
+    // Allocate the playback-tap ring buffer on the first device start.
+    // Stays allocated for the app lifetime - the audio thread only ever
+    // writes into a fixed-size, pre-allocated buffer, never reallocates.
+    if (playbackTapBuf.size() != (size_t)kPlaybackTapBufSize) {
+        playbackTapBuf.assign((size_t)kPlaybackTapBufSize, 0.0f);
+        playbackTapWritePos.store(0, std::memory_order_release);
+    }
+    playbackTapSampleRate.store(sampleRate, std::memory_order_release);
+
+    // Same treatment for the mic-tap ring buffer (read side of the audio
+    // callback). Allocated once, reset signal-detected flag so plugging
+    // in a different input device re-evaluates whether any signal is
+    // actually arriving.
+    if (micTapBuf.size() != (size_t)kMicTapBufSize) {
+        micTapBuf.assign((size_t)kMicTapBufSize, 0.0f);
+        micTapWritePos.store(0, std::memory_order_release);
+    }
+    micTapSampleRate.store(sampleRate, std::memory_order_release);
+    micTapHasSignal.store(false, std::memory_order_release);
 }
 
 void AudioEngine::audioDeviceStopped() {
@@ -375,6 +408,241 @@ void AudioEngine::audioDeviceIOCallbackWithContext(
         spectrumBufL[spectrumWritePos] = (numOutputChannels > 0) ? outputChannelData[0][s] : 0.0f;
         spectrumBufR[spectrumWritePos] = (numOutputChannels > 1) ? outputChannelData[1][s] : 0.0f;
         spectrumWritePos = (spectrumWritePos + 1) % kSpectrumBufSize;
+    }
+
+    // Wavetable capture-from-playback ring buffer: mono-summed final mix,
+    // always-on, used by the +Frame -> "From recent playback" dialog. Single
+    // writer (this audio callback), single reader (UI thread snapshot).
+    // No lock - the reader tolerates torn reads since worst case is a
+    // visual glitch on the dialog's waveform display.
+    if (playbackTapBuf.size() == (size_t)kPlaybackTapBufSize) {
+        int wp = playbackTapWritePos.load(std::memory_order_relaxed);
+        for (int s = 0; s < numSamples; ++s) {
+            float l = (numOutputChannels > 0) ? outputChannelData[0][s] : 0.0f;
+            float r = (numOutputChannels > 1) ? outputChannelData[1][s] : l;
+            playbackTapBuf[(size_t)wp] = 0.5f * (l + r);
+            wp = (wp + 1) & (kPlaybackTapBufSize - 1);  // pow-2 wrap
+        }
+        playbackTapWritePos.store(wp, std::memory_order_release);
+    }
+
+    // Mic-tap: same shape as the playback-tap above, but it reads from
+    // inputChannelData. Mono-sums every input channel (most setups have
+    // 1 input mic but stereo inputs e.g. line-in still get summed for
+    // a single-cycle frame source - users who need stereo capture
+    // should use audio tracks). Drives the +Frame -> "From microphone"
+    // capture dialog. Also latches micTapHasSignal so the dialog can
+    // tell a silent mic apart from a missing one.
+    if (micTapBuf.size() == (size_t)kMicTapBufSize && numInputChannels > 0) {
+        int wp = micTapWritePos.load(std::memory_order_relaxed);
+        const float invCh = 1.0f / (float)numInputChannels;
+        bool sawSignal = false;
+        for (int s = 0; s < numSamples; ++s) {
+            float sum = 0.0f;
+            for (int ch = 0; ch < numInputChannels; ++ch)
+                sum += inputChannelData[ch][s];
+            const float v = sum * invCh;
+            micTapBuf[(size_t)wp] = v;
+            wp = (wp + 1) & (kMicTapBufSize - 1);
+            if (std::abs(v) > 1.0e-5f) sawSignal = true;
+        }
+        micTapWritePos.store(wp, std::memory_order_release);
+        if (sawSignal && !micTapHasSignal.load(std::memory_order_relaxed))
+            micTapHasSignal.store(true, std::memory_order_release);
+    }
+
+    // Capture-from-project preview audio (#capV2). Mixes on top of the
+    // graph output so the dialog can audition the pre-rendered song or a
+    // marker-position granular drone while picking the capture spot.
+    // SongPlay reads the rendered project PCM linearly. GrainLoop runs an
+    // overlap-add stream of 4 Hann-windowed grains (envelope length N =
+    // previewGrainLenSamples) with jittered source-start positions inside
+    // the longer source buffer the UI publishes - this is proper granular
+    // synthesis, NOT a clip on loop, so the audition is a continuous
+    // drone without a visible seam. On mode changes we run a short
+    // linear crossfade between the outgoing and incoming modes so
+    // transport state transitions don't click.
+    {
+        const int requestedMode = previewMode.load(std::memory_order_acquire);
+
+        // Observe a mode change once (this block runs on the audio thread
+        // only, so currAppliedPreviewMode is single-writer). When we see
+        // a new request we move the current mode into "outgoing" and
+        // start the fade. SongPlay always restarts reading at the latest
+        // UI-published marker; GrainLoop re-staggers voice phases so the
+        // OLA stream begins fresh (incoming voices) while the outgoing
+        // grain stream's current voice state keeps producing the dying
+        // tail through the crossfade.
+        if (requestedMode != currAppliedPreviewMode) {
+            outgoingPreviewMode = currAppliedPreviewMode;
+            prevSongPosForFade  = previewSongPosSamples.load(std::memory_order_acquire);
+            previewFadeCounter  = kPreviewCrossfadeSamples;
+            currAppliedPreviewMode = requestedMode;
+            if (requestedMode == (int)PreviewMode::GrainLoop)
+                grainNeedsReinit = true;
+        }
+
+        const bool fading = (previewFadeCounter > 0 && outgoingPreviewMode != 0);
+        const bool anyActive = (currAppliedPreviewMode != 0) || fading;
+
+        if (anyActive) {
+            auto songPtr  = previewSongPcm.load();
+            auto grainPtr = previewGrainBuf.load();
+            const int grainLen = previewGrainLenSamples.load(std::memory_order_acquire);
+
+            // Snapshot the current song-play position. We advance it
+            // locally and publish back at the end of the block.
+            int64_t songPos = previewSongPosSamples.load(std::memory_order_acquire);
+
+            // (Re-)initialise loop state if the grain length, source
+            // buffer, or mode transition into GrainLoop says so. We do
+            // this once at block start so the per-sample loop stays
+            // branchless on the hot path. If grainPtr is null or too
+            // short for a loop plus crossfade to fit, granularSample
+            // below returns 0.
+            //
+            // Freeze-mode dispatch: the per-block snapshot below picks
+            // which "sustain the marker" algorithm runs. Only the
+            // CrossfadeLoop branch is implemented today; the others
+            // (AsyncGranular, PitchSyncGrains, SpectralFreeze) fall
+            // back to it until their dedicated implementations land.
+            const int freezeMode = grainFreezeMode.load(std::memory_order_acquire);
+            (void)freezeMode; // currently always CrossfadeLoop
+            // Crossfade length is set by the dialog (atomic, per-block
+            // snapshot) and clamped to [0, L/2]: bigger than L/2 would
+            // overlap the two ramps. The reserved tail capacity below
+            // (L/2 samples past the loop) is the maximum the user can
+            // ever ask for, so the buffer size requirement is a fixed
+            // L + L/2 = 3L/2 samples regardless of the current xfade.
+            const int xfadeReq = previewCrossfadeSamples.load(std::memory_order_acquire);
+            const int xfade = std::max(0, std::min(xfadeReq, grainLen / 2));
+            const int reservedTail = grainLen / 2;
+            const bool grainViable = grainPtr && grainLen >= 16
+                                     && (int)grainPtr->size() >= grainLen + reservedTail;
+            if (grainViable) {
+                const float* srcPtr = grainPtr->data();
+                const bool need = grainNeedsReinit
+                               || grainLen != grainLastAppliedLen
+                               || srcPtr != grainLastAppliedSrcPtr;
+                if (need) {
+                    // Anchor selection: center the loop window inside the
+                    // available source PCM. The dialog publishes a multi-
+                    // second window centered on the marker, so a centered
+                    // anchor reads the marker spot. We need anchor + L +
+                    // L/2 <= srcLen so the seam crossfade has lookahead
+                    // material to blend with at any user-picked xfade up
+                    // to the L/2 cap.
+                    const int srcLen = (int)grainPtr->size();
+                    const int needLen = grainLen + reservedTail;
+                    const int maxStart = std::max(0, srcLen - needLen);
+                    grainAnchor            = maxStart / 2;
+                    grainPhase             = 0;
+                    grainLastAppliedLen    = grainLen;
+                    grainLastAppliedSrcPtr = srcPtr;
+                    grainNeedsReinit       = false;
+                }
+            }
+
+            // CrossfadeLoop: single playhead reads [anchor, anchor+L) on
+            // repeat; at the start of each iteration we Hann-crossfade
+            // against [anchor+L, anchor+L+xfade) so the seam doesn't
+            // click. Output is `source[anchor + grainPhase]` straight
+            // through, except in the first `xfade` samples of each
+            // iteration where we blend in the "what would have come next
+            // if we hadn't wrapped" tail.
+            auto granularSample = [&]() -> float {
+                if (!grainViable) return 0.0f;
+                const auto& src = *grainPtr;
+                const int srcLen = (int)src.size();
+                int p = grainPhase;
+                const int idxMain = grainAnchor + p;
+                float out = (idxMain >= 0 && idxMain < srcLen)
+                            ? src[(size_t)idxMain] : 0.0f;
+                if (p < xfade) {
+                    // alpha rises from 0 to 1 across the xfade window
+                    // (Hann half-cycle). Pre-seam tail (source[anchor+L+p])
+                    // weighted by (1 - alpha), in-loop sample weighted by
+                    // alpha -- so at p=0 we are reading the tail (= the
+                    // sample just before the seam, perfectly continuous
+                    // with the previous iteration's end), and by p=xfade
+                    // we are fully on the loop's start.
+                    const float pi = juce::MathConstants<float>::pi;
+                    const float alpha = 0.5f * (1.0f - std::cos(pi * (float)p / (float)xfade));
+                    const int idxTail = grainAnchor + grainLen + p;
+                    float tail = (idxTail >= 0 && idxTail < srcLen)
+                                 ? src[(size_t)idxTail] : 0.0f;
+                    out = alpha * out + (1.0f - alpha) * tail;
+                }
+                ++p;
+                if (p >= grainLen) p = 0;
+                grainPhase = p;
+                return out;
+            };
+
+            auto songSampleAdvance = [&](int64_t& posRef) -> float {
+                if (!songPtr || songPtr->empty()) return 0.0f;
+                const auto& v = *songPtr;
+                const int64_t n = (int64_t)v.size();
+                if (posRef < 0 || posRef >= n) return 0.0f;
+                float s = v[(size_t)posRef];
+                ++posRef;
+                return s;
+            };
+
+            auto modeSample = [&](int mode, int64_t& songPosRef) -> float {
+                if (mode == (int)PreviewMode::SongPlay)
+                    return songSampleAdvance(songPosRef);
+                if (mode == (int)PreviewMode::GrainLoop)
+                    return granularSample();
+                return 0.0f;
+            };
+
+            // Edge case: the granular state machine has a single shared
+            // voice bank, so if we ever needed to read BOTH outgoing AND
+            // incoming as GrainLoop in the same block (impossible in
+            // practice - the only GrainLoop-related transitions are
+            // SongPlay<->GrainLoop and Off<->GrainLoop, never
+            // GrainLoop->GrainLoop), the outgoing tail would corrupt the
+            // incoming state. Guarded just in case future modes change
+            // the matrix: when both are GrainLoop, skip the fade.
+            const bool bothGrain = (currAppliedPreviewMode == (int)PreviewMode::GrainLoop
+                                    && outgoingPreviewMode == (int)PreviewMode::GrainLoop);
+
+            for (int s = 0; s < numSamples; ++s) {
+                float t = 1.0f;
+                if (previewFadeCounter > 0)
+                    t = 1.0f - (float)previewFadeCounter
+                                / (float)kPreviewCrossfadeSamples;
+
+                const float inSamp = modeSample(currAppliedPreviewMode, songPos);
+                float outSamp = t * inSamp;
+
+                if (previewFadeCounter > 0 && outgoingPreviewMode != 0 && !bothGrain) {
+                    const float oldSamp = modeSample(outgoingPreviewMode, prevSongPosForFade);
+                    outSamp += (1.0f - t) * oldSamp;
+                    --previewFadeCounter;
+                    if (previewFadeCounter == 0) outgoingPreviewMode = 0;
+                } else if (previewFadeCounter > 0) {
+                    --previewFadeCounter;
+                    if (previewFadeCounter == 0) outgoingPreviewMode = 0;
+                }
+
+                if (numOutputChannels > 0) outputChannelData[0][s] += outSamp;
+                if (numOutputChannels > 1) outputChannelData[1][s] += outSamp;
+            }
+
+            // Publish the advanced song-play position so the UI's marker
+            // tracks the playhead.
+            previewSongPosSamples.store(songPos, std::memory_order_release);
+
+            // Song finished while in SongPlay: auto-stop. UI's timer will
+            // notice mode==Off and update the transport buttons.
+            if (currAppliedPreviewMode == (int)PreviewMode::SongPlay && songPtr) {
+                if (songPos >= (int64_t)songPtr->size()) {
+                    previewMode.store(0, std::memory_order_release);
+                }
+            }
+        }
     }
 
     // Always-on output capture: every playback is captured so the Output
@@ -613,6 +881,19 @@ void AudioEngine::stop() {
                 n.cache.sampleRate = captureSampleRate;
                 n.cache.startSample = captureStartSample;
                 n.cache.numSamples = (int64_t)n.cache.left.size();
+                n.cache.useDisk = false;
+                n.cache.diskPath.clear();
+                // Stamp the cache with the project's input hash so the
+                // capture-from-song dialog can recognise this rendering
+                // as fresh on next open and skip its offline render.
+                // updateDeterminism mutates flags on all nodes but is
+                // benign (it just walks ccMappings + upstream); a 0
+                // hash means the project isn't cacheable, in which
+                // case we leave inputHash at 0 and the dialog will
+                // re-render from scratch.
+                auto& mgr = graphProcessor.getCacheManager();
+                mgr.updateDeterminism(*graph);
+                n.cache.inputHash = mgr.computeNodeHash(n, *graph);
                 n.cache.valid = true;
                 break;
             }

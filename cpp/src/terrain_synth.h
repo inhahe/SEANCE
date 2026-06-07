@@ -72,8 +72,25 @@ public:
                                     const std::string& phaseExpr,
                                     int fftSize,
                                     int phaseMode);
+
+    // Frequency-domain fill from a SpectralDoc: each curve (mag, phase) is
+    // evaluated as either an expression or a drawn curve, then combined
+    // into a complex spectrum and inverse-FFTed. The doc carries its own
+    // fftSize. Normalized to peak 1.0.
+    void fillFromSpectralDoc(const struct SpectralDoc& doc);
     void fillConstant(float value);
     void fillNoise(unsigned int seed = 42);
+
+    // Fractal value noise (N-D). Generates `octaves` coarse random grids of
+    // doubling resolution, smoothstep-interpolates each into the terrain, and
+    // sums with amplitude * persistence^octave. The result is a smooth,
+    // 1/f-like bumpy field - the orbit reads it as varying noisy texture
+    // instead of independent samples (which would just degenerate into a
+    // noise oscillator). Persistence in (0,1): lower = smoother / fewer
+    // high-frequency details; higher = harsher / more detail. Result is
+    // peak-normalized to 1.0.
+    void fillValueNoise(int octaves = 4, float persistence = 0.55f, unsigned int seed = 42);
+
     void smooth(int passes = 2);            // Gaussian blur to reduce quantization noise
 
     // Get raw data for display
@@ -155,10 +172,88 @@ private:
 // Terrain Synth mode
 // ==============================================================================
 
+// Three render modes for terrain synth:
+//   Direct (SamplePerPoint) - read the terrain value as the audio sample.
+//     Classic wavetable / sample playback. Natural for 1D wavetables and
+//     1D audio files where the terrain "is" a waveform.
+//   AmSine (WaveformPerPoint) - run a sine oscillator at the played pitch,
+//     and use the terrain value at each sample to amplitude-modulate it.
+//     Generic terrain sonification: the only mode that produces meaningful
+//     sound for non-1D terrains (2D images, math expressions, fractal
+//     noise) where Direct mode would just be noise.
+//   AdditiveBank - FFT the 1D wavetable cycle to extract harmonic
+//     magnitudes/phases, then synthesize per-note as a sum of independent
+//     sine partials running at fundamental x ratio. Applies only to terrains
+//     that are 1D wavetable cycles. Unlike Direct mode (where you hear the
+//     baked cycle through one oscillator) each partial is a live sine, so
+//     inharmonic stretches are aliased-free and per-partial modulation
+//     becomes possible.
 enum class TerrainSynthMode {
-    SamplePerPoint,    // terrain value IS the audio sample
-    WaveformPerPoint   // terrain value selects from a wavetable bank
+    SamplePerPoint,    // Direct: terrain value IS the audio sample
+    WaveformPerPoint,  // AM-sine: terrain value AM-modulates a pitched sine
+    AdditiveBank       // Additive: FFT the cycle, run a partial bank
 };
+
+// How many partials the additive-bank mode synthesises. Higher = brighter
+// and more accurate to the wavetable, more CPU. 32 is a reasonable default
+// (covers up to ~3.5kHz of harmonics for a low A note at 110Hz).
+inline constexpr int kAdditiveBankMaxPartials = 64;
+
+// Classification of what kind of source feeds a TerrainSynthProcessor.
+// Different sources make different synthesis modes meaningful:
+//   Wavetable - a single 1D cycle (or an N-D wavetable where the Position
+//     knob picks a 1D slice every block). Direct (play the cycle) and
+//     AdditiveBank (FFT the cycle, sum its partials) both apply. AM-sine
+//     is degenerate here: a sine carrier at the played pitch, AM-modulated
+//     by the cycle moving at the SAME played pitch, just distorts the
+//     cycle into something less musical than the direct cycle itself.
+//   Sample - a 1D audio recording (the Sampler / MultiSampler case). Only
+//     Direct (sample playback at the transposed rate) makes musical sense.
+//     The recording IS the sound, not a single cycle, so the FFT-cycle
+//     assumption Additive bank makes doesn't hold; AM-sine reshapes the
+//     recording into something rarely useful.
+//   Surface - an N-D sonification source (2D image, math expr with y/z/w,
+//     2D+ fractal noise). Direct mode reads raw pixel/voxel values into
+//     the audio stream, producing noise. AM-sine is the only musical
+//     mode here - the terrain becomes a slow amplitude envelope on a
+//     pitched sine carrier.
+enum class SynthSourceClass {
+    Wavetable,
+    Sample,
+    Surface
+};
+
+struct SynthModeAvailability {
+    bool direct       = false;
+    bool amSine       = false;
+    bool additiveBank = false;
+    bool allows(TerrainSynthMode m) const {
+        switch (m) {
+            case TerrainSynthMode::SamplePerPoint:   return direct;
+            case TerrainSynthMode::WaveformPerPoint: return amSine;
+            case TerrainSynthMode::AdditiveBank:     return additiveBank;
+        }
+        return false;
+    }
+    // Snap a candidate mode to the nearest applicable one. Preference order
+    // is the mode itself if allowed, then Direct, then AM-sine, then
+    // AdditiveBank, so a project with a stale invalid mode always falls
+    // back to a sensible default.
+    TerrainSynthMode clamp(TerrainSynthMode m) const {
+        if (allows(m)) return m;
+        if (direct)       return TerrainSynthMode::SamplePerPoint;
+        if (amSine)       return TerrainSynthMode::WaveformPerPoint;
+        if (additiveBank) return TerrainSynthMode::AdditiveBank;
+        return m;
+    }
+};
+
+// Classify a TerrainSynthProcessor source by its script prefix. Mirrors
+// the source-detection chain in TerrainSynthProcessor::reloadIfScriptChanged,
+// kept as a free function so the node-graph UI can filter the Synth Mode
+// picker without holding a pointer to the audio processor.
+SynthSourceClass     classifySynthSource(const std::string& script);
+SynthModeAvailability synthModeAvailabilityFor(SynthSourceClass cls);
 
 // ==============================================================================
 // Terrain Synth Processor
@@ -220,6 +315,12 @@ private:
     // frames {tableSize, nFrames}. coord[1] is the frame position and is
     // driven by the "Position" node param (index 21) rather than traversal.
     bool isWavetable = false;
+    // Audio-sample playback: when true, the terrain holds a 1D audio
+    // recording (loaded from __audio__:path). Used to classify the source
+    // for SynthSourceClass::Sample so the Synth Mode picker only offers
+    // Direct (sample playback) rather than AM-sine / AdditiveBank, which
+    // don't make musical sense on a recording.
+    bool isAudioSample = false;
     int  wtFrameCount = 0;
     int  wtNumDims = 0; // number of Position dimensions (1D, 2D, ...)
 
@@ -232,6 +333,52 @@ private:
     float wtScatterRadius = 0.45f;
     std::vector<std::vector<float>> wtScatterFrameSamples; // [frame][sample]
     std::vector<std::vector<float>> wtScatterFramePositions; // [frame][dim]
+
+    // ---- Granular layer (parallel to the cycle layer) ----
+    //
+    // GranularFrame cells in the wavetable are NOT baked into the cycle
+    // terrain (the cells store zeros there) - instead the synth runs a
+    // per-voice 4-voice OLA granular stream for each granular frame and
+    // mixes it in by the same morph weight the cycle layer would use.
+    //
+    // For grid mode: position is the frame's grid coord normalized to
+    // [0,1] per dimension (so (gx / max(1, dims[d]-1))). The per-block
+    // weight is the N-linear interp weight of the current Position into
+    // this grid cell.
+    //
+    // For scatter mode: position is the frame's authored scatter position
+    // (already in [0,1]). The per-block weight is the Wendland RBF weight
+    // divided by the total RBF weight (same normalization the cycle
+    // layer uses).
+    struct GranularLayerEntry {
+        // Source PCM, owned. Voice readers index into this directly via
+        // the frame index; mid-session script reload of a __wavetable2__
+        // synth would reset the table, but reloadIfScriptChanged only
+        // handles __layered__ reloads, so for wavetable2 sources this
+        // vector is stable for the processor's lifetime.
+        std::vector<float> source;
+        double             sourceSampleRate = 0.0;
+        int                grainLength      = 4800;
+        float              embeddedPitchHz  = 440.0f;
+        // Position in the wavetable's N-D Position space, normalized
+        // [0,1] per dim. For grid frames this is the grid-cell coord
+        // mapped to [0,1]; for scatter frames it's the authored coord.
+        std::vector<float> position;
+    };
+    std::vector<GranularLayerEntry> wtGranularFrames;
+
+    // Per-block granular weights, sized to wtGranularFrames.size(). Filled
+    // at the top of each processBlock from the current Position, then read
+    // per-sample. Kept as a member so we don't realloc every block.
+    std::vector<float> granWeights;
+
+    // Lock-free RNG for grain srcStart jitter. JUCE Random is fine on the
+    // audio thread - no syscalls, no allocation.
+    juce::Random granRng;
+
+    // Recompute granWeights from the current Position params. Called once
+    // per block.
+    void updateGranularWeights();
 
     // Envelope curve evaluation cache
     struct EnvCurve {
@@ -263,6 +410,26 @@ private:
         Stage envStage = Off;
         float envLevel = 0.0f;
         double envTime = 0.0;
+
+        // Additive-bank mode per-partial phases. Allocated lazily on the
+        // first note-on that enters AdditiveBank mode so the Voice array
+        // doesn't pay the ~256 byte / voice cost when this mode is unused.
+        std::vector<float> partialPhases;
+
+        // Per-granular-frame OLA state. One entry per GranularLayerEntry
+        // in TerrainSynthProcessor::wtGranularFrames; each entry holds 4
+        // OLA voices with their envelope position and source-start offset.
+        // Allocated lazily on note-on once the granular table is known.
+        // Initialized: envPos = staggered by N/4 across the four OLA
+        // voices so the 4-overlap Hann sums to constant amplitude from
+        // the first sample (no startup transient). srcStart is jittered
+        // per OLA voice on init and every time a voice's envelope wraps.
+        struct GranStream {
+            int envPos[4]   = { 0, 0, 0, 0 };
+            int srcStart[4] = { 0, 0, 0, 0 };
+            bool initialized = false;
+        };
+        std::vector<GranStream> granStreams;
 
         float advanceEnv(float sr, float a, float d, float s, float r,
                          const EnvCurve* aCurve, const EnvCurve* dCurve, const EnvCurve* rCurve);
@@ -306,6 +473,24 @@ private:
     float freezePosition = 0.0f;   // captured position when freeze was activated
 
     std::vector<float> lastPosition; // for UI visualization
+
+    // Additive-bank cache: harmonic magnitudes and phases extracted from the
+    // current 1D wavetable cycle (or the current scatter-blended cycle).
+    // Computed once per block (or on cycle change) so the per-sample loop
+    // is just N sine-table reads + an accumulate.
+    struct PartialBank {
+        std::vector<float> magnitude; // size = kAdditiveBankMaxPartials
+        std::vector<float> phase;     // size = kAdditiveBankMaxPartials
+        bool valid = false;
+        // Fingerprint of the cycle this was computed from, so we don't
+        // recompute on every block when the cycle is static.
+        size_t cycleHash = 0;
+    };
+    PartialBank partialBank;
+    // Refresh partialBank from the current 1D terrain cycle (or
+    // wtScatterFrameSamples blended at the current Position when in
+    // scatter mode).
+    void refreshPartialBank();
 
     float getParam(int idx, float def) const;
 };

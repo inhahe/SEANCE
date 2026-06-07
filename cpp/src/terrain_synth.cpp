@@ -4,6 +4,9 @@
 #include "builtin_synth.h" // for WaveExprParser
 #include "fft_util.h"
 #include "layered_wave_editor.h" // for LayeredWaveform decode/render
+#include "spectral_editor.h"     // for SpectralDoc decode/render
+#include "wavelet_paint.h"       // for __waveletpaint__: decode
+#include "granular_frame.h"      // for GranularFrame side-table entries
 #include <cstring>
 #include <cstdio>
 #include <algorithm>
@@ -78,6 +81,100 @@ void Terrain::fillNoise(unsigned int seed) {
     for (auto& s : data) s = dist(rng);
 }
 
+void Terrain::fillValueNoise(int octaves, float persistence, unsigned int seed) {
+    if (dims.empty() || data.empty()) return;
+    int nd = (int)dims.size();
+    octaves = juce::jlimit(1, 8, octaves);
+
+    std::fill(data.begin(), data.end(), 0.0f);
+
+    // Smallest axis sets the baseline coarseness: octave 0 has ~4 coarse
+    // cells along the smallest axis, doubling each octave. Larger axes scale
+    // proportionally so the texture stays roughly isotropic regardless of
+    // terrain shape.
+    int minDim = std::max(1, *std::min_element(dims.begin(), dims.end()));
+
+    float amp = 1.0f;
+
+    for (int oct = 0; oct < octaves; ++oct) {
+        int baseCoarse = 4 << oct; // 4, 8, 16, 32, ...
+
+        std::vector<int> coarseDims(nd);
+        size_t coarseTotal = 1;
+        for (int i = 0; i < nd; ++i) {
+            int c = std::max(2, (int)std::round((float)dims[i] / (float)minDim
+                                                * (float)baseCoarse));
+            coarseDims[i] = c;
+            coarseTotal *= (size_t)c;
+        }
+
+        // Generate this octave's coarse-grid random samples.
+        std::mt19937 rng(seed + (unsigned int)oct * 7919u);
+        std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+        std::vector<float> coarse(coarseTotal);
+        for (auto& v : coarse) v = dist(rng);
+
+        // For each terrain cell, do N-linear interpolation with a smoothstep
+        // fade across the coarse grid. The smoothstep is what gives value
+        // noise its characteristic organic look vs. plain bilinear (which
+        // would produce visible diamond / triangle artifacts).
+        std::vector<int> idx(nd, 0);
+        const int numCorners = 1 << nd;
+        int i0[8] = {0};
+        float ft[8] = {0};
+
+        size_t flat = 0;
+        const size_t total = data.size();
+        while (flat < total) {
+            for (int i = 0; i < nd; ++i) {
+                float norm = dims[i] > 1
+                    ? (float)idx[i] / (float)(dims[i] - 1)
+                    : 0.5f;
+                float f = norm * (float)(coarseDims[i] - 1);
+                int lo = (int)f;
+                if (lo >= coarseDims[i] - 1) lo = coarseDims[i] - 2;
+                if (lo < 0) lo = 0;
+                float t = f - (float)lo;
+                t = t * t * (3.0f - 2.0f * t); // smoothstep fade
+                i0[i] = lo;
+                ft[i] = t;
+            }
+
+            float result = 0.0f;
+            for (int c = 0; c < numCorners; ++c) {
+                float w = 1.0f;
+                size_t flatC = 0;
+                size_t stride = 1;
+                for (int i = nd - 1; i >= 0; --i) {
+                    int corner = (c >> i) & 1;
+                    int ci = i0[i] + corner;
+                    w *= corner ? ft[i] : (1.0f - ft[i]);
+                    flatC += (size_t)ci * stride;
+                    stride *= (size_t)coarseDims[i];
+                }
+                result += w * coarse[flatC];
+            }
+            data[flat] += amp * result;
+
+            ++flat;
+            for (int d = nd - 1; d >= 0; --d) {
+                if (++idx[d] < dims[d]) break;
+                idx[d] = 0;
+            }
+        }
+
+        amp *= persistence;
+    }
+
+    // Peak-normalize to [-1, 1].
+    float maxAbs = 0.0f;
+    for (auto v : data) maxAbs = std::max(maxAbs, std::abs(v));
+    if (maxAbs > 0.0f) {
+        float scale = 1.0f / maxAbs;
+        for (auto& v : data) v *= scale;
+    }
+}
+
 void Terrain::fillFromExpression(const std::string& expr) {
     if (dims.empty() || data.empty()) return;
     int nd = (int)dims.size();
@@ -122,6 +219,14 @@ void Terrain::fillFromExpression(const std::string& expr) {
             if (*pos == 'y') { pos++; return vars[1]; }
             if (*pos == 'z') { pos++; return vars[2]; }
             if (*pos == 'w') { pos++; return vars[3]; }
+            // Higher-dimension axis variables (5D..8D). Match the axis names
+            // used by TerrainVisualizer's +Dim button: V, U, S, T. The
+            // !isalpha guard prevents these from shadowing function names
+            // that start with the same letter (sin, sqrt, tanh).
+            if (*pos == 'v' && !std::isalpha(*(pos+1))) { pos++; return vars[4]; }
+            if (*pos == 'u' && !std::isalpha(*(pos+1))) { pos++; return vars[5]; }
+            if (*pos == 's' && !std::isalpha(*(pos+1))) { pos++; return vars[6]; }
+            if (*pos == 't' && !std::isalpha(*(pos+1))) { pos++; return vars[7]; }
             if (strncmp(pos, "pi", 2) == 0) { pos += 2; return 3.14159265f; }
             if (*pos == 'e' && !std::isalpha(*(pos+1))) { pos++; return 2.71828183f; }
             return parseNumber();
@@ -266,6 +371,20 @@ void Terrain::fillFromSpectralExpression(const std::string& magExpr,
     if ((int)data.size() == n) {
         data = std::move(timeDomain);
     }
+}
+
+void Terrain::fillFromSpectralDoc(const SpectralDoc& doc) {
+    // Round fftSize up to a power of two; matches the SpectralFrame
+    // wavetable adapter, since both call renderSpectralToWaveform.
+    int n = 2;
+    while (n < doc.fftSize && n < 16384) n <<= 1;
+    if (n < 2) n = 2;
+
+    init({n});
+    std::vector<float> timeDomain;
+    renderSpectralToWaveform(doc, n, timeDomain);
+    if ((int)data.size() == n && (int)timeDomain.size() == n)
+        data = std::move(timeDomain);
 }
 
 void Terrain::fillFromAudioFile(const std::string& path) {
@@ -647,6 +766,67 @@ void TerrainSynthProcessor::reloadIfScriptChanged() {
     }
 }
 
+// Classify a Terrain Synth source by its script prefix. Mirrors the
+// detection chain in the TerrainSynthProcessor constructor / reload path
+// so the node-graph UI can filter the Synth Mode picker without holding
+// a pointer to the live audio processor.
+SynthSourceClass classifySynthSource(const std::string& script) {
+    // Explicit source-type prefixes first.
+    if (script.rfind("__audio__:", 0)         == 0) return SynthSourceClass::Sample;
+    if (script.rfind("__image__:", 0)         == 0) return SynthSourceClass::Surface;
+    if (script.rfind("__layered__:", 0)       == 0) return SynthSourceClass::Wavetable;
+    if (script.rfind("__wavetable__:", 0)     == 0) return SynthSourceClass::Wavetable;
+    if (script.rfind("__wavetable2__:", 0)    == 0) return SynthSourceClass::Wavetable;
+    if (script.rfind("__waveletpaint__:", 0)  == 0) return SynthSourceClass::Wavetable;
+    if (script.rfind("__spectral__:", 0)      == 0) return SynthSourceClass::Wavetable;
+    if (script.rfind("__spectral2__:", 0)     == 0) return SynthSourceClass::Wavetable;
+
+    // Fractal value noise: classified by terrain dimensionality. The
+    // script format is "__valuenoise__:D0,D1,...:OCTAVES:..." so we look
+    // at how many comma-separated dims appear in the first ':'-segment.
+    static const std::string kVN = "__valuenoise__:";
+    if (script.rfind(kVN, 0) == 0) {
+        size_t i = kVN.size();
+        size_t j = script.find(':', i);
+        std::string dims = (j == std::string::npos) ? script.substr(i)
+                                                    : script.substr(i, j - i);
+        int ndims = 1;
+        for (char c : dims) if (c == ',') ++ndims;
+        return (ndims <= 1) ? SynthSourceClass::Wavetable
+                            : SynthSourceClass::Surface;
+    }
+
+    // Fallthrough: bare math expression. The processor auto-detects dims
+    // from variable usage (y/z/w => N-D); we mirror the same naive scan
+    // here so a script using `sin(x*y)` shows up as Surface.
+    bool usesYZW = script.find('y') != std::string::npos
+                || script.find('z') != std::string::npos
+                || script.find('w') != std::string::npos;
+    return usesYZW ? SynthSourceClass::Surface : SynthSourceClass::Wavetable;
+}
+
+SynthModeAvailability synthModeAvailabilityFor(SynthSourceClass cls) {
+    SynthModeAvailability a;
+    switch (cls) {
+        case SynthSourceClass::Wavetable:
+            a.direct       = true;
+            a.amSine       = false;
+            a.additiveBank = true;
+            break;
+        case SynthSourceClass::Sample:
+            a.direct       = true;
+            a.amSine       = false;
+            a.additiveBank = false;
+            break;
+        case SynthSourceClass::Surface:
+            a.direct       = false;
+            a.amSine       = true;
+            a.additiveBank = false;
+            break;
+    }
+    return a;
+}
+
 TerrainSynthProcessor::TerrainSynthProcessor(Node& n, Transport& t) : node(n), transport(t) {
     auto& script = node.script;
     cachedScript = script;
@@ -655,6 +835,7 @@ TerrainSynthProcessor::TerrainSynthProcessor(Node& n, Transport& t) : node(n), t
         terrain.fillFromImage(script.substr(10));
     } else if (script.find("__audio__:") == 0) {
         terrain.fillFromAudioFile(script.substr(10));
+        isAudioSample = true;
     } else if (script.find("__layered__:") == 0) {
         // Layered waveform - decode the layer list and sum into a 1D terrain.
         // This is effectively a single-frame wavetable, so flag it as such so
@@ -676,23 +857,50 @@ TerrainSynthProcessor::TerrainSynthProcessor(Node& n, Transport& t) : node(n), t
         mode = TerrainSynthMode::SamplePerPoint;
         isWavetable = true;
         wtFrameCount = 1;
-    } else if (script.find("__wavetable__:") == 0) {
+    } else if (script.find("__wavetable__:")  == 0
+               || script.find("__wavetable2__:") == 0
+               || script.find("__wavetable3__:") == 0
+               || script.find("__wavetable4__:") == 0) {
         // N-dimensional wavetable - Grid mode builds an (N+1)-D terrain;
         // Scatter mode keeps frames in a flat list and computes a Wendland
-        // RBF blend each block.
+        // RBF blend each block. WavetableDoc::decode handles the v4
+        // library+cell format with colorIdx (current) plus auto-migrating
+        // __wavetable3__ (pre-colorIdx), __wavetable2__, and legacy
+        // __wavetable__ payloads.
         WavetableDoc doc;
         bool decoded = doc.decode(script);
         if (decoded && doc.mode == WavetableMode::Scatter && !doc.scatterFrames.empty()) {
             int ts = doc.tableSize;
             wtScatterFrameSamples.clear();
             wtScatterFramePositions.clear();
+            wtGranularFrames.clear();
             for (auto& sf : doc.scatterFrames) {
+                // Granular frames feed the granular layer, not the cycle
+                // terrain: bake a zero-cycle for the cycle blend so the
+                // cell contributes nothing through terrain.sample(), then
+                // stash the source PCM + grain length in the side table.
+                // We still keep an entry in wtScatterFrameSamples (zeroed)
+                // so the per-block weight indexing aligns 1:1 across both
+                // layers - simplifies the morph math.
+                IWavetableFrame* w = doc.libraryFrameById(sf.waveformId);
+                bool isGran = (w && std::string(w->typeId()) == "granular");
                 std::vector<float> samples;
-                sf.wave.tableSize = ts;
-                sf.wave.render(samples);
+                if (w && !isGran) w->render(ts, samples);
                 if ((int)samples.size() != ts) samples.resize(ts, 0.0f);
                 wtScatterFrameSamples.push_back(std::move(samples));
                 wtScatterFramePositions.push_back(sf.position);
+
+                if (isGran) {
+                    auto* gf = static_cast<GranularFrame*>(w);
+                    GranularLayerEntry e;
+                    e.source           = gf->source;
+                    e.sourceSampleRate = gf->sourceSampleRate;
+                    e.grainLength      = std::max(16, gf->grainLength);
+                    e.embeddedPitchHz  = (gf->embeddedPitchHz > 0.0f)
+                                          ? gf->embeddedPitchHz : 440.0f;
+                    e.position         = sf.position;
+                    wtGranularFrames.push_back(std::move(e));
+                }
             }
             // 1D terrain - the per-block blend writes the active waveform
             // into terrain.data so the per-sample render path is unchanged.
@@ -705,7 +913,7 @@ TerrainSynthProcessor::TerrainSynthProcessor(Node& n, Transport& t) : node(n), t
             wtNumDims = doc.scatterDims;
             traversalParams.mode = TraversalMode::Linear;
             mode = TerrainSynthMode::SamplePerPoint;
-        } else if (decoded && !doc.frames.empty()) {
+        } else if (decoded && !doc.cellWaveformIds.empty()) {
             int ts = doc.tableSize;
 
             // Build terrain dimensions: {tableSize, dim0, dim1, ...}
@@ -713,14 +921,22 @@ TerrainSynthProcessor::TerrainSynthProcessor(Node& n, Transport& t) : node(n), t
             for (int d : doc.gridDims) terrainDims.push_back(std::max(1, d));
             terrain.init(terrainDims);
             auto& data = terrain.getData();
+            wtGranularFrames.clear();
 
             // Compute stride for each grid dimension to map flat frame index
             // to the correct position in the N-dimensional terrain.
-            int nf = (int)doc.frames.size();
+            int nf = (int)doc.cellWaveformIds.size();
             for (int f = 0; f < nf; ++f) {
+                // Granular cells bake zero into the terrain (cycle layer)
+                // and instead register a side-table entry that the per-
+                // voice OLA stream reads. Cycle frames bake their rendered
+                // samples as usual.
+                IWavetableFrame* w = doc.frameAt(f);
+                bool isGran = (w && std::string(w->typeId()) == "granular");
                 std::vector<float> samples;
-                doc.frames[f].tableSize = ts;
-                doc.frames[f].render(samples);
+                if (w && !isGran)
+                    w->render(ts, samples);
+                if ((int)samples.size() != ts) samples.resize(ts, 0.0f);
 
                 // Compute the flat terrain offset for this frame.
                 // The terrain is {ts, dim0, dim1, ...}. Frame f maps to
@@ -749,6 +965,26 @@ TerrainSynthProcessor::TerrainSynthProcessor(Node& n, Transport& t) : node(n), t
                     if (flatIdx >= 0 && flatIdx < terrain.totalSize())
                         data[flatIdx] = samples[i];
                 }
+
+                if (isGran) {
+                    auto* gf = static_cast<GranularFrame*>(w);
+                    GranularLayerEntry e;
+                    e.source           = gf->source;
+                    e.sourceSampleRate = gf->sourceSampleRate;
+                    e.grainLength      = std::max(16, gf->grainLength);
+                    e.embeddedPitchHz  = (gf->embeddedPitchHz > 0.0f)
+                                          ? gf->embeddedPitchHz : 440.0f;
+                    // Normalize gridCoord into [0,1] per dim so the per-
+                    // block Position weight math doesn't need to know about
+                    // the underlying grid resolution.
+                    e.position.assign(gridCoord.size(), 0.0f);
+                    for (size_t d = 0; d < gridCoord.size(); ++d) {
+                        int dim = std::max(1, doc.gridDims[d]);
+                        e.position[d] = (dim <= 1) ? 0.0f
+                            : (float)gridCoord[d] / (float)(dim - 1);
+                    }
+                    wtGranularFrames.push_back(std::move(e));
+                }
             }
             isWavetable = true;
             wtFrameCount = nf;
@@ -759,29 +995,86 @@ TerrainSynthProcessor::TerrainSynthProcessor(Node& n, Transport& t) : node(n), t
         }
         traversalParams.mode = TraversalMode::Linear;
         mode = TerrainSynthMode::SamplePerPoint;
-    } else if (script.find("__spectral__:") == 0) {
-        // Format: __spectral__:<fftSize>:<phaseMode>:<magExpr>|<phaseExpr>
-        std::string rest = script.substr(13);
-        auto c1 = rest.find(':');
-        auto c2 = (c1 != std::string::npos) ? rest.find(':', c1 + 1) : std::string::npos;
-        int fftSize = 2048;
-        int phaseMode = 1; // random
-        std::string magExpr, phaseExpr;
-        if (c1 != std::string::npos && c2 != std::string::npos) {
-            try { fftSize = std::stoi(rest.substr(0, c1)); } catch (...) {}
-            try { phaseMode = std::stoi(rest.substr(c1 + 1, c2 - c1 - 1)); } catch (...) {}
-            std::string body = rest.substr(c2 + 1);
-            auto bar = body.find('|');
-            if (bar != std::string::npos) {
-                magExpr = body.substr(0, bar);
-                phaseExpr = body.substr(bar + 1);
-            } else {
-                magExpr = body;
-            }
+    } else if (script.find("__waveletpaint__:") == 0) {
+        // Wavelet Space painter (#65): the script encodes a DWT coefficient
+        // grid plus the filter/level/size header. IDWT it to a one-cycle
+        // waveform and fill the 1D terrain. waveletPaintToWaveform handles
+        // peak normalisation; size matches the declared totalSize.
+        std::vector<float> coeffs;
+        int nLevels = kWaveletPaintDefaultLevels;
+        int nSize   = kWaveletPaintDefaultSize;
+        std::string filt = kWaveletPaintDefaultFilter;
+        if (decodeWaveletPaint(script, coeffs, nLevels, nSize, filt)) {
+            auto wave = waveletPaintToWaveform(coeffs, nLevels, filt);
+            terrain.init({(int)wave.size()});
+            // Copy IDWT output into terrain data. terrain.init resizes
+            // data to totalSize; we assume the IDWT produced exactly
+            // that many samples.
+            if ((int)terrain.getData().size() == (int)wave.size())
+                terrain.getData() = std::move(wave);
         } else {
-            magExpr = "exp(-f/20)";
+            // Couldn't parse - fall back to a silent 1D terrain.
+            terrain.init({nSize});
+            terrain.fillConstant(0.0f);
         }
-        terrain.fillFromSpectralExpression(magExpr, phaseExpr, fftSize, phaseMode);
+        traversalParams.mode = TraversalMode::Linear;
+        mode = TerrainSynthMode::SamplePerPoint;
+        isWavetable = true;
+        wtFrameCount = 1;
+    } else if (script.find("__valuenoise__:") == 0) {
+        // Fractal value noise terrain. Format:
+        //   __valuenoise__:D0,D1,...:OCTAVES:PERSISTENCE:SEED
+        // The terrain is filled by Terrain::fillValueNoise so the orbit
+        // reads smooth, structured noise instead of independent samples
+        // per cell (which would just degenerate into a noise oscillator).
+        std::string body = script.substr(std::string("__valuenoise__:").size());
+        auto split = [](const std::string& s, char sep) {
+            std::vector<std::string> out; std::string cur;
+            for (char ch : s) {
+                if (ch == sep) { out.push_back(cur); cur.clear(); }
+                else cur.push_back(ch);
+            }
+            out.push_back(cur);
+            return out;
+        };
+        auto parts = split(body, ':');
+        std::vector<int> tdims = {256, 256};
+        int octaves = 4;
+        float persistence = 0.55f;
+        unsigned int seed = 42;
+        if (parts.size() >= 1) {
+            auto dimParts = split(parts[0], ',');
+            tdims.clear();
+            for (auto& p : dimParts) {
+                int v = std::atoi(p.c_str());
+                if (v > 0) tdims.push_back(v);
+            }
+            if (tdims.empty()) tdims = {256, 256};
+        }
+        if (parts.size() >= 2) octaves     = std::atoi(parts[1].c_str());
+        if (parts.size() >= 3) persistence = (float)std::atof(parts[2].c_str());
+        if (parts.size() >= 4) seed        = (unsigned int)std::strtoul(parts[3].c_str(), nullptr, 10);
+
+        terrain.init(tdims);
+        terrain.fillValueNoise(octaves, persistence, seed);
+
+        // 1D noise plays as a noisy wavetable - use Linear traversal.
+        // 2D+ uses the default Orbit traversal (set at construction).
+        if ((int)tdims.size() == 1) {
+            traversalParams.mode = TraversalMode::Linear;
+            mode = TerrainSynthMode::SamplePerPoint;
+        }
+    } else if (script.find("__spectral__:") == 0
+               || script.find("__spectral2__:") == 0)
+    {
+        // Both new (`__spectral2__:`) and legacy (`__spectral__:`) formats
+        // decode through SpectralDoc, which maps the legacy phaseMode combo
+        // to an equivalent Equation expression. From there we have two
+        // SpectralCurves to evaluate and IFFT.
+        SpectralDoc sd;
+        if (!sd.decode(script))
+            sd = SpectralDoc::defaultBuiltin();
+        terrain.fillFromSpectralDoc(sd);
         traversalParams.mode = TraversalMode::Linear;
         mode = TerrainSynthMode::SamplePerPoint;
         isWavetable = true;
@@ -832,6 +1125,205 @@ static float getParamByName(const Node& node, const std::string& name, float def
     return def;
 }
 
+// Extract harmonic magnitudes and phases from the current 1D wavetable
+// cycle, by FFT'ing it. Cached in partialBank so we only recompute when
+// the cycle data changes (which we detect via a cheap fingerprint hash).
+//
+// The synthesised cycle is whatever terrain.data currently holds. For
+// non-scatter grid wavetables we'd want to read a 1D slice at the current
+// Position - but in practice the scatter blend code (see processBlock)
+// already writes the active cycle into terrain.data each block in scatter
+// mode, and grid wavetables that are 2D ({tableSize, nFrames}) need their
+// slice extracted explicitly. We handle both cases here.
+void TerrainSynthProcessor::refreshPartialBank() {
+    // Decide what 1D cycle to analyse.
+    std::vector<float> cycle;
+    {
+        const auto& dims = terrain.getDimensions();
+        // The terrain exposes at(int) so we copy out into our own vector
+        // (this allocation happens once per block when in AdditiveBank
+        // mode - acceptable; the FFT below dominates the cost anyway).
+        int total = terrain.totalSize();
+        if (dims.size() <= 1 || !isWavetable) {
+            // 1D terrain - the whole thing IS the cycle (or whatever scatter
+            // blended into it).
+            cycle.resize(total);
+            for (int i = 0; i < total; ++i) cycle[i] = terrain.at(i);
+        } else {
+            // Multi-frame grid wavetable: extract a 1D slice at the current
+            // Position by nearest-neighbour in the frame axis (good enough
+            // for the additive analysis - the user can morph more smoothly
+            // by switching to scatter mode where the blend is per-block).
+            int tableSize = dims[0];
+            int nFrames = (dims.size() > 1) ? dims[1] : 1;
+            float pos = juce::jlimit(0.0f, 1.0f,
+                getParamByName(node, "Position", 0.5f));
+            int fr = juce::jlimit(0, nFrames - 1, (int)std::round(pos * (nFrames - 1)));
+            cycle.resize(tableSize);
+            for (int i = 0; i < tableSize; ++i)
+                cycle[i] = terrain.at(fr * tableSize + i);
+        }
+    }
+
+    // Round cycle length down to the nearest power of two for the FFT.
+    int n = (int)cycle.size();
+    int fftN = 1;
+    while ((fftN << 1) <= n) fftN <<= 1;
+    if (fftN < 4) { partialBank.valid = false; return; }
+    cycle.resize(fftN);
+
+    // Cheap fingerprint to skip recompute when the cycle is unchanged.
+    // Sums every 8th sample with an integer mix; if it matches the cached
+    // hash we trust the cached partials.
+    size_t h = (size_t)fftN;
+    for (int i = 0; i < fftN; i += 8) {
+        h = h * 1315423911u
+          + (size_t)juce::roundToInt(cycle[i] * 16384.0f);
+    }
+    if (partialBank.valid && partialBank.cycleHash == h) return;
+    partialBank.cycleHash = h;
+
+    // FFT the cycle.
+    FFT fft(fftN);
+    std::vector<std::complex<float>> spec;
+    fft.forwardReal(cycle, spec);
+    // spec has fftN/2+1 bins. Bin k = k-th harmonic of the cycle (the cycle
+    // IS one period of the fundamental, so bin k is at frequency k*f0 when
+    // the wavetable is played at note frequency f0).
+
+    int K = std::min(kAdditiveBankMaxPartials, (int)spec.size());
+    partialBank.magnitude.assign(kAdditiveBankMaxPartials, 0.0f);
+    partialBank.phase    .assign(kAdditiveBankMaxPartials, 0.0f);
+    // Magnitudes are normalised by fftN so that summing them back as a
+    // partial bank reproduces the cycle's amplitude (within rounding).
+    // Factor of 2 because we're only keeping the positive-frequency half of
+    // a real signal's spectrum.
+    float norm = 2.0f / (float)fftN;
+    for (int k = 1; k < K; ++k) { // skip DC (bin 0)
+        float re = spec[k].real();
+        float im = spec[k].imag();
+        partialBank.magnitude[k] = std::sqrt(re*re + im*im) * norm;
+        partialBank.phase[k]     = std::atan2(im, re);
+    }
+    partialBank.valid = true;
+}
+
+// Compute the per-granular-frame morph weight at the current Position.
+// Mirrors the cycle layer's morph math so a granular frame and a cycle
+// frame at the same wavetable position contribute equally to the output.
+//
+// Grid mode: N-linear interp weight of the current Position into the
+// granular frame's grid cell. Identical to the weighting Terrain::sample
+// applies to that cell - so the granular layer "stands in" for the cell's
+// share of the morph, while terrain.sample only delivers the (zero)
+// granular cell + the real contribution from neighbouring cycle cells.
+//
+// Scatter mode: Wendland RBF weight at the current Position, normalized
+// by the total RBF weight (identical to the cycle blend's normalization).
+void TerrainSynthProcessor::updateGranularWeights() {
+    granWeights.assign(wtGranularFrames.size(), 0.0f);
+    if (wtGranularFrames.empty()) return;
+
+    // Build the current Position vector from named params.
+    const int nPosDims = wtScatter ? wtScatterDims : wtNumDims;
+    std::vector<float> pos(std::max(1, nPosDims), 0.0f);
+    for (int d = 0; d < nPosDims; ++d) {
+        std::string pname = (nPosDims == 1) ? std::string("Position")
+                          : std::string("Position ") + std::to_string(d + 1);
+        pos[d] = juce::jlimit(0.0f, 1.0f, getParamByName(node, pname.c_str(), 0.5f));
+    }
+
+    if (wtScatter) {
+        // Wendland weights normalized to sum-1, matching the cycle blend.
+        const float r = std::max(1e-3f, wtScatterRadius);
+        float totalW = 0.0f;
+        std::vector<float> wAll(wtScatterFrameSamples.size(), 0.0f);
+        for (size_t fi = 0; fi < wtScatterFrameSamples.size(); ++fi) {
+            const auto& fp = wtScatterFramePositions[fi];
+            float d2 = 0.0f;
+            for (int d = 0; d < wtScatterDims; ++d) {
+                float a = (d < (int)fp.size()) ? fp[d] : 0.5f;
+                float dd = a - pos[d];
+                d2 += dd * dd;
+            }
+            float dist = std::sqrt(d2);
+            if (dist < r) {
+                float u = dist / r;
+                float v = 1.0f - u;
+                float w = v * v * v * v * (4.0f * u + 1.0f);
+                wAll[fi] = w;
+                totalW += w;
+            }
+        }
+        // Edge case: zero total weight. Fall back to "nearest granular
+        // frame wins" so the user always hears something when the
+        // wavetable contains only granular frames.
+        if (totalW < 1e-9f) {
+            int nearest = -1;
+            float bestD2 = 1e30f;
+            for (size_t gi = 0; gi < wtGranularFrames.size(); ++gi) {
+                const auto& gp = wtGranularFrames[gi].position;
+                float d2 = 0.0f;
+                for (int d = 0; d < wtScatterDims; ++d) {
+                    float a = (d < (int)gp.size()) ? gp[d] : 0.5f;
+                    float dd = a - pos[d];
+                    d2 += dd * dd;
+                }
+                if (d2 < bestD2) { bestD2 = d2; nearest = (int)gi; }
+            }
+            if (nearest >= 0) granWeights[nearest] = 1.0f;
+            return;
+        }
+        // Map granular-frame entries to their per-frame weight in wAll.
+        // The granular entries are pushed in the same order as the
+        // scatter-frame iteration but we store position copies, so we
+        // match by position equality - cheaper to just iterate both
+        // arrays together since they were populated in lockstep skipping
+        // cycle frames. Use position equality as the join key.
+        const float invT = 1.0f / totalW;
+        size_t gi = 0;
+        for (size_t fi = 0; fi < wtScatterFrameSamples.size() && gi < wtGranularFrames.size(); ++fi) {
+            const auto& fp = wtScatterFramePositions[fi];
+            const auto& gp = wtGranularFrames[gi].position;
+            if (fp.size() != gp.size()) continue;
+            bool match = true;
+            for (size_t d = 0; d < fp.size(); ++d) {
+                if (std::abs(fp[d] - gp[d]) > 1e-6f) { match = false; break; }
+            }
+            if (match) {
+                granWeights[gi] = wAll[fi] * invT;
+                ++gi;
+            }
+        }
+        return;
+    }
+
+    // Grid mode: N-linear interp weight. For each granular frame, its
+    // grid-coord position (already in [0,1]) yields a weight as the
+    // product of per-dimension hat functions: max(0, 1 - |pos - gp| * (dim-1)).
+    // This is exactly the weight the terrain's bilinear/N-linear interp
+    // would apply to that grid cell.
+    //
+    // We need the original grid dims to know the cell spacing; we stored
+    // wtNumDims but not the per-dim grid size. Derive it from the terrain
+    // shape: terrainDims = {tableSize, d0, d1, ...} so dims[d+1] is the
+    // grid size in dimension d.
+    const auto& tdims = terrain.getDimensions();
+    for (size_t gi = 0; gi < wtGranularFrames.size(); ++gi) {
+        const auto& gp = wtGranularFrames[gi].position;
+        float w = 1.0f;
+        for (int d = 0; d < (int)gp.size() && (d + 1) < (int)tdims.size(); ++d) {
+            const int   dimSize = std::max(1, tdims[d + 1]);
+            const float scale   = (dimSize <= 1) ? 1.0f : (float)(dimSize - 1);
+            // |pos - gp| measured in cell units. Hat width = 1 cell.
+            const float diff    = std::abs(pos[d] - gp[d]) * scale;
+            const float h       = std::max(0.0f, 1.0f - diff);
+            w *= h;
+        }
+        granWeights[gi] = w;
+    }
+}
+
 void TerrainSynthProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::MidiBuffer& midi) {
     applySignalModulations(node, buf);
     reloadIfScriptChanged();
@@ -871,9 +1363,31 @@ void TerrainSynthProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mi
                              : TraversalMode::Orbit;
     }
 
-    // Synth mode: 0=SamplePerPoint, 1=WaveformPerPoint
-    mode = ((int)getParam(13, 0.0f) == 1) ? TerrainSynthMode::WaveformPerPoint
-                                           : TerrainSynthMode::SamplePerPoint;
+    // Synth mode: 0=Direct (SamplePerPoint), 1=AM-sine (WaveformPerPoint),
+    // 2=Additive bank. Values are clamped via switch so future enum
+    // additions don't crash older projects that have the param at an
+    // unrecognised value. Then we clamp again against the source's
+    // applicability (e.g. AM-sine on a wavetable -> Direct) so legacy
+    // projects with a stale mode value still produce sound that matches
+    // what the picker would offer for the current source.
+    {
+        int modeInt = juce::jlimit(0, 2, (int)getParam(13, 0.0f));
+        TerrainSynthMode requested;
+        switch (modeInt) {
+            case 1:  requested = TerrainSynthMode::WaveformPerPoint; break;
+            case 2:  requested = TerrainSynthMode::AdditiveBank;     break;
+            default: requested = TerrainSynthMode::SamplePerPoint;   break;
+        }
+        SynthSourceClass cls = isAudioSample ? SynthSourceClass::Sample
+                             : isWavetable   ? SynthSourceClass::Wavetable
+                             : classifySynthSource(node.script);
+        mode = synthModeAvailabilityFor(cls).clamp(requested);
+    }
+    // Additive-bank mode needs a fresh harmonic decomposition whenever the
+    // wavetable cycle changes. Refresh once per block - the FFT is N log N
+    // with N=1024 typical, so under 100us; not on the hot per-sample path.
+    if (mode == TerrainSynthMode::AdditiveBank)
+        refreshPartialBank();
 
     // Internal LFO modulation
     lfo1.frequency = getParam(14, 0.5f);
@@ -992,6 +1506,11 @@ void TerrainSynthProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mi
     // Detect audio-rate signal inputs (channels 2+ on the buffer)
     int numSignalInputs = std::max(0, numChannels - 2);
     bool hasSignalInputs = numSignalInputs > 0;
+
+    // Granular layer: refresh the per-frame morph weights from the current
+    // Position so the per-sample voice loop can mix in Σ wGran[i] *
+    // olaStream[i] on top of the cycle terrain.
+    updateGranularWeights();
 
     // Scatter wavetable: blend frames into the 1D terrain at block start
     // using a Wendland C^2 RBF over the current Position. The per-sample
@@ -1218,6 +1737,112 @@ void TerrainSynthProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mi
                     sample = terrain.sample(pitchCoord);
                 }
 
+                // ---- Granular layer mix ----
+                //
+                // For each granular frame with non-trivial morph weight,
+                // run a 4-voice OLA Hann-windowed stream that reads from
+                // the frame's source PCM at envPos[v] + srcStart[v],
+                // scaled by noteHz / embeddedPitchHz so MIDI pitch tracks.
+                // Sum into `sample` weighted by granWeights[i].
+                if (!wtGranularFrames.empty() && isWavetable) {
+                    // Lazy-allocate the per-voice granular stream array on
+                    // first use - voices that never hit a granular cell
+                    // never pay the allocation.
+                    if ((int)v.granStreams.size() != (int)wtGranularFrames.size())
+                        v.granStreams.resize(wtGranularFrames.size());
+
+                    const float TWO_PI = 6.28318530718f;
+                    for (size_t gi = 0; gi < wtGranularFrames.size(); ++gi) {
+                        const float w = granWeights[gi];
+                        if (w <= 1e-5f) continue;
+
+                        const auto& gf = wtGranularFrames[gi];
+                        auto& gs = v.granStreams[gi];
+                        const int srcLen   = (int)gf.source.size();
+                        const int grainLen = std::max(16, gf.grainLength);
+                        if (srcLen <= 0) continue;
+
+                        // Initialize OLA voices: stagger envPos by N/4 so
+                        // the 4-overlap Hann sums to constant amplitude
+                        // from the first sample. Spread srcStart across
+                        // the source window so the texture covers the
+                        // whole captured spot from the first played note
+                        // (each voice gets its quarter of the source as
+                        // its starting base, with small jitter on top).
+                        if (!gs.initialized) {
+                            const int maxStart = std::max(0, srcLen - grainLen);
+                            for (int vi2 = 0; vi2 < 4; ++vi2) {
+                                gs.envPos[vi2] = (vi2 * grainLen) / 4;
+                                int s = (maxStart * vi2) / 4;
+                                if (maxStart > 0) {
+                                    const int jitter = std::min(grainLen / 2, maxStart);
+                                    s += granRng.nextInt(jitter + 1) - jitter / 2;
+                                    s = juce::jlimit(0, maxStart, s);
+                                }
+                                gs.srcStart[vi2] = s;
+                            }
+                            gs.initialized = true;
+                        }
+
+                        // Pitch ratio scales the *source* read rate so the
+                        // played note tracks MIDI - identical to the cycle
+                        // layer's effFreq / 440 mapping but using the
+                        // frame's embedded pitch as the reference.
+                        const float ratio = effFreq /
+                            std::max(1e-3f, gf.embeddedPitchHz);
+                        const float invN  = 1.0f / (float)grainLen;
+                        const int   maxStart = std::max(0, srcLen - grainLen);
+
+                        float granSum = 0.0f;
+                        for (int vi2 = 0; vi2 < 4; ++vi2) {
+                            const int env = gs.envPos[vi2];
+                            // Hann window over the grain envelope.
+                            const float winW = 0.5f * (1.0f -
+                                std::cos(TWO_PI * (float)env * invN));
+                            // Source read with linear interp; pitch-scaled
+                            // so MIDI pitch tracks.
+                            const float srcF = (float)gs.srcStart[vi2] +
+                                (float)env * ratio;
+                            int   i0 = (int)srcF;
+                            float fr = srcF - (float)i0;
+                            if (i0 < 0)              { i0 = 0; fr = 0.0f; }
+                            else if (i0 >= srcLen - 1) { i0 = srcLen - 1; fr = 0.0f; }
+                            const int i1 = std::min(i0 + 1, srcLen - 1);
+                            const float val = gf.source[(size_t)i0] * (1.0f - fr)
+                                            + gf.source[(size_t)i1] * fr;
+                            granSum += winW * val;
+
+                            // Advance envelope; on wrap, random-walk
+                            // srcStart by +/- grainLen/2 (clamped). Tight
+                            // jitter keeps consecutive grains coherent so
+                            // the texture is a continuous drone of the
+                            // source material instead of teleporting to a
+                            // uniformly-random spot every grain (which
+                            // sounds like broken glass). Over many wraps
+                            // the position diffuses across the source so
+                            // a held note explores the whole captured
+                            // window over a few seconds of playback.
+                            int envNext = env + 1;
+                            if (envNext >= grainLen) {
+                                envNext = 0;
+                                if (maxStart > 0) {
+                                    const int jitter = std::min(grainLen, maxStart);
+                                    int s = gs.srcStart[vi2]
+                                        + granRng.nextInt(jitter + 1) - jitter / 2;
+                                    gs.srcStart[vi2] = juce::jlimit(0, maxStart, s);
+                                } else {
+                                    gs.srcStart[vi2] = 0;
+                                }
+                            }
+                            gs.envPos[vi2] = envNext;
+                        }
+                        // 4-overlap Hann sums to constant amplitude 2.0;
+                        // halve to keep unity gain, then weight by the
+                        // morph weight and add to the cycle-layer sample.
+                        sample += w * (granSum * 0.5f);
+                    }
+                }
+
                 // Phase advancement: wavetables (one cycle per period) advance
                 // by frequency/sampleRate; sample-based playback (Sampler etc)
                 // advances by pitchScale/sampleRate, where pitchScale is the
@@ -1235,12 +1860,44 @@ void TerrainSynthProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mi
                     v.phase += samplePitchScale / (float)sampleRate;
                 }
                 if (v.phase > 1.0f) v.phase -= 1.0f;
-            } else {
-                // WaveformPerPoint: terrain value modulates oscillator timbre
+            } else if (mode == TerrainSynthMode::WaveformPerPoint) {
+                // AM-sine: a sine carrier at the played pitch, amplitude-
+                // modulated by the terrain value at the current traversal
+                // coordinate. The terrain isn't the sound - it's a slow
+                // amplitude envelope on top of a pure tone. Useful (and the
+                // only meaningful mode) for non-1D terrains where Direct
+                // mode would be noise.
                 float terrainVal = terrain.sample(coord);
                 sample = std::sin(v.phase * 2.0f * 3.14159265f) * (0.5f + 0.5f * terrainVal);
                 v.phase += effFreq / (float)sampleRate;
                 if (v.phase > 1.0f) v.phase -= 1.0f;
+            } else {
+                // Additive bank: sum N independent sine partials at
+                // fundamental*k, k=1..K. Magnitudes/phases come from a
+                // (cached) FFT of the wavetable cycle.
+                if ((int)v.partialPhases.size() < kAdditiveBankMaxPartials)
+                    v.partialPhases.assign(kAdditiveBankMaxPartials, 0.0f);
+
+                sample = 0.0f;
+                // Anti-aliasing: silence any partial whose frequency exceeds
+                // Nyquist (the wavetable's FFT will already have low values
+                // for those bins in most cases, but this also clamps
+                // user-set pitches that push partials past Nyquist).
+                float nyquist = 0.5f * (float)sampleRate;
+                const int K = (int)partialBank.magnitude.size();
+                const float TWO_PI = 6.28318530718f;
+                for (int k = 1; k < K; ++k) {
+                    float mag = partialBank.magnitude[k];
+                    if (mag <= 1e-5f) continue;
+                    float partialFreq = effFreq * (float)k;
+                    if (partialFreq >= nyquist) break; // higher partials are too
+                    sample += mag * std::sin(TWO_PI * v.partialPhases[k]
+                                              + partialBank.phase[k]);
+                    // Advance this partial's phase.
+                    v.partialPhases[k] += partialFreq / (float)sampleRate;
+                    if (v.partialPhases[k] > 1.0f)
+                        v.partialPhases[k] -= std::floor(v.partialPhases[k]);
+                }
             }
 
             totalSample += sample * env * v.velocity;

@@ -1,6 +1,10 @@
 #include "node_graph_component.h"
+#include "dialog_helpers.h"
 #include "music_theory.h"
 #include "layered_wave_editor.h"
+#include "spectral_editor.h"
+#include "wavelet_painter.h"
+#include "wavelet_paint.h"
 #include "trigger_node.h"
 #include "midi_mod_node.h"
 #include "xy_pad.h"
@@ -9,6 +13,7 @@
 #include "builtin_effects.h"
 #include "drum_synth.h"
 #include "multi_sampler.h"
+#include "terrain_synth.h" // classifySynthSource for Synth Mode picker
 #include <cmath>
 
 namespace SoundShop {
@@ -98,10 +103,18 @@ juce::Colour NodeGraphComponent::getNodeColor(const Node& node) const {
 void NodeGraphComponent::paint(juce::Graphics& g) {
     g.fillAll(juce::Colour(25, 25, 30));
 
-    // If we somehow paint before resized() (e.g. unusual layout cascade), do
-    // the initial fit here so we never draw nodes at the default zoom/pan.
+    // If we somehow paint before resized() (e.g. unusual layout cascade),
+    // apply the initial view here so we never draw nodes at the default
+    // zoom/pan. Prefer the saved pan/zoom (loaded from the project file)
+    // when present, otherwise fit-all so newly-created/imported projects
+    // still get centered.
     if (pendingInitialFit && getWidth() > 0 && getHeight() > 0) {
-        if (graph.nodes.size() > 1) fitAll();
+        if (graph.viewZoom > 0.0f) {
+            zoom = graph.viewZoom;
+            panOffset = {graph.viewPanX, graph.viewPanY};
+        } else if (graph.nodes.size() > 1) {
+            fitAll();
+        }
         pendingInitialFit = false;
     }
 
@@ -343,7 +356,35 @@ void NodeGraphComponent::drawNode(juce::Graphics& g, Node& node) {
             g.setColour(nodeSignalLocked ? juce::Colours::grey : juce::Colours::white);
             auto labelRect = rowRect.reduced(p.autoWriteArmed ? 10.0f : 4.0f, 0.0f);
             g.drawText(p.name, labelRect, juce::Justification::centredLeft, false);
-            juce::String valueStr = juce::String(p.value, 2);
+            // Enum-typed params get their numeric value translated into a
+            // readable label, so the user sees the meaning rather than a
+            // float like "1.00". Everything else falls through to a 2-dp
+            // numeric display.
+            juce::String valueStr;
+            if (p.name == "Synth Mode") {
+                // Display the *effective* mode after clamping against the
+                // source's applicability set. Legacy projects with a stale
+                // mode value (e.g. AM-sine on a wavetable) silently snap to
+                // a valid mode in the audio thread, and we mirror that here
+                // so the row reads what the synth is actually doing.
+                int m = juce::jlimit(0, 2, (int)std::round(p.value));
+                TerrainSynthMode requested = (m == 1) ? TerrainSynthMode::WaveformPerPoint
+                                           : (m == 2) ? TerrainSynthMode::AdditiveBank
+                                                      : TerrainSynthMode::SamplePerPoint;
+                auto avail = synthModeAvailabilityFor(classifySynthSource(node.script));
+                TerrainSynthMode effective = avail.clamp(requested);
+                valueStr = (effective == TerrainSynthMode::SamplePerPoint)   ? "Direct"
+                         : (effective == TerrainSynthMode::WaveformPerPoint) ? "AM-sine"
+                                                                             : juce::String("Additive bank");
+            } else if (p.name == "Traversal") {
+                int m = juce::jlimit(0, 3, (int)std::round(p.value));
+                valueStr = (m == 0) ? "Orbit"
+                         : (m == 1) ? "Linear"
+                         : (m == 2) ? "Lissajous"
+                         : juce::String("Physics");
+            } else {
+                valueStr = juce::String(p.value, 2);
+            }
             g.drawText(valueStr, rowRect.reduced(4, 0), juce::Justification::centredRight, false);
 
             // Modulation indicators (#29): small colored dots after the
@@ -791,6 +832,67 @@ void NodeGraphComponent::mouseDown(const juce::MouseEvent& e) {
                 int idx = (int)((canvasPos.y - paramRowsTop) / PIN_ROW_HEIGHT);
                 if (idx >= 0 && idx < (int)node->params.size()) {
                     auto& p = node->params[idx];
+                    // Enum params (Synth Mode) get a popup picker instead
+                    // of a continuous slider: drag-through-values is clunky
+                    // when the values are discrete labels rather than
+                    // continuous numbers, and lets users park between
+                    // states. For Synth Mode we additionally filter the
+                    // menu to the modes that make sense for the current
+                    // terrain source, with the rest disabled and
+                    // explained inline so users see why they can't pick
+                    // them. Right-click still opens the standard
+                    // arm/disarm menu (handled above), so no UX gets lost.
+                    if (p.name == "Synth Mode") {
+                        selectedNodeId = node->id;
+                        SynthModeAvailability avail =
+                            synthModeAvailabilityFor(classifySynthSource(node->script));
+                        int currentInt = juce::jlimit(0, 2, (int)std::round(p.value));
+                        TerrainSynthMode current = (currentInt == 1) ? TerrainSynthMode::WaveformPerPoint
+                                                 : (currentInt == 2) ? TerrainSynthMode::AdditiveBank
+                                                                     : TerrainSynthMode::SamplePerPoint;
+                        TerrainSynthMode effective = avail.clamp(current);
+
+                        juce::PopupMenu pm;
+                        auto addModeItem = [&](int itemId, const juce::String& label,
+                                               const juce::String& whyDisabled,
+                                               bool isAvailable, bool isCurrent) {
+                            juce::PopupMenu::Item item;
+                            item.itemID = itemId;
+                            item.text = isAvailable ? label
+                                                    : label + "  -  " + whyDisabled;
+                            item.isEnabled = isAvailable;
+                            item.isTicked = isCurrent && isAvailable;
+                            pm.addItem(item);
+                        };
+                        addModeItem(1, "Direct",
+                                    "needs a 1D wavetable cycle or audio sample",
+                                    avail.direct,
+                                    effective == TerrainSynthMode::SamplePerPoint);
+                        addModeItem(2, "AM-sine",
+                                    "only meaningful for 2D+ terrains "
+                                    "(images, math 2D+, fractal noise)",
+                                    avail.amSine,
+                                    effective == TerrainSynthMode::WaveformPerPoint);
+                        addModeItem(3, "Additive bank",
+                                    "needs a 1D wavetable cycle to FFT into partials",
+                                    avail.additiveBank,
+                                    effective == TerrainSynthMode::AdditiveBank);
+
+                        int nodeId = node->id;
+                        int paramIdx = idx;
+                        pm.showMenuAsync({}, [this, nodeId, paramIdx](int r) {
+                            if (r == 0) return;
+                            auto* nd = graph.findNode(nodeId);
+                            if (!nd || paramIdx >= (int)nd->params.size()) return;
+                            // Menu IDs are 1/2/3 (cleared 0 = cancel);
+                            // Synth Mode param values are 0/1/2.
+                            nd->params[paramIdx].value = (float)(r - 1);
+                            graph.dirty = true;
+                            graph.commitSnapshot("Change Synth Mode");
+                            repaint();
+                        });
+                        return;
+                    }
                     dragMode = DragMode::DragParam;
                     dragNodeId = node->id;
                     dragParamIdx = idx;
@@ -838,6 +940,7 @@ void NodeGraphComponent::mouseDrag(const juce::MouseEvent& e) {
     if (dragMode == DragMode::Pan) {
         panOffset += e.position - dragStart;
         dragStart = e.position;
+        publishViewState();
         repaint();
     } else if (dragMode == DragMode::MoveNode) {
         auto* node = graph.findNode(dragNodeId);
@@ -945,6 +1048,7 @@ void NodeGraphComponent::mouseWheelMove(const juce::MouseEvent& e, const juce::M
     auto mousePos = e.position;
     panOffset = mousePos - (mousePos - panOffset) * (zoom / oldZoom);
 
+    publishViewState();
     repaint();
 }
 
@@ -1019,17 +1123,38 @@ void NodeGraphComponent::fitAll() {
     float cy = (minY + maxY) / 2;
     panOffset = {getWidth() / 2.0f - cx * zoom, getHeight() / 2.0f - cy * zoom};
 
+    publishViewState();
+    repaint();
+}
+
+void NodeGraphComponent::publishViewState() {
+    graph.viewZoom = zoom;
+    graph.viewPanX = panOffset.x;
+    graph.viewPanY = panOffset.y;
+}
+
+void NodeGraphComponent::notifyProjectLoaded() {
+    // A new project's view fields have just been populated (or left at 0).
+    // Defer the actual restore to the next paint/resized once we have a
+    // real size - matches the existing first-paint contract and avoids
+    // racing with whatever layout pass triggered the load.
+    pendingInitialFit = true;
     repaint();
 }
 
 void NodeGraphComponent::resized() {
-    // Run the initial fit-all the first time we get a real (non-zero) size,
-    // so the very first paint already shows the graph centered at the right
-    // zoom - no visible zoom-in jitter on project load. Subsequent resizes
-    // (window-resize, panel splits, etc.) leave the user's view alone so we
-    // don't clobber any manual pan/zoom they've done.
+    // Apply the initial view the first time we get a real (non-zero) size,
+    // so the very first paint already shows the graph at the right
+    // zoom - no visible zoom-in jitter on project load. Prefer the saved
+    // pan/zoom (graph.viewZoom > 0) when available, otherwise fit-all.
+    // Subsequent resizes (window-resize, panel splits, etc.) leave the
+    // user's view alone so we don't clobber any manual pan/zoom they've
+    // done.
     if (pendingInitialFit && getWidth() > 0 && getHeight() > 0) {
-        if (graph.nodes.size() > 1) {
+        if (graph.viewZoom > 0.0f) {
+            zoom = graph.viewZoom;
+            panOffset = {graph.viewPanX, graph.viewPanY};
+        } else if (graph.nodes.size() > 1) {
             fitAll();
         }
         pendingInitialFit = false;
@@ -1047,14 +1172,19 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
     menu.addSeparator();
 
     juce::PopupMenu instMenu;
-    juce::PopupMenu synthMenu;
-    synthMenu.addItem(110, "Waveform");
-    synthMenu.addItem(115, "Frequency Domain...");
-    instMenu.addSubMenu("Built-in Synth", synthMenu);
+    // Built-in Synth is a single wavetable-based oscillator. The wavetable
+    // can mix layered (time-domain), frequency-domain (FFT), and wavelet-
+    // domain (DWT) frames - those used to be three separate menu items, but
+    // since any of them lets you author any of the three frame types from
+    // inside the wavetable editor (via + Frame), the three options were
+    // redundant. Collapsed into one entry; pick frame types after the
+    // editor opens.
+    instMenu.addItem(110, "Wavetable");
     juce::PopupMenu terrainMenu;
     terrainMenu.addItem(120, "2D Terrain (sin*cos)");
     terrainMenu.addItem(121, "2D Terrain (noise)");
     terrainMenu.addItem(122, "2D Terrain (custom expression...)");
+    terrainMenu.addItem(125, "N-D Terrain (custom expression, 1-8D)...");
     terrainMenu.addItem(123, "From Image...");
     terrainMenu.addItem(124, "From Audio File...");
     instMenu.addSubMenu("Terrain Synth", terrainMenu);
@@ -1064,7 +1194,10 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
     instMenu.addItem(107, "FM Synth");
     instMenu.addItem(108, "Phase Distortion Synth");
     instMenu.addItem(109, "Particle Cloud Synth");
-    instMenu.addItem(110, "Additive Synth");
+    // Bugfix: this used to be ID 110, which collided with the Built-in Synth
+    // entry above, so clicking "Additive Synth" actually created a Waveform
+    // Synth (the first matching branch in the result chain). Moved to 112.
+    instMenu.addItem(112, "Additive Synth");
     instMenu.addItem(111, "Spectral Grain Synth");
     instMenu.addItem(104, "SoundFont (.sf2)...");
     instMenu.addItem(105, "SFZ Instrument (.sfz)...");
@@ -1214,25 +1347,23 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
                     }
                 });
             return; // don't repaint yet, async
-        } else if (result == 110 || result == 115) {
-            // Built-in synth (unified: uses TerrainSynthProcessor)
-            // 110 = Layered Waveform editor, 115 = Frequency Domain (spectral)
-            const char* nodeName = (result == 110) ? "Waveform Synth" : "Spectral Synth";
-            // The Waveform Synth is strictly 1D, so Sig X / Sig Y inputs
-            // (which modulate a 2D terrain traversal position) are meaningless
-            // and omitted. Spectral Synth also produces a 1D waveform, so
-            // same logic. Only Terrain Synth nodes still expose them.
-            auto& n = graph.addNode(nodeName, NodeType::Instrument,
+        } else if (result == 110) {
+            // Wavetable node - uses TerrainSynthProcessor with a 1D wavetable
+            // script. The wavetable editor lets the user mix layered
+            // (time-domain) / frequency-domain (FFT) / wavelet (DWT) /
+            // captured waveforms freely via its "+ Waveform" popup, so we
+            // don't need separate top-level menu items for the three
+            // synthesizable waveform types. Starts EMPTY (no waveforms) so
+            // the very first user action is picking the type of the first
+            // waveform via "+ Waveform" - skips the dance of deleting an
+            // auto-created sine that wasn't asked for.
+            auto& n = graph.addNode("Wavetable", NodeType::Instrument,
                 {Pin{0, "MIDI", PinKind::Midi, true}},
                 {Pin{0, "Audio", PinKind::Audio, false}}, {p.x, p.y});
-            // Default script depends on which menu item fired
-            if (result == 110)
-                n.script = WavetableDoc::defaultSingleSine().encode();
-            else
-                n.script = ""; // spectral will be filled in by the dialog below
+            n.script = WavetableDoc::defaultEmpty().encode();
 
             // Compact param list: only the controls that actually do something
-            // for a 1D Waveform/Spectral synth. Terrain-traversal params (Speed,
+            // for a 1D Waveform synth. Terrain-traversal params (Speed,
             // Radius, Center, Traversal mode, LFOs, Grain) are omitted since
             // they're meaningless for 1D playback. TerrainSynthProcessor reads
             // missing params via getParam's default-fallback path, and the
@@ -1254,68 +1385,35 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
             // Looked up by name in TerrainSynthProcessor, so list order is free.
             n.params.push_back({"Position", 0.0f,  0.0f,   1.0f});
 
-            if (result == 110) {
-                // Waveform - open the layered waveform editor immediately.
-                auto nodeId = n.id;
-                auto* editor = new LayeredWaveEditorComponent(graph, nodeId, [this]() {
-                    if (onNodeEdited) onNodeEdited();
-                    repaint();
-                });
-                juce::DialogWindow::LaunchOptions opts;
-                opts.content.setOwned(editor);
-                opts.dialogTitle = "Waveform: " + juce::String(n.name);
-                opts.dialogBackgroundColour = juce::Colour(22, 22, 28);
-                opts.escapeKeyTriggersCloseButton = true;
-                opts.useNativeTitleBar = false;
-                opts.resizable = true;
-                opts.launchAsync();
-                (void)nodeId;
-                return;
-            } else if (result == 115) {
-                // Frequency Domain (spectral) - prompt for mag and phase expressions.
-                auto nodeId = n.id;
-                auto* aw = new juce::AlertWindow("Frequency Domain Synth",
-                    "Define the sound's spectrum. `f` is the frequency bin index.\n\n"
-                    "Magnitude examples:\n"
-                    "  exp(-f/20)                  - dark, natural decay\n"
-                    "  1/(f+1)                     - sawtooth-like\n"
-                    "  exp(-((f-30)^2)/40)         - single formant bump\n"
-                    "  sin(f*0.3) + 0.5*cos(f*0.1) - layered slow ripples\n\n"
-                    "Phase defaults to random (natural noise-like) - change to `0`\n"
-                    "for an impulsive clicky attack, or write an expression in `f`.\n\n"
-                    "Functions: sin, cos, exp, log, sqrt, pow, abs, tanh, clamp, noise",
-                    juce::MessageBoxIconType::NoIcon);
-                aw->addTextEditor("mag",   "exp(-f/20)", "Magnitude mag(f):");
-                aw->addTextEditor("phase", "random",     "Phase phase(f):");
-                aw->addComboBox("fftsize", {"512", "1024", "2048", "4096"}, "FFT size:");
-                if (auto* cb = aw->getComboBoxComponent("fftsize")) cb->setSelectedItemIndex(2);
-                aw->addComboBox("phasemode", {"Expression", "Random", "Zero (clicky)", "Linear"}, "Phase mode:");
-                if (auto* cb = aw->getComboBoxComponent("phasemode")) cb->setSelectedItemIndex(1);
-                aw->addButton("OK", 1, juce::KeyPress(juce::KeyPress::returnKey));
-                aw->addButton("Cancel", 0, juce::KeyPress(juce::KeyPress::escapeKey));
-                aw->enterModalState(true, juce::ModalCallbackFunction::create(
-                    [this, nodeId, aw](int result) {
-                        if (result == 1) {
-                            auto mag   = aw->getTextEditorContents("mag").toStdString();
-                            auto phase = aw->getTextEditorContents("phase").toStdString();
-                            int fftIdx = 2, phaseIdx = 1;
-                            if (auto* cb = aw->getComboBoxComponent("fftsize"))
-                                fftIdx = cb->getSelectedItemIndex();
-                            if (auto* cb = aw->getComboBoxComponent("phasemode"))
-                                phaseIdx = cb->getSelectedItemIndex();
-                            int fftSize = (fftIdx == 0) ? 512 : (fftIdx == 1) ? 1024
-                                        : (fftIdx == 2) ? 2048 : 4096;
-                            if (auto* nd = graph.findNode(nodeId)) {
-                                nd->script = "__spectral__:" + std::to_string(fftSize) +
-                                             ":" + std::to_string(phaseIdx) +
-                                             ":" + mag + "|" + phase;
-                            }
-                        }
-                        delete aw;
-                        repaint();
-                    }), true);
-                return;
-            }
+            // Open the wavetable editor immediately. MUST use the
+            // launchNonModalToolDialog path, not launchToolDialog: the
+            // arrangement view's library list uses JUCE's
+            // DragAndDropContainer to drop library entries onto cells /
+            // scatter positions, and a modal parent dialog blocks the
+            // DragImageComponent (which lives on the desktop, outside the
+            // modal hierarchy) from receiving mouseUp via the source-
+            // component listener forwarding chain - so itemDropped never
+            // fires and the drag silently leaves a stranded drag-image
+            // bitmap with no placement. This mirrors the rationale at the
+            // double-click reopen path in main_window.cpp; both entry
+            // points into the wavetable editor must be non-modal for DnD
+            // to work.
+            auto nodeId = n.id;
+            auto* editor = new LayeredWaveEditorComponent(graph, nodeId, [this]() {
+                if (onNodeEdited) onNodeEdited();
+                repaint();
+            });
+            juce::DialogWindow::LaunchOptions opts;
+            opts.content.setOwned(editor);
+            opts.dialogTitle = "Wavetable: " + juce::String(n.name);
+            opts.dialogBackgroundColour = juce::Colour(22, 22, 28);
+            opts.escapeKeyTriggersCloseButton = true;
+            opts.useNativeTitleBar = false;
+            opts.resizable = true;
+            opts.componentToCentreAround = this;
+            SoundShop::launchNonModalToolDialog(opts);
+            (void)nodeId;
+            return;
         } else if (result == 133) {
             // XY Pad: a signal-generating node with X/Y/Z outputs that can
             // be wired through the graph. Also has a fast-path dropdown to
@@ -1340,7 +1438,8 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
                 opts.escapeKeyTriggersCloseButton = true;
                 opts.useNativeTitleBar = false;
                 opts.resizable = true;
-                opts.launchAsync();
+                opts.componentToCentreAround = this;
+                SoundShop::launchToolDialog(opts);
             }
             return;
         } else if (result == 134) {
@@ -1406,53 +1505,35 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
                     }), true);
                 return;
             }
-        } else if (result >= 120 && result <= 124) {
-            // Terrain Synth
-            auto makeTerrainNode = [&](const std::string& name, const std::string& script) -> Node& {
-                auto& n = graph.addNode(name, NodeType::TerrainSynth,
-                    {Pin{0, "MIDI", PinKind::Midi, true},
-                     Pin{0, "Sig X", PinKind::Signal, true, 1},
-                     Pin{0, "Sig Y", PinKind::Signal, true, 1}},
-                    {Pin{0, "Audio", PinKind::Audio, false}}, {p.x, p.y});
-                n.script = script;
-                n.params.push_back({"Attack",   0.01f, 0.001f, 2.0f});
-                n.params.push_back({"Decay",    0.1f,  0.001f, 2.0f});
-                n.params.push_back({"Sustain",  0.7f,  0.0f,   1.0f});
-                n.params.push_back({"Release",  0.3f,  0.001f, 5.0f});
-                n.params.push_back({"Volume",   0.5f,  0.0f,   1.0f});
-                n.params.push_back({"Pan",      0.0f, -1.0f,   1.0f});
-                n.params.push_back({"Speed",        1.0f,  0.01f, 20.0f});  // 5
-                n.params.push_back({"Radius X",     0.3f,  0.0f,   0.5f}); // 6
-                n.params.push_back({"Radius Y",     0.3f,  0.0f,   0.5f}); // 7
-                n.params.push_back({"Center X",     0.5f,  0.0f,   1.0f}); // 8
-                n.params.push_back({"Center Y",     0.5f,  0.0f,   1.0f}); // 9
-                n.params.push_back({"Rad Mod Spd",  0.0f,  0.0f,  10.0f}); // 10
-                n.params.push_back({"Rad Mod Amt",  0.0f,  0.0f,   0.3f}); // 11
-                n.params.push_back({"Traversal",    0.0f,  0.0f,   3.0f}); // 12: 0=Orbit,1=Linear,2=Lissajous,3=Physics
-                n.params.push_back({"Synth Mode",   0.0f,  0.0f,   1.0f}); // 13: 0=SamplePerPoint,1=WaveformPerPoint
-                n.params.push_back({"LFO1 Rate",    0.5f,  0.01f, 20.0f}); // 14
-                n.params.push_back({"LFO2 Rate",    0.2f,  0.01f, 20.0f}); // 15
-                n.params.push_back({"LFO1 Amount",  0.0f,  0.0f,   1.0f}); // 16
-                n.params.push_back({"LFO2 Amount",  0.0f,  0.0f,   1.0f}); // 17
-                n.params.push_back({"Grain Size",   0.0f,  0.0f,   0.5f}); // 18
-                n.params.push_back({"Freeze",       0.0f,  0.0f,   1.0f}); // 19
-                n.params.push_back({"Grain Jitter", 0.0f,  0.0f,   1.0f}); // 20
-                return n;
-            };
-
+        } else if (result >= 120 && result <= 125) {
+            // Terrain Synth. The terrain engine and visualizer both support
+            // N-dimensional terrains (1..8 axes); the visualizer's + Dim /
+            // - Dim buttons add/remove axes at runtime, and
+            // makeTerrainNode() takes a numDims arg so callers can also
+            // create higher-D terrains directly. Image (2D) and audio (1D)
+            // sources have fixed dimensionality - the only path that
+            // varies N at create time is the formula path (result 125).
             if (result == 120) {
-                makeTerrainNode("Terrain (sin*cos)", "sin(x) * cos(y)");
+                makeTerrainNode("Terrain (sin*cos)", "sin(x) * cos(y)", p);
             } else if (result == 121) {
-                makeTerrainNode("Terrain (noise)", "noise(0)");
+                // Fractal value noise: smooth, 1/f-ish bumpy terrain. The
+                // orbit reads varying noisy texture as it moves, rather than
+                // independent random samples per cell (which is what the old
+                // expression-based "noise(0)" produced and was effectively
+                // equivalent to a noise oscillator with the terrain abstraction
+                // adding nothing). Script format documented in terrain_synth.cpp.
+                makeTerrainNode("Terrain (noise)",
+                                "__valuenoise__:256,256:4:0.55:42", p);
             } else if (result == 122) {
-                auto nodeId = makeTerrainNode("Terrain", "sin(x)*cos(y)").id;
+                auto nodeId = makeTerrainNode("Terrain", "sin(x)*cos(y)", p).id;
                 auto* aw = new juce::AlertWindow("Terrain Expression",
-                    "Enter a 2D expression. Variables: x, y (0..2pi)\n"
+                    "Enter a 2D expression. Variables: x, y (each ranges 0..2pi)\n"
                     "Functions: sin, cos, abs, sqrt, pow, tanh, noise\n\n"
                     "Examples:\n"
                     "  sin(x) * cos(y)\n"
                     "  sin(x*3) + cos(y*2) * 0.5\n"
-                    "  tanh(sin(x) * sin(y) * 3)",
+                    "  tanh(sin(x) * sin(y) * 3)\n\n"
+                    "For 3D-8D terrains, use the N-D Terrain menu item instead.",
                     juce::MessageBoxIconType::NoIcon);
                 aw->addTextEditor("expr", "sin(x) * cos(y)", "Expression:");
                 aw->addButton("OK", 1); aw->addButton("Cancel", 0);
@@ -1465,7 +1546,7 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
                     }), true);
                 return;
             } else if (result == 123) {
-                auto nodeId = makeTerrainNode("Terrain (image)", "").id;
+                auto nodeId = makeTerrainNode("Terrain (image)", "", p).id;
                 if (auto* nd = graph.findNode(nodeId)) nd->script = "__image__";
                 auto chooser = std::make_shared<juce::FileChooser>("Load Image", juce::File(), "*.png;*.jpg;*.bmp");
                 chooser->launchAsync(juce::FileBrowserComponent::openMode,
@@ -1478,7 +1559,7 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
                     });
                 return;
             } else if (result == 124) {
-                auto nodeId = makeTerrainNode("Terrain (audio)", "").id;
+                auto nodeId = makeTerrainNode("Terrain (audio)", "", p).id;
                 auto chooser = std::make_shared<juce::FileChooser>("Load Audio", juce::File(), "*.wav;*.mp3;*.aiff;*.flac");
                 chooser->launchAsync(juce::FileBrowserComponent::openMode,
                     [this, nodeId, chooser](const juce::FileChooser& fc) {
@@ -1488,6 +1569,53 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
                                 nd->script = "__audio__:" + file.getFullPathName().toStdString();
                         repaint();
                     });
+                return;
+            } else if (result == 125) {
+                // N-D Terrain (custom expression). Open a dialog with a
+                // dim-count combo and an expression editor. Default is 3D
+                // so the option is meaningfully different from the 2D
+                // preset above; user can pick anything in 1..8.
+                auto canvasPos = p;
+                auto* aw = new juce::AlertWindow(
+                    "N-D Terrain Expression",
+                    "Variables per axis: x, y, z, w, v, u, s, t (each ranges 0..2pi)\n"
+                    "Functions: sin, cos, abs, sqrt, pow, tanh, noise\n"
+                    "\n"
+                    "Pick the number of dimensions (1-8). Each dimension creates one\n"
+                    "Sig input pin and one Center/Radius parameter pair on the synth.\n"
+                    "Axes you don't reference in the expression are constant along\n"
+                    "that axis but still exist as inputs you can modulate.\n"
+                    "\n"
+                    "Examples:\n"
+                    "  1D:  sin(x)\n"
+                    "  2D:  sin(x) * cos(y)\n"
+                    "  3D:  sin(x) * cos(y) * sin(z)\n"
+                    "  4D:  tanh(sin(x) + cos(y) + sin(z) * cos(w))",
+                    juce::MessageBoxIconType::NoIcon);
+                aw->addComboBox("dims",
+                    {"1", "2", "3", "4", "5", "6", "7", "8"},
+                    "Dimensions:");
+                if (auto* cb = aw->getComboBoxComponent("dims"))
+                    cb->setSelectedItemIndex(2, juce::dontSendNotification); // default 3D
+                aw->addTextEditor("expr",
+                    "sin(x) * cos(y) * sin(z)",
+                    "Expression:");
+                aw->addButton("OK", 1);
+                aw->addButton("Cancel", 0);
+                aw->enterModalState(true, juce::ModalCallbackFunction::create(
+                    [this, aw, canvasPos](int res) {
+                        if (res == 1) {
+                            int numDims = 2;
+                            if (auto* cb = aw->getComboBoxComponent("dims"))
+                                numDims = juce::jlimit(1, 8, cb->getSelectedItemIndex() + 1);
+                            std::string expr = aw->getTextEditorContents("expr").toStdString();
+                            std::string nodeName = juce::String(numDims).toStdString() + "D Terrain";
+                            makeTerrainNode(nodeName, expr, canvasPos, numDims);
+                            if (onNodeEdited) onNodeEdited();
+                        }
+                        delete aw;
+                        repaint();
+                    }), true);
                 return;
             }
         } else if (result == 102) {
@@ -1596,8 +1724,9 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
             n.params.push_back({"Release",     0.3f, 0.001f, 10.0f});
             n.params.push_back({"Volume",      0.5f, 0.0f, 1.0f});
             repaint();
-        } else if (result == 110) {
-            // Additive Synth
+        } else if (result == 112) {
+            // Additive Synth (ID changed from 110 to 112 to break a
+            // pre-existing collision with the Built-in Synth menu entry).
             auto& n = graph.addNode("Additive", NodeType::Instrument,
                 {Pin{0, "MIDI", PinKind::Midi, true}},
                 {Pin{0, "Audio", PinKind::Audio, false}}, {p.x, p.y});
@@ -2370,6 +2499,61 @@ void NodeGraphComponent::showLinkMenu(int linkId) {
         }
         repaint();
     });
+}
+
+// ==============================================================================
+// Terrain node factory (#? - N-D terrain creation)
+// ==============================================================================
+
+Node& NodeGraphComponent::makeTerrainNode(const std::string& name,
+                                          const std::string& script,
+                                          juce::Point<float> canvasPos,
+                                          int numDims) {
+    static const char* axisNames[] = {"X", "Y", "Z", "W", "V", "U", "S", "T"};
+    numDims = juce::jlimit(1, 8, numDims);
+
+    std::vector<Pin> inPins;
+    inPins.push_back(Pin{0, "MIDI", PinKind::Midi, true});
+    for (int d = 0; d < numDims; ++d)
+        inPins.push_back(Pin{0, std::string("Sig ") + axisNames[d],
+                             PinKind::Signal, true, 1});
+
+    auto& n = graph.addNode(name, NodeType::TerrainSynth,
+        inPins,
+        {Pin{0, "Audio", PinKind::Audio, false}},
+        {canvasPos.x, canvasPos.y});
+    n.script = script;
+    n.params.push_back({"Attack",   0.01f, 0.001f, 2.0f});
+    n.params.push_back({"Decay",    0.1f,  0.001f, 2.0f});
+    n.params.push_back({"Sustain",  0.7f,  0.0f,   1.0f});
+    n.params.push_back({"Release",  0.3f,  0.001f, 5.0f});
+    n.params.push_back({"Volume",   0.5f,  0.0f,   1.0f});
+    n.params.push_back({"Pan",      0.0f, -1.0f,   1.0f});
+    n.params.push_back({"Speed",        1.0f,  0.01f, 20.0f});
+    // All radii first, then all centres - matches the original 2D ordering.
+    for (int d = 0; d < numDims; ++d)
+        n.params.push_back({std::string("Radius ") + axisNames[d],
+                            0.3f, 0.0f, 0.5f});
+    for (int d = 0; d < numDims; ++d)
+        n.params.push_back({std::string("Center ") + axisNames[d],
+                            0.5f, 0.0f, 1.0f});
+    n.params.push_back({"Rad Mod Spd",  0.0f,  0.0f,  10.0f});
+    n.params.push_back({"Rad Mod Amt",  0.0f,  0.0f,   0.3f});
+    n.params.push_back({"Traversal",    0.0f,  0.0f,   3.0f}); // 0=Orbit,1=Linear,2=Lissajous,3=Physics
+    // Synth Mode: 0=Direct (SamplePerPoint), 1=AM-sine (WaveformPerPoint),
+    // 2=Additive bank (per-partial sines). Direct is natural for 1D
+    // wavetable/audio terrains; AM-sine is the only meaningful mode for
+    // 2D/N-D terrains (image, math expression, fractal noise); Additive
+    // bank applies only to 1D wavetable cycles.
+    n.params.push_back({"Synth Mode",   0.0f,  0.0f,   2.0f});
+    n.params.push_back({"LFO1 Rate",    0.5f,  0.01f, 20.0f});
+    n.params.push_back({"LFO2 Rate",    0.2f,  0.01f, 20.0f});
+    n.params.push_back({"LFO1 Amount",  0.0f,  0.0f,   1.0f});
+    n.params.push_back({"LFO2 Amount",  0.0f,  0.0f,   1.0f});
+    n.params.push_back({"Grain Size",   0.0f,  0.0f,   0.5f});
+    n.params.push_back({"Freeze",       0.0f,  0.0f,   1.0f});
+    n.params.push_back({"Grain Jitter", 0.0f,  0.0f,   1.0f});
+    return n;
 }
 
 } // namespace SoundShop

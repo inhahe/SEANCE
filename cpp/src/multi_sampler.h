@@ -213,6 +213,13 @@ private:
     std::array<std::array<float, 2>, 2> amigaZ1 {}; // [stage][channel]
     std::array<std::array<float, 2>, 2> amigaZ2 {};
 
+    // Diagnostic counters - rate-limit the silent-MOD-playback debug logs so
+    // the log doesn't flood. See multi_sampler.cpp comments at each use site.
+    bool diagFirstProcess = true;
+    bool diagFirstMidiSeen = false;
+    int  diagNoteOnsLogged = 0;
+    int  diagUnmatchedLogged = 0;
+
     // Re-parse the script and reload WAV files into zones if node.script
     // has changed since the last call. Called at the top of processBlock
     // so runtime edits to the doc take effect without a graph rebuild.

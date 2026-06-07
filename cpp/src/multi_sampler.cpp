@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
+#include <cstdio>
 #include <sstream>
 
 namespace SoundShop {
@@ -272,6 +273,16 @@ bool MultiSamplerDoc::decode(const std::string& script) {
 
 MultiSamplerProcessor::MultiSamplerProcessor(Node& n) : node(n) {
     voices.resize(32);
+    // Silent-MOD-playback diagnostic: log every MultiSampler that gets
+    // constructed so we can see how many the project has, and what their
+    // script payload looks like at construction time. We only print the
+    // first 80 chars so the log stays scannable.
+    std::string scriptPrefix = node.script.substr(0, 80);
+    std::fprintf(stderr,
+                 "[MultiSampler] ctor: node id=%d name='%s' scriptLen=%d head='%s'\n",
+                 node.id, node.name.c_str(), (int)node.script.size(),
+                 scriptPrefix.c_str());
+    std::fflush(stderr);
 }
 
 void MultiSamplerProcessor::prepareToPlay(double sr, int /*bs*/) {
@@ -308,7 +319,28 @@ void MultiSamplerProcessor::prepareToPlay(double sr, int /*bs*/) {
 }
 
 void MultiSamplerProcessor::reloadIfNeeded() {
-    if (node.script == lastLoadedScript && !doc.zones.empty()) return;
+    // Short-circuit only when (a) the script is unchanged, AND (b) every
+    // zone actually has sample data loaded. The earlier guard checked just
+    // `!doc.zones.empty()`, which trapped us in a permanent-silence state
+    // whenever loadZoneSamples() decoded zones but failed to populate any
+    // of their dataL/dataR buffers (e.g. the WAV file was missing the
+    // first time we entered, or AudioFormatManager couldn't open it). In
+    // that state findZonesFor() skipped every zone (lengthSamples == 0)
+    // and there was no path back to a retry without the user re-importing
+    // the MOD - and even re-import only worked if it produced a different
+    // node.script, which isn't guaranteed.
+    //
+    // The corrected condition: only consider ourselves "loaded" when at
+    // least one zone has lengthSamples > 0. If every zone is still empty,
+    // we'll retry loadZoneSamples() on the next block. This is cheap
+    // (juce::File::existsAsFile is fast, and we early-exit per zone) and
+    // self-healing: once the source files exist, the next block fixes it.
+    auto anyZoneLoaded = [this]() {
+        for (auto& z : doc.zones) if (z.lengthSamples > 0) return true;
+        return false;
+    };
+    if (node.script == lastLoadedScript && !doc.zones.empty() && anyZoneLoaded())
+        return;
     if (node.script.rfind(MultiSamplerDoc::kPrefix, 0) != 0) return;
     if (!doc.decode(node.script)) return;
     lastLoadedScript = node.script;
@@ -319,6 +351,12 @@ void MultiSamplerProcessor::loadZoneSamples() {
     juce::AudioFormatManager fm;
     fm.registerBasicFormats();
 
+    // One-line per-load trace so silent-load failures are visible on the
+    // user's stderr / debug log. We don't spam every block: reloadIfNeeded
+    // only calls us when zones aren't loaded yet (or when the script
+    // changed), so this fires at most once per successful load.
+    int loaded = 0, missing = 0, unreadable = 0;
+
     for (auto& z : doc.zones) {
         z.dataL.clear();
         z.dataR.clear();
@@ -326,10 +364,22 @@ void MultiSamplerProcessor::loadZoneSamples() {
         z.fileSampleRate = sampleRate;
 
         auto file = juce::File(z.samplePath);
-        if (!file.existsAsFile()) continue;
+        if (!file.existsAsFile()) {
+            ++missing;
+            std::fprintf(stderr,
+                         "[MultiSampler] missing sample file: '%s'\n",
+                         z.samplePath.c_str());
+            continue;
+        }
 
         std::unique_ptr<juce::AudioFormatReader> reader(fm.createReaderFor(file));
-        if (!reader) continue;
+        if (!reader) {
+            ++unreadable;
+            std::fprintf(stderr,
+                         "[MultiSampler] no reader for '%s' (unknown format?)\n",
+                         z.samplePath.c_str());
+            continue;
+        }
 
         int len = (int)reader->lengthInSamples;
         int numCh = std::min<int>(2, reader->numChannels);
@@ -344,7 +394,28 @@ void MultiSamplerProcessor::loadZoneSamples() {
 
         z.fileSampleRate = reader->sampleRate;
         z.lengthSamples  = len;
+        ++loaded;
     }
+
+    // Always log the summary so we can correlate against UI state.
+    std::fprintf(stderr,
+                 "[MultiSampler] loadZoneSamples node=%d ('%s'): "
+                 "%d loaded, %d missing, %d unreadable (of %d zones)\n",
+                 node.id, node.name.c_str(),
+                 loaded, missing, unreadable, (int)doc.zones.size());
+    // For the first few zones, dump their key/vel ranges and lengthSamples
+    // so we can see whether the doc decode produced anything sensible and
+    // whether the note-on we receive can actually match a zone.
+    const int kZonesToDump = std::min<int>(4, (int)doc.zones.size());
+    for (int i = 0; i < kZonesToDump; ++i) {
+        const auto& z = doc.zones[i];
+        std::fprintf(stderr,
+                     "[MultiSampler]   zone %d: note=[%d..%d] vel=[%d..%d] "
+                     "base=%d len=%d path='%s'\n",
+                     i, z.loNote, z.hiNote, z.loVel, z.hiVel, z.baseNote,
+                     z.lengthSamples, z.samplePath.c_str());
+    }
+    std::fflush(stderr);
 }
 
 std::vector<int> MultiSamplerProcessor::findZonesFor(int note, int vel) const {
@@ -384,11 +455,37 @@ void MultiSamplerProcessor::processBlock(juce::AudioBuffer<float>& buf,
     // zones / envelopes) without needing a full graph rebuild.
     reloadIfNeeded();
 
+    // Silent-MOD-playback diagnostic: log the first block so we can confirm
+    // the graph is actually pumping this processor at all. If the sampler
+    // never logs this, the issue is upstream (graph topology / connection
+    // ordering / processor not wired to audio thread).
+    if (diagFirstProcess) {
+        diagFirstProcess = false;
+        std::fprintf(stderr,
+                     "[MultiSampler] first processBlock node=%d ('%s') "
+                     "sr=%.0f zones=%d midiEvents=%d\n",
+                     node.id, node.name.c_str(), sampleRate,
+                     (int)doc.zones.size(), midi.getNumEvents());
+        std::fflush(stderr);
+    }
+
     if (doc.zones.empty()) return;
 
     const int numSamples = buf.getNumSamples();
     const int numChannels = buf.getNumChannels();
     if (numSamples <= 0 || numChannels <= 0) return;
+
+    // Silent-MOD-playback diagnostic: log the first MIDI buffer we ever
+    // see with events on it. Distinguishes "no MIDI ever arrives" (cable
+    // not wired) from "MIDI arrives but no zones match" (zone ranges
+    // wrong vs note pitches).
+    if (!diagFirstMidiSeen && midi.getNumEvents() > 0) {
+        diagFirstMidiSeen = true;
+        std::fprintf(stderr,
+                     "[MultiSampler] first MIDI seen node=%d events=%d\n",
+                     node.id, midi.getNumEvents());
+        std::fflush(stderr);
+    }
 
     // ---- handle incoming MIDI ----
     for (const auto meta : midi) {
@@ -397,6 +494,42 @@ void MultiSamplerProcessor::processBlock(juce::AudioBuffer<float>& buf,
             int note = msg.getNoteNumber();
             int vel  = msg.getVelocity();
             auto zoneIdxs = findZonesFor(note, vel);
+
+            // Silent-MOD-playback diagnostic: log the first 4 note-ons
+            // with matched-zone counts. If matched=0 here even when the
+            // sampler has zones, the note doesn't fall in any zone's
+            // key/vel rectangle - which would point at decode or import
+            // putting wrong ranges in the zones.
+            if (diagNoteOnsLogged < 4) {
+                ++diagNoteOnsLogged;
+                std::fprintf(stderr,
+                             "[MultiSampler] note-on node=%d note=%d vel=%d "
+                             "matchedZones=%d\n",
+                             node.id, note, vel, (int)zoneIdxs.size());
+                std::fflush(stderr);
+            }
+            // Even after the first 4, log unmatched note-ons (a few of them)
+            // so a totally-quiet sampler still produces evidence.
+            if (zoneIdxs.empty() && diagUnmatchedLogged < 8) {
+                ++diagUnmatchedLogged;
+                std::fprintf(stderr,
+                             "[MultiSampler] UNMATCHED note-on node=%d note=%d "
+                             "vel=%d (zones=%d)\n",
+                             node.id, note, vel, (int)doc.zones.size());
+                // Show what the first couple of zones look like so we can
+                // see whether ranges are wrong vs the note is out-of-range.
+                int dump = std::min<int>(2, (int)doc.zones.size());
+                for (int i = 0; i < dump; ++i) {
+                    const auto& z = doc.zones[i];
+                    std::fprintf(stderr,
+                                 "[MultiSampler]   zone %d: note=[%d..%d] "
+                                 "vel=[%d..%d] base=%d len=%d\n",
+                                 i, z.loNote, z.hiNote, z.loVel, z.hiVel,
+                                 z.baseNote, z.lengthSamples);
+                }
+                std::fflush(stderr);
+            }
+
             for (int zi : zoneIdxs) {
                 auto& z = doc.zones[zi];
                 auto& v = allocateVoice();

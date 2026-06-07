@@ -1,7 +1,10 @@
 #include "main_window.h"
+#include "dialog_helpers.h"
 #include "terrain_synth.h"
 #include "builtin_synth.h"
 #include "layered_wave_editor.h"
+#include "spectral_editor.h"
+#include "wavelet_painter.h"
 #include "trigger_node.h"
 #include "midi_mod_node.h"
 #include "midi_device_wizard.h"
@@ -384,6 +387,9 @@ MainContentComponent::MainContentComponent() {
         auto file = juce::File(recentProjects[0]);
         if (file.existsAsFile()) {
             ProjectFile::load(recentProjects[0].toStdString(), graph, nullptr);
+            // Re-apply the saved pan/zoom from the loaded graph (or fit-all
+            // if none was persisted) on the next paint.
+            if (graphComponent) graphComponent->notifyProjectLoaded();
             loaded = true;
         }
     }
@@ -1158,14 +1164,18 @@ void MainContentComponent::menuItemSelected(int menuItemID, int) {
         case 111: showMidiDeviceWizard(); break;
         case 400: {
             // Spectrum Analyzer (#10): open a floating non-modal window.
+            // Parented to the main content component so the OS doesn't give
+            // it a separate taskbar entry.
             auto* viz = new SpectrumVisualizerComponent(audioEngine);
-            auto* dw = new juce::DialogWindow(
-                "Spectrum Analyzer", juce::Colour(18, 20, 28), true);
-            dw->setContentOwned(viz, true);
-            dw->setResizable(true, false);
-            dw->setUsingNativeTitleBar(true);
-            dw->setVisible(true);
-            dw->centreWithSize(viz->getWidth(), viz->getHeight());
+            juce::DialogWindow::LaunchOptions opts;
+            opts.content.setOwned(viz);
+            opts.dialogTitle = "Spectrum Analyzer";
+            opts.dialogBackgroundColour = juce::Colour(18, 20, 28);
+            opts.escapeKeyTriggersCloseButton = true;
+            opts.useNativeTitleBar = false;
+            opts.resizable = true;
+            opts.componentToCentreAround = this;
+            SoundShop::launchToolDialog(opts);
             break;
         }
         case 300: openHelpDoc("index.html"); break;
@@ -1204,7 +1214,8 @@ void MainContentComponent::menuItemSelected(int menuItemID, int) {
             opts.escapeKeyTriggersCloseButton = true;
             opts.useNativeTitleBar = false;
             opts.resizable = true;
-            opts.launchAsync();
+            opts.componentToCentreAround = this;
+            SoundShop::launchToolDialog(opts);
             break;
         }
         case 21: {
@@ -1367,7 +1378,9 @@ public:
         removeDimBtn.setButtonText("- Dim");
         addDimBtn.setTooltip("Add a terrain dimension. Adds a new Sig input pin and Position "
                              "knobs (Center/Radius) on the synth node. The terrain extends into "
-                             "the new axis - fill it with an expression using x, y, z, w variables.");
+                             "the new axis - reference it in your expression with the axis variable "
+                             "(x, y, z, w, v, u, s, t for dims 1-8). Axes you don't reference are "
+                             "constant along that axis but still exist as inputs you can modulate.");
         removeDimBtn.setTooltip("Remove the last terrain dimension");
         addDimBtn.onClick = [this]() { changeDimCount(1); };
         removeDimBtn.onClick = [this]() { changeDimCount(-1); };
@@ -1661,8 +1674,13 @@ public:
         // Info label
         g.setColour(juce::Colours::grey);
         g.setFont(11.0f);
-        auto modeStr = proc.getMode() == TerrainSynthMode::SamplePerPoint
-            ? "Sample/Point" : "Waveform/Point";
+        const char* modeStr;
+        switch (proc.getMode()) {
+            case TerrainSynthMode::SamplePerPoint:   modeStr = "Direct";        break;
+            case TerrainSynthMode::WaveformPerPoint: modeStr = "AM-sine";       break;
+            case TerrainSynthMode::AdditiveBank:     modeStr = "Additive bank"; break;
+            default:                                 modeStr = "?";             break;
+        }
         juce::String travStr;
         switch (proc.getTraversalParams().mode) {
             case TraversalMode::Orbit: travStr = "Orbit"; break;
@@ -1812,7 +1830,8 @@ void MainContentComponent::showPluginUI(int nodeId) {
         opts.escapeKeyTriggersCloseButton = true;
         opts.useNativeTitleBar = false;
         opts.resizable = true;
-        opts.launchAsync();
+        opts.componentToCentreAround = this;
+        SoundShop::launchToolDialog(opts);
         return;
     }
 
@@ -1827,7 +1846,8 @@ void MainContentComponent::showPluginUI(int nodeId) {
         opts.escapeKeyTriggersCloseButton = true;
         opts.useNativeTitleBar = false;
         opts.resizable = true;
-        opts.launchAsync();
+        opts.componentToCentreAround = this;
+        SoundShop::launchToolDialog(opts);
         return;
     }
 
@@ -1845,7 +1865,8 @@ void MainContentComponent::showPluginUI(int nodeId) {
         opts.escapeKeyTriggersCloseButton = true;
         opts.useNativeTitleBar = false;
         opts.resizable = true;
-        opts.launchAsync();
+        opts.componentToCentreAround = this;
+        SoundShop::launchToolDialog(opts);
         return;
     }
 
@@ -1861,7 +1882,8 @@ void MainContentComponent::showPluginUI(int nodeId) {
         opts.escapeKeyTriggersCloseButton = true;
         opts.useNativeTitleBar = false;
         opts.resizable = true;
-        opts.launchAsync();
+        opts.componentToCentreAround = this;
+        SoundShop::launchToolDialog(opts);
         return;
     }
 
@@ -1875,7 +1897,8 @@ void MainContentComponent::showPluginUI(int nodeId) {
         opts.escapeKeyTriggersCloseButton = true;
         opts.useNativeTitleBar = false;
         opts.resizable = true;
-        opts.launchAsync();
+        opts.componentToCentreAround = this;
+        SoundShop::launchToolDialog(opts);
         return;
     }
 
@@ -1889,7 +1912,8 @@ void MainContentComponent::showPluginUI(int nodeId) {
         opts.escapeKeyTriggersCloseButton = true;
         opts.useNativeTitleBar = false;
         opts.resizable = true;
-        opts.launchAsync();
+        opts.componentToCentreAround = this;
+        SoundShop::launchToolDialog(opts);
         return;
     }
 
@@ -1910,7 +1934,8 @@ void MainContentComponent::showPluginUI(int nodeId) {
         opts.escapeKeyTriggersCloseButton = true;
         opts.useNativeTitleBar = false;
         opts.resizable = true;
-        opts.launchAsync();
+        opts.componentToCentreAround = this;
+        SoundShop::launchToolDialog(opts);
         return;
     }
 
@@ -1927,17 +1952,80 @@ void MainContentComponent::showPluginUI(int nodeId) {
         opts.escapeKeyTriggersCloseButton = true;
         opts.useNativeTitleBar = false;
         opts.resizable = true;
-        opts.launchAsync();
+        opts.componentToCentreAround = this;
+        SoundShop::launchToolDialog(opts);
+        return;
+    }
+
+    // Wavelet-space painter for nodes authored with a DWT coefficient grid.
+    if (node && (node->type == NodeType::Instrument || node->type == NodeType::TerrainSynth)
+        && !node->plugin && node->pluginIndex < 0
+        && node->script.rfind("__waveletpaint__:", 0) == 0) {
+        auto* editor = new WaveletPainterComponent(graph, node->id, [this]() {
+            audioEngine.getGraphProcessor().requestRebuild();
+        });
+        // Use LaunchOptions + componentToCentreAround so the OS treats this as
+        // a child of the main window. With useNativeTitleBar(true) and no
+        // parent, Windows gives the dialog its own taskbar entry, which is
+        // wrong for an editor sub-window.
+        juce::DialogWindow::LaunchOptions opts;
+        opts.content.setOwned(editor);
+        opts.dialogTitle = "Wavelet Space: " + juce::String(node->name);
+        opts.dialogBackgroundColour = juce::Colour(22, 22, 28);
+        opts.escapeKeyTriggersCloseButton = true;
+        opts.useNativeTitleBar = false;
+        opts.resizable = true;
+        opts.componentToCentreAround = this;
+        SoundShop::launchToolDialog(opts);
+        return;
+    }
+
+    // Spectral (frequency-domain) editor for nodes authored with a
+    // mag/phase spectrum. Both the new `__spectral2__:` format and the
+    // legacy `__spectral__:` format open the same editor; the editor
+    // converts legacy data to the new format on save.
+    if (node && (node->type == NodeType::Instrument || node->type == NodeType::TerrainSynth)
+        && !node->plugin && node->pluginIndex < 0
+        && (node->script.rfind("__spectral__:", 0) == 0
+            || node->script.rfind("__spectral2__:", 0) == 0)) {
+        auto* editor = new SpectralEditorComponent(graph, node->id, [this]() {
+            audioEngine.getGraphProcessor().requestRebuild();
+        });
+        // Use LaunchOptions + componentToCentreAround so the OS treats this as
+        // a child of the main window (no separate taskbar entry).
+        juce::DialogWindow::LaunchOptions opts;
+        opts.content.setOwned(editor);
+        opts.dialogTitle = "Frequency Domain: " + juce::String(node->name);
+        opts.dialogBackgroundColour = juce::Colour(22, 22, 28);
+        opts.escapeKeyTriggersCloseButton = true;
+        opts.useNativeTitleBar = false;
+        opts.resizable = true;
+        opts.componentToCentreAround = this;
+        SoundShop::launchToolDialog(opts);
         return;
     }
 
     // Layered waveform editor takes priority for nodes whose script is a
-    // layered spec (single frame) or a wavetable spec (multi-frame). Both
-    // open the same editor.
+    // layered spec (single frame) or a wavetable spec (multi-frame). All
+    // five formats open the same editor:
+    //   __layered__:    single-frame legacy time-domain layered spec
+    //   __wavetable__:  legacy multi-frame wavetable (v1)
+    //   __wavetable2__: v2 multi-frame container (inline frame data per cell)
+    //   __wavetable3__: v3 library + cell-by-reference format (pre-colorIdx)
+    //   __wavetable4__: current library + cell-by-reference format with
+    //                   per-entry colorIdx. This is what newly-created
+    //                   Wavetable nodes encode their script as
+    //                   (defaultEmpty().encode()), so leaving it out of the
+    //                   gate meant double-click on a freshly-added Wavetable
+    //                   node fell through to the generic visualizer with no
+    //                   way to reopen the wavetable editor.
     if (node && (node->type == NodeType::Instrument || node->type == NodeType::TerrainSynth)
         && !node->plugin && node->pluginIndex < 0
         && (node->script.rfind("__layered__:", 0) == 0
-            || node->script.rfind("__wavetable__:", 0) == 0)) {
+            || node->script.rfind("__wavetable__:", 0) == 0
+            || node->script.rfind("__wavetable2__:", 0) == 0
+            || node->script.rfind("__wavetable3__:", 0) == 0
+            || node->script.rfind("__wavetable4__:", 0) == 0)) {
         auto* editor = new LayeredWaveEditorComponent(graph, node->id, [this]() {
             audioEngine.getGraphProcessor().requestRebuild();
         });
@@ -1945,14 +2033,31 @@ void MainContentComponent::showPluginUI(int nodeId) {
         // window. The user can keep working in the graph while the
         // waveform editor is open. Closing the window destroys the
         // editor. Multiple editors for different nodes can coexist.
-        auto* dw = new juce::DialogWindow(
-            "Waveform: " + juce::String(node->name),
-            juce::Colour(22, 22, 28), true);
-        dw->setContentOwned(editor, true);
-        dw->setResizable(true, false);
-        dw->setUsingNativeTitleBar(true);
-        dw->setVisible(true);
-        dw->centreWithSize(editor->getWidth(), editor->getHeight());
+        // componentToCentreAround = this parents the dialog to the main
+        // window so the OS doesn't give it a separate taskbar entry.
+        juce::DialogWindow::LaunchOptions opts;
+        opts.content.setOwned(editor);
+        opts.dialogTitle = "Wavetable: " + juce::String(node->name);
+        opts.dialogBackgroundColour = juce::Colour(22, 22, 28);
+        opts.escapeKeyTriggersCloseButton = true;
+        opts.useNativeTitleBar = false;
+        opts.resizable = true;
+        opts.componentToCentreAround = this;
+        // Single-window editor: arrangement view and per-waveform edit view
+        // are both panels of the same editor (toggled via "Edit waveform" /
+        // close in the per-waveform view).
+        //
+        // Non-modal launch (#17) is required, not just nice-to-have: the
+        // arrangement view's library list uses JUCE DragAndDropContainer
+        // to drop library entries onto grid cells / scatter positions. A
+        // modal parent dialog blocks the DragImageComponent (which lives
+        // on the desktop, outside the modal hierarchy) from receiving
+        // mouseUp via the source-component listener forwarding chain, so
+        // itemDropped never fires and the drag silently leaves a stranded
+        // drag-image bitmap on the cell. launchNonModalToolDialog keeps
+        // the delete-on-close behavior of launchToolDialog without
+        // entering modal state.
+        SoundShop::launchNonModalToolDialog(opts);
         return;
     }
 
@@ -1970,7 +2075,8 @@ void MainContentComponent::showPluginUI(int nodeId) {
             opts.escapeKeyTriggersCloseButton = true;
             opts.useNativeTitleBar = false;
             opts.resizable = true;
-            opts.launchAsync();
+            opts.componentToCentreAround = this;
+            SoundShop::launchToolDialog(opts);
         }
         return;
     }
@@ -2072,7 +2178,8 @@ void MainContentComponent::showPluginInfo(int nodeId) {
     opts.escapeKeyTriggersCloseButton = true;
     opts.useNativeTitleBar = false;
     opts.resizable = true;
-    opts.launchAsync();
+    opts.componentToCentreAround = this;
+    SoundShop::launchToolDialog(opts);
 }
 
 void MainContentComponent::showPluginPresets(int nodeId) {
@@ -2278,7 +2385,8 @@ void MainContentComponent::showMidiMap(int nodeId) {
     opts.escapeKeyTriggersCloseButton = true;
     opts.useNativeTitleBar = false;
     opts.resizable = true;
-    opts.launchAsync();
+    opts.componentToCentreAround = this;
+    SoundShop::launchToolDialog(opts);
 }
 
 void MainContentComponent::onPlay() {
@@ -2483,7 +2591,8 @@ void MainContentComponent::showMidiDeviceWizard() {
     opts.escapeKeyTriggersCloseButton = true;
     opts.useNativeTitleBar = false;
     opts.resizable = false;
-    opts.launchAsync();
+    opts.componentToCentreAround = this;
+    SoundShop::launchToolDialog(opts);
 }
 
 void MainContentComponent::openProject() {
@@ -2635,7 +2744,10 @@ void MainContentComponent::openProjectFile(const juce::String& path) {
     discardAutosave();
     discardUndoTreePersist();
     lastAutosaveAttemptMs = juce::Time::getMillisecondCounterHiRes();
-    graphComponent->fitAll();
+    // Restore the saved pan/zoom from the loaded project (or fit-all if
+    // none was persisted). Replaces the unconditional fitAll() that used
+    // to clobber the user's last view on every load.
+    graphComponent->notifyProjectLoaded();
     graphComponent->repaint();
 
     // Shared-history handling (#90): check for a sidecar and, if it
@@ -2826,9 +2938,20 @@ void MainContentComponent::importModFile() {
                 msg = "Import failed: " + juce::String(result.error);
             }
 
-            juce::AlertWindow::showMessageBoxAsync(
-                juce::MessageBoxIconType::InfoIcon,
-                "Tracker Import", msg);
+            // NativeMessageBox (not AlertWindow) so the popup is parented
+            // to this window's HWND via the OS MessageBox() API - that's
+            // what actually prevents a second taskbar entry. JUCE's
+            // AlertWindow is a top-level desktop component without an
+            // owner HWND, so even withAssociatedComponent it still spawns
+            // its own taskbar icon.
+            juce::NativeMessageBox::showAsync(
+                juce::MessageBoxOptions()
+                    .withIconType(juce::MessageBoxIconType::InfoIcon)
+                    .withTitle("Tracker Import")
+                    .withMessage(msg)
+                    .withButton("OK")
+                    .withAssociatedComponent(this),
+                nullptr);
             graphComponent->repaint();
         });
 }
@@ -3952,7 +4075,9 @@ void MainContentComponent::tryRecoverAutosave() {
                 if (auto* node = safe->graph.findNode(id))
                     safe->openEditor(*node);
 
-            safe->graphComponent->fitAll();
+            // Restore the saved pan/zoom from the autosave (or fit-all if
+            // none was persisted) instead of unconditionally re-fitting.
+            safe->graphComponent->notifyProjectLoaded();
             safe->graphComponent->repaint();
 
             // After loading the autosave, also restore the undo tree
@@ -4271,7 +4396,8 @@ void MainContentComponent::showScriptConsoleForNode(int nodeId) {
     opts.escapeKeyTriggersCloseButton = true;
     opts.useNativeTitleBar = false;
     opts.resizable = true;
-    opts.launchAsync();
+    opts.componentToCentreAround = this;
+    SoundShop::launchToolDialog(opts);
 }
 
 // ==============================================================================
@@ -4508,7 +4634,8 @@ void MainContentComponent::showAudioDeviceSettings() {
     opts.escapeKeyTriggersCloseButton = true;
     opts.useNativeTitleBar = false;
     opts.resizable = true;
-    opts.launchAsync();
+    opts.componentToCentreAround = this;
+    SoundShop::launchToolDialog(opts);
     return;
 
 #if 0
@@ -4648,7 +4775,8 @@ void MainContentComponent::showAudioDeviceSettings() {
     opts.escapeKeyTriggersCloseButton = true;
     opts.useNativeTitleBar = false;
     opts.resizable = true;
-    opts.launchAsync();
+    opts.componentToCentreAround = this;
+    SoundShop::launchToolDialog(opts);
 #endif
 }
 
@@ -4662,7 +4790,8 @@ void MainContentComponent::showPluginSettingsDialog() {
     opts.escapeKeyTriggersCloseButton = true;
     opts.useNativeTitleBar = false;
     opts.resizable = true;
-    opts.launchAsync();
+    opts.componentToCentreAround = this;
+    SoundShop::launchToolDialog(opts);
 }
 
 void MainContentComponent::showSongSettingsDialog() {
@@ -4860,7 +4989,8 @@ void MainContentComponent::openHotkeySettings() {
     opts.escapeKeyTriggersCloseButton = false; // escape is used for canceling capture
     opts.useNativeTitleBar = false;
     opts.resizable = true;
-    opts.launchAsync();
+    opts.componentToCentreAround = this;
+    SoundShop::launchToolDialog(opts);
 }
 
 bool MainContentComponent::keyStateChanged(bool isKeyDown) {

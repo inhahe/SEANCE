@@ -64,12 +64,19 @@ private:
 #ifdef _WIN32
         FreeConsole();
 #endif
-        // Put the log in %APPDATA%/SEANCE/seance.log (Windows) or
-        // ~/.config/SEANCE/seance.log (Linux/macOS).
-        auto logDir = juce::File::getSpecialLocation(
-            juce::File::userApplicationDataDirectory).getChildFile("SEANCE");
-        logDir.createDirectory();
-        auto logFile = logDir.getChildFile("seance.log");
+        // Put seance.log next to the executable so it's easy to find while
+        // debugging. Fall back to %APPDATA%/SEANCE/seance.log (Windows) or
+        // ~/.config/SEANCE/seance.log (Linux/macOS) only if the exe dir
+        // isn't writable (e.g. SEANCE installed under Program Files).
+        auto exeDir = juce::File::getSpecialLocation(
+            juce::File::currentExecutableFile).getParentDirectory();
+        auto logFile = exeDir.getChildFile("seance.log");
+        if (!exeDir.hasWriteAccess()) {
+            auto logDir = juce::File::getSpecialLocation(
+                juce::File::userApplicationDataDirectory).getChildFile("SEANCE");
+            logDir.createDirectory();
+            logFile = logDir.getChildFile("seance.log");
+        }
 
         // Redirect stderr to the log file (truncates on each launch).
         // Every existing fprintf(stderr, ...) call in the codebase now

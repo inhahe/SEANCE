@@ -131,8 +131,12 @@ ConvolutionEditorComponent::ConvolutionEditorComponent(NodeGraph& g, int nid,
 }
 
 void ConvolutionEditorComponent::commitIR() {
-    if (auto* nd = graph.findNode(nodeId))
+    if (auto* nd = graph.findNode(nodeId)) {
         nd->script = ConvolutionProcessor::encodeIR(ir);
+        // Mark the project dirty so the close/quit save prompt fires and
+        // autosave captures IR edits.
+        graph.dirty = true;
+    }
 }
 
 void ConvolutionEditorComponent::updateFreqResponse() {

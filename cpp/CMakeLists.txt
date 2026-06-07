@@ -57,6 +57,8 @@ juce_add_gui_app(SEANCE
 
 target_sources(SEANCE PRIVATE
     src/main.cpp
+    src/dialog_helpers.cpp
+    src/dialog_helpers.h
     src/main_window.cpp
     src/main_window.h
     src/node_graph.cpp
@@ -109,6 +111,8 @@ target_sources(SEANCE PRIVATE
     src/wavelet.h
     src/spectrum_visualizer.h
     src/wavelet_painter.h
+    src/wavelet_painter.cpp
+    src/wavelet_paint.h
     src/sfizz_processor.h
     src/plugin_sandbox.h
     src/plugin_sandbox.cpp
@@ -134,8 +138,19 @@ target_sources(SEANCE PRIVATE
     src/mod_import.h
     src/fft_util.cpp
     src/fft_util.h
+    src/wavetable_frame.h
+    src/wavelet_frame.h
+    src/wavelet_frame.cpp
+    src/sample_frame.h
+    src/sample_frame.cpp
+    src/granular_frame.h
+    src/granular_frame.cpp
+    src/capture_from_playback.h
+    src/capture_from_playback.cpp
     src/layered_wave_editor.cpp
     src/layered_wave_editor.h
+    src/spectral_editor.cpp
+    src/spectral_editor.h
     src/effect_regions.h
     src/time_gate_processor.cpp
     src/time_gate_processor.h

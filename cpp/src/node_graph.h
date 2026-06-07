@@ -496,6 +496,21 @@ public:
     double loopEndBeat = 0;
     double projectSampleRate = 0; // 0 = use device rate
 
+    // Saved view state for the main node-graph component. Persisted to
+    // the project file so reopening the project restores the user's
+    // last pan/zoom instead of snapping back to a fit-all view.
+    //   viewZoom = 0  -> "no saved view", the component falls back to
+    //                    fitAll() on first paint (the default for new
+    //                    or pre-feature projects).
+    //   viewZoom > 0  -> restore that zoom and (viewPanX, viewPanY) as
+    //                    the screen-space offset.
+    // These are intentionally excluded from undo snapshots (writeProject
+    // is given includeView=false in serializeForUndo) so undoing graph
+    // edits does not also jerk the user's view around.
+    float viewZoom = 0.0f;
+    float viewPanX = 0.0f;
+    float viewPanY = 0.0f;
+
     // Song length and repeat behavior.
     //
     // songLengthBeats = 0 means "auto" - derive the effective end from the

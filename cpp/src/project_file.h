@@ -20,7 +20,13 @@ public:
     // entry points are thin wrappers that open a file. Used by the snapshot
     // undo system (#84) to (de)serialize graph state to/from in-memory text
     // without touching the filesystem.
-    static bool writeProject(std::ostream& out, NodeGraph& graph, GraphProcessor* gp);
+    // includeView controls whether the node-graph component's pan/zoom
+    // are written. True for file saves (so reopening restores the
+    // view), false for undo snapshots (so undoing graph edits doesn't
+    // also fling the user's viewport around). Defaults to true so all
+    // existing call sites get the save-style behaviour.
+    static bool writeProject(std::ostream& out, NodeGraph& graph,
+                             GraphProcessor* gp, bool includeView = true);
     static bool readProject(std::istream& in, NodeGraph& graph, PluginHost* pluginHost);
 
     // Convenience: serialize the graph to a string with NO plugin state.

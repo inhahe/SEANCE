@@ -485,14 +485,6 @@ private:
         bool hover = false;
     };
 
-    // Frame tab row in Grid mode - one [select | x] pair per frame.
-    struct FrameTab {
-        std::unique_ptr<juce::TextButton> selectBtn;
-        std::unique_ptr<FrameDeleteX>     deleteBtn;
-    };
-    std::vector<FrameTab> frameTabs;
-    juce::Component frameTabsRow;
-
     // The wavetable arrangement view (scatter/grid visualization + the
     // sidebar with frames list, mode-conversion, axis steppers, RBF
     // radius, per-axis position controls, and N-D rotation sliders).
@@ -564,7 +556,7 @@ private:
     void setEditingLibraryEntry(int libId);
 
     void rebuildRows();
-    void rebuildFrameTabs();
+    void updateHintText();
     // Bring the embedded frame editor into sync with the current frame.
     // For layered frames: tear down any embed, show the layer rows.
     // For spectral / wavelet frames: hide the layer rows, build (or keep)

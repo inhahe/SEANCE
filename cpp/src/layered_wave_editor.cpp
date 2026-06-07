@@ -2468,7 +2468,7 @@ public:
                           ? hitTestFrame(e.position, areaR)
                           : hitTestGridCell(e.position, areaR);
             if (hit >= 0) {
-                showFrameContextMenu(hit);
+                showFrameContextMenu(hit, e.getScreenPosition());
                 return;
             }
             if (is3D()) {
@@ -2607,7 +2607,7 @@ public:
     // erases the scatter entry (keeping at least one frame). Either way the
     // pop-out window's frames list and frame tabs refresh through
     // notifyPopoutDocMutated.
-    void showFrameContextMenu(int frameIdx) {
+    void showFrameContextMenu(int frameIdx, juce::Point<int> screenPos) {
         const bool isGrid = (owner.wave.mode == WavetableMode::Grid);
         const int filled = (int)(isGrid
             ? std::count_if(owner.wave.cellWaveformIds.begin(),
@@ -2618,7 +2618,13 @@ public:
         m.addItem(1, "Remove from wavetable", filled > 1);
         // Capture the frame index by value so it survives the async menu.
         juce::Component::SafePointer<ScatterView> self(this);
-        m.showMenuAsync(juce::PopupMenu::Options().withTargetComponent(this),
+        // withTargetComponent(this) anchored the menu to the entire
+        // ScatterView, so it landed at the bottom of the whole pane
+        // instead of next to the clicked dot. Use a 1x1 target screen
+        // rect at the actual cursor position so the menu pops up where
+        // the user clicked.
+        const juce::Rectangle<int> targetArea(screenPos, screenPos + juce::Point<int>(1, 1));
+        m.showMenuAsync(juce::PopupMenu::Options().withTargetScreenArea(targetArea),
             [self, frameIdx](int r) {
                 if (!self || r != 1) return;
                 self->removeFrameFromWavetable(frameIdx);
@@ -2645,7 +2651,7 @@ public:
             owner.wave.cellWaveformIds[frameIdx] = -1;
         }
         owner.wave.scatterFromGridSnapshot.reset();
-        owner.rebuildFrameTabs();
+        owner.updateHintText();
         owner.rebuildRows();
         owner.onLayerChanged();
         owner.notifyPopoutDocMutated();
@@ -2792,7 +2798,7 @@ public:
             if (libId < 0) return;
             owner.wave.assignCellToLibrary(owner.currentFrameIdx, libId);
             owner.wave.scatterFromGridSnapshot.reset();
-            owner.rebuildFrameTabs();
+            owner.updateHintText();
             owner.rebuildRows();
             owner.onLayerChanged();
             refreshAfterDocMutation();
@@ -2843,7 +2849,7 @@ public:
             owner.wave.scatterFromGridSnapshot.reset();
             rebuildAxisSteppers();
             owner.syncPositionParams();
-            owner.rebuildFrameTabs();
+            owner.updateHintText();
             // The view N now grew by one - regrow the rotation-angle vector,
             // rebuild this window's rotation slider strip + the selected-
             // frame position strip, and refresh the main editor's
@@ -2870,7 +2876,7 @@ public:
                 owner.currentFrameIdx = 0;
             rebuildAxisSteppers();
             owner.syncPositionParams();
-            owner.rebuildFrameTabs();
+            owner.updateHintText();
             // View N shrank - shrink the rotation-angle vector and rebuild
             // the slider strip + selected-frame strip / projection combo
             // accordingly.
@@ -3017,7 +3023,7 @@ public:
     }
 
     // Discoverability hint is owned by LayeredWaveEditorComponent and
-    // refreshed by its rebuildFrameTabs(). Nothing to do here - this used
+    // refreshed by its updateHintText(). Nothing to do here - this used
     // to update an embedded hint label that no longer exists.
 
     ~WavetableViewWindowContent() override = default;
@@ -3178,7 +3184,7 @@ private:
         }
         owner.ensureScatterPlaneAngles();
         owner.syncPositionParams();
-        owner.rebuildFrameTabs();
+        owner.updateHintText();
         owner.rebuildRows();
         owner.onLayerChanged();
         refreshAfterDocMutation();
@@ -3331,7 +3337,7 @@ private:
                 // currentFrameIdx (cell selection) may now point at a
                 // cleared cell - leave it; the user can pick a new one.
                 owner.wave.scatterFromGridSnapshot.reset();
-                owner.rebuildFrameTabs();
+                owner.updateHintText();
                 owner.rebuildRows();
                 owner.onLayerChanged();
                 refreshAfterDocMutation();
@@ -3435,7 +3441,7 @@ private:
                                                          (int)owner.wave.scatterFrames.size() - 1);
                     }
                     owner.wave.scatterFromGridSnapshot.reset();
-                    owner.rebuildFrameTabs();
+                    owner.updateHintText();
                     owner.rebuildRows();
                     owner.onLayerChanged();
                     refreshAfterDocMutation();
@@ -3517,7 +3523,7 @@ private:
                         if (owner.wave.cellWaveformIds[k] >= 0) { next = k; break; }
                     owner.currentFrameIdx = std::max(0, next);
                 }
-                owner.rebuildFrameTabs();
+                owner.updateHintText();
                 owner.rebuildRows();
                 owner.onLayerChanged();
                 refreshAfterDocMutation();
@@ -3760,7 +3766,7 @@ private:
             if (destLibId >= 0) owner.currentLibraryId = destLibId;
         }
         owner.wave.scatterFromGridSnapshot.reset();
-        owner.rebuildFrameTabs();
+        owner.updateHintText();
         owner.rebuildRows();
         owner.onLayerChanged();
         refreshAfterDocMutation();
@@ -3882,7 +3888,7 @@ LayeredWaveEditorComponent::LayeredWaveEditorComponent(NodeGraph& g, int nid, st
     // Default to the first non-empty cell so currentFrameIdx points at a
     // real frame whenever one exists. For a fully-empty wavetable
     // (defaultEmpty()), leave currentFrameIdx at 0 - it points at the
-    // single empty cell, which rebuildFrameTabs / currentLayers /
+    // single empty cell, which updateHintText / currentLayers /
     // updateFrameEditorEmbed all handle as "no current frame".
     currentFrameIdx = 0;
     if (wave.mode == WavetableMode::Grid) {
@@ -3942,8 +3948,6 @@ LayeredWaveEditorComponent::LayeredWaveEditorComponent(NodeGraph& g, int nid, st
             arrangementView->view->dpi = (float)main->dpi;
     }
 
-    addAndMakeVisible(frameTabsRow);
-
     addAndMakeVisible(helpBtn);
     helpBtn.setTooltip("Open the wavetable / layered waveform docs");
     helpBtn.onClick = []() { openHelpDocFile("wavetables.html"); };
@@ -3969,7 +3973,7 @@ LayeredWaveEditorComponent::LayeredWaveEditorComponent(NodeGraph& g, int nid, st
                         juce::Colours::white.withAlpha(0.55f));
     hintLabel.setFont(juce::Font(juce::FontOptions(12.0f).withStyle("italic")));
     hintLabel.setInterceptsMouseClicks(false, false);
-    // Visibility is reapplied whenever frames change (in rebuildFrameTabs)
+    // Visibility is reapplied whenever frames change (in updateHintText)
     // and on first layout (in resized).
     hintLabel.setVisible(wave.cellWaveformIds.size() <= 1);
 
@@ -4067,7 +4071,7 @@ LayeredWaveEditorComponent::LayeredWaveEditorComponent(NodeGraph& g, int nid, st
     layersViewport.setViewedComponent(&layersContainer, false);
     layersViewport.setScrollBarsShown(true, false);
 
-    rebuildFrameTabs();
+    updateHintText();
     rebuildScatterUI();
     rebuildRows();
     refreshPreview();
@@ -4196,7 +4200,7 @@ void LayeredWaveEditorComponent::showAddWaveformMenu(juce::Component* anchor) {
                 // Adding or replacing a cell invalidates any pending
                 // scatter-revert snapshot.
                 wave.scatterFromGridSnapshot.reset();
-                rebuildFrameTabs();
+                updateHintText();
             } else {
                 ScatterFrame sf;
                 if (r == 1
@@ -4256,7 +4260,7 @@ void LayeredWaveEditorComponent::showAddWaveformMenu(juce::Component* anchor) {
             // is a no-op when idx == currentFrameIdx (already true here
             // since the add code set it), so an explicit refresh is
             // enough - the right pane is already bound to it.
-            rebuildFrameTabs();
+            updateHintText();
             refreshPreview();
             notifyPopoutFrameOrPositionChanged();
         });
@@ -4341,7 +4345,7 @@ void LayeredWaveEditorComponent::setEditingLibraryEntry(int libId) {
     // stale ids in deferred callbacks).
     if (libId != -1 && wave.findLibraryIndexById(libId) < 0) return;
     currentLibraryId = libId;
-    rebuildFrameTabs();
+    updateHintText();
     rebuildRows();
     refreshPreview();
     notifyPopoutFrameOrPositionChanged();
@@ -4377,7 +4381,7 @@ void LayeredWaveEditorComponent::switchToFrame(int idx) {
 
     if (!cellChanged && !editorChanged) return;
 
-    rebuildFrameTabs();
+    updateHintText();
     rebuildRows();
     refreshPreview();
     // Pop-out's per-axis "Selected frame position" strip tracks the
@@ -4405,26 +4409,24 @@ void LayeredWaveEditorComponent::FrameDeleteX::mouseUp(const juce::MouseEvent& e
     if (getLocalBounds().contains(e.getPosition()) && onClick) onClick();
 }
 
-void LayeredWaveEditorComponent::rebuildFrameTabs() {
-    frameTabs.clear();
-    frameTabsRow.removeAllChildren();
+void LayeredWaveEditorComponent::updateHintText() {
     // Discoverability hint - shown while the library has 0 or 1 entries
     // so a fresh user sees the basic interactions (add a waveform, click
     // a cell, click a row). Hides once the library has a couple of
     // entries (the multi-waveform nature is visible at that point).
-    bool showHint = (wave.library.size() <= 1);
+    const bool showHint = (wave.library.size() <= 1);
     if (wave.mode == WavetableMode::Grid) {
         hintLabel.setText(
             "Tip: this is a wavetable. Click  + Waveform  to add a waveform to the "
-            "library, then place it in cells on the left. Click a tab (or a Library row) "
+            "library, then place it in cells on the left. Click a Library row "
             "to edit a waveform; edits flow into every cell that uses it. "
             "Back out in the node graph, the synth node itself has a Position knob "
             "(or Position 1, 2, ... once you add more axes) that morphs between waveforms.",
             juce::dontSendNotification);
     } else {
         hintLabel.setText(
-            "Tip: click  + Waveform  to add a waveform; click a dot to select it "
-            "and a tab (or a Library row) to edit its waveform. "
+            "Tip: click  + Waveform  to add a waveform; click a dot to select it, "
+            "or click a Library row to edit its waveform. "
             "Back out in the node graph, the synth node itself has a Position knob "
             "(or Position 1, 2, ... once you add more axes) that morphs between waveforms.",
             juce::dontSendNotification);
@@ -4433,77 +4435,6 @@ void LayeredWaveEditorComponent::rebuildFrameTabs() {
         hintLabel.setVisible(showHint);
         resized();
     }
-
-    // Frame tabs are now one-per-LIBRARY-ENTRY (not one-per-cell). The
-    // tab strip is the "which waveform am I editing" affordance. Clicking
-    // a tab focuses the editor on that library entry; the X removes the
-    // entry from the library (and clears every cell that referenced it).
-    // Cells are managed separately in the arrangement view and the Cells
-    // list - the tab strip never mentions cells.
-    for (size_t k = 0; k < wave.library.size(); ++k) {
-        const auto& entry = wave.library[k];
-        const int entryId = entry.id;
-        const int useCount = wave.countCellsUsingLibrary(entryId);
-
-        juce::String label = entry.name.empty()
-            ? juce::String("Waveform ") + juce::String((int)k + 1)
-            : juce::String(entry.name);
-        if (useCount > 0)
-            label += juce::String(" (") + juce::String(useCount)
-                   + juce::String::fromUTF8("\xC3\x97)");
-
-        FrameTab ft;
-        ft.selectBtn = std::make_unique<juce::TextButton>();
-        ft.selectBtn->setButtonText(label);
-        ft.selectBtn->setClickingTogglesState(true);
-        ft.selectBtn->setToggleState(entryId == currentLibraryId,
-                                     juce::dontSendNotification);
-        // Same explicit on-state colour as the Library list rows. JUCE's
-        // default toggle-on shade reads as no change at all, so the tab
-        // appears unresponsive to clicks.
-        ft.selectBtn->setColour(juce::TextButton::buttonOnColourId,
-                                juce::Colour(0xffffc34a).withAlpha(0.55f));
-        ft.selectBtn->setColour(juce::TextButton::textColourOnId,
-                                juce::Colours::black);
-        ft.selectBtn->setTooltip(
-            "Edit this waveform. Edits flow into every cell that references it. "
-            "Use 'Assign to selected cell' (in the sidebar) to place it in another cell.");
-        ft.selectBtn->onClick = [this, entryId]() {
-            setEditingLibraryEntry(entryId);
-        };
-        frameTabsRow.addAndMakeVisible(ft.selectBtn.get());
-
-        ft.deleteBtn = std::make_unique<FrameDeleteX>();
-        ft.deleteBtn->setTooltip(
-            useCount > 0
-                ? juce::String("Delete this waveform from the library. The ")
-                      + juce::String(useCount)
-                      + juce::String(useCount == 1 ? " cell" : " cells")
-                      + juce::String(" using it will become empty.")
-                : juce::String("Delete this (unplaced) waveform from the library."));
-        ft.deleteBtn->onClick = [this, entryId]() {
-            // removeLibraryEntry also clears every cell that referenced it.
-            wave.removeLibraryEntry(entryId);
-            // If the editor was focused on this entry, fall back to the
-            // first surviving entry (or -1 if the library is now empty).
-            if (currentLibraryId == entryId) {
-                currentLibraryId = wave.library.empty() ? -1 : wave.library.front().id;
-            }
-            // currentFrameIdx (cell selection) may now point at a cell whose
-            // id was cleared - that's fine, the cell is just empty now and
-            // the right pane reflects whichever entry currentLibraryId picked.
-            wave.scatterFromGridSnapshot.reset();
-            rebuildFrameTabs();
-            rebuildRows();
-            onLayerChanged();
-            notifyPopoutDocMutated();
-        };
-        frameTabsRow.addAndMakeVisible(ft.deleteBtn.get());
-
-        frameTabs.push_back(std::move(ft));
-    }
-    resized(); // trigger tab layout
-    frameTabsRow.repaint();
 }
 
 LayeredWaveEditorComponent::~LayeredWaveEditorComponent() {
@@ -4683,7 +4614,7 @@ void LayeredWaveEditorComponent::appendCapturedFramesAlongPosition(
             // user sees it on the right pane immediately.
             currentLibraryId = libId;
             wave.scatterFromGridSnapshot.reset();
-            rebuildFrameTabs();
+            updateHintText();
             rebuildRows();
             onLayerChanged();
             notifyPopoutFrameOrPositionChanged();
@@ -4697,7 +4628,7 @@ void LayeredWaveEditorComponent::appendCapturedFramesAlongPosition(
             wave.scatterFrames[(size_t)idx].waveformId = libId;
             currentLibraryId = libId;
             wave.scatterFromGridSnapshot.reset();
-            rebuildFrameTabs();
+            updateHintText();
             rebuildRows();
             onLayerChanged();
             notifyPopoutFrameOrPositionChanged();
@@ -4751,7 +4682,7 @@ void LayeredWaveEditorComponent::appendCapturedFramesAlongPosition(
         // Sync the editor target to match the new selection.
         if (firstNewLibId >= 0) currentLibraryId = firstNewLibId;
         wave.scatterFromGridSnapshot.reset();
-        rebuildFrameTabs();
+        updateHintText();
     } else {
         // Scatter mode: lay the frames out along the X axis (dim 0),
         // equally spaced from 0.1 .. 0.9 so they sit visibly inside the
@@ -4935,27 +4866,11 @@ void LayeredWaveEditorComponent::resized() {
 
     a.removeFromTop(6);
 
-    // Frame tab row spans the top, just under the toolbar. Labels are by
-    // cell coordinate in Grid mode ("(0,1)") and 1..N in Scatter mode. The
-    // arrangement-view Cells list mirrors this; we keep the tab strip for
-    // a quick textual selector that's always visible regardless of where
-    // the user has scrolled the sidebar.
-    auto tabRow = a.removeFromTop(28);
-    frameTabsRow.setBounds(tabRow);
-    {
-        int bw = (wave.mode == WavetableMode::Grid) ? 48 : 32;  // grid labels are wider
-        int xw = 16, gap = 3;
-        int x = 0;
-        for (int i = 0; i < (int)frameTabs.size(); ++i) {
-            int h = tabRow.getHeight() - 4;
-            frameTabs[i].selectBtn->setBounds(x, 2, bw, h);
-            x += bw;
-            frameTabs[i].deleteBtn->setBounds(x, 2, xw, h);
-            x += xw + gap;
-        }
-    }
-
-    a.removeFromTop(4);
+    // (The old "Frame tabs" row that used to sit here has been removed:
+    // it listed one tab per library entry, which exactly duplicated the
+    // Library list in the arrangement-view sidebar. With the sidebar
+    // already always visible, the tab strip was redundant and ate ~32 px
+    // of vertical space that the editor body now reclaims.)
 
     // ---- Body split: LEFT = arrangement view, RIGHT = per-waveform editor.
     // Both are always visible. Right pane is sized to give the editor enough

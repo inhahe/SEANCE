@@ -386,7 +386,15 @@ MainContentComponent::MainContentComponent() {
     if (autoLoadLastProject && !recentProjects.empty()) {
         auto file = juce::File(recentProjects[0]);
         if (file.existsAsFile()) {
-            ProjectFile::load(recentProjects[0].toStdString(), graph, nullptr);
+            // Lock for the batch mutation (see node_graph.h mutationLock
+            // comment). Constructor-time load typically runs before the
+            // audio device callback fires, but locking unconditionally
+            // makes the invariant "all batch graph mutations hold this
+            // lock" hold even if the device starts unusually early.
+            {
+                std::lock_guard<std::mutex> graphLk(graph.mutationLock);
+                ProjectFile::load(recentProjects[0].toStdString(), graph, nullptr);
+            }
             // Re-apply the saved pan/zoom from the loaded graph (or fit-all
             // if none was persisted) on the next paint.
             if (graphComponent) graphComponent->notifyProjectLoaded();
@@ -453,7 +461,14 @@ MainContentComponent::MainContentComponent() {
     //  3. setRootSnapshot below - capture the initial state so the very
     //     first edit has a state to revert to.
     graph.undoTree.onLoadSnapshot = [this](const std::string& snap) {
-        ProjectFile::loadFromString(snap, graph, nullptr);
+        // Hold the graph mutation lock for the snapshot reparse: it clears
+        // graph.nodes/links and rebuilds them from the snapshot text, which
+        // is the same kind of batch mutation as MOD import. Same race risk
+        // (see mutationLock comment in node_graph.h), same fix.
+        {
+            std::lock_guard<std::mutex> graphLk(graph.mutationLock);
+            ProjectFile::loadFromString(snap, graph, nullptr);
+        }
         // Drop editor panels whose underlying node no longer exists in the
         // restored state. Surviving panels keep their state and just
         // re-render the new node data.
@@ -672,9 +687,19 @@ void MainContentComponent::resized() {
             routingStrip->setVisible(false);
         }
 
-        int perEditor = editorArea.getHeight() / std::max(1, (int)editorPanels.size());
-        for (auto& panel : editorPanels) {
-            panel->component->setBounds(editorArea.removeFromTop(perEditor));
+        // Lay out panels top-to-bottom using each panel's own heightPx.
+        // The last panel absorbs whatever rounding/remainder is left so we
+        // don't draw a sliver of unpainted area at the bottom. If the
+        // summed heights overflow the available area (heightPx wasn't
+        // recalc'd, edge case), each panel still gets its requested
+        // height and trailing panels get clipped by setBounds; that's
+        // visibly wrong but recoverable on next resize.
+        int n = (int)editorPanels.size();
+        for (int i = 0; i < n; ++i) {
+            auto& panel = editorPanels[(size_t)i];
+            int h = (i == n - 1) ? editorArea.getHeight()
+                                 : juce::jmin(editorArea.getHeight(), panel->heightPx);
+            panel->component->setBounds(editorArea.removeFromTop(h));
         }
     } else {
         routingStrip->setVisible(false);
@@ -2726,8 +2751,15 @@ void MainContentComponent::upgradeLegacyNodes() {
 
 void MainContentComponent::openProjectFile(const juce::String& path) {
     editorPanels.clear();
-    ProjectFile::load(path.toStdString(), graph, &audioEngine.getPluginHost());
-    upgradeLegacyNodes();
+    // Hold the graph mutation lock for the load + legacy-node fixup.
+    // ProjectFile::load clears graph.nodes/links and rebuilds them from the
+    // file - same batch-mutation race surface as MOD import. See the
+    // mutationLock comment in node_graph.h.
+    {
+        std::lock_guard<std::mutex> graphLk(graph.mutationLock);
+        ProjectFile::load(path.toStdString(), graph, &audioEngine.getPluginHost());
+        upgradeLegacyNodes();
+    }
 
     auto editorIds = graph.openEditors;
     graph.openEditors.clear();
@@ -2917,7 +2949,22 @@ void MainContentComponent::importModFile() {
             // doesn't start playing immediately on rebuild.
             if (transport.playing) onStop();
 
-            auto result = ModImporter::import(file.getFullPathName().toStdString(), graph);
+            // Hold the graph mutation lock for the entire import. Without
+            // this, the audio callback (which iterates graph.nodes and
+            // calls GraphProcessor::rebuildGraph whenever it observes a
+            // node-count change) can race with mod_import's repeated
+            // graph.addNode() calls and read torn Node::id values from a
+            // mid-reallocation vector - the root cause of the earlier
+            // tracker-import crash (SEANCE.exe.63000.dmp, observed
+            // nodeMap entries with id=0 and id=1132382734). The audio
+            // thread uses try_lock and outputs silence while we hold
+            // this, which is the right tradeoff for a few hundred ms of
+            // import work.
+            ModImporter::ImportResult result;
+            {
+                std::lock_guard<std::mutex> graphLk(graph.mutationLock);
+                result = ModImporter::import(file.getFullPathName().toStdString(), graph);
+            }
 
             juce::String msg;
             if (result.success) {
@@ -3213,13 +3260,23 @@ void MainContentComponent::openEditor(Node& node) {
 
     auto panel = std::make_unique<EditorPanel>();
     panel->nodeId = node.id;
+    panel->heightPx = 200;
     panel->component = std::make_unique<PianoRollComponent>(graph, node, &transport);
     panel->component->onClose = [this](int nodeId) { closeEditor(nodeId); };
+    // Resize handle at the top of the piano roll panel. The handle's
+    // mouseDrag fires this with the per-frame screen-y delta; we adjust
+    // THIS panel's heightPx by -deltaPx (drag UP = grow). Panels above
+    // keep their own heightPx and just shift up/down as the total stack
+    // grows/shrinks.
+    int nodeIdCopy = node.id;
+    panel->component->onResizeDrag = [this, nodeIdCopy](int deltaPx) {
+        resizeEditorPanel(nodeIdCopy, deltaPx);
+    };
     addAndMakeVisible(panel->component.get());
     editorPanels.push_back(std::move(panel));
 
     graph.activeEditorNodeId = node.id;
-    editorPanelHeight = (int)editorPanels.size() * 200;
+    recalcEditorPanelHeight();
     resized();
 }
 
@@ -3228,9 +3285,48 @@ void MainContentComponent::closeEditor(int nodeId) {
         std::remove_if(editorPanels.begin(), editorPanels.end(),
             [nodeId](auto& p) { return p->nodeId == nodeId; }),
         editorPanels.end());
-    editorPanelHeight = editorPanels.empty() ? 250
-        : (int)editorPanels.size() * 200;
+    recalcEditorPanelHeight();
     resized();
+}
+
+void MainContentComponent::resizeEditorPanel(int nodeId, int deltaPx) {
+    // Find the panel being resized and bump its heightPx. Drag UP gives
+    // a negative deltaPx (cursor moves toward small Y), which should
+    // GROW the panel - so subtract.
+    //
+    // The ceiling is computed dynamically against the available window
+    // area minus the heights of the OTHER panels, so the total stack
+    // never grows past where the node graph would disappear. Without
+    // this dynamic ceiling, dragging up past the cap visually saturates
+    // but the panel's heightPx keeps growing - the user then has to drag
+    // back down the same number of pixels before anything happens.
+    int othersTotal = 0;
+    for (auto& p : editorPanels)
+        if (p->nodeId != nodeId) othersTotal += p->heightPx;
+    int maxStack = juce::jmax(120, getHeight() - 120);
+    int maxThisPanel = juce::jmax(80, maxStack - othersTotal);
+
+    for (auto& panel : editorPanels) {
+        if (panel->nodeId != nodeId) continue;
+        panel->heightPx = juce::jlimit(80, maxThisPanel, panel->heightPx - deltaPx);
+        break;
+    }
+    recalcEditorPanelHeight();
+    resized();
+}
+
+void MainContentComponent::recalcEditorPanelHeight() {
+    if (editorPanels.empty()) {
+        editorPanelHeight = 250; // keeps the empty-state default in sync
+        return;
+    }
+    int total = 0;
+    for (auto& panel : editorPanels)
+        total += panel->heightPx;
+    // Leave at least 120px for the graph area so the user can't drag the
+    // stack so tall that the node graph becomes invisible / unreachable.
+    int maxStack = juce::jmax(120, getHeight() - 120);
+    editorPanelHeight = juce::jlimit(80, maxStack, total);
 }
 
 bool MainContentComponent::tryQuit() {
@@ -4057,14 +4153,21 @@ void MainContentComponent::tryRecoverAutosave() {
             // Ctrl+S saves to the real file, not the autosave. Leave the
             // project dirty so the user knows there are unsaved changes.
             safe->editorPanels.clear();
-            ProjectFile::load(getAutosaveFile().getFullPathName().toStdString(),
-                              safe->graph, &safe->audioEngine.getPluginHost());
-            safe->upgradeLegacyNodes();
-            // Per-plugin override files contain newer plugin state than
-            // the (full but periodically-stale) autosave.ssp. Apply them
-            // on top so the user sees the most recent plugin tweaks.
-            safe->applyPerPluginOverrides();
-            safe->cleanupOrphanPluginFiles();
+            // Lock for the batch mutation (see node_graph.h mutationLock
+            // comment). Autosave recovery happens after the device is
+            // already running, so the audio callback is actively iterating
+            // graph.nodes and would otherwise race with the load.
+            {
+                std::lock_guard<std::mutex> graphLk(safe->graph.mutationLock);
+                ProjectFile::load(getAutosaveFile().getFullPathName().toStdString(),
+                                  safe->graph, &safe->audioEngine.getPluginHost());
+                safe->upgradeLegacyNodes();
+                // Per-plugin override files contain newer plugin state than
+                // the (full but periodically-stale) autosave.ssp. Apply them
+                // on top so the user sees the most recent plugin tweaks.
+                safe->applyPerPluginOverrides();
+                safe->cleanupOrphanPluginFiles();
+            }
             ProjectFile::currentPath = capturedOriginal.toStdString();
             safe->projectDirty = true;
             safe->graph.dirty = true;

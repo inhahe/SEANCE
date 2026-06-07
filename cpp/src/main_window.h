@@ -129,12 +129,27 @@ private:
     struct EditorPanel {
         int nodeId;
         std::unique_ptr<PianoRollComponent> component;
+        // Per-panel height in pixels. Each panel gets its own height so
+        // the user can resize MIDI tracks independently by dragging the
+        // strip at the top of each piano roll. editorPanelHeight (the
+        // total stack height) is recomputed as the sum of these.
+        int heightPx = 200;
     };
     std::vector<std::unique_ptr<EditorPanel>> editorPanels;
     int editorPanelHeight = 250;
     void openEditor(Node& node);
     void closeEditor(int nodeId);
     void updateLayout();
+    // Resize callback wired into each PianoRollComponent's resize handle.
+    // `deltaPx` is the pixel delta from the drag (positive = handle moved
+    // down, i.e. shrink). The matching panel's heightPx is adjusted by
+    // -deltaPx (drag UP = grow); panels above it keep their heights and
+    // just shift position. Total editorPanelHeight tracks the sum.
+    void resizeEditorPanel(int nodeId, int deltaPx);
+    // Recompute editorPanelHeight as the sum of every panel's heightPx,
+    // clamped to leave at least some graph area visible. Called whenever
+    // a panel is added, removed, or resized.
+    void recalcEditorPanelHeight();
 
     bool projectDirty = false;
     ScriptEngine scriptEngine;

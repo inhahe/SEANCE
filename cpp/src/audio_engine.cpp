@@ -192,6 +192,24 @@ void AudioEngine::audioDeviceIOCallbackWithContext(
 
     if (!graph || !transport) return;
 
+    // Take the graph mutation lock for this entire callback. A non-blocking
+    // try_lock is used so we don't stall the audio device while another
+    // thread is mid-mutation - e.g. MOD import (~100ms) pushing ~10 new
+    // nodes into graph.nodes. A previous tracker-import crash dump
+    // (SEANCE.exe.63000.dmp) was traced to this race: the audio callback
+    // iterating graph.nodes for both per-node MIDI routing and
+    // GraphProcessor::rebuildGraph, while mod_import.cpp simultaneously
+    // pushed new entries (occasionally triggering vector reallocation),
+    // resulted in torn reads of Node::id (observed 0 and 1132382734 in
+    // the rebuilt nodeMap) and a crash downstream in the JUCE graph
+    // wiring. Holding the lock here pairs with std::lock_guard in
+    // batch-mutators (mod_import callsite, project file load, undo
+    // restore - to be added at those sites). If we can't acquire
+    // immediately the block is silent, which is barely audible against
+    // a multi-second import and dramatically better than a crash.
+    std::unique_lock<std::mutex> graphLk(graph->mutationLock, std::try_to_lock);
+    if (!graphLk.owns_lock()) return;
+
     double graphRate = getProjectSampleRate();
     bool needsResample = (std::abs(graphRate - sampleRate) > 1.0);
 

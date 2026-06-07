@@ -36,6 +36,19 @@ public:
     // reallocate when nodes are added, invalidating old pointers.
     void refreshNode() { node = graph.findNode(nodeId); }
 
+    // Wired by MainContentComponent: invoked when the user drags the
+    // resize handle at the top of this panel. `deltaPx` is the cursor's
+    // vertical delta since the last callback (positive = handle moved
+    // down). The host adjusts this panel's heightPx by -deltaPx (drag UP
+    // = grow) and re-lays-out the editor stack; panels above just shift.
+    std::function<void(int deltaPx)> onResizeDrag;
+
+    // Height of the drag strip at the very top of the panel. Visible as
+    // a thin grip bar; mouseDown there starts the resize gesture and the
+    // event is consumed before reaching the toolbar. Exposed publicly so
+    // toolbarHeight() can shift the toolbar down by this amount.
+    static constexpr int RESIZE_HANDLE_H = 6;
+
 private:
     NodeGraph& graph;
     int nodeId;
@@ -127,6 +140,12 @@ private:
     juce::ScrollBar hScrollBar{false}; // horizontal
     juce::ScrollBar vScrollBar{true};  // vertical (pitch)
     juce::Slider hZoomSlider;
+    // Vertical zoom (rows-per-octave). Backed by state.visibleRange:
+    // smaller visibleRange = fewer rows = taller note lanes. Slider runs
+    // 12..120 semitones; we invert the display so dragging right = thicker
+    // rows (matches the user's mental model of "zoom in"). Ctrl+Shift+
+    // scroll on the grid also drives this.
+    juce::Slider vZoomSlider;
     static constexpr int SCROLLBAR_SIZE = 20;
 
     // Audition tracking
@@ -154,7 +173,18 @@ private:
     juce::TextButton muteBtn{"Mute"}, soloBtn{"Solo"};
     juce::Slider panSlider;
     juce::Label panLbl;
-    int toolbarHeight() const { return compactMode ? 28 : 82; }
+    // toolbarHeight includes the RESIZE_HANDLE_H strip at the very top
+    // so every "below toolbar" offset in paint() / mouseDown() / etc.
+    // automatically accounts for the handle. The toolbar buttons are
+    // laid out with a matching removeFromTop(RESIZE_HANDLE_H) at the
+    // start of resized() so they sit below the handle, not under it.
+    int toolbarHeight() const { return (compactMode ? 28 : 82) + RESIZE_HANDLE_H; }
+
+    // Resize-handle gesture state. mouseDown in the top RESIZE_HANDLE_H
+    // strip sets resizingHeight=true; subsequent mouseDrag events fire
+    // onResizeDrag with the per-frame deltaY. Reset on mouseUp.
+    bool resizingHeight = false;
+    int  resizeLastY = 0;
 
     // Custom LookAndFeel for smaller combo box fonts
     struct SmallComboLookAndFeel : public juce::LookAndFeel_V4 {

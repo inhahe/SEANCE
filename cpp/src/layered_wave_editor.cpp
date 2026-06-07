@@ -287,6 +287,18 @@ public:
             " - Spectral freeze: FFT freeze - ethereal pad sustain");
         freezeModeCombo.onChange = [this]() { onFreezeModeChanged(); };
 
+        addAndMakeVisible(playBtn);
+        playBtn.setButtonText("Play");
+        playBtn.setTooltip(
+            "Audition this captured waveform - feeds the source PCM into "
+            "the engine's granular preview path with this editor's current "
+            "grain length, crossfade, and freeze mode, so you can hear "
+            "what the synth will play at note-on without having to wire "
+            "it up first. Click again to stop.");
+        playBtn.setColour(juce::TextButton::buttonColourId,
+                          juce::Colour(60, 110, 70));
+        playBtn.onClick = [this]() { togglePlay(); };
+
         addAndMakeVisible(recaptureBtn);
         recaptureBtn.setButtonText("Re-capture from song...");
         recaptureBtn.setTooltip(
@@ -299,6 +311,15 @@ public:
         };
 
         syncFromFrame();
+    }
+
+    ~GranularFrameEditorComponent() override {
+        // Stop the audition if it was running. The engine's preview state
+        // is global, so leaving GrainLoop active after this component dies
+        // would keep auditioning silently (the buffer pointer survives
+        // until something else replaces it). Editor swaps when the user
+        // clicks a different library entry, so this runs on every change.
+        stopPlay();
     }
 
     void paint(juce::Graphics& g) override {
@@ -397,34 +418,56 @@ public:
         // Intrinsic width for a ComboBox = widest item text + chrome
         // (drop-arrow box + side padding). Used by the freeze, note, and
         // octave combos so they're "just wide enough" rather than stretched
-        // across the row. ~24 px arrow box + ~12 px side padding = 36 px
-        // total chrome budget, which matches JUCE's default LookAndFeel.
-        auto intrinsicComboWidth = [](juce::ComboBox& cb) {
-            const juce::Font f = cb.getLookAndFeel().getComboBoxFont(cb);
+        // across the row. Chrome budget = drop-arrow box (~26) + side
+        // padding (~16) + visual cushion (~12) so the longest item label
+        // has breathing room and never crowds the arrow. The minimum-width
+        // floor keeps single-character items (Octave "0..9", Note "C")
+        // from rendering as a tiny pill that's mostly just the arrow -
+        // they need to be wide enough to be a comfortable click target
+        // even when the text inside is narrow.
+        //
+        // NB1: Font::getStringWidth was deprecated in JUCE 8 and now
+        // returns 0 - using it here gave every combo a 36 px (drop-arrow
+        // only) width. The replacement is GlyphArrangement::getStringWidthInt.
+        //
+        // NB2: GlyphArrangement::getStringWidthInt itself is only reliable
+        // when the Font handed to it was built with FontOptions. Pulling
+        // the font from cb.getLookAndFeel().getComboBoxFont(cb) yields a
+        // deprecated-constructed Font in JUCE 8 (zero metrics), which
+        // collapsed all three combos to the 80 px floor and clipped
+        // "Pitch-synced grains". We build the measurement font ourselves
+        // via FontOptions, replicating what LookAndFeel_V4 would use for
+        // a ComboBox at this row height (min(15, rowH * 0.85)).
+        auto intrinsicComboWidth = [rowH](juce::ComboBox& cb) {
+            const float fontH = juce::jmin(15.0f, (float)rowH * 0.85f);
+            const juce::Font f{juce::FontOptions(fontH)};
             int maxText = 0;
             for (int i = 0; i < cb.getNumItems(); ++i)
-                maxText = std::max(maxText, f.getStringWidth(cb.getItemText(i)));
-            return maxText + 36;
+                maxText = std::max(maxText,
+                    juce::GlyphArrangement::getStringWidthInt(f, cb.getItemText(i)));
+            return std::max(80, maxText + 54);
         };
 
         layoutRow(grainLengthLabel, grainLengthSlider, false);
         layoutRow(crossfadeLabel,   crossfadeSlider,   false);
         layoutRow(pitchLabel,       pitchSlider,       false);
         // Note + Octave + Cents shortcut row. Each combo is sized to its
-        // widest item (note: "C#"/"D#"/..., octave: "0".."9"), so the row
-        // packs left and the cents readout sits flush right rather than the
-        // combos hogging the whole row's width.
+        // widest item (note: "C#"/"D#"/..., octave: "0".."9"), and the
+        // cents readout sits immediately after the octave combo rather
+        // than flush right - keeps the three related controls visually
+        // grouped instead of spread across the full row width.
         {
             auto row = a.removeFromTop(rowH);
             noteOctaveLabel.setBounds(row.removeFromLeft(100));
             row.removeFromLeft(4);
-            const int centsW = 52;
-            centsLabel.setBounds(row.removeFromRight(centsW));
             const int noteW   = intrinsicComboWidth(noteCombo);
             const int octaveW = intrinsicComboWidth(octaveCombo);
+            const int centsW  = 52;
             noteCombo.setBounds(row.removeFromLeft(noteW).withHeight(rowH));
             row.removeFromLeft(6);
             octaveCombo.setBounds(row.removeFromLeft(octaveW).withHeight(rowH));
+            row.removeFromLeft(8);
+            centsLabel.setBounds(row.removeFromLeft(centsW));
             a.removeFromTop(rowGap);
         }
         // Freeze mode row: label (100 px) + combo sized to its widest item
@@ -440,7 +483,14 @@ public:
         }
 
         a.removeFromTop(paramsToBtnGap);
-        recaptureBtn.setBounds(a.removeFromTop(btnH).removeFromLeft(220));
+        // Bottom button row: Play (audition the source through the engine
+        // preview path) on the left, Re-capture (replace the source PCM)
+        // immediately after. Both stay at the left edge so they're easy to
+        // find rather than scattered across the row.
+        auto btnRow = a.removeFromTop(btnH);
+        playBtn.setBounds(btnRow.removeFromLeft(80));
+        btnRow.removeFromLeft(8);
+        recaptureBtn.setBounds(btnRow.removeFromLeft(220));
     }
 
 private:
@@ -462,7 +512,15 @@ private:
     juce::Label      centsLabel;
     juce::ComboBox   freezeModeCombo;
     juce::Label      freezeModeLabel;
+    juce::TextButton playBtn;
     juce::TextButton recaptureBtn;
+
+    // Whether this editor instance is currently auditioning through the
+    // engine's preview path. Tracked here (rather than reading from the
+    // engine) so the destructor only tears the preview down when WE
+    // started it - in case some other UI took over the preview slot
+    // before this editor was destroyed.
+    bool playing = false;
 
     juce::Rectangle<int> waveBounds;
 
@@ -620,7 +678,66 @@ private:
         if (id >= 1 && id <= 4) {
             frame.freezeMode = (GranularFreezeMode)(id - 1);
             if (onApply) onApply();
+            // Live-update the engine's audition freeze mode if we're
+            // currently playing, so the user hears the change.
+            if (playing) {
+                if (auto* eng = AudioEngine::getInstance())
+                    eng->setGrainFreezeMode(frame.freezeMode);
+            }
         }
+    }
+
+    // Engine-preview audition (Play / Stop button). Uses the same
+    // GrainLoop preview path as CaptureFromSongDialog so the audition
+    // is exactly what would play at note-on with this frame's settings.
+    void togglePlay() {
+        if (playing) stopPlay();
+        else         startPlay();
+    }
+
+    void startPlay() {
+        auto* eng = AudioEngine::getInstance();
+        if (!eng) return;
+        if (frame.source.empty()) return;  // nothing to audition
+
+        // Source: hand the engine a shared_ptr copy of the frame's PCM.
+        // Copying once (rather than aliasing the frame's vector) keeps the
+        // engine safe from concurrent UI edits to frame.source mid-block.
+        auto src = std::make_shared<std::vector<float>>(frame.source);
+
+        // Grain length: use the frame's own grainLength, converted from
+        // source samples to engine samples if the rates differ. The
+        // engine's preview reads at the device rate; resampling on the
+        // fly is the synth's job at note-on, but for the audition path
+        // we keep it simple and feed source-rate samples directly. (The
+        // engine pulls samples 1:1 without rate conversion in the
+        // GrainLoop path; for accurate pitch the source would need to be
+        // resampled, but for "does this sound right?" the source-rate
+        // playback is what the synth does too when noteHz matches
+        // embeddedPitchHz.)
+        const int grainLen = std::max(64, frame.grainLength);
+        const int xfadeLen = std::max(0, frame.crossfadeSamples);
+
+        eng->setGrainFreezeMode(frame.freezeMode);
+        eng->setPreviewGrainLength(grainLen);
+        eng->setPreviewCrossfadeLength(xfadeLen);
+        eng->setPreviewGrainBuffer(std::move(src));
+        eng->setPreviewMode(AudioEngine::PreviewMode::GrainLoop);
+
+        playing = true;
+        playBtn.setButtonText("Stop");
+        playBtn.setColour(juce::TextButton::buttonColourId,
+                          juce::Colour(140, 70, 70));
+    }
+
+    void stopPlay() {
+        if (!playing) return;
+        playing = false;
+        if (auto* eng = AudioEngine::getInstance())
+            eng->clearPreview();
+        playBtn.setButtonText("Play");
+        playBtn.setColour(juce::TextButton::buttonColourId,
+                          juce::Colour(60, 110, 70));
     }
 };
 
@@ -2596,58 +2713,63 @@ public:
     }
 
     // Compute the paint-scoped view transform (renderScale, renderCx,
-    // renderCy). Picks a single constant scale that fits the worst-case
-    // projected extent of the unit N-hypercube across ALL possible
-    // rotations, instead of fitting the current bbox.
+    // renderCy). Picks a single constant scale that guarantees no rotation
+    // of the projected cube can clip a corner, and that this scale stays
+    // the same as the user adds more axes (the cube doesn't shrink when
+    // you go from 3D to 4D to 5D...).
     //
     // Why constant instead of per-rotation fit: the old fit-bbox approach
     // made the wireframe "breathe" as you rotated - a square rotated 45deg
     // has a smaller axis-aligned bbox than the un-rotated square, so scale
     // grew, then shrank again as you kept rotating. The visual result was
-    // a wireframe that resized constantly. Locking the scale to the
+    // a wireframe that resized constantly. Locking the scale to a single
     // worst-case extent means the cube can't grow under any rotation; it
     // shrinks slightly into the visible area at non-worst-case angles but
     // never gets cropped.
     //
-    // Worst-case extent: every corner of [0,1]^N is at distance sqrt(N)/2
-    // from the centre, so under ANY rotation the projected coord of any
-    // corner lies in [-sqrt(N)/2, +sqrt(N)/2] on each screen axis. Max
-    // span = sqrt(N). On top of that:
-    //   - axonometric: each non-projected dim adds up to weight*0.5 per
-    //     axis (worst when its rotated value hits 0 or 1). Padded as
-    //     0.5 * 0.22 * numNonProj per side, doubled for both sides.
-    //   - perspective: removed - projectPoint is now purely orthographic
-    //     in both 2D and 3D modes (parallax is still applied via z, so
-    //     stereo still fuses with depth).
+    // Worst-case extent math (the user's hint of "sqrt(2)" was the right
+    // intuition - generalized here):
+    //   For a unit D-cube centred at the origin with vertices at +/- 0.5
+    //   in each of its D axes, projected to one screen axis via a unit
+    //   projection vector v of length D, the projected coordinate of any
+    //   vertex is sum_i v_i * (+/- 0.5). The max over vertices is
+    //   0.5 * sum_i |v_i|. Subject to sum_i v_i^2 = 1 (unit vector), this
+    //   sum is maximized when v_i = +/- 1/sqrt(D) for all i, giving
+    //   0.5 * sqrt(D). Full span across both vertex signs = sqrt(D).
+    //   So an axis-aligned unit cube edge of length 1 projects to at most
+    //   sqrt(D) on the screen under any rotation. D=2 -> sqrt(2). D=3 ->
+    //   sqrt(3). Both screen axes can hit this bound simultaneously (any
+    //   two orthonormal projection vectors can each be close to the
+    //   diagonal), so we have to fit min(W,H), not max(W,H).
+    //
+    //   Crucially, D = the number of dims that project directly to screen
+    //   (2 in 2D view, 3 in 3D view) - NOT the total N. Extra axes beyond
+    //   D get axonometric offset bars (small "skew" lines off each base-
+    //   cube corner) rather than full-dim rotation. That's why adding a
+    //   4th, 5th, ... axis no longer shrinks the base cube - the bound is
+    //   sqrt(2) or sqrt(3), constant in N. The axonometric protrusions
+    //   for extra dims can technically poke a hair past the bound; the
+    //   3% margin below absorbs them in practice, and at high N the user
+    //   accepts that the protrusions visualize the extra dims and aren't
+    //   required to stay strictly inside the view.
     void computeViewTransform(juce::Rectangle<float> area) const {
-        int N = std::max(2, std::min(kMaxRenderDims, owner.wave.numDimensions()));
+        // Number of dims that project directly to screen X / Y (/ Z).
+        const int projDims = 2 + (is3D() ? 1 : 0);
 
-        // Number of dims that don't feed directly into screen X/Y(/Z).
-        int projDims = 2 + (is3D() ? 1 : 0);
-        int nonProj  = std::max(0, N - projDims);
+        // Worst-case projected span of the unit cube along either screen axis.
+        // Independent of total N - this is what keeps the base-cube size
+        // constant as the user adds axes.
+        const float worst = std::sqrt((float)projDims);
 
-        // Cube diagonal in projected screen coords (worst-case under any rotation)
-        float worst = std::sqrt((float)N);
-        // Axonometric padding: each non-projected dim contributes up to
-        // weight*1.0 across its [0,1] range, half on each side; sum across dims.
-        worst += 0.22f * (float)nonProj;
-
-        // Margin: leave ~3% on each side so dot outlines and the cell-coord
-        // labels printed below dots don't clip at the edge.
+        // Margin: leave ~3% on each side so dot outlines, cell-coord
+        // labels printed below dots, and the small axonometric
+        // protrusions from extra (non-projected) dims don't clip at the
+        // edge of the view rectangle.
         constexpr float marginFactor = 0.94f;
-        // Fit to the WIDER of the two dimensions. The cube is always
-        // bounded by [-sqrt(N)/2, +sqrt(N)/2] in BOTH screen axes (under
-        // any rotation), so fitting the smaller dimension would leave
-        // large dead space on the longer dimension whenever the view
-        // area is non-square (which is the common case here: a wide
-        // arrangement view with a sidebar on the right still leaves the
-        // view rectangle wider than tall). Fitting the larger dimension
-        // makes the cube use the full available width/height; at extreme
-        // rotations where the projected bbox reaches sqrt(N) in BOTH
-        // axes simultaneously, the smaller dimension may clip, but in
-        // practice that's a small price for a much larger view in every
-        // other configuration. The user explicitly accepted this trade-off.
-        float fit = std::max(area.getWidth(), area.getHeight()) * marginFactor;
+
+        // Fit the SMALLER dimension so the worst-case rotation fits in
+        // BOTH screen axes simultaneously - no clipping under any rotation.
+        const float fit = std::min(area.getWidth(), area.getHeight()) * marginFactor;
         renderScale = fit / std::max(1e-3f, worst);
         renderCx = area.getCentreX();
         renderCy = area.getCentreY();
@@ -4080,7 +4202,7 @@ public:
         framesListLabel.setJustificationType(juce::Justification::centredLeft);
         framesListLabel.setTooltip(
             "Cells in the arrangement view that currently hold a waveform. Each row "
-            "shows the cell's coordinate (Grid) or its frame number (Scatter). Click to "
+            "shows the cell's coordinate (Grid) or its waveform number (Scatter). Click to "
             "select the cell; X clears the cell (library entry survives).");
         addAndMakeVisible(framesListLabel);
 
@@ -4222,7 +4344,7 @@ public:
                                         "In Scatter mode each slider sets that waveform's "
                                         "coordinate on the axis (0..1). In Grid mode each "
                                         "stepper picks which cell along the axis - moving "
-                                        "onto an occupied cell swaps the two frames.");
+                                        "onto an occupied cell swaps the two waveforms.");
         settingsContainer.addAndMakeVisible(selFrameSectionLabel);
 
         // ---- Rotation section header ----
@@ -4916,7 +5038,7 @@ private:
             sl->setValue((double)owner.wave.gridDims[d], juce::dontSendNotification);
             sl->setTooltip("Number of cells along axis " + axName((int)d) + " (1..64). "
                            "Grow to add more positions along this axis; shrink to drop "
-                           "frames whose coord on this axis is beyond the new size.");
+                           "waveforms whose coord on this axis is beyond the new size.");
             int axisIdx = (int)d;
             sl->onValueChange = [this, sl_raw = sl.get(), axisIdx]() {
                 int newSize = (int)sl_raw->getValue();
@@ -6047,53 +6169,31 @@ void LayeredWaveEditorComponent::appendCapturedFramesAlongPosition(
     if (frames.empty()) return;
     const int N = (int)frames.size();
 
-    // Single-frame capture (e.g. project-song "Save waveform at marker",
-    // single-slice mic/file capture) targets the currently SELECTED cell
-    // if one is selected. This is what the user means when they pick a
-    // moment in the song, select a specific cell in the arrangement view,
-    // and click Save - "put this captured waveform HERE", not "make a new
-    // cell at the end". Multi-frame captures (mic / file with N>1 slices)
-    // still append along axis 0, since N>1 frames can't all fit in one
-    // cell.
+    // Single-waveform capture (project-song "Save waveform at marker",
+    // single-slice mic/file capture) goes to the Library list only - it
+    // does NOT auto-assign to any cell in the arrangement. The user's
+    // expectation when grabbing one spot is "give me this waveform to
+    // work with", not "destroy whatever was in the selected cell and put
+    // this there". The library entry is selected so the right-pane editor
+    // immediately shows the new capture, and from there the user can drop
+    // it into a cell via the Library list's "Assign to selected cell"
+    // button if they want. Multi-waveform captures (mic / file with N>1
+    // slices) still append along axis 0 because the user explicitly chose
+    // N>1 slices and the implied intent is to populate an axis.
     if (N == 1) {
-        const int idx = currentFrameIdx;
-        if (wave.mode == WavetableMode::Grid
-            && idx >= 0 && idx < (int)wave.cellWaveformIds.size())
-        {
-            const int libId = wave.addLibraryEntry(std::move(frames[0]));
-            // assignCellToLibrary replaces the cell's reference; the old
-            // library entry survives (orphaned), so the user can re-place
-            // or delete it via the Library list. Library entries are now
-            // independent of cells.
-            wave.assignCellToLibrary(idx, libId);
-            // Sync the editor target to the freshly-captured entry so the
-            // user sees it on the right pane immediately.
-            currentLibraryId = libId;
-            wave.scatterFromGridSnapshot.reset();
-            updateHintText();
-            rebuildRows();
-            onLayerChanged();
-            notifyPopoutFrameOrPositionChanged();
-            notifyPopoutDocMutated();
-            return;
-        }
-        if (wave.mode == WavetableMode::Scatter
-            && idx >= 0 && idx < (int)wave.scatterFrames.size())
-        {
-            const int libId = wave.addLibraryEntry(std::move(frames[0]));
-            wave.scatterFrames[(size_t)idx].waveformId = libId;
-            currentLibraryId = libId;
-            wave.scatterFromGridSnapshot.reset();
-            updateHintText();
-            rebuildRows();
-            onLayerChanged();
-            notifyPopoutFrameOrPositionChanged();
-            notifyPopoutDocMutated();
-            repaintScatterViews();
-            return;
-        }
-        // No valid selection - fall through to the append path below so
-        // the captured frame doesn't get dropped on the floor.
+        const int libId = wave.addLibraryEntry(std::move(frames[0]));
+        currentLibraryId = libId;
+        // Don't touch currentFrameIdx - the cell the user had selected
+        // stays selected, just nothing was placed in it. The Library
+        // list now has a new entry the user can drop in via "Assign to
+        // selected cell".
+        wave.scatterFromGridSnapshot.reset();
+        updateHintText();
+        rebuildRows();
+        onLayerChanged();
+        notifyPopoutFrameOrPositionChanged();
+        notifyPopoutDocMutated();
+        return;
     }
 
     if (wave.mode == WavetableMode::Grid) {

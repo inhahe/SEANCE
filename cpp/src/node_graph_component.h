@@ -107,6 +107,14 @@ private:
     void deleteSelectedLink();
     void deleteSelectedNode();
 
+    // Delete `rootId` along with every descendant if it's a Group
+    // container. Walks the group tree so nested groups cascade too,
+    // then removes connected links, closes any open editors, fires
+    // onNodeDeleted, unlinks the root from its parent group (if any),
+    // and removes everything from graph.nodes. Pushes one undo
+    // snapshot for the whole operation.
+    void deleteNodeAndDescendants(int rootId);
+
     // Build a TerrainSynth node with the requested name, script, and
     // dimensionality (1..8). Creates MIDI + N Signal input pins, an Audio
     // output pin, and the standard envelope/volume/pan/traversal/grain

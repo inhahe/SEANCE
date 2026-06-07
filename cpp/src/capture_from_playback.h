@@ -100,8 +100,24 @@ private:
     juce::Label     hintLabel;
     juce::ToggleButton freezeToggle { "Freeze view" };  // Playback / Mic only
     juce::TextButton loadFileBtn    { "Load file..." }; // File only
-    juce::TextButton captureBtn { "Capture frames" };
+    juce::TextButton captureBtn { "Capture waveforms" };
     juce::TextButton cancelBtn  { "Cancel" };
+
+    // Embedded pitch picker (note + octave + cents readout). Drives the
+    // produced GranularFrame's embeddedPitchHz so MIDI playback at the
+    // matching key plays the source at 1:1, with the usual wavetable-
+    // style pitch shift for other keys. Mirrors the picker in the
+    // post-capture GranularFrameEditorComponent so the user can dial in
+    // the pitch at capture time without having to open the editor.
+    juce::Label    noteOctaveLabel;
+    juce::ComboBox noteCombo;
+    juce::ComboBox octaveCombo;
+    juce::Label    centsLabel;
+    // Current embedded pitch in Hz. Updated by noteCombo / octaveCombo
+    // onChange. Defaults to A4 (440 Hz) so MIDI note 69 plays the source
+    // at 1:1 if the user doesn't touch the picker. buildFrames reads
+    // this for the GranularFrame's embeddedPitchHz.
+    double capturedPitchHz = 440.0;
 
     juce::Rectangle<int> waveRect;
 
@@ -249,7 +265,22 @@ private:
     // next. Stored as an int 0-3 in the combo's selected-id field.
     juce::ComboBox   freezeModeCombo;
     juce::Label      freezeModeLabel;
-    juce::TextButton saveBtn   { "Save frame at marker" };
+    // Embedded pitch picker (note + octave + cents readout). Drives the
+    // produced GranularFrame's embeddedPitchHz so MIDI playback at the
+    // matching key plays the source at 1:1, with the usual wavetable-
+    // style pitch shift for other keys. Mirrors the picker in the
+    // post-capture GranularFrameEditorComponent so the user can dial in
+    // the pitch at capture time without having to open the editor.
+    juce::Label      noteOctaveLabel;
+    juce::ComboBox   noteCombo;
+    juce::ComboBox   octaveCombo;
+    juce::Label      centsLabel;
+    // Current embedded pitch in Hz. Updated by noteCombo / octaveCombo
+    // onChange. Defaults to A4 (440 Hz) so MIDI note 69 plays the source
+    // at 1:1 if the user doesn't touch the picker. buildFrameAtMarker
+    // reads this for the GranularFrame's embeddedPitchHz.
+    double capturedPitchHz = 440.0;
+    juce::TextButton saveBtn   { "Save waveform at marker" };
     juce::TextButton cancelBtn { "Close" };
 
     juce::Rectangle<int> waveRect;

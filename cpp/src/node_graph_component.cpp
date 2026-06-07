@@ -1029,6 +1029,13 @@ void NodeGraphComponent::mouseUp(const juce::MouseEvent& e) {
                 int outPin = dragPinIsOutput ? dragPinId : targetPin;
                 int inPin  = dragPinIsOutput ? targetPin : dragPinId;
                 graph.addLink(outPin, inPin);
+                // Graph-topology change: snapshot it so undo/redo can revert
+                // the new cable AND so the persisted-undo-tree's current
+                // snapshot stays in sync with graph.links. Without this,
+                // tryRestoreUndoTree() at next startup would reparse a
+                // pre-cable snapshot over the freshly-loaded .ssp and
+                // silently drop the cable the user just made.
+                graph.commitSnapshot("Connect pins");
             }
         }
     }
@@ -2184,19 +2191,12 @@ void NodeGraphComponent::showNodeMenu(Node& node) {
         if (!node) return;
 
         if (result == 1) {
-            // Delete node and connected links
-            std::set<int> pinIds;
-            for (auto& p : node->pinsIn) pinIds.insert(p.id);
-            for (auto& p : node->pinsOut) pinIds.insert(p.id);
-            graph.links.erase(std::remove_if(graph.links.begin(), graph.links.end(),
-                [&](auto& l) { return pinIds.count(l.startPin) || pinIds.count(l.endPin); }),
-                graph.links.end());
-            if (onNodeDeleted) onNodeDeleted(nodeId);
-            graph.openEditors.erase(std::remove_if(graph.openEditors.begin(), graph.openEditors.end(),
-                [nodeId](int id) { return id == nodeId; }), graph.openEditors.end());
-            graph.nodes.erase(std::remove_if(graph.nodes.begin(), graph.nodes.end(),
-                [nodeId](auto& n) { return n.id == nodeId; }), graph.nodes.end());
-            graph.dirty = true;
+            // Delete node (and, if it's a Group container, every node
+            // inside the group - this is the entry point used when the
+            // user right-clicks the grey container left behind by a
+            // tracker import and chooses Delete to nuke the whole
+            // import in one shot).
+            deleteNodeAndDescendants(nodeId);
         } else if (result == 2) {
             auto& dup = graph.addNode(node->name, node->type, {}, {},
                 {node->pos.x + 50, node->pos.y + 50});
@@ -2348,38 +2348,82 @@ void NodeGraphComponent::deleteSelectedLink() {
         [this](auto& l) { return l.id == selectedLinkId; }), graph.links.end());
     graph.dirty = true;
     selectedLinkId = -1;
+    // Topology change - keep undo tree and graph.links in sync (see
+    // mouseUp's matching commitSnapshot for why this matters at quit/restart).
+    graph.commitSnapshot("Delete connection");
     repaint();
 }
 
 void NodeGraphComponent::deleteSelectedNode() {
     if (selectedNodeId < 0) return;
-    auto* node = graph.findNode(selectedNodeId);
-    if (!node) return;
+    if (!graph.findNode(selectedNodeId)) return;
+    deleteNodeAndDescendants(selectedNodeId);
+    selectedNodeId = -1;
+    repaint();
+}
 
-    // Remove connected links
+void NodeGraphComponent::deleteNodeAndDescendants(int rootId) {
+    auto* root = graph.findNode(rootId);
+    if (!root) return;
+
+    // Collect every node to delete: the root plus, if it's a Group, every
+    // descendant via childNodeIds (recursively, so a group-of-groups
+    // cascades fully). Set guards against accidental cycles in malformed
+    // childNodeIds data.
+    std::set<int> victims;
+    std::vector<int> stack { rootId };
+    while (!stack.empty()) {
+        int id = stack.back();
+        stack.pop_back();
+        if (!victims.insert(id).second) continue;
+        auto* n = graph.findNode(id);
+        if (!n) continue;
+        if (n->type == NodeType::Group) {
+            for (int childId : n->childNodeIds)
+                if (!victims.count(childId))
+                    stack.push_back(childId);
+        }
+    }
+
+    // Gather all pin IDs across the victim set so we can sweep matching
+    // links in one pass instead of N passes.
     std::set<int> pinIds;
-    for (auto& p : node->pinsIn) pinIds.insert(p.id);
-    for (auto& p : node->pinsOut) pinIds.insert(p.id);
+    for (int id : victims) {
+        if (auto* n = graph.findNode(id)) {
+            for (auto& p : n->pinsIn)  pinIds.insert(p.id);
+            for (auto& p : n->pinsOut) pinIds.insert(p.id);
+        }
+    }
     graph.links.erase(std::remove_if(graph.links.begin(), graph.links.end(),
         [&](auto& l) { return pinIds.count(l.startPin) || pinIds.count(l.endPin); }),
         graph.links.end());
 
-    // Close any live editor panels for this node before removing it,
-    // so they don't hold dangling references.
-    int nid = selectedNodeId;
-    if (onNodeDeleted) onNodeDeleted(nid);
+    // Notify upstream (editor panels, audio engine, etc.) so they can
+    // drop any dangling references before the nodes vanish.
+    for (int id : victims)
+        if (onNodeDeleted) onNodeDeleted(id);
 
-    // Remove from open editors
+    // Close open editor panels for every victim.
     graph.openEditors.erase(std::remove_if(graph.openEditors.begin(), graph.openEditors.end(),
-        [nid](int id) { return id == nid; }), graph.openEditors.end());
+        [&](int id) { return victims.count(id) > 0; }), graph.openEditors.end());
 
-    // Remove node
+    // Unlink the root from any parent group's childNodeIds (descendants
+    // are members of `root`, which is going away with them, so they don't
+    // need separate parent-group cleanup).
+    if (root->parentGroupId >= 0)
+        graph.removeFromGroup(rootId);
+
+    // Drop all victims from graph.nodes in one pass.
     graph.nodes.erase(std::remove_if(graph.nodes.begin(), graph.nodes.end(),
-        [nid](auto& n) { return n.id == nid; }), graph.nodes.end());
+        [&](auto& n) { return victims.count(n.id) > 0; }), graph.nodes.end());
+
+    // Clear stale selections if the user had a victim selected.
+    if (victims.count(selectedNodeId)) selectedNodeId = -1;
 
     graph.dirty = true;
-    selectedNodeId = -1;
-    repaint();
+    graph.commitSnapshot(victims.size() > 1
+        ? "Delete group (" + std::to_string(victims.size()) + " nodes)"
+        : "Delete node");
 }
 
 void NodeGraphComponent::showLinkMenu(int linkId) {
@@ -2436,10 +2480,16 @@ void NodeGraphComponent::showLinkMenu(int linkId) {
                 [linkId](auto& l) { return l.id == linkId; }), graph.links.end());
             graph.dirty = true;
             selectedLinkId = -1;
+            // See mouseUp's commitSnapshot - topology changes need to
+            // commit, otherwise the deletion is undone at next startup
+            // when the persisted undo tree's current snapshot is reapplied
+            // over the freshly-loaded .ssp.
+            graph.commitSnapshot("Delete connection");
         } else if (result >= 10 && result <= 16) {
             float gains[] = {0, -3, -6, -12, -20, 3, 6};
             lk->gainDb = gains[result - 10];
             graph.dirty = true;
+            graph.commitSnapshot("Set connection gain");
         } else if (result == 31) {
             // Help: Effect Groups -> open the docs page
             if (onOpenHelpDoc) onOpenHelpDoc("layers-and-groups.html");
@@ -2460,6 +2510,7 @@ void NodeGraphComponent::showLinkMenu(int linkId) {
                         auto& grp = graph.addEffectGroup(name);
                         grp.linkIds.push_back(lid);
                         graph.dirty = true;
+                        graph.commitSnapshot("New effect group");
                     }
                     delete aw;
                     repaint();
@@ -2475,6 +2526,7 @@ void NodeGraphComponent::showLinkMenu(int linkId) {
                 else
                     grp->linkIds.push_back(linkId); // add
                 graph.dirty = true;
+                graph.commitSnapshot("Toggle effect group membership");
             }
         } else if (result == 17 && lk) {
             auto* aw = new juce::AlertWindow("Connection Gain",
@@ -2491,6 +2543,7 @@ void NodeGraphComponent::showLinkMenu(int linkId) {
                         for (auto& l : graph.links)
                             if (l.id == lid) { l.gainDb = juce::jlimit(-60.0f, 24.0f, val); break; }
                         graph.dirty = true;
+                        graph.commitSnapshot("Set connection gain");
                     }
                     delete aw;
                     repaint();

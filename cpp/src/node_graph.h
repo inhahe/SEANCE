@@ -60,7 +60,12 @@ enum class NodeType {
 };
 
 struct Pin {
-    int id;
+    // Default to -1 so an uninitialized Pin (e.g. one default-constructed
+    // by project_file.cpp's `[PinIn]` / `[PinOut]` section opener before
+    // the `id=` line is parsed) reads as a recognizable sentinel rather
+    // than as garbage from whatever memory the int happened to occupy.
+    // Real pin IDs come from NodeGraph::newId() which starts at 1.
+    int id = -1;
     std::string name;
     PinKind kind;
     bool isInput;
@@ -241,7 +246,14 @@ struct TakeLane {
 };
 
 struct Node {
-    int id;
+    // Default to -1 so an uninitialized Node (e.g. one default-constructed
+    // by project_file.cpp's `[Node]` section opener before the `id=` line
+    // is parsed, or a torn read of this field from a concurrent push_back
+    // reallocation) reads as a recognizable sentinel rather than as
+    // garbage memory. Real node IDs come from NodeGraph::newId() which
+    // starts at 1. Downstream code (graph rebuild, findNode, save) can
+    // and should skip / refuse nodes with id < 0.
+    int id = -1;
     std::string name;
     NodeType type;
     std::vector<Pin> pinsIn;
@@ -479,6 +491,35 @@ public:
     std::vector<Node> nodes;
     std::vector<Link> links;
     std::vector<int> openEditors;  // node IDs - never store Node*
+
+    // Synchronization between graph-mutating threads (UI / file load /
+    // tracker import) and the audio thread, which iterates `nodes` and
+    // `links` every block (both directly for MIDI routing in
+    // AudioEngine::audioDeviceIOCallbackWithContext and indirectly via
+    // GraphProcessor::rebuildGraph when the node count changes).
+    //
+    // Why this is required: a previous tracker-import crash (SEANCE.exe
+    // .63000.dmp) was traced to a data race. MOD import calls
+    // graph.addNode() ~10 times in succession; each call may trigger a
+    // std::vector reallocation. The audio callback, observing the size
+    // change between blocks, rebuilds the JUCE processor graph by
+    // iterating graph.nodes. If reallocation happened mid-iteration, the
+    // audio thread read garbage Node::id values (observed 0 and
+    // 1132382734 in the rebuilt nodeMap), which then crashed downstream
+    // in the JUCE graph wiring.
+    //
+    // Usage pattern (audio thread): take a try-lock at the top of the
+    // audio callback and fall through to silence if the lock can't be
+    // acquired immediately - blocking on the audio thread would risk
+    // device underruns, and a single silent block during a multi-second
+    // import is barely audible compared to a crash. Usage pattern
+    // (mutators): hold a std::lock_guard for the duration of any batch
+    // that pushes more than a couple of nodes/links (tracker import,
+    // project file load, undo snapshot restore). Single-node menu
+    // additions don't strictly need it - those are one push_back and
+    // race-resolve quickly - but locking them too costs nothing and is
+    // future-safe.
+    mutable std::mutex mutationLock;
 
     float editorPanelHeight = 250.0f;
     int activeEditorNodeId = -1; // node ID of the currently focused editor

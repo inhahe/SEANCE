@@ -1870,6 +1870,15 @@ ModImporter::ImportResult ModImporter::import(const std::string& path, NodeGraph
             return 24.0f + std::max(rows, 1) * 20.0f + 8.0f;
         };
 
+        // X range that the import will occupy: col1 (MIDI tracks) starts
+        // at posX, col2 (samplers) at posX + kNodeW + 60, and the Reverb
+        // Send is placed further right at posX + 700 by the wiring pass
+        // (later moved by this layout pass, but its temporary position
+        // sets the rightmost extent we care about). Total right edge =
+        // posX + 700 + kNodeW.
+        const float importLeft  = posX;
+        const float importRight = posX + 700.0f + kNodeW;
+
         // Collect IDs of all nodes created by this import.
         // The group node's childNodeIds list catches everything including
         // the Reverb Send node.
@@ -1880,12 +1889,22 @@ ModImporter::ImportResult ModImporter::import(const std::string& path, NodeGraph
                 if (cid >= 0 && cid < (int)isOurs.size())
                     isOurs[cid] = true;
 
-        // Find a clear Y below all pre-existing nodes (skip Master Out -
-        // it stays far to the right and shouldn't push the import down).
+        // Find a clear Y below all pre-existing nodes that HORIZONTALLY
+        // OVERLAP with the import's column range. Master Out (Output
+        // type), sidebar utilities, an orphaned node parked far to the
+        // right, or anything else outside [importLeft, importRight]
+        // can't push the import down - if there's no vertical conflict,
+        // the import lands at posY directly. This is what keeps a
+        // fresh import from sliding to the bottom of the canvas just
+        // because some unrelated node lives in another corner of the
+        // graph.
         float startY = posY;
         for (auto& n : graph.nodes) {
             if (n.id < (int)isOurs.size() && isOurs[n.id]) continue;
             if (n.type == NodeType::Output) continue;
+            const float nodeLeft  = n.pos.x;
+            const float nodeRight = n.pos.x + kNodeW;
+            if (nodeRight < importLeft || nodeLeft > importRight) continue;
             float bottom = n.pos.y + nodeH(n);
             startY = std::max(startY, bottom + kGap * 2);
         }

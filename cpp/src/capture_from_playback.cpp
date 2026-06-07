@@ -37,11 +37,121 @@ static const char* sourceName(CaptureSource s) {
     return "?";
 }
 
+// ---- Note/Octave <-> Hz helpers (12-TET, A4 = 440 Hz, scientific
+//      pitch notation: C4 = middle C, MIDI 60; A4 = MIDI 69).
+//
+// Hard-coded to 12-TET rather than going through the project's tuning
+// system: embeddedPitchHz describes the recording itself, not the
+// project's tuning preference, and the user picking "A4" wants 440 Hz
+// regardless of what tuning the project later uses for playback.
+// Mirrors the helpers in layered_wave_editor.cpp's
+// GranularFrameEditorComponent so the capture-time picker and the
+// post-capture editor agree on every Hz/note conversion.
+static int noteOctaveToMidi(int note, int octave) {
+    return 12 * (octave + 1) + note;  // C0 = 12, A4 = 69
+}
+static double midiToHz(int midi) {
+    return 440.0 * std::pow(2.0, (midi - 69) / 12.0);
+}
+static double noteOctaveToHz(int note, int octave) {
+    return midiToHz(noteOctaveToMidi(note, octave));
+}
+// Returns (note 0..11, octave 0..9) of the nearest MIDI note to hz.
+static std::pair<int, int> hzToNearestNoteOctave(double hz) {
+    if (hz <= 0.0) return {9, 4};  // safe default = A4
+    int midi = (int)std::lround(69.0 + 12.0 * std::log2(hz / 440.0));
+    midi = std::clamp(midi, 12, 12 * 10 + 11);  // C0 .. B9
+    const int octave = midi / 12 - 1;
+    const int note = midi % 12;
+    return {note, octave};
+}
+// Cents offset of hz from the nearest 12-TET note (-49 .. +50).
+static int hzToCentsFromNearest(double hz) {
+    if (hz <= 0.0) return 0;
+    const double midiExact   = 69.0 + 12.0 * std::log2(hz / 440.0);
+    const double midiNearest = std::round(midiExact);
+    return (int)std::lround((midiExact - midiNearest) * 100.0);
+}
+static juce::String formatCents(double hz) {
+    const int cents = hzToCentsFromNearest(hz);
+    juce::String t;
+    if (cents > 0) t << "+";
+    t << cents << " \xC2\xA2";  // UTF-8 cent sign
+    return t;
+}
+// Note + octave + cents row builder. Shared by both capture dialogs.
+// Caller supplies the three controls already-allocated; we addAndMakeVisible
+// them, populate the combos, wire tooltips, and set the initial selection
+// to match A4 (440 Hz).
+static void setUpPitchPicker(juce::Component& parent,
+                             juce::Label& noteOctaveLabel,
+                             juce::ComboBox& noteCombo,
+                             juce::ComboBox& octaveCombo,
+                             juce::Label& centsLabel) {
+    parent.addAndMakeVisible(noteOctaveLabel);
+    noteOctaveLabel.setText("As note", juce::dontSendNotification);
+    noteOctaveLabel.setColour(juce::Label::textColourId,
+                              juce::Colours::white.withAlpha(0.85f));
+    noteOctaveLabel.setFont(juce::Font(juce::FontOptions(11.0f)));
+
+    parent.addAndMakeVisible(noteCombo);
+    const char* kNoteNames[12] = {"C", "C#", "D", "D#", "E", "F",
+                                  "F#", "G", "G#", "A", "A#", "B"};
+    for (int i = 0; i < 12; ++i)
+        noteCombo.addItem(kNoteNames[i], i + 1);
+    noteCombo.setTooltip(
+        "Pitch class to label the captured source with. The synth uses "
+        "this so MIDI playback at the matching key plays the source at "
+        "1:1, with the usual wavetable-style pitch shift for other keys. "
+        "Pair with Octave to set the exact pitch.");
+
+    parent.addAndMakeVisible(octaveCombo);
+    for (int o = 0; o <= 9; ++o)
+        octaveCombo.addItem(juce::String(o), o + 1);
+    octaveCombo.setTooltip(
+        "Octave to label the captured source with, using scientific "
+        "pitch notation (A4 = 440 Hz, middle C = C4). Combined with "
+        "Note this sets the captured waveform's embedded pitch so MIDI "
+        "playback tracks correctly.");
+
+    parent.addAndMakeVisible(centsLabel);
+    centsLabel.setColour(juce::Label::textColourId,
+                         juce::Colours::white.withAlpha(0.7f));
+    centsLabel.setFont(juce::Font(juce::FontOptions(11.0f)));
+    centsLabel.setJustificationType(juce::Justification::centredLeft);
+    centsLabel.setText("0 \xC2\xA2", juce::dontSendNotification);
+    centsLabel.setTooltip(
+        "How far the labelled pitch is from the nearest 12-TET note in "
+        "cents. Always 0 from this picker (it produces exact notes); "
+        "the post-capture editor's Hz slider can place the pitch "
+        "between notes if you need it.");
+
+    // Default to A4 = 440 Hz so MIDI note 69 plays at 1:1 when the user
+    // doesn't touch the picker. Matches the GranularFrame default.
+    noteCombo.setSelectedId(9 + 1, juce::dontSendNotification);   // A
+    octaveCombo.setSelectedId(4 + 1, juce::dontSendNotification); // 4
+}
+
+// Drop-arrow box + side padding + visual cushion + a min-width floor so
+// single-char items don't render as a tiny arrow-only pill. Same shape
+// as the helper in layered_wave_editor.cpp so the two capture-related
+// UIs agree on combo proportions.
+static int intrinsicComboWidth(juce::ComboBox& cb) {
+    const juce::Font f = cb.getLookAndFeel().getComboBoxFont(cb);
+    int maxText = 0;
+    for (int i = 0; i < cb.getNumItems(); ++i)
+        maxText = std::max(maxText,
+            juce::GlyphArrangement::getStringWidthInt(f, cb.getItemText(i)));
+    return std::max(80, maxText + 54);
+}
+
 CaptureFromPlaybackDialog::CaptureFromPlaybackDialog(CaptureSource src, int ts, OnCapture onCap)
     : onCapture(std::move(onCap)),
       source(src),
       tableSize(std::max(64, ts)) {
-    setSize(720, 440);
+    // Height bumped to make room for the embedded pitch row underneath
+    // the num-frames slider while keeping the waveform area unchanged.
+    setSize(720, 472);
 
     addAndMakeVisible(numFramesLabel);
     numFramesLabel.setText("Number of waveforms:", juce::dontSendNotification);
@@ -113,6 +223,23 @@ CaptureFromPlaybackDialog::CaptureFromPlaybackDialog(CaptureSource src, int ts, 
                                 "region inside it.");
         loadFileBtn.onClick = [this]() { chooseAndLoadFile(); };
     }
+
+    // Embedded pitch picker. Lets the user label the capture with the
+    // pitch it represents (A4 = 440 Hz default) so MIDI playback at the
+    // matching key plays the source at 1:1; other keys pitch-shift via
+    // the synth's usual wavetable stride math. Mirrors the picker in the
+    // post-capture GranularFrameEditorComponent.
+    setUpPitchPicker(*this, noteOctaveLabel, noteCombo, octaveCombo, centsLabel);
+    auto onPitchPickerChanged = [this]() {
+        const int n = noteCombo.getSelectedId() - 1;
+        const int o = octaveCombo.getSelectedId() - 1;
+        if (n < 0 || n > 11 || o < 0 || o > 9) return;
+        capturedPitchHz = noteOctaveToHz(n, o);
+        centsLabel.setText(formatCents(capturedPitchHz),
+                           juce::dontSendNotification);
+    };
+    noteCombo.onChange   = onPitchPickerChanged;
+    octaveCombo.onChange = onPitchPickerChanged;
 
     addAndMakeVisible(captureBtn);
     captureBtn.setTooltip(
@@ -289,6 +416,17 @@ void CaptureFromPlaybackDialog::resized() {
     controlsRow.removeFromLeft(12);
     regionInfoLabel.setBounds(controlsRow);
 
+    r.removeFromBottom(6);
+    // Embedded pitch row: label + note + octave + cents readout. Same
+    // left-edge as the controls row above so the form aligns visually.
+    auto pitchRow = r.removeFromBottom(26);
+    noteOctaveLabel.setBounds(pitchRow.removeFromLeft(140));
+    noteCombo.setBounds(pitchRow.removeFromLeft(intrinsicComboWidth(noteCombo)));
+    pitchRow.removeFromLeft(6);
+    octaveCombo.setBounds(pitchRow.removeFromLeft(intrinsicComboWidth(octaveCombo)));
+    pitchRow.removeFromLeft(10);
+    centsLabel.setBounds(pitchRow.removeFromLeft(80));
+
     r.removeFromBottom(4);
     sourceInfoLabel.setBounds(r.removeFromBottom(20));
 
@@ -346,8 +484,8 @@ void CaptureFromPlaybackDialog::updateRegionInfoLabel() {
         : 0.0;
     juce::String msg;
     msg << "Region: " << juce::String(spanSec, 2) << " s   |   "
-        << n << " frames, "
-        << juce::String(perFrameMs, 1) << " ms between frame centers";
+        << n << " waveforms, "
+        << juce::String(perFrameMs, 1) << " ms between waveform centers";
     regionInfoLabel.setText(msg, juce::dontSendNotification);
 }
 
@@ -504,9 +642,10 @@ CaptureFromPlaybackDialog::buildFrames(int n) const {
     // is a GranularFrame holding a multi-sample window of the source PCM
     // plus a default ~100 ms grain length. The synth plays it back via
     // 4-voice OLA so the timbre evolves over time instead of being
-    // collapsed to one cycle. embeddedPitchHz=440 (A4) until YIN pitch
-    // detection lands - so MIDI note 69 plays at 1:1, others get pitch
-    // shifted the same way as cycle frames.
+    // collapsed to one cycle. embeddedPitchHz comes from the in-dialog
+    // pitch picker (Note + Octave, default A4 = 440 Hz) so MIDI playback
+    // at the matching key plays the source at 1:1 and other keys
+    // pitch-shift via the usual wavetable stride math.
     const int   tapLen     = (int)tap.size();
     const int   regionLen  = std::max(0, regionEnd - regionStart);
     const double sr        = (tapSampleRate > 0.0) ? tapSampleRate : 48000.0;
@@ -537,7 +676,7 @@ CaptureFromPlaybackDialog::buildFrames(int n) const {
         }
 
         auto frame = std::make_unique<GranularFrame>(
-            std::move(source), sr, grainLenSamples, 440.0f);
+            std::move(source), sr, grainLenSamples, (float)capturedPitchHz);
         out.push_back(std::move(frame));
     }
     return out;
@@ -719,7 +858,9 @@ CaptureFromSongDialog::CaptureFromSongDialog(NodeGraph& g, Transport& t,
       tableSize(std::max(64, ts)),
       onCapture(std::move(onCap))
 {
-    setSize(820, 552);
+    // Height bumped to make room for the embedded pitch row above the
+    // freeze-mode picker while keeping the waveform area unchanged.
+    setSize(820, 584);
 
     // ----- Transport row -----
     addAndMakeVisible(playBtn);
@@ -868,6 +1009,23 @@ CaptureFromSongDialog::CaptureFromSongDialog(NodeGraph& g, Transport& t,
             regenerateGrain();
     };
 
+    // ----- Embedded pitch picker -----
+    // Sets the captured frame's embeddedPitchHz so MIDI playback at the
+    // matching key plays the source at 1:1; other keys pitch-shift via
+    // the synth's usual wavetable stride math. Mirrors the picker in the
+    // post-capture GranularFrameEditorComponent.
+    setUpPitchPicker(*this, noteOctaveLabel, noteCombo, octaveCombo, centsLabel);
+    auto onPitchPickerChanged = [this]() {
+        const int n = noteCombo.getSelectedId() - 1;
+        const int o = octaveCombo.getSelectedId() - 1;
+        if (n < 0 || n > 11 || o < 0 || o > 9) return;
+        capturedPitchHz = noteOctaveToHz(n, o);
+        centsLabel.setText(formatCents(capturedPitchHz),
+                           juce::dontSendNotification);
+    };
+    noteCombo.onChange   = onPitchPickerChanged;
+    octaveCombo.onChange = onPitchPickerChanged;
+
     // ----- Status / hint labels -----
     addAndMakeVisible(statusLabel);
     statusLabel.setJustificationType(juce::Justification::centredLeft);
@@ -1009,11 +1167,25 @@ void CaptureFromSongDialog::resized() {
 
     r.removeFromBottom(6);
 
+    // Embedded pitch row: label + note + octave + cents readout.
+    auto pitchRow = r.removeFromBottom(26);
+    noteOctaveLabel.setBounds(pitchRow.removeFromLeft(70));
+    noteCombo.setBounds(pitchRow.removeFromLeft(intrinsicComboWidth(noteCombo)));
+    pitchRow.removeFromLeft(6);
+    octaveCombo.setBounds(pitchRow.removeFromLeft(intrinsicComboWidth(octaveCombo)));
+    pitchRow.removeFromLeft(10);
+    centsLabel.setBounds(pitchRow.removeFromLeft(80));
+
+    r.removeFromBottom(6);
+
     // Freeze-mode row: dropdown + brief space (status label stays on
-    // the width row above, so this row is the picker alone).
+    // the width row above, so this row is the picker alone). Width is
+    // measured from the combo's longest item so the dropdown text never
+    // gets clipped behind the arrow.
     auto freezeRow = r.removeFromBottom(26);
     freezeModeLabel.setBounds(freezeRow.removeFromLeft(70));
-    freezeModeCombo.setBounds(freezeRow.removeFromLeft(220));
+    freezeModeCombo.setBounds(
+        freezeRow.removeFromLeft(intrinsicComboWidth(freezeModeCombo)));
 
     r.removeFromBottom(8);
 
@@ -1447,10 +1619,11 @@ CaptureFromSongDialog::buildFrameAtMarker() const {
             source[(size_t)i] = song[(size_t)s];
     }
 
-    // YIN pitch detection: planned follow-up. Until then we use the
-    // GranularFrame default (A4 = 440 Hz) so MIDI note 69 plays at 1:1
-    // and other notes pitch-shift by grain stride. Users can dial in
-    // the right pitch by ear via MIDI key choice for now.
+    // Embedded pitch: pull from the in-dialog Note + Octave picker
+    // (default A4 = 440 Hz) so MIDI playback at the matching key plays
+    // the source at 1:1 and other keys pitch-shift via the synth's
+    // wavetable stride math. The post-capture editor can still re-tune
+    // by ear via its Hz slider if the user prefers an off-grid pitch.
     //
     // Freeze mode: pull from the picker so the frame replays at note-on
     // with the same algorithm the user just auditioned. The combo's
@@ -1468,7 +1641,7 @@ CaptureFromSongDialog::buildFrameAtMarker() const {
         (int)std::round(crossfadeSlider.getValue() * 0.001 * songSampleRate));
     auto frame = std::make_unique<GranularFrame>(
         std::move(source), songSampleRate, grainLenSamples,
-        440.0f, mode, xfadeSamples);
+        (float)capturedPitchHz, mode, xfadeSamples);
     out.push_back(std::move(frame));
     return out;
 }

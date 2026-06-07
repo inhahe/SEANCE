@@ -351,9 +351,49 @@ PianoRollComponent::PianoRollComponent(NodeGraph& g, Node& n, Transport* t)
     hZoomSlider.setValue(state.hZoom, juce::dontSendNotification);
     hZoomSlider.setSliderStyle(juce::Slider::LinearHorizontal);
     hZoomSlider.setTextBoxStyle(juce::Slider::NoTextBox, true, 0, 0);
-    hZoomSlider.setTooltip("Horizontal zoom");
+    hZoomSlider.setTooltip("Horizontal zoom - drag to stretch or shrink the timeline. "
+                           "Also: Ctrl + mouse wheel.");
     hZoomSlider.onValueChange = [this]() {
         state.hZoom = (float)hZoomSlider.getValue();
+        updateScrollBars();
+        repaint();
+    };
+
+    // Vertical zoom: backs state.visibleRange (semitones-on-screen). The
+    // slider value IS a "zoom level" running 1..10, where 10 = most
+    // zoomed in (12 semitones / one octave visible) and 1 = most zoomed
+    // out (120 semitones, nearly the full MIDI keyboard). Mapping is
+    // linear in semitones-visible to keep the drag feel uniform across
+    // the range. Slider direction matches hZoom: drag right = zoom in =
+    // thicker note lanes.
+    addAndMakeVisible(vZoomSlider);
+    vZoomSlider.setRange(1.0, 10.0, 0.1);
+    vZoomSlider.setSliderStyle(juce::Slider::LinearHorizontal);
+    vZoomSlider.setTextBoxStyle(juce::Slider::NoTextBox, true, 0, 0);
+    vZoomSlider.setTooltip("Vertical zoom - drag right to thicken the "
+                           "note lanes (fewer semitones visible), left "
+                           "to thin them (more visible). Also: "
+                           "Ctrl+Shift + mouse wheel on the grid.");
+    // Helpers: visibleRange <-> slider value. visibleRange in [12, 120];
+    // slider in [1, 10] inverted so right = zoomed in.
+    auto rangeToSlider = [](int range) {
+        return 10.0 - (juce::jlimit(12, 120, range) - 12) / 12.0;
+    };
+    auto sliderToRange = [](double v) {
+        return (int)std::round(12.0 + (10.0 - v) * 12.0);
+    };
+    vZoomSlider.setValue(rangeToSlider(state.visibleRange),
+                         juce::dontSendNotification);
+    vZoomSlider.onValueChange = [this, sliderToRange]() {
+        int newRange = sliderToRange(vZoomSlider.getValue());
+        if (newRange == state.visibleRange) return;
+        state.visibleRange = newRange;
+        // Re-clamp scrollPitch so the new range still fits inside MIDI
+        // 0..127 - without this, zooming out at the top or bottom of the
+        // keyboard would clip the visible range against the MIDI ceiling.
+        state.scrollPitch = juce::jlimit(newRange / 2,
+                                          127 - newRange / 2,
+                                          state.scrollPitch);
         updateScrollBars();
         repaint();
     };
@@ -495,8 +535,16 @@ PianoRollComponent::PianoRollComponent(NodeGraph& g, Node& n, Transport* t)
 void PianoRollComponent::resized() {
     refreshNode(); if (!node) return;
     auto area = getLocalBounds();
-    int th = toolbarHeight();
     int rowH = 26;
+
+    // Reserve the resize-handle strip at the very top. The handle is
+    // painted directly by paint() and handled by mouseDown - no child
+    // component - but the layout has to skip its height so the toolbar
+    // sits below it instead of underneath. toolbarHeight() already
+    // includes RESIZE_HANDLE_H so every grid offset elsewhere in the
+    // file (paint, mouseDown, etc.) accounts for the strip without
+    // touching them individually.
+    area.removeFromTop(RESIZE_HANDLE_H);
 
     // Row 0: title + M/S/Pan + compact + close
     auto row0 = area.removeFromTop(rowH);
@@ -583,9 +631,12 @@ void PianoRollComponent::resized() {
             x += w + 2;
         };
         // Like place2 but measures the button text to determine width.
+        // NB: Font::getStringWidth was deprecated in JUCE 8 and returns 0
+        // (silently making every button collapse to just `pad`). Use
+        // GlyphArrangement::getStringWidthInt instead.
         auto placeBtn = [&](juce::TextButton& btn, int pad = 16) {
             auto font = btn.getLookAndFeel().getTextButtonFont(btn, rowH - 2);
-            int w = font.getStringWidth(btn.getButtonText()) + pad;
+            int w = juce::GlyphArrangement::getStringWidthInt(font, btn.getButtonText()) + pad;
             place2(btn, w);
         };
         auto placeLblCombo = [&](juce::Label& lbl, int lw, juce::ComboBox& cb, int cw) {
@@ -644,10 +695,14 @@ void PianoRollComponent::resized() {
     pianoArea.removeFromTop(toolbarHeight());
     vScrollBar.setBounds(pianoArea.removeFromRight(SCROLLBAR_SIZE));
     auto bottomBar = pianoArea.removeFromBottom(SCROLLBAR_SIZE);
-    // Zoom slider gets a generous width (40% of the bar, min 150px) so it's
-    // easy to grab. The horizontal scrollbar takes the rest.
-    int zoomW = std::max(150, (int)(bottomBar.getWidth() * 0.4f));
-    hZoomSlider.setBounds(bottomBar.removeFromRight(zoomW));
+    // Bottom bar holds (from right) the vertical-zoom slider, the
+    // horizontal-zoom slider, and the horizontal scrollbar in the
+    // remaining left space. Each zoom slider gets ~25% of the bar with a
+    // 110-px floor so they stay grabbable on narrow editor panels.
+    int vZoomW = std::max(110, (int)(bottomBar.getWidth() * 0.22f));
+    int hZoomW = std::max(110, (int)(bottomBar.getWidth() * 0.22f));
+    vZoomSlider.setBounds(bottomBar.removeFromRight(vZoomW));
+    hZoomSlider.setBounds(bottomBar.removeFromRight(hZoomW));
     hScrollBar.setBounds(bottomBar);
 
     updateScrollBars();
@@ -668,9 +723,29 @@ void PianoRollComponent::paint(juce::Graphics& g) {
             }
     }
 
-    // Draw toolbar background
+    // Draw toolbar background (includes the resize handle area at the
+    // very top; the handle strip is overpainted with its own colour and
+    // grip dots immediately after).
     g.setColour(juce::Colour(35, 35, 40));
     g.fillRect(0, 0, getWidth(), toolbarHeight());
+
+    // Resize handle strip - thin grip at the very top of the panel.
+    // Click+drag here resizes this panel's height; panels above just
+    // shift position. Drawn slightly darker than the toolbar so the
+    // boundary is obvious, with three centred grip dots as the affordance.
+    {
+        juce::Rectangle<int> hb(0, 0, getWidth(), RESIZE_HANDLE_H);
+        g.setColour(juce::Colour(22, 22, 28));
+        g.fillRect(hb);
+        g.setColour(juce::Colour(95, 95, 115));
+        int cx = getWidth() / 2;
+        int cy = RESIZE_HANDLE_H / 2;
+        for (int i = -1; i <= 1; ++i)
+            g.fillRect(cx + i * 10 - 1, cy - 1, 2, 2);
+        // Subtle bottom hairline to separate the handle from the toolbar.
+        g.setColour(juce::Colour(0, 0, 0).withAlpha(0.4f));
+        g.drawHorizontalLine(RESIZE_HANDLE_H - 1, 0.0f, (float)getWidth());
+    }
 
     auto area = getLocalBounds().toFloat();
     area.removeFromTop(toolbarHeight());
@@ -756,18 +831,70 @@ void PianoRollComponent::paint(juce::Graphics& g) {
                 keyCol = isBlack ? juce::Colour(40, 40, 50) : juce::Colour(60, 60, 70);
             g.setColour(keyCol);
             g.fillRect(0.0f, y, (float)KEY_WIDTH - 2, rowH);
+        }
+    }
 
-            if (rowH > 7) {
-                auto name = MusicTheory::noteName(pitch);
-                float fontSize = juce::jlimit(7.0f, 14.0f, rowH * 0.75f);
-                g.setFont(juce::Font(fontSize));
-                juce::Colour textCol = (!inScale && !isChromatic) ? juce::Colour(60, 60, 60)
-                    : (pitch % 12 == 0) ? juce::Colour(180, 180, 180)
-                    : juce::Colour(120, 120, 120);
-                g.setColour(textCol);
-                g.drawText(name, juce::Rectangle<float>(3, y, KEY_WIDTH - 5, rowH),
-                           juce::Justification::centredLeft, false);
-            }
+    // Note-name labels (second pass). Drawn AFTER all row backgrounds /
+    // key fills so a label whose rect extends across several rows (sparse
+    // mode, below) isn't overdrawn by subsequent row fills. Two regimes:
+    //  - "Dense" (rowH >= 9): label every key, font scales with row
+    //    height. Normal case at default visibleRange=18 + comfortable panel.
+    //  - "Sparse" (rowH < 9): per-row text would be sub-8-px and either
+    //    unreadable or refused by the renderer. Label only the C-of-each-
+    //    octave anchor row, letting that label use up to a full octave's
+    //    worth of vertical space - so C3/C4/C5/... stay legible at
+    //    maximum vertical zoom-out. Without this, a 200-px-tall MIDI
+    //    panel (98 px of grid / 18 rows = ~5 px per row) shows no labels
+    //    at all and the keyboard column is unreadable.
+    {
+        // Dense threshold of 6.5 px guarantees the user gets a label on
+        // every row when they zoom all the way in (visibleRange=12 -> at
+        // a 200-px default panel, rowH lands at ~7.7 px). Above this we
+        // print every key; below it we fall back to one C-per-octave so
+        // we don't draw garbage at extreme zoom-out.
+        const bool dense = rowH >= 6.5f;
+        // 0.85 fills the row a touch more aggressively than before -
+        // helpful at the new lower dense threshold where rowH can be
+        // ~7 px. Font floor at 7 matches the lowered dense threshold
+        // (rowH ~6.5 -> font ~5.5 -> clamp 7); ceiling 14 keeps sparse-
+        // mode labels from dwarfing their anchor row.
+        float labelH = dense ? rowH : juce::jmin(rowH * 12.0f, 16.0f);
+        float fontSize = juce::jlimit(7.0f, 14.0f, labelH * 0.85f);
+        // JUCE 8: the deprecated Font(float) constructor renders as a
+        // zero-glyph font in this codebase (same root cause as
+        // Font::getStringWidth returning 0 - see notes in
+        // layered_wave_editor.cpp's intrinsicComboWidth helper). Going
+        // through FontOptions is the supported path and produces actual
+        // glyphs.
+        g.setFont(juce::Font(juce::FontOptions(fontSize)));
+        // In dense mode, centre the text vertically in the row. In sparse
+        // mode, top-align so each C label sits at its anchor row -
+        // centring across 12 rows would slide the label down into the
+        // next octave.
+        auto just = dense ? juce::Justification::centredLeft
+                          : juce::Justification::topLeft;
+
+        for (int i = 0; i < visRange; ++i) {
+            int pitch = pitchHi - i;
+            if (pitch < 0 || pitch > 127) continue;
+            const bool isOctaveAnchor = (pitch % 12 == 0); // C
+            if (!dense && !isOctaveAnchor) continue;
+            if (rowH <= 2.5f) continue;
+
+            float y = i * rowH;
+            bool inScale = isChromatic || scaleNotes.count(pitch % 12) > 0;
+            // Out-of-scale notes used to render at (60,60,60) on a
+            // (25,25,28) key fill - contrast ratio ~1.3:1, basically
+            // invisible. Bumped to (120,120,120) so the labels are
+            // legible while still being dimmer than in-scale (170) and
+            // root (220) via the row-background contrast.
+            juce::Colour textCol = (!inScale && !isChromatic) ? juce::Colour(120, 120, 120)
+                : isOctaveAnchor ? juce::Colour(220, 220, 220)
+                : juce::Colour(170, 170, 170);
+            g.setColour(textCol);
+            g.drawText(MusicTheory::noteName(pitch),
+                       juce::Rectangle<float>(3, y, KEY_WIDTH - 5, labelH),
+                       just, false);
         }
     }
 
@@ -786,7 +913,7 @@ void PianoRollComponent::paint(juce::Graphics& g) {
             g.drawVerticalLine((int)x, 0, gridH);
             if (isBar) {
                 int barNum = (int)((double)beat / bpb) + 1;
-                g.setFont(10.0f);
+                g.setFont(juce::Font(juce::FontOptions(10.0f)));
                 g.setColour(juce::Colour(200, 200, 200).withAlpha(0.5f));
                 g.drawText(juce::String(barNum), x + 2, 2, 30, 12,
                            juce::Justification::centredLeft);
@@ -844,7 +971,10 @@ void PianoRollComponent::paint(juce::Graphics& g) {
             if (noteW > 14 && rowH > 7) {
                 auto name = MusicTheory::noteName(note.pitch);
                 float fontSize = juce::jlimit(8.0f, 14.0f, rowH * 0.75f);
-                g.setFont(juce::Font(fontSize));
+                // JUCE 8: route through FontOptions so Graphics::drawText
+                // actually rasterises glyphs - the deprecated Font(float)
+                // produces empty output in 8.0.12.
+                g.setFont(juce::Font(juce::FontOptions(fontSize)));
                 g.setColour(isSel ? juce::Colours::black : juce::Colours::white.withAlpha(0.8f));
                 g.drawText(name,
                     juce::Rectangle<float>(nx1 + 3, ny, noteW - 6, rowH),
@@ -964,7 +1094,7 @@ void PianoRollComponent::paint(juce::Graphics& g) {
                 }
                 if (label.isNotEmpty()) {
                     g.setColour(juce::Colours::white.withAlpha(0.9f));
-                    g.setFont(juce::Font(std::min(10.0f, barH - 2.0f)));
+                    g.setFont(juce::Font(juce::FontOptions(std::min(10.0f, barH - 2.0f))));
                     g.drawText(label, rx1 + 4, (int)ry, (int)(rx2 - rx1 - 8), (int)barH,
                                juce::Justification::centredLeft, false);
                 }
@@ -1010,11 +1140,11 @@ void PianoRollComponent::paint(juce::Graphics& g) {
             }
             if (laneLabel.isNotEmpty()) {
                 g.setColour(juce::Colours::white.withAlpha(0.7f));
-                g.setFont(juce::Font(11.0f, juce::Font::bold));
+                g.setFont(juce::Font(juce::FontOptions(11.0f).withStyle("Bold")));
                 g.drawText(laneLabel, gridX + 6, (int)exprY + 2, 200, 14,
                            juce::Justification::centredLeft, false);
                 g.setColour(juce::Colours::grey.withAlpha(0.5f));
-                g.setFont(juce::Font(9.0f));
+                g.setFont(juce::Font(juce::FontOptions(9.0f)));
                 g.drawText(laneHint, gridX + 210, (int)exprY + 2, 350, 14,
                            juce::Justification::centredLeft, false);
             }
@@ -1219,6 +1349,17 @@ PianoRollComponent::NoteHit PianoRollComponent::findNoteAt(juce::Point<float> sc
 
 void PianoRollComponent::mouseDown(const juce::MouseEvent& e) {
     refreshNode(); if (!node) return;
+
+    // Resize-handle gesture: clicks in the top RESIZE_HANDLE_H strip
+    // start a panel-resize drag and don't reach anything else. Tracked
+    // through mouseDrag in screen-y coordinates so the drag survives the
+    // panel shifting under the cursor mid-gesture.
+    if (e.y < RESIZE_HANDLE_H && onResizeDrag) {
+        resizingHeight = true;
+        resizeLastY = e.getScreenY();
+        return;
+    }
+
     auto [beat, pitch] = screenToBeatPitch(e.position);
 
     // Expression lane interaction
@@ -1449,6 +1590,22 @@ void PianoRollComponent::mouseDown(const juce::MouseEvent& e) {
 
 void PianoRollComponent::mouseDrag(const juce::MouseEvent& e) {
     refreshNode(); if (!node) return;
+
+    // Resize-handle drag - fire deltaY in screen coords up to the host
+    // so the panel's heightPx tracks the cursor. Doing this in screen-y
+    // (rather than e.y / e.position.y) is important because the panel's
+    // bounds shift under the cursor as the host re-lays-out the stack
+    // mid-gesture; local coords would oscillate.
+    if (resizingHeight && onResizeDrag) {
+        int y = e.getScreenY();
+        int dy = y - resizeLastY;
+        if (dy != 0) {
+            onResizeDrag(dy);
+            resizeLastY = y;
+        }
+        return;
+    }
+
     auto [beat, pitch] = screenToBeatPitch(e.position);
     float snap = state.snap > 0 ? state.snap : 0.0625f;
     bool altHeld = e.mods.isAltDown();
@@ -1544,6 +1701,13 @@ void PianoRollComponent::mouseDrag(const juce::MouseEvent& e) {
 
 void PianoRollComponent::mouseUp(const juce::MouseEvent& e) {
     refreshNode(); if (!node) return;
+    // Clear panel-resize gesture before anything else - the handle drag
+    // never sets dragMode and never has a clip/note to operate on, so the
+    // rest of mouseUp would just be a no-op for it anyway.
+    if (resizingHeight) {
+        resizingHeight = false;
+        return;
+    }
     if (dragMode == DragBox) {
         auto [b1, p1] = screenToBeatPitch(dragStartScreen);
         auto [b2, p2] = screenToBeatPitch(dragCurrentScreen);
@@ -1689,6 +1853,13 @@ void PianoRollComponent::updateScrollBars() {
 
 void PianoRollComponent::mouseMove(const juce::MouseEvent& e) {
     refreshNode(); if (!node) return;
+    // Top resize-handle strip wins over note-edge cursor changes - it's
+    // physically above the grid and getting a left-right arrow there
+    // would be misleading.
+    if (e.y < RESIZE_HANDLE_H && onResizeDrag) {
+        setMouseCursor(juce::MouseCursor::UpDownResizeCursor);
+        return;
+    }
     auto hit = findNoteAt(e.position);
     if (hit.valid() && (hit.edge == NoteHit::Left || hit.edge == NoteHit::Right))
         setMouseCursor(juce::MouseCursor::LeftRightResizeCursor);
@@ -1699,7 +1870,25 @@ void PianoRollComponent::mouseMove(const juce::MouseEvent& e) {
 void PianoRollComponent::mouseWheelMove(const juce::MouseEvent& e,
                                          const juce::MouseWheelDetails& wheel) {
     refreshNode(); if (!node) return;
-    if (e.mods.isCtrlDown()) {
+    if (e.mods.isCtrlDown() && e.mods.isShiftDown()) {
+        // Ctrl+Shift+scroll: vertical zoom (rows-per-octave). Up = zoom
+        // in (fewer semitones, thicker note lanes). Step in semitones so
+        // a single wheel notch makes a perceptible row-height change at
+        // any zoom level - using a multiplicative factor felt too slow
+        // near the zoomed-in end where visibleRange is already small.
+        int step = wheel.deltaY > 0 ? -2 : 2;
+        int newRange = juce::jlimit(12, 120, state.visibleRange + step);
+        if (newRange != state.visibleRange) {
+            state.visibleRange = newRange;
+            state.scrollPitch = juce::jlimit(newRange / 2,
+                                              127 - newRange / 2,
+                                              state.scrollPitch);
+            // Keep the vZoom slider in sync. Reuse the same mapping the
+            // slider's onValueChange uses (inverted, linear-in-semitones).
+            double sliderValue = 10.0 - (newRange - 12) / 12.0;
+            vZoomSlider.setValue(sliderValue, juce::dontSendNotification);
+        }
+    } else if (e.mods.isCtrlDown()) {
         // Ctrl+scroll: horizontal zoom
         float zoomDelta = wheel.deltaY * 0.3f;
         state.hZoom = juce::jlimit(0.2f, 20.0f, state.hZoom * (1.0f + zoomDelta));
@@ -2262,7 +2451,14 @@ void PianoRollComponent::zoomToSelection() {
 
     // Set vertical scroll and range
     state.scrollPitch = (minPitch + maxPitch) / 2;
-    state.visibleRange = std::max(12, maxPitch - minPitch + pitchPad * 2);
+    state.visibleRange = juce::jlimit(12, 120,
+                                       maxPitch - minPitch + pitchPad * 2);
+
+    // Sync zoom sliders to the post-fit state so the slider thumbs
+    // reflect the new zoom instead of lagging on the old value.
+    hZoomSlider.setValue(state.hZoom, juce::dontSendNotification);
+    vZoomSlider.setValue(10.0 - (state.visibleRange - 12) / 12.0,
+                         juce::dontSendNotification);
 
     updateScrollBars();
     repaint();

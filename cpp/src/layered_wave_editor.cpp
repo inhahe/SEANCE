@@ -1697,7 +1697,8 @@ private:
 //                          cross-eyed; this is how a Holmes stereoscope or
 //                          a VR headset presents the pair).
 class LayeredWaveEditorComponent::ScatterView : public juce::Component,
-                                                public juce::SettableTooltipClient {
+                                                public juce::SettableTooltipClient,
+                                                public juce::DragAndDropTarget {
 public:
     explicit ScatterView(LayeredWaveEditorComponent& o) : owner(o) {}
 
@@ -1996,6 +1997,56 @@ public:
             // both render once over the whole viewport.
             paintScene(g, full, 0);
         }
+
+        // Drop / cell-drag indicators painted on top so they sit above
+        // the dots and wireframe.
+        drawDragOverlays(g, full);
+    }
+
+    // Highlight rings for in-progress drags. Two cases:
+    //   * Grid cell-drag in progress: paint a green ring around the
+    //     destination cell so the user sees where the swap will land.
+    //   * Library drop in progress: paint a green ring at the drop
+    //     target (a grid cell in Grid mode, the cursor position in
+    //     Scatter mode).
+    // Both use the same green for visual consistency - drop = drop,
+    // regardless of source.
+    void drawDragOverlays(juce::Graphics& g, juce::Rectangle<float> full) {
+        auto ringAtScreen = [&g](juce::Point<float> p, float radius) {
+            g.setColour(juce::Colour(0xff5be36e).withAlpha(0.95f));
+            g.drawEllipse(p.x - radius, p.y - radius,
+                          radius * 2.0f, radius * 2.0f, 2.0f);
+            g.setColour(juce::Colour(0xff5be36e).withAlpha(0.18f));
+            g.fillEllipse(p.x - radius, p.y - radius,
+                          radius * 2.0f, radius * 2.0f);
+        };
+
+        auto ringAtCell = [&](int cellIdx) {
+            if (cellIdx < 0 || cellIdx >= owner.wave.gridCellCount()) return;
+            auto area = sceneRectForPoint(full.getCentre(), full);
+            computeViewTransform(area);
+            auto cellPos = owner.wave.cellCenterPosition(cellIdx);
+            int needN = std::max(2, owner.wave.numDimensions());
+            while ((int)cellPos.size() < needN) cellPos.push_back(0.5f);
+            auto sp = projectToScreen(cellPos, area);
+            ringAtScreen(sp, 12.0f);
+        };
+
+        // 1. Grid cell-drag preview (destination cell).
+        if (dragCellSrcIdx >= 0 && dragCellDstIdx >= 0
+            && dragCellDstIdx != dragCellSrcIdx
+            && owner.wave.mode == WavetableMode::Grid) {
+            ringAtCell(dragCellDstIdx);
+        }
+
+        // 2. Library-row drop hover.
+        if (hoverDropActive) {
+            if (owner.wave.mode == WavetableMode::Grid) {
+                ringAtCell(hoverDropCellIdx);
+            } else {
+                ringAtScreen(hoverDropScreenPt, 10.0f);
+            }
+        }
     }
 
     // Render one stereoscopic eye-view (or the flat monoscopic / anaglyph
@@ -2276,14 +2327,16 @@ public:
         auto legend = area.reduced(8.0f);
         float lx = legend.getRight() - 200.0f;
         float ly = legend.getBottom() - 14.0f;
-        // Row 1: blue dot = "frame (waveform)".
+        // Row 1: blue dot = "waveform". (Traditional wavetable-synth jargon
+        // calls each cycle a "frame", but SoundShop targets non-musicians,
+        // so the plain term "waveform" reads better here.)
         g.setColour(juce::Colour(0xff5fb3ff).withAlpha(0.9f));
         g.fillEllipse(lx, ly, 8.0f, 8.0f);
         g.setColour(juce::Colours::white.withAlpha(0.85f));
         g.drawEllipse(lx, ly, 8.0f, 8.0f, 1.0f);
         g.setColour(juce::Colours::white.withAlpha(0.75f));
         g.setFont(10.0f);
-        g.drawText("= frame (waveform)",
+        g.drawText("= waveform",
                    (int)(lx + 12), (int)(ly - 2), 140, 12,
                    juce::Justification::left);
 
@@ -2367,8 +2420,26 @@ public:
     // ---- Mouse interaction ----
     int dragFrameIdx = -1;
     bool dragCursor = false;
-    bool dragOrbit = false;             // right-button camera orbit
+    bool dragOrbit = false;             // left- or right-button camera orbit
     juce::Point<float> orbitStart;       // mouse position when orbit drag began
+
+    // Grid-mode "drag this cell to another cell" state. Set on mouseDown
+    // when a populated cell is left-clicked AND the wavetable has 1 or 2
+    // grid dims (higher dims have axes that the view doesn't show, so the
+    // drag would be ambiguous). dragCellDstIdx is the closest cell under
+    // the cursor right now; on mouseUp, if src != dst, the two cells'
+    // library refs are swapped (matching the axis-stepper drag path used
+    // by handleSelFrameGridChange). -1 means no drag active / no target.
+    int dragCellSrcIdx = -1;
+    int dragCellDstIdx = -1;
+
+    // Library-drag-over state. While a Library row is being dragged over
+    // the view, this is the index of the cell (Grid) or -2 (Scatter, drop
+    // at cursor) that the drop will land on. Used to paint a hover ring
+    // so the user sees where the drop will go. -1 = no drag active.
+    int hoverDropCellIdx = -1;
+    bool hoverDropActive = false;
+    juce::Point<float> hoverDropScreenPt;
     // Snapshots of the (axisX,axisZ) and (axisY,axisZ) plane angles when
     // an orbit drag begins. Horizontal mouse delta adds onto the
     // (axisX, axisZ) plane angle (visually "yaw" - swings the scene left
@@ -2421,6 +2492,30 @@ public:
         return best;
     }
 
+    // Like hitTestGridCell, but considers EMPTY cells too and has no
+    // distance cap - returns the closest cell regardless of how far away
+    // the cursor is. Used as a drop target locator (cell-drag swap, and
+    // Library-row drop into an empty cell). Returns -1 only when there
+    // are no cells at all.
+    int nearestGridCellAny(juce::Point<float> p, juce::Rectangle<float> area) const {
+        if (owner.wave.mode != WavetableMode::Grid) return -1;
+        computeViewTransform(area);
+        const int total = owner.wave.gridCellCount();
+        if (total <= 0) return -1;
+        int best = -1;
+        float bestD2 = std::numeric_limits<float>::max();
+        for (int i = 0; i < total; ++i) {
+            auto cellPos = owner.wave.cellCenterPosition(i);
+            int needN = std::max(2, owner.wave.numDimensions());
+            while ((int)cellPos.size() < needN) cellPos.push_back(0.5f);
+            auto sp = projectToScreen(cellPos, area);
+            float dx = sp.x - p.x, dy = sp.y - p.y;
+            float d2 = dx*dx + dy*dy;
+            if (d2 < bestD2) { bestD2 = d2; best = i; }
+        }
+        return best;
+    }
+
     // Inverse projection: convert a screen point back into the projected
     // axes (axisX, axisY) of the N-D position. Other axes are left at the
     // current value of `current`. Only meaningful in 2D mode (any 3D mode
@@ -2456,11 +2551,25 @@ public:
         return out;
     }
 
+    // Begin an orbit drag from the given start point. Used by both the
+    // right-button-on-empty path (legacy gesture) and the left-button-on-
+    // empty path. Operates in both 2D and 3D views - in a flat 2D view
+    // the rotation still tips the wavetable's hidden axes into the
+    // projection, so the user sees dots move and can keep tipping until
+    // axes that were edge-on come into view.
+    void beginOrbit(juce::Point<float> startPos) {
+        dragOrbit = true;
+        orbitStart = startPos;
+        orbitStartYaw   = owner.getScatterPlaneAngle(axisX, axisZ);
+        orbitStartPitch = owner.getScatterPlaneAngle(axisY, axisZ);
+    }
+
     void mouseDown(const juce::MouseEvent& e) override {
         // Right-button (or any mod-popup): if it lands on a dot, show that
         // frame's context menu (Remove from wavetable). On empty space it
-        // starts a camera orbit in any 3D mode. In flat 2D mode with no
-        // dot under the click there's nothing to do.
+        // starts a camera orbit. Used to be 3D-only, but the X-Z / Y-Z
+        // rotation it drives is also meaningful in a "flat" 2D view (it
+        // tips hidden dims into the projection), so 2D gets it too now.
         if (e.mods.isRightButtonDown() || e.mods.isPopupMenu()) {
             auto fullR = getLocalBounds().toFloat().reduced(2.0f);
             auto areaR = sceneRectForPoint(e.position, fullR);
@@ -2471,21 +2580,21 @@ public:
                 showFrameContextMenu(hit, e.getScreenPosition());
                 return;
             }
-            if (is3D()) {
-                dragOrbit = true;
-                orbitStart = e.position;
-                orbitStartYaw   = owner.getScatterPlaneAngle(axisX, axisZ);
-                orbitStartPitch = owner.getScatterPlaneAngle(axisY, axisZ);
-            }
+            beginOrbit(e.position);
             return;
         }
 
         auto full = getLocalBounds().toFloat().reduced(2.0f);
         auto area = sceneRectForPoint(e.position, full);
 
-        // Grid mode: click selects the cell's frame; clicks in empty space
-        // are a no-op. Cells are locked to fixed centres so there's nothing
-        // to drag here (moving frames between cells is a planned feature).
+        // Grid mode left-click:
+        //  - On a populated cell: select it (switchToFrame); if the
+        //    wavetable has 1 or 2 grid dims, ALSO arm a cell-drag so the
+        //    user can drag the populated cell onto another cell and the
+        //    two get swapped on release.
+        //  - On empty cell / empty space: start an orbit drag instead of
+        //    no-opping. This is what makes the view rotatable by dragging
+        //    anywhere in 2D / 3D.
         if (owner.wave.mode != WavetableMode::Scatter) {
             int cell = hitTestGridCell(e.position, area);
             if (cell >= 0) {
@@ -2493,7 +2602,16 @@ public:
                 // (currentLibraryId) is synced when the clicked cell holds
                 // a library entry, matching the Cells list behaviour.
                 owner.switchToFrame(cell);
+                const bool dimsOK = ((int)owner.wave.gridDims.size() <= 2);
+                if (dimsOK
+                    && owner.wave.libraryIdForCell(cell) >= 0) {
+                    dragCellSrcIdx = cell;
+                    dragCellDstIdx = cell;
+                }
                 repaint();
+            } else {
+                // Empty cell or background - start orbit.
+                beginOrbit(e.position);
             }
             return;
         }
@@ -2509,64 +2627,75 @@ public:
         }
 
         if (hit >= 0) {
-            // Select + start drag. Route through switchToFrame() so the
-            // editor target (currentLibraryId) follows the click to the
-            // scatter dot's library entry.
+            // Select + (conditionally) start drag. Route through
+            // switchToFrame() so the editor target (currentLibraryId)
+            // follows the click to the scatter dot's library entry. Only
+            // arm the drag-to-move path when the wavetable has 1 or 2
+            // scatter dims - higher dim counts would only update axisX /
+            // axisY anyway (the inverse projection is ambiguous), which
+            // tends to feel like the dot snaps unexpectedly.
             owner.switchToFrame(hit);
-            dragFrameIdx = hit;
+            const bool dimsOK = (owner.wave.scatterDims <= 2);
+            dragFrameIdx = dimsOK ? hit : -1;
             dragCursor = false;
             repaint();
             return;
         }
 
-        // No frame was hit and we're in Scatter mode: nothing to do. The
-        // old behaviour was to move a yellow Position cursor here, but the
-        // cursor concept has been removed - playback position is driven by
-        // the synth node's Position params (cables / sliders) instead.
-        // Use the + Frame button on the toolbar to place a new frame.
+        // No frame was hit and we're in Scatter mode: start an orbit drag.
+        // The old behaviour was to move a yellow Position cursor here, but
+        // the cursor concept has been removed - playback position is driven
+        // by the synth node's Position params (cables / sliders) instead.
+        // Use + Waveform in the sidebar to add a new dot, or drag a Library
+        // row onto the view to drop one at the cursor.
         dragCursor = false;
         dragFrameIdx = -1;
+        beginOrbit(e.position);
     }
 
     void mouseDrag(const juce::MouseEvent& e) override {
-        // Orbit drag is allowed in both modes (it just rotates the view).
-        // In Grid mode there's nothing else to drag, so orbit is the only
-        // path here.
-        if (owner.wave.mode != WavetableMode::Scatter) {
-            if (dragOrbit) {
-                float dx = e.position.x - orbitStart.x;
-                float dy = e.position.y - orbitStart.y;
-                float newYaw   = orbitStartYaw + dx * 0.5f;
-                float newPitch = juce::jlimit(-85.0f, 85.0f,
-                                               orbitStartPitch + dy * 0.5f);
-                owner.setScatterPlaneAngle(axisX, axisZ, newYaw);
-                owner.setScatterPlaneAngle(axisY, axisZ, newPitch);
-                owner.notifyScatterViewRotated();
-            }
-            return;
-        }
-
-        if (dragOrbit) {
+        // Helper: apply an orbit step from current mouse position. Shared
+        // by Grid and Scatter so the rotation feel is identical.
+        auto applyOrbit = [this, &e]() {
+            float dx = e.position.x - orbitStart.x;
+            float dy = e.position.y - orbitStart.y;
+            float newYaw   = orbitStartYaw + dx * 0.5f;
+            float newPitch = juce::jlimit(-85.0f, 85.0f,
+                                           orbitStartPitch + dy * 0.5f);
             // Orbit speed: ~0.5 degree per pixel. The pitch axis is
             // clamped to +/-85 degrees to avoid the gimbal-flip jolt at
             // the poles - that clamp doesn't generalise to the full N-D
             // rotation set, so we only apply it to the (axisY, axisZ)
             // angle that the drag actually writes (other planes from
             // the slider sidebar are unrestricted).
-            float dx = e.position.x - orbitStart.x;
-            float dy = e.position.y - orbitStart.y;
-            float newYaw   = orbitStartYaw + dx * 0.5f;
-            float newPitch = juce::jlimit(-85.0f, 85.0f,
-                                           orbitStartPitch + dy * 0.5f);
             owner.setScatterPlaneAngle(axisX, axisZ, newYaw);
             owner.setScatterPlaneAngle(axisY, axisZ, newPitch);
             owner.notifyScatterViewRotated();
+        };
+
+        // Grid mode: orbit OR cell-drag. Both are mutually exclusive (set
+        // up in mouseDown), so a single if/else chain is enough.
+        if (owner.wave.mode != WavetableMode::Scatter) {
+            if (dragOrbit) { applyOrbit(); return; }
+
+            if (dragCellSrcIdx >= 0) {
+                auto full = getLocalBounds().toFloat().reduced(2.0f);
+                auto area = sceneRectForPoint(e.position, full);
+                int dst = nearestGridCellAny(e.position, area);
+                if (dst != dragCellDstIdx) {
+                    dragCellDstIdx = dst;
+                    repaint();
+                }
+            }
             return;
         }
+
+        if (dragOrbit) { applyOrbit(); return; }
 
         auto full = getLocalBounds().toFloat().reduced(2.0f);
         auto area = sceneRectForPoint(e.position, full);
         if (dragFrameIdx >= 0 && dragFrameIdx < (int)owner.wave.scatterFrames.size()) {
+            // mouseDown already gated this on scatterDims <= 2.
             auto& sf = owner.wave.scatterFrames[dragFrameIdx];
             sf.position = screenToPosition(e.position, area, sf.position);
             owner.notifyPopoutFrameOrPositionChanged();
@@ -2576,9 +2705,129 @@ public:
     }
 
     void mouseUp(const juce::MouseEvent&) override {
+        // Commit any pending Grid cell-swap drag. If the user dropped
+        // back onto the source cell (or never moved off it), this is a
+        // no-op - the click already selected the cell in mouseDown.
+        if (dragCellSrcIdx >= 0 && dragCellDstIdx >= 0
+            && dragCellSrcIdx != dragCellDstIdx) {
+            commitGridCellDrag(dragCellSrcIdx, dragCellDstIdx);
+        }
         dragFrameIdx = -1;
         dragCursor = false;
         dragOrbit = false;
+        dragCellSrcIdx = -1;
+        dragCellDstIdx = -1;
+    }
+
+    // Swap the library refs of two grid cells. Mirrors the swap done by
+    // handleSelFrameGridChange (axis-stepper drag): src lib id moves to
+    // dst, dst lib id moves to src (so a move-onto-empty leaves the
+    // source empty, and a move-onto-populated displaces the existing dot
+    // back to the source cell). Selection follows the user's intent and
+    // stays with the moved waveform at dst.
+    void commitGridCellDrag(int srcIdx, int dstIdx) {
+        if (owner.wave.mode != WavetableMode::Grid) return;
+        if (srcIdx < 0 || dstIdx < 0) return;
+        if (srcIdx >= (int)owner.wave.cellWaveformIds.size()
+            || dstIdx >= (int)owner.wave.cellWaveformIds.size()) return;
+        std::swap(owner.wave.cellWaveformIds[(size_t)srcIdx],
+                  owner.wave.cellWaveformIds[(size_t)dstIdx]);
+        owner.currentFrameIdx = dstIdx;
+        const int destLibId = owner.wave.libraryIdForCell(dstIdx);
+        if (destLibId >= 0) owner.currentLibraryId = destLibId;
+        owner.wave.scatterFromGridSnapshot.reset();
+        owner.updateHintText();
+        owner.rebuildRows();
+        owner.onLayerChanged();
+        owner.notifyPopoutDocMutated();
+    }
+
+    // ---- DragAndDropTarget: accept Library-row drops --------------------
+    //
+    // A Library row in the sidebar can be dragged onto the view and
+    // released to place that library entry into the wavetable. In Grid
+    // mode the drop assigns the entry to whichever cell is nearest the
+    // cursor. In Scatter mode it creates a new ScatterFrame at the drop
+    // position (using screenToPosition's inverse projection - axisX /
+    // axisY get the cursor's coordinates, any extra dims default to 0.5).
+    // Description format is "libdrag:<entryId>"; see LibraryDragButton
+    // in WavetableViewWindowContent.
+    static int parseLibraryDragId(const juce::var& description) {
+        const juce::String s = description.toString();
+        const juce::String prefix("libdrag:");
+        if (!s.startsWith(prefix)) return -1;
+        return s.substring(prefix.length()).getIntValue();
+    }
+
+    bool isInterestedInDragSource(const SourceDetails& d) override {
+        return parseLibraryDragId(d.description) >= 0;
+    }
+
+    void itemDragEnter(const SourceDetails& d) override {
+        if (parseLibraryDragId(d.description) < 0) return;
+        hoverDropActive = true;
+        itemDragMove(d);
+    }
+
+    void itemDragMove(const SourceDetails& d) override {
+        if (parseLibraryDragId(d.description) < 0) return;
+        hoverDropActive = true;
+        hoverDropScreenPt = d.localPosition.toFloat();
+        if (owner.wave.mode == WavetableMode::Grid) {
+            auto full = getLocalBounds().toFloat().reduced(2.0f);
+            auto area = sceneRectForPoint(hoverDropScreenPt, full);
+            hoverDropCellIdx = nearestGridCellAny(hoverDropScreenPt, area);
+        } else {
+            hoverDropCellIdx = -1;
+        }
+        repaint();
+    }
+
+    void itemDragExit(const SourceDetails&) override {
+        hoverDropActive = false;
+        hoverDropCellIdx = -1;
+        repaint();
+    }
+
+    void itemDropped(const SourceDetails& d) override {
+        const int entryId = parseLibraryDragId(d.description);
+        hoverDropActive = false;
+        hoverDropCellIdx = -1;
+        if (entryId < 0) { repaint(); return; }
+        // Verify the entry still exists - drag-and-drop is async, so the
+        // user could in principle have deleted the source row mid-drag.
+        if (owner.wave.findLibraryIndexById(entryId) < 0) { repaint(); return; }
+
+        auto full = getLocalBounds().toFloat().reduced(2.0f);
+        const juce::Point<float> pos = d.localPosition.toFloat();
+        auto area = sceneRectForPoint(pos, full);
+
+        if (owner.wave.mode == WavetableMode::Grid) {
+            const int cell = nearestGridCellAny(pos, area);
+            if (cell < 0) { repaint(); return; }
+            owner.wave.assignCellToLibrary(cell, entryId);
+            owner.currentFrameIdx = cell;
+            owner.currentLibraryId = entryId;
+        } else {
+            // Scatter: place a new dot at the drop position. screenToPosition
+            // pads the position vector to wave.numDimensions() with 0.5 for
+            // any dims the view doesn't show, which is what the user spec
+            // calls "automatically set upon release" for >2D wavetables.
+            std::vector<float> seedPos(owner.wave.numDimensions(), 0.5f);
+            std::vector<float> newPos = screenToPosition(pos, area, seedPos);
+            ScatterFrame sf;
+            sf.waveformId = entryId;
+            sf.position = std::move(newPos);
+            owner.wave.scatterFrames.push_back(std::move(sf));
+            owner.currentFrameIdx = (int)owner.wave.scatterFrames.size() - 1;
+            owner.currentLibraryId = entryId;
+        }
+        owner.wave.scatterFromGridSnapshot.reset();
+        owner.updateHintText();
+        owner.rebuildRows();
+        owner.onLayerChanged();
+        owner.notifyPopoutDocMutated();
+        repaint();
     }
 
     // Double-click a frame dot (Scatter) or grid cell (Grid) to jump
@@ -2717,6 +2966,32 @@ class LayeredWaveEditorComponent::WavetableViewWindowContent
     : public juce::Component
 {
 public:
+    // A Library row that doubles as a drag source: the user can grab the
+    // row and drop it onto the arrangement view to place that waveform
+    // into a cell (Grid) or as a new dot (Scatter). The button's onClick
+    // (set in rebuildLibraryList) keeps working for plain clicks because
+    // JUCE only routes mouseUp to the button when no drag was started.
+    class LibraryDragButton : public juce::TextButton {
+    public:
+        LibraryDragButton(int libId_) : libId(libId_) {}
+        void mouseDrag(const juce::MouseEvent& e) override {
+            // Only kick off a drag once the user has moved a few pixels;
+            // a tiny jitter on click shouldn't suddenly become a drop.
+            if (e.getDistanceFromDragStart() < 5) {
+                juce::TextButton::mouseDrag(e);
+                return;
+            }
+            if (auto* dnd = juce::DragAndDropContainer::findParentDragContainerFor(this)) {
+                if (!dnd->isDragAndDropActive()) {
+                    juce::var desc(juce::String("libdrag:") + juce::String(libId));
+                    dnd->startDragging(desc, this);
+                }
+            }
+        }
+    private:
+        int libId;
+    };
+
     explicit WavetableViewWindowContent(LayeredWaveEditorComponent& o)
         : owner(o)
     {
@@ -3286,7 +3561,7 @@ private:
                 label += juce::String(" (used ") + juce::String(useCount)
                        + juce::String::fromUTF8("\xC3\x97)");
 
-            auto btn = std::make_unique<juce::TextButton>();
+            auto btn = std::make_unique<LibraryDragButton>(entryId);
             btn->setButtonText(label);
             btn->setClickingTogglesState(true);
             btn->setToggleState(entryId == owner.currentLibraryId,
@@ -3306,7 +3581,9 @@ private:
                 "Click to edit this waveform in the right pane. Edits flow into "
                 "every cell that references it. Use 'Assign to selected cell' "
                 "below to place this waveform in the cell currently selected "
-                "in the arrangement view.");
+                "in the arrangement view. Drag this row onto the wavetable view "
+                "to drop it as a new waveform at the cursor (or into a cell in "
+                "Grid mode).");
             btn->onClick = [this, entryId]() {
                 owner.setEditingLibraryEntry(entryId);
                 rebuildLibraryList();
@@ -4852,17 +5129,29 @@ void LayeredWaveEditorComponent::resized() {
     }
 
     // Top button row spans the whole window:
-    //                                                       [?] [Apply] [Close]
+    //   [Render mode: Direct] [Additive bank]              [?] [Apply] [Close]
     // "+ Waveform" used to sit on the left here; it has been moved into
     // the arrangement-view sidebar (next to the Library list) so it lives
-    // beside the data structure it mutates. The Compare panel is
-    // per-waveform and lives at the top of the right pane, not here.
+    // beside the data structure it mutates. "Render mode" sets the synth
+    // node's Synth Mode param, which applies to the WHOLE wavetable (not
+    // per-waveform), so it belongs in the global toolbar rather than the
+    // right-pane per-waveform editor where it used to sit.
     auto top = a.removeFromTop(28);
     closeBtn.setBounds(top.removeFromRight(60));
     top.removeFromRight(4);
     applyBtn.setBounds(top.removeFromRight(60));
     top.removeFromRight(4);
     helpBtn.setBounds(top.removeFromRight(26));
+    top.removeFromRight(12); // separator gap from the right-side cluster
+
+    compareLabel.setVisible(true);
+    compareDirectBtn.setVisible(true);
+    compareAdditiveBtn.setVisible(true);
+    compareLabel.setBounds(top.removeFromLeft(80));
+    top.removeFromLeft(4);
+    compareDirectBtn.setBounds(top.removeFromLeft(60));
+    top.removeFromLeft(2);
+    compareAdditiveBtn.setBounds(top.removeFromLeft(100));
 
     a.removeFromTop(6);
 
@@ -4885,15 +5174,13 @@ void LayeredWaveEditorComponent::resized() {
         arrangementView->setBounds(a);
     }
 
-    // ---- Right pane: capture flow OR (Compare + editor body + preview) ----
+    // ---- Right pane: capture flow OR (editor body + preview) ----
     // While a capture is in progress, the capture component occupies the
     // entire right pane in place of the normal per-frame editor stack.
     // Hide the per-frame widgets so they don't poke through, and skip the
-    // rest of the right-pane layout.
+    // rest of the right-pane layout. The Render mode buttons stay visible
+    // - they live in the top toolbar now and apply to the whole node.
     if (capturePanel) {
-        compareLabel.setVisible(false);
-        compareDirectBtn.setVisible(false);
-        compareAdditiveBtn.setVisible(false);
         if (embeddedFrameEditor) embeddedFrameEditor->setVisible(false);
         layersViewport.setVisible(false);
         addLayerBtn.setVisible(false);
@@ -4901,19 +5188,6 @@ void LayeredWaveEditorComponent::resized() {
         capturePanel->setBounds(right);
         return;
     }
-
-    // Compare panel (Direct / Additive bank) at the top of the right pane.
-    compareLabel.setVisible(true);
-    compareDirectBtn.setVisible(true);
-    compareAdditiveBtn.setVisible(true);
-    auto cmpRow = right.removeFromTop(24);
-    compareLabel.setBounds(cmpRow.removeFromLeft(80));
-    cmpRow.removeFromLeft(4);
-    compareDirectBtn.setBounds(cmpRow.removeFromLeft(60));
-    cmpRow.removeFromLeft(2);
-    compareAdditiveBtn.setBounds(cmpRow.removeFromLeft(100));
-
-    right.removeFromTop(6);
 
     // Preview strip at the bottom of the right pane. Bounds are stashed for
     // paint() so the geometry stays in one place.

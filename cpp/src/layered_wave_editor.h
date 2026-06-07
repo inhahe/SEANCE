@@ -345,7 +345,15 @@ struct WavetableDoc {
 //
 // The editor holds a WavetableDoc (one or more frames). Only one frame is
 // editable at a time - the current frame - selected via frame-tab buttons.
-class LayeredWaveEditorComponent : public juce::Component, private juce::Timer {
+// Inherits DragAndDropContainer so the arrangement view can accept drops
+// from the Library list (dropped library entry -> new cell or scatter
+// dot at the cursor) and from cell-drag-to-cell (1D/2D wavetables only).
+// The container is parented high enough in the tree that all drag
+// sources and targets (Library row buttons, the embedded ScatterView)
+// can find it via DragAndDropContainer::findParentDragContainerFor.
+class LayeredWaveEditorComponent : public juce::Component,
+                                   public juce::DragAndDropContainer,
+                                   private juce::Timer {
 public:
     LayeredWaveEditorComponent(NodeGraph& graph, int nodeId, std::function<void()> onApply);
     ~LayeredWaveEditorComponent() override;

@@ -126,6 +126,65 @@ private:
     float phase = 0;
 };
 
+// Parallel MIDI generator that emits the MPE Configuration Message (the RPN
+// "zone" handshake) into a hosted plugin's MIDI input, so MPE-capable plugins
+// interpret incoming channels 2..16 as per-note member channels.
+//
+// Why a separate node wired *alongside* the real MIDI source (rather than
+// transforming the note stream): it only ever ADDS the RPN handshake and never
+// touches notes, so a non-MPE plugin - which simply ignores the unknown RPN -
+// is byte-for-byte unaffected. And because it injects directly at the plugin's
+// graph input, the handshake bypasses the cable-level MIDI-Learn CC filter that
+// could otherwise strip the RPN's CC 6/38/100/101 bytes.
+//
+// Lifecycle: emits for the first few blocks after construction (covers plugin
+// load, graph rebuild, and the MPE toggle - all of which recreate this node)
+// and re-arms on every transport play-start edge (covers plugins that reset
+// their zone layout when playback stops).
+class MpeConfigProcessor : public juce::AudioProcessor {
+public:
+    MpeConfigProcessor(Node& n, Transport& t) : node(n), transport(t) {}
+    const juce::String getName() const override { return "MPE Config"; }
+    void prepareToPlay(double, int) override {}
+    void releaseResources() override {}
+    void processBlock(juce::AudioBuffer<float>& buf, juce::MidiBuffer& midi) override {
+        buf.clear();
+        const bool playing = transport.playing;
+        if (playing && !wasPlaying) emitCountdown = kEmitBlocks;
+        wasPlaying = playing;
+        if (emitCountdown > 0) {
+            --emitCountdown;
+            // Lower zone: master channel 1, member channels 2..16 (15 of them).
+            // Per-note bend range from the node (default 48 semis); master bend
+            // range 2 to match the legacy/global pitch-wheel range used
+            // elsewhere (see signal_modulation.h / TerrainSynth).
+            const int pnRange = juce::jlimit(0, 96, node.mpePitchBendRange);
+            const juce::MidiBuffer mcm = juce::MPEMessages::setLowerZone(15, pnRange, 2);
+            for (const auto meta : mcm)
+                midi.addEvent(meta.getMessage(), 0);
+        }
+    }
+    double getTailLengthSeconds() const override { return 0; }
+    bool acceptsMidi() const override { return false; }
+    bool producesMidi() const override { return true; }
+    bool isBusesLayoutSupported(const BusesLayout&) const override { return true; }
+    juce::AudioProcessorEditor* createEditor() override { return nullptr; }
+    bool hasEditor() const override { return false; }
+    int getNumPrograms() override { return 1; }
+    int getCurrentProgram() override { return 0; }
+    void setCurrentProgram(int) override {}
+    const juce::String getProgramName(int) override { return {}; }
+    void changeProgramName(int, const juce::String&) override {}
+    void getStateInformation(juce::MemoryBlock&) override {}
+    void setStateInformation(const void*, int) override {}
+private:
+    Node& node;
+    Transport& transport;
+    bool wasPlaying = false;
+    static constexpr int kEmitBlocks = 4;
+    int emitCountdown = kEmitBlocks;
+};
+
 class GraphProcessor {
 public:
     GraphProcessor();

@@ -9,6 +9,7 @@
 #include "midi_mod_node.h"
 #include "midi_device_wizard.h"
 #include "xy_pad.h"
+#include "signal_shape_node.h"
 #include "spectrum_tap.h"
 #include "analyzer_nodes.h"
 #include "convolution_processor.h"
@@ -132,7 +133,12 @@ MainContentComponent::MainContentComponent() {
     // Play/Stop buttons skip tooltips - labels are self-explanatory and
     // universally understood. Keeping tooltips would just clutter the
     // hover layer over the most-used controls.
-    stopBtn.setTooltip("Stop playback and rewind to the start of the loop (or to 0 if loop is off)");
+    // Stop is only meaningful while the song is actually playing; it starts
+    // disabled (with an explanatory tooltip) and the timer enables it during
+    // playback. See the timer callback for the live enable/tooltip update.
+    stopBtn.setEnabled(false);
+    stopBtn.setTooltip("Nothing is playing right now - press Play to start. "
+                       "Stop then halts playback and rewinds.");
     recordBtn.setTooltip("Start playback while arming any tracks ready to record audio or MIDI input");
     fitAllBtn.setTooltip("Zoom and pan the node graph so every node fits in the visible area");
     metroBtn.setTooltip("Toggle the metronome click during playback and recording");
@@ -249,10 +255,16 @@ MainContentComponent::MainContentComponent() {
             bounceToAudioTrack();
     };
     // Position display
-    positionLabel.setText("1 : 1.0", juce::dontSendNotification);
+    positionLabel.setText("0:00.0   Bar 1:1.0", juce::dontSendNotification);
     positionLabel.setFont(juce::Font(juce::Font::getDefaultMonospacedFontName(), 14.0f, 0));
     positionLabel.setColour(juce::Label::textColourId, juce::Colours::limegreen);
-    positionLabel.setTooltip("Current transport position, shown as bar : beat");
+    positionLabel.setTooltip("Playback position / total song length, shown two ways:\n"
+                             "  - left: elapsed time / total time as minutes:seconds "
+                             "(e.g. 0:00.0/15:30.0)\n"
+                             "  - right: musical position / total bars as Bar:Beat "
+                             "(both 1-based, so the song starts at Bar 1, Beat 1.0)\n"
+                             "The total is shown once the song has clips (or an explicit "
+                             "length set via the Song button).");
     addAndMakeVisible(positionLabel);
 
     // Time signature
@@ -375,6 +387,11 @@ MainContentComponent::MainContentComponent() {
     graphComponent->onFreezeNode = [this](int nodeId) { freezeNode(nodeId); };
     graphComponent->onRunScript = [this](int nodeId) { showScriptConsoleForNode(nodeId); };
     graphComponent->onOpenHelpDoc = [this](juce::String rel) { openHelpDoc(rel); };
+    graphComponent->onSignalShapeManualTrigger = [this](int nodeId) {
+        if (auto* proc = dynamic_cast<SignalShapeProcessor*>(
+                audioEngine.getGraphProcessor().getProcessorForNode(nodeId)))
+            proc->fireManualTrigger();
+    };
 
     // Load prefs, plugin cache, recent projects (audio engine deferred to timer)
     pluginSettings.load("soundshop_plugins.cfg");
@@ -673,7 +690,8 @@ void MainContentComponent::resized() {
     timeSigLabel.setBounds(0, 0, 0, 0); // hidden
     timeSigCombo.setBounds(transport.getX() + x, transport.getY() + 4, 75, 24);
     x += 78;
-    positionLabel.setBounds(transport.getX() + x, transport.getY() + 2, 80, 28);
+    // Wide enough for the current/total form, e.g. "0:00.0/15:30.0   Bar 1:1.0/20".
+    positionLabel.setBounds(transport.getX() + x, transport.getY() + 2, 270, 28);
 
     // Split: graph on top, editors on bottom, routing strip between them
     if (!editorPanels.empty()) {
@@ -794,6 +812,32 @@ void MainContentComponent::timerCallback() {
     }
     transport.playing = engineIsPlaying;
 
+    // Stop is only actionable while the song is actually playing. Grey it out
+    // (with an explanatory tooltip) when stopped/paused so it's clear there's
+    // nothing to stop - and re-enable it the moment playback starts. Guarded
+    // on the current enabled state so we don't churn the tooltip every tick.
+    // (See "grayed-out controls must explain themselves" in the project rules.)
+    if (stopBtn.isEnabled() != transport.playing) {
+        stopBtn.setEnabled(transport.playing);
+        stopBtn.setTooltip(transport.playing
+            ? "Stop playback and rewind to the start of the loop (or to 0 if loop is off)"
+            : "Nothing is playing right now - press Play to start. "
+              "Stop then halts playback and rewinds.");
+    }
+
+    // Keep the Loop button's lit/unlit state in sync with the actual loop
+    // setting. The onClick handler sets the colour when the user toggles it,
+    // but looping can also be enabled programmatically - by a project load,
+    // an undo/redo, or a tracker import whose module loops back to a section.
+    // Syncing here (guarded so we don't repaint every tick) makes the button
+    // reflect all of those uniformly. Colours mirror the onClick handler.
+    {
+        juce::Colour want = graph.loopEnabled ? juce::Colour(60, 60, 120)
+                                              : juce::Colour(55, 55, 60);
+        if (loopBtn.findColour(juce::TextButton::buttonColourId) != want)
+            loopBtn.setColour(juce::TextButton::buttonColourId, want);
+    }
+
     // Evaluate Python signals on UI thread and apply to plugin parameters
     if (scriptEngine.isInitialized()) {
         int sample = (int)transport.positionSamples;
@@ -833,11 +877,48 @@ void MainContentComponent::timerCallback() {
             audioEngine.getGraphProcessor().applyAutomation(autoValues);
     }
 
-    // Update position display
+    // Update position display - show BOTH representations so it's clear what
+    // each value means: elapsed wall-clock time (min:sec, starts at 0:00.0,
+    // natural for non-musicians) AND musical position (Bar:Beat, 1-based, for
+    // anyone working to the grid). Each is shown as current / total so the song
+    // length is always visible, e.g. "0:00.0/15:30.0   Bar 1:1.0/20".
     {
-        auto [bar, beat] = transport.timeSigMap.beatToBarBeat(transport.positionBeats());
-        positionLabel.setText(juce::String(bar) + " : " + juce::String(beat, 1),
-                              juce::dontSendNotification);
+        auto fmtMinSec = [](double secs) {
+            if (secs < 0.0) secs = 0.0;
+            int mins = (int)(secs / 60.0);
+            double rem = secs - mins * 60.0;
+            return juce::String(mins) + ":" + juce::String(rem, 1).paddedLeft('0', 4);
+        };
+
+        double secs = (transport.sampleRate > 0.0)
+                          ? (double)transport.positionSamples / transport.sampleRate
+                          : 0.0;
+        auto bb = transport.timeSigMap.beatToBarBeat(transport.positionBeats());
+
+        // Total song length (beats). 0 = no clips / no explicit length, in which
+        // case there's no meaningful total to show.
+        double totalBeats = graph.effectiveSongLengthBeats();
+
+        juce::String timeStr = fmtMinSec(secs);
+        juce::String barStr  = "Bar " + juce::String(bb.first) + ":"
+                             + juce::String(bb.second, 1);
+
+        if (totalBeats > 0.0) {
+            double totalSecs = (transport.sampleRate > 0.0)
+                                   ? transport.beatsToSamples(totalBeats) / transport.sampleRate
+                                   : 0.0;
+            // Total bar count: the bar that the song's end falls in. When the
+            // length lands exactly on a downbeat (beat 1.0), the song fills the
+            // PREVIOUS bar, so a 20-bar song reads "/20" not "/21".
+            auto tot = transport.timeSigMap.beatToBarBeat(totalBeats);
+            int totalBars = tot.first;
+            if (tot.second <= 1.0 + 1e-6 && totalBars > 1) totalBars -= 1;
+
+            timeStr += "/" + fmtMinSec(totalSecs);
+            barStr  += "/" + juce::String(totalBars);
+        }
+
+        positionLabel.setText(timeStr + "   " + barStr, juce::dontSendNotification);
     }
 
     graphComponent->repaint();
@@ -1072,6 +1153,7 @@ juce::PopupMenu MainContentComponent::getMenuForIndex(int idx, const juce::Strin
         menu.addItem(309, "Trigger Node");
         menu.addItem(310, "MIDI Modulator");
         menu.addItem(311, "Convolution Filter");
+        menu.addItem(313, "Signal Shape (LFO / Envelope)");
         menu.addSeparator();
         menu.addItem(312, "Keyboard Shortcuts");
         menu.addSeparator();
@@ -1217,6 +1299,7 @@ void MainContentComponent::menuItemSelected(int menuItemID, int) {
         case 310: openHelpDoc("midi-modulator.html"); break;
         case 311: openHelpDoc("convolution.html"); break;
         case 312: openHelpDoc("keyboard-shortcuts.html"); break;
+        case 313: openHelpDoc("signal-shape.html"); break;
         case 320:
             juce::AlertWindow::showMessageBoxAsync(
                 juce::MessageBoxIconType::InfoIcon,
@@ -2450,6 +2533,14 @@ void MainContentComponent::showMidiMap(int nodeId) {
 }
 
 void MainContentComponent::onPlay() {
+    // If the playhead is parked at or past the end of the song (e.g. a previous
+    // play-once playthrough finished and left the playhead at the end), restart
+    // from the top. Otherwise Play would resume past the last note and produce
+    // silence until a loop wrapped the playhead back to the start.
+    double endBeat = graph.effectiveSongLengthBeats();
+    if (endBeat > 0.0 && transport.positionBeats() >= endBeat - 1e-6)
+        audioEngine.rewindToStart();
+
     transport.playing = true;
     audioEngine.play();
     playBtn.setButtonText("Pause");
@@ -2691,7 +2782,7 @@ void MainContentComponent::upgradeLegacyNodes() {
                 if (p.kind == PinKind::Midi) { hasMidiIn = true; break; }
             if (!hasMidiIn)
                 n.pinsIn.insert(n.pinsIn.begin(),
-                    {graph.getNextId(), "MIDI In", PinKind::Midi, true});
+                    {graph.allocId(), "MIDI In", PinKind::Midi, true});
         }
 
         // Legacy "Reverb" stub: Effect node with name "Reverb" and no
@@ -3014,6 +3105,12 @@ void MainContentComponent::importModFile() {
                     msg += "\n\nSamples saved to:\n" + juce::String(result.sampleDir);
                 projectDirty = true;
                 graph.dirty = true;
+                // Push an undo snapshot so the imported group/tracks/samplers
+                // enter the undo system. Without this the new nodes live only
+                // in the live graph and a later unrelated Ctrl+Z restores a
+                // pre-import snapshot, silently deleting the whole import -
+                // which then gets saved, so the mod "doesn't save/reload".
+                graph.commitSnapshot("Import tracker module");
                 audioEngine.getGraphProcessor().requestRebuild();
                 graphComponent->fitAll();
             } else {

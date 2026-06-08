@@ -90,15 +90,27 @@ inline void clearSignalModulations(Node& node) {
 // messages apply to ALL active voices.
 //
 // Each synth can call this at the top of processBlock after handling
-// note-on/off, then read v.mpePitchBend / v.mpePressure / v.mpeTimbre
-// inside its per-sample loop.
+// note-on/off, then read v.mpe.pitchBend / v.mpe.pressure /
+// v.mpe.polyPressure / v.mpe.timbre inside its per-sample loop (or use
+// effectivePressure(v.mpe) for the combined channel+poly pressure).
 // ==============================================================================
 
 struct MpeVoiceState {
-    float pitchBend = 0.0f;   // semitones, +/- pitchBendRange
-    float pressure  = 0.0f;   // 0..1 (channel aftertouch)
-    float timbre    = 0.5f;   // 0..1 (CC74)
+    float pitchBend    = 0.0f;   // semitones, +/- pitchBendRange
+    float pressure     = 0.0f;   // 0..1 (channel aftertouch - one value per channel)
+    float polyPressure = 0.0f;   // 0..1 (polyphonic key pressure - per note)
+    float timbre       = 0.5f;   // 0..1 (CC74)
 };
+
+// Combined pressure a voice should respond to: channel aftertouch (applies to
+// every note on the channel) plus polyphonic key pressure (this note only),
+// clamped to 0..1. A controller might send either, both, or neither; both
+// fields default to 0 so this is a no-op until pressure actually arrives.
+// Use this as the single "how hard is this note being pressed right now" value
+// for amplitude / brightness swells.
+inline float effectivePressure(const MpeVoiceState& m) {
+    return std::clamp(m.pressure + m.polyPressure, 0.0f, 1.0f);
+}
 
 // Distribute MPE messages from `midi` into a voice array. Each voice
 // must have: bool active, int note, int mpeChannel, MpeVoiceState mpe.
@@ -113,11 +125,21 @@ inline void distributeMpeMessages(const juce::MidiBuffer& midi,
 
         if (msg.isPitchWheel()) {
             float pbNorm = (msg.getPitchWheelValue() - 8192) / 8192.0f;
-            float pbSemi = pbNorm * pitchBendRange;
+            // The pitch-bend range depends on which channel the wheel arrives
+            // on. A *member* channel (MPE, 2..16) carries one note, so it uses
+            // the wide per-note range (default 48 semis). Channel 1 is either a
+            // non-MPE controller (every note on ch 1) or the MPE *master*
+            // channel - in both cases the wheel is a global bend that should
+            // use the standard GM range (+/-2 semis), matching TerrainSynth's
+            // kPitchBendRangeSemis. Using the wide range here would slam a
+            // normal pitch wheel +/-48 semitones (4 octaves).
+            constexpr float kLegacyPitchBendSemis = 2.0f;
             for (auto& v : voices) {
                 if (!v.active) continue;
-                if (v.mpeChannel == ch || ch == 1)
-                    v.mpe.pitchBend = pbSemi;
+                if (ch != 1 && v.mpeChannel == ch)
+                    v.mpe.pitchBend = pbNorm * pitchBendRange;
+                else if (ch == 1)
+                    v.mpe.pitchBend = pbNorm * kLegacyPitchBendSemis;
             }
         } else if (msg.isChannelPressure()) {
             float p = msg.getChannelPressureValue() / 127.0f;
@@ -125,6 +147,21 @@ inline void distributeMpeMessages(const juce::MidiBuffer& midi,
                 if (!v.active) continue;
                 if (v.mpeChannel == ch || ch == 1)
                     v.mpe.pressure = p;
+            }
+        } else if (msg.isAftertouch()) {
+            // Polyphonic key pressure: carries a note number, so it's routed
+            // only to the voice(s) currently holding that note (on the
+            // matching channel, or any channel in non-MPE mode where
+            // everything arrives on channel 1). This is how per-note pressure
+            // reaches the right voice without ever touching a mono signal
+            // cable - the note number is the disambiguator a single signal
+            // can't carry.
+            float p = msg.getAfterTouchValue() / 127.0f;
+            int n = msg.getNoteNumber();
+            for (auto& v : voices) {
+                if (!v.active) continue;
+                if ((v.mpeChannel == ch || ch == 1) && v.note == n)
+                    v.mpe.polyPressure = p;
             }
         } else if (msg.isController() && msg.getControllerNumber() == 74) {
             float t = msg.getControllerValue() / 127.0f;

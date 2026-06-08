@@ -3,6 +3,7 @@
 #include "wavetable_frame.h"
 #include <juce_gui_basics/juce_gui_basics.h>
 #include <vector>
+#include <map>
 #include <functional>
 #include <string>
 #include <memory>
@@ -44,6 +45,96 @@ struct WaveLayer {
     std::string formulaExpr = "sin(x)";
 };
 
+// Editor component for a single WaveLayer. Used by the wavetable editor (one
+// row per layer in a stack) and by the SignalShape editor (one editor per
+// "layer" composing the LFO/envelope shape). The editor owns no model state
+// itself - it edits the WaveLayer pointed to by `layerPtr`, and notifies the
+// owner via callbacks whenever the user mutates anything.
+//
+// Lifetime contract: the WaveLayer pointed to must outlive the editor, and
+// must not be relocated (vector reallocation, erase, etc.) while the editor
+// holds a pointer to it. The owner is responsible for calling setLayerPtr()
+// whenever the underlying storage moves. The wavetable editor's solution is
+// to rebuild every editor whenever the layer vector mutates - that keeps the
+// pointer logic trivial at the cost of a UI rebuild per add/delete (cheap
+// since the user can't add/delete fast enough to notice).
+class WaveLayerEditor : public juce::Component {
+public:
+    struct Callbacks {
+        // Required. Called whenever the user mutates the layer through any
+        // control on this editor. The owner typically responds by re-rendering
+        // a preview / committing to the model / requesting a graph rebuild.
+        std::function<void()> onChanged;
+        // Optional. If set, a small "X" delete button appears in the top-right
+        // and invokes this when clicked. The owner is responsible for actually
+        // removing the layer from its container - this editor just signals
+        // the intent. If null, the delete button is hidden (single-layer
+        // editors that don't support deletion).
+        std::function<void()> onDelete;
+        // Optional. If set, the row label reads "Layer N" using the returned
+        // 1-based index. Called every syncFromModel(). If null, the label
+        // reads "Layer" with no index suffix.
+        std::function<int()> indexForLabel;
+    };
+
+    WaveLayerEditor(WaveLayer* layerPtr, Callbacks cb);
+
+    // Rebind to a different layer (e.g. after the owner's storage moved).
+    // Triggers a full UI sync from the new layer's state.
+    void setLayerPtr(WaveLayer* p);
+    WaveLayer* getLayerPtr() const { return layer; }
+
+    // Pull every visible control's state from the underlying layer. Call
+    // after setLayerPtr or after any external mutation (preset load,
+    // project load, ...). Internal mutations don't need it - they update
+    // both the model and the controls themselves.
+    void syncFromModel();
+
+    // Re-render the mini per-layer preview strip. Cheap (512 samples).
+    // Internal callbacks already call this; external code only needs it
+    // when the layer was mutated without going through this editor.
+    void refreshPreview();
+
+    void resized() override;
+    void paint(juce::Graphics& g) override;
+    void mouseDown(const juce::MouseEvent& e) override;
+    void mouseDrag(const juce::MouseEvent& e) override;
+    void mouseUp(const juce::MouseEvent&) override;
+
+    static constexpr int previewHeight = 92;
+    // Total minimum row height: label + shape btn row + sub-row +
+    // 3 slider rows + padding + preview. Owners use this to lay out
+    // a vertical stack of editors at a uniform pitch.
+    static int rowHeight() { return 22 + 24 + 24 + 20 * 3 + 12 + previewHeight + 4; }
+
+private:
+    void updateShapeButtons();
+    juce::Rectangle<float> getPreviewAreaBounds() const;
+    bool mouseToPointXY(juce::Point<float> p, float& outX, float& outY) const;
+    int findPointNear(float x, float y, float radius = 0.05f) const;
+    void sortPointsByX();
+    void writeFreehandSample(float x, float y);
+    void showPresetMenu();
+
+    WaveLayer* layer = nullptr;
+    Callbacks callbacks;
+
+    juce::Label label;
+    juce::TextButton sineBtn, sawBtn, squareBtn, triangleBtn, noiseBtn, drawnBtn, formulaBtn;
+    juce::TextButton freehandToggle;
+    juce::TextEditor formulaEditor;
+    juce::Slider ratioSlider, phaseSlider, ampSlider;
+    juce::Label  ratioLabel, phaseLabel, ampLabel;
+    juce::TextButton presetBtn;
+    juce::TextButton deleteBtn;
+    std::vector<float> previewSamples;
+    int draggingIdx = -1;
+
+    bool freehandDrawing = false;
+    int  lastFreehandIdx = -1;
+    float lastFreehandY = 0.0f;
+};
+
 struct LayeredWaveform : public IWavetableFrame {
     std::vector<WaveLayer> layers;
     int tableSize = 2048;
@@ -70,6 +161,85 @@ struct LayeredWaveform : public IWavetableFrame {
     std::string encodeBody() const override;
     bool decodeBody(const std::string& body) override;
     std::unique_ptr<IWavetableFrame> clone() const override;
+};
+
+// -----------------------------------------------------------------------------
+// LayerStackComponent
+// -----------------------------------------------------------------------------
+//
+// Reusable vertical stack of WaveLayerEditor rows + a "+ Layer" button +
+// (optionally) a summation preview pane that shows all layers summed into one
+// cycle. This is the shared layered-waveform editing surface used by BOTH the
+// Wavetable editor's right pane and the Signal Shape (LFO / envelope) editor,
+// so the add/delete/edit-a-layer experience is identical in both places.
+//
+// The component does NOT own its model: it edits the `layers` vector of a
+// LayeredWaveform supplied via setTarget() and fires onChanged after every
+// mutation. The owner decides what onChanged does (commit to node.script,
+// request a graph rebuild, re-render its own preview, ...).
+//
+// Realloc safety: the WaveLayerEditor rows hold WaveLayer* into
+// target->layers. Any add or delete that can reallocate that vector rebuilds
+// ALL rows (rebuildRows), so no row ever holds a dangling pointer - the same
+// strategy the wavetable editor used before this was extracted.
+//
+// Options let callers omit the bits that only make sense in one context (e.g.
+// the wavetable editor keeps its own multi-frame-type preview, so it turns the
+// summation preview OFF; the LFO editor turns it ON). The per-row controls
+// (shape buttons, harmonic ratio, phase, amp, draw/formula) are identical in
+// both editors and are not configurable - harmonic ratio is kept everywhere
+// because an extra-rate layer is a useful capability for an LFO too.
+class LayerStackComponent : public juce::Component {
+public:
+    struct Options {
+        // When true, a preview pane at the bottom draws the sum of all layers
+        // (peak-normalized, matching what a consumer actually renders).
+        bool showSummationPreview = false;
+        int  summationPreviewHeight = 140;
+        juce::String addLayerButtonText = "+ Layer";
+        // Shown centered over the (empty) row area when there are no layers.
+        juce::String emptyHint;
+        // Seed for a freshly added layer. Arg = current layer count. If null,
+        // a default-constructed WaveLayer (sine, ratio 1, amp 1) is used.
+        std::function<WaveLayer(int existingCount)> makeNewLayer;
+    };
+
+    LayerStackComponent(Options opts, std::function<void()> onChanged);
+
+    // Bind to the LayeredWaveform to edit (nullptr clears the stack). Cheap to
+    // call defensively: it only rebuilds rows when the target pointer or its
+    // layer count differs from what's currently displayed.
+    void setTarget(LayeredWaveform* lw);
+    LayeredWaveform* getTarget() const { return target; }
+
+    // Force a full rebuild + re-sync from the model. Use after an external,
+    // in-place mutation that changed layer values or count without going
+    // through this component (e.g. the owner decoded a new doc into the same
+    // LayeredWaveform object).
+    void refreshFromModel();
+
+    void resized() override;
+    void paint(juce::Graphics& g) override;
+
+private:
+    void rebuildRows();
+    void addLayer();
+    void renderSummation();
+    void layoutRows();
+
+    Options opts;
+    std::function<void()> onChanged;
+    LayeredWaveform* target = nullptr;
+    int shownLayerCount = -1;   // staleness sentinel for setTarget
+
+    juce::TextButton addLayerBtn;
+    juce::Viewport   viewport;
+    juce::Component  container;
+    std::vector<std::unique_ptr<WaveLayerEditor>> rows;
+    juce::Label      emptyHintLabel;
+
+    std::vector<float> summationSamples;
+    juce::Rectangle<int> summationBounds;
 };
 
 // A wavetable can be authored in two modes:
@@ -416,16 +586,14 @@ public:
     void paint(juce::Graphics& g) override;
     void timerCallback() override;
 
-    // Layer access goes through these so LayerRow doesn't have to know about
-    // the current frame selection.
+    // Layer access goes through these so the WaveLayerEditor rows don't have
+    // to know about the current frame selection.
     std::vector<WaveLayer>& currentLayers();
     const std::vector<WaveLayer>& currentLayers() const;
 
 private:
-    class LayerRow; // inner component for a single layer's controls
     class ScatterView; // inner component for the N-D scatter viewport
     class WavetableViewWindowContent; // arrangement view + sidebar (embedded)
-    friend class LayerRow;
     friend class ScatterView;
     friend class WavetableViewWindowContent;
 
@@ -497,7 +665,6 @@ private:
     // the menu is dismissed.
     void showAddWaveformMenu(juce::Component* anchor);
 
-    juce::TextButton addLayerBtn { "+ Layer" };
     juce::TextButton applyBtn    { "Apply" };
     juce::TextButton closeBtn    { "Close" };
     juce::TextButton helpBtn     { "?" };
@@ -537,13 +704,19 @@ private:
     // list in the arrangement sidebar. Called whenever currentLibraryId
     // changes, the editor is constructed, or the user finishes editing.
     void refreshIdentityRow();
-    juce::Viewport   layersViewport;
-    juce::Component  layersContainer;
-    std::vector<std::unique_ptr<LayerRow>> rows;
+
+    // Shared layer-stack widget (the "+ Layer" header, the scrolling list of
+    // WaveLayerEditor rows, and per-layer add/delete). Identical code is used
+    // by the Signal Shape (LFO / envelope) editor. Summation preview is OFF
+    // here - the wavetable editor has its own multi-frame-type preview strip
+    // (refreshPreview / previewBounds) that handles spectral / wavelet /
+    // granular frames too, which the shared component knows nothing about.
+    // Bound to the current layered frame via setTarget(currentEditingLayeredFrame()).
+    std::unique_ptr<LayerStackComponent> layerStack;
 
     // When the current frame is non-layered (spectral / wavelet), the
     // matching editor is embedded into the same screen area normally
-    // occupied by layersViewport, so the wavetable editor stays a single
+    // occupied by the layer stack, so the wavetable editor stays a single
     // window regardless of which frame type the user is editing.
     // Recreated whenever the user switches to a frame of a different type
     // (it's bound to a specific frame via the frame-backed ctor).
@@ -648,6 +821,15 @@ private:
     LayeredWaveform* currentEditingLayeredFrame();
     const LayeredWaveform* currentEditingLayeredFrame() const;
 
+    // The normalized wavetable Position [0,1]^N of the frame the editor is
+    // currently targeting (currentLibraryId), derived from the first cell /
+    // scatter dot that references it. Grid: the cell's per-axis grid coord
+    // divided by (dimSize-1). Scatter: the dot's authored position. Empty
+    // if the entry isn't placed in any cell (or no editing target). Used to
+    // tell the synth which frame to audition so a frame's Play button plays
+    // THAT frame, not whatever the live Position knob selects.
+    std::vector<float> currentFramePosition() const;
+
     // Set the right-pane editor's target. Triggers the same UI refresh as
     // switchToFrame() did in the old model: rebuilds the frame tab strip,
     // rebuilds the layer rows / embedded sub-editor, refreshes preview,
@@ -667,9 +849,19 @@ private:
     void rebuildScatterUI();        // re-evaluates rotation slider count when dim count changes
     void refreshPreview();
     void commitToNode(); // encode `wave` into node.script
+    // Push a graph undo snapshot so a settled wavetable edit enters the undo
+    // system. Without this the edit lives only in the node's script (updated
+    // by commitToNode) and is silently destroyed by any later, unrelated
+    // Ctrl+Z that restores an earlier snapshot - which then gets saved,
+    // making the waveform/cell "vanish" on reload.
+    void commitUndoStep();
     void onLayerChanged();
     void switchToFrame(int idx);
     void syncPositionParams();      // ensure node has the right number of Position params
+    // One block-rate modulation pin per Position axis, named by axis (X/Y/Z/W).
+    // `pinToAxis` maps each existing Position pin's id to its axis index,
+    // captured before syncPositionParams() reshuffles the Position params.
+    void syncPositionModPins(Node& nd, const std::map<int, int>& pinToAxis);
 };
 
 } // namespace SoundShop

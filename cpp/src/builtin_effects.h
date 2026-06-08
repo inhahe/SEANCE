@@ -1241,6 +1241,8 @@ public:
                 v.held = true;
                 v.time = 0;
                 v.relTime = 0;
+                v.mpeChannel = msg.getChannel();
+                v.mpe = MpeVoiceState{};
                 for (int i = 0; i < 4; ++i) v.phase[i] = 0;
                 v.fb1 = v.fb2 = 0;
             } else if (msg.isNoteOff()) {
@@ -1249,6 +1251,9 @@ public:
                         { v.held = false; v.relTime = v.time; }
             }
         }
+        // Distribute MPE / per-note expression (pitch bend, channel + poly
+        // pressure, timbre) into the voices (#78).
+        distributeMpeMessages(midi, voices);
 
         const float kPi2 = 6.28318530718f;
         float volume = paramByName(node, "Volume", 0.5f);
@@ -1290,53 +1295,64 @@ public:
                 float o4 = std::sin(v.phase[3] * kPi2 + fb) * env[3];
                 v.fb2 = v.fb1; v.fb1 = o4;
                 float o3, o2, o1;
+                // Per-voice output accumulator. Earlier code added straight
+                // into the shared `out` and then did `out *= v.vel`, which
+                // scaled every already-summed voice by THIS voice's velocity
+                // (and, with the new pressure swell, by this voice's pressure)
+                // - a polyphony bug that only stayed hidden while playing one
+                // note at a time. Accumulate per voice, scale once, then add.
+                float voiceOut = 0.0f;
                 switch (algo) {
                     case 0: // 4->3->2->1->out
                         o3 = std::sin(v.phase[2]*kPi2 + o4*kPi2) * env[2];
                         o2 = std::sin(v.phase[1]*kPi2 + o3*kPi2) * env[1];
                         o1 = std::sin(v.phase[0]*kPi2 + o2*kPi2) * env[0];
-                        out += o1; break;
+                        voiceOut += o1; break;
                     case 1: // (3+4)->2->1->out
                         o3 = std::sin(v.phase[2]*kPi2 + o4*kPi2) * env[2];
                         o2 = std::sin(v.phase[1]*kPi2 + (o3+o4)*0.5f*kPi2) * env[1];
                         o1 = std::sin(v.phase[0]*kPi2 + o2*kPi2) * env[0];
-                        out += o1; break;
+                        voiceOut += o1; break;
                     case 2: // 4->3->out, 2->1->out
                         o3 = std::sin(v.phase[2]*kPi2 + o4*kPi2) * env[2];
                         o2 = std::sin(v.phase[1]*kPi2) * env[1];
                         o1 = std::sin(v.phase[0]*kPi2 + o2*kPi2) * env[0];
-                        out += (o3 + o1) * 0.5f; break;
+                        voiceOut += (o3 + o1) * 0.5f; break;
                     case 3: // 4->(1+2+3)->out
                         o3 = std::sin(v.phase[2]*kPi2 + o4*kPi2) * env[2];
                         o2 = std::sin(v.phase[1]*kPi2 + o4*kPi2) * env[1];
                         o1 = std::sin(v.phase[0]*kPi2 + o4*kPi2) * env[0];
-                        out += (o1 + o2 + o3) * 0.33f; break;
+                        voiceOut += (o1 + o2 + o3) * 0.33f; break;
                     case 4: // (4->3)->out, 2->out, 1->out
                         o3 = std::sin(v.phase[2]*kPi2 + o4*kPi2) * env[2];
                         o2 = std::sin(v.phase[1]*kPi2) * env[1];
                         o1 = std::sin(v.phase[0]*kPi2) * env[0];
-                        out += (o1 + o2 + o3) * 0.33f; break;
+                        voiceOut += (o1 + o2 + o3) * 0.33f; break;
                     case 5: // (4->3)->out, (4->2)->out, 1->out
                         o3 = std::sin(v.phase[2]*kPi2 + o4*kPi2) * env[2];
                         o2 = std::sin(v.phase[1]*kPi2 + o4*kPi2) * env[1];
                         o1 = std::sin(v.phase[0]*kPi2) * env[0];
-                        out += (o1 + o2 + o3) * 0.33f; break;
+                        voiceOut += (o1 + o2 + o3) * 0.33f; break;
                     case 6: // 4->3->2->out, 1->out
                         o3 = std::sin(v.phase[2]*kPi2 + o4*kPi2) * env[2];
                         o2 = std::sin(v.phase[1]*kPi2 + o3*kPi2) * env[1];
                         o1 = std::sin(v.phase[0]*kPi2) * env[0];
-                        out += (o1 + o2) * 0.5f; break;
+                        voiceOut += (o1 + o2) * 0.5f; break;
                     default: // 7: all additive
                         o3 = std::sin(v.phase[2]*kPi2) * env[2];
                         o2 = std::sin(v.phase[1]*kPi2) * env[1];
                         o1 = std::sin(v.phase[0]*kPi2) * env[0];
-                        out += (o1 + o2 + o3 + o4) * 0.25f; break;
+                        voiceOut += (o1 + o2 + o3 + o4) * 0.25f; break;
                 }
                 // Advance phases.
                 for (int i = 0; i < 4; ++i)
                     v.phase[i] += (baseFreq * ops[i].ratio) / (float)sampleRate;
                 v.time += dt;
-                out *= v.vel;
+                // Velocity + aftertouch swell (channel + poly pressure),
+                // applied to THIS voice only. Pressure defaults to 0, so this
+                // is a no-op until the controller sends aftertouch.
+                float pMul = 1.0f + node.aftertouchSensitivity * effectivePressure(v.mpe);
+                out += voiceOut * v.vel * pMul;
             }
             out *= volume;
             out = juce::jlimit(-1.0f, 1.0f, out);
@@ -1464,7 +1480,12 @@ public:
             float out = 0;
             for (auto& v : voices) {
                 if (!v.active) continue;
-                float freq = 440.0f * std::pow(2.0f, (v.note - 69) / 12.0f);
+                // Include MPE per-note pitch bend (#78); previously this
+                // synth distributed MPE messages but ignored the bend.
+                float freq = 440.0f * std::pow(2.0f, (v.note - 69 + v.mpe.pitchBend) / 12.0f);
+                // Velocity + aftertouch swell (channel + poly pressure).
+                // No-op until the controller sends pressure (defaults 0).
+                float pMul = 1.0f + node.aftertouchSensitivity * effectivePressure(v.mpe);
 
                 // Amplitude ADSR
                 float ampEnv = 0;
@@ -1519,14 +1540,14 @@ public:
                         float window = 1.0f - p;
                         distorted = std::sin(distorted * kPi2) * window;
                         // Skip the sin() below - we already computed the output
-                        out += distorted * ampEnv * v.vel;
+                        out += distorted * ampEnv * v.vel * pMul;
                         v.phase += freq / (float)sampleRate;
                         v.time += dt;
                         goto nextVoice;
                     }
                 }
 
-                out += std::sin(distorted * kPi2) * ampEnv * v.vel;
+                out += std::sin(distorted * kPi2) * ampEnv * v.vel * pMul;
                 v.phase += freq / (float)sampleRate;
                 v.time += dt;
                 nextVoice:;
@@ -2642,12 +2663,15 @@ public:
                 v.vel = msg.getVelocity() / 127.0f;
                 v.time = 0; v.relTime = 0;
                 v.phases.assign(64, 0.0);
+                v.mpeChannel = msg.getChannel();
+                v.mpe = MpeVoiceState{};
             } else if (msg.isNoteOff()) {
                 for (auto& v : voices)
                     if (v.active && v.held && v.note == msg.getNoteNumber())
                         { v.held = false; v.relTime = v.time; }
             }
         }
+        distributeMpeMessages(midi, voices);
 
         const float kPi2 = 6.28318530718f;
         float dt = 1.0f / (float)sampleRate;
@@ -2685,7 +2709,8 @@ public:
                     if (v.phases[p] > 1.0) v.phases[p] -= 1.0;
                 }
 
-                out += voiceOut * env * v.vel;
+                float pMul = 1.0f + node.aftertouchSensitivity * effectivePressure(v.mpe);
+                out += voiceOut * env * v.vel * pMul;
                 v.time += dt;
             }
 
@@ -3238,12 +3263,15 @@ public:
                 v.vel = msg.getVelocity() / 127.0f;
                 v.time = 0; v.relTime = 0;
                 v.spawnTimer = 0;
+                v.mpeChannel = msg.getChannel();
+                v.mpe = MpeVoiceState{};
             } else if (msg.isNoteOff()) {
                 for (auto& v : voices)
                     if (v.active && v.held && v.note == msg.getNoteNumber())
                         { v.held = false; v.relTime = v.time; }
             }
         }
+        distributeMpeMessages(midi, voices);
 
         for (int s = 0; s < numSamples; ++s) {
             float out = 0;
@@ -3270,7 +3298,7 @@ public:
                     g.grainIdx = rng() % grainBank.size();
                     g.pos = 0;
                     g.len = grainSizeSamples;
-                    float baseFreq = 440.0f * std::pow(2.0f, (v.note - 69) / 12.0f);
+                    float baseFreq = 440.0f * std::pow(2.0f, (v.note - 69 + v.mpe.pitchBend) / 12.0f);
                     g.rate = baseFreq / 440.0f; // pitch ratio relative to A4
                     activeGrains.push_back(g);
                 }
@@ -3292,7 +3320,8 @@ public:
                     g.pos += g.rate;
                     ++it;
                 }
-                out += voiceOut * env * v.vel;
+                float pMul = 1.0f + node.aftertouchSensitivity * effectivePressure(v.mpe);
+                out += voiceOut * env * v.vel * pMul;
             }
 
             if (activeGrains.size() > 1)
@@ -3379,6 +3408,8 @@ private:
         int note = 0;
         float vel = 0, time = 0, relTime = 0;
         float spawnTimer = 0;
+        int mpeChannel = 1;
+        MpeVoiceState mpe;
     };
     std::vector<Voice> voices;
     Voice& allocVoice() {

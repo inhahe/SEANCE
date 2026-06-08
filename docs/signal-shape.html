@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Signal Shape (LFO / Envelope) — SEANCE</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="wrap">
+<header>
+<h1>Signal Shape (LFO / Envelope)</h1>
+<nav>
+  <a href="index.html">Home</a>
+  <a href="graph-basics.html">Graph Basics</a>
+  <a href="pin-kinds.html">Pin Kinds</a>
+  <a href="trigger-node.html">Trigger Node</a>
+  <a href="midi-modulator.html">MIDI Modulator</a>
+</nav>
+</header>
+
+<p>The <strong>Signal Shape</strong> node generates a control signal you wire into any Param or Signal pin to modulate it over time. It replaces what other DAWs split into "LFO" and "Envelope" and "macro-curve" — there's one node, and the difference between an LFO and an envelope is just which repeat mode you pick. Add one from <em>Sources → Signal Shape (LFO / Envelope)</em> in the right-click menu, wire its Signal Out into the parameter you want to modulate, and double-click the node to open the editor.</p>
+
+<p>By design the node only runs when its output is actually wired into something. An idle, unconnected shape costs no CPU.</p>
+
+<h2>The four pieces of a shape</h2>
+
+<p>Every signal shape has four pieces. The first one is the only one you <em>have</em> to set; the rest have sensible defaults.</p>
+
+<ol>
+  <li>A <strong>shape</strong> — the curve over time, built as a <strong>stack of layers</strong> exactly like the wavetable editor. Each layer is a parametric oscillator (<code>sin</code>, <code>tri</code>, <code>saw</code>, …), or breakpoint curve points, or a freehand drawing, or a math expression in the variable <code>t</code> (where <code>t</code> goes from 0 to 1 over one shape pass). Click <em>+ Layer</em> to add layers; they're summed together, and a <em>Sum of all layers</em> preview under the stack shows the combined contour. A brand-new shape has <strong>no layers</strong> and outputs a flat 0 until you add one.</li>
+  <li>A <strong>repeat mode</strong> — what happens after the shape reaches the end of its pass. Three options: <em>Don't repeat</em> (one-shot, holds the last value forever — this is an envelope), <em>Repeat forever</em> (loops continuously — this is an LFO), <em>Repeat N times</em> (loops N times then holds, useful for "three pulses then stop").</li>
+  <li>An optional <strong>trigger expression</strong> — a one-line expression that, when it becomes non-zero, restarts the shape from <code>t = 0</code>. If you leave it blank, the shape starts at app start and just runs.</li>
+  <li>An optional set of <strong>signal inputs</strong> — extra Signal pins on the node that feed your shape and trigger expressions as variables <code>s1</code>, <code>s2</code>, … so any value flowing in the graph can drive the shape.</li>
+</ol>
+
+<h2>Make an LFO</h2>
+
+<p>A fresh Signal Shape is set up <em>as</em> an LFO — repeat forever, no trigger — but it starts <strong>neutral</strong>: it has <strong>no layers</strong>, so it outputs a constant 0 and won't sweep anything until you give it a contour. The editor opens showing an empty layer stack with a <em>+ Layer</em> button and a hint. Click <em>+ Layer</em> to add your first layer (it comes in as a sine), then on that layer's row pick <em>Sine</em> / <em>Saw</em> / <em>Square</em> / <em>Triangle</em> / <em>Drawn</em> / <em>Formula</em>, or draw the curve by hand. Add more layers to sum several shapes into one (e.g. a slow sine plus a fast ripple) — the <em>Sum of all layers</em> preview shows the result. Then wire Signal Out to (for example) a synth's filter cutoff Param pin and you have vibrato-style modulation.</p>
+
+<h3>Setting the speed</h3>
+
+<p>How fast the shape cycles is shown two equivalent ways in the editor, side by side: <strong>Cycle length</strong> (how long one cycle takes) and <strong>Rate</strong> (how many cycles per unit time). They're the <em>same</em> setting — <code>Rate = 1 &divide; Cycle length</code> — so editing one updates the other; the <code>=</code> between them is the reminder. Use whichever feels natural: "I want a cycle every 2 seconds" → type 2 in Cycle length; "I want 0.5&nbsp;Hz" → type 0.5 in Rate. You get the same LFO either way.</p>
+
+<p>The <strong>Sync to beat</strong> toggle next to them decides the units:</p>
+<ul>
+  <li><strong>Off:</strong> Cycle length is in <em>seconds</em>, Rate is in <em>Hz</em> (cycles per second). The LFO's speed ignores the song tempo.</li>
+  <li><strong>On (tempo-locked):</strong> Cycle length is in <em>beats</em>, Rate is in <em>cycles per beat</em>. The LFO speeds up and slows down with the song tempo — so a 1-beat cycle stays locked to the groove no matter the BPM.</li>
+</ul>
+
+<p>Rate and Sync to beat are also the first two sliders on the node's face in the graph, so you can nudge the speed without opening the editor; the editor fields and the face sliders always stay in agreement.</p>
+
+<h3>Locked to the song, or free-running</h3>
+
+<p>Underneath the speed row is a checkbox: <strong>Free-run (ignore song position)</strong>. It decides what clock the LFO runs off — which matters for whether your song sounds the same every time you play it:</p>
+<ul>
+  <li><strong>Off (the default):</strong> the LFO's position is <em>locked to the song position</em>. Press play from the same spot and the LFO is always at the same point in its cycle, so what you hear matches what gets exported, and replaying a section sounds identical every time. While playback is stopped, the LFO holds still (and follows the playhead if you scrub).</li>
+  <li><strong>On:</strong> the LFO runs continuously off its own clock, like an old analog synth's LFO — always moving, even when the song is stopped, and drifting independently of the song. It feels alive, but it's <em>not</em> reproducible: a bounce can come out different from what you heard, and two playthroughs won't match.</li>
+</ul>
+<p>Leave it off unless you specifically want that never-stopping, free-floating wobble. (This checkbox does nothing once you set a Trigger — see below — because a triggered shape already restarts cleanly on every trigger, so it's greyed out in that case.)</p>
+
+<p>Common LFO shape expressions:</p>
+<ul>
+  <li><code>sin(t * 2*pi)</code> — sine wave.</li>
+  <li><code>tri(t)</code> — triangle.</li>
+  <li><code>saw(t)</code> — saw ramp from -1 to 1.</li>
+  <li><code>2*(t&lt;0.5)-1</code> — square (uses a comparison: 1 when t&lt;0.5, 0 otherwise, then rescaled to ±1).</li>
+  <li><code>random(floor(t*8))</code> — sample-and-hold: 8 random steps per cycle.</li>
+</ul>
+
+<h2>Make an envelope</h2>
+
+<p>An envelope is just a shape with <em>repeat = Don't repeat</em> and a trigger expression that fires on note-on. Set:</p>
+<ul>
+  <li>Shape: something like <code>exp(-t*4)</code> for a fast decay, or use the curve editor and draw an ADSR-looking contour.</li>
+  <li>Repeat: <em>Don't repeat</em>.</li>
+  <li>Trigger: <code>gate</code> — fires whenever a MIDI note arrives on the MIDI In pin.</li>
+</ul>
+
+<p>Wire MIDI In to your MIDI source and Signal Out to (for example) a synth's amp envelope. Every note-on resets the shape's <code>t</code> to 0 and plays the curve from start to end, then holds the final value.</p>
+
+<h2>Trigger expressions</h2>
+
+<p>The trigger expression is evaluated every sample. Whenever it transitions from zero (or negative) to non-zero (positive), the shape restarts. Some useful trigger expressions:</p>
+
+<ul>
+  <li><code>gate</code> — fires on every note-on. (<code>gate</code> is 1 while any note is held, 0 otherwise; the rising edge fires.)</li>
+  <li><code>vel &gt; 0.7</code> — fires only when the note's velocity is above 0.7 (0–1 range). Great for accent envelopes that only play on hard hits.</li>
+  <li><code>note == 60</code> — fires only on middle C.</li>
+  <li><code>s1 &gt; 0.5</code> — fires when signal input <code>s1</code> crosses 0.5. Lets you chain shapes: one shape's output triggers the next.</li>
+  <li>(blank) — never fires from a trigger, so the shape just runs free.</li>
+</ul>
+
+<p>The <strong>Manual Trigger</strong> button in the editor fires the shape immediately regardless of the expression — handy for previewing while editing.</p>
+
+<h2>Signal inputs (s1, s2, …)</h2>
+
+<p>Click <strong>Signal inputs:</strong> in the editor and bump it from 0 up to however many extra inputs you need (up to 16). The node grows new Signal In pins named <em>s1</em>, <em>s2</em>, … in order, and you can reference those values directly in both the shape expression and the trigger expression as the variables <code>s1</code>, <code>s2</code>, etc.</p>
+
+<p>Examples (in the <em>expression</em> box):</p>
+<ul>
+  <li><strong>FM the LFO with another LFO:</strong> <code>sin(t * 2*pi + s1 * 4)</code> — input <code>s1</code> modulates the phase.</li>
+  <li><strong>Amplitude blend:</strong> <code>sin(t*2*pi) * s1 + saw(t) * (1 - s1)</code> — input <code>s1</code> crossfades between a sine and a saw.</li>
+  <li><strong>External gate:</strong> trigger = <code>s1</code>, with another signal wired into the <code>s1</code> pin — that signal's rising edges retrigger the shape. Wire a Trigger node's Signal Out into <code>s1</code> for per-note-conditional retriggers.</li>
+</ul>
+
+<h2>Reading the drawn shape from an input: shape(pos)</h2>
+
+<p>There's an important distinction between <strong>two ways to read your drawn shape</strong>:</p>
+
+<ul>
+  <li><code>curve</code> reads the drawing at the node's <em>own</em> running phase. It's the LFO/envelope contour playing out over time. You don't choose where in the drawing it reads — the node's clock does.</li>
+  <li><code>shape(pos)</code> reads the drawing at a position <em>you</em> compute. Now you decide where in the drawing to look, sample by sample.</li>
+</ul>
+
+<p>This matters when you want an <strong>input signal to index into the drawing</strong> rather than just scale it. Picture the drawing as a lookup curve (a transfer function) and the input as the thing sliding a finger along it:</p>
+
+<ul>
+  <li><strong>Waveshaper:</strong> <code>shape(s1)</code> — input <code>s1</code> sweeps through the drawn curve. Wire an LFO or an audio-rate signal into <code>s1</code> and the drawing reshapes it.</li>
+  <li><strong>Phase warp:</strong> <code>shape(x + s1*0.1)</code> — play the drawing at the normal rate but nudge the read position with the input.</li>
+  <li><strong>Map a bipolar input:</strong> <code>shape(s1*0.5 + 0.5)</code> — an input that swings <code>-1..1</code> reads across the whole drawing once.</li>
+  <li><strong>Double-speed read:</strong> <code>shape(t * 2)</code> — ignore the node's phase and scan the drawing yourself.</li>
+</ul>
+
+<p>The position you pass to <code>shape()</code> is a <strong>0..1 phase that wraps around</strong> — so 1.25 reads the same place as 0.25, and negatives wrap too. That's the key to why there's no "the input is infinite but the drawing is finite" conflict: the drawing is never addressed by an absolute sample number. It's addressed by a normalized 0..1 position, and <em>any</em> continuous value — the node's clock, an input signal, or your own math — can supply that position. <code>shape(x)</code> is exactly equivalent to <code>curve</code>.</p>
+
+<h2>MIDI variables</h2>
+
+<p>If you wire MIDI into the node's MIDI In pin, the following variables are available in both shape and trigger expressions:</p>
+
+<ul>
+  <li><code>gate</code> — 1 while at least one note is held, 0 otherwise.</li>
+  <li><code>note</code> — MIDI note number (0–127) of the most recent note-on.</li>
+  <li><code>freq</code> — frequency in Hz of the most recent note-on.</li>
+  <li><code>vel</code> — velocity (0–1) of the most recent note-on.</li>
+</ul>
+
+<p>Use them to make the shape react to the note. E.g. shape = <code>sin(t * 2*pi) * vel</code> makes the LFO depth scale with how hard the note was played.</p>
+
+<h2>Presets</h2>
+
+<p>Each layer row has the same preset menu as the wavetable / layered-waveform editor — common LFO and envelope curves you can load as a starting point and then tweak. Pick a preset on a layer's row and that layer's shape and curve points are replaced with the preset's contents. Your other layers, repeat mode, trigger expression, and signal-input count are <em>not</em> touched, so you can swap one layer's contour without losing the rest of your setup.</p>
+
+<h2>Params on the node face</h2>
+
+<p>Two params live on the node itself, exposed as Param pins so you can modulate them with other shapes:</p>
+<ul>
+  <li><strong>Period</strong> — how long one pass of the shape takes, in beats. Doubles the LFO/envelope's wall-clock duration when doubled.</li>
+  <li><strong>Output gain</strong> — multiplies the final shape value. Negative inverts. Use to scale the shape output without rewriting the expression.</li>
+</ul>
+
+<div class="tip">
+<strong>Tip:</strong> the same Signal Shape node can act as <em>both</em> an LFO and an envelope depending on which output you wire — set repeat = <em>Repeat forever</em> and a high-gate trigger, and the shape will run continuously between notes (LFO behavior) but also reset on each note-on (envelope behavior). One node, two roles.
+</div>
+
+<footer>
+<a href="index.html">← Back to index</a>
+</footer>
+</div>
+</body>
+</html>

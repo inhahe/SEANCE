@@ -8,6 +8,8 @@
 #include <stack>
 #include <cctype>
 #include <complex>
+#include <unordered_map>
+#include <string>
 
 namespace SoundShop {
 
@@ -241,112 +243,256 @@ float Wavetable::sample(float phase, float frequencyHz, float sr) const {
 }
 
 // ==============================================================================
-// WaveExprParser - simple math expression evaluator
+// WaveExprParser - expression evaluator
 // ==============================================================================
+//
+// Recursive-descent parser. Grammar (low to high precedence):
+//
+//   ternary   = or        ( '?' ternary ':' ternary )?      (right-assoc)
+//   or        = and       ( '||' and )*
+//   and       = compare   ( '&&' compare )*
+//   compare   = expr      ( ('<'|'>'|'<='|'>='|'=='|'!=') expr )?
+//   expr      = muldiv    ( ('+'|'-') muldiv )*
+//   muldiv    = pow       ( ('*'|'/') pow )*
+//   pow       = unary     ( '^' pow )?                       (right-assoc)
+//   unary     = ('!'|'-') unary | atom
+//   atom      = '(' ternary ')' | function | identifier | number
+//
+// Built-in identifiers:   x, f, pi, e
+// Custom identifiers:     looked up in `extraVars` (caller-supplied map)
+// Built-in functions:     sin, cos, tan, abs, sqrt, exp, log, pow(a,b),
+//                         saw, square, triangle, noise, tanh, clamp(v,lo,hi),
+//                         floor, ceil, min(a,b), max(a,b), if(c,a,b)
+// Built-in zero-arg:      random  (uniform [-pi, pi])
+//
+// Notes:
+// - Comparisons and booleans return 1.0f for true, 0.0f for false.
+// - `&&` / `||` are NOT short-circuit (both sides evaluate). Same for the
+//   ternary's true and false branches and if()'s second / third arg. This
+//   keeps the evaluator simple (no AST yet); side-effecting calls like
+//   noise() and random execute in both branches.
+// - Unknown identifiers (not in extraVars, not a built-in) evaluate to 0.
 
-// Tokenizer + recursive descent parser for waveform expressions
-// Supports: sin, cos, abs, sqrt, pow, saw, square, triangle, noise, x, pi, e
-// Operators: + - * / ^ ( )
-
-// File-local reusable parser. Binds both `x` and `f` as free variables so the
-// same expression language works for time-domain ("x in [0, 2pi)") and
-// frequency-domain ("f = bin index") evaluation. Other wave-editor callers
-// pass f=0 and vice versa.
 namespace {
 struct ExprParser {
-    const char* str;
-    const char* pos;
+    const char* str = nullptr;
+    const char* pos = nullptr;
     float x = 0.0f;
     float f = 0.0f;
     std::mt19937 rng{42};
+    const std::unordered_map<std::string, float>* extraVars = nullptr;
+    // Optional sampler for the shape(pos) function. Null/empty -> shape()
+    // returns 0. Set by the evaluateWithVars overload that takes a sampler.
+    const std::function<float(float)>* shapeFn = nullptr;
 
     void skipWS() { while (*pos == ' ' || *pos == '\t') pos++; }
+
+    static bool isIdentStart(char c) {
+        return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_';
+    }
+    static bool isIdentCont(char c) {
+        return isIdentStart(c) || (c >= '0' && c <= '9');
+    }
 
     float parseNumber() {
         skipWS();
         const char* start = pos;
-        if (*pos == '-' || *pos == '+') pos++;
-        while (std::isdigit(*pos) || *pos == '.') pos++;
+        // Unary sign is handled by parseUnary; parseNumber accepts only digits/dot.
+        while (std::isdigit((unsigned char)*pos) || *pos == '.') pos++;
         if (pos == start) return 0;
         return std::strtof(start, nullptr);
+    }
+
+    // Read an identifier (alphanumeric + underscore, starts with letter/_).
+    // Returns empty string if no identifier at current position; advances pos
+    // past the identifier on success.
+    std::string parseIdentifier() {
+        skipWS();
+        if (!isIdentStart(*pos)) return {};
+        const char* start = pos;
+        while (isIdentCont(*pos)) pos++;
+        return std::string(start, pos - start);
+    }
+
+    // Helper: match a function name followed by '('. If matched, advance past
+    // the '(' and return true. Otherwise rewind and return false.
+    bool matchFunc(const char* name) {
+        skipWS();
+        size_t n = std::strlen(name);
+        if (std::strncmp(pos, name, n) != 0) return false;
+        // Must be followed by '(' with no intervening identifier chars
+        if (isIdentCont(pos[n])) return false;
+        const char* save = pos;
+        pos += n;
+        skipWS();
+        if (*pos != '(') { pos = save; return false; }
+        pos++; // consume '('
+        return true;
+    }
+
+    // Match a bare keyword (no trailing '('): identifier that exactly equals
+    // `name` and is followed by a non-identifier character. Advances pos on
+    // success.
+    bool matchKeyword(const char* name) {
+        skipWS();
+        size_t n = std::strlen(name);
+        if (std::strncmp(pos, name, n) != 0) return false;
+        if (isIdentCont(pos[n])) return false;
+        pos += n;
+        return true;
+    }
+
+    // Match a punctuation operator like "<=" or "&&". Advances pos on match.
+    bool matchOp(const char* op) {
+        size_t n = std::strlen(op);
+        if (std::strncmp(pos, op, n) == 0) { pos += n; return true; }
+        return false;
     }
 
     float parseAtom() {
         skipWS();
         if (*pos == '(') {
             pos++;
-            float val = parseExpr();
+            float val = parseTernary();
             skipWS();
             if (*pos == ')') pos++;
             return val;
         }
-        if (*pos == '-') { pos++; return -parseAtom(); }
 
-        if (strncmp(pos, "sin(", 4) == 0)  { pos += 3; return std::sin(parseAtom()); }
-        if (strncmp(pos, "cos(", 4) == 0)  { pos += 3; return std::cos(parseAtom()); }
-        if (strncmp(pos, "tan(", 4) == 0)  { pos += 3; return std::tan(parseAtom()); }
-        if (strncmp(pos, "abs(", 4) == 0)  { pos += 3; return std::abs(parseAtom()); }
-        if (strncmp(pos, "sqrt(", 5) == 0) { pos += 4; return std::sqrt(std::abs(parseAtom())); }
-        if (strncmp(pos, "exp(", 4) == 0)  { pos += 3; return std::exp(parseAtom()); }
-        if (strncmp(pos, "log(", 4) == 0)  { pos += 3; float v = parseAtom(); return v > 0 ? std::log(v) : 0.0f; }
-        if (strncmp(pos, "pow(", 4) == 0) {
-            pos += 4;
-            float base = parseExpr();
-            skipWS(); if (*pos == ',') pos++;
-            float exp = parseExpr();
-            skipWS(); if (*pos == ')') pos++;
-            return std::pow(base, exp);
-        }
-        if (strncmp(pos, "saw(", 4) == 0) {
-            pos += 3;
-            float v = parseAtom();
+        // Single-arg math functions
+        if (matchFunc("sin"))      { float v = parseTernary(); skipWS(); if (*pos == ')') pos++; return std::sin(v); }
+        if (matchFunc("cos"))      { float v = parseTernary(); skipWS(); if (*pos == ')') pos++; return std::cos(v); }
+        if (matchFunc("tan"))      { float v = parseTernary(); skipWS(); if (*pos == ')') pos++; return std::tan(v); }
+        if (matchFunc("abs"))      { float v = parseTernary(); skipWS(); if (*pos == ')') pos++; return std::abs(v); }
+        if (matchFunc("sqrt"))     { float v = parseTernary(); skipWS(); if (*pos == ')') pos++; return std::sqrt(std::abs(v)); }
+        if (matchFunc("exp"))      { float v = parseTernary(); skipWS(); if (*pos == ')') pos++; return std::exp(v); }
+        if (matchFunc("log"))      { float v = parseTernary(); skipWS(); if (*pos == ')') pos++; return v > 0 ? std::log(v) : 0.0f; }
+        if (matchFunc("tanh"))     { float v = parseTernary(); skipWS(); if (*pos == ')') pos++; return std::tanh(v); }
+        if (matchFunc("floor"))    { float v = parseTernary(); skipWS(); if (*pos == ')') pos++; return std::floor(v); }
+        if (matchFunc("ceil"))     { float v = parseTernary(); skipWS(); if (*pos == ')') pos++; return std::ceil(v); }
+
+        // Shape-helper functions (wrap to 2-pi domain like the time-domain x)
+        if (matchFunc("saw")) {
+            float v = parseTernary(); skipWS(); if (*pos == ')') pos++;
             float t = v / (2.0f * 3.14159265f);
             return 2.0f * (t - std::floor(t + 0.5f));
         }
-        if (strncmp(pos, "square(", 7) == 0) {
-            pos += 6;
-            float v = parseAtom();
+        if (matchFunc("square")) {
+            float v = parseTernary(); skipWS(); if (*pos == ')') pos++;
             return std::sin(v) >= 0 ? 1.0f : -1.0f;
         }
-        if (strncmp(pos, "triangle(", 9) == 0) {
-            pos += 8;
-            float v = parseAtom();
+        if (matchFunc("triangle")) {
+            float v = parseTernary(); skipWS(); if (*pos == ')') pos++;
             float t = v / (2.0f * 3.14159265f);
             return 4.0f * std::abs(t - std::floor(t + 0.5f)) - 1.0f;
         }
-        if (strncmp(pos, "noise(", 6) == 0) {
-            pos += 5;
-            parseAtom();
+
+        // shape(pos) — sample the caller-supplied shape table at `pos`.
+        // The sampler decides the domain (SignalShape wraps pos as a 0..1
+        // phase). Without a sampler bound, evaluates to 0.
+        if (matchFunc("shape")) {
+            float p = parseTernary(); skipWS(); if (*pos == ')') pos++;
+            return (shapeFn && *shapeFn) ? (*shapeFn)(p) : 0.0f;
+        }
+
+        // noise() — ignores any argument, returns uniform [-1, 1]
+        if (matchFunc("noise")) {
+            parseTernary(); skipWS(); if (*pos == ')') pos++;
             std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
             return dist(rng);
         }
-        if (strncmp(pos, "random", 6) == 0 && pos[6] != '(') {
-            // bare `random` => uniform [-pi, pi] (useful for phase expressions)
-            pos += 6;
-            std::uniform_real_distribution<float> dist(-3.14159265f, 3.14159265f);
-            return dist(rng);
+
+        // Two-arg functions
+        if (matchFunc("pow")) {
+            float base = parseTernary();
+            skipWS(); if (*pos == ',') pos++;
+            float exp_ = parseTernary();
+            skipWS(); if (*pos == ')') pos++;
+            return std::pow(base, exp_);
         }
-        if (strncmp(pos, "tanh(", 5) == 0) { pos += 4; return std::tanh(parseAtom()); }
-        if (strncmp(pos, "clamp(", 6) == 0) {
-            pos += 6;
-            float v = parseExpr();
+        if (matchFunc("min")) {
+            float a = parseTernary();
             skipWS(); if (*pos == ',') pos++;
-            float lo = parseExpr();
+            float b = parseTernary();
+            skipWS(); if (*pos == ')') pos++;
+            return std::min(a, b);
+        }
+        if (matchFunc("max")) {
+            float a = parseTernary();
             skipWS(); if (*pos == ',') pos++;
-            float hi = parseExpr();
+            float b = parseTernary();
+            skipWS(); if (*pos == ')') pos++;
+            return std::max(a, b);
+        }
+
+        // Three-arg functions
+        if (matchFunc("clamp")) {
+            float v = parseTernary();
+            skipWS(); if (*pos == ',') pos++;
+            float lo = parseTernary();
+            skipWS(); if (*pos == ',') pos++;
+            float hi = parseTernary();
             skipWS(); if (*pos == ')') pos++;
             return std::clamp(v, lo, hi);
         }
-        if (*pos == 'x' && !std::isalnum(*(pos + 1))) { pos++; return x; }
-        if (*pos == 'f' && !std::isalnum(*(pos + 1))) { pos++; return f; }
-        if (strncmp(pos, "pi", 2) == 0 && !std::isalnum(*(pos + 2))) { pos += 2; return 3.14159265f; }
-        if (*pos == 'e' && !std::isalpha(*(pos + 1))) { pos++; return 2.71828183f; }
+        if (matchFunc("if")) {
+            float cond = parseTernary();
+            skipWS(); if (*pos == ',') pos++;
+            float thenV = parseTernary();
+            skipWS(); if (*pos == ',') pos++;
+            float elseV = parseTernary();
+            skipWS(); if (*pos == ')') pos++;
+            return cond != 0.0f ? thenV : elseV;
+        }
+
+        // Bare keywords (no parens)
+        if (matchKeyword("random")) {
+            std::uniform_real_distribution<float> dist(-3.14159265f, 3.14159265f);
+            return dist(rng);
+        }
+        if (matchKeyword("pi")) return 3.14159265f;
+        // `e` is a built-in identifier; if the user wants Euler's e they can
+        // use `e`, but anything starting with `e` like `exp` was already
+        // matched above as a function. We check single-letter `e` after all
+        // multi-char tokens, via matchKeyword.
+
+        // Identifier: built-in single-letter (x, f, e) or custom variable.
+        skipWS();
+        if (isIdentStart(*pos)) {
+            const char* save = pos;
+            std::string ident = parseIdentifier();
+            // Built-in single-letter vars
+            if (ident == "x") return x;
+            if (ident == "f") return f;
+            if (ident == "e") return 2.71828183f;
+            // Custom variable lookup
+            if (extraVars) {
+                auto it = extraVars->find(ident);
+                if (it != extraVars->end()) return it->second;
+            }
+            // Unknown identifier: rewind and let parseNumber try (which will
+            // return 0 since no digits). This means unknown idents silently
+            // evaluate to 0 rather than parse-error - matches the old
+            // parser's "fall through to parseNumber returning 0" behavior.
+            pos = save;
+            // Consume the identifier so we don't loop forever
+            while (isIdentCont(*pos)) pos++;
+            return 0.0f;
+        }
 
         return parseNumber();
     }
 
+    float parseUnary() {
+        skipWS();
+        if (*pos == '!') { pos++; float v = parseUnary(); return (v == 0.0f) ? 1.0f : 0.0f; }
+        if (*pos == '-') { pos++; return -parseUnary(); }
+        if (*pos == '+') { pos++; return parseUnary(); }
+        return parseAtom();
+    }
+
     float parsePow() {
-        float val = parseAtom();
+        float val = parseUnary();
         skipWS();
         if (*pos == '^') { pos++; val = std::pow(val, parsePow()); }
         return val;
@@ -374,11 +520,63 @@ struct ExprParser {
         return val;
     }
 
+    float parseCompare() {
+        float lhs = parseExpr();
+        skipWS();
+        // Order matters: try two-char operators before single-char so '<='
+        // doesn't get partially matched as '<' first.
+        if (matchOp("<=")) { float r = parseExpr(); return (lhs <= r) ? 1.0f : 0.0f; }
+        if (matchOp(">=")) { float r = parseExpr(); return (lhs >= r) ? 1.0f : 0.0f; }
+        if (matchOp("==")) { float r = parseExpr(); return (lhs == r) ? 1.0f : 0.0f; }
+        if (matchOp("!=")) { float r = parseExpr(); return (lhs != r) ? 1.0f : 0.0f; }
+        if (matchOp("<"))  { float r = parseExpr(); return (lhs <  r) ? 1.0f : 0.0f; }
+        if (matchOp(">"))  { float r = parseExpr(); return (lhs >  r) ? 1.0f : 0.0f; }
+        return lhs;
+    }
+
+    float parseAnd() {
+        float val = parseCompare();
+        while (true) {
+            skipWS();
+            if (matchOp("&&")) {
+                float rhs = parseCompare();
+                val = (val != 0.0f && rhs != 0.0f) ? 1.0f : 0.0f;
+            } else break;
+        }
+        return val;
+    }
+
+    float parseOr() {
+        float val = parseAnd();
+        while (true) {
+            skipWS();
+            if (matchOp("||")) {
+                float rhs = parseAnd();
+                val = (val != 0.0f || rhs != 0.0f) ? 1.0f : 0.0f;
+            } else break;
+        }
+        return val;
+    }
+
+    float parseTernary() {
+        float cond = parseOr();
+        skipWS();
+        if (*pos == '?') {
+            pos++;
+            float thenV = parseTernary();
+            skipWS();
+            if (*pos == ':') pos++;
+            float elseV = parseTernary();
+            return cond != 0.0f ? thenV : elseV;
+        }
+        return cond;
+    }
+
     float eval(float xVal, float fVal) {
         x = xVal;
         f = fVal;
         pos = str;
-        return parseExpr();
+        return parseTernary();
     }
 };
 } // anonymous namespace
@@ -411,6 +609,34 @@ float WaveExprParser::evaluateAt(const std::string& expr, float x, float f) {
     ExprParser parser;
     parser.str = expr.c_str();
     return parser.eval(x, f);
+}
+
+float WaveExprParser::evaluateWithVars(const std::string& expr,
+                                       const std::unordered_map<std::string, float>& vars) {
+    if (expr.empty()) return 0.0f;
+    ExprParser parser;
+    parser.str = expr.c_str();
+    parser.extraVars = &vars;
+    // x and f default to 0 — the caller usually passes phase via vars["x"]
+    // or by including "x" in the map. For SignalShape we use phase as a
+    // var named "x" (mapped to 0..2pi) so the existing shape expressions
+    // like sin(x) keep working.
+    auto itX = vars.find("x"); if (itX != vars.end()) parser.x = itX->second;
+    auto itF = vars.find("f"); if (itF != vars.end()) parser.f = itF->second;
+    return parser.eval(parser.x, parser.f);
+}
+
+float WaveExprParser::evaluateWithVars(const std::string& expr,
+                                       const std::unordered_map<std::string, float>& vars,
+                                       const std::function<float(float)>& shapeFn) {
+    if (expr.empty()) return 0.0f;
+    ExprParser parser;
+    parser.str = expr.c_str();
+    parser.extraVars = &vars;
+    parser.shapeFn = &shapeFn;
+    auto itX = vars.find("x"); if (itX != vars.end()) parser.x = itX->second;
+    auto itF = vars.find("f"); if (itF != vars.end()) parser.f = itF->second;
+    return parser.eval(parser.x, parser.f);
 }
 
 // ==============================================================================
@@ -499,10 +725,11 @@ void BuiltinSynthProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mi
             }
             if (vi >= 0) {
                 voices[vi].active = true;
-                voices[vi].noteNumber = msg.getNoteNumber();
-                voices[vi].midiChannel = msg.getChannel();
+                voices[vi].note = msg.getNoteNumber();
+                voices[vi].mpeChannel = msg.getChannel();
                 voices[vi].frequency = (float)juce::MidiMessage::getMidiNoteInHertz(msg.getNoteNumber());
                 voices[vi].velocity = msg.getVelocity() / 127.0f;
+                voices[vi].mpe = MpeVoiceState{};
                 voices[vi].envStage = SynthVoice::Attack;
                 voices[vi].envLevel = 0.0f;
                 voices[vi].envTime = 0;
@@ -510,7 +737,7 @@ void BuiltinSynthProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mi
             }
         } else if (msg.isNoteOff()) {
             for (int i = 0; i < MAX_VOICES; ++i) {
-                if (voices[i].active && voices[i].noteNumber == msg.getNoteNumber()
+                if (voices[i].active && voices[i].note == msg.getNoteNumber()
                     && voices[i].envStage != SynthVoice::Release) {
                     voices[i].envStage = SynthVoice::Release;
                     voices[i].envTime = 0;
@@ -528,20 +755,27 @@ void BuiltinSynthProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mi
                 voices[i] = {};
         }
     }
+    // Distribute per-note expression (pitch bend, channel + poly key
+    // pressure, timbre) to the matching voices. No-op until a controller
+    // actually sends these messages.
+    distributeMpeMessages(midi, voices);
 
     // Render voices
     float phaseInc;
     for (int i = 0; i < MAX_VOICES; ++i) {
         if (!voices[i].active) continue;
         auto& v = voices[i];
-        phaseInc = v.frequency / (float)sampleRate;
+        // Apply per-note pitch bend (semitones) and aftertouch swell.
+        float freq = v.frequency * std::pow(2.0f, v.mpe.pitchBend / 12.0f);
+        float pMul = 1.0f + node.aftertouchSensitivity * effectivePressure(v.mpe);
+        phaseInc = freq / (float)sampleRate;
 
         for (int s = 0; s < numSamples; ++s) {
             float env = v.advance((float)sampleRate, attack, decay, sustain, release);
             if (!v.active) break;
 
-            float sample = wavetable.sample(v.phase, v.frequency, (float)sampleRate);
-            sample *= env * v.velocity * volume;
+            float sample = wavetable.sample(v.phase, freq, (float)sampleRate);
+            sample *= env * v.velocity * volume * pMul;
 
             for (int c = 0; c < numChannels; ++c)
                 buf.addSample(c, s, sample);

@@ -367,7 +367,10 @@ void WaveletPainterComponent::commitToNode() {
         externalFrame->filterName   = filterName;
     } else if (graph) {
         if (auto* nd = graph->findNode(nodeId)) {
-            nd->script = encodeWaveletPaint(coefficients, numLevels, filterName);
+            // Synchronised: a standalone wavelet-paint node classifies as a
+            // wavetable source, so TerrainSynthProcessor polls its script on
+            // the audio thread. Lock the per-node mutex around the write.
+            setNodeScriptSynced(*nd, encodeWaveletPaint(coefficients, numLevels, filterName));
             // Mark the project dirty so close/quit prompts the user to save
             // and autosave captures these edits. (The externalFrame branch
             // above writes into a frame inside the owning LayeredWaveEditor,

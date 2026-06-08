@@ -67,6 +67,20 @@ public:
     void stop();
     void pause() { playing = false; }
 
+    // Move the playhead back to the start of playback - the loop start if a
+    // user loop region is active, otherwise beat 0. Used when Play is pressed
+    // while the playhead is parked at/past the song end so playback restarts
+    // from the top instead of beginning in silence past the last note.
+    void rewindToStart() {
+        if (transport && transport->loopEnabled
+            && transport->loopEndBeat > transport->loopStartBeat)
+            positionSamples = (int64_t)transport->beatsToSamples(transport->loopStartBeat);
+        else
+            positionSamples = 0;
+        songPlayCount = 0;
+        endTailSamplesRemaining = -1;
+    }
+
     double getBpm() const { return bpm.load(); }
     void setBpm(double b) { bpm = b; }
 
@@ -491,6 +505,15 @@ private:
     // atomic is trivially copyable and lock-free.
     std::atomic<int> grainFreezeMode { 0 };
     static constexpr int kPreviewCrossfadeSamples = 480;  // ~10 ms @ 48 kHz
+    // The GrainLoop freeze preview (used for marker-scrub audition and the
+    // capture-dialog Play button when there's no synth node to route through)
+    // plays the source PCM directly at full scale. A wired-up synth note, by
+    // contrast, is attenuated by env * velocity * Volume before it hits the
+    // mix. To keep the freeze audition from being noticeably louder than
+    // actual note playback, scale the GrainLoop output down by this factor.
+    // It's a perceptual match, not an exact one (a dense full-mix grain and a
+    // single synth voice never measure identically), so this is tuned by ear.
+    static constexpr float kFreezePreviewGain = 0.5f;
 public:
 
     // MPE recording: captures per-note expression from hardware MPE controllers

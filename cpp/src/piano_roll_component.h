@@ -28,6 +28,8 @@ public:
     void mouseDrag(const juce::MouseEvent& e) override;
     void mouseUp(const juce::MouseEvent& e) override;
     void mouseMove(const juce::MouseEvent& e) override;
+    void mouseEnter(const juce::MouseEvent& e) override;
+    void mouseExit(const juce::MouseEvent& e) override;
     void mouseWheelMove(const juce::MouseEvent& e, const juce::MouseWheelDetails& w) override;
     bool keyPressed(const juce::KeyPress& key) override;
 
@@ -62,19 +64,63 @@ private:
     enum ExprLane { ExprNone, ExprVelocity, ExprPitchBend, ExprSlide, ExprPressure, ExprAutomation };
     ExprLane exprLane = ExprNone;
     static constexpr float EXPR_LANE_HEIGHT = 80.0f;
-    juce::TextButton exprPBBtn{"PB"}, exprSlideBtn{"Slide"}, exprPressBtn{"Press"};
+    juce::ComboBox exprLaneCombo;  // select which MPE expression curve to view/edit
     juce::ComboBox autoParamCombo; // select which parameter's automation to view/edit
     int autoParamIndex = -1;       // index into node.params, -1 = none
 
     // Drag state
-    enum DragModeEnum { DragNone, DragNote, DragResizeLeft, DragResizeRight, DragBox, DragExprPoint };
+    enum DragModeEnum { DragNone, DragNote, DragResizeLeft, DragResizeRight, DragBox, DragExprPoint, DragSongEnd };
     DragModeEnum dragMode = DragNone;
     int dragNoteCI = -1, dragNoteNI = -1;
+
+    // Song-end resize handle. A draggable orange border is drawn at the end of
+    // this timeline's content (the rightmost clip's end). Dragging it left
+    // shortens the song - trimming any notes past the new end on release -
+    // while dragging right adds empty beats. songEndDragVisBeats/Scroll capture
+    // the horizontal mapping at gesture start so live resizing stays smooth even
+    // as the derived timeline length (which feeds the cursor->beat conversion)
+    // changes underneath the drag.
+    int   songEndDragClipIdx = -1;
+    float songEndDragVisBeats = 0;
+    float songEndDragScroll = 0;
+    // Node-local end beat of the rightmost clip (0 and clipIdx=-1 if no clips).
+    float songEndBeatLocal(int* clipIdxOut = nullptr) const;
+    // Node-local beat -> on-screen x (mirrors the beatToX used in paint).
+    float beatToScreenX(float beatLocal) const;
+    static constexpr float SONG_END_GRAB_PX = 5.0f;
     float dragStartBeat = 0;
     int dragStartPitch = 0;
     juce::Point<float> dragStartScreen, dragCurrentScreen;
     float lastClickBeat = 0;
     int lastClickPitch = 60;
+
+    // Live paste target. Tracks the grid cell under the cursor (updated in
+    // mouseMove) so Ctrl+V pastes where the mouse is pointing and paint() can
+    // draw a ghost preview of the clipboard there. hoverValid is false when the
+    // cursor is off the grid (over toolbar / keys / scrollbars / outside the
+    // component) so the ghost only appears over editable space.
+    float hoverBeat = 0;
+    int hoverPitch = 60;
+    bool hoverValid = false;
+
+    // Deferred right-click context menu. Showing a juce::PopupMenu synchronously
+    // from mouseDown while the right button is still held lets the button-release
+    // land on (and auto-select) whatever item sits under the cursor - which is
+    // the first item, "Place Note Here", so a plain right-click dropped a stray
+    // note. We arm the menu on right mouseDown and actually show it on mouseUp,
+    // when no button is held, so selecting an item requires a deliberate click.
+    // (This also matches the Windows convention of opening context menus on
+    // right-button release.)
+    bool rightClickArmed = false;
+    juce::Point<float> rightClickDownPos;
+
+    // Marquee (box) selection. The selection is recomputed live on every drag
+    // tick so notes highlight as the rectangle sweeps over them and unhighlight
+    // when they fall back out. marqueeBase is the selection that existed when the
+    // drag began (empty for a plain drag, the prior selection for Shift+drag) so
+    // each tick can rebuild selection = base + notes-currently-in-box.
+    std::set<std::pair<int, int>> marqueeBase;
+    void updateMarqueeSelection();
 
     // Undo snapshots for drag operations
     struct NoteSnapshot {
@@ -99,7 +145,6 @@ public:
 
 private:
     // Helpers
-    void updateExprLaneButtonStyles();
     std::pair<float, int> screenToBeatPitch(juce::Point<float> pos) const;
 
     struct NoteHit {
@@ -111,10 +156,15 @@ private:
     void showNoteMenu();
     void showEmptyMenu();
 
-    // Clipboard (static - shared across all piano roll instances)
+    // Clipboard (static - shared across all piano roll instances).
+    // Notes are stored relative to the copied block's TOP-LEFT corner so paste
+    // can re-anchor the whole block to the paste point (the click / marquee-drag
+    // origin): offsetFromFirst is beats from the earliest note, pitchBelowTop is
+    // semitones below the highest note. On paste the top-left note lands at the
+    // anchor and the rest keep their relative positions.
     struct ClipboardNote {
-        float offsetFromFirst; // beat offset relative to the earliest copied note
-        int pitch;
+        float offsetFromFirst; // beats from the earliest copied note (>= 0)
+        int   pitchBelowTop;   // semitones below the highest copied note (>= 0)
         float duration;
         int velocity;
         float detune;

@@ -355,6 +355,17 @@ if(MSVC)
     target_link_options(SEANCE PRIVATE
         "$<$<CONFIG:Debug>:/NODEFAULTLIB:python314_d.lib>"
         "/SUBSYSTEM:WINDOWS")
+
+    # Emit debug symbols (PDB) for Release too. /Zi keeps full /O2 codegen but
+    # produces a side PDB, and /DEBUG tells the linker to write it; /OPT:REF and
+    # /OPT:ICF undo the linker's default of disabling those optimisations when
+    # /DEBUG is present, so the Release binary stays the same size/speed. Without
+    # this, a Release crash dump has no symbols and the faulting frame can't be
+    # named - which is exactly what bit us diagnosing the granular-wavetable
+    # autosave crash. The PDB ships next to SEANCE.exe in the artefacts folder.
+    target_compile_options(SEANCE PRIVATE "$<$<CONFIG:Release>:/Zi>")
+    target_link_options(SEANCE PRIVATE
+        "$<$<CONFIG:Release>:/DEBUG;/OPT:REF;/OPT:ICF>")
 endif()
 
 # Windows Media Foundation (for M4A/WMA export)

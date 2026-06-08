@@ -33,7 +33,7 @@
       <li><em>Velocity</em> — scales the velocity of every note-on. Sample-accurate, applied at the moment the event passes through.</li>
       <li><em>Pitch Bend</em> — sets the channel pitch bend value continuously. Replaces any pitch bend coming in.</li>
       <li><em>Mod Wheel</em> — sends CC#1 (the standard mod wheel controller) at the signal's current value. Most synths map mod wheel to vibrato depth by default, so this is the easy way to get auto-vibrato.</li>
-      <li><em>Aftertouch</em> — sends channel pressure events. Synths that respond to aftertouch (built-in synths and many plugins) react in real time.</li>
+      <li><em>Channel Pressure</em> — sends channel-aftertouch (channel pressure) events. This is a single value applied to <strong>all</strong> notes currently held on the channel — it is <em>not</em> per-note "key pressure" / polyphonic aftertouch, so it can't push one held note harder than another. That's deliberate: a signal cable carries one value per sample, which maps exactly onto channel pressure, whereas true per-note pressure can't ride a mono signal (it's handled inside the synth voice instead). Synths that respond to aftertouch (built-in synths and many plugins) react in real time.</li>
       <li><em>CC#</em> — sends an arbitrary control change number, which you specify in the box that appears next to the target combo. Common useful CCs: 7 (volume), 10 (pan), 11 (expression), 64 (sustain pedal).</li>
     </ul>
   </li>

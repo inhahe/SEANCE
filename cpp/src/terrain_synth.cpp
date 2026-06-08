@@ -799,15 +799,25 @@ float TerrainSynthProcessor::Voice::advanceEnv(float sr, float a, float h, float
 // ==============================================================================
 
 void TerrainSynthProcessor::reloadIfScriptChanged() {
-    if (node.script == cachedScript) return;
-    cachedScript = node.script;
+    // node.script is rewritten by UI-thread editors (setNodeScriptSynced) and
+    // read here on the audio thread. A std::string assignment is not atomic,
+    // so an unsynchronised read can see the new size with a stale/freed data
+    // pointer - for a multi-MB granular wavetable that means memcpy'ing ~1.4 MB
+    // from a garbage pointer and crashing. Take a locked snapshot off the
+    // shared per-node mutex, then work off that copy so nothing else in
+    // processBlock touches node.script concurrently with a writer.
+    {
+        std::lock_guard<std::mutex> lock(*node.auditionMutex);
+        if (node.script == cachedScript) return;
+        cachedScript = node.script;
+    }
 
     // For now, only re-parse __layered__ scripts at runtime - other
     // script types (audio, image, wavetable) load files and don't
     // change during a session.
-    if (node.script.find("__layered__:") == 0) {
+    if (cachedScript.find("__layered__:") == 0) {
         LayeredWaveform lw;
-        if (lw.decode(node.script)) {
+        if (lw.decode(cachedScript)) {
             std::vector<float> samples;
             lw.render(samples);
             terrain.init({(int)samples.size()});
@@ -950,6 +960,8 @@ TerrainSynthProcessor::TerrainSynthProcessor(Node& n, Transport& t) : node(n), t
                     e.grainLength      = std::max(16, gf->grainLength);
                     e.embeddedPitchHz  = (gf->embeddedPitchHz > 0.0f)
                                           ? gf->embeddedPitchHz : 440.0f;
+                    e.freezeMode       = (int)gf->freezeMode;
+                    e.crossfadeSamples = std::max(0, gf->crossfadeSamples);
                     e.position         = sf.position;
                     wtGranularFrames.push_back(std::move(e));
                 }
@@ -1026,6 +1038,8 @@ TerrainSynthProcessor::TerrainSynthProcessor(Node& n, Transport& t) : node(n), t
                     e.grainLength      = std::max(16, gf->grainLength);
                     e.embeddedPitchHz  = (gf->embeddedPitchHz > 0.0f)
                                           ? gf->embeddedPitchHz : 440.0f;
+                    e.freezeMode       = (int)gf->freezeMode;
+                    e.crossfadeSamples = std::max(0, gf->crossfadeSamples);
                     // Normalize gridCoord into [0,1] per dim so the per-
                     // block Position weight math doesn't need to know about
                     // the underlying grid resolution.
@@ -1273,10 +1287,7 @@ void TerrainSynthProcessor::refreshPartialBank() {
 // Scatter mode: Wendland RBF weight at the current Position, normalized
 // by the total RBF weight (identical to the cycle blend's normalization).
 void TerrainSynthProcessor::updateGranularWeights() {
-    granWeights.assign(wtGranularFrames.size(), 0.0f);
-    if (wtGranularFrames.empty()) return;
-
-    // Build the current Position vector from named params.
+    // Live Position from the named params -> the shared, all-voices weights.
     const int nPosDims = wtScatter ? wtScatterDims : wtNumDims;
     std::vector<float> pos(std::max(1, nPosDims), 0.0f);
     for (int d = 0; d < nPosDims; ++d) {
@@ -1284,6 +1295,13 @@ void TerrainSynthProcessor::updateGranularWeights() {
                           : std::string("Position ") + std::to_string(d + 1);
         pos[d] = juce::jlimit(0.0f, 1.0f, getParamByName(node, pname.c_str(), 0.5f));
     }
+    computeGranularWeights(pos, granWeights);
+}
+
+void TerrainSynthProcessor::computeGranularWeights(const std::vector<float>& pos,
+                                                   std::vector<float>& out) {
+    out.assign(wtGranularFrames.size(), 0.0f);
+    if (wtGranularFrames.empty()) return;
 
     if (wtScatter) {
         // Wendland weights normalized to sum-1, matching the cycle blend.
@@ -1295,7 +1313,7 @@ void TerrainSynthProcessor::updateGranularWeights() {
             float d2 = 0.0f;
             for (int d = 0; d < wtScatterDims; ++d) {
                 float a = (d < (int)fp.size()) ? fp[d] : 0.5f;
-                float dd = a - pos[d];
+                float dd = a - (d < (int)pos.size() ? pos[d] : 0.5f);
                 d2 += dd * dd;
             }
             float dist = std::sqrt(d2);
@@ -1318,12 +1336,12 @@ void TerrainSynthProcessor::updateGranularWeights() {
                 float d2 = 0.0f;
                 for (int d = 0; d < wtScatterDims; ++d) {
                     float a = (d < (int)gp.size()) ? gp[d] : 0.5f;
-                    float dd = a - pos[d];
+                    float dd = a - (d < (int)pos.size() ? pos[d] : 0.5f);
                     d2 += dd * dd;
                 }
                 if (d2 < bestD2) { bestD2 = d2; nearest = (int)gi; }
             }
-            if (nearest >= 0) granWeights[nearest] = 1.0f;
+            if (nearest >= 0) out[nearest] = 1.0f;
             return;
         }
         // Map granular-frame entries to their per-frame weight in wAll.
@@ -1343,7 +1361,7 @@ void TerrainSynthProcessor::updateGranularWeights() {
                 if (std::abs(fp[d] - gp[d]) > 1e-6f) { match = false; break; }
             }
             if (match) {
-                granWeights[gi] = wAll[fi] * invT;
+                out[gi] = wAll[fi] * invT;
                 ++gi;
             }
         }
@@ -1379,17 +1397,152 @@ void TerrainSynthProcessor::updateGranularWeights() {
             if (dimSize <= 1) continue;
             const float scale   = (float)(dimSize - 1);
             // |pos - gp| measured in cell units. Hat width = 1 cell.
-            const float diff    = std::abs(pos[d] - gp[d]) * scale;
+            const float diff    = std::abs((d < (int)pos.size() ? pos[d] : 0.5f)
+                                           - gp[d]) * scale;
             const float h       = std::max(0.0f, 1.0f - diff);
             w *= h;
         }
-        granWeights[gi] = w;
+        out[gi] = w;
+    }
+}
+
+int TerrainSynthProcessor::startVoice(int noteNumber, int channel, int velocity) {
+    channel = juce::jlimit(1, 16, channel);
+    // Allocate a free voice, else steal the quietest one.
+    int vi = -1;
+    float minLev = 999.0f;
+    for (int i = 0; i < MAX_VOICES; ++i) {
+        if (!voices[i].active) { vi = i; break; }
+        if (voices[i].envLevel < minLev) { minLev = voices[i].envLevel; vi = i; }
+    }
+    if (vi < 0) return -1;
+
+    auto& v = voices[vi];
+    v.active = true;
+    v.noteNumber = noteNumber;
+    v.midiChannel = channel;
+    v.baseFrequency = transport.noteToFreq(noteNumber);
+    // Seed effective frequency with the current bend factor so notes
+    // triggered while the pitch wheel is held start at the bent pitch.
+    v.frequency = v.baseFrequency * pitchBendFactor[channel - 1];
+    // Velocity sensitivity from the unified envelope (sens=0 -> always full
+    // volume, organ-like; sens=1 -> linear velocity scaling, piano-like).
+    // Fall back to the legacy "Vel Sens" param for old projects.
+    {
+        float velSens = node.ahdsrEnvelope.velocitySensitivity;
+        velSens = getParamByName(node, "Vel Sens", velSens);
+        float raw = juce::jlimit(0, 127, velocity) / 127.0f;
+        // envPeak scales the envelope across every stage (adsr_envelope.cpp:
+        // 740-742) - the single place velocity is applied to the voice level.
+        // Do NOT multiply by a separate velocity factor downstream.
+        v.envPeak = 1.0f - velSens * (1.0f - raw);
+    }
+    v.phase = 0;
+    v.startBeat = transport.positionBeats();
+    v.envStage = Voice::Attack;
+    v.envLevel = 0;
+    v.envTime = 0;
+    v.sustainHeld = false;
+    v.polyAftertouch = 0.0f;
+    // Clear any audition Position override left over from a previous note on
+    // this (reused) voice; the audition drain re-sets it for editor previews.
+    v.hasAuditionPos = false;
+    v.auditionPos.clear();
+    return vi;
+}
+
+void TerrainSynthProcessor::releaseNote(int noteNumber, int channel) {
+    channel = juce::jlimit(1, 16, channel);
+    for (int i = 0; i < MAX_VOICES; ++i) {
+        if (voices[i].active && voices[i].noteNumber == noteNumber
+            && voices[i].envStage != Voice::Release) {
+            // Sustain pedal held: defer release until the pedal comes up.
+            if (sustainPedal[channel - 1]) {
+                voices[i].sustainHeld = true;
+            } else {
+                voices[i].envStage = Voice::Release;
+                voices[i].envTime = 0;
+            }
+        }
     }
 }
 
 void TerrainSynthProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::MidiBuffer& midi) {
     applySignalModulations(node, buf);
     reloadIfScriptChanged();
+
+    // TEMP DIAGNOSTIC (#88 Position modulation): accumulate the LFO signal and
+    // the resulting Position value across every block, then dump min / max /
+    // mean over the window ~twice a second. This measures the two reported
+    // symptoms directly:
+    //   * "favouring waveform 1" -> mean Position != 0.5, or a lopsided
+    //     min..max range (e.g. 0.00..0.50 instead of 0.00..1.00).
+    //   * "sudden jump to the right every cycle" -> max creeping upward over
+    //     successive windows (a drift / accumulation bug) vs a stable range
+    //     (the LFO shape's own endpoints not matching = expected).
+    if (isWavetable && !node.modPins.empty()) {
+        const auto& mp = node.modPins.front();
+        int slotIdx = -1, sigCount = 0;
+        for (auto& pin : node.pinsIn) {
+            if (pin.id == mp.pinId) { slotIdx = sigCount; break; }
+            if (pin.kind == PinKind::Signal || pin.kind == PinKind::Param) ++sigCount;
+        }
+        int ch = 2 + slotIdx;
+        bool chOk = (slotIdx >= 0 && ch < buf.getNumChannels());
+        float sig = chOk ? buf.getSample(ch, 0) : 0.0f;
+        float pval = (mp.paramIndex >= 0 && mp.paramIndex < (int)node.params.size())
+                        ? node.params[mp.paramIndex].value : 0.0f;
+
+        static int   dbgN     = 0;
+        static float sigMin    = 1e9f,  sigMax    = -1e9f,  sigSum    = 0.0f;
+        static float valMin    = 1e9f,  valMax    = -1e9f,  valSum    = 0.0f;
+        if (chOk) {
+            sigMin = std::min(sigMin, sig); sigMax = std::max(sigMax, sig); sigSum += sig;
+            valMin = std::min(valMin, pval); valMax = std::max(valMax, pval); valSum += pval;
+            ++dbgN;
+        }
+        if (dbgN >= 90) {
+            juce::String pname = (mp.paramIndex >= 0 && mp.paramIndex < (int)node.params.size())
+                            ? juce::String(node.params[mp.paramIndex].name) : juce::String("?");
+            juce::String s;
+            s << "[WT-MOD] node=" << node.name << " bufCh=" << buf.getNumChannels()
+              << " param=" << pname << " ch=" << ch
+              << " | sig[min=" << juce::String(sigMin, 3) << " max=" << juce::String(sigMax, 3)
+              << " mean=" << juce::String(sigSum / dbgN, 3) << "]"
+              << " | pos[min=" << juce::String(valMin, 3) << " max=" << juce::String(valMax, 3)
+              << " mean=" << juce::String(valSum / dbgN, 3) << "]";
+            juce::Logger::writeToLog(s);
+            dbgN = 0;
+            sigMin = valMin = 1e9f; sigMax = valMax = -1e9f; sigSum = valSum = 0.0f;
+        }
+    }
+
+    // Drain UI-side audition events directly into voices. This is how editor
+    // preview buttons (e.g. the wavetable editor's GranularFrameEditor-
+    // Component Play button) audition through the actual voice / envelope /
+    // Volume path instead of the audio engine's separate preview mixer - so
+    // the editor preview matches the eventual graph playback. We start voices
+    // here rather than re-injecting MIDI so each audition note-on can carry a
+    // per-voice wavetable Position override (ev.position): a frame's Play
+    // button must audition THAT frame, regardless of where the live Position
+    // knob sits. Plain MIDI / timeline notes go through the same startVoice/
+    // releaseNote helpers below with no override.
+    {
+        std::lock_guard<std::mutex> lock(*node.auditionMutex);
+        for (auto& ev : node.pendingAudition) {
+            if (ev.isNoteOn) {
+                int vi = startVoice(ev.pitch, 1, ev.velocity);
+                if (vi >= 0 && !ev.position.empty()) {
+                    voices[vi].hasAuditionPos = true;
+                    voices[vi].auditionPos    = ev.position;
+                }
+            } else {
+                releaseNote(ev.pitch, 1);
+            }
+        }
+        node.pendingAudition.clear();
+    }
+
     buf.clear();
     int numSamples = buf.getNumSamples();
     int numChannels = buf.getNumChannels();
@@ -1441,9 +1594,13 @@ void TerrainSynthProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mi
             case 2:  requested = TerrainSynthMode::AdditiveBank;     break;
             default: requested = TerrainSynthMode::SamplePerPoint;   break;
         }
+        // Use cachedScript (the audio-thread-owned snapshot refreshed by
+        // reloadIfScriptChanged at the top of this block), never node.script
+        // directly - reading the live string here would re-introduce the
+        // UI/audio data race that reloadIfScriptChanged exists to avoid.
         SynthSourceClass cls = isAudioSample ? SynthSourceClass::Sample
                              : isWavetable   ? SynthSourceClass::Wavetable
-                             : classifySynthSource(node.script);
+                             : classifySynthSource(cachedScript);
         mode = synthModeAvailabilityFor(cls).clamp(requested);
     }
     // Additive-bank mode needs a fresh harmonic decomposition whenever the
@@ -1472,57 +1629,12 @@ void TerrainSynthProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mi
     for (auto metadata : midi) {
         auto msg = metadata.getMessage();
         if (msg.isNoteOn()) {
-            int vi = -1;
-            float minLev = 999;
-            for (int i = 0; i < MAX_VOICES; ++i) {
-                if (!voices[i].active) { vi = i; break; }
-                if (voices[i].envLevel < minLev) { minLev = voices[i].envLevel; vi = i; }
-            }
-            if (vi >= 0) {
-                int ch = juce::jlimit(1, 16, msg.getChannel());
-                voices[vi].active = true;
-                voices[vi].noteNumber = msg.getNoteNumber();
-                voices[vi].midiChannel = ch;
-                voices[vi].baseFrequency = transport.noteToFreq(msg.getNoteNumber());
-                // Seed effective frequency with the current bend factor so
-                // notes triggered while the pitch wheel is held start at the
-                // bent pitch rather than the nominal one.
-                voices[vi].frequency =
-                    voices[vi].baseFrequency * pitchBendFactor[ch - 1];
-                // Apply velocity sensitivity from the unified envelope
-                // (sens=0 -> always full volume, organ-like; sens=1 ->
-                // linear velocity scaling, piano-like). Fall back to the
-                // legacy "Vel Sens" param for any project that still
-                // carries it instead of the new ahdsrEnvelope field.
-                {
-                    float velSens = node.ahdsrEnvelope.velocitySensitivity;
-                    velSens = getParamByName(node, "Vel Sens", velSens);
-                    float raw = msg.getVelocity() / 127.0f;
-                    voices[vi].velocity = 1.0f - velSens * (1.0f - raw);
-                    // Capture peak amplitude for the envelope shape.
-                    voices[vi].envPeak = 1.0f - velSens * (1.0f - raw);
-                }
-                voices[vi].phase = 0;
-                voices[vi].startBeat = transport.positionBeats();
-                voices[vi].envStage = Voice::Attack;
-                voices[vi].envLevel = 0;
-                voices[vi].envTime = 0;
-            }
+            startVoice(msg.getNoteNumber(),
+                       juce::jlimit(1, 16, msg.getChannel()),
+                       msg.getVelocity());
         } else if (msg.isNoteOff()) {
-            int ch = juce::jlimit(1, 16, msg.getChannel());
-            for (int i = 0; i < MAX_VOICES; ++i)
-                if (voices[i].active && voices[i].noteNumber == msg.getNoteNumber()
-                    && voices[i].envStage != Voice::Release) {
-                    // If sustain pedal is held on this channel, defer the
-                    // release until the pedal comes back up; otherwise
-                    // release immediately.
-                    if (sustainPedal[ch - 1]) {
-                        voices[i].sustainHeld = true;
-                    } else {
-                        voices[i].envStage = Voice::Release;
-                        voices[i].envTime = 0;
-                    }
-                }
+            releaseNote(msg.getNoteNumber(),
+                        juce::jlimit(1, 16, msg.getChannel()));
         } else if (msg.isPitchWheel()) {
             // Pitch bend: update this channel's bend factor and retune any
             // currently-playing voices on the same channel so sustained
@@ -1636,6 +1748,19 @@ void TerrainSynthProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mi
     // Position so the per-sample voice loop can mix in Σ wGran[i] *
     // olaStream[i] on top of the cycle terrain.
     updateGranularWeights();
+
+    // Wavetable-editor audition voices select their frame from a per-voice
+    // Position override rather than the live Position. Compute each such
+    // voice's own weight set once per block (cheap - one pass over the
+    // granular frames) so the per-sample loop can read them without touching
+    // the shared granWeights. Only audition voices pay this.
+    if (!wtGranularFrames.empty()) {
+        for (int vi = 0; vi < MAX_VOICES; ++vi) {
+            auto& v = voices[vi];
+            if (v.active && v.hasAuditionPos && !v.auditionPos.empty())
+                computeGranularWeights(v.auditionPos, v.auditionWeights);
+        }
+    }
 
     // Scatter wavetable: blend frames into the 1D terrain at block start
     // using a Wendland C^2 RBF over the current Position. The per-sample
@@ -1781,11 +1906,38 @@ void TerrainSynthProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mi
             }
         }
 
-        // Override coordinates with audio-rate signal inputs (channels 2+)
+        // Override coordinates with the explicit per-axis "Sig <axis>" signal
+        // inputs (the coordinate-driver pins created on Surface terrain synths
+        // - "Sig X", "Sig Y", ...). The Nth such pin maps onto coord[N].
+        //
+        // This must be PIN-AWARE, not a blind "channel 2+si -> coord[si]" map:
+        // tonal synths now also carry an "Aftertouch" Signal pin (#78) and the
+        // on-demand "Mod: ..." modulation pins (#88), all of which occupy
+        // control channels (2,3,4,...) interleaved with any Sig pins. Those
+        // pins are NOT coordinate drivers - Aftertouch feeds the amplitude
+        // swell and Mod pins modulate named params via applySignalModulations
+        // at the top of the block (which is how a wired LFO already reaches the
+        // wavetable Position). Treating their channels as coordinates was the
+        // bug that made a "Mod: Position" LFO land on the phase axis instead of
+        // the frame position (no audible Position movement, subtle per-note
+        // timbre wobble). We walk pinsIn counting control slots exactly the way
+        // graph_processor routes them (Signal+Param pins -> channels 2+), and
+        // only act on the "Sig " axis pins.
         if (hasSignalInputs) {
-            for (int si = 0; si < numSignalInputs && si < nd; ++si) {
-                float sigVal = buf.getSample(2 + si, s);
-                coord[si] = juce::jlimit(0.0f, 1.0f, (sigVal + 1.0f) * 0.5f);
+            int slot = 0;   // control-slot index; buffer channel = 2 + slot
+            int axis = 0;   // which terrain coordinate the next Sig pin drives
+            for (auto& p : node.pinsIn) {
+                if (p.kind != PinKind::Signal && p.kind != PinKind::Param)
+                    continue;
+                if (p.name.rfind("Sig ", 0) == 0 && axis < nd) {
+                    int ch = 2 + slot;
+                    if (ch < numChannels) {
+                        float sigVal = buf.getSample(ch, s);
+                        coord[axis] = juce::jlimit(0.0f, 1.0f, (sigVal + 1.0f) * 0.5f);
+                    }
+                    ++axis;
+                }
+                ++slot;
             }
         }
 
@@ -1872,10 +2024,18 @@ void TerrainSynthProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mi
                 // ---- Granular layer mix ----
                 //
                 // For each granular frame with non-trivial morph weight,
-                // run a 4-voice OLA Hann-windowed stream that reads from
-                // the frame's source PCM at envPos[v] + srcStart[v],
-                // scaled by noteHz / embeddedPitchHz so MIDI pitch tracks.
-                // Sum into `sample` weighted by granWeights[i].
+                // sustain the captured marker window as a held note. The
+                // algorithm MUST match what the capture/freeze dialog
+                // auditions (audio_engine.cpp granularSample) so that
+                // "what you audition = what you get". The audition plays
+                // a CrossfadeLoop for every freeze mode today (its
+                // `(void)freezeMode` fallback), so the synth does too;
+                // the only thing the synth adds is pitch tracking, since
+                // the audition plays at the captured pitch while a synth
+                // note must follow MIDI. When the audition grows per-mode
+                // implementations (AsyncGranular, ...), add the matching
+                // synth branch here in lockstep - never let the two
+                // diverge, or the user hears one thing and plays another.
                 if (!wtGranularFrames.empty() && isWavetable) {
                     // Lazy-allocate the per-voice granular stream array on
                     // first use - voices that never hit a granular cell
@@ -1883,9 +2043,17 @@ void TerrainSynthProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mi
                     if ((int)v.granStreams.size() != (int)wtGranularFrames.size())
                         v.granStreams.resize(wtGranularFrames.size());
 
-                    const float TWO_PI = 6.28318530718f;
+                    // Audition voices (wavetable editor Play) use their own
+                    // per-voice weights so they play the edited frame; all
+                    // other voices share the live-Position granWeights.
+                    const float* gw =
+                        (v.hasAuditionPos
+                         && v.auditionWeights.size() == wtGranularFrames.size())
+                            ? v.auditionWeights.data()
+                            : granWeights.data();
+
                     for (size_t gi = 0; gi < wtGranularFrames.size(); ++gi) {
-                        const float w = granWeights[gi];
+                        const float w = gw[gi];
                         if (w <= 1e-5f) continue;
 
                         const auto& gf = wtGranularFrames[gi];
@@ -1894,101 +2062,81 @@ void TerrainSynthProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mi
                         const int grainLen = std::max(16, gf.grainLength);
                         if (srcLen <= 0) continue;
 
-                        // Initialize OLA voices: stagger envPos by N/4 so
-                        // the 4-overlap Hann sums to constant amplitude
-                        // from the first sample. Spread srcStart across
-                        // the source window so the texture covers the
-                        // whole captured spot from the first played note
-                        // (each voice gets its quarter of the source as
-                        // its starting base, with small jitter on top).
+                        // CrossfadeLoop geometry, identical to the
+                        // audition: loop the L-sample window [anchor,
+                        // anchor+L) and Hann-crossfade the seam against the
+                        // L/2-sample lookahead tail [anchor+L, anchor+L+xf).
+                        // The anchor is centered so the loop reads the
+                        // marker spot. If the source is too short to hold
+                        // a loop plus its lookahead tail the audition would
+                        // be silent (grainViable==false), so the synth
+                        // contributes nothing too - same gate, same result.
+                        const int reservedTail = grainLen / 2;
+                        const int needLen      = grainLen + reservedTail;
+                        if (srcLen < needLen) continue;
+                        const int maxStart = srcLen - needLen;
+                        const int anchor   = maxStart / 2;
+                        const int xfade = std::max(0,
+                            std::min(gf.crossfadeSamples, grainLen / 2));
+
                         if (!gs.initialized) {
-                            const int maxStart = std::max(0, srcLen - grainLen);
-                            for (int vi2 = 0; vi2 < 4; ++vi2) {
-                                gs.envPos[vi2] = (vi2 * grainLen) / 4;
-                                int s = (maxStart * vi2) / 4;
-                                if (maxStart > 0) {
-                                    const int jitter = std::min(grainLen / 2, maxStart);
-                                    s += granRng.nextInt(jitter + 1) - jitter / 2;
-                                    s = juce::jlimit(0, maxStart, s);
-                                }
-                                gs.srcStart[vi2] = s;
-                            }
+                            gs.loopPhase = 0.0f;
                             gs.initialized = true;
                         }
 
-                        // Pitch ratio scales the *source* read rate so the
-                        // played note tracks MIDI - identical to the cycle
-                        // layer's effFreq / 440 mapping but using the
-                        // frame's embedded pitch as the reference.
-                        //
-                        // Sample-rate correction: source PCM is sampled at
-                        // gf.sourceSampleRate but the OLA advances 1 output
-                        // sample per device tick (1/sampleRate seconds).
-                        // For the source to play "at native pitch" when
-                        // effFreq == embeddedPitchHz we have to read
-                        // sourceSampleRate/sampleRate source samples per
-                        // device sample, otherwise a 48k source on a 44.1k
-                        // device drifts ~8% flat (audible as the wrong
-                        // octave when the rate ratio is large, e.g. a 192k
-                        // song-render played on a 44.1k device pitches
-                        // every note 4x lower). Default to 1.0 if the
-                        // frame didn't record its source rate (legacy
-                        // frames; pre-0.9 file format).
+                        // Pitch ratio: resample the whole loop so the held
+                        // note tracks MIDI. ratio == 1 (loop plays at its
+                        // native rate, exactly the audition) when the note
+                        // equals the frame's embedded pitch and the source
+                        // and device sample rates match. srRatio corrects
+                        // for a source captured at a different rate than the
+                        // device (e.g. a 48k song-render on a 44.1k device).
                         const float srRatio = (gf.sourceSampleRate > 0.0)
                             ? (float)(gf.sourceSampleRate / sampleRate)
                             : 1.0f;
                         const float ratio = (effFreq /
                             std::max(1e-3f, gf.embeddedPitchHz)) * srRatio;
-                        const float invN  = 1.0f / (float)grainLen;
-                        const int   maxStart = std::max(0, srcLen - grainLen);
 
-                        float granSum = 0.0f;
-                        for (int vi2 = 0; vi2 < 4; ++vi2) {
-                            const int env = gs.envPos[vi2];
-                            // Hann window over the grain envelope.
-                            const float winW = 0.5f * (1.0f -
-                                std::cos(TWO_PI * (float)env * invN));
-                            // Source read with linear interp; pitch-scaled
-                            // so MIDI pitch tracks.
-                            const float srcF = (float)gs.srcStart[vi2] +
-                                (float)env * ratio;
-                            int   i0 = (int)srcF;
-                            float fr = srcF - (float)i0;
-                            if (i0 < 0)              { i0 = 0; fr = 0.0f; }
-                            else if (i0 >= srcLen - 1) { i0 = srcLen - 1; fr = 0.0f; }
-                            const int i1 = std::min(i0 + 1, srcLen - 1);
-                            const float val = gf.source[(size_t)i0] * (1.0f - fr)
-                                            + gf.source[(size_t)i1] * fr;
-                            granSum += winW * val;
+                        const float* src = gf.source.data();
+                        const float p = gs.loopPhase;          // [0, grainLen)
 
-                            // Advance envelope; on wrap, random-walk
-                            // srcStart by +/- grainLen/2 (clamped). Tight
-                            // jitter keeps consecutive grains coherent so
-                            // the texture is a continuous drone of the
-                            // source material instead of teleporting to a
-                            // uniformly-random spot every grain (which
-                            // sounds like broken glass). Over many wraps
-                            // the position diffuses across the source so
-                            // a held note explores the whole captured
-                            // window over a few seconds of playback.
-                            int envNext = env + 1;
-                            if (envNext >= grainLen) {
-                                envNext = 0;
-                                if (maxStart > 0) {
-                                    const int jitter = std::min(grainLen, maxStart);
-                                    int s = gs.srcStart[vi2]
-                                        + granRng.nextInt(jitter + 1) - jitter / 2;
-                                    gs.srcStart[vi2] = juce::jlimit(0, maxStart, s);
-                                } else {
-                                    gs.srcStart[vi2] = 0;
-                                }
-                            }
-                            gs.envPos[vi2] = envNext;
+                        // Main playhead read (linear interp).
+                        const float mainF = (float)anchor + p;
+                        int   mi0 = (int)mainF;
+                        float mfr = mainF - (float)mi0;
+                        if (mi0 < 0)               { mi0 = 0; mfr = 0.0f; }
+                        else if (mi0 > srcLen - 1) { mi0 = srcLen - 1; mfr = 0.0f; }
+                        const int mi1 = std::min(mi0 + 1, srcLen - 1);
+                        float out = src[(size_t)mi0] * (1.0f - mfr)
+                                  + src[(size_t)mi1] * mfr;
+
+                        // Seam crossfade over the first `xfade` samples of
+                        // each loop iteration. alpha rises 0->1 (Hann half-
+                        // cycle); the pre-seam tail fades out as the loop
+                        // start fades in, so the wrap is click-free.
+                        if (xfade > 0 && p < (float)xfade) {
+                            const float pi = juce::MathConstants<float>::pi;
+                            const float alpha = 0.5f * (1.0f -
+                                std::cos(pi * p / (float)xfade));
+                            const float tailF = (float)(anchor + grainLen) + p;
+                            int   ti0 = (int)tailF;
+                            float tfr = tailF - (float)ti0;
+                            if (ti0 < 0)               { ti0 = 0; tfr = 0.0f; }
+                            else if (ti0 > srcLen - 1) { ti0 = srcLen - 1; tfr = 0.0f; }
+                            const int ti1 = std::min(ti0 + 1, srcLen - 1);
+                            const float tail = src[(size_t)ti0] * (1.0f - tfr)
+                                             + src[(size_t)ti1] * tfr;
+                            out = alpha * out + (1.0f - alpha) * tail;
                         }
-                        // 4-overlap Hann sums to constant amplitude 2.0;
-                        // halve to keep unity gain, then weight by the
-                        // morph weight and add to the cycle-layer sample.
-                        sample += w * (granSum * 0.5f);
+
+                        // Advance the fractional playhead by the pitch
+                        // ratio and wrap at the loop length.
+                        float np = p + ratio;
+                        while (np >= (float)grainLen) np -= (float)grainLen;
+                        while (np < 0.0f)             np += (float)grainLen;
+                        gs.loopPhase = np;
+
+                        sample += w * out;
                     }
                 }
 
@@ -2058,7 +2206,9 @@ void TerrainSynthProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mi
                                                        : channelAftertouch[v.midiChannel - 1];
             float at = juce::jlimit(0.0f, 1.0f, chanAT + v.polyAftertouch);
             float atMul = 1.0f + node.aftertouchSensitivity * at;
-            totalSample += sample * env * v.velocity * atMul;
+            // env already includes velocity scaling via envPeak (see
+            // adsr_envelope.cpp:221) - do not multiply by velocity again.
+            totalSample += sample * env * atMul;
             activeVoiceCount++;
         }
 

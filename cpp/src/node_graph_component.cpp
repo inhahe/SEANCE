@@ -8,6 +8,7 @@
 #include "trigger_node.h"
 #include "midi_mod_node.h"
 #include "xy_pad.h"
+#include "signal_shape_node.h"
 #include "convolution_processor.h"
 #include "soundfont_processor.h"
 #include "builtin_effects.h"
@@ -772,7 +773,7 @@ void NodeGraphComponent::mouseDown(const juce::MouseEvent& e) {
                                     // Add a new Signal input pin and bind it to this param.
                                     if (paramIdx >= (int)nd->params.size()) return;
                                     std::string pinName = "Mod: " + nd->params[paramIdx].name;
-                                    int newPinId = graph.getNextId();
+                                    int newPinId = graph.allocId();
                                     nd->pinsIn.push_back({newPinId, pinName, PinKind::Signal, true, 1});
                                     Node::ModPin mp;
                                     mp.paramIndex = paramIdx;
@@ -1095,6 +1096,45 @@ void NodeGraphComponent::mouseDoubleClick(const juce::MouseEvent& e) {
         return;
     }
 
+    // Double-click a Signal Shape node opens its editor. XY Pad nodes
+    // share NodeType::SignalShape but use a different dedicated editor
+    // (xy_pad.h) - keep that opening on double-click too. The
+    // distinguishing tag is the "__xypad__" script.
+    if (node->type == NodeType::SignalShape) {
+        int captured = node->id;
+        if (node->script == "__xypad__") {
+            auto* pad = new XYPadComponent(graph, captured);
+            juce::DialogWindow::LaunchOptions opts;
+            opts.content.setOwned(pad);
+            opts.dialogTitle = "XY Pad";
+            opts.dialogBackgroundColour = juce::Colour(25, 25, 32);
+            opts.escapeKeyTriggersCloseButton = true;
+            opts.useNativeTitleBar = false;
+            opts.resizable = true;
+            opts.componentToCentreAround = this;
+            SoundShop::launchToolDialog(opts);
+        } else {
+            auto* editor = new SignalShapeEditorComponent(graph, captured,
+                [this]() {
+                    if (onNodeEdited) onNodeEdited();
+                    repaint();
+                },
+                [this, captured]() {
+                    if (onSignalShapeManualTrigger) onSignalShapeManualTrigger(captured);
+                });
+            juce::DialogWindow::LaunchOptions opts;
+            opts.content.setOwned(editor);
+            opts.dialogTitle = "Signal Shape: " + juce::String(node->name);
+            opts.dialogBackgroundColour = juce::Colour(22, 22, 28);
+            opts.escapeKeyTriggersCloseButton = true;
+            opts.useNativeTitleBar = false;
+            opts.resizable = true;
+            opts.componentToCentreAround = this;
+            SoundShop::launchToolDialog(opts);
+        }
+        return;
+    }
+
     if (node->type == NodeType::MidiTimeline || node->type == NodeType::AudioTimeline) {
         // Open piano roll editor
         bool already = false;
@@ -1264,9 +1304,12 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
     menu.addItem(6, "WASM Script...");
 
     juce::PopupMenu sigMenu;
-    sigMenu.addItem(130, "LFO (sine)");
-    sigMenu.addItem(131, "LFO (custom expression...)");
-    sigMenu.addItem(132, "Envelope (custom expression...)");
+    // Single unified "Signal Shape" entry. Replaces the old separate LFO
+    // sine / LFO custom-expression / Envelope custom-expression items
+    // (#107) - those were just preset starting points for the same
+    // underlying node, with no behavior the user can't reach by editing
+    // the shape + trigger expression inside the SignalShape editor.
+    sigMenu.addItem(130, "Signal Shape (LFO / Envelope)");
     sigMenu.addSeparator();
     sigMenu.addItem(133, "XY Pad");
     sigMenu.addItem(134, "Spectrum Tap");
@@ -1386,7 +1429,7 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
             n.params.push_back({"Decay",    0.1f,  0.001f, 2.0f});
             n.params.push_back({"Sustain",  0.7f,  0.0f,   1.0f});
             n.params.push_back({"Release",  0.3f,  0.001f, 5.0f});
-            n.params.push_back({"Volume",   0.5f,  0.0f,   1.0f});
+            n.params.push_back({"Volume",   1.0f,  0.0f,   1.0f});
             n.params.push_back({"Pan",      0.0f, -1.0f,   1.0f});
             // Velocity sensitivity: 0 = ignore velocity (every note at full
             // volume), 1 = linear response (default, v/127 gain).
@@ -1483,61 +1526,70 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
                 n.params.push_back({"Bins",   64.0f,   16.0f, 512.0f});
             else if (result == 141)
                 n.params.push_back({"Window", 1024.0f, 256.0f, 4096.0f});
-        } else if (result >= 130 && result <= 132) {
-            // Signal Shape nodes
-            auto makeSignalNode = [&](const std::string& name, const std::string& expr,
-                                      float modeVal) -> Node& {
-                auto& n = graph.addNode(name, NodeType::SignalShape,
-                    {Pin{0, "MIDI In", PinKind::Midi, true}},      // trigger input for envelope
-                    {Pin{0, "Param Out", PinKind::Param, false},
-                     Pin{0, "Signal Out", PinKind::Signal, false, 1}},  // both UI-rate and audio-rate
-                    {p.x, p.y});
-                n.script = expr;
-                n.params.push_back({"Mode",       modeVal, 0.0f, 1.0f});    // 0=LFO, 1=Envelope
-                n.params.push_back({"Rate",       1.0f,    0.01f, 50.0f});   // Hz or beats
-                n.params.push_back({"Min",        0.0f,   -1.0f, 1.0f});
-                n.params.push_back({"Max",        1.0f,   -1.0f, 1.0f});
-                n.params.push_back({"Beat Sync",  0.0f,    0.0f, 1.0f});    // 0=free, 1=synced
-                n.params.push_back({"Phase",      0.0f,    0.0f, 1.0f});
-                n.params.push_back({"Output",     0.0f,   -1.0f, 1.0f});    // read-only, current value
-                return n;
-            };
+        } else if (result == 130) {
+            // Signal Shape node. Single menu item replacing the old
+            // LFO / LFO-expression / Envelope-expression trio - the
+            // underlying processor is the same in all three cases,
+            // distinguished only by trigger expression and repeat mode
+            // (both editable inside the SignalShape editor that opens
+            // immediately on creation).
+            //
+            // Pins:
+            //   In:  "MIDI In" only. The OLD code documented its lone
+            //        MIDI input as "trigger input for envelope" but
+            //        the new processor uses MIDI for gate/freq/note/vel
+            //        VARIABLES; triggering is done via the trigger
+            //        expression (e.g. "gate"). Additional Signal input
+            //        pins (s1..sN) appear as the user dials up
+            //        signalInputCount in the editor.
+            //   Out: Param Out + Signal Out (both carry the same value;
+            //        Param Out exists for orange-cable connections to
+            //        param-arming inputs, Signal Out for audio-rate
+            //        consumers).
+            auto& n = graph.addNode("Signal Shape", NodeType::SignalShape,
+                {Pin{0, "MIDI In", PinKind::Midi, true}},
+                {Pin{0, "Param Out", PinKind::Param, false},
+                 Pin{0, "Signal Out", PinKind::Signal, false, 1}},
+                {p.x, p.y});
 
-            if (result == 130) {
-                makeSignalNode("LFO (sine)", "sin(x)", 0.0f);
-            } else if (result == 131) {
-                auto nodeId = makeSignalNode("LFO", "sin(x)", 0.0f).id;
-                auto* aw = new juce::AlertWindow("LFO Expression",
-                    "x = 0..2pi, output -1..1\nFunctions: sin, cos, abs, saw, square, triangle",
-                    juce::MessageBoxIconType::NoIcon);
-                aw->addTextEditor("expr", "sin(x) + 0.3*sin(3*x)", "Expression:");
-                aw->addButton("OK", 1); aw->addButton("Cancel", 0);
-                aw->enterModalState(true, juce::ModalCallbackFunction::create(
-                    [this, nodeId, aw](int res) {
-                        if (res == 1)
-                            if (auto* nd = graph.findNode(nodeId))
-                                nd->script = aw->getTextEditorContents("expr").toStdString();
-                        delete aw; repaint();
-                    }), true);
-                return;
-            } else if (result == 132) {
-                auto nodeId = makeSignalNode("Envelope", "sin(x)", 1.0f).id;
-                auto* aw = new juce::AlertWindow("Envelope Expression",
-                    "x = 0..2pi (start to end of envelope)\n"
-                    "Example: (1 - cos(x)) * 0.5  (fade in then out)\n"
-                    "Example: sin(x/2)^2  (smooth attack, hold, release)",
-                    juce::MessageBoxIconType::NoIcon);
-                aw->addTextEditor("expr", "(1 - cos(x)) * 0.5", "Expression:");
-                aw->addButton("OK", 1); aw->addButton("Cancel", 0);
-                aw->enterModalState(true, juce::ModalCallbackFunction::create(
-                    [this, nodeId, aw](int res) {
-                        if (res == 1)
-                            if (auto* nd = graph.findNode(nodeId))
-                                nd->script = aw->getTextEditorContents("expr").toStdString();
-                        delete aw; repaint();
-                    }), true);
-                return;
-            }
+            // Seed node.script with a NEUTRAL default: a free-running
+            // (Forever) shape with ZERO layers. A layer-less shape renders to
+            // a flat 0, so a brand-new node does NOT sweep anything - its
+            // output sits at 0 until the user adds a layer in the editor.
+            // (A default Sine would start modulating downstream params the
+            // instant the node is created, which surprised users.) The editor
+            // opens showing an empty layer stack with a "+ Layer" button and a
+            // hint explaining the node stays at 0 until a layer is added.
+            SignalShapeDoc seed = SignalShapeDoc::defaultLFO();
+            n.script = seed.encode();
+
+            n.params.push_back({"Rate",       1.0f,    0.01f, 50.0f});   // Hz, or beats/cycle when Beat Sync = 1
+            n.params.push_back({"Beat Sync",  0.0f,    0.0f, 1.0f});      // 0=free, 1=synced
+            n.params.push_back({"Phase",      0.0f,    0.0f, 1.0f});      // phase offset
+            n.params.push_back({"Output",     0.0f,   -1.0f, 1.0f});      // read-only current value
+
+            // Open the SignalShape editor immediately - matches the
+            // "wavetable opens on create" pattern above. Non-modal so the
+            // user can leave it up while interacting with the graph.
+            int newNodeId = n.id;
+            auto* editor = new SignalShapeEditorComponent(graph, newNodeId,
+                [this]() {
+                    if (onNodeEdited) onNodeEdited();
+                    repaint();
+                },
+                [this, newNodeId]() {
+                    if (onSignalShapeManualTrigger) onSignalShapeManualTrigger(newNodeId);
+                });
+            juce::DialogWindow::LaunchOptions opts;
+            opts.content.setOwned(editor);
+            opts.dialogTitle = "Signal Shape: " + juce::String(n.name);
+            opts.dialogBackgroundColour = juce::Colour(22, 22, 28);
+            opts.escapeKeyTriggersCloseButton = true;
+            opts.useNativeTitleBar = false;
+            opts.resizable = true;
+            opts.componentToCentreAround = this;
+            SoundShop::launchToolDialog(opts);
+            return;
         } else if (result >= 120 && result <= 125) {
             // Terrain Synth. The terrain engine and visualizer both support
             // N-dimensional terrains (1..8 axes); the visualizer's + Dim /
@@ -1837,7 +1889,7 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
             n.params.push_back({"Decay",   (result == 100) ? 0.3f   : 0.1f,   0.001f, 2.0f});
             n.params.push_back({"Sustain", (result == 100) ? 0.5f   : 0.0f,   0.0f,   1.0f});
             n.params.push_back({"Release", (result == 100) ? 0.5f   : 0.1f,   0.001f, 5.0f});
-            n.params.push_back({"Volume",  0.5f, 0.0f, 1.0f});
+            n.params.push_back({"Volume",  1.0f, 0.0f, 1.0f});
             n.params.push_back({"Pan",     0.0f, -1.0f, 1.0f});
         } else if (result == 206) {
             auto& n = graph.addNode("Pitch Shift", NodeType::Effect,
@@ -1866,8 +1918,8 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
                 if (midiIO) {
                     // Arpeggiator needs both MIDI and audio pins
                     n.pinsIn.clear(); n.pinsOut.clear();
-                    n.pinsIn.push_back({graph.getNextId(), "MIDI In", PinKind::Midi, true});
-                    n.pinsOut.push_back({graph.getNextId(), "MIDI Out", PinKind::Midi, false});
+                    n.pinsIn.push_back({graph.allocId(), "MIDI In", PinKind::Midi, true});
+                    n.pinsOut.push_back({graph.allocId(), "MIDI Out", PinKind::Midi, false});
                 }
                 n.script = script;
                 n.params = std::move(params);
@@ -1947,7 +1999,7 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
                     auto& vcn = graph.addNode("Vocoder", NodeType::Effect,
                         {Pin{0, "Audio In", PinKind::Audio, true}},
                         {Pin{0, "Audio Out", PinKind::Audio, false}}, {p.x, p.y});
-                    vcn.pinsIn.push_back({graph.getNextId(), "Modulator", PinKind::Signal, true, 1});
+                    vcn.pinsIn.push_back({graph.allocId(), "Modulator", PinKind::Signal, true, 1});
                     vcn.script = "__waveletvocoder__";
                     vcn.params.push_back({"Bands", 5.0f, 1.0f, 8.0f});
                     vcn.params.push_back({"Mix",   1.0f, 0.0f, 1.0f});
@@ -1958,7 +2010,7 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
                     auto& ptn = graph.addNode("Pitch Tracker", NodeType::Effect,
                         {Pin{0, "Audio In", PinKind::Audio, true}},
                         {Pin{0, "Audio Out", PinKind::Audio, false}}, {p.x, p.y});
-                    ptn.pinsOut.push_back({graph.getNextId(), "Pitch Out", PinKind::Signal, false});
+                    ptn.pinsOut.push_back({graph.allocId(), "Pitch Out", PinKind::Signal, false});
                     ptn.script = "__pitchtracker__";
                     ptn.params.push_back({"Min Hz",      50.0f,  20.0f, 5000.0f});
                     ptn.params.push_back({"Max Hz",    2000.0f,  20.0f, 5000.0f});
@@ -2048,7 +2100,7 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
                     // Wire any audio source (kick drum track, etc.) into
                     // this pin and the compressor's envelope follower
                     // triggers from that signal instead of the main input.
-                    cn.pinsIn.push_back({graph.getNextId(), "Sidechain",
+                    cn.pinsIn.push_back({graph.allocId(), "Sidechain",
                                          PinKind::Signal, true, 1});
                     break;
                 }
@@ -2081,9 +2133,9 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
                     {}, {}, {p.x, p.y});
                 n.pinsIn.clear();
                 n.pinsOut.clear();
-                n.pinsIn.push_back({graph.getNextId(),  "MIDI In",  PinKind::Midi,   true});
-                n.pinsIn.push_back({graph.getNextId(),  "Sig 1",    PinKind::Signal, true, 1});
-                n.pinsOut.push_back({graph.getNextId(), "MIDI Out", PinKind::Midi,   false});
+                n.pinsIn.push_back({graph.allocId(),  "MIDI In",  PinKind::Midi,   true});
+                n.pinsIn.push_back({graph.allocId(),  "Sig 1",    PinKind::Signal, true, 1});
+                n.pinsOut.push_back({graph.allocId(), "MIDI Out", PinKind::Midi,   false});
                 n.script = MidiModDoc::defaultDoc().encode();
                 break;
             }
@@ -2102,10 +2154,10 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
                     {}, {}, {p.x, p.y});
                 n.pinsIn.clear();
                 n.pinsOut.clear();
-                n.pinsIn.push_back({graph.getNextId(),  "MIDI In",    PinKind::Midi,   true});
-                n.pinsIn.push_back({graph.getNextId(),  "Audio In",   PinKind::Audio,  true});
-                n.pinsOut.push_back({graph.getNextId(), "MIDI Out",   PinKind::Midi,   false});
-                n.pinsOut.push_back({graph.getNextId(), "Signal Out", PinKind::Signal, false});
+                n.pinsIn.push_back({graph.allocId(),  "MIDI In",    PinKind::Midi,   true});
+                n.pinsIn.push_back({graph.allocId(),  "Audio In",   PinKind::Audio,  true});
+                n.pinsOut.push_back({graph.allocId(), "MIDI Out",   PinKind::Midi,   false});
+                n.pinsOut.push_back({graph.allocId(), "Signal Out", PinKind::Signal, false});
                 // Seed with a sensible default doc so the node does something
                 // on first placement.
                 n.script = TriggerDoc::defaultDoc().encode();
@@ -2168,6 +2220,28 @@ void NodeGraphComponent::showNodeMenu(Node& node) {
         menu.addItem(8, "MIDI Map...");
         if (node.pluginIndex >= 0)
             menu.addItem(6, "Plugin Info...");
+        // MPE handshake for hosted plugins that take MIDI: emits the MPE
+        // Configuration Message so an MPE-capable plugin interprets incoming
+        // channels 2..16 as per-note member channels. Harmless on non-MPE
+        // plugins (they ignore the RPN). Built-in synths read MPE natively
+        // and don't get this entry.
+        //
+        // The label carries the caveat inline because JUCE PopupMenu items
+        // can't show hover tooltips, and the warning matters at the decision
+        // point: turning this on only helps when the MIDI feeding this plugin
+        // is actually MPE (an MPE-enabled timeline or an MPE controller wired
+        // in). With a non-MPE source every note lands on the master channel
+        // (ch 1), which a strict MPE plugin may play flat or not voice at all.
+        if (node.plugin) {
+            bool hasMidiIn = false;
+            for (auto& p : node.pinsIn)
+                if (p.kind == PinKind::Midi) { hasMidiIn = true; break; }
+            if (hasMidiIn)
+                menu.addItem(181,
+                             node.mpeEnabled ? "Disable MPE"
+                                             : "Enable MPE (needs an MPE source)",
+                             true, node.mpeEnabled);
+        }
     }
     // Envelope editor on tonal / note-triggered synths. The AHDSR
     // envelope on Node is universal across all synth types (built-in,
@@ -2189,6 +2263,12 @@ void NodeGraphComponent::showNodeMenu(Node& node) {
     }
     if (isTonalSynth)
         menu.addItem(180, "Envelope (AHDSR)...");
+
+    // Signal Shape gets an "Edit Shape" entry (and we hide it for the
+    // sibling XY Pad node, which shares NodeType::SignalShape but has
+    // its own dedicated editor opened via double-click).
+    if (node.type == NodeType::SignalShape && node.script != "__xypad__")
+        menu.addItem(190, "Edit Shape...");
     // Mute / Solo
     menu.addItem(160, node.muted ? "Unmute" : "Mute", true, node.muted);
     menu.addItem(161, node.soloed ? "Unsolo" : "Solo", true, node.soloed);
@@ -2253,8 +2333,8 @@ void NodeGraphComponent::showNodeMenu(Node& node) {
         } else if (result == 2) {
             auto& dup = graph.addNode(node->name, node->type, {}, {},
                 {node->pos.x + 50, node->pos.y + 50});
-            for (auto& p : node->pinsIn) dup.pinsIn.push_back({graph.getNextId(), p.name, p.kind, true, p.channels});
-            for (auto& p : node->pinsOut) dup.pinsOut.push_back({graph.getNextId(), p.name, p.kind, false, p.channels});
+            for (auto& p : node->pinsIn) dup.pinsIn.push_back({graph.allocId(), p.name, p.kind, true, p.channels});
+            for (auto& p : node->pinsOut) dup.pinsOut.push_back({graph.allocId(), p.name, p.kind, false, p.channels});
             dup.params = node->params;
             dup.clips = node->clips;
         } else if (result == 3) {
@@ -2275,6 +2355,14 @@ void NodeGraphComponent::showNodeMenu(Node& node) {
         } else if (result == 9) {
             node->mpeEnabled = !node->mpeEnabled;
             graph.dirty = true;
+        } else if (result == 181) {
+            // Plugin MPE toggle: adds/removes the parallel MCM generator node,
+            // so it needs a graph rebuild (unlike the timeline toggle above,
+            // which only changes how notes are emitted inside processBlock).
+            node->mpeEnabled = !node->mpeEnabled;
+            graph.commitSnapshot(node->mpeEnabled ? "Enable plugin MPE"
+                                                  : "Disable plugin MPE");
+            if (onNodeEdited) onNodeEdited();
         } else if (result == 10) {
             if (node->cache.enabled) {
                 node->cache.enabled = false;
@@ -2344,6 +2432,28 @@ void NodeGraphComponent::showNodeMenu(Node& node) {
             // snapshot here so an undo right after closing the dialog
             // reverts the whole edit.
             graph.commitSnapshot("Edit envelope");
+        } else if (result == 190) {
+            // Open the Signal Shape editor for an existing node. Same
+            // launch flow as the "create + open" path in the menu above,
+            // including the manual-trigger lookup callback.
+            int captured = nodeId;
+            auto* editor = new SignalShapeEditorComponent(graph, captured,
+                [this]() {
+                    if (onNodeEdited) onNodeEdited();
+                    repaint();
+                },
+                [this, captured]() {
+                    if (onSignalShapeManualTrigger) onSignalShapeManualTrigger(captured);
+                });
+            juce::DialogWindow::LaunchOptions opts;
+            opts.content.setOwned(editor);
+            opts.dialogTitle = "Signal Shape: " + juce::String(node->name);
+            opts.dialogBackgroundColour = juce::Colour(22, 22, 28);
+            opts.escapeKeyTriggersCloseButton = true;
+            opts.useNativeTitleBar = false;
+            opts.resizable = true;
+            opts.componentToCentreAround = this;
+            SoundShop::launchToolDialog(opts);
         } else if (result == 170) {
             // Convolution auto-merge (#33): convolve this node's IR with
             // the downstream convolution's IR, put the result in this node,
@@ -2464,6 +2574,22 @@ void NodeGraphComponent::deleteNodeAndDescendants(int rootId) {
     auto* root = graph.findNode(rootId);
     if (!root) return;
 
+    // If this root is a MOD-import root group that overrode the global song
+    // settings on import, capture the stashed PRE-import values now (before
+    // the node is erased and `root` dangles). We restore them after the
+    // deletion so removing the whole module backs out its loop contribution
+    // and returns the song settings to whatever the user had before import.
+    // This only fires for the import's root group node — single child nodes
+    // never carry modImportSavedSong, so deleting one node of a mod leaves
+    // the song settings untouched, as required.
+    const bool   restoreModSong   = root->modImportSavedSong;
+    const int    rmRepeatMode      = root->modImportPrevRepeatMode;
+    const int    rmRepeatCount      = root->modImportPrevRepeatCount;
+    const double rmSongLength      = root->modImportPrevSongLength;
+    const bool   rmLoopEnabled      = root->modImportPrevLoopEnabled;
+    const double rmLoopStart        = root->modImportPrevLoopStart;
+    const double rmLoopEnd          = root->modImportPrevLoopEnd;
+
     // Collect every node to delete: the root plus, if it's a Group, every
     // descendant via childNodeIds (recursively, so a group-of-groups
     // cascades fully). Set guards against accidental cycles in malformed
@@ -2530,6 +2656,19 @@ void NodeGraphComponent::deleteNodeAndDescendants(int rootId) {
     // otherwise keep the song playing past the actual content.
     if (anyTimelineDeleted && graph.songLengthBeats > 0)
         graph.songLengthBeats = 0;
+
+    // Restore the pre-import song settings if this root group node had
+    // overridden them on import. Done after the timeline-reset above so the
+    // user's original choice wins over the auto-reset (deleting the module
+    // should return to the pre-import state, not a half-reset one).
+    if (restoreModSong) {
+        graph.songRepeatMode  = (NodeGraph::SongRepeat)rmRepeatMode;
+        graph.songRepeatCount = rmRepeatCount;
+        graph.songLengthBeats = rmSongLength;
+        graph.loopEnabled     = rmLoopEnabled;
+        graph.loopStartBeat   = rmLoopStart;
+        graph.loopEndBeat     = rmLoopEnd;
+    }
 
     graph.dirty = true;
     graph.commitSnapshot(victims.size() > 1

@@ -390,7 +390,7 @@ static PyObject* py_add_marker(PyObject*, PyObject* args) {
     markers.erase(std::remove_if(markers.begin(), markers.end(),
         [name](auto& m) { return m.name == name; }), markers.end());
     Marker m;
-    m.id = g_currentGraph->getNextId();
+    m.id = g_currentGraph->allocId();
     m.name = name;
     m.beat = beat;
     markers.push_back(m);
@@ -658,7 +658,9 @@ static PyMethodDef soundshopMethods[] = {
         if (!g_currentGraph || nodeIdx < 0 || nodeIdx >= (int)g_currentGraph->nodes.size()) {
             PyErr_SetString(PyExc_IndexError, "Node index out of range"); return nullptr;
         }
-        g_currentGraph->nodes[nodeIdx].script = script;
+        // Synchronised write: this can target a live node whose processor
+        // polls script on the audio thread (see setNodeScriptSynced).
+        setNodeScriptSynced(g_currentGraph->nodes[nodeIdx], script);
         Py_RETURN_NONE;
     }, METH_VARARGS, "Set node script: (node_idx, script_text)"},
     {"get_script", [](PyObject*, PyObject* args) -> PyObject* {

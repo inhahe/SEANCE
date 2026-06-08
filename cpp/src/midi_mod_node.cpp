@@ -209,15 +209,16 @@ public:
         label.setFont(12.0f);
 
         addAndMakeVisible(targetCombo);
-        targetCombo.addItem("Velocity",    1);
-        targetCombo.addItem("Pitch Bend",  2);
-        targetCombo.addItem("Mod Wheel",   3);
-        targetCombo.addItem("Aftertouch",  4);
-        targetCombo.addItem("CC#",         5);
+        targetCombo.addItem("Velocity",         1);
+        targetCombo.addItem("Pitch Bend",       2);
+        targetCombo.addItem("Mod Wheel",        3);
+        targetCombo.addItem("Channel Pressure", 4);
+        targetCombo.addItem("CC#",              5);
         targetCombo.setTooltip("Which MIDI message this signal input modulates: "
                                "Velocity (note loudness), Pitch Bend (note pitch +/-2 semitones), "
-                               "Mod Wheel (CC#1, often vibrato depth), Aftertouch (key pressure), "
-                               "or any custom CC number.");
+                               "Mod Wheel (CC#1, often vibrato depth), Channel Pressure "
+                               "(channel aftertouch - one value applied to ALL held notes, "
+                               "not per-note key pressure), or any custom CC number.");
         targetCombo.onChange = [this]() { applyToRule(); };
 
         addAndMakeVisible(ccSlider);
@@ -381,12 +382,12 @@ void MidiModEditorComponent::syncNodePins() {
     int midiInId = -1;
     for (auto& p : nd->pinsIn)
         if (p.kind == PinKind::Midi) { midiInId = p.id; break; }
-    if (midiInId < 0) midiInId = graph.getNextId();
+    if (midiInId < 0) midiInId = graph.allocId();
     newPins.push_back({midiInId, "MIDI In", PinKind::Midi, true});
 
     for (int i = 0; i < wantedSigs; ++i) {
         int id = (i < (int)existingSignalIds.size())
-                 ? existingSignalIds[i] : graph.getNextId();
+                 ? existingSignalIds[i] : graph.allocId();
         newPins.push_back({id,
             "Sig " + std::to_string(i + 1),
             PinKind::Signal, true, 1});

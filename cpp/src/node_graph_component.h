@@ -39,6 +39,13 @@ public:
     std::function<void(int)> onFreezeNode;        // called with node ID
     std::function<void(int)> onRunScript;         // called with node ID
     std::function<void(juce::String)> onOpenHelpDoc; // called with docs/<file> relative path
+    // Fire a one-shot manual trigger on the live SignalShape processor for
+    // node `id`. main_window wires this to GraphProcessor::getProcessorForNode
+    // + dynamic_cast<SignalShapeProcessor*> + fireManualTrigger(). No-op if
+    // the processor isn't a SignalShape (defensive - the editor only enables
+    // its Manual Trigger button when the lookup succeeds, but the audio
+    // graph may have rebuilt since the dialog opened).
+    std::function<void(int)> onSignalShapeManualTrigger;
 
     // Convert between screen and canvas coordinates
     juce::Point<float> screenToCanvas(juce::Point<float> screen) const;

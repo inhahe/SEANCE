@@ -220,6 +220,17 @@ bool ProjectFile::writeProject(std::ostream& f, NodeGraph& graph,
             }
             writeStr(f, "childNodeIds", ids);
         }
+        // MOD-import song-setting restore stash (only meaningful on the
+        // import's root group node; harmless/absent on others).
+        if (node.modImportSavedSong) {
+            writeInt(f, "modImportSavedSong", 1);
+            writeInt(f, "modImportPrevRepeatMode", node.modImportPrevRepeatMode);
+            writeInt(f, "modImportPrevRepeatCount", node.modImportPrevRepeatCount);
+            writeFloat(f, "modImportPrevSongLength", (float)node.modImportPrevSongLength);
+            writeInt(f, "modImportPrevLoopEnabled", node.modImportPrevLoopEnabled ? 1 : 0);
+            writeFloat(f, "modImportPrevLoopStart", (float)node.modImportPrevLoopStart);
+            writeFloat(f, "modImportPrevLoopEnd", (float)node.modImportPrevLoopEnd);
+        }
 
         for (auto& pin : node.pinsIn) {
             f << "[PinIn]\n";
@@ -554,7 +565,11 @@ bool ProjectFile::readProject(std::istream& f, NodeGraph& graph, PluginHost* plu
                         "performanceMode", "perfReleaseMode", "perfVelocity",
                         "mpeEnabled", "mpePitchBendRange", "parentGroupId",
                         "groupBeatOffset", "anchorMarker", "groupExpanded",
-                        "childNodeIds", "modPin"
+                        "childNodeIds", "modPin",
+                        "modImportSavedSong", "modImportPrevRepeatMode",
+                        "modImportPrevRepeatCount", "modImportPrevSongLength",
+                        "modImportPrevLoopEnabled", "modImportPrevLoopStart",
+                        "modImportPrevLoopEnd"
                     };
                     // Peek ahead. We need a one-line lookahead but can't
                     // un-read with std::getline, so do the scan inline:
@@ -628,6 +643,13 @@ bool ProjectFile::readProject(std::istream& f, NodeGraph& graph, PluginHost* plu
             else if (key == "groupBeatOffset") curNode->groupBeatOffset = std::stof(val);
             else if (key == "anchorMarker") curNode->anchorMarker = val;
             else if (key == "groupExpanded") curNode->groupExpanded = (val == "1");
+            else if (key == "modImportSavedSong") curNode->modImportSavedSong = (val == "1");
+            else if (key == "modImportPrevRepeatMode") curNode->modImportPrevRepeatMode = std::stoi(val);
+            else if (key == "modImportPrevRepeatCount") curNode->modImportPrevRepeatCount = std::stoi(val);
+            else if (key == "modImportPrevSongLength") curNode->modImportPrevSongLength = std::stof(val);
+            else if (key == "modImportPrevLoopEnabled") curNode->modImportPrevLoopEnabled = (val == "1");
+            else if (key == "modImportPrevLoopStart") curNode->modImportPrevLoopStart = std::stof(val);
+            else if (key == "modImportPrevLoopEnd") curNode->modImportPrevLoopEnd = std::stof(val);
             else if (key == "childNodeIds") {
                 // Parse comma-separated IDs
                 std::istringstream ss(val);

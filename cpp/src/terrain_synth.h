@@ -360,6 +360,16 @@ private:
         double             sourceSampleRate = 0.0;
         int                grainLength      = 4800;
         float              embeddedPitchHz  = 440.0f;
+        // Freeze-mode for held notes. Mirrors GranularFrame::freezeMode
+        // (0=CrossfadeLoop, 1=AsyncGranular, ...). The synth voice
+        // branches on this so "what you audition = what you get": the
+        // capture/freeze audition plays CrossfadeLoop, so the synth
+        // must too. Stored as int to avoid pulling granular_frame.h's
+        // enum into this header.
+        int                freezeMode       = 0;   // 0 = CrossfadeLoop
+        // Seam crossfade length in samples, used by CrossfadeLoop.
+        // Clamped per-sample to [0, grainLength/2] by the reader.
+        int                crossfadeSamples = 2400;
         // Position in the wavetable's N-D Position space, normalized
         // [0,1] per dim. For grid frames this is the grid-cell coord
         // mapped to [0,1]; for scatter frames it's the authored coord.
@@ -372,13 +382,29 @@ private:
     // per-sample. Kept as a member so we don't realloc every block.
     std::vector<float> granWeights;
 
-    // Lock-free RNG for grain srcStart jitter. JUCE Random is fine on the
-    // audio thread - no syscalls, no allocation.
-    juce::Random granRng;
-
     // Recompute granWeights from the current Position params. Called once
     // per block.
     void updateGranularWeights();
+
+    // Compute per-granular-frame morph weights for an arbitrary Position
+    // vector into `out` (resized to wtGranularFrames.size()). updateGranular-
+    // Weights() is just this called with the live Position params; audition
+    // voices call it with their own per-voice override Position so a frame's
+    // Play button in the wavetable editor auditions THAT frame regardless of
+    // where the live Position knob sits.
+    void computeGranularWeights(const std::vector<float>& pos,
+                                std::vector<float>& out);
+
+    // Allocate (stealing the quietest if all busy) and start a voice for a
+    // note-on. Returns the voice index, or -1 if none could be allocated.
+    // Shared by the MIDI note-on path and the UI audition drain so both go
+    // through identical envelope / velocity / pitch-bend seeding. Clears any
+    // stale audition override on the reused voice. velocity is 0..127.
+    int  startVoice(int noteNumber, int channel, int velocity);
+    // Release every active voice matching noteNumber on `channel` (honouring
+    // the sustain pedal). Shared by the MIDI note-off path and the audition
+    // drain's note-off.
+    void releaseNote(int noteNumber, int channel);
 
     // Envelope curve evaluation cache
     struct EnvCurve {
@@ -398,7 +424,6 @@ private:
         int midiChannel = 1;       // 1..16, used for per-channel bend / mod wheel
         float baseFrequency = 440.0f; // frequency before bend, set at note-on
         float frequency = 440.0f;  // effective frequency (base * bend), used by render
-        float velocity = 1.0f;
         float phase = 0.0f;
         double startBeat = 0;
         // Sustain pedal: true if this voice received a note-off while CC64
@@ -433,20 +458,34 @@ private:
         // doesn't pay the ~256 byte / voice cost when this mode is unused.
         std::vector<float> partialPhases;
 
-        // Per-granular-frame OLA state. One entry per GranularLayerEntry
-        // in TerrainSynthProcessor::wtGranularFrames; each entry holds 4
-        // OLA voices with their envelope position and source-start offset.
+        // Per-granular-frame playback state. One entry per
+        // GranularLayerEntry in TerrainSynthProcessor::wtGranularFrames.
         // Allocated lazily on note-on once the granular table is known.
-        // Initialized: envPos = staggered by N/4 across the four OLA
-        // voices so the 4-overlap Hann sums to constant amplitude from
-        // the first sample (no startup transient). srcStart is jittered
-        // per OLA voice on init and every time a voice's envelope wraps.
+        // The synth plays the CrossfadeLoop freeze mode (matching what the
+        // capture/freeze dialog auditions), so the only state needed is a
+        // fractional playhead. When per-mode synth implementations land
+        // (AsyncGranular, ...) add their state here alongside loopPhase.
         struct GranStream {
-            int envPos[4]   = { 0, 0, 0, 0 };
-            int srcStart[4] = { 0, 0, 0, 0 };
             bool initialized = false;
+            // Fractional playhead for the CrossfadeLoop freeze mode.
+            // Advances by the pitch `ratio` each output sample and wraps
+            // at grainLength, so a held note plays the marker window as a
+            // faithful tape loop resampled to track MIDI pitch.
+            float loopPhase = 0.0f;
         };
         std::vector<GranStream> granStreams;
+
+        // Wavetable-editor audition override. When a Play button in the
+        // wavetable editor triggers this voice, hasAuditionPos is set and
+        // auditionPos holds the edited frame's normalized Position. The
+        // granular layer then uses auditionWeights (computed per block from
+        // auditionPos) instead of the synth-wide granWeights, so the voice
+        // plays the frame being edited rather than whatever the live Position
+        // knob selects. Plain MIDI / timeline notes leave this false and use
+        // the shared granWeights. Reset on every voice (re)allocation.
+        bool               hasAuditionPos = false;
+        std::vector<float> auditionPos;
+        std::vector<float> auditionWeights;
 
         float advanceEnv(float sr, float a, float h, float d, float s, float r,
                          const EnvCurve* aCurve, const EnvCurve* dCurve, const EnvCurve* rCurve);

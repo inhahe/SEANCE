@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <random>
 #include <limits>
+#include <map>
 
 namespace SoundShop {
 
@@ -138,11 +139,23 @@ void LibraryColorSwatch::mouseUp(const juce::MouseEvent& e) {
 // re-captured source replaces in place, doesn't accumulate as a new entry).
 class GranularFrameEditorComponent : public juce::Component {
 public:
+    // sendAuditionIn: optional callback to route the Play button through the
+    // owning synth node's pendingAudition queue instead of the AudioEngine's
+    // separate GrainLoop preview path. Signature: (bool noteOn, int pitch,
+    // int velocity). When provided, the Play button sends a MIDI note-on
+    // (default A4=69, vel 100) to the synth and Stop sends note-off, so the
+    // audition renders through the actual voice / AHDSR envelope / Volume
+    // param path - matching what a wired-up MIDI note would sound like. When
+    // null, falls back to the legacy AudioEngine::setPreviewGrainBuffer path
+    // (used by the CaptureFromSongDialog post-capture editor where there's
+    // no owning synth node yet).
     GranularFrameEditorComponent(GranularFrame& f,
                                  std::function<void()> onApplyIn,
-                                 std::function<void()> onRecaptureIn)
+                                 std::function<void()> onRecaptureIn,
+                                 std::function<void(bool, int, int)> sendAuditionIn = {})
         : frame(f), onApply(std::move(onApplyIn)),
-          onRecapture(std::move(onRecaptureIn))
+          onRecapture(std::move(onRecaptureIn)),
+          sendAudition(std::move(sendAuditionIn))
     {
         addAndMakeVisible(titleLabel);
         titleLabel.setText("Captured granular waveform",
@@ -512,6 +525,7 @@ private:
     GranularFrame& frame;
     std::function<void()> onApply;
     std::function<void()> onRecapture;
+    std::function<void(bool, int, int)> sendAudition; // (noteOn, pitch, velocity)
 
     juce::Label      titleLabel;
     juce::Label      sourceInfoLabel;
@@ -702,42 +716,52 @@ private:
         }
     }
 
-    // Engine-preview audition (Play / Stop button). Uses the same
-    // GrainLoop preview path as CaptureFromSongDialog so the audition
-    // is exactly what would play at note-on with this frame's settings.
+    // Audition (Play / Stop button).
+    //
+    // Preferred path: sendAudition is set when this editor is hosted inside
+    // a synth-owned wavetable editor. We send MIDI note-on (A4 / vel 100)
+    // to the owning synth node's pendingAudition queue and the
+    // TerrainSynthProcessor renders it through the actual voice / AHDSR /
+    // Volume path - matching exactly what a wired-up MIDI note plays. This
+    // is the right answer for "does this cell sound the same as a played
+    // note?" because there is literally one playback path.
+    //
+    // Fallback path: when sendAudition is null (e.g. the post-capture
+    // editor in CaptureFromSongDialog where there is no synth node yet),
+    // use the AudioEngine's GrainLoop preview mixer to play the source PCM
+    // directly. This bypasses the synth's envelope and Volume param, so
+    // levels won't match a wired-up note - but it's the only option when
+    // there is no synth node to route through.
     void togglePlay() {
         if (playing) stopPlay();
         else         startPlay();
     }
 
+    // A4 = MIDI note 69 = 440 Hz. Matches the embedded-pitch slider's
+    // default for capture flows that don't know the source's true pitch,
+    // so an unconfigured source plays at its native rate (no resampling).
+    static constexpr int kAuditionPitch    = 69;
+    static constexpr int kAuditionVelocity = 127;
+
     void startPlay() {
-        auto* eng = AudioEngine::getInstance();
-        if (!eng) return;
-        if (frame.source.empty()) return;  // nothing to audition
+        if (sendAudition) {
+            sendAudition(true, kAuditionPitch, kAuditionVelocity);
+        } else {
+            auto* eng = AudioEngine::getInstance();
+            if (!eng) return;
+            if (frame.source.empty()) return;  // nothing to audition
 
-        // Source: hand the engine a shared_ptr copy of the frame's PCM.
-        // Copying once (rather than aliasing the frame's vector) keeps the
-        // engine safe from concurrent UI edits to frame.source mid-block.
-        auto src = std::make_shared<std::vector<float>>(frame.source);
+            // Source: hand the engine a shared_ptr copy of the frame's PCM.
+            auto src = std::make_shared<std::vector<float>>(frame.source);
+            const int grainLen = std::max(64, frame.grainLength);
+            const int xfadeLen = std::max(0, frame.crossfadeSamples);
 
-        // Grain length: use the frame's own grainLength, converted from
-        // source samples to engine samples if the rates differ. The
-        // engine's preview reads at the device rate; resampling on the
-        // fly is the synth's job at note-on, but for the audition path
-        // we keep it simple and feed source-rate samples directly. (The
-        // engine pulls samples 1:1 without rate conversion in the
-        // GrainLoop path; for accurate pitch the source would need to be
-        // resampled, but for "does this sound right?" the source-rate
-        // playback is what the synth does too when noteHz matches
-        // embeddedPitchHz.)
-        const int grainLen = std::max(64, frame.grainLength);
-        const int xfadeLen = std::max(0, frame.crossfadeSamples);
-
-        eng->setGrainFreezeMode(frame.freezeMode);
-        eng->setPreviewGrainLength(grainLen);
-        eng->setPreviewCrossfadeLength(xfadeLen);
-        eng->setPreviewGrainBuffer(std::move(src));
-        eng->setPreviewMode(AudioEngine::PreviewMode::GrainLoop);
+            eng->setGrainFreezeMode(frame.freezeMode);
+            eng->setPreviewGrainLength(grainLen);
+            eng->setPreviewCrossfadeLength(xfadeLen);
+            eng->setPreviewGrainBuffer(std::move(src));
+            eng->setPreviewMode(AudioEngine::PreviewMode::GrainLoop);
+        }
 
         playing = true;
         playBtn.setButtonText("Stop");
@@ -748,8 +772,12 @@ private:
     void stopPlay() {
         if (!playing) return;
         playing = false;
-        if (auto* eng = AudioEngine::getInstance())
-            eng->clearPreview();
+        if (sendAudition) {
+            sendAudition(false, kAuditionPitch, 0);
+        } else {
+            if (auto* eng = AudioEngine::getInstance())
+                eng->clearPreview();
+        }
         playBtn.setButtonText("Play");
         playBtn.setColour(juce::TextButton::buttonColourId,
                           juce::Colour(60, 110, 70));
@@ -1116,6 +1144,183 @@ bool LayeredWaveform::decode(const std::string& s) {
             layers.push_back(layer);
     }
     return !layers.empty();
+}
+
+// ==============================================================================
+// LayerStackComponent
+// ==============================================================================
+
+LayerStackComponent::LayerStackComponent(Options o, std::function<void()> ch)
+    : opts(std::move(o)), onChanged(std::move(ch))
+{
+    addLayerBtn.setButtonText(opts.addLayerButtonText);
+    addLayerBtn.setTooltip("Add a new layer. Each layer is a sine, saw, square, "
+                           "triangle, noise, drawn or formula shape; all the "
+                           "layers are summed into the final waveform.");
+    addLayerBtn.onClick = [this]() { addLayer(); };
+    addAndMakeVisible(addLayerBtn);
+
+    viewport.setViewedComponent(&container, false);
+    viewport.setScrollBarsShown(true, false);
+    addAndMakeVisible(viewport);
+
+    emptyHintLabel.setJustificationType(juce::Justification::centredTop);
+    emptyHintLabel.setColour(juce::Label::textColourId, juce::Colour(0xff808088));
+    emptyHintLabel.setText(opts.emptyHint, juce::dontSendNotification);
+    addChildComponent(emptyHintLabel);   // visibility toggled in rebuildRows
+}
+
+void LayerStackComponent::setTarget(LayeredWaveform* lw) {
+    int cnt = lw ? (int)lw->layers.size() : -1;
+    // Already in sync (same object, same layer count) -> the existing rows
+    // still point at valid WaveLayers, so there's nothing to rebuild. This
+    // makes setTarget cheap to call defensively from a resized() pass.
+    if (lw == target && cnt == shownLayerCount) return;
+    target = lw;
+    rebuildRows();
+    resized();
+}
+
+void LayerStackComponent::refreshFromModel() {
+    rebuildRows();
+    resized();
+}
+
+void LayerStackComponent::rebuildRows() {
+    rows.clear();
+    container.removeAllChildren();
+    shownLayerCount = target ? (int)target->layers.size() : -1;
+
+    int rh = WaveLayerEditor::rowHeight();
+    int vw = std::max(viewport.getWidth(), 480);
+    int y = 0;
+    if (target) {
+        for (int i = 0; i < (int)target->layers.size(); ++i) {
+            // Capture i by value; the delete callback uses it to identify the
+            // slot. The non-realloc invariant holds because we rebuild every
+            // row whenever the layer count changes (add / delete).
+            WaveLayerEditor::Callbacks cb;
+            cb.onChanged = [this]() {
+                renderSummation();
+                if (onChanged) onChanged();
+            };
+            cb.indexForLabel = [i]() { return i + 1; };
+            cb.onDelete = [this, i]() {
+                if (!target) return;
+                if (i < 0 || i >= (int)target->layers.size()) return;
+                target->layers.erase(target->layers.begin() + i);
+                rebuildRows();
+                resized();
+                renderSummation();
+                if (onChanged) onChanged();
+            };
+            auto row = std::make_unique<WaveLayerEditor>(&target->layers[i],
+                                                         std::move(cb));
+            row->setBounds(0, y, vw, rh);
+            row->syncFromModel();
+            container.addAndMakeVisible(row.get());
+            rows.push_back(std::move(row));
+            y += rh + 4;
+        }
+    }
+    container.setSize(vw, std::max(y, 10));
+
+    bool empty = rows.empty();
+    emptyHintLabel.setVisible(empty && opts.emptyHint.isNotEmpty());
+
+    renderSummation();
+}
+
+void LayerStackComponent::addLayer() {
+    if (!target) return;
+    WaveLayer l = opts.makeNewLayer ? opts.makeNewLayer((int)target->layers.size())
+                                    : WaveLayer{};
+    target->layers.push_back(l);
+    rebuildRows();
+    resized();
+    renderSummation();
+    if (onChanged) onChanged();
+}
+
+void LayerStackComponent::renderSummation() {
+    if (!opts.showSummationPreview || !target || target->layers.empty()) {
+        summationSamples.clear();
+        repaint();
+        return;
+    }
+    target->render(512, summationSamples);
+    repaint();
+}
+
+void LayerStackComponent::layoutRows() {
+    int vw = viewport.getWidth();
+    int rh = WaveLayerEditor::rowHeight();
+    int y = 0;
+    for (auto& row : rows) {
+        row->setBounds(0, y, vw, rh);
+        y += rh + 4;
+    }
+    container.setSize(vw, std::max(y, 10));
+}
+
+void LayerStackComponent::resized() {
+    auto r = getLocalBounds();
+
+    if (opts.showSummationPreview) {
+        summationBounds = r.removeFromBottom(opts.summationPreviewHeight);
+        r.removeFromBottom(6);
+    } else {
+        summationBounds = juce::Rectangle<int>();
+    }
+
+    auto header = r.removeFromTop(24);
+    addLayerBtn.setBounds(header.removeFromLeft(110));
+    r.removeFromTop(4);
+
+    viewport.setBounds(r);
+    layoutRows();
+
+    if (emptyHintLabel.isVisible()) {
+        emptyHintLabel.setBounds(r.reduced(20).withHeight(60));
+        emptyHintLabel.toFront(false);
+    }
+}
+
+void LayerStackComponent::paint(juce::Graphics& g) {
+    if (summationBounds.isEmpty()) return;
+    auto a = summationBounds.toFloat();
+    g.setColour(juce::Colour(0xff111114));
+    g.fillRoundedRectangle(a, 4.0f);
+    g.setColour(juce::Colour(0xff2a2a30));
+    g.drawRoundedRectangle(a, 4.0f, 1.0f);
+
+    g.setColour(juce::Colour(0xff808088));
+    g.setFont(juce::FontOptions(12.0f));
+    g.drawText("Sum of all layers", a.reduced(6).removeFromTop(16),
+               juce::Justification::topLeft);
+
+    float cy = a.getCentreY();
+    g.setColour(juce::Colour(0xff2a2a30));
+    g.drawHorizontalLine((int)cy, a.getX(), a.getRight());
+
+    if (summationSamples.empty()) {
+        g.setColour(juce::Colour(0xff55555c));
+        g.drawText("(no layers yet - add one to shape the signal)", a,
+                   juce::Justification::centred);
+        return;
+    }
+
+    g.setColour(juce::Colour(0xff5fb3ff));
+    juce::Path p;
+    int n = (int)summationSamples.size();
+    float h = a.getHeight();
+    for (int i = 0; i < n; ++i) {
+        float x = a.getX() + (n > 1 ? (float)i / (float)(n - 1) : 0.0f) * a.getWidth();
+        float y = cy - summationSamples[i] * h * 0.42f;
+        if (i == 0) p.startNewSubPath(x, y);
+        else        p.lineTo(x, y);
+    }
+    g.strokePath(p, juce::PathStrokeType(1.5f));
 }
 
 // ==============================================================================
@@ -2098,7 +2303,8 @@ LayeredWaveform LayeredWaveform::defaultSine() {
 }
 
 // ==============================================================================
-// LayerRow - one row per layer
+// WaveLayerEditor - one editor per layer (shared between the wavetable
+// editor's stacked layer rows and the SignalShape editor's single layer view)
 // ==============================================================================
 
 // Sample one layer's contribution over one cycle (amp-scaled, not normalized).
@@ -2119,444 +2325,529 @@ static void renderSingleLayer(const WaveLayer& layer, int tableSize,
     }
 }
 
-class LayeredWaveEditorComponent::LayerRow : public juce::Component {
-public:
-    LayerRow(LayeredWaveEditorComponent& owner_, int index_)
-        : owner(owner_), index(index_)
-    {
-        addAndMakeVisible(label);
-        label.setJustificationType(juce::Justification::centredLeft);
-        label.setFont(13.0f);
+// ---------------- WaveLayerEditor presets ----------------
+//
+// Preset = a snapshot of WaveLayer fields the user can stamp in as a
+// starting point. Presets cover all shape modes so the user can drop in a
+// "ready-made" waveform and tweak from there, rather than building every
+// wave from scratch.
+namespace {
+struct WaveLayerPreset {
+    const char* name;
+    std::function<void(WaveLayer&)> apply;
+};
 
-        auto addShapeBtn = [this](juce::TextButton& b, const char* name, WaveLayer::Shape s) {
-            addAndMakeVisible(b);
-            b.setButtonText(name);
-            b.setClickingTogglesState(true);
-            b.setRadioGroupId(0); // we'll handle toggling manually
-            b.onClick = [this, s]() {
-                auto& l = owner.currentLayers()[index];
-                l.shape = s;
-                // Seed a fresh Drawn layer with a few points so the user has
-                // something grabable instead of an empty canvas.
-                if (s == WaveLayer::Drawn && l.drawnPoints.empty())
-                    l.drawnPoints = defaultDrawnPoints();
-                updateShapeButtons();
-                refreshPreview();
-                owner.onLayerChanged();
+static const std::vector<WaveLayerPreset>& wavePresets() {
+    static const std::vector<WaveLayerPreset> presets = {
+        { "Sine",         [](WaveLayer& l) { l.shape = WaveLayer::Sine; } },
+        { "Saw",          [](WaveLayer& l) { l.shape = WaveLayer::Saw; } },
+        { "Square",       [](WaveLayer& l) { l.shape = WaveLayer::Square; } },
+        { "Triangle",     [](WaveLayer& l) { l.shape = WaveLayer::Triangle; } },
+        { "Noise",        [](WaveLayer& l) { l.shape = WaveLayer::Noise; } },
+        // Pulse 25%: drawn as a single rectangle: high for first quarter,
+        // low for remainder. Two points isn't enough for cubic interpolation
+        // to render a flat pulse, so use a denser set.
+        { "Pulse 25%",    [](WaveLayer& l) {
+            l.shape = WaveLayer::Drawn;
+            l.freehandMode = false;
+            l.drawnPoints = {
+                {0.00f,  1.0f}, {0.24f,  1.0f},
+                {0.25f, -1.0f}, {0.99f, -1.0f}
             };
-        };
-        addShapeBtn(sineBtn,     "Sine",     WaveLayer::Sine);
-        addShapeBtn(sawBtn,      "Saw",      WaveLayer::Saw);
-        addShapeBtn(squareBtn,   "Square",   WaveLayer::Square);
-        addShapeBtn(triangleBtn, "Triangle", WaveLayer::Triangle);
-        addShapeBtn(noiseBtn,    "Noise",    WaveLayer::Noise);
-        addShapeBtn(drawnBtn,    "Draw",     WaveLayer::Drawn);
-        addShapeBtn(formulaBtn,  "Formula",  WaveLayer::Formula);
-
-        addAndMakeVisible(freehandToggle);
-        freehandToggle.setButtonText("Points");
-        freehandToggle.setTooltip("Toggle between Points mode (click to place control points with smooth interpolation) "
-                                  "and Freehand mode (click and drag to draw the waveform shape directly).");
-        freehandToggle.onClick = [this]() {
-            auto& l = owner.currentLayers()[index];
-            l.freehandMode = !l.freehandMode;
-            freehandToggle.setButtonText(l.freehandMode ? "Freehand" : "Points");
-            // Seed freehand samples if switching to freehand for the first time.
-            if (l.freehandMode && l.drawnSamples.empty())
-                l.drawnSamples = defaultFreehandSamples();
-            refreshPreview();
-            owner.onLayerChanged();
-        };
-        freehandToggle.setVisible(false); // only visible when shape == Drawn
-
-        // Formula expression editor - only visible when shape == Formula.
-        // Uses the same WaveExprParser vocabulary as the freq-domain editor:
-        // sin, cos, tan, exp, log, sqrt, pow, abs, tanh, clamp,
-        // saw(x), square(x), triangle(x), noise(), random, pi, e, + - * / ^.
-        // `x` ranges over [0, 2*pi) for one cycle.
-        addAndMakeVisible(formulaEditor);
-        formulaEditor.setMultiLine(false);
-        formulaEditor.setReturnKeyStartsNewLine(false);
-        formulaEditor.setTooltip("Expression in `x` (radians, 0 to 2*pi over one cycle). "
-                                 "Vocabulary: sin, cos, tan, exp, log, sqrt, pow, abs, tanh, clamp, "
-                                 "saw(x), square(x), triangle(x), noise(), random, pi, e. "
-                                 "Output is clamped to -1..1.");
-        formulaEditor.setText("sin(x)", juce::dontSendNotification);
-        formulaEditor.onTextChange = [this]() {
-            auto& l = owner.currentLayers()[index];
-            l.formulaExpr = formulaEditor.getText().toStdString();
-            refreshPreview();
-            owner.onLayerChanged();
-        };
-        formulaEditor.setVisible(false);
-
-        auto setupSlider = [this](juce::Slider& sl, double lo, double hi, double step, const char* suffix) {
-            addAndMakeVisible(sl);
-            sl.setSliderStyle(juce::Slider::LinearHorizontal);
-            sl.setTextBoxStyle(juce::Slider::TextBoxRight, false, 55, 18);
-            sl.setRange(lo, hi, step);
-            sl.setTextValueSuffix(suffix);
-            sl.onValueChange = [this]() {
-                auto& l = owner.currentLayers()[index];
-                l.ratio = (int)ratioSlider.getValue();
-                l.phase = (float)phaseSlider.getValue();
-                l.amp   = (float)ampSlider.getValue();
-                refreshPreview();
-                owner.onLayerChanged();
+        }},
+        { "Pulse 75%",    [](WaveLayer& l) {
+            l.shape = WaveLayer::Drawn;
+            l.freehandMode = false;
+            l.drawnPoints = {
+                {0.00f,  1.0f}, {0.74f,  1.0f},
+                {0.75f, -1.0f}, {0.99f, -1.0f}
             };
+        }},
+        // Half-sine: rectified sine, useful as an envelope curve.
+        { "Half-sine",    [](WaveLayer& l) {
+            l.shape = WaveLayer::Formula;
+            l.formulaExpr = "if(sin(x) > 0, sin(x), 0)";
+        }},
+        // Ramp shapes via Drawn so the user can grab points to reshape.
+        { "Ramp up",      [](WaveLayer& l) {
+            l.shape = WaveLayer::Drawn;
+            l.freehandMode = false;
+            l.drawnPoints = { {0.0f, -1.0f}, {0.999f, 1.0f} };
+        }},
+        { "Ramp down",    [](WaveLayer& l) {
+            l.shape = WaveLayer::Drawn;
+            l.freehandMode = false;
+            l.drawnPoints = { {0.0f, 1.0f}, {0.999f, -1.0f} };
+        }},
+        // Formula presets for common analog-flavored shapes.
+        { "Soft saw",     [](WaveLayer& l) {
+            l.shape = WaveLayer::Formula;
+            l.formulaExpr = "tanh(2 * saw(x))";
+        }},
+        { "FM bell",      [](WaveLayer& l) {
+            l.shape = WaveLayer::Formula;
+            l.formulaExpr = "sin(x + 0.7 * sin(2.4 * x))";
+        }},
+        { "Organ-ish",    [](WaveLayer& l) {
+            l.shape = WaveLayer::Formula;
+            l.formulaExpr = "0.6*sin(x) + 0.3*sin(2*x) + 0.1*sin(4*x)";
+        }},
+    };
+    return presets;
+}
+} // anonymous namespace
+
+// ---------------- WaveLayerEditor implementation ----------------
+
+WaveLayerEditor::WaveLayerEditor(WaveLayer* layerPtr, Callbacks cb)
+    : layer(layerPtr), callbacks(std::move(cb))
+{
+    addAndMakeVisible(label);
+    label.setJustificationType(juce::Justification::centredLeft);
+    label.setFont(13.0f);
+
+    auto addShapeBtn = [this](juce::TextButton& b, const char* name, WaveLayer::Shape s) {
+        addAndMakeVisible(b);
+        b.setButtonText(name);
+        b.setClickingTogglesState(true);
+        b.setRadioGroupId(0); // we'll handle toggling manually
+        b.onClick = [this, s]() {
+            if (!layer) return;
+            layer->shape = s;
+            // Seed a fresh Drawn layer with a few points so the user has
+            // something grabable instead of an empty canvas.
+            if (s == WaveLayer::Drawn && layer->drawnPoints.empty())
+                layer->drawnPoints = defaultDrawnPoints();
+            updateShapeButtons();
+            refreshPreview();
+            if (callbacks.onChanged) callbacks.onChanged();
         };
-        setupSlider(ratioSlider, 1.0, 16.0, 1.0, "x");
-        setupSlider(phaseSlider, 0.0, 1.0, 0.01, "");
-        setupSlider(ampSlider,   0.0, 1.0, 0.01, "");
-        ratioSlider.setTooltip("Harmonic ratio: how many times faster this layer cycles than the fundamental. "
-                               "1 = root pitch, 2 = one octave up, 3 = one octave + a fifth, etc. Higher numbers add brighter overtones.");
-        phaseSlider.setTooltip("Phase offset (0 to 1): shifts where in its cycle this layer starts. "
-                               "Affects how layers add up when summed - different phases give different timbres.");
-        ampSlider.setTooltip("Amplitude (0 to 1): how loud this layer is in the final sum. 0 = silent, 1 = full volume. "
-                             "Use to balance layers against each other.");
+    };
+    addShapeBtn(sineBtn,     "Sine",     WaveLayer::Sine);
+    addShapeBtn(sawBtn,      "Saw",      WaveLayer::Saw);
+    addShapeBtn(squareBtn,   "Square",   WaveLayer::Square);
+    addShapeBtn(triangleBtn, "Triangle", WaveLayer::Triangle);
+    addShapeBtn(noiseBtn,    "Noise",    WaveLayer::Noise);
+    addShapeBtn(drawnBtn,    "Draw",     WaveLayer::Drawn);
+    addShapeBtn(formulaBtn,  "Formula",  WaveLayer::Formula);
 
-        addAndMakeVisible(ratioLabel);
-        addAndMakeVisible(phaseLabel);
-        addAndMakeVisible(ampLabel);
-        ratioLabel.setText("Harmonic",  juce::dontSendNotification);
-        phaseLabel.setText("Phase",     juce::dontSendNotification);
-        ampLabel  .setText("Amplitude", juce::dontSendNotification);
-        for (auto* l : { &ratioLabel, &phaseLabel, &ampLabel }) {
-            l->setFont(11.0f);
-            l->setJustificationType(juce::Justification::centredLeft);
-        }
-
-        addAndMakeVisible(deleteBtn);
-        deleteBtn.setButtonText("X");
-        deleteBtn.onClick = [this]() {
-            owner.currentLayers().erase(owner.currentLayers().begin() + index);
-            owner.rebuildRows();
-            owner.onLayerChanged();
-        };
-    }
-
-    void syncFromModel() {
-        auto& l = owner.currentLayers()[index];
-        label.setText("Layer " + juce::String(index + 1), juce::dontSendNotification);
-        ratioSlider.setValue(l.ratio, juce::dontSendNotification);
-        phaseSlider.setValue(l.phase, juce::dontSendNotification);
-        ampSlider  .setValue(l.amp,   juce::dontSendNotification);
-        updateShapeButtons();
-        freehandToggle.setVisible(l.shape == WaveLayer::Drawn);
-        freehandToggle.setButtonText(l.freehandMode ? "Freehand" : "Points");
-        formulaEditor.setVisible(l.shape == WaveLayer::Formula);
-        if (l.shape == WaveLayer::Formula)
-            formulaEditor.setText(l.formulaExpr, juce::dontSendNotification);
+    addAndMakeVisible(freehandToggle);
+    freehandToggle.setButtonText("Points");
+    freehandToggle.setTooltip("Toggle between Points mode (click to place control points with smooth interpolation) "
+                              "and Freehand mode (click and drag to draw the waveform shape directly).");
+    freehandToggle.onClick = [this]() {
+        if (!layer) return;
+        layer->freehandMode = !layer->freehandMode;
+        freehandToggle.setButtonText(layer->freehandMode ? "Freehand" : "Points");
+        // Seed freehand samples if switching to freehand for the first time.
+        if (layer->freehandMode && layer->drawnSamples.empty())
+            layer->drawnSamples = defaultFreehandSamples();
         refreshPreview();
-    }
+        if (callbacks.onChanged) callbacks.onChanged();
+    };
+    freehandToggle.setVisible(false); // only visible when shape == Drawn
 
-    void refreshPreview() {
-        if (index < 0 || index >= (int)owner.currentLayers().size()) return;
-        renderSingleLayer(owner.currentLayers()[index], 512, previewSamples);
-        repaint();
-    }
+    // Formula expression editor - only visible when shape == Formula.
+    // Uses the same WaveExprParser vocabulary as the freq-domain editor:
+    // sin, cos, tan, exp, log, sqrt, pow, abs, tanh, clamp,
+    // saw(x), square(x), triangle(x), noise(), random, pi, e, + - * / ^,
+    // floor, ceil, min(a,b), max(a,b), if(c,a,b), and conditions
+    // (<, >, <=, >=, ==, !=, &&, ||, !, ternary ?:).
+    // `x` ranges over [0, 2*pi) for one cycle.
+    addAndMakeVisible(formulaEditor);
+    formulaEditor.setMultiLine(false);
+    formulaEditor.setReturnKeyStartsNewLine(false);
+    formulaEditor.setTooltip("Expression in `x` (radians, 0 to 2*pi over one cycle). "
+                             "Vocabulary: sin, cos, tan, exp, log, sqrt, pow, abs, tanh, clamp, "
+                             "floor, ceil, min, max, if(c,a,b), c?a:b, saw(x), square(x), triangle(x), "
+                             "noise(), random, pi, e. Output is clamped to -1..1.");
+    formulaEditor.setText("sin(x)", juce::dontSendNotification);
+    formulaEditor.onTextChange = [this]() {
+        if (!layer) return;
+        layer->formulaExpr = formulaEditor.getText().toStdString();
+        refreshPreview();
+        if (callbacks.onChanged) callbacks.onChanged();
+    };
+    formulaEditor.setVisible(false);
 
-    void updateShapeButtons() {
-        auto& l = owner.currentLayers()[index];
-        sineBtn    .setToggleState(l.shape == WaveLayer::Sine,     juce::dontSendNotification);
-        sawBtn     .setToggleState(l.shape == WaveLayer::Saw,      juce::dontSendNotification);
-        squareBtn  .setToggleState(l.shape == WaveLayer::Square,   juce::dontSendNotification);
-        triangleBtn.setToggleState(l.shape == WaveLayer::Triangle, juce::dontSendNotification);
-        noiseBtn   .setToggleState(l.shape == WaveLayer::Noise,    juce::dontSendNotification);
-        drawnBtn   .setToggleState(l.shape == WaveLayer::Drawn,    juce::dontSendNotification);
-        formulaBtn .setToggleState(l.shape == WaveLayer::Formula,  juce::dontSendNotification);
-        freehandToggle.setVisible(l.shape == WaveLayer::Drawn);
-        freehandToggle.setButtonText(l.freehandMode ? "Freehand" : "Points");
-        formulaEditor.setVisible(l.shape == WaveLayer::Formula);
-        if (l.shape == WaveLayer::Formula
-            && formulaEditor.getText().toStdString() != l.formulaExpr)
-        {
-            formulaEditor.setText(l.formulaExpr, juce::dontSendNotification);
-        }
-    }
-
-    void resized() override {
-        auto a = getLocalBounds().reduced(4);
-        auto top = a.removeFromTop(22);
-        label.setBounds(top.removeFromLeft(70));
-        deleteBtn.setBounds(top.removeFromRight(22));
-
-        // Shape button row - 7 buttons (sine/saw/square/triangle/noise/draw/formula)
-        auto btnRow = a.removeFromTop(24);
-        int bw = btnRow.getWidth() / 7;
-        sineBtn    .setBounds(btnRow.removeFromLeft(bw));
-        sawBtn     .setBounds(btnRow.removeFromLeft(bw));
-        squareBtn  .setBounds(btnRow.removeFromLeft(bw));
-        triangleBtn.setBounds(btnRow.removeFromLeft(bw));
-        noiseBtn   .setBounds(btnRow.removeFromLeft(bw));
-        drawnBtn   .setBounds(btnRow.removeFromLeft(bw));
-        formulaBtn .setBounds(btnRow);
-
-        // Sub-row: Freehand/Points toggle (Drawn) or Formula text editor (Formula).
-        // Always reserve the height so the slider rows below don't jump when
-        // toggling shape.
-        auto subRow = a.removeFromTop(24);
-        if (freehandToggle.isVisible()) {
-            freehandToggle.setBounds(subRow.removeFromLeft(100));
-        } else if (formulaEditor.isVisible()) {
-            formulaEditor.setBounds(subRow);
-        }
-
-        // Reserve space for the mini preview (bottom of row)
-        a.removeFromBottom(previewHeight);
-
-        // Slider rows
-        auto sliderRow = [&](juce::Label& lab, juce::Slider& sl) {
-            auto r = a.removeFromTop(20);
-            lab.setBounds(r.removeFromLeft(70));
-            sl.setBounds(r);
+    auto setupSlider = [this](juce::Slider& sl, double lo, double hi, double step, const char* suffix) {
+        addAndMakeVisible(sl);
+        sl.setSliderStyle(juce::Slider::LinearHorizontal);
+        sl.setTextBoxStyle(juce::Slider::TextBoxRight, false, 55, 18);
+        sl.setRange(lo, hi, step);
+        sl.setTextValueSuffix(suffix);
+        sl.onValueChange = [this]() {
+            if (!layer) return;
+            layer->ratio = (int)ratioSlider.getValue();
+            layer->phase = (float)phaseSlider.getValue();
+            layer->amp   = (float)ampSlider.getValue();
+            refreshPreview();
+            if (callbacks.onChanged) callbacks.onChanged();
         };
-        sliderRow(ratioLabel, ratioSlider);
-        sliderRow(phaseLabel, phaseSlider);
-        sliderRow(ampLabel,   ampSlider);
+    };
+    setupSlider(ratioSlider, 1.0, 16.0, 1.0, "x");
+    setupSlider(phaseSlider, 0.0, 1.0, 0.01, "");
+    setupSlider(ampSlider,   0.0, 1.0, 0.01, "");
+    ratioSlider.setTooltip("Harmonic ratio: how many times faster this layer cycles than the fundamental. "
+                           "1 = root pitch, 2 = one octave up, 3 = one octave + a fifth, etc. Higher numbers add brighter overtones.");
+    phaseSlider.setTooltip("Phase offset (0 to 1): shifts where in its cycle this layer starts. "
+                           "Affects how layers add up when summed - different phases give different timbres.");
+    ampSlider.setTooltip("Amplitude (0 to 1): how loud this layer is in the final sum. 0 = silent, 1 = full volume. "
+                         "Use to balance layers against each other.");
+
+    addAndMakeVisible(ratioLabel);
+    addAndMakeVisible(phaseLabel);
+    addAndMakeVisible(ampLabel);
+    ratioLabel.setText("Harmonic",  juce::dontSendNotification);
+    phaseLabel.setText("Phase",     juce::dontSendNotification);
+    ampLabel  .setText("Amplitude", juce::dontSendNotification);
+    for (auto* l : { &ratioLabel, &phaseLabel, &ampLabel }) {
+        l->setFont(11.0f);
+        l->setJustificationType(juce::Justification::centredLeft);
     }
 
-    void paint(juce::Graphics& g) override {
-        g.setColour(juce::Colour(40, 40, 50));
-        g.fillRoundedRectangle(getLocalBounds().toFloat(), 4.0f);
-        g.setColour(juce::Colour(70, 70, 90));
-        g.drawRoundedRectangle(getLocalBounds().toFloat(), 4.0f, 1.0f);
+    addAndMakeVisible(presetBtn);
+    presetBtn.setButtonText("Preset");
+    presetBtn.setTooltip("Pick a starting waveform. Replaces the layer's shape with a preset; "
+                         "you can edit it further from there.");
+    presetBtn.onClick = [this]() { showPresetMenu(); };
 
-        // Mini waveform preview for just this layer's contribution
-        auto bounds = getLocalBounds().reduced(6).toFloat();
-        auto previewArea = bounds.removeFromBottom((float)previewHeight).reduced(2.0f);
+    addAndMakeVisible(deleteBtn);
+    deleteBtn.setButtonText("X");
+    deleteBtn.setTooltip("Remove this layer.");
+    deleteBtn.onClick = [this]() {
+        if (callbacks.onDelete) callbacks.onDelete();
+    };
+    // No delete callback -> single-layer editor, hide the X.
+    deleteBtn.setVisible((bool) callbacks.onDelete);
+}
 
-        g.setColour(juce::Colour(24, 24, 30));
-        g.fillRoundedRectangle(previewArea, 3.0f);
+void WaveLayerEditor::setLayerPtr(WaveLayer* p) {
+    layer = p;
+    syncFromModel();
+}
 
-        // Center line
-        float cy = previewArea.getCentreY();
-        g.setColour(juce::Colours::grey.withAlpha(0.25f));
-        g.drawHorizontalLine((int)cy, previewArea.getX(), previewArea.getRight());
+void WaveLayerEditor::syncFromModel() {
+    if (!layer) return;
+    auto& l = *layer;
+    if (callbacks.indexForLabel) {
+        label.setText("Layer " + juce::String(callbacks.indexForLabel()),
+                      juce::dontSendNotification);
+    } else {
+        label.setText("Layer", juce::dontSendNotification);
+    }
+    ratioSlider.setValue(l.ratio, juce::dontSendNotification);
+    phaseSlider.setValue(l.phase, juce::dontSendNotification);
+    ampSlider  .setValue(l.amp,   juce::dontSendNotification);
+    updateShapeButtons();
+    freehandToggle.setVisible(l.shape == WaveLayer::Drawn);
+    freehandToggle.setButtonText(l.freehandMode ? "Freehand" : "Points");
+    formulaEditor.setVisible(l.shape == WaveLayer::Formula);
+    if (l.shape == WaveLayer::Formula)
+        formulaEditor.setText(l.formulaExpr, juce::dontSendNotification);
+    refreshPreview();
+}
 
-        if (!previewSamples.empty()) {
-            float cx = previewArea.getX() + 2;
-            float w  = previewArea.getWidth() - 4;
-            float h  = previewArea.getHeight() - 4;
+void WaveLayerEditor::refreshPreview() {
+    if (!layer) return;
+    renderSingleLayer(*layer, 512, previewSamples);
+    repaint();
+}
 
-            juce::Path p;
-            int n = (int)previewSamples.size();
-            for (int i = 0; i < n; ++i) {
-                float x = cx + (float)i / (float)(n - 1) * w;
-                float y = cy - previewSamples[i] * h * 0.45f;
-                if (i == 0) p.startNewSubPath(x, y);
-                else p.lineTo(x, y);
+void WaveLayerEditor::updateShapeButtons() {
+    if (!layer) return;
+    auto& l = *layer;
+    sineBtn    .setToggleState(l.shape == WaveLayer::Sine,     juce::dontSendNotification);
+    sawBtn     .setToggleState(l.shape == WaveLayer::Saw,      juce::dontSendNotification);
+    squareBtn  .setToggleState(l.shape == WaveLayer::Square,   juce::dontSendNotification);
+    triangleBtn.setToggleState(l.shape == WaveLayer::Triangle, juce::dontSendNotification);
+    noiseBtn   .setToggleState(l.shape == WaveLayer::Noise,    juce::dontSendNotification);
+    drawnBtn   .setToggleState(l.shape == WaveLayer::Drawn,    juce::dontSendNotification);
+    formulaBtn .setToggleState(l.shape == WaveLayer::Formula,  juce::dontSendNotification);
+    freehandToggle.setVisible(l.shape == WaveLayer::Drawn);
+    freehandToggle.setButtonText(l.freehandMode ? "Freehand" : "Points");
+    formulaEditor.setVisible(l.shape == WaveLayer::Formula);
+    if (l.shape == WaveLayer::Formula
+        && formulaEditor.getText().toStdString() != l.formulaExpr)
+    {
+        formulaEditor.setText(l.formulaExpr, juce::dontSendNotification);
+    }
+}
+
+void WaveLayerEditor::showPresetMenu() {
+    juce::PopupMenu m;
+    const auto& presets = wavePresets();
+    for (int i = 0; i < (int)presets.size(); ++i)
+        m.addItem(i + 1, presets[i].name);
+    m.showMenuAsync(juce::PopupMenu::Options().withTargetComponent(&presetBtn),
+        [this](int result) {
+            if (result <= 0 || !layer) return;
+            const auto& presets = wavePresets();
+            int idx = result - 1;
+            if (idx < 0 || idx >= (int)presets.size()) return;
+            presets[idx].apply(*layer);
+            syncFromModel();
+            if (callbacks.onChanged) callbacks.onChanged();
+        });
+}
+
+void WaveLayerEditor::resized() {
+    auto a = getLocalBounds().reduced(4);
+    auto top = a.removeFromTop(22);
+    label.setBounds(top.removeFromLeft(70));
+    if (deleteBtn.isVisible())
+        deleteBtn.setBounds(top.removeFromRight(22));
+    // Preset button sits to the left of the (optional) delete button.
+    presetBtn.setBounds(top.removeFromRight(72));
+
+    // Shape button row - 7 buttons (sine/saw/square/triangle/noise/draw/formula)
+    auto btnRow = a.removeFromTop(24);
+    int bw = btnRow.getWidth() / 7;
+    sineBtn    .setBounds(btnRow.removeFromLeft(bw));
+    sawBtn     .setBounds(btnRow.removeFromLeft(bw));
+    squareBtn  .setBounds(btnRow.removeFromLeft(bw));
+    triangleBtn.setBounds(btnRow.removeFromLeft(bw));
+    noiseBtn   .setBounds(btnRow.removeFromLeft(bw));
+    drawnBtn   .setBounds(btnRow.removeFromLeft(bw));
+    formulaBtn .setBounds(btnRow);
+
+    // Sub-row: Freehand/Points toggle (Drawn) or Formula text editor (Formula).
+    // Always reserve the height so the slider rows below don't jump when
+    // toggling shape.
+    auto subRow = a.removeFromTop(24);
+    if (freehandToggle.isVisible()) {
+        freehandToggle.setBounds(subRow.removeFromLeft(100));
+    } else if (formulaEditor.isVisible()) {
+        formulaEditor.setBounds(subRow);
+    }
+
+    // Reserve space for the mini preview (bottom of row)
+    a.removeFromBottom(previewHeight);
+
+    // Slider rows
+    auto sliderRow = [&](juce::Label& lab, juce::Slider& sl) {
+        auto r = a.removeFromTop(20);
+        lab.setBounds(r.removeFromLeft(70));
+        sl.setBounds(r);
+    };
+    sliderRow(ratioLabel, ratioSlider);
+    sliderRow(phaseLabel, phaseSlider);
+    sliderRow(ampLabel,   ampSlider);
+}
+
+void WaveLayerEditor::paint(juce::Graphics& g) {
+    g.setColour(juce::Colour(40, 40, 50));
+    g.fillRoundedRectangle(getLocalBounds().toFloat(), 4.0f);
+    g.setColour(juce::Colour(70, 70, 90));
+    g.drawRoundedRectangle(getLocalBounds().toFloat(), 4.0f, 1.0f);
+
+    // Mini waveform preview for just this layer's contribution
+    auto bounds = getLocalBounds().reduced(6).toFloat();
+    auto previewArea = bounds.removeFromBottom((float)previewHeight).reduced(2.0f);
+
+    g.setColour(juce::Colour(24, 24, 30));
+    g.fillRoundedRectangle(previewArea, 3.0f);
+
+    // Center line
+    float cy = previewArea.getCentreY();
+    g.setColour(juce::Colours::grey.withAlpha(0.25f));
+    g.drawHorizontalLine((int)cy, previewArea.getX(), previewArea.getRight());
+
+    if (!previewSamples.empty()) {
+        float cx = previewArea.getX() + 2;
+        float w  = previewArea.getWidth() - 4;
+        float h  = previewArea.getHeight() - 4;
+
+        juce::Path p;
+        int n = (int)previewSamples.size();
+        for (int i = 0; i < n; ++i) {
+            float x = cx + (float)i / (float)(n - 1) * w;
+            float y = cy - previewSamples[i] * h * 0.45f;
+            if (i == 0) p.startNewSubPath(x, y);
+            else p.lineTo(x, y);
+        }
+        g.setColour(juce::Colour(150, 200, 255));
+        g.strokePath(p, juce::PathStrokeType(1.3f));
+
+        // For Drawn layers in Points mode, overlay the control points so
+        // the user can see and grab them.
+        if (layer && layer->shape == WaveLayer::Drawn && !layer->freehandMode) {
+            for (int i = 0; i < (int)layer->drawnPoints.size(); ++i) {
+                const auto& pt = layer->drawnPoints[i];
+                // Scale y by amp because the preview renders amp*shape,
+                // so the visible curve is also amp-scaled.
+                float x = cx + pt.first * w;
+                float y = cy - (pt.second * layer->amp) * h * 0.45f;
+                bool isDragged = (i == draggingIdx);
+                g.setColour(isDragged ? juce::Colours::yellow : juce::Colours::white);
+                g.fillEllipse(x - 3.0f, y - 3.0f, 6.0f, 6.0f);
+                g.setColour(juce::Colour(60, 90, 140));
+                g.drawEllipse(x - 3.0f, y - 3.0f, 6.0f, 6.0f, 1.0f);
             }
-            g.setColour(juce::Colour(150, 200, 255));
-            g.strokePath(p, juce::PathStrokeType(1.3f));
-
-            // For Drawn layers in Points mode, overlay the control points so
-            // the user can see and grab them.
-            const auto& layer = owner.currentLayers()[index];
-            if (layer.shape == WaveLayer::Drawn && !layer.freehandMode) {
-                for (int i = 0; i < (int)layer.drawnPoints.size(); ++i) {
-                    const auto& pt = layer.drawnPoints[i];
-                    // Scale y by amp because the preview renders amp*shape,
-                    // so the visible curve is also amp-scaled.
-                    float x = cx + pt.first * w;
-                    float y = cy - (pt.second * layer.amp) * h * 0.45f;
-                    bool isDragged = (i == draggingIdx);
-                    g.setColour(isDragged ? juce::Colours::yellow : juce::Colours::white);
-                    g.fillEllipse(x - 3.0f, y - 3.0f, 6.0f, 6.0f);
-                    g.setColour(juce::Colour(60, 90, 140));
-                    g.drawEllipse(x - 3.0f, y - 3.0f, 6.0f, 6.0f, 1.0f);
-                }
-            }
         }
     }
+}
 
-    static constexpr int previewHeight = 92;
-    static int rowHeight() { return 22 + 24 + 24 + 20 * 3 + 12 + previewHeight + 4; }
+juce::Rectangle<float> WaveLayerEditor::getPreviewAreaBounds() const {
+    auto bounds = getLocalBounds().reduced(6).toFloat();
+    return bounds.removeFromBottom((float)previewHeight).reduced(2.0f);
+}
 
-    juce::Rectangle<float> getPreviewAreaBounds() const {
-        auto bounds = getLocalBounds().reduced(6).toFloat();
-        return bounds.removeFromBottom((float)previewHeight).reduced(2.0f);
+bool WaveLayerEditor::mouseToPointXY(juce::Point<float> p, float& outX, float& outY) const {
+    auto area = getPreviewAreaBounds();
+    if (!area.contains(p)) return false;
+    outX = (p.x - area.getX()) / juce::jmax(1.0f, area.getWidth());
+    outY = 1.0f - 2.0f * (p.y - area.getY()) / juce::jmax(1.0f, area.getHeight());
+    outX = juce::jlimit(0.0f, 0.999f, outX);
+    outY = juce::jlimit(-1.0f, 1.0f, outY);
+    return true;
+}
+
+int WaveLayerEditor::findPointNear(float x, float y, float radius) const {
+    if (!layer) return -1;
+    auto& pts = layer->drawnPoints;
+    int best = -1;
+    float bestD2 = radius * radius;
+    for (int i = 0; i < (int)pts.size(); ++i) {
+        float dx = pts[i].first - x;
+        float dy = (pts[i].second - y) * 0.5f; // compress y to match x scale
+        float d2 = dx * dx + dy * dy;
+        if (d2 < bestD2) { bestD2 = d2; best = i; }
     }
+    return best;
+}
 
-    // Convert a mouse position in component coordinates to (x, y) in the
-    // normalized space used by drawnPoints: x in [0, 1), y in [-1, 1].
-    // Returns true if p is inside the preview area.
-    bool mouseToPointXY(juce::Point<float> p, float& outX, float& outY) const {
-        auto area = getPreviewAreaBounds();
-        if (!area.contains(p)) return false;
-        outX = (p.x - area.getX()) / juce::jmax(1.0f, area.getWidth());
-        outY = 1.0f - 2.0f * (p.y - area.getY()) / juce::jmax(1.0f, area.getHeight());
-        outX = juce::jlimit(0.0f, 0.999f, outX);
-        outY = juce::jlimit(-1.0f, 1.0f, outY);
-        return true;
-    }
+void WaveLayerEditor::sortPointsByX() {
+    if (!layer) return;
+    auto& pts = layer->drawnPoints;
+    std::sort(pts.begin(), pts.end(),
+              [](const std::pair<float,float>& a, const std::pair<float,float>& b) {
+                  return a.first < b.first;
+              });
+}
 
-    // Find the closest point to (x, y), returning its index, or -1 if none
-    // is within `radius` (in normalized coordinates, where x spans 1 unit
-    // and y spans 2 units).
-    int findPointNear(float x, float y, float radius = 0.05f) const {
-        auto& pts = owner.currentLayers()[index].drawnPoints;
-        int best = -1;
-        float bestD2 = radius * radius;
-        for (int i = 0; i < (int)pts.size(); ++i) {
-            float dx = pts[i].first - x;
-            float dy = (pts[i].second - y) * 0.5f; // compress y to match x scale
-            float d2 = dx * dx + dy * dy;
-            if (d2 < bestD2) { bestD2 = d2; best = i; }
+void WaveLayerEditor::writeFreehandSample(float x, float y) {
+    if (!layer) return;
+    auto& samples = layer->drawnSamples;
+    if (samples.empty()) samples = defaultFreehandSamples();
+    int n = (int)samples.size();
+    int idx = juce::jlimit(0, n - 1, (int)(x * (float)n));
+    if (lastFreehandIdx >= 0 && lastFreehandIdx != idx) {
+        // Interpolate between last and current to avoid gaps.
+        int from = lastFreehandIdx;
+        int to = idx;
+        float fromY = lastFreehandY;
+        float toY = y;
+        int steps = std::abs(to - from);
+        int dir = (to > from) ? 1 : -1;
+        for (int s = 0; s <= steps; ++s) {
+            int si = from + s * dir;
+            if (si < 0 || si >= n) continue;
+            float t = (steps > 0) ? (float)s / (float)steps : 1.0f;
+            samples[si] = fromY + (toY - fromY) * t;
         }
-        return best;
+    } else {
+        samples[idx] = y;
+    }
+    lastFreehandIdx = idx;
+    lastFreehandY = y;
+}
+
+void WaveLayerEditor::mouseDown(const juce::MouseEvent& e) {
+    if (!layer) return;
+    auto& l = *layer;
+    if (l.shape != WaveLayer::Drawn) return;
+    float x, y;
+    if (!mouseToPointXY(e.position, x, y)) return;
+
+    if (l.freehandMode) {
+        // Freehand: start drawing samples
+        freehandDrawing = true;
+        lastFreehandIdx = -1;
+        writeFreehandSample(x, y);
+        refreshPreview();
+        if (callbacks.onChanged) callbacks.onChanged();
+        return;
     }
 
-    void sortPointsByX() {
-        auto& pts = owner.currentLayers()[index].drawnPoints;
-        std::sort(pts.begin(), pts.end(),
-                  [](const std::pair<float,float>& a, const std::pair<float,float>& b) {
-                      return a.first < b.first;
-                  });
-    }
-
-    // Write freehand sample data at normalized position x with value y,
-    // interpolating between the previous write position and the current one
-    // so there are no gaps when dragging quickly.
-    void writeFreehandSample(float x, float y) {
-        auto& samples = owner.currentLayers()[index].drawnSamples;
-        if (samples.empty()) samples = defaultFreehandSamples();
-        int n = (int)samples.size();
-        int idx = juce::jlimit(0, n - 1, (int)(x * (float)n));
-        if (lastFreehandIdx >= 0 && lastFreehandIdx != idx) {
-            // Interpolate between last and current to avoid gaps.
-            int from = lastFreehandIdx;
-            int to = idx;
-            float fromY = lastFreehandY;
-            float toY = y;
-            int steps = std::abs(to - from);
-            int dir = (to > from) ? 1 : -1;
-            for (int s = 0; s <= steps; ++s) {
-                int si = from + s * dir;
-                if (si < 0 || si >= n) continue;
-                float t = (steps > 0) ? (float)s / (float)steps : 1.0f;
-                samples[si] = fromY + (toY - fromY) * t;
-            }
-        } else {
-            samples[idx] = y;
-        }
-        lastFreehandIdx = idx;
-        lastFreehandY = y;
-    }
-
-    void mouseDown(const juce::MouseEvent& e) override {
-        auto& l = owner.currentLayers()[index];
-        if (l.shape != WaveLayer::Drawn) return;
-        float x, y;
-        if (!mouseToPointXY(e.position, x, y)) return;
-
-        if (l.freehandMode) {
-            // Freehand: start drawing samples
-            freehandDrawing = true;
-            lastFreehandIdx = -1;
-            writeFreehandSample(x, y);
-            refreshPreview();
-            owner.onLayerChanged();
-            return;
-        }
-
-        // Points mode (original behavior)
-        auto& pts = l.drawnPoints;
-        int hit = findPointNear(x, y);
-        if (e.mods.isShiftDown() && hit >= 0) {
-            // Shift-click a point to delete it (keep at least 2 points so
-            // interpolation has something to work with).
-            if ((int)pts.size() > 2) {
-                pts.erase(pts.begin() + hit);
-                draggingIdx = -1;
-                refreshPreview();
-                owner.onLayerChanged();
-            }
-            return;
-        }
-        if (hit >= 0) {
-            draggingIdx = hit;
-        } else {
-            // Add a new point at the cursor, then sort by x so interpolation stays valid.
-            pts.emplace_back(x, y);
-            sortPointsByX();
-            // After sorting, re-find the point we just added so we can continue
-            // dragging it.
+    // Points mode (original behavior)
+    auto& pts = l.drawnPoints;
+    int hit = findPointNear(x, y);
+    if (e.mods.isShiftDown() && hit >= 0) {
+        // Shift-click a point to delete it (keep at least 2 points so
+        // interpolation has something to work with).
+        if ((int)pts.size() > 2) {
+            pts.erase(pts.begin() + hit);
             draggingIdx = -1;
-            for (int i = 0; i < (int)pts.size(); ++i)
-                if (std::abs(pts[i].first - x) < 1e-5f && std::abs(pts[i].second - y) < 1e-5f)
-                    { draggingIdx = i; break; }
             refreshPreview();
-            owner.onLayerChanged();
+            if (callbacks.onChanged) callbacks.onChanged();
         }
+        return;
     }
+    if (hit >= 0) {
+        draggingIdx = hit;
+    } else {
+        // Add a new point at the cursor, then sort by x so interpolation stays valid.
+        pts.emplace_back(x, y);
+        sortPointsByX();
+        // After sorting, re-find the point we just added so we can continue
+        // dragging it.
+        draggingIdx = -1;
+        for (int i = 0; i < (int)pts.size(); ++i)
+            if (std::abs(pts[i].first - x) < 1e-5f && std::abs(pts[i].second - y) < 1e-5f)
+                { draggingIdx = i; break; }
+        refreshPreview();
+        if (callbacks.onChanged) callbacks.onChanged();
+    }
+}
 
-    void mouseDrag(const juce::MouseEvent& e) override {
-        auto& l = owner.currentLayers()[index];
-        if (l.shape != WaveLayer::Drawn) return;
+void WaveLayerEditor::mouseDrag(const juce::MouseEvent& e) {
+    if (!layer) return;
+    auto& l = *layer;
+    if (l.shape != WaveLayer::Drawn) return;
 
-        if (l.freehandMode && freehandDrawing) {
-            auto area = getPreviewAreaBounds();
-            auto cp = e.position;
-            cp.x = juce::jlimit(area.getX(), area.getRight() - 1.0f, cp.x);
-            cp.y = juce::jlimit(area.getY(), area.getBottom(), cp.y);
-            float x, y;
-            mouseToPointXY(cp, x, y);
-            writeFreehandSample(x, y);
-            refreshPreview();
-            owner.onLayerChanged();
-            return;
-        }
-
-        // Points mode
-        if (draggingIdx < 0) return;
-        auto& pts = l.drawnPoints;
-        if (draggingIdx >= (int)pts.size()) { draggingIdx = -1; return; }
-        float x, y;
-        // Use clamped conversion so dragging outside the area still moves the point.
+    if (l.freehandMode && freehandDrawing) {
         auto area = getPreviewAreaBounds();
         auto cp = e.position;
         cp.x = juce::jlimit(area.getX(), area.getRight() - 1.0f, cp.x);
         cp.y = juce::jlimit(area.getY(), area.getBottom(), cp.y);
+        float x, y;
         mouseToPointXY(cp, x, y);
-        pts[draggingIdx] = { x, y };
-        // Re-sort after movement since x may have changed order.
-        // Remember old position so we can re-find after sort.
-        float ox = x, oy = y;
-        sortPointsByX();
-        draggingIdx = -1;
-        for (int i = 0; i < (int)pts.size(); ++i)
-            if (std::abs(pts[i].first - ox) < 1e-5f && std::abs(pts[i].second - oy) < 1e-5f)
-                { draggingIdx = i; break; }
+        writeFreehandSample(x, y);
         refreshPreview();
-        owner.onLayerChanged();
+        if (callbacks.onChanged) callbacks.onChanged();
+        return;
     }
 
-    void mouseUp(const juce::MouseEvent&) override {
-        draggingIdx = -1;
-        freehandDrawing = false;
-        lastFreehandIdx = -1;
-    }
+    // Points mode
+    if (draggingIdx < 0) return;
+    auto& pts = l.drawnPoints;
+    if (draggingIdx >= (int)pts.size()) { draggingIdx = -1; return; }
+    float x, y;
+    // Use clamped conversion so dragging outside the area still moves the point.
+    auto area = getPreviewAreaBounds();
+    auto cp = e.position;
+    cp.x = juce::jlimit(area.getX(), area.getRight() - 1.0f, cp.x);
+    cp.y = juce::jlimit(area.getY(), area.getBottom(), cp.y);
+    mouseToPointXY(cp, x, y);
+    pts[draggingIdx] = { x, y };
+    // Re-sort after movement since x may have changed order.
+    // Remember old position so we can re-find after sort.
+    float ox = x, oy = y;
+    sortPointsByX();
+    draggingIdx = -1;
+    for (int i = 0; i < (int)pts.size(); ++i)
+        if (std::abs(pts[i].first - ox) < 1e-5f && std::abs(pts[i].second - oy) < 1e-5f)
+            { draggingIdx = i; break; }
+    refreshPreview();
+    if (callbacks.onChanged) callbacks.onChanged();
+}
 
-private:
-    LayeredWaveEditorComponent& owner;
-    int index;
-
-    juce::Label label;
-    juce::TextButton sineBtn, sawBtn, squareBtn, triangleBtn, noiseBtn, drawnBtn, formulaBtn;
-    juce::TextButton freehandToggle;
-    juce::TextEditor formulaEditor;
-    juce::Slider ratioSlider, phaseSlider, ampSlider;
-    juce::Label  ratioLabel, phaseLabel, ampLabel;
-    juce::TextButton deleteBtn;
-    std::vector<float> previewSamples;
-    int draggingIdx = -1;
-
-    // Freehand drawing state
-    bool freehandDrawing = false;
-    int  lastFreehandIdx = -1;
-    float lastFreehandY = 0.0f;
-};
+void WaveLayerEditor::mouseUp(const juce::MouseEvent&) {
+    draggingIdx = -1;
+    freehandDrawing = false;
+    lastFreehandIdx = -1;
+}
 
 // ==============================================================================
 // ScatterView - N-D scatter wavetable viewport
@@ -5456,21 +5747,26 @@ LayeredWaveEditorComponent::LayeredWaveEditorComponent(NodeGraph& g, int nid, st
     }
     currentPosition.assign(std::max(1, wave.numDimensions()), 0.5f);
 
-    addAndMakeVisible(addLayerBtn);
-    addLayerBtn.setTooltip("Add a new harmonic layer to the current waveform. "
-                           "Each layer is a sine, saw, square, triangle, noise, or drawn shape "
-                           "that gets summed into the final waveform.");
-    addLayerBtn.onClick = [this]() {
-        auto& layers = currentLayers();
-        WaveLayer l;
-        l.shape = WaveLayer::Sine;
-        l.ratio = (int)layers.size() + 1; // each new layer defaults to next harmonic
-        l.phase = 0.0f;
-        l.amp = 0.5f;
-        layers.push_back(l);
-        rebuildRows();
-        onLayerChanged();
-    };
+    // Shared layer-stack widget (same code the Signal Shape editor uses).
+    // Summation preview OFF: this editor renders its own multi-frame-type
+    // preview strip below. New layers default to the next harmonic at half
+    // amplitude, matching the old inline "+ Layer" behaviour.
+    {
+        LayerStackComponent::Options lsOpts;
+        lsOpts.showSummationPreview = false;
+        lsOpts.addLayerButtonText = "+ Layer";
+        lsOpts.makeNewLayer = [](int count) {
+            WaveLayer l;
+            l.shape = WaveLayer::Sine;
+            l.ratio = count + 1; // each new layer defaults to next harmonic
+            l.phase = 0.0f;
+            l.amp   = 0.5f;
+            return l;
+        };
+        layerStack = std::make_unique<LayerStackComponent>(
+            std::move(lsOpts), [this]() { onLayerChanged(); });
+        addChildComponent(*layerStack); // visibility toggled in resized()
+    }
 
     // The "+ Waveform" button used to live up here on the top toolbar.
     // It now lives in the arrangement-view sidebar (below the Library
@@ -5596,14 +5892,18 @@ LayeredWaveEditorComponent::LayeredWaveEditorComponent(NodeGraph& g, int nid, st
     applyBtn.onClick = [this]() {
         commitToNode();
         if (onApply) onApply();
+        commitUndoStep();
     };
 
     addAndMakeVisible(closeBtn);
     closeBtn.setButtonText("Close");
     closeBtn.onClick = [this]() {
-        // Commit on close too so work isn't lost by accident.
+        // Commit on close too so work isn't lost by accident. The undo step
+        // must be pushed synchronously here - the timer can't fire after the
+        // dialog is destroyed below.
         commitToNode();
         if (onApply) onApply();
+        commitUndoStep();
         // Single-window editor: just delete our parent dialog. The
         // arrangement view is an embedded child of this component and
         // dies with us.
@@ -5614,10 +5914,6 @@ LayeredWaveEditorComponent::LayeredWaveEditorComponent(NodeGraph& g, int nid, st
             });
         }
     };
-
-    addAndMakeVisible(layersViewport);
-    layersViewport.setViewedComponent(&layersContainer, false);
-    layersViewport.setScrollBarsShown(true, false);
 
     // ---- Per-waveform identity row (top of right pane) ----
     // Tiny colour swatch + name TextEditor for the library entry the
@@ -5643,6 +5939,7 @@ LayeredWaveEditorComponent::LayeredWaveEditorComponent(NodeGraph& g, int nid, st
         // ensure every observer (arrangement view, library list, popout)
         // repaints with the new colour.
         commitToNode();
+        commitUndoStep();
         refreshIdentityRow();
         if (arrangementView) {
             arrangementView->rebuildLibraryList();
@@ -5667,6 +5964,7 @@ LayeredWaveEditorComponent::LayeredWaveEditorComponent(NodeGraph& g, int nid, st
         if (wave.library[libIdx].name == newName) return;
         wave.library[libIdx].name = newName;
         commitToNode();
+        commitUndoStep();
         if (arrangementView) arrangementView->rebuildLibraryList();
         notifyPopoutDocMutated();
     };
@@ -5802,15 +6100,49 @@ void LayeredWaveEditorComponent::showAddWaveformMenu(juce::Component* anchor) {
         });
 }
 
+// Display name for a Position axis's block-rate modulation pin. Single-axis
+// terrains keep the plain "Mod: Position" name; multi-axis terrains label each
+// pin with its axis letter (X, Y, Z, W) so the pin says which axis it drives,
+// falling back to a number past the four named axes.
+static std::string positionModPinName(int axisIndex, int numAxes) {
+    if (numAxes <= 1) return "Mod: Position";
+    static const char* letters = "XYZW";
+    if (axisIndex >= 0 && axisIndex < 4)
+        return std::string("Mod: Position ") + letters[axisIndex];
+    return "Mod: Position " + std::to_string(axisIndex + 1);
+}
+
 void LayeredWaveEditorComponent::syncPositionParams() {
     auto* nd = graph.findNode(nodeId);
     if (!nd) return;
     int n = wave.numDimensions();
 
-    // Remove existing Position params (any param starting with "Position").
     auto isPosName = [](const std::string& s) {
         return s.rfind("Position", 0) == 0;
     };
+
+    // Capture which axis each existing Position-modulation pin currently drives,
+    // keyed by pinId, *before* the erase/re-add below shuffles param indices. A
+    // modPin is a Position one if its paramIndex points at a Position-named
+    // param; its axis index is that param's ordinal among the Position params.
+    // Binding by axis index (not pin name) lets us freely rename the pins.
+    std::map<int, int> pinToAxis;   // pinId -> axis index
+    {
+        std::map<int, int> paramIdxToAxis;
+        int axis = 0;
+        for (int i = 0; i < (int)nd->params.size(); ++i)
+            if (isPosName(nd->params[i].name)) paramIdxToAxis[i] = axis++;
+        for (const auto& mp : nd->modPins) {
+            auto a = paramIdxToAxis.find(mp.paramIndex);
+            if (a != paramIdxToAxis.end()) pinToAxis[mp.pinId] = a->second;
+        }
+    }
+
+    // Remove existing Position params, but remember their current values so an
+    // axis add/remove doesn't reset the user's positions back to centre.
+    std::map<std::string, float> prevValues;
+    for (const auto& p : nd->params)
+        if (isPosName(p.name)) prevValues[p.name] = p.value;
     nd->params.erase(std::remove_if(nd->params.begin(), nd->params.end(),
         [&](const Param& p) { return isPosName(p.name); }), nd->params.end());
 
@@ -5818,10 +6150,126 @@ void LayeredWaveEditorComponent::syncPositionParams() {
     for (int i = 0; i < n; ++i) {
         Param p;
         p.name = (n == 1) ? "Position" : ("Position " + std::to_string(i + 1));
-        p.value = 0.5f;
+        auto it = prevValues.find(p.name);
+        p.value = (it != prevValues.end()) ? it->second : 0.5f;
         p.minVal = 0.0f;
         p.maxVal = 1.0f;
         nd->params.push_back(std::move(p));
+    }
+
+    // Keep one block-rate modulation input pin per Position axis: add a pin when
+    // an axis is added, remove it (and any cables) when an axis is removed.
+    syncPositionModPins(*nd, pinToAxis);
+}
+
+void LayeredWaveEditorComponent::syncPositionModPins(Node& nd,
+                                                     const std::map<int, int>& pinToAxis) {
+    auto isPosName = [](const std::string& s) {
+        return s.rfind("Position", 0) == 0;
+    };
+
+    // Map axis index -> current param index for the (freshly rebuilt) Position
+    // params.
+    std::vector<int> axisToParamIndex;
+    for (int i = 0; i < (int)nd.params.size(); ++i)
+        if (isPosName(nd.params[i].name)) axisToParamIndex.push_back(i);
+    const int numAxes = (int)axisToParamIndex.size();
+    std::vector<bool> axisHasPin(numAxes, false);
+
+    // Pass 1: walk existing mod pins. Position pins (those captured in
+    // pinToAxis) are re-bound to their axis's new param index, renamed to the
+    // current axis label, and pruned if their axis no longer exists.
+    // Non-Position pins are left bound but re-resolved by name as a safety net
+    // in case param indices shifted.
+    for (auto it = nd.modPins.begin(); it != nd.modPins.end();) {
+        auto pa = pinToAxis.find(it->pinId);
+        if (pa == pinToAxis.end()) {
+            // Not a Position pin - re-resolve its paramIndex by pin name.
+            const Pin* pin = nullptr;
+            for (const auto& p : nd.pinsIn)
+                if (p.id == it->pinId) { pin = &p; break; }
+            if (pin && pin->name.rfind("Mod: ", 0) == 0) {
+                std::string target = pin->name.substr(5);
+                for (int i = 0; i < (int)nd.params.size(); ++i)
+                    if (nd.params[i].name == target) { it->paramIndex = i; break; }
+            }
+            ++it;
+            continue;
+        }
+        int axis = pa->second;
+        if (axis >= 0 && axis < numAxes) {
+            it->paramIndex = axisToParamIndex[axis];
+            for (auto& p : nd.pinsIn)
+                if (p.id == it->pinId) { p.name = positionModPinName(axis, numAxes); break; }
+            axisHasPin[axis] = true;
+            ++it;
+        } else {
+            // Axis removed: drop the pin, any cables into it, and the binding.
+            int pinId = it->pinId;
+            nd.pinsIn.erase(std::remove_if(nd.pinsIn.begin(), nd.pinsIn.end(),
+                [pinId](const Pin& p) { return p.id == pinId; }), nd.pinsIn.end());
+            graph.links.erase(std::remove_if(graph.links.begin(), graph.links.end(),
+                [pinId](const auto& lk) { return lk.endPin == pinId; }), graph.links.end());
+            it = nd.modPins.erase(it);
+        }
+    }
+
+    // Pass 2: ensure each axis ends up with exactly one *bound* modulation pin.
+    // An axis may already own an orphan pin - a "Mod: Position" pin in pinsIn
+    // with no matching modPin binding. That happens when a node was saved while
+    // its modPins were lost or empty (e.g. the historical getNextId() id
+    // collision that handed two pins the same id and produced unbound duplicate
+    // Position pins). Re-adopt an existing orphan instead of blindly appending
+    // yet another duplicate, and prune any leftover duplicate pins so the node
+    // converges to a single clean pin per axis.
+    for (int axis = 0; axis < numAxes; ++axis) {
+        if (axisHasPin[axis]) continue;
+        const std::string wantName = positionModPinName(axis, numAxes);
+
+        // Gather existing pins with this axis's name that aren't bound to a modPin.
+        std::vector<int> orphanIds;
+        for (const auto& p : nd.pinsIn) {
+            if (p.name != wantName) continue;
+            bool bound = false;
+            for (const auto& mp : nd.modPins)
+                if (mp.pinId == p.id) { bound = true; break; }
+            if (!bound) orphanIds.push_back(p.id);
+        }
+
+        if (!orphanIds.empty()) {
+            // Prefer adopting an orphan that already carries an incoming cable so
+            // dedup never severs the user's existing connection.
+            auto hasLink = [&](int id) {
+                for (auto& lk : graph.links) if (lk.endPin == id) return true;
+                return false;
+            };
+            std::stable_sort(orphanIds.begin(), orphanIds.end(),
+                [&](int a, int b) { return hasLink(a) && !hasLink(b); });
+
+            Node::ModPin mp;
+            mp.paramIndex = axisToParamIndex[axis];
+            mp.pinId = orphanIds.front();
+            mp.depth = 1.0f;
+            nd.modPins.push_back(mp);
+
+            // Drop any extra duplicate orphan pins and the cables into them.
+            for (size_t k = 1; k < orphanIds.size(); ++k) {
+                int dupId = orphanIds[k];
+                nd.pinsIn.erase(std::remove_if(nd.pinsIn.begin(), nd.pinsIn.end(),
+                    [dupId](const Pin& p) { return p.id == dupId; }), nd.pinsIn.end());
+                graph.links.erase(std::remove_if(graph.links.begin(), graph.links.end(),
+                    [dupId](const auto& lk) { return lk.endPin == dupId; }), graph.links.end());
+            }
+        } else {
+            // No existing pin for this axis - create a fresh one.
+            int newPinId = graph.allocId();
+            nd.pinsIn.push_back({newPinId, wantName, PinKind::Signal, true, 1});
+            Node::ModPin mp;
+            mp.paramIndex = axisToParamIndex[axis];
+            mp.pinId = newPinId;
+            mp.depth = 1.0f;
+            nd.modPins.push_back(mp);
+        }
     }
 }
 
@@ -5856,6 +6304,51 @@ LayeredWaveform* LayeredWaveEditorComponent::currentEditingLayeredFrame() {
 
 const LayeredWaveform* LayeredWaveEditorComponent::currentEditingLayeredFrame() const {
     return wave.layeredFrameByLibrary(currentLibraryId);
+}
+
+std::vector<float> LayeredWaveEditorComponent::currentFramePosition() const {
+    if (currentLibraryId < 0) return {};
+
+    if (wave.mode == WavetableMode::Scatter) {
+        // The dot's authored coord IS the Position the synth blends at.
+        for (const auto& sf : wave.scatterFrames) {
+            if (sf.waveformId == currentLibraryId) {
+                std::vector<float> pos = sf.position;
+                pos.resize(std::max((size_t)wave.scatterDims, pos.size()), 0.5f);
+                return pos;
+            }
+        }
+        return {};
+    }
+
+    // Grid mode: find the flat cell index that references this entry, then
+    // decompose it into per-axis grid coords using the SAME row-major
+    // ordering the synth uses when it builds wtGranularFrames[].position
+    // (terrain_synth.cpp): innermost (last) dim varies fastest. Normalize
+    // each coord by (dimSize-1) so a single-row axis maps to 0.
+    const int nf = (int)wave.cellWaveformIds.size();
+    int flat = -1;
+    for (int f = 0; f < nf; ++f) {
+        if (wave.cellWaveformIds[f] == currentLibraryId) { flat = f; break; }
+    }
+    if (flat < 0) return {};
+
+    std::vector<int> gridCoord;
+    int remaining = flat;
+    for (int di = (int)wave.gridDims.size() - 1; di >= 0; --di) {
+        const int dim = std::max(1, wave.gridDims[di]);
+        gridCoord.push_back(remaining % dim);
+        remaining /= dim;
+    }
+    std::reverse(gridCoord.begin(), gridCoord.end());
+
+    std::vector<float> pos(gridCoord.size(), 0.0f);
+    for (size_t d = 0; d < gridCoord.size(); ++d) {
+        const int dim = std::max(1, wave.gridDims[d]);
+        pos[d] = (dim <= 1) ? 0.0f
+                            : (float)gridCoord[d] / (float)(dim - 1);
+    }
+    return pos;
 }
 
 std::vector<WaveLayer>& LayeredWaveEditorComponent::currentLayers() {
@@ -6331,27 +6824,24 @@ void LayeredWaveEditorComponent::notifyPopoutDocMutated() {
 }
 
 void LayeredWaveEditorComponent::rebuildRows() {
-    rows.clear();
-    layersContainer.removeAllChildren();
-
-    int y = 0;
-    int rh = LayerRow::rowHeight();
-    int vw = std::max(layersViewport.getWidth(), 500);
-    const auto& layers = currentLayers();
-    for (int i = 0; i < (int)layers.size(); ++i) {
-        auto row = std::make_unique<LayerRow>(*this, i);
-        row->setBounds(0, y, vw, rh);
-        row->syncFromModel();
-        layersContainer.addAndMakeVisible(row.get());
-        rows.push_back(std::move(row));
-        y += rh + 4;
+    // Bind the shared layer stack to whichever layered frame is currently
+    // targeted (nullptr for non-layered frames -> the stack shows an empty
+    // list, and updateFrameEditorEmbed() hides it in favour of the embed).
+    // setTarget internally rebuilds its rows + re-lays-out, with the same
+    // realloc-safe "rebuild all rows on any add/delete" invariant.
+    if (layerStack) {
+        layerStack->setTarget(currentEditingLayeredFrame());
+        // Force a rebuild even when the target object/count is unchanged: a
+        // frame's layer DATA may have been mutated in place (e.g. preset load,
+        // capture replace) without changing the count, and callers rely on
+        // rebuildRows() refreshing the visible row controls from the model.
+        layerStack->refreshFromModel();
     }
-    layersContainer.setSize(vw, std::max(y, 10));
 
     // For spectral / wavelet frames, the layers area becomes the seat for
-    // the matching frame editor instead. Doing this after sizing the
-    // (empty) layersContainer means we don't show stale rows under the
-    // embedded editor for a flicker frame.
+    // the matching frame editor instead. Doing this after the layer stack is
+    // re-bound (and hidden, for non-layered frames) means we don't show stale
+    // rows under the embedded editor for a flicker frame.
     updateFrameEditorEmbed();
 
     // The per-waveform name+colour row at the top of the right pane
@@ -6385,7 +6875,7 @@ void LayeredWaveEditorComponent::updateFrameEditorEmbed() {
     IWavetableFrame* f = currentEditingFrame();
     const std::string tid = f ? f->typeId() : std::string();
 
-    // Layered frames use the inline LayerRow widgets - tear down any embed
+    // Layered frames use the inline WaveLayerEditor widgets - tear down any embed
     // and surface the viewport. Every other frame type either gets a
     // dedicated embedded editor below, or gets a "no editor for this type"
     // fallback in resized() (which hides + Layer so the user isn't offered
@@ -6396,7 +6886,7 @@ void LayeredWaveEditorComponent::updateFrameEditorEmbed() {
             embeddedFrameEditor.reset();
             embeddedFrameType.clear();
         }
-        layersViewport.setVisible(true);
+        if (layerStack) layerStack->setVisible(true);
         return;
     }
 
@@ -6432,8 +6922,31 @@ void LayeredWaveEditorComponent::updateFrameEditorEmbed() {
             auto onRecap = [this]() {
                 showCapturePanelInline(0, /*replaceCurrentEntry=*/true);
             };
+            // Audition through the owning synth node's pendingAudition queue.
+            // TerrainSynthProcessor::processBlock drains the queue and emits
+            // real note-ons, so the Play button auditions through the same
+            // voice / envelope / Volume path a wired-up MIDI note would hit.
+            // Capturing `this` is safe because the editor's lifetime is bounded
+            // by the LayeredWaveEditorComponent, which itself outlives the
+            // embeddedFrameEditor. We look the node up fresh on every call via
+            // graph.findNode(nodeId) so a graph.nodes reallocation can never
+            // leave us holding a stale Node*.
+            auto onAudition = [this](bool noteOn, int pitch, int velocity) {
+                if (auto* nd = graph.findNode(nodeId)) {
+                    // Tag the note-on with THIS frame's wavetable Position so
+                    // the synth auditions the edited frame, not whatever the
+                    // live Position knob currently selects. Computed fresh on
+                    // each Play so moving the scatter dot is reflected
+                    // immediately. Note-offs carry no position.
+                    std::vector<float> pos = noteOn ? currentFramePosition()
+                                                    : std::vector<float>{};
+                    std::lock_guard<std::mutex> lock(*nd->auditionMutex);
+                    nd->pendingAudition.push_back(
+                        {noteOn, pitch, velocity, std::move(pos)});
+                }
+            };
             embeddedFrameEditor = std::make_unique<GranularFrameEditorComponent>(
-                *gf, onSubApply, onRecap);
+                *gf, onSubApply, onRecap, onAudition);
         }
     }
     // tid == "sample" deliberately falls through with no embeddedFrameEditor;
@@ -6442,18 +6955,18 @@ void LayeredWaveEditorComponent::updateFrameEditorEmbed() {
 
     if (!embeddedFrameEditor) {
         // No embed for this frame type. We still want to hide the layer
-        // viewport (it's not meaningful for non-layered frames). resized()
+        // stack (it's not meaningful for non-layered frames). resized()
         // detects "haveFrame && !embeddedFrameEditor && tid != layered"
         // and draws the placeholder + hides + Layer.
-        layersViewport.setVisible(false);
+        if (layerStack) layerStack->setVisible(false);
         return;
     }
 
     embeddedFrameType = tid;
     addAndMakeVisible(embeddedFrameEditor.get());
-    layersViewport.setVisible(false);
+    if (layerStack) layerStack->setVisible(false);
 
-    // Re-lay-out so the embed gets the layersViewport's rectangle. resized()
+    // Re-lay-out so the embed gets the layer stack's rectangle. resized()
     // checks for the embed and prefers it over the viewport when present.
     resized();
 }
@@ -6472,7 +6985,12 @@ void LayeredWaveEditorComponent::refreshPreview() {
 
 void LayeredWaveEditorComponent::commitToNode() {
     if (auto* nd = graph.findNode(nodeId)) {
-        nd->script = wave.encode();
+        // Synchronised write: the audio thread (TerrainSynthProcessor) polls
+        // this node's script live, and the granular wavetable script is multi-
+        // megabyte, so a raw assignment races the audio read and crashes mid-
+        // copy. encode() builds the string outside the lock; the helper only
+        // holds the per-node mutex for the (cheap) move-assignment.
+        setNodeScriptSynced(*nd, wave.encode());
         // Bump the project-dirty flag so quit-without-save prompts and
         // autosave both pick up wavetable-editor edits. Without this, the
         // user can spend a session sculpting waveforms, close SEANCE, and
@@ -6480,6 +6998,14 @@ void LayeredWaveEditorComponent::commitToNode() {
         // node's script changed.
         graph.dirty = true;
     }
+}
+
+void LayeredWaveEditorComponent::commitUndoStep() {
+    // commitSnapshot() de-dups against the previous snapshot, so calling this
+    // on every settled edit (debounced apply, Apply/Close, rename, recolour)
+    // is cheap when nothing actually changed and pushes exactly one undo step
+    // per distinct wavetable state otherwise.
+    graph.commitSnapshot("Edit wavetable");
 }
 
 void LayeredWaveEditorComponent::onLayerChanged() {
@@ -6495,6 +7021,10 @@ void LayeredWaveEditorComponent::onLayerChanged() {
 void LayeredWaveEditorComponent::timerCallback() {
     stopTimer();
     if (onApply) onApply();
+    // The debounce has settled - this is the natural commit point for the
+    // bulk of wavetable edits (waveform sculpting, cell placement, grid
+    // resize, deletes all route through onLayerChanged -> this timer).
+    commitUndoStep();
 }
 
 void LayeredWaveEditorComponent::resized() {
@@ -6564,8 +7094,7 @@ void LayeredWaveEditorComponent::resized() {
     // - they live in the top toolbar now and apply to the whole node.
     if (capturePanel) {
         if (embeddedFrameEditor) embeddedFrameEditor->setVisible(false);
-        layersViewport.setVisible(false);
-        addLayerBtn.setVisible(false);
+        if (layerStack) layerStack->setVisible(false);
         // Identity row also hidden during capture - the right pane is
         // entirely owned by the capture panel until the user closes it.
         identityLabel.setVisible(false);
@@ -6632,41 +7161,28 @@ void LayeredWaveEditorComponent::resized() {
                                ((embedNeeded != (embeddedFrameEditor != nullptr))
                                 || (embedNeeded && !embedMatches)
                                 || (isLayered && embeddedFrameEditor != nullptr));
-    const bool rowsStale     = haveFrame && isLayered &&
-                               (int)rows.size() != (int)currentLayers().size();
+    const bool rowsStale     = haveFrame && isLayered && layerStack &&
+                               layerStack->getTarget() != currentEditingLayeredFrame();
     if (embedStale || rowsStale) {
         rebuildRows();
     }
 
     if (!haveFrame) {
         if (embeddedFrameEditor) embeddedFrameEditor->setVisible(false);
-        layersViewport.setVisible(false);
-        addLayerBtn.setVisible(false);
+        if (layerStack) layerStack->setVisible(false);
         placeholderBounds = juce::Rectangle<int>();
     } else if (embeddedFrameEditor) {
         embeddedFrameEditor->setVisible(true);
-        addLayerBtn.setVisible(false);
-        layersViewport.setVisible(false);
+        if (layerStack) layerStack->setVisible(false);
         embeddedFrameEditor->setBounds(right);
         placeholderBounds = juce::Rectangle<int>();
     } else if (isLayered) {
-        // +Layer button sits in a small header strip above the layer rows
-        // so it's clearly part of the layered-frame section.
-        addLayerBtn.setVisible(true);
-        layersViewport.setVisible(true);
-        auto layerHeader = right.removeFromTop(24);
-        addLayerBtn.setBounds(layerHeader.removeFromLeft(100));
-        right.removeFromTop(4);
-
-        layersViewport.setBounds(right);
-        int vw = layersViewport.getWidth();
-        int rh = LayerRow::rowHeight();
-        int y = 0;
-        for (auto& row : rows) {
-            row->setBounds(0, y, vw, rh);
-            y += rh + 4;
+        // The shared layer stack owns its own "+ Layer" header + scrolling
+        // row list, so it just takes the whole right-pane body rectangle.
+        if (layerStack) {
+            layerStack->setVisible(true);
+            layerStack->setBounds(right);
         }
-        layersContainer.setSize(vw, std::max(y, 10));
         placeholderBounds = juce::Rectangle<int>();
     } else {
         // Frame type has no dedicated embedded editor yet (currently
@@ -6676,8 +7192,7 @@ void LayeredWaveEditorComponent::resized() {
         // better than the old fall-through where + Layer appeared above
         // an empty viewport - the button suggested layered semantics on
         // a non-layered frame.
-        addLayerBtn.setVisible(false);
-        layersViewport.setVisible(false);
+        if (layerStack) layerStack->setVisible(false);
         placeholderBounds = right;
     }
 }
@@ -6729,7 +7244,7 @@ void LayeredWaveEditorComponent::paint(juce::Graphics& g) {
     if (!haveFrame) {
         // Editor body area is everything in the right pane above the preview.
         // We can't easily reconstruct it here without re-running the resized()
-        // geometry, but the layersViewport/embed are hidden anyway, so the
+        // geometry, but the layer stack / embed are hidden anyway, so the
         // placeholder just goes in the preview rect.
         g.setColour(juce::Colours::grey.withAlpha(0.75f));
         g.setFont(12.0f);

@@ -65,7 +65,27 @@
   <li><strong>Mod wheel (CC#1)</strong> — drives a default 6 Hz vibrato whose depth scales with the wheel position. Can be disabled per-synth by setting the <em>Vibrato</em> param to 0, freeing CC#1 to be MIDI-Learned elsewhere.</li>
   <li><strong>Sustain pedal (CC#64)</strong> — holds notes through their release stage until the pedal comes up. Works on Piano, Waveform, Sampler, Drum Machine, and SoundFont synths. On Drum Machine specifically, the drum has no release stage to defer, so the pedal instead <em>freezes the decay envelope</em> on every voice triggered while the pedal is held — the drum rings at its current amplitude until you lift the pedal, then resumes its natural decay.</li>
   <li><strong>Velocity</strong> — scales per-note volume. Each synth has a <em>Vel Sens</em> param (0..1) that controls how much velocity affects loudness. Set to 0 to ignore velocity entirely.</li>
+  <li><strong>Aftertouch (channel &amp; per-note)</strong> — pressing harder on already-held keys swells their volume. There are two flavors: <em>channel pressure</em> is one value for the whole keyboard (every held note swells together), while <em>polyphonic key pressure</em> is per-note — push one held key harder than its neighbour and only that note swells. The synth handles both, routing each per-note message to the right voice by its note number and adding it on top of channel pressure. How much the swell affects volume is set per synth by the <em>Aftertouch</em> sensitivity (default 0.5). Per-note pressure only does something if your controller actually sends it (many keyboards send channel pressure only).</li>
 </ul>
+
+<p>Per-note pressure is special because it's the one expression a Signal cable can't carry: a cable holds a single number per moment, which can't say <em>which</em> of several held notes it belongs to. So unlike channel pressure (which is exposed as an Aftertouch signal pin you can drive from any source), polyphonic key pressure is consumed inside the synth itself, matched to each voice by note number.</p>
+
+<h2>MPE — per-note expression</h2>
+
+<p><strong>MPE</strong> (MIDI Polyphonic Expression) lets <em>each note you hold</em> carry its own pitch bend, pressure, and timbre. On a normal keyboard, bending the pitch wheel bends the whole chord; with MPE you can bend just one note and leave the others where they are. Controllers built for this — the ROLI Seaboard, LinnStrument, Expressive E Osmose — send each note on its own channel so the expression stays separated.</p>
+
+<p>There are two places you turn MPE on, depending on what you're doing:</p>
+
+<ol>
+  <li><strong>To capture an MPE controller</strong> — wire its MIDI Input node to a track, arm the track (Record Here), and play. SEANCE records each note's pitch-slide, pressure, and timbre as editable curves on that note.</li>
+  <li><strong>To play those notes back expressively</strong> — right-click the <strong>Timeline</strong> node → <em>Enable MPE</em>. Now each note goes out on its own channel with its recorded expression, instead of all notes sharing one channel.</li>
+</ol>
+
+<p>The built-in synths understand MPE out of the box. If you're driving a <strong>hosted VST3/AU plugin</strong> instead, right-click the plugin's node → <em>Enable MPE (needs an MPE source)</em>. SEANCE then sends the plugin the little "MPE Configuration" handshake it needs to switch into per-note mode. A plugin doesn't need anything SEANCE-specific to respond — this is the same standard handshake every MPE host sends, so any plugin that supports MPE the normal way works here too.</p>
+
+<p>One thing to know, which is why the menu item spells it out: only turn this on when the MIDI feeding the plugin is actually MPE — an MPE-enabled timeline, or an MPE controller wired straight in. With a plain keyboard or a non-MPE timeline, every note arrives on channel 1, which the plugin now treats as the zone's shared <em>master</em> channel. Most plugins still play those notes, just without per-note expression; some stricter ones reserve channel 1 for control and may play them quietly or not at all. Nothing breaks and your pitch wheel still works — you just get no benefit from MPE, and possibly fewer voices, so leave it off unless the source is MPE.</p>
+
+<p>Per-note pitch bend uses a wide range (48 semitones by default) so a full controller glide reaches its intended pitch; a plain pitch wheel on a normal keyboard still bends the usual ±2 semitones.</p>
 
 <h2>What if my keyboard doesn't play?</h2>
 

@@ -1838,22 +1838,53 @@ ModImporter::ImportResult ModImporter::import(const std::string& path, NodeGraph
         }
     }
 
-    // Whole-song loop detection: if the pattern walk ended because a Bxx
-    // position jump landed on an already-visited order, set the project's
-    // Song Length + Repeat so playback loops indefinitely back to beat 0.
-    // (See task #91 and the orderVisited bookkeeping above.) This replaces
-    // the old "safety counter unrolls the loop N times" hack.
-    if (wholeSongLoopTarget >= 0) {
+    // Loop handling. A Bxx position jump that lands on an already-visited
+    // order is the module's *own* loop instruction. We honour a genuine loop
+    // (and only a genuine loop - a song that simply runs off the end of the
+    // order list leaves songRepeatMode at None and plays once, which is the
+    // play-once-by-default behaviour the user wanted). How we represent the
+    // loop depends on where the module jumps back to:
+    // When we are about to override the global song settings, stash the
+    // PRE-import values on the import's root group node first, so deleting
+    // that root node later can restore them (back out the module's loop
+    // contribution while preserving whatever the user had before import).
+    auto stashPreImportSong = [&]() {
+        if (auto* grpNode = graph.findNode(groupId)) {
+            grpNode->modImportSavedSong      = true;
+            grpNode->modImportPrevRepeatMode = (int)graph.songRepeatMode;
+            grpNode->modImportPrevRepeatCount = graph.songRepeatCount;
+            grpNode->modImportPrevSongLength = graph.songLengthBeats;
+            grpNode->modImportPrevLoopEnabled = graph.loopEnabled;
+            grpNode->modImportPrevLoopStart  = graph.loopStartBeat;
+            grpNode->modImportPrevLoopEnd    = graph.loopEndBeat;
+        }
+    };
+
+    if (wholeSongLoopTarget == 0) {
+        // Jump back to the very start = "repeat the whole song" (the classic
+        // module self-repeat, e.g. a trailing B00). Represent it as Song
+        // Repeat = Forever, which wraps playback to beat 0 indefinitely -
+        // exactly the module's intent. Song Length marks the natural end.
+        stashPreImportSong();
         graph.songLengthBeats  = currentBeat;
         graph.songRepeatMode   = NodeGraph::SongRepeat::Forever;
         graph.songRepeatCount  = 1;
-        if (wholeSongLoopTarget != 0) {
-            fprintf(stderr,
-                "MOD song loop target order = %d (non-zero); loop approximates "
-                "as wrap-to-beat-0 so the intro will replay each iteration. "
-                "Use Song Length + Repeat to fine-tune if needed.\n",
-                wholeSongLoopTarget);
-        }
+    } else if (wholeSongLoopTarget > 0) {
+        // Jump back to a specific later order = "play the intro once, then
+        // loop this section forever." Song Repeat Forever can't express that
+        // (it would replay the intro every cycle), so we use the transport
+        // loop region instead: the intro [0..sectionStart) plays once, then
+        // playback wraps between the section start and the song end - matching
+        // the module. Song Length still marks the natural end for when the
+        // user turns the loop off; songRepeatMode stays None so disabling the
+        // loop yields play-once rather than a surprise whole-song repeat.
+        stashPreImportSong();
+        graph.songLengthBeats = currentBeat;
+        graph.songRepeatMode  = NodeGraph::SongRepeat::None;
+        graph.songRepeatCount = 1;
+        graph.loopStartBeat   = orderStartBeat[wholeSongLoopTarget];
+        graph.loopEndBeat     = currentBeat;
+        graph.loopEnabled     = true;
     }
 
     // ------------------------------------------------------------------

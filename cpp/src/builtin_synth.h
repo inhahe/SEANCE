@@ -1,11 +1,14 @@
 #pragma once
 #include "node_graph.h"
 #include "transport.h"
+#include "signal_modulation.h"
 #include <juce_audio_processors/juce_audio_processors.h>
 #include <vector>
 #include <array>
 #include <string>
 #include <cmath>
+#include <unordered_map>
+#include <functional>
 
 namespace SoundShop {
 
@@ -60,9 +63,27 @@ private:
     void initTables();
 };
 
-// Simple expression parser for waveform generation
-// Supports: sin, cos, tan, abs, sqrt, pow, x, pi, numbers, +, -, *, /, (, )
-// Also: saw(x), square(x), triangle(x), noise()
+// Expression parser for waveform / LFO / envelope generation.
+//
+// Grammar precedence (low to high):
+//   ternary (? :) -> || -> && -> < > <= >= == != -> + - -> * / -> ^ -> ! -unary
+//   -> atom (number, identifier, function, parenthesized expression)
+//
+// Built-in vars:        x, f, pi, e
+// Custom vars:          any identifier name, value supplied via `extraVars`
+//                       map passed to evaluateWithVars()
+// Built-in functions:   sin, cos, tan, abs, sqrt, exp, log, pow(a,b), tanh,
+//                       saw, square, triangle, noise, floor, ceil,
+//                       min(a,b), max(a,b), clamp(v,lo,hi), if(c,a,b),
+//                       shape(pos)  (samples a caller-supplied table; see the
+//                                    evaluateWithVars overload below — returns
+//                                    0 when no sampler is supplied)
+// Zero-arg keyword:     random  (uniform [-pi, pi])
+//
+// Comparison / boolean ops return 1.0f for true, 0.0f for false. They are
+// NOT short-circuit (both sides evaluate) — same for the ternary's true and
+// false branches and if()'s second/third arg. Unknown identifiers evaluate
+// to 0 (silent fallback) rather than parse errors.
 class WaveExprParser {
 public:
     // Evaluate expression using `x` as free variable over [0, 2*pi).
@@ -75,16 +96,39 @@ public:
 
     // Evaluate a single value with both x and f bound (general helper).
     static float evaluateAt(const std::string& expr, float x, float f);
+
+    // Evaluate with a caller-supplied variable bindings map. Use this for
+    // expressions that reference dynamic variables (signal-input samples,
+    // MIDI state like gate/freq/vel, the composite shape value `curve`,
+    // etc.). The map name "x" / "f" override the default x=0 / f=0.
+    // No clamping — caller decides.
+    static float evaluateWithVars(const std::string& expr,
+                                  const std::unordered_map<std::string, float>& vars);
+
+    // Same as above, but also binds the `shape(pos)` function to `shapeFn`.
+    // `pos` is whatever the expression passes; the sampler decides the domain
+    // (SignalShape treats it as a 0..1 phase that wraps). When `shapeFn` is
+    // empty (default-constructed), `shape(...)` evaluates to 0. Use this for
+    // input-driven lookups into a drawn waveform (waveshaping), independent of
+    // the phase-locked `curve` variable.
+    static float evaluateWithVars(const std::string& expr,
+                                  const std::unordered_map<std::string, float>& vars,
+                                  const std::function<float(float)>& shapeFn);
 };
 
 // Voice for polyphonic playback
 struct SynthVoice {
     bool active = false;
-    int noteNumber = -1;
-    int midiChannel = 1;
+    int note = -1;
+    int mpeChannel = 1;
     float frequency = 440.0f;
     float phase = 0.0f;
     float velocity = 1.0f;
+
+    // Per-voice expression (pitch bend, channel + poly key pressure, timbre).
+    // distributeMpeMessages() in signal_modulation.h fills this from the MIDI
+    // stream; the render loop reads mpe.pitchBend and effectivePressure(mpe).
+    MpeVoiceState mpe;
 
     // ADSR state
     enum EnvStage { Off, Attack, Decay, Sustain, Release };

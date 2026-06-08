@@ -375,11 +375,34 @@ struct Node {
     float absoluteBeatOffset = 0.0f; // cached: cascading offset through all parents (updated by resolveAnchors)
     bool groupExpanded = true;      // show children in graph view
 
+    // MOD-import song-setting restore: when a module import overrides the
+    // global song settings (repeat mode, song length, loop region), the
+    // PRE-import values are stashed on the import's root group node here.
+    // Deleting that root group node (the grey node that cascades to the
+    // whole tree) restores them, backing out the module's loop contribution
+    // while preserving whatever the user had set before importing. Stored as
+    // int for the repeat mode because SongRepeat is declared later in the
+    // header (after struct Node), so Node cannot name the enum type.
+    bool   modImportSavedSong     = false;
+    int    modImportPrevRepeatMode = 0;     // (int)NodeGraph::SongRepeat
+    int    modImportPrevRepeatCount = 1;
+    double modImportPrevSongLength = 0.0;
+    bool   modImportPrevLoopEnabled = false;
+    double modImportPrevLoopStart  = 0.0;
+    double modImportPrevLoopEnd    = 0.0;
+
     // Audition MIDI events injected from the UI (thread-safe via simple flag)
     struct AuditionEvent {
         bool isNoteOn;
         int pitch;
         int velocity;
+        // Optional wavetable Position override for the voice this note-on
+        // creates. Empty = no override (voice follows the live Position
+        // params). Used by the wavetable editor so a frame's Play button
+        // auditions THAT frame regardless of where the Position knob sits.
+        // One entry per Position dimension, each in [0,1]. Ignored on
+        // note-off events.
+        std::vector<float> position;
     };
     std::vector<AuditionEvent> pendingAudition; // written by UI, read by audio thread
     std::shared_ptr<std::mutex> auditionMutex = std::make_shared<std::mutex>();
@@ -432,6 +455,28 @@ struct Node {
     bool recordArmed = false;     // armed for recording
     bool inputMonitor = false;    // pass input through to output in real-time
 };
+
+// Thread-safe write to a live node's `script`.
+//
+// Several audio-thread processors poll their owning node's `script` every
+// block to pick up live editor edits without a full graph rebuild (e.g.
+// TerrainSynthProcessor::reloadIfScriptChanged, #23). Meanwhile UI-thread
+// editors rewrite `node.script` in place when the user edits a waveform.
+// A raw `node.script = ...` assignment is therefore a data race: a
+// std::string assignment is not atomic, so the audio thread can observe the
+// new size paired with a stale/freed data pointer and copy from garbage.
+// For a multi-megabyte granular-wavetable script this reliably crashes
+// mid-copy (~1.4 MB memcpy from a bad pointer) about a second after an edit,
+// when the autosave/poll happens to land inside the write window.
+//
+// Writers that target a node which may have a running processor MUST go
+// through this helper, and the matching audio-thread reader must take the
+// same per-node mutex (`auditionMutex`) around its read. Node-creation sites
+// that build a fresh node before any processor exists don't need it.
+inline void setNodeScriptSynced(Node& node, std::string s) {
+    std::lock_guard<std::mutex> lock(*node.auditionMutex);
+    node.script = std::move(s);
+}
 
 // Named marker on the project timeline
 struct Marker {
@@ -709,6 +754,13 @@ public:
 
     void setNextId(int id) { nextId = std::max(nextId, id); }
     int getNextId() const { return nextId; }
+    // Allocate and return a fresh id, bumping the internal counter so the
+    // same value isn't handed out twice. Use this when you need a NEW id
+    // for a pin you're appending from outside addNode (e.g. SignalShape's
+    // dynamic-signal-input pin rewrite). getNextId() above is the
+    // peek-without-allocate variant - useful for save/load size hints,
+    // not for actually creating ids.
+    int allocId() { return newId(); }
 
     float getTimelineBeats(const Node& node) const;
 

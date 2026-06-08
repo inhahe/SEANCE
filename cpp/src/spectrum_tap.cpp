@@ -560,7 +560,7 @@ bool SpectrumTapComponent::syncBinPins() {
     while (sigPinPositions.size() < binNames.size()) {
         int binIdx = (int)sigPinPositions.size();
         Pin pin;
-        pin.id = graph.getNextId();
+        pin.id = graph.allocId();
         pin.name = binNames[binIdx];
         pin.kind = PinKind::Signal;
         pin.isInput = false;

@@ -25,7 +25,7 @@
   <li><strong>Click empty space</strong> to place a new note at that pitch and beat. The note takes the most-recent length you set.</li>
   <li><strong>Drag a note</strong> to move it in time and pitch.</li>
   <li><strong>Drag the right edge</strong> of a note to resize it. Drag the left edge too if you want to change where it starts.</li>
-  <li><strong>Click+drag in empty space</strong> to box-select multiple notes at once.</li>
+  <li><strong>Click+drag in empty space</strong> to box-select multiple notes at once. Notes highlight live as the box sweeps over them, so you can see what you're grabbing before you let go. Hold <strong>Shift</strong> while dragging to add to the current selection instead of replacing it.</li>
   <li><strong>Right-click a note</strong> for the per-note menu (delete, copy, paste, change pitch, etc.).</li>
   <li><strong>Right-click empty space</strong> for the canvas menu.</li>
   <li><strong>Delete</strong> key removes whatever's selected.</li>
@@ -66,6 +66,19 @@
   <li><strong>Detune</strong> slider — applies a fine pitch offset in cents (1/100 of a semitone) to selected notes. Use for subtle out-of-tune effects or to match another instrument's tuning.</li>
 </ul>
 
+<h2>Copy and paste notes</h2>
+
+<p>You can duplicate a phrase instead of redrawing it:</p>
+
+<ol>
+  <li><strong>Select the notes</strong> — drag a box around them in empty space, or press <strong>Ctrl+A</strong> to grab the whole clip.</li>
+  <li><strong>Copy with Ctrl+C</strong> (or right-click → <em>Copy</em>). <strong>Ctrl+X</strong> cuts instead — copy then delete.</li>
+  <li><strong>Move the mouse to where you want it</strong> — a faint blue <em>ghost</em> of the copied notes follows your cursor across the grid, showing exactly where they'll land.</li>
+  <li><strong>Paste with Ctrl+V.</strong> The whole block drops in with its top-left note (earliest beat, highest pitch) right where the ghost was, and every note keeps its shape relative to that corner.</li>
+</ol>
+
+<p>You control <em>both</em> where in time and at what pitch the copy lands — move the mouse higher to paste the phrase higher, further right to paste it later. (Prefer right-clicking? Right-click empty space → <em>Paste</em> drops it at the spot you clicked instead.) The paste start snaps to the current snap setting, the clip stretches to fit if needed, and the whole paste is one <strong>Ctrl+Z</strong> away from undoing. The clipboard is shared between all open piano rolls, so you can copy from one MIDI Timeline and paste into another.</p>
+
 <h2>Mute, Solo, Pan</h2>
 
 <p>The <strong>Mute</strong> and <strong>Solo</strong> buttons in the toolbar work on this MIDI Timeline node. Mute silences it; Solo silences every other non-soloed track. The <strong>Pan</strong> slider sends this track's audio left or right in the stereo field — though for a MIDI Timeline that controls a synth, it's the synth's audio output that gets panned, not the MIDI events themselves.</p>
@@ -78,7 +91,10 @@
   <li><strong>Off</strong> — hides the lane to maximize note grid space.</li>
   <li><strong>Vel</strong> (Velocity) — one vertical bar per note, spanning the note's duration. Bar height shows velocity (0-127). Drag a bar up or down to change that note's velocity.</li>
   <li><strong>Automate Param</strong> dropdown — pick any parameter on the parent node, and a continuous automation curve appears in the lane. Click in the lane to add control points; drag points to shape the curve. The curve uses Catmull-Rom smoothing between points. The synth reads the parameter from the curve during playback whenever this clip is playing.</li>
+  <li><strong>MPE Lane</strong> dropdown — appears only when this timeline has MPE enabled (right-click the node → <em>Enable MPE</em>). Pick <strong>Pitch Bend</strong>, <strong>Slide (timbre)</strong>, or <strong>Pressure</strong> to view and edit that per-note expression curve for the selected notes. Click to add a breakpoint, drag to move one, right-click a point to delete it. This is where you tidy up gestures recorded from an MPE controller. (The MPE Lane and the Automate Param dropdown share the lane — choosing one clears the other.)</li>
 </ul>
+
+<p>With MPE on, each note is also tinted toward orange in proportion to how hard it was pressed, so you can spot the heavy notes without opening the lane. Right-click selected notes → <strong>MPE Expression</strong> for three cleanups: <strong>Smooth / Thin Curves</strong> collapses the dense recorded stream into a few editable points, <strong>Clear Expression</strong> wipes the curves, and <strong>Bake Pressure to Automation</strong> copies a note's pressure onto any parameter's automation lane (e.g. drive a filter cutoff from how hard you played).</p>
 
 <h2>Mouse and keyboard navigation</h2>
 
@@ -88,6 +104,17 @@
   <li><strong>Ctrl + wheel</strong> — zoom horizontally toward the cursor</li>
   <li><strong>Horizontal zoom slider</strong> — at the bottom; gives you a precise zoom value if scroll-wheel zoom doesn't get you there</li>
 </ul>
+
+<h2>Making the song shorter or longer</h2>
+
+<p>At the end of your notes — the right edge of the last clip — there's a draggable orange bar labelled <strong>END</strong>. It marks where the song stops.</p>
+
+<ul>
+  <li><strong>Drag END to the left</strong> to shorten the song. Any notes left stranded past the new end are removed, and notes that hang over the edge are trimmed back to fit.</li>
+  <li><strong>Drag END to the right</strong> to add empty beats and make the song longer.</li>
+</ul>
+
+<p>The handle snaps to the current snap setting as you drag; hold <strong>Alt</strong> to place it at any exact spot. Shortening the song is a single <strong>Ctrl+Z</strong> away from undoing, so don't worry about trimming too far — you can always step it back.</p>
 
 <h2>Compact mode</h2>
 

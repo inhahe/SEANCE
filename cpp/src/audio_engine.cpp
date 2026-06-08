@@ -625,7 +625,9 @@ void AudioEngine::audioDeviceIOCallbackWithContext(
                 ++p;
                 if (p >= grainLen) p = 0;
                 grainPhase = p;
-                return out;
+                // Attenuate to roughly match a synth note's post-Volume level
+                // so marker-scrub / freeze audition isn't louder than playback.
+                return out * kFreezePreviewGain;
             };
 
             auto songSampleAdvance = [&](int64_t& posRef) -> float {

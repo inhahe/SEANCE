@@ -387,7 +387,10 @@ void SpectralEditorComponent::commitToNode() {
         externalFrame->doc = doc;
     } else if (graph) {
         if (auto* nd = graph->findNode(nodeId)) {
-            nd->script = doc.encode();
+            // Synchronised: a standalone spectral node classifies as a
+            // wavetable source, so TerrainSynthProcessor polls its script on
+            // the audio thread. Lock the per-node mutex around the write.
+            setNodeScriptSynced(*nd, doc.encode());
             // Mark the project dirty so quit-without-save prompts and
             // autosave both notice these edits. (The externalFrame branch
             // above is inside a layered-wave parent that bumps the flag

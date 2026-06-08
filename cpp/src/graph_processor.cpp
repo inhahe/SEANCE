@@ -412,6 +412,25 @@ void GraphProcessor::rebuildGraph(NodeGraph& graph, Transport& transport) {
     nodeMap.clear();
     nodeInputMap.clear();
 
+    // Helper: widen a built-in processor so it physically has enough audio
+    // channels to carry audio-rate control signals. Channels 0+1 are the audio
+    // pair; every Signal/Param INPUT pin needs a dedicated control INPUT channel
+    // (2, 3, ...) and every Signal/Param OUTPUT pin a control OUTPUT channel.
+    // Without this, the processor declares the JUCE default stereo (2-in/2-out)
+    // layout, AudioProcessorGraph::isConnectionLegal rejects every connection to
+    // channel index >= 2, and control cables silently never reach the node -
+    // which is why signal modulation (e.g. wavetable Position) had no effect.
+    // Hosted plugins never have Signal/Param pins, so this is a no-op for them.
+    auto widenForControl = [&](juce::AudioProcessor& p, const Node& n) {
+        int numCtrlIn = 0, numCtrlOut = 0;
+        for (auto& pin : n.pinsIn)
+            if (pin.kind == PinKind::Signal || pin.kind == PinKind::Param) ++numCtrlIn;
+        for (auto& pin : n.pinsOut)
+            if (pin.kind == PinKind::Signal || pin.kind == PinKind::Param) ++numCtrlOut;
+        if (numCtrlIn > 0 || numCtrlOut > 0)
+            p.setPlayConfigDetails(2 + numCtrlIn, 2 + numCtrlOut, sampleRate, blockSize);
+    };
+
     // Add an audio output node (graph sink)
     auto outNode = processorGraph->addNode(
         std::make_unique<juce::AudioProcessorGraph::AudioGraphIOProcessor>(
@@ -449,6 +468,7 @@ void GraphProcessor::rebuildGraph(NodeGraph& graph, Transport& transport) {
             proc = std::make_unique<CachePlaybackProcessor>(node, transport);
             if (proc) {
                 proc->enableAllBuses();
+                widenForControl(*proc, node);
                 auto graphNode = processorGraph->addNode(std::move(proc));
                 if (graphNode) {
                     nodeMap[node.id] = graphNode->nodeID;
@@ -490,7 +510,7 @@ void GraphProcessor::rebuildGraph(NodeGraph& graph, Transport& transport) {
                 }
             if (!hasAT) {
                 Pin atPin;
-                atPin.id = graph.getNextId();
+                atPin.id = graph.allocId();
                 atPin.name = "Aftertouch";
                 atPin.kind = PinKind::Signal;
                 atPin.isInput = true;
@@ -651,12 +671,24 @@ void GraphProcessor::rebuildGraph(NodeGraph& graph, Transport& transport) {
 
         if (proc) {
             proc->enableAllBuses();
+            widenForControl(*proc, node);
             auto graphNode = processorGraph->addNode(std::move(proc));
             if (graphNode) {
                 // Insert a pan processor after audio-producing nodes
                 if (node.type != NodeType::Output) {
+                    // Count the node's Signal/Param OUT pins up front - the pan
+                    // node must be wide enough to pass these control channels
+                    // through (channels 2..2+numCtrlOuts-1) in addition to the
+                    // stereo audio pair.
+                    int numCtrlOuts = 0;
+                    for (auto& pin : node.pinsOut)
+                        if (pin.kind == PinKind::Signal || pin.kind == PinKind::Param)
+                            ++numCtrlOuts;
                     auto panProc = std::make_unique<PanProcessor>(node, graph);
                     panProc->enableAllBuses();
+                    if (numCtrlOuts > 0)
+                        panProc->setPlayConfigDetails(2 + numCtrlOuts, 2 + numCtrlOuts,
+                                                      sampleRate, blockSize);
                     auto panNode = processorGraph->addNode(std::move(panProc));
                     if (panNode) {
                         // Chain: node -> pan -> (downstream will connect to panNode)
@@ -672,10 +704,6 @@ void GraphProcessor::rebuildGraph(NodeGraph& graph, Transport& transport) {
                         // channel 2+i of the source) would dead-end at the pan
                         // processor because downstream connections go through
                         // nodeMap[node.id] = panNode.
-                        int numCtrlOuts = 0;
-                        for (auto& pin : node.pinsOut)
-                            if (pin.kind == PinKind::Signal || pin.kind == PinKind::Param)
-                                ++numCtrlOuts;
                         for (int i = 0; i < numCtrlOuts; ++i) {
                             processorGraph->addConnection({{graphNode->nodeID, 2 + i},
                                                            {panNode->nodeID, 2 + i}});
@@ -691,6 +719,31 @@ void GraphProcessor::rebuildGraph(NodeGraph& graph, Transport& transport) {
                     nodeInputMap[node.id] = graphNode->nodeID;
                 }
             }
+        }
+    }
+
+    // MPE configuration: for each hosted plugin with MPE enabled, wire a small
+    // parallel MIDI generator into its input. The generator emits the MPE
+    // Configuration Message (the RPN "zone" handshake) so MPE-capable plugins
+    // interpret incoming channels 2..16 as per-note member channels. It only
+    // ADDS the RPN and never touches the note stream, so a non-MPE plugin -
+    // which ignores the unknown RPN - is byte-for-byte unaffected. Built-in
+    // synths read MPE channels natively and don't need the handshake, so this
+    // is gated on node.plugin. Injecting at the plugin's graph input (rather
+    // than on a cable) also bypasses the cable-level MIDI-Learn CC filter that
+    // could otherwise strip the RPN's CC 6/38/100/101 bytes.
+    for (auto& node : graph.nodes) {
+        if (!node.mpeEnabled) continue;
+        if (!node.plugin) continue;
+        auto it = nodeInputMap.find(node.id);
+        if (it == nodeInputMap.end()) continue;
+        auto cfgProc = std::make_unique<MpeConfigProcessor>(node, transport);
+        cfgProc->enableAllBuses();
+        auto cfgNode = processorGraph->addNode(std::move(cfgProc));
+        if (cfgNode) {
+            processorGraph->addConnection({
+                {cfgNode->nodeID, juce::AudioProcessorGraph::midiChannelIndex},
+                {it->second, juce::AudioProcessorGraph::midiChannelIndex}});
         }
     }
 
@@ -771,6 +824,9 @@ void GraphProcessor::rebuildGraph(NodeGraph& graph, Transport& transport) {
                     auto gateProc = std::make_unique<TimeGateProcessor>(
                         link.id, *srcNode, graph, transport);
                     gateProc->enableAllBuses();
+                    if (srcNumCtrlOuts > 0)
+                        gateProc->setPlayConfigDetails(2 + srcNumCtrlOuts, 2 + srcNumCtrlOuts,
+                                                       sampleRate, blockSize);
                     auto gateNode = processorGraph->addNode(std::move(gateProc));
                     if (gateNode) {
                         processorGraph->addConnection({{effectiveSrc, 0}, {gateNode->nodeID, 0}});
@@ -796,6 +852,9 @@ void GraphProcessor::rebuildGraph(NodeGraph& graph, Transport& transport) {
         if (link.gainDb != 0.0f) {
             auto gainProc = std::make_unique<GainProcessor>(link.gainDb);
             gainProc->enableAllBuses();
+            if (srcNumCtrlOuts > 0)
+                gainProc->setPlayConfigDetails(2 + srcNumCtrlOuts, 2 + srcNumCtrlOuts,
+                                               sampleRate, blockSize);
             auto gainNode = processorGraph->addNode(std::move(gainProc));
             if (gainNode) {
                 // Route: src -> gain -> dst

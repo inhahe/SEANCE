@@ -158,6 +158,16 @@ bool ProjectFile::writeProject(std::ostream& f, NodeGraph& graph,
         for (auto& pt : node.envAttackPoints) f << "envAtkPt=" << pt.first << "," << pt.second << "\n";
         for (auto& pt : node.envDecayPoints) f << "envDecPt=" << pt.first << "," << pt.second << "\n";
         for (auto& pt : node.envReleasePoints) f << "envRelPt=" << pt.first << "," << pt.second << "\n";
+        // Shared AHDSR envelope (post-migration replacement for envAttackCurve
+        // et al.). One line — encode() returns a single line with no newlines
+        // and length-prefixed curve fields, so it survives writeStr round-trip
+        // regardless of curve content. Saved unconditionally because it carries
+        // sensible defaults (linear ramps, 5ms / 0ms / 200ms / 0.7 / 300ms /
+        // velSens=1) — we want those defaults to persist exactly across save/
+        // load rather than relying on the constructor at load time.
+        writeStr(f, "ahdsrEnvelope", node.ahdsrEnvelope.encode());
+        if (node.aftertouchSensitivity != 0.5f)
+            writeFloat(f, "aftertouchSensitivity", node.aftertouchSensitivity);
         writeInt(f, "pluginIndex", node.pluginIndex);
         if (node.panLaw != PanLaw::EqualPower) writeInt(f, "panLaw", (int)node.panLaw);
         if (node.pan != 0.0f) writeFloat(f, "pan", node.pan);
@@ -538,7 +548,8 @@ bool ProjectFile::readProject(std::istream& f, NodeGraph& graph, PluginHost* plu
                         "soloed", "script", "scriptLines",
                         "midiInputSourceId", "envAttackCurve",
                         "envDecayCurve", "envReleaseCurve", "envAtkPt",
-                        "envDecPt", "envRelPt", "pluginIndex", "pluginState",
+                        "envDecPt", "envRelPt", "ahdsrEnvelope",
+                        "aftertouchSensitivity", "pluginIndex", "pluginState",
                         "panLaw", "pan", "spatialX", "spatialY", "spatialZ",
                         "performanceMode", "perfReleaseMode", "perfVelocity",
                         "mpeEnabled", "mpePitchBendRange", "parentGroupId",
@@ -587,6 +598,19 @@ bool ProjectFile::readProject(std::istream& f, NodeGraph& graph, PluginHost* plu
                 auto c = val.find(',');
                 if (c != std::string::npos)
                     curNode->envReleasePoints.push_back({std::stof(val.substr(0,c)), std::stof(val.substr(c+1))});
+            }
+            else if (key == "ahdsrEnvelope") {
+                // Failure to decode (corrupt / partial line) leaves the
+                // freshly-constructed default envelope in place rather than
+                // wiping it — better to play with default ADSR than to
+                // hard-fail the load on one bad field.
+                AHDSREnvelope tmp;
+                if (AHDSREnvelope::decode(val, tmp))
+                    curNode->ahdsrEnvelope = std::move(tmp);
+            }
+            else if (key == "aftertouchSensitivity") {
+                try { curNode->aftertouchSensitivity = std::stof(val); }
+                catch (...) {}
             }
             else if (key == "pluginIndex") curNode->pluginIndex = std::stoi(val);
             else if (key == "pluginState") curNode->pendingPluginState = val;

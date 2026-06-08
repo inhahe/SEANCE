@@ -12,6 +12,7 @@
 #include "tuning.h"
 #include "undo.h"
 #include "plugin_host.h"
+#include "adsr_envelope.h"
 
 namespace SoundShop {
 
@@ -301,18 +302,41 @@ struct Node {
     int performanceReleaseMode = 1;   // 0=OnKeyUp, 1=OnNextEvent (legato)
     bool performanceVelocity = true;  // use incoming velocity
 
-    // Custom envelope curves (expressions mapping x in 0..1 to amplitude 0..1)
-    // Empty = default linear. x=0 is start of stage, x=1 is end.
-    // Attack: default "x" (linear rise). Try "x^0.5" for fast attack.
-    // Decay: default "1-x*(1-s)" where s is sustain. Try "1-x^2*(1-s)".
-    // Release: default "1-x" (linear fall). Try "(1-x)^3" for long tail.
-    std::string envAttackCurve;   // expression, empty = linear
+    // The unified AHDSR amplitude envelope used by every tonal /
+    // note-triggered synth (built-in, terrain, wavetable, layered,
+    // spectral, FM, additive, PD, particle). Stores A/H/D/S/R time
+    // values, sustain level, velocity sensitivity, and the per-segment
+    // SpectralCurve shapes for Attack / Decay / Release.
+    //
+    // Edited via the shared AHDSREnvelopeComponent (opened either inline
+    // from a synth dialog or via a right-click "Envelope..." menu on
+    // the node). Save/load and undo serialize this through encode/decode.
+    //
+    // Note for migration: the legacy envAttackCurve / envAttackPoints
+    // etc. fields below are kept for backward compatibility while the
+    // codebase transitions to ahdsrEnvelope. Once all sites read from
+    // ahdsrEnvelope, the legacy fields will be removed. Project load
+    // copies legacy values into ahdsrEnvelope before the audio
+    // processor sees the node.
+    AHDSREnvelope ahdsrEnvelope;
+
+    // DEPRECATED - kept only to keep existing code compiling during
+    // the migration to ahdsrEnvelope. Do not add new readers.
+    std::string envAttackCurve;
     std::string envDecayCurve;
     std::string envReleaseCurve;
-    // Control points alternative (phase 0-1, amplitude 0-1)
     std::vector<std::pair<float, float>> envAttackPoints;
     std::vector<std::pair<float, float>> envDecayPoints;
     std::vector<std::pair<float, float>> envReleasePoints;
+
+    // Per-channel aftertouch input. When something is wired to the
+    // "Aftertouch" Signal input pin on a synth node, the wired signal's
+    // current value (0..1) drives the per-voice aftertouch. When the
+    // pin is unwired, the synth uses channel-pressure events from the
+    // incoming MIDI stream instead. Either way the value is exposed to
+    // every voice as a per-sample modulation source that defaults to
+    // scaling output amplitude by 1 + 0.5*aftertouch.
+    float aftertouchSensitivity = 0.5f;  // 0 = ignore, 1 = full volume swell
 
     // Panning and spatial positioning
     PanLaw panLaw = PanLaw::EqualPower; // panning law for PanProcessor

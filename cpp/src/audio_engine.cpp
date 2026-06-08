@@ -428,6 +428,37 @@ void AudioEngine::audioDeviceIOCallbackWithContext(
         spectrumWritePos = (spectrumWritePos + 1) % kSpectrumBufSize;
     }
 
+    // Master Out peak metering. Output nodes don't get a PanProcessor in
+    // the graph (graph_processor.cpp ~604 guards on `type != Output`), so
+    // the per-node meterPeakL/R never get written for them and their
+    // green meter bar stays dark forever. Without a meter on Master Out
+    // the user has no way to tell "audio reached the output but the
+    // device is silent" apart from "audio never reached the output" -
+    // both look like dead silence. Scan the final device buffer here and
+    // stamp every Output node so the UI's existing meter-draw path
+    // (node_graph_component.cpp) lights them up consistently with every
+    // other node. Same lock-free pattern as PanProcessor: torn reads on
+    // the UI thread are tolerated (one frame of stale meter).
+    {
+        float pkL = 0, pkR = 0;
+        if (numOutputChannels > 0) {
+            auto* d = outputChannelData[0];
+            for (int s = 0; s < numSamples; ++s) pkL = std::max(pkL, std::abs(d[s]));
+        }
+        if (numOutputChannels > 1) {
+            auto* d = outputChannelData[1];
+            for (int s = 0; s < numSamples; ++s) pkR = std::max(pkR, std::abs(d[s]));
+        } else {
+            pkR = pkL;
+        }
+        for (auto& n : graph->nodes) {
+            if (n.type == NodeType::Output) {
+                n.meterPeakL = pkL;
+                n.meterPeakR = pkR;
+            }
+        }
+    }
+
     // Wavetable capture-from-playback ring buffer: mono-summed final mix,
     // always-on, used by the +Frame -> "From recent playback" dialog. Single
     // writer (this audio callback), single reader (UI thread snapshot).

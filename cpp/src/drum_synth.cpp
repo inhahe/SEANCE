@@ -277,6 +277,7 @@ void DrumSynthProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::MidiB
         if (msg.isNoteOn()) {
             int si = findSoundForNote(msg.getNoteNumber());
             if (si >= 0) {
+                int ch = juce::jlimit(1, 16, msg.getChannel());
                 // Find a free voice
                 int vi = -1;
                 for (int i = 0; i < MAX_DRUM_VOICES; ++i) {
@@ -285,13 +286,43 @@ void DrumSynthProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::MidiB
                 if (vi < 0) vi = 0; // steal first voice
                 voices[vi].active = true;
                 voices[vi].soundIdx = si;
+                voices[vi].midiChannel = ch;
                 voices[vi].time = 0;
+                // If the pedal is already down on this channel, the new
+                // voice is born held - its decay won't advance until the
+                // pedal comes up. Matches user expectation: "I'm holding
+                // the pedal, so anything I hit rings out."
+                voices[vi].sustainHeld = sustainPedal[ch - 1];
                 {
                     float raw = msg.getVelocity() / 127.0f;
                     voices[vi].velocity = 1.0f - velSens * (1.0f - raw);
                 }
                 voices[vi].rng.seed((unsigned)msg.getNoteNumber() * 1234 + (unsigned)(voices[vi].time * 10000));
             }
+        } else if (msg.isController() && msg.getControllerNumber() == 64) {
+            // Sustain pedal (CC#64).  Drums have no note-off-driven
+            // release stage (the decay is purely time-based), so the
+            // analogue of TerrainSynth's "defer release" is: freeze the
+            // decay envelope while the pedal is down on this channel.
+            // Pedal-down marks every active voice on the channel as held;
+            // pedal-up clears the flag so the natural decay resumes from
+            // whatever amplitude the voice was frozen at.
+            int ch = juce::jlimit(1, 16, msg.getChannel());
+            bool held = msg.getControllerValue() >= 64;
+            sustainPedal[ch - 1] = held;
+            for (int i = 0; i < MAX_DRUM_VOICES; ++i)
+                if (voices[i].active && voices[i].midiChannel == ch)
+                    voices[i].sustainHeld = held;
+        } else if (msg.isAllNotesOff() || msg.isAllSoundOff()) {
+            // Honour panic / transport-stop. AllNotesOff cuts current
+            // voices to silence; AllSoundOff also clears sustain state so
+            // a stuck pedal doesn't keep the next hit frozen.
+            for (int i = 0; i < MAX_DRUM_VOICES; ++i) {
+                voices[i].active = false;
+                voices[i].sustainHeld = false;
+            }
+            if (msg.isAllSoundOff())
+                for (int c = 0; c < 16; ++c) sustainPedal[c] = false;
         }
     }
 
@@ -304,11 +335,17 @@ void DrumSynthProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::MidiB
             if (!voices[vi].active) continue;
             float sample = renderDrumSample(voices[vi].soundIdx, voices[vi]);
             total += sample;
-            voices[vi].time += 1.0 / sampleRate;
+            // Freeze the decay envelope while the sustain pedal holds
+            // this voice. The voice keeps rendering at the same amplitude
+            // (renderDrumSample is a pure function of voice.time) until
+            // the pedal comes up and time starts advancing again.
+            if (!voices[vi].sustainHeld)
+                voices[vi].time += 1.0 / sampleRate;
             // Auto-deactivate once the voice has decayed below the
             // inaudibility threshold (≈ -43 dB).  Uses the same per-sound
             // decay computation as getTailLengthSeconds() so the two stay
-            // in lockstep - no magic 5-second cap.
+            // in lockstep - no magic 5-second cap. Held voices don't
+            // advance time, so they can't reach the threshold here.
             int si = voices[vi].soundIdx;
             if (si >= 0 && si < (int)sounds.size()) {
                 double tau = drumDecayTau(sounds[si]);

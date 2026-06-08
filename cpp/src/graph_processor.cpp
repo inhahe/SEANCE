@@ -11,6 +11,7 @@
 #include "pitch_shift_processor.h"
 #include "time_gate_processor.h"
 #include "spectrum_tap.h"
+#include "analyzer_nodes.h"
 #include "convolution_processor.h"
 #include "soundfont_processor.h"
 #include "builtin_effects.h"
@@ -457,6 +458,47 @@ void GraphProcessor::rebuildGraph(NodeGraph& graph, Transport& transport) {
             continue;
         }
 
+        // Ensure tonal / note-triggered synths carry a Signal input pin
+        // named "Aftertouch" so users can wire any signal source (an
+        // LFO, an XY pad axis, channel pressure from a separate MIDI
+        // source, etc.) to drive the synth's per-voice volume swell.
+        // The pin is added once and persists in the project file via
+        // the normal pin save/load. When unwired, the synth falls back
+        // to channel-pressure events on its own MIDI input.
+        auto isTonalSynthNodeForPin = [](const Node& n) {
+            if (n.type == NodeType::TerrainSynth) return true;
+            if (n.type == NodeType::Instrument && !n.plugin) {
+                auto isScript = [&](const char* tag) {
+                    return n.script.rfind(tag, 0) == 0;
+                };
+                if (isScript("__fmsynth__")    || isScript("__additivesynth__") ||
+                    isScript("__pdsynth__")    || isScript("__particlesynth__") ||
+                    isScript("__drumsynth__")  || isScript("__spectralgrain__:"))
+                    return true;
+                // Built-in / wavetable / layered / spectral / audio variants
+                // all live under NodeType::Instrument with various
+                // script prefixes - hand them the pin too.
+                return true;
+            }
+            return false;
+        };
+        if (isTonalSynthNodeForPin(node)) {
+            bool hasAT = false;
+            for (auto& p : node.pinsIn)
+                if (p.kind == PinKind::Signal && p.name == "Aftertouch") {
+                    hasAT = true; break;
+                }
+            if (!hasAT) {
+                Pin atPin;
+                atPin.id = graph.getNextId();
+                atPin.name = "Aftertouch";
+                atPin.kind = PinKind::Signal;
+                atPin.isInput = true;
+                atPin.channels = 1;
+                node.pinsIn.push_back(atPin);
+            }
+        }
+
         if (node.type == NodeType::MidiTimeline) {
             proc = std::make_unique<MidiTimelineProcessor>(node, transport);
         } else if (node.type == NodeType::AudioTimeline) {
@@ -518,8 +560,19 @@ void GraphProcessor::rebuildGraph(NodeGraph& graph, Transport& transport) {
             proc = std::make_unique<SignalShapeProcessor>(node, transport);
         } else if (node.type == NodeType::MidiInput) {
             proc = std::make_unique<MidiInputProcessor>(node);
-        } else if (node.type == NodeType::Effect && node.script == "__spectrumtap__") {
+        } else if (node.type == NodeType::Effect && node.script.rfind("__spectrumtap__", 0) == 0) {
+            // Spectrum Tap may carry per-bin custom response curves appended
+            // to its tag as "__spectrumtap__|<curve1>|<curve2>|...", so we
+            // prefix-match rather than compare exactly.
             proc = std::make_unique<SpectrumTapProcessor>(node);
+        } else if (node.type == NodeType::Effect &&
+                   (node.script == "__spectrumanalyzer__" ||
+                    node.script == "__oscilloscope__" ||
+                    node.script == "__spectrogram__")) {
+            // Pure passthrough + capture-to-shared-ring-buffer.
+            // The editor side reads from the same AnalyzerCapture via the
+            // node-id-keyed registry.
+            proc = std::make_unique<AnalyzerProcessor>(node);
         } else if (node.type == NodeType::Effect &&
                    node.script.rfind("__convolution__:", 0) == 0) {
             proc = std::make_unique<ConvolutionProcessor>(node);
@@ -612,6 +665,21 @@ void GraphProcessor::rebuildGraph(NodeGraph& graph, Transport& transport) {
                         processorGraph->addConnection({
                             {graphNode->nodeID, juce::AudioProcessorGraph::midiChannelIndex},
                             {panNode->nodeID, juce::AudioProcessorGraph::midiChannelIndex}});
+                        // Wire control channels (Signal/Param outputs) through
+                        // the pan node too. Pan only manipulates channels 0+1;
+                        // control channels 2+ pass through unchanged. Without
+                        // this, a source node's Signal Out pin (which lives on
+                        // channel 2+i of the source) would dead-end at the pan
+                        // processor because downstream connections go through
+                        // nodeMap[node.id] = panNode.
+                        int numCtrlOuts = 0;
+                        for (auto& pin : node.pinsOut)
+                            if (pin.kind == PinKind::Signal || pin.kind == PinKind::Param)
+                                ++numCtrlOuts;
+                        for (int i = 0; i < numCtrlOuts; ++i) {
+                            processorGraph->addConnection({{graphNode->nodeID, 2 + i},
+                                                           {panNode->nodeID, 2 + i}});
+                        }
                         nodeMap[node.id] = panNode->nodeID;       // downstream pulls audio from pan
                         nodeInputMap[node.id] = graphNode->nodeID; // upstream pushes MIDI/audio into the actual processor
                     } else {
@@ -663,6 +731,17 @@ void GraphProcessor::rebuildGraph(NodeGraph& graph, Transport& transport) {
         auto srcGraphId = nodeMap[srcNodeId];
         auto dstGraphId = nodeInputMap[dstNodeId];
 
+        // Count the source node's Signal/Param OUT pins so any pass-through
+        // (gate/gain) processors we insert below also forward channels 2+.
+        int srcNumCtrlOuts = 0;
+        for (auto& sn : graph.nodes) {
+            if (sn.id != srcNodeId) continue;
+            for (auto& pin : sn.pinsOut)
+                if (pin.kind == PinKind::Signal || pin.kind == PinKind::Param)
+                    ++srcNumCtrlOuts;
+            break;
+        }
+
         // If this link has time-gated effect regions on any node, insert a
         // TimeGateProcessor that silences audio outside the active regions.
         auto effectiveSrc = srcGraphId;
@@ -699,6 +778,14 @@ void GraphProcessor::rebuildGraph(NodeGraph& graph, Transport& transport) {
                         processorGraph->addConnection({
                             {effectiveSrc, juce::AudioProcessorGraph::midiChannelIndex},
                             {gateNode->nodeID, juce::AudioProcessorGraph::midiChannelIndex}});
+                        // Forward control channels (Signal/Param outputs)
+                        // through the time-gate node too. TimeGateProcessor
+                        // only silences channels 0+1 outside active regions;
+                        // control channels pass through.
+                        for (int i = 0; i < srcNumCtrlOuts; ++i) {
+                            processorGraph->addConnection({{effectiveSrc, 2 + i},
+                                                           {gateNode->nodeID, 2 + i}});
+                        }
                         effectiveSrc = gateNode->nodeID;
                     }
                 }
@@ -717,6 +804,16 @@ void GraphProcessor::rebuildGraph(NodeGraph& graph, Transport& transport) {
                 processorGraph->addConnection({
                     {srcGraphId, juce::AudioProcessorGraph::midiChannelIndex},
                     {gainNode->nodeID, juce::AudioProcessorGraph::midiChannelIndex}});
+                // Forward control channels too. GainProcessor scales every
+                // channel by linkGainDb - for control links the scaling acts
+                // as a signal scale, for audio links the control channels are
+                // unused. Either way they need to traverse the gain node so
+                // downstream connections from a control-source pin still see
+                // their data.
+                for (int i = 0; i < srcNumCtrlOuts; ++i) {
+                    processorGraph->addConnection({{srcGraphId, 2 + i},
+                                                   {gainNode->nodeID, 2 + i}});
+                }
                 effectiveSrc = gainNode->nodeID;
             }
         }
@@ -739,7 +836,22 @@ void GraphProcessor::rebuildGraph(NodeGraph& graph, Transport& transport) {
                 }
                 break;
             }
-            processorGraph->addConnection({{effectiveSrc, 0}, {dstGraphId, signalChIdx}});
+            // Find the source channel: each Signal/Param OUT pin gets its own
+            // channel starting at 2 (channels 0+1 are reserved for audio).
+            // This lets a single node expose multiple distinct control signals
+            // simultaneously (e.g. SpectrumTap with one Signal Out per bin,
+            // or the XY pad with X/Y/Z axes on separate pins).
+            int srcSignalCh = 2;
+            for (auto& sn : graph.nodes) {
+                if (sn.id != srcNodeId) continue;
+                int sigCount = 0;
+                for (auto& pin : sn.pinsOut) {
+                    if (pin.id == link.startPin) { srcSignalCh = 2 + sigCount; break; }
+                    if (pin.kind == PinKind::Signal || pin.kind == PinKind::Param) sigCount++;
+                }
+                break;
+            }
+            processorGraph->addConnection({{effectiveSrc, srcSignalCh}, {dstGraphId, signalChIdx}});
         } else {
             // Audio + MIDI: connect as before
             processorGraph->addConnection({{effectiveSrc, 0}, {dstGraphId, 0}});

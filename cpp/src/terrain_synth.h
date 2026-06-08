@@ -405,11 +405,28 @@ private:
         // was down, so release is deferred until the pedal comes back up.
         bool sustainHeld = false;
 
-        // ADSR
-        enum Stage { Off, Attack, Decay, Sustain, Release };
+        // AHDSR (Attack, Hold, Decay, Sustain, Release). The Hold stage
+        // sits between Attack and Decay and stays at peak for
+        // node.ahdsrEnvelope.holdMs - useful for percussive / brassy
+        // patches where the note should "ring out" at full volume
+        // before fading. holdMs = 0 (the default) skips Hold and
+        // transitions Attack -> Decay directly.
+        enum Stage { Off, Attack, Hold, Decay, Sustain, Release };
         Stage envStage = Off;
         float envLevel = 0.0f;
         double envTime = 0.0;
+        // Velocity-scaled peak amplitude. Captured at note-on from
+        // (1 - velSens) + velSens * (vel/127). The envelope shape goes
+        // from 0 to envPeak across Attack instead of 0->1, then Decay
+        // lands at envPeak * sustain. Velocity sensitivity comes from
+        // node.ahdsrEnvelope.velocitySensitivity.
+        float envPeak = 1.0f;
+
+        // Per-note (polyphonic) aftertouch value 0..1. Set by
+        // poly-pressure MIDI events; layered on top of the per-channel
+        // aftertouch in the render loop. MPE-style controllers route
+        // independent pressure per voice via this field.
+        float polyAftertouch = 0.0f;
 
         // Additive-bank mode per-partial phases. Allocated lazily on the
         // first note-on that enters AdditiveBank mode so the Voice array
@@ -431,7 +448,7 @@ private:
         };
         std::vector<GranStream> granStreams;
 
-        float advanceEnv(float sr, float a, float d, float s, float r,
+        float advanceEnv(float sr, float a, float h, float d, float s, float r,
                          const EnvCurve* aCurve, const EnvCurve* dCurve, const EnvCurve* rCurve);
     };
     static constexpr int MAX_VOICES = 16;
@@ -453,6 +470,18 @@ private:
     // captured as sustainHeld instead of immediately releasing.
     bool sustainPedal[16] = {false,false,false,false,false,false,false,false,
                               false,false,false,false,false,false,false,false};
+
+    // Per-channel aftertouch (channel pressure, CC-like value 0..1). Set
+    // by isChannelPressure() MIDI events; consumed in the render loop
+    // as a volume swell multiplier scaled by node.aftertouchSensitivity.
+    // The "Aftertouch" Signal input pin on the synth, when wired,
+    // overrides this with the wired signal's current sample value
+    // instead (lets users drive aftertouch from any signal source -
+    // LFO, XY pad, automation, another voice's amplitude, etc.)
+    float channelAftertouch[16] = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};
+    // Set per-block from the "Aftertouch" Signal input pin when it's
+    // wired. Negative means "unwired - fall back to MIDI value".
+    float aftertouchOverride = -1.0f;
 
     // Internal LFOs for modulation
     struct LFO {

@@ -1,6 +1,7 @@
 #pragma once
 #include "node_graph.h"
 #include "wavetable_frame.h"
+#include "curve_editor.h"   // SpectralCurve + SpectralCurvePanel (reusable)
 #include <juce_gui_basics/juce_gui_basics.h>
 #include <vector>
 #include <functional>
@@ -9,40 +10,9 @@
 
 namespace SoundShop {
 
-// A single user-authored curve over FFT bins, used for either magnitude
-// or phase in a SpectralDoc. Can be defined as a formula in `f` (the bin
-// index) OR drawn graphically. Drawn mode mirrors the waveform editor's
-// Drawn shape: a Points sub-mode (Catmull-Rom through control points) or
-// Freehand sub-mode (per-sample direct draw). All three options apply to
-// both magnitude and phase, so the user can mix-and-match - e.g., a
-// formula magnitude with a freehand-drawn phase response.
-struct SpectralCurve {
-    enum Mode { Equation, Drawn };
-    Mode mode = Equation;
-
-    // When mode == Equation: a single text expression evaluated per bin
-    // with `f` ranging across [0, halfBins). Uses the WaveExprParser
-    // grammar shared with the waveform Formula shape:
-    // sin, cos, tan, exp, log, sqrt, pow, abs, tanh, clamp,
-    // saw(f), square(f), triangle(f), noise(), random, pi, e, + - * / ^.
-    std::string expression = "exp(-f/20)";
-
-    // When mode == Drawn: same two sub-modes as WaveLayer::Drawn.
-    // Points mode (freehandMode == false): control points in
-    //   (normalized-bin 0..1, value 0..1 for mag / -pi..pi for phase),
-    //   Catmull-Rom interpolation between them.
-    // Freehand mode (freehandMode == true): 512 per-sample values
-    //   covering the whole bin range, linearly resampled to halfBins
-    //   on evaluation.
-    bool freehandMode = false;
-    std::vector<std::pair<float, float>> drawnPoints;
-    std::vector<float> drawnSamples;
-
-    // Evaluate this curve to `halfBins` samples. Values for magnitude are
-    // expected in [0, +inf) (will be clamped to >= 0); values for phase
-    // are radians and are passed through unchanged.
-    std::vector<float> evaluate(int halfBins) const;
-};
+// SpectralCurve (mag/phase authoring with Equation / Points / Freehand
+// modes) lives in curve_editor.h and is reused by other parts of the
+// codebase (e.g. SpectrumTap's per-bin frequency-response curves).
 
 // One full frequency-domain wavetable frame: a magnitude curve and a
 // phase curve combined into a real spectrum, then IFFTed to a single-cycle
@@ -121,9 +91,6 @@ public:
     void timerCallback() override;
 
 private:
-    class CurvePanel; // inner: one (Equation/Drawn) panel for mag or phase
-    friend class CurvePanel;
-
     // Either (graph, nodeId) or externalFrame is active, never both.
     NodeGraph* graph = nullptr;
     int nodeId = 0;
@@ -141,8 +108,8 @@ private:
     juce::TextButton closeBtn { "Close" };
     juce::TextButton helpBtn  { "?" };
 
-    std::unique_ptr<CurvePanel> phasePanel;  // top
-    std::unique_ptr<CurvePanel> magPanel;    // bottom
+    std::unique_ptr<SpectralCurvePanel> phasePanel;  // top
+    std::unique_ptr<SpectralCurvePanel> magPanel;    // bottom
 
     void refreshPreview();
     void commitToNode();

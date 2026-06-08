@@ -513,13 +513,20 @@ void TriggerProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::MidiBuf
     }
     midi.swapWith(output);
 
-    // 3. Render signal output into audio channel 0 (the Signal out pin).
+    // 3. Render signal output into the Signal Out pin's control channel.
+    // Per the graph processor convention (graph_processor.cpp:844-854),
+    // Signal/Param OUT pins are mapped to channels starting at 2 in pin-
+    // declaration order among control pins. The Trigger node declares
+    // pinsOut = [MIDI Out, Signal Out], so Signal Out is the first (and only)
+    // control pin -> channel 2.
+    //
     // Multiple active shapes: last-added wins on overlap (replace policy).
     // If no shapes are active we emit the default rest value (0.0f via clear).
     int numCh = buf.getNumChannels();
-    if (numCh > 0) {
+    constexpr int kSignalOutCh = 2;
+    if (numCh > kSignalOutCh) {
         // Initialize to 0 (or the "rest" of the last still-active shape).
-        auto* out = buf.getWritePointer(0);
+        auto* out = buf.getWritePointer(kSignalOutCh);
         for (int i = 0; i < numSamples; ++i) out[i] = 0.0f;
 
         // Iterate shapes in order; the last write for a given sample wins.

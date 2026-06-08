@@ -151,6 +151,14 @@ target_sources(SEANCE PRIVATE
     src/layered_wave_editor.h
     src/spectral_editor.cpp
     src/spectral_editor.h
+    src/curve_editor.cpp
+    src/curve_editor.h
+    src/adsr_envelope.cpp
+    src/adsr_envelope.h
+    src/adsr_envelope_component.cpp
+    src/adsr_envelope_component.h
+    src/envelope_presets.cpp
+    src/envelope_presets.h
     src/effect_regions.h
     src/time_gate_processor.cpp
     src/time_gate_processor.h
@@ -160,6 +168,8 @@ target_sources(SEANCE PRIVATE
     src/xy_pad.h
     src/spectrum_tap.cpp
     src/spectrum_tap.h
+    src/analyzer_nodes.cpp
+    src/analyzer_nodes.h
     src/convolution_processor.cpp
     src/convolution_processor.h
     src/convolution_editor.cpp

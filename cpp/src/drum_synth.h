@@ -45,8 +45,16 @@ struct DrumSound {
 struct DrumVoice {
     bool active = false;
     int soundIdx = -1;
+    int midiChannel = 1;    // 1..16; which channel the trigger came in on,
+                            // so per-channel sustain pedal can find its voices
     double time = 0;        // seconds since trigger
     float velocity = 1.0f;
+    // Sustain-pedal hold. While true the render loop freezes `time` so the
+    // exponential decay envelope stops advancing - the voice rings at its
+    // current amplitude until the pedal comes up. This is the drum analogue
+    // of TerrainSynth's "defer the release stage": drums have no note-off-
+    // triggered release in the first place, so we hold the decay itself.
+    bool sustainHeld = false;
     std::mt19937 rng{42};
 };
 
@@ -85,6 +93,10 @@ private:
     std::vector<DrumSound> sounds;
     static constexpr int MAX_DRUM_VOICES = 16;
     DrumVoice voices[MAX_DRUM_VOICES];
+    // Per-MIDI-channel sustain pedal state (CC#64). Mirrors the
+    // TerrainSynth::sustainPedal[16] design so the two synths behave
+    // consistently from the pedal's point of view. Index = channel - 1.
+    bool sustainPedal[16] = {};
 
     int findSoundForNote(int midiNote);
     float renderDrumSample(int soundIdx, DrumVoice& voice);

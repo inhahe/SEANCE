@@ -25,14 +25,29 @@ public:
         // Mute/solo: smooth ramp instead of an instant clear, so toggling
         // mute or solo during playback fades out over globalCrossfadeSec
         // and doesn't click.
+        //
+        // The mute fade ONLY applies to audio channels (0+1). Control
+        // signals on channels 2+ (Signal/Param outputs) pass through
+        // unchanged - muting a node silences its audio output, but its
+        // Signal pins keep emitting so downstream nodes that depend on
+        // those signals still work. Likewise we never early-return when
+        // the audio is fully off: the control channels still need their
+        // values to reach the downstream processors.
         bool muted = currentlyMuted();
         muteFader.setCrossfadeDuration(graph.globalCrossfadeSec);
         muteFader.setTarget(muted ? 0.0f : 1.0f);
         // Drop MIDI as soon as the user mutes - we don't want new note-ons
         // arriving during the fade-out tail. Audio fades out naturally.
         if (muted) midi.clear();
-        muteFader.process(buf);
-        if (muteFader.isFullyOff()) return;
+        // Run the fader on a wrapper view of just channels 0+1 so
+        // channels 2+ (control signals) are untouched.
+        int numAudioCh = std::min(2, buf.getNumChannels());
+        if (numAudioCh > 0) {
+            float* audioPtrs[2] = { buf.getWritePointer(0),
+                numAudioCh > 1 ? buf.getWritePointer(1) : nullptr };
+            juce::AudioBuffer<float> audioOnly(audioPtrs, numAudioCh, buf.getNumSamples());
+            muteFader.process(audioOnly);
+        }
 
         // Peak metering (#99): scan the post-mute buffer for this block's
         // peak and write it atomically. The UI reads these at 30 Hz to

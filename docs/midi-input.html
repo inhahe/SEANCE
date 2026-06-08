@@ -63,7 +63,7 @@
 <ul>
   <li><strong>Pitch bend</strong> — ±2 semitones, applies to all sustained notes in real time</li>
   <li><strong>Mod wheel (CC#1)</strong> — drives a default 6 Hz vibrato whose depth scales with the wheel position. Can be disabled per-synth by setting the <em>Vibrato</em> param to 0, freeing CC#1 to be MIDI-Learned elsewhere.</li>
-  <li><strong>Sustain pedal (CC#64)</strong> — holds notes through their release stage until the pedal comes up. Works on Piano, Waveform, Sampler, Drum Machine, and SoundFont synths.</li>
+  <li><strong>Sustain pedal (CC#64)</strong> — holds notes through their release stage until the pedal comes up. Works on Piano, Waveform, Sampler, Drum Machine, and SoundFont synths. On Drum Machine specifically, the drum has no release stage to defer, so the pedal instead <em>freezes the decay envelope</em> on every voice triggered while the pedal is held — the drum rings at its current amplitude until you lift the pedal, then resumes its natural decay.</li>
   <li><strong>Velocity</strong> — scales per-note volume. Each synth has a <em>Vel Sens</em> param (0..1) that controls how much velocity affects loudness. Set to 0 to ignore velocity entirely.</li>
 </ul>
 

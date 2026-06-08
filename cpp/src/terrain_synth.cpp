@@ -677,63 +677,115 @@ float TerrainSynthProcessor::EnvCurve::evaluate(float t) const {
 }
 
 void TerrainSynthProcessor::rebuildEnvCurves() {
-    if (!node.envAttackCurve.empty())
-        attackCurve.buildFromExpression(node.envAttackCurve);
-    else if (!node.envAttackPoints.empty())
-        attackCurve.buildFromPoints(node.envAttackPoints);
-    else
-        attackCurve.valid = false;
+    // Primary source: the unified node.ahdsrEnvelope SpectralCurves
+    // (per-segment Attack / Decay / Release, with three authoring
+    // modes: Equation / Drawn / Freehand). We bake each curve to a
+    // 256-sample lookup table by calling SpectralCurve::evaluate.
+    //
+    // Legacy projects that still carry the old envAttackCurve (raw
+    // expression strings) / envAttackPoints fields fall through to
+    // those paths below. The menu handler that opens the envelope
+    // editor mirrors changes back to the legacy fields so playback
+    // doesn't desync during the migration window.
+    auto bakeFromSpectral = [](const SpectralCurve& sc, EnvCurve& out) {
+        auto samples = sc.evaluate(ENV_TABLE_SIZE);
+        if ((int)samples.size() != ENV_TABLE_SIZE) {
+            out.valid = false;
+            return false;
+        }
+        out.table = std::move(samples);
+        out.valid = true;
+        return true;
+    };
 
-    if (!node.envDecayCurve.empty())
-        decayCurve.buildFromExpression(node.envDecayCurve);
-    else if (!node.envDecayPoints.empty())
-        decayCurve.buildFromPoints(node.envDecayPoints);
-    else
-        decayCurve.valid = false;
-
-    if (!node.envReleaseCurve.empty())
-        releaseCurve.buildFromExpression(node.envReleaseCurve);
-    else if (!node.envReleasePoints.empty())
-        releaseCurve.buildFromPoints(node.envReleasePoints);
-    else
-        releaseCurve.valid = false;
+    // Attack
+    if (!bakeFromSpectral(node.ahdsrEnvelope.attackCurve, attackCurve)) {
+        if (!node.envAttackCurve.empty())
+            attackCurve.buildFromExpression(node.envAttackCurve);
+        else if (!node.envAttackPoints.empty())
+            attackCurve.buildFromPoints(node.envAttackPoints);
+        else
+            attackCurve.valid = false;
+    }
+    // Decay
+    if (!bakeFromSpectral(node.ahdsrEnvelope.decayCurve, decayCurve)) {
+        if (!node.envDecayCurve.empty())
+            decayCurve.buildFromExpression(node.envDecayCurve);
+        else if (!node.envDecayPoints.empty())
+            decayCurve.buildFromPoints(node.envDecayPoints);
+        else
+            decayCurve.valid = false;
+    }
+    // Release
+    if (!bakeFromSpectral(node.ahdsrEnvelope.releaseCurve, releaseCurve)) {
+        if (!node.envReleaseCurve.empty())
+            releaseCurve.buildFromExpression(node.envReleaseCurve);
+        else if (!node.envReleasePoints.empty())
+            releaseCurve.buildFromPoints(node.envReleasePoints);
+        else
+            releaseCurve.valid = false;
+    }
 }
 
 // ==============================================================================
 // TerrainSynthProcessor::Voice
 // ==============================================================================
 
-float TerrainSynthProcessor::Voice::advanceEnv(float sr, float a, float d, float s, float r,
+float TerrainSynthProcessor::Voice::advanceEnv(float sr, float a, float h, float d, float s, float r,
                                                  const EnvCurve* aCurve, const EnvCurve* dCurve,
                                                  const EnvCurve* rCurve) {
     if (envStage == Off) return 0.0f;
     float dt = 1.0f / sr;
     envTime += dt;
+    // All shapes scale to envPeak so velocity sensitivity is honored
+    // uniformly across stages. envPeak is set by the caller at note-on
+    // from velSens * vel/127 + (1 - velSens).
+    const float peak = envPeak;
     switch (envStage) {
         case Attack: {
             float t = (float)(envTime / std::max(0.001, (double)a));
-            if (t >= 1.0f) { envLevel = 1.0f; envStage = Decay; envTime = 0; }
-            else envLevel = (aCurve && aCurve->valid) ? aCurve->evaluate(t) : t;
+            if (t >= 1.0f) {
+                envLevel = peak;
+                // Skip Hold entirely when its duration is zero - common
+                // case for classic ADSR patches.
+                envStage = (h > 0.0001f) ? Hold : Decay;
+                envTime = 0;
+            } else {
+                float shape = (aCurve && aCurve->valid) ? aCurve->evaluate(t) : t;
+                envLevel = shape * peak;
+            }
+            break;
+        }
+        case Hold: {
+            envLevel = peak;
+            if ((float)envTime >= h) {
+                envStage = Decay;
+                envTime = 0;
+            }
             break;
         }
         case Decay: {
             float t = (float)(envTime / std::max(0.001, (double)d));
-            if (t >= 1.0f) { envLevel = s; envStage = Sustain; envTime = 0; }
+            float sustainLevel = s * peak;
+            if (t >= 1.0f) { envLevel = sustainLevel; envStage = Sustain; envTime = 0; }
             else {
-                float shape = (dCurve && dCurve->valid) ? dCurve->evaluate(t) : t;
-                envLevel = 1.0f - shape * (1.0f - s); // 1.0 -> sustain
+                // dCurve goes 1 -> 0 across the segment; map onto
+                // peak -> sustainLevel so the curve shape is preserved
+                // when the user changes velocity.
+                float shape = (dCurve && dCurve->valid) ? dCurve->evaluate(t) : (1.0f - t);
+                envLevel = sustainLevel + (peak - sustainLevel) * shape;
             }
             break;
         }
         case Sustain:
-            envLevel = s;
+            envLevel = s * peak;
             break;
         case Release: {
             float t = (float)(envTime / std::max(0.001, (double)r));
             if (t >= 1.0f) { envLevel = 0; envStage = Off; active = false; }
             else {
-                float shape = (rCurve && rCurve->valid) ? rCurve->evaluate(t) : t;
-                envLevel = (1.0f - shape) * s; // sustain -> 0
+                float shape = (rCurve && rCurve->valid) ? rCurve->evaluate(t) : (1.0f - t);
+                envLevel = shape * (s * peak);
             }
             break;
         }
@@ -1314,7 +1366,18 @@ void TerrainSynthProcessor::updateGranularWeights() {
         float w = 1.0f;
         for (int d = 0; d < (int)gp.size() && (d + 1) < (int)tdims.size(); ++d) {
             const int   dimSize = std::max(1, tdims[d + 1]);
-            const float scale   = (dimSize <= 1) ? 1.0f : (float)(dimSize - 1);
+            // Single-cell axis: the lone cell covers the whole [0,1]
+            // range of the Position param. With no neighbour to
+            // interpolate to, weight is 1.0 regardless of pos[d] -
+            // matching Terrain::sample, which special-cases dim=1 by
+            // collapsing both interpolation corners onto index 0.
+            // Without this, a 1x1x...x1 wavetable comes out at half
+            // amplitude at the default Position=0.5, and goes completely
+            // silent the moment the user moves Position to 1.0 (because
+            // the cell's stored gp[d] is 0.0 and the hat function reads
+            // h = 1 - |1 - 0| = 0).
+            if (dimSize <= 1) continue;
+            const float scale   = (float)(dimSize - 1);
             // |pos - gp| measured in cell units. Hat width = 1 cell.
             const float diff    = std::abs(pos[d] - gp[d]) * scale;
             const float h       = std::max(0.0f, 1.0f - diff);
@@ -1426,13 +1489,18 @@ void TerrainSynthProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mi
                 // bent pitch rather than the nominal one.
                 voices[vi].frequency =
                     voices[vi].baseFrequency * pitchBendFactor[ch - 1];
-                // Apply the node's velocity-sensitivity setting: sens=0
-                // collapses everything to full volume, sens=1 is linear.
-                // Default 1.0 preserves prior behavior for older projects.
+                // Apply velocity sensitivity from the unified envelope
+                // (sens=0 -> always full volume, organ-like; sens=1 ->
+                // linear velocity scaling, piano-like). Fall back to the
+                // legacy "Vel Sens" param for any project that still
+                // carries it instead of the new ahdsrEnvelope field.
                 {
-                    float velSens = getParamByName(node, "Vel Sens", 1.0f);
+                    float velSens = node.ahdsrEnvelope.velocitySensitivity;
+                    velSens = getParamByName(node, "Vel Sens", velSens);
                     float raw = msg.getVelocity() / 127.0f;
                     voices[vi].velocity = 1.0f - velSens * (1.0f - raw);
+                    // Capture peak amplitude for the envelope shape.
+                    voices[vi].envPeak = 1.0f - velSens * (1.0f - raw);
                 }
                 voices[vi].phase = 0;
                 voices[vi].startBeat = transport.positionBeats();
@@ -1472,6 +1540,28 @@ void TerrainSynthProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mi
             // render loop to read.
             int ch = juce::jlimit(1, 16, msg.getChannel());
             modWheel[ch - 1] = (float)msg.getControllerValue() / 127.0f;
+        } else if (msg.isChannelPressure()) {
+            // Channel aftertouch: hardware keyboards send this when the
+            // player presses harder on a key already held down. We store
+            // per-channel and let the render loop multiply final volume
+            // by (1 + sensitivity * aftertouch). The "Aftertouch" signal
+            // input pin, when wired, overrides this with the signal's
+            // sample value instead.
+            int ch = juce::jlimit(1, 16, msg.getChannel());
+            channelAftertouch[ch - 1] = (float)msg.getChannelPressureValue() / 127.0f;
+        } else if (msg.isAftertouch()) {
+            // Polyphonic aftertouch (per-note pressure). Store it on
+            // every voice that currently holds the same note number on
+            // the same channel. Treated as an additional layer on top
+            // of channel aftertouch.
+            int ch = juce::jlimit(1, 16, msg.getChannel());
+            float v = (float)msg.getAfterTouchValue() / 127.0f;
+            for (int i = 0; i < MAX_VOICES; ++i) {
+                if (voices[i].active && voices[i].midiChannel == ch
+                    && voices[i].noteNumber == msg.getNoteNumber()) {
+                    voices[i].polyAftertouch = v;
+                }
+            }
         } else if (msg.isController() && msg.getControllerNumber() == 64) {
             // Sustain pedal (CC#64): when released, any voices that had
             // their release deferred (sustainHeld=true) are sent into their
@@ -1506,6 +1596,41 @@ void TerrainSynthProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mi
     // Detect audio-rate signal inputs (channels 2+ on the buffer)
     int numSignalInputs = std::max(0, numChannels - 2);
     bool hasSignalInputs = numSignalInputs > 0;
+
+    // Find the "Aftertouch" input pin among the node's Signal inputs
+    // and read its current block-mean value. The signal inputs map to
+    // audio buffer channels starting at channel 2, in the order they
+    // appear in node.pinsIn (filtered to Signal kind). When unwired
+    // (no node provides this channel) the channel stays at silence
+    // and we fall back to MIDI channel-pressure. We use the block
+    // mean rather than per-sample so a slow LFO drives a smooth
+    // aftertouch rather than carrying its audio shape into the
+    // amplitude swell.
+    {
+        aftertouchOverride = -1.0f;
+        int sigIdx = 0;
+        int targetSigIdx = -1;
+        for (auto& p : node.pinsIn) {
+            if (p.kind != PinKind::Signal) continue;
+            if (p.name == "Aftertouch") { targetSigIdx = sigIdx; break; }
+            ++sigIdx;
+        }
+        if (targetSigIdx >= 0) {
+            int chan = 2 + targetSigIdx;
+            if (chan < numChannels) {
+                const float* data = buf.getReadPointer(chan);
+                double acc = 0.0;
+                for (int s = 0; s < numSamples; ++s) acc += std::abs(data[s]);
+                float mean = (numSamples > 0) ? (float)(acc / numSamples) : 0.0f;
+                // Only treat the pin as "wired" when the channel
+                // actually carries non-zero data. This keeps the
+                // MIDI-pressure fallback live in the common case of a
+                // dangling pin (no cable plugged in).
+                if (mean > 1e-6f)
+                    aftertouchOverride = juce::jlimit(0.0f, 1.0f, mean);
+            }
+        }
+    }
 
     // Granular layer: refresh the per-frame morph weights from the current
     // Position so the per-sample voice loop can mix in Σ wGran[i] *
@@ -1687,7 +1812,14 @@ void TerrainSynthProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mi
         for (int vi = 0; vi < MAX_VOICES; ++vi) {
             if (!voices[vi].active) continue;
             auto& v = voices[vi];
-            float env = v.advanceEnv((float)sampleRate, attack, decay, sustain, release,
+            // Read AHDSR values: prefer node.ahdsrEnvelope (the new
+            // authoritative field), but the existing per-block local
+            // copies of attack/decay/sustain/release - read once from
+            // params[0..3] - are kept as fallback / migration path so
+            // old projects still play. holdMs is new and lives only on
+            // the unified envelope.
+            float hold = node.ahdsrEnvelope.holdMs * 0.001f;
+            float env = v.advanceEnv((float)sampleRate, attack, hold, decay, sustain, release,
                                       &attackCurve, &decayCurve, &releaseCurve);
             if (!v.active) continue;
 
@@ -1788,8 +1920,25 @@ void TerrainSynthProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mi
                         // played note tracks MIDI - identical to the cycle
                         // layer's effFreq / 440 mapping but using the
                         // frame's embedded pitch as the reference.
-                        const float ratio = effFreq /
-                            std::max(1e-3f, gf.embeddedPitchHz);
+                        //
+                        // Sample-rate correction: source PCM is sampled at
+                        // gf.sourceSampleRate but the OLA advances 1 output
+                        // sample per device tick (1/sampleRate seconds).
+                        // For the source to play "at native pitch" when
+                        // effFreq == embeddedPitchHz we have to read
+                        // sourceSampleRate/sampleRate source samples per
+                        // device sample, otherwise a 48k source on a 44.1k
+                        // device drifts ~8% flat (audible as the wrong
+                        // octave when the rate ratio is large, e.g. a 192k
+                        // song-render played on a 44.1k device pitches
+                        // every note 4x lower). Default to 1.0 if the
+                        // frame didn't record its source rate (legacy
+                        // frames; pre-0.9 file format).
+                        const float srRatio = (gf.sourceSampleRate > 0.0)
+                            ? (float)(gf.sourceSampleRate / sampleRate)
+                            : 1.0f;
+                        const float ratio = (effFreq /
+                            std::max(1e-3f, gf.embeddedPitchHz)) * srRatio;
                         const float invN  = 1.0f / (float)grainLen;
                         const int   maxStart = std::max(0, srcLen - grainLen);
 
@@ -1900,7 +2049,16 @@ void TerrainSynthProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mi
                 }
             }
 
-            totalSample += sample * env * v.velocity;
+            // Aftertouch volume swell. Channel aftertouch + poly
+            // aftertouch combine (capped at 1) so per-note pressure
+            // adds on top of the channel-wide value. When the synth's
+            // "Aftertouch" input pin is wired, aftertouchOverride
+            // replaces channel aftertouch with the wired signal.
+            float chanAT = (aftertouchOverride >= 0.0f) ? aftertouchOverride
+                                                       : channelAftertouch[v.midiChannel - 1];
+            float at = juce::jlimit(0.0f, 1.0f, chanAT + v.polyAftertouch);
+            float atMul = 1.0f + node.aftertouchSensitivity * at;
+            totalSample += sample * env * v.velocity * atMul;
             activeVoiceCount++;
         }
 

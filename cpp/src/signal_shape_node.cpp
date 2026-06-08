@@ -20,6 +20,26 @@ void SignalShapeProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mid
     buf.clear();
     int numSamples = buf.getNumSamples();
 
+    // XY Pad mode: this is the same NodeType but a different node, identified
+    // by the "__xypad__" script tag. It has three Signal output pins
+    // (X Out, Y Out, Z Out) and three user-driven params (X, Y, Z, all 0..1)
+    // that the XYPadComponent writes from the user's drag position
+    // (xy_pad.cpp:81). Each output is a per-block constant equal to its
+    // param value. Channel mapping per graph_processor.cpp:844-854:
+    // signal-out slot N -> channel 2+N.
+    if (node.script == "__xypad__") {
+        int numCh = buf.getNumChannels();
+        const int kNumOuts = 3;
+        for (int i = 0; i < kNumOuts; ++i) {
+            int ch = 2 + i;
+            if (ch >= numCh) break;
+            float v = juce::jlimit(0.0f, 1.0f, getParam(i, 0.5f));
+            auto* out = buf.getWritePointer(ch);
+            for (int s = 0; s < numSamples; ++s) out[s] = v;
+        }
+        return;
+    }
+
     // Params:
     // 0 = Mode (0=LFO, 1=Envelope)
     // 1 = Rate (Hz for LFO, duration in beats for Envelope)
@@ -91,11 +111,21 @@ void SignalShapeProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mid
     if (!node.params.empty() && node.params.size() > 6)
         node.params[6].value = lastOutputValue;
 
-    // Also write to audio channel 0 for audio-rate Signal pin output
-    if (buf.getNumChannels() > 0) {
+    // Write to the control-rate output channels for both pins. Per the graph
+    // processor convention (graph_processor.cpp:844-854), Signal/Param OUT
+    // pins map to channels starting at 2 in pin-declaration order among
+    // control pins. SignalShape declares pinsOut = [Param Out, Signal Out],
+    // so Param Out -> channel 2 and Signal Out -> channel 3. Both pins carry
+    // the same computed signal value (they exist as separate pins so the
+    // user can pick a label matching how they're using the node).
+    int numCh = buf.getNumChannels();
+    constexpr int kParamOutCh = 2;
+    constexpr int kSignalOutCh = 3;
+    if (numCh > kParamOutCh) {
         // Fill the entire buffer with the signal (per-sample for fidelity)
         // Re-evaluate per sample for smooth output
-        auto* out = buf.getWritePointer(0);
+        auto* paramOut = buf.getWritePointer(kParamOutCh);
+        auto* signalOut = (numCh > kSignalOutCh) ? buf.getWritePointer(kSignalOutCh) : nullptr;
         float ph = phase;
         for (int i = 0; i < numSamples; ++i) {
             float val = 0;
@@ -116,7 +146,9 @@ void SignalShapeProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mid
                 val = wavetable.sample(envPhase, 1.0f, (float)sampleRate);
             }
             // Map to -1..1 output range (Signal pins use -1..1)
-            out[i] = juce::jlimit(-1.0f, 1.0f, val);
+            float out = juce::jlimit(-1.0f, 1.0f, val);
+            paramOut[i] = out;
+            if (signalOut) signalOut[i] = out;
         }
     } // "Output" param
 }

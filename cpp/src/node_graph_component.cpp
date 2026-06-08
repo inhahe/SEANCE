@@ -14,6 +14,8 @@
 #include "drum_synth.h"
 #include "multi_sampler.h"
 #include "terrain_synth.h" // classifySynthSource for Synth Mode picker
+#include "adsr_envelope_component.h"
+#include "envelope_presets.h"
 #include <cmath>
 
 namespace SoundShop {
@@ -1268,6 +1270,10 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
     sigMenu.addSeparator();
     sigMenu.addItem(133, "XY Pad");
     sigMenu.addItem(134, "Spectrum Tap");
+    sigMenu.addSeparator();
+    sigMenu.addItem(140, "Spectrum Analyzer");
+    sigMenu.addItem(141, "Oscilloscope");
+    sigMenu.addItem(142, "Spectrogram");
     menu.addSubMenu("Signal Shape", sigMenu);
 
     // Plugin instruments/effects
@@ -1457,6 +1463,26 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
                 {Pin{0, "Audio Out", PinKind::Audio, false}},
                 {p.x, p.y});
             n.script = "__spectrumtap__";
+        } else if (result == 140 || result == 141 || result == 142) {
+            // Audio analyzer nodes: pure visualizers that pass audio
+            // through and display the signal. All three are Effect nodes
+            // with Audio In + Audio Out; the script tag selects which
+            // editor opens on double-click.
+            const char* nodeName    = (result == 140) ? "Spectrum Analyzer"
+                                    : (result == 141) ? "Oscilloscope"
+                                                      : "Spectrogram";
+            const char* scriptTag   = (result == 140) ? "__spectrumanalyzer__"
+                                    : (result == 141) ? "__oscilloscope__"
+                                                      : "__spectrogram__";
+            auto& n = graph.addNode(nodeName, NodeType::Effect,
+                {Pin{0, "Audio In", PinKind::Audio, true}},
+                {Pin{0, "Audio Out", PinKind::Audio, false}},
+                {p.x, p.y});
+            n.script = scriptTag;
+            if (result == 140)
+                n.params.push_back({"Bins",   64.0f,   16.0f, 512.0f});
+            else if (result == 141)
+                n.params.push_back({"Window", 1024.0f, 256.0f, 4096.0f});
         } else if (result >= 130 && result <= 132) {
             // Signal Shape nodes
             auto makeSignalNode = [&](const std::string& name, const std::string& expr,
@@ -2062,15 +2088,22 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
                 break;
             }
             case 219: {
-                // Trigger node - MIDI in, MIDI out + Signal out.
+                // Trigger node - MIDI in + Audio in, MIDI out + Signal out.
                 // Uses the Effect node type but has two distinct output pins
                 // (one MIDI, one Signal) rather than the usual MIDI-only or
                 // audio-only effect layout.
+                //
+                // The Audio In pin feeds the AudioThreshold firing mode:
+                // TriggerProcessor::processBlock scans audio buffer channel 0
+                // for level crossings against the rule's thresholdDb (see
+                // trigger_node.cpp:431-456). Audio is optional - rules using
+                // NoteOn / NoteOff don't need anything wired here.
                 auto& n = graph.addNode("Trigger", NodeType::Effect,
                     {}, {}, {p.x, p.y});
                 n.pinsIn.clear();
                 n.pinsOut.clear();
                 n.pinsIn.push_back({graph.getNextId(),  "MIDI In",    PinKind::Midi,   true});
+                n.pinsIn.push_back({graph.getNextId(),  "Audio In",   PinKind::Audio,  true});
                 n.pinsOut.push_back({graph.getNextId(), "MIDI Out",   PinKind::Midi,   false});
                 n.pinsOut.push_back({graph.getNextId(), "Signal Out", PinKind::Signal, false});
                 // Seed with a sensible default doc so the node does something
@@ -2136,6 +2169,26 @@ void NodeGraphComponent::showNodeMenu(Node& node) {
         if (node.pluginIndex >= 0)
             menu.addItem(6, "Plugin Info...");
     }
+    // Envelope editor on tonal / note-triggered synths. The AHDSR
+    // envelope on Node is universal across all synth types (built-in,
+    // terrain, FM, additive, PD, particle, drum-pitched), so we offer
+    // the entry-point on any synth-bearing node. We exclude raw plugin-
+    // hosting Instruments (those have their own envelope inside the
+    // plugin) by checking pluginIndex < 0.
+    bool isTonalSynth = false;
+    if (node.type == NodeType::Instrument && node.pluginIndex < 0) isTonalSynth = true;
+    if (node.type == NodeType::TerrainSynth) isTonalSynth = true;
+    {
+        auto isScript = [&](const char* tag) {
+            return node.script.rfind(tag, 0) == 0;
+        };
+        if (isScript("__fmsynth__") || isScript("__additivesynth__") ||
+            isScript("__pdsynth__") || isScript("__particlesynth__") ||
+            isScript("__drumsynth__"))
+            isTonalSynth = true;
+    }
+    if (isTonalSynth)
+        menu.addItem(180, "Envelope (AHDSR)...");
     // Mute / Solo
     menu.addItem(160, node.muted ? "Unmute" : "Mute", true, node.muted);
     menu.addItem(161, node.soloed ? "Unsolo" : "Solo", true, node.soloed);
@@ -2246,6 +2299,51 @@ void NodeGraphComponent::showNodeMenu(Node& node) {
             // "Record Here" toggle (#77)
             node->recordArmed = !node->recordArmed;
             graph.dirty = true;
+        } else if (result == 180) {
+            // Open the shared AHDSR envelope editor on this node.
+            // The dialog hosts the reusable AHDSREnvelopeComponent
+            // editing node->ahdsrEnvelope by reference; on every
+            // change we mark the graph dirty and snapshot for undo.
+            int captured = nodeId;
+            auto* content = new AHDSREnvelopeComponent(node->ahdsrEnvelope,
+                [this, captured]() {
+                    if (auto* n = graph.findNode(captured)) {
+                        graph.dirty = true;
+                        // Sync the legacy expression fields so any code
+                        // still reading them sees the new shape until
+                        // the migration is complete.
+                        n->envAttackCurve  = n->ahdsrEnvelope.attackCurve.expression;
+                        n->envDecayCurve   = n->ahdsrEnvelope.decayCurve.expression;
+                        n->envReleaseCurve = n->ahdsrEnvelope.releaseCurve.expression;
+                        // Sync the first four params (A/D/S/R in seconds /
+                        // 0..1 level) so the existing audio-thread param
+                        // reader still produces a usable envelope until
+                        // the synth processor is fully migrated.
+                        auto setParam = [&](int idx, float v) {
+                            if (idx < (int)n->params.size()) n->params[idx].value = v;
+                        };
+                        setParam(0, n->ahdsrEnvelope.attackMs  * 0.001f);
+                        setParam(1, n->ahdsrEnvelope.decayMs   * 0.001f);
+                        setParam(2, n->ahdsrEnvelope.sustain);
+                        setParam(3, n->ahdsrEnvelope.releaseMs * 0.001f);
+                    }
+                });
+            content->setSize(700, 420);
+            juce::DialogWindow::LaunchOptions opt;
+            opt.dialogTitle = "Envelope - " + juce::String(node->name);
+            opt.content.setOwned(content);
+            opt.escapeKeyTriggersCloseButton = true;
+            opt.useNativeTitleBar = true;
+            opt.resizable = true;
+            opt.componentToCentreAround = this;
+            opt.launchAsync();
+            // Snapshot is committed when the dialog closes via the
+            // surrounding "Edit envelope" undo step; the per-keystroke
+            // onChanged calls only mark dirty so undo doesn't fragment
+            // into one step per slider tick. We commit a single
+            // snapshot here so an undo right after closing the dialog
+            // reverts the whole edit.
+            graph.commitSnapshot("Edit envelope");
         } else if (result == 170) {
             // Convolution auto-merge (#33): convolve this node's IR with
             // the downstream convolution's IR, put the result in this node,
@@ -2386,12 +2484,18 @@ void NodeGraphComponent::deleteNodeAndDescendants(int rootId) {
     }
 
     // Gather all pin IDs across the victim set so we can sweep matching
-    // links in one pass instead of N passes.
+    // links in one pass instead of N passes. Also remember whether any
+    // victim was a timeline node — we use that below to decide whether to
+    // reset the explicit song-length override.
     std::set<int> pinIds;
+    bool anyTimelineDeleted = false;
     for (int id : victims) {
         if (auto* n = graph.findNode(id)) {
             for (auto& p : n->pinsIn)  pinIds.insert(p.id);
             for (auto& p : n->pinsOut) pinIds.insert(p.id);
+            if (n->type == NodeType::AudioTimeline ||
+                n->type == NodeType::MidiTimeline)
+                anyTimelineDeleted = true;
         }
     }
     graph.links.erase(std::remove_if(graph.links.begin(), graph.links.end(),
@@ -2419,6 +2523,13 @@ void NodeGraphComponent::deleteNodeAndDescendants(int rootId) {
 
     // Clear stale selections if the user had a victim selected.
     if (victims.count(selectedNodeId)) selectedNodeId = -1;
+
+    // If any deleted node was a timeline, revert songLengthBeats to "auto"
+    // (0) so the effective length recomputes from the remaining timelines.
+    // An explicit override that referenced a now-deleted track would
+    // otherwise keep the song playing past the actual content.
+    if (anyTimelineDeleted && graph.songLengthBeats > 0)
+        graph.songLengthBeats = 0;
 
     graph.dirty = true;
     graph.commitSnapshot(victims.size() > 1

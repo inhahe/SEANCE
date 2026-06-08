@@ -171,6 +171,21 @@ public:
             s.setRange(minV, maxV, step);
             s.setTooltip(tip);
             lab.setTooltip(tip);
+            // Reverse the LookAndFeel_V4 default fill so the BRIGHT segment
+            // sits to the RIGHT of the thumb (unset / remaining range) and
+            // the DIM segment sits to the LEFT (already-set value). This is
+            // backwards from typical fill-from-zero sliders, but the user
+            // wants it that way for these three (grain length, crossfade,
+            // embedded pitch) because the bright bar reads as "headroom
+            // left" instead of "amount applied". Swap by querying the
+            // current trackColour / backgroundColour and writing them in
+            // the opposite slots - that way any future theme tweak still
+            // round-trips through this swap without us hardcoding hex
+            // values that would drift from the rest of the UI.
+            const auto bright = s.findColour(juce::Slider::trackColourId);
+            const auto dim    = s.findColour(juce::Slider::backgroundColourId);
+            s.setColour(juce::Slider::trackColourId,      dim);
+            s.setColour(juce::Slider::backgroundColourId, bright);
         };
 
         setupSlider(grainLengthSlider, grainLengthLabel,

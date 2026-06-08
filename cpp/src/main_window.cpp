@@ -10,6 +10,7 @@
 #include "midi_device_wizard.h"
 #include "xy_pad.h"
 #include "spectrum_tap.h"
+#include "analyzer_nodes.h"
 #include "convolution_processor.h"
 #include "convolution_editor.h"
 #include "sampler_editor.h"
@@ -1200,7 +1201,7 @@ void MainContentComponent::menuItemSelected(int menuItemID, int) {
             opts.useNativeTitleBar = false;
             opts.resizable = true;
             opts.componentToCentreAround = this;
-            SoundShop::launchToolDialog(opts);
+            SoundShop::launchNonModalToolDialog(opts);
             break;
         }
         case 300: openHelpDoc("index.html"); break;
@@ -1912,9 +1913,13 @@ void MainContentComponent::showPluginUI(int nodeId) {
         return;
     }
 
-    // Spectrum Tap: open the frequency bin editor
-    if (node && node->script == "__spectrumtap__") {
-        auto* comp = new SpectrumTapComponent(graph, node->id);
+    // Spectrum Tap: open the frequency bin editor. Match by prefix since the
+    // script may carry per-bin custom response curves after the tag.
+    if (node && node->script.rfind("__spectrumtap__", 0) == 0) {
+        auto* comp = new SpectrumTapComponent(graph, node->id, [this]() {
+            audioEngine.getGraphProcessor().requestRebuild();
+            graphComponent->repaint();
+        });
         juce::DialogWindow::LaunchOptions opts;
         opts.content.setOwned(comp);
         opts.dialogTitle = "Spectrum Tap: " + juce::String(node->name);
@@ -1924,6 +1929,36 @@ void MainContentComponent::showPluginUI(int nodeId) {
         opts.resizable = true;
         opts.componentToCentreAround = this;
         SoundShop::launchToolDialog(opts);
+        return;
+    }
+
+    // Audio analyzer nodes (Spectrum Analyzer, Oscilloscope, Spectrogram):
+    // open the matching live visualizer in a non-modal floating window so
+    // the user can keep the song playing while watching the display.
+    if (node && (node->script == "__spectrumanalyzer__" ||
+                 node->script == "__oscilloscope__" ||
+                 node->script == "__spectrogram__")) {
+        juce::Component* viz = nullptr;
+        juce::String title;
+        if (node->script == "__spectrumanalyzer__") {
+            viz = new SpectrumAnalyzerComponent(graph, node->id);
+            title = "Spectrum Analyzer: " + juce::String(node->name);
+        } else if (node->script == "__oscilloscope__") {
+            viz = new OscilloscopeComponent(graph, node->id);
+            title = "Oscilloscope: " + juce::String(node->name);
+        } else {
+            viz = new SpectrogramComponent(graph, node->id);
+            title = "Spectrogram: " + juce::String(node->name);
+        }
+        juce::DialogWindow::LaunchOptions opts;
+        opts.content.setOwned(viz);
+        opts.dialogTitle = title;
+        opts.dialogBackgroundColour = juce::Colour(18, 20, 28);
+        opts.escapeKeyTriggersCloseButton = true;
+        opts.useNativeTitleBar = false;
+        opts.resizable = true;
+        opts.componentToCentreAround = this;
+        SoundShop::launchNonModalToolDialog(opts);
         return;
     }
 

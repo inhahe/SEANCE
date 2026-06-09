@@ -98,20 +98,14 @@ AHDSREnvelopeComponent::AHDSREnvelopeComponent(AHDSREnvelope& e,
 
     // Bottom buttons.
     addAndMakeVisible(editAttackBtn);
-    addAndMakeVisible(editHoldBtn);
     addAndMakeVisible(editDecayBtn);
     addAndMakeVisible(editReleaseBtn);
     editAttackBtn .setTooltip("Edit the shape of the attack ramp (linear / exponential / freehand) using the same three-mode curve editor used elsewhere in the app.");
-    editHoldBtn   .setTooltip("Edit the shape of the hold plateau. The hold curve is a multiplier on the peak level (default flat = stays at peak). Shape it into a swell or dip during the hold; it always returns to peak before the decay starts. Only audible when Hold time is above 0.");
     editDecayBtn  .setTooltip("Edit the shape of the decay ramp.");
     editReleaseBtn.setTooltip("Edit the shape of the release tail.");
     editAttackBtn .onClick = [this]() {
         openCurveEditor("Attack Curve", env.attackCurve,
                         juce::Colour(120, 200, 120));
-    };
-    editHoldBtn.onClick = [this]() {
-        openCurveEditor("Hold Curve", env.holdCurve,
-                        juce::Colour(120, 200, 200));
     };
     editDecayBtn.onClick = [this]() {
         openCurveEditor("Decay Curve", env.decayCurve,
@@ -637,11 +631,10 @@ void AHDSREnvelopeComponent::resized() {
 
     // Preview + edit buttons.
     auto btnRow = r.removeFromBottom(26);
-    int bw = btnRow.getWidth() / 4;
+    int bw = btnRow.getWidth() / 3;
     editAttackBtn .setBounds(btnRow.withX(btnRow.getX() + 0 * bw).withWidth(bw - 4));
-    editHoldBtn   .setBounds(btnRow.withX(btnRow.getX() + 1 * bw).withWidth(bw - 4));
-    editDecayBtn  .setBounds(btnRow.withX(btnRow.getX() + 2 * bw).withWidth(bw - 4));
-    editReleaseBtn.setBounds(btnRow.withX(btnRow.getX() + 3 * bw).withWidth(bw - 4));
+    editDecayBtn  .setBounds(btnRow.withX(btnRow.getX() + 1 * bw).withWidth(bw - 4));
+    editReleaseBtn.setBounds(btnRow.withX(btnRow.getX() + 2 * bw).withWidth(bw - 4));
     r.removeFromBottom(4);
     previewBounds = r;
 }
@@ -666,7 +659,6 @@ void AHDSREnvelopeComponent::paintPreview(juce::Graphics& g,
     // proportionally to their durations, capped so a tiny / huge value
     // doesn't drown the preview.
     auto A = env.attackCurve.evaluate(64);
-    auto Hc = env.holdCurve.evaluate(64);
     auto D = env.decayCurve.evaluate(64);
     auto R = env.releaseCurve.evaluate(64);
 
@@ -702,14 +694,7 @@ void AHDSREnvelopeComponent::paintPreview(juce::Graphics& g,
         path.lineTo((float)(x + t * (xA - x)), (float)yAt(A[i]));
     }
     path.lineTo((float)xA, (float)yAt(1));
-    // Hold plateau, shaped by the hold curve (a 0..1 multiplier on peak).
-    // Only drawn as a shaped segment when it has visible width.
-    if (xH > xA && !Hc.empty()) {
-        for (int i = 0; i < (int)Hc.size(); ++i) {
-            float t = (float)i / (float)(Hc.size() - 1);
-            path.lineTo((float)(xA + t * (xH - xA)), (float)yAt(Hc[i]));
-        }
-    }
+    // Hold plateau stays flat at peak.
     path.lineTo((float)xH, (float)yAt(1));
     for (int i = 0; i < (int)D.size(); ++i) {
         float t = (float)i / (float)(D.size() - 1);

@@ -438,20 +438,18 @@ private:
     // drain's note-off.
     void releaseNote(int noteNumber, int channel);
 
-    // Envelope curve evaluation cache
-    struct EnvCurve {
-        std::vector<float> table; // 256 samples, maps t(0..1) to amplitude(0..1)
-        bool valid = false;
-        void buildFromExpression(const std::string& expr);
-        void buildFromPoints(const std::vector<std::pair<float, float>>& points);
-        float evaluate(float t) const; // t in 0..1
-    };
-    EnvCurve attackCurve, holdCurve, decayCurve, releaseCurve;
-    void rebuildEnvCurves();
+    // Shared AHDSR amplitude envelope. The baked curve tables live on the
+    // processor (one set per node, sampled by every voice); each Voice owns
+    // a lightweight AHDSREnvelopeRuntime for playback. `effectiveEnv` is a
+    // per-block copy of node.ahdsrEnvelope with the legacy "Vel Sens" param
+    // folded into velocitySensitivity for backward compatibility.
+    AHDSRCurveTables envTables;
+    AHDSREnvelope    effectiveEnv;
+    void rebuildEnvCurves();   // refreshes effectiveEnv + bakes envTables
 
     // Voices
     struct Voice {
-        bool active = false;
+        // "Active" (slot in use) is derived from env.isActive().
         int noteNumber = -1;
         int midiChannel = 1;       // 1..16, used for per-channel bend / mod wheel
         float baseFrequency = 440.0f; // frequency before bend, set at note-on
@@ -462,22 +460,12 @@ private:
         // was down, so release is deferred until the pedal comes back up.
         bool sustainHeld = false;
 
-        // AHDSR (Attack, Hold, Decay, Sustain, Release). The Hold stage
-        // sits between Attack and Decay and stays at peak for
-        // node.ahdsrEnvelope.holdMs - useful for percussive / brassy
-        // patches where the note should "ring out" at full volume
-        // before fading. holdMs = 0 (the default) skips Hold and
-        // transitions Attack -> Decay directly.
-        enum Stage { Off, Attack, Hold, Decay, Sustain, Release };
-        Stage envStage = Off;
-        float envLevel = 0.0f;
-        double envTime = 0.0;
-        // Velocity-scaled peak amplitude. Captured at note-on from
-        // (1 - velSens) + velSens * (vel/127). The envelope shape goes
-        // from 0 to envPeak across Attack instead of 0->1, then Decay
-        // lands at envPeak * sustain. Velocity sensitivity comes from
-        // node.ahdsrEnvelope.velocitySensitivity.
-        float envPeak = 1.0f;
+        // Shared per-voice amplitude envelope runtime (Attack, Hold, Decay,
+        // Sustain, Release). Driven by the processor's effectiveEnv +
+        // envTables. Velocity is applied inside the runtime via the
+        // envelope's velocitySensitivity, so the render loop must NOT apply
+        // a separate velocity multiply.
+        AHDSREnvelopeRuntime env;
 
         // Per-note (polyphonic) aftertouch value 0..1. Set by
         // poly-pressure MIDI events; layered on top of the per-channel
@@ -519,12 +507,26 @@ private:
         std::vector<float> auditionPos;
         std::vector<float> auditionWeights;
 
-        float advanceEnv(float sr, float a, float h, float d, float s, float r,
-                         const EnvCurve* aCurve, const EnvCurve* hCurve,
-                         const EnvCurve* dCurve, const EnvCurve* rCurve);
+        // Direct unplaced-frame audition. When the wavetable editor's Play
+        // button auditions a granular library frame that isn't placed into
+        // the grid/scatter, the note-on carries the frame data here. The
+        // voice then renders ONLY this frame (full weight, its own playhead),
+        // bypassing the cycle terrain and the placed-frame morph entirely, so
+        // a freshly-captured library-only frame is audible without first
+        // dropping it into a cell. Null on every ordinary note. Reset on
+        // voice (re)allocation alongside hasAuditionPos.
+        std::shared_ptr<Node::AuditionGranularFrame> auditionFrame;
+        GranStream                                    auditionFrameStream;
+
     };
     static constexpr int MAX_VOICES = 16;
     Voice voices[MAX_VOICES];
+
+    // Reusable per-block scratch for audition voices diverted to the
+    // AudioEngine audition-monitor bus (editor "Play" on an unrouted synth
+    // node - see Node::reachesOutput). Sized to the block in processBlock;
+    // never read across blocks. Avoids a per-block heap allocation.
+    std::vector<float> auditionScratch;
 
     // Per-channel pitch bend factor (1.0 = no bend, 2^(semis/12) otherwise).
     // Default bend range is +/-2 semitones - configurable per-synth later.

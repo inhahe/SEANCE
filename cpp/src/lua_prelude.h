@@ -20,6 +20,19 @@ inline constexpr const char* kSoundShopLuaPrelude =
     "function square(p) p=p-math.floor(p) if p<0.5 then return 1 else return -1 end end\n"
     "function triangle(p) p=p-math.floor(p) if p<0.5 then return 4*p-1 else return 3-4*p end end\n"
     "function noise(x) return math.random() end\n"
+    // Range converters + unipolar aliases. Control signals on the wire are
+    // unipolar 0..1, but sin/cos/tan return bipolar -1..1, so a bare sin()
+    // clips its negative half. unipolar(x) maps -1..1 -> 0..1 (wrap a whole
+    // bipolar expression in it); bipolar(x) maps 0..1 -> -1..1. usin/ucos/utan
+    // and usaw/usquare/utriangle are the unipolar shorthands.
+    "function unipolar(x) return x*0.5+0.5 end\n"
+    "function bipolar(x) return x*2-1 end\n"
+    "function usin(x) return math.sin(x)*0.5+0.5 end\n"
+    "function ucos(x) return math.cos(x)*0.5+0.5 end\n"
+    "function utan(x) return math.tan(x)*0.5+0.5 end\n"
+    "function usaw(p) return saw(p)*0.5+0.5 end\n"
+    "function usquare(p) p=p-math.floor(p) if p<0.5 then return 1 else return 0 end end\n"
+    "function utriangle(p) return triangle(p)*0.5+0.5 end\n"
     "out_pin=0 out=0\n";
 
 } // namespace SoundShop

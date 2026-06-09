@@ -428,9 +428,16 @@ MainContentComponent::MainContentComponent() {
         // Auto-create MidiInput nodes for all connected hardware devices
         // so a fresh install sees the user's controller immediately.
         auto devices = juce::MidiInput::getAvailableDevices();
-        Node* defaultTrack = nullptr;
+        // Resolve the default track's MIDI input pin ID up front - pin IDs are
+        // stable across addNode() reallocations, so we never hold a Node*/Pin*
+        // across the addNode() calls below (dangling-reference anti-pattern).
+        int defaultTrackMidiPinId = -1;
         for (auto& n : graph.nodes)
-            if (n.type == NodeType::MidiTimeline) { defaultTrack = &n; break; }
+            if (n.type == NodeType::MidiTimeline) {
+                for (auto& pin : n.pinsIn)
+                    if (pin.kind == PinKind::Midi) { defaultTrackMidiPinId = pin.id; break; }
+                break;
+            }
         float yPos = 200;
         for (auto& dev : devices) {
             if (isVirtualOrControlPort(dev.name)) continue;
@@ -442,12 +449,9 @@ MainContentComponent::MainContentComponent() {
             auto& n = graph.addNode(dev.name.toStdString(), NodeType::MidiInput,
                 {}, {Pin{0, "MIDI Out", PinKind::Midi, false}}, {80, yPos});
             n.midiInputSourceId = dev.identifier.toStdString();
-            if (defaultTrack && !n.pinsOut.empty())
-                for (auto& pin : defaultTrack->pinsIn)
-                    if (pin.kind == PinKind::Midi) {
-                        graph.addLink(n.pinsOut[0].id, pin.id);
-                        break;
-                    }
+            int outPinId = n.pinsOut.empty() ? -1 : n.pinsOut[0].id;
+            if (defaultTrackMidiPinId >= 0 && outPinId >= 0)
+                graph.addLink(outPinId, defaultTrackMidiPinId);
             yPos += 50;
         }
     } else {
@@ -2691,10 +2695,17 @@ void MainContentComponent::onRecord() {
 void MainContentComponent::newProject() {
     editorPanels.clear();
     editorPanelHeight = 250;
-    graph.nodes.clear();
-    graph.links.clear();
-    graph.openEditors.clear();
-    graph.setupDefaultGraph();
+    // Clearing + rebuilding the graph is a structural mutation the audio
+    // callback can race against (it iterates graph.nodes/links under a
+    // try-lock). Pair the lock here, matching the project-load path. See the
+    // mutationLock comment in node_graph.h.
+    {
+        std::lock_guard<std::mutex> graphLk(graph.mutationLock);
+        graph.nodes.clear();
+        graph.links.clear();
+        graph.openEditors.clear();
+        graph.setupDefaultGraph();
+    }
 
     // Auto-create MidiInput nodes for all currently connected hardware
     // MIDI devices - so the user's controller is immediately wired and
@@ -2702,11 +2713,23 @@ void MainContentComponent::newProject() {
     // Keyboard node is already created by setupDefaultGraph(); this
     // adds hardware devices alongside it.
     {
+        // Same structural-mutation lock as the clear/rebuild above: addNode()
+        // below can reallocate graph.nodes while the audio callback iterates.
+        std::lock_guard<std::mutex> graphLk(graph.mutationLock);
+
         auto devices = juce::MidiInput::getAvailableDevices();
-        // Find the default MIDI track to wire to (the one setupDefaultGraph made).
-        Node* defaultTrack = nullptr;
+        // Resolve the default MIDI track's MIDI input PIN ID up front. Pin IDs
+        // are stable across vector reallocation, so we never hold a Node* /
+        // Pin* across the addNode() calls below (which can reallocate
+        // graph.nodes and dangle such pointers - the dangling-reference
+        // anti-pattern CLAUDE.md forbids).
+        int defaultTrackMidiPinId = -1;
         for (auto& n : graph.nodes)
-            if (n.type == NodeType::MidiTimeline) { defaultTrack = &n; break; }
+            if (n.type == NodeType::MidiTimeline) {
+                for (auto& pin : n.pinsIn)
+                    if (pin.kind == PinKind::Midi) { defaultTrackMidiPinId = pin.id; break; }
+                break;
+            }
 
         float yPos = 200; // stagger below the Computer Keyboard node
         for (auto& dev : devices) {
@@ -2723,16 +2746,12 @@ void MainContentComponent::newProject() {
             auto& n = graph.addNode(dev.name.toStdString(), NodeType::MidiInput,
                 {}, {Pin{0, "MIDI Out", PinKind::Midi, false}}, {80, yPos});
             n.midiInputSourceId = dev.identifier.toStdString();
+            int outPinId = n.pinsOut.empty() ? -1 : n.pinsOut[0].id;
 
-            // Wire to the default track so the device plays immediately.
-            if (defaultTrack && !n.pinsOut.empty()) {
-                for (auto& pin : defaultTrack->pinsIn) {
-                    if (pin.kind == PinKind::Midi) {
-                        graph.addLink(n.pinsOut[0].id, pin.id);
-                        break;
-                    }
-                }
-            }
+            // Wire to the default track so the device plays immediately. Both
+            // endpoints are referenced by stable pin ID, not by pointer.
+            if (defaultTrackMidiPinId >= 0 && outPinId >= 0)
+                graph.addLink(outPinId, defaultTrackMidiPinId);
             yPos += 50;
         }
     }

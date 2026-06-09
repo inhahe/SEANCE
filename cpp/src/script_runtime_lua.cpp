@@ -65,7 +65,8 @@ public:
         float v = (float)lua_tonumber(L, -1);
         lua_pop(L, 1);
         if (!std::isfinite(v)) v = 0.0f;
-        return juce::jlimit(-1.0f, 1.0f, v);
+        // Control signals are unipolar 0..1 on the wire (see signal_modulation.h).
+        return juce::jlimit(0.0f, 1.0f, v);
     }
 
     void runMidi(const ScriptVars& vars, IExprEmitSink* sink) override {
@@ -233,7 +234,8 @@ static int l_out(lua_State* L) {
     int i = (int)luaL_checkinteger(L, 1);
     float v = (float)luaL_checknumber(L, 2);
     if (i >= 0 && i < self->curCtx->numSamples)
-        self->curCtx->out[i] = juce::jlimit(-1.0f, 1.0f, v);
+        // Control signals are unipolar 0..1 on the wire (signal_modulation.h).
+        self->curCtx->out[i] = juce::jlimit(0.0f, 1.0f, v);
     return 0;
 }
 static int l_sig(lua_State* L) {

@@ -208,7 +208,10 @@ private:
     int   repeatsDone = 0;
     double timeSinceTrigger = 0.0;
     bool  prevTriggerHigh = false;
-    float lastOutputValue = 0.0f;
+    // Neutral resting value on the unipolar 0..1 control wire is 0.5 ("no
+    // modulation"), so an idle / not-yet-triggered node holds at neutral rather
+    // than pegging its target param to the minimum.
+    float lastOutputValue = 0.5f;
     bool  wasPlaying = false;   // transport play rising edge, for the start hook
 
     std::atomic<bool> manualTriggerPending { false };

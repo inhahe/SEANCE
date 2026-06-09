@@ -152,6 +152,9 @@ void AudioEngine::audioDeviceAboutToStart(juce::AudioIODevice* device) {
     projectBufR.resize(maxProjectSamples, 0.0f);
     resampleBufL.resize(maxProjectSamples, 0.0f);
     resampleBufR.resize(maxProjectSamples, 0.0f);
+    auditionMonL.resize(maxProjectSamples, 0.0f);
+    auditionMonR.resize(maxProjectSamples, 0.0f);
+    auditionMonLen = 0;
     resamplePhase = 0.0;
 
     // Allocate the playback-tap ring buffer on the first device start.
@@ -176,6 +179,34 @@ void AudioEngine::audioDeviceAboutToStart(juce::AudioIODevice* device) {
 }
 
 void AudioEngine::audioDeviceStopped() {
+}
+
+// ---- Audition-monitor bus ----
+// See audio_engine.h. All three run on the audio thread; clear/mix bracket the
+// graph process, addAuditionMonitor runs inside it. No locking by construction.
+void AudioEngine::clearAuditionMonitor(int n) {
+    auditionMonLen = std::min(n, (int)auditionMonL.size());
+    if (auditionMonLen > 0) {
+        std::memset(auditionMonL.data(), 0, auditionMonLen * sizeof(float));
+        std::memset(auditionMonR.data(), 0, auditionMonLen * sizeof(float));
+    }
+}
+
+void AudioEngine::addAuditionMonitor(const float* mono, int n) {
+    if (!mono) return;
+    const int lim = std::min(n, auditionMonLen);
+    for (int s = 0; s < lim; ++s) {
+        auditionMonL[s] += mono[s];
+        auditionMonR[s] += mono[s];
+    }
+}
+
+void AudioEngine::mixAuditionMonitorInto(float* left, float* right, int n) const {
+    const int lim = std::min(n, auditionMonLen);
+    for (int s = 0; s < lim; ++s) {
+        if (left)  left[s]  += auditionMonL[s];
+        if (right) right[s] += auditionMonR[s];
+    }
 }
 
 void AudioEngine::audioDeviceIOCallbackWithContext(
@@ -345,9 +376,15 @@ void AudioEngine::audioDeviceIOCallbackWithContext(
     };
 
     if (!needsResample) {
-        // Same rate - no resampling needed
+        // Same rate - no resampling needed. Clear the audition-monitor bus
+        // before the graph runs (synth nodes accumulate into it during
+        // processBlock), then sum it onto the graph output afterwards.
+        clearAuditionMonitor(numSamples);
         graphProcessor.processBlock(*graph, *transport,
                                      outputChannelData, numOutputChannels, numSamples);
+        mixAuditionMonitorInto(numOutputChannels > 0 ? outputChannelData[0] : nullptr,
+                               numOutputChannels > 1 ? outputChannelData[1] : nullptr,
+                               numSamples);
         if (playing.load()) {
             positionSamples += numSamples;
             // Loop: wrap position back to loop start
@@ -371,9 +408,14 @@ void AudioEngine::audioDeviceIOCallbackWithContext(
         std::memset(projectBufL.data(), 0, projectSamples * sizeof(float));
         std::memset(projectBufR.data(), 0, projectSamples * sizeof(float));
 
-        // Process graph at project rate
+        // Process graph at project rate. Clear the audition-monitor bus first
+        // (synth nodes accumulate into it during processBlock) and sum it into
+        // the project buffers afterwards so it resamples along with the graph
+        // output below.
+        clearAuditionMonitor(projectSamples);
         float* projPtrs[2] = {projectBufL.data(), projectBufR.data()};
         graphProcessor.processBlock(*graph, *transport, projPtrs, 2, projectSamples);
+        mixAuditionMonitorInto(projectBufL.data(), projectBufR.data(), projectSamples);
 
         // Resample: linear interpolation from project rate to device rate
         for (int s = 0; s < numSamples; ++s) {
@@ -565,6 +607,10 @@ void AudioEngine::audioDeviceIOCallbackWithContext(
             // L + L/2 = 3L/2 samples regardless of the current xfade.
             const int xfadeReq = previewCrossfadeSamples.load(std::memory_order_acquire);
             const int xfade = std::max(0, std::min(xfadeReq, grainLen / 2));
+            // Playback pitch ratio (1.0 = native). Drives the fractional
+            // playhead advance below so the "As note" picker can audition the
+            // marker at the pitch the captured frame will play in the synth.
+            const float grainRatio = previewGrainRatio.load(std::memory_order_acquire);
             const int reservedTail = grainLen / 2;
             const bool grainViable = grainPtr && grainLen >= 16
                                      && (int)grainPtr->size() >= grainLen + reservedTail;
@@ -603,11 +649,19 @@ void AudioEngine::audioDeviceIOCallbackWithContext(
                 if (!grainViable) return 0.0f;
                 const auto& src = *grainPtr;
                 const int srcLen = (int)src.size();
-                int p = grainPhase;
-                const int idxMain = grainAnchor + p;
-                float out = (idxMain >= 0 && idxMain < srcLen)
-                            ? src[(size_t)idxMain] : 0.0f;
-                if (p < xfade) {
+                const float p = grainPhase;  // fractional, [0, grainLen)
+
+                // Main playhead read (linear interpolation).
+                const float mainF = (float)grainAnchor + p;
+                int   mi0 = (int)mainF;
+                float mfr = mainF - (float)mi0;
+                if (mi0 < 0)               { mi0 = 0; mfr = 0.0f; }
+                else if (mi0 > srcLen - 1) { mi0 = srcLen - 1; mfr = 0.0f; }
+                const int mi1 = std::min(mi0 + 1, srcLen - 1);
+                float out = src[(size_t)mi0] * (1.0f - mfr)
+                          + src[(size_t)mi1] * mfr;
+
+                if (xfade > 0 && p < (float)xfade) {
                     // alpha rises from 0 to 1 across the xfade window
                     // (Hann half-cycle). Pre-seam tail (source[anchor+L+p])
                     // weighted by (1 - alpha), in-loop sample weighted by
@@ -616,15 +670,24 @@ void AudioEngine::audioDeviceIOCallbackWithContext(
                     // with the previous iteration's end), and by p=xfade
                     // we are fully on the loop's start.
                     const float pi = juce::MathConstants<float>::pi;
-                    const float alpha = 0.5f * (1.0f - std::cos(pi * (float)p / (float)xfade));
-                    const int idxTail = grainAnchor + grainLen + p;
-                    float tail = (idxTail >= 0 && idxTail < srcLen)
-                                 ? src[(size_t)idxTail] : 0.0f;
+                    const float alpha = 0.5f * (1.0f - std::cos(pi * p / (float)xfade));
+                    const float tailF = (float)(grainAnchor + grainLen) + p;
+                    int   ti0 = (int)tailF;
+                    float tfr = tailF - (float)ti0;
+                    if (ti0 < 0)               { ti0 = 0; tfr = 0.0f; }
+                    else if (ti0 > srcLen - 1) { ti0 = srcLen - 1; tfr = 0.0f; }
+                    const int ti1 = std::min(ti0 + 1, srcLen - 1);
+                    const float tail = src[(size_t)ti0] * (1.0f - tfr)
+                                     + src[(size_t)ti1] * tfr;
                     out = alpha * out + (1.0f - alpha) * tail;
                 }
-                ++p;
-                if (p >= grainLen) p = 0;
-                grainPhase = p;
+
+                // Advance the fractional playhead by the pitch ratio and wrap
+                // at the loop length.
+                float np = p + grainRatio;
+                while (np >= (float)grainLen) np -= (float)grainLen;
+                while (np < 0.0f)             np += (float)grainLen;
+                grainPhase = np;
                 // Attenuate to roughly match a synth note's post-Volume level
                 // so marker-scrub / freeze audition isn't louder than playback.
                 return out * kFreezePreviewGain;

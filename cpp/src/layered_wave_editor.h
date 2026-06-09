@@ -645,6 +645,27 @@ struct WavetableDoc {
 // the new waveform takes effect; it is called on a debounce timer (not on
 // every slider tick) to avoid racing JUCE's async graph rebuild.
 //
+// A horizontal slider whose *draggable* travel spans [0, dragMax] (the
+// comfortable range a user normally wants), while its underlying value range
+// and text box accept anything up to a much larger safety ceiling. Values
+// above dragMax simply pin the thumb at the right end instead of being
+// clamped, so the text field is a free numeric entry (type 6, 8, etc.) without
+// letting the drag run off to absurd values. Used for the per-waveform gain:
+// drag covers 0..4x, but you can still type a higher (or lower) figure.
+class FreeEntrySlider : public juce::Slider {
+public:
+    FreeEntrySlider()
+        : juce::Slider(juce::Slider::LinearHorizontal,
+                       juce::Slider::TextBoxRight) {}
+    double dragMax = 4.0;
+    double valueToProportionOfLength(double value) override {
+        return juce::jlimit(0.0, 1.0, value / dragMax);
+    }
+    double proportionOfLengthToValue(double proportion) override {
+        return juce::jlimit(0.0, dragMax, proportion * dragMax);
+    }
+};
+
 // The editor holds a WavetableDoc (one or more frames). Only one frame is
 // editable at a time - the current frame - selected via frame-tab buttons.
 // Inherits DragAndDropContainer so the arrangement view can accept drops
@@ -777,15 +798,15 @@ private:
     std::unique_ptr<LibraryColorSwatch> nameColorSwatch;
     juce::TextEditor nameEditor;
 
-    // Per-waveform output gain (IWavetableFrame::gain). A rotary on the
-    // identity row, in the range [0, 2] (1.0 = unity). Because every frame
-    // type peak-normalises its cycle, this is the ONLY way to make one
-    // waveform louder/quieter than its neighbours; it scales the rendered
-    // samples post-normalisation, so it shows in the preview and in the
-    // baked synth output and morphs. Drag-end commits one undo step.
-    juce::Label  gainLabel { {}, "Gain:" };
-    juce::Slider gainSlider { juce::Slider::RotaryHorizontalVerticalDrag,
-                              juce::Slider::TextBoxRight };
+    // Per-waveform output gain (IWavetableFrame::gain). A horizontal slider on
+    // the identity row whose drag spans 0..4x (1.0 = unity); the text box
+    // accepts higher or lower typed values up to a safety ceiling. Because
+    // every frame type peak-normalises its cycle, this is the ONLY way to make
+    // one waveform louder/quieter than its neighbours; it scales the rendered
+    // samples post-normalisation, so it shows in the preview and in the baked
+    // synth output and morphs. Drag-end commits one undo step.
+    juce::Label     gainLabel { {}, "Gain:" };
+    FreeEntrySlider gainSlider;
 
     // Push the editor's current colour / name into the library entry the
     // editor is targeting, and reflect any change back into the library
@@ -885,6 +906,14 @@ private:
                                 bool replaceCurrentEntry = false);
     void dismissCapturePanel();
     void appendCapturedFramesAlongPosition(std::vector<std::unique_ptr<IWavetableFrame>> frames);
+    // Build the capture panel's metadata write-through sink: commits "As
+    // note" pitch / freeze mode / crossfade edits straight to the library
+    // frame the editor currently targets (currentLibraryId, re-looked-up
+    // live so a doc mutation or a rebinding Save can never dangle). Shared by
+    // the capture panel's replace mode (bound when the panel opens) and
+    // append mode (bound after the first Save, once a frame exists to write
+    // to) so a metadata edit can't be silently lost on Close in either mode.
+    std::function<void(double, int, double)> makeCaptureMetadataSink();
     // Replace the wave on the currently-edited library entry with the
     // first captured frame (drops the rest). Used by re-capture flows.
     // No-op if currentLibraryId is unset, the entry has been removed, or

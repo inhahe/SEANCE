@@ -5,6 +5,25 @@
 
 namespace SoundShop {
 
+// ---------------------------------------------------------------------------
+// Control-signal range convention (the ONE place this is documented in code).
+//
+// Every control signal carried on a Signal/Param pin (or a control channel,
+// 2+, of an audio buffer) is UNIPOLAR 0..1. 0.5 is the neutral "no change"
+// resting value. This is deliberately uniform across ALL signal producers
+// (Signal Shape, Control Bank, XY Pad, MIDI Mod, scripts) so a consumer never
+// has to know who fed it. AUDIO (channels 0/1) is still bipolar -1..1; this
+// convention is only about CONTROL signals.
+//
+// A consumer that wants a bipolar swing (e.g. additive modulation around a
+// base value) converts at the read site with toBipolar(); a producer that
+// computed a bipolar value (a raw sin(), say) maps it onto the wire with
+// toUnipolar(). The two cancel for an LFO, so LFO behaviour is identical to
+// the old all-bipolar world while fixing producers (like a Control Bank fader
+// at 0) that used to emit 0 and get misread as "-1 / param minimum".
+inline float toBipolar(float x)  { return x * 2.0f - 1.0f; }   // 0..1  -> -1..1
+inline float toUnipolar(float x) { return x * 0.5f + 0.5f; }   // -1..1 -> 0..1
+
 // Apply incoming Signal-cable modulations to the node's params at the
 // start of a processBlock. For each ModPin on the node, reads the signal
 // value from the corresponding audio channel (2 + control-slot index)
@@ -14,11 +33,12 @@ namespace SoundShop {
 // Call this at the TOP of every processor's processBlock. It's safe to
 // call on nodes with no modPins - the function returns immediately.
 //
-// Modulation model: bipolar additive.
-//   modulated = baseValue + signal * depth * (maxVal - minVal) / 2
-// A signal of +1 with depth 1 pushes the param to the top of its range;
-// a signal of -1 pushes to the bottom. The result is clamped to
-// [minVal, maxVal]. The `depth` per modPin defaults to 1.0.
+// Modulation model: bipolar additive around the base value.
+//   modulated = baseValue + toBipolar(signal) * depth * (maxVal - minVal) / 2
+// The incoming signal is the unipolar 0..1 wire value; toBipolar() maps it to
+// -1..1 so that a signal of 1.0 pushes the param to the top of its range, 0.0
+// to the bottom, and 0.5 (the neutral resting value) leaves it unchanged. The
+// result is clamped to [minVal, maxVal]. The `depth` per modPin defaults 1.0.
 //
 // Resolution: block-rate (reads channel at sample 0). For per-sample
 // modulation of time-critical params like filter cutoff, the processor
@@ -63,7 +83,7 @@ inline void applySignalModulations(Node& node,
         }
 
         float range = p.maxVal - p.minVal;
-        float modVal = p.baseValue + sigVal * mp.depth * range * 0.5f;
+        float modVal = p.baseValue + toBipolar(sigVal) * mp.depth * range * 0.5f;
         p.value = std::clamp(modVal, p.minVal, p.maxVal);
     }
 }

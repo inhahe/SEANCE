@@ -759,6 +759,12 @@ private:
             eng->setGrainFreezeMode(frame.freezeMode);
             eng->setPreviewGrainLength(grainLen);
             eng->setPreviewCrossfadeLength(xfadeLen);
+            // Pitch the preview to the frame's "As note" label, matching the
+            // synth-voice path (note 69 = A4): ratio = 440 / embeddedPitchHz.
+            // Without this the fallback preview always plays at native rate and
+            // ignores the embedded-pitch picker.
+            eng->setPreviewGrainRatio(
+                frame.embeddedPitchHz > 0.0f ? 440.0f / frame.embeddedPitchHz : 1.0f);
             eng->setPreviewGrainBuffer(std::move(src));
             eng->setPreviewMode(AudioEngine::PreviewMode::GrainLoop);
         }
@@ -6575,7 +6581,12 @@ LayeredWaveEditorComponent::LayeredWaveEditorComponent(NodeGraph& g, int nid, st
     gainLabel.setJustificationType(juce::Justification::centredRight);
 
     addAndMakeVisible(gainSlider);
-    gainSlider.setRange(0.0, 2.0, 0.001);
+    // dragMax (4.0) is the slider's draggable ceiling; the value range goes
+    // higher (up to 64x, a safety bound that prevents absurd / NaN values)
+    // so the text box can accept typed figures above 4. Values over 4 pin the
+    // thumb at the right end - see FreeEntrySlider.
+    gainSlider.dragMax = 4.0;
+    gainSlider.setRange(0.0, 64.0, 0.001);
     gainSlider.setDoubleClickReturnValue(true, 1.0);
     gainSlider.setNumDecimalPlacesToDisplay(2);
     gainSlider.setTextBoxStyle(juce::Slider::TextBoxRight, false, 48, 18);
@@ -6583,8 +6594,10 @@ LayeredWaveEditorComponent::LayeredWaveEditorComponent(NodeGraph& g, int nid, st
         "Output volume of THIS waveform, multiplied on top of the cycle "
         "(1.00 = unchanged). Every waveform is peak-normalised to the same "
         "loudness, so this is how you make one frame louder or quieter than "
-        "its neighbours. It changes the actual samples, so it shows in the "
-        "preview and in morphs between frames. Double-click to reset to 1.00.");
+        "its neighbours. The slider drags from 0 to 4x; type a number in the "
+        "box for higher or lower values. It changes the actual samples, so it "
+        "shows in the preview and in morphs between frames. Double-click to "
+        "reset to 1.00.");
     gainSlider.onValueChange = [this]() {
         auto* f = currentEditingFrame();
         if (!f) return;
@@ -7262,6 +7275,29 @@ void LayeredWaveEditorComponent::repaintScatterViews() {
 }
 
 
+std::function<void(double, int, double)>
+LayeredWaveEditorComponent::makeCaptureMetadataSink() {
+    return [this](double pitchHz, int freezeIdx, double crossfadeMs) {
+        auto* g = dynamic_cast<GranularFrame*>(
+            wave.libraryFrameById(currentLibraryId));
+        // [OCT-DBG] temporary diagnostic for the lost capture-window octave.
+        juce::Logger::writeToLog(juce::String("[OCT-DBG] sink fired libId=")
+            + juce::String(currentLibraryId)
+            + " pitchHz=" + juce::String(pitchHz, 3)
+            + " gFound=" + juce::String(g ? 1 : 0));
+        if (!g) return;
+        g->embeddedPitchHz = (float)pitchHz;
+        g->freezeMode = (GranularFreezeMode)juce::jlimit(0, 3, freezeIdx);
+        const double sr = (g->sourceSampleRate > 0.0)
+                              ? g->sourceSampleRate : 44100.0;
+        g->crossfadeSamples =
+            std::max(0, (int)std::round(crossfadeMs * 0.001 * sr));
+        // Same commit path the frame editor uses: encode to the node script
+        // live + dirty flag, plus debounced undo.
+        onLayerChanged();
+    };
+}
+
 void LayeredWaveEditorComponent::showCapturePanelInline(int sourceKind,
                                                         bool replaceCurrentEntry) {
     // sourceKind: 0=Playback (project song), 1=Mic, 2=File.
@@ -7315,6 +7351,28 @@ void LayeredWaveEditorComponent::showCapturePanelInline(int sourceKind,
             });
         } else {
             appendCapturedFramesAlongPosition(std::move(frames));
+            // After a Save in append mode the dialog stays open and
+            // currentLibraryId now points at the frame just appended (set by
+            // appendCapturedFramesAlongPosition). Bind the capture panel's
+            // metadata write-through sink so any further "As note" / freeze /
+            // crossfade edit commits live to that frame instead of being
+            // silently dropped on Close. Previously onMetadataEdited was only
+            // wired in replace mode, so publishMetadataEdit() was a no-op in
+            // append mode and a post-Save octave change was lost. The sink
+            // tracks currentLibraryId, so a later Save (new frame) rebinds
+            // automatically. CaptureFromPlaybackDialog (mic/file) has no such
+            // sink; the dynamic_cast simply no-ops there.
+            if (auto* songPanel =
+                    dynamic_cast<CaptureFromSongDialog*>(capturePanel.get())) {
+                if (!songPanel->onMetadataEdited)
+                    songPanel->onMetadataEdited = makeCaptureMetadataSink();
+                // [OCT-DBG] temporary diagnostic for the lost capture-window octave.
+                juce::Logger::writeToLog(juce::String("[OCT-DBG] append bind: songPanel=1 libId=")
+                    + juce::String(currentLibraryId)
+                    + " sinkSet=" + juce::String(songPanel->onMetadataEdited ? 1 : 0));
+            } else {
+                juce::Logger::writeToLog("[OCT-DBG] append bind: songPanel=0 (cast failed)");
+            }
         }
     };
 
@@ -7335,6 +7393,28 @@ void LayeredWaveEditorComponent::showCapturePanelInline(int sourceKind,
             auto p = std::make_unique<CaptureFromSongDialog>(
                 *gp, *tp, wave.tableSize, onCaptured);
             p->onDismiss = [this]() { dismissCapturePanel(); };
+            // Re-capture / replace mode is where the two save models unify.
+            // The capture panel becomes bound to the SPECIFIC existing library
+            // frame it's replacing: we (1) SEED its editable controls from that
+            // frame so the panel opens reflecting reality, and (2) install a
+            // live write-through sink so any metadata edit (pitch / freeze /
+            // crossfade) commits to the frame the instant it changes - exactly
+            // like GranularFrameEditorComponent. Result: closing the panel can
+            // no longer silently revert a metadata change; only the PCM grab
+            // stays an explicit Save (it depends on marker position + Width).
+            if (doReplace) {
+                if (auto* g = dynamic_cast<GranularFrame*>(currentEditingFrame())) {
+                    const double sr = (g->sourceSampleRate > 0.0)
+                                          ? g->sourceSampleRate : 44100.0;
+                    const double xfadeMs = (double)g->crossfadeSamples / sr * 1000.0;
+                    p->seedFromExistingFrame((double)g->embeddedPitchHz,
+                                             (int)g->freezeMode, xfadeMs);
+                }
+                // Write-through sink tracks currentLibraryId (== the frame
+                // being replaced throughout this session), re-looked-up live so
+                // a graph.nodes / wave.library move can never dangle.
+                p->onMetadataEdited = makeCaptureMetadataSink();
+            }
             panel = std::move(p);
         }
     } else {
@@ -7362,9 +7442,19 @@ void LayeredWaveEditorComponent::dismissCapturePanel() {
     if (!capturePanel) return;
     removeChildComponent(capturePanel.get());
     capturePanel.reset();
-    // Bring the per-frame editor / Compare panel / preview back. resized()
-    // handles the visibility / bounds toggle now that capturePanel is null.
-    resized();
+    // Rebind the per-frame editor before bringing it back. While the capture
+    // panel was open it write-through-edited the bound frame's metadata (the
+    // "As note" pitch, freeze mode, crossfade) via makeCaptureMetadataSink,
+    // but the embedded GranularFrameEditorComponent created at Save time
+    // seeded its controls ONCE in its constructor and was hidden behind the
+    // capture panel - so those edits never reached its sliders. Just calling
+    // resized() would re-show that STALE editor (e.g. the octave reverting to
+    // its save-time value, and worse, a later interaction committing the stale
+    // value back over the edited one). rebuildRows() tears down and recreates
+    // the embed bound to the current frame, re-seeding every control from the
+    // live (edited) data, then lays out. It ends in resized(), so the
+    // visibility/bounds toggle still happens now that capturePanel is null.
+    rebuildRows();
     repaint();
 }
 
@@ -7637,9 +7727,31 @@ void LayeredWaveEditorComponent::updateFrameEditorEmbed() {
                     // immediately. Note-offs carry no position.
                     std::vector<float> pos = noteOn ? currentFramePosition()
                                                     : std::vector<float>{};
+                    // Ship the edited frame's actual data so the synth can
+                    // render it even when it isn't placed into the grid/scatter
+                    // (a freshly-captured library-only frame is otherwise absent
+                    // from the synth's wtGranularFrames table and would be
+                    // silent). Looked up fresh via currentEditingFrame() so we
+                    // never hold a stale frame pointer across a doc edit, and
+                    // it carries the exact on-screen bytes so Play matches what
+                    // you see even before the ~150ms graph rebuild. Note-offs
+                    // carry no payload.
+                    std::shared_ptr<Node::AuditionGranularFrame> gpayload;
+                    if (noteOn) {
+                        if (auto* g = dynamic_cast<GranularFrame*>(currentEditingFrame())) {
+                            gpayload = std::make_shared<Node::AuditionGranularFrame>();
+                            gpayload->source =
+                                std::make_shared<std::vector<float>>(g->source);
+                            gpayload->sourceSampleRate = g->sourceSampleRate;
+                            gpayload->grainLength      = g->grainLength;
+                            gpayload->embeddedPitchHz  = g->embeddedPitchHz;
+                            gpayload->freezeMode       = (int)g->freezeMode;
+                            gpayload->crossfadeSamples = g->crossfadeSamples;
+                        }
+                    }
                     std::lock_guard<std::mutex> lock(*nd->auditionMutex);
                     nd->pendingAudition.push_back(
-                        {noteOn, pitch, velocity, std::move(pos)});
+                        {noteOn, pitch, velocity, std::move(pos), std::move(gpayload)});
                 }
             };
             embeddedFrameEditor = std::make_unique<GranularFrameEditorComponent>(
@@ -7835,17 +7947,19 @@ void LayeredWaveEditorComponent::resized() {
         nameEditor.setBounds(idRow);
     }
 
-    // Gain row directly under the identity row: [Gain: label][rotary]. Kept
-    // on its own line so the rotary + value text box have room without
-    // squeezing the name editor. Same visibility gating as the identity row.
+    // Gain row directly under the identity row: [Gain: label][slider+box].
+    // Kept on its own line so the horizontal slider + value text box have room
+    // without squeezing the name editor. Same visibility gating as the
+    // identity row.
     {
-        const int gH = 30;
+        const int gH = 26;
         auto gRow = right.removeFromTop(gH);
         right.removeFromTop(6);
         gainLabel.setBounds(gRow.removeFromLeft(70));
         gRow.removeFromLeft(2);
-        // Rotary + attached text box; cap the width so it doesn't sprawl.
-        gainSlider.setBounds(gRow.removeFromLeft(juce::jmin(gRow.getWidth(), 150)));
+        // Horizontal slider + attached text box; cap the width so it doesn't
+        // sprawl across the whole pane on wide windows.
+        gainSlider.setBounds(gRow.removeFromLeft(juce::jmin(gRow.getWidth(), 240)));
     }
 
     // Middle: either the layered-frame layer rows + viewport, the embedded

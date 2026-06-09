@@ -23,6 +23,13 @@ ControlBankComponent::ControlBankComponent(NodeGraph& g, int nid,
     addBtn.onClick = [this]() { addSlider(); };
     addAndMakeVisible(addBtn);
 
+    removeLastBtn.setTooltip("Remove the last slider, its output pin, and any "
+                             "cables wired to it.");
+    removeLastBtn.onClick = [this]() {
+        if (!rows.empty()) removeSlider((int)rows.size() - 1);
+    };
+    addAndMakeVisible(removeLastBtn);
+
     orientationToggle.setTooltip("Lay the faders out horizontally (stacked, "
                                  "window width sets their length) instead of "
                                  "vertically (in a row, window height sets "
@@ -103,6 +110,17 @@ void ControlBankComponent::rebuildRows() {
         row.slider->setValue((double)nd->params[(size_t)i].value,
                              juce::dontSendNotification);
         row.slider->setDoubleClickReturnValue(true, 0.5);
+        // Swap the two sides of the thumb: by default JUCE fills the
+        // value-side of the track with trackColourId and leaves the rest in
+        // backgroundColourId. Exchanging them flips which side reads as
+        // "filled", so the colour grows from the high end instead of the low.
+        {
+            auto& lf = juce::LookAndFeel::getDefaultLookAndFeel();
+            auto trackCol = lf.findColour(juce::Slider::trackColourId);
+            auto bgCol    = lf.findColour(juce::Slider::backgroundColourId);
+            row.slider->setColour(juce::Slider::trackColourId,      bgCol);
+            row.slider->setColour(juce::Slider::backgroundColourId, trackCol);
+        }
         {
             juce::Slider* sl = row.slider.get();
             int idx = i;
@@ -142,9 +160,15 @@ void ControlBankComponent::rebuildRows() {
         if (!canRemove)
             r.removeBtn->setTooltip("A Control Bank needs at least one slider.");
     }
+    removeLastBtn.setEnabled(canRemove);
+    removeLastBtn.setTooltip(canRemove
+        ? "Remove the last slider, its output pin, and any cables wired to it."
+        : "A Control Bank needs at least one slider.");
     addBtn.setEnabled((int)rows.size() < kMaxSliders);
-    if (!addBtn.isEnabled())
-        addBtn.setTooltip("Maximum of " + juce::String(kMaxSliders) + " sliders reached.");
+    addBtn.setTooltip(addBtn.isEnabled()
+        ? "Add a slider. Each slider gets its own control-signal output pin "
+          "you can wire to any param."
+        : "Maximum of " + juce::String(kMaxSliders) + " sliders reached.");
 
     resized();
     repaint();
@@ -217,6 +241,8 @@ void ControlBankComponent::resized() {
 
     auto topRow = area.removeFromTop(26);
     addBtn.setBounds(topRow.removeFromLeft(90));
+    topRow.removeFromLeft(6);
+    removeLastBtn.setBounds(topRow.removeFromLeft(90));
     orientationToggle.setBounds(topRow.removeFromRight(170));
     area.removeFromTop(8);
 

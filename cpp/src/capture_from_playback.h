@@ -199,6 +199,26 @@ public:
     // DialogWindow. If left empty the dialog-window behavior is used.
     std::function<void()> onDismiss;
 
+    // Live write-through sink for post-hoc metadata edits (the unified save
+    // model). When set - which the host does only in RE-CAPTURE / replace
+    // mode, where the dialog is bound to an existing library GranularFrame -
+    // changing the "As note" picker, the Freeze mode, or the Crossfade slider
+    // fires this callback IMMEDIATELY, so the host can mutate the live frame
+    // and commit, exactly like GranularFrameEditorComponent does on every
+    // edit. This is what makes the capture panel "always save" its metadata
+    // the way the frame editor does: closing the panel can no longer silently
+    // discard a pitch/freeze/crossfade change. The PCM grab itself stays an
+    // explicit "Save waveform at marker" act because it depends on the marker
+    // position and Width (capture-time params), which is inherent to capture,
+    // not a save-model discrepancy. Crossfade is reported in MILLISECONDS
+    // (rate-independent) so the host can convert to samples against the
+    // frame's OWN sourceSampleRate rather than this dialog's render rate.
+    // Left null in append mode (no pre-existing frame to write through to);
+    // there, creation stays an explicit Save and Close legitimately creates
+    // nothing.
+    std::function<void(double pitchHz, int freezeModeIdx, double crossfadeMs)>
+        onMetadataEdited;
+
     void paint(juce::Graphics& g) override;
     void resized() override;
     void mouseDown(const juce::MouseEvent& e) override;
@@ -296,7 +316,37 @@ private:
 
     void onRenderComplete();
     void regenerateGrain();
+    // Publish the GrainLoop playback pitch ratio to the audio engine so the
+    // live marker audition is pitched to match what the synth voice will
+    // produce when the captured frame is triggered at the editor's reference
+    // note (A4 = 440 Hz). ratio = 440 / capturedPitchHz. Called when the
+    // "As note" picker changes and whenever the grain audition is respun.
+    void publishPreviewPitch();
+    // Push the current post-hoc metadata (pitch, freeze mode, crossfade) to
+    // the onMetadataEdited write-through sink, if one is set. No-op otherwise
+    // (append mode). Called from the pitch / freeze / crossfade handlers.
+    void publishMetadataEdit();
     void setState(TState s);
+
+public:
+    // Seed the dialog's editable controls (note/octave + cents picker, freeze
+    // mode, crossfade slider) AND the live audition to mirror an existing
+    // granular frame. Used when this dialog is embedded to RE-CAPTURE an
+    // existing library frame: without seeding, the controls would default
+    // (A4 pitch, Crossfade loop, default crossfade ms) and a Save - or, under
+    // the unified save model, any metadata edit - would silently relabel the
+    // frame, discarding the user's original choices. Seeding from the existing
+    // frame means the panel opens reflecting the frame's real state, so the
+    // write-through sink only ever changes what the user deliberately touches.
+    // crossfadeMs is rate-independent; the caller converts the frame's stored
+    // crossfadeSamples to ms against the frame's own sourceSampleRate. Safe to
+    // call right after construction. Uses dontSendNotification so seeding never
+    // fires the write-through sink. Pass freezeModeIdx -1 / crossfadeMs < 0 to
+    // leave those controls at their defaults.
+    void seedFromExistingFrame(double pitchHz, int freezeModeIdx,
+                               double crossfadeMs);
+
+private:
     void updateButtonsForState();
     void updateStatusLabel();
     // Keeps the crossfade slider's range capped at half the current

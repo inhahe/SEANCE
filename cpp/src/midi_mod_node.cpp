@@ -1,4 +1,5 @@
 #include "midi_mod_node.h"
+#include "signal_modulation.h"   // toBipolar() - control-signal range convention
 #include <sstream>
 #include <algorithm>
 #include <cmath>
@@ -127,32 +128,36 @@ void MidiModulatorProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::M
 
         switch (r.target) {
             case ModTarget::PitchBend: {
-                // sig -1..+1 scales to -amount..+amount semitones around
-                // center, then back to the 14-bit range assuming +/-2 semi
-                // is the typical synth bend range (value 16383 = +100%).
-                float bendFrac = juce::jlimit(-1.0f, 1.0f, sig * r.amount);
+                // Pitch bend is inherently bipolar (center = 8192), so convert
+                // the unipolar 0..1 wire signal to -1..1: 0.5 -> no bend, 0 ->
+                // -amount, 1 -> +amount. Maps back to the 14-bit range assuming
+                // the typical +/-2 semi synth bend range (value 16383 = +100%).
+                float bendFrac = juce::jlimit(-1.0f, 1.0f, toBipolar(sig) * r.amount);
                 int bendVal = 8192 + (int)std::round(bendFrac * 8191.0f);
                 bendVal = juce::jlimit(0, 16383, bendVal);
                 output.addEvent(juce::MidiMessage::pitchWheel(ch, bendVal), 0);
                 break;
             }
             case ModTarget::ModWheel: {
-                // sig -1..+1 -> 0..1 -> 0..127 scaled by amount
-                float n = juce::jlimit(0.0f, 1.0f, (sig + 1.0f) * 0.5f * r.amount);
+                // Mod wheel is unipolar (0..127). The wire signal is already
+                // unipolar 0..1, so it maps straight through, scaled by amount.
+                float n = juce::jlimit(0.0f, 1.0f, sig * r.amount);
                 int v = (int)std::round(n * 127.0f);
                 v = juce::jlimit(0, 127, v);
                 output.addEvent(juce::MidiMessage::controllerEvent(ch, 1, v), 0);
                 break;
             }
             case ModTarget::Aftertouch: {
-                float n = juce::jlimit(0.0f, 1.0f, (sig + 1.0f) * 0.5f * r.amount);
+                // Unipolar 0..127 target; wire signal is already 0..1.
+                float n = juce::jlimit(0.0f, 1.0f, sig * r.amount);
                 int v = (int)std::round(n * 127.0f);
                 v = juce::jlimit(0, 127, v);
                 output.addEvent(juce::MidiMessage::channelPressureChange(ch, v), 0);
                 break;
             }
             case ModTarget::CC: {
-                float n = juce::jlimit(0.0f, 1.0f, (sig + 1.0f) * 0.5f * r.amount);
+                // Unipolar 0..127 target; wire signal is already 0..1.
+                float n = juce::jlimit(0.0f, 1.0f, sig * r.amount);
                 int v = (int)std::round(n * 127.0f);
                 v = juce::jlimit(0, 127, v);
                 output.addEvent(juce::MidiMessage::controllerEvent(ch, r.ccNumber, v), 0);
@@ -173,8 +178,11 @@ void MidiModulatorProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::M
             float velScale = 1.0f;
             for (size_t i = 0; i < doc.rules.size(); ++i) {
                 if (doc.rules[i].target != ModTarget::Velocity) continue;
+                // Velocity scaling is bidirectional around 1.0x, so convert the
+                // unipolar 0..1 wire signal to -1..1: 0.5 -> no change, 1 ->
+                // +amount louder, 0 -> -amount quieter.
                 float sig = readSigAt((int)i, off);
-                velScale *= 1.0f + doc.rules[i].amount * sig;
+                velScale *= 1.0f + doc.rules[i].amount * toBipolar(sig);
             }
             int newVel = juce::jlimit(1, 127,
                 (int)std::round(msg.getVelocity() * velScale));

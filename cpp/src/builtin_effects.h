@@ -1447,11 +1447,11 @@ public:
         float dcwA     = std::max(0.001f, paramByName(node, "DCW Attack", 0.01f));
         float dcwD     = std::max(0.001f, paramByName(node, "DCW Decay", 0.3f));
         float dcwS     = paramByName(node, "DCW Sustain", 0.3f);
-        // Amplitude ADSR
-        float aA       = std::max(0.001f, paramByName(node, "Attack", 0.005f));
-        float aD       = std::max(0.001f, paramByName(node, "Decay", 0.1f));
-        float aS       = paramByName(node, "Sustain", 0.7f);
-        float aR       = std::max(0.001f, paramByName(node, "Release", 0.3f));
+        // Amplitude envelope: shared node AHDSR is the single source of
+        // truth (times, levels, per-segment curves, velocity sensitivity).
+        // Bake its shape curves once per block; every voice samples them.
+        effectiveEnv = node.ahdsrEnvelope;
+        ampTables.prepare(effectiveEnv);
         float volume   = paramByName(node, "Volume", 0.5f);
 
         for (auto meta : midi) {
@@ -1463,11 +1463,12 @@ public:
                 v.vel = msg.getVelocity() / 127.0f;
                 v.mpeChannel = msg.getChannel();
                 v.mpe = MpeVoiceState{};
-                v.phase = 0; v.time = 0; v.relTime = 0;
+                v.phase = 0; v.time = 0;
+                v.ampEnv.noteOn(v.vel);
             } else if (msg.isNoteOff()) {
                 for (auto& v : voices)
                     if (v.active && v.held && v.note == msg.getNoteNumber())
-                        { v.held = false; v.relTime = v.time; }
+                        { v.held = false; v.ampEnv.noteOff(); }
             }
         }
         // Distribute MPE per-channel messages to voices (#78)
@@ -1487,17 +1488,11 @@ public:
                 // No-op until the controller sends pressure (defaults 0).
                 float pMul = 1.0f + node.aftertouchSensitivity * effectivePressure(v.mpe);
 
-                // Amplitude ADSR
-                float ampEnv = 0;
-                if (v.held) {
-                    if (v.time < aA) ampEnv = v.time / aA;
-                    else if (v.time < aA + aD) ampEnv = 1.0f + (aS - 1.0f) * ((v.time - aA) / aD);
-                    else ampEnv = aS;
-                } else {
-                    float rt = v.time - v.relTime;
-                    ampEnv = aS * std::max(0.0f, 1.0f - rt / aR);
-                    if (rt >= aR) { v.active = false; continue; }
-                }
+                // Amplitude envelope from the shared runtime (velocity is
+                // already folded into the peak via velocitySensitivity, so we
+                // must NOT multiply by v.vel again below).
+                float ampEnv = v.ampEnv.tick((float)sampleRate, effectiveEnv, ampTables);
+                if (!v.ampEnv.isActive()) { v.active = false; continue; }
 
                 // DCW envelope (drives depth): attack -> decay -> sustain level × maxDepth
                 float dcwEnv = 0;
@@ -1540,14 +1535,14 @@ public:
                         float window = 1.0f - p;
                         distorted = std::sin(distorted * kPi2) * window;
                         // Skip the sin() below - we already computed the output
-                        out += distorted * ampEnv * v.vel * pMul;
+                        out += distorted * ampEnv * pMul;
                         v.phase += freq / (float)sampleRate;
                         v.time += dt;
                         goto nextVoice;
                     }
                 }
 
-                out += std::sin(distorted * kPi2) * ampEnv * v.vel * pMul;
+                out += std::sin(distorted * kPi2) * ampEnv * pMul;
                 v.phase += freq / (float)sampleRate;
                 v.time += dt;
                 nextVoice:;
@@ -1559,10 +1554,10 @@ public:
         }
     }
 
-    // Tail = the Release param (single-envelope synth, voice dies at
-    // time = releaseTime after note-off).
+    // Tail = the shared envelope's Release time (voice dies once the
+    // amplitude envelope reaches Off after note-off).
     double getTailLengthSeconds() const override {
-        return (double) std::max(0.001f, paramByName(node, "Release", 0.3f));
+        return (double) std::max(0.001f, node.ahdsrEnvelope.releaseMs * 0.001f);
     }
     bool acceptsMidi() const override { return true; }
     bool producesMidi() const override { return false; }
@@ -1580,13 +1575,18 @@ public:
 private:
     Node& node;
     double sampleRate = 44100;
+    // Shared amplitude-envelope curve tables (baked once per block) + the
+    // effective envelope snapshot the voices sample against.
+    AHDSRCurveTables ampTables;
+    AHDSREnvelope effectiveEnv;
     struct Voice {
         bool active = false, held = false;
         int note = 0;
-        float vel = 0, time = 0, relTime = 0;
+        float vel = 0, time = 0;
         double phase = 0;
         int mpeChannel = 1;
         MpeVoiceState mpe;
+        AHDSREnvelopeRuntime ampEnv;  // shared amplitude envelope runtime
     };
     std::vector<Voice> voices;
     Voice& allocVoice() {
@@ -2648,10 +2648,9 @@ public:
             case 4: stretch = 0.0f;  brightness = 0.0f; break; // Organ (all equal)
             default: break; // Custom - use manual Stretch/Brightness
         }
-        float aA = std::max(0.001f, paramByName(node, "Attack", 0.01f));
-        float aD = std::max(0.001f, paramByName(node, "Decay", 0.1f));
-        float aS = paramByName(node, "Sustain", 0.7f);
-        float aR = std::max(0.001f, paramByName(node, "Release", 0.3f));
+        // Amplitude envelope: shared node AHDSR (single source of truth).
+        effectiveEnv = node.ahdsrEnvelope;
+        ampTables.prepare(effectiveEnv);
         float volume = paramByName(node, "Volume", 0.5f);
 
         for (auto meta : midi) {
@@ -2661,14 +2660,15 @@ public:
                 v.active = true; v.held = true;
                 v.note = msg.getNoteNumber();
                 v.vel = msg.getVelocity() / 127.0f;
-                v.time = 0; v.relTime = 0;
+                v.time = 0;
                 v.phases.assign(64, 0.0);
                 v.mpeChannel = msg.getChannel();
                 v.mpe = MpeVoiceState{};
+                v.ampEnv.noteOn(v.vel);
             } else if (msg.isNoteOff()) {
                 for (auto& v : voices)
                     if (v.active && v.held && v.note == msg.getNoteNumber())
-                        { v.held = false; v.relTime = v.time; }
+                        { v.held = false; v.ampEnv.noteOff(); }
             }
         }
         distributeMpeMessages(midi, voices);
@@ -2682,17 +2682,10 @@ public:
                 if (!v.active) continue;
                 float baseFreq = 440.0f * std::pow(2.0f, (v.note - 69 + v.mpe.pitchBend) / 12.0f);
 
-                // ADSR
-                float env;
-                if (v.held) {
-                    if (v.time < aA) env = v.time / aA;
-                    else if (v.time < aA + aD) env = 1.0f + (aS - 1.0f) * ((v.time - aA) / aD);
-                    else env = aS;
-                } else {
-                    float rt = v.time - v.relTime;
-                    env = aS * std::max(0.0f, 1.0f - rt / aR);
-                    if (rt >= aR) { v.active = false; continue; }
-                }
+                // Amplitude envelope from the shared runtime (velocity folded
+                // into the peak via velocitySensitivity - no extra v.vel below).
+                float env = v.ampEnv.tick((float)sampleRate, effectiveEnv, ampTables);
+                if (!v.ampEnv.isActive()) { v.active = false; continue; }
 
                 // Sum partials
                 float voiceOut = 0;
@@ -2710,7 +2703,7 @@ public:
                 }
 
                 float pMul = 1.0f + node.aftertouchSensitivity * effectivePressure(v.mpe);
-                out += voiceOut * env * v.vel * pMul;
+                out += voiceOut * env * pMul;
                 v.time += dt;
             }
 
@@ -2724,10 +2717,10 @@ public:
         }
     }
 
-    // Tail = the Release param (additive voice envelope dies at
-    // time = releaseTime after note-off).
+    // Tail = the shared envelope's Release time (voice dies once the
+    // amplitude envelope reaches Off after note-off).
     double getTailLengthSeconds() const override {
-        return (double) std::max(0.001f, paramByName(node, "Release", 0.3f));
+        return (double) std::max(0.001f, node.ahdsrEnvelope.releaseMs * 0.001f);
     }
     bool acceptsMidi() const override { return true; }
     bool producesMidi() const override { return false; }
@@ -2745,13 +2738,17 @@ public:
 private:
     Node& node;
     double sampleRate = 44100;
+    // Shared amplitude-envelope curve tables + effective envelope snapshot.
+    AHDSRCurveTables ampTables;
+    AHDSREnvelope effectiveEnv;
     struct Voice {
         bool active = false, held = false;
         int note = 0;
-        float vel = 0, time = 0, relTime = 0;
+        float vel = 0, time = 0;
         std::vector<double> phases;
         int mpeChannel = 1;
         MpeVoiceState mpe;
+        AHDSREnvelopeRuntime ampEnv;  // shared amplitude envelope runtime
     };
     std::vector<Voice> voices;
     Voice& allocVoice() {
@@ -3243,10 +3240,9 @@ public:
 
         float density   = std::max(1.0f, paramByName(node, "Density", 20.0f));
         float grainMs   = std::max(1.0f, paramByName(node, "Grain Size", 40.0f));
-        float aA = std::max(0.001f, paramByName(node, "Attack", 0.01f));
-        float aD = std::max(0.001f, paramByName(node, "Decay", 0.1f));
-        float aS = paramByName(node, "Sustain", 0.7f);
-        float aR = std::max(0.001f, paramByName(node, "Release", 0.3f));
+        // Amplitude envelope: shared node AHDSR (single source of truth).
+        effectiveEnv = node.ahdsrEnvelope;
+        ampTables.prepare(effectiveEnv);
         float volume = paramByName(node, "Volume", 0.5f);
 
         int grainSizeSamples = (int)(grainMs * 0.001f * (float)sampleRate);
@@ -3261,14 +3257,15 @@ public:
                 v.active = true; v.held = true;
                 v.note = msg.getNoteNumber();
                 v.vel = msg.getVelocity() / 127.0f;
-                v.time = 0; v.relTime = 0;
+                v.time = 0;
                 v.spawnTimer = 0;
                 v.mpeChannel = msg.getChannel();
                 v.mpe = MpeVoiceState{};
+                v.ampEnv.noteOn(v.vel);
             } else if (msg.isNoteOff()) {
                 for (auto& v : voices)
                     if (v.active && v.held && v.note == msg.getNoteNumber())
-                        { v.held = false; v.relTime = v.time; }
+                        { v.held = false; v.ampEnv.noteOff(); }
             }
         }
         distributeMpeMessages(midi, voices);
@@ -3278,17 +3275,10 @@ public:
             for (auto& v : voices) {
                 if (!v.active) continue;
 
-                // ADSR
-                float env;
-                if (v.held) {
-                    if (v.time < aA) env = v.time / aA;
-                    else if (v.time < aA + aD) env = 1.0f + (aS - 1.0f) * ((v.time - aA) / aD);
-                    else env = aS;
-                } else {
-                    float rt = v.time - v.relTime;
-                    env = aS * std::max(0.0f, 1.0f - rt / aR);
-                    if (rt >= aR) { v.active = false; continue; }
-                }
+                // Amplitude envelope from the shared runtime (velocity folded
+                // into the peak via velocitySensitivity - no extra v.vel below).
+                float env = v.ampEnv.tick((float)sampleRate, effectiveEnv, ampTables);
+                if (!v.ampEnv.isActive()) { v.active = false; continue; }
 
                 // Spawn grains
                 v.spawnTimer += dt;
@@ -3321,7 +3311,7 @@ public:
                     ++it;
                 }
                 float pMul = 1.0f + node.aftertouchSensitivity * effectivePressure(v.mpe);
-                out += voiceOut * env * v.vel * pMul;
+                out += voiceOut * env * pMul;
             }
 
             if (activeGrains.size() > 1)
@@ -3336,11 +3326,11 @@ public:
             activeGrains.erase(activeGrains.begin(), activeGrains.begin() + 1024);
     }
 
-    // Tail = ADSR release + the longest grain still ringing out.
+    // Tail = AHDSR release + the longest grain still ringing out.
     // After release, voices stop spawning grains and the envelope dies at
-    // aR seconds; any in-flight grain plays for at most grainSize ms more.
+    // releaseMs; any in-flight grain plays for at most grainSize ms more.
     double getTailLengthSeconds() const override {
-        double aR     = (double) std::max(0.001f, paramByName(node, "Release",   0.3f));
+        double aR     = (double) std::max(0.001f, node.ahdsrEnvelope.releaseMs * 0.001f);
         double grainS = (double) std::max(1.0f,   paramByName(node, "Grain Size", 40.0f)) * 0.001;
         return aR + grainS;
     }
@@ -3403,13 +3393,17 @@ private:
         }
     }
 
+    // Shared amplitude-envelope curve tables + effective envelope snapshot.
+    AHDSRCurveTables ampTables;
+    AHDSREnvelope effectiveEnv;
     struct Voice {
         bool active = false, held = false;
         int note = 0;
-        float vel = 0, time = 0, relTime = 0;
+        float vel = 0, time = 0;
         float spawnTimer = 0;
         int mpeChannel = 1;
         MpeVoiceState mpe;
+        AHDSREnvelopeRuntime ampEnv;  // shared amplitude envelope runtime
     };
     std::vector<Voice> voices;
     Voice& allocVoice() {

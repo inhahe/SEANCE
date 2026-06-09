@@ -12,20 +12,16 @@ namespace SoundShop {
 // the usual four:
 //
 //   Attack  : 0 -> 1 over `attackMs` milliseconds
-//   Hold    : stays near 1 for `holdMs` milliseconds (shapeable plateau)
+//   Hold    : stays at peak (flat) for `holdMs` milliseconds
 //   Decay   : 1 -> sustain over `decayMs` milliseconds
 //   Sustain : stays at `sustain` (flat) for as long as the key is held
 //   Release : current level -> 0 over `releaseMs` milliseconds after note-off
 //
-// The Attack / Hold / Decay / Release stages each have an independent
+// The Attack / Decay / Release stages each have an independent
 // SpectralCurve describing the shape of the ramp (linear, exponential,
 // S-curve, freehand, etc.) using the same three-mode (Equation / Drawn /
-// Freehand) editor used elsewhere in the app. The Hold curve is a multiplier
-// on the peak level across the hold window: its default expression is the
-// constant "1" (a true flat plateau at peak), but it can be shaped into a
-// swell or a dip during the hold. The curve always re-arrives at peak at the
-// end of Hold so the following Decay starts from peak without a discontinuity.
-// Sustain is flat by definition so it has no curve.
+// Freehand) editor used elsewhere in the app. Hold and Sustain are flat by
+// definition so they have no curve.
 //
 // `velocitySensitivity` (0..1) scales the envelope's peak amplitude by the
 // note's MIDI velocity:
@@ -47,7 +43,6 @@ struct AHDSREnvelope {
     // first time the user opens an editor for an unset curve they
     // see something sensible rather than a flat line.
     SpectralCurve attackCurve;
-    SpectralCurve holdCurve;
     SpectralCurve decayCurve;
     SpectralCurve releaseCurve;
 
@@ -68,14 +63,46 @@ struct AHDSREnvelope {
 };
 
 // ==============================================================================
-// AHDSREnvelopeRuntime - per-voice runtime state for the envelope above.
-// Synths construct one per voice; on note-on they call noteOn(velocity);
-// on note-off they call noteOff(); each sample they call tick(sampleRate,
-// envelope) to advance and read the current 0..1 amplitude.
+// AHDSRCurveTables - the shared, per-node baked lookup tables for one
+// AHDSREnvelope's Attack / Decay / Release shape curves. A synth processor
+// holds ONE of these and calls prepare(env) once per processBlock (or
+// whenever the envelope changed). The bake is hashed so it is a no-op when
+// the curves are unchanged. All voices of that node sample these same tables,
+// so the 256-sample curve evaluation happens once per node, not once per
+// voice. This is the "defining the curves" half of the shared envelope code.
+// ==============================================================================
+class AHDSRCurveTables {
+public:
+    // Rebake the Attack / Decay / Release tables from the envelope's curves.
+    // Cheap (early-out) when the curves match the last bake.
+    void prepare(const AHDSREnvelope& env);
+
+    // Sample a baked curve at t in 0..1 (linear interp between table entries).
+    float attack(float t)  const { return sample(attackTable,  t); }
+    float decay(float t)   const { return sample(decayTable,   t); }
+    float release(float t) const { return sample(releaseTable, t); }
+
+    static constexpr int kTableSize = 256;
+
+private:
+    static float sample(const std::vector<float>& tbl, float t);
+    std::vector<float> attackTable;
+    std::vector<float> decayTable;
+    std::vector<float> releaseTable;
+    size_t lastCurveHash = 0;     // skip rebake when curves haven't changed
+};
+
+// ==============================================================================
+// AHDSREnvelopeRuntime - per-voice playback state for the envelope above.
+// Synths construct one per voice; on note-on they call noteOn(velocity); on
+// note-off they call noteOff(); each sample they call tick(sampleRate,
+// envelope, tables) to advance and read the current 0..1 amplitude. The
+// tables are owned by the processor (one per node) and passed in. This is the
+// "applying the curves while playing" half of the shared envelope code.
 //
-// The runtime owns the precomputed curve tables (256-sample lookup per
-// stage) so curve evaluation in the audio thread is a cheap linear lerp
-// of two table entries.
+// Velocity: noteOn() stores the 0..1 velocity. tick() scales the *target
+// peak* by the envelope's velocitySensitivity, so a synth routing its master
+// amplitude through this runtime must NOT also multiply by velocity itself.
 // ==============================================================================
 class AHDSREnvelopeRuntime {
 public:
@@ -84,17 +111,13 @@ public:
     void noteOn(float velocity01);
     void noteOff();
 
-    // Called once per processBlock (or whenever the envelope has changed)
-    // to refresh the curve lookup tables. Cheap if the envelope hasn't
-    // changed since the last call (it stores the hash of the curves it
-    // last baked from and skips the work when unchanged).
-    void prepareCurves(const AHDSREnvelope& env);
-
     // Advance one sample and return the current 0..1 amplitude.
-    float tick(float sampleRate, const AHDSREnvelope& env);
+    float tick(float sampleRate, const AHDSREnvelope& env,
+               const AHDSRCurveTables& tables);
 
     bool isActive() const { return stage != Stage::Off; }
     Stage currentStage() const { return stage; }
+    float level() const { return currentLevel; }   // for voice-steal "quietest"
 
     // Forcibly silence + reset (for steal / panic). Does not transition
     // through release.
@@ -106,14 +129,6 @@ private:
     float currentLevel = 0.0f;
     float peak = 1.0f;            // scaled by velocity at note-on
     float releaseStartLevel = 0.0f;
-
-    // 256-sample precomputed curve tables (x in 0..1 -> shape in 0..1).
-    static constexpr int kTableSize = 256;
-    std::vector<float> attackTable;
-    std::vector<float> holdTable;
-    std::vector<float> decayTable;
-    std::vector<float> releaseTable;
-    size_t lastCurveHash = 0;     // skip rebake when curves haven't changed
 };
 
 } // namespace SoundShop

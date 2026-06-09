@@ -945,6 +945,13 @@ CaptureFromSongDialog::CaptureFromSongDialog(NodeGraph& g, Transport& t,
         updateStatusLabel();
         if (state == TState::Paused || state == TState::Scrubbing)
             regenerateGrain();
+        // Unified save model: write the crossfade through to the live frame in
+        // re-capture mode - but only for genuine user moves, not the synthetic
+        // value the width-clamp injects (that would clobber the frame's xfade
+        // when the user only touched Width, a capture-time param). No-op in
+        // append mode.
+        if (!syncingCrossfadeFromWidth)
+            publishMetadataEdit();
     };
     // Initial range: cap at width/2. Width slider has already been
     // configured above with its default value, so this is the right
@@ -1007,6 +1014,9 @@ CaptureFromSongDialog::CaptureFromSongDialog(NodeGraph& g, Transport& t,
         // current marker spot. No-op if not currently in GrainLoop.
         if (state == TState::Paused || state == TState::Scrubbing)
             regenerateGrain();
+        // Unified save model: write the freeze mode through to the live frame
+        // in re-capture mode. No-op in append.
+        publishMetadataEdit();
     };
 
     // ----- Embedded pitch picker -----
@@ -1022,6 +1032,13 @@ CaptureFromSongDialog::CaptureFromSongDialog(NodeGraph& g, Transport& t,
         capturedPitchHz = noteOctaveToHz(n, o);
         centsLabel.setText(formatCents(capturedPitchHz),
                            juce::dontSendNotification);
+        // Retune the live marker audition immediately so picking "As note" is
+        // audible right away, matching what the synth voice will play.
+        publishPreviewPitch();
+        // Unified save model: in re-capture mode, write the new pitch label
+        // straight through to the live frame so closing the panel can't lose
+        // it (matches the frame editor's per-edit commit). No-op in append.
+        publishMetadataEdit();
     };
     noteCombo.onChange   = onPitchPickerChanged;
     octaveCombo.onChange = onPitchPickerChanged;
@@ -1429,6 +1446,9 @@ void CaptureFromSongDialog::regenerateGrain() {
     // the engine guards against that via grainLen-vs-buffer-size check
     // and grainLastAppliedSrcPtr comparison, falling back to silence
     // if the pairing is invalid.
+    // Re-apply the "As note" playback pitch every time we respin the source
+    // (marker move, width/mode change) so the audition stays pitched.
+    publishPreviewPitch();
     eng->setPreviewGrainLength(widthSamples);
     // Crossfade length, in samples, from the dedicated slider. The
     // engine clamps to [0, L/2] internally so it's always safe; we just
@@ -1438,6 +1458,68 @@ void CaptureFromSongDialog::regenerateGrain() {
         (int)std::round(crossfadeSlider.getValue() * 0.001 * songSampleRate));
     eng->setPreviewCrossfadeLength(xfadeSamples);
     eng->setPreviewGrainBuffer(std::move(src));
+}
+
+void CaptureFromSongDialog::seedFromExistingFrame(double pitchHz,
+                                                  int freezeModeIdx,
+                                                  double crossfadeMs) {
+    // ----- Pitch -----
+    if (pitchHz > 0.0) {
+        capturedPitchHz = pitchHz;
+        auto [n, o] = hzToNearestNoteOctave(pitchHz);
+        if (n >= 0 && n <= 11) noteCombo.setSelectedId(n + 1, juce::dontSendNotification);
+        if (o >= 0 && o <= 9)  octaveCombo.setSelectedId(o + 1, juce::dontSendNotification);
+        centsLabel.setText(formatCents(pitchHz), juce::dontSendNotification);
+        publishPreviewPitch();
+    }
+
+    // ----- Freeze mode -----
+    if (freezeModeIdx >= 0 && freezeModeIdx <= 3) {
+        freezeModeCombo.setSelectedId(freezeModeIdx + 1, juce::dontSendNotification);
+        // Match the live audition to the seeded mode (the onChange handler that
+        // would normally do this is suppressed by dontSendNotification).
+        if (auto* eng = AudioEngine::getInstance())
+            eng->setGrainFreezeMode((AudioEngine::GrainFreezeMode)freezeModeIdx);
+    }
+
+    // ----- Crossfade (ms) -----
+    if (crossfadeMs >= 0.0) {
+        // Width may cap the crossfade max below the frame's stored value; clamp
+        // into the slider's current range so the visible value is honest, but
+        // remember the frame's true intent in crossfadeDesiredMs so a later
+        // Width increase can restore it (mirrors syncCrossfadeMaxToWidth).
+        crossfadeDesiredMs = crossfadeMs;
+        const double vis = juce::jlimit(crossfadeSlider.getMinimum(),
+                                        crossfadeSlider.getMaximum(), crossfadeMs);
+        crossfadeSlider.setValue(vis, juce::dontSendNotification);
+    }
+}
+
+void CaptureFromSongDialog::publishMetadataEdit() {
+    if (!onMetadataEdited) return;  // append mode: no live frame bound
+    const int fz = juce::jlimit(0, 3, freezeModeCombo.getSelectedId() - 1);
+    // Report crossfade in ms (rate-independent), using the user's INTENDED value
+    // (crossfadeDesiredMs) rather than the visible slider value. The visible
+    // value is clamped down to half the current Width; writing that to the bound
+    // frame would silently shrink its crossfade whenever an UNRELATED edit (e.g.
+    // pitch) fires while Width happens to cap the slider below the frame's real
+    // value. The frame keeps its own grainLength (Width is a capture-time param
+    // that doesn't write through), and the synth clamps the seam to grainLength/2
+    // at use time, so storing the full intent here is both safe and lossless.
+    onMetadataEdited(capturedPitchHz, fz, crossfadeDesiredMs);
+}
+
+void CaptureFromSongDialog::publishPreviewPitch() {
+    auto* eng = AudioEngine::getInstance();
+    if (!eng) return;
+    // Reference note A4 (440 Hz) matches the wavetable editor's audition pitch
+    // (kAuditionPitch = 69), so the marker preview, the editor's Play button,
+    // and a synth note at A4 all sound the captured frame at the same pitch.
+    // capturedPitchHz is the pitch the user is labelling this grain as, so
+    // playing it "as A4" resamples by 440 / capturedPitchHz.
+    constexpr double kReferenceHz = 440.0;
+    const double hz = (capturedPitchHz > 0.0) ? capturedPitchHz : kReferenceHz;
+    eng->setPreviewGrainRatio((float)(kReferenceHz / hz));
 }
 
 int CaptureFromSongDialog::xForSamplePos(int64_t pos) const {

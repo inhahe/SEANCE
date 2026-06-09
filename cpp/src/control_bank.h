@@ -60,6 +60,7 @@ private:
 
     juce::Label    titleLabel;
     juce::TextButton addBtn{"+ Slider"};
+    juce::TextButton removeLastBtn{"- Slider"};
     juce::ToggleButton orientationToggle{"Horizontal sliders"};
 
     Node* node() { return graph.findNode(nodeId); }

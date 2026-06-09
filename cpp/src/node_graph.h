@@ -279,6 +279,17 @@ struct Node {
     // worst a meter glitch, never a crash. Decay is applied UI-side.
     float meterPeakL = 0.0f;
     float meterPeakR = 0.0f;
+
+    // Runtime-only (not serialized): does this node have an audio path to an
+    // Output node? Recomputed by GraphProcessor::rebuildGraph after every
+    // topology change. Used by synth audition (editor "Play" on an unplaced
+    // library frame): when a synth node can't reach an Output, its audition
+    // voices are diverted to the AudioEngine's audition-monitor bus so the
+    // preview is still audible. When the node IS routed to output, the
+    // audition stays in the normal graph path so it flows through the user's
+    // downstream effects/pan exactly like a played note. Defaults to true so
+    // the conservative "stay in graph" behavior holds before the first build.
+    bool reachesOutput = true;
     std::vector<Param> params;
 
     // On-demand signal modulation pins (#88). Each entry binds a
@@ -318,23 +329,7 @@ struct Node {
     // Edited via the shared AHDSREnvelopeComponent (opened either inline
     // from a synth dialog or via a right-click "Envelope..." menu on
     // the node). Save/load and undo serialize this through encode/decode.
-    //
-    // Note for migration: the legacy envAttackCurve / envAttackPoints
-    // etc. fields below are kept for backward compatibility while the
-    // codebase transitions to ahdsrEnvelope. Once all sites read from
-    // ahdsrEnvelope, the legacy fields will be removed. Project load
-    // copies legacy values into ahdsrEnvelope before the audio
-    // processor sees the node.
     AHDSREnvelope ahdsrEnvelope;
-
-    // DEPRECATED - kept only to keep existing code compiling during
-    // the migration to ahdsrEnvelope. Do not add new readers.
-    std::string envAttackCurve;
-    std::string envDecayCurve;
-    std::string envReleaseCurve;
-    std::vector<std::pair<float, float>> envAttackPoints;
-    std::vector<std::pair<float, float>> envDecayPoints;
-    std::vector<std::pair<float, float>> envReleasePoints;
 
     // Per-channel aftertouch input. When something is wired to the
     // "Aftertouch" Param input pin on a synth node, the wired control's
@@ -400,6 +395,24 @@ struct Node {
     double modImportPrevLoopStart  = 0.0;
     double modImportPrevLoopEnd    = 0.0;
 
+    // Direct granular-frame payload carried by an audition note-on so the
+    // synth can render a SPECIFIC granular frame that isn't placed into the
+    // wavetable's grid/scatter (and therefore isn't in the synth's
+    // wtGranularFrames table). The wavetable editor's Play button uses this
+    // so a freshly-captured, library-only frame is audible immediately and
+    // faithfully (exact on-screen bytes, no wait for the ~150ms graph
+    // rebuild). Mirrors GranularFrame's fields without pulling
+    // granular_frame.h into this header. Shared so the large source PCM isn't
+    // deep-copied through the audio-thread queue.
+    struct AuditionGranularFrame {
+        std::shared_ptr<std::vector<float>> source; // mono PCM at sourceSampleRate
+        double sourceSampleRate = 0.0;
+        int    grainLength      = 4800;
+        float  embeddedPitchHz  = 440.0f;
+        int    freezeMode       = 0;    // 0 = CrossfadeLoop
+        int    crossfadeSamples = 2400;
+    };
+
     // Audition MIDI events injected from the UI (thread-safe via simple flag)
     struct AuditionEvent {
         bool isNoteOn;
@@ -412,6 +425,12 @@ struct Node {
         // One entry per Position dimension, each in [0,1]. Ignored on
         // note-off events.
         std::vector<float> position;
+        // Optional direct granular frame to render for this note-on. When set
+        // (non-null), the voice plays THIS frame exclusively, bypassing both
+        // the cycle terrain and the placed-frame morph - this is how the
+        // editor auditions an unplaced library frame. Null for ordinary
+        // MIDI / timeline notes and for non-granular frame auditions.
+        std::shared_ptr<AuditionGranularFrame> granularFrame;
     };
     std::vector<AuditionEvent> pendingAudition; // written by UI, read by audio thread
     std::shared_ptr<std::mutex> auditionMutex = std::make_shared<std::mutex>();

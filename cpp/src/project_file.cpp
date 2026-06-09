@@ -152,19 +152,12 @@ bool ProjectFile::writeProject(std::ostream& f, NodeGraph& graph,
         }
         if (!node.midiInputSourceId.empty())
             writeStr(f, "midiInputSourceId", node.midiInputSourceId);
-        if (!node.envAttackCurve.empty()) writeStr(f, "envAttackCurve", node.envAttackCurve);
-        if (!node.envDecayCurve.empty()) writeStr(f, "envDecayCurve", node.envDecayCurve);
-        if (!node.envReleaseCurve.empty()) writeStr(f, "envReleaseCurve", node.envReleaseCurve);
-        for (auto& pt : node.envAttackPoints) f << "envAtkPt=" << pt.first << "," << pt.second << "\n";
-        for (auto& pt : node.envDecayPoints) f << "envDecPt=" << pt.first << "," << pt.second << "\n";
-        for (auto& pt : node.envReleasePoints) f << "envRelPt=" << pt.first << "," << pt.second << "\n";
-        // Shared AHDSR envelope (post-migration replacement for envAttackCurve
-        // et al.). One line — encode() returns a single line with no newlines
-        // and length-prefixed curve fields, so it survives writeStr round-trip
-        // regardless of curve content. Saved unconditionally because it carries
-        // sensible defaults (linear ramps, 5ms / 0ms / 200ms / 0.7 / 300ms /
-        // velSens=1) — we want those defaults to persist exactly across save/
-        // load rather than relying on the constructor at load time.
+        // Shared AHDSR envelope. One line — encode() returns a single line with
+        // no newlines and length-prefixed curve fields, so it survives writeStr
+        // round-trip regardless of curve content. Saved unconditionally because
+        // it carries sensible defaults (linear ramps, 5ms / 0ms / 200ms / 0.7 /
+        // 300ms / velSens=1) — we want those defaults to persist exactly across
+        // save/load rather than relying on the constructor at load time.
         writeStr(f, "ahdsrEnvelope", node.ahdsrEnvelope.encode());
         if (node.aftertouchSensitivity != 0.5f)
             writeFloat(f, "aftertouchSensitivity", node.aftertouchSensitivity);
@@ -604,23 +597,16 @@ bool ProjectFile::readProject(std::istream& f, NodeGraph& graph, PluginHost* plu
                 }
             }
             else if (key == "midiInputSourceId") curNode->midiInputSourceId = val;
-            else if (key == "envAttackCurve") curNode->envAttackCurve = val;
-            else if (key == "envDecayCurve") curNode->envDecayCurve = val;
-            else if (key == "envReleaseCurve") curNode->envReleaseCurve = val;
-            else if (key == "envAtkPt") {
-                auto c = val.find(',');
-                if (c != std::string::npos)
-                    curNode->envAttackPoints.push_back({std::stof(val.substr(0,c)), std::stof(val.substr(c+1))});
-            }
-            else if (key == "envDecPt") {
-                auto c = val.find(',');
-                if (c != std::string::npos)
-                    curNode->envDecayPoints.push_back({std::stof(val.substr(0,c)), std::stof(val.substr(c+1))});
-            }
-            else if (key == "envRelPt") {
-                auto c = val.find(',');
-                if (c != std::string::npos)
-                    curNode->envReleasePoints.push_back({std::stof(val.substr(0,c)), std::stof(val.substr(c+1))});
+            // Legacy per-node envelope fields (envAttackCurve / envDecayCurve /
+            // envReleaseCurve and the envAtkPt / envDecPt / envRelPt point
+            // lists) were replaced by the shared ahdsrEnvelope. They're still
+            // recognised here so old projects load cleanly, but their values
+            // are intentionally discarded — the node now carries its amplitude
+            // shape solely in ahdsrEnvelope.
+            else if (key == "envAttackCurve" || key == "envDecayCurve" ||
+                     key == "envReleaseCurve" || key == "envAtkPt" ||
+                     key == "envDecPt" || key == "envRelPt") {
+                // discard
             }
             else if (key == "ahdsrEnvelope") {
                 // Failure to decode (corrupt / partial line) leaves the

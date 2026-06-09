@@ -165,6 +165,15 @@ private:
     std::vector<float> projectBufL, projectBufR;
     double resamplePhase = 0.0;
 
+    // Audition-monitor bus (see addAuditionMonitor in the public section).
+    // Sized to the project buffer; cleared each callback before the graph
+    // processes and summed into the graph output afterwards. auditionMonLen is
+    // the valid sample count for the current block.
+    std::vector<float> auditionMonL, auditionMonR;
+    int auditionMonLen = 0;
+    void clearAuditionMonitor(int n);
+    void mixAuditionMonitorInto(float* left, float* right, int n) const;
+
     // Incoming MIDI from hardware controllers
     // Incoming MIDI from hardware devices, with per-message source device
     // identifier so the audio thread can look up the matching MidiInput
@@ -330,6 +339,24 @@ public:
     void recordParamChange(int nodeId, int paramIdx, float value);
 
     // ============================================================
+    // Audition-monitor bus.
+    // ============================================================
+    // When a synth node is NOT routed to an Output node (Node::reachesOutput
+    // == false), its editor "Play" audition voices have nowhere to go in the
+    // graph - the rendered audio dead-ends at the unconnected node. To keep the
+    // preview audible regardless of wiring, TerrainSynthProcessor diverts those
+    // audition voices here instead of into its graph output buffer. The audio
+    // callback clears this bus before processing the graph and sums it into the
+    // final output afterwards (at project rate, so it resamples with the rest).
+    //
+    // Thread model: addAuditionMonitor() is only ever called from inside
+    // graphProcessor.processBlock(), which the audio callback invokes between
+    // clearAuditionMonitor() and mixAuditionMonitorInto() on the SAME thread -
+    // so no locking is needed. Synth nodes accumulate (multiple unrouted synths
+    // auditioning at once sum together). Mono in, panned dead-center.
+    void addAuditionMonitor(const float* mono, int n);
+
+    // ============================================================
     // Preview audio for the "Capture from project" dialog (#capV2).
     // ============================================================
     // The dialog pre-renders the whole song to mono PCM once on open,
@@ -399,6 +426,21 @@ public:
     int  getPreviewCrossfadeLength() const {
         return previewCrossfadeSamples.load(std::memory_order_acquire);
     }
+    // Set the GrainLoop playback pitch ratio. 1.0 = play the marker loop at
+    // its native rate (the literal recording). >1 plays it faster/higher,
+    // <1 slower/lower. The capture dialog's "As note" picker drives this so
+    // the marker audition is pitched to match what the eventual synth voice
+    // will produce when the captured frame is played at the editor's
+    // reference note (A4 = 440 Hz): ratio = 440 / capturedPitchHz. The audio
+    // thread resamples the loop with linear interpolation; the source buffer
+    // already reserves an L/2 lookahead tail, so any ratio in the supported
+    // pitch range stays inside the buffer. Safe to call from any thread.
+    void setPreviewGrainRatio(float r) {
+        previewGrainRatio.store(r > 0.0f ? r : 1.0f, std::memory_order_release);
+    }
+    float getPreviewGrainRatio() const {
+        return previewGrainRatio.load(std::memory_order_acquire);
+    }
     void setPreviewMode(PreviewMode m) {
         previewMode.store((int)m, std::memory_order_release);
     }
@@ -421,6 +463,7 @@ public:
         setPreviewGrainBuffer(nullptr);
         previewGrainLenSamples.store(0, std::memory_order_release);
         previewCrossfadeSamples.store(0, std::memory_order_release);
+        previewGrainRatio.store(1.0f, std::memory_order_release);
         previewSongPosSamples.store(0, std::memory_order_release);
     }
 
@@ -429,6 +472,7 @@ private:
     std::atomic<int64_t>  previewSongPosSamples { 0 };
     std::atomic<int>      previewGrainLenSamples { 0 };
     std::atomic<int>      previewCrossfadeSamples { 0 };
+    std::atomic<float>    previewGrainRatio { 1.0f };
     std::atomic<std::shared_ptr<std::vector<float>>> previewSongPcm;
     std::atomic<std::shared_ptr<std::vector<float>>> previewGrainBuf;
     // Audio-thread-only crossfade state.
@@ -482,8 +526,10 @@ private:
     //                         anchor + L + L/2 samples available to leave
     //                         room for the largest xfade the user can
     //                         pick; the init clamps anchor accordingly.
-    //   grainPhase          - current position within the loop, in [0, L).
-    //                         Increments by 1 per sample, wraps at L.
+    //   grainPhase          - current fractional position within the loop, in
+    //                         [0, L). Advances by previewGrainRatio per sample
+    //                         (1.0 = native pitch) with linear interpolation,
+    //                         wraps at L.
     //   grainLastAppliedLen - L the state was initialised for. If the UI
     //                         changes L, we reset.
     //   grainLastAppliedSrcPtr - last source buffer ptr; new buffer triggers
@@ -496,7 +542,7 @@ private:
     int     previewFadeCounter = 0;
     int64_t prevSongPosForFade = 0;
     int     grainAnchor            = 0;
-    int     grainPhase             = 0;
+    float   grainPhase             = 0.0f;
     int     grainLastAppliedLen    = 0;
     const float* grainLastAppliedSrcPtr = nullptr;
     bool    grainNeedsReinit       = false;

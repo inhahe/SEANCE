@@ -327,14 +327,20 @@ private:
         }
     }
 
-    // Signal role: read audio-out channel 0 back into ctx.out.
+    // Signal role: read audio-out channel 0 back into ctx.out. Control signals
+    // are unipolar 0..1 on the wire (see signal_modulation.h), so a signal-role
+    // module must write 0..1 into its output channel; we clamp here to enforce
+    // that, matching the Lua runtime's out() clamp.
     void readSignalOutput(const ScriptBlockCtx& c) {
         if (!c.out) return;
         uint32_t off = audioOutOffset; // pair 0, channel 0
-        if (off + (uint32_t)c.numSamples * sizeof(float) <= memSize)
-            std::memcpy(c.out, mem + off, (size_t)c.numSamples * sizeof(float));
-        else
+        if (off + (uint32_t)c.numSamples * sizeof(float) <= memSize) {
+            const float* src = reinterpret_cast<const float*>(mem + off);
+            for (int i = 0; i < c.numSamples; ++i)
+                c.out[i] = juce::jlimit(0.0f, 1.0f, src[i]);
+        } else {
             std::memset(c.out, 0, (size_t)c.numSamples * sizeof(float));
+        }
     }
 
     // MIDI role: drain the script's MIDI-out events into ctx.sink, stamping each

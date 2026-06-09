@@ -640,7 +640,20 @@ void NodeGraphComponent::drawLink(juce::Graphics& g, Link& link) {
         };
 
         float tagR = std::max(4.0f, 5.0f * zoom); // tag radius
-        float t = 0.35f; // starting position along the cable
+
+        // Count how many tags this cable will draw: one circle for wire
+        // identity, plus one diamond per effect group the link belongs to.
+        // Knowing the total up front lets us centre the whole cluster on the
+        // wire's midpoint (t=0.5) instead of starting at a fixed offset.
+        int tagCount = 1;
+        for (const auto& grp : graph.effectGroups)
+            for (int lid : grp.linkIds)
+                if (lid == link.id) { ++tagCount; break; }
+
+        const float tagSpacing = 0.12f; // gap between consecutive tags in t
+        // Centre the run of tags on t=0.5: a run of N tags spans
+        // (N-1)*spacing, so the first sits half a span before the midpoint.
+        float t = 0.5f - (tagCount - 1) * tagSpacing * 0.5f;
 
         // --- Circle tag: individual wire identity ---
         {
@@ -652,7 +665,7 @@ void NodeGraphComponent::drawLink(juce::Graphics& g, Link& link) {
             g.fillEllipse(pos.x - tagR, pos.y - tagR, tagR * 2, tagR * 2);
             g.setColour(juce::Colours::white.withAlpha(0.8f));
             g.drawEllipse(pos.x - tagR, pos.y - tagR, tagR * 2, tagR * 2, 1.0f);
-            t += 0.12f;
+            t += tagSpacing;
         }
 
         // --- Diamond tags: one per group this link belongs to ---
@@ -662,7 +675,7 @@ void NodeGraphComponent::drawLink(juce::Graphics& g, Link& link) {
                 if (lid == link.id) { inGroup = true; break; }
             if (!inGroup) continue;
 
-            auto pos = bezierAt(std::min(t, 0.85f));
+            auto pos = bezierAt(juce::jlimit(0.0f, 1.0f, t));
             uint32_t col = grp.color;
             g.setColour(juce::Colour((uint8_t)((col >> 16) & 0xFF),
                                      (uint8_t)((col >> 8) & 0xFF),
@@ -686,7 +699,7 @@ void NodeGraphComponent::drawLink(juce::Graphics& g, Link& link) {
                            80, 12, juce::Justification::centredLeft, false);
             }
 
-            t += 0.12f;
+            t += tagSpacing;
         }
     }
 }
@@ -1618,15 +1631,16 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
             // missing params via getParam's default-fallback path, and the
             // Position param is now looked up by name so its index doesn't
             // matter.
-            n.params.push_back({"Attack",   0.01f, 0.001f, 2.0f});
-            n.params.push_back({"Decay",    0.1f,  0.001f, 2.0f});
-            n.params.push_back({"Sustain",  0.7f,  0.0f,   1.0f});
-            n.params.push_back({"Release",  0.3f,  0.001f, 5.0f});
+            // Amplitude envelope lives on the shared node AHDSR (single
+            // source of truth, edited via right-click "Envelope (AHDSR)..."),
+            // not as inline params. Seed it with this synth's classic ADSR
+            // character. Velocity sensitivity is part of the envelope too.
+            n.ahdsrEnvelope.attackMs  = 10.0f;
+            n.ahdsrEnvelope.decayMs   = 100.0f;
+            n.ahdsrEnvelope.sustain   = 0.7f;
+            n.ahdsrEnvelope.releaseMs = 300.0f;
             n.params.push_back({"Volume",   1.0f,  0.0f,   1.0f});
             n.params.push_back({"Pan",      0.0f, -1.0f,   1.0f});
-            // Velocity sensitivity: 0 = ignore velocity (every note at full
-            // volume), 1 = linear response (default, v/127 gain).
-            n.params.push_back({"Vel Sens", 1.0f,  0.0f,   1.0f});
             // Mod-wheel vibrato depth (0 = disable the default behavior so
             // the user can MIDI-Learn CC1 to a different param instead).
             n.params.push_back({"Vibrato",  1.0f,  0.0f,   1.0f});
@@ -2013,10 +2027,10 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
                         n.script = "__sf2__:" + file.getFullPathName().toStdString();
                     else
                         n.script = "__sfz__:" + file.getFullPathName().toStdString();
-                    n.params.push_back({"Attack",   0.01f, 0.001f, 2.0f});
-                    n.params.push_back({"Decay",    0.1f,  0.001f, 2.0f});
-                    n.params.push_back({"Sustain",  0.7f,  0.0f,   1.0f});
-                    n.params.push_back({"Release",  0.3f,  0.001f, 5.0f});
+                    // No Attack/Decay/Sustain/Release params: the SoundFont /
+                    // SFZ player's amplitude envelope comes from the sound-
+                    // bank file itself (SF2 preset / SFZ region ampeg), so
+                    // node-level ADSR sliders would be inert.
                     n.params.push_back({"Volume",   0.5f,  0.0f,   1.0f});
                     n.params.push_back({"Pan",      0.0f, -1.0f,   1.0f});
                     n.params.push_back({"Vel Sens", 1.0f,  0.0f,   1.0f});
@@ -2062,11 +2076,12 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
             n.script = "__spectralgrain__:exp(-f/10)";
             n.params.push_back({"Density",    20.0f, 1.0f, 200.0f});
             n.params.push_back({"Grain Size", 40.0f, 1.0f, 200.0f});
-            n.params.push_back({"Attack",      0.01f, 0.001f, 2.0f});
-            n.params.push_back({"Decay",       0.1f, 0.001f, 5.0f});
-            n.params.push_back({"Sustain",     0.7f, 0.0f, 1.0f});
-            n.params.push_back({"Release",     0.3f, 0.001f, 10.0f});
             n.params.push_back({"Volume",      0.5f, 0.0f, 1.0f});
+            // Amplitude envelope on the shared node AHDSR (see Wavetable above).
+            n.ahdsrEnvelope.attackMs  = 10.0f;
+            n.ahdsrEnvelope.decayMs   = 100.0f;
+            n.ahdsrEnvelope.sustain   = 0.7f;
+            n.ahdsrEnvelope.releaseMs = 300.0f;
             repaint();
         } else if (result == 112) {
             // Additive Synth (ID changed from 110 to 112 to break a
@@ -2079,11 +2094,12 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
             n.params.push_back({"Partials",   16.0f, 1.0f, 64.0f});
             n.params.push_back({"Stretch",     0.0f, 0.0f,  2.0f});
             n.params.push_back({"Brightness",  1.0f, 0.0f,  3.0f});
-            n.params.push_back({"Attack",      0.01f, 0.001f, 2.0f});
-            n.params.push_back({"Decay",       0.1f, 0.001f, 5.0f});
-            n.params.push_back({"Sustain",     0.7f, 0.0f, 1.0f});
-            n.params.push_back({"Release",     0.3f, 0.001f, 10.0f});
             n.params.push_back({"Volume",      0.5f, 0.0f, 1.0f});
+            // Amplitude envelope on the shared node AHDSR (see Wavetable above).
+            n.ahdsrEnvelope.attackMs  = 10.0f;
+            n.ahdsrEnvelope.decayMs   = 100.0f;
+            n.ahdsrEnvelope.sustain   = 0.7f;
+            n.ahdsrEnvelope.releaseMs = 300.0f;
             repaint();
         } else if (result == 109) {
             // Particle Cloud Synth
@@ -2110,11 +2126,13 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
             n.params.push_back({"DCW Attack",  0.01f, 0.001f, 2.0f});
             n.params.push_back({"DCW Decay",   0.3f, 0.001f, 5.0f});
             n.params.push_back({"DCW Sustain", 0.3f, 0.0f, 1.0f});
-            n.params.push_back({"Attack",      0.005f, 0.001f, 2.0f});
-            n.params.push_back({"Decay",       0.1f, 0.001f, 5.0f});
-            n.params.push_back({"Sustain",     0.7f, 0.0f, 1.0f});
-            n.params.push_back({"Release",     0.3f, 0.001f, 10.0f});
             n.params.push_back({"Volume",      0.5f, 0.0f, 1.0f});
+            // Amplitude envelope on the shared node AHDSR (the DCW envelope
+            // above is a separate timbral envelope and stays as params).
+            n.ahdsrEnvelope.attackMs  = 5.0f;
+            n.ahdsrEnvelope.decayMs   = 100.0f;
+            n.ahdsrEnvelope.sustain   = 0.7f;
+            n.ahdsrEnvelope.releaseMs = 300.0f;
             repaint();
         } else if (result == 100 || result == 103) {
             // Piano and Drum Machine: functional defaults that route through
@@ -2143,11 +2161,14 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
                 n.script = lw.encode();
             }
 
+            // Amplitude envelope on the shared node AHDSR, seeded with each
+            // preset's character (Piano: slow decay + sustain + long release;
+            // Drum Machine: snappy, no sustain). Edited via "Envelope (AHDSR)...".
+            n.ahdsrEnvelope.attackMs  = (result == 100) ? 5.0f   : 1.0f;
+            n.ahdsrEnvelope.decayMs   = (result == 100) ? 300.0f : 100.0f;
+            n.ahdsrEnvelope.sustain   = (result == 100) ? 0.5f   : 0.0f;
+            n.ahdsrEnvelope.releaseMs = (result == 100) ? 500.0f : 100.0f;
             // Compact param list (same rationale as Waveform Synth above).
-            n.params.push_back({"Attack",  (result == 100) ? 0.005f : 0.001f, 0.001f, 2.0f});
-            n.params.push_back({"Decay",   (result == 100) ? 0.3f   : 0.1f,   0.001f, 2.0f});
-            n.params.push_back({"Sustain", (result == 100) ? 0.5f   : 0.0f,   0.0f,   1.0f});
-            n.params.push_back({"Release", (result == 100) ? 0.5f   : 0.1f,   0.001f, 5.0f});
             n.params.push_back({"Volume",  1.0f, 0.0f, 1.0f});
             n.params.push_back({"Pan",     0.0f, -1.0f, 1.0f});
         } else if (result == 206) {
@@ -2502,23 +2523,29 @@ void NodeGraphComponent::showNodeMenu(Node& node) {
                              true, node.mpeEnabled);
         }
     }
-    // Envelope editor on tonal / note-triggered synths. The AHDSR
-    // envelope on Node is universal across all synth types (built-in,
-    // terrain, FM, additive, PD, particle, drum-pitched), so we offer
-    // the entry-point on any synth-bearing node. We exclude raw plugin-
-    // hosting Instruments (those have their own envelope inside the
-    // plugin) by checking pluginIndex < 0.
+    // Envelope editor on synths whose amplitude envelope IS the shared node
+    // AHDSR. These read node.ahdsrEnvelope directly through the shared
+    // AHDSREnvelopeRuntime: the Terrain/wavetable engine plus the Additive,
+    // PD, and Spectral Grain synths. Synths that supply their own amplitude
+    // envelope - FM (per-operator), Particle (per-grain), Drum (per-sound),
+    // and the sample/region-file players (SoundFont, SFZ, Sfizz,
+    // MultiSampler) - are NOT offered the editor, because editing it would be
+    // inert (a silent lie). Extending a shared master-VCA to those synths is
+    // tracked as future work in known-issues.md. Raw plugin-hosting
+    // Instruments (pluginIndex >= 0) have their envelope inside the plugin.
     bool isTonalSynth = false;
-    if (node.type == NodeType::Instrument && node.pluginIndex < 0) isTonalSynth = true;
-    if (node.type == NodeType::TerrainSynth) isTonalSynth = true;
-    {
+    if (node.type == NodeType::TerrainSynth) {
+        isTonalSynth = true;
+    } else if (node.type == NodeType::Instrument && node.pluginIndex < 0) {
         auto isScript = [&](const char* tag) {
             return node.script.rfind(tag, 0) == 0;
         };
-        if (isScript("__fmsynth__") || isScript("__additivesynth__") ||
-            isScript("__pdsynth__") || isScript("__particlesynth__") ||
-            isScript("__drumsynth__"))
-            isTonalSynth = true;
+        bool ownEnvelope =
+            isScript("__fmsynth__") || isScript("__particlesynth__") ||
+            isScript("__drumsynth__") || isScript("__sf2__") ||
+            isScript("__sfz__") || isScript("__sfizz__") ||
+            isScript(MultiSamplerDoc::kPrefix);
+        isTonalSynth = !ownEnvelope;
     }
     if (isTonalSynth)
         menu.addItem(180, "Envelope (AHDSR)...");
@@ -2653,32 +2680,16 @@ void NodeGraphComponent::showNodeMenu(Node& node) {
             graph.dirty = true;
         } else if (result == 180) {
             // Open the shared AHDSR envelope editor on this node.
-            // The dialog hosts the reusable AHDSREnvelopeComponent
-            // editing node->ahdsrEnvelope by reference; on every
-            // change we mark the graph dirty and snapshot for undo.
+            // The dialog hosts the reusable AHDSREnvelopeComponent editing
+            // node->ahdsrEnvelope by reference. node->ahdsrEnvelope is the
+            // single source of truth that every tonal synth reads directly,
+            // so the onChanged callback only needs to mark the graph dirty
+            // (the undo snapshot is committed once when the dialog closes).
             int captured = nodeId;
             auto* content = new AHDSREnvelopeComponent(node->ahdsrEnvelope,
                 [this, captured]() {
-                    if (auto* n = graph.findNode(captured)) {
+                    if (auto* n = graph.findNode(captured))
                         graph.dirty = true;
-                        // Sync the legacy expression fields so any code
-                        // still reading them sees the new shape until
-                        // the migration is complete.
-                        n->envAttackCurve  = n->ahdsrEnvelope.attackCurve.expression;
-                        n->envDecayCurve   = n->ahdsrEnvelope.decayCurve.expression;
-                        n->envReleaseCurve = n->ahdsrEnvelope.releaseCurve.expression;
-                        // Sync the first four params (A/D/S/R in seconds /
-                        // 0..1 level) so the existing audio-thread param
-                        // reader still produces a usable envelope until
-                        // the synth processor is fully migrated.
-                        auto setParam = [&](int idx, float v) {
-                            if (idx < (int)n->params.size()) n->params[idx].value = v;
-                        };
-                        setParam(0, n->ahdsrEnvelope.attackMs  * 0.001f);
-                        setParam(1, n->ahdsrEnvelope.decayMs   * 0.001f);
-                        setParam(2, n->ahdsrEnvelope.sustain);
-                        setParam(3, n->ahdsrEnvelope.releaseMs * 0.001f);
-                    }
                 });
             content->setSize(700, 420);
             juce::DialogWindow::LaunchOptions opt;
@@ -2790,14 +2801,20 @@ void NodeGraphComponent::showNodeMenu(Node& node) {
                             std::vector<int> downPinIds;
                             for (auto& p : downNode->pinsIn)  downPinIds.push_back(p.id);
                             for (auto& p : downNode->pinsOut) downPinIds.push_back(p.id);
-                            graph.links.erase(std::remove_if(graph.links.begin(), graph.links.end(),
-                                [&downPinIds](const Link& l) {
-                                    for (int pid : downPinIds)
-                                        if (l.startPin == pid || l.endPin == pid) return true;
-                                    return false;
-                                }), graph.links.end());
-                            graph.nodes.erase(std::remove_if(graph.nodes.begin(), graph.nodes.end(),
-                                [downId](const Node& nn) { return nn.id == downId; }), graph.nodes.end());
+                            // Guard the structural edit against the audio
+                            // callback iterating graph.nodes/links (see the
+                            // mutationLock comment in deleteNodeAndDescendants).
+                            {
+                                std::lock_guard<std::mutex> graphLk(graph.mutationLock);
+                                graph.links.erase(std::remove_if(graph.links.begin(), graph.links.end(),
+                                    [&downPinIds](const Link& l) {
+                                        for (int pid : downPinIds)
+                                            if (l.startPin == pid || l.endPin == pid) return true;
+                                        return false;
+                                    }), graph.links.end());
+                                graph.nodes.erase(std::remove_if(graph.nodes.begin(), graph.nodes.end(),
+                                    [downId](const Node& nn) { return nn.id == downId; }), graph.nodes.end());
+                            }
                             graph.dirty = true;
                             graph.commitSnapshot("Merge convolutions");
                         }
@@ -2922,6 +2939,19 @@ void NodeGraphComponent::deleteNodeAndDescendants(int rootId) {
                 anyTimelineDeleted = true;
         }
     }
+    // Hold the graph mutation lock across the entire structural edit (links
+    // erase + nodes erase + the scalar song-setting fixups + commitSnapshot's
+    // serialization read). The audio callback iterates graph.nodes and
+    // graph.links under a try-lock (audio_engine.cpp ~210); without pairing
+    // the lock here, erasing nodes/links while the audio thread was mid-
+    // iteration produced torn reads / use-after-free - the same race that
+    // crashed tracker import (.63000.dmp) and, more recently, deleting the
+    // wavetable node (SEANCE.exe.80308.dmp). The lock_guard lives to end of
+    // function; commitSnapshot only serializes (reads) the graph and never
+    // takes mutationLock, so holding it across the snapshot is deadlock-free
+    // and additionally prevents an audio-thread rebuild mid-serialization.
+    std::lock_guard<std::mutex> graphLk(graph.mutationLock);
+
     graph.links.erase(std::remove_if(graph.links.begin(), graph.links.end(),
         [&](auto& l) { return pinIds.count(l.startPin) || pinIds.count(l.endPin); }),
         graph.links.end());
@@ -3175,10 +3205,12 @@ Node& NodeGraphComponent::makeTerrainNode(const std::string& name,
         {Pin{0, "Audio", PinKind::Audio, false}},
         {canvasPos.x, canvasPos.y});
     n.script = script;
-    n.params.push_back({"Attack",   0.01f, 0.001f, 2.0f});
-    n.params.push_back({"Decay",    0.1f,  0.001f, 2.0f});
-    n.params.push_back({"Sustain",  0.7f,  0.0f,   1.0f});
-    n.params.push_back({"Release",  0.3f,  0.001f, 5.0f});
+    // Amplitude envelope lives in node.ahdsrEnvelope (single source of truth),
+    // not as Attack/Decay/Sustain/Release params. Seed a sensible default.
+    n.ahdsrEnvelope.attackMs  = 10.0f;
+    n.ahdsrEnvelope.decayMs   = 100.0f;
+    n.ahdsrEnvelope.sustain   = 0.7f;
+    n.ahdsrEnvelope.releaseMs = 300.0f;
     n.params.push_back({"Volume",   0.5f,  0.0f,   1.0f});
     n.params.push_back({"Pan",      0.0f, -1.0f,   1.0f});
     n.params.push_back({"Speed",        1.0f,  0.01f, 20.0f});

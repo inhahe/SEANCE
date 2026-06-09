@@ -297,9 +297,24 @@ void MidiScriptProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Midi
         sigChans.push_back((ch < numCh) ? buf.getReadPointer(ch) : nullptr);
     }
 
-    // Detect the transport play rising edge (stopped -> rolling) for the start hook.
+    // Detect transport edges. The rising edge (stopped -> rolling) fires the
+    // start hook; the falling edge (rolling -> stopped) flushes any notes the
+    // script left held so they don't ring forever - e.g. a `start: noteon(64)`
+    // with no matching `noteoff` would otherwise sustain on the downstream
+    // synth even after the user hits stop.
     const bool playStart = transport.playing && !wasPlaying;
+    const bool playStop  = !transport.playing && wasPlaying;
     wasPlaying = transport.playing;
+
+    // On stop: send all-notes-off on every channel into the output buffer and
+    // drop any scheduled note-offs (now moot). Mirrors MidiTimelineProcessor's
+    // stop behaviour; downstream synths (Terrain/wavetable, etc.) release their
+    // voices on this message.
+    if (playStop) {
+        for (int ch = 1; ch <= 16; ++ch)
+            midiIn.addEvent(juce::MidiMessage::allNotesOff(ch), 0);
+        pendingOffs.clear();
+    }
 
     if (!runtime) return;
 

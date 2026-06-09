@@ -391,6 +391,18 @@ struct ExprParser {
         if (matchFunc("floor"))    { float v = parseTernary(); skipWS(); if (*pos == ')') pos++; return std::floor(v); }
         if (matchFunc("ceil"))     { float v = parseTernary(); skipWS(); if (*pos == ')') pos++; return std::ceil(v); }
 
+        // Range converters and unipolar trig aliases. Control signals on the
+        // wire are unipolar 0..1, but sin/cos/tan (and saw/square/triangle/
+        // noise) return bipolar -1..1, so a bare sin() clips its negative half
+        // on the wire. unipolar(x) maps -1..1 -> 0..1 (wrap a whole bipolar
+        // expression in it); bipolar(x) maps 0..1 -> -1..1. usin/ucos/utan are
+        // shorthands for unipolar(sin(x)) etc.
+        if (matchFunc("unipolar")) { float v = parseTernary(); skipWS(); if (*pos == ')') pos++; return v * 0.5f + 0.5f; }
+        if (matchFunc("bipolar"))  { float v = parseTernary(); skipWS(); if (*pos == ')') pos++; return v * 2.0f - 1.0f; }
+        if (matchFunc("usin"))     { float v = parseTernary(); skipWS(); if (*pos == ')') pos++; return std::sin(v) * 0.5f + 0.5f; }
+        if (matchFunc("ucos"))     { float v = parseTernary(); skipWS(); if (*pos == ')') pos++; return std::cos(v) * 0.5f + 0.5f; }
+        if (matchFunc("utan"))     { float v = parseTernary(); skipWS(); if (*pos == ')') pos++; return std::tan(v) * 0.5f + 0.5f; }
+
         // Shape-helper functions (wrap to 2-pi domain like the time-domain x)
         if (matchFunc("saw")) {
             float v = parseTernary(); skipWS(); if (*pos == ')') pos++;
@@ -407,6 +419,22 @@ struct ExprParser {
             return 4.0f * std::abs(t - std::floor(t + 0.5f)) - 1.0f;
         }
 
+        // Unipolar (0..1) shape helpers - same waves mapped onto the wire range.
+        if (matchFunc("usaw")) {
+            float v = parseTernary(); skipWS(); if (*pos == ')') pos++;
+            float t = v / (2.0f * 3.14159265f);
+            return (2.0f * (t - std::floor(t + 0.5f))) * 0.5f + 0.5f;
+        }
+        if (matchFunc("usquare")) {
+            float v = parseTernary(); skipWS(); if (*pos == ')') pos++;
+            return std::sin(v) >= 0 ? 1.0f : 0.0f;
+        }
+        if (matchFunc("utriangle")) {
+            float v = parseTernary(); skipWS(); if (*pos == ')') pos++;
+            float t = v / (2.0f * 3.14159265f);
+            return (4.0f * std::abs(t - std::floor(t + 0.5f)) - 1.0f) * 0.5f + 0.5f;
+        }
+
         // shape(pos) — sample the caller-supplied shape table at `pos`.
         // The sampler decides the domain (SignalShape wraps pos as a 0..1
         // phase). Without a sampler bound, evaluates to 0.
@@ -419,6 +447,12 @@ struct ExprParser {
         if (matchFunc("noise")) {
             parseTernary(); skipWS(); if (*pos == ')') pos++;
             std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+            return dist(rng);
+        }
+        // Unipolar noise: uniform 0..1, ready to drive a control wire directly.
+        if (matchFunc("unoise")) {
+            parseTernary(); skipWS(); if (*pos == ')') pos++;
+            std::uniform_real_distribution<float> dist(0.0f, 1.0f);
             return dist(rng);
         }
 

@@ -47,6 +47,8 @@
 
 <p>For continuous controls (pitch bend, mod wheel, aftertouch, CC), the modulator emits an event every audio block when the signal changes — the downstream synth sees a smooth stream of updates instead of one-shot values. For velocity, the modulator scales the velocity of each individual note-on as it passes through using the signal value at that exact sample.</p>
 
+<p>Signals run 0–1. For the <strong>one-directional</strong> targets — Mod Wheel, Channel Pressure, CC# — that maps straight through: 0 sends 0, 1 sends 127. For the <strong>two-directional</strong> targets — Pitch Bend and Velocity — <strong>0.5 is the neutral centre</strong> (no bend / unchanged velocity), below 0.5 pushes one way and above 0.5 the other. So an LFO resting at 0.5 leaves pitch alone, and a Signal Shape envelope (which rests at 0.5 until it fires) won't nudge anything until a note triggers it.</p>
+
 <p>If multiple rules target the same MIDI attribute (e.g. two rules both modulating Mod Wheel), the rules add together. This lets you build composite modulation — for example, a slow LFO plus a per-note envelope both contributing to the mod wheel signal a synth receives.</p>
 
 <h2>Common patterns</h2>

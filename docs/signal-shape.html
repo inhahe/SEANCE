@@ -22,12 +22,22 @@
 
 <p>By design the node only runs when its output is actually wired into something. An idle, unconnected shape costs no CPU.</p>
 
+<h2>What it outputs: a 0–1 signal</h2>
+
+<p>The output is a <strong>control signal between 0 and 1</strong>, the standard range every control signal in SEANCE uses. <strong>0.5 is the neutral "no change" level</strong>: a Signal Shape sitting at 0.5 leaves whatever it's wired to exactly where you set it, 1 pushes that parameter all the way up, 0 all the way down. That's why a brand-new, layer-less shape rests at 0.5 — it does nothing until you give it a contour.</p>
+
+<p>You mostly don't have to think about this: drop in a layer and the drawn shape's height maps straight onto 0–1, and <code>curve</code> (the variable that plays your drawing) is already 0–1. The one thing to watch is when you <em>type your own formula in the Output box</em> using trig: <code>sin</code>, <code>cos</code> and <code>tan</code> swing from −1 to 1, so a bare <code>sin(...)</code> would spend half its time below 0 and get clipped flat. Two easy fixes:</p>
+<ul>
+  <li>Use the <strong>unipolar versions</strong>: <code>usin</code>, <code>ucos</code>, <code>utan</code> (and <code>usaw</code>, <code>usquare</code>, <code>utriangle</code>) — same wave, already mapped into 0–1.</li>
+  <li>Or wrap a whole expression in <code>unipolar(...)</code>, which maps −1..1 → 0..1. (<code>bipolar(x)</code> goes the other way if you ever need it.)</li>
+</ul>
+
 <h2>The four pieces of a shape</h2>
 
 <p>Every signal shape has four pieces. The first one is the only one you <em>have</em> to set; the rest have sensible defaults.</p>
 
 <ol>
-  <li>A <strong>shape</strong> — the curve over time, built as a <strong>stack of layers</strong> exactly like the wavetable editor. Each layer is a parametric oscillator (<code>sin</code>, <code>tri</code>, <code>saw</code>, …), or breakpoint curve points, or a freehand drawing, or a math expression in the variable <code>t</code> (where <code>t</code> goes from 0 to 1 over one shape pass). Click <em>+ Layer</em> to add layers; they're summed together, and a <em>Sum of all layers</em> preview under the stack shows the combined contour. A brand-new shape has <strong>no layers</strong> and outputs a flat 0 until you add one.</li>
+  <li>A <strong>shape</strong> — the curve over time, built as a <strong>stack of layers</strong> exactly like the wavetable editor. Each layer is a parametric oscillator (<code>sin</code>, <code>tri</code>, <code>saw</code>, …), or breakpoint curve points, or a freehand drawing, or a math expression in the variable <code>t</code> (where <code>t</code> goes from 0 to 1 over one shape pass). Click <em>+ Layer</em> to add layers; they're summed together, and a <em>Sum of all layers</em> preview under the stack shows the combined contour. A brand-new shape has <strong>no layers</strong> and outputs a flat 0.5 (neutral) until you add one.</li>
   <li>A <strong>repeat mode</strong> — what happens after the shape reaches the end of its pass. Three options: <em>Don't repeat</em> (one-shot, holds the last value forever — this is an envelope), <em>Repeat forever</em> (loops continuously — this is an LFO), <em>Repeat N times</em> (loops N times then holds, useful for "three pulses then stop").</li>
   <li>An optional <strong>trigger expression</strong> — a one-line expression that, when it becomes non-zero, restarts the shape from <code>t = 0</code>. If you leave it blank, the shape starts at app start and just runs.</li>
   <li>An optional set of <strong>signal inputs</strong> — extra Signal pins on the node that feed your shape and trigger expressions as variables <code>s1</code>, <code>s2</code>, … so any value flowing in the graph can drive the shape.</li>
@@ -35,7 +45,7 @@
 
 <h2>Make an LFO</h2>
 
-<p>A fresh Signal Shape is set up <em>as</em> an LFO — repeat forever, no trigger — but it starts <strong>neutral</strong>: it has <strong>no layers</strong>, so it outputs a constant 0 and won't sweep anything until you give it a contour. The editor opens showing an empty layer stack with a <em>+ Layer</em> button and a hint. Click <em>+ Layer</em> to add your first layer (it comes in as a sine), then on that layer's row pick <em>Sine</em> / <em>Saw</em> / <em>Square</em> / <em>Triangle</em> / <em>Drawn</em> / <em>Formula</em>, or draw the curve by hand. Add more layers to sum several shapes into one (e.g. a slow sine plus a fast ripple) — the <em>Sum of all layers</em> preview shows the result. Then wire Signal Out to (for example) a synth's filter cutoff Param pin and you have vibrato-style modulation.</p>
+<p>A fresh Signal Shape is set up <em>as</em> an LFO — repeat forever, no trigger — but it starts <strong>neutral</strong>: it has <strong>no layers</strong>, so it outputs a constant 0.5 (neutral) and won't sweep anything until you give it a contour. The editor opens showing an empty layer stack with a <em>+ Layer</em> button and a hint. Click <em>+ Layer</em> to add your first layer (it comes in as a sine), then on that layer's row pick <em>Sine</em> / <em>Saw</em> / <em>Square</em> / <em>Triangle</em> / <em>Drawn</em> / <em>Formula</em>, or draw the curve by hand. Add more layers to sum several shapes into one (e.g. a slow sine plus a fast ripple) — the <em>Sum of all layers</em> preview shows the result. Then wire Signal Out to (for example) a synth's filter cutoff Param pin and you have vibrato-style modulation.</p>
 
 <h3>Setting the speed</h3>
 
@@ -98,8 +108,8 @@
 
 <p>Examples (in the <em>expression</em> box):</p>
 <ul>
-  <li><strong>FM the LFO with another LFO:</strong> <code>sin(t * 2*pi + s1 * 4)</code> — input <code>s1</code> modulates the phase.</li>
-  <li><strong>Amplitude blend:</strong> <code>sin(t*2*pi) * s1 + saw(t) * (1 - s1)</code> — input <code>s1</code> crossfades between a sine and a saw.</li>
+  <li><strong>FM the LFO with another LFO:</strong> <code>usin(t * 2*pi + s1 * 4)</code> — input <code>s1</code> modulates the phase. (<code>usin</code>, not <code>sin</code>, so the result stays in 0–1.)</li>
+  <li><strong>Amplitude blend:</strong> <code>usin(t*2*pi) * s1 + usaw(t) * (1 - s1)</code> — input <code>s1</code> crossfades between a sine and a saw.</li>
   <li><strong>External gate:</strong> trigger = <code>s1</code>, with another signal wired into the <code>s1</code> pin — that signal's rising edges retrigger the shape. Wire a Trigger node's Signal Out into <code>s1</code> for per-note-conditional retriggers.</li>
 </ul>
 
@@ -117,7 +127,7 @@
 <ul>
   <li><strong>Waveshaper:</strong> <code>shape(s1)</code> — input <code>s1</code> sweeps through the drawn curve. Wire an LFO or an audio-rate signal into <code>s1</code> and the drawing reshapes it.</li>
   <li><strong>Phase warp:</strong> <code>shape(x + s1*0.1)</code> — play the drawing at the normal rate but nudge the read position with the input.</li>
-  <li><strong>Map a bipolar input:</strong> <code>shape(s1*0.5 + 0.5)</code> — an input that swings <code>-1..1</code> reads across the whole drawing once.</li>
+  <li><strong>Read across the whole drawing:</strong> <code>shape(s1)</code> — inputs are already 0–1, so an input sweeping its full range reads across the entire drawing once.</li>
   <li><strong>Double-speed read:</strong> <code>shape(t * 2)</code> — ignore the node's phase and scan the drawing yourself.</li>
 </ul>
 
@@ -134,7 +144,7 @@
   <li><code>vel</code> — velocity (0–1) of the most recent note-on.</li>
 </ul>
 
-<p>Use them to make the shape react to the note. E.g. shape = <code>sin(t * 2*pi) * vel</code> makes the LFO depth scale with how hard the note was played.</p>
+<p>Use them to make the shape react to the note. E.g. Output = <code>usin(t * 2*pi) * vel</code> makes the LFO depth scale with how hard the note was played. (<code>usin</code> keeps the result in 0–1; a bare <code>sin</code> would clip its lower half.)</p>
 
 <h2>Presets</h2>
 

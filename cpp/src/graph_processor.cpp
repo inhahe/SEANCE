@@ -998,6 +998,53 @@ void GraphProcessor::rebuildGraph(NodeGraph& graph, Transport& transport) {
         }
     }
 
+    // ---- Output reachability (audition routing) ----
+    // Recompute, for every node, whether it has an audio path to an Output
+    // node. Synth audition (editor "Play" on an unplaced library frame) reads
+    // node.reachesOutput: when false, the audition voices are diverted to the
+    // AudioEngine audition-monitor bus so the preview is audible even though the
+    // node isn't wired to output; when true, the audition stays in the normal
+    // graph path so it flows through the user's downstream effects/pan exactly
+    // like a played note. Only audio-kind links carry the preview, so control
+    // (Signal/Param) and MIDI cables are ignored here.
+    {
+        std::vector<std::pair<int,int>> audioEdges; // (srcNodeId, dstNodeId)
+        for (auto& link : graph.links) {
+            int srcNodeId = -1, dstNodeId = -1;
+            PinKind srcKind = PinKind::Audio;
+            for (auto& n : graph.nodes) {
+                for (auto& p : n.pinsOut)
+                    if (p.id == link.startPin) { srcNodeId = n.id; srcKind = p.kind; }
+                for (auto& p : n.pinsIn)
+                    if (p.id == link.endPin) dstNodeId = n.id;
+            }
+            if (srcNodeId < 0 || dstNodeId < 0) continue;
+            if (srcKind != PinKind::Audio) continue;
+            audioEdges.push_back({srcNodeId, dstNodeId});
+        }
+        // Seed the frontier with Output nodes; everything else starts false.
+        std::vector<int> frontier;
+        for (auto& n : graph.nodes) {
+            n.reachesOutput = (n.type == NodeType::Output);
+            if (n.reachesOutput) frontier.push_back(n.id);
+        }
+        // Backward BFS: a node feeding (via an audio edge) any node that
+        // reaches output also reaches output.
+        while (!frontier.empty()) {
+            int cur = frontier.back();
+            frontier.pop_back();
+            for (auto& e : audioEdges) {
+                if (e.second != cur) continue;
+                if (Node* sn = graph.findNode(e.first)) {
+                    if (!sn->reachesOutput) {
+                        sn->reachesOutput = true;
+                        frontier.push_back(e.first);
+                    }
+                }
+            }
+        }
+    }
+
     lastNodeCount = (int)graph.nodes.size();
     lastLinkCount = (int)graph.links.size();
 

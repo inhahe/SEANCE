@@ -209,14 +209,23 @@ void SignalShapeProcessor::bindShape() {
 }
 
 void SignalShapeProcessor::rebuildShapeSamples() {
-    // Render the layer stack into the shape table. With zero layers this
-    // produces all zeros (a flat 0 signal), which is exactly what a
-    // freshly-created node should output until the user adds a layer.
+    // Render the layer stack into the shape table. render() produces a BIPOLAR
+    // -1..1 waveform (same renderer the Wavetable instrument uses for audio),
+    // but a control signal on the wire is UNIPOLAR 0..1 (see signal_modulation.h
+    // for the convention). So we remap -1..1 -> 0..1 here, making the drawn
+    // shape's height read directly as the output value: trough = 0, peak = 1.
+    // This keeps `curve` (and the default "curve" expression) natively 0..1.
+    //
+    // With zero layers render() yields all zeros, which remap to a flat 0.5 -
+    // the neutral "no modulation" resting level, exactly what a freshly-created
+    // node should output until the user adds a layer.
     doc.layers.render(kShapeTableSize, shapeSamples);
     if ((int)shapeSamples.size() != kShapeTableSize) {
         // Defensive: render should always produce kShapeTableSize samples,
         // but make sure the per-sample sampler can't index OOB if it didn't.
-        shapeSamples.assign(kShapeTableSize, 0.0f);
+        shapeSamples.assign(kShapeTableSize, 0.5f);
+    } else {
+        for (float& v : shapeSamples) v = v * 0.5f + 0.5f;
     }
 }
 
@@ -550,7 +559,11 @@ void SignalShapeProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mid
             // globals. The trigger expression above is always the Builtin DSL.
             out = runtime ? runtime->evalSignal(vars)
                           : WaveExprParser::evaluateWithVars(expr, vars, shapeFn);
-            out = juce::jlimit(-1.0f, 1.0f, out);
+            // Control signals are unipolar 0..1 on the wire (see
+            // signal_modulation.h). `curve` is already 0..1; bipolar math like a
+            // bare sin() will clip its negative half here unless the author
+            // wraps it (unipolar(...) / usin(...)).
+            out = juce::jlimit(0.0f, 1.0f, out);
 
             if (shouldAdvance) {
                 phase += phaseDelta;
@@ -603,8 +616,9 @@ namespace {
 // one place to learn what's bound. Kept short - long-form docs live in
 // the Help menu / REFERENCE.md.
 const char* kSignalShapeHelp =
+    "Output is a control signal in the range 0..1 (0.5 = neutral / no change).\n"
     "Variables:\n"
-    "  curve = the value of the shown waveform at the current phase offset.\n"
+    "  curve = the drawn waveform's height at the current phase, as 0..1.\n"
     "    (The default expression is just \"curve\" - plays the drawn shape as-is.)\n"
     "  x = phase 0..1, t = seconds since trigger, beat, bpm,\n"
     "  gate = MIDI note held 0/1, freq = held-note Hz, note = MIDI #, vel = velocity 0..1,\n"
@@ -612,7 +626,12 @@ const char* kSignalShapeHelp =
     "Functions: sin cos tan abs sqrt exp log pow tanh saw square triangle noise,\n"
     "  floor ceil min(a,b) max(a,b) clamp(v,lo,hi) if(c,a,b), <  >  <=  >=  ==  !=  && || !, c?a:b.\n"
     "  shape(pos) samples the drawn waveform at pos (0..1 phase, wraps) - e.g.\n"
-    "  shape(s1) reads the drawing at a position set by input s1. Output clamped to [-1, 1].";
+    "  shape(s1) reads the drawing at a position set by input s1.\n"
+    "Heads up: sin/cos/tan (and saw/square/triangle/noise) return -1..1, so a bare\n"
+    "  sin(...) clips its negative half on the 0..1 output. Use the unipolar forms\n"
+    "  usin/ucos/utan (or usaw/usquare/utriangle), or wrap a whole bipolar\n"
+    "  expression in unipolar(...): e.g. unipolar(sin(x*6.28)*0.5 + ...). bipolar(x)\n"
+    "  does the reverse (0..1 -> -1..1). Output clamped to [0, 1].";
 
 const char* kSignalShapeLuaHelp =
     "Signal Shape (Lua) generates the control signal with an embedded Lua 5.4\n"
@@ -623,27 +642,32 @@ const char* kSignalShapeLuaHelp =
     "  - function start()  optional - runs once when playback starts.\n"
     "  - function loop()   required.\n"
     "\n"
-    "Per sample: loop() RETURNS the output value (-1..1) for this sample. The\n"
+    "Output is a control signal in 0..1 (0.5 = neutral / no change).\n"
+    "Per sample: loop() RETURNS the output value (0..1) for this sample. The\n"
     "  built-in machinery still runs, so you can read `curve` (the drawn shape at\n"
-    "  the current phase) plus x/phase, t, beat, bpm, gate, freq, note, vel, rep,\n"
-    "  rate, s1..sN, and shape(pos).\n"
-    "  Example - a tremolo that follows the drawing:\n"
+    "  the current phase, as 0..1) plus x/phase, t, beat, bpm, gate, freq, note,\n"
+    "  vel, rep, rate, s1..sN, and shape(pos).\n"
+    "  Example - a tremolo that follows the drawing (stays in 0..1):\n"
     "    function loop() return curve * (0.5 + 0.5*sin(t*6.28*5)) end\n"
     "\n"
     "Per block (raw mode): loop() fills the whole block itself with out(i, value),\n"
     "  i = 0..n-1. The phase/repeat/curve machinery is bypassed; use shape(pos)\n"
     "  and sig(k, i) to read the drawing and inputs. Variables: n, sr, dt, bpm,\n"
     "  rate, t/tStart/tEnd, beat/beatStart/beatEnd, note, vel, gate, freq, s1..sN.\n"
-    "  Example - a 5 Hz sine LFO, sample-accurate:\n"
+    "  Example - a 5 Hz sine LFO, sample-accurate (usin keeps it in 0..1):\n"
     "    function loop()\n"
     "      for i = 0, n-1 do\n"
     "        local tt = tStart + i*dt\n"
-    "        out(i, sin(tt*6.28318*5))\n"
+    "        out(i, usin(tt*6.28318*5))\n"
     "      end\n"
     "    end\n"
     "\n"
+    "Heads up: sin/cos/tan return -1..1, so a bare sin() clips its negative half\n"
+    "  on the 0..1 output. Use usin/ucos/utan (or usaw/usquare/utriangle), or wrap\n"
+    "  a bipolar expression in unipolar(...); bipolar(x) does the reverse.\n"
     "Maths: the math.* library plus aliases sin cos tan sqrt abs exp log floor\n"
-    "  ceil min max pow(a,b) clamp(x,lo,hi) saw square triangle noise() pi.\n"
+    "  ceil min max pow(a,b) clamp(x,lo,hi) saw square triangle noise() pi,\n"
+    "  unipolar bipolar usin ucos utan usaw usquare utriangle.\n"
     "Sandboxed: no io/os/package/debug, no require/load/dofile.";
 } // namespace
 
@@ -696,7 +720,8 @@ SignalShapeEditorComponent::SignalShapeEditorComponent(NodeGraph& g, int nid,
     lsOpts.summationPreviewHeight = 120;
     lsOpts.addLayerButtonText = "+ Layer";
     lsOpts.emptyHint = "No layers yet. Click \"+ Layer\" to give this LFO / "
-                       "envelope a shape (until then it outputs a flat 0).";
+                       "envelope a shape (until then it outputs a steady 0.5 - "
+                       "the neutral \"no modulation\" level).";
     lsOpts.makeNewLayer = [](int count) {
         WaveLayer l;
         l.shape = WaveLayer::Sine;

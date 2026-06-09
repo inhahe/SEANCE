@@ -69,8 +69,11 @@ private:
     int autoParamIndex = -1;       // index into node.params, -1 = none
 
     // Drag state
-    enum DragModeEnum { DragNone, DragNote, DragResizeLeft, DragResizeRight, DragBox, DragExprPoint, DragSongEnd };
+    enum DragModeEnum { DragNone, DragNote, DragResizeLeft, DragResizeRight, DragBox, DragExprPoint, DragSongEnd,
+                        DragLoopStart, DragLoopEnd };
     DragModeEnum dragMode = DragNone;
+    // Grab tolerance (px) for the A-B loop region's start/end boundary lines.
+    static constexpr float LOOP_EDGE_GRAB_PX = 5.0f;
     int dragNoteCI = -1, dragNoteNI = -1;
 
     // Song-end resize handle. A draggable orange border is drawn at the end of

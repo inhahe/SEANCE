@@ -14,6 +14,8 @@ public:
     void mouseDown(const juce::MouseEvent& e) override;
     void mouseDrag(const juce::MouseEvent& e) override;
     void mouseUp(const juce::MouseEvent& e) override;
+    void mouseMove(const juce::MouseEvent& e) override;
+    void mouseExit(const juce::MouseEvent& e) override;
     void mouseWheelMove(const juce::MouseEvent& e, const juce::MouseWheelDetails& w) override;
     void mouseDoubleClick(const juce::MouseEvent& e) override;
     bool keyPressed(const juce::KeyPress& key) override;
@@ -46,6 +48,14 @@ public:
     // its Manual Trigger button when the lookup succeeds, but the audio
     // graph may have rebuilt since the dialog opened).
     std::function<void(int)> onSignalShapeManualTrigger;
+
+    // Returns the audio graph's live {sampleRate, blockSize}. Wired by
+    // main_window to the audio engine. Used by the cable right-click menu to
+    // show the exact Param update rate (sampleRate / blockSize) and the block
+    // size, instead of a hard-coded approximation. May be null before wiring,
+    // or return sampleRate <= 0 before the audio device has started - callers
+    // must fall back to a generic label in that case.
+    std::function<std::pair<double, int>()> getAudioFormat;
 
     // Convert between screen and canvas coordinates
     juce::Point<float> screenToCanvas(juce::Point<float> screen) const;
@@ -90,6 +100,9 @@ private:
     juce::Point<float> dragCurrent;
     int selectedNodeId = -1;
     int selectedLinkId = -1;
+    int hoveredLinkId = -1;   // cable currently within right-click distance of
+                              //   the cursor (highlighted so the user can see
+                              //   what a right-click / click will target)
 
     // Drawing helpers
     void drawGrid(juce::Graphics& g);

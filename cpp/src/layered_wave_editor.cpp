@@ -4357,6 +4357,18 @@ public:
     class LibraryDragButton : public juce::TextButton {
     public:
         explicit LibraryDragButton(int libId_) : libId(libId_) {}
+        // Right-click on the row pops the per-waveform context menu (Add to
+        // grid / Duplicate / Delete). Set in rebuildLibraryList. We intercept
+        // mouseDown for the popup-menu case so the button never toggles its
+        // selection state on a right-click.
+        std::function<void(juce::Point<int>)> onRightClick;
+        void mouseDown(const juce::MouseEvent& e) override {
+            if (e.mods.isPopupMenu()) {
+                if (onRightClick) onRightClick(e.getScreenPosition());
+                return;
+            }
+            juce::TextButton::mouseDown(e);
+        }
         void mouseDrag(const juce::MouseEvent& e) override {
             // Only kick off a drag once the user has moved a few pixels;
             // a tiny jitter on click shouldn't suddenly become a drop.
@@ -4416,6 +4428,11 @@ public:
     explicit WavetableViewWindowContent(LayeredWaveEditorComponent& o)
         : owner(o)
     {
+        // Accept keyboard focus so Del/Backspace can delete the highlighted
+        // library entry (see keyPressed). The popup window grabs focus when
+        // it opens; clicking anywhere in this content keeps it here.
+        setWantsKeyboardFocus(true);
+
         view = std::make_unique<ScatterView>(owner);
         addAndMakeVisible(view.get());
         view->setTooltip(
@@ -4653,6 +4670,19 @@ public:
                                         "onto an occupied cell swaps the two waveforms.");
         settingsContainer.addAndMakeVisible(selFrameSectionLabel);
 
+        // ---- "Add to grid" button (shown instead of the position section
+        //      when the highlighted library waveform isn't placed yet) ----
+        addToGridBtn.setTooltip("This waveform exists in the library but isn't "
+                                "placed in the arrangement view yet, so it has no "
+                                "cell position. Click to drop it into the grid "
+                                "(first empty cell, or a new cell if the grid is "
+                                "full) - the position controls then appear.");
+        addToGridBtn.onClick = [this]() {
+            if (owner.currentLibraryId >= 0)
+                addLibraryEntryToGrid(owner.currentLibraryId);
+        };
+        settingsContainer.addAndMakeVisible(addToGridBtn);
+
         // ---- Rotation section header ----
         rotationSectionLabel.setText("Rotation (per N-D plane):", juce::dontSendNotification);
         rotationSectionLabel.setColour(juce::Label::textColourId, juce::Colours::lightgrey);
@@ -4831,15 +4861,32 @@ public:
         contentY += sectionGap;
 
         // -- Selected-frame position controls (sliders or steppers) --
-        selFrameSectionLabel.setBounds(contentX, contentY, innerW, 18);
-        contentY += 18 + 2;
-        for (size_t k = 0; k < selFrameSliders.size(); ++k) {
-            if (k < selFrameLabels.size())
-                selFrameLabels[k]->setBounds(contentX, contentY, 32, rowH);
-            selFrameSliders[k]->setBounds(contentX + 32, contentY, innerW - 32, rowH);
-            contentY += rowH + rowGap;
+        // The position section only makes sense when the highlighted library
+        // waveform is actually placed in the arrangement view. When it isn't
+        // (a freshly-created entry that's still library-only), the cell
+        // coordinates would be meaningless, so we hide the label + sliders and
+        // show an "Add to grid" button instead. With nothing highlighted at
+        // all, the whole section collapses.
+        const bool placed  = highlightedWaveformPlaced();
+        const bool haveLib = (owner.currentLibraryId >= 0);
+        selFrameSectionLabel.setVisible(placed);
+        for (auto& s : selFrameSliders) s->setVisible(placed);
+        for (auto& l : selFrameLabels)  l->setVisible(placed);
+        addToGridBtn.setVisible(!placed && haveLib);
+        if (placed) {
+            selFrameSectionLabel.setBounds(contentX, contentY, innerW, 18);
+            contentY += 18 + 2;
+            for (size_t k = 0; k < selFrameSliders.size(); ++k) {
+                if (k < selFrameLabels.size())
+                    selFrameLabels[k]->setBounds(contentX, contentY, 32, rowH);
+                selFrameSliders[k]->setBounds(contentX + 32, contentY, innerW - 32, rowH);
+                contentY += rowH + rowGap;
+            }
+            contentY += sectionGap;
+        } else if (haveLib) {
+            addToGridBtn.setBounds(contentX, contentY, std::min(innerW, 160), 26);
+            contentY += 26 + sectionGap;
         }
-        contentY += sectionGap;
 
         // -- Rotation sliders (one per N-D plane) --
         rotationSectionLabel.setBounds(contentX, contentY, innerW, 18);
@@ -4904,6 +4951,10 @@ public:
     // snapshotted cell center should disable it), and repaints the view.
     void refreshFrameAndPositionValues() {
         refreshSelFrameValues();
+        // The highlighted entry's placed/unplaced state may have flipped
+        // (e.g. selecting a library-only entry), which swaps the position
+        // section for the "Add to grid" button - relayout to apply.
+        layoutSettingsContainer();
         updateConvertButton();
         // Cell selection moved - the Assign button's "cell selected" half
         // may have flipped.
@@ -4928,16 +4979,26 @@ public:
     // happen, but the fallback keeps the UI from going stale silently).
     void refreshLibraryHighlight() {
         if (libraryRowButtons.size() != owner.wave.library.size()) {
+            // Library changed shape (entry added/removed). Rebuild the rows
+            // - which also sets each row's toggle state - then fall through
+            // to the scroll-into-view logic below so a freshly-added entry
+            // (which lands at the bottom of the list) is scrolled into view.
             rebuildLibraryList();
-            return;
+        } else {
+            for (size_t i = 0; i < libraryRowButtons.size(); ++i) {
+                const int entryId = owner.wave.library[i].id;
+                libraryRowButtons[i]->setToggleState(
+                    entryId == owner.currentLibraryId,
+                    juce::dontSendNotification);
+            }
         }
         juce::Component* selRow = nullptr;
-        for (size_t i = 0; i < libraryRowButtons.size(); ++i) {
-            const int entryId = owner.wave.library[i].id;
-            const bool selected = (entryId == owner.currentLibraryId);
-            libraryRowButtons[i]->setToggleState(selected,
-                                                 juce::dontSendNotification);
-            if (selected) selRow = libraryRowButtons[i].get();
+        for (size_t i = 0; i < libraryRowButtons.size()
+                          && i < owner.wave.library.size(); ++i) {
+            if (owner.wave.library[i].id == owner.currentLibraryId) {
+                selRow = libraryRowButtons[i].get();
+                break;
+            }
         }
         if (selRow) {
             // Scroll the selected row into view if it isn't already. Use
@@ -5117,6 +5178,13 @@ public:
                 owner.setEditingLibraryEntry(entryId);
                 rebuildLibraryList();
                 updateAssignButtonEnabled();
+                // setEditingLibraryEntry repoints currentFrameIdx at this
+                // entry's first placement (if any); refresh the position
+                // section visibility / values to match.
+                refreshFrameAndPositionValues();
+            };
+            btn->onRightClick = [this, entryId](juce::Point<int> sp) {
+                showLibraryRowMenu(entryId, sp);
             };
             libraryListContainer.addAndMakeVisible(btn.get());
             libraryRowButtons.push_back(std::move(btn));
@@ -5156,29 +5224,153 @@ public:
                           + juce::String(useCount == 1 ? " cell" : " cells")
                           + juce::String(" referencing it will become empty.")
                     : juce::String("Remove this unplaced library entry."));
-            del->onClick = [this, entryId]() {
-                // Removing a library entry also clears every cell that
-                // referenced it (handled inside removeLibraryEntry).
-                owner.wave.removeLibraryEntry(entryId);
-                // If the editor was focused on this entry, fall back to the
-                // first surviving entry (or -1 if the library is empty).
-                if (owner.currentLibraryId == entryId) {
-                    owner.currentLibraryId = owner.wave.library.empty()
-                        ? -1
-                        : owner.wave.library.front().id;
-                }
-                // currentFrameIdx (cell selection) may now point at a
-                // cleared cell - leave it; the user can pick a new one.
-                owner.wave.scatterFromGridSnapshot.reset();
-                owner.updateHintText();
-                owner.rebuildRows();
-                owner.onLayerChanged();
-                refreshAfterDocMutation();
-            };
+            del->onClick = [this, entryId]() { deleteLibraryEntry(entryId); };
             libraryListContainer.addAndMakeVisible(del.get());
             libraryRowDeletes.push_back(std::move(del));
         }
         layoutLibraryListEntries();
+    }
+
+    // True when the currently-highlighted library entry is actually placed
+    // in the arrangement view (at least one Grid cell or Scatter dot
+    // references it). Drives whether the "Selected waveform position"
+    // section shows its cell-coordinate controls or the "Add to grid"
+    // button instead.
+    bool highlightedWaveformPlaced() const {
+        return owner.currentLibraryId >= 0
+            && owner.wave.countCellsUsingLibrary(owner.currentLibraryId) > 0;
+    }
+
+    // Remove a library entry (and clear every cell/dot that referenced it).
+    // Shared by the row's X button, the right-click menu's Delete, and the
+    // Del/Backspace key. Falls the editor target back to the first surviving
+    // entry (or -1 when the library is now empty).
+    void deleteLibraryEntry(int entryId) {
+        if (owner.wave.findLibraryIndexById(entryId) < 0) return;
+        owner.wave.removeLibraryEntry(entryId);
+        if (owner.currentLibraryId == entryId) {
+            owner.currentLibraryId = owner.wave.library.empty()
+                ? -1
+                : owner.wave.library.front().id;
+        }
+        owner.wave.scatterFromGridSnapshot.reset();
+        owner.updateHintText();
+        owner.rebuildRows();
+        owner.onLayerChanged();
+        refreshAfterDocMutation();
+        refreshFrameAndPositionValues();
+    }
+
+    // Clone a library entry's waveform into a brand-new library entry WITHOUT
+    // placing it in the arrangement view (the right-click "Duplicate" action).
+    // Distinct from ScatterView::duplicateLibraryEntryFromCell, which also
+    // drops a placed copy next to the source dot/cell.
+    void duplicateLibraryEntry(int entryId) {
+        const int srcIdx = owner.wave.findLibraryIndexById(entryId);
+        if (srcIdx < 0) return;
+        auto* srcWave = owner.wave.library[(size_t)srcIdx].wave.get();
+        if (!srcWave) return;
+        std::string srcName = owner.wave.library[(size_t)srcIdx].name;
+        if (srcName.empty())
+            srcName = "Waveform " + std::to_string(srcIdx + 1);
+        const int newId = owner.wave.addLibraryEntry(srcWave->clone(),
+                                                     srcName + " (copy)");
+        if (newId < 0) return;
+        owner.currentLibraryId = newId;
+        owner.wave.scatterFromGridSnapshot.reset();
+        owner.updateHintText();
+        owner.rebuildRows();
+        owner.onLayerChanged();
+        refreshAfterDocMutation();
+        refreshFrameAndPositionValues();
+    }
+
+    // Place an existing library entry into the arrangement view. Grid mode:
+    // fills the first empty cell, growing the first axis by one if every cell
+    // is occupied (capped at 64). Scatter mode: drops a new dot at the centre
+    // (0.5 on every axis). Used by the "Add to grid" button and the
+    // right-click "Add to grid" menu item.
+    void addLibraryEntryToGrid(int entryId) {
+        if (owner.wave.findLibraryIndexById(entryId) < 0) return;
+        if (owner.wave.mode == WavetableMode::Scatter) {
+            ScatterFrame sf;
+            sf.waveformId = entryId;
+            sf.position.assign((size_t)std::max(2, owner.wave.scatterDims), 0.5f);
+            owner.wave.scatterFrames.push_back(std::move(sf));
+            owner.currentFrameIdx = (int)owner.wave.scatterFrames.size() - 1;
+        } else {
+            int target = -1;
+            for (size_t c = 0; c < owner.wave.cellWaveformIds.size(); ++c)
+                if (owner.wave.cellWaveformIds[c] < 0) { target = (int)c; break; }
+            if (target < 0) {
+                // Every cell full - grow the first axis by one to make room,
+                // unless we're already at the per-axis ceiling.
+                if (!owner.wave.gridDims.empty()
+                    && owner.wave.gridDims[0] < 64) {
+                    owner.wave.resizeGridAxis(0, owner.wave.gridDims[0] + 1);
+                    for (size_t c = 0; c < owner.wave.cellWaveformIds.size(); ++c)
+                        if (owner.wave.cellWaveformIds[c] < 0) { target = (int)c; break; }
+                }
+            }
+            if (target < 0) return;  // couldn't make room
+            owner.wave.cellWaveformIds[(size_t)target] = entryId;
+            owner.currentFrameIdx = target;
+        }
+        owner.currentLibraryId = entryId;
+        owner.wave.scatterFromGridSnapshot.reset();
+        owner.updateHintText();
+        owner.rebuildRows();
+        owner.onLayerChanged();
+        refreshAfterDocMutation();
+        refreshFrameAndPositionValues();
+    }
+
+    // Right-click context menu for a Library row: Add to grid / Duplicate /
+    // Delete. Async + SafePointer-guarded so the callback no-ops if the
+    // window is gone by the time the user picks an item.
+    void showLibraryRowMenu(int entryId, juce::Point<int> screenPos) {
+        const int idx = owner.wave.findLibraryIndexById(entryId);
+        if (idx < 0) return;
+        juce::String name = owner.wave.library[(size_t)idx].name.empty()
+            ? juce::String("Waveform ") + juce::String(idx + 1)
+            : juce::String(owner.wave.library[(size_t)idx].name);
+        const bool placed = owner.wave.countCellsUsingLibrary(entryId) > 0;
+
+        juce::PopupMenu m;
+        m.addSectionHeader(name);
+        // 1 = Add to grid (disabled when already placed at least once -
+        // there's still a use for re-adding, but keep it enabled so the user
+        // can drop additional copies). We keep it always enabled.
+        m.addItem(1, "Add to grid");
+        m.addItem(2, "Duplicate");
+        m.addSeparator();
+        m.addItem(3, "Delete");
+        juce::ignoreUnused(placed);
+
+        juce::Component::SafePointer<WavetableViewWindowContent> self(this);
+        m.showMenuAsync(
+            juce::PopupMenu::Options().withTargetScreenArea(
+                juce::Rectangle<int>(screenPos, screenPos + juce::Point<int>(1, 1))),
+            [self, entryId](int result) {
+                if (self == nullptr || result == 0) return;
+                if (result == 1) self->addLibraryEntryToGrid(entryId);
+                else if (result == 2) self->duplicateLibraryEntry(entryId);
+                else if (result == 3) self->deleteLibraryEntry(entryId);
+            });
+    }
+
+    // Del/Backspace removes the highlighted library entry (matching the row's
+    // X button). Only fires when a library entry is highlighted; returns false
+    // otherwise so the key falls through to any other handler.
+    bool keyPressed(const juce::KeyPress& key) override {
+        if (key == juce::KeyPress::deleteKey
+            || key == juce::KeyPress::backspaceKey) {
+            if (owner.currentLibraryId >= 0) {
+                deleteLibraryEntry(owner.currentLibraryId);
+                return true;
+            }
+        }
+        return false;
     }
 
 private:
@@ -5665,6 +5857,7 @@ private:
     // directly; in Grid mode they're IncDec steppers that move the selected
     // frame between cells (swapping with whatever is in the destination).
     juce::Label selFrameSectionLabel;
+    juce::TextButton addToGridBtn { "Add to grid" };
     std::vector<std::unique_ptr<juce::Slider>> selFrameSliders;
     std::vector<std::unique_ptr<juce::Label>>  selFrameLabels;
 
@@ -6261,9 +6454,13 @@ void LayeredWaveEditorComponent::syncPositionModPins(Node& nd,
                     [dupId](const auto& lk) { return lk.endPin == dupId; }), graph.links.end());
             }
         } else {
-            // No existing pin for this axis - create a fresh one.
+            // No existing pin for this axis - create a fresh one. Position
+            // modulation is block-rate (applySignalModulations reads sample 0),
+            // so the pin is a Param (block-rate, orange) - NOT a Signal
+            // (audio-rate, amber). They route identically at the cable level
+            // (#82); the kind is what the user sees and reasons about.
             int newPinId = graph.allocId();
-            nd.pinsIn.push_back({newPinId, wantName, PinKind::Signal, true, 1});
+            nd.pinsIn.push_back({newPinId, wantName, PinKind::Param, true, 1});
             Node::ModPin mp;
             mp.paramIndex = axisToParamIndex[axis];
             mp.pinId = newPinId;
@@ -6271,6 +6468,24 @@ void LayeredWaveEditorComponent::syncPositionModPins(Node& nd,
             nd.modPins.push_back(mp);
         }
     }
+
+    // NOTE: we deliberately do NOT rewrite the kind of *existing* Position
+    // modulation pins here. A user may have intentionally set one to Signal
+    // (e.g. for an audio-rate FM-style patch), and silently migrating it to
+    // Param on every editor re-sync would change their pin type out from under
+    // them. Only freshly-created pins (above) default to Param (block-rate);
+    // existing pins keep whatever kind the project already has.
+
+    // Keep the Aftertouch signal pin after every Position pin so a freshly
+    // appended Position axis never leaves Aftertouch wedged between two
+    // position inputs. The graph builder enforces the same ordering at build
+    // time; doing it here too means the node face updates immediately when
+    // the user adds an axis, without waiting for a rebuild. No-op when no
+    // Aftertouch pin exists yet.
+    std::stable_partition(nd.pinsIn.begin(), nd.pinsIn.end(),
+        [](const Pin& p) {
+            return !(p.kind == PinKind::Signal && p.name == "Aftertouch");
+        });
 }
 
 void LayeredWaveEditorComponent::rebuildScatterUI() {
@@ -6374,6 +6589,20 @@ void LayeredWaveEditorComponent::setEditingLibraryEntry(int libId) {
     // stale ids in deferred callbacks).
     if (libId != -1 && wave.findLibraryIndexById(libId) < 0) return;
     currentLibraryId = libId;
+    // Point the cell/dot selection at this entry's first placement (if any)
+    // so the "Selected waveform position" section describes THIS waveform
+    // rather than whatever cell was previously selected. When the entry isn't
+    // placed anywhere, currentFrameIdx is left as-is; the position section
+    // hides itself (see highlightedWaveformPlaced) and offers "Add to grid".
+    if (libId >= 0) {
+        if (wave.mode == WavetableMode::Grid) {
+            for (int c = 0; c < (int)wave.cellWaveformIds.size(); ++c)
+                if (wave.cellWaveformIds[(size_t)c] == libId) { currentFrameIdx = c; break; }
+        } else {
+            for (int c = 0; c < (int)wave.scatterFrames.size(); ++c)
+                if (wave.scatterFrames[(size_t)c].waveformId == libId) { currentFrameIdx = c; break; }
+        }
+    }
     updateHintText();
     rebuildRows();
     refreshPreview();

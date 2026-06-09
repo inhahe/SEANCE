@@ -1057,20 +1057,13 @@ void PianoRollComponent::paint(juce::Graphics& g) {
         }
     }
 
-    // Loop region highlight
-    if (transport && transport->loopEnabled && transport->loopEndBeat > transport->loopStartBeat) {
-        float lx1 = gridX + ((float)transport->loopStartBeat - scrollBeat) / visibleBeats * gridW;
-        float lx2 = gridX + ((float)transport->loopEndBeat - scrollBeat) / visibleBeats * gridW;
-        lx1 = std::max(lx1, gridX);
-        lx2 = std::min(lx2, gridX + gridW);
-        if (lx2 > lx1) {
-            g.setColour(juce::Colour(60, 60, 150).withAlpha(0.15f));
-            g.fillRect(lx1, 0.0f, lx2 - lx1, gridH);
-            g.setColour(juce::Colour(100, 100, 255).withAlpha(0.5f));
-            g.drawVerticalLine((int)lx1, 0, gridH);
-            g.drawVerticalLine((int)lx2, 0, gridH);
-        }
-    }
+    // Loop region: drawn later (after the notes, just before the song-end
+    // handle) as an explicit A-B loop overlay - a top loop-bar with inward
+    // bracket end-caps, dashed boundary lines, and a "LOOP" label - rather
+    // than a flat full-height wash. The wash read as a brighter "more active"
+    // stretch of grid and got mistaken for a third beat-activation level; the
+    // bracketed bar reads unmistakably as a loop. See REFERENCE.md
+    // "Grid regions and song length".
 
     // Markers
     for (auto& marker : graph.markers) {
@@ -1332,6 +1325,50 @@ void PianoRollComponent::paint(juce::Graphics& g) {
         // Divider line
         g.setColour(juce::Colours::grey.withAlpha(0.5f));
         g.drawHorizontalLine((int)exprY, gridX, gridX + gridW);
+    }
+
+    // Loop region overlay (drawn on top of the notes so it's always visible,
+    // matching the END handle). Drawn as a thin outline that frames the looped
+    // span - NOT a filled wash or solid bar, both of which hid the notes inside
+    // the region and read as a brightness "level". The two vertical edge lines
+    // are the drag handles (grab to move loopStart / loopEnd); thin top & bottom
+    // hairlines tie them into a frame, and a small "LOOP" tag marks the start.
+    if (transport && transport->loopEnabled &&
+        transport->loopEndBeat > transport->loopStartBeat) {
+        float lxFull1 = beatToX((float)transport->loopStartBeat - node->absoluteBeatOffset);
+        float lxFull2 = beatToX((float)transport->loopEndBeat   - node->absoluteBeatOffset);
+        float lx1 = std::max(lxFull1, gridX);
+        float lx2 = std::min(lxFull2, gridX + gridW);
+        if (lx2 > lx1) {
+            juce::Colour loopCol(90, 140, 255);
+            bool edge1On = (lxFull1 >= gridX && lxFull1 <= gridX + gridW);
+            bool edge2On = (lxFull2 >= gridX && lxFull2 <= gridX + gridW);
+            bool draggingThis = (dragMode == DragLoopStart || dragMode == DragLoopEnd);
+
+            // Thin top & bottom hairlines frame the span without covering cells.
+            g.setColour(loopCol.withAlpha(0.55f));
+            g.drawHorizontalLine(0, lx1, lx2);
+            g.drawHorizontalLine((int)gridH - 1, lx1, lx2);
+
+            // Vertical boundary lines = the drag handles. A touch brighter and
+            // 2px so they're easy to grab; the active edge brightens further.
+            auto drawEdge = [&](float x, bool active) {
+                g.setColour(loopCol.withAlpha(active ? 1.0f : 0.85f));
+                g.fillRect(x - 1.0f, 0.0f, 2.0f, gridH);
+                // small inward ticks at top so it reads as a loop boundary
+                g.fillRect(x - 1.0f, 0.0f, 6.0f, 2.0f);
+                g.fillRect(x - 1.0f, gridH - 2.0f, 6.0f, 2.0f);
+            };
+            if (edge1On) drawEdge(lxFull1, draggingThis && dragMode == DragLoopStart);
+            if (edge2On) drawEdge(lxFull2, draggingThis && dragMode == DragLoopEnd);
+
+            // "LOOP" tag at the start edge (clamped on-screen), small and high
+            // so it doesn't sit over the note rows people actually read.
+            g.setColour(loopCol.brighter(0.4f));
+            g.setFont(juce::Font(juce::FontOptions(9.0f)));
+            g.drawText("LOOP", (int)lx1 + 4, 1, 46, 10,
+                       juce::Justification::centredLeft);
+        }
     }
 
     // Song-end resize handle. A draggable orange border at the end of this
@@ -1687,6 +1724,31 @@ void PianoRollComponent::mouseDown(const juce::MouseEvent& e) {
         }
     }
 
+    // A-B loop boundary handles: grab the loop start/end vertical line when the
+    // cursor is near it (and not over a note). loopStart/End are absolute beats;
+    // beatToScreenX takes node-local, so subtract the node's absolute offset.
+    if (!hit.valid() && transport && transport->loopEnabled
+        && transport->loopEndBeat > transport->loopStartBeat
+        && e.position.x >= KEY_WIDTH && e.position.y > toolbarHeight()) {
+        float sx1 = beatToScreenX((float)transport->loopStartBeat - node->absoluteBeatOffset);
+        float sx2 = beatToScreenX((float)transport->loopEndBeat   - node->absoluteBeatOffset);
+        float d1 = std::abs(e.position.x - sx1);
+        float d2 = std::abs(e.position.x - sx2);
+        // Prefer whichever edge is closer when both are within grab range.
+        if (d1 <= LOOP_EDGE_GRAB_PX && d1 <= d2) {
+            dragMode = DragLoopStart;
+            setMouseCursor(juce::MouseCursor::LeftRightResizeCursor);
+            repaint();
+            return;
+        }
+        if (d2 <= LOOP_EDGE_GRAB_PX) {
+            dragMode = DragLoopEnd;
+            setMouseCursor(juce::MouseCursor::LeftRightResizeCursor);
+            repaint();
+            return;
+        }
+    }
+
     if (hit.valid()) {
         if (e.mods.isShiftDown()) {
             auto k = std::make_pair(hit.ci, hit.ni);
@@ -1825,6 +1887,21 @@ void PianoRollComponent::mouseDrag(const juce::MouseEvent& e) {
             clip.lengthBeats = target - clip.startBeat;
             graph.dirty = true;
         }
+    } else if (dragMode == DragLoopStart || dragMode == DragLoopEnd) {
+        // Loop boundaries are absolute beats; `beat` is node-local, so add the
+        // node's absolute offset. Snap unless Alt is held. Keep start < end with
+        // at least one snap unit between them.
+        float absTarget = std::max(0.0f, snapBeat(beat)) + node->absoluteBeatOffset;
+        float gap = std::max(snap, 0.25f);
+        if (dragMode == DragLoopStart)
+            graph.loopStartBeat = std::min((double)absTarget, graph.loopEndBeat - gap);
+        else
+            graph.loopEndBeat = std::max((double)absTarget, graph.loopStartBeat + gap);
+        if (transport) {
+            transport->loopStartBeat = graph.loopStartBeat;
+            transport->loopEndBeat = graph.loopEndBeat;
+        }
+        graph.dirty = true;
     } else if (dragMode == DragExprPoint) {
         // Automation point dragging
         if (exprDragNI == -2 && exprDragCI >= 0 && exprDragCI < (int)node->params.size()) {
@@ -1921,12 +1998,27 @@ void PianoRollComponent::mouseUp(const juce::MouseEvent& e) {
             // Note indices shifted as notes were removed; drop the selection
             // rather than leave it pointing at moved/removed entries.
             state.selected.clear();
+            // Dragging END right extends the clip past an explicit song-length
+            // override; grow the override so the added beats play. The snapshot
+            // below captures the new value, so undo restores it. No-op in auto
+            // mode (where shortening/extending follows the clip directly).
+            graph.growSongLengthToContent();
             graph.commitSnapshot("Resize song end");
             // Preserve the visible beat span if the timeline length changed
             // (mirrors the note-placement path).
             updateScrollBars();
         }
         songEndDragClipIdx = -1;
+        dragMode = DragNone;
+        setMouseCursor(juce::MouseCursor::NormalCursor);
+        repaint();
+        return;
+    }
+
+    // Commit a loop-edge drag as a single undo step. The loop fields live on the
+    // graph and are captured by commitSnapshot (serializeForUndo writes them).
+    if (dragMode == DragLoopStart || dragMode == DragLoopEnd) {
+        graph.commitSnapshot("Move loop edge");
         dragMode = DragNone;
         setMouseCursor(juce::MouseCursor::NormalCursor);
         repaint();
@@ -1991,15 +2083,26 @@ void PianoRollComponent::mouseUp(const juce::MouseEvent& e) {
                 int ci = (int)(targetClip - &node->clips[0]);
                 MidiNote nnCopy = nn;
                 auto* nodePtr = node;
+                // Grow an explicit song-length override so a note placed past
+                // the song end actually plays (no-op in auto mode). Capture
+                // prior/new for undo.
+                float newClipLen = targetClip->lengthBeats;
+                double priorSongLen = graph.growSongLengthToContent();
+                double newSongLen = graph.songLengthBeats;
+                auto* graphPtr = &graph;
                 graph.undoTree.pushDone(std::make_unique<LambdaCommand>(
                     "Place note",
-                    [nodePtr, ci, nnCopy]() {
-                        if (ci < (int)nodePtr->clips.size())
+                    [nodePtr, graphPtr, ci, nnCopy, newClipLen, newSongLen]() {
+                        if (ci < (int)nodePtr->clips.size()) {
                             nodePtr->clips[ci].notes.push_back(nnCopy);
+                            nodePtr->clips[ci].lengthBeats = newClipLen;
+                        }
+                        graphPtr->songLengthBeats = newSongLen;
                     },
-                    [nodePtr, ci]() {
+                    [nodePtr, graphPtr, ci, priorSongLen]() {
                         if (ci < (int)nodePtr->clips.size() && !nodePtr->clips[ci].notes.empty())
                             nodePtr->clips[ci].notes.pop_back();
+                        graphPtr->songLengthBeats = priorSongLen;
                     }
                 ));
             }
@@ -2094,7 +2197,16 @@ void PianoRollComponent::mouseMove(const juce::MouseEvent& e) {
         return;
     }
     auto hit = findNoteAt(e.position);
-    if (hit.valid() && (hit.edge == NoteHit::Left || hit.edge == NoteHit::Right))
+    bool nearLoopEdge = false;
+    if (!hit.valid() && transport && transport->loopEnabled
+        && transport->loopEndBeat > transport->loopStartBeat
+        && e.position.x >= KEY_WIDTH && e.position.y > toolbarHeight()) {
+        float sx1 = beatToScreenX((float)transport->loopStartBeat - node->absoluteBeatOffset);
+        float sx2 = beatToScreenX((float)transport->loopEndBeat   - node->absoluteBeatOffset);
+        nearLoopEdge = std::abs(e.position.x - sx1) <= LOOP_EDGE_GRAB_PX
+                    || std::abs(e.position.x - sx2) <= LOOP_EDGE_GRAB_PX;
+    }
+    if ((hit.valid() && (hit.edge == NoteHit::Left || hit.edge == NoteHit::Right)) || nearLoopEdge)
         setMouseCursor(juce::MouseCursor::LeftRightResizeCursor);
     else
         setMouseCursor(juce::MouseCursor::NormalCursor);
@@ -2807,19 +2919,27 @@ void PianoRollComponent::pasteAtCursor() {
             targetClip->lengthBeats = std::ceil(noteEnd / 4.0f) * 4.0f;
     }
 
+    // If an explicit song-length override is clamping playback, grow it so the
+    // freshly-pasted notes actually play. No-op in auto mode. Capture the prior
+    // value so undo restores it.
+    double priorSongLen = graph.growSongLengthToContent();
+    double newSongLen   = graph.songLengthBeats;
+
     auto* nodePtr = node;
+    auto* graphPtr = &graph;
     float newLength = targetClip->lengthBeats;
     graph.undoTree.pushDone(std::make_unique<LambdaCommand>(
         "Paste " + std::to_string(pasted.size()) + " notes",
-        [nodePtr, pasted, ci, newLength]() {
+        [nodePtr, graphPtr, pasted, ci, newLength, newSongLen]() {
             // redo: re-append the pasted notes (they were the tail of the clip)
             if (ci < (int)nodePtr->clips.size()) {
                 for (auto& p : pasted)
                     nodePtr->clips[ci].notes.push_back(p.note);
                 nodePtr->clips[ci].lengthBeats = newLength;
             }
+            graphPtr->songLengthBeats = newSongLen;
         },
-        [nodePtr, pasted, ci, priorLength]() {
+        [nodePtr, graphPtr, pasted, ci, priorLength, priorSongLen]() {
             // undo: remove the pasted notes (highest index first) and restore length
             if (ci < (int)nodePtr->clips.size()) {
                 for (int i = (int)pasted.size() - 1; i >= 0; --i) {
@@ -2829,6 +2949,7 @@ void PianoRollComponent::pasteAtCursor() {
                 }
                 nodePtr->clips[ci].lengthBeats = priorLength;
             }
+            graphPtr->songLengthBeats = priorSongLen;
         }
     ));
 
@@ -2948,6 +3069,9 @@ void PianoRollComponent::pasteClipAtCursor() {
     pasted.startBeat = pasteBeat;
     pasted.name += " (copy)";
     node->clips.push_back(pasted);
+    // A pasted clip can land past the song end; grow an explicit override so
+    // it plays (no-op in auto mode).
+    graph.growSongLengthToContent();
     graph.dirty = true;
     repaint();
 }
@@ -3078,6 +3202,20 @@ void PianoRollComponent::showEmptyMenu() {
     menu.addItem(1, "Place Note Here");
     menu.addSeparator();
 
+    // When the right-click lands inside (or on the edge of) the A-B loop region,
+    // surface a one-click way to remove it right at the top level. Loops imported
+    // from MOD/tracker files surprise users who never set one, so make turning it
+    // off obvious. (Also available in the Clip submenu and by dragging the edges.)
+    if (transport && transport->loopEnabled
+        && transport->loopEndBeat > transport->loopStartBeat) {
+        double absClick = (double)lastClickBeat + node->absoluteBeatOffset;
+        if (absClick >= transport->loopStartBeat - 0.5
+            && absClick <= transport->loopEndBeat + 0.5) {
+            menu.addItem(98, "Disable Loop Region");
+            menu.addSeparator();
+        }
+    }
+
     juce::PopupMenu snapMenu;
     snapMenu.addItem(10, "1/4 beat", true, std::abs(state.snap - 0.25f) < 0.01f);
     snapMenu.addItem(11, "1/2 beat", true, std::abs(state.snap - 0.5f) < 0.01f);
@@ -3122,6 +3260,27 @@ void PianoRollComponent::showEmptyMenu() {
     quantMenu2.addItem(77, "1/3 beat (triplet, 100%)");
     menu.addSubMenu("Quantize All", quantMenu2);
 
+    // Loop region — define / adjust the A-B playback loop directly from the
+    // grid. The convenience items (selection / clip / whole song) let the user
+    // define a loop in one click instead of placing start and end separately.
+    {
+        juce::PopupMenu loopMenu;
+        bool haveSel = !state.selected.empty();
+        bool clipHere = false;
+        for (auto& c : node->clips)
+            if (lastClickBeat >= c.startBeat && lastClickBeat < c.startBeat + c.lengthBeats)
+                { clipHere = true; break; }
+        loopMenu.addItem(91, "Loop Selected Notes", haveSel);
+        loopMenu.addItem(92, "Loop Clip Under Cursor", clipHere);
+        loopMenu.addItem(93, "Loop Whole Song");
+        loopMenu.addSeparator();
+        loopMenu.addItem(95, "Set Loop Start Here");
+        loopMenu.addItem(96, "Set Loop End Here");
+        loopMenu.addSeparator();
+        loopMenu.addItem(98, "Clear Loop Region", transport && transport->loopEnabled);
+        menu.addSubMenu("Loop Region", loopMenu);
+    }
+
     // Clip operations
     menu.addSeparator();
     juce::PopupMenu clipMenu;
@@ -3138,9 +3297,6 @@ void PianoRollComponent::showEmptyMenu() {
     clipMenu.addSeparator();
     clipMenu.addItem(88, "Insert Time Here (1 bar)");
     clipMenu.addItem(89, "Delete Time (1 bar at cursor)");
-    clipMenu.addSeparator();
-    clipMenu.addItem(95, "Set Loop Start Here");
-    clipMenu.addItem(96, "Set Loop End Here");
     clipMenu.addSeparator();
     clipMenu.addItem(97, "Add Marker Here...");
     menu.addSubMenu("Clip", clipMenu);
@@ -3232,6 +3388,9 @@ void PianoRollComponent::showEmptyMenu() {
                     nn.pitch = lastClickPitch;
                     nn.duration = noteDur;
                     target->notes.push_back(nn);
+                    // Grow an explicit song-length override so a note added
+                    // past the song end plays (no-op in auto mode).
+                    graph.growSongLengthToContent();
                 }
                 break;
             }
@@ -3467,13 +3626,92 @@ void PianoRollComponent::showEmptyMenu() {
                     }), true);
                 break;
             }
+            case 91: { // Loop selected notes (span the selection's beat extent)
+                float minB = 1e9f, maxB = -1e9f;
+                for (auto& [ci, ni] : state.selected) {
+                    if (ci < 0 || ci >= (int)node->clips.size()) continue;
+                    auto& clip = node->clips[ci];
+                    if (ni < 0 || ni >= (int)clip.notes.size()) continue;
+                    auto& nt = clip.notes[ni];
+                    float s = clip.startBeat + nt.offset;
+                    minB = std::min(minB, s);
+                    maxB = std::max(maxB, s + nt.duration);
+                }
+                if (maxB > minB) {
+                    graph.loopStartBeat = minB + node->absoluteBeatOffset;
+                    graph.loopEndBeat   = maxB + node->absoluteBeatOffset;
+                    graph.loopEnabled = true;
+                    if (transport) {
+                        transport->loopEnabled = true;
+                        transport->loopStartBeat = graph.loopStartBeat;
+                        transport->loopEndBeat = graph.loopEndBeat;
+                    }
+                    graph.commitSnapshot("Loop selected notes");
+                }
+                break;
+            }
+            case 92: { // Loop the clip under the cursor
+                for (auto& c : node->clips)
+                    if (lastClickBeat >= c.startBeat && lastClickBeat < c.startBeat + c.lengthBeats) {
+                        graph.loopStartBeat = c.startBeat + node->absoluteBeatOffset;
+                        graph.loopEndBeat   = c.startBeat + c.lengthBeats + node->absoluteBeatOffset;
+                        graph.loopEnabled = true;
+                        if (transport) {
+                            transport->loopEnabled = true;
+                            transport->loopStartBeat = graph.loopStartBeat;
+                            transport->loopEndBeat = graph.loopEndBeat;
+                        }
+                        graph.commitSnapshot("Loop clip");
+                        break;
+                    }
+                break;
+            }
+            case 93: { // Loop the whole song (full project length, mirrors the Loop button)
+                float maxBeat = 0;
+                for (auto& n : graph.nodes)
+                    for (auto& c : n.clips)
+                        maxBeat = std::max(maxBeat, c.startBeat + c.lengthBeats);
+                if (maxBeat <= 0) maxBeat = 4;
+                graph.loopStartBeat = 0;
+                graph.loopEndBeat = maxBeat;
+                graph.loopEnabled = true;
+                if (transport) {
+                    transport->loopEnabled = true;
+                    transport->loopStartBeat = graph.loopStartBeat;
+                    transport->loopEndBeat = graph.loopEndBeat;
+                }
+                graph.commitSnapshot("Loop whole song");
+                break;
+            }
             case 95: // Set loop start
                 graph.loopStartBeat = lastClickBeat + node->absoluteBeatOffset;
+                // Keep end strictly after start so the region stays valid.
+                if (graph.loopEndBeat <= graph.loopStartBeat)
+                    graph.loopEndBeat = graph.loopStartBeat + std::max(state.snap, 0.25f);
                 graph.loopEnabled = true;
+                if (transport) {
+                    transport->loopEnabled = true;
+                    transport->loopStartBeat = graph.loopStartBeat;
+                    transport->loopEndBeat = graph.loopEndBeat;
+                }
+                graph.commitSnapshot("Set loop start");
                 break;
             case 96: // Set loop end
                 graph.loopEndBeat = lastClickBeat + node->absoluteBeatOffset;
+                if (graph.loopEndBeat <= graph.loopStartBeat)
+                    graph.loopStartBeat = std::max(0.0, graph.loopEndBeat - std::max((double)state.snap, 0.25));
                 graph.loopEnabled = true;
+                if (transport) {
+                    transport->loopEnabled = true;
+                    transport->loopStartBeat = graph.loopStartBeat;
+                    transport->loopEndBeat = graph.loopEndBeat;
+                }
+                graph.commitSnapshot("Set loop end");
+                break;
+            case 98: // Disable / clear the loop region
+                graph.loopEnabled = false;
+                if (transport) transport->loopEnabled = false;
+                graph.commitSnapshot("Clear loop region");
                 break;
             case 84: { // Add new clip
                 float snap = state.snap > 0 ? state.snap : 1.0f;

@@ -420,6 +420,14 @@ bool ProjectFile::readProject(std::istream& f, NodeGraph& graph, PluginHost* plu
     graph.nodes.clear();
     graph.links.clear();
     graph.openEditors.clear();
+    // The loop region is only serialized when enabled (writeProject omits the
+    // keys otherwise), so reset it here: parsing a snapshot or file that has no
+    // loop keys must yield "no loop", not inherit a stale loop from the graph's
+    // prior state. Without this, undo/redo of a "disable loop" edit wouldn't
+    // stick (the redo snapshot has no keys, so loopEnabled would stay true).
+    graph.loopEnabled = false;
+    graph.loopStartBeat = 0;
+    graph.loopEndBeat = 0;
 
     std::vector<int> pendingEditorIds;
     int pendingActiveEditorId = -1;

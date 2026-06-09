@@ -36,6 +36,20 @@
 
 <p>Pick <em>Drawn</em> on a layer to switch its shape from a math curve to a freehand canvas — drag in the layer's preview to draw the shape directly with the mouse. Useful when you want a specific transient or asymmetry that no math primitive gives you.</p>
 
+<h2>The waveform library</h2>
+
+<p>Every waveform you create lives in the <strong>Library</strong> list on the right side of the wavetable window. The library is just the set of waveforms that <em>exist</em> — placing one into the morphing arrangement (the grid or scatter view) is a separate step, so you can build up a palette of shapes and then decide where each one goes.</p>
+
+<ul>
+  <li><strong>Click a row</strong> to highlight it — that waveform opens in the editor on the left, and any edits you make flow into every cell that references it.</li>
+  <li><strong>+ Waveform</strong> adds a new waveform to the library. When the list is long enough to scroll, it automatically scrolls down so the new entry is in view.</li>
+  <li><strong>Press Del (or Backspace)</strong> while a row is highlighted to delete that waveform. Any cells or dots that referenced it become empty. (The <strong>X</strong> on the row does the same thing.)</li>
+  <li><strong>Right-click a row</strong> for a menu with <em>Add to grid</em> (drop it into the arrangement), <em>Duplicate</em> (make an independent copy in the library), and <em>Delete</em>.</li>
+  <li><strong>Drag a row</strong> onto the arrangement view to place that waveform at the cursor (or into a cell in Grid mode).</li>
+</ul>
+
+<p>A newly-created waveform isn't placed in the arrangement yet, so it has no grid position. While it's highlighted but unplaced, the "Selected waveform position" controls are replaced by an <strong>Add to grid</strong> button — click it to drop the waveform into the arrangement (it fills the first empty cell, growing the grid if it's full), and the position controls reappear so you can move it around.</p>
+
 <h2>Multi-frame wavetables</h2>
 
 <p>One layered cycle gives you a single timbre. Click <strong>+ Add Frame</strong> to stack several distinct cycles into a wavetable. The synth gets a <em>Position</em> knob that crossfades between frames as you sweep it — automate Position over the course of a note and the timbre morphs in real time. Modulate it from an LFO for cyclic timbre wobble, or from velocity for "play harder = brighter."</p>

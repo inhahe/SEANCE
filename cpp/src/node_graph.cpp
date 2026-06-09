@@ -60,6 +60,23 @@ double NodeGraph::effectiveSongLengthBeats() const {
     return maxEnd;
 }
 
+double NodeGraph::growSongLengthToContent() {
+    double prior = songLengthBeats;
+    if (songLengthBeats <= 0) return prior;  // auto mode follows clips already
+    double contentEnd = 0.0;
+    for (const auto& n : nodes) {
+        if (n.type != NodeType::AudioTimeline &&
+            n.type != NodeType::MidiTimeline) continue;
+        if (n.clips.empty()) continue;
+        contentEnd = std::max(contentEnd, (double) getTimelineBeats(n));
+    }
+    if (contentEnd > songLengthBeats) {
+        songLengthBeats = contentEnd;
+        dirty = true;
+    }
+    return prior;
+}
+
 Node& NodeGraph::addNode(const std::string& name, NodeType type,
                           std::vector<Pin> ins, std::vector<Pin> outs,
                           Vec2 pos) {

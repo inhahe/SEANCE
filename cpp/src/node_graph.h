@@ -657,6 +657,18 @@ public:
     // having no end and just plays until the user presses Stop).
     double effectiveSongLengthBeats() const;
 
+    // When content is added past an explicit song-length override (e.g. the
+    // user pastes or draws notes beyond the current song end), the override
+    // would otherwise clamp playback and silently cut off the new content -
+    // the auto-derived length follows the clips, but the override doesn't.
+    // Call this after any edit that can extend a clip: in auto mode
+    // (songLengthBeats <= 0) it's a no-op (the auto value already covers the
+    // content); with an explicit override it grows the override to the new
+    // content end so the added beats actually play. Never shrinks the
+    // override, so a deliberately-longer "trailing silence" length is kept.
+    // Returns the prior override value so callers can restore it on undo.
+    double growSongLengthToContent();
+
     // Tuning system and concert pitch (project-wide)
     TuningSystem tuningSystem = TuningSystem::Equal12;
     float concertPitch = 440.0f; // Hz for A4

@@ -112,6 +112,10 @@ MainContentComponent::MainContentComponent() {
     graphComponent->onNodeDeleted = [this](int nodeId) {
         closeEditor(nodeId);
     };
+    graphComponent->getAudioFormat = [this]() {
+        return std::make_pair(audioEngine.getSampleRate(),
+                              audioEngine.getBlockSize());
+    };
 
     // Hotkey system: register callbacks and load saved bindings
     setupHotkeyCallbacks();

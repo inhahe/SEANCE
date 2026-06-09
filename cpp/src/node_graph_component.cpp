@@ -42,6 +42,39 @@ static juce::Colour colourForPinKind(PinKind k) {
     return juce::Colour(200, 200, 200);
 }
 
+// Human-readable name for a pin/wire kind. The bare enum names ("Param",
+// "Signal") mean nothing to a non-musician, so each is described in plain
+// language by what it actually carries and how often it updates. The Param and
+// Signal update rates depend on the live sample rate / block size, so pass them
+// in (sampleRate / blockSize); when unknown (<=0) a generic phrasing is used.
+// Shown as the header of the cable right-click menu.
+static juce::String nameForPinKind(PinKind k, double sampleRate, int blockSize) {
+    bool haveFmt = sampleRate > 0.0 && blockSize > 0;
+    switch (k) {
+        case PinKind::Audio:  return "Audio - the sound itself";
+        case PinKind::Midi:   return "MIDI - notes & controllers";
+        case PinKind::Param: {
+            if (haveFmt) {
+                int perSec = (int)std::lround(sampleRate / (double)blockSize);
+                return "Param - smooth control values (updates "
+                       + juce::String(perSec) + "x/sec, once per "
+                       + juce::String(blockSize) + "-sample block)";
+            }
+            return "Param - smooth control values (once per audio block)";
+        }
+        case PinKind::Signal: {
+            if (haveFmt) {
+                // Every sample => the sample rate. Show in kHz to keep it short.
+                juce::String khz = juce::String(sampleRate / 1000.0, 1);
+                return "Signal - fast control values (updates every sample, "
+                       + khz + "k/sec)";
+            }
+            return "Signal - fast control values (updates every sample)";
+        }
+    }
+    return "Unknown";
+}
+
 NodeGraphComponent::NodeGraphComponent(NodeGraph& g) : graph(g) {
     setWantsKeyboardFocus(true);
 }
@@ -137,9 +170,17 @@ void NodeGraphComponent::paint(juce::Graphics& g) {
         }
     }
 
-    // Draw links
+    // Draw links. The hovered cable is deferred and drawn AFTER the nodes
+    // (below) so its highlight/glow is never occluded - cables route under node
+    // bodies, and a short cable between two adjacent nodes would otherwise have
+    // its entire highlight hidden behind the nodes, making it look like nothing
+    // lit up even though the hover hit-test fired.
+    auto emphasised = [&](const Link& l) {
+        return l.id == hoveredLinkId || l.id == selectedLinkId;
+    };
     for (auto& link : graph.links)
-        drawLink(g, link);
+        if (!emphasised(link))
+            drawLink(g, link);
 
     // Draw pending link
     if (dragMode == DragMode::DragLink)
@@ -148,6 +189,18 @@ void NodeGraphComponent::paint(juce::Graphics& g) {
     // Draw nodes
     for (auto& node : graph.nodes)
         drawNode(g, node);
+
+    // Emphasised cables (selected and/or hovered) on top of everything, so the
+    // highlight stays fully visible - traceable end-to-end and never occluded
+    // by nodes. Selected first, hovered last so the hovered cable wins when a
+    // different cable is selected. (Selection is also set by a right-click, so
+    // the targeted cable stays lit while its context menu is open.)
+    for (auto& link : graph.links)
+        if (link.id == selectedLinkId && link.id != hoveredLinkId)
+            drawLink(g, link);
+    for (auto& link : graph.links)
+        if (link.id == hoveredLinkId)
+            drawLink(g, link);
 }
 
 void NodeGraphComponent::drawGrid(juce::Graphics& g) {
@@ -497,12 +550,38 @@ void NodeGraphComponent::drawLink(juce::Graphics& g, Link& link) {
     path.cubicTo(ctrl1, ctrl2, end);
 
     // Base alpha - much dimmer when the link is heavily attenuated.
+    // "Emphasised" = the cable the user is targeting: either hovered, or
+    // selected (which is also set by a right-click, so the cable stays lit up
+    // while its context menu is open). Both get the full glow treatment.
+    bool isSelected = (link.id == selectedLinkId);
+    bool isHovered  = (link.id == hoveredLinkId);
+    bool emphasise  = isSelected || isHovered;
     float baseAlpha = (link.gainDb < -10.0f) ? 0.3f : 0.8f;
-    float thickness = ((link.id == selectedLinkId) ? 3.0f : 2.0f) * zoom;
+    if (emphasise) baseAlpha = 1.0f; // full opacity when targeted
+    float thickness = 2.0f * zoom;
+    if (emphasise) thickness = 3.5f * zoom;
+
+    // Glow: a soft halo of progressively wider, low-alpha strokes drawn
+    // underneath the cable so the connection the cursor will target reads as
+    // lit up. Drawn in the source-kind colour (a single-colour halo is fine
+    // even for a two-tone Param<->Signal cable).
+    if (emphasise) {
+        juce::Colour glowCol = colourForPinKind(srcKind);
+        for (int i = 3; i >= 1; --i)
+            g.setColour(glowCol.withAlpha(0.13f)),
+            g.strokePath(path, juce::PathStrokeType(thickness + (float)i * 4.0f * zoom,
+                         juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
+    }
+
+    // Cable colour: brighten when emphasised so it stands out above its neighbours.
+    auto strokeColour = [&](PinKind k) {
+        auto c = colourForPinKind(k).withAlpha(baseAlpha);
+        return emphasise ? c.brighter(0.5f) : c;
+    };
 
     if (srcKind == dstKind) {
         // Single-kind cable: stroke the full bezier in one colour.
-        g.setColour(colourForPinKind(srcKind).withAlpha(baseAlpha));
+        g.setColour(strokeColour(srcKind));
         g.strokePath(path, juce::PathStrokeType(thickness));
     } else {
         // Mixed-kind cable (currently only Param↔Signal). Stroke the whole
@@ -518,7 +597,7 @@ void NodeGraphComponent::drawLink(juce::Graphics& g, Link& link) {
             return {x, y};
         };
 
-        g.setColour(colourForPinKind(srcKind).withAlpha(baseAlpha));
+        g.setColour(strokeColour(srcKind));
         g.strokePath(path, juce::PathStrokeType(thickness));
 
         // Sample the tail half (t in [0.5, 1.0]) as a smooth polyline.
@@ -529,7 +608,7 @@ void NodeGraphComponent::drawLink(juce::Graphics& g, Link& link) {
             float t = 0.5f + 0.5f * (float)i / (float)tailSegments;
             tail.lineTo(bezAt(t));
         }
-        g.setColour(colourForPinKind(dstKind).withAlpha(baseAlpha));
+        g.setColour(strokeColour(dstKind));
         g.strokePath(tail, juce::PathStrokeType(thickness));
     }
 
@@ -657,14 +736,27 @@ int NodeGraphComponent::pinAtPoint(juce::Point<float> canvasPos, bool& isOutput)
 
 int NodeGraphComponent::linkAtPoint(juce::Point<float> canvasPos) {
     auto screenPos = canvasToScreen(canvasPos);
+    // Return the CLOSEST link within tolerance, not merely the first one in
+    // iteration order. Overlapping cables (e.g. an audio cable and a Signal
+    // modulation cable running between the same pair of nodes) would otherwise
+    // always resolve to whichever appears first in graph.links, making the
+    // other one impossible to right-click / select / delete.
+    int   bestLink = -1;
+    float bestDist = 13.0f; // hit tolerance in px (generous so thin cables are
+                            // easy to hover/click, esp. when zoomed out)
     for (auto& link : graph.links) {
         juce::Point<float> start, end;
+        bool foundSrc = false, foundDst = false;
         for (auto& node : graph.nodes) {
             for (auto& pin : node.pinsOut)
-                if (pin.id == link.startPin) start = canvasToScreen(getPinPosition(node, pin));
+                if (pin.id == link.startPin) { start = canvasToScreen(getPinPosition(node, pin)); foundSrc = true; }
             for (auto& pin : node.pinsIn)
-                if (pin.id == link.endPin) end = canvasToScreen(getPinPosition(node, pin));
+                if (pin.id == link.endPin) { end = canvasToScreen(getPinPosition(node, pin)); foundDst = true; }
         }
+        // Skip dangling links whose endpoints no longer exist - otherwise their
+        // default {0,0} endpoints create a phantom hot-spot at the canvas origin.
+        if (!foundSrc || !foundDst) continue;
+
         // Simple distance check to the line
         float dx = std::abs(end.x - start.x) * 0.5f;
         dx = std::max(dx, 30.0f * zoom);
@@ -672,14 +764,26 @@ int NodeGraphComponent::linkAtPoint(juce::Point<float> canvasPos) {
         path.startNewSubPath(start);
         path.cubicTo(start.x + dx, start.y, end.x - dx, end.y, end.x, end.y);
 
+        // Measure distance to the line SEGMENTS between consecutive flattened
+        // points, not to the points themselves. PathFlatteningIterator only
+        // subdivides where the curve bends, so the straight stretches where the
+        // cable exits each pin horizontally get just their two endpoints - tens
+        // of px apart. Measuring point-to-sample-point distance there would miss
+        // a cursor sitting right on the straight part of the wire (exactly the
+        // region near a node), which is why hover/right-click failed within a
+        // short distance of a node. juce::Line::getDistanceFromPoint clamps to
+        // the segment, so this is the true distance to the drawn cable.
         juce::PathFlatteningIterator it(path, {}, 2.0f);
-        float minDist = 999999;
-        while (it.next())
-            minDist = std::min(minDist, screenPos.getDistanceFrom({it.x2, it.y2}));
+        float minDist = 999999.0f;
+        juce::Point<float> dummy;
+        while (it.next()) {
+            juce::Line<float> seg(it.x1, it.y1, it.x2, it.y2);
+            minDist = std::min(minDist, seg.getDistanceFromPoint(screenPos, dummy));
+        }
 
-        if (minDist < 8.0f) return link.id;
+        if (minDist < bestDist) { bestDist = minDist; bestLink = link.id; }
     }
-    return -1;
+    return bestLink;
 }
 
 // ==============================================================================
@@ -770,11 +874,15 @@ void NodeGraphComponent::mouseDown(const juce::MouseEvent& e) {
                                     graph.dirty = true;
                                     graph.commitSnapshot("Remove modulation input");
                                 } else {
-                                    // Add a new Signal input pin and bind it to this param.
+                                    // Add a new modulation input pin and bind it to this param.
+                                    // Modulation is consumed block-rate (applySignalModulations
+                                    // reads sample 0), so the pin is a Param (block-rate, orange) -
+                                    // NOT a Signal (sample-rate, amber). The receiver decides the
+                                    // consumption rate; Param/Signal cables are interchangeable.
                                     if (paramIdx >= (int)nd->params.size()) return;
                                     std::string pinName = "Mod: " + nd->params[paramIdx].name;
                                     int newPinId = graph.allocId();
-                                    nd->pinsIn.push_back({newPinId, pinName, PinKind::Signal, true, 1});
+                                    nd->pinsIn.push_back({newPinId, pinName, PinKind::Param, true, 1});
                                     Node::ModPin mp;
                                     mp.paramIndex = paramIdx;
                                     mp.pinId = newPinId;
@@ -1047,6 +1155,25 @@ void NodeGraphComponent::mouseUp(const juce::MouseEvent& e) {
     dragParamIdx = -1;
     dragHoverPinId = -1;
     repaint();
+}
+
+void NodeGraphComponent::mouseMove(const juce::MouseEvent& e) {
+    // Highlight the cable under the cursor (within right-click distance) so the
+    // user can see exactly which connection a click / right-click will target.
+    // Uses the same hit-test as selection, so the highlighted cable is always
+    // the one that would actually be picked.
+    int over = linkAtPoint(screenToCanvas(e.position));
+    if (over != hoveredLinkId) {
+        hoveredLinkId = over;
+        repaint();
+    }
+}
+
+void NodeGraphComponent::mouseExit(const juce::MouseEvent&) {
+    if (hoveredLinkId != -1) {
+        hoveredLinkId = -1;
+        repaint();
+    }
 }
 
 void NodeGraphComponent::mouseWheelMove(const juce::MouseEvent& e, const juce::MouseWheelDetails& wheel) {
@@ -2683,6 +2810,49 @@ void NodeGraphComponent::showLinkMenu(int linkId) {
         if (l.id == linkId) { link = &l; break; }
 
     juce::PopupMenu menu;
+
+    // Header: show the wire's signal type so the user knows what they're
+    // looking at (the pin colour alone isn't self-explanatory). When the two
+    // endpoints differ (an implicit Param<->Signal conversion), show both.
+    if (link) {
+        PinKind srcKind = PinKind::Audio, dstKind = PinKind::Audio;
+        bool foundSrc = false, foundDst = false;
+        for (auto& node : graph.nodes) {
+            for (auto& pin : node.pinsOut)
+                if (pin.id == link->startPin) { srcKind = pin.kind; foundSrc = true; }
+            for (auto& pin : node.pinsIn)
+                if (pin.id == link->endPin)   { dstKind = pin.kind; foundDst = true; }
+        }
+        if (foundSrc && foundDst) {
+            double sr = 0.0; int bs = 0;
+            if (getAudioFormat) { auto fmt = getAudioFormat(); sr = fmt.first; bs = fmt.second; }
+            if (srcKind == dstKind) {
+                menu.addSectionHeader(nameForPinKind(srcKind, sr, bs));
+            } else {
+                // Implicit Param<->Signal conversion: keep the header short by
+                // naming the two kinds with a plain-language note about what the
+                // conversion does to the update rate.
+                auto shortName = [](PinKind k) -> juce::String {
+                    switch (k) {
+                        case PinKind::Audio:  return "Audio";
+                        case PinKind::Midi:   return "MIDI";
+                        case PinKind::Param:  return "Param";
+                        case PinKind::Signal: return "Signal";
+                    }
+                    return "?";
+                };
+                juce::String rateTxt = (sr > 0.0 && bs > 0)
+                    ? juce::String((int)std::lround(sr / (double)bs)) + "x/sec"
+                    : "block-rate";
+                juce::String note = (dstKind == PinKind::Param)
+                    ? " (resampled to " + rateTxt + ")"
+                    : (dstKind == PinKind::Signal ? " (upsampled to every sample)" : "");
+                menu.addSectionHeader(shortName(srcKind) + " \xe2\x86\x92 "
+                                      + shortName(dstKind) + note);
+            }
+        }
+    }
+
     menu.addItem(1, "Delete Connection");
     menu.addSeparator();
 
@@ -2739,6 +2909,11 @@ void NodeGraphComponent::showLinkMenu(int linkId) {
             float gains[] = {0, -3, -6, -12, -20, 3, 6};
             lk->gainDb = gains[result - 10];
             graph.dirty = true;
+            // A gain change doesn't alter node/link counts, so the audio graph
+            // won't auto-rebuild. Without a rebuild the GainProcessor (only
+            // inserted when gainDb != 0) is never created/removed, so the new
+            // gain has no audible effect. Force a rebuild.
+            if (onNodeEdited) onNodeEdited();
             graph.commitSnapshot("Set connection gain");
         } else if (result == 31) {
             // Help: Effect Groups -> open the docs page
@@ -2793,6 +2968,9 @@ void NodeGraphComponent::showLinkMenu(int linkId) {
                         for (auto& l : graph.links)
                             if (l.id == lid) { l.gainDb = juce::jlimit(-60.0f, 24.0f, val); break; }
                         graph.dirty = true;
+                        // Force an audio-graph rebuild so the GainProcessor is
+                        // inserted/updated (gain change alone won't trigger one).
+                        if (onNodeEdited) onNodeEdited();
                         graph.commitSnapshot("Set connection gain");
                     }
                     delete aw;

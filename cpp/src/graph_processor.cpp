@@ -517,6 +517,20 @@ void GraphProcessor::rebuildGraph(NodeGraph& graph, Transport& transport) {
                 atPin.channels = 1;
                 node.pinsIn.push_back(atPin);
             }
+            // Normalize pin order: keep the Aftertouch signal input AFTER
+            // every other input pin (MIDI, Position / Sig axes). It's
+            // appended here at graph-build time, but adding a Position axis
+            // in the wavetable editor later push_backs a new Position pin
+            // behind the existing Aftertouch, leaving Aftertouch wedged
+            // between two Position inputs. Stable-partition moves the single
+            // Aftertouch pin to the end while preserving every other pin's
+            // relative order. Runs every build, so it also normalizes the
+            // order of projects saved with the old wedged layout. Links
+            // reference pins by id, so reordering never breaks a cable.
+            std::stable_partition(node.pinsIn.begin(), node.pinsIn.end(),
+                [](const Pin& p) {
+                    return !(p.kind == PinKind::Signal && p.name == "Aftertouch");
+                });
         }
 
         if (node.type == NodeType::MidiTimeline) {

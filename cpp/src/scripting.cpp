@@ -16,6 +16,7 @@
 #include "music_theory.h"
 #include <sstream>
 #include <cstdio>
+#include <cctype>
 
 namespace SoundShop {
 
@@ -863,6 +864,128 @@ std::vector<ScriptEngine::SignalValue> ScriptEngine::evaluateSignals(
     }
 
     return results;
+}
+
+// =============================================================================
+// Singleton + static-shape baking
+// =============================================================================
+ScriptEngine& ScriptEngine::instance() {
+    static ScriptEngine engine;
+    return engine;
+}
+
+// Pull a human-readable message out of the current Python exception state.
+static std::string fetchPythonError() {
+    if (!PyErr_Occurred()) return {};
+    PyObject *type = nullptr, *value = nullptr, *tb = nullptr;
+    PyErr_Fetch(&type, &value, &tb);
+    PyErr_NormalizeException(&type, &value, &tb);
+    std::string msg;
+    if (value) {
+        if (PyObject* s = PyObject_Str(value)) {
+            if (const char* c = PyUnicode_AsUTF8(s)) msg = c;
+            Py_DECREF(s);
+        }
+    }
+    if (type) {
+        if (PyObject* nm = PyObject_GetAttrString(type, "__name__")) {
+            if (const char* c = PyUnicode_AsUTF8(nm))
+                msg = std::string(c) + (msg.empty() ? "" : ": " + msg);
+            Py_DECREF(nm);
+        }
+    }
+    Py_XDECREF(type); Py_XDECREF(value); Py_XDECREF(tb);
+    PyErr_Clear();
+    return msg.empty() ? std::string("Python error") : msg;
+}
+
+bool ScriptEngine::bakeShapeExpr(const std::string& src, bool domainRadians, int N,
+                                 std::vector<float>& out, std::string& error) {
+    const bool clampResult = domainRadians; // periodic shapes clamp to [-1,1]
+    out.assign(N > 0 ? N : 0, 0.0f);
+    error.clear();
+    if (N <= 0) return true;
+
+    if (!initialized && !init()) {
+        error = "Python interpreter unavailable";
+        return false;
+    }
+
+    // Wrap the user source into a function body. A bare expression (no newline,
+    // no `return`) becomes `return (<expr>)`; a multi-line body is indented and
+    // used verbatim (the user supplies the `return`).
+    auto trim = [](const std::string& s) {
+        size_t a = 0, b = s.size();
+        while (a < b && std::isspace((unsigned char)s[a])) ++a;
+        while (b > a && std::isspace((unsigned char)s[b - 1])) --b;
+        return s.substr(a, b - a);
+    };
+    std::string trimmed = trim(src);
+    std::string body;
+    // Non-periodic curves expose `f` as an alias of the normalized position `x`
+    // so a curve written in terms of either name evaluates the same.
+    if (!domainRadians) body = "    f = x\n";
+    if (trimmed.find('\n') == std::string::npos &&
+        trimmed.find("return") == std::string::npos) {
+        body += "    return (" + trimmed + ")\n";
+    } else {
+        std::istringstream lines(trimmed);
+        std::string ln;
+        std::string user;
+        while (std::getline(lines, ln)) user += "    " + ln + "\n";
+        if (user.empty()) user = "    return 0.0\n";
+        body += user;
+    }
+
+    std::ostringstream code;
+    code << "from math import sin, cos, tan, sqrt, exp, log, floor, ceil, "
+            "pi, e, tanh, atan, asin, acos\n"
+            "import random as __ssr\n"
+            "def pow(a, b): return a ** b\n"
+            "def clamp(v, lo, hi): return lo if v < lo else (hi if v > hi else v)\n"
+            "def fract(v): return v - floor(v)\n"
+            "def saw(p):\n    p = p - floor(p)\n    return 2 * p - 1\n"
+            "def square(p):\n    p = p - floor(p)\n    return 1.0 if p < 0.5 else -1.0\n"
+            "def triangle(p):\n    p = p - floor(p)\n    return 4 * p - 1 if p < 0.5 else 3 - 4 * p\n"
+            "def noise(v=0.0): return __ssr.random()\n"
+         << "def __shape(x):\n" << body
+         << "__N = " << N << "\n"
+         << "if " << (clampResult ? "True" : "False") << ":\n"
+            "    __result = [float(__shape(__i / __N * 2.0 * pi)) for __i in range(__N)]\n"
+            "else:\n"
+            "    __result = [float(__shape((__i / (__N - 1)) if __N > 1 else 0.0)) for __i in range(__N)]\n";
+
+    PyObject* globals = PyDict_New();
+    if (!globals) { error = "out of memory"; out.assign(N, 0.0f); return false; }
+    PyDict_SetItemString(globals, "__builtins__", PyEval_GetBuiltins());
+
+    PyObject* res = PyRun_String(code.str().c_str(), Py_file_input, globals, globals);
+    if (!res) {
+        error = fetchPythonError();
+        Py_DECREF(globals);
+        out.assign(N, 0.0f);
+        return false;
+    }
+    Py_DECREF(res);
+
+    PyObject* list = PyDict_GetItemString(globals, "__result"); // borrowed
+    bool ok = false;
+    if (list && PyList_Check(list) && PyList_Size(list) == (Py_ssize_t)N) {
+        ok = true;
+        for (int i = 0; i < N; ++i) {
+            PyObject* item = PyList_GetItem(list, i); // borrowed
+            double v = item ? PyFloat_AsDouble(item) : 0.0;
+            if (PyErr_Occurred()) { PyErr_Clear(); v = 0.0; }
+            if (clampResult) v = v < -1.0 ? -1.0 : (v > 1.0 ? 1.0 : v);
+            out[i] = (float)v;
+        }
+    } else {
+        error = "shape did not produce " + std::to_string(N) + " values";
+    }
+    Py_DECREF(globals);
+
+    if (!ok) { out.assign(N, 0.0f); return false; }
+    return true;
 }
 
 } // namespace SoundShop

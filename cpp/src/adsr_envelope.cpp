@@ -20,6 +20,12 @@ void AHDSREnvelope::setDefaultCurves(AHDSREnvelope& e) {
     e.attackCurve.expression = "x";
     e.attackCurve.freehandMode = false;
 
+    // Hold is a multiplier on peak across the hold window. Default "1" is a
+    // true flat plateau (identical to the legacy hold-at-peak behaviour).
+    e.holdCurve.mode = SpectralCurve::Equation;
+    e.holdCurve.expression = "1";
+    e.holdCurve.freehandMode = false;
+
     e.decayCurve.mode = SpectralCurve::Equation;
     e.decayCurve.expression = "1-x";
     e.decayCurve.freehandMode = false;
@@ -34,9 +40,13 @@ void AHDSREnvelope::setDefaultCurves(AHDSREnvelope& e) {
 // same convention). Curves themselves can contain ';' though, so we
 // instead encode them as base64-ish (no, they're already '|'-safe but
 // may contain ';'). To stay robust we wrap each field length-prefixed:
-//   "ahdsrv1:a=<f>;h=<f>;d=<f>;s=<f>;r=<f>;vs=<f>;ac=<n>:<encoded>;dc=<n>:<encoded>;rc=<n>:<encoded>"
+//   "ahdsrv1:a=<f>;h=<f>;d=<f>;s=<f>;r=<f>;vs=<f>;ac=<n>:<enc>;dc=<n>:<enc>;rc=<n>:<enc>;hc=<n>:<enc>"
 // where <n> is the byte length of the curve payload that follows the ':'.
 // This makes parsing unambiguous regardless of curve content.
+//
+// `hc` (the Hold curve) is appended LAST and is optional on decode: strings
+// written before the Hold curve existed end after `rc`, and load with the
+// default flat hold ("1"). Keeping it last preserves backward compatibility.
 std::string AHDSREnvelope::encode() const {
     auto fnum = [](float v) {
         std::ostringstream o;
@@ -61,7 +71,8 @@ std::string AHDSREnvelope::encode() const {
       << "vs=" << fnum(velocitySensitivity) << ";"
       << curveField("ac", attackCurve) << ";"
       << curveField("dc", decayCurve) << ";"
-      << curveField("rc", releaseCurve);
+      << curveField("rc", releaseCurve) << ";"
+      << curveField("hc", holdCurve);
     return o.str();
 }
 
@@ -110,6 +121,9 @@ bool AHDSREnvelope::decode(const std::string& s, AHDSREnvelope& out) {
     if (!parseCurve("ac", out.attackCurve))  return false;
     if (!parseCurve("dc", out.decayCurve))   return false;
     if (!parseCurve("rc", out.releaseCurve)) return false;
+    // Hold curve is optional: absent in pre-Hold-curve saves, in which case
+    // out.holdCurve keeps the default flat "1" seeded by setDefaultCurves.
+    if (i < s.size()) parseCurve("hc", out.holdCurve);
     return true;
 }
 
@@ -150,6 +164,7 @@ static size_t hashCurveSet(const AHDSREnvelope& env) {
     size_t r = 0;
     auto mix = [&](size_t v) { r ^= v + 0x9e3779b9 + (r << 6) + (r >> 2); };
     mix(h(env.attackCurve.encode()));
+    mix(h(env.holdCurve.encode()));
     mix(h(env.decayCurve.encode()));
     mix(h(env.releaseCurve.encode()));
     return r;
@@ -160,20 +175,23 @@ void AHDSREnvelopeRuntime::prepareCurves(const AHDSREnvelope& env) {
     if (hh == lastCurveHash && (int)attackTable.size() == kTableSize) return;
     lastCurveHash = hh;
     attackTable  = env.attackCurve.evaluate(kTableSize);
+    holdTable    = env.holdCurve.evaluate(kTableSize);
     decayTable   = env.decayCurve.evaluate(kTableSize);
     releaseTable = env.releaseCurve.evaluate(kTableSize);
-    // Defensive: if any failed to return the requested size, pad with linear.
-    auto fixup = [](std::vector<float>& v, bool rising) {
+    // Defensive: if any failed to return the requested size, pad with a
+    // sensible default. `fill` is the constant a flat curve should hold.
+    auto fixup = [](std::vector<float>& v, bool rising, bool flatOne) {
         if ((int)v.size() == kTableSize) return;
         v.resize(kTableSize);
         for (int i = 0; i < kTableSize; ++i) {
             float t = (float)i / (float)(kTableSize - 1);
-            v[i] = rising ? t : 1.0f - t;
+            v[i] = flatOne ? 1.0f : (rising ? t : 1.0f - t);
         }
     };
-    fixup(attackTable,  true);
-    fixup(decayTable,   false);
-    fixup(releaseTable, false);
+    fixup(attackTable,  true,  false);
+    fixup(holdTable,    false, true);   // flat plateau at peak
+    fixup(decayTable,   false, false);
+    fixup(releaseTable, false, false);
 }
 
 static float sampleTable(const std::vector<float>& tbl, float t) {
@@ -208,10 +226,18 @@ float AHDSREnvelopeRuntime::tick(float sampleRate, const AHDSREnvelope& env) {
             break;
         }
         case Stage::Hold: {
-            currentLevel = velPeak;
-            if (timeInStage * 1000.0 >= (double)env.holdMs) {
+            float dur = std::max(0.0005f, env.holdMs * 0.001f);
+            float t = (float)(timeInStage / dur);
+            if (t >= 1.0f) {
+                // End the plateau at peak so Decay (which starts from peak)
+                // continues without a discontinuity, regardless of the
+                // hold curve's final value.
+                currentLevel = velPeak;
                 stage = Stage::Decay;
                 timeInStage = 0.0;
+            } else {
+                // holdTable is a 0..1 multiplier on peak (default flat 1).
+                currentLevel = sampleTable(holdTable, t) * velPeak;
             }
             break;
         }

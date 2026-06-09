@@ -1,0 +1,159 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>MIDI Script — SEANCE</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="wrap">
+<header>
+<h1>MIDI Script</h1>
+<nav>
+  <a href="index.html">Home</a>
+  <a href="graph-basics.html">Graph Basics</a>
+  <a href="signal-shape.html">Signal Shape</a>
+  <a href="midi-modulator.html">MIDI Modulator</a>
+  <a href="pin-kinds.html">Pin Kinds</a>
+</nav>
+</header>
+
+<p>A <strong>MIDI Script</strong> node generates MIDI by running a tiny program you write — a drum machine, a generative sequencer, an arpeggiator, an LFO-to-CC, a chord exploder, whatever you can express in a line or two of maths. The program runs <em>once for every audio sample</em> and emits MIDI live, so it stays perfectly in time and reacts instantly to the transport and to incoming signals.</p>
+
+<p>You don't need to install anything or know a "real" programming language — the script is the same little expression language used elsewhere in SEANCE (the same <code>sin</code>, <code>noise</code>, <code>floor</code>, <code>?:</code> you'd type into a Signal Shape), with a few extra things bolted on: you can write several statements, remember values between samples, and call functions that <em>emit MIDI</em>.</p>
+
+<p>Add one from <em>Signal Shape → MIDI Script (algorithmic MIDI)</em> in the right-click menu. The editor opens automatically; double-click the node (or right-click → <em>Edit Program…</em>) to reopen it later. Wire the node's <strong>MIDI Out</strong> into any synth.</p>
+
+<h2>Your first beat</h2>
+
+<p>Type this into the program box:</p>
+
+<pre>ph = beat - floor(beat)
+(ph &lt; dt*bpm/60) ? note(36, 110, 0.1) : 0</pre>
+
+<p>Press play. You'll hear a kick drum (MIDI note 36) on every beat. Here's what each piece does:</p>
+
+<ul>
+  <li><code>beat</code> is the transport position counted in beats. <code>floor(beat)</code> chops off the fraction, so <code>ph</code> is "how far into the current beat we are", from 0 up to 1.</li>
+  <li>The second line fires a note only in the tiny window right at the start of each beat (<code>dt*bpm/60</code> is the length of one sample expressed in beats). The <code>? … : 0</code> is an "if": emit the note when the condition is true, otherwise do nothing.</li>
+  <li><code>note(36, 110, 0.1)</code> plays note 36 at velocity 110 for 0.1 seconds, then releases it automatically.</li>
+</ul>
+
+<p>Add a random hi-hat by appending another line:</p>
+
+<pre>(noise(0) &gt; 0.6) ? note(42, 60, 0.05) : 0</pre>
+
+<h2>Emitting MIDI</h2>
+
+<p>These functions push MIDI at the current instant. Pitch and velocity are 0–127.</p>
+
+<ul>
+  <li><code>note(pitch, vel, durSec)</code> — play a note that releases itself after <code>durSec</code> seconds. The easiest one to use.</li>
+  <li><code>noteon(pitch, vel)</code> / <code>noteoff(pitch)</code> — start and stop a note yourself, when you want to control the length by hand.</li>
+  <li><code>cc(number, value)</code> — a control-change message. <code>value</code> runs 0–1 (it's scaled to MIDI's 0–127 for you). Great for sweeping a filter: <code>cc(74, 0.5 + 0.5*sin(t))</code>.</li>
+  <li><code>bend(value)</code> — pitch bend, where <code>value</code> goes from −1 (down) through 0 (centre) to +1 (up).</li>
+</ul>
+
+<h2>Remembering things between samples</h2>
+
+<p>Any variable you assign with <code>=</code> <strong>keeps its value</strong> the next sample, and the next, forever — so you can build up state over time without any special syntax. A simple step sequencer that advances a counter on each beat:</p>
+
+<pre>ph = beat - floor(beat)
+hit = ph &lt; dt*bpm/60
+hit ? (step = (step + 1) % 4) : 0
+hit ? note(48 + step*3, 100, 0.2) : 0</pre>
+
+<p>Here <code>step</code> survives from one note to the next, walking 0,1,2,3,0,1,… and choosing the pitch. (Variables start at 0 the first time, and reset whenever you edit the program.)</p>
+
+<h2>Running something once: <code>init:</code> and <code>start:</code></h2>
+
+<p>Because the program runs <em>every sample, forever</em>, there's no obvious place to do something a single time — like play one note at the very beginning, or set up a table before the music starts. Two optional <strong>section headers</strong> solve this. Put one on a line by itself and everything below it (until the next header) becomes that section:</p>
+
+<ul>
+  <li><code>init:</code> runs <strong>once</strong> when the program loads or whenever you edit it. Use it to seed persistent variables — a starting step, a random seed, a lookup table. Emit functions here do nothing (init is for setup, not sound).</li>
+  <li><code>start:</code> runs <strong>once</strong> each time playback starts from stop, right on the downbeat. Unlike init it <em>can</em> emit, so it's the place for a one-shot: a single note, a chord, a reset CC.</li>
+  <li><code>loop:</code> is everything else — the per-sample body you've been writing all along. Any lines <em>before</em> the first header are loop by default, so a program with no headers behaves exactly as before.</li>
+</ul>
+
+<p>All three sections share the same persistent variables, so <code>init:</code> can set a counter that <code>loop:</code> reads and <code>start:</code> resets. A program that plays one chord at the downbeat and then stays silent is just:</p>
+
+<pre>start:
+note(60, 100, 1.0)
+note(64, 100, 1.0)
+note(67, 100, 1.0)</pre>
+
+<p>And a sequencer that always begins from step 0 every time you hit play:</p>
+
+<pre>init:
+step = 0
+
+start:
+step = 0
+
+loop:
+ph = beat - floor(beat)
+hit = ph &lt; dt*bpm/60
+hit ? (step = (step + 1) % 4) : 0
+hit ? note(48 + step*3, 100, 0.2) : 0</pre>
+
+<h2>Reading the world</h2>
+
+<p>Your program can read a handful of built-in values every sample:</p>
+
+<ul>
+  <li><code>t</code> — seconds since the song started; <code>beat</code>, <code>bar</code> — musical position; <code>bpm</code> — tempo; <code>playing</code> — 1 while playing.</li>
+  <li><code>dt</code> — the length of one sample in seconds; <code>sr</code> — the sample rate.</li>
+  <li><code>note</code>, <code>vel</code>, <code>gate</code>, <code>freq</code> — the most recent note arriving at the node's <strong>MIDI In</strong> pin (its number, velocity 0–1, whether a key is held, and its pitch in Hz). Use these to react to what you play.</li>
+  <li><code>s1</code>, <code>s2</code>, … — Signal input pins (see below).</li>
+</ul>
+
+<p>The full maths toolbox is available too: <code>sin cos tan sqrt abs exp log pow tanh saw square triangle noise floor ceil min max clamp if</code>, comparisons (<code>&lt; &gt; == …</code>), and <code>&amp;&amp; || !</code>.</p>
+
+<h2>Signal inputs and a drawn shape</h2>
+
+<p>The editor has two spinners and an optional shape:</p>
+
+<ul>
+  <li><strong>Signal inputs (s1..sN)</strong> — dial this up to add amber Signal input pins. Wire an LFO, envelope, or XY-pad output into them and read them as <code>s1</code>, <code>s2</code>, …  For example <code>cc(1, s1)</code> turns an incoming signal into mod-wheel data.</li>
+  <li><strong>Shape</strong> — an optional hand-built curve (the same layer editor used for wavetables). Sample it anywhere with <code>shape(pos)</code>, where <code>pos</code> runs 0→1. Use it as a velocity contour, a melody table, or a probability curve. Until you add a layer it just returns 0.</li>
+</ul>
+
+<h2>Multiple outputs — one cable per drum</h2>
+
+<p>A real drum kit wants the kick, snare, and hat going to different places. Turn up <strong>MIDI outputs</strong> to give the node several output pins ("MIDI Out 1", "MIDI Out 2", …), then choose where each note goes by setting <code>out</code> before you emit:</p>
+
+<pre>out = 0;  note(36, 110, 0.1)
+out = 1;  note(38, 90, 0.1)
+out = 2;  note(42, 60, 0.05)</pre>
+
+<p>Each output is its own independent MIDI cable (numbered from 0 in the script, shown as "MIDI Out 1" upward on the node) — <em>not</em> a MIDI channel you have to manage. Wire each one to a different drum instrument.</p>
+
+<h2>Choosing a language: Built-in, Lua, or WebAssembly</h2>
+
+<p>Everything above uses the built-in expression language — no setup, always real-time-safe. When your idea outgrows one-liners, the <strong>Language</strong> dropdown at the top of the editor switches the <em>same node</em> to a full programming language:</p>
+
+<ul>
+  <li><strong>Built-in</strong> (default) — the little expression language. Runs once per sample.</li>
+  <li><strong>Lua</strong> — a complete scripting language. Write a <code>loop()</code> function (it runs each sample or each block) plus optional <code>start()</code>; any top-level code runs once at the start. You get loops, tables, functions, and the same emit calls (<code>note</code>, <code>cc</code>, …). A second <strong>Run</strong> dropdown picks <em>Per sample</em> (sample-accurate, but heavy code can stutter the audio — the editor warns you) or <em>Per block</em> (much cheaper; for tight timing you pass a sample offset as the last argument, e.g. <code>note(36,110,0.1, i)</code> inside a <code>for i=0,n-1</code> loop).</li>
+  <li><strong>WebAssembly</strong> — load a <code>.wasm</code> module you compiled from C, Rust, Zig, or AssemblyScript. The editor shows a <em>Choose .wasm file…</em> button instead of the text box. Runs once per block.</li>
+</ul>
+
+<p>A quick Lua version of the kick-drum beat:</p>
+
+<pre>function loop()
+  local ph = beat - floor(beat)
+  if ph &lt; dt*bpm/60 then note(36, 110, 0.1) end
+end</pre>
+
+<p>Click <em>Language reference…</em> with Lua selected to see the full Lua model and a sample-accurate per-block example.</p>
+
+<div class="tip">
+<strong>Stuck for syntax?</strong> Click <em>Language reference…</em> at the bottom of the editor for the complete list of variables, functions, and examples (it switches to match the language you've picked). And remember the node is a <em>generator</em>: whatever MIDI you wire <em>into</em> it only sets the <code>note</code>/<code>vel</code>/<code>gate</code> variables — it is not passed through to the outputs.
+</div>
+
+<footer>
+<a href="index.html">← Back to index</a>
+</footer>
+</div>
+</body>
+</html>

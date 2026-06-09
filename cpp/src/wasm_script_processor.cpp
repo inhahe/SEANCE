@@ -129,6 +129,9 @@ bool WasmScriptProcessor::loadWasm(const std::vector<uint8_t>& wasmBytes) {
         return m3Err_none;
     });
 
+    // ss_midi_out(samplePos, status, d1, d2): emit a MIDI event to output 0.
+    // The 8th event byte (off+7) carries the destination output index; this
+    // single-output form always tags 0.
     m3_LinkRawFunction(wasmModule, "env", "ss_midi_out", "v(iiii)", [](IM3Runtime rt, IM3ImportContext ctx, uint64_t* sp, void* mem) -> const void* {
         auto* self = (WasmScriptProcessor*)m3_GetUserData(rt);
         uint32_t count = rmem<uint32_t>(self->wasmMem, H_MIDI_OUT_COUNT);
@@ -139,7 +142,29 @@ bool WasmScriptProcessor::loadWasm(const std::vector<uint8_t>& wasmBytes) {
         self->wasmMem[off + 4] = (uint8_t)sp[1];
         self->wasmMem[off + 5] = (uint8_t)sp[2];
         self->wasmMem[off + 6] = (uint8_t)sp[3];
-        self->wasmMem[off + 7] = 0;
+        self->wasmMem[off + 7] = 0; // output index 0
+        wmem<uint32_t>(self->wasmMem, H_MIDI_OUT_COUNT, count + 1);
+        return m3Err_none;
+    });
+
+    // ss_midi_out_n(out_index, samplePos, status, d1, d2): emit a MIDI event to
+    // the given output pin. Routed to an independent cable when the script also
+    // exports ss_num_midi_outputs() > 1 (see copyMidiOut + the graph's per-output
+    // channel filter). out_index is clamped to the declared output count.
+    m3_LinkRawFunction(wasmModule, "env", "ss_midi_out_n", "v(iiiii)", [](IM3Runtime rt, IM3ImportContext ctx, uint64_t* sp, void* mem) -> const void* {
+        auto* self = (WasmScriptProcessor*)m3_GetUserData(rt);
+        uint32_t count = rmem<uint32_t>(self->wasmMem, H_MIDI_OUT_COUNT);
+        if (count >= MAX_MIDI_EVENTS) return m3Err_none;
+        uint32_t off = self->midiOutOffset + count * MIDI_EVENT_SIZE;
+        if (off + MIDI_EVENT_SIZE > self->wasmMemSize) return m3Err_none;
+        int outIdx = (int)(int32_t)sp[0];
+        if (outIdx < 0) outIdx = 0;
+        if (outIdx > self->numMidiOutPins - 1) outIdx = self->numMidiOutPins - 1;
+        wmem<uint32_t>(self->wasmMem, off + 0, (uint32_t)sp[1]);
+        self->wasmMem[off + 4] = (uint8_t)sp[2];
+        self->wasmMem[off + 5] = (uint8_t)sp[3];
+        self->wasmMem[off + 6] = (uint8_t)sp[4];
+        self->wasmMem[off + 7] = (uint8_t)outIdx;
         wmem<uint32_t>(self->wasmMem, H_MIDI_OUT_COUNT, count + 1);
         return m3Err_none;
     });
@@ -166,6 +191,14 @@ bool WasmScriptProcessor::loadWasm(const std::vector<uint8_t>& wasmBytes) {
     if (fnNumOut) { m3_CallV(fnNumOut); m3_GetResultsV(fnNumOut, &numAudioOutPairs); }
     numAudioInPairs  = juce::jlimit(0, 8, numAudioInPairs);
     numAudioOutPairs = juce::jlimit(1, 8, numAudioOutPairs);
+
+    // Optional: number of independent MIDI output pins (default 1). Scripts that
+    // want to route to multiple MIDI cables export ss_num_midi_outputs() and emit
+    // via ss_midi_out_n(out_index, ...).
+    IM3Function fnNumMidiOut = nullptr;
+    m3_FindFunction(&fnNumMidiOut, wasmRuntime, "ss_num_midi_outputs");
+    if (fnNumMidiOut) { m3_CallV(fnNumMidiOut); m3_GetResultsV(fnNumMidiOut, &numMidiOutPins); }
+    numMidiOutPins = juce::jlimit(1, 16, numMidiOutPins);
 
     // Initialize header before calling ss_init
     computeOffsets();
@@ -227,8 +260,16 @@ void WasmScriptProcessor::populateNodePins(Node& n) {
         n.pinsOut.push_back({nextPinId++, name, PinKind::Audio, false, 2});
     }
 
-    // MIDI output
-    n.pinsOut.push_back({nextPinId++, "MIDI Out", PinKind::Midi, false});
+    // MIDI output(s). One "MIDI Out" pin by default; if the script declared
+    // ss_num_midi_outputs() > 1 we expose "MIDI Out 1..N" and the graph splices
+    // a per-output channel filter so each behaves as an independent cable.
+    if (numMidiOutPins <= 1) {
+        n.pinsOut.push_back({nextPinId++, "MIDI Out", PinKind::Midi, false});
+    } else {
+        for (int i = 0; i < numMidiOutPins; ++i)
+            n.pinsOut.push_back({nextPinId++, "MIDI Out " + std::to_string(i + 1),
+                                 PinKind::Midi, false});
+    }
 }
 
 // ==============================================================================
@@ -411,6 +452,18 @@ void WasmScriptProcessor::copyMidiOut(juce::MidiBuffer& midi) {
         uint8_t status = wasmMem[off + 4];
         uint8_t d1 = wasmMem[off + 5];
         uint8_t d2 = wasmMem[off + 6];
+        uint8_t outIdx = wasmMem[off + 7];
+
+        // Multi-output routing: re-stamp the channel nibble of channel-voice
+        // messages (status 0x80..0xEF) to (outIdx+1) so the graph's per-output
+        // MidiChannelFilterProcessor can split each output into its own cable.
+        // System messages (0xF0+) have no channel nibble and pass through.
+        // With a single output we leave the status byte untouched so the
+        // script's own channel choice survives.
+        if (numMidiOutPins > 1 && status >= 0x80 && status < 0xF0) {
+            int ch = juce::jlimit(0, numMidiOutPins - 1, (int)outIdx); // 0-based
+            status = (uint8_t)((status & 0xF0) | (ch & 0x0F));
+        }
         midi.addEvent(juce::MidiMessage(status, d1, d2), (int)samplePos);
     }
 }

@@ -24,7 +24,7 @@
 <p>A layer is one shape with three knobs:</p>
 
 <ul>
-  <li><strong>Shape</strong> — Sine, Saw, Square, Triangle, Noise, or Drawn (freehand). Pick from the row of buttons at the top of each layer row.</li>
+  <li><strong>Shape</strong> — Sine, Saw, Square, Triangle, Noise, Drawn (freehand), or Formula (a typed math expression). Pick from the row of buttons at the top of each layer row.</li>
   <li><strong>Harmonic</strong> — what multiple of the root pitch this layer cycles at. 1 means the same as the played note (the fundamental); 2 is one octave up; 3 is one octave + a fifth; higher numbers add brighter overtones. This is how you sculpt timbre — sine layers stacked at integer harmonics give organ-like additive sounds; non-integer harmonics give bell-like inharmonic textures.</li>
   <li><strong>Phase</strong> — where in its cycle the layer starts (0 to 1). Doesn't matter for a single sine but affects how layers add up — two sines at the same pitch but opposite phase cancel completely; phase shifts between layers reshape the combined waveform.</li>
   <li><strong>Amplitude</strong> — how loud this layer is in the sum (0 to 1). Use to balance layers against each other.</li>
@@ -35,6 +35,20 @@
 <h3>The Drawn shape</h3>
 
 <p>Pick <em>Drawn</em> on a layer to switch its shape from a math curve to a freehand canvas — drag in the layer's preview to draw the shape directly with the mouse. Useful when you want a specific transient or asymmetry that no math primitive gives you.</p>
+
+<h3>The Formula shape</h3>
+
+<p>Pick <em>Formula</em> to type a math expression instead of picking a fixed wave. The expression is evaluated over one cycle in the variable <code>x</code>, which sweeps from 0 to 2π (one full turn), and the result is clamped to the −1…1 range. So <code>sin(x)</code> is a plain sine, <code>tanh(3*sin(x))</code> is a softly-overdriven sine, and <code>sin(x) + 0.3*saw(3*x)</code> adds a third-harmonic sawtooth bite. You have the usual math vocabulary available: <code>sin cos tan sqrt abs exp log floor ceil min max pow clamp saw square triangle noise</code>, plus <code>pi</code> and <code>e</code>.</p>
+
+<p>Next to the expression field is a small <strong>language</strong> dropdown with three choices:</p>
+
+<ul>
+  <li><strong>Built-in</strong> (default) — SEANCE's own expression language. Fast, always available, and evaluated live.</li>
+  <li><strong>Lua</strong> — write the shape as a little Lua program. Handy if you already know Lua or want loops/locals to build up a complex shape. A bare expression like <code>sin(x)</code> works as-is; for a longer program, end it with <code>return &lt;value&gt;</code>.</li>
+  <li><strong>Python</strong> — same idea in Python. Generator-style one-liners like <code>sum(0.6**k * sin((k+1)*x) for k in range(6))</code> are a quick way to stack harmonics.</li>
+</ul>
+
+<p>Lua and Python shapes are computed once, in the background, the moment you finish typing — they never run while audio is playing, so they can't cause clicks or dropouts no matter how heavy the math is. If your script has a mistake, a red <em>Script error</em> message appears over the layer preview telling you what went wrong, and the layer stays silent until you fix it. A language that isn't available in your build shows up greyed-out with a tooltip explaining why.</p>
 
 <h2>The waveform library</h2>
 
@@ -50,6 +64,12 @@
 
 <p>A newly-created waveform isn't placed in the arrangement yet, so it has no grid position. While it's highlighted but unplaced, the "Selected waveform position" controls are replaced by an <strong>Add to grid</strong> button — click it to drop the waveform into the arrangement (it fills the first empty cell, growing the grid if it's full), and the position controls reappear so you can move it around.</p>
 
+<h3>Making one waveform louder or quieter</h3>
+
+<p>Here's a gotcha that surprises people: every waveform you build is automatically <strong>normalised</strong> to the same peak loudness. So if you stack a quiet layer and a loud layer, or draw a tiny ripple, the result still comes out at full level — and two different frames in a wavetable play back equally loud no matter how you shaped them. There's nothing in the shape controls that lets you say "this one should be half as loud."</p>
+
+<p>That's what the <strong>Gain</strong> knob (just under the waveform's name/colour row, on the right) is for. Turn it down toward 0 to make this waveform quieter, up toward 2 to make it louder; 1.00 is unchanged, and double-clicking snaps it back to 1.00. It changes the waveform itself — you'll see the preview shrink or grow — so when you sweep the Position knob to morph between a loud frame and a quiet one, you actually hear the volume swell and fade. Gain belongs to the waveform, so every place you've dropped that waveform shares it.</p>
+
 <h2>Multi-frame wavetables</h2>
 
 <p>One layered cycle gives you a single timbre. Click <strong>+ Add Frame</strong> to stack several distinct cycles into a wavetable. The synth gets a <em>Position</em> knob that crossfades between frames as you sweep it — automate Position over the course of a note and the timbre morphs in real time. Modulate it from an LFO for cyclic timbre wobble, or from velocity for "play harder = brighter."</p>
@@ -58,9 +78,17 @@
 
 <h2>N-dimensional grids</h2>
 
-<p>One Position knob gives you a 1D morph through frames. Click <strong>+ Dim</strong> to add a second axis, and the synth gains a second Position knob — now your frames form a 2D grid you can sweep through with two parameters at once. Add more dimensions for 3D, 4D, even higher. Each axis is independent, so you can wire them up to different modulation sources for orthogonal control over different aspects of the sound.</p>
+<p>A grid starts out as a single row of cells, drawn as a <strong>segmented line</strong>: each cell is a tick-marked segment along the line, with its waveform shown as a dot in the middle and an index label like <em>[0]</em>, <em>[1]</em> below. That's the 1D morph — one Position knob sweeps along the row. Click <strong>+ Dim</strong> to add a second axis, and the line becomes a 2D checkerboard of cells with a second Position knob; add more dimensions for a cube and beyond. Each axis is independent, so you can wire them up to different modulation sources for orthogonal control over different aspects of the sound.</p>
 
 <p>Most users won't go past 2D, but the option is there for ambitious sound design where you want, say, brightness on one axis and detune-spread on another.</p>
+
+<p>A Position knob only shows up once its axis has something to morph through. A grid axis that's still one waveform wide has no second frame to crossfade to, so it stays knob-free — grow it to two or more waveforms and its Position knob (and its <em>Mod: Position</em> cable input) appear automatically. Shrink it back to a single waveform and the knob goes away again.</p>
+
+<h3>Empty cells and volume</h3>
+
+<p>A grid doesn't have to be completely filled — you can leave some cells empty (no waveform). By default SEANCE keeps the sound at full volume as you morph across the gaps: it spreads the morph over whichever cells <em>are</em> filled, so an empty cell never makes the sound quieter. This is the <strong>Empty cells fade volume</strong> toggle (below the axis-size sliders), and <em>off</em> is the default. If your grid has no empty cells, the toggle does nothing.</p>
+
+<p>Turn <strong>Empty cells fade volume</strong> <em>on</em> when you actually want the gaps to be heard — morphing toward an empty cell then ducks the sound toward silence, so a sparse grid becomes a rhythm of swells and dropouts. It's the same idea as Scatter mode's <em>Distance fades volume</em> toggle, just for grid cells instead of scattered dots.</p>
 
 <h2>Scatter mode</h2>
 
@@ -68,7 +96,21 @@
 
 <p>Click <strong>Mode: Grid</strong> in the toolbar to switch to <strong>Mode: Scatter</strong>. Now each frame has a free position vector (X, Y, optionally Z, and beyond), and you can drag the frames around in the viewport. The synth interpolates between frames based on the current Position values using a Wendland radial basis function — frames near the current position blend in, frames far away contribute less. The result is a smoother and more organic morph than grid interpolation, especially when frames don't sit at grid intersections.</p>
 
-<p>Use the per-frame coordinate sliders below the viewport to numerically place frames if dragging doesn't get you the precision you want.</p>
+<p>You can always get back. The conversion button reads <strong>↩ Back to Grid</strong> when an exact, lossless return is possible (you converted from a grid and haven't moved any dot off its original cell). If you've since edited axes or dragged dots around — or you built the wavetable in Scatter from the start — the button instead reads <strong>Convert → Grid</strong> and lays your dots out into a simple one-row grid (one cell per dot) so you're never stuck in Scatter mode.</p>
+
+<p>Scatter starts out as a <strong>line</strong>: a single horizontal axis with your dots strung along it, draggable left and right. Use <strong>+ Dim</strong> to grow it into a square (two axes), then a cube, and so on — the same <strong>+ Dim</strong> / <strong>− Dim</strong> buttons that add morph axes anywhere. Take the line's one axis away with <strong>− Dim</strong> and the viewport becomes a small dashed circle — a compact <em>drop target</em> with no line or square, just a "drag a waveform here" affordance to remind you that you can drop sounds in to begin. (How many of these axes you can actually <em>sweep</em> is a separate question — see below.)</p>
+
+<p>Use the per-frame coordinate sliders below the viewport to numerically place a frame if dragging doesn't get you the precision you want. There's one slider per <em>axis the view has</em> (one for the line, two for the square, and so on) — so you can place a frame along every visible axis, even a lone dot that doesn't span anything yet. That's how you set frames up to spread apart: place them at different coordinates and the morph axes appear (see below). Note this is a placement control and is separate from how many Position knobs the synth shows.</p>
+
+<p>Just like a grid axis only becomes a Position knob once it has two or more cells to morph between, a scatter axis only becomes a Position knob once your dots actually <em>spread out</em> along it. The rule is per-axis: with one dot (or none) there's nothing to traverse, so no Position knobs appear at all. Spread two dots apart horizontally and an <strong>X</strong> knob appears; spread them vertically instead and you get a <strong>Y</strong> knob instead — each axis shows up on its own, only when the dots differ along it. Drag a dot back into line with the others and that axis's knob disappears again. So if you place a sound and no Position knob shows up, that's expected — give it a neighbour and pull them apart to create an axis to sweep.</p>
+
+<h3>Distance fades volume</h3>
+
+<p>By default the scatter blend is <em>normalized</em>: wherever you put the Position, the in-range frames are mixed into a full-volume average. Moving around changes <em>which</em> frames you hear, but never the overall loudness — and a lone frame always plays at full volume no matter where Position sits.</p>
+
+<p>Flip on the <strong>Distance fades volume</strong> toggle (below the RBF radius slider) and the blend uses each frame's raw proximity weight as its <em>gain</em> instead. Now every scatter dot is a little "loudness island": loudest right at the dot, fading down to silence at the edge of its radius, and silent in the empty gaps between dots. As you sweep Position across the field you walk past each dot in turn, swelling it in as you approach and ducking it out as you leave — the scatter equivalent of moving a listener through a room of sound sources.</p>
+
+<p>This toggle only changes the <em>gain</em> math; it doesn't add or remove any Position knob. Position knobs come purely from how your dots are spread out (see below), so you need at least two dots spanning an axis before there's anything to automate either way.</p>
 
 <h3>The 3D anaglyph viewport</h3>
 

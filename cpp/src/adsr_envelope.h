@@ -12,16 +12,20 @@ namespace SoundShop {
 // the usual four:
 //
 //   Attack  : 0 -> 1 over `attackMs` milliseconds
-//   Hold    : stays at 1 for `holdMs` milliseconds (flat, no shape)
+//   Hold    : stays near 1 for `holdMs` milliseconds (shapeable plateau)
 //   Decay   : 1 -> sustain over `decayMs` milliseconds
 //   Sustain : stays at `sustain` (flat) for as long as the key is held
 //   Release : current level -> 0 over `releaseMs` milliseconds after note-off
 //
-// The Attack / Decay / Release stages each have an independent SpectralCurve
-// describing the shape of the ramp (linear, exponential, S-curve, freehand,
-// etc.) using the same three-mode (Equation / Drawn / Freehand) editor used
-// elsewhere in the app. Sustain and Hold are flat by definition so they have
-// no curve.
+// The Attack / Hold / Decay / Release stages each have an independent
+// SpectralCurve describing the shape of the ramp (linear, exponential,
+// S-curve, freehand, etc.) using the same three-mode (Equation / Drawn /
+// Freehand) editor used elsewhere in the app. The Hold curve is a multiplier
+// on the peak level across the hold window: its default expression is the
+// constant "1" (a true flat plateau at peak), but it can be shaped into a
+// swell or a dip during the hold. The curve always re-arrives at peak at the
+// end of Hold so the following Decay starts from peak without a discontinuity.
+// Sustain is flat by definition so it has no curve.
 //
 // `velocitySensitivity` (0..1) scales the envelope's peak amplitude by the
 // note's MIDI velocity:
@@ -43,6 +47,7 @@ struct AHDSREnvelope {
     // first time the user opens an editor for an unset curve they
     // see something sensible rather than a flat line.
     SpectralCurve attackCurve;
+    SpectralCurve holdCurve;
     SpectralCurve decayCurve;
     SpectralCurve releaseCurve;
 
@@ -105,6 +110,7 @@ private:
     // 256-sample precomputed curve tables (x in 0..1 -> shape in 0..1).
     static constexpr int kTableSize = 256;
     std::vector<float> attackTable;
+    std::vector<float> holdTable;
     std::vector<float> decayTable;
     std::vector<float> releaseTable;
     size_t lastCurveHash = 0;     // skip rebake when curves haven't changed

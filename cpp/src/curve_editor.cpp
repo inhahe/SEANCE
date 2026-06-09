@@ -115,12 +115,39 @@ static std::vector<std::string> splitChar(const std::string& s, char sep) {
 // ==============================================================================
 // SpectralCurve - evaluation and serialization
 // ==============================================================================
+// Resolution of the normalized buffer baked from a Lua/Python equation.
+static constexpr int kScriptBakeRes = 1024;
+
+void SpectralCurve::rebake() {
+    if (mode != Equation || lang == ShapeLang::Builtin) {
+        scriptSamples.clear();
+        scriptError.clear();
+        return;
+    }
+    std::string err;
+    bakeShapeExpr(lang, expression, /*domainRadians=*/false, kScriptBakeRes,
+                  scriptSamples, err);
+    scriptError = err;
+}
+
 std::vector<float> SpectralCurve::evaluate(int N) const {
     std::vector<float> out(N, 0.0f);
     if (N <= 0) return out;
 
     if (mode == Equation) {
-        out = WaveExprParser::evaluateOverBins(expression, N);
+        if (lang == ShapeLang::Builtin) {
+            // Built-in: `f` is the integer bin index over [0, N), evaluated
+            // live. Pure C++, safe from any thread.
+            out = WaveExprParser::evaluateOverBins(expression, N);
+            return out;
+        }
+        // Lua/Python: resample the pre-baked normalized [0,1] buffer. Never
+        // calls the interpreter (which isn't audio-thread safe).
+        for (int k = 0; k < N; ++k) {
+            float x = (N > 1) ? (float)k / (float)(N - 1) : 0.0f;
+            out[k] = scriptSamples.empty() ? 0.0f
+                                           : sampleDrawnSamplesAt(scriptSamples, x);
+        }
         return out;
     }
 
@@ -141,7 +168,9 @@ std::vector<float> SpectralCurve::evaluate(int N) const {
 std::string SpectralCurve::encode() const {
     std::ostringstream o;
     if (mode == Equation) {
-        o << "eq," << escapeFormula(expression);
+        // Field 2 = authoring language ("builtin"/"lua"/"python"); absent in
+        // pre-language saves, which decode as Built-in.
+        o << "eq," << escapeFormula(expression) << "," << shapeLangKey(lang);
     } else if (freehandMode) {
         o << "drawnfh," << drawnSamples.size();
         for (float v : drawnSamples) o << "," << v;
@@ -160,6 +189,8 @@ bool SpectralCurve::decode(const std::string& body, SpectralCurve& out) {
     if (kind == "eq") {
         out.mode = SpectralCurve::Equation;
         if (f.size() > 1) out.expression = unescapeFormula(f[1]);
+        if (f.size() > 2) out.lang = shapeLangFromKey(f[2]);
+        out.rebake();   // populate scriptSamples for Lua/Python equations
         return true;
     }
     if (kind == "drawnfh") {
@@ -257,7 +288,32 @@ SpectralCurvePanel::SpectralCurvePanel(SpectralCurve& curve_,
     exprEditor.setText(curve.expression, juce::dontSendNotification);
     exprEditor.onTextChange = [this]() {
         curve.expression = exprEditor.getText().toStdString();
+        curve.rebake();           // refresh Lua/Python bake (no-op for Built-in)
         if (onChanged) onChanged();
+        repaint();
+    };
+
+    // Language selector (Built-in / Lua / Python) for the Equation expression.
+    addAndMakeVisible(langCombo);
+    langCombo.addItem("Built-in", 1);
+    langCombo.addItem("Lua",      2);
+    langCombo.addItem("Python",   3);
+    langCombo.setItemEnabled(2, shapeLangAvailable(ShapeLang::Lua));
+    langCombo.setItemEnabled(3, shapeLangAvailable(ShapeLang::Python));
+    langCombo.setSelectedId((int)curve.lang + 1, juce::dontSendNotification);
+    langCombo.setTooltip("Language for the Equation. Built-in: `f` is the bin index "
+                         "(0..N-1) over the curve. Lua / Python: `f` is the normalized "
+                         "position 0..1, with full loops/variables (e.g. sum many "
+                         "harmonics). Lua/Python are baked into the curve when you edit, "
+                         "not run live; multi-line bodies must end with `return`.");
+    langCombo.onChange = [this]() {
+        curve.lang = (ShapeLang)(langCombo.getSelectedId() - 1);
+        exprEditor.setMultiLine(curve.lang != ShapeLang::Builtin);
+        exprEditor.setReturnKeyStartsNewLine(curve.lang != ShapeLang::Builtin);
+        curve.rebake();
+        updateModeUI();
+        if (onChanged) onChanged();
+        repaint();
     };
 
     updateModeUI();
@@ -269,6 +325,7 @@ void SpectralCurvePanel::syncFromModel() {
     {
         exprEditor.setText(curve.expression, juce::dontSendNotification);
     }
+    curve.rebake();   // ensure scriptSamples reflect the loaded expression/lang
     freehandToggle.setButtonText(curve.freehandMode ? "Freehand" : "Points");
     updateModeUI();
 }
@@ -313,6 +370,11 @@ void SpectralCurvePanel::updateModeUI() {
     equationBtn.setToggleState(eq, juce::dontSendNotification);
     drawBtn.setToggleState(!eq, juce::dontSendNotification);
     exprEditor.setVisible(eq);
+    langCombo.setVisible(eq);
+    langCombo.setSelectedId((int)curve.lang + 1, juce::dontSendNotification);
+    bool scripted = eq && curve.lang != ShapeLang::Builtin;
+    exprEditor.setMultiLine(scripted);
+    exprEditor.setReturnKeyStartsNewLine(scripted);
     freehandToggle.setVisible(!eq);
     freehandToggle.setButtonText(curve.freehandMode ? "Freehand" : "Points");
     resized();
@@ -330,7 +392,14 @@ void SpectralCurvePanel::resized() {
     equationBtn.setBounds(top.removeFromRight(72));
 
     if (curve.mode == SpectralCurve::Equation) {
-        exprEditor.setBounds(a.removeFromTop(24));
+        // Language combo on its own narrow row, then the expression editor -
+        // taller and multi-line for Lua/Python so loops are practical to write.
+        auto comboRow = a.removeFromTop(22);
+        langCombo.setBounds(comboRow.removeFromLeft(90));
+        a.removeFromTop(2);
+        int exprH = (curve.lang == ShapeLang::Builtin) ? 24 : 84;
+        exprEditor.setBounds(a.removeFromTop(exprH));
+        a.removeFromTop(2);
     }
     canvasBounds = a;
 }
@@ -396,6 +465,15 @@ void SpectralCurvePanel::paint(juce::Graphics& g) {
             g.setColour(juce::Colour(60, 90, 140));
             g.drawEllipse(x - 3.0f, y - 3.0f, 6.0f, 6.0f, 1.0f);
         }
+    }
+
+    // Surface a Lua/Python bake error over the canvas.
+    if (curve.mode == SpectralCurve::Equation && !curve.scriptError.empty()) {
+        g.setColour(juce::Colours::red.withAlpha(0.9f));
+        g.setFont(11.0f);
+        g.drawFittedText("Script error: " + juce::String(curve.scriptError),
+                         cb.toNearestInt().reduced(4),
+                         juce::Justification::topLeft, 3);
     }
 }
 

@@ -2,6 +2,7 @@
 #include "layered_wave_editor.h"
 #include <juce_core/juce_core.h>
 #include <cmath>
+#include <cstring>
 #include <limits>
 #include <sstream>
 #include <unordered_map>
@@ -64,6 +65,9 @@ std::string SignalShapeDoc::encode() const {
     o << "repeatN=" << repeatN << "\n";
     o << "freeRun=" << (freeRun ? 1 : 0) << "\n";
     o << "sigCount=" << signalInputCount << "\n";
+    o << "lang=" << (int)language << "\n";
+    o << "rate=" << (int)rate << "\n";
+    o << "wasm=" << b64(wasmPath) << "\n";
 
     // Encode the whole layer stack via LayeredWaveform's encodeBody so the
     // full state lands on one line. An empty stack encodes as just the
@@ -102,6 +106,12 @@ bool SignalShapeDoc::decode(const std::string& s) {
             try { freeRun = std::stoi(val) != 0; } catch (...) {}
         } else if (key == "sigCount") {
             try { signalInputCount = juce::jlimit(0, 16, std::stoi(val)); } catch (...) {}
+        } else if (key == "lang") {
+            try { language = (ScriptLang)juce::jlimit(0, 2, std::stoi(val)); } catch (...) {}
+        } else if (key == "rate") {
+            try { rate = (ScriptRate)juce::jlimit(0, 1, std::stoi(val)); } catch (...) {}
+        } else if (key == "wasm") {
+            wasmPath = unb64(val);
         } else if (key == "layer") {
             // Decode the whole stack. Old single-layer scripts used the same
             // body encoding for their one layer, so they decode into a
@@ -116,6 +126,9 @@ bool SignalShapeDoc::decode(const std::string& s) {
 // -----------------------------------------------------------------------------
 // SignalShapeProcessor
 // -----------------------------------------------------------------------------
+
+// Forward decl: defined below, but referenced by bindShape()'s shape lambda.
+static float sampleShape(const std::vector<float>& tbl, float phase);
 
 SignalShapeProcessor::SignalShapeProcessor(Node& n, Transport& t)
     : node(n), transport(t)
@@ -141,10 +154,11 @@ void SignalShapeProcessor::reloadIfScriptChanged() {
     //                                  parking it in doc.layer.formulaExpr.
     if (SignalShapeDoc::isSignalShapeScript(node.script)) {
         doc.decode(node.script);
-    } else if (node.script == "__xypad__") {
+    } else if (node.script == "__xypad__"
+               || node.script.rfind("__controlbank__", 0) == 0) {
         // No real shape to render; rebuildShapeSamples will fill with zeros
-        // but the XY Pad path in processBlock bypasses shape evaluation
-        // entirely.
+        // but the XY Pad / Control Bank paths in processBlock bypass shape
+        // evaluation entirely.
         doc = SignalShapeDoc::defaultLFO();
     } else if (!node.script.empty()) {
         doc = SignalShapeDoc::defaultLFO();
@@ -165,6 +179,33 @@ void SignalShapeProcessor::reloadIfScriptChanged() {
     timeSinceTrigger = 0.0;
     prevTriggerHigh = false;
     running = doc.triggerExpr.empty(); // no trigger -> free-running
+
+    // (Re)create the language runtime. Effective rate from the capability matrix:
+    // Builtin -> PerSample, Wasm -> PerBlock, Lua -> doc.rate.
+    ScriptRate effRate = doc.rate;
+    if (!scriptLangSupportsRate(doc.language, effRate))
+        effRate = (doc.language == ScriptLang::Wasm) ? ScriptRate::PerBlock
+                                                     : ScriptRate::PerSample;
+    runtime = makeScriptRuntime(doc.language, ScriptRole::Signal, effRate);
+    if (!runtime) // language unavailable in this build -> fall back to Builtin.
+        runtime = makeScriptRuntime(ScriptLang::Builtin, ScriptRole::Signal,
+                                    ScriptRate::PerSample);
+    bindShape();
+
+    // Builtin / Lua run `expr` (the composition source); Wasm loads from the path.
+    const std::string& src = (doc.language == ScriptLang::Wasm) ? doc.wasmPath
+                                                                : doc.expr;
+    std::string err;
+    runtime->load(src, err);
+    runtime->reset();
+
+    runBlockMode = runtime->supportsPerBlock()
+                   && (effRate == ScriptRate::PerBlock || !runtime->supportsPerSample());
+}
+
+void SignalShapeProcessor::bindShape() {
+    if (!runtime) return;
+    runtime->setShape([this](float pos) { return sampleShape(shapeSamples, pos); });
 }
 
 void SignalShapeProcessor::rebuildShapeSamples() {
@@ -205,6 +246,22 @@ void SignalShapeProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mid
     if (node.script == "__xypad__") {
         const int kNumOuts = 3;
         for (int i = 0; i < kNumOuts; ++i) {
+            int ch = 2 + i;
+            if (ch >= numCh) break;
+            float v = juce::jlimit(0.0f, 1.0f, getParam(i, 0.5f));
+            auto* out = buf.getWritePointer(ch);
+            for (int s = 0; s < numSamples; ++s) out[s] = v;
+        }
+        return;
+    }
+
+    // Control Bank mode - one Signal output per slider, identified by the
+    // "__controlbank__" script tag (a trailing ":h" only flags horizontal UI
+    // layout). Each output channel 2+i is driven by param i (the slider value,
+    // 0..1). Like XY Pad, this bypasses all shape/trigger machinery.
+    if (node.script.rfind("__controlbank__", 0) == 0) {
+        const int numOuts = (int)node.params.size();
+        for (int i = 0; i < numOuts; ++i) {
             int ch = 2 + i;
             if (ch >= numCh) break;
             float v = juce::jlimit(0.0f, 1.0f, getParam(i, 0.5f));
@@ -306,8 +363,73 @@ void SignalShapeProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mid
             ++numOutCtrlPins;
     const int outChEnd = std::min(numCh, outChStart + numOutCtrlPins);
 
+    // Transport play rising edge -> run the language's start hook (Lua start()).
+    const bool playStart = transport.playing && !wasPlaying;
+    wasPlaying = transport.playing;
+
+    // ---- Per-block dispatch (Lua block-rate / Wasm) ----------------------
+    // Raw-signal mode: the script fills the whole output buffer itself. The
+    // trigger / phase / repeat / curve machinery below is bypassed entirely.
+    if (runBlockMode && runtime) {
+        if ((int)blockOut.size() < numSamples)
+            blockOut.assign((size_t)juce::jmax(1, numSamples), 0.0f);
+
+        const float freqHz = (lastNoteOn >= 0)
+                           ? 440.0f * std::pow(2.0f, (lastNoteOn - 69) / 12.0f) : 0.0f;
+        if (playStart) {
+            ScriptVars sv;
+            sv["bpm"]  = (float)transport.bpm;
+            sv["note"] = (float)lastNoteOn;
+            sv["vel"]  = lastVelocity;
+            sv["gate"] = (notesHeld > 0) ? 1.0f : 0.0f;
+            sv["freq"] = freqHz;
+            sv["rate"] = rate;
+            runtime->onStart(sv, nullptr); // Signal role: no MIDI sink
+        }
+
+        ScriptBlockCtx ctx;
+        ctx.sampleRate = juce::jmax(1.0, sampleRate);
+        ctx.numSamples = numSamples;
+        ctx.bpm        = transport.bpm;
+        ctx.playing    = transport.playing;
+        ctx.posSamples = transport.positionSamples;
+        ctx.posBeats   = transport.positionBeats();
+        ctx.note       = lastNoteOn;
+        ctx.vel        = lastVelocity;
+        ctx.gate       = (notesHeld > 0) ? 1.0f : 0.0f;
+        ctx.freq       = freqHz;
+        ctx.rate       = rate;
+        ctx.sig        = &sigChans;
+        ctx.sigCount   = sigCount;
+        ctx.out        = blockOut.data();
+        runtime->runBlock(ctx);
+
+        // Fan the single computed buffer out to every Signal/Param output channel.
+        for (int ch = outChStart; ch < outChEnd; ++ch)
+            std::memcpy(buf.getWritePointer(ch), blockOut.data(),
+                        sizeof(float) * (size_t)numSamples);
+
+        lastOutputValue = (numSamples > 0) ? blockOut[numSamples - 1] : lastOutputValue;
+        if ((int)node.params.size() > 3)
+            node.params[3].value = lastOutputValue;
+        return;
+    }
+
     // ---- Per-sample loop -------------------------------------------------
     bool fireManualNow = manualTriggerPending.exchange(false);
+
+    // Per-sample start hook (Builtin start: / Lua start()) on the play edge.
+    if (playStart && runtime) {
+        ScriptVars sv;
+        sv["bpm"]  = (float)transport.bpm;
+        sv["note"] = (float)lastNoteOn;
+        sv["vel"]  = lastVelocity;
+        sv["gate"] = (notesHeld > 0) ? 1.0f : 0.0f;
+        sv["freq"] = (lastNoteOn >= 0)
+                   ? 440.0f * std::pow(2.0f, (lastNoteOn - 69) / 12.0f) : 0.0f;
+        sv["rate"] = rate;
+        runtime->onStart(sv, nullptr);
+    }
 
     // shape(pos) sampler: lets expressions resample the drawn waveform at an
     // arbitrary position (input-driven lookup / waveshaping), independent of
@@ -422,9 +544,12 @@ void SignalShapeProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mid
 
         float out = 0.0f;
         if (running) {
-            // Evaluate the composition expression. expr defaults to "curve"
-            // which just passes the shape through.
-            out = WaveExprParser::evaluateWithVars(expr, vars, shapeFn);
+            // Evaluate the composition via the language runtime. For Builtin this
+            // walks `expr` (defaulting to "curve", which passes the shape through);
+            // for Lua-per-sample it runs loop() with curve/x/phase/... bound as
+            // globals. The trigger expression above is always the Builtin DSL.
+            out = runtime ? runtime->evalSignal(vars)
+                          : WaveExprParser::evaluateWithVars(expr, vars, shapeFn);
             out = juce::jlimit(-1.0f, 1.0f, out);
 
             if (shouldAdvance) {
@@ -488,6 +613,38 @@ const char* kSignalShapeHelp =
     "  floor ceil min(a,b) max(a,b) clamp(v,lo,hi) if(c,a,b), <  >  <=  >=  ==  !=  && || !, c?a:b.\n"
     "  shape(pos) samples the drawn waveform at pos (0..1 phase, wraps) - e.g.\n"
     "  shape(s1) reads the drawing at a position set by input s1. Output clamped to [-1, 1].";
+
+const char* kSignalShapeLuaHelp =
+    "Signal Shape (Lua) generates the control signal with an embedded Lua 5.4\n"
+    "program.\n"
+    "\n"
+    "Program structure:\n"
+    "  - Top-level code runs ONCE at load (globals persist).\n"
+    "  - function start()  optional - runs once when playback starts.\n"
+    "  - function loop()   required.\n"
+    "\n"
+    "Per sample: loop() RETURNS the output value (-1..1) for this sample. The\n"
+    "  built-in machinery still runs, so you can read `curve` (the drawn shape at\n"
+    "  the current phase) plus x/phase, t, beat, bpm, gate, freq, note, vel, rep,\n"
+    "  rate, s1..sN, and shape(pos).\n"
+    "  Example - a tremolo that follows the drawing:\n"
+    "    function loop() return curve * (0.5 + 0.5*sin(t*6.28*5)) end\n"
+    "\n"
+    "Per block (raw mode): loop() fills the whole block itself with out(i, value),\n"
+    "  i = 0..n-1. The phase/repeat/curve machinery is bypassed; use shape(pos)\n"
+    "  and sig(k, i) to read the drawing and inputs. Variables: n, sr, dt, bpm,\n"
+    "  rate, t/tStart/tEnd, beat/beatStart/beatEnd, note, vel, gate, freq, s1..sN.\n"
+    "  Example - a 5 Hz sine LFO, sample-accurate:\n"
+    "    function loop()\n"
+    "      for i = 0, n-1 do\n"
+    "        local tt = tStart + i*dt\n"
+    "        out(i, sin(tt*6.28318*5))\n"
+    "      end\n"
+    "    end\n"
+    "\n"
+    "Maths: the math.* library plus aliases sin cos tan sqrt abs exp log floor\n"
+    "  ceil min max pow(a,b) clamp(x,lo,hi) saw square triangle noise() pi.\n"
+    "Sandboxed: no io/os/package/debug, no require/load/dofile.";
 } // namespace
 
 SignalShapeEditorComponent::SignalShapeEditorComponent(NodeGraph& g, int nid,
@@ -508,6 +665,26 @@ SignalShapeEditorComponent::SignalShapeEditorComponent(NodeGraph& g, int nid,
 
     // Pull current state from node.script (decode or seed defaults).
     loadFromNode();
+
+    // Language + execution-rate control strip.
+    {
+        ScriptLangBar::Callbacks cbs;
+        cbs.onLanguage = [this](ScriptLang l) {
+            doc.language = l;
+            updateLanguageUI();
+            resized();        // body region changes size with the language
+            commitToNode();
+        };
+        cbs.onRate = [this](ScriptRate r) {
+            doc.rate = r;
+            updateLanguageUI();
+            resized();
+            commitToNode();
+        };
+        langBar = std::make_unique<ScriptLangBar>(std::move(cbs));
+        langBar->setState(doc.language, doc.rate);
+        addAndMakeVisible(*langBar);
+    }
 
     // Embedded layer-stack editor - the shared LayerStackComponent (same
     // widget the Wavetable editor uses). Summation preview ON so the user
@@ -533,10 +710,14 @@ SignalShapeEditorComponent::SignalShapeEditorComponent(NodeGraph& g, int nid,
     layerStack->setTarget(&doc.layers);
     addAndMakeVisible(*layerStack);
 
-    // Expression editors.
+    // Expression / program editor. For the Built-in language this is the
+    // single-line "curve transform" expression; for Lua it becomes a multi-line
+    // program (updateLanguageUI toggles multi-line + height). For Wasm it is
+    // hidden and the wasmPanel takes its place.
     addAndMakeVisible(exprLabel);
     addAndMakeVisible(exprEditor);
     exprEditor.setMultiLine(false);
+    exprEditor.setReturnKeyStartsNewLine(true);
     exprEditor.setText(doc.expr, juce::dontSendNotification);
     exprEditor.onTextChange = [this]() {
         doc.expr = exprEditor.getText().toStdString();
@@ -546,6 +727,21 @@ SignalShapeEditorComponent::SignalShapeEditorComponent(NodeGraph& g, int nid,
                           "Default 'curve' passes the waveform through unchanged.\n"
                           "Use shape(pos) to read the drawing at an arbitrary\n"
                           "position, e.g. shape(s1) for input-driven lookup.");
+
+    // .wasm file picker (only visible when the language is WebAssembly).
+    wasmPanel = std::make_unique<WasmFilePanel>([this](std::string p) {
+        doc.wasmPath = std::move(p);
+        commitToNode();
+    });
+    wasmPanel->setPath(doc.wasmPath);
+    addChildComponent(*wasmPanel);   // visibility toggled by updateLanguageUI()
+
+    // Contextual one-liner under the program editor (set by updateLanguageUI).
+    addChildComponent(scriptNote);
+    scriptNote.setColour(juce::Label::textColourId, juce::Colour(0xff8a8a90));
+    scriptNote.setFont(juce::Font(12.0f));
+    scriptNote.setJustificationType(juce::Justification::topLeft);
+    scriptNote.setMinimumHorizontalScale(1.0f);
 
     addAndMakeVisible(triggerLabel);
     addAndMakeVisible(triggerEditor);
@@ -710,17 +906,20 @@ SignalShapeEditorComponent::SignalShapeEditorComponent(NodeGraph& g, int nid,
     // occupying editor space.
     varsHelpBtn.setTooltip(kSignalShapeHelp);
     varsHelpBtn.onClick = [this]() {
+        const bool lua = (doc.language == ScriptLang::Lua);
         juce::NativeMessageBox::showAsync(
             juce::MessageBoxOptions()
                 .withIconType(juce::MessageBoxIconType::InfoIcon)
-                .withTitle("Signal Shape - variables & functions")
-                .withMessage(kSignalShapeHelp)
+                .withTitle(lua ? "Signal Shape - Lua reference"
+                               : "Signal Shape - variables & functions")
+                .withMessage(lua ? kSignalShapeLuaHelp : kSignalShapeHelp)
                 .withButton("OK")
                 .withAssociatedComponent(this),
             nullptr);
     };
 
     refreshRepeatButtons();
+    updateLanguageUI();
 
     // Size LAST (see note at top of constructor): now that every child —
     // including the layer stack — exists, the resized() that setSize() triggers
@@ -729,10 +928,22 @@ SignalShapeEditorComponent::SignalShapeEditorComponent(NodeGraph& g, int nid,
     // row plus the summation preview without scrolling; the dialog is resizable
     // for more. The variables/functions reference is now a button (not an
     // always-visible block), freeing ~150px for the layer stack.
-    setSize(720, 880);
+    setSize(720, 952);
 }
 
-SignalShapeEditorComponent::~SignalShapeEditorComponent() = default;
+SignalShapeEditorComponent::~SignalShapeEditorComponent() {
+    // Per-edit commitToNode() writes node.script live (so the audio graph hears
+    // edits immediately) but deliberately does NOT push an undo step - that
+    // would fragment undo into one step per keystroke/click and re-serialize the
+    // whole graph each time. The natural commit point for a modeless dialog is
+    // when it closes, so push a single snapshot here covering the whole editing
+    // session (expression, trigger, repeat, layers, language/rate/wasm, signal
+    // count). commitSnapshot de-dups against the previous step, so closing
+    // without changes is a no-op; if anything changed it also sets graph.dirty
+    // so the user is prompted to save on quit. (See known-issues.md - this also
+    // fixes the long-standing gap where Signal Shape edits left no undo step.)
+    graph.commitSnapshot("Edit Signal Shape");
+}
 
 void SignalShapeEditorComponent::loadFromNode() {
     auto* nd = graph.findNode(nodeId);
@@ -810,6 +1021,64 @@ void SignalShapeEditorComponent::commitToNode() {
     if (onChanged) onChanged();
 }
 
+void SignalShapeEditorComponent::updateLanguageUI() {
+    const bool isWasm = (doc.language == ScriptLang::Wasm);
+    const bool isLua  = (doc.language == ScriptLang::Lua);
+    // raw-buffer mode: the script fills the whole block itself, bypassing the
+    // built-in phase / repeat / curve machinery (Lua per-block and Wasm).
+    const bool rawMode = isWasm || (isLua && doc.rate == ScriptRate::PerBlock);
+
+    exprEditor.setVisible(!isWasm);
+    if (wasmPanel) wasmPanel->setVisible(isWasm);
+    exprEditor.setMultiLine(isLua, false);
+
+    if (isWasm)
+        exprLabel.setText("WebAssembly module:", juce::dontSendNotification);
+    else if (isLua)
+        exprLabel.setText("Lua program (return the output value):",
+                          juce::dontSendNotification);
+    else
+        exprLabel.setText("Output (expression of curve, etc.):",
+                          juce::dontSendNotification);
+
+    // Contextual note: explain what the script controls in this mode, and call
+    // out which built-in controls below are bypassed in raw-buffer mode.
+    juce::String note;
+    if (doc.language == ScriptLang::Builtin) {
+        note = {};
+    } else if (rawMode) {
+        note = "Raw mode: your script writes every sample of the block itself. "
+               "The Trigger, Repeat, Speed and drawn-curve controls below are "
+               "bypassed (the shape is still readable via shape(pos)).";
+    } else { // Lua per-sample
+        note = "Per-sample Lua: your program runs once per sample and returns the "
+               "output value. It can read `curve` (the drawn shape at the current "
+               "phase) and all the variables below still apply.";
+    }
+    scriptNote.setText(note, juce::dontSendNotification);
+    scriptNote.setVisible(note.isNotEmpty());
+
+    // In raw-buffer mode the phase/curve machinery is bypassed, so grey out the
+    // controls that no longer have any effect (their tooltips still explain why
+    // via the contextual note above).
+    const bool machineryActive = !rawMode;
+    for (auto* b : { &foreverBtn, &onceBtn, &nTimesBtn })
+        b->setEnabled(machineryActive);
+    repeatNEditor.setEnabled(machineryActive && doc.repeatMode == SignalShapeDoc::NTimes);
+    triggerEditor.setEnabled(machineryActive);
+    freeRunToggle.setEnabled(machineryActive && doc.triggerExpr.empty());
+    manualTriggerBtn.setEnabled(machineryActive && onManualTrigger != nullptr);
+
+    // Point the reference button at the active language.
+    if (isLua) {
+        varsHelpBtn.setButtonText("Lua reference\u2026");
+        varsHelpBtn.setTooltip(kSignalShapeLuaHelp);
+    } else {
+        varsHelpBtn.setButtonText("Variables & functions\u2026");
+        varsHelpBtn.setTooltip(kSignalShapeHelp);
+    }
+}
+
 bool SignalShapeEditorComponent::syncSignalInputPins() {
     auto* nd = graph.findNode(nodeId);
     if (!nd) return false;
@@ -869,14 +1138,26 @@ bool SignalShapeEditorComponent::syncSignalInputPins() {
 void SignalShapeEditorComponent::resized() {
     auto r = getLocalBounds().reduced(10);
 
+    // Language + rate control strip pinned to the very top.
+    if (langBar) {
+        langBar->setBounds(r.removeFromTop(ScriptLangBar::kHeight));
+        r.removeFromTop(8);
+    }
+
     // The layer stack is the primary editing surface, so it takes the top and
     // absorbs all spare vertical space (it scrolls internally for many layers
     // and contains its own + Layer button and summation preview). Everything
     // below it is a fixed-height block; we reserve that block's height up
     // front and hand the remainder to the stack.
+    // For Lua / Wasm the "expression" row grows into a multi-line program editor
+    // (or the .wasm file panel), so reserve more height there; a contextual note
+    // sits just under it when a script language is active.
+    const bool scriptLang = (doc.language != ScriptLang::Builtin);
+    const int exprBodyH = scriptLang ? 150 : 24;
+    const int noteH     = scriptLang ? (16 + 4) : 0;
     const int speedH   = 24 + 8;
     const int clockH   = 24 + 6;   // free-run toggle row
-    const int exprH    = 18 + 24 + 6;
+    const int exprH    = 18 + exprBodyH + noteH + 6;
     const int trigH    = 18 + 24 + 6;
     const int repeatH  = 24 + 8;
     const int sigH     = 24 + 8;
@@ -927,7 +1208,19 @@ void SignalShapeEditorComponent::resized() {
         e.setBounds(r.removeFromTop(24));
         r.removeFromTop(6);
     };
-    labelRow(exprLabel, exprEditor);
+
+    // Expression / program row: variable height. The exprEditor and the .wasm
+    // file panel share the same rectangle (updateLanguageUI chooses which is
+    // visible). A contextual note sits just under it for script languages.
+    {
+        exprLabel.setBounds(r.removeFromTop(18));
+        auto body = r.removeFromTop(exprBodyH);
+        exprEditor.setBounds(body);
+        if (wasmPanel) wasmPanel->setBounds(body);
+        if (noteH > 0) scriptNote.setBounds(r.removeFromTop(noteH).withTrimmedBottom(4));
+        r.removeFromTop(6);
+    }
+
     labelRow(triggerLabel, triggerEditor);
 
     // Repeat row: label + 3 buttons + repeatN spinner.

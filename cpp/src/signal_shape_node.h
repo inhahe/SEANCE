@@ -2,9 +2,12 @@
 #include "node_graph.h"
 #include "transport.h"
 #include "builtin_synth.h"        // reuse Wavetable and WaveExprParser
+#include "script_runtime.h"       // IScriptRuntime, ScriptLang/Rate
+#include "script_lang_bar.h"      // ScriptLangBar + WasmFilePanel (editor UI)
 #include "layered_wave_editor.h"  // reuse WaveLayer + WaveLayerEditor
 #include <juce_audio_processors/juce_audio_processors.h>
 #include <atomic>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -62,8 +65,30 @@ struct SignalShapeDoc {
     // (flat 0 output) so it does nothing until the user adds a layer - it never
     // starts sweeping a default shape on its own.
     LayeredWaveform layers;
-    std::string expr = "curve";       // Composition expression evaluated per sample.
+    std::string expr = "curve";       // Composition source. For Builtin this is a
+                                      // one-line expression of `curve`/etc.; for
+                                      // Lua it holds the whole Lua program (its
+                                      // loop() returns the value, or fills the
+                                      // buffer in block mode). Ignored for Wasm.
     std::string triggerExpr;          // Trigger condition; empty = always running.
+
+    // Which scripting language evaluates `expr`:
+    //   Builtin - the SEANCE mini-expression language (per-sample only).
+    //   Lua     - embedded Lua 5.4 (per-sample OR per-block, see `rate`).
+    //   Wasm    - a user-supplied .wasm binary (per-block only; from wasmPath).
+    // The drawn shape, trigger, repeat and phase machinery apply to the
+    // per-sample path (Builtin, Lua-per-sample). Per-block (Lua block-rate,
+    // Wasm) is a raw-signal mode: the script fills the output buffer directly
+    // and the trigger / phase / curve machinery is bypassed.
+    ScriptLang language = ScriptLang::Builtin;
+
+    // Execution rate. Builtin is always PerSample; Wasm is always PerBlock; only
+    // Lua honours this choice. PerSample is sample-accurate but heavy Lua can
+    // stutter the audio thread; PerBlock runs the script once per audio block.
+    ScriptRate rate = ScriptRate::PerSample;
+
+    // Filesystem path to the .wasm binary (Wasm language only).
+    std::string wasmPath;
 
     enum RepeatMode { Forever = 0, Once = 1, NTimes = 2 };
     RepeatMode repeatMode = Forever;
@@ -160,6 +185,20 @@ private:
     std::vector<float> shapeSamples;
     void rebuildShapeSamples();
 
+    // The active language runtime (Builtin / Lua / Wasm) that evaluates the
+    // composition. Re-created when the script or language changes.
+    std::unique_ptr<IScriptRuntime> runtime;
+    // True when the runtime fills the whole block (Wasm always; Lua block-rate).
+    // In that mode the trigger / phase / repeat / curve machinery is bypassed and
+    // the script writes the output buffer directly via runBlock().
+    bool runBlockMode = false;
+    // Scratch output buffer for block mode (filled by runBlock, then fanned out
+    // to every Signal/Param output channel). Kept as a member so it isn't
+    // reallocated on the audio thread every block.
+    std::vector<float> blockOut;
+    // Bind the shape(pos) sampler on the runtime after a shape rebuild.
+    void bindShape();
+
     // Per-sample run state. `running` is true while the trigger expression
     // evaluates > 0 (or always, when triggerExpr is empty). `repeatsDone`
     // counts full cycles completed since the last rising-edge trigger so
@@ -170,6 +209,7 @@ private:
     double timeSinceTrigger = 0.0;
     bool  prevTriggerHigh = false;
     float lastOutputValue = 0.0f;
+    bool  wasPlaying = false;   // transport play rising edge, for the start hook
 
     std::atomic<bool> manualTriggerPending { false };
 
@@ -239,6 +279,15 @@ private:
     // Working copy of the doc; encoded back to node.script on every change.
     SignalShapeDoc doc;
 
+    // Language + execution-rate control strip and the .wasm file picker shown
+    // in place of the program editor for the WebAssembly language.
+    std::unique_ptr<ScriptLangBar> langBar;
+    std::unique_ptr<WasmFilePanel> wasmPanel;
+    // A contextual one-liner under the program editor explaining what the script
+    // does in the current language/rate (e.g. "transforms curve each sample" vs
+    // "fills the whole block - phase/repeat/curve are bypassed").
+    juce::Label   scriptNote;
+
     // Embedded layer-stack editor: the SAME shared widget the Wavetable
     // editor uses for its layer rows (+ Layer button, per-layer shape/ratio/
     // phase/amp/draw/formula rows) plus a summation preview. Bound to
@@ -296,6 +345,10 @@ private:
     // Also reconciles node.pinsIn to match doc.signalInputCount when needed.
     void commitToNode();
     void loadFromNode();
+    // Show the expression editor (Builtin / Lua) or the .wasm file panel (Wasm),
+    // toggle multi-line for Lua programs, and update the caption + contextual
+    // note to match the current language/rate.
+    void updateLanguageUI();
     void refreshRepeatButtons();
     // Read the "Rate"/"Beat Sync" node params into the speed controls and
     // format the unit labels for the current sync mode. Does not overwrite a

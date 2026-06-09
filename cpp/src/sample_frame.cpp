@@ -48,7 +48,7 @@ void SampleFrame::cleanLoopBoundaries() {
     cycle = std::move(out);
 }
 
-void SampleFrame::render(int tableSize, std::vector<float>& out) const {
+void SampleFrame::renderRaw(int tableSize, std::vector<float>& out) const {
     out.assign((size_t)tableSize, 0.0f);
     if (cycle.empty() || tableSize <= 0) return;
 

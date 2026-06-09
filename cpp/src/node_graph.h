@@ -57,7 +57,14 @@ enum class NodeType {
     // no inputs and one MIDI output. The cable wiring from the Input node to
     // a Timeline or synth IS the live-input routing - no flags, no hidden
     // state. See project_midi_input_architecture.md.
-    MidiInput
+    MidiInput,
+    // MidiScript: an algorithmic MIDI generator. Runs a small program (the
+    // SEANCE mini-language with statements, persistent state and MIDI emit
+    // functions) once per sample and outputs MIDI live. One merged MIDI input,
+    // N Signal inputs, and 1..16 independent MIDI outputs. See midi_script_node.h.
+    // NOTE: new enum values MUST be appended at the END - project files store
+    // node.type as a raw int, so reordering would corrupt existing saves.
+    MidiScript
 };
 
 struct Pin {
@@ -330,8 +337,10 @@ struct Node {
     std::vector<std::pair<float, float>> envReleasePoints;
 
     // Per-channel aftertouch input. When something is wired to the
-    // "Aftertouch" Signal input pin on a synth node, the wired signal's
-    // current value (0..1) drives the per-voice aftertouch. When the
+    // "Aftertouch" Param input pin on a synth node, the wired control's
+    // value (0..1, read as the block mean) drives the per-voice
+    // aftertouch. It's a Param (block-rate) pin because the consumer
+    // averages it over the whole block to stay smooth. When the
     // pin is unwired, the synth uses channel-pressure events from the
     // incoming MIDI stream instead. Either way the value is exposed to
     // every voice as a per-sample modulation source that defaults to

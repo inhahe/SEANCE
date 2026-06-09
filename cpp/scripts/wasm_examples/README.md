@@ -373,6 +373,7 @@ wasm-ld --no-entry --export-all *.o -o lua_effect.wasm
 | `ss_prepare` | `() -> void` | — | Called when sample rate or buffer size changes. |
 | `ss_num_audio_inputs` | `() -> i32` | 1 | Number of stereo input pairs. Return 0 for MIDI-only. |
 | `ss_num_audio_outputs` | `() -> i32` | 1 | Number of stereo output pairs. |
+| `ss_num_midi_outputs` | `() -> i32` | 1 | Number of independent MIDI output pins (1..16). >1 exposes "MIDI Out 1..N", each its own cable; emit to a specific one with `ss_midi_out_n`. |
 
 ### Host Functions (callable from your script)
 
@@ -380,7 +381,8 @@ wasm-ld --no-entry --export-all *.o -o lua_effect.wasm
 |----------|-----------|-------------|
 | `ss_declare_param` | `(name: *u8, def: f32, min: f32, max: f32) -> i32` | Declare a parameter. Call only during `ss_init()`. Returns param index. |
 | `ss_get_param` | `(index: i32) -> f32` | Read current parameter value. |
-| `ss_midi_out` | `(sample_offset: i32, status: u8, d1: u8, d2: u8) -> void` | Emit a MIDI event. |
+| `ss_midi_out` | `(sample_offset: i32, status: u8, d1: u8, d2: u8) -> void` | Emit a MIDI event to MIDI output 0. |
+| `ss_midi_out_n` | `(out_index: i32, sample_offset: i32, status: u8, d1: u8, d2: u8) -> void` | Emit a MIDI event to a specific MIDI output pin (needs `ss_num_midi_outputs() > 1`). With multiple outputs the host re-stamps the channel for routing, so don't rely on the channel nibble of `status` surviving. |
 | `ss_log` | `(msg: *u8) -> void` | Debug print (no-op in release). |
 
 All host functions are imported from module `"env"`.
@@ -426,7 +428,7 @@ MIDI EVENTS (at midi_in_offset / midi_out_offset, 8 bytes each, max 256)
   +0x04  u8   status byte
   +0x05  u8   data1
   +0x06  u8   data2
-  +0x07  u8   reserved
+  +0x07  u8   output index (out events only; ss_midi_out_n target pin, else 0)
 ```
 
 ### Constraints

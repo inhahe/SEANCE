@@ -139,7 +139,7 @@ void renderSpectralToWaveform(const SpectralDoc& doc,
 // SpectralFrame - IWavetableFrame adapter
 // =============================================================================
 
-void SpectralFrame::render(int tableSize, std::vector<float>& out) const {
+void SpectralFrame::renderRaw(int tableSize, std::vector<float>& out) const {
     renderSpectralToWaveform(doc, tableSize, out);
 }
 

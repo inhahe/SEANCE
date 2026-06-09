@@ -3,7 +3,7 @@
 
 namespace SoundShop {
 
-void WaveletFrame::render(int tableSize, std::vector<float>& out) const {
+void WaveletFrame::renderRaw(int tableSize, std::vector<float>& out) const {
     // The wavelet coefficient grid always IDWTs to exactly totalSize
     // samples; we resample (nearest-neighbour) to the requested tableSize
     // so a wavelet frame fits into a wavetable whose other frames may use

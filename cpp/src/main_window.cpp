@@ -584,6 +584,96 @@ MainContentComponent::~MainContentComponent() {
 
 void MainContentComponent::paint(juce::Graphics& g) {
     g.fillAll(juce::Colour(30, 30, 35));
+
+    // First-paint trigger for the heavy startup init (audio device + plugin
+    // instantiation/state-restore). We defer it off the *first* paint rather
+    // than doing it in the constructor so the window is actually on screen
+    // before the message thread blocks - otherwise the user stares at nothing
+    // during the couple-second warm-up. callAsync posts the work to the next
+    // message-loop iteration, by which point this first frame has been flushed
+    // to the screen. Guarded so it only fires once; a SafePointer keeps it safe
+    // if the component is torn down before the async lands.
+    if (!deferredInitScheduled) {
+        deferredInitScheduled = true;
+        juce::Component::SafePointer<MainContentComponent> safeThis(this);
+        juce::MessageManager::callAsync([safeThis]() {
+            if (auto* self = safeThis.getComponent())
+                self->runDeferredStartupInit();
+        });
+    }
+}
+
+void MainContentComponent::runDeferredStartupInit() {
+    // Runs exactly once, on the message-loop iteration after the window's first
+    // paint. The audio device init + per-plugin instantiation/state-restore
+    // below run synchronously and block interaction for a couple of seconds, so
+    // we bracket the work with the OS busy cursor to signal "not ready yet".
+    // No messages are pumped during the block, so the cursor stays busy the
+    // whole time; hideWaitCursor() restores it once we're interactive.
+    juce::MouseCursor::showWaitCursor();
+
+    audioEngine.init();
+    audioEngine.getPluginHost().loadScanCache("soundshop_plugins_cache.dat");
+
+    // Reload plugins for any nodes that were loaded before the audio engine was ready
+    {
+        bool anyLoaded = false;
+        for (auto& n : graph.nodes) {
+            if (n.pluginIndex >= 0 && !n.plugin) {
+                auto loaded = audioEngine.getPluginHost().loadPlugin(
+                    n.pluginIndex, audioEngine.getSampleRate(), audioEngine.getBlockSize());
+                if (loaded) {
+                    // Restore saved plugin state
+                    if (!n.pendingPluginState.empty() && loaded->instance) {
+                        juce::MemoryBlock stateData;
+                        stateData.fromBase64Encoding(n.pendingPluginState);
+                        if (stateData.getSize() > 0)
+                            loaded->instance->setStateInformation(
+                                stateData.getData(), (int)stateData.getSize());
+                        n.pendingPluginState.clear();
+                    }
+                    n.plugin = std::move(loaded);
+                    anyLoaded = true;
+                }
+            }
+        }
+        if (anyLoaded)
+            audioEngine.getGraphProcessor().requestRebuild();
+    }
+
+    // Restore CC mappings from loaded project
+    syncCCMappingsFromGraph();
+
+    // Restore project sample rate
+    if (graph.projectSampleRate > 0)
+        audioEngine.setProjectSampleRate(graph.projectSampleRate);
+
+    // Restore editor panels from loaded project (deferred until UI is ready)
+    if (!graph.openEditors.empty()) {
+        auto editorIds = graph.openEditors;
+        graph.openEditors.clear();
+        for (int id : editorIds)
+            if (auto* node = graph.findNode(id))
+                openEditor(*node);
+    }
+    // Note: the initial fit-all happens inside NodeGraphComponent's first
+    // resized()/paint() call, *before* this runs, so the user never sees the
+    // un-fit default zoom. Don't re-fit here - that would clobber any manual
+    // pan/zoom the user has already done while the audio engine was warming up.
+
+    // Force the OS to clear any stale "Not Responding" state
+#ifdef _WIN32
+    if (auto* tlc = getTopLevelComponent())
+        if (auto* peer = tlc->getPeer())
+            if (auto hwnd = (HWND)peer->getNativeHandle()) {
+                wchar_t title[256];
+                GetWindowTextW(hwnd, title, 256);
+                SetWindowTextW(hwnd, title);
+            }
+#endif
+
+    // Heavy init done - the app is interactive now, so drop the busy cursor.
+    juce::MouseCursor::hideWaitCursor();
 }
 
 bool MainContentComponent::keyPressed(const juce::KeyPress& key) {
@@ -929,72 +1019,9 @@ void MainContentComponent::timerCallback() {
     for (auto& panel : editorPanels)
         panel->component->repaint();
 
-    // Deferred startup: init audio engine after window is visible
-    if (startupFrames > 0) {
-        startupFrames--;
-        if (startupFrames == 0) {
-            audioEngine.init();
-            audioEngine.getPluginHost().loadScanCache("soundshop_plugins_cache.dat");
-
-            // Reload plugins for any nodes that were loaded before the audio engine was ready
-            {
-                bool anyLoaded = false;
-                for (auto& n : graph.nodes) {
-                    if (n.pluginIndex >= 0 && !n.plugin) {
-                        auto loaded = audioEngine.getPluginHost().loadPlugin(
-                            n.pluginIndex, audioEngine.getSampleRate(), audioEngine.getBlockSize());
-                        if (loaded) {
-                            // Restore saved plugin state
-                            if (!n.pendingPluginState.empty() && loaded->instance) {
-                                juce::MemoryBlock stateData;
-                                stateData.fromBase64Encoding(n.pendingPluginState);
-                                if (stateData.getSize() > 0)
-                                    loaded->instance->setStateInformation(
-                                        stateData.getData(), (int)stateData.getSize());
-                                n.pendingPluginState.clear();
-                            }
-                            n.plugin = std::move(loaded);
-                            anyLoaded = true;
-                        }
-                    }
-                }
-                if (anyLoaded)
-                    audioEngine.getGraphProcessor().requestRebuild();
-            }
-
-            // Restore CC mappings from loaded project
-            syncCCMappingsFromGraph();
-
-            // Restore project sample rate
-            if (graph.projectSampleRate > 0)
-                audioEngine.setProjectSampleRate(graph.projectSampleRate);
-
-            // Restore editor panels from loaded project (deferred until UI is ready)
-            if (!graph.openEditors.empty()) {
-                auto editorIds = graph.openEditors;
-                graph.openEditors.clear();
-                for (int id : editorIds)
-                    if (auto* node = graph.findNode(id))
-                        openEditor(*node);
-            }
-            // Note: the initial fit-all happens inside NodeGraphComponent's
-            // first resized()/paint() call, *before* this timer-deferred init
-            // runs, so the user never sees the un-fit default zoom. Don't
-            // re-fit here - that would clobber any manual pan/zoom the user
-            // has already done while audio engine was warming up.
-
-            // Force the OS to clear any stale "Not Responding" state
-#ifdef _WIN32
-            if (auto* tlc = getTopLevelComponent())
-                if (auto* peer = tlc->getPeer())
-                    if (auto hwnd = (HWND)peer->getNativeHandle()) {
-                        wchar_t title[256];
-                        GetWindowTextW(hwnd, title, 256);
-                        SetWindowTextW(hwnd, title);
-                    }
-#endif
-        }
-    }
+    // (Heavy startup init is no longer driven from here - it runs once from
+    // runDeferredStartupInit(), scheduled off the window's first paint. See
+    // MainContentComponent::paint().)
 
     // Undo-tree persistence tick. Coalesces any number of pushes/undos
     // since the previous tick into one disk write. The serializer is
@@ -1158,6 +1185,7 @@ juce::PopupMenu MainContentComponent::getMenuForIndex(int idx, const juce::Strin
         menu.addItem(310, "MIDI Modulator");
         menu.addItem(311, "Convolution Filter");
         menu.addItem(313, "Signal Shape (LFO / Envelope)");
+        menu.addItem(314, "MIDI Script (Algorithmic MIDI)");
         menu.addSeparator();
         menu.addItem(312, "Keyboard Shortcuts");
         menu.addSeparator();
@@ -1304,6 +1332,7 @@ void MainContentComponent::menuItemSelected(int menuItemID, int) {
         case 311: openHelpDoc("convolution.html"); break;
         case 312: openHelpDoc("keyboard-shortcuts.html"); break;
         case 313: openHelpDoc("signal-shape.html"); break;
+        case 314: openHelpDoc("midi-script.html"); break;
         case 320:
             juce::AlertWindow::showMessageBoxAsync(
                 juce::MessageBoxIconType::InfoIcon,
@@ -2060,7 +2089,8 @@ void MainContentComponent::showPluginUI(int nodeId) {
         opts.useNativeTitleBar = false;
         opts.resizable = true;
         opts.componentToCentreAround = this;
-        SoundShop::launchToolDialog(opts);
+        if (auto* dlg = SoundShop::launchToolDialog(opts))
+            dlg->setResizeLimits(320, 400, 6000, 6000);
         return;
     }
 
@@ -2159,9 +2189,11 @@ void MainContentComponent::showPluginUI(int nodeId) {
     //   __wavetable__:  legacy multi-frame wavetable (v1)
     //   __wavetable2__: v2 multi-frame container (inline frame data per cell)
     //   __wavetable3__: v3 library + cell-by-reference format (pre-colorIdx)
-    //   __wavetable4__: current library + cell-by-reference format with
-    //                   per-entry colorIdx. This is what newly-created
-    //                   Wavetable nodes encode their script as
+    //   __wavetable4__: v4 library + cell-by-reference format with per-entry
+    //                   colorIdx (no gain).
+    //   __wavetable5__: current library + cell-by-reference format with
+    //                   per-entry colorIdx AND per-frame gain. This is what
+    //                   newly-created Wavetable nodes encode their script as
     //                   (defaultEmpty().encode()), so leaving it out of the
     //                   gate meant double-click on a freshly-added Wavetable
     //                   node fell through to the generic visualizer with no
@@ -2172,7 +2204,8 @@ void MainContentComponent::showPluginUI(int nodeId) {
             || node->script.rfind("__wavetable__:", 0) == 0
             || node->script.rfind("__wavetable2__:", 0) == 0
             || node->script.rfind("__wavetable3__:", 0) == 0
-            || node->script.rfind("__wavetable4__:", 0) == 0)) {
+            || node->script.rfind("__wavetable4__:", 0) == 0
+            || node->script.rfind("__wavetable5__:", 0) == 0)) {
         auto* editor = new LayeredWaveEditorComponent(graph, node->id, [this]() {
             audioEngine.getGraphProcessor().requestRebuild();
         });

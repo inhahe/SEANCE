@@ -889,6 +889,9 @@ static float sampleDrawnSamples(const std::vector<float>& samples, float x) {
     return samples[i0] * (1.0f - frac) + samples[i1] * frac;
 }
 
+// Resolution of the one-cycle buffer baked from a Lua/Python Formula layer.
+static constexpr int kFormulaBakeRes = 2048;
+
 static float sampleLayer(const WaveLayer& layer, float x, std::mt19937& rng) {
     if (layer.shape == WaveLayer::Drawn) {
         if (layer.freehandMode && !layer.drawnSamples.empty())
@@ -896,16 +899,34 @@ static float sampleLayer(const WaveLayer& layer, float x, std::mt19937& rng) {
         return sampleDrawnPoints(layer.drawnPoints, x);
     }
     if (layer.shape == WaveLayer::Formula) {
-        // Evaluate the expression at x in radians, like the freq-domain editor's
-        // time-domain mode. WaveExprParser::evaluateAt does not clamp, so cap
-        // here to [-1, 1] to match the other shapes' output range.
-        if (layer.formulaExpr.empty()) return 0.0f;
-        float v = WaveExprParser::evaluateAt(layer.formulaExpr,
-                                             2.0f * (float)M_PI * x,
-                                             0.0f);
-        return juce::jlimit(-1.0f, 1.0f, v);
+        if (layer.formulaLang == ShapeLang::Builtin) {
+            // Built-in: evaluate the expression live at x in radians. The
+            // parser is pure C++ and safe to call from the render path.
+            if (layer.formulaExpr.empty()) return 0.0f;
+            float v = WaveExprParser::evaluateAt(layer.formulaExpr,
+                                                 2.0f * (float)M_PI * x,
+                                                 0.0f);
+            return juce::jlimit(-1.0f, 1.0f, v);
+        }
+        // Lua/Python: read the pre-baked one-cycle buffer. x carries the layer's
+        // ratio/phase, so wrapping the single cycle reproduces the harmonic.
+        if (!layer.formulaSamples.empty())
+            return sampleDrawnSamples(layer.formulaSamples, x);
+        return 0.0f;
     }
     return evalShape(layer.shape, x, rng);
+}
+
+void WaveLayer::rebakeFormula() {
+    if (shape != Formula || formulaLang == ShapeLang::Builtin) {
+        formulaSamples.clear();
+        formulaError.clear();
+        return;
+    }
+    std::string err;
+    bakeShapeExpr(formulaLang, formulaExpr, /*domainRadians=*/true,
+                  kFormulaBakeRes, formulaSamples, err);
+    formulaError = err;
 }
 
 void LayeredWaveform::render(std::vector<float>& out) const {
@@ -1003,7 +1024,10 @@ static void encodeLayer(std::ostringstream& o, const WaveLayer& l) {
     } else if (l.shape == WaveLayer::Formula) {
         // Field 4 = escaped expression. Commas inside the formula are mapped
         // to `;` so the comma-split parser still sees a single field.
-        o << "," << escapeFormula(l.formulaExpr);
+        // Field 5 = authoring language ("builtin"/"lua"/"python"); absent in
+        // pre-language saves, which decode as Built-in.
+        o << "," << escapeFormula(l.formulaExpr)
+          << "," << shapeLangKey(l.formulaLang);
     }
 }
 
@@ -1028,6 +1052,9 @@ static bool parseLayer(const std::string& lp, WaveLayer& out) {
             out.formulaExpr = unescapeFormula(f[4]);
         if (out.formulaExpr.empty())
             out.formulaExpr = "sin(x)";
+        if (f.size() > 5)
+            out.formulaLang = shapeLangFromKey(f[5]);
+        out.rebakeFormula();   // populate formulaSamples for Lua/Python layers
         return true;
     }
     if (out.shape == WaveLayer::Drawn && f.size() > 4) {
@@ -1107,11 +1134,11 @@ bool LayeredWaveform::decodeBody(const std::string& body) {
 // requested table size instead of the member tableSize. Implemented via a
 // shallow copy so the existing const render(out) can stay untouched and the
 // member tableSize doesn't have to be mutated through const.
-void LayeredWaveform::render(int ts, std::vector<float>& out) const {
+void LayeredWaveform::renderRaw(int ts, std::vector<float>& out) const {
     if (ts <= 0) { out.clear(); return; }
     LayeredWaveform tmp = *this;
     tmp.tableSize = ts;
-    tmp.render(out);
+    tmp.render(out);   // no-arg render = gain-free primitive; base render() applies gain
 }
 
 std::unique_ptr<IWavetableFrame> LayeredWaveform::clone() const {
@@ -1365,19 +1392,20 @@ static std::string sanitizeLabel(const std::string& s) {
 }
 
 // =============================================================================
-// __wavetable4__ format (current) - library + cell-by-reference model with
-// per-entry colour
+// __wavetable5__ format (current) - library + cell-by-reference model with
+// per-entry colour and per-entry gain
 // =============================================================================
 //
 // Top-level grammar:
-//   __wavetable4__:<ts>:<modeSpec>:<libCount>[<libEntry>]*:<cellCount>[<cell>]*
+//   __wavetable5__:<ts>:<modeSpec>:<libCount>[<libEntry>]*:<cellCount>[<cell>]*
 //
 //   modeSpec (Grid):    g;<numDims>;<dim0>;<dim1>;...
 //   modeSpec (Scatter): s;<scatterDims>;<radius>
 //
-//   libEntry: :<id>:<colorIdx>:<nameLen>:<name><typeId>:<bodyLen>:<body>
-//     <colorIdx> is -1 (= Auto) or a 0-based palette index. <name> is
-//     exactly <nameLen> raw chars (no escaping). <body> is exactly
+//   libEntry: :<id>:<colorIdx>:<gain>:<nameLen>:<name><typeId>:<bodyLen>:<body>
+//     <colorIdx> is -1 (= Auto) or a 0-based palette index. <gain> is the
+//     per-frame output gain (IWavetableFrame::gain), a float; 1 = unity.
+//     <name> is exactly <nameLen> raw chars (no escaping). <body> is exactly
 //     <bodyLen> raw chars, same length-prefix trick as v2.
 //
 //   cell (Grid):    :<libraryId>
@@ -1385,27 +1413,33 @@ static std::string sanitizeLabel(const std::string& s) {
 //   cell (Scatter): :<libraryId>:<pos0>;<pos1>;...@<label>
 //     Label is sanitized for '@' ':' '|' (see sanitizeLabel).
 //
-// Why a fourth version: v3 already had a name field on the library entry,
-// but no colour. v4 adds <colorIdx> between <id> and <nameLen> so the
-// user's "this waveform is yellow" choice survives save/load. v3 files
-// load fine through decodeWavetableV3 with colorIdx defaulting to -1
-// (Auto). v2/v1 decoders also auto-migrate by promoting each non-null
-// cell to a fresh library entry.
+// Why a fifth version: v4 added per-entry <colorIdx>. v5 adds per-entry
+// <gain> (between <colorIdx> and <nameLen>) so a per-waveform volume scaler
+// survives save/load. v4 files load through decodeWavetableV4 (gain defaults
+// to 1.0). v3 (pre-colour) and v2/v1 decoders also still migrate forward.
+// The shared decoder decodeWavetableV4or5() reads the gain field only when
+// told the payload is v5, so one function covers both.
 
 std::string WavetableDoc::encode() const {
     std::ostringstream o;
-    o << "__wavetable4__:" << tableSize << ":";
+    o << "__wavetable5__:" << tableSize << ":";
     if (mode == WavetableMode::Grid) {
         o << "g;" << gridDims.size();
         for (int d : gridDims) o << ";" << d;
+        // Optional trailing field: "empty cells fade volume" (no
+        // renormalization). Absent in older payloads, which decode as false
+        // (renormalized over filled cells).
+        o << ";" << (absoluteBlend ? 1 : 0);
     } else {
-        o << "s;" << scatterDims << ";" << scatterRadius;
+        o << "s;" << scatterDims << ";" << scatterRadius
+          << ";" << (absoluteBlend ? 1 : 0);
     }
 
     // Library section.
     o << ":" << library.size();
     for (const auto& e : library) {
-        o << ":" << e.id << ":" << e.colorIdx << ":"
+        float gain = e.wave ? e.wave->gain : 1.0f;
+        o << ":" << e.id << ":" << e.colorIdx << ":" << gain << ":"
           << e.name.size() << ":" << e.name;
         const char* tid = e.wave ? e.wave->typeId() : "layered";
         std::string body = e.wave ? e.wave->encodeBody() : "";
@@ -1535,11 +1569,15 @@ static bool parseModeSpec(WavetableDoc& doc, const std::string& modeSpec) {
     if (isScatter) {
         doc.mode = WavetableMode::Scatter;
         auto dp = splitSemi(modeBody);
-        if (!dp.empty())   try { doc.scatterDims   = std::stoi(dp[0]); } catch (...) { doc.scatterDims = 2; }
+        if (!dp.empty())   try { doc.scatterDims   = std::stoi(dp[0]); } catch (...) { doc.scatterDims = 1; }
         if (dp.size() > 1) try { doc.scatterRadius = std::stof(dp[1]); } catch (...) { doc.scatterRadius = 0.45f; }
-        // Scatter mode must have at least 2 axes. Legacy files with
-        // scatterDims=1 would otherwise lock all dots onto y=0.5.
-        if (doc.scatterDims < 2) doc.scatterDims = 2;
+        // Optional 4th field (added later): non-normalized "distance fades
+        // volume" blend. Absent in older v4/v3/v2 payloads, which decode as
+        // false (the original volume-normalized behavior).
+        if (dp.size() > 2) try { doc.absoluteBlend = (std::stoi(dp[2]) != 0); } catch (...) { doc.absoluteBlend = false; }
+        // scatterDims is the geometric view dimension: 0 = drop-target
+        // placeholder, 1 = line view, 2+ = square/cube. Clamp to >= 0.
+        if (doc.scatterDims < 0) doc.scatterDims = 0;
     } else {
         doc.mode = WavetableMode::Grid;
         auto dp = splitSemi(modeBody);
@@ -1549,18 +1587,27 @@ static bool parseModeSpec(WavetableDoc& doc, const std::string& modeSpec) {
             try { doc.gridDims.push_back(std::stoi(dp[d + 1])); }
             catch (...) { doc.gridDims.push_back(1); }
         }
+        // Optional trailing field after the dims: "empty cells fade volume"
+        // (no renormalization). Absent in older payloads -> false.
+        if ((int)dp.size() > numDims + 1)
+            try { doc.absoluteBlend = (std::stoi(dp[numDims + 1]) != 0); } catch (...) { doc.absoluteBlend = false; }
     }
     return true;
 }
 
 // =============================================================================
-// __wavetable4__ decoder (current format - library entries carry colorIdx)
+// __wavetable4__ / __wavetable5__ decoder
 // =============================================================================
 //
-// Same wire layout as v3 with one extra field per library entry (colorIdx,
-// between id and nameLen). See the format-grammar comment above encode().
+// v4: library entries carry colorIdx (between id and nameLen).
+// v5: same, plus a per-entry gain float (between colorIdx and nameLen).
+//
+// `hasGain` selects which layout to expect. v4 payloads pass false (gain
+// defaults to 1.0); v5 payloads pass true. See the format-grammar comment
+// above encode().
 
-static bool decodeWavetableV4(WavetableDoc& doc, const std::string& body) {
+static bool decodeWavetableV4or5(WavetableDoc& doc, const std::string& body,
+                                 bool hasGain) {
     V2Reader r(body);
     try { doc.tableSize = std::stoi(r.readUntil(':')); }
     catch (...) { doc.tableSize = 2048; }
@@ -1579,6 +1626,10 @@ static bool decodeWavetableV4(WavetableDoc& doc, const std::string& body) {
         try { id = std::stoi(r.readUntil(':')); } catch (...) { return false; }
         int colorIdx = -1;
         try { colorIdx = std::stoi(r.readUntil(':')); } catch (...) { return false; }
+        float gain = 1.0f;
+        if (hasGain) {
+            try { gain = std::stof(r.readUntil(':')); } catch (...) { gain = 1.0f; }
+        }
         size_t nameLen = 0;
         try { nameLen = (size_t)std::stoul(r.readUntil(':')); } catch (...) { return false; }
         std::string name = r.readN(nameLen);
@@ -1602,6 +1653,9 @@ static bool decodeWavetableV4(WavetableDoc& doc, const std::string& body) {
             lw->tableSize = doc.tableSize;
             frame = std::move(lw);
         }
+        // Per-frame gain lives on the base class and is serialised by the
+        // container (not encodeBody), so apply it here after the body decode.
+        if (frame) frame->gain = gain;
 
         WaveformLibraryEntry entry;
         entry.id = id;
@@ -1866,9 +1920,10 @@ static bool decodeWavetableLegacy(WavetableDoc& doc, const std::string& body) {
         // Scatter: dimsField = "scatterDims;radius"
         auto dp = splitSemi(dimsField);
         doc.mode = WavetableMode::Scatter;
-        if (!dp.empty())     try { doc.scatterDims   = std::stoi(dp[0]); } catch (...) { doc.scatterDims = 2; }
+        if (!dp.empty())     try { doc.scatterDims   = std::stoi(dp[0]); } catch (...) { doc.scatterDims = 1; }
         if (dp.size() > 1)   try { doc.scatterRadius = std::stof(dp[1]); } catch (...) { doc.scatterRadius = 0.45f; }
-        if (doc.scatterDims < 2) doc.scatterDims = 2;
+        if (dp.size() > 2)   try { doc.absoluteBlend = (std::stoi(dp[2]) != 0); } catch (...) {}
+        if (doc.scatterDims < 0) doc.scatterDims = 0;
         if (parts.size() > 2) try { frameCount = std::stoi(parts[2]); } catch (...) {}
         frameStartIdx = 3;
 
@@ -1938,9 +1993,14 @@ bool WavetableDoc::decode(const std::string& s) {
     scatterFromGridSnapshot.reset();
 
     {
+        const std::string prefix = "__wavetable5__:";
+        if (s.rfind(prefix, 0) == 0)
+            return decodeWavetableV4or5(*this, s.substr(prefix.size()), /*hasGain=*/true);
+    }
+    {
         const std::string prefix = "__wavetable4__:";
         if (s.rfind(prefix, 0) == 0)
-            return decodeWavetableV4(*this, s.substr(prefix.size()));
+            return decodeWavetableV4or5(*this, s.substr(prefix.size()), /*hasGain=*/false);
     }
     {
         const std::string prefix = "__wavetable3__:";
@@ -2127,6 +2187,46 @@ std::vector<float> WavetableDoc::cellCenterPosition(int cellIdx) const {
     return pos;
 }
 
+std::vector<int> WavetableDoc::effectiveAxes() const {
+    std::vector<int> axes;
+    if (mode == WavetableMode::Grid) {
+        // An axis with a single cell is inert - a Position along it always
+        // resolves to the only cell. Only axes of size >= 2 are traversable.
+        for (int d = 0; d < (int)gridDims.size(); ++d)
+            if (gridDims[d] >= 2) axes.push_back(d);
+    } else {
+        // Scatter traversability is per-dimension and purely positional,
+        // exactly analogous to a grid axis needing >=2 cells: dimension d is
+        // traversable iff the dots actually span a range along d (i.e. they
+        // don't all share the same coordinate on d). Consequences:
+        //   - 0 or 1 dot spans nothing (a single point has no extent) -> no
+        //     axes at all, regardless of the blend mode (normalized vs
+        //     "distance fades volume"). The blend mode only changes the gain
+        //     math, never which axes exist.
+        //   - 2 dots differing only in X -> just an X axis.
+        //   - 2 dots differing only in Y -> just a Y axis (no X axis).
+        //   - 2 dots differing in both -> both axes.
+        // Drag a dot until it stops differing on an axis and that axis's
+        // Position control disappears, just like shrinking a grid axis to one
+        // cell. Each dimension is evaluated independently.
+        constexpr float spanEps = 1e-6f;
+        if ((int)scatterFrames.size() >= 2) {
+            for (int d = 0; d < scatterDims; ++d) {
+                float lo = 0.0f, hi = 0.0f;
+                bool any = false;
+                for (const auto& sf : scatterFrames) {
+                    const float v = (d < (int)sf.position.size())
+                                      ? sf.position[(size_t)d] : 0.5f;
+                    if (!any) { lo = hi = v; any = true; }
+                    else { lo = std::min(lo, v); hi = std::max(hi, v); }
+                }
+                if (any && (hi - lo) > spanEps) axes.push_back(d);
+            }
+        }
+    }
+    return axes;
+}
+
 void WavetableDoc::resizeGridAxis(int axisIdx, int newSize) {
     if (axisIdx < 0 || axisIdx >= (int)gridDims.size()) return;
     if (newSize < 1) newSize = 1;
@@ -2180,7 +2280,9 @@ void WavetableDoc::convertGridToScatter() {
     std::vector<ScatterFrame> newScatter;
     newScatter.reserve(total);
 
-    const int outDims = std::max((int)gridDims.size(), 2);
+    // Preserve the grid's dimensionality (floored to 1 so a 1D grid becomes a
+    // 1D line-view scatter, a 2D grid becomes a 2D square-view scatter, etc.).
+    const int outDims = std::max((int)gridDims.size(), 1);
 
     for (int cellIdx = 0; cellIdx < total; ++cellIdx) {
         const int libId = cellWaveformIds[cellIdx];
@@ -2264,6 +2366,27 @@ void WavetableDoc::revertScatterToGrid() {
     scatterFrames.clear();
     // The snapshot is consumed by a successful revert; a fresh
     // convertGridToScatter() will install a new one if the user converts again.
+    scatterFromGridSnapshot.reset();
+}
+
+void WavetableDoc::convertScatterToGrid() {
+    // Lossy fallback for when canRevertScatterToGrid() is false (authored as
+    // Scatter, or the snapshot was invalidated by an axis/dot edit). Lay every
+    // dot out into a 1D grid of N cells in their current frame order. The
+    // free-form scatter coordinates are discarded - the user can re-add axes /
+    // grow cells once back in Grid mode. The shared library is untouched.
+    std::vector<int> newCells;
+    newCells.reserve(scatterFrames.size());
+    for (const auto& sf : scatterFrames)
+        newCells.push_back(sf.waveformId);
+
+    if (newCells.empty())
+        newCells.push_back(-1);  // keep a single empty cell so the grid is valid
+
+    cellWaveformIds = std::move(newCells);
+    gridDims = { (int)cellWaveformIds.size() };
+    mode = WavetableMode::Grid;
+    scatterFrames.clear();
     scatterFromGridSnapshot.reset();
 }
 
@@ -2465,10 +2588,36 @@ WaveLayerEditor::WaveLayerEditor(WaveLayer* layerPtr, Callbacks cb)
     formulaEditor.onTextChange = [this]() {
         if (!layer) return;
         layer->formulaExpr = formulaEditor.getText().toStdString();
+        layer->rebakeFormula();      // refresh Lua/Python bake (no-op for Built-in)
         refreshPreview();
         if (callbacks.onChanged) callbacks.onChanged();
     };
     formulaEditor.setVisible(false);
+
+    // Language selector for the Formula expression (Built-in / Lua / Python).
+    // Only visible when shape == Formula. Lua/Python let the user use loops and
+    // variables (e.g. summing many harmonics) and are baked into the cycle when
+    // edited - they do not run on the audio thread.
+    addChildComponent(formulaLangCombo);
+    formulaLangCombo.addItem("Built-in", 1);
+    formulaLangCombo.addItem("Lua",      2);
+    formulaLangCombo.addItem("Python",   3);
+    formulaLangCombo.setItemEnabled(2, shapeLangAvailable(ShapeLang::Lua));
+    formulaLangCombo.setItemEnabled(3, shapeLangAvailable(ShapeLang::Python));
+    formulaLangCombo.setSelectedId(1, juce::dontSendNotification);
+    formulaLangCombo.setTooltip("Language for the Formula expression. Built-in: fast math "
+                                "expressions. Lua / Python: full languages with loops and "
+                                "variables (e.g. sum many harmonics for additive synthesis). "
+                                "All are baked into the wavetable when you edit, not run live. "
+                                "Write a value in `x` (radians, 0..2*pi); multi-line bodies "
+                                "must end with `return`.");
+    formulaLangCombo.onChange = [this]() {
+        if (!layer) return;
+        layer->formulaLang = (ShapeLang)(formulaLangCombo.getSelectedId() - 1);
+        layer->rebakeFormula();
+        refreshPreview();
+        if (callbacks.onChanged) callbacks.onChanged();
+    };
 
     auto setupSlider = [this](juce::Slider& sl, double lo, double hi, double step, const char* suffix) {
         addAndMakeVisible(sl);
@@ -2543,8 +2692,12 @@ void WaveLayerEditor::syncFromModel() {
     freehandToggle.setVisible(l.shape == WaveLayer::Drawn);
     freehandToggle.setButtonText(l.freehandMode ? "Freehand" : "Points");
     formulaEditor.setVisible(l.shape == WaveLayer::Formula);
-    if (l.shape == WaveLayer::Formula)
+    formulaLangCombo.setVisible(l.shape == WaveLayer::Formula);
+    formulaLangCombo.setSelectedId((int)l.formulaLang + 1, juce::dontSendNotification);
+    if (l.shape == WaveLayer::Formula) {
         formulaEditor.setText(l.formulaExpr, juce::dontSendNotification);
+        l.rebakeFormula();
+    }
     refreshPreview();
 }
 
@@ -2567,6 +2720,8 @@ void WaveLayerEditor::updateShapeButtons() {
     freehandToggle.setVisible(l.shape == WaveLayer::Drawn);
     freehandToggle.setButtonText(l.freehandMode ? "Freehand" : "Points");
     formulaEditor.setVisible(l.shape == WaveLayer::Formula);
+    formulaLangCombo.setVisible(l.shape == WaveLayer::Formula);
+    formulaLangCombo.setSelectedId((int)l.formulaLang + 1, juce::dontSendNotification);
     if (l.shape == WaveLayer::Formula
         && formulaEditor.getText().toStdString() != l.formulaExpr)
     {
@@ -2618,6 +2773,8 @@ void WaveLayerEditor::resized() {
     if (freehandToggle.isVisible()) {
         freehandToggle.setBounds(subRow.removeFromLeft(100));
     } else if (formulaEditor.isVisible()) {
+        formulaLangCombo.setBounds(subRow.removeFromLeft(84));
+        subRow.removeFromLeft(4);
         formulaEditor.setBounds(subRow);
     }
 
@@ -2685,6 +2842,16 @@ void WaveLayerEditor::paint(juce::Graphics& g) {
                 g.drawEllipse(x - 3.0f, y - 3.0f, 6.0f, 6.0f, 1.0f);
             }
         }
+    }
+
+    // Surface a Lua/Python bake error over the preview so a broken script
+    // isn't just silently flat.
+    if (layer && layer->shape == WaveLayer::Formula && !layer->formulaError.empty()) {
+        g.setColour(juce::Colours::red.withAlpha(0.9f));
+        g.setFont(11.0f);
+        g.drawFittedText("Script error: " + juce::String(layer->formulaError),
+                         previewArea.toNearestInt().reduced(4),
+                         juce::Justification::topLeft, 3);
     }
 }
 
@@ -3289,7 +3456,19 @@ public:
             const char* n[] = { "X", "Y", "Z", "W", "V", "U", "T", "S" };
             return juce::String((i >= 0 && i < 8) ? n[i] : "?");
         };
-        if (is3D()) {
+        // Low-dimensional scatter views (line / drop-target) get a tailored
+        // label rather than the generic "axes: X x Y" string, which would
+        // misrepresent how many axes actually exist.
+        const bool lowDimScatter =
+            (owner.wave.mode == WavetableMode::Scatter
+             && owner.wave.numDimensions() <= 1);
+        if (lowDimScatter) {
+            if (owner.wave.numDimensions() == 1)
+                g.drawText("axis: " + axName(axisX),
+                           area.reduced(6, 4).toNearestInt(),
+                           juce::Justification::topLeft);
+            // numDimensions()==0: no axis to label (drop-target view).
+        } else if (is3D()) {
             g.drawText("axes: " + axName(axisX) + " x " + axName(axisY) + " x " + axName(axisZ),
                        area.reduced(6, 4).toNearestInt(), juce::Justification::topLeft);
             const char* modeTag = nullptr;
@@ -3307,6 +3486,32 @@ public:
                        area.reduced(6, 4).toNearestInt(), juce::Justification::topLeft);
         }
 
+        // ---- Scatter drop-target placeholder (0 axes) --------------------------
+        // With scatterDims == 0 there's no line or square to draw - just an
+        // affordance telling the user they can drop a waveform here to begin.
+        // Any dots that exist project to the centre (empty position vectors),
+        // so they're still drawn by the scatter dot loop below; this just adds
+        // the "drag here" cue around them.
+        if (owner.wave.mode == WavetableMode::Scatter
+            && owner.wave.numDimensions() <= 0) {
+            auto c = area.getCentre();
+            // A small dashed circle, not a big square - just a compact "drop a
+            // waveform here" target at the centre of the view.
+            const float ringR = 20.0f;
+            const float dashes[] = { 5.0f, 4.0f };
+            juce::Path ring, dashed;
+            ring.addEllipse(c.x - ringR, c.y - ringR, ringR * 2.0f, ringR * 2.0f);
+            juce::PathStrokeType(1.6f).createDashedStroke(dashed, ring, dashes, 2);
+            g.setColour(juce::Colour(0xff5be36e).withAlpha(0.6f));
+            g.fillPath(dashed);
+            g.setColour(juce::Colours::white.withAlpha(0.55f));
+            g.setFont(11.0f);
+            g.drawText("Drag a waveform here",
+                       juce::Rectangle<float>(c.x - 110.0f, c.y + ringR + 4.0f,
+                                              220.0f, 14.0f).toNearestInt(),
+                       juce::Justification::centred);
+        }
+
         bool useAnaglyph = (stereoMode == StereoMode::Anaglyph);
 
         // ---- Grid mode rendering -------------------------------------------------
@@ -3314,8 +3519,11 @@ public:
         // from WavetableDoc::cellCenterPosition, padded to the rendering axis
         // count so projectPoint can read axisX/axisY/axisZ out of it.
         if (owner.wave.mode == WavetableMode::Grid) {
-            const int viewDims = std::max(2, std::max((int)owner.wave.gridDims.size(),
-                                                       owner.wave.scatterDims));
+            // View dimension for the grid = number of grid axes, floored at 1.
+            // A 1-axis grid renders as a segmented line (cells = segments
+            // divided by tick marks), 2 as a checkerboard, 3 as a cube, etc.
+            // scatterDims is irrelevant in Grid mode.
+            const int viewDims = std::max(1, (int)owner.wave.gridDims.size());
 
             // Faint cell-boundary grid: for each dim d with more than one
             // cell, draw every interior cell-boundary slab as the wireframe
@@ -3372,9 +3580,23 @@ public:
                     for (int i = 1; i < dd; ++i) {
                         const float t = (float)i / (float)dd;
                         if (nOther == 0) {
-                            // Degenerate (1-D grid): the "slab" is a point;
-                            // nothing meaningful to draw. The outer wireframe
-                            // already shows the [0..1] extent.
+                            // 1-D grid: the cell boundary is a single point on
+                            // the line, not a slab. Draw a short perpendicular
+                            // tick so the line reads as a row of discrete cells
+                            // (the 1-D analog of the 2-D checkerboard's grid
+                            // lines). The tick direction is derived from the
+                            // projected line direction so it stays perpendicular
+                            // under any view rotation.
+                            auto e0 = projectToScreen(std::vector<float>{0.0f}, area);
+                            auto e1 = projectToScreen(std::vector<float>{1.0f}, area);
+                            const float dx = e1.x - e0.x, dy = e1.y - e0.y;
+                            const float len = std::sqrt(dx * dx + dy * dy);
+                            const float px = (len > 1e-3f) ? -dy / len : 0.0f;
+                            const float py = (len > 1e-3f) ?  dx / len : 1.0f;
+                            const float h = 9.0f;
+                            auto bp = projectToScreen(std::vector<float>{t}, area);
+                            g.drawLine(bp.x - px * h, bp.y - py * h,
+                                       bp.x + px * h, bp.y + py * h, 1.0f);
                             continue;
                         }
                         // Iterate unique edges of the (N-1)-cube: for each
@@ -3612,7 +3834,12 @@ public:
     //     plane (un-rotated, dims > 2 collapse on top of each other,
     //     which is mathematically correct).
     void drawHypercube(juce::Graphics& g, juce::Rectangle<float> area, int eyeSign) {
-        int N = std::max(2, std::min(kMaxRenderDims, owner.wave.numDimensions()));
+        // N is the geometric view dimension, capped at kMaxRenderDims. N>=2
+        // draws a square/cube wireframe; N==1 draws a single line (the [0,1]
+        // extent along axisX); N==0 (scatter drop-target placeholder) has no
+        // outline to draw - paintScene paints the drop affordance instead.
+        int N = std::min(kMaxRenderDims, owner.wave.numDimensions());
+        if (N < 1) return;
         int nVerts = 1 << N;
         std::vector<Projected> pp((size_t)nVerts);
         for (int c = 0; c < nVerts; ++c) {
@@ -3949,11 +4176,22 @@ public:
             && dragCellSrcIdx != dragCellDstIdx) {
             commitGridCellDrag(dragCellSrcIdx, dragCellDstIdx);
         }
+        // A just-finished scatter-dot drag may have crossed an axis-span
+        // threshold: a dot that now differs along Y where it didn't before
+        // makes the Y axis traversable (its Position knob/pin + placement
+        // slider appear), and vice-versa. Re-sync the Position params and
+        // rebuild the sidebar ONCE here at the gesture endpoint - never per
+        // drag tick, because syncPositionParams mutates node.params that the
+        // audio thread reads without a lock.
+        const bool wasScatterDotDrag = (dragFrameIdx >= 0
+                                        && owner.wave.mode == WavetableMode::Scatter);
         dragFrameIdx = -1;
         dragCursor = false;
         dragOrbit = false;
         dragCellSrcIdx = -1;
         dragCellDstIdx = -1;
+        if (wasScatterDotDrag)
+            owner.notifyPopoutDocMutated();
     }
 
     // Swap the library refs of two grid cells. Mirrors the swap done by
@@ -4551,9 +4789,11 @@ public:
         settingsContainer.addAndMakeVisible(gridAxesLabel);
 
         settingsContainer.addAndMakeVisible(addAxisBtn);
-        addAxisBtn.setTooltip("Add a new axis (dimension). Each axis is exposed to the "
-                              "synth as one Position knob. Max 8 axes. In Grid mode the "
-                              "new axis starts with one cell; in Scatter mode every "
+        addAxisBtn.setTooltip("Add a new axis (dimension). Each *traversable* axis is "
+                              "exposed to the synth as one Position knob. Max 8 axes. In "
+                              "Grid mode the new axis starts with one cell - so it has "
+                              "nothing to morph through yet and gets no Position knob "
+                              "until you grow it to 2+ cells. In Scatter mode every "
                               "existing dot gets its new coordinate defaulted to the "
                               "midpoint (0.5).");
         addAxisBtn.onClick = [this]() {
@@ -4612,12 +4852,12 @@ public:
                 if (owner.currentFrameIdx >= (int)owner.wave.cellWaveformIds.size())
                     owner.currentFrameIdx = 0;
             } else {
-                // Scatter: minimum is 2 dims - dropping below that would
-                // collapse the visible plane (the load path enforces the
-                // same floor at lines ~1205 / ~1534). Truncate each dot's
-                // position vector to the new dim count; no dots are
-                // deleted because every position is valid in fewer dims.
-                if (owner.wave.scatterDims <= 2) return;
+                // Scatter: the floor is 0 dims (a drop-target placeholder
+                // view). 1 dim renders as a line view, 2+ as the square/cube
+                // view. Truncate each dot's position vector to the new dim
+                // count; no dots are deleted because every position is valid
+                // in fewer dims.
+                if (owner.wave.scatterDims <= 0) return;
                 --owner.wave.scatterDims;
                 for (auto& sf : owner.wave.scatterFrames) {
                     if ((int)sf.position.size() > owner.wave.scatterDims)
@@ -4655,6 +4895,25 @@ public:
                                 "transitions between waveforms; larger = smoother blends.");
         radiusSlider.onValueChange = [this]() {
             owner.wave.scatterRadius = (float)radiusSlider.getValue();
+            owner.onLayerChanged();
+            view->repaint();
+        };
+
+        // ---- "Distance fades volume" toggle (Grid + Scatter) ----
+        // Button text and tooltip are set per-mode in the visibility-gating
+        // block (updateModeUI), since the wording differs between the grid
+        // "empty cells fade volume" framing and the scatter "distance fades
+        // volume" framing. Here we just register it and wire the click.
+        settingsContainer.addAndMakeVisible(absBlendToggle);
+        absBlendToggle.setButtonText("Distance fades volume");
+        absBlendToggle.setToggleState(owner.wave.absoluteBlend, juce::dontSendNotification);
+        absBlendToggle.onClick = [this]() {
+            owner.wave.absoluteBlend = absBlendToggle.getToggleState();
+            // The blend mode only changes the gain math (normalized average vs
+            // raw-weight gain); it does NOT change which axes are traversable -
+            // that's purely the cells'/dots' spatial spread. So no Position-
+            // param / placement-strip re-sync is needed, just rebuild the audio
+            // render and repaint.
             owner.onLayerChanged();
             view->repaint();
         };
@@ -4829,9 +5088,28 @@ public:
         // state matches the no-op handler).
         const int curN = isGrid ? (int)owner.wave.gridDims.size()
                                 : owner.wave.scatterDims;
-        const int floorN = isGrid ? 1 : 2;
+        const int floorN = isGrid ? 1 : 0;
         addAxisBtn.setEnabled(curN < 8);
         removeAxisBtn.setEnabled(curN > floorN);
+        // Why-disabled tooltips so a greyed button explains itself (CLAUDE.md).
+        if (curN >= 8)
+            addAxisBtn.setTooltip("Already at the maximum of 8 axes.");
+        else
+            addAxisBtn.setTooltip(isGrid
+                ? juce::String("Add a grid dimension (new axis starts with 1 cell).")
+                : juce::String("Add a scatter dimension. 1 axis = line view, 2 = square, "
+                               "3 = cube, and so on."));
+        if (curN <= floorN)
+            removeAxisBtn.setTooltip(isGrid
+                ? juce::String("A grid always needs at least one axis - can't remove the last one.")
+                : juce::String("Already at the minimum (0 axes - the drag-and-drop target view)."));
+        else
+            removeAxisBtn.setTooltip(isGrid
+                ? juce::String("Remove the last axis. Waveforms whose coordinate on the dropped "
+                               "axis is non-zero are deleted.")
+                : juce::String("Remove the last axis. Every dot's position vector is truncated "
+                               "(its coordinate on the dropped axis is discarded). At 1 axis this "
+                               "gives a line view; at 0, the drag-and-drop target."));
 
         gridAxesLabel.setBounds(contentX, contentY, innerW, 18);
         contentY += 18 + 2;
@@ -4847,9 +5125,22 @@ public:
         removeAxisBtn.setBounds(contentX + 76, contentY, 70, 24);
         contentY += 24;
 
+        // The radius slider is scatter-only (it's the RBF cutoff). The
+        // "fades volume" toggle is shown in BOTH modes, but its wording
+        // differs: in scatter it's about distance to a dot, in grid it's
+        // about morphing toward an empty cell.
         if (isGrid) {
             radiusLabel.setVisible(false);
             radiusSlider.setVisible(false);
+            contentY += sectionGap;
+            absBlendToggle.setButtonText("Empty cells fade volume");
+            absBlendToggle.setTooltip(
+                "Off (default): empty cells don't drain volume - the morph is "
+                "renormalized over the filled cells, so the output stays full-"
+                "volume even when some cells are empty.\n"
+                "On: morphing toward an empty cell ducks the output toward "
+                "silence (the older pre-renormalization grid behavior). Has no "
+                "effect when every cell is filled.");
         } else {
             radiusLabel.setVisible(true);
             radiusSlider.setVisible(true);
@@ -4857,7 +5148,20 @@ public:
             radiusLabel.setBounds(contentX, contentY, 80, rowH);
             radiusSlider.setBounds(contentX + 80, contentY, innerW - 80, rowH);
             contentY += rowH;
+            absBlendToggle.setButtonText("Distance fades volume");
+            absBlendToggle.setTooltip(
+                "Off (default): the blend is volume-normalized, so the overall "
+                "level stays constant as you morph and a lone waveform always "
+                "plays at full volume.\n"
+                "On: moving the Position toward a waveform makes it louder and "
+                "away makes it quieter; a Position outside every waveform's RBF "
+                "radius is silent. Lets a single scatter dot act as a loudness "
+                "island you swell into.");
         }
+        absBlendToggle.setToggleState(owner.wave.absoluteBlend, juce::dontSendNotification);
+        absBlendToggle.setVisible(true);
+        absBlendToggle.setBounds(contentX, contentY, innerW, rowH);
+        contentY += rowH;
         contentY += sectionGap;
 
         // -- Selected-frame position controls (sliders or steppers) --
@@ -4869,11 +5173,16 @@ public:
         // all, the whole section collapses.
         const bool placed  = highlightedWaveformPlaced();
         const bool haveLib = (owner.currentLibraryId >= 0);
-        selFrameSectionLabel.setVisible(placed);
-        for (auto& s : selFrameSliders) s->setVisible(placed);
-        for (auto& l : selFrameLabels)  l->setVisible(placed);
+        // A placed waveform on an arrangement with no geometric axes (a scatter
+        // space dialled all the way down to 0 dims - the drop-target view) has
+        // no position controls; hide the header too so it doesn't dangle over
+        // an empty section.
+        const bool showPos = placed && !selFrameSliders.empty();
+        selFrameSectionLabel.setVisible(showPos);
+        for (auto& s : selFrameSliders) s->setVisible(showPos);
+        for (auto& l : selFrameLabels)  l->setVisible(showPos);
         addToGridBtn.setVisible(!placed && haveLib);
-        if (placed) {
+        if (showPos) {
             selFrameSectionLabel.setBounds(contentX, contentY, innerW, 18);
             contentY += 18 + 2;
             for (size_t k = 0; k < selFrameSliders.size(); ++k) {
@@ -4883,7 +5192,7 @@ public:
                 contentY += rowH + rowGap;
             }
             contentY += sectionGap;
-        } else if (haveLib) {
+        } else if (!placed && haveLib) {
             addToGridBtn.setBounds(contentX, contentY, std::min(innerW, 160), 26);
             contentY += 26 + sectionGap;
         }
@@ -4930,6 +5239,12 @@ public:
     // changes (add/remove frame, convert mode, cell placement). Rebuilds
     // every list/stepper/button that depends on the doc's structure.
     void refreshAfterDocMutation() {
+        // Grid axis resize / scatter frame add/remove / mode convert can cross
+        // the "traversable" threshold (grid axis 1<->2, scatter frames 1<->2
+        // under normalized blend), changing the effective dimension count. Re-
+        // sync Position params/pins so a newly-traversable axis gains its control
+        // and a now-inert one loses it. Guarded internally - no-op when unchanged.
+        owner.maybeSyncPositionParams();
         rebuildLibraryList();
         rebuildFramesList();
         rebuildAxisSteppers();
@@ -4942,6 +5257,28 @@ public:
         // inside layoutSettingsContainer().
         resized();
         view->repaint();
+    }
+
+    // Deferred variant of refreshAfterDocMutation(). MUST be used instead of
+    // calling refreshAfterDocMutation() directly from a juce::Slider's
+    // onValueChange handler when that refresh can destroy the very slider whose
+    // callback is on the stack (the per-axis size steppers and the selected-
+    // frame grid steppers both live in lists that refreshAfterDocMutation()
+    // clears+rebuilds). JUCE's Slider::Pimpl::mouseWheelMove keeps touching the
+    // Slider (and its ScopedDragNotification) as the stack unwinds AFTER the
+    // value-change callback returns, so synchronously deleting the slider here
+    // is a use-after-free (unlike JUCE Buttons, Sliders don't guard their
+    // callbacks with a SafePointer). Deferring the rebuild to the next message-
+    // loop tick lets the mouse-wheel/drag machinery finish unwinding against a
+    // still-alive slider; the SafePointer guards against the window closing in
+    // between. Model mutation stays synchronous at the call site - only the UI
+    // rebuild is deferred.
+    void scheduleRefreshAfterDocMutation() {
+        juce::MessageManager::callAsync(
+            [safe = juce::Component::SafePointer<WavetableViewWindowContent>(this)]() {
+                if (auto* self = safe.getComponent())
+                    self->refreshAfterDocMutation();
+            });
     }
 
     // Called by owner whenever currentFrameIdx changes OR a scatter
@@ -5027,10 +5364,14 @@ private:
             owner.currentPosition.assign(owner.wave.numDimensions(), 0.5f);
             owner.currentFrameIdx = 0;
         } else {
-            // Reverse path: only succeeds if every dot is still at its
-            // snapshotted cell center. Button is disabled otherwise.
-            if (!owner.wave.canRevertScatterToGrid()) return;
-            owner.wave.revertScatterToGrid();
+            // Reverse path. If every dot is still at its snapshotted cell
+            // center we do a lossless revert (exact original grid layout).
+            // Otherwise we fall back to a general flatten-to-1D-grid so the
+            // user can always get back to Grid mode.
+            if (owner.wave.canRevertScatterToGrid())
+                owner.wave.revertScatterToGrid();
+            else
+                owner.wave.convertScatterToGrid();
             owner.currentFrameIdx = 0;
         }
         owner.ensureScatterPlaneAngles();
@@ -5043,6 +5384,9 @@ private:
         resized();
     }
 
+public:
+    // Public so the owning editor's onLayerChanged() can re-evaluate the
+    // button after any mutation (keeps "Back to Grid" from going stale).
     void updateConvertButton() {
         if (owner.wave.mode == WavetableMode::Grid) {
             convertBtn.setButtonText(juce::String::fromUTF8("Convert \xE2\x86\x92 Scatter"));
@@ -5053,19 +5397,28 @@ private:
                                   "any dot off its original cell center.");
         } else {
             const bool canRevert = owner.wave.canRevertScatterToGrid();
-            convertBtn.setButtonText(juce::String::fromUTF8("\xE2\x86\xA9 Back to Grid"));
-            convertBtn.setEnabled(canRevert);
-            convertBtn.setTooltip(canRevert
-                ? juce::String("Revert to Grid mode. Every dot is still at its original "
-                               "cell center, so the conversion is lossless.")
-                : juce::String("Greyed out: one or more dots has been moved off its "
-                               "original cell center (or the wavetable was authored as "
-                               "Scatter from the start). To get back to Grid, drag every "
-                               "dot exactly onto a cell center - or accept Scatter mode "
-                               "as final."));
+            // Always enabled - if a lossless revert isn't possible we fall back
+            // to a general (lossy) flatten-to-1D-grid, so the user is never
+            // stranded in Scatter mode.
+            convertBtn.setEnabled(true);
+            if (canRevert) {
+                convertBtn.setButtonText(juce::String::fromUTF8("\xE2\x86\xA9 Back to Grid"));
+                convertBtn.setTooltip("Revert to Grid mode. Every dot is still at its "
+                                      "original cell center, so the conversion is lossless "
+                                      "(the exact grid layout you started with comes back).");
+            } else {
+                convertBtn.setButtonText(juce::String::fromUTF8("Convert \xE2\x86\x92 Grid"));
+                convertBtn.setTooltip("Convert to Grid mode. This wavetable can't be losslessly "
+                                      "reverted (it was authored as Scatter, or you edited axes / "
+                                      "moved dots), so the dots are laid out into a 1D grid - one "
+                                      "cell per dot, in their current order. The free-form scatter "
+                                      "positions are discarded; the waveforms themselves are kept. "
+                                      "Once in Grid mode you can add axes and grow cells.");
+            }
         }
     }
 
+private:
     // Walk the existing frames-list buttons / delete-X widgets and re-bound
     // them based on the current viewport width. This is split out from
     // rebuildFramesList so resized() can apply correct widths after the
@@ -5287,15 +5640,34 @@ public:
 
     // Place an existing library entry into the arrangement view. Grid mode:
     // fills the first empty cell, growing the first axis by one if every cell
-    // is occupied (capped at 64). Scatter mode: drops a new dot at the centre
-    // (0.5 on every axis). Used by the "Add to grid" button and the
-    // right-click "Add to grid" menu item.
+    // is occupied (capped at 64). Scatter mode: drops a new dot beside the
+    // existing dots (offset along X), or dead-centre if it's the first dot.
+    // Used by the "Add to grid" button and the right-click "Add to grid" item.
     void addLibraryEntryToGrid(int entryId) {
         if (owner.wave.findLibraryIndexById(entryId) < 0) return;
         if (owner.wave.mode == WavetableMode::Scatter) {
             ScatterFrame sf;
             sf.waveformId = entryId;
-            sf.position.assign((size_t)std::max(2, owner.wave.scatterDims), 0.5f);
+            // Size the position vector to the geometric dimension. 0 dims (the
+            // drop-target view) yields an empty vector - all dots sit at the
+            // same (empty) point and blend equally.
+            sf.position.assign((size_t)std::max(0, owner.wave.scatterDims), 0.5f);
+            // Offset along X from the existing dots so the new one lands beside
+            // them instead of stacked invisibly on top - and so dropping a
+            // second waveform in immediately yields a traversable X axis (the
+            // dots now span a range). The user can drag it elsewhere (e.g. to
+            // differ in Y instead) afterwards. A lone first dot stays centred
+            // (it's inert until a second dot gives it something to span).
+            // Guard on a non-empty position so the 0-dim case (no X axis) is
+            // safe.
+            if (!sf.position.empty() && !owner.wave.scatterFrames.empty()) {
+                float maxX = 0.0f;
+                for (const auto& f : owner.wave.scatterFrames)
+                    if (!f.position.empty()) maxX = std::max(maxX, f.position[0]);
+                sf.position[0] = (maxX < 0.85f)
+                    ? (maxX + 0.15f)
+                    : juce::jlimit(0.05f, 0.95f, maxX - 0.15f);
+            }
             owner.wave.scatterFrames.push_back(std::move(sf));
             owner.currentFrameIdx = (int)owner.wave.scatterFrames.size() - 1;
         } else {
@@ -5536,7 +5908,10 @@ private:
             sl->setValue((double)owner.wave.gridDims[d], juce::dontSendNotification);
             sl->setTooltip("Number of cells along axis " + axName((int)d) + " (1..64). "
                            "Grow to add more positions along this axis; shrink to drop "
-                           "waveforms whose coord on this axis is beyond the new size.");
+                           "waveforms whose coord on this axis is beyond the new size. "
+                           "Growing from 1 to 2 makes the axis traversable, so its "
+                           "Position knob and Mod input appear on the synth; shrinking "
+                           "back to 1 removes them.");
             int axisIdx = (int)d;
             sl->onValueChange = [this, sl_raw = sl.get(), axisIdx]() {
                 int newSize = (int)sl_raw->getValue();
@@ -5553,7 +5928,10 @@ private:
                 owner.updateHintText();
                 owner.rebuildRows();
                 owner.onLayerChanged();
-                refreshAfterDocMutation();
+                // Deferred: this rebuild deletes the slider we're inside the
+                // onValueChange of (axisSizeSliders.clear()). See
+                // scheduleRefreshAfterDocMutation() for the use-after-free.
+                scheduleRefreshAfterDocMutation();
             };
 
             settingsContainer.addAndMakeVisible(sl.get());
@@ -5616,8 +5994,28 @@ private:
         }
     }
 
+    // Which axes get a "Selected waveform position" control. This is the set
+    // of GEOMETRIC axes of the active mode (numDimensions()), NOT the
+    // traversable set (effectiveAxes):
+    //   Grid: every axis (single-cell axes included, so the "+ at the end"
+    //         grow affordance keeps working from this strip).
+    //   Scatter: every scatterDims axis, so the selected dot can be placed
+    //         along each visible axis - including a lone dot on a 1-D line.
+    // Deliberately decoupled from the synth's Position knobs (which DO track
+    // effectiveAxes): placement is an editor concern, and moving dots apart on
+    // a geometric axis is exactly how the user *creates* a traversable axis.
+    // Tying the strip to effectiveAxes produced a chicken-and-egg dead end - a
+    // lone dot had no slider, so there was no way to position it (or to spread
+    // a second dot away from it numerically) to make the axis traversable.
+    std::vector<int> selFrameAxisList() const {
+        const int N = std::max(0, owner.wave.numDimensions());
+        std::vector<int> v((size_t)N);
+        for (int d = 0; d < N; ++d) v[(size_t)d] = d;
+        return v;
+    }
+
     // -- Per-axis position controls for the currently selected frame.
-    //    Scatter mode: continuous 0..1 sliders, one per dimension.
+    //    Scatter mode: continuous 0..1 sliders, one per traversable dimension.
     //    Grid mode: IncDec steppers, one per axis, picking the cell coord.
     //    Moving onto an occupied Grid cell swaps the two frames. --
     void rebuildSelFrameControls() {
@@ -5626,7 +6024,7 @@ private:
         selFrameSliders.clear();
         selFrameLabels.clear();
 
-        const int N = std::max(1, owner.wave.numDimensions());
+        const std::vector<int> axes = selFrameAxisList();
         const bool isGrid = (owner.wave.mode == WavetableMode::Grid);
 
         auto axName = [](int i) -> juce::String {
@@ -5635,7 +6033,8 @@ private:
             return juce::String(i);
         };
 
-        for (int d = 0; d < N; ++d) {
+        for (int di = 0; di < (int)axes.size(); ++di) {
+            const int d = axes[(size_t)di];  // geometric axis index
             auto lab = std::make_unique<juce::Label>();
             lab->setText(axName(d) + ":", juce::dontSendNotification);
             lab->setColour(juce::Label::textColourId, juce::Colours::lightgrey);
@@ -5689,7 +6088,8 @@ private:
     // Push the selected frame's position into the slider widgets without
     // firing onValueChange (we'd just write back what we read).
     void refreshSelFrameValues() {
-        const int N = std::max(1, owner.wave.numDimensions());
+        const std::vector<int> axes = selFrameAxisList();
+        const int N = (int)axes.size();
         if ((int)selFrameSliders.size() != N) {
             rebuildSelFrameControls();
             layoutSettingsContainer();
@@ -5700,20 +6100,19 @@ private:
                                      juce::String(idx + 1) + "):",
                                      juce::dontSendNotification);
         if (owner.wave.mode == WavetableMode::Scatter) {
-            std::vector<float> pos(N, 0.5f);
-            if (idx >= 0 && idx < (int)owner.wave.scatterFrames.size()) {
-                const auto& sf = owner.wave.scatterFrames[(size_t)idx];
-                for (int d = 0; d < N && d < (int)sf.position.size(); ++d)
-                    pos[(size_t)d] = sf.position[(size_t)d];
+            const ScatterFrame* sf = (idx >= 0 && idx < (int)owner.wave.scatterFrames.size())
+                                       ? &owner.wave.scatterFrames[(size_t)idx] : nullptr;
+            for (int di = 0; di < N; ++di) {
+                const int d = axes[(size_t)di];  // geometric axis
+                float v = (sf && d < (int)sf->position.size()) ? sf->position[(size_t)d] : 0.5f;
+                selFrameSliders[(size_t)di]->setValue((double)v, juce::dontSendNotification);
             }
-            for (int d = 0; d < N; ++d)
-                selFrameSliders[(size_t)d]->setValue((double)pos[(size_t)d],
-                                                     juce::dontSendNotification);
         } else {
             std::vector<int> coord;
             if (idx >= 0 && idx < owner.wave.gridCellCount())
                 coord = owner.wave.cellIdxToGridCoord(idx);
-            for (int d = 0; d < N; ++d) {
+            for (int di = 0; di < N; ++di) {
+                const int d = axes[(size_t)di];  // geometric axis
                 int sz = (d < (int)owner.wave.gridDims.size())
                             ? owner.wave.gridDims[(size_t)d] : 1;
                 sz = std::max(1, sz);
@@ -5722,9 +6121,9 @@ private:
                 // the last build via the per-axis steppers. Same +1 trick
                 // as in rebuildSelFrameControls so + at the end grows.
                 int stepperMax = std::min(64, sz + 1);
-                selFrameSliders[(size_t)d]->setRange(1.0, (double)stepperMax, 1.0);
-                selFrameSliders[(size_t)d]->setValue((double)(c + 1),
-                                                     juce::dontSendNotification);
+                selFrameSliders[(size_t)di]->setRange(1.0, (double)stepperMax, 1.0);
+                selFrameSliders[(size_t)di]->setValue((double)(c + 1),
+                                                      juce::dontSendNotification);
             }
         }
     }
@@ -5796,7 +6195,10 @@ private:
         owner.updateHintText();
         owner.rebuildRows();
         owner.onLayerChanged();
-        refreshAfterDocMutation();
+        // Deferred: refreshAfterDocMutation() rebuilds selFrameSliders, deleting
+        // the stepper whose onValueChange invoked us. See
+        // scheduleRefreshAfterDocMutation() for the use-after-free rationale.
+        scheduleRefreshAfterDocMutation();
     }
 
     LayeredWaveEditorComponent& owner;
@@ -5851,6 +6253,7 @@ private:
     // Scatter section (lives inside settingsContainer)
     juce::Label  radiusLabel;
     juce::Slider radiusSlider;
+    juce::ToggleButton absBlendToggle;
 
     // Selected-frame position section (lives inside settingsContainer).
     // In Scatter mode the sliders edit scatterFrames[currentFrameIdx].position
@@ -5909,11 +6312,11 @@ LayeredWaveEditorComponent::LayeredWaveEditorComponent(NodeGraph& g, int nid, st
         const int idB = wave.addLibraryEntry(
             std::make_unique<LayeredWaveform>(LayeredWaveform::defaultSine()));
         ScatterFrame a; a.waveformId = idA;
-        a.position.assign(wave.scatterDims, 0.5f);
-        a.position[0] = 0.25f;
+        a.position.assign((size_t)std::max(0, wave.scatterDims), 0.5f);
+        if (!a.position.empty()) a.position[0] = 0.25f;
         ScatterFrame b; b.waveformId = idB;
-        b.position.assign(wave.scatterDims, 0.5f);
-        b.position[0] = 0.75f;
+        b.position.assign((size_t)std::max(0, wave.scatterDims), 0.5f);
+        if (!b.position.empty()) b.position[0] = 0.75f;
         wave.scatterFrames.push_back(std::move(a));
         wave.scatterFrames.push_back(std::move(b));
     }
@@ -6164,6 +6567,41 @@ LayeredWaveEditorComponent::LayeredWaveEditorComponent(NodeGraph& g, int nid, st
     nameEditor.onReturnKey = commitNameEdit;
     nameEditor.onFocusLost  = commitNameEdit;
 
+    // ---- Per-waveform gain knob ----
+    addAndMakeVisible(gainLabel);
+    gainLabel.setFont(11.0f);
+    gainLabel.setColour(juce::Label::textColourId,
+                        juce::Colours::white.withAlpha(0.75f));
+    gainLabel.setJustificationType(juce::Justification::centredRight);
+
+    addAndMakeVisible(gainSlider);
+    gainSlider.setRange(0.0, 2.0, 0.001);
+    gainSlider.setDoubleClickReturnValue(true, 1.0);
+    gainSlider.setNumDecimalPlacesToDisplay(2);
+    gainSlider.setTextBoxStyle(juce::Slider::TextBoxRight, false, 48, 18);
+    gainSlider.setTooltip(
+        "Output volume of THIS waveform, multiplied on top of the cycle "
+        "(1.00 = unchanged). Every waveform is peak-normalised to the same "
+        "loudness, so this is how you make one frame louder or quieter than "
+        "its neighbours. It changes the actual samples, so it shows in the "
+        "preview and in morphs between frames. Double-click to reset to 1.00.");
+    gainSlider.onValueChange = [this]() {
+        auto* f = currentEditingFrame();
+        if (!f) return;
+        f->gain = (float)gainSlider.getValue();
+        // Live: re-render preview + push to node so audio reflects it while
+        // dragging.
+        refreshPreview();
+        commitToNode();
+        notifyPopoutDocMutated();
+        // Undo: during a drag, defer the snapshot to drag end (one Ctrl+Z per
+        // sweep). For non-drag changes (textbox typing, double-click reset)
+        // there is no drag end, so commit immediately.
+        if (!gainSlider.isMouseButtonDown())
+            commitUndoStep();
+    };
+    gainSlider.onDragEnd = [this]() { commitUndoStep(); };
+
     updateHintText();
     rebuildScatterUI();
     rebuildRows();
@@ -6293,12 +6731,13 @@ void LayeredWaveEditorComponent::showAddWaveformMenu(juce::Component* anchor) {
         });
 }
 
-// Display name for a Position axis's block-rate modulation pin. Single-axis
-// terrains keep the plain "Mod: Position" name; multi-axis terrains label each
-// pin with its axis letter (X, Y, Z, W) so the pin says which axis it drives,
-// falling back to a number past the four named axes.
+// Display name for a Position axis's block-rate modulation pin. Every pin is
+// labelled with its axis letter (X, Y, Z, W) so it always says which axis it
+// drives - even a single-axis terrain reads "Mod: Position X" rather than a
+// bare "Mod: Position" that leaves the user guessing. Falls back to a number
+// past the four named axes.
 static std::string positionModPinName(int axisIndex, int numAxes) {
-    if (numAxes <= 1) return "Mod: Position";
+    juce::ignoreUnused(numAxes);
     static const char* letters = "XYZW";
     if (axisIndex >= 0 && axisIndex < 4)
         return std::string("Mod: Position ") + letters[axisIndex];
@@ -6308,7 +6747,12 @@ static std::string positionModPinName(int axisIndex, int numAxes) {
 void LayeredWaveEditorComponent::syncPositionParams() {
     auto* nd = graph.findNode(nodeId);
     if (!nd) return;
-    int n = wave.numDimensions();
+    // Expose one Position param per *traversable* axis, not per geometric
+    // axis: a single-cell grid axis (or a lone normalized scatter frame) has
+    // nothing for a Position to do, so it gets no param/pin. Position params
+    // are numbered contiguously over the effective axes; the synth maps the
+    // k-th param back to its geometry axis via WavetableDoc::effectiveAxes().
+    int n = wave.effectiveDimCount();
 
     auto isPosName = [](const std::string& s) {
         return s.rfind("Position", 0) == 0;
@@ -6353,6 +6797,21 @@ void LayeredWaveEditorComponent::syncPositionParams() {
     // Keep one block-rate modulation input pin per Position axis: add a pin when
     // an axis is added, remove it (and any cables) when an axis is removed.
     syncPositionModPins(*nd, pinToAxis);
+}
+
+void LayeredWaveEditorComponent::maybeSyncPositionParams() {
+    auto* nd = graph.findNode(nodeId);
+    if (!nd) return;
+    // Count current Position params and compare against how many *traversable*
+    // axes the doc now has. Only when they diverge - e.g. a grid axis just grew
+    // 1->2, or scatter frames crossed the 1<->2 boundary under normalized blend -
+    // do we pay the param/pin rebuild. Keeps spurious churn (and the unlocked
+    // audio-thread param read it races with) off the common no-op path.
+    int posCount = 0;
+    for (const auto& p : nd->params)
+        if (p.name.rfind("Position", 0) == 0) ++posCount;
+    if (posCount != wave.effectiveDimCount())
+        syncPositionParams();
 }
 
 void LayeredWaveEditorComponent::syncPositionModPins(Node& nd,
@@ -6476,7 +6935,7 @@ void LayeredWaveEditorComponent::syncPositionModPins(Node& nd,
     // them. Only freshly-created pins (above) default to Param (block-rate);
     // existing pins keep whatever kind the project already has.
 
-    // Keep the Aftertouch signal pin after every Position pin so a freshly
+    // Keep the Aftertouch pin after every Position pin so a freshly
     // appended Position axis never leaves Aftertouch wedged between two
     // position inputs. The graph builder enforces the same ordering at build
     // time; doing it here too means the node face updates immediately when
@@ -6484,7 +6943,7 @@ void LayeredWaveEditorComponent::syncPositionModPins(Node& nd,
     // Aftertouch pin exists yet.
     std::stable_partition(nd.pinsIn.begin(), nd.pinsIn.end(),
         [](const Pin& p) {
-            return !(p.kind == PinKind::Signal && p.name == "Aftertouch");
+            return p.name != "Aftertouch";
         });
 }
 
@@ -6616,7 +7075,16 @@ void LayeredWaveEditorComponent::refreshIdentityRow() {
     identityLabel.setVisible(have);
     if (nameColorSwatch) nameColorSwatch->setVisible(have);
     nameEditor.setVisible(have);
+    gainLabel.setVisible(have);
+    gainSlider.setVisible(have);
     if (!have) return;
+
+    // Sync the gain knob to the frame the editor is currently bound to.
+    // currentEditingFrame() can differ from the library entry at libIdx in
+    // theory, but in practice they track together; reading the frame's gain
+    // directly keeps the knob honest for every frame type.
+    if (auto* f = currentEditingFrame())
+        gainSlider.setValue(f->gain, juce::dontSendNotification);
 
     const auto& entry = wave.library[libIdx];
     // Update the swatch colour to what the dots actually paint, so the
@@ -7243,6 +7711,13 @@ void LayeredWaveEditorComponent::onLayerChanged() {
     // concurrent rebuilds).
     refreshPreview();
     commitToNode();
+    // Any doc mutation can invalidate the lossless "Back to Grid" round-trip
+    // (a dragged dot, an added/removed axis, a placed/deleted frame all reset
+    // or break the scatter->grid snapshot). onLayerChanged() is the universal
+    // "something changed" notifier, so re-evaluating the Convert button here
+    // guarantees it never sits stale-enabled regardless of which handler fired
+    // - the button greys the instant the round-trip stops being possible.
+    if (arrangementView) arrangementView->updateConvertButton();
     // (Re)start the debounce: fire 150ms after the last change.
     startTimer(150);
 }
@@ -7329,6 +7804,8 @@ void LayeredWaveEditorComponent::resized() {
         identityLabel.setVisible(false);
         if (nameColorSwatch) nameColorSwatch->setVisible(false);
         nameEditor.setVisible(false);
+        gainLabel.setVisible(false);
+        gainSlider.setVisible(false);
         previewBounds = juce::Rectangle<int>();  // suppresses preview paint
         capturePanel->setBounds(right);
         return;
@@ -7356,6 +7833,19 @@ void LayeredWaveEditorComponent::resized() {
             idRow.removeFromLeft(4);
         }
         nameEditor.setBounds(idRow);
+    }
+
+    // Gain row directly under the identity row: [Gain: label][rotary]. Kept
+    // on its own line so the rotary + value text box have room without
+    // squeezing the name editor. Same visibility gating as the identity row.
+    {
+        const int gH = 30;
+        auto gRow = right.removeFromTop(gH);
+        right.removeFromTop(6);
+        gainLabel.setBounds(gRow.removeFromLeft(70));
+        gRow.removeFromLeft(2);
+        // Rotary + attached text box; cap the width so it doesn't sprawl.
+        gainSlider.setBounds(gRow.removeFromLeft(juce::jmin(gRow.getWidth(), 150)));
     }
 
     // Middle: either the layered-frame layer rows + viewport, the embedded

@@ -153,7 +153,7 @@ struct GranularFrame : public IWavetableFrame {
           crossfadeSamples(xfadeSamples) {}
 
     const char* typeId() const override { return "granular"; }
-    void render(int tableSize, std::vector<float>& out) const override;
+    void renderRaw(int tableSize, std::vector<float>& out) const override;
     std::string encodeBody() const override;
     bool decodeBody(const std::string& body) override;
     std::unique_ptr<IWavetableFrame> clone() const override;

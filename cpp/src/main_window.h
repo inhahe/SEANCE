@@ -152,7 +152,9 @@ private:
     void recalcEditorPanelHeight();
 
     bool projectDirty = false;
-    ScriptEngine scriptEngine;
+    // The embedded CPython interpreter is process-global; share the one
+    // ScriptEngine instance with the static-shape baker (shape_expr.cpp).
+    ScriptEngine& scriptEngine = ScriptEngine::instance();
     PluginWindowManager pluginWindows;
     void showScriptConsole();
     void showScriptConsoleForNode(int nodeId);
@@ -165,7 +167,14 @@ private:
     void freezeNode(int nodeId);
     void syncCCMappingsToGraph();
     void syncCCMappingsFromGraph();
-    int startupFrames = 5; // bring to front after this many timer ticks
+
+    // Heavy one-time startup init (audio device open + plugin instantiation /
+    // state restore). Scheduled via callAsync off the window's first paint so
+    // the window is on screen before the message thread blocks. The flag guards
+    // it to fire exactly once.
+    void runDeferredStartupInit();
+    bool deferredInitScheduled = false;
+
     int saveFlashFrames = 0; // countdown for "Saved!" title flash
 
     // Hotplug detection for MIDI input devices. The timer polls

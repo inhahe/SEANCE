@@ -322,7 +322,14 @@ private:
     // don't make musical sense on a recording.
     bool isAudioSample = false;
     int  wtFrameCount = 0;
-    int  wtNumDims = 0; // number of Position dimensions (1D, 2D, ...)
+    int  wtNumDims = 0; // number of *geometric* Position dimensions (1D, 2D, ...)
+    // Geometric axis index for each exposed Position param, in param order.
+    // Grid exposes a Position param only for *traversable* axes (grid size>=2),
+    // numbered contiguously, so the k-th param drives geometric axis
+    // wtEffectiveAxes[k]; inert (single-cell) axes have no param and are pinned
+    // to coord 0. Mirror of WavetableDoc::effectiveAxes(). For scatter this is
+    // all dims (when traversable) or empty (single frame, normalized blend).
+    std::vector<int> wtEffectiveAxes;
 
     // Scatter wavetable: instead of a rectilinear terrain, frames are stored
     // explicitly with their N-D positions. Each block we compute a Wendland
@@ -331,6 +338,21 @@ private:
     bool wtScatter = false;
     int  wtScatterDims = 0;
     float wtScatterRadius = 0.45f;
+    // Mirror of WavetableDoc::absoluteBlend. When true the blend uses raw
+    // weights as gain ("fades volume") instead of normalizing:
+    //   - Scatter: raw Wendland weights as gain (distance fades volume).
+    //   - Grid: no occupancy renormalization (empty cells fade volume).
+    // When false (default) the blend is volume-normalized in both modes.
+    bool wtAbsoluteBlend = false;
+
+    // Grid-only occupancy mask, parallel to `terrain` but over the *morph*
+    // axes alone (gridDims, no phase axis): 1.0 where a cell holds a frame
+    // (cycle or granular), 0.0 where the cell is empty. Sampled at the morph
+    // coordinate to get the fraction of interpolation weight landing on filled
+    // cells; the cycle sample is divided by that fraction so empty cells don't
+    // drain volume. Only consulted in grid mode when !wtAbsoluteBlend.
+    Terrain wtGridOccupancy;
+    bool wtGridHasEmptyCells = false; // true if any cell is empty (mask worth applying)
     std::vector<std::vector<float>> wtScatterFrameSamples; // [frame][sample]
     std::vector<std::vector<float>> wtScatterFramePositions; // [frame][dim]
 
@@ -386,6 +408,16 @@ private:
     // per block.
     void updateGranularWeights();
 
+    // Build the geometric-axis-indexed scatter query point from the live
+    // Position params. Position params exist only for *traversable* axes
+    // (wtEffectiveAxes), numbered contiguously; every non-traversable axis
+    // stays at 0.5 (the dot-plane center). So a lone dot under "distance
+    // fades volume" exposes a single radial-proximity knob ("Position")
+    // while its other coordinates pin to the dot's center, and a multi-dot
+    // scatter exposes one knob per dimension as before. Used by both the
+    // block-start cycle blend and updateGranularWeights so they agree.
+    std::vector<float> scatterQueryPosition();
+
     // Compute per-granular-frame morph weights for an arbitrary Position
     // vector into `out` (resized to wtGranularFrames.size()). updateGranular-
     // Weights() is just this called with the live Position params; audition
@@ -414,7 +446,7 @@ private:
         void buildFromPoints(const std::vector<std::pair<float, float>>& points);
         float evaluate(float t) const; // t in 0..1
     };
-    EnvCurve attackCurve, decayCurve, releaseCurve;
+    EnvCurve attackCurve, holdCurve, decayCurve, releaseCurve;
     void rebuildEnvCurves();
 
     // Voices
@@ -488,7 +520,8 @@ private:
         std::vector<float> auditionWeights;
 
         float advanceEnv(float sr, float a, float h, float d, float s, float r,
-                         const EnvCurve* aCurve, const EnvCurve* dCurve, const EnvCurve* rCurve);
+                         const EnvCurve* aCurve, const EnvCurve* hCurve,
+                         const EnvCurve* dCurve, const EnvCurve* rCurve);
     };
     static constexpr int MAX_VOICES = 16;
     Voice voices[MAX_VOICES];

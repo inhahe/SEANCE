@@ -9,6 +9,10 @@
 //   void    ss_prepare(void)              — called when sample rate / block size changes
 //   int32_t ss_num_audio_inputs(void)     — default 1 (stereo pair)
 //   int32_t ss_num_audio_outputs(void)    — default 1 (stereo pair)
+//   int32_t ss_num_midi_outputs(void)     — default 1; >1 exposes "MIDI Out 1..N"
+//                                           pins, each an independent cable.
+//                                           Emit to a specific one with
+//                                           ss_midi_out_n(out_index, ...).
 
 #ifndef SOUNDSHOP_WASM_H
 #define SOUNDSHOP_WASM_H
@@ -35,9 +39,20 @@ void ss_log(const char* msg);
 __attribute__((import_module("env"), import_name("ss_get_param")))
 float ss_get_param(int32_t index);
 
-// Emit a MIDI event to the output buffer.
+// Emit a MIDI event to the output buffer (MIDI output 0).
 __attribute__((import_module("env"), import_name("ss_midi_out")))
 void ss_midi_out(int32_t sample_offset, uint8_t status, uint8_t d1, uint8_t d2);
+
+// Emit a MIDI event to a specific MIDI output pin (0-based out_index). Only
+// meaningful when the script exports ss_num_midi_outputs() > 1; out_index is
+// clamped to the declared count. Each output is an independent MIDI cable in
+// the graph — the host routes by re-stamping the event's channel internally,
+// so do NOT rely on the channel nibble of `status` surviving when there is
+// more than one output. With a single output, ss_midi_out (or out_index 0)
+// passes the status byte through unchanged.
+__attribute__((import_module("env"), import_name("ss_midi_out_n")))
+void ss_midi_out_n(int32_t out_index, int32_t sample_offset,
+                   uint8_t status, uint8_t d1, uint8_t d2);
 
 // ============================================================================
 // Shared memory layout

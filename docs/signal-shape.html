@@ -148,6 +148,18 @@
   <li><strong>Output gain</strong> — multiplies the final shape value. Negative inverts. Use to scale the shape output without rewriting the expression.</li>
 </ul>
 
+<h2>Scripting it: Built-in, Lua, or WebAssembly</h2>
+
+<p>By default the "Output" box uses SEANCE's little expression language. The <strong>Language</strong> dropdown at the top of the editor swaps in a full programming language for the <em>same node</em>:</p>
+
+<ul>
+  <li><strong>Built-in</strong> (default) — the expression that turns <code>curve</code> into the output, as described above.</li>
+  <li><strong>Lua, per sample</strong> — the "Output" box becomes a small Lua program. Write a <code>loop()</code> that <em>returns</em> the output value each sample. You can still read <code>curve</code> (the drawn shape at the current phase) and every variable above, so the drawing, trigger, repeat and speed all keep working — you've just upgraded the output formula to a real language. Example: <code>function loop() return curve * (0.5 + 0.5*sin(t*31.4)) end</code>.</li>
+  <li><strong>Lua, per block</strong> or <strong>WebAssembly</strong> — <em>raw mode</em>: your script fills the whole signal itself, sample by sample (Lua: <code>out(i, value)</code> for <code>i = 0..n-1</code>). The drawing's phase, trigger, repeat and speed controls no longer apply and are greyed out — but you can still sample the drawing with <code>shape(pos)</code> and read inputs with <code>sig(k, i)</code>. This is the mode for fully custom, sample-accurate signal generation.</li>
+</ul>
+
+<p>The <strong>Run</strong> dropdown (per sample / per block) is only adjustable for Lua; the built-in language is always per-sample and WebAssembly is always per-block. With Lua selected, the <em>Lua reference</em> button shows the full model and examples.</p>
+
 <div class="tip">
 <strong>Tip:</strong> the same Signal Shape node can act as <em>both</em> an LFO and an envelope depending on which output you wire — set repeat = <em>Repeat forever</em> and a high-gate trigger, and the shape will run continuously between notes (LFO behavior) but also reset on each note-on (envelope behavior). One node, two roles.
 </div>

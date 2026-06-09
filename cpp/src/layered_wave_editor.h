@@ -1,6 +1,7 @@
 #pragma once
 #include "node_graph.h"
 #include "wavetable_frame.h"
+#include "shape_expr.h"
 #include <juce_gui_basics/juce_gui_basics.h>
 #include <vector>
 #include <map>
@@ -37,12 +38,27 @@ struct WaveLayer {
     std::vector<float> drawnSamples;  // 512 samples for freehand mode
 
     // For Formula shape: a single text expression evaluated over one cycle
-    // with `x` ranging across [0, 2*pi) (radians). Reuses the WaveExprParser
-    // shared with the frequency-domain editor, so the same vocabulary works
-    // both places: sin, cos, tan, exp, log, sqrt, pow, abs, tanh, clamp,
-    // saw(x), square(x), triangle(x), noise(), random, pi, e, + - * / ^.
-    // Output is clamped to [-1, 1] by the parser.
+    // with `x` ranging across [0, 2*pi) (radians). The same vocabulary works
+    // in all three languages: sin, cos, tan, exp, log, sqrt, pow, abs, tanh,
+    // clamp, saw(x), square(x), triangle(x), noise(), pi, e, + - * / ^.
+    // Output is clamped to [-1, 1].
     std::string formulaExpr = "sin(x)";
+
+    // Authoring language for the Formula expression. Built-in is evaluated
+    // live (pure C++, thread-safe). Lua/Python are baked once into
+    // formulaSamples at edit/load time on the UI thread (the interpreters are
+    // not audio-thread safe) and sampled from there during render.
+    ShapeLang formulaLang = ShapeLang::Builtin;
+
+    // Transient (not serialized): one cycle of the Lua/Python-baked formula,
+    // and the last bake error (empty when OK). Re-baked by rebakeFormula().
+    std::vector<float> formulaSamples;
+    std::string        formulaError;
+
+    // Re-bake formulaSamples from formulaExpr for the current formulaLang.
+    // No-op (clears the buffer) for Built-in. Call after any change to
+    // formulaExpr / formulaLang and after loading from a project.
+    void rebakeFormula();
 };
 
 // Editor component for a single WaveLayer. Used by the wavetable editor (one
@@ -123,6 +139,7 @@ private:
     juce::TextButton sineBtn, sawBtn, squareBtn, triangleBtn, noiseBtn, drawnBtn, formulaBtn;
     juce::TextButton freehandToggle;
     juce::TextEditor formulaEditor;
+    juce::ComboBox   formulaLangCombo;   // Built-in / Lua / Python (Formula only)
     juce::Slider ratioSlider, phaseSlider, ampSlider;
     juce::Label  ratioLabel, phaseLabel, ampLabel;
     juce::TextButton presetBtn;
@@ -139,7 +156,17 @@ struct LayeredWaveform : public IWavetableFrame {
     std::vector<WaveLayer> layers;
     int tableSize = 2048;
 
-    // Sum layers into `out` (resized to this->tableSize). Normalized to peak 1.0.
+    // Un-hide the base-class render(int, out) wrapper. Declaring the no-arg
+    // render(out) below would otherwise hide ALL base `render` overloads by
+    // name, so callers that do lw.render(ts, out) wouldn't compile. The base
+    // wrapper (renderRaw + gain) is exactly what they want.
+    using IWavetableFrame::render;
+
+    // Sum layers into `out` (resized to this->tableSize). Normalized to peak
+    // 1.0. This is the gain-FREE primitive: it does NOT apply IWavetableFrame::
+    // gain (that's applied by the base-class render(int,out) wrapper, which
+    // renderRaw() delegates here through). Callers wanting the gained cycle
+    // should go through the IWavetableFrame render() path.
     void render(std::vector<float>& out) const;
 
     // Encode as a string stored in node.script, prefixed with "__layered__:".
@@ -157,7 +184,7 @@ struct LayeredWaveform : public IWavetableFrame {
     // size; encodeBody/decodeBody handle the body without the __layered__:
     // prefix so a container can length-prefix it inline.
     const char* typeId() const override { return "layered"; }
-    void render(int tableSize, std::vector<float>& out) const override;
+    void renderRaw(int tableSize, std::vector<float>& out) const override;
     std::string encodeBody() const override;
     bool decodeBody(const std::string& body) override;
     std::unique_ptr<IWavetableFrame> clone() const override;
@@ -404,8 +431,28 @@ struct WavetableDoc {
     std::vector<int> gridDims;             // size per dimension (e.g., {4} for 1D, {3,4} for 2D)
 
     // ---- Scatter mode ----
-    int scatterDims = 2;                   // number of N-D coord axes
+    int scatterDims = 1;                   // number of N-D coord axes (0=drop-target, 1=line, 2+=square/cube view)
     float scatterRadius = 0.45f;           // RBF cutoff (in normalized [0,1] units)
+    // "Distance fades volume" toggle, shared by both Scatter and Grid modes
+    // (the WavetableMode union of state, even though the field lives in the
+    // scatter block for historical reasons).
+    //
+    // When false (default) the blend is volume-normalized: the active weights
+    // are divided by their sum so the total output level stays constant as you
+    // morph.
+    //   - Scatter: a lone frame is always full volume regardless of distance.
+    //   - Grid: empty cells don't drain volume - the synth renormalizes the
+    //     morph over the *filled* cells, so the output stays full-volume even
+    //     when some cells are empty.
+    // When true the raw blend weight is used directly as gain:
+    //   - Scatter: moving the Position toward a frame makes it louder, away
+    //     makes it quieter, and a point outside every frame's radius is silent.
+    //     Lets a single scatter dot act as a "loudness island".
+    //   - Grid: empty cells fade volume - morphing toward an empty cell ducks
+    //     the output toward silence (the pre-renormalization grid behavior).
+    // Serialized as the optional last field of the mode spec (4th for scatter,
+    // after the dims for grid).
+    bool absoluteBlend = false;
     std::vector<ScatterFrame> scatterFrames;
 
     // Set by convertGridToScatter() and consulted by canRevertScatterToGrid().
@@ -431,9 +478,31 @@ struct WavetableDoc {
 
     // Number of position dimensions exposed to the synth as Position params.
     // Grid: number of grid axes. Scatter: scatterDims.
+    //
+    // NOTE: this is the *geometric* dimension count - it drives the
+    // visualization (rotation planes, projection combo, axis steppers) and
+    // must include inert axes. For the count of axes the user can actually
+    // *traverse* (which drives the Position params/pins), use
+    // effectiveDimCount() instead.
     int numDimensions() const {
         return mode == WavetableMode::Grid ? (int)gridDims.size() : scatterDims;
     }
+
+    // Indices of the axes the user can actually traverse - i.e. the axes for
+    // which a Position parameter / modulation pin is worth exposing. Defined
+    // in the .cpp. The rule:
+    //   Grid:    every axis whose size is >= 2 (a size-1 axis has a single
+    //            cell, so a Position along it does nothing), in axis order.
+    //   Scatter: all scatterDims axes when there's something for a position
+    //            to do - either >= 2 frames to interpolate between, OR the
+    //            "distance fades volume" blend is on (so moving toward/away
+    //            from even a single frame changes loudness). Otherwise empty
+    //            (a lone normalized frame is always full volume regardless of
+    //            position, so its axes are inert).
+    // The k-th entry maps the k-th Position parameter to its geometry axis;
+    // the synth pins all other (inert) grid axes to coordinate 0.
+    std::vector<int> effectiveAxes() const;
+    int effectiveDimCount() const { return (int)effectiveAxes().size(); }
 
     // Number of editable cells in the active mode.
     int activeFrameCount() const {
@@ -548,6 +617,15 @@ struct WavetableDoc {
     // Scatter -> Grid. Caller must check canRevertScatterToGrid() first;
     // calling otherwise is a no-op (asserted in debug).
     void revertScatterToGrid();
+
+    // General (lossy) Scatter -> Grid conversion, used when a lossless
+    // revertScatterToGrid() isn't possible (the wavetable was authored as
+    // Scatter, or axes/dots were edited so the snapshot no longer matches).
+    // Flattens every scatter dot into a 1D grid of N cells in frame order
+    // (one dot per cell), discarding the free-form scatter positions. The
+    // library is untouched; cells reference the same waveform ids. Always
+    // succeeds, so the editor can offer a "to Grid" path unconditionally.
+    void convertScatterToGrid();
 
     // Encode/decode
     std::string encode() const;
@@ -698,6 +776,16 @@ private:
     juce::Label      identityLabel { {}, "Waveform:" };
     std::unique_ptr<LibraryColorSwatch> nameColorSwatch;
     juce::TextEditor nameEditor;
+
+    // Per-waveform output gain (IWavetableFrame::gain). A rotary on the
+    // identity row, in the range [0, 2] (1.0 = unity). Because every frame
+    // type peak-normalises its cycle, this is the ONLY way to make one
+    // waveform louder/quieter than its neighbours; it scales the rendered
+    // samples post-normalisation, so it shows in the preview and in the
+    // baked synth output and morphs. Drag-end commits one undo step.
+    juce::Label  gainLabel { {}, "Gain:" };
+    juce::Slider gainSlider { juce::Slider::RotaryHorizontalVerticalDrag,
+                              juce::Slider::TextBoxRight };
 
     // Push the editor's current colour / name into the library entry the
     // editor is targeting, and reflect any change back into the library
@@ -858,6 +946,12 @@ private:
     void onLayerChanged();
     void switchToFrame(int idx);
     void syncPositionParams();      // ensure node has the right number of Position params
+    // Re-sync Position params/pins only when the effective dimension count has
+    // actually changed since the params were last built. Cheap to call on every
+    // structural mutation (grid axis resize, scatter frame add/remove, cell
+    // placement); skips the erase/re-add churn - and the audio-thread param read
+    // race it would otherwise expose - whenever the count is unchanged.
+    void maybeSyncPositionParams();
     // One block-rate modulation pin per Position axis, named by axis (X/Y/Z/W).
     // `pinToAxis` maps each existing Position pin's id to its axis index,
     // captured before syncPositionParams() reshuffles the Position params.

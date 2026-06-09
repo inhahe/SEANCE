@@ -24,7 +24,7 @@ namespace SoundShop {
 //   +--------------------------------------------------------------------+
 //   |  [          envelope preview (waveform shape)          ]           |
 //   |                                                                    |
-//   |  [Edit attack...] [Edit decay...] [Edit release...]                |
+//   |  [Attack...] [Hold...] [Decay...] [Release...]                     |
 //   +--------------------------------------------------------------------+
 //
 // The preview lights up the segment being edited; clicking an "Edit ..."
@@ -67,9 +67,10 @@ private:
     juce::Slider attackS, holdS, decayS, sustainS, releaseS, velS;
 
     // Bottom: curve preview + per-segment edit buttons.
-    juce::TextButton editAttackBtn  { "Edit Attack Curve..."  };
-    juce::TextButton editDecayBtn   { "Edit Decay Curve..."   };
-    juce::TextButton editReleaseBtn { "Edit Release Curve..." };
+    juce::TextButton editAttackBtn  { "Attack Curve..."  };
+    juce::TextButton editHoldBtn    { "Hold Curve..."    };
+    juce::TextButton editDecayBtn   { "Decay Curve..."   };
+    juce::TextButton editReleaseBtn { "Release Curve..." };
     juce::Rectangle<int> previewBounds;
 
     // Listener token for the preset manager so the dropdown stays in

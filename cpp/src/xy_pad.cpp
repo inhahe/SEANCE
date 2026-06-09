@@ -29,7 +29,13 @@ XYPadComponent::XYPadComponent(NodeGraph& g, int nid) : graph(g), nodeId(nid) {
     zCombo.onChange = [this, onCombo]() { onCombo(zCombo, zBind); };
 
     startTimerHz(30); // repaint for visual feedback
-    setSize(340, 420);
+    // Open large enough that the pad area is a generous square. The dialog is
+    // resizable (all open paths pass opts.resizable = true) and the pad is
+    // derived from getLocalBounds(), so stretching the window enlarges the pad
+    // and - because mouseToXY divides the cursor offset by the pad size - makes
+    // each axis proportionally finer to drag. A bigger default makes that
+    // headroom obvious instead of opening cramped.
+    setSize(460, 560);
 }
 
 void XYPadComponent::rebuildCombos() {

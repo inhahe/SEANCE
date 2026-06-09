@@ -40,11 +40,37 @@ public:
     // '|', ';' or '@' (those are the wavetable-format delimiters).
     virtual const char* typeId() const = 0;
 
-    // Render one cycle of the waveform into `out`. Implementations should
-    // resize `out` to `tableSize` and fill it with samples in [-1, 1].
-    // Peak normalisation policy is up to the concrete type; the synth
-    // does not re-normalise.
-    virtual void render(int tableSize, std::vector<float>& out) const = 0;
+    // Per-frame output gain, applied on TOP of whatever the concrete type
+    // renders (see render() below). Default 1.0 = unchanged. Every frame
+    // type peak-normalises its raw cycle (LayeredWaveform to peak 1.0,
+    // SampleFrame/SpectralFrame/... likewise), which means without this knob
+    // every waveform in a wavetable plays back at the SAME loudness - there
+    // is no way to make one frame quieter or louder than its neighbours, and
+    // morphs between frames carry no volume contour. `gain` is the post-
+    // normalisation scalar that fixes that: it actually changes the rendered
+    // samples, so it shows up in the editor preview, in the baked synth
+    // terrain, and in every cross-frame morph. Lives on the base class so it
+    // applies uniformly to every frame type and is serialised once by the
+    // wavetable container (WavetableDoc), not per-subclass.
+    float gain = 1.0f;
+
+    // Render one cycle of the waveform into `out`, WITHOUT the per-frame
+    // `gain` applied. Implementations resize `out` to `tableSize` and fill
+    // it with samples in [-1, 1]. Peak-normalisation policy is up to the
+    // concrete type; the synth does not re-normalise. External callers should
+    // use render() (below), not this - this is the gain-free primitive.
+    virtual void renderRaw(int tableSize, std::vector<float>& out) const = 0;
+
+    // Public render entry point: renderRaw() followed by the per-frame gain.
+    // ALL consumers (synth bake, editor preview, scatter/grid morph blend)
+    // call this, so a non-unity gain is reflected everywhere the frame is
+    // heard or drawn. Non-virtual on purpose - the gain rule is identical for
+    // every frame type, so it lives here once instead of in each subclass.
+    void render(int tableSize, std::vector<float>& out) const {
+        renderRaw(tableSize, out);
+        if (gain != 1.0f)
+            for (auto& v : out) v *= gain;
+    }
 
     // Serialise the frame body (no type tag, no length prefix - just the
     // raw body string). The container is responsible for wrapping this

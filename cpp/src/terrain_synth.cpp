@@ -707,6 +707,11 @@ void TerrainSynthProcessor::rebuildEnvCurves() {
         else
             attackCurve.valid = false;
     }
+    // Hold (a 0..1 multiplier on peak across the hold window; default
+    // flat "1"). No legacy fallback - the Hold curve is new and lives
+    // only on the unified envelope.
+    if (!bakeFromSpectral(node.ahdsrEnvelope.holdCurve, holdCurve))
+        holdCurve.valid = false;
     // Decay
     if (!bakeFromSpectral(node.ahdsrEnvelope.decayCurve, decayCurve)) {
         if (!node.envDecayCurve.empty())
@@ -732,8 +737,8 @@ void TerrainSynthProcessor::rebuildEnvCurves() {
 // ==============================================================================
 
 float TerrainSynthProcessor::Voice::advanceEnv(float sr, float a, float h, float d, float s, float r,
-                                                 const EnvCurve* aCurve, const EnvCurve* dCurve,
-                                                 const EnvCurve* rCurve) {
+                                                 const EnvCurve* aCurve, const EnvCurve* hCurve,
+                                                 const EnvCurve* dCurve, const EnvCurve* rCurve) {
     if (envStage == Off) return 0.0f;
     float dt = 1.0f / sr;
     envTime += dt;
@@ -757,10 +762,18 @@ float TerrainSynthProcessor::Voice::advanceEnv(float sr, float a, float h, float
             break;
         }
         case Hold: {
-            envLevel = peak;
-            if ((float)envTime >= h) {
+            float t = (float)(envTime / std::max(0.001, (double)h));
+            if (t >= 1.0f) {
+                // End the plateau at peak so Decay (which starts from peak)
+                // continues without a discontinuity, whatever the hold
+                // curve's final value.
+                envLevel = peak;
                 envStage = Decay;
                 envTime = 0;
+            } else {
+                // hCurve is a 0..1 multiplier on peak (default flat 1).
+                float shape = (hCurve && hCurve->valid) ? hCurve->evaluate(t) : 1.0f;
+                envLevel = shape * peak;
             }
             break;
         }
@@ -839,6 +852,9 @@ SynthSourceClass classifySynthSource(const std::string& script) {
     if (script.rfind("__layered__:", 0)       == 0) return SynthSourceClass::Wavetable;
     if (script.rfind("__wavetable__:", 0)     == 0) return SynthSourceClass::Wavetable;
     if (script.rfind("__wavetable2__:", 0)    == 0) return SynthSourceClass::Wavetable;
+    if (script.rfind("__wavetable3__:", 0)    == 0) return SynthSourceClass::Wavetable;
+    if (script.rfind("__wavetable4__:", 0)    == 0) return SynthSourceClass::Wavetable;
+    if (script.rfind("__wavetable5__:", 0)    == 0) return SynthSourceClass::Wavetable;
     if (script.rfind("__waveletpaint__:", 0)  == 0) return SynthSourceClass::Wavetable;
     if (script.rfind("__spectral__:", 0)      == 0) return SynthSourceClass::Wavetable;
     if (script.rfind("__spectral2__:", 0)     == 0) return SynthSourceClass::Wavetable;
@@ -922,13 +938,14 @@ TerrainSynthProcessor::TerrainSynthProcessor(Node& n, Transport& t) : node(n), t
     } else if (script.find("__wavetable__:")  == 0
                || script.find("__wavetable2__:") == 0
                || script.find("__wavetable3__:") == 0
-               || script.find("__wavetable4__:") == 0) {
+               || script.find("__wavetable4__:") == 0
+               || script.find("__wavetable5__:") == 0) {
         // N-dimensional wavetable - Grid mode builds an (N+1)-D terrain;
         // Scatter mode keeps frames in a flat list and computes a Wendland
-        // RBF blend each block. WavetableDoc::decode handles the v4
-        // library+cell format with colorIdx (current) plus auto-migrating
-        // __wavetable3__ (pre-colorIdx), __wavetable2__, and legacy
-        // __wavetable__ payloads.
+        // RBF blend each block. WavetableDoc::decode handles the v5
+        // library+cell format with colorIdx + per-frame gain (current) plus
+        // auto-migrating __wavetable4__ (no gain), __wavetable3__ (pre-
+        // colorIdx), __wavetable2__, and legacy __wavetable__ payloads.
         WavetableDoc doc;
         bool decoded = doc.decode(script);
         if (decoded && doc.mode == WavetableMode::Scatter && !doc.scatterFrames.empty()) {
@@ -972,9 +989,11 @@ TerrainSynthProcessor::TerrainSynthProcessor(Node& n, Transport& t) : node(n), t
             wtScatter = true;
             wtScatterDims = doc.scatterDims;
             wtScatterRadius = doc.scatterRadius;
+            wtAbsoluteBlend = doc.absoluteBlend;
             isWavetable = true;
             wtFrameCount = (int)wtScatterFrameSamples.size();
             wtNumDims = doc.scatterDims;
+            wtEffectiveAxes = doc.effectiveAxes();
             traversalParams.mode = TraversalMode::Linear;
             mode = TerrainSynthMode::SamplePerPoint;
         } else if (decoded && !doc.cellWaveformIds.empty()) {
@@ -986,6 +1005,17 @@ TerrainSynthProcessor::TerrainSynthProcessor(Node& n, Transport& t) : node(n), t
             terrain.init(terrainDims);
             auto& data = terrain.getData();
             wtGranularFrames.clear();
+
+            // Occupancy mask over the morph axes only (gridDims, no phase
+            // axis): 1.0 where a cell holds a frame, 0.0 where it's empty.
+            // Used to renormalize the cycle sample over filled cells so empty
+            // cells don't drain volume (unless wtAbsoluteBlend is on).
+            wtAbsoluteBlend = doc.absoluteBlend;
+            std::vector<int> occDims;
+            for (int d : doc.gridDims) occDims.push_back(std::max(1, d));
+            wtGridOccupancy.init(occDims);
+            auto& occData = wtGridOccupancy.getData();
+            wtGridHasEmptyCells = false;
 
             // Compute stride for each grid dimension to map flat frame index
             // to the correct position in the N-dimensional terrain.
@@ -1022,6 +1052,16 @@ TerrainSynthProcessor::TerrainSynthProcessor(Node& n, Transport& t) : node(n), t
                 }
                 std::reverse(gridCoord.begin(), gridCoord.end());
 
+                // Record cell occupancy at this grid coord (cycle or granular
+                // both count as filled; only a missing frame is "empty").
+                {
+                    bool filled = (w != nullptr);
+                    if (!filled) wtGridHasEmptyCells = true;
+                    int occFlat = wtGridOccupancy.coordToFlatIndex(gridCoord);
+                    if (occFlat >= 0 && occFlat < wtGridOccupancy.totalSize())
+                        occData[occFlat] = filled ? 1.0f : 0.0f;
+                }
+
                 for (int i = 0; i < ts && i < (int)samples.size(); ++i) {
                     std::vector<int> fullIdx = {i};
                     fullIdx.insert(fullIdx.end(), gridCoord.begin(), gridCoord.end());
@@ -1055,6 +1095,7 @@ TerrainSynthProcessor::TerrainSynthProcessor(Node& n, Transport& t) : node(n), t
             isWavetable = true;
             wtFrameCount = nf;
             wtNumDims = doc.numDimensions();
+            wtEffectiveAxes = doc.effectiveAxes();
         } else {
             terrain.init({2048});
             terrain.fillFromExpression("sin(x)");
@@ -1222,8 +1263,22 @@ void TerrainSynthProcessor::refreshPartialBank() {
             // by switching to scatter mode where the blend is per-block).
             int tableSize = dims[0];
             int nFrames = (dims.size() > 1) ? dims[1] : 1;
+            // Pick the Position param that drives geometric axis 0 (the frame
+            // axis sliced here). Under the contiguous "Position 1..K" naming the
+            // bare "Position" only exists when there's a single traversable axis,
+            // so resolve by name from wtEffectiveAxes instead of assuming it.
+            std::string posName = "Position";
+            {
+                const int K = (int)wtEffectiveAxes.size();
+                for (int k = 0; k < K; ++k)
+                    if (wtEffectiveAxes[k] == 0) {
+                        posName = (K == 1) ? std::string("Position")
+                                : std::string("Position ") + std::to_string(k + 1);
+                        break;
+                    }
+            }
             float pos = juce::jlimit(0.0f, 1.0f,
-                getParamByName(node, "Position", 0.5f));
+                getParamByName(node, posName.c_str(), 0.5f));
             int fr = juce::jlimit(0, nFrames - 1, (int)std::round(pos * (nFrames - 1)));
             cycle.resize(tableSize);
             for (int i = 0; i < tableSize; ++i)
@@ -1286,14 +1341,56 @@ void TerrainSynthProcessor::refreshPartialBank() {
 //
 // Scatter mode: Wendland RBF weight at the current Position, normalized
 // by the total RBF weight (identical to the cycle blend's normalization).
+std::vector<float> TerrainSynthProcessor::scatterQueryPosition() {
+    std::vector<float> qpos(std::max(1, wtScatterDims), 0.5f);
+    // Default every axis to the dots' shared coordinate on that axis (read
+    // from frame 0). For a NON-traversable axis every dot shares the same
+    // value, so pinning the query there makes that axis contribute zero to all
+    // RBF distances - exactly what "this axis is inert" should mean. (Pinning
+    // to a hardcoded 0.5 instead would add a constant |0.5 - shared| offset to
+    // every distance, wrongly shrinking all weights when the dots sit off the
+    // midpoint.) Traversable axes are then overwritten by their live Position
+    // param below, so frame 0's value there is irrelevant.
+    if (!wtScatterFramePositions.empty()) {
+        const auto& p0 = wtScatterFramePositions.front();
+        for (int d = 0; d < wtScatterDims && d < (int)p0.size(); ++d)
+            qpos[(size_t)d] = p0[(size_t)d];
+    }
+    const int K = (int)wtEffectiveAxes.size();
+    for (int k = 0; k < K; ++k) {
+        const int axis = wtEffectiveAxes[k];
+        std::string pname = (K == 1) ? std::string("Position")
+                          : std::string("Position ") + std::to_string(k + 1);
+        if (axis >= 0 && axis < (int)qpos.size())
+            qpos[axis] = juce::jlimit(0.0f, 1.0f, getParamByName(node, pname.c_str(), 0.5f));
+    }
+    return qpos;
+}
+
 void TerrainSynthProcessor::updateGranularWeights() {
     // Live Position from the named params -> the shared, all-voices weights.
-    const int nPosDims = wtScatter ? wtScatterDims : wtNumDims;
-    std::vector<float> pos(std::max(1, nPosDims), 0.0f);
-    for (int d = 0; d < nPosDims; ++d) {
-        std::string pname = (nPosDims == 1) ? std::string("Position")
-                          : std::string("Position ") + std::to_string(d + 1);
-        pos[d] = juce::jlimit(0.0f, 1.0f, getParamByName(node, pname.c_str(), 0.5f));
+    // `pos` is always GEOMETRIC-axis-indexed so it lines up with the granular
+    // frames' stored positions (gp[d] / fp[d] use the geometric axis order).
+    std::vector<float> pos;
+    if (wtScatter) {
+        // Scatter: Position params exist only for traversable axes
+        // (wtEffectiveAxes); non-traversable axes pin to 0.5. See
+        // scatterQueryPosition() for the full rationale.
+        pos = scatterQueryPosition();
+    } else {
+        // Grid: Position params exist only for traversable axes (numbered
+        // contiguously); map the k-th param back to geometric axis
+        // wtEffectiveAxes[k]. Inert axes keep 0 - the hat function special-cases
+        // their single cell (dimSize<=1) and ignores the value.
+        pos.assign(std::max(1, wtNumDims), 0.0f);
+        const int K = (int)wtEffectiveAxes.size();
+        for (int k = 0; k < K; ++k) {
+            const int axis = wtEffectiveAxes[k];
+            std::string pname = (K == 1) ? std::string("Position")
+                              : std::string("Position ") + std::to_string(k + 1);
+            if (axis >= 0 && axis < (int)pos.size())
+                pos[axis] = juce::jlimit(0.0f, 1.0f, getParamByName(node, pname.c_str(), 0.0f));
+        }
     }
     computeGranularWeights(pos, granWeights);
 }
@@ -1304,7 +1401,9 @@ void TerrainSynthProcessor::computeGranularWeights(const std::vector<float>& pos
     if (wtGranularFrames.empty()) return;
 
     if (wtScatter) {
-        // Wendland weights normalized to sum-1, matching the cycle blend.
+        // Wendland weights - normalized to sum-1 by default, matching the
+        // cycle blend; in "distance fades volume" mode (wtAbsoluteBlend)
+        // the raw weight is used as gain instead (invT = 1, no fallback).
         const float r = std::max(1e-3f, wtScatterRadius);
         float totalW = 0.0f;
         std::vector<float> wAll(wtScatterFrameSamples.size(), 0.0f);
@@ -1327,8 +1426,9 @@ void TerrainSynthProcessor::computeGranularWeights(const std::vector<float>& pos
         }
         // Edge case: zero total weight. Fall back to "nearest granular
         // frame wins" so the user always hears something when the
-        // wavetable contains only granular frames.
-        if (totalW < 1e-9f) {
+        // wavetable contains only granular frames. Skipped in absolute mode,
+        // where a Position outside every radius is intentionally silent.
+        if (!wtAbsoluteBlend && totalW < 1e-9f) {
             int nearest = -1;
             float bestD2 = 1e30f;
             for (size_t gi = 0; gi < wtGranularFrames.size(); ++gi) {
@@ -1350,7 +1450,8 @@ void TerrainSynthProcessor::computeGranularWeights(const std::vector<float>& pos
         // match by position equality - cheaper to just iterate both
         // arrays together since they were populated in lockstep skipping
         // cycle frames. Use position equality as the join key.
-        const float invT = 1.0f / totalW;
+        const float invT = wtAbsoluteBlend ? 1.0f
+                                           : (totalW > 1e-9f ? 1.0f / totalW : 0.0f);
         size_t gi = 0;
         for (size_t fi = 0; fi < wtScatterFrameSamples.size() && gi < wtGranularFrames.size(); ++fi) {
             const auto& fp = wtScatterFramePositions[fi];
@@ -1709,21 +1810,26 @@ void TerrainSynthProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mi
     int numSignalInputs = std::max(0, numChannels - 2);
     bool hasSignalInputs = numSignalInputs > 0;
 
-    // Find the "Aftertouch" input pin among the node's Signal inputs
-    // and read its current block-mean value. The signal inputs map to
-    // audio buffer channels starting at channel 2, in the order they
-    // appear in node.pinsIn (filtered to Signal kind). When unwired
-    // (no node provides this channel) the channel stays at silence
-    // and we fall back to MIDI channel-pressure. We use the block
-    // mean rather than per-sample so a slow LFO drives a smooth
-    // aftertouch rather than carrying its audio shape into the
-    // amplitude swell.
+    // Find the "Aftertouch" input pin among the node's control inputs
+    // and read its current block-mean value. Control inputs map to audio
+    // buffer channels starting at channel 2, in the order they appear in
+    // node.pinsIn. The slot index must count BOTH Signal and Param pins,
+    // exactly the way graph_processor assigns control channels (it routes
+    // Signal *and* Param input pins onto channels 2+). Counting only Signal
+    // pins here mis-mapped the channel once the Position modulation pins -
+    // and the Aftertouch pin itself - became block-rate Param, reading a
+    // neighbouring pin's data as aftertouch. When unwired (no node provides
+    // this channel) the channel stays at silence and we fall back to MIDI
+    // channel-pressure. We use the block mean rather than per-sample so a
+    // slow LFO drives a smooth aftertouch rather than carrying its audio
+    // shape into the amplitude swell - which is exactly why this pin is a
+    // block-rate Param, not an audio-rate Signal.
     {
         aftertouchOverride = -1.0f;
         int sigIdx = 0;
         int targetSigIdx = -1;
         for (auto& p : node.pinsIn) {
-            if (p.kind != PinKind::Signal) continue;
+            if (p.kind != PinKind::Signal && p.kind != PinKind::Param) continue;
             if (p.name == "Aftertouch") { targetSigIdx = sigIdx; break; }
             ++sigIdx;
         }
@@ -1766,13 +1872,7 @@ void TerrainSynthProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mi
     // using a Wendland C^2 RBF over the current Position. The per-sample
     // path then reads terrain.sample(phase) unchanged.
     if (isWavetable && wtScatter && !wtScatterFrameSamples.empty()) {
-        std::vector<float> qpos(wtScatterDims, 0.5f);
-        for (int d = 0; d < wtScatterDims; ++d) {
-            std::string pname = (wtScatterDims == 1)
-                ? std::string("Position")
-                : std::string("Position ") + std::to_string(d + 1);
-            qpos[d] = juce::jlimit(0.0f, 1.0f, getParamByName(node, pname.c_str(), 0.5f));
-        }
+        std::vector<float> qpos = scatterQueryPosition();
         int nFrames = (int)wtScatterFrameSamples.size();
         std::vector<float> weights(nFrames, 0.0f);
         float totalW = 0.0f;
@@ -1795,24 +1895,33 @@ void TerrainSynthProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mi
                 totalW += w;
             }
         }
-        if (totalW < 1e-9f) {
-            // Fall back to nearest frame so we never produce silence.
-            int nearest = 0;
-            float bestD2 = 1e30f;
-            for (int fi = 0; fi < nFrames; ++fi) {
-                const auto& fp = wtScatterFramePositions[fi];
-                float d2 = 0.0f;
-                for (int dim = 0; dim < wtScatterDims; ++dim) {
-                    float a = (dim < (int)fp.size()) ? fp[dim] : 0.5f;
-                    float dd = a - qpos[dim];
-                    d2 += dd * dd;
+        float invT;
+        if (wtAbsoluteBlend) {
+            // "Distance fades volume": use the raw Wendland weight as gain.
+            // No nearest-frame fallback - a Position outside every frame's
+            // radius is deliberately silent (totalW stays 0, the weighted
+            // accumulation below produces no output).
+            invT = 1.0f;
+        } else {
+            if (totalW < 1e-9f) {
+                // Fall back to nearest frame so we never produce silence.
+                int nearest = 0;
+                float bestD2 = 1e30f;
+                for (int fi = 0; fi < nFrames; ++fi) {
+                    const auto& fp = wtScatterFramePositions[fi];
+                    float d2 = 0.0f;
+                    for (int dim = 0; dim < wtScatterDims; ++dim) {
+                        float a = (dim < (int)fp.size()) ? fp[dim] : 0.5f;
+                        float dd = a - qpos[dim];
+                        d2 += dd * dd;
+                    }
+                    if (d2 < bestD2) { bestD2 = d2; nearest = fi; }
                 }
-                if (d2 < bestD2) { bestD2 = d2; nearest = fi; }
+                weights[nearest] = 1.0f;
+                totalW = 1.0f;
             }
-            weights[nearest] = 1.0f;
-            totalW = 1.0f;
+            invT = 1.0f / totalW;
         }
-        float invT = 1.0f / totalW;
         auto& tdata = terrain.getData();
         int ts = (int)tdata.size();
 
@@ -1890,18 +1999,23 @@ void TerrainSynthProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mi
             // Scatter mode: terrain is 1D, blend already happened pre-loop -
             // nothing to write into coord[d+1] (would crash, no such dim).
             if (!wtScatter) {
-                // Set each Position dimension from named params.
-                // 1D: "Position" -> coord[1]
-                // ND: "Position 1"..."Position N"
-                if (wtNumDims == 1 && nd >= 2) {
-                    coord[1] = juce::jlimit(0.0f, 1.0f, getParamByName(node, "Position", 0.0f));
-                } else {
-                    for (int d = 0; d < wtNumDims && d + 1 < nd; ++d) {
-                        std::string pname = (wtNumDims == 1) ? "Position"
-                            : "Position " + std::to_string(d + 1);
-                        coord[d + 1] = juce::jlimit(0.0f, 1.0f,
-                            getParamByName(node, pname.c_str(), 0.0f));
-                    }
+                // Grid: coord[axis+1] is geometric position axis `axis`. Default
+                // every position axis to 0 (inert single-cell axes only have
+                // index 0, and Terrain::sample collapses them onto 0 anyway),
+                // then drive each *traversable* axis from its Position param.
+                // Position params are numbered contiguously over the traversable
+                // axes; wtEffectiveAxes[k] is the geometric axis the k-th param
+                // controls. Naming matches syncPositionParams(): "Position" for a
+                // lone traversable axis, "Position 1".."Position K" otherwise.
+                for (int d = 1; d < nd; ++d) coord[d] = 0.0f;
+                const int K = (int)wtEffectiveAxes.size();
+                for (int k = 0; k < K; ++k) {
+                    const int axis = wtEffectiveAxes[k];
+                    if (axis + 1 >= nd) continue;
+                    std::string pname = (K == 1) ? std::string("Position")
+                        : std::string("Position ") + std::to_string(k + 1);
+                    coord[axis + 1] = juce::jlimit(0.0f, 1.0f,
+                        getParamByName(node, pname.c_str(), 0.0f));
                 }
             }
         }
@@ -1948,6 +2062,20 @@ void TerrainSynthProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mi
         if (s == numSamples / 2)
             lastPosition = coord;
 
+        // Grid renormalization gain: divide the cycle sample by the fraction
+        // of interpolation weight that lands on *filled* cells, so empty cells
+        // don't drain volume. Computed once per sample from the morph
+        // coordinate (coord[1..]) - the phase axis (coord[0]) is excluded.
+        // Skipped when absolute blend is on (empty cells should fade volume)
+        // or when there are no empty cells (the mask is all-ones, gain == 1).
+        float gridRenormGain = 1.0f;
+        if (isWavetable && !wtScatter && !wtAbsoluteBlend && wtGridHasEmptyCells
+            && wtGridOccupancy.totalSize() > 0 && (int)coord.size() >= 2) {
+            std::vector<float> occCoord(coord.begin() + 1, coord.end());
+            float occ = wtGridOccupancy.sample(occCoord);
+            if (occ > 1e-4f) gridRenormGain = 1.0f / occ;
+        }
+
         float totalSample = 0.0f;
         int activeVoiceCount = 0;
 
@@ -1972,7 +2100,7 @@ void TerrainSynthProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mi
             // the unified envelope.
             float hold = node.ahdsrEnvelope.holdMs * 0.001f;
             float env = v.advanceEnv((float)sampleRate, attack, hold, decay, sustain, release,
-                                      &attackCurve, &decayCurve, &releaseCurve);
+                                      &attackCurve, &holdCurve, &decayCurve, &releaseCurve);
             if (!v.active) continue;
 
             // Per-voice effective frequency = (base * pitch-bend) * vibrato
@@ -2020,6 +2148,10 @@ void TerrainSynthProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mi
                     // Raw sample mode (no grain crossfade)
                     sample = terrain.sample(pitchCoord);
                 }
+
+                // Renormalize the cycle sample over filled grid cells so
+                // empty cells don't drain volume (no-op when gain == 1).
+                sample *= gridRenormGain;
 
                 // ---- Granular layer mix ----
                 //
@@ -2136,7 +2268,10 @@ void TerrainSynthProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mi
                         while (np < 0.0f)             np += (float)grainLen;
                         gs.loopPhase = np;
 
-                        sample += w * out;
+                        // Same empty-cell renormalization the cycle layer
+                        // gets, so a granular frame next to empty cells stays
+                        // full-volume too (no-op when gain == 1).
+                        sample += w * out * gridRenormGain;
                     }
                 }
 

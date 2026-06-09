@@ -284,6 +284,26 @@ struct ExprParser {
     // Optional sampler for the shape(pos) function. Null/empty -> shape()
     // returns 0. Set by the evaluateWithVars overload that takes a sampler.
     const std::function<float(float)>* shapeFn = nullptr;
+    // Program-mode extras (see runProgram). stateVars is the persistent,
+    // assignable variable store; sink receives MIDI emit calls. Both null
+    // for plain expression evaluation, in which case assignments are
+    // discarded and emit functions are no-ops.
+    std::unordered_map<std::string, float>* stateVars = nullptr;
+    IExprEmitSink* sink = nullptr;
+
+    // The MIDI output index that emit calls route to. Read from the
+    // reserved `out` variable (stateVars first, then extraVars), default 0.
+    int currentOut() const {
+        if (stateVars) {
+            auto it = stateVars->find("out");
+            if (it != stateVars->end()) return std::max(0, (int)std::lround(it->second));
+        }
+        if (extraVars) {
+            auto it = extraVars->find("out");
+            if (it != extraVars->end()) return std::max(0, (int)std::lround(it->second));
+        }
+        return 0;
+    }
 
     void skipWS() { while (*pos == ' ' || *pos == '\t') pos++; }
 
@@ -445,6 +465,43 @@ struct ExprParser {
             return cond != 0.0f ? thenV : elseV;
         }
 
+        // -------------------------------------------------------------------
+        // Program-mode MIDI emit functions. These have a SIDE EFFECT (push a
+        // MIDI event into `sink`) and return 1.0 (so they can be used in a
+        // ternary, e.g. `(beat<0.01) ? note(60,100,0.5) : 0`). With no sink
+        // bound they parse their args (so the program still type-checks) and
+        // return 0. The destination output is read from the `out` variable.
+        // -------------------------------------------------------------------
+        if (matchFunc("note")) {           // note(pitch, vel, durSec)
+            float p = parseTernary(); skipWS(); if (*pos == ',') pos++;
+            float v = parseTernary(); skipWS(); if (*pos == ',') pos++;
+            float d = parseTernary(); skipWS(); if (*pos == ')') pos++;
+            if (sink) { sink->emitNote(currentOut(), p, v, d); return 1.0f; }
+            return 0.0f;
+        }
+        if (matchFunc("noteon")) {         // noteon(pitch, vel)
+            float p = parseTernary(); skipWS(); if (*pos == ',') pos++;
+            float v = parseTernary(); skipWS(); if (*pos == ')') pos++;
+            if (sink) { sink->emitNoteOn(currentOut(), p, v); return 1.0f; }
+            return 0.0f;
+        }
+        if (matchFunc("noteoff")) {        // noteoff(pitch)
+            float p = parseTernary(); skipWS(); if (*pos == ')') pos++;
+            if (sink) { sink->emitNoteOff(currentOut(), p); return 1.0f; }
+            return 0.0f;
+        }
+        if (matchFunc("cc")) {             // cc(number, value 0..1)
+            float n = parseTernary(); skipWS(); if (*pos == ',') pos++;
+            float v = parseTernary(); skipWS(); if (*pos == ')') pos++;
+            if (sink) { sink->emitCC(currentOut(), n, v); return 1.0f; }
+            return 0.0f;
+        }
+        if (matchFunc("bend")) {           // bend(value -1..1)
+            float v = parseTernary(); skipWS(); if (*pos == ')') pos++;
+            if (sink) { sink->emitBend(currentOut(), v); return 1.0f; }
+            return 0.0f;
+        }
+
         // Bare keywords (no parens)
         if (matchKeyword("random")) {
             std::uniform_real_distribution<float> dist(-3.14159265f, 3.14159265f);
@@ -465,10 +522,16 @@ struct ExprParser {
             if (ident == "x") return x;
             if (ident == "f") return f;
             if (ident == "e") return 2.71828183f;
-            // Custom variable lookup
+            // Custom variable lookup. Read-only per-call vars take precedence
+            // over the persistent state store, so a transport/input binding
+            // can't be shadowed by a stale state value of the same name.
             if (extraVars) {
                 auto it = extraVars->find(ident);
                 if (it != extraVars->end()) return it->second;
+            }
+            if (stateVars) {
+                auto it = stateVars->find(ident);
+                if (it != stateVars->end()) return it->second;
             }
             // Unknown identifier: rewind and let parseNumber try (which will
             // return 0 since no digits). This means unknown idents silently
@@ -578,6 +641,55 @@ struct ExprParser {
         pos = str;
         return parseTernary();
     }
+
+    // ---- Program mode -----------------------------------------------------
+    // Skip whitespace AND statement separators (';' and newlines) between
+    // statements. Newlines aren't skipped by skipWS (which only eats spaces /
+    // tabs) precisely so a newline terminates a statement; here we step over
+    // the run of separators that sit between two statements.
+    void skipSeparators() {
+        while (*pos == ' ' || *pos == '\t' || *pos == '\r'
+               || *pos == '\n' || *pos == ';')
+            pos++;
+    }
+
+    // Parse one statement: either `ident = expr` (assignment into stateVars,
+    // persistent) or a bare expression evaluated for side effects. Returns
+    // the statement's value.
+    float parseStatement() {
+        skipWS();
+        // Look-ahead for an assignment: an identifier immediately followed by
+        // a single '=' that is NOT part of '==' (equality). On no match we
+        // rewind and treat the whole thing as a bare expression.
+        const char* save = pos;
+        std::string ident = parseIdentifier();
+        if (!ident.empty()) {
+            skipWS();
+            if (*pos == '=' && pos[1] != '=') {
+                pos++; // consume '='
+                float v = parseTernary();
+                if (stateVars) (*stateVars)[ident] = v;
+                return v;
+            }
+            pos = save; // not an assignment after all
+        }
+        return parseTernary();
+    }
+
+    // Run the whole program. Statements separated by ';' / newlines. Returns
+    // the value of the last statement (0 for an empty program).
+    float runProgram() {
+        pos = str;
+        x = 0.0f;
+        f = 0.0f;
+        float last = 0.0f;
+        skipSeparators();
+        while (*pos != '\0') {
+            last = parseStatement();
+            skipSeparators();
+        }
+        return last;
+    }
 };
 } // anonymous namespace
 
@@ -598,8 +710,14 @@ std::vector<float> WaveExprParser::evaluateOverBins(const std::string& expr, int
     if (expr.empty()) return result; // all zeros
     ExprParser parser;
     parser.str = expr.c_str();
+    // `f` is the integer index over [0, numBins) (frequency bin for spectral
+    // curves). `x` is the same position normalized to [0, 1] - this is what
+    // non-periodic [0,1] curves (e.g. ADSR segment shapes "x", "1-x") are
+    // written in terms of. Binding both lets one evaluator serve both the
+    // spectral (bin-index) and normalized-position curve domains.
     for (int i = 0; i < numBins; ++i) {
-        result[i] = parser.eval(0.0f, (float)i);
+        float xn = (numBins > 1) ? (float)i / (float)(numBins - 1) : 0.0f;
+        result[i] = parser.eval(xn, (float)i);
     }
     return result;
 }
@@ -637,6 +755,21 @@ float WaveExprParser::evaluateWithVars(const std::string& expr,
     auto itX = vars.find("x"); if (itX != vars.end()) parser.x = itX->second;
     auto itF = vars.find("f"); if (itF != vars.end()) parser.f = itF->second;
     return parser.eval(parser.x, parser.f);
+}
+
+float WaveExprParser::runProgram(const std::string& program,
+                                 const std::unordered_map<std::string, float>& vars,
+                                 std::unordered_map<std::string, float>& stateVars,
+                                 IExprEmitSink* sink,
+                                 const std::function<float(float)>& shapeFn) {
+    if (program.empty()) return 0.0f;
+    ExprParser parser;
+    parser.str       = program.c_str();
+    parser.extraVars = &vars;
+    parser.stateVars = &stateVars;
+    parser.sink      = sink;
+    parser.shapeFn   = &shapeFn;
+    return parser.runProgram();
 }
 
 // ==============================================================================

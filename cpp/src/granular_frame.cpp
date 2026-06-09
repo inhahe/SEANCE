@@ -15,7 +15,7 @@ static int ceilPow2(int n) {
     return p;
 }
 
-void GranularFrame::render(int tableSize, std::vector<float>& out) const {
+void GranularFrame::renderRaw(int tableSize, std::vector<float>& out) const {
     out.assign((size_t)tableSize, 0.0f);
     if (source.empty() || tableSize <= 0) return;
 

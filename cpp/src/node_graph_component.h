@@ -113,7 +113,11 @@ private:
 
     // Hit testing
     Node* nodeAtPoint(juce::Point<float> canvasPos);
-    int pinAtPoint(juce::Point<float> canvasPos, bool& isOutput);
+    // wantInput: -1 = accept any pin, 0 = only output pins, 1 = only input
+    // pins. Returns the CLOSEST matching pin to canvasPos (or -1). Drag/drop
+    // pass the opposite of the source pin's direction so a target never
+    // resolves to the wrong side / the source pin itself.
+    int pinAtPoint(juce::Point<float> canvasPos, bool& isOutput, int wantInput = -1);
     int linkAtPoint(juce::Point<float> canvasPos);
     juce::Rectangle<float> getNodeBounds(const Node& node) const;
     juce::Point<float> getPinPosition(const Node& node, const Pin& pin) const;

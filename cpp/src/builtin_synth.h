@@ -84,6 +84,45 @@ private:
 // NOT short-circuit (both sides evaluate) — same for the ternary's true and
 // false branches and if()'s second/third arg. Unknown identifiers evaluate
 // to 0 (silent fallback) rather than parse errors.
+//
+// ----------------------------------------------------------------------------
+// Program mode (statements, persistent state, side effects)
+// ----------------------------------------------------------------------------
+//
+// runProgram() runs a *multi-statement* program rather than a single
+// expression. This powers the algorithmic MIDI node: the same grammar and
+// built-in functions as the expression evaluator, plus:
+//
+//   * Statements separated by ';' or newlines. Each statement is either:
+//       - an assignment  `name = expr`  (writes to the persistent stateVars
+//         store, so the value survives across calls / audio blocks), or
+//       - a bare expression evaluated for its side effects (the emit
+//         functions below).
+//   * MIDI emit functions that push events into a caller-supplied sink:
+//       note(p,v,d) noteon(p,v) noteoff(p) cc(n,v) bend(v)
+//     All take floats; the sink quantizes (7-bit CC, 14-bit bend) at emission.
+//   * The reserved variable `out` selects which MIDI output the subsequent
+//     emit calls route to (0-based; default 0). Set it with `out = 1`.
+//
+// The emit functions are no-ops (returning 0) when no sink is supplied, so a
+// program can be parse-checked or run purely for its assignments. Likewise an
+// assignment with no stateVars store is silently discarded.
+struct IExprEmitSink {
+    virtual ~IExprEmitSink() = default;
+    // pitch/vel are 0..127 (rounded); durSec is the note length in seconds.
+    virtual void emitNote   (int out, float pitch, float vel, float durSec) = 0;
+    virtual void emitNoteOn (int out, float pitch, float vel) = 0;
+    virtual void emitNoteOff(int out, float pitch) = 0;
+    // value01 is 0..1 (scaled to 0..127). num is the CC number 0..127.
+    virtual void emitCC     (int out, float num, float value01) = 0;
+    // value is -1..1 (scaled to the 14-bit 0..16383 pitch-bend range).
+    virtual void emitBend   (int out, float value) = 0;
+    // PerBlock path: set the sample offset (within the current block) stamped on
+    // subsequently-emitted events. No-op for per-sample sinks (offset is always
+    // the host loop's current sample). Default no-op so existing sinks compile.
+    virtual void setSampleOffset(int /*sampleOffset*/) {}
+};
+
 class WaveExprParser {
 public:
     // Evaluate expression using `x` as free variable over [0, 2*pi).
@@ -114,6 +153,18 @@ public:
     static float evaluateWithVars(const std::string& expr,
                                   const std::unordered_map<std::string, float>& vars,
                                   const std::function<float(float)>& shapeFn);
+
+    // Run a multi-statement program once (see the "Program mode" comment
+    // above). `vars` are read-only per-call bindings (transport, inputs);
+    // `stateVars` is the persistent read/write store assignments land in
+    // (and where the reserved `out` selector lives). `sink` receives MIDI
+    // emit calls (may be null). `shapeFn` backs shape(pos) (may be empty).
+    // Returns the value of the last statement (0 for an empty program).
+    static float runProgram(const std::string& program,
+                            const std::unordered_map<std::string, float>& vars,
+                            std::unordered_map<std::string, float>& stateVars,
+                            IExprEmitSink* sink,
+                            const std::function<float(float)>& shapeFn);
 };
 
 // Voice for polyphonic playback

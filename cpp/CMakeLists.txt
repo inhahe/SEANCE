@@ -95,6 +95,11 @@ target_sources(SEANCE PRIVATE
     src/melody_player.h
     src/wasm_script_processor.cpp
     src/wasm_script_processor.h
+    src/script_runtime.h
+    src/script_runtime.cpp
+    src/script_runtime_builtin.cpp
+    src/script_runtime_lua.cpp
+    src/script_runtime_wasm.cpp
     src/builtin_synth.cpp
     src/builtin_synth.h
     src/terrain_synth.cpp
@@ -107,6 +112,15 @@ target_sources(SEANCE PRIVATE
     src/tracker_file_parser.h
     src/signal_shape_node.cpp
     src/signal_shape_node.h
+    src/midi_script_node.cpp
+    src/midi_script_node.h
+    src/midi_script_editor.cpp
+    src/midi_script_editor.h
+    src/script_lang_bar.cpp
+    src/script_lang_bar.h
+    src/shape_expr.cpp
+    src/shape_expr.h
+    src/lua_prelude.h
     src/signal_modulation.h
     src/wavelet.h
     src/spectrum_visualizer.h
@@ -166,6 +180,8 @@ target_sources(SEANCE PRIVATE
     src/routing_strip.h
     src/xy_pad.cpp
     src/xy_pad.h
+    src/control_bank.cpp
+    src/control_bank.h
     src/spectrum_tap.cpp
     src/spectrum_tap.h
     src/analyzer_nodes.cpp
@@ -327,6 +343,22 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/wasm3/source")
     target_include_directories(wasm3 PUBLIC third_party/wasm3/source)
     target_link_libraries(SEANCE PRIVATE wasm3)
     target_include_directories(SEANCE PRIVATE third_party/wasm3/source)
+endif()
+
+# Lua 5.4 (optional — embedded scripting language for MIDI Script / Signal
+# Shape nodes; builds without it, the "Lua" language option is just disabled).
+# We compile the Lua core + standard libraries as a static C library, excluding
+# the standalone interpreter (lua.c), the bytecode compiler/amalgamation
+# (luac.c / onelua.c) and the internal test harness (ltests.c) — each of those
+# either defines its own main() or pulls in everything via #include.
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/lua/lua.h")
+    file(GLOB LUA_SOURCES third_party/lua/*.c)
+    list(FILTER LUA_SOURCES EXCLUDE REGEX "(lua|luac|onelua|ltests)\\.c$")
+    add_library(lua54 STATIC ${LUA_SOURCES})
+    target_include_directories(lua54 PUBLIC third_party/lua)
+    target_link_libraries(SEANCE PRIVATE lua54)
+    target_include_directories(SEANCE PRIVATE third_party/lua)
+    target_compile_definitions(SEANCE PRIVATE HAS_LUA=1)
 endif()
 
 # Python embedding

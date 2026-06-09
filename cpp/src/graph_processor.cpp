@@ -5,6 +5,7 @@
 #include "multi_sampler.h"
 #include "sfizz_processor.h"
 #include "signal_shape_node.h"
+#include "midi_script_node.h"
 #include "cache_processor.h"
 #include "pan_processor.h"
 #include "gain_processor.h"
@@ -503,33 +504,41 @@ void GraphProcessor::rebuildGraph(NodeGraph& graph, Transport& transport) {
             return false;
         };
         if (isTonalSynthNodeForPin(node)) {
-            bool hasAT = false;
+            // Aftertouch is system-managed (auto-created here, never chosen by
+            // the user), and it's consumed as the block MEAN in terrain_synth
+            // (averaged across the whole block to stay smooth). That makes it a
+            // block-rate value, so its pin is Param (orange), not Signal
+            // (amber). Match by name regardless of kind, and normalize any
+            // existing Signal Aftertouch pin from older projects to Param -
+            // safe precisely because this pin is system-managed, not a
+            // user-set type we'd be overriding.
+            Pin* existingAT = nullptr;
             for (auto& p : node.pinsIn)
-                if (p.kind == PinKind::Signal && p.name == "Aftertouch") {
-                    hasAT = true; break;
-                }
-            if (!hasAT) {
+                if (p.name == "Aftertouch") { existingAT = &p; break; }
+            if (existingAT) {
+                existingAT->kind = PinKind::Param;
+            } else {
                 Pin atPin;
                 atPin.id = graph.allocId();
                 atPin.name = "Aftertouch";
-                atPin.kind = PinKind::Signal;
+                atPin.kind = PinKind::Param;
                 atPin.isInput = true;
                 atPin.channels = 1;
                 node.pinsIn.push_back(atPin);
             }
-            // Normalize pin order: keep the Aftertouch signal input AFTER
-            // every other input pin (MIDI, Position / Sig axes). It's
-            // appended here at graph-build time, but adding a Position axis
-            // in the wavetable editor later push_backs a new Position pin
-            // behind the existing Aftertouch, leaving Aftertouch wedged
-            // between two Position inputs. Stable-partition moves the single
-            // Aftertouch pin to the end while preserving every other pin's
-            // relative order. Runs every build, so it also normalizes the
-            // order of projects saved with the old wedged layout. Links
-            // reference pins by id, so reordering never breaks a cable.
+            // Normalize pin order: keep the Aftertouch input AFTER every other
+            // input pin (MIDI, Position / Sig axes). It's appended here at
+            // graph-build time, but adding a Position axis in the wavetable
+            // editor later push_backs a new Position pin behind the existing
+            // Aftertouch, leaving Aftertouch wedged between two Position
+            // inputs. Stable-partition moves the single Aftertouch pin to the
+            // end while preserving every other pin's relative order. Runs every
+            // build, so it also normalizes the order of projects saved with the
+            // old wedged layout. Links reference pins by id, so reordering
+            // never breaks a cable.
             std::stable_partition(node.pinsIn.begin(), node.pinsIn.end(),
                 [](const Pin& p) {
-                    return !(p.kind == PinKind::Signal && p.name == "Aftertouch");
+                    return p.name != "Aftertouch";
                 });
         }
 
@@ -592,6 +601,8 @@ void GraphProcessor::rebuildGraph(NodeGraph& graph, Transport& transport) {
             proc = std::make_unique<TerrainSynthProcessor>(node, transport);
         } else if (node.type == NodeType::SignalShape) {
             proc = std::make_unique<SignalShapeProcessor>(node, transport);
+        } else if (node.type == NodeType::MidiScript) {
+            proc = std::make_unique<MidiScriptProcessor>(node, transport);
         } else if (node.type == NodeType::MidiInput) {
             proc = std::make_unique<MidiInputProcessor>(node);
         } else if (node.type == NodeType::Effect && node.script.rfind("__spectrumtap__", 0) == 0) {
@@ -761,6 +772,11 @@ void GraphProcessor::rebuildGraph(NodeGraph& graph, Transport& transport) {
         }
     }
 
+    // Per-output MIDI channel filters for multi-output MidiScript nodes. Keyed
+    // by (sourceNodeId, midiOutputIndex) so all cables leaving the same output
+    // pin share one filter node. Populated lazily in the link loop below.
+    std::map<std::pair<int,int>, juce::AudioProcessorGraph::NodeID> midiOutFilters;
+
     // Create connections based on our links
     for (auto& link : graph.links) {
         // Find source node and pin
@@ -929,10 +945,56 @@ void GraphProcessor::rebuildGraph(NodeGraph& graph, Transport& transport) {
             // Audio + MIDI: connect as before
             processorGraph->addConnection({{effectiveSrc, 0}, {dstGraphId, 0}});
             processorGraph->addConnection({{effectiveSrc, 1}, {dstGraphId, 1}});
-            processorGraph->addConnection({
-                {effectiveSrc, juce::AudioProcessorGraph::midiChannelIndex},
-                {dstGraphId, juce::AudioProcessorGraph::midiChannelIndex}
-            });
+
+            // Multi-output MIDI: a MidiScript or WASM Script node with >1 MIDI
+            // output pin tags each emitted event with channel = (output index
+            // + 1). Splice a per-output channel filter between source and
+            // destination so each output pin behaves as an independent
+            // single-stream cable. With a single MIDI output (the common case)
+            // we connect directly.
+            int midiOutCount = 0, thisMidiOutIdx = -1;
+            if (srcKind == PinKind::Midi) {
+                for (auto& sn : graph.nodes) {
+                    if (sn.id != srcNodeId) continue;
+                    if (sn.type == NodeType::MidiScript ||
+                        sn.type == NodeType::Script) {
+                        int idx = 0;
+                        for (auto& pin : sn.pinsOut) {
+                            if (pin.kind != PinKind::Midi) continue;
+                            if (pin.id == link.startPin) thisMidiOutIdx = idx;
+                            ++idx;
+                        }
+                        midiOutCount = idx;
+                    }
+                    break;
+                }
+            }
+
+            if (midiOutCount > 1 && thisMidiOutIdx >= 0) {
+                auto key = std::make_pair(srcNodeId, thisMidiOutIdx);
+                auto found = midiOutFilters.find(key);
+                juce::AudioProcessorGraph::NodeID filterId;
+                if (found != midiOutFilters.end()) {
+                    filterId = found->second;
+                } else {
+                    auto filt = std::make_unique<MidiChannelFilterProcessor>(thisMidiOutIdx + 1);
+                    filt->enableAllBuses();
+                    auto filtNode = processorGraph->addNode(std::move(filt));
+                    filterId = filtNode->nodeID;
+                    midiOutFilters[key] = filterId;
+                    processorGraph->addConnection({
+                        {effectiveSrc, juce::AudioProcessorGraph::midiChannelIndex},
+                        {filterId, juce::AudioProcessorGraph::midiChannelIndex}});
+                }
+                processorGraph->addConnection({
+                    {filterId, juce::AudioProcessorGraph::midiChannelIndex},
+                    {dstGraphId, juce::AudioProcessorGraph::midiChannelIndex}});
+            } else {
+                processorGraph->addConnection({
+                    {effectiveSrc, juce::AudioProcessorGraph::midiChannelIndex},
+                    {dstGraphId, juce::AudioProcessorGraph::midiChannelIndex}
+                });
+            }
         }
     }
 

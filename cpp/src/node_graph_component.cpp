@@ -8,7 +8,9 @@
 #include "trigger_node.h"
 #include "midi_mod_node.h"
 #include "xy_pad.h"
+#include "control_bank.h"
 #include "signal_shape_node.h"
+#include "midi_script_editor.h"
 #include "convolution_processor.h"
 #include "soundfont_processor.h"
 #include "builtin_effects.h"
@@ -128,6 +130,7 @@ juce::Colour NodeGraphComponent::getNodeColor(const Node& node) const {
         case NodeType::TerrainSynth:  return juce::Colour(120, 60, 100);
         case NodeType::SignalShape:   return juce::Colour(180, 120, 40);
         case NodeType::MidiInput:     return juce::Colour(50, 130, 70); // green - matches MIDI wire color
+        case NodeType::MidiScript:    return juce::Colour(40, 140, 90); // green family - a MIDI generator
         default:                      return juce::Colour(80, 80, 80);
     }
 }
@@ -715,23 +718,42 @@ Node* NodeGraphComponent::nodeAtPoint(juce::Point<float> canvasPos) {
     return nullptr;
 }
 
-int NodeGraphComponent::pinAtPoint(juce::Point<float> canvasPos, bool& isOutput) {
+int NodeGraphComponent::pinAtPoint(juce::Point<float> canvasPos, bool& isOutput, int wantInput) {
+    // Return the CLOSEST pin to the cursor, not merely the first one found in
+    // iteration order. The old "first within radius, outputs before inputs"
+    // logic had two failure modes: (1) when two pins were both in range it
+    // returned whichever was iterated first rather than the nearer one, and
+    // (2) it always preferred outputs, so when dropping a cable onto an input
+    // pin that happened to sit near some output pin (e.g. the source node's own
+    // output, or an adjacent node's output), it returned that output instead -
+    // making the drop's direction check fail and silently refusing the
+    // connection. That's exactly why dragging "Signal Out" onto a synth's
+    // bottom-left "Aftertouch" input could fail while a higher input succeeded.
+    //
+    // wantInput: -1 = accept either direction (starting a drag), 0 = only
+    // output pins, 1 = only input pins. Drag/drop pass the opposite of the
+    // source pin's direction so a target pin can never resolve to the wrong
+    // side.
     float hitRadius = PIN_RADIUS * 2;
+    int   bestPin = -1;
+    bool  bestIsOut = false;
+    float bestDist = hitRadius;
     for (auto& node : graph.nodes) {
-        for (auto& pin : node.pinsOut) {
-            if (getPinPosition(node, pin).getDistanceFrom(canvasPos) < hitRadius) {
-                isOutput = true;
-                return pin.id;
+        if (wantInput != 1) {
+            for (auto& pin : node.pinsOut) {
+                float d = getPinPosition(node, pin).getDistanceFrom(canvasPos);
+                if (d < bestDist) { bestDist = d; bestPin = pin.id; bestIsOut = true; }
             }
         }
-        for (auto& pin : node.pinsIn) {
-            if (getPinPosition(node, pin).getDistanceFrom(canvasPos) < hitRadius) {
-                isOutput = false;
-                return pin.id;
+        if (wantInput != 0) {
+            for (auto& pin : node.pinsIn) {
+                float d = getPinPosition(node, pin).getDistanceFrom(canvasPos);
+                if (d < bestDist) { bestDist = d; bestPin = pin.id; bestIsOut = false; }
             }
         }
     }
-    return -1;
+    if (bestPin >= 0) isOutput = bestIsOut;
+    return bestPin;
 }
 
 int NodeGraphComponent::linkAtPoint(juce::Point<float> canvasPos) {
@@ -1074,7 +1096,10 @@ void NodeGraphComponent::mouseDrag(const juce::MouseEvent& e) {
         //     either control kind drive either control input.
         auto canvasPos = screenToCanvas(e.position);
         bool isOut = false;
-        int hovered = pinAtPoint(canvasPos, isOut);
+        // Only consider pins on the opposite side from the source: dragging
+        // from an output looks for an input target and vice-versa. This stops a
+        // nearby output pin from shadowing the input the user is aiming at.
+        int hovered = pinAtPoint(canvasPos, isOut, dragPinIsOutput ? 1 : 0);
         bool valid = false;
         if (hovered >= 0 && hovered != dragPinId && isOut != dragPinIsOutput) {
             // Look up both pins' kinds and check compatibility
@@ -1122,7 +1147,10 @@ void NodeGraphComponent::mouseUp(const juce::MouseEvent& e) {
         // compatible (Param↔Signal counts as compatible).
         auto canvasPos = screenToCanvas(e.position);
         bool isOut;
-        int targetPin = pinAtPoint(canvasPos, isOut);
+        // Match the highlight logic: only accept a target on the opposite side
+        // from the source pin, so a nearby output can't shadow the intended
+        // input (which silently refused the connection - the Aftertouch bug).
+        int targetPin = pinAtPoint(canvasPos, isOut, dragPinIsOutput ? 1 : 0);
         if (targetPin >= 0 && isOut != dragPinIsOutput && targetPin != dragPinId) {
             PinKind srcKind = PinKind::Audio, dstKind = PinKind::Audio;
             bool gotSrc = false, gotDst = false;
@@ -1223,6 +1251,26 @@ void NodeGraphComponent::mouseDoubleClick(const juce::MouseEvent& e) {
         return;
     }
 
+    // Double-click a MIDI Script node opens its program editor.
+    if (node->type == NodeType::MidiScript) {
+        int captured = node->id;
+        auto* editor = new MidiScriptEditorComponent(graph, captured,
+            [this]() {
+                if (onNodeEdited) onNodeEdited();
+                repaint();
+            });
+        juce::DialogWindow::LaunchOptions opts;
+        opts.content.setOwned(editor);
+        opts.dialogTitle = "MIDI Script: " + juce::String(node->name);
+        opts.dialogBackgroundColour = juce::Colour(22, 22, 28);
+        opts.escapeKeyTriggersCloseButton = true;
+        opts.useNativeTitleBar = false;
+        opts.resizable = true;
+        opts.componentToCentreAround = this;
+        SoundShop::launchToolDialog(opts);
+        return;
+    }
+
     // Double-click a Signal Shape node opens its editor. XY Pad nodes
     // share NodeType::SignalShape but use a different dedicated editor
     // (xy_pad.h) - keep that opening on double-click too. The
@@ -1234,6 +1282,22 @@ void NodeGraphComponent::mouseDoubleClick(const juce::MouseEvent& e) {
             juce::DialogWindow::LaunchOptions opts;
             opts.content.setOwned(pad);
             opts.dialogTitle = "XY Pad";
+            opts.dialogBackgroundColour = juce::Colour(25, 25, 32);
+            opts.escapeKeyTriggersCloseButton = true;
+            opts.useNativeTitleBar = false;
+            opts.resizable = true;
+            opts.componentToCentreAround = this;
+            if (auto* dlg = SoundShop::launchToolDialog(opts))
+                dlg->setResizeLimits(320, 400, 6000, 6000);
+        } else if (node->script.rfind("__controlbank__", 0) == 0) {
+            auto* bank = new ControlBankComponent(graph, captured,
+                [this]() {
+                    if (onNodeEdited) onNodeEdited();
+                    repaint();
+                });
+            juce::DialogWindow::LaunchOptions opts;
+            opts.content.setOwned(bank);
+            opts.dialogTitle = "Control Bank: " + juce::String(node->name);
             opts.dialogBackgroundColour = juce::Colour(25, 25, 32);
             opts.escapeKeyTriggersCloseButton = true;
             opts.useNativeTitleBar = false;
@@ -1437,8 +1501,10 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
     // underlying node, with no behavior the user can't reach by editing
     // the shape + trigger expression inside the SignalShape editor.
     sigMenu.addItem(130, "Signal Shape (LFO / Envelope)");
+    sigMenu.addItem(131, "MIDI Script (algorithmic MIDI)");
     sigMenu.addSeparator();
     sigMenu.addItem(133, "XY Pad");
+    sigMenu.addItem(135, "Control Bank");
     sigMenu.addItem(134, "Spectrum Tap");
     sigMenu.addSeparator();
     sigMenu.addItem(140, "Spectrum Analyzer");
@@ -1622,8 +1688,43 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
                 opts.useNativeTitleBar = false;
                 opts.resizable = true;
                 opts.componentToCentreAround = this;
-                SoundShop::launchToolDialog(opts);
+                if (auto* dlg = SoundShop::launchToolDialog(opts))
+                    dlg->setResizeLimits(320, 400, 6000, 6000);
             }
+            return;
+        } else if (result == 135) {
+            // Control Bank: a bank of manual macro faders. Each slider emits
+            // one control-signal output (0..1) you can wire to any param. Same
+            // NodeType::SignalShape family as XY Pad / Signal Shape, tagged by
+            // the "__controlbank__" script and handled by SignalShapeProcessor's
+            // control-bank branch. Starts with 4 sliders; add/remove in the
+            // editor (which opens immediately, like XY Pad / Wavetable).
+            const int kStartSliders = 4;
+            std::vector<Pin> outs;
+            for (int i = 0; i < kStartSliders; ++i)
+                outs.push_back(Pin{0, "Slider " + std::to_string(i + 1),
+                                   PinKind::Signal, false, 1});
+            auto& n = graph.addNode("Control Bank", NodeType::SignalShape,
+                                    {}, outs, {p.x, p.y});
+            n.script = "__controlbank__"; // vertical by default
+            for (int i = 0; i < kStartSliders; ++i)
+                n.params.push_back({"Slider " + std::to_string(i + 1), 0.5f, 0.0f, 1.0f});
+
+            int newNodeId = n.id;
+            auto* bank = new ControlBankComponent(graph, newNodeId,
+                [this]() {
+                    if (onNodeEdited) onNodeEdited();
+                    repaint();
+                });
+            juce::DialogWindow::LaunchOptions opts;
+            opts.content.setOwned(bank);
+            opts.dialogTitle = "Control Bank: " + juce::String(n.name);
+            opts.dialogBackgroundColour = juce::Colour(25, 25, 32);
+            opts.escapeKeyTriggersCloseButton = true;
+            opts.useNativeTitleBar = false;
+            opts.resizable = true;
+            opts.componentToCentreAround = this;
+            SoundShop::launchToolDialog(opts);
             return;
         } else if (result == 134) {
             // Spectrum Tap - insert inline on audio for frequency analysis.
@@ -1653,6 +1754,37 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
                 n.params.push_back({"Bins",   64.0f,   16.0f, 512.0f});
             else if (result == 141)
                 n.params.push_back({"Window", 1024.0f, 256.0f, 4096.0f});
+        } else if (result == 131) {
+            // MIDI Script node - algorithmic MIDI generator. Runs a small
+            // program (statements + persistent state + MIDI emit functions)
+            // once per sample and outputs MIDI live. Default pins: one merged
+            // "MIDI In" and one "MIDI Out 1"; the editor lets the user add
+            // Signal inputs (s1..sN) and more MIDI outputs. See
+            // midi_script_node.h.
+            auto& n = graph.addNode("MIDI Script", NodeType::MidiScript,
+                {Pin{0, "MIDI In", PinKind::Midi, true}},
+                {Pin{0, "MIDI Out 1", PinKind::Midi, false}},
+                {p.x, p.y});
+
+            MidiScriptDoc seed = MidiScriptDoc::defaultDoc();
+            n.script = seed.encode();
+
+            int newNodeId = n.id;
+            auto* editor = new MidiScriptEditorComponent(graph, newNodeId,
+                [this]() {
+                    if (onNodeEdited) onNodeEdited();
+                    repaint();
+                });
+            juce::DialogWindow::LaunchOptions opts;
+            opts.content.setOwned(editor);
+            opts.dialogTitle = "MIDI Script: " + juce::String(n.name);
+            opts.dialogBackgroundColour = juce::Colour(22, 22, 28);
+            opts.escapeKeyTriggersCloseButton = true;
+            opts.useNativeTitleBar = false;
+            opts.resizable = true;
+            opts.componentToCentreAround = this;
+            SoundShop::launchToolDialog(opts);
+            return;
         } else if (result == 130) {
             // Signal Shape node. Single menu item replacing the old
             // LFO / LFO-expression / Envelope-expression trio - the
@@ -2392,10 +2524,15 @@ void NodeGraphComponent::showNodeMenu(Node& node) {
         menu.addItem(180, "Envelope (AHDSR)...");
 
     // Signal Shape gets an "Edit Shape" entry (and we hide it for the
-    // sibling XY Pad node, which shares NodeType::SignalShape but has
-    // its own dedicated editor opened via double-click).
-    if (node.type == NodeType::SignalShape && node.script != "__xypad__")
+    // sibling XY Pad / Control Bank nodes, which share NodeType::SignalShape
+    // but have their own dedicated editors opened via double-click).
+    if (node.type == NodeType::SignalShape && node.script != "__xypad__"
+        && node.script.rfind("__controlbank__", 0) != 0)
         menu.addItem(190, "Edit Shape...");
+    if (node.type == NodeType::SignalShape && node.script.rfind("__controlbank__", 0) == 0)
+        menu.addItem(191, "Edit Control Bank...");
+    if (node.type == NodeType::MidiScript)
+        menu.addItem(192, "Edit Program...");
     // Mute / Solo
     menu.addItem(160, node.muted ? "Unmute" : "Mute", true, node.muted);
     menu.addItem(161, node.soloed ? "Unsolo" : "Solo", true, node.soloed);
@@ -2575,6 +2712,40 @@ void NodeGraphComponent::showNodeMenu(Node& node) {
             juce::DialogWindow::LaunchOptions opts;
             opts.content.setOwned(editor);
             opts.dialogTitle = "Signal Shape: " + juce::String(node->name);
+            opts.dialogBackgroundColour = juce::Colour(22, 22, 28);
+            opts.escapeKeyTriggersCloseButton = true;
+            opts.useNativeTitleBar = false;
+            opts.resizable = true;
+            opts.componentToCentreAround = this;
+            SoundShop::launchToolDialog(opts);
+        } else if (result == 191) {
+            // Open the Control Bank editor for an existing node.
+            int captured = nodeId;
+            auto* bank = new ControlBankComponent(graph, captured,
+                [this]() {
+                    if (onNodeEdited) onNodeEdited();
+                    repaint();
+                });
+            juce::DialogWindow::LaunchOptions opts;
+            opts.content.setOwned(bank);
+            opts.dialogTitle = "Control Bank: " + juce::String(node->name);
+            opts.dialogBackgroundColour = juce::Colour(25, 25, 32);
+            opts.escapeKeyTriggersCloseButton = true;
+            opts.useNativeTitleBar = false;
+            opts.resizable = true;
+            opts.componentToCentreAround = this;
+            SoundShop::launchToolDialog(opts);
+        } else if (result == 192) {
+            // Open the MIDI Script editor for an existing node.
+            int captured = nodeId;
+            auto* editor = new MidiScriptEditorComponent(graph, captured,
+                [this]() {
+                    if (onNodeEdited) onNodeEdited();
+                    repaint();
+                });
+            juce::DialogWindow::LaunchOptions opts;
+            opts.content.setOwned(editor);
+            opts.dialogTitle = "MIDI Script: " + juce::String(node->name);
             opts.dialogBackgroundColour = juce::Colour(22, 22, 28);
             opts.escapeKeyTriggersCloseButton = true;
             opts.useNativeTitleBar = false;

@@ -1,4 +1,5 @@
 #pragma once
+#include "shape_expr.h"
 #include <juce_gui_basics/juce_gui_basics.h>
 #include <vector>
 #include <string>
@@ -29,6 +30,24 @@ struct SpectralCurve {
     bool freehandMode = false;
     std::vector<std::pair<float, float>> drawnPoints;
     std::vector<float> drawnSamples;
+
+    // Authoring language for the Equation expression.
+    //   Built-in - WaveExprParser, `f` is the integer bin index over [0, N);
+    //              evaluated live at the requested N.
+    //   Lua / Python - `f` is the normalized position [0, 1]; baked once into
+    //              scriptSamples (UI thread) and resampled on evaluate(), since
+    //              the interpreters aren't safe to call from the audio thread.
+    ShapeLang lang = ShapeLang::Builtin;
+
+    // Transient (not serialized): the Lua/Python bake over normalized [0,1] and
+    // the last bake error (empty when OK). Re-baked by rebake().
+    std::vector<float> scriptSamples;
+    std::string        scriptError;
+
+    // Re-bake scriptSamples from `expression` for the current language. No-op
+    // (clears the buffer) for Built-in. Call after editing the expression /
+    // language and after decoding from a project.
+    void rebake();
 
     // Evaluate this curve at N evenly-spaced samples spanning [0, 1].
     std::vector<float> evaluate(int N) const;
@@ -85,6 +104,7 @@ private:
     juce::TextButton equationBtn, drawBtn;
     juce::TextButton freehandToggle;
     juce::TextEditor exprEditor;
+    juce::ComboBox   langCombo;   // Built-in / Lua / Python (Equation mode)
 
     juce::Rectangle<int> canvasBounds;
     int draggingIdx = -1;

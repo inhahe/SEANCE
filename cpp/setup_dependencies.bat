@@ -65,6 +65,23 @@ if exist "%BASE%third_party\wasm3\source\wasm3.h" (
 echo.
 
 :: ============================================
+:: Lua 5.4 (embedded scripting for MIDI Script / Signal Shape nodes)
+:: ============================================
+if exist "%BASE%third_party\lua\lua.h" (
+    echo [OK] Lua: Already downloaded
+) else (
+    echo [..] Downloading Lua 5.4...
+    git clone --depth 1 --branch v5.4.7 https://github.com/lua/lua.git "%BASE%third_party\lua" 2>nul
+    if exist "%BASE%third_party\lua\lua.h" (
+        echo [OK] Lua: Downloaded
+    ) else (
+        echo [SKIP] Lua: Download failed. The "Lua" script language will be disabled.
+        echo        Clone manually: git clone --branch v5.4.7 https://github.com/lua/lua third_party/lua
+    )
+)
+echo.
+
+:: ============================================
 :: Rubber Band (pitch shifting / time stretching)
 :: ============================================
 if exist "%BASE%third_party\rubberband\rubberband\RubberBandStretcher.h" (

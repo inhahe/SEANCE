@@ -80,6 +80,31 @@ inline float midiNoteToFrequency(int note, TuningSystem tuning = TuningSystem::E
     return concertPitch * std::pow(2.0f, ((float)(note - 69) + centsOff / 100.0f) / 12.0f);
 }
 
+// Total pitch deviation, in cents, of `note` under (tuning, concertPitch)
+// relative to a plugin that renders the raw MIDI note number at standard
+// 12-TET / A=440. This is exactly how far a host must pitch-bend such a plugin
+// to reach the intended frequency. It splits into two parts:
+//   - a per-pitch-class TEMPERAMENT component (offsets[note%12]) that differs
+//     between notes (zero for Equal12), and
+//   - a uniform CONCERT-PITCH component (1200*log2(concertPitch/440)) that is
+//     the same for every note.
+// The uniform component alone is representable on a single shared MIDI channel;
+// the temperament component needs a separate channel per note (MPE).
+inline float tuningCentsDeviation(int note, TuningSystem tuning = TuningSystem::Equal12,
+                                  float concertPitch = 440.0f) {
+    const float* offsets = tuningCentsOffset(tuning);
+    float temperamentCents = offsets[note % 12];
+    float concertCents = 1200.0f * std::log2(concertPitch / 440.0f);
+    return temperamentCents + concertCents;
+}
+
+// The uniform (pitch-class-independent) concert-pitch component, in cents.
+// This is the only part of the tuning that can be delivered on one shared
+// channel, so it is what the cable applies when collapsing to a non-MPE plugin.
+inline float concertPitchCents(float concertPitch = 440.0f) {
+    return 1200.0f * std::log2(concertPitch / 440.0f);
+}
+
 // Common concert pitch standards
 struct ConcertPitchPreset {
     const char* name;

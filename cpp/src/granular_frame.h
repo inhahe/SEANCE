@@ -6,6 +6,30 @@
 
 namespace SoundShop {
 
+// Maximum grain length (ms) offered by the granular frame editor's grain-length
+// slider, and the reference "max freeze window" size. A captured source is
+// always at least this long (the song capture grabs ~1 s, the editor caps the
+// slider at min(this, captured duration)), so the freeze window - whose width
+// is the grain length - can range up to its max entirely inside the stored
+// buffer, leaving room to slide the window as a sub-selection of the capture.
+inline constexpr int kGranularMaxGrainMs = 500;
+
+// Configurable overlapping-grain-count bounds for the two grain-cloud freeze
+// modes (AsyncGranular, PitchSyncGrains). The granular voice clamps grainCount
+// to this range and normalises gain by 2/grainCount so the level is constant.
+// The frame-editor and capture-dialog "Grains" controls use it as their range.
+// 4 is the historical fixed count (kept the default for backward compat).
+inline constexpr int kGranularMinGrains = 2;
+inline constexpr int kGranularMaxGrains = 16;
+
+// Power-of-two FFT sizes offered by the Spectral-freeze "FFT size" pickers (in
+// the frame editor and the capture dialogs). The UI prepends an "Auto" entry
+// that maps to fftSize == 0 (the voice auto-picks the largest size that fits
+// the window, <= 2048). Shared so the two UIs stay in lockstep. Capped at 8192
+// to match the voice's hard cap (granular_freeze.cpp SpectralFreeze case).
+inline constexpr int kSpectralFftSizes[]   = {256, 512, 1024, 2048, 4096, 8192};
+inline constexpr int kNumSpectralFftSizes  = 6;
+
 // Picks which "sustain the marker spot" algorithm the granular layer runs
 // while a note is held on this frame. None is strictly better than the
 // others; they each have a unique sonic character:
@@ -35,6 +59,62 @@ enum class GranularFreezeMode : int {
     PitchSyncGrains = 2,
     SpectralFreeze  = 3,
 };
+
+// Freeze-window WIDTH sentinels (windowLen / GranularFrame::windowLen). A
+// non-negative windowLen is an explicit absolute width in samples; the two
+// negative values below are "auto" markers resolved by resolveAutoWindowLen():
+//
+//   kWindowLegacyAuto (-1): the original "auto = exactly one grainLength wide"
+//       window. EVERY frame saved before per-method auto existed carries -1, and
+//       it MUST keep resolving to grainLen so those frames stay byte-for-byte
+//       identical on reload. Do not repurpose this value.
+//
+//   kWindowAutoPerMethod (-2): "auto = autoWindowMultiplier(mode) x grainLength",
+//       recomputed whenever the grain length or the freeze method changes. New
+//       captures / freshly-created frames default to this so the grain-cloud
+//       modes get several grain-periods of roam room out of the box (a 1x window
+//       collapses AsyncGranular / PitchSyncGrains into a one-grain loop). It
+//       only becomes an explicit (>=0) width once the user drags the band or
+//       moves a capture window slider.
+inline constexpr int kWindowLegacyAuto    = -1;
+inline constexpr int kWindowAutoPerMethod = -2;
+
+// Per-method auto window-width multiplier (x grainLength) used by the
+// kWindowAutoPerMethod sentinel. The grain-cloud modes (AsyncGranular,
+// PitchSyncGrains) need multiple grain-periods of roam room or they degenerate
+// into a single repeating grain, so they default to 4x. CrossfadeLoop's window
+// IS the loop body and SpectralFreeze's window IS one analysis frame, so both
+// default to 1x (which matches the historical one-grain-wide behaviour). If you
+// retune these the change is forward-only: it affects newly captured frames
+// (which carry the -2 sentinel); frames already saved keep whatever width they
+// resolved to, so old projects never shift.
+inline int autoWindowMultiplier(GranularFreezeMode mode) {
+    switch (mode) {
+        case GranularFreezeMode::AsyncGranular:
+        case GranularFreezeMode::PitchSyncGrains:
+            return 4;
+        case GranularFreezeMode::CrossfadeLoop:
+        case GranularFreezeMode::SpectralFreeze:
+        default:
+            return 1;
+    }
+}
+
+// Resolve a (possibly sentinel) windowLen into a freeze-window WIDTH in samples.
+// Shared by the audio voice (granular_freeze) and the frame editor / capture
+// preview so audition, held notes, and the on-screen band all use an identical
+// width. The result is intentionally NOT floored or capped here - the voice
+// applies its own clamps (cloud modes floor the width at grainLen; every mode
+// caps at srcLen).
+//   windowLen >= 0                    -> explicit width (returned as-is).
+//   windowLen == kWindowAutoPerMethod -> autoWindowMultiplier(mode) * grainLen.
+//   anything else (incl. kWindowLegacyAuto) -> grainLen (byte-for-byte legacy).
+inline int resolveAutoWindowLen(int windowLen, GranularFreezeMode mode, int grainLen) {
+    if (windowLen >= 0) return windowLen;
+    if (windowLen == kWindowAutoPerMethod)
+        return autoWindowMultiplier(mode) * grainLen;
+    return grainLen;
+}
 
 // GranularFrame holds a multi-second window of mono PCM that the synth
 // plays back via overlap-add granular synthesis (4-voice Hann-windowed
@@ -115,6 +195,43 @@ struct GranularFrame : public IWavetableFrame {
     // source picking jittered start positions.
     int grainLength = 4800;  // ~100 ms @ 48 kHz
 
+    // Start sample of the freeze WINDOW within `source`. The freeze window is
+    // the sub-selection of the captured buffer that every freeze mode actually
+    // operates on: CrossfadeLoop loops [windowStart, windowStart+windowLen),
+    // the granular modes roam inside it, SpectralFreeze analyses inside it. The
+    // editor draws it as a draggable/resizable band over the source thumbnail.
+    //
+    // -1 is the sentinel "auto-centre": the voice positions the window with the
+    // historical centred-with-lookahead formula
+    // max(0, (srcLen - (grainLength + grainLength/2)) / 2). All frames captured
+    // or saved before this field existed decode as -1, so they sound exactly as
+    // before. Fresh captures also leave it -1 (centred, matching the audition);
+    // it only becomes an explicit offset once the user drags the band.
+    int windowStart = -1;
+
+    // Width (in samples) of the freeze window. Decoupled from grainLength: the
+    // window is the region the freeze roams over, the grain is the size of each
+    // overlapping Hann grain inside it. They are different scales - only
+    // CrossfadeLoop wants them equal. A window WIDER than the grain is what
+    // makes AsyncGranular and PitchSyncGrains diverge: the cloud needs multiple
+    // grain-periods of roam room for pitch-period snapping to matter. The
+    // window must satisfy grainLength <= windowLen <= srcLen.
+    //
+    // Two negative sentinels (see kWindowLegacyAuto / kWindowAutoPerMethod and
+    // resolveAutoWindowLen above):
+    //   kWindowLegacyAuto (-1): "auto = exactly grainLength" - the original
+    //       one-grain-wide window. Every pre-field frame decodes as -1 and keeps
+    //       sounding byte-for-byte the same.
+    //   kWindowAutoPerMethod (-2): "auto = autoWindowMultiplier(mode) x
+    //       grainLength" - the cloud modes get roam room, the loop/FFT modes
+    //       stay 1x. This is the default for freshly created / captured frames,
+    //       so a new Async/PitchSync capture no longer collapses into a loop.
+    // The editor clamps windowLen up to at least grainLength whenever the grain
+    // grows, and seeds a fresh explicit (>=0) width when the user resizes the
+    // band. On disk the auto state rides a dedicated flag field so -2 survives a
+    // round-trip without breaking the +1-biased width encoding (see encodeBody).
+    int windowLen = kWindowAutoPerMethod;
+
     // Source pitch in Hz. The synth scales source reads by
     // noteHz / embeddedPitchHz so MIDI pitch tracks. Default A4 = 440 Hz
     // (set at construction); when YIN detection lands the capture
@@ -137,6 +254,26 @@ struct GranularFrame : public IWavetableFrame {
     // decode with the previous hard-coded ~10 ms (480-sample) default
     // so their audible character is preserved.
     int crossfadeSamples = 2400;  // ~50 ms @ 48 kHz
+
+    // Number of overlapping Hann grains in the OLA cloud, for the two
+    // grain-cloud freeze modes (AsyncGranular, PitchSyncGrains). More grains
+    // = denser, smoother cloud (and a softer per-grain identity); fewer = a
+    // sparser, more granular stutter. Ignored by CrossfadeLoop and
+    // SpectralFreeze. The voice normalises gain by 2/grainCount (Hann COLA at
+    // grainLength/grainCount hop), so the level stays constant as you change
+    // it. Range [2, 16]; 4 is the historical hard-coded value (kAsync/kPS), so
+    // frames saved before this field existed decode as 4 and sound identical.
+    int grainCount = 4;
+
+    // Requested FFT size (samples, a power of two) for SpectralFreeze. Larger
+    // = finer frequency resolution (more bins = N/2+1) but a coarser time
+    // window; must fit inside the freeze window. Ignored by the other three
+    // modes. 0 == "auto": the voice picks the largest power of two that fits
+    // the window, capped at 2048 (the historical behaviour), so frames saved
+    // before this field existed decode as 0 and sound identical. A non-zero
+    // value is clamped to the largest power of two <= min(value, window,
+    // 8192) and floored at 256.
+    int fftSize = 0;
 
     // Which capture source originally produced this frame's PCM:
     //   -1 = unknown / not applicable (frame built from scratch, duplicated,

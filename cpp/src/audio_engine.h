@@ -478,6 +478,43 @@ public:
         previewEmbeddedPitchHz.store(hz > 0.0f ? hz : 440.0f,
                                      std::memory_order_release);
     }
+    // Start sample of the freeze WINDOW (band) within the preview source.
+    // -1 == auto-centre (legacy behaviour); >= 0 places an explicit band of
+    // width = grainLength that every freeze mode confines its reads to. The
+    // editor's draggable selection band drives this so the audition freezes
+    // the exact sub-selection the placed frame will. Safe to call from any
+    // thread; the voice re-anchors when it changes.
+    void setPreviewWindowStart(int s) {
+        previewWindowStart.store(s, std::memory_order_release);
+    }
+    int  getPreviewWindowStart() const {
+        return previewWindowStart.load(std::memory_order_acquire);
+    }
+    // Freeze-window WIDTH in samples; -1 == auto (== grain length). Decoupled
+    // from grain length so the cloud modes get multi-grain roam room.
+    void setPreviewWindowLen(int n) {
+        previewWindowLen.store(n, std::memory_order_release);
+    }
+    int  getPreviewWindowLen() const {
+        return previewWindowLen.load(std::memory_order_acquire);
+    }
+    // Number of overlapping grains in the OLA cloud (AsyncGranular /
+    // PitchSyncGrains audition). <= 0 == auto (4). The voice clamps to
+    // [2, 16] and normalises gain by 2/count so level is constant.
+    void setPreviewGrainCount(int n) {
+        previewGrainCount.store(n, std::memory_order_release);
+    }
+    int  getPreviewGrainCount() const {
+        return previewGrainCount.load(std::memory_order_acquire);
+    }
+    // Requested SpectralFreeze FFT size (power of two); 0 == auto. The voice
+    // clamps to the largest pow2 fitting the window.
+    void setPreviewFftSize(int n) {
+        previewFftSize.store(n, std::memory_order_release);
+    }
+    int  getPreviewFftSize() const {
+        return previewFftSize.load(std::memory_order_acquire);
+    }
     void setPreviewMode(PreviewMode m) {
         previewMode.store((int)m, std::memory_order_release);
     }
@@ -502,6 +539,10 @@ public:
         previewCrossfadeSamples.store(0, std::memory_order_release);
         previewGrainRatio.store(1.0f, std::memory_order_release);
         previewEmbeddedPitchHz.store(440.0f, std::memory_order_release);
+        previewWindowStart.store(-1, std::memory_order_release);
+        previewWindowLen.store(-1, std::memory_order_release);
+        previewGrainCount.store(0, std::memory_order_release);   // 0 == auto
+        previewFftSize.store(0, std::memory_order_release);      // 0 == auto
         previewSongPosSamples.store(0, std::memory_order_release);
         grainNeedsReinit = true;  // force voice re-anchor on next GrainLoop entry
     }
@@ -513,6 +554,10 @@ private:
     std::atomic<int>      previewCrossfadeSamples { 0 };
     std::atomic<float>    previewGrainRatio { 1.0f };
     std::atomic<float>    previewEmbeddedPitchHz { 440.0f };
+    std::atomic<int>      previewWindowStart { -1 };
+    std::atomic<int>      previewWindowLen { -1 };
+    std::atomic<int>      previewGrainCount { 0 };   // 0 == auto (4 grains)
+    std::atomic<int>      previewFftSize { 0 };      // 0 == auto FFT size
     std::atomic<std::shared_ptr<std::vector<float>>> previewSongPcm;
     std::atomic<std::shared_ptr<std::vector<float>>> previewGrainBuf;
     // Audio-thread-only crossfade state.

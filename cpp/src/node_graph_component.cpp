@@ -2849,26 +2849,28 @@ void NodeGraphComponent::showNodeMenu(Node& node) {
         menu.addItem(8, "MIDI Map...");
         if (node.pluginIndex >= 0)
             menu.addItem(6, "Plugin Info...");
-        // MPE handshake for hosted plugins that take MIDI: emits the MPE
-        // Configuration Message so an MPE-capable plugin interprets incoming
-        // channels 2..16 as per-note member channels. Harmless on non-MPE
-        // plugins (they ignore the RPN). Built-in synths read MPE natively
-        // and don't get this entry.
+        // "MPE mode" for a hosted plugin: a user-asserted flag telling SEANCE
+        // this plugin is itself running in MPE mode. MPE capability can't be
+        // detected reliably, so the user states it. When on, SEANCE emits the
+        // MPE Configuration Message (zone handshake) and the cable-level tuning
+        // adapter spreads each note onto its own member channel (2..16) with a
+        // full per-note tuning bend - this is what lets unequal temperaments and
+        // per-note expression reach the plugin. It also spreads a plain single-
+        // channel source automatically, so an MPE source is NOT required.
         //
-        // The label carries the caveat inline because JUCE PopupMenu items
-        // can't show hover tooltips, and the warning matters at the decision
-        // point: turning this on only helps when the MIDI feeding this plugin
-        // is actually MPE (an MPE-enabled timeline or an MPE controller wired
-        // in). With a non-MPE source every note lands on the master channel
-        // (ch 1), which a strict MPE plugin may play flat or not voice at all.
+        // The caveat is inline because JUCE PopupMenu items can't show hover
+        // tooltips and it matters at the decision point: only turn this on if
+        // the plugin really is in MPE mode. Enabling it for a plugin that is
+        // NOT in MPE mode scatters one voice's notes across channels it treats
+        // as independent, which typically makes it misbehave or go silent.
         if (node.plugin) {
             bool hasMidiIn = false;
             for (auto& p : node.pinsIn)
                 if (p.kind == PinKind::Midi) { hasMidiIn = true; break; }
             if (hasMidiIn)
                 menu.addItem(181,
-                             node.mpeEnabled ? "Disable MPE"
-                                             : "Enable MPE (needs an MPE source)",
+                             node.mpeEnabled ? "Disable MPE mode"
+                                             : "Enable MPE mode (only if plugin is in MPE mode)",
                              true, node.mpeEnabled);
         }
     }

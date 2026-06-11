@@ -382,6 +382,13 @@ private:
         std::vector<float> source;
         double             sourceSampleRate = 0.0;
         int                grainLength      = 4800;
+        // Start sample of the freeze WINDOW (band) within source. -1 ==
+        // auto-centre (legacy). Mirrors GranularFrame::windowStart so the synth
+        // freezes the exact band the editor/audition show.
+        int                windowStart      = -1;
+        // Width (samples) of the freeze window; -1 == auto (== grainLength).
+        // Decoupled from grainLength. Mirrors GranularFrame::windowLen.
+        int                windowLen        = -1;
         float              embeddedPitchHz  = 440.0f;
         // Freeze-mode for held notes. Mirrors GranularFrame::freezeMode
         // (0=CrossfadeLoop, 1=AsyncGranular, ...). The synth voice
@@ -390,6 +397,15 @@ private:
         // must too. Stored as int to avoid pulling granular_frame.h's
         // enum into this header.
         int                freezeMode       = 0;   // 0 = CrossfadeLoop
+        // Overlapping-grain count for the two grain-cloud modes (Async /
+        // Pitch-sync). Mirrors GranularFrame::grainCount; [2,16], 4 = the
+        // historical hardcoded value (byte-identical at 4). Ignored by
+        // CrossfadeLoop / SpectralFreeze.
+        int                grainCount       = 4;
+        // Requested SpectralFreeze FFT size (power-of-two). Mirrors
+        // GranularFrame::fftSize; 0 == auto (largest pow2 <= min(window,2048)).
+        // Ignored by the non-spectral modes.
+        int                fftSize          = 0;
         // Seam crossfade length in samples, used by CrossfadeLoop.
         // Clamped per-sample to [0, grainLength/2] by the reader.
         int                crossfadeSamples = 2400;

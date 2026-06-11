@@ -61,7 +61,9 @@ void GranularFrame::renderRaw(int tableSize, std::vector<float>& out) const {
 }
 
 std::string GranularFrame::encodeBody() const {
-    // <srcLen>;<srcRate>;<grainLen>;<pitchHz>;<freezeMode>;<xfadeSamples>;<s0,s1,...>
+    // <srcLen>;<srcRate>;<grainLen>;<pitchHz>;<freezeMode>;<xfadeSamples>;
+    //   <captureSourceKind+1>;<windowStart+1>;<windowLen+1>;<grainCount>;<fftSize>;
+    //   <windowAutoPerMethod>;<s0,s1,...>
     // %.4f gives 4 decimals - same density convention as SampleFrame.
     // A 1-second 48 kHz source encodes to ~280 KB of text. Big but
     // tolerable inside the length-prefixed wavetable2 body; a future
@@ -78,7 +80,31 @@ std::string GranularFrame::encodeBody() const {
        << embeddedPitchHz << ';'
        << (int)freezeMode << ';'
        << crossfadeSamples << ';'
-       << (captureSourceKind + 1) << ';';
+       << (captureSourceKind + 1) << ';'
+       // windowStart written biased by +1 so the sentinel -1 (auto-centre)
+       // stays a non-negative all-digit token like captureSourceKind. Decodes
+       // back via (token - 1): 0 -> -1 (auto), k+1 -> k (explicit offset).
+       << (windowStart + 1) << ';'
+       // windowLen, same +1 bias: 0 -> -1 (auto = grainLength), k+1 -> k. The
+       // per-method-auto sentinel (kWindowAutoPerMethod = -2) can't ride the +1
+       // bias - it would emit a non-digit "-1" token and corrupt the header run
+       // - so it's written as 0 here (an OLD reader decodes that as -1 = legacy
+       // 1x-grain auto, a graceful downgrade) and flagged by the
+       // windowAutoPerMethod field appended after fftSize below.
+       << ((windowLen == kWindowAutoPerMethod) ? 0 : (windowLen + 1)) << ';'
+       // grainCount: plain positive int (always >= 1), written as-is. Absent in
+       // pre-field projects, which default to 4 (the old hard-coded grain count).
+       << grainCount << ';'
+       // fftSize: requested SpectralFreeze FFT size, 0 == auto. Written as-is.
+       // Absent in pre-field projects, which default to 0 (auto), reproducing
+       // the original largest-pow2-<=2048 behaviour.
+       << fftSize << ';'
+       // windowAutoPerMethod flag: 1 when windowLen is the per-method-auto
+       // sentinel (-2), else 0. Appended after fftSize so both older readers
+       // (which stop consuming ints at the sample list) and older files (which
+       // lack it -> decodes as 0 = not auto) stay correct. When set, decode
+       // restores windowLen to the -2 sentinel regardless of the width token.
+       << ((windowLen == kWindowAutoPerMethod) ? 1 : 0) << ';';
     char buf[24];
     for (size_t i = 0; i < source.size(); ++i) {
         if (i > 0) ss << ',';
@@ -163,6 +189,44 @@ bool GranularFrame::decodeBody(const std::string& body) {
     // (2). Absent in pre-field projects, which correctly stay "unknown".
     if (tryOptInt(tmp)) {
         captureSourceKind = (tmp >= 1 && tmp <= 3) ? (tmp - 1) : -1;
+    }
+    // Fourth optional int: windowStart, biased by +1 on write. Absent in
+    // projects saved before this field existed, which correctly stay -1
+    // (auto-centre), reproducing their original freeze position.
+    windowStart = -1;
+    if (tryOptInt(tmp)) {
+        windowStart = (tmp >= 1) ? (tmp - 1) : -1;
+    }
+    // Fifth optional int: windowLen, biased by +1 on write. Absent in projects
+    // saved before this field existed, which stay -1 (auto = grainLength).
+    windowLen = -1;
+    if (tryOptInt(tmp)) {
+        windowLen = (tmp >= 1) ? (tmp - 1) : -1;
+    }
+    // Sixth optional int: grainCount (overlapping grains in the two cloud
+    // modes). Written as-is. Absent in pre-field projects -> 4 (the old
+    // hard-coded kAsync/kPS value), so they sound identical. Clamped [2, 16].
+    grainCount = 4;
+    if (tryOptInt(tmp)) {
+        grainCount = std::clamp(tmp, 2, 16);
+    }
+    // Seventh optional int: fftSize (requested SpectralFreeze FFT size, 0 ==
+    // auto). Written as-is. Absent in pre-field projects -> 0 (auto), which
+    // reproduces the original largest-pow2-<=2048 behaviour. A non-zero value
+    // is sanity-clamped here; the voice re-validates against the window width.
+    fftSize = 0;
+    if (tryOptInt(tmp)) {
+        fftSize = (tmp <= 0) ? 0 : std::clamp(tmp, 256, 8192);
+    }
+    // Eighth optional int: windowAutoPerMethod flag. 1 means the windowLen field
+    // is the per-method-auto sentinel (kWindowAutoPerMethod = -2): override the
+    // width we just decoded so the band auto-tracks autoWindowMultiplier(mode) x
+    // grain. Absent in pre-field projects -> 0 (never auto), so they keep the
+    // windowLen they decoded above (legacy -1 or an explicit width). The width
+    // token itself was written as 0 in this case, which decoded to -1; the
+    // override below replaces it with -2.
+    if (tryOptInt(tmp)) {
+        if (tmp == 1) windowLen = kWindowAutoPerMethod;
     }
     size_t sampleStart = pos;
 

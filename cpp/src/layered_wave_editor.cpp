@@ -139,7 +139,8 @@ void LibraryColorSwatch::mouseUp(const juce::MouseEvent& e) {
 // user clicks the Re-capture button - the host opens the capture panel and
 // routes the resulting frame back into the current library entry (so the
 // re-captured source replaces in place, doesn't accumulate as a new entry).
-class GranularFrameEditorComponent : public juce::Component {
+class GranularFrameEditorComponent : public juce::Component,
+                                     public juce::SettableTooltipClient {
 public:
     // sendAuditionIn: optional callback to route the Play button through the
     // owning synth node's pendingAudition queue instead of the AudioEngine's
@@ -159,6 +160,25 @@ public:
           onRecapture(std::move(onRecaptureIn)),
           sendAudition(std::move(sendAuditionIn))
     {
+        // Tooltip for the waveform thumbnail area (the amber selection band).
+        // Sub-region of the component with no child covering it, so the
+        // component-level tooltip shows here.
+        setTooltip(
+            "Captured source. The amber band is the freeze WINDOW - the slice "
+            "the current freeze mode actually sustains. Drag the MIDDLE to move "
+            "it; drag an EDGE to resize it. What resizing does depends on the "
+            "freeze mode:\n"
+            " - Async / Pitch-synced grains: the band is an independent window "
+            "the grains roam over (one grain wide up to the whole capture). A "
+            "wider window is what makes these two modes differ - pin it to the "
+            "grain width and they sound the same.\n"
+            " - Crossfade loop: the loop IS the whole band, so resizing sets the "
+            "loop length (grain length is unused, its slider greys out).\n"
+            " - Spectral freeze: the band sets the FFT analysis region; grain "
+            "length is unused, its slider greys out.\n"
+            "A dashed band is auto-placed; dragging or resizing places it "
+            "explicitly.");
+
         addAndMakeVisible(titleLabel);
         titleLabel.setText("Captured granular waveform",
                            juce::dontSendNotification);
@@ -182,6 +202,14 @@ public:
                           juce::Colours::white.withAlpha(0.85f));
             lab.setFont(juce::Font(11.0f));
             s.setSliderStyle(juce::Slider::LinearHorizontal);
+            // Grab the thumb relatively instead of teleporting the value to
+            // wherever the track is clicked. With the default (snaps-to-mouse
+            // == true), a single stray click low on the log-skewed Embedded
+            // pitch track jumps the value into sub-bass (~D1, 36.7 Hz) with no
+            // drag - the reported "As note was set to D1 and I never set it"
+            // surprise. Relative drag means a click does nothing until you
+            // actually move, so accidental clicks can't slam these values.
+            s.setSliderSnapsToMousePosition(false);
             s.setTextBoxStyle(juce::Slider::TextBoxRight, false, 70, 18);
             s.setRange(minV, maxV, step);
             s.setTooltip(tip);
@@ -213,6 +241,38 @@ public:
                     5.0, 500.0, 1.0);
         grainLengthSlider.setTextValueSuffix(" ms");
         grainLengthSlider.onValueChange = [this]() { onGrainLengthChanged(); };
+
+        // Number of overlapping grains in the OLA cloud. Only the two grain-
+        // cloud modes use it; greys out for Crossfade / Spectral (tooltip set
+        // per-mode in refreshGrainSliderForMode). Range matches the voice's
+        // [2, kMaxGrains] clamp.
+        setupSlider(grainCountSlider, grainCountLabel,
+                    "Grains",
+                    "How many overlapping grains make up the cloud. More = "
+                    "denser, smoother; fewer = sparser, more granular. The level "
+                    "stays constant as you change it.",
+                    2.0, (double)GrainFreezeVoice::kMaxGrains, 1.0);
+        grainCountSlider.onValueChange = [this]() { onGrainCountChanged(); };
+
+        // FFT size for Spectral freeze. Discrete powers of two + Auto (largest
+        // that fits the window). Greys out outside Spectral mode.
+        addAndMakeVisible(fftSizeLabel);
+        fftSizeLabel.setText("FFT size", juce::dontSendNotification);
+        fftSizeLabel.setColour(juce::Label::textColourId,
+                               juce::Colours::white.withAlpha(0.85f));
+        fftSizeLabel.setFont(juce::Font(11.0f));
+        addAndMakeVisible(fftSizeCombo);
+        // ID 1 == Auto (fftSize 0); IDs 2.. map to the power-of-two sizes in
+        // kFftSizes. Keep this table in sync with fftComboIdToSize / sizeToId.
+        fftSizeCombo.addItem("Auto", 1);
+        for (int i = 0; i < kNumSpectralFftSizes; ++i)
+            fftSizeCombo.addItem(juce::String(kSpectralFftSizes[i]), i + 2);
+        fftSizeCombo.setTooltip(
+            "FFT size for Spectral freeze, in samples. Larger = finer frequency "
+            "detail (more bins) but a coarser time window, and needs a wider "
+            "selection band to fit. Auto picks the largest size that fits the "
+            "band (up to 2048). Only used by Spectral freeze.");
+        fftSizeCombo.onChange = [this]() { onFftSizeChanged(); };
 
         setupSlider(crossfadeSlider, crossfadeLabel,
                     "Crossfade",
@@ -313,7 +373,10 @@ public:
             "Which 'sustain the spot' algorithm runs while a note is held:\n"
             " - Crossfade loop: faithful tape loop with a short seam blend\n"
             " - Async granular: many grains at random offsets - frozen blur\n"
-            " - Pitch-synced grains: one-cycle loop locked to embedded pitch\n"
+            " - Pitch-synced grains: like Async but grain origins snap to the\n"
+            "   detected pitch period, so the cloud has a clean, stable pitch\n"
+            "   (only differs from Async when the freeze window is wider than\n"
+            "   the grain - widen the amber band to give it roam room)\n"
             " - Spectral freeze: FFT freeze - ethereal pad sustain");
         freezeModeCombo.onChange = [this]() { onFreezeModeChanged(); };
 
@@ -410,6 +473,39 @@ public:
         // Centre baseline.
         g.setColour(juce::Colours::white.withAlpha(0.2f));
         g.drawHorizontalLine((int)midY, r.getX() + 2.0f, r.getRight() - 2.0f);
+
+        // ---- Freeze-window selection band ----
+        // The sub-selection the current freeze mode operates on. Amber so it
+        // reads clearly against the blue waveform. A dashed outline means "auto"
+        // (windowStart == -1, follows the source); a solid outline means the
+        // user has placed it explicitly. Drag the middle to move it, the edges
+        // to resize it (floor = minWindowSamples(), ceiling = whole capture).
+        const int wLen = std::min(effectiveWindowLen(), N);
+        const int ws   = effectiveWindowStart();
+        const float bx0 = sampleToX(ws);
+        const float bx1 = sampleToX(ws + wLen);
+        juce::Rectangle<float> band(bx0, r.getY() + 2.0f,
+                                    std::max(2.0f, bx1 - bx0),
+                                    r.getHeight() - 4.0f);
+        const bool autoCentred = (frame.windowStart < 0);
+        const juce::Colour amber(255, 190, 70);
+        g.setColour(amber.withAlpha(0.16f));
+        g.fillRect(band);
+        g.setColour(amber.withAlpha(autoCentred ? 0.55f : 0.95f));
+        if (autoCentred) {
+            // Dashed outline for the auto-centred (unplaced) band.
+            const float dashes[2] = {4.0f, 3.0f};
+            g.drawDashedLine({band.getTopLeft(), band.getTopRight()}, dashes, 2, 1.2f);
+            g.drawDashedLine({band.getBottomLeft(), band.getBottomRight()}, dashes, 2, 1.2f);
+            g.drawDashedLine({band.getTopLeft(), band.getBottomLeft()}, dashes, 2, 1.2f);
+            g.drawDashedLine({band.getTopRight(), band.getBottomRight()}, dashes, 2, 1.2f);
+        } else {
+            g.drawRect(band, 1.4f);
+        }
+        // Grab handles at the band edges.
+        g.setColour(amber.withAlpha(0.9f));
+        g.fillRect(band.getX() - 1.0f, band.getY(), 2.0f, band.getHeight());
+        g.fillRect(band.getRight() - 1.0f, band.getY(), 2.0f, band.getHeight());
     }
 
     void resized() override {
@@ -429,10 +525,12 @@ public:
         // disappearing.
         const int rowH = 22;
         const int rowGap = 4;
-        // 5 rows: grain length, crossfade, pitch, note+octave shortcut,
-        // freeze mode. The note+octave shortcut sits directly under the
-        // pitch slider so the pairing is visually obvious.
-        const int numRows = 5;
+        // 7 rows: grain length, grains, FFT size, crossfade, pitch,
+        // note+octave shortcut, freeze mode. The grains/FFT rows sit under
+        // grain length (all the per-mode "texture" controls grouped); the
+        // note+octave shortcut sits directly under the pitch slider so the
+        // pairing is visually obvious.
+        const int numRows = 7;
         const int paramsH = numRows * rowH + (numRows - 1) * rowGap;
         const int btnH = 28;
         const int waveToParamsGap = 8;
@@ -490,6 +588,16 @@ public:
         };
 
         layoutRow(grainLengthLabel, grainLengthSlider, false);
+        layoutRow(grainCountLabel,  grainCountSlider,  false);
+        // FFT-size row: label (100 px) + combo sized to its widest item.
+        {
+            auto row = a.removeFromTop(rowH);
+            fftSizeLabel.setBounds(row.removeFromLeft(100));
+            row.removeFromLeft(4);
+            const int fftW = intrinsicComboWidth(fftSizeCombo);
+            fftSizeCombo.setBounds(row.removeFromLeft(fftW).withHeight(rowH));
+            a.removeFromTop(rowGap);
+        }
         layoutRow(crossfadeLabel,   crossfadeSlider,   false);
         layoutRow(pitchLabel,       pitchSlider,       false);
         // Note + Octave + Cents shortcut row. Each combo is sized to its
@@ -534,6 +642,110 @@ public:
         recaptureBtn.setBounds(btnRow.removeFromLeft(220));
     }
 
+    // ---- Selection-band dragging ------------------------------------------
+    // Click-drag the amber band over the source thumbnail to choose which
+    // sub-section of the capture the freeze operates on. Drag the MIDDLE to move
+    // the band; drag either EDGE handle to resize it (the width floor is the
+    // grain length, the ceiling is the whole capture). Clicking outside the band
+    // re-centres it on the cursor.
+    enum class BandDrag { None, Move, ResizeL, ResizeR };
+    static constexpr float kBandEdgePx = 6.0f;  // px grab zone for edge handles
+    BandDrag bandHitTest(float px, int ws, int len) const {
+        const float xL = sampleToX(ws);
+        const float xR = sampleToX(ws + len);
+        const bool nearL = std::abs(px - xL) <= kBandEdgePx;
+        const bool nearR = std::abs(px - xR) <= kBandEdgePx;
+        if (nearL && nearR) {
+            // Both grab zones overlap: the band has collapsed to roughly the
+            // grab-zone width (e.g. min grain length at a zoomed-out thumbnail),
+            // so its interior Move zone has vanished. A fixed ResizeL-first
+            // preference here makes the RIGHT edge permanently unreachable, and
+            // since dragging the left edge rightward is clamped to right-floor,
+            // the band can never be re-expanded - the reported "stuck collapsed
+            // band, can't re-expand or drag" bug. Resolve by the side of the
+            // band centre the cursor sits on: click to the LEFT to grab the
+            // left edge (drag further left to grow), to the RIGHT to grab the
+            // right edge (drag further right to grow). Either direction can
+            // always re-expand the band.
+            const float mid = 0.5f * (xL + xR);
+            return (px <= mid) ? BandDrag::ResizeL : BandDrag::ResizeR;
+        }
+        if (nearL) return BandDrag::ResizeL;
+        if (nearR) return BandDrag::ResizeR;
+        return BandDrag::Move;
+    }
+    void mouseDown(const juce::MouseEvent& e) override {
+        if (!bandDraggable()) return;
+        if (!waveBounds.contains(e.getPosition())) return;
+        const int ws  = effectiveWindowStart();
+        const int len = effectiveWindowLen();
+        const float px = (float)e.position.x;
+        bandDrag = bandHitTest(px, ws, len);
+        if (bandDrag == BandDrag::Move) {
+            const int s = xToSample(px);
+            // Grab inside the band -> preserve offset; outside -> centre on cursor.
+            bandGrabOffset = (s >= ws && s < ws + len) ? (s - ws) : (len / 2);
+            setBand(s - bandGrabOffset, len);
+        }
+    }
+    void mouseDrag(const juce::MouseEvent& e) override {
+        if (bandDrag == BandDrag::None) return;
+        const int srcLen = (int)frame.source.size();
+        const int s = xToSample((float)e.position.x);
+        // Resize floor is mode-dependent: the grain-cloud modes hold the window
+        // at >= grain (a grain must fit), while CrossfadeLoop / SpectralFreeze
+        // (no granulation) let it shrink to ~5 ms / one FFT block.
+        const int floorLen = minWindowSamples();
+        if (bandDrag == BandDrag::Move) {
+            setBand(s - bandGrabOffset, effectiveWindowLen());
+        } else if (bandDrag == BandDrag::ResizeR) {
+            // Right edge follows the cursor; left edge (start) stays put.
+            const int start = effectiveWindowStart();
+            setBand(start, std::clamp(s - start, floorLen, srcLen - start));
+        } else { // ResizeL: left edge follows the cursor; right edge stays put.
+            const int right = effectiveWindowStart() + effectiveWindowLen();
+            const int start = std::clamp(s, 0, right - floorLen);
+            setBand(start, right - start);
+        }
+    }
+    void mouseUp(const juce::MouseEvent&) override {
+        bandDrag = BandDrag::None;
+    }
+    void mouseMove(const juce::MouseEvent& e) override {
+        juce::MouseCursor cur = juce::MouseCursor::NormalCursor;
+        if (bandDraggable() && waveBounds.contains(e.getPosition())) {
+            const auto hit = bandHitTest((float)e.position.x,
+                                         effectiveWindowStart(),
+                                         effectiveWindowLen());
+            cur = (hit == BandDrag::Move)
+                      ? juce::MouseCursor::DraggingHandCursor
+                      : juce::MouseCursor::LeftRightResizeCursor;
+        }
+        setMouseCursor(cur);
+    }
+
+    // Commit an explicit band, clamped so it stays inside the source. The band
+    // always sets the freeze WINDOW (frame.windowStart / frame.windowLen) - it
+    // never touches the grain length. What that window then means is the mode's
+    // business (grains roam it / the loop spans it / the FFT analyses it). The
+    // resize floor is mode-dependent (minWindowSamples). Drives the live preview
+    // and the debounced undo/apply just like the sliders, so a band drag
+    // coalesces into one undo step on settle.
+    void setBand(int start, int len) {
+        const int srcLen = (int)frame.source.size();
+        len   = std::clamp(len, std::min(minWindowSamples(), srcLen), srcLen);
+        start = std::clamp(start, 0, std::max(0, srcLen - len));
+        frame.windowStart = start;
+        frame.windowLen   = len;
+        // In CrossfadeLoop the loop length == the window, so the crossfade seam
+        // cap moves with it; refresh the slider range so it can't sit above
+        // window/2 (which the voice would silently halve).
+        refreshCrossfadeRange();
+        pushPreviewWindow();
+        repaint();
+        if (onApply) onApply();
+    }
+
 private:
     GranularFrame& frame;
     std::function<void()> onApply;
@@ -544,6 +756,10 @@ private:
     juce::Label      sourceInfoLabel;
     juce::Slider     grainLengthSlider;
     juce::Label      grainLengthLabel;
+    juce::Slider     grainCountSlider;       // # overlapping grains (cloud modes)
+    juce::Label      grainCountLabel;
+    juce::ComboBox   fftSizeCombo;           // FFT size (Spectral mode)
+    juce::Label      fftSizeLabel;
     juce::Slider     crossfadeSlider;
     juce::Label      crossfadeLabel;
     juce::Slider     pitchSlider;
@@ -566,6 +782,14 @@ private:
 
     juce::Rectangle<int> waveBounds;
 
+    // Selection-band drag state. bandDrag (type declared above mouseDown) names
+    // which part of the band the current gesture grabbed (None when idle): Move
+    // slides it, ResizeL/ResizeR drag an edge. bandGrabOffset is the sample
+    // offset from the band's start to the grab point (Move only), so the band
+    // tracks the cursor without jumping.
+    BandDrag bandDrag = BandDrag::None;
+    int  bandGrabOffset = 0;
+
     // Suppress onValueChange feedback while we're pushing model state into
     // the controls. Without this, syncFromFrame() would re-fire every
     // setValue and push back into the frame (no-op in result but it'd still
@@ -583,6 +807,133 @@ private:
     }
     int msToSamples(double ms) const {
         return (int)std::round(ms * sampleRateOrFallback() / 1000.0);
+    }
+
+    // ---- Freeze-window (selection band) geometry --------------------------
+    // The band is a sub-selection of the captured source that the current freeze
+    // mode operates on, with an independent POSITION (frame.windowStart) and
+    // WIDTH (frame.windowLen). The band is resizable in EVERY mode - it just
+    // means different things: Async/PitchSync roam grains over it (a band wider
+    // than the grain is what makes them diverge), CrossfadeLoop loops the whole
+    // band, SpectralFreeze FFTs it. windowStart/windowLen == -1 mean "auto": an
+    // unplaced band one grain wide, DISPLAYED at the legacy centred-with-
+    // lookahead position so the band always shows where the freeze sits even
+    // before any drag.
+    //
+    // Only the two grain-cloud modes actually USE the grain length, so only they
+    // floor the window at the grain (a grain must fit). CrossfadeLoop and
+    // SpectralFreeze don't granulate (their grain slider is greyed out), so their
+    // window can shrink below the grain - down to ~5 ms (crossfade: a short
+    // pitched buzz) or one FFT block (spectral).
+    bool modeUsesGrain() const {
+        return frame.freezeMode == GranularFreezeMode::AsyncGranular
+            || frame.freezeMode == GranularFreezeMode::PitchSyncGrains;
+    }
+    // FFT-size combo uses the shared kSpectralFftSizes table (granular_frame.h)
+    // after the "Auto" entry (combo ID 1, fftSize 0). Combo ID = index + 2.
+    static int fftComboIdToSize(int id) {
+        const int i = id - 2;
+        return (i >= 0 && i < kNumSpectralFftSizes) ? kSpectralFftSizes[i] : 0;
+    }
+    // frame.fftSize -> combo ID (1 == Auto when no exact match).
+    static int fftSizeToComboId(int size) {
+        for (int i = 0; i < kNumSpectralFftSizes; ++i)
+            if (kSpectralFftSizes[i] == size) return i + 2;
+        return 1;  // Auto
+    }
+    // Smallest allowed window width for the current mode (the band's resize
+    // floor). Mirrors the voice's per-mode bandLen floor in granular_freeze.cpp.
+    int minWindowSamples() const {
+        const int srcLen = std::max(1, (int)frame.source.size());
+        switch (frame.freezeMode) {
+            case GranularFreezeMode::AsyncGranular:
+            case GranularFreezeMode::PitchSyncGrains:
+                return std::min(std::max(16, frame.grainLength), srcLen);
+            case GranularFreezeMode::SpectralFreeze:
+                return std::min(256, srcLen);            // smallest viable FFT
+            case GranularFreezeMode::CrossfadeLoop:
+            default:
+                return std::min(std::max(16, msToSamples(5.0)), srcLen);
+        }
+    }
+    int effectiveWindowLen() const {
+        const int srcLen  = std::max(1, (int)frame.source.size());
+        if (frame.windowLen >= 0)
+            return std::clamp(frame.windowLen, minWindowSamples(), srcLen);
+        // Auto width, via the shared resolver so the editor band matches the
+        // voice sample-for-sample:
+        //   kWindowLegacyAuto (-1)     -> grainLength (legacy one-grain window,
+        //                                 keeps old CrossfadeLoop frames looping
+        //                                 exactly one grain).
+        //   kWindowAutoPerMethod (-2)  -> autoWindowMultiplier(mode) x grainLength
+        //                                 (cloud modes get roam room by default).
+        const int autoLen = resolveAutoWindowLen(frame.windowLen,
+                                                  frame.freezeMode,
+                                                  frame.grainLength);
+        return std::clamp(autoLen, minWindowSamples(), srcLen);
+    }
+    // Largest crossfade seam the loop can hold: half the loop length. In
+    // CrossfadeLoop the loop IS the window, so it tracks the window width; in the
+    // other modes the crossfade slider is inert, so fall back to half the grain.
+    int crossfadeMaxSamples() const {
+        const int loop = (frame.freezeMode == GranularFreezeMode::CrossfadeLoop)
+                             ? effectiveWindowLen()
+                             : std::max(16, frame.grainLength);
+        return std::max(1, loop / 2);
+    }
+    int maxWindowStart() const {
+        return std::max(0, (int)frame.source.size() - effectiveWindowLen());
+    }
+    int effectiveWindowStart() const {
+        if (frame.windowStart >= 0)
+            return std::clamp(frame.windowStart, 0, maxWindowStart());
+        const int g = std::max(16, frame.grainLength);
+        const int srcLen = (int)frame.source.size();
+        return std::clamp(std::max(0, (srcLen - (g + g / 2)) / 2),
+                          0, maxWindowStart());
+    }
+    // Pixel x for a source sample index, within the wave thumbnail's draw area.
+    float sampleToX(int sample) const {
+        const int srcLen = std::max(1, (int)frame.source.size());
+        auto r = waveBounds.toFloat();
+        const float W = (float)((int)r.getWidth() - 4);
+        return r.getX() + 2.0f + (float)sample / (float)srcLen * W;
+    }
+    // Inverse: source sample index for a pixel x.
+    int xToSample(float x) const {
+        const int srcLen = std::max(1, (int)frame.source.size());
+        auto r = waveBounds.toFloat();
+        const float W = std::max(1.0f, (float)((int)r.getWidth() - 4));
+        const float t = (x - (r.getX() + 2.0f)) / W;
+        return std::clamp((int)std::round(t * (float)srcLen), 0, srcLen);
+    }
+    // True when the band is interactive (the minimum window is narrower than the
+    // whole source, so there's room to move/resize a sub-window).
+    bool bandDraggable() const {
+        return !frame.source.empty()
+            && minWindowSamples() < (int)frame.source.size();
+    }
+    // Push the current freeze window (start + width) into the live AudioEngine
+    // preview (fallback audition path only). The synth-routed audition re-reads
+    // both when its graph rebuilds (debounced via onApply), matching how grain
+    // length and the other params already propagate to a held note.
+    void pushPreviewWindow() {
+        if (playing && !sendAudition)
+            if (auto* eng = AudioEngine::getInstance()) {
+                eng->setPreviewWindowStart(frame.windowStart);
+                eng->setPreviewWindowLen(frame.windowLen);
+            }
+    }
+    // Push the grain count + FFT size into the live AudioEngine preview
+    // (fallback audition path only). Same propagation model as
+    // pushPreviewWindow: the synth-routed audition re-reads both on graph
+    // rebuild (debounced via onApply).
+    void pushPreviewExtras() {
+        if (playing && !sendAudition)
+            if (auto* eng = AudioEngine::getInstance()) {
+                eng->setPreviewGrainCount(frame.grainCount);
+                eng->setPreviewFftSize(frame.fftSize);
+            }
     }
 
     // ---- Note/Octave <-> Hz helpers (12-TET, A4 = 440 Hz, scientific
@@ -641,16 +992,28 @@ private:
              << juce::String((int)frame.source.size()) << " samples";
         sourceInfoLabel.setText(info, juce::dontSendNotification);
 
-        grainLengthSlider.setValue(samplesToMs(frame.grainLength),
-                                   juce::dontSendNotification);
-        // Crossfade cap = half the grain length - the synth clamps it at
-        // use time, so reflect that in the slider's range so dragging
-        // doesn't silently land on a value the engine immediately halves.
-        const double maxXfMs = samplesToMs(frame.grainLength) * 0.5;
-        crossfadeSlider.setRange(1.0, std::max(2.0, maxXfMs), 1.0);
-        crossfadeSlider.setValue(
-            std::min(samplesToMs(frame.crossfadeSamples), maxXfMs),
+        // The grain must fit inside the freeze window, which fits inside the
+        // capture, so the grain can never exceed the captured duration. Cap the
+        // slider's max at min(kGranularMaxGrainMs, capturedMs). (The freeze
+        // window's width is separate - the draggable band - and floors at the
+        // grain length, so growing the grain pushes the window's floor up.)
+        const double capturedMs = samplesToMs((int)frame.source.size());
+        const double maxGrainMs = std::max(5.0,
+            std::min((double)kGranularMaxGrainMs, capturedMs));
+        grainLengthSlider.setRange(5.0, maxGrainMs, 1.0);
+        grainLengthSlider.setValue(
+            std::min(samplesToMs(frame.grainLength), maxGrainMs),
             juce::dontSendNotification);
+        grainCountSlider.setValue(
+            std::clamp(frame.grainCount, 2, GrainFreezeVoice::kMaxGrains),
+            juce::dontSendNotification);
+        fftSizeCombo.setSelectedId(fftSizeToComboId(frame.fftSize),
+                                   juce::dontSendNotification);
+        // Crossfade cap = half the loop length (the window in CrossfadeLoop,
+        // the grain otherwise) - the voice clamps it at use time, so reflect
+        // that in the slider's range so dragging doesn't silently land on a
+        // value the engine immediately halves.
+        refreshCrossfadeRange();
         pitchSlider.setValue((double)frame.embeddedPitchHz,
                              juce::dontSendNotification);
         // Mirror the slider's Hz into the note/octave combos + cents label
@@ -662,22 +1025,79 @@ private:
 
         freezeModeCombo.setSelectedId((int)frame.freezeMode + 1,
                                       juce::dontSendNotification);
+        refreshGrainSliderForMode();
 
         suppressCallbacks = false;
         repaint();
     }
 
+    // Re-range the crossfade slider against the current loop length
+    // (crossfadeMaxSamples == window/2 in CrossfadeLoop, grain/2 otherwise) so
+    // the user can't drag it above loop/2 - a value the voice would silently
+    // halve. Clamps the stored crossfade down (and the slider) when it no longer
+    // fits. Uses dontSendNotification, so it never re-fires onCrossfadeChanged.
+    void refreshCrossfadeRange() {
+        const double maxXfMs = samplesToMs(crossfadeMaxSamples());
+        crossfadeSlider.setRange(1.0, std::max(2.0, maxXfMs), 1.0);
+        if (samplesToMs(frame.crossfadeSamples) > maxXfMs) {
+            crossfadeSlider.setValue(maxXfMs, juce::dontSendNotification);
+            frame.crossfadeSamples = msToSamples(maxXfMs);
+        } else {
+            crossfadeSlider.setValue(samplesToMs(frame.crossfadeSamples),
+                                     juce::dontSendNotification);
+        }
+    }
+
+    // Set the grain length from a sample count: clamp to the slider's valid
+    // range (5 ms .. min(500 ms, captured duration)), write frame.grainLength,
+    // sync the slider, and re-clamp the crossfade cap. Pure state sync - the
+    // caller fires onApply/repaint. Only used by the grain slider now (the band
+    // no longer edits the grain in any mode).
+    void applyGrainLengthSamples(int gSamples) {
+        const int srcLen = (int)frame.source.size();
+        const double capturedMs = samplesToMs(srcLen);
+        const double maxGrainMs = std::max(5.0,
+            std::min((double)kGranularMaxGrainMs, capturedMs));
+        const double ms = std::clamp(samplesToMs(gSamples), 5.0, maxGrainMs);
+        frame.grainLength = msToSamples(ms);
+        suppressCallbacks = true;
+        grainLengthSlider.setRange(5.0, maxGrainMs, 1.0);
+        grainLengthSlider.setValue(ms, juce::dontSendNotification);
+        refreshCrossfadeRange();
+        suppressCallbacks = false;
+    }
+
     void onGrainLengthChanged() {
         if (suppressCallbacks) return;
-        frame.grainLength = msToSamples(grainLengthSlider.getValue());
-        // Re-clamp crossfade to grainLength/2 since the cap just moved.
-        const double maxXfMs = samplesToMs(frame.grainLength) * 0.5;
-        suppressCallbacks = true;
-        crossfadeSlider.setRange(1.0, std::max(2.0, maxXfMs), 1.0);
-        if (crossfadeSlider.getValue() > maxXfMs)
-            crossfadeSlider.setValue(maxXfMs, juce::dontSendNotification);
-        suppressCallbacks = false;
-        frame.crossfadeSamples = msToSamples(crossfadeSlider.getValue());
+        applyGrainLengthSamples(msToSamples(grainLengthSlider.getValue()));
+        // The grain slider is only enabled in the grain-cloud modes, where the
+        // window floors at the grain length. Bump an explicit band up so it
+        // still holds the (possibly larger) grain, then slide its start inside
+        // the source. Auto (windowStart == -1) needs no fixup.
+        if (frame.windowStart >= 0 && modeUsesGrain()) {
+            const int srcLen = (int)frame.source.size();
+            const int g = std::max(16, frame.grainLength);
+            int len = (frame.windowLen >= 0) ? frame.windowLen : g;
+            len = std::clamp(std::max(len, g), std::min(g, srcLen), srcLen);
+            frame.windowLen   = len;
+            frame.windowStart = std::clamp(frame.windowStart, 0,
+                                           std::max(0, srcLen - len));
+        }
+        pushPreviewWindow();
+        if (onApply) onApply();
+        repaint();  // band geometry may have changed
+    }
+    void onGrainCountChanged() {
+        if (suppressCallbacks) return;
+        frame.grainCount = std::clamp((int)std::round(grainCountSlider.getValue()),
+                                      2, GrainFreezeVoice::kMaxGrains);
+        pushPreviewExtras();
+        if (onApply) onApply();
+    }
+    void onFftSizeChanged() {
+        if (suppressCallbacks) return;
+        frame.fftSize = fftComboIdToSize(fftSizeCombo.getSelectedId());
+        pushPreviewExtras();
         if (onApply) onApply();
     }
     void onCrossfadeChanged() {
@@ -714,11 +1134,97 @@ private:
         // sendNotificationSync ensures all of that happens before we return.
         pitchSlider.setValue(hz, juce::sendNotificationSync);
     }
+    // Enable/disable + retooltip the grain-length slider for the current mode.
+    // Only the two grain-cloud modes (Async, Pitch-synced) actually granulate,
+    // so only they use the grain length. CrossfadeLoop loops the whole window
+    // and SpectralFreeze FFTs it - neither has a grain - so grey the slider out
+    // and say why (per the "grayed-out controls must explain themselves" rule).
+    void refreshGrainSliderForMode() {
+        const bool usesGrain   = modeUsesGrain();
+        const bool isSpectral  = (frame.freezeMode == GranularFreezeMode::SpectralFreeze);
+        // Grain length + grain count are the two grain-cloud controls: enabled
+        // together, greyed together.
+        grainLengthSlider.setEnabled(usesGrain);
+        grainCountSlider.setEnabled(usesGrain);
+        // FFT size is the Spectral-only control.
+        fftSizeCombo.setEnabled(isSpectral);
+        fftSizeLabel.setEnabled(isSpectral);
+
+        if (usesGrain) {
+            grainLengthSlider.setTooltip(
+                "Length of each grain window in the OLA stream, in "
+                "milliseconds. Short (~20 ms) = fast textural blur; "
+                "long (~200 ms) = stable sustain. Doesn't change the captured "
+                "source - just the size of the grains the synth scatters across "
+                "the selection band while a note is held. The band can't be "
+                "narrower than one grain.");
+            grainCountSlider.setTooltip(
+                "How many overlapping grains make up the cloud. More = denser, "
+                "smoother (and a softer per-grain identity); fewer = sparser, "
+                "more granular. The level stays constant as you change it.");
+        } else if (isSpectral) {
+            grainLengthSlider.setTooltip(
+                "Disabled in Spectral-freeze mode - this mode freezes the FFT "
+                "magnitude spectrum of the selection band, so grain length has "
+                "no effect. Switch to Async or Pitch-synced grains to use it, "
+                "or drag the band edges to set the spectral analysis region.");
+            grainCountSlider.setTooltip(
+                "Disabled in Spectral-freeze mode - there are no grains. Use the "
+                "FFT size control instead. Switch to Async or Pitch-synced "
+                "grains to set the grain count.");
+        } else { // CrossfadeLoop
+            grainLengthSlider.setTooltip(
+                "Disabled in Crossfade-loop mode - this mode loops the whole "
+                "selection band (there are no grains), so loop length is set by "
+                "resizing the amber band, not by this slider. Switch to Async "
+                "or Pitch-synced grains to use it.");
+            grainCountSlider.setTooltip(
+                "Disabled in Crossfade-loop mode - this mode loops the whole "
+                "band, with no grains to count. Switch to Async or Pitch-synced "
+                "grains to set the grain count.");
+        }
+
+        if (isSpectral) {
+            fftSizeCombo.setTooltip(
+                "FFT size for Spectral freeze, in samples. Larger = finer "
+                "frequency detail (more bins) but a coarser time window, and "
+                "needs a wider selection band to fit. Auto picks the largest "
+                "size that fits the band (up to 2048).");
+        } else {
+            fftSizeCombo.setTooltip(
+                "Disabled outside Spectral-freeze mode - the FFT size only "
+                "matters when freezing the magnitude spectrum. Switch the freeze "
+                "mode to Spectral freeze to use it.");
+        }
+    }
     void onFreezeModeChanged() {
         if (suppressCallbacks) return;
         const int id = freezeModeCombo.getSelectedId();
         if (id >= 1 && id <= 4) {
             frame.freezeMode = (GranularFreezeMode)(id - 1);
+            // The window floor changes with the mode (cloud modes floor at the
+            // grain; crossfade/spectral floor smaller). Re-clamp an explicit band
+            // to the new floor so the stored windowLen stays honest - e.g. a tiny
+            // crossfade window grows back to >= grain when switching to a cloud
+            // mode. Auto (windowStart == -1) needs no fixup.
+            if (frame.windowStart >= 0 && frame.windowLen >= 0) {
+                const int srcLen = (int)frame.source.size();
+                const int len = std::clamp(frame.windowLen,
+                                           std::min(minWindowSamples(), srcLen),
+                                           srcLen);
+                frame.windowLen   = len;
+                frame.windowStart = std::clamp(frame.windowStart, 0,
+                                               std::max(0, srcLen - len));
+            }
+            // The band's meaning and floor change with the mode (only the cloud
+            // modes use the grain), so refresh the grain slider's enabled state
+            // + tooltip, re-range the crossfade cap (loop length depends on the
+            // mode), re-push the live preview window, and repaint the band at
+            // its new effective floor.
+            refreshGrainSliderForMode();
+            refreshCrossfadeRange();
+            pushPreviewWindow();
+            repaint();
             if (onApply) onApply();
             // Live-update the engine's audition freeze mode if we're
             // currently playing, so the user hears the change.
@@ -778,6 +1284,13 @@ private:
             // ignores the embedded-pitch picker.
             eng->setPreviewGrainRatio(
                 frame.embeddedPitchHz > 0.0f ? 440.0f / frame.embeddedPitchHz : 1.0f);
+            // Freeze the exact selection band the editor shows (-1 = auto).
+            eng->setPreviewWindowStart(frame.windowStart);
+            eng->setPreviewWindowLen(frame.windowLen);
+            // Grain count + FFT size (cloud / spectral modes; auto-ignored by
+            // the others), matching the synth-voice path.
+            eng->setPreviewGrainCount(frame.grainCount);
+            eng->setPreviewFftSize(frame.fftSize);
             eng->setPreviewGrainBuffer(std::move(src));
             eng->setPreviewMode(AudioEngine::PreviewMode::GrainLoop);
         }
@@ -7636,9 +8149,10 @@ void LayeredWaveEditorComponent::repaintScatterViews() {
 }
 
 
-std::function<void(double, int, double)>
+std::function<void(double, int, double, int, int)>
 LayeredWaveEditorComponent::makeCaptureMetadataSink() {
-    return [this](double pitchHz, int freezeIdx, double crossfadeMs) {
+    return [this](double pitchHz, int freezeIdx, double crossfadeMs,
+                  int grainCount, int fftSize) {
         auto* g = dynamic_cast<GranularFrame*>(
             wave.libraryFrameById(currentLibraryId));
         if (!g) return;
@@ -7648,6 +8162,9 @@ LayeredWaveEditorComponent::makeCaptureMetadataSink() {
                               ? g->sourceSampleRate : 44100.0;
         g->crossfadeSamples =
             std::max(0, (int)std::round(crossfadeMs * 0.001 * sr));
+        g->grainCount = juce::jlimit(kGranularMinGrains, kGranularMaxGrains,
+                                     grainCount);
+        g->fftSize = (fftSize <= 0) ? 0 : fftSize;
         // Same commit path the frame editor uses: encode to the node script
         // live + dirty flag, plus debounced undo.
         onLayerChanged();
@@ -7724,8 +8241,13 @@ void LayeredWaveEditorComponent::showCapturePanelInline(int sourceKind,
             // wired in replace mode, so publishMetadataEdit() was a no-op in
             // append mode and a post-Save octave change was lost. The sink
             // tracks currentLibraryId, so a later Save (new frame) rebinds
-            // automatically. CaptureFromPlaybackDialog (mic/file) has no such
-            // sink; the dynamic_cast simply no-ops there.
+            // automatically. Only done for the song dialog: it always produces
+            // exactly ONE frame, so the rebound sink unambiguously targets it.
+            // CaptureFromPlaybackDialog (mic/file) can append N frames per Save,
+            // so a single-frame write-through target would be ambiguous; its
+            // sink is wired only in REPLACE mode (one bound frame), where
+            // seedFromExistingFrame also seeds the preserved crossfade so the
+            // echo is a true no-op. The dynamic_cast no-ops for that dialog.
             if (auto* songPanel =
                     dynamic_cast<CaptureFromSongDialog*>(capturePanel.get())) {
                 if (!songPanel->onMetadataEdited)
@@ -7766,7 +8288,8 @@ void LayeredWaveEditorComponent::showCapturePanelInline(int sourceKind,
                                           ? g->sourceSampleRate : 44100.0;
                     const double xfadeMs = (double)g->crossfadeSamples / sr * 1000.0;
                     p->seedFromExistingFrame((double)g->embeddedPitchHz,
-                                             (int)g->freezeMode, xfadeMs);
+                                             (int)g->freezeMode, xfadeMs,
+                                             g->grainCount, g->fftSize);
                 }
                 // Write-through sink tracks currentLibraryId (== the frame
                 // being replaced throughout this session), re-looked-up live so
@@ -7781,6 +8304,25 @@ void LayeredWaveEditorComponent::showCapturePanelInline(int sourceKind,
         auto p = std::make_unique<CaptureFromPlaybackDialog>(
             src, wave.tableSize, onCaptured);
         p->onDismiss = [this]() { dismissCapturePanel(); };
+        // Re-capture / replace mode unifies the save model here exactly as it
+        // does for the song dialog above: bind the panel to the SPECIFIC frame
+        // being replaced, (1) SEED its metadata controls from that frame so it
+        // opens reflecting reality, and (2) install the live write-through sink
+        // so any metadata edit (pitch / freeze / grains / FFT) commits to the
+        // frame the instant it changes. This dialog has no crossfade control, so
+        // we seed the frame's crossfade ms and the sink echoes it back unchanged
+        // (a no-op write that never clobbers the editor-set crossfade).
+        if (doReplace) {
+            if (auto* g = dynamic_cast<GranularFrame*>(currentEditingFrame())) {
+                const double sr = (g->sourceSampleRate > 0.0)
+                                      ? g->sourceSampleRate : 44100.0;
+                const double xfadeMs = (double)g->crossfadeSamples / sr * 1000.0;
+                p->seedFromExistingFrame((double)g->embeddedPitchHz,
+                                         (int)g->freezeMode, xfadeMs,
+                                         g->grainCount, g->fftSize);
+            }
+            p->onMetadataEdited = makeCaptureMetadataSink();
+        }
         panel = std::move(p);
     }
 
@@ -8097,8 +8639,12 @@ void LayeredWaveEditorComponent::updateFrameEditorEmbed() {
                                 std::make_shared<std::vector<float>>(g->source);
                             gpayload->sourceSampleRate = g->sourceSampleRate;
                             gpayload->grainLength      = g->grainLength;
+                            gpayload->windowStart      = g->windowStart;
+                            gpayload->windowLen        = g->windowLen;
                             gpayload->embeddedPitchHz  = g->embeddedPitchHz;
                             gpayload->freezeMode       = (int)g->freezeMode;
+                            gpayload->grainCount       = g->grainCount;
+                            gpayload->fftSize          = g->fftSize;
                             gpayload->crossfadeSamples = g->crossfadeSamples;
                             gpayload->gain             = g->gain;
                         }

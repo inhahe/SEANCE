@@ -334,6 +334,18 @@ void AudioEngine::audioDeviceIOCallbackWithContext(
         int numSamples,
         const juce::AudioIODeviceCallbackContext& /*context*/) {
 
+    // Flush denormals to zero for the whole audio callback (sets FTZ/DAZ in
+    // MXCSR, restored on scope exit). Without this, IIR/feedback state in the
+    // graph - synth filters and envelopes, reverb/delay effects, hosted VST3
+    // plugins - drifts into subnormal float range as a sound decays toward
+    // silence, where x86 FPUs run ~100x slower. The resulting sporadic CPU
+    // spikes overrun the audio device and surface as random "vinyl dust"
+    // clicks that linger for a second or two after the source stops (the
+    // decaying tail keeps recirculating denormals until it flushes out). This
+    // one guard covers the entire signal chain: graph render, granular freeze
+    // preview, and the master mix below.
+    juce::ScopedNoDenormals noDenormals;
+
     // Clear output
     for (int ch = 0; ch < numOutputChannels; ++ch)
         std::memset(outputChannelData[ch], 0, sizeof(float) * numSamples);
@@ -715,6 +727,10 @@ void AudioEngine::audioDeviceIOCallbackWithContext(
             const int   xfadeReq      = previewCrossfadeSamples.load(std::memory_order_acquire);
             const float grainRatio    = previewGrainRatio.load(std::memory_order_acquire);
             const float embeddedPitch = previewEmbeddedPitchHz.load(std::memory_order_acquire);
+            const int   windowStart   = previewWindowStart.load(std::memory_order_acquire);
+            const int   windowLen     = previewWindowLen.load(std::memory_order_acquire);
+            const int   grainCount    = previewGrainCount.load(std::memory_order_acquire);
+            const int   fftSize       = previewFftSize.load(std::memory_order_acquire);
             // Cheap pre-gate: skip the voice entirely when there's no usable
             // source. The voice applies the same per-mode viability test and
             // returns 0 for too-short sources, so silence here == silence in
@@ -738,8 +754,10 @@ void AudioEngine::audioDeviceIOCallbackWithContext(
                 if (!grainViable) return 0.0f;
                 const double rate = getSampleRate();
                 const float out = grainFreezeVoice.process(
-                    srcPtr, srcLen, grainLen, xfadeReq, embeddedPitch,
-                    rate, rate, grainRatio, (GranularFreezeMode)freezeMode);
+                    srcPtr, srcLen, grainLen, windowStart, windowLen,
+                    grainCount, fftSize, xfadeReq,
+                    embeddedPitch, rate, rate, grainRatio,
+                    (GranularFreezeMode)freezeMode);
                 // Attenuate to roughly match a synth note's post-Volume level
                 // so marker-scrub / freeze audition isn't louder than playback.
                 return out * kFreezePreviewGain;

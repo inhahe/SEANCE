@@ -222,6 +222,164 @@ void MidiTimelineProcessor::emitExpression(juce::MidiBuffer& midi, int mpeIdx,
 }
 
 // ==============================================================================
+// MidiTuningAdapterProcessor - cable-level note->frequency delivery for plugins
+// ==============================================================================
+
+int MidiTuningAdapterProcessor::encodeBend(float semis, int rangeSemis) {
+    if (rangeSemis < 1) rangeSemis = 1;
+    int raw = 8192 + (int)std::lround((double)semis / (double)rangeSemis * 8191.0);
+    return juce::jlimit(0, 16383, raw);
+}
+
+int MidiTuningAdapterProcessor::allocVoice(int inCh, int pitch) {
+    // Round-robin over the 15 member slots, reusing a free one if available.
+    for (int i = 0; i < kMembers; ++i) {
+        int idx = (nextVoice + i) % kMembers;
+        if (!voices[idx].active) {
+            voices[idx] = {true, inCh, pitch, 0.0f};
+            nextVoice = (idx + 1) % kMembers;
+            return idx;
+        }
+    }
+    // All busy - steal the next slot.
+    int idx = nextVoice;
+    voices[idx] = {true, inCh, pitch, 0.0f};
+    nextVoice = (idx + 1) % kMembers;
+    return idx;
+}
+
+int MidiTuningAdapterProcessor::findVoice(int inCh, int pitch) const {
+    for (int i = 0; i < kMembers; ++i)
+        if (voices[i].active && voices[i].inCh == inCh && voices[i].pitch == pitch)
+            return i;
+    return -1;
+}
+
+void MidiTuningAdapterProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::MidiBuffer& midi) {
+    buf.clear();
+
+    const bool playing = transport.playing;
+    if (wasPlaying && !playing)
+        for (auto& v : voices) v = {};          // release stale channel assignments
+    if (playing && !wasPlaying)
+        rpnCountdown = 4;                         // re-arm the collapse-mode RPN
+    wasPlaying = playing;
+
+    // Default tuning (12-TET / A440): nothing to reconcile - pure pass-through.
+    if (transport.isDefaultTuning()) return;
+
+    const bool mpe = dstNode.mpeEnabled;
+    const int memberRange = juce::jlimit(1, 96, dstNode.mpePitchBendRange);
+
+    juce::MidiBuffer out;
+
+    if (!mpe) {
+        // ---- Collapse mode --------------------------------------------------
+        // Plugin is not in MPE mode: everything onto channel 1, and only the
+        // uniform concert-pitch component can be delivered (per-note temperament
+        // needs separate channels). Pin ch1's bend range to a small, near-
+        // universal value via RPN so the sub-semitone concert bend lands right
+        // on plugins that honor it; plugins that ignore the RPN and keep a fixed
+        // range are the documented "may not honor tuning" case.
+        if (rpnCountdown > 0) {
+            --rpnCountdown;
+            out.addEvent(juce::MidiMessage::controllerEvent(1, 101, 0), 0); // RPN MSB
+            out.addEvent(juce::MidiMessage::controllerEvent(1, 100, 0), 0); // RPN LSB -> 0 (bend range)
+            out.addEvent(juce::MidiMessage::controllerEvent(1, 6, kCollapseRange), 0); // data MSB = semitones
+            out.addEvent(juce::MidiMessage::controllerEvent(1, 38, 0), 0); // data LSB = cents
+        }
+
+        const float concertSemis = transport.concertCents() / 100.0f;
+        const int concertBend = encodeBend(concertSemis, kCollapseRange);
+        const int bendDelta = concertBend - 8192; // constant 14-bit offset (range matches)
+
+        // Establish the concert bend at the top of the block; incoming wheels
+        // below re-send it summed with the user's own bend.
+        out.addEvent(juce::MidiMessage::pitchWheel(1, concertBend), 0);
+
+        for (const auto meta : midi) {
+            auto m = meta.getMessage();
+            const int so = meta.samplePosition;
+            m.setChannel(1);
+            if (m.isPitchWheel()) {
+                int summed = juce::jlimit(0, 16383, m.getPitchWheelValue() + bendDelta);
+                out.addEvent(juce::MidiMessage::pitchWheel(1, summed), so);
+            } else {
+                out.addEvent(m, so);
+            }
+        }
+    } else {
+        // ---- MPE mode -------------------------------------------------------
+        // Plugin is in MPE mode: give every note its own member channel (2..16)
+        // and apply the FULL per-note tuning bend (concert pitch + temperament),
+        // summed with any expression pitch-bend already on the stream. This also
+        // spreads a single-channel source across member channels on the fly.
+        for (const auto meta : midi) {
+            auto m = meta.getMessage();
+            const int so = meta.samplePosition;
+            const int inCh = m.getChannel();
+
+            if (m.isNoteOn()) {
+                const int pitch = m.getNoteNumber();
+                const int slot = allocVoice(inCh, pitch);
+                const int outCh = slot + 2;
+                const float tuneSemis = transport.noteTuningCents(pitch) / 100.0f;
+                voices[slot].exprSemis = 0.0f;
+                out.addEvent(juce::MidiMessage::pitchWheel(outCh,
+                    encodeBend(tuneSemis, memberRange)), so);
+                out.addEvent(juce::MidiMessage::noteOn(outCh, pitch,
+                    (juce::uint8)m.getVelocity()), so);
+            } else if (m.isNoteOff()) {
+                const int pitch = m.getNoteNumber();
+                const int slot = findVoice(inCh, pitch);
+                const int outCh = (slot >= 0) ? slot + 2 : inCh;
+                out.addEvent(juce::MidiMessage::noteOff(outCh, pitch,
+                    (juce::uint8)m.getVelocity()), so);
+                if (slot >= 0) voices[slot].active = false;
+            } else if (m.isPitchWheel()) {
+                const float exprSemis =
+                    ((m.getPitchWheelValue() - 8192) / 8191.0f) * memberRange;
+                bool matched = false;
+                for (int i = 0; i < kMembers; ++i) {
+                    if (!voices[i].active || voices[i].inCh != inCh) continue;
+                    voices[i].exprSemis = exprSemis;
+                    const float tuneSemis = transport.noteTuningCents(voices[i].pitch) / 100.0f;
+                    out.addEvent(juce::MidiMessage::pitchWheel(i + 2,
+                        encodeBend(tuneSemis + exprSemis, memberRange)), so);
+                    matched = true;
+                }
+                if (!matched) {
+                    // Global bend from a single-channel source: fan out to every
+                    // active voice so the whole chord bends together.
+                    for (int i = 0; i < kMembers; ++i) {
+                        if (!voices[i].active) continue;
+                        voices[i].exprSemis = exprSemis;
+                        const float tuneSemis = transport.noteTuningCents(voices[i].pitch) / 100.0f;
+                        out.addEvent(juce::MidiMessage::pitchWheel(i + 2,
+                            encodeBend(tuneSemis + exprSemis, memberRange)), so);
+                    }
+                }
+            } else {
+                // CC / pressure / aftertouch etc: follow the note onto its member
+                // channel(s). Channel-wide messages with no live voice pass
+                // through unchanged.
+                bool matched = false;
+                for (int i = 0; i < kMembers; ++i) {
+                    if (!voices[i].active || voices[i].inCh != inCh) continue;
+                    auto mm = m;
+                    mm.setChannel(i + 2);
+                    out.addEvent(mm, so);
+                    matched = true;
+                }
+                if (!matched) out.addEvent(m, so);
+            }
+        }
+    }
+
+    midi.swapWith(out);
+}
+
+// ==============================================================================
 // AudioTimelineProcessor - plays audio file clips
 // ==============================================================================
 
@@ -971,30 +1129,57 @@ void GraphProcessor::rebuildGraph(NodeGraph& graph, Transport& transport) {
                 }
             }
 
+            // Resolve the final MIDI source node feeding this destination:
+            // either a per-output channel filter (multi-output script) or the
+            // direct source.
+            auto midiSrcId = effectiveSrc;
             if (midiOutCount > 1 && thisMidiOutIdx >= 0) {
                 auto key = std::make_pair(srcNodeId, thisMidiOutIdx);
                 auto found = midiOutFilters.find(key);
-                juce::AudioProcessorGraph::NodeID filterId;
                 if (found != midiOutFilters.end()) {
-                    filterId = found->second;
+                    midiSrcId = found->second;
                 } else {
                     auto filt = std::make_unique<MidiChannelFilterProcessor>(thisMidiOutIdx + 1);
                     filt->enableAllBuses();
                     auto filtNode = processorGraph->addNode(std::move(filt));
-                    filterId = filtNode->nodeID;
-                    midiOutFilters[key] = filterId;
+                    midiSrcId = filtNode->nodeID;
+                    midiOutFilters[key] = midiSrcId;
                     processorGraph->addConnection({
                         {effectiveSrc, juce::AudioProcessorGraph::midiChannelIndex},
-                        {filterId, juce::AudioProcessorGraph::midiChannelIndex}});
+                        {midiSrcId, juce::AudioProcessorGraph::midiChannelIndex}});
                 }
+            }
+
+            // Cable-level tuning adapter: when this MIDI cable feeds a HOSTED
+            // plugin (vs a native synth that tunes itself), splice in a
+            // MidiTuningAdapterProcessor as the last hop. It reconciles the
+            // project tuning into pitch-bend (spread to member channels in MPE
+            // mode, or concert-only on channel 1 otherwise) and is a pure
+            // pass-through at default tuning. Native-synth and non-MIDI cables
+            // never get one.
+            bool dstIsHostedPlugin = false;
+            if (srcKind == PinKind::Midi) {
+                for (auto& dn : graph.nodes)
+                    if (dn.id == dstNodeId) { dstIsHostedPlugin = (dn.plugin != nullptr); break; }
+            }
+
+            if (dstIsHostedPlugin) {
+                Node* dstNodePtr = nullptr;
+                for (auto& dn : graph.nodes)
+                    if (dn.id == dstNodeId) { dstNodePtr = &dn; break; }
+                auto adapter = std::make_unique<MidiTuningAdapterProcessor>(*dstNodePtr, transport);
+                adapter->enableAllBuses();
+                auto adapterNode = processorGraph->addNode(std::move(adapter));
                 processorGraph->addConnection({
-                    {filterId, juce::AudioProcessorGraph::midiChannelIndex},
+                    {midiSrcId, juce::AudioProcessorGraph::midiChannelIndex},
+                    {adapterNode->nodeID, juce::AudioProcessorGraph::midiChannelIndex}});
+                processorGraph->addConnection({
+                    {adapterNode->nodeID, juce::AudioProcessorGraph::midiChannelIndex},
                     {dstGraphId, juce::AudioProcessorGraph::midiChannelIndex}});
             } else {
                 processorGraph->addConnection({
-                    {effectiveSrc, juce::AudioProcessorGraph::midiChannelIndex},
-                    {dstGraphId, juce::AudioProcessorGraph::midiChannelIndex}
-                });
+                    {midiSrcId, juce::AudioProcessorGraph::midiChannelIndex},
+                    {dstGraphId, juce::AudioProcessorGraph::midiChannelIndex}});
             }
         }
     }

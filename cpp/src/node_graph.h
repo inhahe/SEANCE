@@ -429,8 +429,12 @@ struct Node {
         std::shared_ptr<std::vector<float>> source; // mono PCM at sourceSampleRate
         double sourceSampleRate = 0.0;
         int    grainLength      = 4800;
+        int    windowStart      = -1;   // freeze-window start; -1 = auto-centre
+        int    windowLen        = -1;   // freeze-window width; -1 = auto (= grain)
         float  embeddedPitchHz  = 440.0f;
         int    freezeMode       = 0;    // 0 = CrossfadeLoop
+        int    grainCount       = 4;    // cloud-mode overlapping grains [2,16]
+        int    fftSize          = 0;    // SpectralFreeze FFT size; 0 = auto
         int    crossfadeSamples = 2400;
         float  gain             = 1.0f; // mirrors IWavetableFrame::gain
     };

@@ -1174,6 +1174,21 @@ juce::PopupMenu MainContentComponent::getMenuForIndex(int idx, const juce::Strin
             for (int i = 0; i < (int)TuningSystem::COUNT; ++i)
                 tuningMenu.addItem(70 + i, tuningSystemName((TuningSystem)i),
                                    true, graph.tuningSystem == (TuningSystem)i);
+            // Unequal temperaments need per-note pitch bend, which for hosted
+            // VST3/AU plugins means MPE. Warn that the temperament only reaches
+            // a hosted plugin if that plugin is switched to MPE mode (right-click
+            // the plugin node -> Enable MPE), and that even then a plugin which
+            // ignores the bend-range message and keeps its own fixed range may
+            // not be tuned exactly. Built-in synths are always tuned correctly.
+            if (graph.tuningSystem != TuningSystem::Equal12) {
+                tuningMenu.addSeparator();
+                tuningMenu.addItem(-1, "Note: this temperament reaches a hosted plugin", false);
+                tuningMenu.addItem(-1, "only when that plugin is in MPE mode", false);
+                tuningMenu.addItem(-1, "(right-click the plugin node -> Enable MPE).", false);
+                tuningMenu.addItem(-1, "Plugins that keep their own fixed bend range", false);
+                tuningMenu.addItem(-1, "may still not be tuned exactly. Built-in", false);
+                tuningMenu.addItem(-1, "synths are always tuned correctly.", false);
+            }
             menu.addSubMenu("Tuning System", tuningMenu);
 
             juce::PopupMenu pitchMenu;

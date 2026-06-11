@@ -816,9 +816,13 @@ TerrainSynthProcessor::TerrainSynthProcessor(Node& n, Transport& t) : node(n), t
                     e.source           = gf->source;
                     e.sourceSampleRate = gf->sourceSampleRate;
                     e.grainLength      = std::max(16, gf->grainLength);
+                    e.windowStart      = gf->windowStart;
+                    e.windowLen        = gf->windowLen;
                     e.embeddedPitchHz  = (gf->embeddedPitchHz > 0.0f)
                                           ? gf->embeddedPitchHz : 440.0f;
                     e.freezeMode       = (int)gf->freezeMode;
+                    e.grainCount       = gf->grainCount;
+                    e.fftSize          = gf->fftSize;
                     e.crossfadeSamples = std::max(0, gf->crossfadeSamples);
                     e.gain             = gf->gain;
                     e.position         = sf.position;
@@ -918,9 +922,13 @@ TerrainSynthProcessor::TerrainSynthProcessor(Node& n, Transport& t) : node(n), t
                     e.source           = gf->source;
                     e.sourceSampleRate = gf->sourceSampleRate;
                     e.grainLength      = std::max(16, gf->grainLength);
+                    e.windowStart      = gf->windowStart;
+                    e.windowLen        = gf->windowLen;
                     e.embeddedPitchHz  = (gf->embeddedPitchHz > 0.0f)
                                           ? gf->embeddedPitchHz : 440.0f;
                     e.freezeMode       = (int)gf->freezeMode;
+                    e.grainCount       = gf->grainCount;
+                    e.fftSize          = gf->fftSize;
                     e.crossfadeSamples = std::max(0, gf->crossfadeSamples);
                     e.gain             = gf->gain;
                     // Normalize gridCoord into [0,1] per dim so the per-
@@ -2044,8 +2052,11 @@ void TerrainSynthProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mi
                 // sampleRate from the enclosing per-sample scope.
                 auto renderGrainSample =
                     [&](const float* srcData, int srcLen, int grainLen,
-                        int xfadeReq, float embeddedPitchHz, double srcSampleRate,
-                        int freezeMode, Voice::GranStream& gs) -> float {
+                        int windowStart, int windowLen, int grainCount,
+                        int fftSize, int xfadeReq,
+                        float embeddedPitchHz,
+                        double srcSampleRate, int freezeMode,
+                        Voice::GranStream& gs) -> float {
                     grainLen = std::max(16, grainLen);
                     if (srcLen <= 0) return 0.0f;
                     // Pitch ratio: resample so the held note tracks MIDI.
@@ -2057,9 +2068,10 @@ void TerrainSynthProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mi
                         ? (float)(srcSampleRate / sampleRate) : 1.0f;
                     const float ratio = (effFreq /
                         std::max(1e-3f, embeddedPitchHz)) * srRatio;
-                    return gs.voice.process(srcData, srcLen, grainLen, xfadeReq,
-                                            embeddedPitchHz, srcSampleRate,
-                                            sampleRate, ratio,
+                    return gs.voice.process(srcData, srcLen, grainLen, windowStart,
+                                            windowLen, grainCount, fftSize, xfadeReq,
+                                            embeddedPitchHz,
+                                            srcSampleRate, sampleRate, ratio,
                                             (GranularFreezeMode)freezeMode);
                 };
 
@@ -2077,7 +2089,8 @@ void TerrainSynthProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mi
                     // library frame directly (the grain reader bypasses render()).
                     sample += af.gain * renderGrainSample(
                         af.source->data(), (int)af.source->size(),
-                        af.grainLength, af.crossfadeSamples,
+                        af.grainLength, af.windowStart, af.windowLen,
+                        af.grainCount, af.fftSize, af.crossfadeSamples,
                         af.embeddedPitchHz, af.sourceSampleRate,
                         af.freezeMode, v.auditionFrameStream);
                 } else if (!wtGranularFrames.empty() && isWavetable) {
@@ -2110,7 +2123,8 @@ void TerrainSynthProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mi
                         // apply it here.
                         sample += w * gridRenormGain * gf.gain * renderGrainSample(
                             gf.source.data(), (int)gf.source.size(),
-                            gf.grainLength, gf.crossfadeSamples,
+                            gf.grainLength, gf.windowStart, gf.windowLen,
+                            gf.grainCount, gf.fftSize, gf.crossfadeSamples,
                             gf.embeddedPitchHz, gf.sourceSampleRate,
                             gf.freezeMode, v.granStreams[gi]);
                     }

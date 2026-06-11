@@ -54,6 +54,8 @@ struct CaptureDialogPrefs {
     double gain      = 1.0;     // gainSlider
     int    noteId    = 9 + 1;   // noteCombo selected id (A)
     int    octaveId  = 4 + 1;   // octaveCombo selected id (4)
+    double grainMs   = 100.0;   // grainLenSlider (ms)
+    double crossfadeMs = 50.0;  // crossfadeSlider desired ms (= kXfadeDefMs)
 };
 static CaptureDialogPrefs& captureDialogPrefs() {
     static CaptureDialogPrefs p;
@@ -172,10 +174,10 @@ CaptureFromPlaybackDialog::CaptureFromPlaybackDialog(CaptureSource src, int ts, 
     : onCapture(std::move(onCap)),
       source(src),
       tableSize(std::max(64, ts)) {
-    // Height bumped to make room for the embedded pitch row and the freeze-
-    // mode row underneath the num-frames slider while keeping the waveform
-    // area unchanged.
-    setSize(720, 536);
+    // Height bumped to make room for the embedded pitch row, the freeze-mode
+    // row, and the grain-length + freeze-window + crossfade rows underneath the
+    // num-frames slider while keeping the waveform area unchanged.
+    setSize(720, 606);
 
     addAndMakeVisible(numFramesLabel);
     numFramesLabel.setText("Waveforms to slice out:", juce::dontSendNotification);
@@ -196,11 +198,10 @@ CaptureFromPlaybackDialog::CaptureFromPlaybackDialog(CaptureSource src, int ts, 
         "1 = a single frozen snapshot; more = smoother evolution but more "
         "memory.");
     numFramesSlider.onValueChange = [this]() {
-        // Mic: refit the per-waveform window to the new slot spacing so the
-        // bands stay zero-gap when the count changes. Gaps / overlap are
-        // reserved for region resizing, so we only refit here, not on a
-        // handle drag. No-op for the auto-sizing sources.
-        syncWindowToFitSlots();
+        // Re-apply the per-method auto window for the new count (no-op once the
+        // user has overridden the window). The window stays a fixed sample count
+        // across count changes when explicitly set, matching the editor.
+        syncWindowToAuto();
         // Enable / disable + relabel the per-waveform slider for the new count
         // (disabled at 1 waveform, where the window just spans the selection).
         updateSamplesPerWaveformControl();
@@ -211,55 +212,81 @@ CaptureFromPlaybackDialog::CaptureFromPlaybackDialog(CaptureSource src, int ts, 
         repaint(waveRect);
     };
 
-    // Mic only: per-waveform source-window length, in samples. Other sources
-    // auto-size the window (see effectiveSrcLen). 48000 samples ~ 1 second at
-    // 48 kHz, matching the auto default so the captured character is the same
-    // until the user deliberately changes it.
-    if (source == CaptureSource::Mic) {
-        addAndMakeVisible(samplesPerWaveformLabel);
-        samplesPerWaveformLabel.setText("Samples per waveform:", juce::dontSendNotification);
-        samplesPerWaveformLabel.setJustificationType(juce::Justification::centredRight);
-
-        addAndMakeVisible(samplesPerWaveformSlider);
-        // Max = the full display/capture buffer (kDisplayWindowSamples) so the
-        // window can always grow to match the whole selection - e.g. with one
-        // waveform the section must be able to span the entire selection, which
-        // can be the whole buffer. A smaller cap (the old 192000) left a single
-        // band stuck far short of a large selection. Step of 1 sample so the
-        // window can land exactly on the slot spacing (regionLen / n); a coarse
-        // step would leave the bands a few samples shy of tiling and reopen a
-        // hairline gap.
-        samplesPerWaveformSlider.setRange(2000.0, (double)kDisplayWindowSamples, 1.0);
-        samplesPerWaveformSlider.setValue(48000.0, juce::dontSendNotification);
-        samplesPerWaveformSlider.setSliderStyle(juce::Slider::LinearHorizontal);
-        samplesPerWaveformSlider.setTextBoxStyle(juce::Slider::TextBoxRight, false, 70, 22);
-        // Tooltip + enabled state are set by updateSamplesPerWaveformControl(),
-        // which also handles the single-waveform case where this slider is
-        // disabled (the lone window just spans the whole selection). Called
-        // below once the control exists, and again whenever the count or region
-        // changes.
-        samplesPerWaveformSlider.onValueChange = [this]() {
-            updateRegionInfoLabel();
-            if (auditioning) regenerateAuditionGrain();
-            repaint(waveRect);
-        };
-
-        addAndMakeVisible(fitWidthBtn);
-        // Tooltip + enabled state for both this button and the slider are set by
-        // updateSamplesPerWaveformControl() (called below), which disables both
-        // at a single waveform.
-        fitWidthBtn.onClick = [this]() {
-            // syncWindowToFitSlots writes the slider with dontSendNotification
-            // (so it can be reused from the count handler without recursing),
-            // so refresh the dependent state here the way onValueChange would.
-            syncWindowToFitSlots();
-            updateRegionInfoLabel();
-            if (auditioning) regenerateAuditionGrain();
-            repaint(waveRect);
-        };
-
+    // Grain length (all sources), in milliseconds. The size of each overlapping
+    // Hann grain the cloud modes scatter; inert for CrossfadeLoop / SpectralFreeze
+    // (greyed by refreshFreezeExtras). Mirrors the wave editor's grain control so
+    // capture and editor agree. Changing it re-derives the auto window
+    // (autoWindowMultiplier x grain) unless the user has overridden the window.
+    addAndMakeVisible(grainLenLabel);
+    grainLenLabel.setText("Grain length (ms):", juce::dontSendNotification);
+    grainLenLabel.setJustificationType(juce::Justification::centredRight);
+    addAndMakeVisible(grainLenSlider);
+    grainLenSlider.setRange(5.0, 500.0, 1.0);
+    grainLenSlider.setValue(captureDialogPrefs().grainMs, juce::dontSendNotification);
+    grainLenSlider.setSliderStyle(juce::Slider::LinearHorizontal);
+    grainLenSlider.setTextBoxStyle(juce::Slider::TextBoxRight, false, 60, 22);
+    grainLenSlider.setTooltip(
+        "Length of each overlapping grain inside a captured waveform, in "
+        "milliseconds. Shorter = a tighter, buzzier texture; longer = a smoother, "
+        "more tonal one. The freeze window (\"Samples per waveform\" below) "
+        "auto-tracks a multiple of this - 4x for the grain-cloud modes (Async / "
+        "Pitch-sync) so they have room to roam, 1x for the others - until you "
+        "drag the window yourself. Only Async and Pitch-sync grains use the grain "
+        "directly; Crossfade loop and Spectral freeze use the whole window.");
+    grainLenSlider.onValueChange = [this]() {
+        // Re-derive the auto window (mult x grain) unless the user overrode it,
+        // then refresh the displayed window control + bands + audition.
+        syncWindowToAuto();
         updateSamplesPerWaveformControl();
-    }
+        updateRegionInfoLabel();
+        if (auditioning) regenerateAuditionGrain();
+        repaint(waveRect);
+    };
+
+    // Per-waveform freeze-WINDOW length (all sources), in samples. Auto-tracks
+    // autoWindowMultiplier(mode) x grain (see syncWindowToAuto) until the user
+    // drags it; with a single waveform it spans the whole selection (disabled).
+    addAndMakeVisible(samplesPerWaveformLabel);
+    samplesPerWaveformLabel.setText("Samples per waveform:", juce::dontSendNotification);
+    samplesPerWaveformLabel.setJustificationType(juce::Justification::centredRight);
+
+    addAndMakeVisible(samplesPerWaveformSlider);
+    // Max = the full display/capture buffer (kDisplayWindowSamples) so the
+    // window can always grow to match the whole selection - e.g. with one
+    // waveform the section must be able to span the entire selection, which
+    // can be the whole buffer. Step of 1 sample so the window can land exactly
+    // on the slot spacing (regionLen / n) for the "Fit width" tiling.
+    samplesPerWaveformSlider.setRange(256.0, (double)kDisplayWindowSamples, 1.0);
+    samplesPerWaveformSlider.setValue(48000.0, juce::dontSendNotification);
+    samplesPerWaveformSlider.setSliderStyle(juce::Slider::LinearHorizontal);
+    samplesPerWaveformSlider.setTextBoxStyle(juce::Slider::TextBoxRight, false, 70, 22);
+    // Tooltip + enabled state are set by updateSamplesPerWaveformControl().
+    // A user drag flips the window into explicit (overridden) mode.
+    samplesPerWaveformSlider.onValueChange = [this]() {
+        windowUserSet = true;   // user override - stop auto-tracking the grain
+        syncCrossfadeMaxToWindow();   // the crossfade cap tracks the new window
+        updateRegionInfoLabel();
+        if (auditioning) regenerateAuditionGrain();
+        repaint(waveRect);
+    };
+
+    addAndMakeVisible(fitWidthBtn);
+    // Tooltip + enabled state for both this button and the slider are set by
+    // updateSamplesPerWaveformControl() (called below), which disables both
+    // at a single waveform.
+    fitWidthBtn.onClick = [this]() {
+        // syncWindowToFitSlots writes the slider with dontSendNotification (so it
+        // can be reused without recursing) and marks windowUserSet, so refresh
+        // the dependent state here the way onValueChange would.
+        syncWindowToFitSlots();
+        syncCrossfadeMaxToWindow();   // the crossfade cap tracks the new window
+        updateRegionInfoLabel();
+        if (auditioning) regenerateAuditionGrain();
+        repaint(waveRect);
+    };
+
+    syncWindowToAuto();
+    updateSamplesPerWaveformControl();
 
     addAndMakeVisible(regionInfoLabel);
     regionInfoLabel.setJustificationType(juce::Justification::centredLeft);
@@ -368,6 +395,8 @@ CaptureFromPlaybackDialog::CaptureFromPlaybackDialog(CaptureSource src, int ts, 
                            juce::dontSendNotification);
         // Keep a running audition pitched to the freshly-labelled note.
         if (auditioning) regenerateAuditionGrain();
+        // Re-capture / unified save: commit the pitch change to the bound frame.
+        publishMetadataEdit();
     };
     noteCombo.onChange   = onPitchPickerChanged;
     octaveCombo.onChange = onPitchPickerChanged;
@@ -414,9 +443,95 @@ CaptureFromPlaybackDialog::CaptureFromPlaybackDialog(CaptureSource src, int ts, 
         if (idx < 0) return;
         if (auto* eng = AudioEngine::getInstance())
             eng->setGrainFreezeMode((AudioEngine::GrainFreezeMode)idx);
+        // The grain count / FFT size relevance changes with the mode.
+        refreshFreezeExtras();
+        // The per-method auto window multiplier changes with the mode (4x for
+        // the cloud modes, 1x otherwise), so re-derive the auto window unless
+        // the user has overridden it, then refresh the displayed control + bands.
+        syncWindowToAuto();
+        updateSamplesPerWaveformControl();
+        updateRegionInfoLabel();
+        repaint(waveRect);
         // Re-spin the audition so the new mode re-anchors on the current slice.
         if (auditioning) regenerateAuditionGrain();
+        // Re-capture / unified save: commit the freeze-mode change to the frame.
+        publishMetadataEdit();
     };
+
+    // ----- Per-waveform texture controls (grain count / FFT size) -----
+    addAndMakeVisible(grainCountLabel);
+    grainCountLabel.setText("Grains per waveform:", juce::dontSendNotification);
+    grainCountLabel.setJustificationType(juce::Justification::centredRight);
+    addAndMakeVisible(grainCountSlider);
+    grainCountSlider.setSliderStyle(juce::Slider::LinearHorizontal);
+    grainCountSlider.setTextBoxStyle(juce::Slider::TextBoxRight, false, 50, 22);
+    grainCountSlider.setRange((double)kGranularMinGrains,
+                              (double)kGranularMaxGrains, 1.0);
+    grainCountSlider.setValue(4.0, juce::dontSendNotification);  // historical default
+    grainCountSlider.onValueChange = [this]() {
+        if (auto* eng = AudioEngine::getInstance())
+            eng->setPreviewGrainCount(selectedGrainCount());
+        if (auditioning) regenerateAuditionGrain();
+        // Re-capture / unified save: commit the grain-count change to the frame.
+        publishMetadataEdit();
+    };
+
+    addAndMakeVisible(fftSizeLabel);
+    fftSizeLabel.setText("FFT size per waveform:", juce::dontSendNotification);
+    fftSizeLabel.setJustificationType(juce::Justification::centredRight);
+    addAndMakeVisible(fftSizeCombo);
+    fftSizeCombo.addItem("Auto", 1);
+    for (int i = 0; i < kNumSpectralFftSizes; ++i)
+        fftSizeCombo.addItem(juce::String(kSpectralFftSizes[i]), i + 2);
+    fftSizeCombo.setSelectedId(1, juce::dontSendNotification);  // Auto
+    fftSizeCombo.onChange = [this]() {
+        if (auto* eng = AudioEngine::getInstance())
+            eng->setPreviewFftSize(selectedFftSize());
+        if (auditioning) regenerateAuditionGrain();
+        // Re-capture / unified save: commit the FFT-size change to the frame.
+        publishMetadataEdit();
+    };
+    refreshFreezeExtras();
+
+    // ----- Crossfade slider (all sources) -----
+    addAndMakeVisible(crossfadeLabel);
+    crossfadeLabel.setText("Crossfade (ms):", juce::dontSendNotification);
+    crossfadeLabel.setJustificationType(juce::Justification::centredRight);
+    addAndMakeVisible(crossfadeSlider);
+    crossfadeDesiredMs = juce::jmax(kXfadeMinMs, captureDialogPrefs().crossfadeMs);
+    // Provisional range; syncCrossfadeMaxToWindow below sets the real max
+    // (half the freeze window) once the window controls are configured.
+    crossfadeSlider.setRange(kXfadeMinMs, juce::jmax(2.0, crossfadeDesiredMs), 1.0);
+    crossfadeSlider.setValue(crossfadeDesiredMs, juce::dontSendNotification);
+    crossfadeSlider.setSliderStyle(juce::Slider::LinearHorizontal);
+    crossfadeSlider.setTextBoxStyle(juce::Slider::TextBoxRight, false, 60, 22);
+    crossfadeSlider.setTooltip(
+        "Crossfade-loop seam length in milliseconds. In Crossfade loop mode the "
+        "loop blends its end back into its start over this duration to hide the "
+        "seam click. Short (1-10 ms): tight, the loop period is most audible. "
+        "Long (near the cap = half the freeze window): the loop becomes a rolling "
+        "crossfade between two playheads, smoother but more blurred. The max "
+        "tracks half the \"Samples per waveform\" window because the engine can't "
+        "overlap two ramps longer than that in one loop. Effective only with "
+        "Freeze = Crossfade loop (left enabled in the other modes so you can set "
+        "it ahead of time).");
+    crossfadeSlider.onValueChange = [this]() {
+        // Ignore the synthetic notification fired when syncCrossfadeMaxToWindow
+        // clamps the value to a shrunken window - that's not the user picking a
+        // new crossfade, and writing it back would clobber their intent and fire
+        // a spurious metadata write on a mere window change.
+        if (!syncingCrossfadeFromWindow) {
+            crossfadeDesiredMs = crossfadeSlider.getValue();
+            if (auditioning) regenerateAuditionGrain();
+            // Unified save model: commit the crossfade change to the bound frame
+            // (re-capture mode); no-op in append mode.
+            publishMetadataEdit();
+        }
+    };
+    // Cap the crossfade at half the current freeze window now that the window
+    // controls (grain, samples-per-waveform, count, mode) are all configured.
+    // (reverseSliderFill is applied with the other sliders further below.)
+    syncCrossfadeMaxToWindow();
 
     addAndMakeVisible(captureBtn);
     captureBtn.setTooltip(
@@ -525,8 +640,10 @@ CaptureFromPlaybackDialog::CaptureFromPlaybackDialog(CaptureSource src, int ts, 
         s.setColour(juce::Slider::backgroundColourId, bright);
     };
     reverseSliderFill(numFramesSlider);
+    reverseSliderFill(grainLenSlider);
     reverseSliderFill(samplesPerWaveformSlider);
     reverseSliderFill(gainSlider);
+    reverseSliderFill(crossfadeSlider);
     reverseSliderFill(previewIndexSlider);
 
     // Initial state per source.
@@ -560,6 +677,10 @@ CaptureFromPlaybackDialog::~CaptureFromPlaybackDialog() {
         p.gain      = gainSlider.getValue();
         p.noteId    = noteCombo.getSelectedId();
         p.octaveId  = octaveCombo.getSelectedId();
+        p.grainMs   = grainLenSlider.getValue();
+        // Save the user's DESIRED crossfade (independent of the window-driven
+        // clamp) so reopening restores intent, not a clamped value.
+        p.crossfadeMs = crossfadeDesiredMs;
     }
     // Tear down any region-audition loop before the buffers go out of scope,
     // so subsequent audio blocks emit silence (the engine caches the preview
@@ -640,7 +761,7 @@ void CaptureFromPlaybackDialog::refreshSnapshot() {
         const int oneSec = (int)std::min((double)sz, std::max(1.0, rate));
         regionEnd   = sz;
         regionStart = std::max(0, sz - oneSec);
-        syncWindowToFitSlots();   // Mic: zero-gap bands on first fill.
+        syncWindowToAuto();   // per-method auto window (mult x grain) on first fill
         updateSamplesPerWaveformControl();  // single-waveform: window = selection
         updateRegionInfoLabel();
     } else {
@@ -701,6 +822,8 @@ void CaptureFromPlaybackDialog::chooseAndLoadFile() {
             regionStart     = 0;
             regionEnd       = len;
             captureBtn.setEnabled(true);
+            syncWindowToAuto();                 // per-method auto window for the file
+            updateSamplesPerWaveformControl();  // single-waveform: window = selection
 
             if (truncated) {
                 fileSourcePath += "  (truncated to " +
@@ -751,15 +874,29 @@ void CaptureFromPlaybackDialog::resized() {
         previewIndexSlider.setBounds(prevRow.removeFromLeft(260));
         r.removeFromBottom(6);
     }
-    // Mic gets an extra "Samples per waveform" row directly above the
-    // buttons. Built before the waveforms-count row so the two read
-    // top-to-bottom as "Waveforms to slice out" then "Samples per waveform".
-    if (source == CaptureSource::Mic) {
+    // Crossfade row (all sources), just below the freeze window it caps against.
+    {
+        auto xfadeRow = r.removeFromBottom(26);
+        crossfadeLabel.setBounds(xfadeRow.removeFromLeft(140));
+        crossfadeSlider.setBounds(xfadeRow.removeFromLeft(260));
+        r.removeFromBottom(6);
+    }
+    // "Samples per waveform" (freeze window) row, then the grain-length row,
+    // directly above the buttons (all sources). Removed from the bottom in this
+    // order so they read top-to-bottom as "Waveforms to slice out", "Grain
+    // length", "Samples per waveform".
+    {
         auto sampRow = r.removeFromBottom(26);
         samplesPerWaveformLabel.setBounds(sampRow.removeFromLeft(140));
         samplesPerWaveformSlider.setBounds(sampRow.removeFromLeft(260));
         sampRow.removeFromLeft(12);
         fitWidthBtn.setBounds(sampRow.removeFromLeft(170));
+        r.removeFromBottom(6);
+    }
+    {
+        auto grainRow = r.removeFromBottom(26);
+        grainLenLabel.setBounds(grainRow.removeFromLeft(140));
+        grainLenSlider.setBounds(grainRow.removeFromLeft(260));
         r.removeFromBottom(6);
     }
     auto controlsRow = r.removeFromBottom(26);
@@ -775,6 +912,20 @@ void CaptureFromPlaybackDialog::resized() {
     freezeModeLabel.setBounds(freezeRow.removeFromLeft(140));
     freezeModeCombo.setBounds(
         freezeRow.removeFromLeft(intrinsicComboWidth(freezeModeCombo)));
+    // Mode-specific extra to the right of the freeze picker: grain count for
+    // the cloud modes, FFT size for Spectral freeze. The two control pairs
+    // share the same slot - only the one that applies to the current mode is
+    // visible (refreshFreezeExtras toggles visibility), so they don't need
+    // separate horizontal space.
+    freezeRow.removeFromLeft(14);
+    auto extraRow = freezeRow;
+    auto grainRow = extraRow;
+    grainCountLabel.setBounds(grainRow.removeFromLeft(140));
+    grainCountSlider.setBounds(grainRow.removeFromLeft(120));
+    auto fftRow = extraRow;
+    fftSizeLabel.setBounds(fftRow.removeFromLeft(140));
+    fftSizeCombo.setBounds(
+        fftRow.removeFromLeft(intrinsicComboWidth(fftSizeCombo)));
 
     r.removeFromBottom(6);
     // Embedded pitch row: label + note + octave + cents readout. Same
@@ -1078,43 +1229,45 @@ void CaptureFromPlaybackDialog::paint(juce::Graphics& g) {
     drawHandle(xe);
 }
 
-int CaptureFromPlaybackDialog::effectiveSrcLen() const {
-    const int    regionLen = std::max(0, regionEnd - regionStart);
-    const double sr        = (tapSampleRate > 0.0) ? tapSampleRate : 48000.0;
-    const int    grainLen  = std::max(64, (int)std::round(0.1 * sr));  // 100 ms
-    const int    tapLen    = (int)tap.size();
+int CaptureFromPlaybackDialog::effectiveGrainLen() const {
+    const double sr = (tapSampleRate > 0.0) ? tapSampleRate : 48000.0;
+    const double ms = grainLenSlider.getValue();
+    return std::max(64, (int)std::round(ms / 1000.0 * sr));
+}
 
-    if (source == CaptureSource::Mic) {
-        const int n = (int)std::round(numFramesSlider.getValue());
-        if (n <= 1) {
-            // A single waveform spans the WHOLE selection - there is no per-
-            // waveform spacing to honour, so the one window simply is the
-            // selection. The "Samples per waveform" slider is disabled in this
-            // case (see updateSamplesPerWaveformControl), so it can't be the
-            // source of truth here; the selection size is.
-            int w = regionLen;
-            w = std::max(w, grainLen);      // OLA needs at least one grain
-            if (tapLen > 0) w = std::min(w, tapLen);
-            return w;
-        }
-        // 2+ waveforms: the "Samples per waveform" slider is the single source
-        // of truth for the window length - a fixed sample count, independent of
-        // the region size. Resizing the selection then re-spaces the bands
-        // without resizing them (the constant window keeps each band's width
-        // constant). The slider's step is 1 sample so it can land exactly on the
-        // slot spacing (regionLen / n) for the zero-gap tiling default.
-        int w = (int)std::round(samplesPerWaveformSlider.getValue());
-        w = std::max(w, grainLen);          // OLA needs at least one grain
+int CaptureFromPlaybackDialog::effectiveSrcLen() const {
+    const int regionLen = std::max(0, regionEnd - regionStart);
+    const int tapLen    = (int)tap.size();
+    const int grainLen  = effectiveGrainLen();
+    const int n         = (int)std::round(numFramesSlider.getValue());
+
+    // Floor: the grain-cloud modes need the band to hold at least one grain;
+    // the loop / FFT modes (which ignore the grain) only need a few samples.
+    const GranularFreezeMode mode = selectedFreezeMode();
+    const bool grainCloud = (mode == GranularFreezeMode::AsyncGranular
+                             || mode == GranularFreezeMode::PitchSyncGrains);
+    const int  floor      = grainCloud ? grainLen : 256;
+
+    if (n <= 1) {
+        // A single waveform spans the WHOLE selection - there is no per-waveform
+        // spacing to honour, so the one window simply is the selection. The
+        // "Samples per waveform" slider is disabled in this case (see
+        // updateSamplesPerWaveformControl), so the selection size is the source
+        // of truth, not the slider.
+        int w = regionLen;
+        w = std::max(w, floor);
         if (tapLen > 0) w = std::min(w, tapLen);
         return w;
     }
 
-    // File / Playback auto-size: ~1 s or 4x grain, capped to the region.
-    int wanted = std::max((int)std::llround(sr), grainLen * 4);
-    wanted = std::max(wanted, grainLen);
-    const int cap = regionLen > 0 ? regionLen : tapLen;
-    if (cap <= 0) return 0;
-    return std::min(wanted, cap);
+    // 2+ waveforms: the "Samples per waveform" slider is the source of truth - a
+    // fixed sample count. It auto-tracks autoWindowMultiplier(mode) x grain via
+    // syncWindowToAuto() until the user overrides it; either way the current
+    // value is read here.
+    int w = (int)std::round(samplesPerWaveformSlider.getValue());
+    w = std::max(w, floor);
+    if (tapLen > 0) w = std::min(w, tapLen);
+    return w;
 }
 
 int CaptureFromPlaybackDialog::bandStartForIndex(int i, int n, int srcLen) const {
@@ -1167,23 +1320,42 @@ int CaptureFromPlaybackDialog::bandStartForIndex(int i, int n, int srcLen) const
 }
 
 void CaptureFromPlaybackDialog::syncWindowToFitSlots() {
-    if (source != CaptureSource::Mic) return;
-    // Set the window to exactly one slot spacing (regionLen / n) so the n
-    // bands tile the selection edge-to-edge with zero gaps. This is the
-    // zero-gap default applied when the count changes or on first fill; the
-    // user can then override it via the slider, and resizing the selection
-    // afterwards keeps this window size (sliding the bands, not rescaling).
-    // dontSendNotification so this programmatic set doesn't recurse through
-    // onValueChange.
+    // Set the window to exactly one slot spacing (regionLen / n) so the n bands
+    // tile the selection edge-to-edge with zero gaps. This is an explicit user
+    // action (the "Fit width to selection" button), so it counts as a window
+    // override - the window then stays fixed across grain / mode changes until
+    // re-fit or re-dragged. dontSendNotification so this programmatic set doesn't
+    // recurse through onValueChange (which is why we mark the override here).
     const int n      = (int)std::round(numFramesSlider.getValue());
     const int regLen = std::max(0, regionEnd - regionStart);
     if (n <= 0 || regLen <= 0) return;
     const double spacing = (double)regLen / (double)n;
     samplesPerWaveformSlider.setValue(spacing, juce::dontSendNotification);
+    windowUserSet = true;
+}
+
+void CaptureFromPlaybackDialog::syncWindowToAuto() {
+    // While the window is auto (the user hasn't dragged it), keep the slider on
+    // autoWindowMultiplier(mode) x grain - the per-method default that gives the
+    // grain-cloud modes roam room (4x) and keeps the loop / FFT modes at 1x,
+    // matching the editor's kWindowAutoPerMethod sentinel. No-op once overridden,
+    // and for a single waveform (whose window is the whole selection - handled by
+    // updateSamplesPerWaveformControl / effectiveSrcLen). dontSendNotification so
+    // this never flips windowUserSet.
+    if (windowUserSet) return;
+    const int n = (int)std::round(numFramesSlider.getValue());
+    if (n <= 1) return;
+    const int grainLen = effectiveGrainLen();
+    const int mult     = autoWindowMultiplier(selectedFreezeMode());
+    int w = mult * grainLen;
+    const int tapLen = (int)tap.size();
+    if (tapLen > 0) w = std::min(w, tapLen);
+    w = juce::jlimit((int)samplesPerWaveformSlider.getMinimum(),
+                     (int)samplesPerWaveformSlider.getMaximum(), w);
+    samplesPerWaveformSlider.setValue((double)w, juce::dontSendNotification);
 }
 
 void CaptureFromPlaybackDialog::updateSamplesPerWaveformControl() {
-    if (source != CaptureSource::Mic) return;
     const int n = (int)std::round(numFramesSlider.getValue());
     if (n <= 1) {
         // One waveform spans the whole selection: there is nothing for this
@@ -1206,6 +1378,8 @@ void CaptureFromPlaybackDialog::updateSamplesPerWaveformControl() {
         fitWidthBtn.setTooltip(
             "Not needed with a single waveform - it already spans the whole "
             "selection. Add more waveforms to use this.");
+        // The window (= selection) drives the crossfade-seam cap.
+        syncCrossfadeMaxToWindow();
         return;
     }
     samplesPerWaveformSlider.setEnabled(true);
@@ -1216,19 +1390,38 @@ void CaptureFromPlaybackDialog::updateSamplesPerWaveformControl() {
         "waveform\" until each band abuts the next. Use it after resizing "
         "the selection to snap back to a clean edge-to-edge layout.");
     samplesPerWaveformSlider.setTooltip(
-        "How many audio samples each captured waveform spans - the length of "
-        "the source snapshot behind one waveform. Bigger = each waveform holds "
-        "a longer slice of sound (more of the timbre's movement); smaller = a "
-        "tighter, more frozen moment. At 48 kHz, 48000 samples is about 1 "
-        "second. The shaded orange bands over the waveform show each one's "
-        "span, each exactly this wide and spaced evenly across the selection "
-        "with the same gap everywhere - including the margins to the two "
-        "handles. When the selection equals this times the waveform count "
-        "the bands tile it with no gaps; a wider selection opens every gap "
-        "equally. Make this large enough that the bands overlap and they "
-        "stay contained within the selection (first flush left, last flush "
-        "right) instead of spilling past the handles. The band width never "
-        "changes, so resizing re-spaces the bands rather than rescaling.");
+        "The freeze WINDOW: how many audio samples each captured waveform spans "
+        "- the region the freeze mode loops (Crossfade), roams (Async / "
+        "Pitch-sync grains), or analyses (Spectral). At 48 kHz, 48000 samples is "
+        "about 1 second. Until you drag it, this auto-tracks a multiple of the "
+        "grain length above - 4x for the grain-cloud modes so they have room to "
+        "roam, 1x for the others - exactly like the wave editor's window. Drag it "
+        "to set an explicit width (it then stays fixed as you change the grain or "
+        "mode). The shaded orange bands over the waveform show each waveform's "
+        "span, each exactly this wide and spaced evenly across the selection; "
+        "\"Fit width to selection\" snaps them to tile with no gaps.");
+    // The freeze window drives the crossfade-seam cap (half the window).
+    syncCrossfadeMaxToWindow();
+}
+
+void CaptureFromPlaybackDialog::syncCrossfadeMaxToWindow() {
+    // The CrossfadeLoop seam can be at most half the loop, and the loop IS the
+    // freeze window, so cap the slider at effectiveSrcLen()/2 (in ms). Mirrors
+    // the engine's xfade = min(req, window/2) clamp and the editor's
+    // crossfadeMaxSamples, so the visible value always equals the audible one.
+    // The displayed value is min(desired, newMax): shrinking the window clamps
+    // the crossfade down, growing it back restores the user's choice. The
+    // syncingCrossfadeFromWindow guard keeps setRange's internal clamp (which
+    // fires onValueChange synchronously) from overwriting crossfadeDesiredMs.
+    const double sr        = (tapSampleRate > 0.0) ? tapSampleRate : 48000.0;
+    const int    windowLen = effectiveSrcLen();
+    const double maxMs     = juce::jmax(kXfadeMinMs,
+                                        (double)(windowLen / 2) / sr * 1000.0);
+    const double visible   = juce::jlimit(kXfadeMinMs, maxMs, crossfadeDesiredMs);
+    syncingCrossfadeFromWindow = true;
+    crossfadeSlider.setRange(kXfadeMinMs, juce::jmax(2.0, maxMs), 1.0);
+    crossfadeSlider.setValue(visible, juce::dontSendNotification);
+    syncingCrossfadeFromWindow = false;
 }
 
 void CaptureFromPlaybackDialog::updatePreviewIndexControl() {
@@ -1258,27 +1451,11 @@ void CaptureFromPlaybackDialog::updatePreviewIndexControl() {
     }
 }
 
-int CaptureFromPlaybackDialog::loopLenForWindow(int windowLen) const {
-    if (windowLen <= 0) return 0;
-    const int n = (int)std::round(numFramesSlider.getValue());
-    if (n <= 1) {
-        // Single waveform: the loop is the whole window (= whole selection),
-        // so the captured frame plays the entire selected sound on repeat.
-        return std::max(16, windowLen);
-    }
-    // Multiple waveforms: cap the loop at a ~100 ms neutral grain so each
-    // frame is a stationary timbral snapshot the wavetable morphs through,
-    // but never longer than the window itself.
-    const double sr = (tapSampleRate > 0.0) ? tapSampleRate : 48000.0;
-    const int neutralGrain = std::max(64, (int)std::round(0.1 * sr));
-    return std::max(16, std::min(neutralGrain, windowLen));
-}
-
 std::vector<float>
-CaptureFromPlaybackDialog::buildGrainSource(int startIdx, int loopLen) const {
+CaptureFromPlaybackDialog::buildGrainSource(int startIdx, int windowLen) const {
     const int tapLen       = (int)tap.size();
-    const int reservedTail = std::max(0, loopLen / 2);
-    const int srcLen       = std::max(0, loopLen + reservedTail);
+    const int reservedTail = std::max(0, windowLen / 2);
+    const int srcLen       = std::max(0, windowLen + reservedTail);
     std::vector<float> source((size_t)srcLen, 0.0f);
     for (int s = 0; s < srcLen; ++s) {
         const int idx = startIdx + s;
@@ -1288,6 +1465,133 @@ CaptureFromPlaybackDialog::buildGrainSource(int startIdx, int loopLen) const {
     return source;
 }
 
+void CaptureFromPlaybackDialog::refreshFreezeExtras() {
+    const GranularFreezeMode mode = selectedFreezeMode();
+    const bool usesGrain = (mode == GranularFreezeMode::AsyncGranular
+                            || mode == GranularFreezeMode::PitchSyncGrains);
+    const bool isSpectral = (mode == GranularFreezeMode::SpectralFreeze);
+    // The grain-count and FFT-size controls share one slot in the freeze row,
+    // so show only the pair that applies to the current mode. CrossfadeLoop
+    // uses neither, so both hide. The visible control is always enabled; the
+    // tooltip on each still explains what it does.
+    grainCountLabel.setVisible(usesGrain);
+    grainCountSlider.setVisible(usesGrain);
+    fftSizeLabel.setVisible(isSpectral);
+    fftSizeCombo.setVisible(isSpectral);
+    grainCountLabel.setEnabled(usesGrain);
+    grainCountSlider.setEnabled(usesGrain);
+    fftSizeLabel.setEnabled(isSpectral);
+    fftSizeCombo.setEnabled(isSpectral);
+
+    grainCountSlider.setTooltip(usesGrain
+        ? "How many overlapping grains make up each captured waveform's cloud. "
+          "More = denser and smoother; fewer = sparser and more granular. The "
+          "level stays constant as you change it. Only used by Async and "
+          "Pitch-sync grains."
+        : "Disabled - the current freeze mode has no grains. Switch to Async or "
+          "Pitch-sync grains to set the grain count.");
+    fftSizeCombo.setTooltip(isSpectral
+        ? "FFT size for each captured waveform's Spectral freeze, in samples. "
+          "Larger = finer frequency detail (more bins) but a coarser time "
+          "window. Auto picks the largest size that fits the waveform (up to "
+          "2048). Only used by Spectral freeze."
+        : "Disabled - the FFT size only matters in Spectral-freeze mode. Switch "
+          "the freeze mode to Spectral freeze to use it.");
+
+    // Grain length is only used by the grain-cloud modes; CrossfadeLoop loops
+    // the whole window and SpectralFreeze FFTs it, so grey it out there (its
+    // value still seeds the auto window multiplier, 1x for these modes).
+    grainLenLabel.setEnabled(usesGrain);
+    grainLenSlider.setEnabled(usesGrain);
+    grainLenSlider.setTooltip(usesGrain
+        ? "Length of each overlapping grain inside a captured waveform, in "
+          "milliseconds. Shorter = tighter/buzzier; longer = smoother/more tonal. "
+          "The freeze window below auto-tracks 4x this (until you drag it) so the "
+          "cloud has room to roam. Used by Async and Pitch-sync grains."
+        : "Disabled - the current freeze mode has no grains: Crossfade loop "
+          "loops the whole freeze window and Spectral freeze analyses it. Switch "
+          "to Async or Pitch-sync grains to set the grain length. (Use \"Samples "
+          "per waveform\" to set the loop / analysis length for this mode.)");
+
+    // Keep the engine audition in sync with the current values.
+    if (auto* eng = AudioEngine::getInstance()) {
+        eng->setPreviewGrainCount(selectedGrainCount());
+        eng->setPreviewFftSize(selectedFftSize());
+    }
+}
+
+void CaptureFromPlaybackDialog::seedFromExistingFrame(double pitchHz,
+                                                      int freezeModeIdx,
+                                                      double crossfadeMs,
+                                                      int grainCount,
+                                                      int fftSize) {
+    // ----- Pitch -----
+    if (pitchHz > 0.0) {
+        capturedPitchHz = pitchHz;
+        auto [n, o] = hzToNearestNoteOctave(pitchHz);
+        if (n >= 0 && n <= 11) noteCombo.setSelectedId(n + 1, juce::dontSendNotification);
+        if (o >= 0 && o <= 9)  octaveCombo.setSelectedId(o + 1, juce::dontSendNotification);
+        centsLabel.setText(formatCents(pitchHz), juce::dontSendNotification);
+    }
+
+    // ----- Freeze mode -----
+    if (freezeModeIdx >= 0 && freezeModeIdx <= 3) {
+        freezeModeCombo.setSelectedId(freezeModeIdx + 1, juce::dontSendNotification);
+        // Match the live audition to the seeded mode (the onChange handler that
+        // would normally do this is suppressed by dontSendNotification).
+        if (auto* eng = AudioEngine::getInstance())
+            eng->setGrainFreezeMode((AudioEngine::GrainFreezeMode)freezeModeIdx);
+    }
+
+    // ----- Crossfade (ms) -----
+    // Seed the Crossfade slider from the frame so re-capture starts at its
+    // current seam length. Remember the desired value (the source of truth that
+    // survives the window-driven clamp); the trailing updateSamplesPerWaveformControl
+    // below re-caps the slider to the seeded mode's window via
+    // syncCrossfadeMaxToWindow, so set crossfadeDesiredMs first.
+    if (crossfadeMs >= 0.0) {
+        crossfadeDesiredMs = juce::jmax(kXfadeMinMs, crossfadeMs);
+        const double vis = juce::jlimit(crossfadeSlider.getMinimum(),
+                                        crossfadeSlider.getMaximum(),
+                                        crossfadeDesiredMs);
+        crossfadeSlider.setValue(vis, juce::dontSendNotification);
+    }
+
+    // ----- Texture (grain count / FFT size) -----
+    if (grainCount >= kGranularMinGrains) {
+        grainCountSlider.setValue(
+            (double)juce::jlimit(kGranularMinGrains, kGranularMaxGrains, grainCount),
+            juce::dontSendNotification);
+    }
+    if (fftSize >= 0) {
+        // 0 == Auto (combo id 1); otherwise pick the matching size's id.
+        int id = 1;
+        for (int i = 0; i < kNumSpectralFftSizes; ++i)
+            if (kSpectralFftSizes[i] == fftSize) { id = i + 2; break; }
+        fftSizeCombo.setSelectedId(id, juce::dontSendNotification);
+    }
+    // Reflect the seeded mode's relevance + push the seeded values to the engine
+    // audition (the freeze onChange that would normally do this is suppressed by
+    // dontSendNotification above).
+    refreshFreezeExtras();
+    // The seeded mode's per-method window multiplier may differ from the
+    // construction-time default, so re-derive the auto window (no-op once the
+    // user overrides it) and refresh the displayed control.
+    syncWindowToAuto();
+    updateSamplesPerWaveformControl();
+}
+
+void CaptureFromPlaybackDialog::publishMetadataEdit() {
+    if (!onMetadataEdited) return;  // append mode: no live frame bound
+    const int fz = juce::jlimit(0, 3, freezeModeCombo.getSelectedId() - 1);
+    // Report the user's DESIRED crossfade (the intent that survives the
+    // window-driven clamp), not the visible slider value, so a frame whose seam
+    // is temporarily clamped by a narrow window keeps its true length - mirrors
+    // the song dialog's write-through contract.
+    onMetadataEdited(capturedPitchHz, fz, crossfadeDesiredMs,
+                     selectedGrainCount(), selectedFftSize());
+}
+
 std::vector<std::unique_ptr<IWavetableFrame>>
 CaptureFromPlaybackDialog::buildFrames(int n) const {
     std::vector<std::unique_ptr<IWavetableFrame>> out;
@@ -1295,42 +1599,51 @@ CaptureFromPlaybackDialog::buildFrames(int n) const {
     n = std::min(n, 32);
     out.reserve((size_t)n);
 
-    // Mic/file capture mirrors the song-capture path: each emitted frame
-    // is a GranularFrame that loops a window of the source PCM. The loop
-    // length depends on the waveform count (loopLenForWindow): a single
-    // waveform loops the WHOLE window (= whole selection) so the frame
-    // plays back the entire recorded sound, while multiple waveforms cap
-    // the loop at a ~100 ms timbral snapshot the wavetable Position
-    // parameter morphs through. embeddedPitchHz comes from the in-dialog
-    // pitch picker (Note + Octave, default A4 = 440 Hz) so MIDI playback at
-    // the matching key plays the source at 1:1 and other keys pitch-shift
-    // via the usual wavetable stride math.
+    // Each emitted frame is a BANDED GranularFrame: its source PCM is one freeze
+    // WINDOW (= "Samples per waveform") of the tap plus a half-window lookahead
+    // tail for the loop seam, with windowStart = 0 / windowLen = the band so the
+    // voice runs its clean per-mode banded math (Crossfade loops the window, the
+    // grain-cloud modes roam inside it, Spectral analyses inside it). The grain
+    // is the separate "Grain length" control, so the cloud modes get roam room
+    // exactly like the wave editor. embeddedPitchHz comes from the in-dialog
+    // pitch picker (Note + Octave, default A4 = 440 Hz) so MIDI playback at the
+    // matching key plays the source at 1:1 and other keys pitch-shift via the
+    // usual wavetable stride math.
     const double sr      = (tapSampleRate > 0.0) ? tapSampleRate : 48000.0;
 
-    // Per-frame source WINDOW length (the band width). For Mic this comes
-    // from the "Samples per waveform" slider (or the whole selection when
-    // there is a single waveform); for File / Playback it auto-sizes. The
-    // section bands are drawn from the same windowLen so the drawn bands and
-    // the captured loops agree.
-    const int windowLen  = effectiveSrcLen();
-    const int loopLen    = loopLenForWindow(windowLen);
+    // Per-frame freeze-window (band) width and grain. For a single waveform the
+    // window is the whole selection; for 2+ it is the "Samples per waveform"
+    // slider (auto = mult x grain until overridden). The section bands are drawn
+    // from the same window so the drawn bands and the captured frames agree.
+    const int windowLen = effectiveSrcLen();
+    const int grainLen  = effectiveGrainLen();
 
-    // Seam crossfade: ~50 ms (clamped to L/2 by the player), matching the
-    // audition so capture sounds like preview. Stored on the frame so the
-    // synth's CrossfadeLoop reader uses the same blend.
-    const int xfadeSamples = std::min(std::max(0, (int)std::round(0.05 * sr)),
-                                      std::max(0, loopLen / 2));
+    // Seam crossfade: the Crossfade slider's ms value (clamped to window/2 by the
+    // player - the loop body is the window), matching the audition so capture
+    // sounds like preview. Only audible in CrossfadeLoop, but baked into every
+    // frame so a later mode switch in the editor already has the seam set.
+    const int xfadeSamples = std::min(
+        std::max(0, (int)std::round(crossfadeSlider.getValue() * 0.001 * sr)),
+        std::max(0, windowLen / 2));
 
     for (int i = 0; i < n; ++i) {
-        // Same slot geometry the section bands draw, so the captured loop
-        // body matches the on-screen bands exactly. buildGrainSource adds
-        // the loopLen/2 lookahead tail past the band end for the seam.
+        // Same slot geometry the section bands draw, so the captured band body
+        // matches the on-screen bands exactly. buildGrainSource adds the
+        // windowLen/2 lookahead tail past the band end for the seam.
         const int startIdx = bandStartForIndex(i, n, windowLen);
-        std::vector<float> source = buildGrainSource(startIdx, loopLen);
+        std::vector<float> source = buildGrainSource(startIdx, windowLen);
 
         auto frame = std::make_unique<GranularFrame>(
-            std::move(source), sr, loopLen, (float)capturedPitchHz,
+            std::move(source), sr, grainLen, (float)capturedPitchHz,
             selectedFreezeMode(), xfadeSamples);
+        // Banded: the band is the first windowLen samples of the source (the rest
+        // is the seam lookahead). This is what gives the cloud modes roam room.
+        frame->windowStart = 0;
+        frame->windowLen   = windowLen;
+        // Per-waveform texture: overlapping-grain count (cloud modes) and FFT
+        // size (Spectral). Auto-ignored by the modes that don't use them.
+        frame->grainCount = selectedGrainCount();
+        frame->fftSize    = selectedFftSize();
         // Per-frame output gain (the in-dialog Gain control). Carried on the
         // GranularFrame's IWavetableFrame::gain so the synth's granular layer
         // scales playback by it (and the wave editor's Gain knob can adjust it
@@ -1370,16 +1683,15 @@ void CaptureFromPlaybackDialog::regenerateAuditionGrain() {
     const double sr        = tapSampleRate;
 
     // Audition the user-selected frame using the exact geometry buildFrames
-    // bakes, so the preview is honest: the single-waveform case loops the
-    // whole selection (you hear the recorded sound), the multi-waveform case
-    // auditions whichever waveform the "Preview waveform" picker selects.
-    // windowLen is the band width (effectiveSrcLen); loopLen is what actually
-    // loops.
+    // bakes, so the preview is honest: the same banded source (window + seam
+    // lookahead), grain, and per-method window the captured frame will carry.
+    // The single-waveform case spans the whole selection (you hear the recorded
+    // sound); the multi-waveform case auditions whichever waveform the "Preview
+    // waveform" picker selects.
     const int n        = (int)std::round(numFramesSlider.getValue());
     const int windowLen = effectiveSrcLen();
     if (windowLen <= 0) return;
-    const int loopLen  = loopLenForWindow(windowLen);
-    if (loopLen <= 0) return;
+    const int grainLen = effectiveGrainLen();
 
     // 0-based band index. With a single waveform there is only band 0; with
     // 2+ the "Preview waveform" slider (1-based) chooses, clamped into range.
@@ -1388,7 +1700,7 @@ void CaptureFromPlaybackDialog::regenerateAuditionGrain() {
         : juce::jlimit(0, n - 1,
                        (int)std::round(previewIndexSlider.getValue()) - 1);
     const int startIdx = bandStartForIndex(repIdx, n, windowLen);
-    auto src = std::make_shared<std::vector<float>>(buildGrainSource(startIdx, loopLen));
+    auto src = std::make_shared<std::vector<float>>(buildGrainSource(startIdx, windowLen));
 
     // Bake the dialog's output gain into this throwaway preview buffer so the
     // audition loudness matches what the captured frame will play at. The
@@ -1407,11 +1719,26 @@ void CaptureFromPlaybackDialog::regenerateAuditionGrain() {
     // Publish the source's natural pitch so PitchSyncGrains can derive the
     // loop period; the other freeze modes ignore it.
     eng->setPreviewEmbeddedPitch((float)hz);
-    eng->setPreviewGrainLength(loopLen);
-    // ~50 ms seam crossfade, matching buildFrames; engine clamps to L/2.
-    const int xfadeSamples = std::min(std::max(0, (int)std::round(0.05 * sr)),
-                                      std::max(0, loopLen / 2));
+    // Banded preview, identical to the captured frame: the band is the first
+    // windowLen samples (windowStart = 0), the grain is the separate grain
+    // control. The published grain length is clamped to the source size so the
+    // engine's viability gate (size >= grainLen) passes even for a tiny window
+    // in a mode that ignores the grain; the voice uses the band, not the grain,
+    // for those modes anyway.
+    const int srcLen = (int)src->size();
+    eng->setPreviewGrainLength(std::min(grainLen, srcLen));
+    eng->setPreviewWindowStart(0);
+    eng->setPreviewWindowLen(windowLen);
+    // Seam crossfade from the Crossfade slider, matching buildFrames; engine
+    // clamps to window/2.
+    const int xfadeSamples = std::min(
+        std::max(0, (int)std::round(crossfadeSlider.getValue() * 0.001 * sr)),
+        std::max(0, windowLen / 2));
     eng->setPreviewCrossfadeLength(xfadeSamples);
+    // Re-publish the texture choices on every respin so a restart after a
+    // clearPreview still auditions at the user's grain count / FFT size.
+    eng->setPreviewGrainCount(selectedGrainCount());
+    eng->setPreviewFftSize(selectedFftSize());
     eng->setPreviewGrainBuffer(std::move(src));
 }
 
@@ -1778,10 +2105,51 @@ CaptureFromSongDialog::CaptureFromSongDialog(NodeGraph& g, Transport& t,
         // current marker spot. No-op if not currently in GrainLoop.
         if (state == TState::Paused || state == TState::Scrubbing)
             regenerateGrain();
+        // The grain count / FFT size relevance changes with the mode.
+        refreshFreezeExtras();
         // Unified save model: write the freeze mode through to the live frame
         // in re-capture mode. No-op in append.
         publishMetadataEdit();
     };
+
+    // ----- Per-waveform texture controls (grain count / FFT size) -----
+    addAndMakeVisible(grainCountLabel);
+    grainCountLabel.setText("Grains per waveform:", juce::dontSendNotification);
+    grainCountLabel.setJustificationType(juce::Justification::centredRight);
+    addAndMakeVisible(grainCountSlider);
+    grainCountSlider.setSliderStyle(juce::Slider::LinearHorizontal);
+    grainCountSlider.setTextBoxStyle(juce::Slider::TextBoxRight, false, 50, 22);
+    grainCountSlider.setRange((double)kGranularMinGrains,
+                              (double)kGranularMaxGrains, 1.0);
+    grainCountSlider.setValue(4.0, juce::dontSendNotification);  // historical default
+    grainCountSlider.onValueChange = [this]() {
+        if (auto* eng = AudioEngine::getInstance())
+            eng->setPreviewGrainCount(selectedGrainCount());
+        if (state == TState::Paused || state == TState::Scrubbing)
+            regenerateGrain();
+        // Unified save model: write the grain count through to the live frame
+        // in re-capture mode. No-op in append.
+        publishMetadataEdit();
+    };
+
+    addAndMakeVisible(fftSizeLabel);
+    fftSizeLabel.setText("FFT size per waveform:", juce::dontSendNotification);
+    fftSizeLabel.setJustificationType(juce::Justification::centredRight);
+    addAndMakeVisible(fftSizeCombo);
+    fftSizeCombo.addItem("Auto", 1);
+    for (int i = 0; i < kNumSpectralFftSizes; ++i)
+        fftSizeCombo.addItem(juce::String(kSpectralFftSizes[i]), i + 2);
+    fftSizeCombo.setSelectedId(1, juce::dontSendNotification);  // Auto
+    fftSizeCombo.onChange = [this]() {
+        if (auto* eng = AudioEngine::getInstance())
+            eng->setPreviewFftSize(selectedFftSize());
+        if (state == TState::Paused || state == TState::Scrubbing)
+            regenerateGrain();
+        // Unified save model: write the FFT size through to the live frame in
+        // re-capture mode. No-op in append.
+        publishMetadataEdit();
+    };
+    refreshFreezeExtras();
 
     // ----- Embedded pitch picker -----
     // Sets the captured frame's embeddedPitchHz so MIDI playback at the
@@ -1967,6 +2335,19 @@ void CaptureFromSongDialog::resized() {
     freezeModeLabel.setBounds(freezeRow.removeFromLeft(70));
     freezeModeCombo.setBounds(
         freezeRow.removeFromLeft(intrinsicComboWidth(freezeModeCombo)));
+    // Mode-specific extra to the right of the freeze picker: grain count for
+    // the cloud modes, FFT size for Spectral freeze. The two control pairs
+    // share the same slot - only the one applying to the current mode is
+    // visible (refreshFreezeExtras toggles visibility), so they don't need
+    // separate horizontal space.
+    freezeRow.removeFromLeft(14);
+    auto songGrainRow = freezeRow;
+    grainCountLabel.setBounds(songGrainRow.removeFromLeft(140));
+    grainCountSlider.setBounds(songGrainRow.removeFromLeft(120));
+    auto songFftRow = freezeRow;
+    fftSizeLabel.setBounds(songFftRow.removeFromLeft(140));
+    fftSizeCombo.setBounds(
+        songFftRow.removeFromLeft(intrinsicComboWidth(fftSizeCombo)));
 
     r.removeFromBottom(8);
 
@@ -2221,12 +2602,18 @@ void CaptureFromSongDialog::regenerateGrain() {
     const int xfadeSamples = std::max(0,
         (int)std::round(crossfadeSlider.getValue() * 0.001 * songSampleRate));
     eng->setPreviewCrossfadeLength(xfadeSamples);
+    // Re-publish the texture choices on every respin so a restart after a
+    // clearPreview (Stop) still auditions at the user's grain count / FFT size.
+    eng->setPreviewGrainCount(selectedGrainCount());
+    eng->setPreviewFftSize(selectedFftSize());
     eng->setPreviewGrainBuffer(std::move(src));
 }
 
 void CaptureFromSongDialog::seedFromExistingFrame(double pitchHz,
                                                   int freezeModeIdx,
-                                                  double crossfadeMs) {
+                                                  double crossfadeMs,
+                                                  int grainCount,
+                                                  int fftSize) {
     // ----- Pitch -----
     if (pitchHz > 0.0) {
         capturedPitchHz = pitchHz;
@@ -2257,6 +2644,24 @@ void CaptureFromSongDialog::seedFromExistingFrame(double pitchHz,
                                         crossfadeSlider.getMaximum(), crossfadeMs);
         crossfadeSlider.setValue(vis, juce::dontSendNotification);
     }
+
+    // ----- Texture (grain count / FFT size) -----
+    if (grainCount >= kGranularMinGrains) {
+        grainCountSlider.setValue(
+            (double)juce::jlimit(kGranularMinGrains, kGranularMaxGrains, grainCount),
+            juce::dontSendNotification);
+    }
+    if (fftSize >= 0) {
+        // 0 == Auto (combo id 1); otherwise pick the matching size's id.
+        int id = 1;
+        for (int i = 0; i < kNumSpectralFftSizes; ++i)
+            if (kSpectralFftSizes[i] == fftSize) { id = i + 2; break; }
+        fftSizeCombo.setSelectedId(id, juce::dontSendNotification);
+    }
+    // Reflect the seeded mode's relevance + push the seeded values to the
+    // engine audition (the freeze onChange that would normally do this is
+    // suppressed by dontSendNotification above).
+    refreshFreezeExtras();
 }
 
 void CaptureFromSongDialog::publishMetadataEdit() {
@@ -2270,7 +2675,50 @@ void CaptureFromSongDialog::publishMetadataEdit() {
     // value. The frame keeps its own grainLength (Width is a capture-time param
     // that doesn't write through), and the synth clamps the seam to grainLength/2
     // at use time, so storing the full intent here is both safe and lossless.
-    onMetadataEdited(capturedPitchHz, fz, crossfadeDesiredMs);
+    onMetadataEdited(capturedPitchHz, fz, crossfadeDesiredMs,
+                     selectedGrainCount(), selectedFftSize());
+}
+
+void CaptureFromSongDialog::refreshFreezeExtras() {
+    const int idx = juce::jlimit(0, 3, freezeModeCombo.getSelectedId() - 1);
+    const GranularFreezeMode mode = (GranularFreezeMode)idx;
+    const bool usesGrain = (mode == GranularFreezeMode::AsyncGranular
+                            || mode == GranularFreezeMode::PitchSyncGrains);
+    const bool isSpectral = (mode == GranularFreezeMode::SpectralFreeze);
+
+    // The grain-count and FFT-size controls share one slot in the freeze row,
+    // so show only the pair that applies to the current mode. CrossfadeLoop
+    // uses neither, so both hide. The visible control is always enabled; the
+    // tooltip on each still explains what it does.
+    grainCountLabel.setVisible(usesGrain);
+    grainCountSlider.setVisible(usesGrain);
+    fftSizeLabel.setVisible(isSpectral);
+    fftSizeCombo.setVisible(isSpectral);
+    grainCountLabel.setEnabled(usesGrain);
+    grainCountSlider.setEnabled(usesGrain);
+    fftSizeLabel.setEnabled(isSpectral);
+    fftSizeCombo.setEnabled(isSpectral);
+
+    grainCountSlider.setTooltip(usesGrain
+        ? "How many overlapping grains make up each captured waveform's cloud. "
+          "More = denser and smoother; fewer = sparser and more granular. The "
+          "level stays constant as you change it. Only used by Async and "
+          "Pitch-sync grains."
+        : "Disabled - the current freeze mode has no grains. Switch to Async or "
+          "Pitch-sync grains to set the grain count.");
+    fftSizeCombo.setTooltip(isSpectral
+        ? "FFT size for each captured waveform's Spectral freeze, in samples. "
+          "Larger = finer frequency detail (more bins) but a coarser time "
+          "window. Auto picks the largest size that fits the waveform (up to "
+          "2048). Only used by Spectral freeze."
+        : "Disabled - the FFT size only matters in Spectral-freeze mode. Switch "
+          "the freeze mode to Spectral freeze to use it.");
+
+    // Keep the engine audition in sync with the current values.
+    if (auto* eng = AudioEngine::getInstance()) {
+        eng->setPreviewGrainCount(selectedGrainCount());
+        eng->setPreviewFftSize(selectedFftSize());
+    }
 }
 
 void CaptureFromSongDialog::publishPreviewPitch() {
@@ -2491,6 +2939,11 @@ CaptureFromSongDialog::buildFrameAtMarker() const {
     auto frame = std::make_unique<GranularFrame>(
         std::move(source), songSampleRate, grainLenSamples,
         (float)capturedPitchHz, mode, xfadeSamples);
+    // Bake the per-waveform texture choices (grain count for the cloud modes,
+    // FFT size for Spectral freeze) so the saved frame replays with the same
+    // density / resolution the user just auditioned.
+    frame->grainCount = selectedGrainCount();
+    frame->fftSize    = selectedFftSize();
     out.push_back(std::move(frame));
     return out;
 }

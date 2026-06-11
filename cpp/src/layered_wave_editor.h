@@ -972,7 +972,7 @@ private:
     // the capture panel's replace mode (bound when the panel opens) and
     // append mode (bound after the first Save, once a frame exists to write
     // to) so a metadata edit can't be silently lost on Close in either mode.
-    std::function<void(double, int, double)> makeCaptureMetadataSink();
+    std::function<void(double, int, double, int, int)> makeCaptureMetadataSink();
     // Replace the wave on the currently-edited library entry with the
     // first captured frame (drops the rest). Used by re-capture flows.
     // No-op if currentLibraryId is unset, the entry has been removed, or

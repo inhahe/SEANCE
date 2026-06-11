@@ -113,8 +113,26 @@ uint64_t AudioCacheManager::computeNodeHash(const Node& node, const NodeGraph& g
         }
     }
 
-    // Hash script
-    h = hashCombine(h, hashString(node.script));
+    // Hash script.
+    //
+    // THREAD SAFETY: this runs on the AUDIO thread (computeNodeHash ->
+    // isCacheValid -> GraphProcessor::rebuildGraph, which executes inside the
+    // audio callback). Meanwhile UI-thread editors rewrite node.script in place
+    // when the user edits a waveform - e.g. dragging the freeze band in the
+    // layered-wave / granular editor fires onLayerChanged -> commitToNode ->
+    // setNodeScriptSynced on every drag tick. A std::string assignment is not
+    // atomic, so without synchronisation this hash read can observe the new
+    // size paired with a stale/freed data pointer and copy from garbage - for a
+    // multi-megabyte granular wavetable script that reliably crashes mid-copy
+    // (SEANCE.exe.17316.dmp: access violation in hashString during a band
+    // drag). setNodeScriptSynced holds node.auditionMutex around the write, so
+    // we take the same per-node mutex around the read to pair with it. This is
+    // the cache-hash sibling of the reloadIfScriptChanged fix in known-issues.md
+    // (that reader was synced; this one had been missed).
+    {
+        std::lock_guard<std::mutex> scriptLock(*node.auditionMutex);
+        h = hashCombine(h, hashString(node.script));
+    }
 
     // Hash plugin index and state
     h = hashCombine(h, (uint64_t)(node.pluginIndex + 1));

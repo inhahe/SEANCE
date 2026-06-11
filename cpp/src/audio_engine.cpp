@@ -52,17 +52,30 @@ void AudioEngine::init() {
     //       exact device/type the user last selected is restored. We never
     //       override an explicit saved choice.
     //
-    //   (b) First run (no file)   -> default the driver type to DirectSound.
-    //       JUCE's out-of-the-box default is WASAPI, which on Windows welds the
+    //   (b) First run (no file)   -> default the driver type to Windows Audio
+    //       (WASAPI shared mode). This is JUCE's out-of-the-box default anyway,
+    //       but we set it explicitly so the intent is clear and survives any
+    //       change to JUCE's ordering.
+    //
+    //       WASAPI is the right default because it gives clean, low-latency
+    //       output. We previously forced DirectSound here to dodge a WASAPI
+    //       limitation - on Windows its shared-mode "default device" welds the
     //       default input (e.g. a USB webcam mic) and the default output (e.g.
-    //       HDMI) into a single shared-mode device. When those are different
-    //       physical devices with independent clocks, WASAPI's combined device
-    //       corrupts the captured input into a square-wave-like garbage signal
-    //       (a known JUCE limitation). DirectSound buffers the two endpoints
-    //       independently and captures the mic correctly. We only set this as
-    //       the *first-run* default - the saved-settings path above takes
-    //       precedence, so a user who deliberately switches back to WASAPI in
-    //       the Audio Device Settings dialog keeps WASAPI on subsequent runs.
+    //       HDMI) into one device, and when those are different physical
+    //       endpoints with independent clocks the captured input is corrupted
+    //       into a square-wave-like garbage signal. But DirectSound's price for
+    //       fixing that is a polling-based output path that crackles/glitches
+    //       under load (audible "vinyl dust" clicks, worse on a busy graph),
+    //       and that hit EVERY user by default - including the large majority
+    //       who only play notes, play songs, or capture from a file and never
+    //       touch the mic-with-mismatched-devices case. Trading universal
+    //       output glitches for a mic bug most users never hit was the wrong
+    //       default, so we lead with clean WASAPI output and handle the mic
+    //       case reactively: ensureAudioInputEnabled() picks a concrete input
+    //       device, and the mic/IR capture dialogs guide the user to switch the
+    //       driver to DirectSound via the "Audio device..." button if their
+    //       input sounds garbled. The saved-settings path above always takes
+    //       precedence, so any deliberate driver choice persists across runs.
     std::unique_ptr<juce::XmlElement> savedState;
     {
         auto settingsFile = getAudioSettingsFile();
@@ -71,10 +84,10 @@ void AudioEngine::init() {
     }
 
     if (savedState == nullptr) {
-        // First run: prefer the DirectSound driver type if it's available.
+        // First run: prefer the Windows Audio (WASAPI) driver type if present.
         for (auto* type : deviceManager->getAvailableDeviceTypes()) {
-            if (type->getTypeName() == "DirectSound") {
-                deviceManager->setCurrentAudioDeviceType("DirectSound", true);
+            if (type->getTypeName() == "Windows Audio") {
+                deviceManager->setCurrentAudioDeviceType("Windows Audio", true);
                 break;
             }
         }
@@ -82,7 +95,7 @@ void AudioEngine::init() {
 
     // Initialize with both input (for recording, IR capture) and output.
     // savedState restores the user's last choice if present; otherwise JUCE
-    // opens the default devices for the current (possibly DirectSound) type.
+    // opens the default devices for the current (first-run: Windows Audio) type.
     auto result = deviceManager->initialise(
         /*numInputChannelsNeeded*/  1,
         /*numOutputChannelsNeeded*/ 2,

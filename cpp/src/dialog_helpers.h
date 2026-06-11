@@ -1,7 +1,20 @@
 #pragma once
 #include <juce_gui_basics/juce_gui_basics.h>
 
+namespace juce { class AudioDeviceManager; }
+
 namespace SoundShop {
+
+// Open the standard Audio Device Settings dialog (driver type / input /
+// output / sample rate / buffer size + MIDI input selection) as a taskbar-
+// less tool dialog centred on `centreAround`. Shared by the Settings menu
+// item and the microphone-capture dialog's "Audio device..." button so
+// there's a single place that builds the AudioDeviceSelectorComponent.
+// centreAround should be a component inside the main window so the popup is
+// owned by the main HWND (no second taskbar entry). Returns the dialog, or
+// nullptr if there's no device manager.
+juce::DialogWindow* launchAudioDeviceSettings(juce::AudioDeviceManager& dm,
+                                              juce::Component* centreAround);
 
 // Launch a JUCE DialogWindow with the given options, but WITHOUT a Windows
 // taskbar entry. Use this for editor sub-windows (waveform editor, spectral

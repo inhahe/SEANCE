@@ -17,6 +17,8 @@
 #include <random>
 #include <limits>
 #include <map>
+#include <cctype>
+#include <cstdlib>
 
 namespace SoundShop {
 
@@ -328,12 +330,23 @@ public:
         playBtn.onClick = [this]() { togglePlay(); };
 
         addAndMakeVisible(recaptureBtn);
-        recaptureBtn.setButtonText("Re-capture from song...");
+        // Name the button after the source this frame was captured from, so a
+        // mic-captured frame doesn't mislabel its re-capture as "from song".
+        // Unknown origin (-1: pre-field project or from-scratch frame) falls
+        // back to the historical "song" default, matching onRecap's fallback.
+        const char* srcWord;
+        switch (frame.captureSourceKind) {
+            case 1:  srcWord = "mic";  break;
+            case 2:  srcWord = "file"; break;
+            default: srcWord = "song"; break;  // 0 song, -1 unknown
+        }
+        recaptureBtn.setButtonText(juce::String("Re-capture from ") + srcWord + "...");
         recaptureBtn.setTooltip(
-            "Open the capture panel and replace this granular waveform's "
-            "source PCM with a fresh capture. Grain length, crossfade, "
-            "embedded pitch, and freeze mode are preserved on re-capture "
-            "so you keep your tuning when changing the source.");
+            juce::String("Open the capture panel and replace this granular "
+            "waveform's source PCM with a fresh capture from the ") + srcWord +
+            ". Grain length, crossfade, embedded pitch, and freeze mode are "
+            "preserved on re-capture so you keep your tuning when changing "
+            "the source.");
         recaptureBtn.onClick = [this]() {
             if (onRecapture) onRecapture();
         };
@@ -2157,6 +2170,56 @@ int WavetableDoc::gridCellCount() const {
     return n;
 }
 
+// === TEMP WAVETABLE DIAGNOSTIC (throwaway) ===
+// Dump the grid/cell/scatter/library state to D:/temp/wt_diag.txt so we can see
+// exactly when gridDims and cellWaveformIds desync, and whether cells point at
+// the expected library entries. Called from the conversion + axis-edit paths.
+void WavetableDoc::debugDumpState(const char* tag) const {
+    juce::String s;
+    s << "--- " << tag << " ---\n";
+    s << "mode=" << (mode == WavetableMode::Grid ? "Grid" : "Scatter")
+      << "  scatterDims=" << scatterDims << "\n";
+    s << "gridDims=[";
+    long long prod = gridDims.empty() ? 0 : 1;
+    for (size_t d = 0; d < gridDims.size(); ++d) {
+        s << gridDims[d] << (d + 1 < gridDims.size() ? "x" : "");
+        prod *= gridDims[d];
+    }
+    s << "]  product=" << prod
+      << "  cellWaveformIds.size()=" << (int)cellWaveformIds.size();
+    if (prod != (long long)cellWaveformIds.size())
+        s << "   *** MISMATCH ***";
+    s << "\n";
+    s << "library(" << (int)library.size() << "): ";
+    for (const auto& e : library)
+        s << "[" << e.id << ":" << (e.name.empty() ? "<unnamed>" : e.name) << "] ";
+    s << "\n";
+    s << "cells: ";
+    for (size_t i = 0; i < cellWaveformIds.size(); ++i) {
+        const int id = cellWaveformIds[i];
+        const char* nm = "<empty>";
+        if (id >= 0) {
+            int li = findLibraryIndexById(id);
+            nm = (li >= 0 && !library[(size_t)li].name.empty())
+                     ? library[(size_t)li].name.c_str() : "<unnamed-or-missing>";
+        }
+        s << i << "=" << id << "(" << nm << ") ";
+    }
+    s << "\n";
+    if (mode == WavetableMode::Scatter) {
+        s << "scatterFrames(" << (int)scatterFrames.size() << "): ";
+        for (const auto& sf : scatterFrames) {
+            s << "id=" << sf.waveformId << "@(";
+            for (size_t d = 0; d < sf.position.size(); ++d)
+                s << juce::String(sf.position[d], 2) << (d + 1 < sf.position.size() ? "," : "");
+            s << ") ";
+        }
+        s << "\n";
+    }
+    juce::File("D:/temp/wt_diag.txt").appendText(s);
+}
+// === END TEMP DIAGNOSTIC ===
+
 std::vector<int> WavetableDoc::cellIdxToGridCoord(int idx) const {
     const int total = gridCellCount();
     if (idx < 0 || idx >= total) return {};
@@ -2272,6 +2335,7 @@ void WavetableDoc::resizeGridAxis(int axisIdx, int newSize) {
 
     // Any prior scatter-revert snapshot is invalidated by a topology change.
     scatterFromGridSnapshot.reset();
+    debugDumpState("after resizeGridAxis");
 }
 
 void WavetableDoc::convertGridToScatter() {
@@ -2310,6 +2374,7 @@ void WavetableDoc::convertGridToScatter() {
     mode = WavetableMode::Scatter;
     cellWaveformIds.clear();
     scatterFromGridSnapshot = std::move(snap);
+    debugDumpState("after convertGridToScatter");
 }
 
 bool WavetableDoc::canRevertScatterToGrid() const {
@@ -2373,27 +2438,114 @@ void WavetableDoc::revertScatterToGrid() {
     // The snapshot is consumed by a successful revert; a fresh
     // convertGridToScatter() will install a new one if the user converts again.
     scatterFromGridSnapshot.reset();
+    debugDumpState("after revertScatterToGrid (lossless)");
 }
 
 void WavetableDoc::convertScatterToGrid() {
     // Lossy fallback for when canRevertScatterToGrid() is false (authored as
-    // Scatter, or the snapshot was invalidated by an axis/dot edit). Lay every
-    // dot out into a 1D grid of N cells in their current frame order. The
-    // free-form scatter coordinates are discarded - the user can re-add axes /
-    // grow cells once back in Grid mode. The shared library is untouched.
-    std::vector<int> newCells;
-    newCells.reserve(scatterFrames.size());
-    for (const auto& sf : scatterFrames)
-        newCells.push_back(sf.waveformId);
+    // Scatter, or the snapshot was invalidated by an axis/dot edit). Unlike a
+    // plain flatten-to-1D, this PRESERVES the scatter's dimensionality wherever
+    // possible: it quantizes each axis's dot coordinates into distinct sorted
+    // "tracks" and rebuilds the N-D grid those tracks imply. For dots that form
+    // a clean Cartesian lattice (e.g. a grid converted to scatter, even after a
+    // save/load drops the lossless snapshot) this reconstructs the original
+    // grid shape exactly - a 2x2x2 comes back as a 2x2x2, not a 1x8 line, and
+    // holes (empty cells) are preserved. Irregular/sparse scatters that would
+    // blow up into a mostly-empty grid, or whose dots collide into one cell,
+    // fall back to the simple 1D layout. The shared library is untouched.
+    const int nFrames = (int)scatterFrames.size();
 
-    if (newCells.empty())
-        newCells.push_back(-1);  // keep a single empty cell so the grid is valid
+    auto flattenTo1D = [&]() {
+        std::vector<int> newCells;
+        newCells.reserve(scatterFrames.size());
+        for (const auto& sf : scatterFrames)
+            newCells.push_back(sf.waveformId);
+        if (newCells.empty())
+            newCells.push_back(-1);  // keep a single empty cell so the grid is valid
+        cellWaveformIds = std::move(newCells);
+        gridDims = { (int)cellWaveformIds.size() };
+    };
 
-    cellWaveformIds = std::move(newCells);
-    gridDims = { (int)cellWaveformIds.size() };
+    bool built = false;
+    if (nFrames > 0) {
+        // Geometric dimensionality of the scatter space, clamped to what the
+        // dots actually carry.
+        int D = std::max(1, scatterDims);
+        for (const auto& sf : scatterFrames)
+            D = std::min(D, std::max(1, (int)sf.position.size()));
+
+        constexpr float tol = 1e-3f;
+        auto coordOf = [&](const ScatterFrame& sf, int d) -> float {
+            return (d < (int)sf.position.size()) ? sf.position[(size_t)d] : 0.5f;
+        };
+
+        // Per-axis sorted distinct coordinate values ("tracks").
+        std::vector<std::vector<float>> tracks((size_t)D);
+        for (int d = 0; d < D; ++d) {
+            std::vector<float> vals;
+            for (const auto& sf : scatterFrames) {
+                const float v = coordOf(sf, d);
+                bool found = false;
+                for (float u : vals) if (std::abs(u - v) <= tol) { found = true; break; }
+                if (!found) vals.push_back(v);
+            }
+            std::sort(vals.begin(), vals.end());
+            tracks[(size_t)d] = std::move(vals);
+        }
+
+        std::vector<int> dims((size_t)D, 1);
+        long long prod = 1;
+        for (int d = 0; d < D; ++d) {
+            dims[(size_t)d] = std::max(1, (int)tracks[(size_t)d].size());
+            prod *= dims[(size_t)d];
+        }
+
+        // Row-major flatten (last axis fastest), matching gridCoordToCellIdx.
+        auto flatten = [&](const std::vector<int>& c) {
+            int flat = 0, stride = 1;
+            for (int d = D - 1; d >= 0; --d) { flat += c[(size_t)d] * stride; stride *= dims[(size_t)d]; }
+            return flat;
+        };
+
+        // Only reconstruct N-D when the grid stays reasonably dense (an
+        // irregular scatter would explode into a mostly-empty grid).
+        if (prod > 0 && prod <= (long long)nFrames * 4 + 4) {
+            std::vector<int> ndCells((size_t)prod, -1);
+            bool clean = true;
+            for (const auto& sf : scatterFrames) {
+                std::vector<int> c((size_t)D, 0);
+                for (int d = 0; d < D; ++d) {
+                    const float v = coordOf(sf, d);
+                    int best = 0; float bestErr = 1e30f;
+                    for (int i = 0; i < (int)tracks[(size_t)d].size(); ++i) {
+                        const float e = std::abs(tracks[(size_t)d][(size_t)i] - v);
+                        if (e < bestErr) { bestErr = e; best = i; }
+                    }
+                    c[(size_t)d] = best;
+                }
+                const int flat = flatten(c);
+                if (flat < 0 || flat >= (int)ndCells.size() || ndCells[(size_t)flat] != -1) {
+                    clean = false;  // collision / out of range -> not a clean lattice
+                    break;
+                }
+                ndCells[(size_t)flat] = sf.waveformId;
+            }
+            if (clean) {
+                cellWaveformIds = std::move(ndCells);
+                gridDims = std::move(dims);
+                built = true;
+            }
+        }
+    }
+
+    if (!built)
+        flattenTo1D();
+
     mode = WavetableMode::Grid;
     scatterFrames.clear();
     scatterFromGridSnapshot.reset();
+    debugDumpState(built ? "after convertScatterToGrid (N-D rebuild)"
+                         : "after convertScatterToGrid (1D fallback)");
 }
 
 WavetableDoc WavetableDoc::defaultSingleSine() {
@@ -4068,6 +4220,10 @@ public:
         if (owner.wave.mode != WavetableMode::Scatter) {
             int cell = hitTestGridCell(e.position, area);
             if (cell >= 0) {
+                // User selected on the View surface: Delete removes only this
+                // placement (clears the cell), not the library waveform.
+                owner.activeSelectionSurface =
+                    LayeredWaveEditorComponent::SelectionSurface::View;
                 // Route through switchToFrame() so the editor target
                 // (currentLibraryId) is synced when the clicked cell holds
                 // a library entry, matching the Cells list behaviour.
@@ -4097,6 +4253,10 @@ public:
         }
 
         if (hit >= 0) {
+            // User selected on the View surface: Delete removes only this
+            // scatter dot (the placement), not the library waveform.
+            owner.activeSelectionSurface =
+                LayeredWaveEditorComponent::SelectionSurface::View;
             // Select + (conditionally) start drag. Route through
             // switchToFrame() so the editor target (currentLibraryId)
             // follows the click to the scatter dot's library entry. Only
@@ -4403,6 +4563,7 @@ public:
         m.addSectionHeader(header);
         m.addSeparator();
         m.addItem(2, "Edit waveform",      entry != nullptr);
+        m.addItem(4, "Rename waveform...",  entry != nullptr);
         m.addItem(3, "Duplicate waveform", entry != nullptr);
         m.addSeparator();
         // Always enabled - the wavetable may be cleared completely; the
@@ -4427,7 +4588,10 @@ public:
                         if (libId >= 0) self->owner.setEditingLibraryEntry(libId);
                         break;
                     case 3:
-                        if (libId >= 0) self->duplicateLibraryEntryFromCell(libId, frameIdx);
+                        if (libId >= 0) self->duplicateLibraryEntryFromCell(libId);
+                        break;
+                    case 4:
+                        if (libId >= 0) self->owner.renameLibraryEntry(libId);
                         break;
                     default: break;
                 }
@@ -4435,17 +4599,15 @@ public:
     }
 
     // "Duplicate waveform" from the dot context menu. Clones the library
-    // entry the dot points at, gives the clone a "<name> (copy)" name,
-    // and places it next to the source so the user sees the new dot/cell
-    // immediately. Always focuses the editor on the new entry.
-    //
-    // Placement strategy:
-    //   * Scatter: push a new ScatterFrame at source.position + a small
-    //     offset on axisX/axisY so it doesn't stack on the source.
-    //   * Grid:    drop into the first empty cell. If every cell is full,
-    //     the new library entry stays unplaced - the user can drag it
-    //     from the Library list onto a cell (or swap a cell out).
-    void duplicateLibraryEntryFromCell(int srcLibId, int srcFrameIdx) {
+    // entry the dot points at into a brand-new library entry named
+    // "<name> (copy)" and focuses the editor on it. Like every other
+    // creation path, the clone is added to the Library ONLY - it is NOT
+    // placed beside the source dot, so duplicating never silently changes
+    // the arrangement (no new dot, no grown grid). The user places it
+    // explicitly via the Library list's "Add to grid" / drag-to-cell.
+    // (Earlier builds dropped a placed copy next to the source; that was
+    // removed for consistency with capture and the + Waveform menu.)
+    void duplicateLibraryEntryFromCell(int srcLibId) {
         const int srcLibIdx = owner.wave.findLibraryIndexById(srcLibId);
         if (srcLibIdx < 0) return;
         auto* srcWavePtr = owner.wave.library[(size_t)srcLibIdx].wave.get();
@@ -4458,38 +4620,6 @@ public:
 
         const int newId = owner.wave.addLibraryEntry(srcWavePtr->clone(), newName);
         if (newId < 0) return;
-
-        if (owner.wave.mode == WavetableMode::Scatter) {
-            if (srcFrameIdx >= 0
-                && srcFrameIdx < (int)owner.wave.scatterFrames.size()) {
-                ScatterFrame sf;
-                sf.waveformId = newId;
-                sf.position = owner.wave.scatterFrames[(size_t)srcFrameIdx].position;
-                // Nudge the new dot off the source by a small amount on the
-                // currently-projected axes so it's visually distinct. Clamp
-                // to [0, 1] so the nudge can't push the dot outside the
-                // unit cube.
-                if (axisX >= 0 && axisX < (int)sf.position.size())
-                    sf.position[(size_t)axisX] = juce::jlimit(0.0f, 1.0f,
-                                                              sf.position[(size_t)axisX] + 0.05f);
-                if (axisY >= 0 && axisY < (int)sf.position.size())
-                    sf.position[(size_t)axisY] = juce::jlimit(0.0f, 1.0f,
-                                                              sf.position[(size_t)axisY] + 0.05f);
-                owner.wave.scatterFrames.push_back(std::move(sf));
-                owner.currentFrameIdx = (int)owner.wave.scatterFrames.size() - 1;
-            }
-        } else {
-            // First empty cell wins. Walks row-major, so on a 1D wavetable
-            // this is "next free position to the right of cell 0", which
-            // matches what the user expects from a quick duplicate.
-            for (size_t c = 0; c < owner.wave.cellWaveformIds.size(); ++c) {
-                if (owner.wave.cellWaveformIds[c] < 0) {
-                    owner.wave.cellWaveformIds[c] = newId;
-                    owner.currentFrameIdx = (int)c;
-                    break;
-                }
-            }
-        }
 
         owner.currentLibraryId = newId;
         owner.wave.scatterFromGridSnapshot.reset();
@@ -4768,9 +4898,10 @@ public:
         framesListLabel.setColour(juce::Label::textColourId, juce::Colours::lightgrey);
         framesListLabel.setJustificationType(juce::Justification::centredLeft);
         framesListLabel.setTooltip(
-            "Cells in the arrangement view that currently hold a waveform. Each row "
-            "shows the cell's coordinate (Grid) or its waveform number (Scatter). Click to "
-            "select the cell; X clears the cell (library entry survives).");
+            "Cells in the arrangement view. In Grid mode each row shows the cell's "
+            "coordinate plus the name of the waveform it holds (or \"- empty -\"); in "
+            "Scatter mode each row shows its waveform name. Click to select the cell; "
+            "X clears the cell (library entry survives).");
         addAndMakeVisible(framesListLabel);
 
         addAndMakeVisible(framesListViewport);
@@ -4810,6 +4941,7 @@ public:
                 // existing cell stays at coord[newAxis]=0). Reset any stale
                 // revert snapshot; the topology changed.
                 owner.wave.scatterFromGridSnapshot.reset();
+                owner.wave.debugDumpState("after grid Add Axis");
             } else {
                 if (owner.wave.scatterDims >= 8) return;
                 ++owner.wave.scatterDims;
@@ -4884,8 +5016,8 @@ public:
             resized();
         };
 
-        // ---- RBF radius (Scatter mode only) ----
-        radiusLabel.setText("RBF radius:", juce::dontSendNotification);
+        // ---- Blend width (Scatter mode only) ----
+        radiusLabel.setText("Blend width:", juce::dontSendNotification);
         radiusLabel.setColour(juce::Label::textColourId, juce::Colours::lightgrey);
         radiusLabel.setJustificationType(juce::Justification::centredLeft);
         settingsContainer.addAndMakeVisible(radiusLabel);
@@ -4895,10 +5027,13 @@ public:
         radiusSlider.setSliderStyle(juce::Slider::LinearHorizontal);
         radiusSlider.setTextBoxStyle(juce::Slider::TextBoxRight, false, 60, 18);
         radiusSlider.setValue(owner.wave.scatterRadius, juce::dontSendNotification);
-        radiusSlider.setTooltip("How far each scatter waveform's influence reaches into "
-                                "N-D space (Wendland radial basis function cutoff, in "
-                                "normalized [0,1] coordinates). Smaller = sharper "
-                                "transitions between waveforms; larger = smoother blends.");
+        radiusSlider.setTooltip("How sharply the blend snaps to the nearest scatter "
+                                "waveform as you move the Position controls. Smaller = "
+                                "sharper transitions between waveforms; larger = smoother, "
+                                "wider blends. The Position always tracks smoothly at any "
+                                "setting. In \"Distance fades volume\" mode this instead "
+                                "sets the literal fade radius (normalized [0,1] units) "
+                                "beyond which a waveform falls silent.");
         radiusSlider.onValueChange = [this]() {
             owner.wave.scatterRadius = (float)radiusSlider.getValue();
             owner.onLayerChanged();
@@ -5394,6 +5529,12 @@ public:
     // Public so the owning editor's onLayerChanged() can re-evaluate the
     // button after any mutation (keeps "Back to Grid" from going stale).
     void updateConvertButton() {
+        // The placements list shows grid cells in Grid mode and free-positioned
+        // dots in Scatter mode. Label it for what it actually contains so
+        // "Cells" doesn't read as wrong terminology while in Scatter mode.
+        framesListLabel.setText(owner.wave.mode == WavetableMode::Grid
+                                    ? "Cells" : "Waveforms",
+                                juce::dontSendNotification);
         if (owner.wave.mode == WavetableMode::Grid) {
             convertBtn.setButtonText(juce::String::fromUTF8("Convert \xE2\x86\x92 Scatter"));
             convertBtn.setEnabled(true);
@@ -5534,6 +5675,10 @@ public:
                 "to drop it as a new waveform at the cursor (or into a cell in "
                 "Grid mode).");
             btn->onClick = [this, entryId]() {
+                // User selected on the Library surface: Delete now targets the
+                // waveform DEFINITION (this entry), not a placement.
+                owner.activeSelectionSurface =
+                    LayeredWaveEditorComponent::SelectionSurface::Library;
                 owner.setEditingLibraryEntry(entryId);
                 rebuildLibraryList();
                 updateAssignButtonEnabled();
@@ -5621,9 +5766,10 @@ public:
     }
 
     // Clone a library entry's waveform into a brand-new library entry WITHOUT
-    // placing it in the arrangement view (the right-click "Duplicate" action).
-    // Distinct from ScatterView::duplicateLibraryEntryFromCell, which also
-    // drops a placed copy next to the source dot/cell.
+    // placing it in the arrangement view (the Library row's right-click
+    // "Duplicate" action). ScatterView::duplicateLibraryEntryFromCell (the
+    // dot's "Duplicate waveform") now behaves identically - all creation
+    // paths are library-only; placement is always a separate explicit step.
     void duplicateLibraryEntry(int entryId) {
         const int srcIdx = owner.wave.findLibraryIndexById(entryId);
         if (srcIdx < 0) return;
@@ -5720,6 +5866,7 @@ public:
         // there's still a use for re-adding, but keep it enabled so the user
         // can drop additional copies). We keep it always enabled.
         m.addItem(1, "Add to grid");
+        m.addItem(4, "Rename...");
         m.addItem(2, "Duplicate");
         m.addSeparator();
         m.addItem(3, "Delete");
@@ -5734,21 +5881,70 @@ public:
                 if (result == 1) self->addLibraryEntryToGrid(entryId);
                 else if (result == 2) self->duplicateLibraryEntry(entryId);
                 else if (result == 3) self->deleteLibraryEntry(entryId);
+                else if (result == 4) self->owner.renameLibraryEntry(entryId);
             });
     }
 
-    // Del/Backspace removes the highlighted library entry (matching the row's
-    // X button). Only fires when a library entry is highlighted; returns false
-    // otherwise so the key falls through to any other handler.
+    // Del/Backspace deletes whatever the user last SELECTED, routed by the
+    // active selection surface so the key matches the user's mental model:
+    //   View surface (clicked a cell/dot in the arrangement view or Cells
+    //     list) -> remove only that PLACEMENT (clears the grid cell / erases
+    //     the scatter dot); the library waveform survives. This matches the
+    //     Cells-list X button and the view's shift-click-to-delete gesture.
+    //   Library surface (clicked a row in the Library list) -> remove the
+    //     waveform DEFINITION and every placement of it, matching the row's X.
+    // Without this split both gestures share currentLibraryId, so Delete
+    // always nuked the library entry even when the user had just clicked a
+    // dot in the view and expected only the dot to disappear.
     bool keyPressed(const juce::KeyPress& key) override {
         if (key == juce::KeyPress::deleteKey
             || key == juce::KeyPress::backspaceKey) {
+            if (owner.activeSelectionSurface
+                    == LayeredWaveEditorComponent::SelectionSurface::View) {
+                // Only the placement. If the selected cell is empty there is
+                // nothing to remove - return false so the key falls through
+                // rather than surprise-deleting the library editor target.
+                return removePlacementAt(owner.currentFrameIdx);
+            }
             if (owner.currentLibraryId >= 0) {
                 deleteLibraryEntry(owner.currentLibraryId);
                 return true;
             }
         }
         return false;
+    }
+
+    // Remove a single PLACEMENT from the wavetable, leaving the underlying
+    // library waveform intact. Shared by the keyboard Delete View-surface path
+    // and the Cells-list X button so the two can't diverge. Returns true if
+    // frameIdx referenced a removable placement (a real scatter dot, or a
+    // populated grid cell); false for an out-of-range index or an already-empty
+    // grid cell, so callers can decide whether to fall through.
+    bool removePlacementAt(int frameIdx) {
+        if (owner.wave.mode == WavetableMode::Scatter) {
+            if (frameIdx < 0 || frameIdx >= (int)owner.wave.scatterFrames.size())
+                return false;
+            owner.wave.scatterFrames.erase(
+                owner.wave.scatterFrames.begin() + frameIdx);
+            // currentFrameIdx may now be past the end; clamp to the last dot
+            // (-1 when the wavetable is now empty, handled as a no-op everywhere).
+            if (owner.currentFrameIdx >= (int)owner.wave.scatterFrames.size())
+                owner.currentFrameIdx = (int)owner.wave.scatterFrames.size() - 1;
+        } else {
+            if (frameIdx < 0 || frameIdx >= (int)owner.wave.cellWaveformIds.size())
+                return false;
+            if (owner.wave.cellWaveformIds[frameIdx] < 0)
+                return false;  // already empty - nothing to clear
+            // Clear the cell reference; the library entry stays so the user can
+            // re-place it. Selection deliberately stays on this (now empty) cell.
+            owner.wave.cellWaveformIds[frameIdx] = -1;
+        }
+        owner.wave.scatterFromGridSnapshot.reset();
+        owner.updateHintText();
+        owner.rebuildRows();
+        owner.onLayerChanged();
+        refreshAfterDocMutation();
+        return true;
     }
 
 private:
@@ -5810,6 +6006,10 @@ private:
                                juce::Colours::black);
             }
             btn->onClick = [this, frameIdx]() {
+                // User selected on the View surface (Cells list): Delete now
+                // removes only this PLACEMENT, leaving the library waveform.
+                owner.activeSelectionSurface =
+                    LayeredWaveEditorComponent::SelectionSurface::View;
                 owner.switchToFrame(frameIdx);
                 rebuildFramesList();
             };
@@ -5825,31 +6025,14 @@ private:
             } else {
                 del->setTooltip(isGridSparse ? juce::String("Clear this cell")
                                               : juce::String("Delete this waveform"));
-                del->onClick = [this, frameIdx, isGridSparse]() {
-                    // Wavetable may go fully empty; the synth handles that
-                    // as silence, library entries persist, and the user can
-                    // refill via "+ Waveform" or a Library drag. Mirrors
-                    // the same relaxation in showFrameContextMenu's
-                    // "Remove from wavetable" action.
-                    if (isGridSparse) {
-                        if (frameIdx < 0 || frameIdx >= (int)owner.wave.cellWaveformIds.size()) return;
-                        // Library entry survives - this only clears the cell ref.
-                        owner.wave.cellWaveformIds[frameIdx] = -1;
-                        // Don't auto-jump selection: the user just clicked
-                        // X on this specific cell, so leaving the cell
-                        // selected (now empty) lets them immediately Assign
-                        // a different library entry into the same slot.
-                    } else {
-                        if (frameIdx < 0 || frameIdx >= (int)owner.wave.scatterFrames.size()) return;
-                        owner.wave.scatterFrames.erase(owner.wave.scatterFrames.begin() + frameIdx);
-                        owner.currentFrameIdx = std::min(owner.currentFrameIdx,
-                                                         (int)owner.wave.scatterFrames.size() - 1);
-                    }
-                    owner.wave.scatterFromGridSnapshot.reset();
-                    owner.updateHintText();
-                    owner.rebuildRows();
-                    owner.onLayerChanged();
-                    refreshAfterDocMutation();
+                del->onClick = [this, frameIdx]() {
+                    // Remove only this placement (clears a grid cell / erases a
+                    // scatter dot); the library entry survives, so the user can
+                    // re-place it via "Assign to selected cell" or a Library
+                    // drag. Same helper the keyboard Delete View-path uses, so
+                    // the X button and Del key can't diverge. The wavetable may
+                    // go fully empty - the synth handles that as silence.
+                    removePlacementAt(frameIdx);
                 };
             }
             framesListContainer.addAndMakeVisible(del.get());
@@ -5867,19 +6050,55 @@ private:
             return "(" + inner + ")";
         };
 
+        // Resolve a cell/dot's display name through the library via its
+        // waveformId, matching the Library list's convention (entry.name,
+        // else "Waveform <libIdx+1>"). Returns empty for an unresolved id.
+        auto waveformName = [&](int wid) -> juce::String {
+            const int libIdx = owner.wave.findLibraryIndexById(wid);
+            if (libIdx < 0) return {};
+            const auto& entry = owner.wave.library[(size_t)libIdx];
+            return entry.name.empty()
+                ? juce::String("Waveform ") + juce::String(libIdx + 1)
+                : juce::String(entry.name);
+        };
+
         if (owner.wave.mode == WavetableMode::Grid) {
             for (int i = 0; i < (int)owner.wave.cellWaveformIds.size(); ++i) {
                 auto coord = owner.wave.cellIdxToGridCoord(i);
                 juce::String label = coordLabel(coord, i + 1);
-                const bool isEmpty = (owner.wave.cellWaveformIds[i] < 0);
-                if (isEmpty) label += "  - empty -";
+                const int wid = owner.wave.cellWaveformIds[i];
+                const bool isEmpty = (wid < 0);
+                if (isEmpty) {
+                    label += "  - empty -";
+                } else {
+                    // Show the waveform that occupies this cell alongside its
+                    // coordinate, so the Cells list reads e.g. "(0,0,0)  Bass"
+                    // instead of just the coordinate. Falls back to the
+                    // positional name for an orphaned id (no library match).
+                    juce::String nm = waveformName(wid);
+                    label += "  " + (nm.isNotEmpty()
+                                         ? nm
+                                         : juce::String("Waveform ") + juce::String(i + 1));
+                }
                 addEntry(label, i, true, isEmpty);
             }
         } else {
             for (int i = 0; i < (int)owner.wave.scatterFrames.size(); ++i) {
-                juce::String label = "Waveform " + juce::String(i + 1);
-                if (!owner.wave.scatterFrames[i].label.empty())
-                    label += "  " + juce::String(owner.wave.scatterFrames[i].label);
+                // Resolve the dot's display name through the library via its
+                // waveformId, mirroring the Library list's convention
+                // (entry.name, else "Waveform <libIdx+1>"). The per-frame
+                // `label` field is almost always empty, so the old code fell
+                // back to a positional "Waveform <i+1>" that had nothing to do
+                // with the actual waveform - e.g. a 2x2x2 grid converted to
+                // scatter showed "Waveform 1..8" instead of the real names.
+                const int wid = owner.wave.scatterFrames[i].waveformId;
+                juce::String label = waveformName(wid);
+                if (label.isEmpty()) {
+                    // Orphaned dot (no matching library entry). Keep it visible
+                    // with a positional fallback so it can still be selected/
+                    // deleted rather than vanishing from the list.
+                    label = juce::String("Waveform ") + juce::String(i + 1);
+                }
                 addEntry(label, i, false, false);
             }
         }
@@ -6284,9 +6503,31 @@ private:
 // LayeredWaveEditorComponent
 // ==============================================================================
 
+// Registry of every live wavetable editor. The editors are non-modal
+// DialogWindows the main window doesn't own (see launchNonModalToolDialog), so
+// when an undo/redo snapshot restore rewrites a node's script the main window
+// has no handle to the editor bound to it. Each editor registers itself here on
+// construction and removes itself on destruction; reloadOpenEditorsAfterSnapshot
+// walks the list and refreshes the matching editors. GUI-thread only, so a plain
+// vector with no locking is safe.
+static std::vector<LayeredWaveEditorComponent*>& openWaveEditors() {
+    static std::vector<LayeredWaveEditorComponent*> s;
+    return s;
+}
+
+void LayeredWaveEditorComponent::reloadOpenEditorsAfterSnapshot(NodeGraph& g) {
+    // Copy the registry first: reloadFromNode() can close an editor (when its
+    // node was undone away), which mutates openWaveEditors() mid-iteration.
+    auto snapshot = openWaveEditors();
+    for (auto* ed : snapshot)
+        if (ed && &ed->graph == &g)
+            ed->reloadFromNode();
+}
+
 LayeredWaveEditorComponent::LayeredWaveEditorComponent(NodeGraph& g, int nid, std::function<void()> apply)
     : graph(g), nodeId(nid), onApply(std::move(apply))
 {
+    openWaveEditors().push_back(this);
     // Decode existing state. Try wavetable first, then fall back to single
     // layered waveform (wrapped as a 1-frame wavetable), then default sine.
     auto* nd = graph.findNode(nodeId);
@@ -6559,18 +6800,20 @@ LayeredWaveEditorComponent::LayeredWaveEditorComponent(NodeGraph& g, int nid, st
     nameEditor.setTooltip(
         "Rename this waveform. The name shows up in the Library list and "
         "in tooltips wherever this waveform is placed. Press Enter to commit.");
+    // Match the app's other input fields: clicking in selects the whole name so
+    // you can immediately type a replacement instead of editing character-by-char.
+    nameEditor.setSelectAllWhenFocused(true);
     auto commitNameEdit = [this]() {
-        const int libIdx = wave.findLibraryIndexById(currentLibraryId);
-        if (libIdx < 0) return;
-        const std::string newName = nameEditor.getText().toStdString();
-        if (wave.library[libIdx].name == newName) return;
-        wave.library[libIdx].name = newName;
-        commitToNode();
-        commitUndoStep();
-        if (arrangementView) arrangementView->rebuildLibraryList();
-        notifyPopoutDocMutated();
+        setLibraryEntryName(currentLibraryId, nameEditor.getText().toStdString());
     };
-    nameEditor.onReturnKey = commitNameEdit;
+    // Enter commits AND drops keyboard focus so the field visibly "quits editing"
+    // (the focus-loss re-commit is a harmless no-op — setLibraryEntryName early-
+    // outs when the name is unchanged). Clicking anywhere outside the field also
+    // commits via onFocusLost.
+    nameEditor.onReturnKey = [this, commitNameEdit]() {
+        commitNameEdit();
+        nameEditor.giveAwayKeyboardFocus();
+    };
     nameEditor.onFocusLost  = commitNameEdit;
 
     // ---- Per-waveform gain knob ----
@@ -6626,6 +6869,13 @@ LayeredWaveEditorComponent::LayeredWaveEditorComponent(NodeGraph& g, int nid, st
     // the right (~440 px), with margins and a gap.
     setSize(1500, 780);
 }
+
+// Library-name helpers defined later in this file (after the capture code).
+// Forward-declared here so showAddWaveformMenu's "+ Waveform" handler can
+// name freshly-inserted scratch/duplicate entries the same way captures are.
+static std::string frameTypeName(const IWavetableFrame* frame);
+static void applyLibraryIdSuffix(WavetableDoc& doc, int libId,
+                                 const std::string& base);
 
 void LayeredWaveEditorComponent::showAddWaveformMenu(juce::Component* anchor) {
     // Anchor must be on-screen - the popup menu attaches itself to its
@@ -6720,7 +6970,13 @@ void LayeredWaveEditorComponent::showAddWaveformMenu(juce::Component* anchor) {
             }
             if (!nf) return;
 
-            const int libId = wave.addLibraryEntry(std::move(nf));
+            // Name the entry after its editor type ("Layered 5", "FFT 6",
+            // "Wavelet 7", or "Granular N" for a duplicated capture) with the
+            // same stable-id suffix the capture paths use, instead of the
+            // generic "Waveform N".
+            const std::string base = frameTypeName(nf.get());
+            const int libId = wave.addLibraryEntry(std::move(nf), base);
+            applyLibraryIdSuffix(wave, libId, base);
             // Sync the editor target to the freshly-added entry so the
             // user can immediately edit what they just created. We do
             // NOT change currentFrameIdx - the user's existing cell /
@@ -6748,13 +7004,19 @@ void LayeredWaveEditorComponent::showAddWaveformMenu(juce::Component* anchor) {
 // labelled with its axis letter (X, Y, Z, W) so it always says which axis it
 // drives - even a single-axis terrain reads "Mod: Position X" rather than a
 // bare "Mod: Position" that leaves the user guessing. Falls back to a number
-// past the four named axes.
-static std::string positionModPinName(int axisIndex, int numAxes) {
+// past the four named axes. The prefix reflects the pin's mode: "Mod: " for a
+// modulation (bipolar-around-knob) input, "Set: " for an absolute
+// (cable-drives-the-value) input. Both prefixes are 5 chars so the suffix
+// ("Position X") parses identically either way.
+static std::string positionModPinName(int axisIndex, int numAxes,
+                                      Node::ModPin::Mode mode = Node::ModPin::Mode::Modulate) {
     juce::ignoreUnused(numAxes);
+    const char* prefix = (mode == Node::ModPin::Mode::Absolute) ? "Set: Position "
+                                                                : "Mod: Position ";
     static const char* letters = "XYZW";
     if (axisIndex >= 0 && axisIndex < 4)
-        return std::string("Mod: Position ") + letters[axisIndex];
-    return "Mod: Position " + std::to_string(axisIndex + 1);
+        return std::string(prefix) + letters[axisIndex];
+    return std::string(prefix) + std::to_string(axisIndex + 1);
 }
 
 void LayeredWaveEditorComponent::syncPositionParams() {
@@ -6788,11 +7050,23 @@ void LayeredWaveEditorComponent::syncPositionParams() {
         }
     }
 
-    // Remove existing Position params, but remember their current values so an
+    // Remove existing Position params, but remember their *resting* value so an
     // axis add/remove doesn't reset the user's positions back to centre.
+    //
+    // Critically, for a param that's currently being signal-modulated we carry
+    // over its baseValue (the user's resting setting), NOT the live `value`
+    // (the modulated reading for the current block). The rebuilt param is left
+    // un-modulated, so applySignalModulations re-snapshots its `value` as the
+    // new baseValue on the next block; feeding it the resting value keeps that
+    // base stable. Capturing the modulated value instead (the old bug) let the
+    // base drift off-centre every time the grid changed - e.g. growing a grid
+    // to 3D while a control fader held Position low would ratchet the base down,
+    // and since the modulation model is `base + (signal-0.5)` a base below 0.5
+    // can no longer sweep the axis across its full 0..1 (you'd hear both cells
+    // blended at the fader extreme instead of the far cell alone).
     std::map<std::string, float> prevValues;
     for (const auto& p : nd->params)
-        if (isPosName(p.name)) prevValues[p.name] = p.value;
+        if (isPosName(p.name)) prevValues[p.name] = p.modulated ? p.baseValue : p.value;
     nd->params.erase(std::remove_if(nd->params.begin(), nd->params.end(),
         [&](const Param& p) { return isPosName(p.name); }), nd->params.end());
 
@@ -6833,120 +7107,154 @@ void LayeredWaveEditorComponent::syncPositionModPins(Node& nd,
         return s.rfind("Position", 0) == 0;
     };
 
+    // Parse the Position axis a control-input pin refers to, INDEPENDENT of its
+    // Mod:/Set: mode prefix. "Mod: Position X", "Set: Position 2", and the 1D
+    // "Mod: Position" all parse; the axis token is a letter (X/Y/Z/W) or a
+    // 1-based number. Returns -1 for anything that isn't a Position control pin.
+    //
+    // Mode-independence is the whole point: a single pin per axis must be
+    // recognised as the SAME axis whether it's currently in Mod or Set mode.
+    // The old code keyed orphan adoption on the literal "Mod: Position X" name,
+    // so a pin switched to "Set: Position X" was invisible to the axis search
+    // and a duplicate "Mod:" pin got appended - producing the 3-Set + 3-Mod
+    // (six pins for three axes) corruption.
+    auto axisOfPinName = [](const std::string& name) -> int {
+        std::string s = name;
+        if (s.rfind("Mod: ", 0) == 0 || s.rfind("Set: ", 0) == 0)
+            s = s.substr(5);
+        if (s.rfind("Position", 0) != 0) return -1;
+        std::string tok = (s.size() > 9) ? s.substr(9) : std::string();
+        if (tok.empty()) return 0;                       // 1D "Position" -> axis 0
+        if (tok.size() == 1 && std::isalpha((unsigned char)tok[0])) {
+            switch (std::toupper((unsigned char)tok[0])) {
+                case 'X': return 0; case 'Y': return 1;
+                case 'Z': return 2; case 'W': return 3;
+            }
+            return -1;
+        }
+        if (std::isdigit((unsigned char)tok[0]))
+            return std::atoi(tok.c_str()) - 1;           // "Position 1" -> axis 0
+        return -1;
+    };
+
     // Map axis index -> current param index for the (freshly rebuilt) Position
     // params.
     std::vector<int> axisToParamIndex;
     for (int i = 0; i < (int)nd.params.size(); ++i)
         if (isPosName(nd.params[i].name)) axisToParamIndex.push_back(i);
     const int numAxes = (int)axisToParamIndex.size();
-    std::vector<bool> axisHasPin(numAxes, false);
 
-    // Pass 1: walk existing mod pins. Position pins (those captured in
-    // pinToAxis) are re-bound to their axis's new param index, renamed to the
-    // current axis label, and pruned if their axis no longer exists.
-    // Non-Position pins are left bound but re-resolved by name as a safety net
-    // in case param indices shifted.
-    for (auto it = nd.modPins.begin(); it != nd.modPins.end();) {
-        auto pa = pinToAxis.find(it->pinId);
-        if (pa == pinToAxis.end()) {
-            // Not a Position pin - re-resolve its paramIndex by pin name.
-            const Pin* pin = nullptr;
-            for (const auto& p : nd.pinsIn)
-                if (p.id == it->pinId) { pin = &p; break; }
-            if (pin && pin->name.rfind("Mod: ", 0) == 0) {
-                std::string target = pin->name.substr(5);
-                for (int i = 0; i < (int)nd.params.size(); ++i)
-                    if (nd.params[i].name == target) { it->paramIndex = i; break; }
-            }
-            ++it;
-            continue;
-        }
-        int axis = pa->second;
-        if (axis >= 0 && axis < numAxes) {
-            it->paramIndex = axisToParamIndex[axis];
-            for (auto& p : nd.pinsIn)
-                if (p.id == it->pinId) { p.name = positionModPinName(axis, numAxes); break; }
-            axisHasPin[axis] = true;
-            ++it;
-        } else {
-            // Axis removed: drop the pin, any cables into it, and the binding.
-            int pinId = it->pinId;
-            nd.pinsIn.erase(std::remove_if(nd.pinsIn.begin(), nd.pinsIn.end(),
-                [pinId](const Pin& p) { return p.id == pinId; }), nd.pinsIn.end());
-            graph.links.erase(std::remove_if(graph.links.begin(), graph.links.end(),
-                [pinId](const auto& lk) { return lk.endPin == pinId; }), graph.links.end());
-            it = nd.modPins.erase(it);
-        }
+    auto hasLink = [&](int pinId) {
+        for (const auto& lk : graph.links) if (lk.endPin == pinId) return true;
+        return false;
+    };
+    auto findModPin = [&](int pinId) -> Node::ModPin* {
+        for (auto& mp : nd.modPins) if (mp.pinId == pinId) return &mp;
+        return nullptr;
+    };
+
+    // ---- Classify every input pin by the Position axis it belongs to ----
+    // The axis comes from the captured pinToAxis binding first (survives
+    // renames), then from parsing the pin's name (survives a lost/empty
+    // binding). Mode never affects axis identity. Pins that resolve to a now-
+    // removed axis (>= numAxes) are queued for deletion.
+    std::vector<std::vector<int>> axisCandidates(numAxes);  // pinIds per axis
+    std::vector<int> stalePositionPins;                     // axis removed
+    for (const auto& pin : nd.pinsIn) {
+        int axis = -1;
+        auto pa = pinToAxis.find(pin.id);
+        if (pa != pinToAxis.end()) axis = pa->second;
+        else                       axis = axisOfPinName(pin.name);
+        if (axis < 0) continue;                             // not a Position pin
+        if (axis < numAxes) axisCandidates[axis].push_back(pin.id);
+        else                stalePositionPins.push_back(pin.id);
     }
 
-    // Pass 2: ensure each axis ends up with exactly one *bound* modulation pin.
-    // An axis may already own an orphan pin - a "Mod: Position" pin in pinsIn
-    // with no matching modPin binding. That happens when a node was saved while
-    // its modPins were lost or empty (e.g. the historical getNextId() id
-    // collision that handed two pins the same id and produced unbound duplicate
-    // Position pins). Re-adopt an existing orphan instead of blindly appending
-    // yet another duplicate, and prune any leftover duplicate pins so the node
-    // converges to a single clean pin per axis.
+    // For each axis pick exactly ONE surviving pin, preferring one that already
+    // carries an incoming cable so dedup never severs the user's connection.
+    std::vector<int> chosenForAxis(numAxes, -1);
+    std::vector<int> pinsToRemove = stalePositionPins;
     for (int axis = 0; axis < numAxes; ++axis) {
-        if (axisHasPin[axis]) continue;
-        const std::string wantName = positionModPinName(axis, numAxes);
+        auto& cands = axisCandidates[axis];
+        if (cands.empty()) continue;
+        int keep = cands.front();
+        for (int id : cands) if (hasLink(id)) { keep = id; break; }
+        chosenForAxis[axis] = keep;
+        for (int id : cands) if (id != keep) pinsToRemove.push_back(id);
+    }
 
-        // Gather existing pins with this axis's name that aren't bound to a modPin.
-        std::vector<int> orphanIds;
-        for (const auto& p : nd.pinsIn) {
-            if (p.name != wantName) continue;
-            bool bound = false;
-            for (const auto& mp : nd.modPins)
-                if (mp.pinId == p.id) { bound = true; break; }
-            if (!bound) orphanIds.push_back(p.id);
-        }
+    // Delete every duplicate / stale Position pin, its binding, and its cables.
+    for (int pinId : pinsToRemove) {
+        nd.pinsIn.erase(std::remove_if(nd.pinsIn.begin(), nd.pinsIn.end(),
+            [pinId](const Pin& p) { return p.id == pinId; }), nd.pinsIn.end());
+        nd.modPins.erase(std::remove_if(nd.modPins.begin(), nd.modPins.end(),
+            [pinId](const Node::ModPin& mp) { return mp.pinId == pinId; }), nd.modPins.end());
+        graph.links.erase(std::remove_if(graph.links.begin(), graph.links.end(),
+            [pinId](const auto& lk) { return lk.endPin == pinId; }), graph.links.end());
+    }
 
-        if (!orphanIds.empty()) {
-            // Prefer adopting an orphan that already carries an incoming cable so
-            // dedup never severs the user's existing connection.
-            auto hasLink = [&](int id) {
-                for (auto& lk : graph.links) if (lk.endPin == id) return true;
-                return false;
-            };
-            std::stable_sort(orphanIds.begin(), orphanIds.end(),
-                [&](int a, int b) { return hasLink(a) && !hasLink(b); });
-
-            Node::ModPin mp;
-            mp.paramIndex = axisToParamIndex[axis];
-            mp.pinId = orphanIds.front();
-            mp.depth = 1.0f;
-            nd.modPins.push_back(mp);
-
-            // Drop any extra duplicate orphan pins and the cables into them.
-            for (size_t k = 1; k < orphanIds.size(); ++k) {
-                int dupId = orphanIds[k];
-                nd.pinsIn.erase(std::remove_if(nd.pinsIn.begin(), nd.pinsIn.end(),
-                    [dupId](const Pin& p) { return p.id == dupId; }), nd.pinsIn.end());
-                graph.links.erase(std::remove_if(graph.links.begin(), graph.links.end(),
-                    [dupId](const auto& lk) { return lk.endPin == dupId; }), graph.links.end());
+    // Ensure each axis ends up with exactly one bound, correctly-labelled pin.
+    for (int axis = 0; axis < numAxes; ++axis) {
+        int pinId = chosenForAxis[axis];
+        if (pinId >= 0) {
+            // An existing pin survives - guarantee it has a binding and that its
+            // name matches its mode. Preserve the user's chosen mode: from the
+            // live binding if present, else parsed from the pin name's prefix so
+            // a re-adopted "Set: " orphan stays Set.
+            Node::ModPin* mp = findModPin(pinId);
+            Node::ModPin::Mode mode = Node::ModPin::Mode::Modulate;
+            if (mp) {
+                mode = mp->mode;
+            } else {
+                for (const auto& p : nd.pinsIn)
+                    if (p.id == pinId) {
+                        if (p.name.rfind("Set: ", 0) == 0)
+                            mode = Node::ModPin::Mode::Absolute;
+                        break;
+                    }
             }
+            if (!mp) {
+                Node::ModPin nmp;
+                nmp.pinId = pinId;
+                nmp.depth = 1.0f;
+                nmp.mode  = mode;
+                nd.modPins.push_back(nmp);
+                mp = &nd.modPins.back();
+            }
+            mp->paramIndex = axisToParamIndex[axis];
+            mp->mode       = mode;
+            for (auto& p : nd.pinsIn)
+                if (p.id == pinId) { p.name = positionModPinName(axis, numAxes, mode); break; }
         } else {
-            // No existing pin for this axis - create a fresh one. Position
-            // modulation is block-rate (applySignalModulations reads sample 0),
-            // so the pin is a Param (block-rate, orange) - NOT a Signal
-            // (audio-rate, amber). They route identically at the cable level
-            // (#82); the kind is what the user sees and reasons about.
+            // No pin for this axis - create a fresh one. Position modulation is
+            // block-rate (applySignalModulations reads sample 0), so the pin is
+            // a Param (block-rate, orange) - NOT a Signal (audio-rate, amber).
+            // They route identically at the cable level (#82); the kind is what
+            // the user sees and reasons about.
             int newPinId = graph.allocId();
-            nd.pinsIn.push_back({newPinId, wantName, PinKind::Param, true, 1});
+            nd.pinsIn.push_back({newPinId, positionModPinName(axis, numAxes),
+                                 PinKind::Param, true, 1});
             Node::ModPin mp;
             mp.paramIndex = axisToParamIndex[axis];
-            mp.pinId = newPinId;
-            mp.depth = 1.0f;
+            mp.pinId      = newPinId;
+            mp.depth      = 1.0f;
             nd.modPins.push_back(mp);
         }
     }
 
-    // NOTE: we deliberately do NOT rewrite the kind of *existing* Position
-    // modulation pins here. A user may have intentionally set one to Signal
-    // (e.g. for an audio-rate FM-style patch), and silently migrating it to
-    // Param on every editor re-sync would change their pin type out from under
-    // them. Only freshly-created pins (above) default to Param (block-rate);
-    // existing pins keep whatever kind the project already has.
+    // Re-resolve genuine NON-Position control pins' paramIndex by exact name, a
+    // safety net in case the param erase/re-add above shifted indices.
+    for (auto& mp : nd.modPins) {
+        const std::string* nm = nullptr;
+        for (const auto& p : nd.pinsIn) if (p.id == mp.pinId) { nm = &p.name; break; }
+        if (!nm) continue;
+        if (axisOfPinName(*nm) >= 0) continue;   // Position pin, already handled
+        if (nm->rfind("Mod: ", 0) == 0 || nm->rfind("Set: ", 0) == 0) {
+            std::string target = nm->substr(5);
+            for (int i = 0; i < (int)nd.params.size(); ++i)
+                if (nd.params[i].name == target) { mp.paramIndex = i; break; }
+        }
+    }
 
     // Keep the Aftertouch pin after every Position pin so a freshly
     // appended Position axis never leaves Aftertouch wedged between two
@@ -7082,6 +7390,53 @@ void LayeredWaveEditorComponent::setEditingLibraryEntry(int libId) {
     notifyPopoutFrameOrPositionChanged();
 }
 
+void LayeredWaveEditorComponent::renameLibraryEntry(int libId) {
+    const int libIdx = wave.findLibraryIndexById(libId);
+    if (libIdx < 0) return;
+    const juce::String oldName(wave.library[(size_t)libIdx].name);
+
+    // Modal text-entry prompt, following the codebase rename pattern
+    // (adsr_envelope_component.cpp). Parented to this component so Windows
+    // groups it under the main window's taskbar icon instead of giving the
+    // dialog its own entry.
+    auto* aw = new juce::AlertWindow("Rename waveform", "New name:",
+                                     juce::MessageBoxIconType::NoIcon, this);
+    aw->addTextEditor("name", oldName);
+    // Pre-select the existing name so typing replaces it immediately, matching
+    // the app's other input dialogs. The AlertWindow grabs keyboard focus for its
+    // first text editor on show, at which point this selects the whole contents.
+    if (auto* te = aw->getTextEditor("name"))
+        te->setSelectAllWhenFocused(true);
+    aw->addButton("Rename", 1, juce::KeyPress(juce::KeyPress::returnKey));
+    aw->addButton("Cancel", 0, juce::KeyPress(juce::KeyPress::escapeKey));
+
+    juce::Component::SafePointer<LayeredWaveEditorComponent> safe(this);
+    aw->enterModalState(true,
+        juce::ModalCallbackFunction::create(
+            [safe, aw, libId](int r) {
+                std::unique_ptr<juce::AlertWindow> disposer(aw);  // free on return
+                if (r != 1 || safe == nullptr) return;
+                safe->setLibraryEntryName(
+                    libId, aw->getTextEditorContents("name").toStdString());
+            }), false);
+}
+
+void LayeredWaveEditorComponent::setLibraryEntryName(int libId,
+                                                     const std::string& newName) {
+    const int libIdx = wave.findLibraryIndexById(libId);
+    if (libIdx < 0) return;
+    if (wave.library[(size_t)libIdx].name == newName) return;
+    wave.library[(size_t)libIdx].name = newName;
+    commitToNode();
+    commitUndoStep();
+    if (arrangementView) arrangementView->rebuildLibraryList();
+    // If the renamed entry is the editor's current target, refresh the inline
+    // identity-row name field so the popup and the inline editor never disagree
+    // (no-clobber: refreshIdentityRow only re-sets the text when it differs).
+    if (libId == currentLibraryId) refreshIdentityRow();
+    notifyPopoutDocMutated();
+}
+
 void LayeredWaveEditorComponent::refreshIdentityRow() {
     const int libIdx = wave.findLibraryIndexById(currentLibraryId);
     const bool have = (libIdx >= 0);
@@ -7203,6 +7558,12 @@ void LayeredWaveEditorComponent::updateHintText() {
 }
 
 LayeredWaveEditorComponent::~LayeredWaveEditorComponent() {
+    // Drop out of the live-editor registry so a concurrent snapshot restore
+    // never dereferences this dying editor.
+    {
+        auto& reg = openWaveEditors();
+        reg.erase(std::remove(reg.begin(), reg.end(), this), reg.end());
+    }
     // If there's a pending debounced apply, flush it now so the audio
     // engine picks up the last edits even if the editor closes quickly.
     if (isTimerRunning()) {
@@ -7280,11 +7641,6 @@ LayeredWaveEditorComponent::makeCaptureMetadataSink() {
     return [this](double pitchHz, int freezeIdx, double crossfadeMs) {
         auto* g = dynamic_cast<GranularFrame*>(
             wave.libraryFrameById(currentLibraryId));
-        // [OCT-DBG] temporary diagnostic for the lost capture-window octave.
-        juce::Logger::writeToLog(juce::String("[OCT-DBG] sink fired libId=")
-            + juce::String(currentLibraryId)
-            + " pitchHz=" + juce::String(pitchHz, 3)
-            + " gFound=" + juce::String(g ? 1 : 0));
         if (!g) return;
         g->embeddedPitchHz = (float)pitchHz;
         g->freezeMode = (GranularFreezeMode)juce::jlimit(0, 3, freezeIdx);
@@ -7318,15 +7674,23 @@ void LayeredWaveEditorComponent::showCapturePanelInline(int sourceKind,
     // capturePanel. They detect the inline mode by virtue of having
     // their onDismiss callback set: the Capture / Save and Close
     // buttons call onDismiss instead of walking up to a DialogWindow.
-    // Save still fires onCapture (which appends frames to the
-    // wavetable); Close just clears the panel.
+    // Save still fires onCapture (which adds frames to the Library);
+    // Close just clears the panel.
     //
     // replaceCurrentEntry: see header doc. Routes onCapture to the
-    // replace-in-place callback instead of the append-along-position
-    // one. Silently falls back to append if no library entry is bound.
+    // replace-in-place callback instead of the add-to-library one.
+    // Silently falls back to add-to-library if no library entry is bound.
     const bool doReplace = replaceCurrentEntry && currentLibraryId >= 0;
-    auto onCaptured = [this, doReplace]
+    auto onCaptured = [this, doReplace, sourceKind]
         (std::vector<std::unique_ptr<IWavetableFrame>> frames) {
+        // Stamp every captured granular frame with the source it came from so
+        // its editor's "Re-capture from …" button names the right source and
+        // re-opens the matching panel. Done here (the single point that knows
+        // sourceKind) so both the add-to-library and replace-in-place paths
+        // below inherit it.
+        for (auto& fr : frames)
+            if (auto* g = dynamic_cast<GranularFrame*>(fr.get()))
+                g->captureSourceKind = sourceKind;
         if (doReplace) {
             replaceCurrentEntryWithCapturedFrame(std::move(frames));
             // In replace mode the capture is intentionally one-shot: the
@@ -7350,10 +7714,10 @@ void LayeredWaveEditorComponent::showCapturePanelInline(int sourceKind,
                 if (safe) safe->dismissCapturePanel();
             });
         } else {
-            appendCapturedFramesAlongPosition(std::move(frames));
+            addCapturedFramesToLibrary(std::move(frames), sourceKind);
             // After a Save in append mode the dialog stays open and
-            // currentLibraryId now points at the frame just appended (set by
-            // appendCapturedFramesAlongPosition). Bind the capture panel's
+            // currentLibraryId now points at the frame just added (set by
+            // addCapturedFramesToLibrary). Bind the capture panel's
             // metadata write-through sink so any further "As note" / freeze /
             // crossfade edit commits live to that frame instead of being
             // silently dropped on Close. Previously onMetadataEdited was only
@@ -7366,12 +7730,6 @@ void LayeredWaveEditorComponent::showCapturePanelInline(int sourceKind,
                     dynamic_cast<CaptureFromSongDialog*>(capturePanel.get())) {
                 if (!songPanel->onMetadataEdited)
                     songPanel->onMetadataEdited = makeCaptureMetadataSink();
-                // [OCT-DBG] temporary diagnostic for the lost capture-window octave.
-                juce::Logger::writeToLog(juce::String("[OCT-DBG] append bind: songPanel=1 libId=")
-                    + juce::String(currentLibraryId)
-                    + " sinkSet=" + juce::String(songPanel->onMetadataEdited ? 1 : 0));
-            } else {
-                juce::Logger::writeToLog("[OCT-DBG] append bind: songPanel=0 (cast failed)");
             }
         }
     };
@@ -7458,107 +7816,98 @@ void LayeredWaveEditorComponent::dismissCapturePanel() {
     repaint();
 }
 
-void LayeredWaveEditorComponent::appendCapturedFramesAlongPosition(
-    std::vector<std::unique_ptr<IWavetableFrame>> frames)
+// Build the BASE Library display name for a captured frame - reflecting its
+// source (mic / file / song) and, for granular captures, the freeze method
+// baked into it - replacing the generic "Waveform N". sourceKind: 0 =
+// project song, 1 = mic, 2 = file (matches showCapturePanelInline). No index
+// number here; the caller appends the entry's stable creation id once it's
+// known (see applyLibraryIdSuffix in addCapturedFramesToLibrary). Returns
+// an empty string for sourceKind < 0 so addLibraryEntry falls back to its
+// own auto-generated default (used by the non-capture insert paths).
+static std::string captureEntryName(int sourceKind, const IWavetableFrame* frame) {
+    if (sourceKind < 0) return {};
+    juce::String src;
+    switch (sourceKind) {
+        case 0:  src = "Song"; break;  // project song
+        case 1:  src = "Mic";  break;  // microphone input
+        case 2:  src = "File"; break;  // audio file
+        default: src = "Capture"; break;
+    }
+    juce::String name = src;
+    if (auto* g = dynamic_cast<const GranularFrame*>(frame)) {
+        switch (g->freezeMode) {
+            case GranularFreezeMode::CrossfadeLoop:   name << " - Crossfade loop";   break;
+            case GranularFreezeMode::AsyncGranular:   name << " - Async granular";   break;
+            case GranularFreezeMode::PitchSyncGrains: name << " - Pitch-sync grains";break;
+            case GranularFreezeMode::SpectralFreeze:  name << " - Spectral freeze";  break;
+        }
+    }
+    return name.toStdString();
+}
+
+// Build the BASE Library display name for a frame created from scratch or by
+// duplicating an existing one (the "+ Waveform" menu's "Edit from scratch"
+// items and "Duplicate current"). Reflects the editor type the frame belongs
+// to - "Layered", "FFT", "Wavelet" - instead of the generic "Waveform N". A
+// duplicated capture keeps its granular type as "Granular". As with
+// captureEntryName the caller appends the entry's stable creation id.
+static std::string frameTypeName(const IWavetableFrame* frame) {
+    if (dynamic_cast<const SpectralFrame*>(frame))  return "FFT";
+    if (dynamic_cast<const WaveletFrame*>(frame))   return "Wavelet";
+    if (dynamic_cast<const GranularFrame*>(frame))  return "Granular";
+    if (dynamic_cast<const LayeredWaveform*>(frame)) return "Layered";
+    return {};  // unknown type - let addLibraryEntry use its own default
+}
+
+// Append an entry's stable creation id (library id - monotonic, reload-safe,
+// never renumbered on deletion) to its display name so otherwise-identical
+// auto-named entries stay distinguishable (e.g. "Layered 5", "Mic 7"). No-op
+// when base is empty, so non-auto-named paths keep addLibraryEntry's default.
+static void applyLibraryIdSuffix(WavetableDoc& doc, int libId,
+                                 const std::string& base) {
+    if (base.empty() || libId < 0) return;
+    const int idx = doc.findLibraryIndexById(libId);
+    if (idx >= 0)
+        doc.library[(size_t)idx].name = base + " " + std::to_string(libId);
+}
+
+void LayeredWaveEditorComponent::addCapturedFramesToLibrary(
+    std::vector<std::unique_ptr<IWavetableFrame>> frames,
+    int sourceKind)
 {
     if (frames.empty()) return;
     const int N = (int)frames.size();
 
-    // Single-waveform capture (project-song "Save waveform at marker",
-    // single-slice mic/file capture) goes to the Library list only - it
-    // does NOT auto-assign to any cell in the arrangement. The user's
-    // expectation when grabbing one spot is "give me this waveform to
-    // work with", not "destroy whatever was in the selected cell and put
-    // this there". The library entry is selected so the right-pane editor
-    // immediately shows the new capture, and from there the user can drop
-    // it into a cell via the Library list's "Assign to selected cell"
-    // button if they want. Multi-waveform captures (mic / file with N>1
-    // slices) still append along axis 0 because the user explicitly chose
-    // N>1 slices and the implied intent is to populate an axis.
-    if (N == 1) {
-        const int libId = wave.addLibraryEntry(std::move(frames[0]));
-        currentLibraryId = libId;
-        // Don't touch currentFrameIdx - the cell the user had selected
-        // stays selected, just nothing was placed in it. The Library
-        // list now has a new entry the user can drop in via "Assign to
-        // selected cell".
-        wave.scatterFromGridSnapshot.reset();
-        updateHintText();
-        rebuildRows();
-        onLayerChanged();
-        notifyPopoutFrameOrPositionChanged();
-        notifyPopoutDocMutated();
-        return;
+    // All captured waveforms - whether the user grabbed one spot or sliced
+    // out N - go to the Library list ONLY. They are NOT auto-placed into
+    // the arrangement: capturing never grows the grid's cell count, never
+    // resizes an axis, and never adds a scatter dot. The user's expectation
+    // when capturing is "give me these waveforms to work with", not "rebuild
+    // my wavetable arrangement around them". Placement is a separate,
+    // explicit step: select a cell (or scatter slot) and use the Library
+    // list's "Assign to selected cell" button to drop an entry in. This
+    // mirrors how the "+ Waveform" menu's insert items behave - they add a
+    // library entry without touching gridDims / cellWaveformIds / the
+    // current cell selection.
+    int firstNewLibId = -1;
+    for (int i = 0; i < N; ++i) {
+        // Base name (source + freeze method for captures) plus the entry's
+        // stable creation id, appended post-add via applyLibraryIdSuffix
+        // because the id isn't known until addLibraryEntry assigns it
+        // (e.g. "Mic - Crossfade loop 7").
+        auto base = captureEntryName(sourceKind, frames[(size_t)i].get());
+        const int libId = wave.addLibraryEntry(std::move(frames[(size_t)i]), base);
+        applyLibraryIdSuffix(wave, libId, base);
+        if (i == 0) firstNewLibId = libId;
     }
 
-    if (wave.mode == WavetableMode::Grid) {
-        // Append along axis 0. Grow gridDims[0] by N (or set it to N
-        // if the wavetable was empty), and fill the new slice with the
-        // captured frames at coord[other] = 0. If the editor's initial
-        // state is the default single-sine in a 1-cell grid we still
-        // append rather than replace - the user can delete the seed
-        // sine afterwards if they want a pure-captured wavetable. This
-        // matches the behavior of the existing per-type "insert new"
-        // entries which never delete the current frame.
-        if (wave.gridDims.empty()) {
-            wave.gridDims.push_back(0);
-            wave.cellWaveformIds.clear();
-        }
-        const int axis = 0;
-        const int oldSize = wave.gridDims[axis];
-        wave.resizeGridAxis(axis, oldSize + N);
-
-        // Fill the freshly-created slice positions. Each captured waveform
-        // is promoted to a fresh library entry; the cell stores the id.
-        int firstNewLibId = -1;
-        for (int i = 0; i < N; ++i) {
-            std::vector<int> coord(wave.gridDims.size(), 0);
-            coord[axis] = oldSize + i;
-            int flat = wave.gridCoordToCellIdx(coord);
-            if (flat >= 0 && flat < (int)wave.cellWaveformIds.size()) {
-                const int libId = wave.addLibraryEntry(std::move(frames[(size_t)i]));
-                wave.cellWaveformIds[flat] = libId;
-                if (i == 0) firstNewLibId = libId;
-            }
-        }
-
-        // Select the first newly-inserted frame so the user can see it
-        // in the editor body.
-        {
-            std::vector<int> coord(wave.gridDims.size(), 0);
-            coord[axis] = oldSize;
-            int flat = wave.gridCoordToCellIdx(coord);
-            if (flat >= 0) currentFrameIdx = flat;
-        }
-        // Sync the editor target to match the new selection.
-        if (firstNewLibId >= 0) currentLibraryId = firstNewLibId;
-        wave.scatterFromGridSnapshot.reset();
-        updateHintText();
-    } else {
-        // Scatter mode: lay the frames out along the X axis (dim 0),
-        // equally spaced from 0.1 .. 0.9 so they sit visibly inside the
-        // unit cube without being pinned to the corners. Other axes get
-        // the center value 0.5.
-        const float x0 = 0.1f, x1 = 0.9f;
-        int firstNewLibId = -1;
-        for (int i = 0; i < N; ++i) {
-            ScatterFrame sf;
-            sf.waveformId = wave.addLibraryEntry(std::move(frames[(size_t)i]));
-            if (i == 0) firstNewLibId = sf.waveformId;
-            sf.position.assign(wave.scatterDims, 0.5f);
-            if (wave.scatterDims > 0) {
-                const float t = (N == 1) ? 0.5f
-                                          : (float)i / (float)(N - 1);
-                sf.position[0] = x0 + t * (x1 - x0);
-            }
-            wave.scatterFrames.push_back(std::move(sf));
-        }
-        currentFrameIdx = (int)wave.scatterFrames.size() - N;
-        if (currentFrameIdx < 0) currentFrameIdx = 0;
-        if (firstNewLibId >= 0) currentLibraryId = firstNewLibId;
-        repaintScatterViews();
-    }
-
+    // Bind the right-pane editor to the first newly-captured entry so the
+    // user immediately sees what they grabbed. Deliberately leave
+    // currentFrameIdx (the cell/scatter-dot selection) untouched - nothing
+    // was placed, so the user's existing arrangement selection stands.
+    if (firstNewLibId >= 0) currentLibraryId = firstNewLibId;
+    wave.scatterFromGridSnapshot.reset();
+    updateHintText();
     rebuildRows();
     onLayerChanged();
     notifyPopoutFrameOrPositionChanged();
@@ -7701,13 +8050,17 @@ void LayeredWaveEditorComponent::updateFrameEditorEmbed() {
     } else if (tid == "granular") {
         auto* gf = dynamic_cast<GranularFrame*>(f);
         if (gf) {
-            // Re-capture replaces the source PCM of the current library
-            // entry in place. Sending sourceKind=0 (project song) matches
-            // how granular frames are typically produced; future variants
-            // (mic, file) would go through the same showCapturePanelInline
-            // path with sourceKind=1/2.
+            // Re-capture replaces the source PCM of the current library entry
+            // in place, re-opening the SAME source the frame was captured from
+            // (song / mic / file) - a mic frame must re-capture from the mic,
+            // not the song. The frame remembers its origin in captureSourceKind;
+            // -1 (unknown, e.g. a pre-field project or a from-scratch frame)
+            // falls back to song, the historical default.
             auto onRecap = [this]() {
-                showCapturePanelInline(0, /*replaceCurrentEntry=*/true);
+                int kind = 0;
+                if (auto* g = dynamic_cast<GranularFrame*>(currentEditingFrame()))
+                    if (g->captureSourceKind >= 0) kind = g->captureSourceKind;
+                showCapturePanelInline(kind, /*replaceCurrentEntry=*/true);
             };
             // Audition through the owning synth node's pendingAudition queue.
             // TerrainSynthProcessor::processBlock drains the queue and emits
@@ -7747,6 +8100,7 @@ void LayeredWaveEditorComponent::updateFrameEditorEmbed() {
                             gpayload->embeddedPitchHz  = g->embeddedPitchHz;
                             gpayload->freezeMode       = (int)g->freezeMode;
                             gpayload->crossfadeSamples = g->crossfadeSamples;
+                            gpayload->gain             = g->gain;
                         }
                     }
                     std::lock_guard<std::mutex> lock(*nd->auditionMutex);
@@ -7815,6 +8169,113 @@ void LayeredWaveEditorComponent::commitUndoStep() {
     // is cheap when nothing actually changed and pushes exactly one undo step
     // per distinct wavetable state otherwise.
     graph.commitSnapshot("Edit wavetable");
+}
+
+bool LayeredWaveEditorComponent::keyPressed(const juce::KeyPress& key) {
+    if (!key.getModifiers().isCtrlDown()) return false;
+    const int code = key.getKeyCode();
+    bool redo;
+    if (code == 'Z')      redo = key.getModifiers().isShiftDown();
+    else if (code == 'Y') redo = true;
+    else                  return false;  // not an undo/redo key - let it pass
+
+    // Materialize any pending debounced edit as a real undo step BEFORE we
+    // undo. Without this, a Ctrl+Z fired inside the 150 ms debounce window (the
+    // common case right after a capture) would revert the LAST committed
+    // snapshot and skip past the just-made edit entirely - the edit lives only
+    // in the node script and would be lost with no matching redo. Flushing it
+    // now turns it into a proper, reversible step.
+    if (isTimerRunning()) {
+        stopTimer();
+        commitToNode();
+        if (onApply) onApply();
+        commitUndoStep();
+    }
+
+    // Defer the actual undo/redo to the next message tick. doUndo()/doRedo()
+    // fire the graph's onLoadSnapshot, which reparses the graph and (via
+    // reloadOpenEditorsAfterSnapshot) rebuilds THIS editor's child components -
+    // unsafe to run synchronously from inside a child's key handler still on the
+    // call stack. The graph outlives every editor, so capturing it by pointer is
+    // safe even if this editor closes in the meantime.
+    NodeGraph* g = &graph;
+    juce::MessageManager::callAsync([g, redo]() {
+        if (redo) g->undoTree.doRedo();
+        else      g->undoTree.doUndo();
+    });
+    return true;
+}
+
+void LayeredWaveEditorComponent::reloadFromNode() {
+    // Cancel any pending debounce first: timerCallback() would otherwise fire
+    // after we reload and commitUndoStep() the OLD wave doc, corrupting both the
+    // node script and the undo tree (re-applying the change we just undid).
+    stopTimer();
+
+    auto* nd = graph.findNode(nodeId);
+    if (!nd) {
+        // The node itself was undone away - nothing left to edit. Close our
+        // pop-out window (async + SafePointer, mirroring the Close button).
+        if (auto* dw = findParentComponentOfClass<juce::DialogWindow>()) {
+            juce::Component::SafePointer<juce::DialogWindow> safe(dw);
+            juce::MessageManager::callAsync([safe]() {
+                if (safe) delete safe.getComponent();
+            });
+        }
+        return;
+    }
+
+    // Preserve the editor target / arrangement selection across the reload when
+    // they survive in the restored doc.
+    const int prevLibraryId = currentLibraryId;
+    const int prevFrameIdx  = currentFrameIdx;
+    const std::vector<float> prevPosition = currentPosition;
+
+    WavetableDoc fresh;
+    if (!fresh.decode(nd->script)) {
+        // Node script is no longer an editable wavetable (shouldn't happen for a
+        // synth we had open). Leave the editor as-is rather than blanking it -
+        // the stale state is at least self-consistent.
+        return;
+    }
+    wave = std::move(fresh);
+
+    // Re-seed selection: keep the previous library entry if it still exists,
+    // else fall back to the first entry the way the constructor does.
+    if (wave.findLibraryIndexById(prevLibraryId) >= 0)
+        currentLibraryId = prevLibraryId;
+    else
+        currentLibraryId = wave.library.empty() ? -1 : wave.library.front().id;
+
+    const int cellCount = (wave.mode == WavetableMode::Grid)
+        ? (int)wave.cellWaveformIds.size()
+        : (int)wave.scatterFrames.size();
+    currentFrameIdx = (cellCount > 0)
+        ? juce::jlimit(0, cellCount - 1, prevFrameIdx) : 0;
+
+    currentPosition.assign((size_t)std::max(1, wave.numDimensions()), 0.5f);
+    for (size_t d = 0; d < currentPosition.size() && d < prevPosition.size(); ++d)
+        currentPosition[d] = prevPosition[d];
+
+    // A reload invalidates any in-progress capture context and the lossless
+    // "Back to Grid" round-trip snapshot.
+    if (capturePanel) dismissCapturePanel();
+    wave.scatterFromGridSnapshot.reset();
+
+    // Rebuild the UI from the restored doc. Deliberately NOT onLayerChanged():
+    // that path commits to the node and pushes a snapshot, which would clobber
+    // the very undo we are responding to. refreshPreview() + the arrangement-
+    // view refreshers rebuild everything visible without writing anything back.
+    updateHintText();
+    rebuildRows();
+    refreshPreview();
+    if (arrangementView) {
+        arrangementView->refreshAfterDocMutation();
+        arrangementView->refreshFrameAndPositionValues();
+    }
+    notifyPopoutFrameOrPositionChanged();
+    notifyPopoutDocMutated();
+    repaint();
 }
 
 void LayeredWaveEditorComponent::onLayerChanged() {

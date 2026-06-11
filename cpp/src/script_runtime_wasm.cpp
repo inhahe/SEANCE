@@ -157,6 +157,10 @@ public:
     bool supportsPerBlock()  const override { return true; }
     std::string getError() const override { return lastErr; }
 
+    // Public accessor for the protected note->Hz mapper so the static wasm3
+    // import trampoline (a captureless lambda) can reach the project tuning.
+    float callNoteFreq(int n) const { return noteFreq(n); }
+
 private:
     ScriptRole role;
     std::string lastErr;
@@ -247,6 +251,18 @@ private:
         m3_LinkRawFunction(mod, "env", "ss_get_param", "f(i)",
             [](IM3Runtime, IM3ImportContext, uint64_t* sp, void*) -> const void* {
                 *(float*)&sp[0] = 0.0f; return m3Err_none;
+            });
+        // ss_note_to_freq(midinote) -> Hz, using the PROJECT tuning system
+        // (the same mapper backing notefreq() in the other languages). Out-of-
+        // range notes return 0. notenum/notename stay WASM-side (pure helpers in
+        // soundshop_wasm.h) since they need no host state.
+        m3_LinkRawFunction(mod, "env", "ss_note_to_freq", "f(i)",
+            [](IM3Runtime r, IM3ImportContext, uint64_t* sp, void*) -> const void* {
+                auto* self = (WasmRuntime*)m3_GetUserData(r);
+                int n = (int)(int32_t)sp[0];
+                float hz = (n < 0 || n > 127) ? 0.0f : self->callNoteFreq(n);
+                *(float*)&sp[0] = hz;
+                return m3Err_none;
             });
         m3_LinkRawFunction(mod, "env", "ss_midi_out", "v(iiii)",
             [](IM3Runtime r, IM3ImportContext, uint64_t* sp, void*) -> const void* {

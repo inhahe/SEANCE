@@ -54,6 +54,16 @@
   <li><code>bend(value)</code> — pitch bend, where <code>value</code> goes from −1 (down) through 0 (centre) to +1 (up).</li>
 </ul>
 
+<h2>Note names instead of numbers</h2>
+
+<p>If you'd rather not remember that middle C is 60, you can write the <strong>name</strong> in quotes anywhere a pitch goes: <code>note("C4", 100, 0.5)</code> is exactly the same as <code>note(60, 100, 0.5)</code>. Names use a letter A–G (upper or lower case), optional sharps (<code>#</code>) or flats (<code>b</code>), and an octave number — <code>"C4"</code>, <code>"c#4"</code>, <code>"Bb3"</code>. (C4 = 60, A4 = 69; leave the octave off and it assumes 4.)</p>
+
+<p>Two helpers convert for you:</p>
+<ul>
+  <li><code>notenum("C4")</code> → <code>60</code> — name to number (so you can do maths on it, e.g. <code>note(notenum("C4") + 7, …)</code> for a fifth up).</li>
+  <li><code>notefreq("C4")</code> or <code>notefreq(60)</code> → the frequency in <strong>Hz</strong>, using whatever <em>tuning system</em> the project is set to (Settings → Tuning) rather than always-standard tuning. (In Lua there's also <code>notename(60)</code> → <code>"C4"</code>, the reverse of <code>notenum</code>; the built-in language can't return text so it doesn't have that one.)</li>
+</ul>
+
 <h2>Remembering things between samples</h2>
 
 <p>Any variable you assign with <code>=</code> <strong>keeps its value</strong> the next sample, and the next, forever — so you can build up state over time without any special syntax. A simple step sequencer that advances a counter on each beat:</p>

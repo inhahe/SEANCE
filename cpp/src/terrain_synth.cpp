@@ -820,6 +820,7 @@ TerrainSynthProcessor::TerrainSynthProcessor(Node& n, Transport& t) : node(n), t
                                           ? gf->embeddedPitchHz : 440.0f;
                     e.freezeMode       = (int)gf->freezeMode;
                     e.crossfadeSamples = std::max(0, gf->crossfadeSamples);
+                    e.gain             = gf->gain;
                     e.position         = sf.position;
                     wtGranularFrames.push_back(std::move(e));
                 }
@@ -921,6 +922,7 @@ TerrainSynthProcessor::TerrainSynthProcessor(Node& n, Transport& t) : node(n), t
                                           ? gf->embeddedPitchHz : 440.0f;
                     e.freezeMode       = (int)gf->freezeMode;
                     e.crossfadeSamples = std::max(0, gf->crossfadeSamples);
+                    e.gain             = gf->gain;
                     // Normalize gridCoord into [0,1] per dim so the per-
                     // block Position weight math doesn't need to know about
                     // the underlying grid resolution.
@@ -1205,6 +1207,39 @@ std::vector<float> TerrainSynthProcessor::scatterQueryPosition() {
         if (axis >= 0 && axis < (int)qpos.size())
             qpos[axis] = juce::jlimit(0.0f, 1.0f, getParamByName(node, pname.c_str(), 0.5f));
     }
+
+    // === TEMP SCATTER DIAGNOSTIC (throwaway) ===
+    // Log qpos + the node's Position params whenever the query moves, so we can
+    // see if the Position sliders actually reach the synth. Throttled to real
+    // changes to avoid hammering the disk every block.
+    {
+        static std::vector<float> sLast;
+        bool changed = (sLast.size() != qpos.size());
+        for (size_t i = 0; !changed && i < qpos.size(); ++i)
+            if (std::abs(sLast[i] - qpos[i]) > 0.005f) changed = true;
+        if (changed) {
+            sLast = qpos;
+            juce::String line;
+            line << "qpos=[";
+            for (size_t i = 0; i < qpos.size(); ++i)
+                line << juce::String(qpos[i], 3) << (i + 1 < qpos.size() ? "," : "");
+            line << "]  effAxes=[";
+            for (size_t i = 0; i < wtEffectiveAxes.size(); ++i)
+                line << wtEffectiveAxes[i] << (i + 1 < wtEffectiveAxes.size() ? "," : "");
+            line << "]  dims=" << wtScatterDims
+                 << "  frames=" << (int)wtScatterFramePositions.size()
+                 << "  params{";
+            for (const auto& p : node.params)
+                if (p.name.rfind("Position", 0) == 0)
+                    line << p.name << "=" << juce::String(p.value, 3)
+                         << (p.modulated ? "(mod)" : "") << " ";
+            line << "}\n";
+            juce::File f("D:/temp/scatter_diag.txt");
+            f.appendText(line);
+        }
+    }
+    // === END TEMP DIAGNOSTIC ===
+
     return qpos;
 }
 
@@ -1248,6 +1283,10 @@ void TerrainSynthProcessor::computeGranularWeights(const std::vector<float>& pos
         const float r = std::max(1e-3f, wtScatterRadius);
         float totalW = 0.0f;
         std::vector<float> wAll(wtScatterFrameSamples.size(), 0.0f);
+        // Distances first (shared by both kernels); track the nearest so the
+        // Shepard weights below can normalize against it overflow-safely.
+        std::vector<float> dists(wtScatterFrameSamples.size(), 0.0f);
+        float dmin = 1e30f;
         for (size_t fi = 0; fi < wtScatterFrameSamples.size(); ++fi) {
             const auto& fp = wtScatterFramePositions[fi];
             float d2 = 0.0f;
@@ -1256,34 +1295,31 @@ void TerrainSynthProcessor::computeGranularWeights(const std::vector<float>& pos
                 float dd = a - (d < (int)pos.size() ? pos[d] : 0.5f);
                 d2 += dd * dd;
             }
-            float dist = std::sqrt(d2);
-            if (dist < r) {
-                float u = dist / r;
-                float v = 1.0f - u;
-                float w = v * v * v * v * (4.0f * u + 1.0f);
-                wAll[fi] = w;
-                totalW += w;
-            }
+            dists[fi] = std::sqrt(d2);
+            dmin = std::min(dmin, dists[fi]);
         }
-        // Edge case: zero total weight. Fall back to "nearest granular
-        // frame wins" so the user always hears something when the
-        // wavetable contains only granular frames. Skipped in absolute mode,
-        // where a Position outside every radius is intentionally silent.
-        if (!wtAbsoluteBlend && totalW < 1e-9f) {
-            int nearest = -1;
-            float bestD2 = 1e30f;
-            for (size_t gi = 0; gi < wtGranularFrames.size(); ++gi) {
-                const auto& gp = wtGranularFrames[gi].position;
-                float d2 = 0.0f;
-                for (int d = 0; d < wtScatterDims; ++d) {
-                    float a = (d < (int)gp.size()) ? gp[d] : 0.5f;
-                    float dd = a - (d < (int)pos.size() ? pos[d] : 0.5f);
-                    d2 += dd * dd;
+        if (wtAbsoluteBlend) {
+            // Compact-support Wendland: raw weight used as gain, silent outside
+            // every frame's radius. Mirrors the cycle blend's absolute path.
+            for (size_t fi = 0; fi < wtScatterFrameSamples.size(); ++fi) {
+                float dist = dists[fi];
+                if (dist < r) {
+                    float u = dist / r;
+                    float v = 1.0f - u;
+                    wAll[fi] = v * v * v * v * (4.0f * u + 1.0f);
                 }
-                if (d2 < bestD2) { bestD2 = d2; nearest = (int)gi; }
             }
-            if (nearest >= 0) out[nearest] = 1.0f;
-            return;
+        } else {
+            // Normalized blend: scale-free inverse-distance (Shepard), matching
+            // the cycle blend so granular and cycle frames morph identically.
+            // Always tracks Position - no hard switch / static-average dead
+            // zones, no nearest-frame fallback needed.
+            float p = 2.0f / std::max(0.05f, wtScatterRadius);
+            for (size_t fi = 0; fi < wtScatterFrameSamples.size(); ++fi) {
+                float ratio = (dmin + 1e-6f) / (dists[fi] + 1e-6f);
+                wAll[fi] = std::pow(ratio, p);
+                totalW += wAll[fi];
+            }
         }
         // Map granular-frame entries to their per-frame weight in wAll.
         // The granular entries are pushed in the same order as the
@@ -1405,52 +1441,6 @@ void TerrainSynthProcessor::releaseNote(int noteNumber, int channel) {
 void TerrainSynthProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::MidiBuffer& midi) {
     applySignalModulations(node, buf);
     reloadIfScriptChanged();
-
-    // TEMP DIAGNOSTIC (#88 Position modulation): accumulate the LFO signal and
-    // the resulting Position value across every block, then dump min / max /
-    // mean over the window ~twice a second. This measures the two reported
-    // symptoms directly:
-    //   * "favouring waveform 1" -> mean Position != 0.5, or a lopsided
-    //     min..max range (e.g. 0.00..0.50 instead of 0.00..1.00).
-    //   * "sudden jump to the right every cycle" -> max creeping upward over
-    //     successive windows (a drift / accumulation bug) vs a stable range
-    //     (the LFO shape's own endpoints not matching = expected).
-    if (isWavetable && !node.modPins.empty()) {
-        const auto& mp = node.modPins.front();
-        int slotIdx = -1, sigCount = 0;
-        for (auto& pin : node.pinsIn) {
-            if (pin.id == mp.pinId) { slotIdx = sigCount; break; }
-            if (pin.kind == PinKind::Signal || pin.kind == PinKind::Param) ++sigCount;
-        }
-        int ch = 2 + slotIdx;
-        bool chOk = (slotIdx >= 0 && ch < buf.getNumChannels());
-        float sig = chOk ? buf.getSample(ch, 0) : 0.0f;
-        float pval = (mp.paramIndex >= 0 && mp.paramIndex < (int)node.params.size())
-                        ? node.params[mp.paramIndex].value : 0.0f;
-
-        static int   dbgN     = 0;
-        static float sigMin    = 1e9f,  sigMax    = -1e9f,  sigSum    = 0.0f;
-        static float valMin    = 1e9f,  valMax    = -1e9f,  valSum    = 0.0f;
-        if (chOk) {
-            sigMin = std::min(sigMin, sig); sigMax = std::max(sigMax, sig); sigSum += sig;
-            valMin = std::min(valMin, pval); valMax = std::max(valMax, pval); valSum += pval;
-            ++dbgN;
-        }
-        if (dbgN >= 90) {
-            juce::String pname = (mp.paramIndex >= 0 && mp.paramIndex < (int)node.params.size())
-                            ? juce::String(node.params[mp.paramIndex].name) : juce::String("?");
-            juce::String s;
-            s << "[WT-MOD] node=" << node.name << " bufCh=" << buf.getNumChannels()
-              << " param=" << pname << " ch=" << ch
-              << " | sig[min=" << juce::String(sigMin, 3) << " max=" << juce::String(sigMax, 3)
-              << " mean=" << juce::String(sigSum / dbgN, 3) << "]"
-              << " | pos[min=" << juce::String(valMin, 3) << " max=" << juce::String(valMax, 3)
-              << " mean=" << juce::String(valSum / dbgN, 3) << "]";
-            juce::Logger::writeToLog(s);
-            dbgN = 0;
-            sigMin = valMin = 1e9f; sigMax = valMax = -1e9f; sigSum = valSum = 0.0f;
-        }
-    }
 
     // Drain UI-side audition events directly into voices. This is how editor
     // preview buttons (e.g. the wavetable editor's GranularFrameEditor-
@@ -1729,6 +1719,9 @@ void TerrainSynthProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mi
         std::vector<float> weights(nFrames, 0.0f);
         float totalW = 0.0f;
         float r = std::max(1e-3f, wtScatterRadius);
+        // Distance from the query to every frame (shared by both blend modes).
+        std::vector<float> dists((size_t)nFrames, 0.0f);
+        float dmin = 1e30f;
         for (int fi = 0; fi < nFrames; ++fi) {
             const auto& fp = wtScatterFramePositions[fi];
             float d2 = 0.0f;
@@ -1737,41 +1730,42 @@ void TerrainSynthProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mi
                 float dd = a - qpos[dim];
                 d2 += dd * dd;
             }
-            float dist = std::sqrt(d2);
-            if (dist < r) {
-                float u = dist / r;
-                float v = 1.0f - u;
-                // Wendland phi_{3,1}: (1-u)^4 * (4u + 1)
-                float w = v * v * v * v * (4.0f * u + 1.0f);
-                weights[fi] = w;
-                totalW += w;
-            }
+            dists[(size_t)fi] = std::sqrt(d2);
+            dmin = std::min(dmin, dists[(size_t)fi]);
         }
         float invT;
         if (wtAbsoluteBlend) {
-            // "Distance fades volume": use the raw Wendland weight as gain.
-            // No nearest-frame fallback - a Position outside every frame's
-            // radius is deliberately silent (totalW stays 0, the weighted
-            // accumulation below produces no output).
+            // "Distance fades volume": compact-support Wendland phi_{3,1},
+            // (1-u)^4*(4u+1), raw weight used directly as gain. A Position
+            // outside every frame's radius is deliberately silent (totalW stays
+            // 0, the weighted accumulation below produces no output), so the
+            // radius is a literal fade distance here.
+            for (int fi = 0; fi < nFrames; ++fi) {
+                float dist = dists[(size_t)fi];
+                if (dist < r) {
+                    float u = dist / r;
+                    float v = 1.0f - u;
+                    weights[fi] = v * v * v * v * (4.0f * u + 1.0f);
+                }
+            }
             invT = 1.0f;
         } else {
-            if (totalW < 1e-9f) {
-                // Fall back to nearest frame so we never produce silence.
-                int nearest = 0;
-                float bestD2 = 1e30f;
-                for (int fi = 0; fi < nFrames; ++fi) {
-                    const auto& fp = wtScatterFramePositions[fi];
-                    float d2 = 0.0f;
-                    for (int dim = 0; dim < wtScatterDims; ++dim) {
-                        float a = (dim < (int)fp.size()) ? fp[dim] : 0.5f;
-                        float dd = a - qpos[dim];
-                        d2 += dd * dd;
-                    }
-                    if (d2 < bestD2) { bestD2 = d2; nearest = fi; }
-                }
-                weights[nearest] = 1.0f;
-                totalW = 1.0f;
+            // Normalized blend: scale-free inverse-distance (Shepard) weights.
+            // Unlike the compact Wendland kernel this ALWAYS tracks Position
+            // smoothly - there's no radius that hard-switches to the nearest
+            // frame (small radius) or collapses to a static uniform average
+            // (large radius). `radius` maps to sharpness (smaller = sharper,
+            // matching the slider tooltip); using (dmin/dist)^p keeps the math
+            // overflow-safe, with the nearest frame normalized to 1 and a query
+            // sitting exactly on a frame resolving to that frame alone.
+            float p = 2.0f / std::max(0.05f, wtScatterRadius);
+            for (int fi = 0; fi < nFrames; ++fi) {
+                float ratio = (dmin + 1e-6f) / (dists[(size_t)fi] + 1e-6f);
+                float w = std::pow(ratio, p);
+                weights[fi] = w;
+                totalW += w;
             }
+            if (totalW < 1e-9f) { weights[0] = 1.0f; totalW = 1.0f; }
             invT = 1.0f / totalW;
         }
         auto& tdata = terrain.getData();
@@ -2032,92 +2026,41 @@ void TerrainSynthProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mi
                 // For each granular frame with non-trivial morph weight,
                 // sustain the captured marker window as a held note. The
                 // algorithm MUST match what the capture/freeze dialog
-                // auditions (audio_engine.cpp granularSample) so that
-                // "what you audition = what you get". The audition plays
-                // a CrossfadeLoop for every freeze mode today (its
-                // `(void)freezeMode` fallback), so the synth does too;
-                // the only thing the synth adds is pitch tracking, since
-                // the audition plays at the captured pitch while a synth
-                // note must follow MIDI. When the audition grows per-mode
-                // implementations (AsyncGranular, ...), add the matching
-                // synth branch here in lockstep - never let the two
-                // diverge, or the user hears one thing and plays another.
-                // One CrossfadeLoop grain reader, shared by the placed-frame
-                // morph below and the unplaced-frame audition path. Reads one
-                // output sample from `srcData` (length srcLen) for a grain of
-                // `grainLen` samples with `xfadeReq` seam crossfade, resampled
-                // so the held note tracks MIDI pitch, and advances `gs`'s
-                // fractional playhead. Returns 0 when the source is too short
-                // to hold a loop plus its L/2 lookahead tail (same viability
-                // gate as the capture audition, so silence here == silence
-                // there). Captures effFreq + sampleRate from the enclosing
-                // per-sample scope.
+                // auditions so that "what you audition = what you get". Both
+                // sites now share ONE implementation - GrainFreezeVoice in
+                // granular_freeze.h - so they cannot diverge: the audition
+                // engine and this synth call the same process() with the same
+                // freeze mode. The only thing the synth adds is pitch tracking
+                // (the `ratio`), since the audition plays at the captured pitch
+                // while a held note must follow MIDI.
+                //
+                // One grain reader, shared by the placed-frame morph below and
+                // the unplaced-frame audition path. Reads one output sample
+                // from `srcData` (length srcLen) for a grain of `grainLen`
+                // samples with `xfadeReq` seam crossfade, in freeze mode
+                // `freezeMode`, resampled so the held note tracks MIDI pitch.
+                // Returns 0 when the source is too short to sustain (same
+                // viability gate as the capture audition). Captures effFreq +
+                // sampleRate from the enclosing per-sample scope.
                 auto renderGrainSample =
                     [&](const float* srcData, int srcLen, int grainLen,
                         int xfadeReq, float embeddedPitchHz, double srcSampleRate,
-                        Voice::GranStream& gs) -> float {
+                        int freezeMode, Voice::GranStream& gs) -> float {
                     grainLen = std::max(16, grainLen);
                     if (srcLen <= 0) return 0.0f;
-                    // CrossfadeLoop geometry: loop the L-sample window
-                    // [anchor, anchor+L) and Hann-crossfade the seam against
-                    // the L/2-sample lookahead tail [anchor+L, anchor+L+xf).
-                    const int reservedTail = grainLen / 2;
-                    const int needLen      = grainLen + reservedTail;
-                    if (srcLen < needLen) return 0.0f;
-                    const int maxStart = srcLen - needLen;
-                    const int anchor   = maxStart / 2;
-                    const int xfade = std::max(0, std::min(xfadeReq, grainLen / 2));
-
-                    if (!gs.initialized) {
-                        gs.loopPhase = 0.0f;
-                        gs.initialized = true;
-                    }
-
-                    // Pitch ratio: resample the whole loop so the held note
-                    // tracks MIDI. ratio == 1 (native rate, exactly the
-                    // audition) when the note equals the frame's embedded
-                    // pitch and source/device rates match. srRatio corrects a
-                    // source captured at a different rate than the device.
+                    // Pitch ratio: resample so the held note tracks MIDI.
+                    // ratio == 1 (native rate, exactly the audition) when the
+                    // note equals the frame's embedded pitch and source/device
+                    // rates match. srRatio corrects a source captured at a
+                    // different rate than the device.
                     const float srRatio = (srcSampleRate > 0.0)
                         ? (float)(srcSampleRate / sampleRate) : 1.0f;
                     const float ratio = (effFreq /
                         std::max(1e-3f, embeddedPitchHz)) * srRatio;
-
-                    const float p = gs.loopPhase;          // [0, grainLen)
-
-                    // Main playhead read (linear interp).
-                    const float mainF = (float)anchor + p;
-                    int   mi0 = (int)mainF;
-                    float mfr = mainF - (float)mi0;
-                    if (mi0 < 0)               { mi0 = 0; mfr = 0.0f; }
-                    else if (mi0 > srcLen - 1) { mi0 = srcLen - 1; mfr = 0.0f; }
-                    const int mi1 = std::min(mi0 + 1, srcLen - 1);
-                    float out = srcData[(size_t)mi0] * (1.0f - mfr)
-                              + srcData[(size_t)mi1] * mfr;
-
-                    // Seam crossfade over the first `xfade` samples of each
-                    // loop iteration (Hann half-cycle alpha 0->1).
-                    if (xfade > 0 && p < (float)xfade) {
-                        const float pi = juce::MathConstants<float>::pi;
-                        const float alpha = 0.5f * (1.0f -
-                            std::cos(pi * p / (float)xfade));
-                        const float tailF = (float)(anchor + grainLen) + p;
-                        int   ti0 = (int)tailF;
-                        float tfr = tailF - (float)ti0;
-                        if (ti0 < 0)               { ti0 = 0; tfr = 0.0f; }
-                        else if (ti0 > srcLen - 1) { ti0 = srcLen - 1; tfr = 0.0f; }
-                        const int ti1 = std::min(ti0 + 1, srcLen - 1);
-                        const float tail = srcData[(size_t)ti0] * (1.0f - tfr)
-                                         + srcData[(size_t)ti1] * tfr;
-                        out = alpha * out + (1.0f - alpha) * tail;
-                    }
-
-                    // Advance the fractional playhead and wrap at loop length.
-                    float np = p + ratio;
-                    while (np >= (float)grainLen) np -= (float)grainLen;
-                    while (np < 0.0f)             np += (float)grainLen;
-                    gs.loopPhase = np;
-                    return out;
+                    return gs.voice.process(srcData, srcLen, grainLen, xfadeReq,
+                                            embeddedPitchHz, srcSampleRate,
+                                            sampleRate, ratio,
+                                            (GranularFreezeMode)freezeMode);
                 };
 
                 if (v.auditionFrame && v.auditionFrame->source
@@ -2129,11 +2072,14 @@ void TerrainSynthProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mi
                     // the table or where the Position knob sits.
                     sample = 0.0f;
                     const auto& af = *v.auditionFrame;
-                    sample += renderGrainSample(
+                    // af.gain mirrors the frame's IWavetableFrame::gain so the
+                    // editor's Gain knob is audible when auditioning a granular
+                    // library frame directly (the grain reader bypasses render()).
+                    sample += af.gain * renderGrainSample(
                         af.source->data(), (int)af.source->size(),
                         af.grainLength, af.crossfadeSamples,
                         af.embeddedPitchHz, af.sourceSampleRate,
-                        v.auditionFrameStream);
+                        af.freezeMode, v.auditionFrameStream);
                 } else if (!wtGranularFrames.empty() && isWavetable) {
                     // Lazy-allocate the per-voice granular stream array on
                     // first use - voices that never hit a granular cell
@@ -2157,12 +2103,16 @@ void TerrainSynthProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mi
                         const auto& gf = wtGranularFrames[gi];
                         // Same empty-cell renormalization the cycle layer gets,
                         // so a granular frame next to empty cells stays
-                        // full-volume too (no-op when gain == 1).
-                        sample += w * gridRenormGain * renderGrainSample(
+                        // full-volume too (no-op when gain == 1). gf.gain is the
+                        // per-frame output gain (the editor's Gain knob / capture
+                        // dialog's Gain control); the cycle layer applies it in
+                        // render(), but the grain reader bypasses render() so we
+                        // apply it here.
+                        sample += w * gridRenormGain * gf.gain * renderGrainSample(
                             gf.source.data(), (int)gf.source.size(),
                             gf.grainLength, gf.crossfadeSamples,
                             gf.embeddedPitchHz, gf.sourceSampleRate,
-                            v.granStreams[gi]);
+                            gf.freezeMode, v.granStreams[gi]);
                     }
                 }
 

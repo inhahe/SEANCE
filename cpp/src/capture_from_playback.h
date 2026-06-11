@@ -1,5 +1,6 @@
 #pragma once
 #include "wavetable_frame.h"
+#include "granular_frame.h"   // GranularFreezeMode
 #include <juce_gui_basics/juce_gui_basics.h>
 #include <vector>
 #include <memory>
@@ -39,9 +40,16 @@ enum class CaptureSource {
 //     complete snapshot is taken).
 //   - The dialog is purely a UI - it produces frames via the OnCapture
 //     callback and lets the editor decide where to put them.
-//   - Audition (hearing the cycle under the cursor) is intentionally
-//     NOT in this first cut; planned as a follow-up. The visual scrub
-//     plus auto-refresh is enough for the user to identify a region.
+//   - Mic source: while the dialog is open the input is monitored through
+//     the output (AudioEngine::inputMonitoring) so the user hears what
+//     they're about to capture. The Freeze button mutes monitoring and
+//     holds the display still for region selection; Go live resumes both.
+//   - The selected region can be auditioned (Mic + File): the Preview
+//     button loops the slice through the engine's GrainLoop preview, and
+//     dragging the region handles plays it automatically (scrub-to-
+//     audition), mirroring the Capture-from-project dialog. Mic requires
+//     the display to be frozen first (a sweeping ring buffer can't loop
+//     stably); File can audition as soon as a file is loaded.
 class CaptureFromPlaybackDialog : public juce::Component, private juce::Timer {
 public:
     using OnCapture = std::function<void(std::vector<std::unique_ptr<IWavetableFrame>>)>;
@@ -95,10 +103,64 @@ private:
     // Controls.
     juce::Slider    numFramesSlider;
     juce::Label     numFramesLabel;
+    // Mic only: how many audio samples each captured waveform spans (its
+    // source-window length). Auto-fit to the slot spacing (regionLen /
+    // numFrames) whenever the count or the initial region changes, so the
+    // bands tile the selection with zero gaps by default; the user can then
+    // override it to open gaps or force overlap. Other sources auto-size the
+    // window (~1 s or 4x grain) - see effectiveSrcLen(). Drives both the
+    // produced GranularFrames and the section bands drawn over the waveform.
+    juce::Slider    samplesPerWaveformSlider;
+    juce::Label     samplesPerWaveformLabel;
+    // Mic only: one-click "set the per-waveform width so the bands tile the
+    // current selection with no gap or overlap" - i.e. snap the window to
+    // regionLen / numFrames (what syncWindowToFitSlots does). Lets the user
+    // freely resize the selection (which opens gaps / overlaps) and then
+    // recover an exact tiling without hand-matching the slider.
+    juce::TextButton fitWidthBtn { "Fit width to selection" };
     juce::Label     regionInfoLabel;
     juce::Label     sourceInfoLabel;   // shows "Source: <name>" plus file path / mic status
     juce::Label     hintLabel;
-    juce::ToggleButton freezeToggle { "Freeze view" };  // Playback / Mic only
+    juce::ToggleButton pauseToggle { "Pause view" };  // Playback only
+    // Mic only: a single prominent button that couples live input monitoring
+    // and the sweeping display. "Pause" mutes monitoring AND halts the
+    // display so the user can drag region handles on a still waveform;
+    // "Go live" resumes both. Deliberately NOT called "Freeze" - that word is
+    // reserved for the granular freeze *methods* (CrossfadeLoop, AsyncGranular,
+    // PitchSyncGrains, SpectralFreeze) used to sustain a captured waveform, so
+    // a "Freeze" button next to a freeze-method picker would be ambiguous.
+    // See setMicLive().
+    juce::TextButton micLiveBtn     { "Pause" };
+    // Mic + File: loop the selected region through the engine's GrainLoop
+    // preview so the user can HEAR the slice they're about to capture before
+    // committing it to the library. Toggles "Preview" <-> "Stop". The loop
+    // follows the region handles as they're dragged (see mouseDrag). Disabled
+    // for Mic until the display is paused (a sweeping buffer can't be
+    // auditioned). See startRegionAudition() / regenerateAuditionGrain().
+    juce::TextButton previewBtn     { "Preview" };
+    // Mic + File: which captured waveform (1..numFrames) the Preview button
+    // auditions. Capture spreads N waveforms across the selection; this picks
+    // which one to hear without committing. 1-based in the UI;
+    // regenerateAuditionGrain reads (value - 1) as the band index. Disabled at
+    // a single waveform (nothing to choose - Preview plays the whole
+    // selection). See updatePreviewIndexControl().
+    juce::Slider     previewIndexSlider;
+    juce::Label      previewIndexLabel;
+    // All sources: output gain applied to every captured waveform. Sets the
+    // produced GranularFrame's per-frame gain (IWavetableFrame::gain) - the
+    // same scalar the wave editor's Gain knob drives - so a recording that's
+    // too quiet or too loud can be levelled at capture time. 1.0 = unity (the
+    // raw recorded level). The Preview reflects it live (the engine preview
+    // path has no per-frame gain, so regenerateAuditionGrain bakes it into the
+    // throwaway preview buffer). Double-click resets to unity. Range 0..4.
+    juce::Slider     gainSlider;
+    juce::Label      gainLabel;
+    // Mic only: opens the Audio Device Settings dialog. The actionable escape
+    // hatch for the known WASAPI-combined-device bug (a USB-webcam mic + a
+    // different output device get welded into one shared-mode device whose
+    // input is corrupted into garbage). Switching the driver type to
+    // DirectSound there fixes it. See the note in the Mic hint text.
+    juce::TextButton audioDeviceBtn { "Audio device..." };
     juce::TextButton loadFileBtn    { "Load file..." }; // File only
     juce::TextButton captureBtn { "Capture waveforms" };
     juce::TextButton cancelBtn  { "Cancel" };
@@ -119,6 +181,24 @@ private:
     // this for the GranularFrame's embeddedPitchHz.
     double capturedPitchHz = 440.0;
 
+    // Granular freeze-mode picker. Selects which "sustain the marker spot"
+    // algorithm the captured frames use (CrossfadeLoop / AsyncGranular /
+    // PitchSyncGrains / SpectralFreeze - see GranularFreezeMode in
+    // granular_frame.h). Drives the live audition through the shared
+    // GrainFreezeVoice and is baked into every produced GranularFrame so the
+    // held synth note sounds exactly like the preview. IDs are 1-based:
+    // ID = (int)mode + 1. Present for all three capture sources.
+    juce::Label    freezeModeLabel;
+    juce::ComboBox freezeModeCombo;
+    // The freeze mode currently picked in freezeModeCombo (defaults to
+    // CrossfadeLoop if nothing is selected). Used by buildFrames (baked into
+    // every produced GranularFrame) and startRegionAudition / the engine.
+    GranularFreezeMode selectedFreezeMode() const {
+        const int idx = freezeModeCombo.getSelectedId() - 1;
+        return (idx >= 0) ? (GranularFreezeMode)idx
+                          : GranularFreezeMode::CrossfadeLoop;
+    }
+
     juce::Rectangle<int> waveRect;
 
     // True after a file has been successfully loaded (File mode only).
@@ -126,6 +206,31 @@ private:
     // a "Press Load file..." prompt.
     bool fileLoaded = false;
     juce::String fileSourcePath;
+
+    // ----- Mic live monitoring (issue: "can't hear the mic") -----
+    // While the Mic dialog is open we route the input through the output so
+    // the user can hear what they're about to capture. micPaused == true
+    // means the user pressed Pause: monitoring is muted and the display is
+    // held still. priorInputMonitoring snapshots the engine's global
+    // inputMonitoring flag at construction so we restore it on close instead
+    // of clobbering the main-window "Mon" toggle. Mic source only.
+    bool micPaused = false;
+    bool priorInputMonitoring = false;
+    // Drive monitoring + display-pause + button text together. live == true:
+    // hear input + sweep; live == false: mute + hold still. Mic source only.
+    void setMicLive(bool live);
+
+    // ----- Region audition (hear the slice before capturing) -----
+    // When true, the selected region is looping through the engine's
+    // GrainLoop preview. Mic + File only. Mic requires the display to be
+    // frozen first (canAudition()); a live sweeping buffer can't be
+    // auditioned stably.
+    bool auditioning = false;
+    bool canAudition() const;          // region valid + buffer stable
+    void startRegionAudition();        // begin the GrainLoop preview
+    void stopRegionAudition();         // PreviewMode::Off
+    void regenerateAuditionGrain();    // (re)publish the region as the loop source
+    void updatePreviewButton();        // text / colour / enabled / tooltip
 
     // Pull a fresh snapshot from AudioEngine (Playback / Mic) and adjust
     // the region to stay within the new buffer length. No-op for File.
@@ -143,9 +248,89 @@ private:
     // synth plays the source back via its 4-voice OLA granular layer.
     std::vector<std::unique_ptr<IWavetableFrame>> buildFrames(int n) const;
 
+    // Per-waveform source-window length in samples, clamped to one grain
+    // (floor) and the selected region (cap). For Mic this reads the
+    // "Samples per waveform" slider; for File / Playback it auto-sizes to
+    // ~1 second or 4x grain. Shared by buildFrames, the region-audition
+    // grain, and the section bands drawn in paint() so all three agree.
+    int effectiveSrcLen() const;
+
+    // Source-window start index (in tap samples) for waveform i of n, given a
+    // window length srcLen. Two regimes meeting continuously at an exact tiling:
+    // when the windows FIT (regionLen >= n*srcLen) the leftover space is split
+    // into n+1 equal gaps so the end margins match the inter-band gaps
+    // (gap = (regionLen - n*srcLen) / (n + 1)); when they must OVERLAP
+    // (regionLen < n*srcLen) the row stays contained within the selection
+    // (band 0 flush to the left handle, band n-1 flush to the right, overlap
+    // distributed between) so it never spills past the handles. Clamped to the
+    // available audio [0, tapLen - srcLen]. Used by buildFrames(); paint() draws
+    // the bands from the same geometry (in pixel space) so the drawn bands and
+    // the captured audio agree.
+    int bandStartForIndex(int i, int n, int srcLen) const;
+
+    // Loop length (in samples) for a captured/auditioned frame, given the
+    // per-frame source WINDOW length (= effectiveSrcLen). This is the L that
+    // the CrossfadeLoop granular player loops on repeat - the part the user
+    // actually hears sustained while a note is held. Two regimes:
+    //   - Single waveform (n == 1): the loop IS the whole window. The window
+    //     equals the whole selection, so the captured frame plays back the
+    //     entire selected sound on repeat ("I recorded a word, I want to hear
+    //     the word"). This is the sample-capture intent.
+    //   - Multiple waveforms (n >= 2): the loop is capped to a ~100 ms neutral
+    //     "timbral snapshot" grain (but never longer than the window itself),
+    //     so each frame is a short stationary texture and the wavetable's
+    //     Position parameter morphs through the N snapshots. This is the
+    //     wavetable intent.
+    // Both the preview (regenerateAuditionGrain) and the bake (buildFrames)
+    // call this so they stay honest with each other and with the synth.
+    int loopLenForWindow(int windowLen) const;
+
+    // Build a CrossfadeLoop granular source buffer: the loopLen-sample loop
+    // body starting at startIdx in the tap, PLUS a loopLen/2 lookahead tail
+    // (drawn from the tap past the loop end, zero-padded if the recording
+    // ends first). The reserved tail is what the engine's / synth's seam
+    // crossfade reads to blend the loop boundary without a click - the same
+    // viability requirement (srcLen >= L + L/2) that terrain_synth's
+    // renderGrainSample and the audio engine's CrossfadeLoop reader enforce.
+    // With this layout the centered-anchor math in those readers resolves to
+    // anchor == 0, so the loop is exactly [startIdx, startIdx + loopLen).
+    std::vector<float> buildGrainSource(int startIdx, int loopLen) const;
+
+    // Mic only: set the "Samples per waveform" slider to the current slot
+    // spacing (regionLen / numFrames), so the window equals one slot and the
+    // section bands tile the selection with zero gaps. Called when the
+    // waveform count changes and when the region is first established - NOT on
+    // region resize, so dragging the handles after setting the count leaves
+    // the window fixed and is what introduces gaps / overlap.
+    void syncWindowToFitSlots();
+
+    // Mic only: enable/disable + relabel the "Samples per waveform" slider for
+    // the current waveform count. With a single waveform there is no per-
+    // waveform spacing to honour - the one window simply spans the whole
+    // selection - so the slider is disabled and shown holding the selection
+    // length (kept in sync as the selection is resized). With 2+ waveforms the
+    // slider is the live per-waveform length control. Call wherever the count or
+    // the region changes.
+    void updateSamplesPerWaveformControl();
+
+    // Mic + File: set the "Preview waveform" slider's range (1..numFrames) and
+    // enabled state for the current count, clamping the current pick into range.
+    // Disabled at a single waveform (there's only one thing to audition). Call
+    // wherever the waveform count changes.
+    void updatePreviewIndexControl();
+
     // Region <-> screen-x mapping (within waveRect).
     int xForIdx(int idx) const;
     int idxForX(int x) const;
+
+    // The interactive zone for the two region handles: waveRect widened by the
+    // handle hit radius on the left and right (vertical extent unchanged). A
+    // handle sitting at the very start/end of the buffer is drawn centred on the
+    // buffer edge, so half of its bar/caps would fall outside waveRect and be
+    // clipped away - making it hard to grab. Drawing, hit-testing, and the
+    // repaint region all use this widened zone so the full bar is visible and
+    // grabbable even when its outer half is past the wave-view edge.
+    juce::Rectangle<int> handleZone() const;
     void updateRegionInfoLabel();
     void updateSourceInfoLabel();
 

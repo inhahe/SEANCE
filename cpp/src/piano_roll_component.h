@@ -222,6 +222,11 @@ private:
     juce::TextButton snapScaleBtn{"Snap to Scale"}, detectKeyBtn{"Detect Key"};
     juce::ComboBox rootCombo, keyCombo, modeCombo, scaleCombo;
     juce::Label rootLbl, keyLbl, modeLbl, scaleLbl;
+    // Push state.{keyRoot,keyName,modeName,scaleName,activeCategory} into the
+    // Root/Key/Mode/Scale dropdowns and refresh their enabled/tooltip state.
+    // Call after any code path that changes the scale selection WITHOUT going
+    // through a combo's own onChange (context menus, key detection).
+    void syncScaleUI();
     juce::Label titleLabel, helpLabel;
     juce::TextButton muteBtn{"Mute"}, soloBtn{"Solo"};
     juce::Slider panSlider;

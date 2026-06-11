@@ -24,6 +24,23 @@ namespace SoundShop {
 static NodeGraph* g_currentGraph = nullptr;
 static int g_activeNodeIndex = -1; // set when running script from a track context
 
+// Convert a Python pitch argument to a MIDI note number. Accepts an int / float
+// (used as the raw MIDI number) OR a note-name string like "C4", "c#4", "Bb3"
+// (a name with no octave defaults to octave 4). On a string that doesn't parse,
+// sets a Python ValueError and returns false; on a wrong type, a TypeError.
+static bool pyPitchToInt(PyObject* o, int& out) {
+    if (PyLong_Check(o))  { out = (int)PyLong_AsLong(o);      return true; }
+    if (PyFloat_Check(o)) { out = (int)PyFloat_AsDouble(o);   return true; }
+    if (PyUnicode_Check(o)) {
+        const char* s = PyUnicode_AsUTF8(o);
+        int n = MusicTheory::parseNoteName(s ? s : "");
+        if (n < 0) { PyErr_Format(PyExc_ValueError, "invalid note name '%s'", s ? s : ""); return false; }
+        out = n; return true;
+    }
+    PyErr_SetString(PyExc_TypeError, "pitch must be an int or a note-name string like 'C4'");
+    return false;
+}
+
 // ==============================================================================
 // Python module: soundshop
 // Provides access to the project from scripts
@@ -121,8 +138,10 @@ static PyObject* py_add_note(PyObject*, PyObject* args) {
     int nodeIdx, clipIdx, pitch;
     float offset, duration;
     int velocity = 100;
-    if (!PyArg_ParseTuple(args, "iiiff|i", &nodeIdx, &clipIdx, &pitch, &offset, &duration, &velocity))
+    PyObject* pitchObj = nullptr;
+    if (!PyArg_ParseTuple(args, "iiOff|i", &nodeIdx, &clipIdx, &pitchObj, &offset, &duration, &velocity))
         return nullptr;
+    if (!pyPitchToInt(pitchObj, pitch)) return nullptr;
     if (!g_currentGraph || nodeIdx < 0 || nodeIdx >= (int)g_currentGraph->nodes.size()) {
         PyErr_SetString(PyExc_IndexError, "Node index out of range");
         return nullptr;
@@ -164,8 +183,10 @@ static PyObject* py_clear_notes(PyObject*, PyObject* args) {
 static PyObject* py_set_note(PyObject*, PyObject* args) {
     int nodeIdx, clipIdx, noteIdx, pitch;
     float offset, duration, detune;
-    if (!PyArg_ParseTuple(args, "iiiifff", &nodeIdx, &clipIdx, &noteIdx, &pitch, &offset, &duration, &detune))
+    PyObject* pitchObj = nullptr;
+    if (!PyArg_ParseTuple(args, "iiiOfff", &nodeIdx, &clipIdx, &noteIdx, &pitchObj, &offset, &duration, &detune))
         return nullptr;
+    if (!pyPitchToInt(pitchObj, pitch)) return nullptr;
     if (!g_currentGraph) { PyErr_SetString(PyExc_RuntimeError, "No project"); return nullptr; }
     auto& node = g_currentGraph->nodes[nodeIdx];
     auto& note = node.clips[clipIdx].notes[noteIdx];
@@ -545,7 +566,55 @@ static PyObject* py_set_bpm(PyObject*, PyObject* args) {
     Py_RETURN_NONE;
 }
 
+// notenum("C4") -> 60   |   notenum("C", 4) -> 60   |   notenum(60) -> 60
+// Returns -1 on a parse error / out-of-range result.
+static PyObject* py_notenum(PyObject*, PyObject* args) {
+    PyObject* o = nullptr; int octave = 0; bool haveOct = false;
+    if (PyTuple_Size(args) >= 2) {
+        const char* pc = nullptr;
+        if (!PyArg_ParseTuple(args, "si", &pc, &octave)) return nullptr;
+        return PyLong_FromLong(MusicTheory::noteNumber(pc ? pc : "", octave));
+    }
+    (void)haveOct;
+    if (!PyArg_ParseTuple(args, "O", &o)) return nullptr;
+    int n;
+    if (!pyPitchToInt(o, n)) return nullptr;
+    return PyLong_FromLong(n);
+}
+
+// notename(60) -> "C4". Accepts a note name too (round-trips via its number).
+static PyObject* py_notename(PyObject*, PyObject* args) {
+    PyObject* o = nullptr;
+    if (!PyArg_ParseTuple(args, "O", &o)) return nullptr;
+    int n;
+    if (!pyPitchToInt(o, n)) return nullptr;
+    if (n < 0 || n > 127) { PyErr_SetString(PyExc_ValueError, "note out of MIDI range 0..127"); return nullptr; }
+    return PyUnicode_FromString(MusicTheory::noteName(n).c_str());
+}
+
+// notefreq("C4") / notefreq(60) / notefreq("C", 4) -> Hz using the PROJECT
+// tuning system (Equal12 / Pythagorean / Just / Meantone) and concert pitch.
+static PyObject* py_notefreq(PyObject*, PyObject* args) {
+    int n = -1;
+    if (PyTuple_Size(args) >= 2) {
+        const char* pc = nullptr; int octave = 0;
+        if (!PyArg_ParseTuple(args, "si", &pc, &octave)) return nullptr;
+        n = MusicTheory::noteNumber(pc ? pc : "", octave);
+    } else {
+        PyObject* o = nullptr;
+        if (!PyArg_ParseTuple(args, "O", &o)) return nullptr;
+        if (!pyPitchToInt(o, n)) return nullptr;
+    }
+    if (n < 0 || n > 127) { PyErr_SetString(PyExc_ValueError, "note out of MIDI range 0..127"); return nullptr; }
+    TuningSystem tuning = g_currentGraph ? g_currentGraph->tuningSystem : TuningSystem::Equal12;
+    float concert = g_currentGraph ? g_currentGraph->concertPitch : 440.0f;
+    return PyFloat_FromDouble((double)midiNoteToFrequency(n, tuning, concert));
+}
+
 static PyMethodDef soundshopMethods[] = {
+    {"notenum", py_notenum, METH_VARARGS, "Note name to MIDI number: notenum('C4') or notenum('C', 4) -> 60; passthrough for ints"},
+    {"notename", py_notename, METH_VARARGS, "MIDI number to note name: notename(60) -> 'C4'"},
+    {"notefreq", py_notefreq, METH_VARARGS, "Note to frequency (Hz) using the project tuning: notefreq('C4') or notefreq(60) or notefreq('C', 4)"},
     {"this_node", py_this_node, METH_NOARGS, "Get active node index (-1 if not in track context)"},
     {"get_node_count", py_get_node_count, METH_NOARGS, "Get number of nodes"},
     {"get_node_names", py_get_node_names, METH_NOARGS, "Get list of node names"},
@@ -569,9 +638,9 @@ static PyMethodDef soundshopMethods[] = {
     {"clear_automation", py_clear_automation, METH_VARARGS, "Clear automation: (node_idx, param_idx)"},
     {"insert_time", py_insert_time, METH_VARARGS, "Insert time: (at_beat, duration, [node_idx=-1 for all])"},
     {"delete_time", py_delete_time, METH_VARARGS, "Delete time: (from_beat, to_beat, [node_idx=-1 for all])"},
-    {"add_note", py_add_note, METH_VARARGS, "Add note: (node_idx, clip_idx, pitch, offset, duration, [velocity=100])"},
+    {"add_note", py_add_note, METH_VARARGS, "Add note: (node_idx, clip_idx, pitch, offset, duration, [velocity=100]). pitch is a MIDI number or a note name like 'C4'"},
     {"clear_notes", py_clear_notes, METH_VARARGS, "Clear notes: (node_idx, clip_idx)"},
-    {"set_note", py_set_note, METH_VARARGS, "Set note: (node_idx, clip_idx, note_idx, pitch, offset, duration, detune)"},
+    {"set_note", py_set_note, METH_VARARGS, "Set note: (node_idx, clip_idx, note_idx, pitch, offset, duration, detune). pitch is a MIDI number or a note name like 'C4'"},
     {"add_cc", py_add_cc, METH_VARARGS, "Add CC event: (node_idx, clip_idx, cc_num, offset, value, [channel])"},
     {"map_cc", py_map_cc, METH_VARARGS, "Map MIDI CC to param: (midi_ch, cc_num, node_idx, param_idx, [min, max])"},
     {"set_audio_file", py_set_audio_file, METH_VARARGS, "Set audio file: (node_idx, clip_idx, path)"},

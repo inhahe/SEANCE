@@ -1,5 +1,6 @@
 #include "builtin_synth.h"
 #include "fft_util.h"
+#include "music_theory.h"
 #include <cstring>
 #include <cstdio>
 #include <algorithm>
@@ -284,6 +285,9 @@ struct ExprParser {
     // Optional sampler for the shape(pos) function. Null/empty -> shape()
     // returns 0. Set by the evaluateWithVars overload that takes a sampler.
     const std::function<float(float)>* shapeFn = nullptr;
+    // Optional note->frequency mapper for notefreq(). Null/empty -> 12-TET A440
+    // fallback. Set by the runProgram / evaluateWithVars overloads that take it.
+    const std::function<float(int)>* noteToFreqFn = nullptr;
     // Program-mode extras (see runProgram). stateVars is the persistent,
     // assignable variable store; sink receives MIDI emit calls. Both null
     // for plain expression evaluation, in which case assignments are
@@ -379,6 +383,20 @@ struct ExprParser {
             return val;
         }
 
+        // String literal -> MIDI note number. A quoted note name like "C4",
+        // "c#4" or "Bb3" evaluates to its MIDI pitch, so a user can write
+        // note("C4", 100, 0.5) anywhere a pitch number is accepted. Accepts
+        // single or double quotes. A name with no octave uses octave 4. A
+        // parse failure yields -1 (out of range -> clamped/dropped downstream).
+        if (*pos == '"' || *pos == '\'') {
+            char quote = *pos++;
+            const char* start = pos;
+            while (*pos != '\0' && *pos != quote) pos++;
+            std::string lit(start, pos - start);
+            if (*pos == quote) pos++; // consume closing quote
+            return (float)MusicTheory::parseNoteName(lit);
+        }
+
         // Single-arg math functions
         if (matchFunc("sin"))      { float v = parseTernary(); skipWS(); if (*pos == ')') pos++; return std::sin(v); }
         if (matchFunc("cos"))      { float v = parseTernary(); skipWS(); if (*pos == ')') pos++; return std::cos(v); }
@@ -441,6 +459,26 @@ struct ExprParser {
         if (matchFunc("shape")) {
             float p = parseTernary(); skipWS(); if (*pos == ')') pos++;
             return (shapeFn && *shapeFn) ? (*shapeFn)(p) : 0.0f;
+        }
+
+        // notefreq(note) — frequency in Hz of a MIDI note, using the PROJECT
+        // tuning system (Equal12 / Pythagorean / Just / Meantone + concert
+        // pitch) when a mapper is bound, else 12-TET A440. The argument may be a
+        // number or a quoted note name (the string literal converts to its
+        // number at the atom level), so notefreq("C4") and notefreq(60) match.
+        if (matchFunc("notefreq")) {
+            float n = parseTernary(); skipWS(); if (*pos == ')') pos++;
+            int note = (int)std::lround(n);
+            if (note < 0 || note > 127) return 0.0f;
+            if (noteToFreqFn && *noteToFreqFn) return (*noteToFreqFn)(note);
+            return 440.0f * std::pow(2.0f, (note - 69) / 12.0f);
+        }
+        // notenum(x) — identity for numbers; for a quoted note name the string
+        // literal already converted to its MIDI number at the atom level, so
+        // this is mainly a readable way to spell an explicit conversion.
+        if (matchFunc("notenum")) {
+            float v = parseTernary(); skipWS(); if (*pos == ')') pos++;
+            return v;
         }
 
         // noise() — ignores any argument, returns uniform [-1, 1]
@@ -780,12 +818,14 @@ float WaveExprParser::evaluateWithVars(const std::string& expr,
 
 float WaveExprParser::evaluateWithVars(const std::string& expr,
                                        const std::unordered_map<std::string, float>& vars,
-                                       const std::function<float(float)>& shapeFn) {
+                                       const std::function<float(float)>& shapeFn,
+                                       const std::function<float(int)>& noteToFreqFn) {
     if (expr.empty()) return 0.0f;
     ExprParser parser;
     parser.str = expr.c_str();
     parser.extraVars = &vars;
     parser.shapeFn = &shapeFn;
+    parser.noteToFreqFn = &noteToFreqFn;
     auto itX = vars.find("x"); if (itX != vars.end()) parser.x = itX->second;
     auto itF = vars.find("f"); if (itF != vars.end()) parser.f = itF->second;
     return parser.eval(parser.x, parser.f);
@@ -795,14 +835,16 @@ float WaveExprParser::runProgram(const std::string& program,
                                  const std::unordered_map<std::string, float>& vars,
                                  std::unordered_map<std::string, float>& stateVars,
                                  IExprEmitSink* sink,
-                                 const std::function<float(float)>& shapeFn) {
+                                 const std::function<float(float)>& shapeFn,
+                                 const std::function<float(int)>& noteToFreqFn) {
     if (program.empty()) return 0.0f;
     ExprParser parser;
-    parser.str       = program.c_str();
-    parser.extraVars = &vars;
-    parser.stateVars = &stateVars;
-    parser.sink      = sink;
-    parser.shapeFn   = &shapeFn;
+    parser.str          = program.c_str();
+    parser.extraVars    = &vars;
+    parser.stateVars    = &stateVars;
+    parser.sink         = sink;
+    parser.shapeFn      = &shapeFn;
+    parser.noteToFreqFn = &noteToFreqFn;
     return parser.runProgram();
 }
 

@@ -359,13 +359,19 @@ void NodeGraphComponent::drawNode(juce::Graphics& g, Node& node) {
     // Parameter rows: drawn below the pins. Each row shows name + value plus
     // a horizontal fill bar indicating position within [min, max]. Drag the
     // row horizontally to change the value (handled in mouseDown/mouseDrag).
-    // Signal-controlled params are drawn dimmed and locked.
-    bool nodeSignalLocked = graph.hasSignalInput(node.id);
+    // Signal-controlled params are drawn dimmed and locked - but only the
+    // specific param a cable actually drives, not every param on the node.
     if (!node.params.empty() && zoom > 0.4f) {
         float paramFontSize = std::max(8.0f, 10.0f * zoom);
         g.setFont(juce::Font(paramFontSize));
         for (int pi = 0; pi < (int)node.params.size(); ++pi) {
             const auto& p = node.params[pi];
+            // Lock visual is reserved for ABSOLUTE-driven params: the cable
+            // sets the value edge-to-edge and the knob can't be touched. A
+            // Mod-driven param stays editable (you drag its resting/base
+            // value while the cable modulates around it), so it renders like
+            // a normal editable row.
+            bool paramLocked = graph.paramHasAbsoluteInput(node.id, pi);
             float rowTop    = pinY + 2;
             float rowBottom = pinY + PIN_ROW_HEIGHT - 2;
             auto rowTL = canvasToScreen({bounds.getX() + 6, rowTop});
@@ -373,17 +379,38 @@ void NodeGraphComponent::drawNode(juce::Graphics& g, Node& node) {
             juce::Rectangle<float> rowRect(rowTL.x, rowTL.y, rowBR.x - rowTL.x, rowBR.y - rowTL.y);
 
             // Background fill bar showing the param's position within its range.
+            // For an absolute-locked param we show the LIVE value the cable is
+            // driving. For an editable param (manual or Mod-driven) we show the
+            // resting/base value the user controls - a Mod cable swings the
+            // live value around but the handle should sit at what the knob is
+            // set to, not jitter with the modulation.
             float range = std::max(1e-6f, p.maxVal - p.minVal);
-            float frac = juce::jlimit(0.0f, 1.0f, (p.value - p.minVal) / range);
+            float dispValue = (!paramLocked && p.modulated) ? p.baseValue : p.value;
+            float frac = juce::jlimit(0.0f, 1.0f, (dispValue - p.minVal) / range);
             auto fillRect = rowRect;
             fillRect.setWidth(rowRect.getWidth() * frac);
 
-            // Signal-locked params are dimmed (orange fill, no handle)
-            if (nodeSignalLocked) {
+            // Signal-locked params are dimmed (orange fill, no draggable handle)
+            if (paramLocked) {
                 g.setColour(juce::Colour(160, 100, 40).withAlpha(0.35f));
                 g.fillRoundedRectangle(fillRect, 2.0f);
                 g.setColour(juce::Colour(120, 80, 40).withAlpha(0.5f));
                 g.drawRoundedRectangle(rowRect, 2.0f, 1.0f);
+
+                // Live-value marker (Set / Absolute mode): the cable's signal IS
+                // the param value, so there's a single value to show and it moves
+                // every block. The graph repaints at 30Hz, so this marker tracks
+                // the incoming signal in real time. It's drawn as a dimmed orange
+                // bar (not white) to read as "driven, not grabbable" - distinct
+                // from the bright white draggable handle on a manual param.
+                float liveX = rowRect.getX() + rowRect.getWidth() * frac;
+                float liveW = std::max(2.0f, 3.0f * zoom);
+                juce::Rectangle<float> liveRect(liveX - liveW * 0.5f,
+                                                rowRect.getY() - 1.0f,
+                                                liveW,
+                                                rowRect.getHeight() + 2.0f);
+                g.setColour(juce::Colour(230, 150, 70).withAlpha(0.9f));
+                g.fillRoundedRectangle(liveRect, 1.0f);
             } else {
                 g.setColour(juce::Colour(80, 110, 160).withAlpha(0.55f));
                 g.fillRoundedRectangle(fillRect, 2.0f);
@@ -401,6 +428,34 @@ void NodeGraphComponent::drawNode(juce::Graphics& g, Node& node) {
                                                   rowRect.getHeight() + 2.0f);
                 g.setColour(juce::Colours::white);
                 g.fillRoundedRectangle(handleRect, 1.0f);
+
+                // Mod-mode second indicator: in "Mod" (bipolar-additive) mode the
+                // white handle stays at the user's resting/base value (which they
+                // can still drag), while the incoming signal swings the LIVE value
+                // around it. Without a separate marker the user has no way to see
+                // what the modulation is actually doing. Draw a cyan marker at the
+                // live modulated value (p.value) - cyan matches the "signal
+                // modulation attached" dot drawn after the param name, so the two
+                // read as the same concept. Updates at 30Hz with the repaint tick.
+                if (p.modulated) {
+                    float liveFrac = juce::jlimit(0.0f, 1.0f,
+                                                  (p.value - p.minVal) / range);
+                    float liveX = rowRect.getX() + rowRect.getWidth() * liveFrac;
+                    // Thin translucent full-height line so it's visible even when
+                    // it sits right on top of the white base handle.
+                    g.setColour(juce::Colours::cyan.withAlpha(0.55f));
+                    g.fillRect(liveX - 0.5f, rowRect.getY(),
+                               1.0f, rowRect.getHeight());
+                    // Solid caret at the bottom edge pointing up at the value, so
+                    // the live marker stays legible against the fill bar.
+                    float cs = std::max(2.5f, 3.0f * zoom);
+                    juce::Path caret;
+                    caret.addTriangle(liveX,        rowRect.getBottom() - cs,
+                                      liveX - cs,    rowRect.getBottom() + 1.0f,
+                                      liveX + cs,    rowRect.getBottom() + 1.0f);
+                    g.setColour(juce::Colours::cyan);
+                    g.fillPath(caret);
+                }
             }
 
             // Armed indicator: red dot next to the name when armed for auto-write
@@ -412,7 +467,7 @@ void NodeGraphComponent::drawNode(juce::Graphics& g, Node& node) {
             }
 
             // Name (left) and value (right)
-            g.setColour(nodeSignalLocked ? juce::Colours::grey : juce::Colours::white);
+            g.setColour(paramLocked ? juce::Colours::grey : juce::Colours::white);
             auto labelRect = rowRect.reduced(p.autoWriteArmed ? 10.0f : 4.0f, 0.0f);
             g.drawText(p.name, labelRect, juce::Justification::centredLeft, false);
             // Enum-typed params get their numeric value translated into a
@@ -442,7 +497,7 @@ void NodeGraphComponent::drawNode(juce::Graphics& g, Node& node) {
                          : (m == 2) ? "Lissajous"
                          : juce::String("Physics");
             } else {
-                valueStr = juce::String(p.value, 2);
+                valueStr = juce::String(dispValue, 2);
             }
             g.drawText(valueStr, rowRect.reduced(4, 0), juce::Justification::centredRight, false);
 
@@ -829,7 +884,50 @@ void NodeGraphComponent::mouseDown(const juce::MouseEvent& e) {
     auto canvasPos = screenToCanvas(e.position);
 
     if (e.mods.isRightButtonDown()) {
-        // Check link hit first for right-click
+        // Resolve any pin directly under the cursor up front. The dot is drawn
+        // centred on the node's left/right edge, so half of it hangs OUTSIDE
+        // the node bounds - nodeAtPoint() (a getNodeBounds().contains() test)
+        // would miss a click on the outer half. pinAtPoint() uses the real pin
+        // positions with a generous radius, so it catches the dot on either
+        // side of the edge.
+        bool pinIsOut = false;
+        int  hitPinId = pinAtPoint(canvasPos, pinIsOut, /*wantInput=*/-1);
+        Node* pinNode = nullptr;
+        const Pin* hitPin = nullptr;
+        bool pinIsControlInput = false;
+        if (hitPinId >= 0) {
+            for (auto& nd : graph.nodes) {
+                auto& pins = pinIsOut ? nd.pinsOut : nd.pinsIn;
+                for (auto& p : pins)
+                    if (p.id == hitPinId) { pinNode = &nd; hitPin = &p; break; }
+                if (pinNode) break;
+            }
+            // Recognise a control-input pin by its "Mod: " / "Set: " NAME, not
+            // only by an existing modPin binding. Some nodes (e.g. wavetables
+            // loaded from older projects saved before modPin serialisation, or
+            // whose bindings were otherwise lost) have orphan "Mod: Position X"
+            // pins with no modPin entry. showPinMenu repairs the binding from
+            // the pin name on demand; detecting by name here means the pin
+            // still takes priority over its cable so the repair is reachable.
+            if (pinNode && !pinIsOut && hitPin
+                && (hitPin->name.rfind("Mod: ", 0) == 0
+                 || hitPin->name.rfind("Set: ", 0) == 0))
+                pinIsControlInput = true;
+        }
+
+        // A control-input pin (Mod/Set) takes priority over the cable plugged
+        // into it. The cable terminates exactly at the pin, so the link
+        // hit-test below would otherwise always win and there'd be no way to
+        // right-click the pin itself to switch Set<->Mod or remove it. (Its
+        // menu's "Remove Input Cable Pin" deletes the cable too, so nothing is
+        // lost.) Regular pins fall through to the normal link-first order so a
+        // cable is still right-clickable at its endpoint.
+        if (pinIsControlInput && pinNode && hitPin) {
+            showPinMenu(*pinNode, *hitPin, /*isInput=*/true);
+            return;
+        }
+
+        // Check link hit for right-click
         int linkId = linkAtPoint(canvasPos);
         if (linkId >= 0) {
             selectedLinkId = linkId;
@@ -837,8 +935,54 @@ void NodeGraphComponent::mouseDown(const juce::MouseEvent& e) {
             showLinkMenu(linkId);
             return;
         }
+        // Non-control pin (or a control pin with no cable): the cursor is right
+        // on the dot but no cable intercepted it. Open the pin menu (which
+        // falls back to the node menu for non-control pins).
+        if (pinNode && hitPin) {
+            showPinMenu(*pinNode, *hitPin, !pinIsOut);
+            return;
+        }
         auto* node = nodeAtPoint(canvasPos);
         if (node) {
+            // Check if right-click landed on a pin's ROW first - the whole
+            // horizontal band of a pin (its circle AND its label text), not
+            // just the small circle. This makes the Mod/Set switch (and other
+            // pin actions) reachable by right-clicking the readable label,
+            // which is what users aim at, instead of the tiny edge dot.
+            //
+            // Each row may carry an input pin (drawn on the left) and/or an
+            // output pin (drawn on the right). When the row has BOTH, split at
+            // the node's horizontal centre. When it has only ONE, the WHOLE row
+            // hits that pin - never split. The split-by-centre rule alone was
+            // the bug: a long input label like "Mod: Position 1" extends past
+            // centreX, so clicking its right half looked for a (non-existent)
+            // output pin on that row and fell through to the node menu.
+            {
+                auto bounds = getNodeBounds(*node);
+                int maxPins = std::max((int)node->pinsIn.size(),
+                                       (int)node->pinsOut.size());
+                float pinRowsTop   = bounds.getY() + HEADER_HEIGHT;
+                float paramRowsTop = pinRowsTop + maxPins * PIN_ROW_HEIGHT;
+                if (canvasPos.y >= pinRowsTop && canvasPos.y < paramRowsTop) {
+                    int row = (int)((canvasPos.y - pinRowsTop) / PIN_ROW_HEIGHT);
+                    const Pin* inPin  = (row < (int)node->pinsIn.size())
+                                            ? &node->pinsIn[(size_t)row]  : nullptr;
+                    const Pin* outPin = (row < (int)node->pinsOut.size())
+                                            ? &node->pinsOut[(size_t)row] : nullptr;
+                    const Pin* pin = nullptr;
+                    bool isInput = true;
+                    if (inPin && outPin) {
+                        bool leftHalf = canvasPos.x < bounds.getCentreX();
+                        pin = leftHalf ? inPin : outPin;
+                        isInput = leftHalf;
+                    } else if (inPin) {
+                        pin = inPin;  isInput = true;   // input-only row
+                    } else if (outPin) {
+                        pin = outPin; isInput = false;  // output-only row
+                    }
+                    if (pin) { showPinMenu(*node, *pin, isInput); return; }
+                }
+            }
             // Check if right-click is on a param row - show arm/disarm menu
             if (!node->params.empty()) {
                 auto bounds = getNodeBounds(*node);
@@ -853,16 +997,30 @@ void NodeGraphComponent::mouseDown(const juce::MouseEvent& e) {
                         pm.addItem(2, "Arm All on This Node");
                         pm.addItem(3, "Disarm All on This Node");
                         pm.addItem(4, "Reset to Default (double-click)");
-                        // Signal modulation pin (#88): offer to add or remove
-                        // a Signal input pin that drives this specific param.
+                        // Signal control pin (#88): offer to add or remove a
+                        // control input pin that drives this specific param.
+                        // Two flavours (per-pin mode on Node::ModPin):
+                        //   Set (Absolute) - the cable sets the value directly,
+                        //       edge-to-edge; the knob locks while connected.
+                        //   Mod (Modulate) - the cable swings the value around
+                        //       the knob's setting; the knob stays editable.
+                        // "Set" is the default (listed first) since a cable
+                        // wired to a param usually reads as "drive this value".
                         bool hasModPin = false;
+                        Node::ModPin::Mode curMode = Node::ModPin::Mode::Modulate;
                         for (auto& mp : node->modPins)
-                            if (mp.paramIndex == idx) { hasModPin = true; break; }
+                            if (mp.paramIndex == idx) { hasModPin = true; curMode = mp.mode; break; }
                         pm.addSeparator();
-                        if (hasModPin)
-                            pm.addItem(10, "Remove Modulation Input");
-                        else
-                            pm.addItem(10, "Add Modulation Input");
+                        if (hasModPin) {
+                            pm.addItem(10, "Remove Input Cable Pin");
+                            if (curMode == Node::ModPin::Mode::Absolute)
+                                pm.addItem(11, "Switch to Modulation (Mod) - swing around the knob");
+                            else
+                                pm.addItem(11, "Switch to Absolute (Set) - cable sets the value");
+                        } else {
+                            pm.addItem(12, "Add Absolute Input (Set) - cable sets this value directly");
+                            pm.addItem(13, "Add Modulation Input (Mod) - cable swings around the knob");
+                        }
                         int nodeId = node->id;
                         int paramIdx = idx;
                         pm.showMenuAsync({}, [this, nodeId, paramIdx, hasModPin](int r) {
@@ -878,55 +1036,10 @@ void NodeGraphComponent::mouseDown(const juce::MouseEvent& e) {
                                 auto& p2 = nd->params[paramIdx];
                                 p2.value = (p2.minVal + p2.maxVal) * 0.5f;
                             }
-                            else if (r == 10) {
-                                if (hasModPin) {
-                                    // Remove the modulation pin + binding.
-                                    for (auto it = nd->modPins.begin(); it != nd->modPins.end(); ++it) {
-                                        if (it->paramIndex == paramIdx) {
-                                            int pinId = it->pinId;
-                                            // Remove pin from pinsIn.
-                                            nd->pinsIn.erase(
-                                                std::remove_if(nd->pinsIn.begin(), nd->pinsIn.end(),
-                                                    [pinId](const Pin& p) { return p.id == pinId; }),
-                                                nd->pinsIn.end());
-                                            // Remove any links connected to this pin.
-                                            graph.links.erase(
-                                                std::remove_if(graph.links.begin(), graph.links.end(),
-                                                    [pinId](const auto& lk) { return lk.endPin == pinId; }),
-                                                graph.links.end());
-                                            nd->modPins.erase(it);
-                                            break;
-                                        }
-                                    }
-                                    // Clear modulation state on the param.
-                                    if (paramIdx < (int)nd->params.size()) {
-                                        auto& p2 = nd->params[paramIdx];
-                                        if (p2.modulated) {
-                                            p2.value = p2.baseValue;
-                                            p2.modulated = false;
-                                        }
-                                    }
-                                    graph.dirty = true;
-                                    graph.commitSnapshot("Remove modulation input");
-                                } else {
-                                    // Add a new modulation input pin and bind it to this param.
-                                    // Modulation is consumed block-rate (applySignalModulations
-                                    // reads sample 0), so the pin is a Param (block-rate, orange) -
-                                    // NOT a Signal (sample-rate, amber). The receiver decides the
-                                    // consumption rate; Param/Signal cables are interchangeable.
-                                    if (paramIdx >= (int)nd->params.size()) return;
-                                    std::string pinName = "Mod: " + nd->params[paramIdx].name;
-                                    int newPinId = graph.allocId();
-                                    nd->pinsIn.push_back({newPinId, pinName, PinKind::Param, true, 1});
-                                    Node::ModPin mp;
-                                    mp.paramIndex = paramIdx;
-                                    mp.pinId = newPinId;
-                                    mp.depth = 1.0f;
-                                    nd->modPins.push_back(mp);
-                                    graph.dirty = true;
-                                    graph.commitSnapshot("Add modulation input");
-                                }
-                            }
+                            else if (r == 10) removeControlInput(nodeId, paramIdx);
+                            else if (r == 11) switchControlInputMode(nodeId, paramIdx);
+                            else if (r == 12) addControlInput(nodeId, paramIdx, /*absolute=*/true);
+                            else if (r == 13) addControlInput(nodeId, paramIdx, /*absolute=*/false);
                             repaint();
                         });
                         return;
@@ -965,8 +1078,9 @@ void NodeGraphComponent::mouseDown(const juce::MouseEvent& e) {
     if (node) {
         // Check if click landed on a param row inside the node - if so,
         // start a horizontal slider interaction (jump-to-click + drag).
-        // Signal-controlled nodes have their params locked - no dragging.
-        if (!node->params.empty() && !graph.hasSignalInput(node->id)) {
+        // A signal-controlled param is locked - no dragging - but only that
+        // specific param, not the rest of the node's params.
+        if (!node->params.empty()) {
             auto bounds = getNodeBounds(*node);
             int maxPins = std::max((int)node->pinsIn.size(), (int)node->pinsOut.size());
             float paramRowsTop = bounds.getY() + HEADER_HEIGHT + maxPins * PIN_ROW_HEIGHT;
@@ -976,7 +1090,11 @@ void NodeGraphComponent::mouseDown(const juce::MouseEvent& e) {
                 && canvasPos.y >= paramRowsTop)
             {
                 int idx = (int)((canvasPos.y - paramRowsTop) / PIN_ROW_HEIGHT);
-                if (idx >= 0 && idx < (int)node->params.size()) {
+                // Only ABSOLUTE-driven params are locked from manual drag. A
+                // Mod-driven param stays draggable: the drag edits its base
+                // (resting) value while the cable keeps modulating around it.
+                if (idx >= 0 && idx < (int)node->params.size()
+                    && !graph.paramHasAbsoluteInput(node->id, idx)) {
                     auto& p = node->params[idx];
                     // Enum params (Synth Mode) get a popup picker instead
                     // of a continuous slider: drag-through-values is clunky
@@ -1047,10 +1165,16 @@ void NodeGraphComponent::mouseDown(const juce::MouseEvent& e) {
                     dragParamWidth = paramRowsRight - paramRowsLeft;
                     dragStart = e.position;
                     selectedNodeId = node->id;
-                    // Jump to the clicked position immediately.
+                    // Jump to the clicked position immediately. When a Mod
+                    // cable is in place (p.modulated) the drag edits the base
+                    // value the modulation swings around, not the live value
+                    // (which applySignalModulations recomputes each block from
+                    // baseValue). A non-modulated param writes value directly.
                     float frac = juce::jlimit(0.0f, 1.0f,
                                               (canvasPos.x - dragParamLeftX) / std::max(1.0f, dragParamWidth));
-                    p.value = p.minVal + frac * (p.maxVal - p.minVal);
+                    float newVal = p.minVal + frac * (p.maxVal - p.minVal);
+                    if (p.modulated) p.baseValue = newVal;
+                    else             p.value = newVal;
                     graph.dirty = true;
                     repaint();
                     return;
@@ -1142,7 +1266,11 @@ void NodeGraphComponent::mouseDrag(const juce::MouseEvent& e) {
             auto canvasPos = screenToCanvas(e.position);
             float frac = juce::jlimit(0.0f, 1.0f,
                                       (canvasPos.x - dragParamLeftX) / std::max(1.0f, dragParamWidth));
-            p.value = p.minVal + frac * (p.maxVal - p.minVal);
+            float newVal = p.minVal + frac * (p.maxVal - p.minVal);
+            // Mod-driven param: edit the base value the modulation swings
+            // around (the live value is recomputed each block from baseValue).
+            if (p.modulated) p.baseValue = newVal;
+            else             p.value = newVal;
             graph.dirty = true;
             // No graph rebuild here - processBlock reads param values fresh
             // every callback via getParam, so the new value is picked up on
@@ -1188,6 +1316,13 @@ void NodeGraphComponent::mouseUp(const juce::MouseEvent& e) {
                 // pre-cable snapshot over the freshly-loaded .ssp and
                 // silently drop the cable the user just made.
                 graph.commitSnapshot("Connect pins");
+                // Force a graph rebuild so the new cable is routed immediately.
+                // The processBlock link-COUNT delta would also catch this, but
+                // relying on the count heuristic is fragile (it misses an
+                // add-one/remove-one in the same frame) - request the rebuild
+                // explicitly on the topology change, the same as every other
+                // edit path.
+                if (onNodeEdited) onNodeEdited();
             }
         }
     }
@@ -1236,8 +1371,9 @@ void NodeGraphComponent::mouseDoubleClick(const juce::MouseEvent& e) {
     if (!node) return;
 
     // Double-click a param row = reset to default (midpoint of range).
-    // Standard DAW convention for "return to center."
-    if (!node->params.empty() && !graph.hasSignalInput(node->id)) {
+    // Standard DAW convention for "return to center." A signal-driven param is
+    // locked (per-param), so it can't be reset by double-click either.
+    if (!node->params.empty()) {
         auto bounds = getNodeBounds(*node);
         int maxPins = std::max((int)node->pinsIn.size(), (int)node->pinsOut.size());
         float paramRowsTop = bounds.getY() + HEADER_HEIGHT + maxPins * PIN_ROW_HEIGHT;
@@ -1247,10 +1383,17 @@ void NodeGraphComponent::mouseDoubleClick(const juce::MouseEvent& e) {
             && canvasPos.y >= paramRowsTop)
         {
             int idx = (int)((canvasPos.y - paramRowsTop) / PIN_ROW_HEIGHT);
-            if (idx >= 0 && idx < (int)node->params.size()) {
+            // Absolute-driven params are locked; Mod-driven stay resettable
+            // (the reset targets the base value).
+            if (idx >= 0 && idx < (int)node->params.size()
+                && !graph.paramHasAbsoluteInput(node->id, idx)) {
                 auto& p = node->params[idx];
-                // Reset to midpoint of range (center for Pan, default for others)
-                p.value = (p.minVal + p.maxVal) * 0.5f;
+                // Reset to midpoint of range (center for Pan, default for
+                // others). For a Mod-driven param this resets the base value
+                // the modulation swings around.
+                float mid = (p.minVal + p.maxVal) * 0.5f;
+                if (p.modulated) p.baseValue = mid;
+                else             p.value = mid;
                 graph.dirty = true;
                 repaint();
                 return;
@@ -1300,7 +1443,12 @@ void NodeGraphComponent::mouseDoubleClick(const juce::MouseEvent& e) {
             opts.useNativeTitleBar = false;
             opts.resizable = true;
             opts.componentToCentreAround = this;
-            if (auto* dlg = SoundShop::launchToolDialog(opts))
+            // Non-modal: a user-input surface (XY pad) must stay usable
+            // alongside the main window, the transport, and other input-node
+            // editors while the song plays. The editor is node-id-safe (looks
+            // up via findNode each access), so it survives its node being
+            // edited or deleted out from under it.
+            if (auto* dlg = SoundShop::launchNonModalToolDialog(opts))
                 dlg->setResizeLimits(320, 400, 6000, 6000);
         } else if (node->script.rfind("__controlbank__", 0) == 0) {
             auto* bank = new ControlBankComponent(graph, captured,
@@ -1316,7 +1464,11 @@ void NodeGraphComponent::mouseDoubleClick(const juce::MouseEvent& e) {
             opts.useNativeTitleBar = false;
             opts.resizable = true;
             opts.componentToCentreAround = this;
-            SoundShop::launchToolDialog(opts);
+            // Non-modal: a Control Bank is a live macro-fader surface meant to
+            // be played while the song runs - and you may want several open at
+            // once. Modal would block the transport and every other node. The
+            // editor is node-id-safe, so deleting its node mid-session is safe.
+            SoundShop::launchNonModalToolDialog(opts);
         } else {
             auto* editor = new SignalShapeEditorComponent(graph, captured,
                 [this]() {
@@ -1334,7 +1486,10 @@ void NodeGraphComponent::mouseDoubleClick(const juce::MouseEvent& e) {
             opts.useNativeTitleBar = false;
             opts.resizable = true;
             opts.componentToCentreAround = this;
-            SoundShop::launchToolDialog(opts);
+            // Non-modal: a Signal Shape has a manual-trigger button and drives
+            // params live, so it belongs in the same play-while-open family as
+            // the XY Pad and Control Bank above.
+            SoundShop::launchNonModalToolDialog(opts);
         }
         return;
     }
@@ -1702,7 +1857,9 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
                 opts.useNativeTitleBar = false;
                 opts.resizable = true;
                 opts.componentToCentreAround = this;
-                if (auto* dlg = SoundShop::launchToolDialog(opts))
+                // Non-modal (see the double-click reopen path above): a live
+                // input surface must coexist with the rest of the UI.
+                if (auto* dlg = SoundShop::launchNonModalToolDialog(opts))
                     dlg->setResizeLimits(320, 400, 6000, 6000);
             }
             return;
@@ -1738,7 +1895,8 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
             opts.useNativeTitleBar = false;
             opts.resizable = true;
             opts.componentToCentreAround = this;
-            SoundShop::launchToolDialog(opts);
+            // Non-modal (see the reopen path): live macro faders.
+            SoundShop::launchNonModalToolDialog(opts);
             return;
         } else if (result == 134) {
             // Spectrum Tap - insert inline on audio for frequency analysis.
@@ -1861,7 +2019,8 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
             opts.useNativeTitleBar = false;
             opts.resizable = true;
             opts.componentToCentreAround = this;
-            SoundShop::launchToolDialog(opts);
+            // Non-modal (live input surface - see the double-click path).
+            SoundShop::launchNonModalToolDialog(opts);
             return;
         } else if (result >= 120 && result <= 125) {
             // Terrain Synth. The terrain engine and visualizer both support
@@ -2479,6 +2638,196 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
     });
 }
 
+// ----------------------------------------------------------------------------
+// Control-input (#88) operations. Shared by the param-row right-click menu and
+// the per-pin right-click menu so both surfaces behave identically. Each looks
+// the node up by id and addresses the binding by stable paramIndex, so nothing
+// dangles across the async menu callback even if the pin/param vectors moved.
+// ----------------------------------------------------------------------------
+void NodeGraphComponent::addControlInput(int nodeId, int paramIdx, bool absolute) {
+    auto* nd = graph.findNode(nodeId);
+    if (!nd || paramIdx < 0 || paramIdx >= (int)nd->params.size()) return;
+    // Consumed block-rate (applySignalModulations reads sample 0), so the pin
+    // is a Param (block-rate, orange) - NOT a Signal. The receiver decides the
+    // rate; Param/Signal cables are interchangeable.
+    std::string pinName = (absolute ? "Set: " : "Mod: ") + nd->params[paramIdx].name;
+    int newPinId = graph.allocId();
+    nd->pinsIn.push_back({newPinId, pinName, PinKind::Param, true, 1});
+    Node::ModPin mp;
+    mp.paramIndex = paramIdx;
+    mp.pinId      = newPinId;
+    mp.depth      = 1.0f;
+    mp.mode       = absolute ? Node::ModPin::Mode::Absolute
+                             : Node::ModPin::Mode::Modulate;
+    nd->modPins.push_back(mp);
+    graph.dirty = true;
+    graph.commitSnapshot(absolute ? "Add absolute input" : "Add modulation input");
+    // Topology changed: the node gained an input pin (and needs a wider input
+    // bus to carry the new control channel). Force a rebuild now - the
+    // node/link COUNT is unchanged, so the processBlock count-delta check would
+    // otherwise miss this edit and keep the synth on its old (too-narrow) bus,
+    // silently dropping any signal later cabled to this pin.
+    if (onNodeEdited) onNodeEdited();
+    repaint();
+}
+
+void NodeGraphComponent::removeControlInput(int nodeId, int paramIdx) {
+    auto* nd = graph.findNode(nodeId);
+    if (!nd) return;
+    for (auto it = nd->modPins.begin(); it != nd->modPins.end(); ++it) {
+        if (it->paramIndex != paramIdx) continue;
+        int pinId = it->pinId;
+        nd->pinsIn.erase(
+            std::remove_if(nd->pinsIn.begin(), nd->pinsIn.end(),
+                [pinId](const Pin& p) { return p.id == pinId; }),
+            nd->pinsIn.end());
+        graph.links.erase(
+            std::remove_if(graph.links.begin(), graph.links.end(),
+                [pinId](const auto& lk) { return lk.endPin == pinId; }),
+            graph.links.end());
+        nd->modPins.erase(it);
+        break;
+    }
+    // Clear modulation state on the param so it returns to its resting value.
+    if (paramIdx >= 0 && paramIdx < (int)nd->params.size()) {
+        auto& p = nd->params[paramIdx];
+        if (p.modulated) { p.value = p.baseValue; p.modulated = false; }
+    }
+    graph.dirty = true;
+    graph.commitSnapshot("Remove control input");
+    if (onNodeEdited) onNodeEdited();
+    repaint();
+}
+
+void NodeGraphComponent::switchControlInputMode(int nodeId, int paramIdx) {
+    auto* nd = graph.findNode(nodeId);
+    if (!nd) return;
+    for (auto& mp : nd->modPins) {
+        if (mp.paramIndex != paramIdx) continue;
+        mp.mode = (mp.mode == Node::ModPin::Mode::Absolute)
+                    ? Node::ModPin::Mode::Modulate
+                    : Node::ModPin::Mode::Absolute;
+        // Relabel the pin's Set:/Mod: prefix to match the new mode.
+        for (auto& pin : nd->pinsIn)
+            if (pin.id == mp.pinId
+                && (pin.name.rfind("Mod: ", 0) == 0
+                 || pin.name.rfind("Set: ", 0) == 0))
+                pin.name = (mp.mode == Node::ModPin::Mode::Absolute
+                              ? "Set: " : "Mod: ") + pin.name.substr(5);
+        break;
+    }
+    // Reset to the resting value so the param doesn't keep the last driven
+    // reading while the new mode takes over on the next audio block.
+    if (paramIdx >= 0 && paramIdx < (int)nd->params.size()) {
+        auto& p = nd->params[paramIdx];
+        if (p.modulated) { p.value = p.baseValue; p.modulated = false; }
+    }
+    graph.dirty = true;
+    graph.commitSnapshot("Switch control input mode");
+    if (onNodeEdited) onNodeEdited();
+    repaint();
+}
+
+void NodeGraphComponent::showPinMenu(Node& node, const Pin& pin, bool isInput) {
+    // Is this an input pin bound to a control-input ModPin? If so, offer the
+    // Set/Mod switch and removal. (Only input pins carry ModPins.)
+    int paramIdx = -1;
+    Node::ModPin::Mode curMode = Node::ModPin::Mode::Modulate;
+    if (isInput) {
+        for (auto& mp : node.modPins)
+            if (mp.pinId == pin.id) { paramIdx = mp.paramIndex; curMode = mp.mode; break; }
+    }
+
+    // Repair path: the pin is named like a control input ("Mod: <param>" /
+    // "Set: <param>") but has NO modPin binding. This happens with wavetable
+    // "Mod: Position X" pins from projects saved before modPin serialisation
+    // existed, or whose bindings were otherwise lost - the pin shows on the
+    // node face but the Set/Mod menu had nothing to act on. Rebuild the
+    // binding from the pin name so the feature self-heals on first right-click.
+    if (paramIdx < 0 && isInput
+        && (pin.name.rfind("Mod: ", 0) == 0 || pin.name.rfind("Set: ", 0) == 0)) {
+        bool absolute = (pin.name.rfind("Set: ", 0) == 0);
+        std::string suffix = pin.name.substr(5);   // text after "Mod: "/"Set: "
+
+        // Resolve which param this pin drives. First try an exact param-name
+        // match ("Mod: Volume" -> param "Volume"). Then handle the wavetable
+        // Position quirk: the PIN is labelled by axis letter ("Position X/Y/Z/W")
+        // while the PARAMS are numbered ("Position 1".."Position N"), so map the
+        // axis letter/number to its ordinal among the Position-named params.
+        int resolved = -1;
+        for (int i = 0; i < (int)node.params.size(); ++i)
+            if (node.params[(size_t)i].name == suffix) { resolved = i; break; }
+        if (resolved < 0 && suffix.rfind("Position", 0) == 0) {
+            int axis = -1;
+            // suffix is "Position X" / "Position 1" etc - read the token after
+            // "Position ".
+            std::string tok = (suffix.size() > 9) ? suffix.substr(9) : std::string();
+            if (tok.size() == 1 && std::isalpha((unsigned char)tok[0])) {
+                switch (std::toupper((unsigned char)tok[0])) {
+                    case 'X': axis = 0; break; case 'Y': axis = 1; break;
+                    case 'Z': axis = 2; break; case 'W': axis = 3; break;
+                }
+            } else if (!tok.empty() && std::isdigit((unsigned char)tok[0])) {
+                axis = std::atoi(tok.c_str()) - 1;   // "Position 1" -> axis 0
+            }
+            if (axis >= 0) {
+                int count = 0;
+                for (int i = 0; i < (int)node.params.size(); ++i) {
+                    if (node.params[(size_t)i].name.rfind("Position", 0) != 0) continue;
+                    if (count == axis) { resolved = i; break; }
+                    ++count;
+                }
+            }
+        }
+
+        if (resolved >= 0) {
+            Node::ModPin mp;
+            mp.paramIndex = resolved;
+            mp.pinId      = pin.id;
+            mp.depth      = 1.0f;
+            mp.mode       = absolute ? Node::ModPin::Mode::Absolute
+                                     : Node::ModPin::Mode::Modulate;
+            node.modPins.push_back(mp);
+            graph.dirty = true;
+            graph.commitSnapshot("Repair control input binding");
+            // An orphaned binding also meant the cable into this pin wasn't
+            // modulating anything (applySignalModulations iterates modPins).
+            // Rebuild so the restored binding takes effect in the audio graph.
+            if (onNodeEdited) onNodeEdited();
+            paramIdx = resolved;
+            curMode  = mp.mode;
+        }
+    }
+
+    if (paramIdx < 0) {
+        // Not a control-input pin (or its binding couldn't be resolved) - no
+        // pin-specific actions. Fall back to the node menu so right-clicking a
+        // plain pin/label still does something.
+        showNodeMenu(node);
+        return;
+    }
+
+    juce::PopupMenu pm;
+    juce::String paramName = (paramIdx < (int)node.params.size())
+                                 ? juce::String(node.params[(size_t)paramIdx].name)
+                                 : juce::String();
+    pm.addSectionHeader(
+        (curMode == Node::ModPin::Mode::Absolute ? "Set: " : "Mod: ") + paramName);
+    if (curMode == Node::ModPin::Mode::Absolute)
+        pm.addItem(1, "Switch to Modulation (Mod) - swing around the knob");
+    else
+        pm.addItem(1, "Switch to Absolute (Set) - cable sets the value");
+    pm.addSeparator();
+    pm.addItem(2, "Remove Input Cable Pin");
+
+    int nodeId = node.id;
+    int pIdx   = paramIdx;
+    pm.showMenuAsync({}, [this, nodeId, pIdx](int r) {
+        if (r == 1)      switchControlInputMode(nodeId, pIdx);
+        else if (r == 2) removeControlInput(nodeId, pIdx);
+    });
+}
+
 void NodeGraphComponent::showNodeMenu(Node& node) {
     juce::PopupMenu menu;
     menu.addItem(5, "Rename...");
@@ -2728,7 +3077,8 @@ void NodeGraphComponent::showNodeMenu(Node& node) {
             opts.useNativeTitleBar = false;
             opts.resizable = true;
             opts.componentToCentreAround = this;
-            SoundShop::launchToolDialog(opts);
+            // Non-modal (live input surface - see the double-click path).
+            SoundShop::launchNonModalToolDialog(opts);
         } else if (result == 191) {
             // Open the Control Bank editor for an existing node.
             int captured = nodeId;
@@ -2745,7 +3095,8 @@ void NodeGraphComponent::showNodeMenu(Node& node) {
             opts.useNativeTitleBar = false;
             opts.resizable = true;
             opts.componentToCentreAround = this;
-            SoundShop::launchToolDialog(opts);
+            // Non-modal (live macro faders - see the double-click path).
+            SoundShop::launchNonModalToolDialog(opts);
         } else if (result == 192) {
             // Open the MIDI Script editor for an existing node.
             int captured = nodeId;

@@ -126,6 +126,21 @@ private:
     void showBackgroundMenu(juce::Point<float> canvasPos);
     void showNodeMenu(Node& node);
     void showLinkMenu(int linkId);
+    // Right-click menu for a single pin (triggered anywhere across the pin's
+    // row, including its label text). For a control-input pin (one bound to a
+    // ModPin) this offers Switch Set/Mod and Remove; for any other pin it
+    // falls back to showNodeMenu so a plain pin right-click still does
+    // something useful.
+    void showPinMenu(Node& node, const Pin& pin, bool isInput);
+
+    // Control-input (#88) operations, shared by the param-row menu and the
+    // pin menu so both surfaces stay in sync. All look the node up by id and
+    // address the binding by stable paramIndex (no dangling references across
+    // the async menu callback). Each commits an undo snapshot and requests a
+    // graph rebuild.
+    void addControlInput(int nodeId, int paramIdx, bool absolute);
+    void removeControlInput(int nodeId, int paramIdx);
+    void switchControlInputMode(int nodeId, int paramIdx);
 
     // Helpers
     void deleteSelectedLink();

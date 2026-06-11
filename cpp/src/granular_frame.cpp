@@ -67,12 +67,18 @@ std::string GranularFrame::encodeBody() const {
     // tolerable inside the length-prefixed wavetable2 body; a future
     // base64-binary path can shrink this ~1.6x.
     std::ostringstream ss;
+    // captureSourceKind is written biased by +1 so the value is always a
+    // non-negative all-digit token (the decode header run only accepts pure
+    // digits): -1 (unknown) -> 0, 0 (song) -> 1, 1 (mic) -> 2, 2 (file) -> 3.
+    // It is always emitted (never omitted) so this optional-int slot keeps a
+    // stable position if more header ints are appended after it later.
     ss << source.size() << ';'
        << sourceSampleRate << ';'
        << grainLength << ';'
        << embeddedPitchHz << ';'
        << (int)freezeMode << ';'
-       << crossfadeSamples << ';';
+       << crossfadeSamples << ';'
+       << (captureSourceKind + 1) << ';';
     char buf[24];
     for (size_t i = 0; i < source.size(); ++i) {
         if (i > 0) ss << ',';
@@ -143,6 +149,7 @@ bool GranularFrame::decodeBody(const std::string& body) {
         pos = semi + 1;
         return true;
     };
+    captureSourceKind = -1;  // unknown unless the (newer) header field is present
     int tmp;
     if (tryOptInt(tmp)) {
         if (tmp >= 0 && tmp <= 3) freezeMode = (GranularFreezeMode)tmp;
@@ -150,6 +157,12 @@ bool GranularFrame::decodeBody(const std::string& body) {
     }
     if (tryOptInt(tmp)) {
         crossfadeSamples = std::max(0, tmp);
+    }
+    // Third optional int: captureSourceKind, biased by +1 on write (see
+    // encodeBody). 0 -> unknown (-1), 1 -> song (0), 2 -> mic (1), 3 -> file
+    // (2). Absent in pre-field projects, which correctly stay "unknown".
+    if (tryOptInt(tmp)) {
+        captureSourceKind = (tmp >= 1 && tmp <= 3) ? (tmp - 1) : -1;
     }
     size_t sampleStart = pos;
 

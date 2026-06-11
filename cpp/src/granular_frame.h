@@ -138,6 +138,18 @@ struct GranularFrame : public IWavetableFrame {
     // so their audible character is preserved.
     int crossfadeSamples = 2400;  // ~50 ms @ 48 kHz
 
+    // Which capture source originally produced this frame's PCM:
+    //   -1 = unknown / not applicable (frame built from scratch, duplicated,
+    //        or loaded from a project saved before this field existed)
+    //    0 = project song playback   (CaptureSource::Playback)
+    //    1 = microphone / audio input (CaptureSource::Mic)
+    //    2 = audio file               (CaptureSource::File)
+    // Used by the granular frame editor so the "Re-capture from …" button
+    // names the right source and re-opens the matching capture panel. A
+    // mic-captured frame must not offer "Re-capture from song" (and vice
+    // versa) - that re-captures from the wrong place entirely.
+    int captureSourceKind = -1;
+
     GranularFrame() = default;
     GranularFrame(std::vector<float> src,
                   double srcRate,

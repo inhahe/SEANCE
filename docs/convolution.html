@@ -61,6 +61,8 @@
 
 <p>SEANCE has a built-in tool to capture impulse responses from real spaces — click <em>Tools → Capture Room IR…</em> in the menus. Place your microphone where the listener would sit, point your speakers into the room, and the tool plays a sine sweep through the speakers and records the room's response with the mic. The captured IR is automatically loaded into a new Convolution Filter node ready to use. See the Room IR Capture dialog's tooltips for the recording parameters.</p>
 
+<p><strong>If the recording sounds wrong</strong> (garbled, noisy, or like your computer's own audio instead of the room), open <em>Settings → Audio Device…</em> and change the driver type to <strong>DirectSound</strong>. On Windows the default driver can scramble microphone input when your mic and speakers are different physical devices; DirectSound captures it correctly. SEANCE already defaults to DirectSound on a fresh install, so you'll usually only need this if you switched the driver yourself.</p>
+
 <h2>Common patterns</h2>
 
 <ul>

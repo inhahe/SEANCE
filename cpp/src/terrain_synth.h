@@ -1,6 +1,7 @@
 #pragma once
 #include "node_graph.h"
 #include "transport.h"
+#include "granular_freeze.h"   // GrainFreezeVoice - shared freeze-mode reader
 #include <juce_audio_processors/juce_audio_processors.h>
 #include <vector>
 #include <string>
@@ -392,6 +393,13 @@ private:
         // Seam crossfade length in samples, used by CrossfadeLoop.
         // Clamped per-sample to [0, grainLength/2] by the reader.
         int                crossfadeSamples = 2400;
+        // Per-frame output gain (mirrors IWavetableFrame::gain). The cycle
+        // layer applies a frame's gain inside render(); the granular layer
+        // reads source PCM directly (bypassing render()), so the voice
+        // multiplies the rendered grain by this so the editor's Gain knob -
+        // and the capture dialog's Gain control - actually changes the
+        // loudness of granular frames. 1.0 = unity.
+        float              gain             = 1.0f;
         // Position in the wavetable's N-D Position space, normalized
         // [0,1] per dim. For grid frames this is the grid-cell coord
         // mapped to [0,1]; for scatter frames it's the authored coord.
@@ -481,17 +489,13 @@ private:
         // Per-granular-frame playback state. One entry per
         // GranularLayerEntry in TerrainSynthProcessor::wtGranularFrames.
         // Allocated lazily on note-on once the granular table is known.
-        // The synth plays the CrossfadeLoop freeze mode (matching what the
-        // capture/freeze dialog auditions), so the only state needed is a
-        // fractional playhead. When per-mode synth implementations land
-        // (AsyncGranular, ...) add their state here alongside loopPhase.
+        // GrainFreezeVoice is the SHARED freeze-mode reader (granular_freeze.h)
+        // that the capture/freeze audition engine also uses, so every freeze
+        // mode (CrossfadeLoop, AsyncGranular, PitchSyncGrains, SpectralFreeze)
+        // sounds identical whether auditioned in the dialog or played as a
+        // held note. The voice carries all per-mode playback state internally.
         struct GranStream {
-            bool initialized = false;
-            // Fractional playhead for the CrossfadeLoop freeze mode.
-            // Advances by the pitch `ratio` each output sample and wraps
-            // at grainLength, so a held note plays the marker window as a
-            // faithful tape loop resampled to track MIDI pitch.
-            float loopPhase = 0.0f;
+            GrainFreezeVoice voice;
         };
         std::vector<GranStream> granStreams;
 

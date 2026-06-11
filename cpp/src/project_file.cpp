@@ -254,7 +254,8 @@ bool ProjectFile::writeProject(std::ostream& f, NodeGraph& graph,
         // entries just record which param each one drives.
         for (auto& mp : node.modPins) {
             f << "modPin=" << mp.paramIndex << "," << mp.pinId
-              << "," << mp.depth << "\n";
+              << "," << mp.depth
+              << "," << (mp.mode == Node::ModPin::Mode::Absolute ? 1 : 0) << "\n";
         }
         for (auto& clip : node.clips) {
             f << "[Clip]\n";
@@ -651,7 +652,10 @@ bool ProjectFile::readProject(std::istream& f, NodeGraph& graph, PluginHost* plu
                 while (std::getline(ss, token, ','))
                     if (!token.empty()) curNode->childNodeIds.push_back(std::stoi(token));
             }
-            // Signal modulation pin bindings (#88): "modPin=paramIdx,pinId,depth"
+            // Signal modulation pin bindings (#88):
+            // "modPin=paramIdx,pinId,depth[,mode]" where mode 0=Modulate,
+            // 1=Absolute. The mode field is optional for back-compat with
+            // older projects (missing -> Modulate).
             else if (key == "modPin") {
                 Node::ModPin mp;
                 auto c1 = val.find(',');
@@ -659,7 +663,15 @@ bool ProjectFile::readProject(std::istream& f, NodeGraph& graph, PluginHost* plu
                 if (c1 != std::string::npos && c2 != std::string::npos) {
                     mp.paramIndex = std::stoi(val.substr(0, c1));
                     mp.pinId      = std::stoi(val.substr(c1 + 1, c2 - c1 - 1));
-                    mp.depth      = std::stof(val.substr(c2 + 1));
+                    auto c3 = val.find(',', c2 + 1);
+                    if (c3 != std::string::npos) {
+                        mp.depth = std::stof(val.substr(c2 + 1, c3 - c2 - 1));
+                        mp.mode  = (std::stoi(val.substr(c3 + 1)) == 1)
+                                       ? Node::ModPin::Mode::Absolute
+                                       : Node::ModPin::Mode::Modulate;
+                    } else {
+                        mp.depth = std::stof(val.substr(c2 + 1));
+                    }
                     curNode->modPins.push_back(mp);
                 }
             }

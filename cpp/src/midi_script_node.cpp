@@ -228,6 +228,11 @@ void MidiScriptProcessor::reloadIfScriptChanged() {
 
     bindShape();
 
+    // Bind the note->frequency mapper so notefreq() honours the project tuning
+    // system. Captures `this` (the processor owns the runtime and holds a
+    // Transport&, so there's no dangling) and re-reads the live tuning each call.
+    runtime->setNoteToFreq([this](int n) { return transport.noteToFreq(n); });
+
     // For Wasm the runtime source is the file path; for Builtin/Lua it's the text.
     const std::string& src = (doc.language == ScriptLang::Wasm) ? doc.wasmPath
                                                                 : doc.program;
@@ -330,8 +335,10 @@ void MidiScriptProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Midi
     const double sr = juce::jmax(1.0, transport.sampleRate);
     const double secPerSample = 1.0 / sr;
     const float gateVal = (notesHeld > 0) ? 1.0f : 0.0f;
-    const float freqHz = (lastNoteOn >= 0)
-                       ? 440.0f * std::pow(2.0f, (lastNoteOn - 69) / 12.0f) : 0.0f;
+    // Use the project tuning system (Equal12 / Pythagorean / Just / Meantone +
+    // concert pitch) for the `freq` binding, matching what notefreq() returns and
+    // what the built-in synth plays - not a hardcoded 12-TET 440.
+    const float freqHz = (lastNoteOn >= 0) ? transport.noteToFreq(lastNoteOn) : 0.0f;
 
     if (runBlockMode) {
         // ---- Per-block dispatch (Lua block-rate / Wasm) ---------------------

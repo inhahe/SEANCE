@@ -5,6 +5,9 @@
 
 namespace SoundShop {
 
+// Defined below shutdown(); forward-declared so init() can reference it.
+static juce::File getAudioSettingsFile();
+
 double AudioEngine::computeMaxGraphTailSeconds() const {
     if (!graph) return 0.0;
     double maxTail = 0.0;
@@ -39,14 +42,60 @@ void AudioEngine::init() {
 
     deviceManager = std::make_unique<juce::AudioDeviceManager>();
 
-    // Try to open default audio device
+    // --- Restore the user's saved audio device choice, or pick a sane
+    // first-run default. ------------------------------------------------------
+    // SEANCE persists the full device setup (driver type, device names, sample
+    // rate, buffer size, channel selection) to a settings file next to the exe
+    // so the choice survives restarts. Two paths:
+    //
+    //   (a) Settings file exists  -> hand the saved XML to initialise() so the
+    //       exact device/type the user last selected is restored. We never
+    //       override an explicit saved choice.
+    //
+    //   (b) First run (no file)   -> default the driver type to DirectSound.
+    //       JUCE's out-of-the-box default is WASAPI, which on Windows welds the
+    //       default input (e.g. a USB webcam mic) and the default output (e.g.
+    //       HDMI) into a single shared-mode device. When those are different
+    //       physical devices with independent clocks, WASAPI's combined device
+    //       corrupts the captured input into a square-wave-like garbage signal
+    //       (a known JUCE limitation). DirectSound buffers the two endpoints
+    //       independently and captures the mic correctly. We only set this as
+    //       the *first-run* default - the saved-settings path above takes
+    //       precedence, so a user who deliberately switches back to WASAPI in
+    //       the Audio Device Settings dialog keeps WASAPI on subsequent runs.
+    std::unique_ptr<juce::XmlElement> savedState;
+    {
+        auto settingsFile = getAudioSettingsFile();
+        if (settingsFile.existsAsFile())
+            savedState = juce::parseXML(settingsFile);
+    }
+
+    if (savedState == nullptr) {
+        // First run: prefer the DirectSound driver type if it's available.
+        for (auto* type : deviceManager->getAvailableDeviceTypes()) {
+            if (type->getTypeName() == "DirectSound") {
+                deviceManager->setCurrentAudioDeviceType("DirectSound", true);
+                break;
+            }
+        }
+    }
+
     // Initialize with both input (for recording, IR capture) and output.
-    // Uses the OS default devices.
-    auto result = deviceManager->initialiseWithDefaultDevices(1, 2);
+    // savedState restores the user's last choice if present; otherwise JUCE
+    // opens the default devices for the current (possibly DirectSound) type.
+    auto result = deviceManager->initialise(
+        /*numInputChannelsNeeded*/  1,
+        /*numOutputChannelsNeeded*/ 2,
+        /*savedState*/              savedState.get(),
+        /*selectDefaultDeviceOnFailure*/ true);
     if (result.isNotEmpty()) {
         fprintf(stderr, "Audio device init warning: %s\n", result.toRawUTF8());
         // Continue anyway - might work with different settings
     }
+
+    // Make sure an input device is actually open with a live channel
+    // (Windows default-device gap - see ensureAudioInputEnabled).
+    ensureAudioInputEnabled();
 
     auto* device = deviceManager->getCurrentAudioDevice();
     if (device) {
@@ -60,6 +109,13 @@ void AudioEngine::init() {
 
     deviceManager->addAudioCallback(this);
 
+    // Persist whatever ensureAudioInputEnabled() landed on so the very first
+    // run writes a settings file (subsequent runs restore it). Then listen for
+    // device changes so any pick the user makes in the Audio Device Settings
+    // dialog is re-persisted automatically.
+    saveAudioSettings();
+    deviceManager->addChangeListener(this);
+
     // Note: we intentionally do NOT auto-enable MIDI input devices here.
     // The node-based input architecture means MIDI devices are enabled only
     // if a matching MidiInput node exists in the current graph. Enablement
@@ -72,11 +128,71 @@ void AudioEngine::init() {
 
 void AudioEngine::shutdown() {
     if (deviceManager) {
+        // Capture the final device state before tearing down so the user's
+        // last-used configuration is what gets restored next launch.
+        saveAudioSettings();
+        deviceManager->removeChangeListener(this);
         deviceManager->removeAudioCallback(this);
         deviceManager->closeAudioDevice();
         deviceManager.reset();
     }
     formatManager.reset();
+}
+
+// Settings file lives next to the executable, matching the convention used by
+// the other SEANCE config files (soundshop_recent_projects.txt,
+// soundshop_prefs.xml, etc.).
+static juce::File getAudioSettingsFile() {
+    return juce::File::getSpecialLocation(juce::File::currentExecutableFile)
+               .getSiblingFile("soundshop_audio_settings.xml");
+}
+
+void AudioEngine::saveAudioSettings() {
+    if (!deviceManager) return;
+    if (auto xml = deviceManager->createStateXml())
+        xml->writeTo(getAudioSettingsFile());
+    // createStateXml() returns nullptr when the current setup is identical to
+    // the default - in that case there's nothing user-specific to persist and
+    // leaving any existing file untouched is fine.
+}
+
+void AudioEngine::changeListenerCallback(juce::ChangeBroadcaster* source) {
+    if (deviceManager && source == deviceManager.get())
+        saveAudioSettings();
+}
+
+bool AudioEngine::ensureAudioInputEnabled() {
+    if (!deviceManager) return false;
+    auto setup = deviceManager->getAudioDeviceSetup();
+
+    // Already have a live input channel and a named input device: nothing to
+    // do. Bail before setAudioDeviceSetup so opening the mic dialog doesn't
+    // needlessly restart the device (which would glitch audio) on the common
+    // path where input is fine.
+    if (!setup.inputChannels.isZero() && setup.inputDeviceName.isNotEmpty())
+        return true;
+
+    if (auto* type = deviceManager->getCurrentDeviceTypeObject()) {
+        type->scanForDevices();
+        const auto inputs = type->getDeviceNames(true);  // input device names
+        if (setup.inputDeviceName.isEmpty() && inputs.size() > 0) {
+            const int defIdx = type->getDefaultDeviceIndex(true);
+            setup.inputDeviceName = inputs[juce::jlimit(0, inputs.size() - 1, defIdx)];
+        }
+    }
+    if (setup.inputDeviceName.isEmpty()) {
+        fprintf(stderr, "No audio input device available to enable\n");
+        return false;
+    }
+    setup.useDefaultInputChannels = true;  // open the device's default inputs
+    setup.inputChannels.setBit(0);          // and guarantee at least channel 0
+    auto err = deviceManager->setAudioDeviceSetup(setup, true);
+    if (err.isNotEmpty()) {
+        fprintf(stderr, "Could not enable audio input: %s\n", err.toRawUTF8());
+        return false;
+    }
+    fprintf(stderr, "Audio input enabled: %s\n", setup.inputDeviceName.toRawUTF8());
+    return true;
 }
 
 void AudioEngine::setProjectSampleRate(double sr) {
@@ -143,6 +259,7 @@ std::vector<AudioEngine::MidiDeviceEntry> AudioEngine::listMidiInputDevices() co
 void AudioEngine::audioDeviceAboutToStart(juce::AudioIODevice* device) {
     sampleRate = device->getCurrentSampleRate();
     blockSize = device->getCurrentBufferSizeSamples();
+
     double graphRate = getProjectSampleRate();
     if (graph)
         graphProcessor.prepare(*graph, graphRate, blockSize);
@@ -585,109 +702,44 @@ void AudioEngine::audioDeviceIOCallbackWithContext(
             // locally and publish back at the end of the block.
             int64_t songPos = previewSongPosSamples.load(std::memory_order_acquire);
 
-            // (Re-)initialise loop state if the grain length, source
-            // buffer, or mode transition into GrainLoop says so. We do
-            // this once at block start so the per-sample loop stays
-            // branchless on the hot path. If grainPtr is null or too
-            // short for a loop plus crossfade to fit, granularSample
-            // below returns 0.
-            //
-            // Freeze-mode dispatch: the per-block snapshot below picks
-            // which "sustain the marker" algorithm runs. Only the
-            // CrossfadeLoop branch is implemented today; the others
-            // (AsyncGranular, PitchSyncGrains, SpectralFreeze) fall
-            // back to it until their dedicated implementations land.
+            // Freeze-mode dispatch. The dialog publishes which "sustain the
+            // marker" algorithm to run (CrossfadeLoop / AsyncGranular /
+            // PitchSyncGrains / SpectralFreeze). We snapshot it once per block
+            // and hand it to the shared GrainFreezeVoice, which is the SAME
+            // reader the synth uses for a held granular note - so the marker
+            // audition is sample-for-sample what the placed frame will play.
             const int freezeMode = grainFreezeMode.load(std::memory_order_acquire);
-            (void)freezeMode; // currently always CrossfadeLoop
-            // Crossfade length is set by the dialog (atomic, per-block
-            // snapshot) and clamped to [0, L/2]: bigger than L/2 would
-            // overlap the two ramps. The reserved tail capacity below
-            // (L/2 samples past the loop) is the maximum the user can
-            // ever ask for, so the buffer size requirement is a fixed
-            // L + L/2 = 3L/2 samples regardless of the current xfade.
-            const int xfadeReq = previewCrossfadeSamples.load(std::memory_order_acquire);
-            const int xfade = std::max(0, std::min(xfadeReq, grainLen / 2));
-            // Playback pitch ratio (1.0 = native). Drives the fractional
-            // playhead advance below so the "As note" picker can audition the
-            // marker at the pitch the captured frame will play in the synth.
-            const float grainRatio = previewGrainRatio.load(std::memory_order_acquire);
-            const int reservedTail = grainLen / 2;
+            // Crossfade seam length (loop modes), pitch ratio (1.0 = native),
+            // and the source's natural pitch (only PitchSyncGrains uses it).
+            // The voice clamps xfade to loopLen/2 internally.
+            const int   xfadeReq      = previewCrossfadeSamples.load(std::memory_order_acquire);
+            const float grainRatio    = previewGrainRatio.load(std::memory_order_acquire);
+            const float embeddedPitch = previewEmbeddedPitchHz.load(std::memory_order_acquire);
+            // Cheap pre-gate: skip the voice entirely when there's no usable
+            // source. The voice applies the same per-mode viability test and
+            // returns 0 for too-short sources, so silence here == silence in
+            // the synth.
             const bool grainViable = grainPtr && grainLen >= 16
-                                     && (int)grainPtr->size() >= grainLen + reservedTail;
-            if (grainViable) {
-                const float* srcPtr = grainPtr->data();
-                const bool need = grainNeedsReinit
-                               || grainLen != grainLastAppliedLen
-                               || srcPtr != grainLastAppliedSrcPtr;
-                if (need) {
-                    // Anchor selection: center the loop window inside the
-                    // available source PCM. The dialog publishes a multi-
-                    // second window centered on the marker, so a centered
-                    // anchor reads the marker spot. We need anchor + L +
-                    // L/2 <= srcLen so the seam crossfade has lookahead
-                    // material to blend with at any user-picked xfade up
-                    // to the L/2 cap.
-                    const int srcLen = (int)grainPtr->size();
-                    const int needLen = grainLen + reservedTail;
-                    const int maxStart = std::max(0, srcLen - needLen);
-                    grainAnchor            = maxStart / 2;
-                    grainPhase             = 0;
-                    grainLastAppliedLen    = grainLen;
-                    grainLastAppliedSrcPtr = srcPtr;
-                    grainNeedsReinit       = false;
-                }
-            }
+                                     && (int)grainPtr->size() >= grainLen;
+            const float* srcPtr = grainViable ? grainPtr->data() : nullptr;
+            const int    srcLen = grainViable ? (int)grainPtr->size() : 0;
+            // On mode-entry into GrainLoop (or after clearPreview) re-anchor the
+            // shared voice so the audition restarts on the fresh marker spot.
+            // The voice also re-anchors itself whenever the source pointer,
+            // length, grain length or freeze mode changes, so steady-state
+            // marker scrubbing needs no manual reinit here.
+            if (grainNeedsReinit) { grainFreezeVoice.reset(); grainNeedsReinit = false; }
 
-            // CrossfadeLoop: single playhead reads [anchor, anchor+L) on
-            // repeat; at the start of each iteration we Hann-crossfade
-            // against [anchor+L, anchor+L+xfade) so the seam doesn't
-            // click. Output is `source[anchor + grainPhase]` straight
-            // through, except in the first `xfade` samples of each
-            // iteration where we blend in the "what would have come next
-            // if we hadn't wrapped" tail.
+            // One sample of the selected freeze algorithm via the shared voice.
+            // srcRate == deviceRate for the audition (the preview PCM is already
+            // at the device sample rate), so the voice's PitchSyncGrains period
+            // is rate/embeddedPitch and grainRatio carries the pitch transpose.
             auto granularSample = [&]() -> float {
                 if (!grainViable) return 0.0f;
-                const auto& src = *grainPtr;
-                const int srcLen = (int)src.size();
-                const float p = grainPhase;  // fractional, [0, grainLen)
-
-                // Main playhead read (linear interpolation).
-                const float mainF = (float)grainAnchor + p;
-                int   mi0 = (int)mainF;
-                float mfr = mainF - (float)mi0;
-                if (mi0 < 0)               { mi0 = 0; mfr = 0.0f; }
-                else if (mi0 > srcLen - 1) { mi0 = srcLen - 1; mfr = 0.0f; }
-                const int mi1 = std::min(mi0 + 1, srcLen - 1);
-                float out = src[(size_t)mi0] * (1.0f - mfr)
-                          + src[(size_t)mi1] * mfr;
-
-                if (xfade > 0 && p < (float)xfade) {
-                    // alpha rises from 0 to 1 across the xfade window
-                    // (Hann half-cycle). Pre-seam tail (source[anchor+L+p])
-                    // weighted by (1 - alpha), in-loop sample weighted by
-                    // alpha -- so at p=0 we are reading the tail (= the
-                    // sample just before the seam, perfectly continuous
-                    // with the previous iteration's end), and by p=xfade
-                    // we are fully on the loop's start.
-                    const float pi = juce::MathConstants<float>::pi;
-                    const float alpha = 0.5f * (1.0f - std::cos(pi * p / (float)xfade));
-                    const float tailF = (float)(grainAnchor + grainLen) + p;
-                    int   ti0 = (int)tailF;
-                    float tfr = tailF - (float)ti0;
-                    if (ti0 < 0)               { ti0 = 0; tfr = 0.0f; }
-                    else if (ti0 > srcLen - 1) { ti0 = srcLen - 1; tfr = 0.0f; }
-                    const int ti1 = std::min(ti0 + 1, srcLen - 1);
-                    const float tail = src[(size_t)ti0] * (1.0f - tfr)
-                                     + src[(size_t)ti1] * tfr;
-                    out = alpha * out + (1.0f - alpha) * tail;
-                }
-
-                // Advance the fractional playhead by the pitch ratio and wrap
-                // at the loop length.
-                float np = p + grainRatio;
-                while (np >= (float)grainLen) np -= (float)grainLen;
-                while (np < 0.0f)             np += (float)grainLen;
-                grainPhase = np;
+                const double rate = getSampleRate();
+                const float out = grainFreezeVoice.process(
+                    srcPtr, srcLen, grainLen, xfadeReq, embeddedPitch,
+                    rate, rate, grainRatio, (GranularFreezeMode)freezeMode);
                 // Attenuate to roughly match a synth note's post-Volume level
                 // so marker-scrub / freeze audition isn't louder than playback.
                 return out * kFreezePreviewGain;

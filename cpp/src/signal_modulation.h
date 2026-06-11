@@ -49,6 +49,46 @@ inline void applySignalModulations(Node& node,
                                     const juce::AudioBuffer<float>& buf) {
     if (node.modPins.empty()) return;
 
+    // === TEMP MODPIN DIAGNOSTIC (throwaway) ===
+    // Only for a node that owns a "Position" param (the wavetable synth), and
+    // only every Nth call so we don't hammer the disk. Dumps, per modPin: pin
+    // name, connected flag, Set/Mod mode, computed chIdx, the raw sample[0] on
+    // THAT channel, plus every control channel's sample[0] so we can see if the
+    // LFO signal is landing on a different channel than the apply side reads.
+    {
+        bool hasPos = false;
+        for (const auto& p : node.params)
+            if (p.name.rfind("Position", 0) == 0) { hasPos = true; break; }
+        static int sCallCount = 0;
+        if (hasPos && ((sCallCount++ % 64) == 0)) {
+            juce::String line;
+            line << "nCh=" << buf.getNumChannels() << "  chans[";
+            for (int c = 2; c < buf.getNumChannels(); ++c)
+                line << "ch" << c << "=" << juce::String(buf.getSample(c, 0), 3) << " ";
+            line << "]  modPins{";
+            for (const auto& mp : node.modPins) {
+                std::string pinName = "?";
+                for (const auto& pin : node.pinsIn)
+                    if (pin.id == mp.pinId) { pinName = pin.name; break; }
+                int slot = -1, sc = 0;
+                for (const auto& pin : node.pinsIn) {
+                    if (pin.id == mp.pinId) { slot = sc; break; }
+                    if (pin.kind == PinKind::Signal || pin.kind == PinKind::Param) ++sc;
+                }
+                int ch = 2 + slot;
+                float sv = (ch >= 0 && ch < buf.getNumChannels()) ? buf.getSample(ch, 0) : -999.0f;
+                line << "[" << pinName.c_str()
+                     << " conn=" << (mp.connected ? 1 : 0)
+                     << " mode=" << (mp.mode == Node::ModPin::Mode::Absolute ? "Set" : "Mod")
+                     << " ch=" << ch << " sig=" << juce::String(sv, 3)
+                     << " pIdx=" << mp.paramIndex << "] ";
+            }
+            line << "}\n";
+            juce::File("D:/temp/modpin_diag.txt").appendText(line);
+        }
+    }
+    // === END TEMP DIAGNOSTIC ===
+
     // Build a quick map: for each Signal/Param pin in pinsIn, which
     // control-slot index is it? (matches graph_processor.cpp's routing
     // logic that puts control signals on channels 2, 3, 4, ...)
@@ -56,6 +96,23 @@ inline void applySignalModulations(Node& node,
     for (auto& mp : node.modPins) {
         if (mp.paramIndex < 0 || mp.paramIndex >= (int)node.params.size())
             continue;
+
+        // Skip bindings with no cable actually feeding the pin. Pins like the
+        // wavetable "Mod: Position" inputs are created eagerly (so the user has
+        // somewhere to plug a cable in), and their modPin binding exists even
+        // when idle. Without this guard we'd read the pin's silent control
+        // channel as a genuine 0.0 modulation and force the bound param to its
+        // minimum every block - which manifested as the Position sliders doing
+        // nothing (the param was pinned to 0 regardless of the slider). The
+        // `connected` flag is recomputed from graph.links at every graph
+        // rebuild (GraphProcessor::buildGraph), so it tracks connect/disconnect.
+        if (!mp.connected) {
+            // A previously-connected binding that just lost its cable must
+            // release the param back to the user's manual resting value.
+            auto& p = node.params[mp.paramIndex];
+            if (p.modulated) { p.value = p.baseValue; p.modulated = false; }
+            continue;
+        }
 
         // Find the control-slot index for this pin - count Signal/Param
         // pins in pinsIn that come before the one with id == mp.pinId.
@@ -76,14 +133,26 @@ inline void applySignalModulations(Node& node,
 
         auto& p = node.params[mp.paramIndex];
         // On the first modulated block, snapshot the current value as
-        // baseValue. On subsequent blocks, baseValue is already stable.
+        // baseValue (the user's manual resting setting). On subsequent blocks,
+        // baseValue is already stable. This applies to BOTH modes: in Absolute
+        // mode baseValue preserves the manual value so disconnecting the cable
+        // (clearSignalModulations) restores it.
         if (!p.modulated) {
             p.baseValue = p.value;
             p.modulated = true;
         }
 
         float range = p.maxVal - p.minVal;
-        float modVal = p.baseValue + toBipolar(sigVal) * mp.depth * range * 0.5f;
+        float modVal;
+        if (mp.mode == Node::ModPin::Mode::Absolute) {
+            // "Set": the cable's value IS the param value, mapped edge-to-edge
+            // across [min,max]. The knob's baseValue is ignored (preserved only
+            // for restore-on-disconnect). 0 -> min, 1 -> max. depth is unused.
+            modVal = p.minVal + sigVal * range;
+        } else {
+            // "Mod": bipolar-additive around baseValue. 0.5 -> no change.
+            modVal = p.baseValue + toBipolar(sigVal) * mp.depth * range * 0.5f;
+        }
         p.value = std::clamp(modVal, p.minVal, p.maxVal);
     }
 }

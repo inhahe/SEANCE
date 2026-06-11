@@ -104,6 +104,8 @@ target_sources(SEANCE PRIVATE
     src/builtin_synth.h
     src/terrain_synth.cpp
     src/terrain_synth.h
+    src/granular_freeze.cpp
+    src/granular_freeze.h
     src/multi_sampler.cpp
     src/multi_sampler.h
     src/multi_sampler_editor.cpp

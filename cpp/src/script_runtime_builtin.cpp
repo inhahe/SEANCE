@@ -31,16 +31,16 @@ public:
 
     void onStart(const ScriptVars& vars, IExprEmitSink* sink) override {
         if (role != ScriptRole::Midi || startProgram.empty()) return;
-        WaveExprParser::runProgram(startProgram, vars, stateVars, sink, shape);
+        WaveExprParser::runProgram(startProgram, vars, stateVars, sink, shape, noteToFreq);
     }
 
     float evalSignal(const ScriptVars& vars) override {
-        return WaveExprParser::evaluateWithVars(source, vars, shape);
+        return WaveExprParser::evaluateWithVars(source, vars, shape, noteToFreq);
     }
 
     void runMidi(const ScriptVars& vars, IExprEmitSink* sink) override {
         if (bodyProgram.empty()) return;
-        WaveExprParser::runProgram(bodyProgram, vars, stateVars, sink, shape);
+        WaveExprParser::runProgram(bodyProgram, vars, stateVars, sink, shape, noteToFreq);
     }
 
     bool supportsPerSample() const override { return true; }
@@ -89,7 +89,7 @@ private:
     void runInit() {
         if (role != ScriptRole::Midi || initProgram.empty()) return;
         ScriptVars vars; // empty: unknown identifiers read as 0
-        WaveExprParser::runProgram(initProgram, vars, stateVars, nullptr, shape);
+        WaveExprParser::runProgram(initProgram, vars, stateVars, nullptr, shape, noteToFreq);
     }
 };
 

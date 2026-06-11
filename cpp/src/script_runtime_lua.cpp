@@ -3,6 +3,7 @@
 #ifdef HAS_LUA
 
 #include "lua_prelude.h"
+#include "music_theory.h"
 #include <juce_core/juce_core.h>
 #include <cmath>
 
@@ -108,6 +109,9 @@ public:
     // trampolines (free functions, not members) can reach it.
     float callShape(float pos) const { return shape ? shape(pos) : 0.0f; }
 
+    // Public accessor for the protected note->Hz mapper (project tuning).
+    float callNoteFreq(int note) const { return noteFreq(note); }
+
 private:
     lua_State* L = nullptr;
     std::string source;
@@ -171,6 +175,18 @@ static LuaRuntime* self_(lua_State* L) {
     return *static_cast<LuaRuntime**>(lua_getextraspace(L));
 }
 
+// Read a note argument that may be a number (MIDI pitch, possibly fractional)
+// or a note-name string ("C4", "c#4", "Bb3", "C" with the default octave). A
+// string that fails to parse yields -1 (out of range) so the note simply gets
+// clamped/dropped downstream rather than silently becoming pitch 0.
+static float readNoteArg(lua_State* L, int idx, float def) {
+    if (lua_type(L, idx) == LUA_TSTRING) {
+        const char* s = lua_tostring(L, idx);
+        return (float)MusicTheory::parseNoteName(s ? s : "");
+    }
+    return (float)luaL_optnumber(L, idx, def);
+}
+
 // ---- MIDI emit trampolines --------------------------------------------------
 static void setOffsetIfBlock(lua_State* L, LuaRuntime* self, int argIndex) {
     if (self->rate == ScriptRate::PerBlock && self->curSink) {
@@ -185,7 +201,7 @@ static void setOffsetIfBlock(lua_State* L, LuaRuntime* self, int argIndex) {
 static int l_note(lua_State* L) {
     LuaRuntime* self = self_(L);
     if (!self->curSink) return 0;
-    float p = (float)luaL_optnumber(L, 1, 0);
+    float p = readNoteArg(L, 1, 0);
     float v = (float)luaL_optnumber(L, 2, 0);
     float d = (float)luaL_optnumber(L, 3, 0.1);
     setOffsetIfBlock(L, self, 4);
@@ -195,7 +211,7 @@ static int l_note(lua_State* L) {
 static int l_noteon(lua_State* L) {
     LuaRuntime* self = self_(L);
     if (!self->curSink) return 0;
-    float p = (float)luaL_optnumber(L, 1, 0);
+    float p = readNoteArg(L, 1, 0);
     float v = (float)luaL_optnumber(L, 2, 0);
     setOffsetIfBlock(L, self, 3);
     self->curSink->emitNoteOn(self->readOut(), p, v);
@@ -204,7 +220,7 @@ static int l_noteon(lua_State* L) {
 static int l_noteoff(lua_State* L) {
     LuaRuntime* self = self_(L);
     if (!self->curSink) return 0;
-    float p = (float)luaL_optnumber(L, 1, 0);
+    float p = readNoteArg(L, 1, 0);
     setOffsetIfBlock(L, self, 2);
     self->curSink->emitNoteOff(self->readOut(), p);
     return 0;
@@ -261,6 +277,54 @@ static int l_shape(lua_State* L) {
     return 1;
 }
 
+// ---- Note-name / frequency conversion ---------------------------------------
+// notenum("C4") -> 60   |   notenum("C", 4) -> 60   |   notenum(60) -> 60
+// Returns -1 on a parse error or out-of-range result.
+static int l_notenum(lua_State* L) {
+    if (lua_type(L, 1) == LUA_TSTRING) {
+        const char* s = lua_tostring(L, 1);
+        int n;
+        if (lua_gettop(L) >= 2 && lua_isnumber(L, 2))
+            n = MusicTheory::noteNumber(s ? s : "", (int)lua_tointeger(L, 2));
+        else
+            n = MusicTheory::parseNoteName(s ? s : "");
+        lua_pushinteger(L, n);
+    } else {
+        lua_pushinteger(L, (lua_Integer)luaL_optinteger(L, 1, -1));
+    }
+    return 1;
+}
+// notename(60) -> "C4". Accepts a note name too (round-trips via its number).
+static int l_notename(lua_State* L) {
+    int n;
+    if (lua_type(L, 1) == LUA_TSTRING) {
+        const char* s = lua_tostring(L, 1);
+        n = MusicTheory::parseNoteName(s ? s : "");
+    } else {
+        n = (int)luaL_optinteger(L, 1, -1);
+    }
+    if (n < 0 || n > 127) { lua_pushnil(L); return 1; }
+    lua_pushstring(L, MusicTheory::noteName(n).c_str());
+    return 1;
+}
+// notefreq("C4") / notefreq(60) / notefreq("C", 4) -> Hz via the PROJECT tuning.
+static int l_notefreq(lua_State* L) {
+    LuaRuntime* self = self_(L);
+    int n;
+    if (lua_type(L, 1) == LUA_TSTRING) {
+        const char* s = lua_tostring(L, 1);
+        if (lua_gettop(L) >= 2 && lua_isnumber(L, 2))
+            n = MusicTheory::noteNumber(s ? s : "", (int)lua_tointeger(L, 2));
+        else
+            n = MusicTheory::parseNoteName(s ? s : "");
+    } else {
+        n = (int)luaL_optinteger(L, 1, -1);
+    }
+    if (n < 0 || n > 127) { lua_pushnumber(L, 0.0); return 1; }
+    lua_pushnumber(L, self->callNoteFreq(n));
+    return 1;
+}
+
 // The convenience-alias prelude (sin, clamp, saw, noise, ...) is shared with the
 // static-shape baker; see lua_prelude.h (kSoundShopLuaPrelude).
 
@@ -268,6 +332,11 @@ void LuaRuntime::registerApi() {
     // Shared.
     lua_pushcfunction(L, l_shape);  lua_setglobal(L, "shape");
     lua_pushcfunction(L, l_sig);    lua_setglobal(L, "sig");
+    // Note-name conversions are pure helpers - available in both roles (a Signal
+    // script can use notefreq() to drive an oscillator at a note's pitch).
+    lua_pushcfunction(L, l_notenum);  lua_setglobal(L, "notenum");
+    lua_pushcfunction(L, l_notename); lua_setglobal(L, "notename");
+    lua_pushcfunction(L, l_notefreq); lua_setglobal(L, "notefreq");
     if (role == ScriptRole::Midi) {
         lua_pushcfunction(L, l_note);    lua_setglobal(L, "note");
         lua_pushcfunction(L, l_noteon);  lua_setglobal(L, "noteon");

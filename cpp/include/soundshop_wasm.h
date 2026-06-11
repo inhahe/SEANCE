@@ -39,6 +39,15 @@ void ss_log(const char* msg);
 __attribute__((import_module("env"), import_name("ss_get_param")))
 float ss_get_param(int32_t index);
 
+// Frequency (Hz) of a MIDI note using the PROJECT tuning system (Equal
+// Temperament / Pythagorean / Just Intonation / Meantone) and concert pitch —
+// NOT a hardcoded 12-TET A440. This is the one note helper that needs the host,
+// because only the host knows the project's tuning. Returns 0 for a note
+// outside 0..127. (Name <-> number conversion is pure and lives in this header
+// as ss_notenum / ss_notename below — no host round-trip needed.)
+__attribute__((import_module("env"), import_name("ss_note_to_freq")))
+float ss_note_to_freq(int32_t midinote);
+
 // Emit a MIDI event to the output buffer (MIDI output 0).
 __attribute__((import_module("env"), import_name("ss_midi_out")))
 void ss_midi_out(int32_t sample_offset, uint8_t status, uint8_t d1, uint8_t d2);
@@ -130,6 +139,74 @@ typedef struct {
 
 static inline ss_midi_event_t* ss_midi_in_events(void) {
     return (ss_midi_event_t*)(uintptr_t)SS_MIDI_IN_OFF;
+}
+
+// ============================================================================
+// Note names <-> MIDI numbers (pure, host-independent)
+// ============================================================================
+// Octave convention matches the rest of SoundShop: C4 = MIDI 60, A4 = 69, so
+// midi = (octave + 1) * 12 + pitch_class. These run entirely inside the module
+// (no host call) because they don't depend on any project state — only
+// ss_note_to_freq()/ss_notefreq() need the host, for the tuning.
+
+// Parse a note-name string like "C4", "c#4", "Bb3" to a MIDI number. Letter
+// A-G (case-insensitive), any run of '#'/'+' (sharp) or 'b' (flat) which may
+// spill into the adjacent octave (so "B#4" = C5, "Cb4" = B3), optional signed
+// octave (defaults to 4 when absent). Returns -1 on a parse error or a result
+// outside 0..127, so callers can detect "not a valid note name".
+static inline int32_t ss_notenum(const char* s) {
+    if (!s) return -1;
+    static const int8_t base[7] = { 9, 11, 0, 2, 4, 5, 7 }; // A B C D E F G
+    const char* p = s;
+    while (*p == ' ' || *p == '\t') ++p;
+    char c = *p;
+    if (c >= 'a' && c <= 'g') c = (char)(c - 'a' + 'A');
+    if (c < 'A' || c > 'G') return -1;
+    int semi = base[c - 'A'];
+    ++p;
+    for (;;) {
+        if (*p == '#' || *p == '+') { semi += 1; ++p; }
+        else if (*p == 'b' || *p == 'B') { semi -= 1; ++p; }
+        else break;
+    }
+    int octave = 4;
+    int neg = 0;
+    if (*p == '-' || *p == '+') { neg = (*p == '-'); ++p; }
+    const char* digits = p;
+    int val = 0;
+    while (*p >= '0' && *p <= '9') { val = val * 10 + (*p - '0'); ++p; }
+    if (p != digits) octave = neg ? -val : val;
+    else if (neg) return -1; // lone '-' with no digits
+    while (*p == ' ' || *p == '\t') ++p;
+    if (*p != '\0') return -1; // trailing junk -> not a note name
+    int midi = (octave + 1) * 12 + semi;
+    if (midi < 0 || midi > 127) return -1;
+    return midi;
+}
+
+// Format a MIDI number as a note name into `out` (needs >= 5 bytes), e.g.
+// 60 -> "C4". Returns `out`. Out-of-range notes produce "?".
+static inline char* ss_notename(int32_t midi, char* out) {
+    static const char* names[12] = { "C","C#","D","D#","E","F","F#","G","G#","A","A#","B" };
+    if (!out) return out;
+    if (midi < 0 || midi > 127) { out[0] = '?'; out[1] = '\0'; return out; }
+    const char* nm = names[midi % 12];
+    int octave = midi / 12 - 1;
+    int i = 0;
+    out[i++] = nm[0];
+    if (nm[1]) out[i++] = nm[1];
+    if (octave < 0) { out[i++] = '-'; octave = -octave; }
+    if (octave >= 10) out[i++] = (char)('0' + octave / 10);
+    out[i++] = (char)('0' + octave % 10);
+    out[i] = '\0';
+    return out;
+}
+
+// Frequency (Hz) of a note name like "C4" via the project tuning — convenience
+// wrapper combining ss_notenum() with the host's ss_note_to_freq().
+static inline float ss_notefreq(const char* name) {
+    int32_t n = ss_notenum(name);
+    return (n < 0) ? 0.0f : ss_note_to_freq(n);
 }
 
 // ============================================================================

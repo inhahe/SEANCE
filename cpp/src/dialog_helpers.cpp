@@ -1,4 +1,6 @@
 #include "dialog_helpers.h"
+#include <juce_audio_devices/juce_audio_devices.h>
+#include <juce_audio_utils/juce_audio_utils.h>  // AudioDeviceSelectorComponent
 
 #ifdef _WIN32
   #ifndef NOMINMAX
@@ -89,6 +91,31 @@ private:
 
     JUCE_DECLARE_NON_COPYABLE(ToolDialogWindow)
 };
+
+juce::DialogWindow* launchAudioDeviceSettings(juce::AudioDeviceManager& dm,
+                                              juce::Component* centreAround) {
+    // JUCE's built-in selector covers driver type / input / output / sample
+    // rate / buffer size + MIDI input in one panel. Owned by the dialog.
+    auto* selector = new juce::AudioDeviceSelectorComponent(
+        dm,
+        0, 2,    // min/max input channels
+        0, 2,    // min/max output channels
+        true,    // show MIDI input options
+        false,   // don't show MIDI output options
+        true,    // show channels as stereo pairs
+        false);  // don't hide advanced options
+    selector->setSize(500, 400);
+
+    juce::DialogWindow::LaunchOptions opts;
+    opts.content.setOwned(selector);
+    opts.dialogTitle = "Audio Device Settings";
+    opts.dialogBackgroundColour = juce::Colour(40, 40, 45);
+    opts.escapeKeyTriggersCloseButton = true;
+    opts.useNativeTitleBar = false;
+    opts.resizable = true;
+    opts.componentToCentreAround = centreAround;
+    return launchToolDialog(opts);
+}
 
 juce::DialogWindow* launchToolDialog(juce::DialogWindow::LaunchOptions& opts) {
     jassert(opts.content != nullptr);

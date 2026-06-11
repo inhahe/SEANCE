@@ -33,6 +33,15 @@
 
 namespace SoundShop {
 
+// Shared "active/lit" accent for transport toggles. The Loop button uses it
+// while looping is enabled, and the Play button uses it while audio is
+// actually playing, so both light up the same recognisable blue (requested:
+// Play and Loop share the active colour). Distinct from the green/red used by
+// the metronome, monitor and keyboard-MIDI toggles. The resting (inactive)
+// look is the LookAndFeel default, restored via removeColour rather than a
+// hardcoded grey, so an un-lit transport button matches every other button.
+static const juce::Colour kTransportLitColour(64, 132, 223);
+
 // Returns true if this machine has a battery (laptop). JUCE 8.0.12 doesn't
 // wrap battery detection cross-platform, so we touch the OS APIs directly:
 // Win32 GetSystemPowerStatus on Windows, fall through to "no battery"
@@ -312,8 +321,10 @@ MainContentComponent::MainContentComponent() {
         } else {
             graph.loopEnabled = false;
         }
-        loopBtn.setColour(juce::TextButton::buttonColourId,
-            graph.loopEnabled ? juce::Colour(60, 60, 120) : juce::Colour(55, 55, 60));
+        if (graph.loopEnabled)
+            loopBtn.setColour(juce::TextButton::buttonColourId, kTransportLitColour);
+        else
+            loopBtn.removeColour(juce::TextButton::buttonColourId);
     };
 
     addAndMakeVisible(songBtn);
@@ -504,6 +515,11 @@ MainContentComponent::MainContentComponent() {
                     return graph.findNode(p->nodeId) == nullptr;
                 }),
             editorPanels.end());
+        // Refresh any open wavetable editor windows so they re-decode their
+        // doc from the restored node->script. Without this, an undo/redo
+        // (including one capturing a mic/file capture into the library) would
+        // leave the open editor showing its stale pre-undo doc.
+        LayeredWaveEditorComponent::reloadOpenEditorsAfterSnapshot(graph);
         audioEngine.getGraphProcessor().requestRebuild();
         if (graphComponent) graphComponent->repaint();
         for (auto& panel : editorPanels)
@@ -910,6 +926,17 @@ void MainContentComponent::timerCallback() {
     }
     transport.playing = engineIsPlaying;
 
+    // Light the Play button while audio is actually playing, sharing the Loop
+    // button's accent colour. Driven off the engine's real playing state (not
+    // just onPlay/onStop) so it also tracks programmatic stops - e.g. the song
+    // auto-stopping at its end. Guarded so we don't churn the colour every tick.
+    if (engineIsPlaying) {
+        if (playBtn.findColour(juce::TextButton::buttonColourId) != kTransportLitColour)
+            playBtn.setColour(juce::TextButton::buttonColourId, kTransportLitColour);
+    } else if (playBtn.isColourSpecified(juce::TextButton::buttonColourId)) {
+        playBtn.removeColour(juce::TextButton::buttonColourId);
+    }
+
     // Stop is only actionable while the song is actually playing. Grey it out
     // (with an explanatory tooltip) when stopped/paused so it's clear there's
     // nothing to stop - and re-enable it the moment playback starts. Guarded
@@ -929,11 +956,11 @@ void MainContentComponent::timerCallback() {
     // an undo/redo, or a tracker import whose module loops back to a section.
     // Syncing here (guarded so we don't repaint every tick) makes the button
     // reflect all of those uniformly. Colours mirror the onClick handler.
-    {
-        juce::Colour want = graph.loopEnabled ? juce::Colour(60, 60, 120)
-                                              : juce::Colour(55, 55, 60);
-        if (loopBtn.findColour(juce::TextButton::buttonColourId) != want)
-            loopBtn.setColour(juce::TextButton::buttonColourId, want);
+    if (graph.loopEnabled) {
+        if (loopBtn.findColour(juce::TextButton::buttonColourId) != kTransportLitColour)
+            loopBtn.setColour(juce::TextButton::buttonColourId, kTransportLitColour);
+    } else if (loopBtn.isColourSpecified(juce::TextButton::buttonColourId)) {
+        loopBtn.removeColour(juce::TextButton::buttonColourId);
     }
 
     // Evaluate Python signals on UI thread and apply to plugin parameters
@@ -2082,7 +2109,10 @@ void MainContentComponent::showPluginUI(int nodeId) {
         return;
     }
 
-    // XY Pad: reopen the pad window on double-click
+    // XY Pad: reopen the pad window on double-click. Non-modal - a live input
+    // surface must stay usable alongside the main window, the transport, and
+    // other input-node editors while the song plays (matches the graph-view
+    // open path). XYPadComponent is node-id-safe, so it survives node deletion.
     if (node && node->script == "__xypad__") {
         auto* pad = new XYPadComponent(graph, node->id);
         juce::DialogWindow::LaunchOptions opts;
@@ -2093,7 +2123,7 @@ void MainContentComponent::showPluginUI(int nodeId) {
         opts.useNativeTitleBar = false;
         opts.resizable = true;
         opts.componentToCentreAround = this;
-        if (auto* dlg = SoundShop::launchToolDialog(opts))
+        if (auto* dlg = SoundShop::launchNonModalToolDialog(opts))
             dlg->setResizeLimits(320, 400, 6000, 6000);
         return;
     }
@@ -4905,28 +4935,9 @@ void MainContentComponent::showAudioDeviceSettings() {
     auto* dm = audioEngine.getDeviceManager();
     if (!dm) return;
 
-    // Use JUCE's built-in AudioDeviceSelectorComponent which provides full
-    // device type / input / output / sample rate / buffer size selection.
-    // This replaces our old custom info panel.
-    auto* selector = new juce::AudioDeviceSelectorComponent(
-        *dm,
-        0, 2,    // min/max input channels
-        0, 2,    // min/max output channels
-        true,    // show MIDI input options
-        false,   // don't show MIDI output options
-        true,    // show channels as stereo pairs
-        false);  // don't hide advanced options
-    selector->setSize(500, 400);
-
-    juce::DialogWindow::LaunchOptions opts;
-    opts.content.setOwned(selector);
-    opts.dialogTitle = "Audio Device Settings";
-    opts.dialogBackgroundColour = juce::Colour(40, 40, 45);
-    opts.escapeKeyTriggersCloseButton = true;
-    opts.useNativeTitleBar = false;
-    opts.resizable = true;
-    opts.componentToCentreAround = this;
-    SoundShop::launchToolDialog(opts);
+    // Shared with the microphone-capture dialog's "Audio device..." button so
+    // both routes build the same AudioDeviceSelectorComponent.
+    SoundShop::launchAudioDeviceSettings(*dm, this);
     return;
 
 #if 0

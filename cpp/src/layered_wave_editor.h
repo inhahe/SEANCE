@@ -545,6 +545,9 @@ struct WavetableDoc {
     // Find the index of a library entry with a given id, or -1.
     int findLibraryIndexById(int id) const;
 
+    // TEMP throwaway diagnostic - dumps grid/cell/scatter/library state to file.
+    void debugDumpState(const char* tag) const;
+
     // ---- Per-cell frame access (rerouted through the library) ----
 
     // Pointer to the waveform of cell `idx` (mode-aware), or nullptr
@@ -684,6 +687,31 @@ public:
     void resized() override;
     void paint(juce::Graphics& g) override;
     void timerCallback() override;
+    // Ctrl+Z / Ctrl+Shift+Z / Ctrl+Y while THIS editor's pop-out window holds
+    // keyboard focus. The editor is a separate top-level DialogWindow, so these
+    // keystrokes never reach MainContentComponent::keyPressed (the main-window
+    // undo handler) - without this override, pressing Ctrl+Z right after a
+    // capture (the dialog has focus) does nothing. Routes to the shared
+    // graph.undoTree so undo/redo works identically from inside the editor; the
+    // snapshot restore then refreshes this editor via reloadFromNode().
+    bool keyPressed(const juce::KeyPress& key) override;
+
+    // Re-read this editor's `wave` document from its node's (restored) script
+    // and rebuild the UI WITHOUT committing. Called after an external undo/redo
+    // rewrites the node out from under the editor: the in-memory `wave` is
+    // decoded only at construction, so a snapshot restore would otherwise leave
+    // the editor showing stale data - and its debounce timer would re-commit
+    // that stale data, silently undoing the undo. Cancels the pending debounce,
+    // re-decodes, preserves the selection when it survives, and refreshes every
+    // view. Closes the window if the node itself was undone away.
+    void reloadFromNode();
+
+    // Refresh every open wavetable editor after an undo/redo snapshot restore.
+    // Iterates the live-editor registry and calls reloadFromNode() on each
+    // editor bound to `g`. Invoked from the main window's onLoadSnapshot once
+    // the graph has been reparsed from the snapshot. Static because the main
+    // window doesn't own the editors' (non-modal DialogWindow) lifetimes.
+    static void reloadOpenEditorsAfterSnapshot(NodeGraph& g);
 
     // Layer access goes through these so the WaveLayerEditor rows don't have
     // to know about the current frame selection.
@@ -727,6 +755,24 @@ private:
     // updates only currentLibraryId.
     int currentLibraryId = -1;
     int currentFrameIdx = 0;            // Grid mode: row-major cell index. Scatter mode: scatter index.
+
+    // Which surface the user most recently SELECTED on. The keyboard Delete
+    // key needs this because currentLibraryId and currentFrameIdx are both
+    // updated when you click a populated cell/dot (see Linkage above), so on
+    // its own "is a library entry highlighted?" can't tell whether the user
+    // means "delete this waveform definition" or "remove this placement".
+    //   Library = last picked a row in the Library list  -> Delete removes the
+    //             waveform DEFINITION (and every placement referencing it).
+    //   View    = last picked a cell/dot in the arrangement view or Cells list
+    //             -> Delete removes only THIS placement; the library waveform
+    //             survives so it can be re-placed.
+    // Set at the genuine click gestures only (library row onClick, Cells-list
+    // row onClick, ScatterView cell/dot mouseDown) - NOT in the programmatic
+    // switchToFrame / setEditingLibraryEntry paths - so internal navigation
+    // (capture binding, post-delete fallback, drag-swap) never silently
+    // changes which thing Delete will hit.
+    enum class SelectionSurface { Library, View };
+    SelectionSurface activeSelectionSurface = SelectionSurface::Library;
     std::vector<float> currentPosition; // Internal default placement for new Scatter frames (center of N-D cube).
     std::vector<float> previewSamples;
     // Bounds of the single-cycle preview strip on the right pane, set by
@@ -905,7 +951,20 @@ private:
     void showCapturePanelInline(int sourceKind,
                                 bool replaceCurrentEntry = false);
     void dismissCapturePanel();
-    void appendCapturedFramesAlongPosition(std::vector<std::unique_ptr<IWavetableFrame>> frames);
+    // Add captured waveforms to the Library list ONLY - they are not placed
+    // into the arrangement, so capturing never grows the grid's cell count
+    // or adds a scatter dot. Placement is a separate explicit step via the
+    // Library list's "Assign to selected cell". The first new entry becomes
+    // the right-pane editor's target; the cell/scatter selection is left
+    // untouched.
+    //
+    // sourceKind (0 = project song, 1 = mic, 2 = file; matches
+    // showCapturePanelInline) is used only to build each new library
+    // entry's display name - "Mic - Crossfade loop" etc. - reflecting the
+    // capture source and the granular freeze method instead of a generic
+    // "Waveform N". -1 falls back to the auto-generated default name.
+    void addCapturedFramesToLibrary(std::vector<std::unique_ptr<IWavetableFrame>> frames,
+                                    int sourceKind = -1);
     // Build the capture panel's metadata write-through sink: commits "As
     // note" pitch / freeze mode / crossfade edits straight to the library
     // frame the editor currently targets (currentLibraryId, re-looked-up
@@ -953,6 +1012,21 @@ private:
     // and pings the pop-out wavetable view. No-op if libId is the current
     // target. libId == -1 explicitly clears the target.
     void setEditingLibraryEntry(int libId);
+
+    // Pop a modal text-entry dialog to rename the library entry `libId`, then
+    // apply it via setLibraryEntryName(). The discoverable rename affordance
+    // for the Library list rows and the arrangement-view dots/cells (their
+    // right-click menus call this); the right-pane identity-row nameEditor is
+    // the inline equivalent for whichever entry the editor is currently on.
+    // No-op if libId no longer exists.
+    void renameLibraryEntry(int libId);
+
+    // Set library entry `libId`'s display name and run the full settle: commit
+    // to the node script, push an undo step, rebuild the Library list, sync the
+    // identity row if this is the current target, and ping the pop-out. Shared
+    // by renameLibraryEntry() (popup) and the identity-row nameEditor (inline).
+    // No-op if the entry is missing or the name is unchanged.
+    void setLibraryEntryName(int libId, const std::string& newName);
 
     void rebuildRows();
     void updateHintText();

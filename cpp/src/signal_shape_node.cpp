@@ -206,6 +206,9 @@ void SignalShapeProcessor::reloadIfScriptChanged() {
 void SignalShapeProcessor::bindShape() {
     if (!runtime) return;
     runtime->setShape([this](float pos) { return sampleShape(shapeSamples, pos); });
+    // Bind notefreq()'s mapper to the project tuning so a Signal-role Lua script
+    // that drives an oscillator at a note's pitch matches the rest of the project.
+    runtime->setNoteToFreq([this](int n) { return transport.noteToFreq(n); });
 }
 
 void SignalShapeProcessor::rebuildShapeSamples() {

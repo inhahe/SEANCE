@@ -300,9 +300,30 @@ struct Node {
     // the node's static pins - it's serialized as part of the normal
     // pin list in project_file.cpp. The modPin just records the binding.
     struct ModPin {
+        // How an incoming control cable affects the bound param:
+        //  - Modulate ("Mod"): bipolar-additive around the knob's resting value
+        //    (baseValue). 0.5 = no change. The user can still edit the knob; the
+        //    cable swings the param around that center. Pin labelled "Mod: ".
+        //  - Absolute ("Set"): the cable's value *is* the param value, mapped
+        //    edge-to-edge across [min,max]. The knob is locked while connected.
+        //    Pin labelled "Set: ".
+        enum class Mode { Modulate, Absolute };
         int paramIndex = -1;  // index into this node's params[]
         int pinId = -1;       // matching pin id in pinsIn
-        float depth = 1.0f;   // modulation depth: 0=none, 1=full range
+        float depth = 1.0f;   // modulation depth: 0=none, 1=full range (Modulate only)
+        Mode mode = Mode::Modulate;  // default Modulate: old projects (no saved
+                                     // mode field) keep their original behaviour
+
+        // Runtime-only connectivity cache (NOT serialized). Recomputed by the
+        // graph processor at build time: true iff some link's endPin == pinId,
+        // i.e. a cable is actually feeding this modulation input. Some pins
+        // (e.g. wavetable "Mod: Position" pins) are created eagerly so the user
+        // can cable to them, but their modPin binding exists even when nothing
+        // is connected. applySignalModulations() must skip those idle bindings -
+        // otherwise it reads the pin's silent control channel (0.0) and forces
+        // the bound param to its minimum, overriding the user's manual setting.
+        // Mirrors Node::reachesOutput (same recompute-on-build discipline).
+        bool connected = false;
     };
     std::vector<ModPin> modPins;
 
@@ -411,6 +432,7 @@ struct Node {
         float  embeddedPitchHz  = 440.0f;
         int    freezeMode       = 0;    // 0 = CrossfadeLoop
         int    crossfadeSamples = 2400;
+        float  gain             = 1.0f; // mirrors IWavetableFrame::gain
     };
 
     // Audition MIDI events injected from the UI (thread-safe via simple flag)
@@ -727,6 +749,41 @@ public:
                     }
                 }
             }
+        }
+        return false;
+    }
+
+    // True if one *specific* param on a node is currently being driven by a
+    // connected Signal/Param cable - i.e. it has a modulation input pin
+    // (Node::ModPin) whose pin has a live link plugged into it. This is the
+    // per-param version of hasSignalInput(): only the actually-driven param's
+    // manual control should lock, not every param on the node.
+    bool paramHasSignalInput(int nodeId, int paramIndex) const {
+        const Node* nd = nullptr;
+        for (const auto& n : nodes) if (n.id == nodeId) { nd = &n; break; }
+        if (!nd) return false;
+        for (const auto& mp : nd->modPins) {
+            if (mp.paramIndex != paramIndex) continue;
+            for (const auto& link : links)
+                if (link.endPin == mp.pinId) return true;
+        }
+        return false;
+    }
+
+    // True if a param is driven by a connected *Absolute* ("Set") cable. Such a
+    // param is fully locked in the UI - the cable sets its value directly, so
+    // there is no resting/base value for the user to edit. A param driven only
+    // by Modulate ("Mod") cables is NOT absolute-locked: the user can still
+    // drag its knob to set the center the modulation swings around.
+    bool paramHasAbsoluteInput(int nodeId, int paramIndex) const {
+        const Node* nd = nullptr;
+        for (const auto& n : nodes) if (n.id == nodeId) { nd = &n; break; }
+        if (!nd) return false;
+        for (const auto& mp : nd->modPins) {
+            if (mp.paramIndex != paramIndex) continue;
+            if (mp.mode != Node::ModPin::Mode::Absolute) continue;
+            for (const auto& link : links)
+                if (link.endPin == mp.pinId) return true;
         }
         return false;
     }

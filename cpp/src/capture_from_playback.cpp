@@ -1,6 +1,7 @@
 #include "capture_from_playback.h"
 #include "audio_engine.h"
 #include "audio_cache.h"
+#include "dialog_helpers.h"
 #include "granular_frame.h"
 #include "graph_processor.h"
 #include "node_graph.h"
@@ -35,6 +36,28 @@ static const char* sourceName(CaptureSource s) {
         case CaptureSource::File:     return "audio file";
     }
     return "?";
+}
+
+// Sticky capture-dialog settings, remembered across opens within a session.
+// The dialog seeds its controls from this on construction and writes the
+// current values back on destruction, so re-opening the mic/file/playback
+// capture dialog restores the user's last waveform count, gain, and labelled
+// pitch instead of resetting to defaults every time. Process-global (one
+// shared set for all three sources, since they share these controls);
+// deliberately NOT persisted to disk - it's a session convenience, not a
+// project/preference value. The per-waveform "Samples per waveform" window is
+// intentionally excluded: it auto-fits to the selection/count on every open
+// (syncWindowToFitSlots), so a remembered value would just be overwritten and
+// fighting that would be confusing.
+struct CaptureDialogPrefs {
+    int    numFrames = 8;       // numFramesSlider
+    double gain      = 1.0;     // gainSlider
+    int    noteId    = 9 + 1;   // noteCombo selected id (A)
+    int    octaveId  = 4 + 1;   // octaveCombo selected id (4)
+};
+static CaptureDialogPrefs& captureDialogPrefs() {
+    static CaptureDialogPrefs p;
+    return p;
 }
 
 // ---- Note/Octave <-> Hz helpers (12-TET, A4 = 440 Hz, scientific
@@ -149,25 +172,94 @@ CaptureFromPlaybackDialog::CaptureFromPlaybackDialog(CaptureSource src, int ts, 
     : onCapture(std::move(onCap)),
       source(src),
       tableSize(std::max(64, ts)) {
-    // Height bumped to make room for the embedded pitch row underneath
-    // the num-frames slider while keeping the waveform area unchanged.
-    setSize(720, 472);
+    // Height bumped to make room for the embedded pitch row and the freeze-
+    // mode row underneath the num-frames slider while keeping the waveform
+    // area unchanged.
+    setSize(720, 536);
 
     addAndMakeVisible(numFramesLabel);
-    numFramesLabel.setText("Number of waveforms:", juce::dontSendNotification);
+    numFramesLabel.setText("Waveforms to slice out:", juce::dontSendNotification);
     numFramesLabel.setJustificationType(juce::Justification::centredRight);
 
     addAndMakeVisible(numFramesSlider);
     numFramesSlider.setRange(1.0, 32.0, 1.0);
-    numFramesSlider.setValue(8.0, juce::dontSendNotification);
+    // Seed from the sticky session prefs so re-opening the dialog restores the
+    // last waveform count (see captureDialogPrefs()).
+    numFramesSlider.setValue((double)captureDialogPrefs().numFrames,
+                             juce::dontSendNotification);
     numFramesSlider.setSliderStyle(juce::Slider::LinearHorizontal);
     numFramesSlider.setTextBoxStyle(juce::Slider::TextBoxRight, false, 60, 22);
     numFramesSlider.setTooltip(
-        "How many captured waveforms to extract across the selected region. "
-        "Each one takes a short audio window at one position; the synth "
-        "morphs through them as the Position parameter sweeps from 0 to 1. "
-        "More waveforms = finer evolution but more memory.");
-    numFramesSlider.onValueChange = [this]() { updateRegionInfoLabel(); };
+        "Slices the selected region into this many short snapshots. The "
+        "wavetable morphs through them as its Position parameter sweeps from "
+        "0 to 1, so the captured sound evolves the way the source did. "
+        "1 = a single frozen snapshot; more = smoother evolution but more "
+        "memory.");
+    numFramesSlider.onValueChange = [this]() {
+        // Mic: refit the per-waveform window to the new slot spacing so the
+        // bands stay zero-gap when the count changes. Gaps / overlap are
+        // reserved for region resizing, so we only refit here, not on a
+        // handle drag. No-op for the auto-sizing sources.
+        syncWindowToFitSlots();
+        // Enable / disable + relabel the per-waveform slider for the new count
+        // (disabled at 1 waveform, where the window just spans the selection).
+        updateSamplesPerWaveformControl();
+        // Re-range + clamp the "Preview waveform" picker to the new count.
+        updatePreviewIndexControl();
+        updateRegionInfoLabel();
+        if (auditioning) regenerateAuditionGrain();
+        repaint(waveRect);
+    };
+
+    // Mic only: per-waveform source-window length, in samples. Other sources
+    // auto-size the window (see effectiveSrcLen). 48000 samples ~ 1 second at
+    // 48 kHz, matching the auto default so the captured character is the same
+    // until the user deliberately changes it.
+    if (source == CaptureSource::Mic) {
+        addAndMakeVisible(samplesPerWaveformLabel);
+        samplesPerWaveformLabel.setText("Samples per waveform:", juce::dontSendNotification);
+        samplesPerWaveformLabel.setJustificationType(juce::Justification::centredRight);
+
+        addAndMakeVisible(samplesPerWaveformSlider);
+        // Max = the full display/capture buffer (kDisplayWindowSamples) so the
+        // window can always grow to match the whole selection - e.g. with one
+        // waveform the section must be able to span the entire selection, which
+        // can be the whole buffer. A smaller cap (the old 192000) left a single
+        // band stuck far short of a large selection. Step of 1 sample so the
+        // window can land exactly on the slot spacing (regionLen / n); a coarse
+        // step would leave the bands a few samples shy of tiling and reopen a
+        // hairline gap.
+        samplesPerWaveformSlider.setRange(2000.0, (double)kDisplayWindowSamples, 1.0);
+        samplesPerWaveformSlider.setValue(48000.0, juce::dontSendNotification);
+        samplesPerWaveformSlider.setSliderStyle(juce::Slider::LinearHorizontal);
+        samplesPerWaveformSlider.setTextBoxStyle(juce::Slider::TextBoxRight, false, 70, 22);
+        // Tooltip + enabled state are set by updateSamplesPerWaveformControl(),
+        // which also handles the single-waveform case where this slider is
+        // disabled (the lone window just spans the whole selection). Called
+        // below once the control exists, and again whenever the count or region
+        // changes.
+        samplesPerWaveformSlider.onValueChange = [this]() {
+            updateRegionInfoLabel();
+            if (auditioning) regenerateAuditionGrain();
+            repaint(waveRect);
+        };
+
+        addAndMakeVisible(fitWidthBtn);
+        // Tooltip + enabled state for both this button and the slider are set by
+        // updateSamplesPerWaveformControl() (called below), which disables both
+        // at a single waveform.
+        fitWidthBtn.onClick = [this]() {
+            // syncWindowToFitSlots writes the slider with dontSendNotification
+            // (so it can be reused from the count handler without recursing),
+            // so refresh the dependent state here the way onValueChange would.
+            syncWindowToFitSlots();
+            updateRegionInfoLabel();
+            if (auditioning) regenerateAuditionGrain();
+            repaint(waveRect);
+        };
+
+        updateSamplesPerWaveformControl();
+    }
 
     addAndMakeVisible(regionInfoLabel);
     regionInfoLabel.setJustificationType(juce::Justification::centredLeft);
@@ -192,7 +284,10 @@ CaptureFromPlaybackDialog::CaptureFromPlaybackDialog(CaptureSource src, int ts, 
                 hint = "Make a sound into your audio input device, then drag the orange "
                        "handles to select a region. Each captured waveform takes a short "
                        "window at its position; the wavetable's Position parameter "
-                       "sweeps through them.";
+                       "sweeps through them.\n"
+                       "If the input sounds wrong (garbled, noisy, or like your computer's "
+                       "own audio), click \"Audio device...\" and switch the driver type to "
+                       "DirectSound.";
                 break;
             case CaptureSource::File:
                 hint = "Load an audio file, then drag the orange handles to select the "
@@ -207,12 +302,46 @@ CaptureFromPlaybackDialog::CaptureFromPlaybackDialog(CaptureSource src, int ts, 
     hintLabel.setFont(juce::Font(juce::FontOptions(12.0f)));
     hintLabel.setColour(juce::Label::textColourId, juce::Colour(160, 160, 180));
 
-    // Live-source controls.
-    if (isLiveSource()) {
-        addAndMakeVisible(freezeToggle);
-        freezeToggle.setTooltip(
+    // Live-source controls. Playback keeps the simple "Pause view" checkbox;
+    // Mic gets a prominent Pause/Go-live button that also drives input
+    // monitoring (so the user hears the mic) - set up below.
+    if (source == CaptureSource::Playback) {
+        addAndMakeVisible(pauseToggle);
+        pauseToggle.setTooltip(
             "Pause the auto-refresh so the waveform display stays still while you "
             "drag the region handles. Turn it off to see new audio.");
+    } else if (source == CaptureSource::Mic) {
+        addAndMakeVisible(micLiveBtn);
+        micLiveBtn.setColour(juce::TextButton::buttonColourId,
+                             juce::Colour(150, 90, 40)); // amber-ish = live/active
+        micLiveBtn.onClick = [this]() { setMicLive(micPaused); };
+
+        // Escape hatch for the WASAPI-combined-device input-corruption bug:
+        // open the Audio Device Settings so the user can switch the driver
+        // type (DirectSound captures a webcam/USB mic correctly when WASAPI
+        // garbles it). See the note appended to the Mic hint text.
+        addAndMakeVisible(audioDeviceBtn);
+        audioDeviceBtn.setTooltip(
+            "Open Audio Device Settings. If the microphone sounds wrong "
+            "(garbled, noisy, or like your computer's own audio), change the "
+            "driver type to DirectSound here - that fixes the most common "
+            "Windows capture problem.");
+        audioDeviceBtn.onClick = [this]() {
+            if (auto* eng = AudioEngine::getInstance())
+                if (auto* dm = eng->getDeviceManager())
+                    SoundShop::launchAudioDeviceSettings(*dm, this);
+        };
+
+        // Enable input monitoring so the mic is audible immediately, saving
+        // the engine's prior global state so we can restore it on close.
+        // Also make sure the device actually has a live input channel open -
+        // a mic plugged in after launch (or a Windows default-device mismatch)
+        // can leave input disabled, so the dialog would show no activity. This
+        // restarts the device only if input is currently off.
+        if (auto* eng = AudioEngine::getInstance()) {
+            priorInputMonitoring = eng->inputMonitoring.load();
+            eng->ensureAudioInputEnabled();
+        }
     }
 
     // File-source controls.
@@ -237,9 +366,57 @@ CaptureFromPlaybackDialog::CaptureFromPlaybackDialog(CaptureSource src, int ts, 
         capturedPitchHz = noteOctaveToHz(n, o);
         centsLabel.setText(formatCents(capturedPitchHz),
                            juce::dontSendNotification);
+        // Keep a running audition pitched to the freshly-labelled note.
+        if (auditioning) regenerateAuditionGrain();
     };
     noteCombo.onChange   = onPitchPickerChanged;
     octaveCombo.onChange = onPitchPickerChanged;
+    // Restore the last labelled pitch from the sticky session prefs (overrides
+    // setUpPitchPicker's A4 default), then recompute the derived Hz / cents.
+    noteCombo.setSelectedId(captureDialogPrefs().noteId, juce::dontSendNotification);
+    octaveCombo.setSelectedId(captureDialogPrefs().octaveId, juce::dontSendNotification);
+    onPitchPickerChanged();
+
+    // Granular freeze-mode picker (all three sources). Selects which "sustain
+    // the spot" algorithm a held note uses; the same shared GrainFreezeVoice
+    // backs this audition and the synth, so what you A/B here is what you play.
+    addAndMakeVisible(freezeModeLabel);
+    freezeModeLabel.setText("Freeze:", juce::dontSendNotification);
+    freezeModeLabel.setJustificationType(juce::Justification::centredRight);
+
+    addAndMakeVisible(freezeModeCombo);
+    // IDs are 1-based; ID = (int)mode + 1. All four are implemented in the
+    // shared granular_freeze.cpp.
+    freezeModeCombo.addItem("Crossfade loop",
+                            (int)GranularFreezeMode::CrossfadeLoop + 1);
+    freezeModeCombo.addItem("Async granular (blur)",
+                            (int)GranularFreezeMode::AsyncGranular + 1);
+    freezeModeCombo.addItem("Pitch-sync grains",
+                            (int)GranularFreezeMode::PitchSyncGrains + 1);
+    freezeModeCombo.addItem("Spectral freeze",
+                            (int)GranularFreezeMode::SpectralFreeze + 1);
+    freezeModeCombo.setSelectedId(
+        (int)GranularFreezeMode::CrossfadeLoop + 1, juce::dontSendNotification);
+    freezeModeCombo.setTooltip(
+        "How a held note sustains the captured spot. The source pitch is baked "
+        "in; held notes resample the result to your MIDI pitch.\n"
+        " - Crossfade loop: faithful tape loop with a short fade across the "
+        "seam. \"What does this spot literally sound like.\"\n"
+        " - Async granular: many short grains at randomised positions. Frozen "
+        "blur / GRM-Freeze texture.\n"
+        " - Pitch-sync grains: loops exactly one detected pitch period for a "
+        "clean sustained tone. Works best on a pitched source.\n"
+        " - Spectral freeze: keeps the FFT magnitudes and regenerates phases "
+        "each frame. Ethereal pad sustain.\n"
+        "Drives the Preview you're hearing, so you can A/B before capturing.");
+    freezeModeCombo.onChange = [this]() {
+        const int idx = freezeModeCombo.getSelectedId() - 1;
+        if (idx < 0) return;
+        if (auto* eng = AudioEngine::getInstance())
+            eng->setGrainFreezeMode((AudioEngine::GrainFreezeMode)idx);
+        // Re-spin the audition so the new mode re-anchors on the current slice.
+        if (auditioning) regenerateAuditionGrain();
+    };
 
     addAndMakeVisible(captureBtn);
     captureBtn.setTooltip(
@@ -270,10 +447,96 @@ CaptureFromPlaybackDialog::CaptureFromPlaybackDialog(CaptureSource src, int ts, 
         }
     };
 
+    // Output gain for the captured waveforms (all sources). Scales each
+    // produced frame's playback level via the per-frame gain field the wave
+    // editor's Gain knob also drives, so a recording that's too quiet or too
+    // loud can be levelled at capture time without a round-trip through the
+    // editor. 1.0 = unity (the raw recorded level); the Preview reflects it
+    // live. Double-click resets to unity.
+    addAndMakeVisible(gainLabel);
+    gainLabel.setText("Gain:", juce::dontSendNotification);
+    gainLabel.setJustificationType(juce::Justification::centredRight);
+
+    addAndMakeVisible(gainSlider);
+    gainSlider.setRange(0.0, 4.0, 0.01);
+    // Seed from the sticky session prefs (see captureDialogPrefs()).
+    gainSlider.setValue(captureDialogPrefs().gain, juce::dontSendNotification);
+    gainSlider.setSliderStyle(juce::Slider::LinearHorizontal);
+    gainSlider.setTextBoxStyle(juce::Slider::TextBoxRight, false, 56, 22);
+    gainSlider.setDoubleClickReturnValue(true, 1.0);
+    gainSlider.setTooltip(
+        "Output level for the captured waveforms. 1.0 = the recorded level; "
+        "below 1 makes them quieter, above 1 louder (up to 4x). Applies to "
+        "every sliced waveform and is reflected in the Preview. This sets the "
+        "same per-waveform gain you can fine-tune later with the Gain knob in "
+        "the wave editor.");
+    gainSlider.onValueChange = [this]() {
+        // Re-publish the loop so the level change is heard immediately while a
+        // preview is running (the preview bakes the gain into its buffer).
+        if (auditioning) regenerateAuditionGrain();
+    };
+
+    // Region-audition button (Mic + File): loop the selected slice so the
+    // user can hear it before capturing. Playback's legacy tap doesn't get
+    // one (it isn't reachable from the menu).
+    if (source == CaptureSource::Mic || source == CaptureSource::File) {
+        addAndMakeVisible(previewBtn);
+        previewBtn.onClick = [this]() {
+            if (auditioning) stopRegionAudition();
+            else             startRegionAudition();
+        };
+
+        // "Preview waveform" selector: which of the N captured waveforms the
+        // Preview button auditions. Range + enabled state are set by
+        // updatePreviewIndexControl() (called below and on every count change);
+        // disabled at a single waveform.
+        addAndMakeVisible(previewIndexLabel);
+        previewIndexLabel.setText("Preview waveform:", juce::dontSendNotification);
+        previewIndexLabel.setJustificationType(juce::Justification::centredRight);
+
+        addAndMakeVisible(previewIndexSlider);
+        previewIndexSlider.setRange(1.0, 1.0, 1.0);   // widened by updatePreviewIndexControl
+        previewIndexSlider.setValue(1.0, juce::dontSendNotification);
+        previewIndexSlider.setSliderStyle(juce::Slider::LinearHorizontal);
+        previewIndexSlider.setTextBoxStyle(juce::Slider::TextBoxRight, false, 60, 22);
+        previewIndexSlider.onValueChange = [this]() {
+            // Re-publish the loop for the newly-selected waveform so the change
+            // is heard immediately while a preview is running.
+            if (auditioning) regenerateAuditionGrain();
+        };
+
+        updatePreviewIndexControl();
+    }
+
+    // Reverse each horizontal slider's two-tone fill: by default JUCE paints
+    // the bright trackColour to the LEFT of the thumb and the dim
+    // backgroundColour to the RIGHT. Swap them so the bright bar reads as
+    // "headroom to the right" instead of "amount filled from the left". Done by
+    // querying the current colours and writing them into the opposite slots, so
+    // any future theme tweak still round-trips through this swap rather than
+    // hardcoding hex values. Mirrors the same swap in layered_wave_editor.cpp's
+    // granular sub-editor sliders. Applied to every slider in the dialog (some
+    // are only created for certain sources; setColour on an unused slider is
+    // harmless).
+    auto reverseSliderFill = [](juce::Slider& s) {
+        const auto bright = s.findColour(juce::Slider::trackColourId);
+        const auto dim    = s.findColour(juce::Slider::backgroundColourId);
+        s.setColour(juce::Slider::trackColourId,      dim);
+        s.setColour(juce::Slider::backgroundColourId, bright);
+    };
+    reverseSliderFill(numFramesSlider);
+    reverseSliderFill(samplesPerWaveformSlider);
+    reverseSliderFill(gainSlider);
+    reverseSliderFill(previewIndexSlider);
+
     // Initial state per source.
     if (isLiveSource()) {
         refreshSnapshot();
         startTimerHz(20);
+        // Mic: start live (monitoring on, display sweeping) and label the
+        // button as the "Pause" action. Done after addAndMakeVisible above.
+        if (source == CaptureSource::Mic)
+            setMicLive(true);
     } else {
         // File: disable capture until a file is loaded. The button gets
         // re-enabled in chooseAndLoadFile() on success.
@@ -282,15 +545,67 @@ CaptureFromPlaybackDialog::CaptureFromPlaybackDialog(CaptureSource src, int ts, 
 
     updateSourceInfoLabel();
     updateRegionInfoLabel();
+    updatePreviewButton();
 }
 
 CaptureFromPlaybackDialog::~CaptureFromPlaybackDialog() {
     stopTimer();
+    // Remember the user's last settings so the next open restores them
+    // (see captureDialogPrefs()). Written on every close, including Cancel -
+    // "last settings" tracks what the user dialled in, not only what they
+    // committed.
+    {
+        auto& p = captureDialogPrefs();
+        p.numFrames = (int)std::round(numFramesSlider.getValue());
+        p.gain      = gainSlider.getValue();
+        p.noteId    = noteCombo.getSelectedId();
+        p.octaveId  = octaveCombo.getSelectedId();
+    }
+    // Tear down any region-audition loop before the buffers go out of scope,
+    // so subsequent audio blocks emit silence (the engine caches the preview
+    // shared_ptrs until the next block reads the cleared pointers).
+    if (auditioning) {
+        if (auto* eng = AudioEngine::getInstance()) eng->clearPreview();
+        auditioning = false;
+    }
+    // Restore the engine's global input-monitoring state we took over while
+    // the Mic dialog was open, so we don't leave the mic routed to the
+    // output (or clobber the user's main-window "Mon" toggle).
+    if (source == CaptureSource::Mic) {
+        if (auto* eng = AudioEngine::getInstance())
+            eng->inputMonitoring.store(priorInputMonitoring);
+    }
+}
+
+void CaptureFromPlaybackDialog::setMicLive(bool live) {
+    micPaused = !live;
+    // Going live invalidates any region audition: the ring buffer will sweep
+    // out from under the loop, so stop it and require a re-pause to audition.
+    if (live && auditioning)
+        stopRegionAudition();
+    if (auto* eng = AudioEngine::getInstance())
+        eng->inputMonitoring.store(live);
+    micLiveBtn.setButtonText(live ? "Pause" : "Go live");
+    micLiveBtn.setColour(juce::TextButton::buttonColourId,
+                         live ? juce::Colour(150, 90, 40)   // amber = live
+                              : juce::Colour(60, 80, 110));  // blue = paused
+    micLiveBtn.setTooltip(live
+        ? "Stop hearing your input and pause the display so you can drag the "
+          "region handles on a still waveform. Click again to go back to live "
+          "input. (This pauses the mic; it is unrelated to the granular "
+          "\"freeze method\" that sustains a captured note.)"
+        : "Resume hearing and showing your live input.");
+    updateSourceInfoLabel();
+    updatePreviewButton();   // pausing enables the Preview button; going live disables it
+    repaint(waveRect);
 }
 
 void CaptureFromPlaybackDialog::timerCallback() {
     if (!isLiveSource()) return;
-    if (!freezeToggle.getToggleState())
+    const bool paused = (source == CaptureSource::Mic)
+                            ? micPaused
+                            : pauseToggle.getToggleState();
+    if (!paused)
         refreshSnapshot();
     updateSourceInfoLabel();
     repaint(waveRect);
@@ -325,10 +640,14 @@ void CaptureFromPlaybackDialog::refreshSnapshot() {
         const int oneSec = (int)std::min((double)sz, std::max(1.0, rate));
         regionEnd   = sz;
         regionStart = std::max(0, sz - oneSec);
+        syncWindowToFitSlots();   // Mic: zero-gap bands on first fill.
+        updateSamplesPerWaveformControl();  // single-waveform: window = selection
         updateRegionInfoLabel();
     } else {
         regionStart = juce::jlimit(0, sz, regionStart);
         regionEnd   = juce::jlimit(regionStart, sz, regionEnd);
+        // Keep the single-waveform window tracking the (re-clamped) selection.
+        updateSamplesPerWaveformControl();
     }
 }
 
@@ -389,6 +708,7 @@ void CaptureFromPlaybackDialog::chooseAndLoadFile() {
             }
             updateSourceInfoLabel();
             updateRegionInfoLabel();
+            updatePreviewButton();   // a region is now selectable -> enable Preview
             repaint();
         });
 }
@@ -404,17 +724,57 @@ void CaptureFromPlaybackDialog::resized() {
     bottomRow.removeFromRight(8);
     captureBtn.setBounds(bottomRow.removeFromRight(150));
     bottomRow.removeFromRight(16);
-    if (isLiveSource())
-        freezeToggle.setBounds(bottomRow.removeFromRight(120));
-    if (source == CaptureSource::File)
+    if (source == CaptureSource::Playback) {
+        pauseToggle.setBounds(bottomRow.removeFromRight(120));
+    } else if (source == CaptureSource::Mic) {
+        micLiveBtn.setBounds(bottomRow.removeFromRight(120));
+        bottomRow.removeFromRight(8);
+        previewBtn.setBounds(bottomRow.removeFromRight(110));
+        // "Audio device..." sits at the left edge of the button row, away
+        // from the capture/cancel cluster on the right.
+        audioDeviceBtn.setBounds(bottomRow.removeFromLeft(130));
+    }
+    if (source == CaptureSource::File) {
         loadFileBtn.setBounds(bottomRow.removeFromLeft(140));
+        bottomRow.removeFromLeft(8);
+        previewBtn.setBounds(bottomRow.removeFromLeft(110));
+    }
 
     r.removeFromBottom(8);
+    // "Preview waveform" selector row (Mic + File) directly above the button
+    // row, pairing visually with the Preview button below it. Removed from the
+    // bottom first so it ends up just under the Samples-per-waveform / count
+    // rows in top-to-bottom reading order.
+    if (source == CaptureSource::Mic || source == CaptureSource::File) {
+        auto prevRow = r.removeFromBottom(26);
+        previewIndexLabel.setBounds(prevRow.removeFromLeft(140));
+        previewIndexSlider.setBounds(prevRow.removeFromLeft(260));
+        r.removeFromBottom(6);
+    }
+    // Mic gets an extra "Samples per waveform" row directly above the
+    // buttons. Built before the waveforms-count row so the two read
+    // top-to-bottom as "Waveforms to slice out" then "Samples per waveform".
+    if (source == CaptureSource::Mic) {
+        auto sampRow = r.removeFromBottom(26);
+        samplesPerWaveformLabel.setBounds(sampRow.removeFromLeft(140));
+        samplesPerWaveformSlider.setBounds(sampRow.removeFromLeft(260));
+        sampRow.removeFromLeft(12);
+        fitWidthBtn.setBounds(sampRow.removeFromLeft(170));
+        r.removeFromBottom(6);
+    }
     auto controlsRow = r.removeFromBottom(26);
     numFramesLabel.setBounds(controlsRow.removeFromLeft(140));
     numFramesSlider.setBounds(controlsRow.removeFromLeft(260));
     controlsRow.removeFromLeft(12);
     regionInfoLabel.setBounds(controlsRow);
+
+    r.removeFromBottom(6);
+    // Freeze-mode row: which granular "sustain the spot" algorithm the captured
+    // frames use. Same left-edge as the rows above so the form aligns.
+    auto freezeRow = r.removeFromBottom(26);
+    freezeModeLabel.setBounds(freezeRow.removeFromLeft(140));
+    freezeModeCombo.setBounds(
+        freezeRow.removeFromLeft(intrinsicComboWidth(freezeModeCombo)));
 
     r.removeFromBottom(6);
     // Embedded pitch row: label + note + octave + cents readout. Same
@@ -426,12 +786,19 @@ void CaptureFromPlaybackDialog::resized() {
     octaveCombo.setBounds(pitchRow.removeFromLeft(intrinsicComboWidth(octaveCombo)));
     pitchRow.removeFromLeft(10);
     centsLabel.setBounds(pitchRow.removeFromLeft(80));
+    // Gain control shares the pitch row's right side (the pitch picker leaves
+    // it empty); the slider takes whatever width is left after its label.
+    pitchRow.removeFromLeft(16);
+    gainLabel.setBounds(pitchRow.removeFromLeft(46));
+    gainSlider.setBounds(pitchRow);
 
     r.removeFromBottom(4);
     sourceInfoLabel.setBounds(r.removeFromBottom(20));
 
     r.removeFromBottom(2);
-    hintLabel.setBounds(r.removeFromBottom(36));
+    // Mic's hint carries an extra line (the DirectSound troubleshooting note),
+    // so give it more vertical room than the other sources.
+    hintLabel.setBounds(r.removeFromBottom(source == CaptureSource::Mic ? 54 : 36));
     r.removeFromBottom(4);
 
     waveRect = r;
@@ -449,6 +816,10 @@ int CaptureFromPlaybackDialog::idxForX(int x) const {
     return juce::jlimit(0, (int)tap.size(), (int)std::round(t * tap.size()));
 }
 
+juce::Rectangle<int> CaptureFromPlaybackDialog::handleZone() const {
+    return waveRect.expanded(kHandleHitRadius, 0);
+}
+
 void CaptureFromPlaybackDialog::updateSourceInfoLabel() {
     juce::String msg;
     msg << "Source: " << sourceName(source);
@@ -460,6 +831,10 @@ void CaptureFromPlaybackDialog::updateSourceInfoLabel() {
         const bool sig = eng && eng->hasMicSignal();
         msg << (sig ? "  -  signal detected"
                     : "  -  no input signal yet (make a sound or check your mic)");
+        // Live/paused state + a feedback caution while monitoring is on.
+        msg << (micPaused
+                    ? "   |   PAUSED (display held still)"
+                    : "   |   LIVE - hearing your input (use headphones to avoid feedback)");
     } else { // Playback
         if (!tap.empty()) msg << "  -  " << juce::String((int)std::round(tapSampleRate)) << " Hz";
     }
@@ -482,28 +857,42 @@ void CaptureFromPlaybackDialog::updateRegionInfoLabel() {
     const double perFrameMs = (n > 0)
         ? (spanSec * 1000.0 / (double)n)
         : 0.0;
+    const int srcLen = effectiveSrcLen();
+    const double winMs = (tapSampleRate > 0.0)
+        ? (double)srcLen * 1000.0 / tapSampleRate
+        : 0.0;
     juce::String msg;
     msg << "Region: " << juce::String(spanSec, 2) << " s   |   "
         << n << " waveforms, "
-        << juce::String(perFrameMs, 1) << " ms between waveform centers";
+        << juce::String(perFrameMs, 1) << " ms apart, each "
+        << juce::String(winMs, 0) << " ms wide";
     regionInfoLabel.setText(msg, juce::dontSendNotification);
 }
 
 void CaptureFromPlaybackDialog::mouseDown(const juce::MouseEvent& e) {
-    if (!waveRect.contains(e.getPosition())) return;
     if (tap.empty()) return;
 
     const int xs = xForIdx(regionStart);
     const int xe = xForIdx(regionEnd);
     const int mx = e.x;
 
-    const int dStart = std::abs(mx - xs);
-    const int dEnd   = std::abs(mx - xe);
-    if (std::min(dStart, dEnd) <= kHandleHitRadius) {
-        dragHandle = (dStart <= dEnd) ? 0 : 1;
-        dragAnchorSampleOffset = 0;
-        return;
+    // Handle grabbing is allowed anywhere in the handle zone (waveRect widened
+    // by the hit radius), so an edge handle whose outer half is past the
+    // wave-view edge is still grabbable from just outside it. The zone's
+    // vertical extent matches waveRect, so this only fires within the handle row.
+    if (handleZone().contains(e.getPosition())) {
+        const int dStart = std::abs(mx - xs);
+        const int dEnd   = std::abs(mx - xe);
+        if (std::min(dStart, dEnd) <= kHandleHitRadius) {
+            dragHandle = (dStart <= dEnd) ? 0 : 1;
+            dragAnchorSampleOffset = 0;
+            return;
+        }
     }
+
+    // Body drag and click-to-create require the click to land inside the wave
+    // area proper, not in the handle slop margin outside it.
+    if (!waveRect.contains(e.getPosition())) return;
     if (mx > xs && mx < xe) {
         dragHandle = 2;
         dragAnchorSampleOffset = idxForX(mx) - regionStart;
@@ -513,7 +902,7 @@ void CaptureFromPlaybackDialog::mouseDown(const juce::MouseEvent& e) {
     regionEnd   = regionStart;
     dragHandle  = 1;
     updateRegionInfoLabel();
-    repaint(waveRect);
+    repaint(handleZone());
 }
 
 void CaptureFromPlaybackDialog::mouseDrag(const juce::MouseEvent& e) {
@@ -530,8 +919,19 @@ void CaptureFromPlaybackDialog::mouseDrag(const juce::MouseEvent& e) {
         regionStart = newStart;
         regionEnd   = newStart + span;
     }
+    // With one waveform the window tracks the selection, so keep the (disabled)
+    // per-waveform slider showing the live selection length while dragging.
+    updateSamplesPerWaveformControl();
     updateRegionInfoLabel();
-    repaint(waveRect);
+    repaint(handleZone());
+    // Scrub-to-audition: hear the slice as the handles move, like the
+    // capture-from-project dialog. Auto-start the loop once the region is
+    // auditionable, and keep its source buffer following the handles.
+    if (canAudition()) {
+        if (auditioning) regenerateAuditionGrain();
+        else             startRegionAudition();
+    }
+    updatePreviewButton();
 }
 
 void CaptureFromPlaybackDialog::mouseUp(const juce::MouseEvent&) {
@@ -607,28 +1007,285 @@ void CaptureFromPlaybackDialog::paint(juce::Graphics& g) {
         g.fillRect(juce::Rectangle<int>(xs, waveRect.getY(), xe - xs, H));
     }
 
-    // Frame-center markers (vertical guides showing where each captured
-    // frame's window center will sit). Helps the user see what they're
-    // grabbing without re-reading the info label.
-    const int n = (int)std::round(numFramesSlider.getValue());
-    if (n > 0 && xe > xs) {
-        g.setColour(juce::Colour::fromFloatRGBA(1.0f, 0.85f, 0.5f, 0.5f));
+    // Per-waveform section bands: each band shows the span of audio one
+    // captured waveform covers (its source window, width = effectiveSrcLen).
+    // The bands keep a FIXED width but are spaced across the selection (see
+    // bandStartForIndex). While they fit, the leftover space is split into
+    // equal gaps everywhere - the same margin before the first band, between
+    // every pair, and after the last - so the end margins match the inter-band
+    // gaps and all grow/shrink together as the selection is resized. When the
+    // bands have to overlap (width > selection / count) they instead stay
+    // CONTAINED within the selection (first band flush to the left handle, last
+    // flush to the right) so the row never spills past the handles. Each band
+    // stays exactly srcLen wide, drawn in the same orange as the region.
+    const int n        = (int)std::round(numFramesSlider.getValue());
+    const int regLen   = std::max(0, regionEnd - regionStart);
+    const int srcLen   = effectiveSrcLen();
+
+    if (n > 0 && regLen > 0 && srcLen > 0) {
+        // Each band is drawn directly from its SAMPLE-space span - the exact
+        // window buildFrames() captures (bandStartForIndex), converted to
+        // pixels with xForIdx. This is the single source of truth for the
+        // geometry, so what you see is what you get.
+        //
+        // Two properties fall out of drawing in sample space:
+        //
+        //  * CONSTANT WIDTH ON RESIZE. xForIdx is a linear map over the whole
+        //    buffer (pixels-per-sample is fixed, independent of the region),
+        //    so a band's pixel width is srcLen * pxPerSample - it depends only
+        //    on "Samples per waveform", never on the selection size. Stretching
+        //    the selection re-spaces the bands (every gap, end margins included)
+        //    but never rescales them.
+        //
+        //  * ZERO GAP AT THE DEFAULT. When regLen == n*srcLen every uniform gap
+        //    is zero, so band i ends at the same sample band i+1 begins and
+        //    xForIdx maps the shared boundary to the SAME pixel: the bands tile
+        //    edge-to-edge with no seam and the outermost edges land on the two
+        //    handles. A wider selection opens every gap by the same amount
+        //    (end margins included); a narrower one overlaps them uniformly.
         for (int i = 0; i < n; ++i) {
-            const float t = (n == 1) ? 0.5f : (float)i / (float)(n - 1);
-            const int cx  = xs + (int)std::round(t * (xe - xs));
-            g.drawVerticalLine(cx, (float)waveRect.getY() + 4.0f,
-                                   (float)waveRect.getBottom() - 4.0f);
+            const int startIdx = bandStartForIndex(i, n, srcLen);
+            const int bx0 = xForIdx(startIdx);
+            const int bx1 = xForIdx(startIdx + srcLen);
+            juce::Rectangle<int> band(bx0, waveRect.getY(),
+                                      std::max(1, bx1 - bx0), H);
+            // Brighter orange fill over the region tint so each band reads as
+            // a distinct slice; thin orange separators at the band edges (no
+            // center line) so overlapping bands stay legible.
+            g.setColour(juce::Colour::fromFloatRGBA(1.0f, 0.65f, 0.2f, 0.16f));
+            g.fillRect(band);
+            g.setColour(juce::Colour::fromFloatRGBA(1.0f, 0.65f, 0.2f, 0.45f));
+            g.drawVerticalLine(bx0,     (float)waveRect.getY(), (float)waveRect.getBottom());
+            g.drawVerticalLine(bx1 - 1, (float)waveRect.getY(), (float)waveRect.getBottom());
         }
     }
 
+    // Clip the handle graphics to the handle zone (waveRect widened by the hit
+    // radius) rather than waveRect itself, so an edge handle's outer half - its
+    // bar and +/-6 px caps - is drawn in full instead of being chopped at the
+    // buffer edge. The zone is the same region the handle hit-test and the
+    // drag/create repaints use, so the overhang is always cleared and never
+    // leaves a ghost. Clamping to the zone (not unbounded) still prevents the
+    // caps from bleeding into the surrounding chrome.
+    const juce::Rectangle<int> hz = handleZone();
     auto drawHandle = [&](int x) {
         g.setColour(juce::Colour(255, 165, 60));
-        g.fillRect(juce::Rectangle<int>(x - 2, waveRect.getY(), 4, H));
-        g.fillRect(juce::Rectangle<int>(x - 6, waveRect.getY(), 12, 8));
-        g.fillRect(juce::Rectangle<int>(x - 6, waveRect.getBottom() - 8, 12, 8));
+        g.fillRect(juce::Rectangle<int>(x - 2, waveRect.getY(), 4, H).getIntersection(hz));
+        g.fillRect(juce::Rectangle<int>(x - 6, waveRect.getY(), 12, 8).getIntersection(hz));
+        g.fillRect(juce::Rectangle<int>(x - 6, waveRect.getBottom() - 8, 12, 8).getIntersection(hz));
     };
     drawHandle(xs);
     drawHandle(xe);
+}
+
+int CaptureFromPlaybackDialog::effectiveSrcLen() const {
+    const int    regionLen = std::max(0, regionEnd - regionStart);
+    const double sr        = (tapSampleRate > 0.0) ? tapSampleRate : 48000.0;
+    const int    grainLen  = std::max(64, (int)std::round(0.1 * sr));  // 100 ms
+    const int    tapLen    = (int)tap.size();
+
+    if (source == CaptureSource::Mic) {
+        const int n = (int)std::round(numFramesSlider.getValue());
+        if (n <= 1) {
+            // A single waveform spans the WHOLE selection - there is no per-
+            // waveform spacing to honour, so the one window simply is the
+            // selection. The "Samples per waveform" slider is disabled in this
+            // case (see updateSamplesPerWaveformControl), so it can't be the
+            // source of truth here; the selection size is.
+            int w = regionLen;
+            w = std::max(w, grainLen);      // OLA needs at least one grain
+            if (tapLen > 0) w = std::min(w, tapLen);
+            return w;
+        }
+        // 2+ waveforms: the "Samples per waveform" slider is the single source
+        // of truth for the window length - a fixed sample count, independent of
+        // the region size. Resizing the selection then re-spaces the bands
+        // without resizing them (the constant window keeps each band's width
+        // constant). The slider's step is 1 sample so it can land exactly on the
+        // slot spacing (regionLen / n) for the zero-gap tiling default.
+        int w = (int)std::round(samplesPerWaveformSlider.getValue());
+        w = std::max(w, grainLen);          // OLA needs at least one grain
+        if (tapLen > 0) w = std::min(w, tapLen);
+        return w;
+    }
+
+    // File / Playback auto-size: ~1 s or 4x grain, capped to the region.
+    int wanted = std::max((int)std::llround(sr), grainLen * 4);
+    wanted = std::max(wanted, grainLen);
+    const int cap = regionLen > 0 ? regionLen : tapLen;
+    if (cap <= 0) return 0;
+    return std::min(wanted, cap);
+}
+
+int CaptureFromPlaybackDialog::bandStartForIndex(int i, int n, int srcLen) const {
+    if (n <= 0 || srcLen <= 0) return regionStart;
+    const int regLen = std::max(0, regionEnd - regionStart);
+    const int tapLen = (int)tap.size();
+
+    // Two regimes, meeting continuously at the point where the windows exactly
+    // tile the selection (freeSpace == 0):
+    //
+    //  * WINDOWS FIT (freeSpace >= 0) - uniform-gap model. The leftover space is
+    //    split into n+1 EQUAL gaps: one before the first window, one between each
+    //    adjacent pair, and one after the last. So the two end margins (leftmost
+    //    band to the left handle, rightmost band to the right) always equal the
+    //    inter-band gaps, and every gap grows / shrinks together as the
+    //    selection is resized.
+    //        gap     = freeSpace / (n + 1)
+    //        start_i = regionStart + (i + 1)*gap + i*srcLen
+    //
+    //  * WINDOWS OVERLAP (freeSpace < 0) - contained model. The windows are
+    //    wider than their share, so they must overlap. Rather than let a uniform
+    //    NEGATIVE end margin push the outer bands past the handles (the selection
+    //    visibly spilling its bounds), we keep the row CONTAINED: band 0 flush to
+    //    the left handle, band n-1 flush to the right, the overlap distributed
+    //    evenly in between.
+    //        step    = (regLen - srcLen) / (n - 1)   // start-to-start spacing
+    //        start_i = regionStart + i*step
+    //
+    // At freeSpace == 0 both give the edge-to-edge tiling (gap 0 / step srcLen)
+    // that syncWindowToFitSlots and the "Fit width to selection" button produce.
+    const double freeSpace = (double)regLen - (double)n * (double)srcLen;
+    double startD;
+    if (freeSpace >= 0.0) {
+        const double gap = freeSpace / (double)(n + 1);
+        startD = (double)regionStart + (double)(i + 1) * gap
+               + (double)i * (double)srcLen;
+    } else if (n == 1) {
+        // A lone window wider than the selection can't be contained; centre it.
+        startD = (double)regionStart + 0.5 * ((double)regLen - (double)srcLen);
+    } else {
+        const double step = (double)(regLen - srcLen) / (double)(n - 1);
+        startD = (double)regionStart + (double)i * step;
+    }
+    int startIdx = (int)std::lround(startD);
+    // Clamp to the available audio only. The window length is honored as-is,
+    // so a window wider than the region honestly extends past the handles
+    // rather than being silently shrunk.
+    startIdx = juce::jlimit(0, std::max(0, tapLen - srcLen), startIdx);
+    return startIdx;
+}
+
+void CaptureFromPlaybackDialog::syncWindowToFitSlots() {
+    if (source != CaptureSource::Mic) return;
+    // Set the window to exactly one slot spacing (regionLen / n) so the n
+    // bands tile the selection edge-to-edge with zero gaps. This is the
+    // zero-gap default applied when the count changes or on first fill; the
+    // user can then override it via the slider, and resizing the selection
+    // afterwards keeps this window size (sliding the bands, not rescaling).
+    // dontSendNotification so this programmatic set doesn't recurse through
+    // onValueChange.
+    const int n      = (int)std::round(numFramesSlider.getValue());
+    const int regLen = std::max(0, regionEnd - regionStart);
+    if (n <= 0 || regLen <= 0) return;
+    const double spacing = (double)regLen / (double)n;
+    samplesPerWaveformSlider.setValue(spacing, juce::dontSendNotification);
+}
+
+void CaptureFromPlaybackDialog::updateSamplesPerWaveformControl() {
+    if (source != CaptureSource::Mic) return;
+    const int n = (int)std::round(numFramesSlider.getValue());
+    if (n <= 1) {
+        // One waveform spans the whole selection: there is nothing for this
+        // slider to control, so lock it and show it holding the selection
+        // length (kept current as the selection is resized) instead of a stale
+        // value. The window length itself comes from effectiveSrcLen, which
+        // returns the selection size in this case.
+        const int regLen = std::max(0, regionEnd - regionStart);
+        samplesPerWaveformSlider.setValue((double)regLen, juce::dontSendNotification);
+        samplesPerWaveformSlider.setEnabled(false);
+        samplesPerWaveformSlider.setTooltip(
+            "Disabled while there is a single waveform: one waveform spans the "
+            "whole selection, so its length is just the selection size - resize "
+            "the selection (drag the orange handles) to change it. Increase "
+            "\"Waveforms to slice out\" above 1 to set a per-waveform length "
+            "independently of the selection.");
+        // The Fit button only tidies the per-waveform width, which is fixed to
+        // the selection here, so it has nothing to do.
+        fitWidthBtn.setEnabled(false);
+        fitWidthBtn.setTooltip(
+            "Not needed with a single waveform - it already spans the whole "
+            "selection. Add more waveforms to use this.");
+        return;
+    }
+    samplesPerWaveformSlider.setEnabled(true);
+    fitWidthBtn.setEnabled(true);
+    fitWidthBtn.setTooltip(
+        "Set the per-waveform width so the bands exactly tile the current "
+        "selection - no gaps, no overlap. Same as dragging \"Samples per "
+        "waveform\" until each band abuts the next. Use it after resizing "
+        "the selection to snap back to a clean edge-to-edge layout.");
+    samplesPerWaveformSlider.setTooltip(
+        "How many audio samples each captured waveform spans - the length of "
+        "the source snapshot behind one waveform. Bigger = each waveform holds "
+        "a longer slice of sound (more of the timbre's movement); smaller = a "
+        "tighter, more frozen moment. At 48 kHz, 48000 samples is about 1 "
+        "second. The shaded orange bands over the waveform show each one's "
+        "span, each exactly this wide and spaced evenly across the selection "
+        "with the same gap everywhere - including the margins to the two "
+        "handles. When the selection equals this times the waveform count "
+        "the bands tile it with no gaps; a wider selection opens every gap "
+        "equally. Make this large enough that the bands overlap and they "
+        "stay contained within the selection (first flush left, last flush "
+        "right) instead of spilling past the handles. The band width never "
+        "changes, so resizing re-spaces the bands rather than rescaling.");
+}
+
+void CaptureFromPlaybackDialog::updatePreviewIndexControl() {
+    if (source != CaptureSource::Mic && source != CaptureSource::File) return;
+    const int n = (int)std::round(numFramesSlider.getValue());
+    // Clamp the current pick into [1, n] before re-ranging (JUCE would
+    // otherwise snap a now-out-of-range value to the new max silently).
+    const int cur = juce::jlimit(1, std::max(1, n),
+                                 (int)std::round(previewIndexSlider.getValue()));
+    previewIndexSlider.setRange(1.0, (double)std::max(1, n), 1.0);
+    previewIndexSlider.setValue((double)cur, juce::dontSendNotification);
+
+    const bool enabled = (n >= 2);
+    previewIndexSlider.setEnabled(enabled);
+    previewIndexLabel.setEnabled(enabled);
+    if (enabled) {
+        previewIndexSlider.setTooltip(
+            "Which of the " + juce::String(n) + " captured waveforms the Preview "
+            "button plays. 1 = the first (earliest in the selection), "
+            + juce::String(n) + " = the last. Change it while previewing to "
+            "audition a different waveform without stopping.");
+    } else {
+        previewIndexSlider.setTooltip(
+            "Disabled with a single waveform - there is only one to hear, and "
+            "Preview plays the whole selection. Increase \"Waveforms to slice "
+            "out\" above 1 to choose among several.");
+    }
+}
+
+int CaptureFromPlaybackDialog::loopLenForWindow(int windowLen) const {
+    if (windowLen <= 0) return 0;
+    const int n = (int)std::round(numFramesSlider.getValue());
+    if (n <= 1) {
+        // Single waveform: the loop is the whole window (= whole selection),
+        // so the captured frame plays the entire selected sound on repeat.
+        return std::max(16, windowLen);
+    }
+    // Multiple waveforms: cap the loop at a ~100 ms neutral grain so each
+    // frame is a stationary timbral snapshot the wavetable morphs through,
+    // but never longer than the window itself.
+    const double sr = (tapSampleRate > 0.0) ? tapSampleRate : 48000.0;
+    const int neutralGrain = std::max(64, (int)std::round(0.1 * sr));
+    return std::max(16, std::min(neutralGrain, windowLen));
+}
+
+std::vector<float>
+CaptureFromPlaybackDialog::buildGrainSource(int startIdx, int loopLen) const {
+    const int tapLen       = (int)tap.size();
+    const int reservedTail = std::max(0, loopLen / 2);
+    const int srcLen       = std::max(0, loopLen + reservedTail);
+    std::vector<float> source((size_t)srcLen, 0.0f);
+    for (int s = 0; s < srcLen; ++s) {
+        const int idx = startIdx + s;
+        if (idx >= 0 && idx < tapLen)
+            source[(size_t)s] = tap[(size_t)idx];
+    }
+    return source;
 }
 
 std::vector<std::unique_ptr<IWavetableFrame>>
@@ -639,47 +1296,166 @@ CaptureFromPlaybackDialog::buildFrames(int n) const {
     out.reserve((size_t)n);
 
     // Mic/file capture mirrors the song-capture path: each emitted frame
-    // is a GranularFrame holding a multi-sample window of the source PCM
-    // plus a default ~100 ms grain length. The synth plays it back via
-    // 4-voice OLA so the timbre evolves over time instead of being
-    // collapsed to one cycle. embeddedPitchHz comes from the in-dialog
-    // pitch picker (Note + Octave, default A4 = 440 Hz) so MIDI playback
-    // at the matching key plays the source at 1:1 and other keys
-    // pitch-shift via the usual wavetable stride math.
-    const int   tapLen     = (int)tap.size();
-    const int   regionLen  = std::max(0, regionEnd - regionStart);
-    const double sr        = (tapSampleRate > 0.0) ? tapSampleRate : 48000.0;
+    // is a GranularFrame that loops a window of the source PCM. The loop
+    // length depends on the waveform count (loopLenForWindow): a single
+    // waveform loops the WHOLE window (= whole selection) so the frame
+    // plays back the entire recorded sound, while multiple waveforms cap
+    // the loop at a ~100 ms timbral snapshot the wavetable Position
+    // parameter morphs through. embeddedPitchHz comes from the in-dialog
+    // pitch picker (Note + Octave, default A4 = 440 Hz) so MIDI playback at
+    // the matching key plays the source at 1:1 and other keys pitch-shift
+    // via the usual wavetable stride math.
+    const double sr      = (tapSampleRate > 0.0) ? tapSampleRate : 48000.0;
 
-    // Grain length: 100 ms is a musically neutral default - long enough
-    // to preserve formant character, short enough that pitched material
-    // still tracks MIDI cleanly. Floor at 64 samples for the OLA math.
-    const int grainLenSamples = std::max(64, (int)std::round(0.1 * sr));
+    // Per-frame source WINDOW length (the band width). For Mic this comes
+    // from the "Samples per waveform" slider (or the whole selection when
+    // there is a single waveform); for File / Playback it auto-sizes. The
+    // section bands are drawn from the same windowLen so the drawn bands and
+    // the captured loops agree.
+    const int windowLen  = effectiveSrcLen();
+    const int loopLen    = loopLenForWindow(windowLen);
 
-    // Source window: aim for ~1 second around each frame's center, or
-    // 4x grain length (whichever is larger). Clamp to the user-selected
-    // region so a small region produces correspondingly small sources -
-    // the user picked that span on purpose.
-    const int srcWanted  = std::max((int)std::llround(sr), grainLenSamples * 4);
-    const int srcLen     = std::min(srcWanted, regionLen > 0 ? regionLen : tapLen);
+    // Seam crossfade: ~50 ms (clamped to L/2 by the player), matching the
+    // audition so capture sounds like preview. Stored on the frame so the
+    // synth's CrossfadeLoop reader uses the same blend.
+    const int xfadeSamples = std::min(std::max(0, (int)std::round(0.05 * sr)),
+                                      std::max(0, loopLen / 2));
 
     for (int i = 0; i < n; ++i) {
-        const float t = (n == 1) ? 0.5f : (float)i / (float)(n - 1);
-        const int centerIdx = regionStart + (int)std::round(t * regionLen);
-        int startIdx = centerIdx - srcLen / 2;
-        startIdx = juce::jlimit(0, std::max(0, tapLen - srcLen), startIdx);
-
-        std::vector<float> source((size_t)srcLen, 0.0f);
-        for (int s = 0; s < srcLen; ++s) {
-            const int src = startIdx + s;
-            if (src >= 0 && src < tapLen)
-                source[(size_t)s] = tap[(size_t)src];
-        }
+        // Same slot geometry the section bands draw, so the captured loop
+        // body matches the on-screen bands exactly. buildGrainSource adds
+        // the loopLen/2 lookahead tail past the band end for the seam.
+        const int startIdx = bandStartForIndex(i, n, windowLen);
+        std::vector<float> source = buildGrainSource(startIdx, loopLen);
 
         auto frame = std::make_unique<GranularFrame>(
-            std::move(source), sr, grainLenSamples, (float)capturedPitchHz);
+            std::move(source), sr, loopLen, (float)capturedPitchHz,
+            selectedFreezeMode(), xfadeSamples);
+        // Per-frame output gain (the in-dialog Gain control). Carried on the
+        // GranularFrame's IWavetableFrame::gain so the synth's granular layer
+        // scales playback by it (and the wave editor's Gain knob can adjust it
+        // afterward). The source PCM stays at the recorded level - gain is a
+        // separate, reversible scalar, not baked into the samples.
+        frame->gain = (float)gainSlider.getValue();
         out.push_back(std::move(frame));
     }
     return out;
+}
+
+// ----- Region audition -------------------------------------------------
+//
+// Lets the user HEAR the selected slice before committing it to the
+// library, reusing the same engine GrainLoop preview the capture-from-song
+// dialog uses: the slice is published as a granular source buffer and
+// looped through the engine's 4-voice OLA stream so the timbre evolves the
+// way the captured frame will when it's triggered. Mic can only audition
+// once the display is paused (canAudition): a live, sweeping ring buffer
+// would shift under the loop on every timer tick.
+
+bool CaptureFromPlaybackDialog::canAudition() const {
+    if (tap.empty() || tapSampleRate <= 0.0) return false;
+    if ((regionEnd - regionStart) < 64) return false;          // too short to loop
+    if (source == CaptureSource::Mic)  return micPaused;        // need a stable buffer
+    if (source == CaptureSource::File) return fileLoaded;
+    return false;  // Playback has no audition button
+}
+
+void CaptureFromPlaybackDialog::regenerateAuditionGrain() {
+    auto* eng = AudioEngine::getInstance();
+    if (!eng) return;
+    if (tap.empty() || tapSampleRate <= 0.0) return;
+
+    const int    regionLen = std::max(0, regionEnd - regionStart);
+    if (regionLen < 64) return;
+    const double sr        = tapSampleRate;
+
+    // Audition the user-selected frame using the exact geometry buildFrames
+    // bakes, so the preview is honest: the single-waveform case loops the
+    // whole selection (you hear the recorded sound), the multi-waveform case
+    // auditions whichever waveform the "Preview waveform" picker selects.
+    // windowLen is the band width (effectiveSrcLen); loopLen is what actually
+    // loops.
+    const int n        = (int)std::round(numFramesSlider.getValue());
+    const int windowLen = effectiveSrcLen();
+    if (windowLen <= 0) return;
+    const int loopLen  = loopLenForWindow(windowLen);
+    if (loopLen <= 0) return;
+
+    // 0-based band index. With a single waveform there is only band 0; with
+    // 2+ the "Preview waveform" slider (1-based) chooses, clamped into range.
+    const int repIdx   = (n <= 1)
+        ? 0
+        : juce::jlimit(0, n - 1,
+                       (int)std::round(previewIndexSlider.getValue()) - 1);
+    const int startIdx = bandStartForIndex(repIdx, n, windowLen);
+    auto src = std::make_shared<std::vector<float>>(buildGrainSource(startIdx, loopLen));
+
+    // Bake the dialog's output gain into this throwaway preview buffer so the
+    // audition loudness matches what the captured frame will play at. The
+    // captured frame instead carries the gain as IWavetableFrame::gain (see
+    // buildFrames) which the synth applies; the engine's preview reader has no
+    // per-frame gain knob, so the preview applies it to the PCM directly.
+    const float previewGain = (float)gainSlider.getValue();
+    if (previewGain != 1.0f)
+        for (auto& s : *src) s *= previewGain;
+
+    // Pitch ratio: play the slice "as A4" so the audition matches the
+    // editor's reference-note audition and a synth note at A4 (440 /
+    // capturedPitchHz). Mirrors CaptureFromSongDialog::publishPreviewPitch.
+    const double hz = (capturedPitchHz > 0.0) ? capturedPitchHz : 440.0;
+    eng->setPreviewGrainRatio((float)(440.0 / hz));
+    // Publish the source's natural pitch so PitchSyncGrains can derive the
+    // loop period; the other freeze modes ignore it.
+    eng->setPreviewEmbeddedPitch((float)hz);
+    eng->setPreviewGrainLength(loopLen);
+    // ~50 ms seam crossfade, matching buildFrames; engine clamps to L/2.
+    const int xfadeSamples = std::min(std::max(0, (int)std::round(0.05 * sr)),
+                                      std::max(0, loopLen / 2));
+    eng->setPreviewCrossfadeLength(xfadeSamples);
+    eng->setPreviewGrainBuffer(std::move(src));
+}
+
+void CaptureFromPlaybackDialog::startRegionAudition() {
+    auto* eng = AudioEngine::getInstance();
+    if (!eng || !canAudition()) { updatePreviewButton(); return; }
+    eng->setGrainFreezeMode(selectedFreezeMode());
+    regenerateAuditionGrain();
+    eng->setPreviewMode(AudioEngine::PreviewMode::GrainLoop);
+    auditioning = true;
+    updatePreviewButton();
+}
+
+void CaptureFromPlaybackDialog::stopRegionAudition() {
+    if (auto* eng = AudioEngine::getInstance()) eng->clearPreview();
+    auditioning = false;
+    updatePreviewButton();
+}
+
+void CaptureFromPlaybackDialog::updatePreviewButton() {
+    // Playback has no preview button (not reachable from the menu).
+    if (source != CaptureSource::Mic && source != CaptureSource::File) return;
+    const bool ok = canAudition();
+    previewBtn.setButtonText(auditioning ? "Stop" : "Preview");
+    previewBtn.setEnabled(ok || auditioning);
+    previewBtn.setColour(juce::TextButton::buttonColourId,
+                         auditioning ? juce::Colour(120, 60, 60)    // red-ish = playing
+                                     : juce::Colour(60, 90, 110));  // blue = idle
+    if (auditioning) {
+        previewBtn.setTooltip("Stop the preview loop.");
+    } else if (ok) {
+        previewBtn.setTooltip("Loop the selected region so you can hear the slice "
+                              "before capturing it. It also plays automatically while "
+                              "you drag the region handles.");
+    } else if (source == CaptureSource::Mic && !micPaused) {
+        previewBtn.setTooltip("Press Pause first - a live, moving input can't be "
+                              "auditioned. Once the display is paused you can preview "
+                              "the selected slice.");
+    } else if (source == CaptureSource::File && !fileLoaded) {
+        previewBtn.setTooltip("Load a file first, then select a region to preview it.");
+    } else {
+        previewBtn.setTooltip("Select a region (at least a few milliseconds wide) to "
+                              "preview it.");
+    }
 }
 
 // =================================================================
@@ -964,45 +1740,33 @@ CaptureFromSongDialog::CaptureFromSongDialog(NodeGraph& g, Transport& t,
     freezeModeLabel.setJustificationType(juce::Justification::centredRight);
 
     addAndMakeVisible(freezeModeCombo);
-    // ComboBox IDs are 1-based; we map them to enum values via -1.
-    // Only Crossfade loop is implemented in the audio engine today; the
-    // other three are stubs that silently fall back to CrossfadeLoop
-    // (see audio_engine.cpp's freeze-mode dispatch). Until their
-    // implementations land, present them disabled with a "(coming soon)"
-    // suffix so the user doesn't waste time toggling them expecting an
-    // audible change.
+    // ComboBox IDs are 1-based; we map them to enum values via -1. All four
+    // algorithms are implemented in the shared GrainFreezeVoice
+    // (granular_freeze.cpp), and the same reader drives both this audition and
+    // the held synth note, so what you A/B here is exactly what you'll play.
     freezeModeCombo.addItem("Crossfade loop",
                             (int)GranularFreezeMode::CrossfadeLoop + 1);
-    freezeModeCombo.addItem("Async granular (blur) - coming soon",
+    freezeModeCombo.addItem("Async granular (blur)",
                             (int)GranularFreezeMode::AsyncGranular + 1);
-    freezeModeCombo.addItem("Pitch-sync grains - coming soon",
+    freezeModeCombo.addItem("Pitch-sync grains",
                             (int)GranularFreezeMode::PitchSyncGrains + 1);
-    freezeModeCombo.addItem("Spectral freeze - coming soon",
+    freezeModeCombo.addItem("Spectral freeze",
                             (int)GranularFreezeMode::SpectralFreeze + 1);
-    freezeModeCombo.setItemEnabled(
-        (int)GranularFreezeMode::AsyncGranular + 1, false);
-    freezeModeCombo.setItemEnabled(
-        (int)GranularFreezeMode::PitchSyncGrains + 1, false);
-    freezeModeCombo.setItemEnabled(
-        (int)GranularFreezeMode::SpectralFreeze + 1, false);
     freezeModeCombo.setSelectedId(
         (int)GranularFreezeMode::CrossfadeLoop + 1,
         juce::dontSendNotification);
     freezeModeCombo.setTooltip(
         "How the loop sustains the marker spot while a captured note is "
-        "held. Currently only Crossfade loop is implemented; the other "
-        "three are reserved slots for upcoming algorithms and will be "
-        "enabled when their engine code lands.\n"
+        "held. The source pitch is baked in; held notes resample the result "
+        "to your MIDI pitch (sampler-style).\n"
         " - Crossfade loop: faithful tape loop with a short fade across "
-        "the seam. The source pitch is baked in; held notes are this loop "
-        "resampled to your MIDI pitch (sampler-style).\n"
-        " - Async granular (coming soon): many short grains at randomised "
-        "positions in a small range. Frozen blur / GRM-Freeze texture.\n"
-        " - Pitch-sync grains (coming soon): grain hop locked to the "
-        "detected pitch period so the loop is one cycle. Requires a "
-        "pitched source.\n"
-        " - Spectral freeze (coming soon): keeps the FFT magnitudes and "
-        "regenerates phases each frame. Ethereal pad sustain.\n"
+        "the seam. \"What does this spot literally sound like.\"\n"
+        " - Async granular: many short grains at randomised positions in a "
+        "small range. Frozen blur / GRM-Freeze texture.\n"
+        " - Pitch-sync grains: loops exactly one detected pitch period so the "
+        "output is a clean sustained tone. Works best on a pitched source.\n"
+        " - Spectral freeze: keeps the FFT magnitudes and regenerates phases "
+        "each frame. Ethereal pad sustain.\n"
         "Also drives the audition you're hearing right now, so you can "
         "A/B them before saving.");
     freezeModeCombo.onChange = [this]() {
@@ -1520,6 +2284,9 @@ void CaptureFromSongDialog::publishPreviewPitch() {
     constexpr double kReferenceHz = 440.0;
     const double hz = (capturedPitchHz > 0.0) ? capturedPitchHz : kReferenceHz;
     eng->setPreviewGrainRatio((float)(kReferenceHz / hz));
+    // Publish the source's natural pitch so PitchSyncGrains can derive the
+    // loop period; the other freeze modes ignore it.
+    eng->setPreviewEmbeddedPitch((float)hz);
 }
 
 int CaptureFromSongDialog::xForSamplePos(int64_t pos) const {

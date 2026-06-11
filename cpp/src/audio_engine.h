@@ -7,6 +7,7 @@
 #include "recording.h"
 #include "multitrack_recorder.h"
 #include "granular_frame.h"
+#include "granular_freeze.h"
 #include <memory>
 #include <set>
 #include <atomic>
@@ -14,13 +15,40 @@
 namespace SoundShop {
 
 class AudioEngine : public juce::AudioIODeviceCallback,
-                    public juce::MidiInputCallback {
+                    public juce::MidiInputCallback,
+                    public juce::ChangeListener {
 public:
     AudioEngine();
     ~AudioEngine();
 
     void init();
     void shutdown();
+
+    // Persist the current audio device configuration (driver type, device
+    // names, sample rate, buffer size, channel selection) to a settings file
+    // next to the executable, so the user's choice survives restarts. Called
+    // automatically whenever the AudioDeviceManager broadcasts a change (i.e.
+    // the user picks a different device in the Audio Device Settings dialog)
+    // and on shutdown. See changeListenerCallback / init for the restore side.
+    void saveAudioSettings();
+
+    // ChangeListener: the AudioDeviceManager broadcasts a change whenever the
+    // device setup is modified. We use it to re-persist the settings so a
+    // device change made in the settings dialog sticks across restarts.
+    void changeListenerCallback(juce::ChangeBroadcaster* source) override;
+
+    // Make sure the audio device actually has a live input channel open.
+    // On Windows the default input and output are frequently different
+    // physical devices, and JUCE's default-device init can land on an
+    // output-only setup (input channels zeroed / input device name empty),
+    // which silently disables the mic so capture / IR / monitoring get no
+    // signal. This picks the device type's default input device + its first
+    // channel if input is currently off, restarting the device only when a
+    // change is actually needed (no-op, no glitch, if input is already
+    // live). Called at init() and again whenever a mic-consuming UI opens
+    // (e.g. the microphone capture dialog) so a mic plugged in mid-session
+    // is picked up. Returns true if input is enabled afterwards.
+    bool ensureAudioInputEnabled();
 
     // Process-wide accessor for UI tools that need read access to the
     // engine (playback-tap ring buffer, transport state, etc.) without
@@ -441,6 +469,15 @@ public:
     float getPreviewGrainRatio() const {
         return previewGrainRatio.load(std::memory_order_acquire);
     }
+    // The marker recording's natural pitch in Hz, published alongside the
+    // grain ratio. Only the PitchSyncGrains freeze mode reads it (to derive
+    // the loop period = sampleRate / pitch); the other modes ignore it. Set to
+    // the same capturedPitchHz the synth bakes into the frame so the audition
+    // pitch-sync loop matches the played note. Safe to call from any thread.
+    void setPreviewEmbeddedPitch(float hz) {
+        previewEmbeddedPitchHz.store(hz > 0.0f ? hz : 440.0f,
+                                     std::memory_order_release);
+    }
     void setPreviewMode(PreviewMode m) {
         previewMode.store((int)m, std::memory_order_release);
     }
@@ -464,7 +501,9 @@ public:
         previewGrainLenSamples.store(0, std::memory_order_release);
         previewCrossfadeSamples.store(0, std::memory_order_release);
         previewGrainRatio.store(1.0f, std::memory_order_release);
+        previewEmbeddedPitchHz.store(440.0f, std::memory_order_release);
         previewSongPosSamples.store(0, std::memory_order_release);
+        grainNeedsReinit = true;  // force voice re-anchor on next GrainLoop entry
     }
 
 private:
@@ -473,6 +512,7 @@ private:
     std::atomic<int>      previewGrainLenSamples { 0 };
     std::atomic<int>      previewCrossfadeSamples { 0 };
     std::atomic<float>    previewGrainRatio { 1.0f };
+    std::atomic<float>    previewEmbeddedPitchHz { 440.0f };
     std::atomic<std::shared_ptr<std::vector<float>>> previewSongPcm;
     std::atomic<std::shared_ptr<std::vector<float>>> previewGrainBuf;
     // Audio-thread-only crossfade state.
@@ -508,48 +548,33 @@ private:
     //                      regenerate phases per frame, IFFT. Ethereal
     //                      pad-like sustain.
     // The mode the dialog wants is in grainFreezeMode (atomic, set by the
-    // GUI thread). The audio thread snapshots it once per block. State that
-    // each algorithm needs is held alongside the mode dispatcher below;
-    // currently only CrossfadeLoop is implemented and the others fall back
-    // to it until their separate stages land.
+    // GUI thread). The audio thread snapshots it once per block and hands it
+    // to the shared GrainFreezeVoice below, which holds all per-mode state
+    // (anchor, loop phase, grain bank, spectral buffers) and dispatches on the
+    // mode. All four algorithms are implemented in granular_freeze.cpp.
     //
-    // CrossfadeLoop state
-    //   grainAnchor         - source-buffer offset where the loop window
-    //                         starts. Loop range is [anchor, anchor + L).
-    //                         The crossfade reads `xfade` samples *past*
-    //                         the loop end (from anchor + L to
-    //                         anchor + L + xfade) and blends them with
-    //                         the loop's start. xfade is the live value
-    //                         in previewCrossfadeSamples, clamped to
-    //                         [0, L/2]. So the dialog needs to publish a
-    //                         source buffer with at least
-    //                         anchor + L + L/2 samples available to leave
-    //                         room for the largest xfade the user can
-    //                         pick; the init clamps anchor accordingly.
-    //   grainPhase          - current fractional position within the loop, in
-    //                         [0, L). Advances by previewGrainRatio per sample
-    //                         (1.0 = native pitch) with linear interpolation,
-    //                         wraps at L.
-    //   grainLastAppliedLen - L the state was initialised for. If the UI
-    //                         changes L, we reset.
-    //   grainLastAppliedSrcPtr - last source buffer ptr; new buffer triggers
-    //                         re-init (so the marker move auditions the
-    //                         new spot).
-    //   grainNeedsReinit    - set on mode-entry into GrainLoop so the next
-    //                         block re-anchors.
+    //   grainNeedsReinit - set on mode-entry into GrainLoop (and clearPreview)
+    //                      so the next block resets the shared voice and it
+    //                      re-anchors on the fresh marker spot. The voice also
+    //                      re-anchors itself when the source pointer, length,
+    //                      grain length or mode changes, so steady-state marker
+    //                      scrubbing needs no manual reinit.
     int     currAppliedPreviewMode = 0;
     int     outgoingPreviewMode = 0;
     int     previewFadeCounter = 0;
     int64_t prevSongPosForFade = 0;
-    int     grainAnchor            = 0;
-    float   grainPhase             = 0.0f;
-    int     grainLastAppliedLen    = 0;
-    const float* grainLastAppliedSrcPtr = nullptr;
     bool    grainNeedsReinit       = false;
     // Atomic mode pick. 0 = CrossfadeLoop (default), 1 = AsyncGranular,
     // 2 = PitchSyncGrains, 3 = SpectralFreeze. Stored as int so the
     // atomic is trivially copyable and lock-free.
     std::atomic<int> grainFreezeMode { 0 };
+    // Shared freeze reader. The same GrainFreezeVoice implementation backs the
+    // held synth note (TerrainSynthProcessor) so that "what you audition in the
+    // capture dialog == what the synth plays back" is guaranteed by construction
+    // rather than by keeping two hand-copied loop readers in lockstep. The voice
+    // owns its own per-mode state and re-anchors itself when the source pointer,
+    // length, grain length or mode changes.
+    GrainFreezeVoice grainFreezeVoice;
     static constexpr int kPreviewCrossfadeSamples = 480;  // ~10 ms @ 48 kHz
     // The GrainLoop freeze preview (used for marker-scrub audition and the
     // capture-dialog Play button when there's no synth node to route through)

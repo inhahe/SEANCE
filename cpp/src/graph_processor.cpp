@@ -25,6 +25,7 @@
 #include <cmath>
 #include <cstring>
 #include <fstream>
+#include <unordered_set>
 
 namespace SoundShop {
 
@@ -1043,6 +1044,23 @@ void GraphProcessor::rebuildGraph(NodeGraph& graph, Transport& transport) {
                 }
             }
         }
+    }
+
+    // ---- ModPin connectivity ----
+    // Recompute, for every node's modPins, whether a cable actually feeds the
+    // pin (some endPin == mp.pinId). applySignalModulations() skips modPins
+    // that aren't connected so an idle, eagerly-created control pin (e.g. a
+    // wavetable "Mod: Position" pin with no cable) doesn't read its silent
+    // control channel as a real 0.0 modulation and clobber the param's manual
+    // value. Built from the same graph.links we just wired, so it stays in
+    // lockstep with the actual connections.
+    {
+        std::unordered_set<int> connectedEndPins;
+        for (auto& link : graph.links)
+            connectedEndPins.insert(link.endPin);
+        for (auto& n : graph.nodes)
+            for (auto& mp : n.modPins)
+                mp.connected = (connectedEndPins.count(mp.pinId) > 0);
     }
 
     lastNodeCount = (int)graph.nodes.size();

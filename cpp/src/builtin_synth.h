@@ -152,7 +152,8 @@ public:
     // the phase-locked `curve` variable.
     static float evaluateWithVars(const std::string& expr,
                                   const std::unordered_map<std::string, float>& vars,
-                                  const std::function<float(float)>& shapeFn);
+                                  const std::function<float(float)>& shapeFn,
+                                  const std::function<float(int)>& noteToFreqFn = {});
 
     // Run a multi-statement program once (see the "Program mode" comment
     // above). `vars` are read-only per-call bindings (transport, inputs);
@@ -164,7 +165,8 @@ public:
                             const std::unordered_map<std::string, float>& vars,
                             std::unordered_map<std::string, float>& stateVars,
                             IExprEmitSink* sink,
-                            const std::function<float(float)>& shapeFn);
+                            const std::function<float(float)>& shapeFn,
+                            const std::function<float(int)>& noteToFreqFn = {});
 };
 
 // Voice for polyphonic playback

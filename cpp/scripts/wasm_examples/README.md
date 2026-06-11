@@ -383,9 +383,12 @@ wasm-ld --no-entry --export-all *.o -o lua_effect.wasm
 | `ss_get_param` | `(index: i32) -> f32` | Read current parameter value. |
 | `ss_midi_out` | `(sample_offset: i32, status: u8, d1: u8, d2: u8) -> void` | Emit a MIDI event to MIDI output 0. |
 | `ss_midi_out_n` | `(out_index: i32, sample_offset: i32, status: u8, d1: u8, d2: u8) -> void` | Emit a MIDI event to a specific MIDI output pin (needs `ss_num_midi_outputs() > 1`). With multiple outputs the host re-stamps the channel for routing, so don't rely on the channel nibble of `status` surviving. |
+| `ss_note_to_freq` | `(midinote: i32) -> f32` | Frequency in Hz of a MIDI note using the **project tuning system** (Equal Temperament / Pythagorean / Just Intonation / Meantone) and concert pitch — not a hardcoded 12-TET A440. Returns 0 for a note outside 0..127. |
 | `ss_log` | `(msg: *u8) -> void` | Debug print (no-op in release). |
 
 All host functions are imported from module `"env"`.
+
+**Note names.** `ss_note_to_freq` is the only note helper that needs the host, because only the host knows the project's tuning. Name ↔ number conversion is pure, so `soundshop_wasm.h` provides it inline (no host round-trip): `ss_notenum("C4") -> 60`, `ss_notename(60, buf) -> "C4"`, and `ss_notefreq("C4")` (which combines `ss_notenum` with `ss_note_to_freq`). C4 = MIDI 60, A4 = 69.
 
 ### Shared Memory Layout
 

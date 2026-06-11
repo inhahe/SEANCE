@@ -129,6 +129,18 @@ bool WasmScriptProcessor::loadWasm(const std::vector<uint8_t>& wasmBytes) {
         return m3Err_none;
     });
 
+    // ss_note_to_freq(midinote) -> Hz, using the project tuning system
+    // (Equal12 / Pythagorean / Just / Meantone + concert pitch). Out-of-range
+    // notes return 0. Mirrors notefreq() in the scripting languages; note-name
+    // <-> number parsing stays WASM-side (pure helpers in soundshop_wasm.h).
+    m3_LinkRawFunction(wasmModule, "env", "ss_note_to_freq", "f(i)", [](IM3Runtime rt, IM3ImportContext ctx, uint64_t* sp, void* mem) -> const void* {
+        auto* self = (WasmScriptProcessor*)m3_GetUserData(rt);
+        int n = (int)(int32_t)sp[0];
+        float hz = (n < 0 || n > 127) ? 0.0f : self->transport.noteToFreq(n);
+        *(float*)&sp[0] = hz;
+        return m3Err_none;
+    });
+
     // ss_midi_out(samplePos, status, d1, d2): emit a MIDI event to output 0.
     // The 8th event byte (off+7) carries the destination output index; this
     // single-output form always tags 0.

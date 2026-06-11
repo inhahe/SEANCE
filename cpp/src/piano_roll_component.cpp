@@ -330,10 +330,17 @@ PianoRollComponent::PianoRollComponent(NodeGraph& g, Node& n, Transport* t)
     addCombo(keyCombo, keyLbl, "Key:");
     addCombo(modeCombo, modeLbl, "Mode:");
     addCombo(scaleCombo, scaleLbl, "Scale:");
-    rootCombo.setTooltip("Root note - the home pitch of the key/scale (e.g. C for C Major)");
-    keyCombo.setTooltip("Key family - Major sounds happy/bright, Minor sounds sad/dark");
-    modeCombo.setTooltip("Mode - variants of the major scale that change the mood (Dorian, Phrygian, Lydian, etc.)");
-    scaleCombo.setTooltip("Scale - broader categories like Pentatonic, Blues, Whole-Tone, Chromatic. "
+    rootCombo.setTooltip("Root note - the home pitch (tonic) of the key/scale, e.g. C for C Major. "
+                         "Combined with Key + Mode (or a fixed Scale) to decide which notes are 'in key'.");
+    // Key + Mode tooltips are (re)set by syncScaleUI() so they can explain the
+    // greyed-out state too; these initial values match the enabled case.
+    keyCombo.setTooltip("Key (parent scale) - the 7 notes to use. Major sounds happy/bright; "
+                        "the Minor variants sound darker. Works together with Root and Mode.");
+    modeCombo.setTooltip("Mode - which note of the Key becomes 'home', rotating the same 7 notes to "
+                         "change the mood. Mode 1 'Ionian (Major)' = the Key itself; Dorian, Phrygian, "
+                         "Lydian, etc. start on a different degree.");
+    scaleCombo.setTooltip("Scale - a fixed non-diatonic note set (Pentatonic, Blues, Whole-Tone, "
+                          "Chromatic, ...). Overrides Key + Mode; pick a Key or Mode to switch back. "
                           "Affects which notes are highlighted as 'in key' on the piano roll.");
 
     // Populate root
@@ -353,17 +360,19 @@ PianoRollComponent::PianoRollComponent(NodeGraph& g, Node& n, Transport* t)
     { int id = 1; for (auto& [name, _] : MusicTheory::keys()) keyCombo.addItem(name, id++); }
     keyCombo.setSelectedItemIndex(findComboIndex(keyCombo, "Major"), juce::dontSendNotification);
     keyCombo.onChange = [this]() {
-        state.activeCategory = "key";
+        state.activeCategory = "keymode";
         state.keyName = keyCombo.getText().toStdString();
+        syncScaleUI();   // un-grey if we were in scale mode
         repaint();
     };
 
     // Populate mode
     { int id = 1; for (auto& [name, _] : MusicTheory::modes()) modeCombo.addItem(name, id++); }
-    modeCombo.setSelectedItemIndex(findComboIndex(modeCombo, "Ionian"), juce::dontSendNotification);
+    modeCombo.setSelectedItemIndex(findComboIndex(modeCombo, "Ionian (Major)"), juce::dontSendNotification);
     modeCombo.onChange = [this]() {
-        state.activeCategory = "mode";
+        state.activeCategory = "keymode";
         state.modeName = modeCombo.getText().toStdString();
+        syncScaleUI();
         repaint();
     };
 
@@ -373,6 +382,7 @@ PianoRollComponent::PianoRollComponent(NodeGraph& g, Node& n, Transport* t)
     scaleCombo.onChange = [this]() {
         state.activeCategory = "scale";
         state.scaleName = scaleCombo.getText().toStdString();
+        syncScaleUI();   // grey out Key + Mode
         repaint();
     };
 
@@ -544,15 +554,8 @@ PianoRollComponent::PianoRollComponent(NodeGraph& g, Node& n, Transport* t)
     snapOffBtn.onClick = [this, setSnap]() { setSnap(0.0f); };
 
     snapScaleBtn.onClick = [this, apply]() {
-        auto getIntervals = [&]() -> std::vector<int> {
-            const ScaleMap* t = nullptr;
-            if (state.activeCategory == "key") t = &MusicTheory::keys();
-            else if (state.activeCategory == "mode") t = &MusicTheory::modes();
-            else if (state.activeCategory == "scale") t = &MusicTheory::scales();
-            if (t) { auto* v = findScale(*t, state.activeName()); if (v) return *v; }
-            return {0,2,4,5,7,9,11};
-        };
-        auto intervals = getIntervals();
+        auto intervals = MusicTheory::activeIntervals(
+            state.activeCategory, state.keyName, state.modeName, state.scaleName);
         int root = state.keyRoot;
         apply([&](MidiNote& n) { n.pitch = MusicTheory::snapToScale(n.pitch, root, intervals); });
     };
@@ -577,14 +580,61 @@ PianoRollComponent::PianoRollComponent(NodeGraph& g, Node& n, Transport* t)
             if (r >= 1 && r <= (int)results.size()) {
                 auto& m = results[r - 1];
                 state.keyRoot = m.root;
-                state.activeCategory = m.category;
-                if (m.category == "key") state.keyName = m.scaleName;
-                else if (m.category == "mode") state.modeName = m.scaleName;
-                else state.scaleName = m.scaleName;
+                // Map the detected match into the Key+Mode model. A "key" match
+                // sets the parent and resets Mode to Ionian (identity rotation);
+                // a "mode" match keeps Major as the parent and sets the Mode; a
+                // "scale" match switches to the fixed-scale regime.
+                if (m.category == "scale") {
+                    state.activeCategory = "scale"; state.scaleName = m.scaleName;
+                } else if (m.category == "mode") {
+                    state.activeCategory = "keymode"; state.keyName = "Major"; state.modeName = m.scaleName;
+                } else {
+                    state.activeCategory = "keymode"; state.keyName = m.scaleName; state.modeName = "Ionian (Major)";
+                }
+                syncScaleUI();
                 repaint();
             }
         });
     };
+
+    // Reflect the initial scale selection into the dropdowns (selection,
+    // enabled state, tooltips) so Key/Mode start correctly greyed if the
+    // project opened in a fixed-scale regime.
+    syncScaleUI();
+}
+
+void PianoRollComponent::syncScaleUI() {
+    auto selByText = [](juce::ComboBox& cb, const std::string& name) {
+        for (int i = 0; i < cb.getNumItems(); ++i)
+            if (cb.getItemText(i).toStdString() == name) {
+                cb.setSelectedItemIndex(i, juce::dontSendNotification);
+                return;
+            }
+    };
+    rootCombo.setSelectedId(state.keyRoot + 1, juce::dontSendNotification);
+    selByText(keyCombo, state.keyName);
+    selByText(modeCombo, state.modeName);
+    selByText(scaleCombo, state.scaleName);
+
+    // Key + Mode only drive the highlight when NOT in the fixed-scale regime.
+    // Grey them out otherwise, and explain why (per the "disabled controls must
+    // explain themselves" rule) - choosing a Key or Mode switches back.
+    const bool keymode = (state.activeCategory != "scale");
+    keyCombo.setEnabled(keymode);
+    modeCombo.setEnabled(keymode);
+    if (keymode) {
+        keyCombo.setTooltip("Key (parent scale) - the 7 notes to use. Major sounds happy/bright; "
+                            "the Minor variants sound darker. Works together with Root and Mode.");
+        modeCombo.setTooltip("Mode - which note of the Key becomes 'home', rotating the same 7 notes to "
+                             "change the mood. Mode 1 'Ionian (Major)' = the Key itself; Dorian, Phrygian, "
+                             "Lydian, etc. start on a different degree.");
+    } else {
+        const juce::String why =
+            "Disabled because a fixed Scale (" + juce::String(state.scaleName) + ") is selected. "
+            "Pick a Key or Mode here to switch back to the rotational key/mode system.";
+        keyCombo.setTooltip(why);
+        modeCombo.setTooltip(why);
+    }
 }
 
 void PianoRollComponent::resized() {
@@ -833,18 +883,8 @@ void PianoRollComponent::paint(juce::Graphics& g) {
     auto pitchToY = [&](int p) { return (pitchHi - p) * rowH; };
 
     // Build scale highlight set
-    auto getIntervals = [&]() -> std::vector<int> {
-        const ScaleMap* table = nullptr;
-        if (state.activeCategory == "key") table = &MusicTheory::keys();
-        else if (state.activeCategory == "mode") table = &MusicTheory::modes();
-        else if (state.activeCategory == "scale") table = &MusicTheory::scales();
-        if (table) {
-            auto* v = findScale(*table, state.activeName());
-            if (v) return *v;
-        }
-        return {0,2,4,5,7,9,11};
-    };
-    auto intervals = getIntervals();
+    auto intervals = MusicTheory::activeIntervals(
+        state.activeCategory, state.keyName, state.modeName, state.scaleName);
     std::set<int> scaleNotes;
     for (int s : intervals) scaleNotes.insert((s + state.keyRoot) % 12);
     bool isChromatic = intervals.size() >= 12;
@@ -2442,13 +2482,13 @@ void PianoRollComponent::showNoteMenu() {
     juce::PopupMenu keyMenu;
     int ki = 0;
     for (auto& [name, _] : MusicTheory::keys())
-        keyMenu.addItem(200 + ki++, name, true, state.activeCategory == "key" && state.keyName == name);
+        keyMenu.addItem(200 + ki++, name, true, state.activeCategory != "scale" && state.keyName == name);
     menu.addSubMenu("Key", keyMenu);
 
     juce::PopupMenu modeMenu;
     int mi = 0;
     for (auto& [name, _] : MusicTheory::modes())
-        modeMenu.addItem(300 + mi++, name, true, state.activeCategory == "mode" && state.modeName == name);
+        modeMenu.addItem(300 + mi++, name, true, state.activeCategory != "scale" && state.modeName == name);
     menu.addSubMenu("Mode", modeMenu);
 
     juce::PopupMenu scaleMenu;
@@ -2578,29 +2618,15 @@ void PianoRollComponent::showNoteMenu() {
             // Detune and velocity are now handled by inline slider
             // components - no case IDs needed.
             case 50: { // Snap to Scale
-                auto getIntervals = [&]() -> std::vector<int> {
-                    const ScaleMap* table = nullptr;
-                    if (state.activeCategory == "key") table = &MusicTheory::keys();
-                    else if (state.activeCategory == "mode") table = &MusicTheory::modes();
-                    else if (state.activeCategory == "scale") table = &MusicTheory::scales();
-                    if (table) { auto* v = findScale(*table, state.activeName()); if (v) return *v; }
-                    return {0,2,4,5,7,9,11};
-                };
-                auto intervals = getIntervals();
+                auto intervals = MusicTheory::activeIntervals(
+                    state.activeCategory, state.keyName, state.modeName, state.scaleName);
                 int root = state.keyRoot;
                 apply([&](MidiNote& n) { n.pitch = MusicTheory::snapToScale(n.pitch, root, intervals); });
                 break;
             }
             case 51: { // Change Key
-                auto getIntervals = [&]() -> std::vector<int> {
-                    const ScaleMap* table = nullptr;
-                    if (state.activeCategory == "key") table = &MusicTheory::keys();
-                    else if (state.activeCategory == "mode") table = &MusicTheory::modes();
-                    else if (state.activeCategory == "scale") table = &MusicTheory::scales();
-                    if (table) { auto* v = findScale(*table, state.activeName()); if (v) return *v; }
-                    return {0,2,4,5,7,9,11};
-                };
-                auto intervals = getIntervals();
+                auto intervals = MusicTheory::activeIntervals(
+                    state.activeCategory, state.keyName, state.modeName, state.scaleName);
                 int root = state.keyRoot;
                 apply([&](MidiNote& n) {
                     n.pitch = juce::jlimit(0, 127,
@@ -2631,10 +2657,14 @@ void PianoRollComponent::showNoteMenu() {
                     if (r >= 1000 && r < 1000 + (int)results.size()) {
                         auto& m = results[r - 1000];
                         state.keyRoot = m.root;
-                        state.activeCategory = m.category;
-                        if (m.category == "key") state.keyName = m.scaleName;
-                        else if (m.category == "mode") state.modeName = m.scaleName;
-                        else state.scaleName = m.scaleName;
+                        if (m.category == "scale") {
+                            state.activeCategory = "scale"; state.scaleName = m.scaleName;
+                        } else if (m.category == "mode") {
+                            state.activeCategory = "keymode"; state.keyName = "Major"; state.modeName = m.scaleName;
+                        } else {
+                            state.activeCategory = "keymode"; state.keyName = m.scaleName; state.modeName = "Ionian (Major)";
+                        }
+                        syncScaleUI();
                         repaint();
                     }
                 });
@@ -2700,19 +2730,22 @@ void PianoRollComponent::showNoteMenu() {
                 break;
             }
             default:
-                if (result >= 100 && result < 112) state.keyRoot = result - 100;
+                if (result >= 100 && result < 112) { state.keyRoot = result - 100; syncScaleUI(); }
                 else if (result >= 200 && result < 300) {
                     int i = 0; for (auto& [name, _] : MusicTheory::keys()) {
-                        if (i++ == result - 200) { state.activeCategory = "key"; state.keyName = name; break; }
+                        if (i++ == result - 200) { state.activeCategory = "keymode"; state.keyName = name; break; }
                     }
+                    syncScaleUI();
                 } else if (result >= 300 && result < 400) {
                     int i = 0; for (auto& [name, _] : MusicTheory::modes()) {
-                        if (i++ == result - 300) { state.activeCategory = "mode"; state.modeName = name; break; }
+                        if (i++ == result - 300) { state.activeCategory = "keymode"; state.modeName = name; break; }
                     }
+                    syncScaleUI();
                 } else if (result >= 400 && result < 500) {
                     int i = 0; for (auto& [name, _] : MusicTheory::scales()) {
                         if (i++ == result - 400) { state.activeCategory = "scale"; state.scaleName = name; break; }
                     }
+                    syncScaleUI();
                 } else if (result >= 800 && result < 900) {
                     // Bake recorded per-note pressure onto a param's automation lane.
                     int pi = result - 800;
@@ -3232,13 +3265,13 @@ void PianoRollComponent::showEmptyMenu() {
     juce::PopupMenu keyMenu;
     int ki = 0;
     for (auto& [name, _] : MusicTheory::keys())
-        keyMenu.addItem(200 + ki++, name, true, state.activeCategory == "key" && state.keyName == name);
+        keyMenu.addItem(200 + ki++, name, true, state.activeCategory != "scale" && state.keyName == name);
     menu.addSubMenu("Key", keyMenu);
 
     juce::PopupMenu modeMenu;
     int mi = 0;
     for (auto& [name, _] : MusicTheory::modes())
-        modeMenu.addItem(300 + mi++, name, true, state.activeCategory == "mode" && state.modeName == name);
+        modeMenu.addItem(300 + mi++, name, true, state.activeCategory != "scale" && state.modeName == name);
     menu.addSubMenu("Mode", modeMenu);
 
     juce::PopupMenu scaleMenu;
@@ -3764,29 +3797,36 @@ void PianoRollComponent::showEmptyMenu() {
                     if (r >= 1000 && r < 1000 + (int)results.size()) {
                         auto& m = results[r - 1000];
                         state.keyRoot = m.root;
-                        state.activeCategory = m.category;
-                        if (m.category == "key") state.keyName = m.scaleName;
-                        else if (m.category == "mode") state.modeName = m.scaleName;
-                        else state.scaleName = m.scaleName;
+                        if (m.category == "scale") {
+                            state.activeCategory = "scale"; state.scaleName = m.scaleName;
+                        } else if (m.category == "mode") {
+                            state.activeCategory = "keymode"; state.keyName = "Major"; state.modeName = m.scaleName;
+                        } else {
+                            state.activeCategory = "keymode"; state.keyName = m.scaleName; state.modeName = "Ionian (Major)";
+                        }
+                        syncScaleUI();
                         repaint();
                     }
                 });
                 break;
             }
             default:
-                if (result >= 100 && result < 112) state.keyRoot = result - 100;
+                if (result >= 100 && result < 112) { state.keyRoot = result - 100; syncScaleUI(); }
                 else if (result >= 200 && result < 300) {
                     int i = 0; for (auto& [name, _] : MusicTheory::keys()) {
-                        if (i++ == result - 200) { state.activeCategory = "key"; state.keyName = name; break; }
+                        if (i++ == result - 200) { state.activeCategory = "keymode"; state.keyName = name; break; }
                     }
+                    syncScaleUI();
                 } else if (result >= 300 && result < 400) {
                     int i = 0; for (auto& [name, _] : MusicTheory::modes()) {
-                        if (i++ == result - 300) { state.activeCategory = "mode"; state.modeName = name; break; }
+                        if (i++ == result - 300) { state.activeCategory = "keymode"; state.modeName = name; break; }
                     }
+                    syncScaleUI();
                 } else if (result >= 400 && result < 500) {
                     int i = 0; for (auto& [name, _] : MusicTheory::scales()) {
                         if (i++ == result - 400) { state.activeCategory = "scale"; state.scaleName = name; break; }
                     }
+                    syncScaleUI();
                 } else if (result == 5999) {
                     // Delete effect region at cursor
                     for (int i = 0; i < (int)node->effectRegions.size(); ++i) {

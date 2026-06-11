@@ -45,10 +45,10 @@
 <p>The four dropdowns in the toolbar set the musical key context for the clip. They affect which notes get highlighted as "in scale" on the piano roll background, and they're what Snap-to-Scale uses.</p>
 
 <ul>
-  <li><strong>Root</strong> — the home pitch (C, C#, D, …). For C Major it's C; for A Minor it's A.</li>
-  <li><strong>Key</strong> — the family (Major, Minor, etc.). Major sounds happy/bright, Minor sounds sad/dark.</li>
-  <li><strong>Mode</strong> — variants of the major scale that change the mood. Ionian is the standard major; Dorian, Phrygian, Lydian, Mixolydian, Aeolian (= natural minor), and Locrian each shift the pattern of whole and half steps for a different flavor.</li>
-  <li><strong>Scale</strong> — broader categories: Pentatonic (5 notes, hard to sound wrong), Blues, Whole-Tone, Chromatic (all 12 notes — turns off scale highlighting), and so on.</li>
+  <li><strong>Root</strong> — the home pitch (C, C#, D, …). For C Major it's C; for A Minor it's A. This is the one setting that's independent of the others.</li>
+  <li><strong>Key</strong> — the <em>parent scale</em>: which seven notes to use. Major sounds happy/bright; the Minor variants (and a few exotic parents) sound darker. <em>Key is not a note letter</em> — that's Root — it's the flavor of the seven-note set.</li>
+  <li><strong>Mode</strong> — which note of the Key becomes "home". <strong>Ionian (Major)</strong> is the Key itself; <strong>Dorian</strong> starts on the 2nd note, <strong>Phrygian</strong> on the 3rd, and so on through <strong>Locrian</strong> — same seven notes, different starting point, different mood. Key and Mode work <em>together</em>: Root A + Key Major + Mode Dorian gives you A Dorian.</li>
+  <li><strong>Scale</strong> — a fixed note set that doesn't follow the Key+Mode system: Pentatonic (5 notes, hard to sound wrong), Blues, Whole-Tone, Chromatic (all 12 notes — turns off scale highlighting), and so on. Picking a Scale <em>overrides</em> Key and Mode (they grey out); choose a Key or Mode again to switch back.</li>
 </ul>
 
 <p>If you don't already know what scale your existing notes are in, click <strong>Detect Key</strong> and the editor will analyze the notes and guess the most likely key/scale, then set the dropdowns to match.</p>

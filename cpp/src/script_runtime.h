@@ -5,6 +5,7 @@
 #include <memory>
 #include <functional>
 #include <unordered_map>
+#include <cmath>
 
 namespace SoundShop {
 
@@ -102,6 +103,21 @@ struct IScriptRuntime {
     // across a block; re-set whenever the table is re-rendered.
     virtual void setShape(std::function<float(float)> shapeFn) { shape = std::move(shapeFn); }
 
+    // Bind the note->frequency mapper, which applies the PROJECT tuning system
+    // (Equal12 / Pythagorean / Just / Meantone + concert pitch) rather than a
+    // hardcoded 12-TET 440. Scripts reach it via notefreq(). The host binds this
+    // capturing its Transport (transport.noteToFreq); the default fallback below
+    // is plain 12-TET so a runtime with no host binding still returns something
+    // sensible.
+    virtual void setNoteToFreq(std::function<float(int)> fn) { noteToFreq = std::move(fn); }
+
+    // Helper for trampolines / evaluators: frequency of a MIDI note using the
+    // bound mapper, or 12-TET A440 if none was bound.
+    float noteFreq(int note) const {
+        if (noteToFreq) return noteToFreq(note);
+        return 440.0f * std::pow(2.0f, (note - 69) / 12.0f);
+    }
+
     // Reset persistent state. Called on reload / when the program text changes.
     // For languages with an init hook (Builtin `init:`, Lua `init()`), this also
     // runs that hook once.
@@ -131,7 +147,8 @@ struct IScriptRuntime {
     virtual std::string getError() const { return {}; }
 
 protected:
-    std::function<float(float)> shape; // shape(pos) sampler (may be empty)
+    std::function<float(float)> shape;       // shape(pos) sampler (may be empty)
+    std::function<float(int)>   noteToFreq;   // note->Hz via project tuning (may be empty)
 };
 
 // Returns true if `lang` can run at `rate` (mirrors the capability matrix).

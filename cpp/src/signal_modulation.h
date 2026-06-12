@@ -49,46 +49,6 @@ inline void applySignalModulations(Node& node,
                                     const juce::AudioBuffer<float>& buf) {
     if (node.modPins.empty()) return;
 
-    // === TEMP MODPIN DIAGNOSTIC (throwaway) ===
-    // Only for a node that owns a "Position" param (the wavetable synth), and
-    // only every Nth call so we don't hammer the disk. Dumps, per modPin: pin
-    // name, connected flag, Set/Mod mode, computed chIdx, the raw sample[0] on
-    // THAT channel, plus every control channel's sample[0] so we can see if the
-    // LFO signal is landing on a different channel than the apply side reads.
-    {
-        bool hasPos = false;
-        for (const auto& p : node.params)
-            if (p.name.rfind("Position", 0) == 0) { hasPos = true; break; }
-        static int sCallCount = 0;
-        if (hasPos && ((sCallCount++ % 64) == 0)) {
-            juce::String line;
-            line << "nCh=" << buf.getNumChannels() << "  chans[";
-            for (int c = 2; c < buf.getNumChannels(); ++c)
-                line << "ch" << c << "=" << juce::String(buf.getSample(c, 0), 3) << " ";
-            line << "]  modPins{";
-            for (const auto& mp : node.modPins) {
-                std::string pinName = "?";
-                for (const auto& pin : node.pinsIn)
-                    if (pin.id == mp.pinId) { pinName = pin.name; break; }
-                int slot = -1, sc = 0;
-                for (const auto& pin : node.pinsIn) {
-                    if (pin.id == mp.pinId) { slot = sc; break; }
-                    if (pin.kind == PinKind::Signal || pin.kind == PinKind::Param) ++sc;
-                }
-                int ch = 2 + slot;
-                float sv = (ch >= 0 && ch < buf.getNumChannels()) ? buf.getSample(ch, 0) : -999.0f;
-                line << "[" << pinName.c_str()
-                     << " conn=" << (mp.connected ? 1 : 0)
-                     << " mode=" << (mp.mode == Node::ModPin::Mode::Absolute ? "Set" : "Mod")
-                     << " ch=" << ch << " sig=" << juce::String(sv, 3)
-                     << " pIdx=" << mp.paramIndex << "] ";
-            }
-            line << "}\n";
-            juce::File("D:/temp/modpin_diag.txt").appendText(line);
-        }
-    }
-    // === END TEMP DIAGNOSTIC ===
-
     // Build a quick map: for each Signal/Param pin in pinsIn, which
     // control-slot index is it? (matches graph_processor.cpp's routing
     // logic that puts control signals on channels 2, 3, 4, ...)

@@ -132,6 +132,8 @@ target_sources(SEANCE PRIVATE
     src/sfizz_processor.h
     src/plugin_sandbox.h
     src/plugin_sandbox.cpp
+    src/self_test.h
+    src/self_test.cpp
     src/cache_processor.h
     src/audio_crossfader.h
     src/trigger_node.cpp
@@ -211,6 +213,10 @@ target_sources(SEANCE PRIVATE
     src/hrtf_data.cpp
     src/hrtf_data.h
     src/tuning.h
+    src/video_decoder.cpp
+    src/video_decoder.h
+    src/video_import_dialog.cpp
+    src/video_import_dialog.h
 )
 
 target_link_libraries(SEANCE PRIVATE

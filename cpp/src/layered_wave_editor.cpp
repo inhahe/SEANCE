@@ -233,12 +233,14 @@ public:
 
         setupSlider(grainLengthSlider, grainLengthLabel,
                     "Grain length",
-                    "Length of each grain window in the OLA stream, in "
-                    "milliseconds. Short (~20 ms) = fast textural blur; "
-                    "long (~200 ms) = stable sustain. Doesn't change the "
-                    "captured source - just how the synth scrubs through "
-                    "it while a note is held.",
-                    5.0, 500.0, 1.0);
+                    "Length of each grain in the OLA cloud, in milliseconds. "
+                    "Short (~5 ms, the default) = a smooth, CONSTANT cloud; "
+                    "longer grains roam over a proportionally wider window and "
+                    "so sound more evolving / less constant. Doesn't change the "
+                    "captured source - just the size of the grains the synth "
+                    "scatters across the selection band while a note is held. "
+                    "Used only by the Async / Pitch-sync modes.",
+                    1.0, 500.0, 0.5);
         grainLengthSlider.setTextValueSuffix(" ms");
         grainLengthSlider.onValueChange = [this]() { onGrainLengthChanged(); };
 
@@ -741,9 +743,10 @@ public:
         // cap moves with it; refresh the slider range so it can't sit above
         // window/2 (which the voice would silently halve).
         refreshCrossfadeRange();
+        updateSourceInfoLabel();   // window size changed - update the ms read-out
         pushPreviewWindow();
         repaint();
-        if (onApply) onApply();
+        applyEdit();
     }
 
 private:
@@ -981,16 +984,32 @@ private:
         centsLabel.setText(t, juce::dontSendNotification);
     }
 
+    // Refresh the read-out under the waveform: total captured duration plus the
+    // current freeze-WINDOW length and (for the grain-cloud modes) the grain
+    // length, all in ms, so the user can compare the selected slice against the
+    // grain size at a glance ("the waveform size versus the grain size"). Called
+    // from syncFromFrame and from every handler that changes the window, grain,
+    // or freeze mode so the numbers track live as the band is dragged.
+    void updateSourceInfoLabel() {
+        const double sr = sampleRateOrFallback();
+        const double srcMs = samplesToMs((int)frame.source.size());
+        juce::String info;
+        info << juce::String(srcMs, 0) << " ms @ "
+             << juce::String((int)std::round(sr / 1000.0)) << " kHz  \xC2\xB7  window "
+             << juce::String(samplesToMs(effectiveWindowLen()), 0) << " ms";
+        // The grain only applies in the two grain-cloud modes; show it there so
+        // the comparison is meaningful and uncluttered elsewhere.
+        if (modeUsesGrain())
+            info << "  \xC2\xB7  grain "
+                 << juce::String(samplesToMs(std::max(16, frame.grainLength)), 0)
+                 << " ms";
+        sourceInfoLabel.setText(info, juce::dontSendNotification);
+    }
+
     void syncFromFrame() {
         suppressCallbacks = true;
 
-        const double sr = sampleRateOrFallback();
-        const double srcSec = (double)frame.source.size() / sr;
-        juce::String info;
-        info << juce::String(srcSec, 2) << " s @ "
-             << juce::String((int)std::round(sr / 1000.0)) << " kHz, "
-             << juce::String((int)frame.source.size()) << " samples";
-        sourceInfoLabel.setText(info, juce::dontSendNotification);
+        updateSourceInfoLabel();
 
         // The grain must fit inside the freeze window, which fits inside the
         // capture, so the grain can never exceed the captured duration. Cap the
@@ -1056,15 +1075,41 @@ private:
     void applyGrainLengthSamples(int gSamples) {
         const int srcLen = (int)frame.source.size();
         const double capturedMs = samplesToMs(srcLen);
-        const double maxGrainMs = std::max(5.0,
+        const double maxGrainMs = std::max(1.0,
             std::min((double)kGranularMaxGrainMs, capturedMs));
-        const double ms = std::clamp(samplesToMs(gSamples), 5.0, maxGrainMs);
+        // Floor at 1 ms so the async cloud can be made as constant as possible;
+        // the voice still enforces a 16-sample engine floor, so very short
+        // values collapse to ~0.33 ms at 48 kHz - harmless but buzzy.
+        const double ms = std::clamp(samplesToMs(gSamples), 1.0, maxGrainMs);
         frame.grainLength = msToSamples(ms);
         suppressCallbacks = true;
-        grainLengthSlider.setRange(5.0, maxGrainMs, 1.0);
+        grainLengthSlider.setRange(1.0, maxGrainMs, 0.5);
         grainLengthSlider.setValue(ms, juce::dontSendNotification);
         refreshCrossfadeRange();
         suppressCallbacks = false;
+    }
+
+    // Commit an audible edit (band, grain, pitch, mode...) to the host.
+    //
+    // onApply persists the change and, in the embedded (synth-hosted) case,
+    // triggers a debounced graph rebuild (onNodeEdited -> requestRebuild ->
+    // rebuildGraph, which calls processorGraph->clear() and destroys every
+    // live voice). That rebuild is what used to silence the audition the
+    // moment the user resized the band: the held note's voice was torn down
+    // and nothing re-established it.
+    //
+    // The fix is level-triggered: while auditioning through the synth path we
+    // re-publish the audition snapshot (sendAudition(true, ...)) on every
+    // audible edit. heldAudition is persistent state the synth reconciles each
+    // block, so the post-rebuild processor re-arms the voice from the *refreshed*
+    // snapshot - the user keeps hearing a continuous note that now reflects the
+    // new band / grain / mode. In the fallback (engine-preview) path there is no
+    // rebuild and the preview atomics were already updated by pushPreview*(), so
+    // this is a cheap no-op there.
+    void applyEdit() {
+        if (playing && sendAudition)
+            sendAudition(true, kAuditionPitch, kAuditionVelocity);
+        if (onApply) onApply();
     }
 
     void onGrainLengthChanged() {
@@ -1083,8 +1128,9 @@ private:
             frame.windowStart = std::clamp(frame.windowStart, 0,
                                            std::max(0, srcLen - len));
         }
+        updateSourceInfoLabel();   // grain (and maybe window) size changed
         pushPreviewWindow();
-        if (onApply) onApply();
+        applyEdit();
         repaint();  // band geometry may have changed
     }
     void onGrainCountChanged() {
@@ -1092,18 +1138,18 @@ private:
         frame.grainCount = std::clamp((int)std::round(grainCountSlider.getValue()),
                                       2, GrainFreezeVoice::kMaxGrains);
         pushPreviewExtras();
-        if (onApply) onApply();
+        applyEdit();
     }
     void onFftSizeChanged() {
         if (suppressCallbacks) return;
         frame.fftSize = fftComboIdToSize(fftSizeCombo.getSelectedId());
         pushPreviewExtras();
-        if (onApply) onApply();
+        applyEdit();
     }
     void onCrossfadeChanged() {
         if (suppressCallbacks) return;
         frame.crossfadeSamples = msToSamples(crossfadeSlider.getValue());
-        if (onApply) onApply();
+        applyEdit();
     }
     void onPitchChanged() {
         if (suppressCallbacks) return;
@@ -1119,7 +1165,7 @@ private:
         octaveCombo.setSelectedId(o + 1, juce::dontSendNotification);
         suppressCallbacks = false;
         updateCentsLabel(pitchSlider.getValue());
-        if (onApply) onApply();
+        applyEdit();
     }
     void onNoteOrOctaveChanged() {
         if (suppressCallbacks) return;
@@ -1152,9 +1198,10 @@ private:
 
         if (usesGrain) {
             grainLengthSlider.setTooltip(
-                "Length of each grain window in the OLA stream, in "
-                "milliseconds. Short (~20 ms) = fast textural blur; "
-                "long (~200 ms) = stable sustain. Doesn't change the captured "
+                "Length of each grain in the OLA cloud, in milliseconds. "
+                "Short (~5 ms, the default) = a smooth, CONSTANT cloud; longer "
+                "grains roam over a proportionally wider window and so sound "
+                "more evolving / less constant. Doesn't change the captured "
                 "source - just the size of the grains the synth scatters across "
                 "the selection band while a note is held. The band can't be "
                 "narrower than one grain.");
@@ -1223,15 +1270,18 @@ private:
             // its new effective floor.
             refreshGrainSliderForMode();
             refreshCrossfadeRange();
+            updateSourceInfoLabel();   // window floor + grain visibility changed
             pushPreviewWindow();
             repaint();
-            if (onApply) onApply();
-            // Live-update the engine's audition freeze mode if we're
-            // currently playing, so the user hears the change.
-            if (playing) {
+            // applyEdit() re-publishes the held audition snapshot (synth path)
+            // so the post-rebuild voice picks up the new freeze mode; in the
+            // engine-preview fallback there's no rebuild, so push the mode
+            // straight to the live preview atomics instead.
+            if (playing && !sendAudition) {
                 if (auto* eng = AudioEngine::getInstance())
                     eng->setGrainFreezeMode(frame.freezeMode);
             }
+            applyEdit();
         }
     }
 
@@ -1272,18 +1322,32 @@ private:
 
             // Source: hand the engine a shared_ptr copy of the frame's PCM.
             auto src = std::make_shared<std::vector<float>>(frame.source);
-            const int grainLen = std::max(64, frame.grainLength);
+            // A grain must fit inside the freeze window or the engine floors the
+            // band width up to the grain, swallowing the source and tripping the
+            // "band too short to roam" viability gate -> silent async preview.
+            // Clamp to the resolved window exactly as the capture dialog and
+            // buildFrames do, so the fallback audition never goes silent.
+            const int grainLen = std::max(64,
+                std::min(frame.grainLength, effectiveWindowLen()));
             const int xfadeLen = std::max(0, frame.crossfadeSamples);
 
             eng->setGrainFreezeMode(frame.freezeMode);
             eng->setPreviewGrainLength(grainLen);
             eng->setPreviewCrossfadeLength(xfadeLen);
             // Pitch the preview to the frame's "As note" label, matching the
-            // synth-voice path (note 69 = A4): ratio = 440 / embeddedPitchHz.
-            // Without this the fallback preview always plays at native rate and
-            // ignores the embedded-pitch picker.
+            // synth-voice path (note 69 = A4): ratio = (440 / embeddedPitchHz)
+            // * (sourceSampleRate / deviceRate). The srRatio factor corrects a
+            // frame captured at a rate other than the graph's processing rate;
+            // without it this fallback preview plays at a different pitch than
+            // the placed synth note (terrain_synth.cpp renderGrainSample) and
+            // than the capture dialog's fixed preview.
+            const double devRate = eng->getSampleRate();
+            const double srRatio = (frame.sourceSampleRate > 0.0 && devRate > 0.0)
+                ? (frame.sourceSampleRate / devRate) : 1.0;
             eng->setPreviewGrainRatio(
-                frame.embeddedPitchHz > 0.0f ? 440.0f / frame.embeddedPitchHz : 1.0f);
+                frame.embeddedPitchHz > 0.0f
+                    ? (float)((440.0 / frame.embeddedPitchHz) * srRatio)
+                    : (float)srRatio);
             // Freeze the exact selection band the editor shows (-1 = auto).
             eng->setPreviewWindowStart(frame.windowStart);
             eng->setPreviewWindowLen(frame.windowLen);
@@ -8177,10 +8241,14 @@ void LayeredWaveEditorComponent::showCapturePanelInline(int sourceKind,
     //
     // Playback uses CaptureFromSongDialog (#capV2): pre-renders the
     // whole project to PCM offline, shows a song-length timeline with
-    // play / pause / stop transport and a draggable marker. While
-    // Playing the engine plays back the rendered song at full
-    // fidelity; while Paused or Scrubbing it loops a short grain
-    // centered on the marker so the user can audition before saving.
+    // play / pause / stop transport and a draggable region (two start/
+    // end handles) carrying N equally-spaced "section band" waveforms -
+    // the same region/N-waveform selection model as the File source.
+    // While Playing the engine plays back the rendered song at full
+    // fidelity (with a moving playhead anchored at the region start);
+    // while Paused or Scrubbing it loops a short grain on the Preview-
+    // index-selected band so the user can audition before saving. One
+    // Capture slices the region into N waveforms.
     //
     // Mic / File still use the original CaptureFromPlaybackDialog -
     // they don't need offline rendering since their data is either a
@@ -8232,27 +8300,16 @@ void LayeredWaveEditorComponent::showCapturePanelInline(int sourceKind,
             });
         } else {
             addCapturedFramesToLibrary(std::move(frames), sourceKind);
-            // After a Save in append mode the dialog stays open and
-            // currentLibraryId now points at the frame just added (set by
-            // addCapturedFramesToLibrary). Bind the capture panel's
-            // metadata write-through sink so any further "As note" / freeze /
-            // crossfade edit commits live to that frame instead of being
-            // silently dropped on Close. Previously onMetadataEdited was only
-            // wired in replace mode, so publishMetadataEdit() was a no-op in
-            // append mode and a post-Save octave change was lost. The sink
-            // tracks currentLibraryId, so a later Save (new frame) rebinds
-            // automatically. Only done for the song dialog: it always produces
-            // exactly ONE frame, so the rebound sink unambiguously targets it.
-            // CaptureFromPlaybackDialog (mic/file) can append N frames per Save,
-            // so a single-frame write-through target would be ambiguous; its
-            // sink is wired only in REPLACE mode (one bound frame), where
-            // seedFromExistingFrame also seeds the preserved crossfade so the
-            // echo is a true no-op. The dynamic_cast no-ops for that dialog.
-            if (auto* songPanel =
-                    dynamic_cast<CaptureFromSongDialog*>(capturePanel.get())) {
-                if (!songPanel->onMetadataEdited)
-                    songPanel->onMetadataEdited = makeCaptureMetadataSink();
-            }
+            // Append mode: the dialog stays open so the user can keep selecting
+            // and capturing more regions. We deliberately do NOT bind a metadata
+            // write-through sink here. Both capture dialogs now slice the
+            // selected region into N equally-spaced waveforms per Capture, so
+            // there is no single unambiguous frame for a post-Capture "As note"
+            // / freeze / crossfade edit to target - the same reason the mic/file
+            // dialog has never wired an append-mode sink. The write-through sink
+            // is wired only in REPLACE mode below, where the panel is bound to
+            // one specific library frame. (A post-Capture metadata tweak in
+            // append mode should be made in that frame's editor instead.)
         }
     };
 
@@ -8281,7 +8338,8 @@ void LayeredWaveEditorComponent::showCapturePanelInline(int sourceKind,
             // crossfade) commits to the frame the instant it changes - exactly
             // like GranularFrameEditorComponent. Result: closing the panel can
             // no longer silently revert a metadata change; only the PCM grab
-            // stays an explicit Save (it depends on marker position + Width).
+            // stays an explicit Save (it depends on the region selection and
+            // per-waveform width - capture-time params).
             if (doReplace) {
                 if (auto* g = dynamic_cast<GranularFrame*>(currentEditingFrame())) {
                     const double sr = (g->sourceSampleRate > 0.0)
@@ -8473,12 +8531,11 @@ void LayeredWaveEditorComponent::replaceCurrentEntryWithCapturedFrame(
     if (libIdx < 0) return;
     auto& entry = wave.library[(size_t)libIdx];
     entry.wave = std::move(frames[0]);
-    // Any additional captured frames are dropped on the floor. CaptureFromSongDialog
-    // produces exactly one frame (single Save = single capture); the
-    // multi-slice CaptureFromPlaybackDialog could produce N, but for the
-    // re-capture path "replace with N frames" doesn't map to a single
-    // library entry, so we take the first slice and let the user re-add
-    // others manually if they want them.
+    // Any additional captured frames are dropped on the floor. Both capture
+    // dialogs can now slice a region into N waveforms per Capture, but for the
+    // re-capture path "replace with N frames" doesn't map to a single library
+    // entry, so we take the first slice and let the user re-add the others
+    // manually if they want them.
 
     // Same downstream sync as append path: re-render preview, push to
     // node, refresh sidebar list (so the row's "used Nx" count and
@@ -8614,45 +8671,77 @@ void LayeredWaveEditorComponent::updateFrameEditorEmbed() {
             // graph.findNode(nodeId) so a graph.nodes reallocation can never
             // leave us holding a stale Node*.
             auto onAudition = [this](bool noteOn, int pitch, int velocity) {
-                if (auto* nd = graph.findNode(nodeId)) {
-                    // Tag the note-on with THIS frame's wavetable Position so
-                    // the synth auditions the edited frame, not whatever the
-                    // live Position knob currently selects. Computed fresh on
-                    // each Play so moving the scatter dot is reflected
-                    // immediately. Note-offs carry no position.
-                    std::vector<float> pos = noteOn ? currentFramePosition()
-                                                    : std::vector<float>{};
-                    // Ship the edited frame's actual data so the synth can
-                    // render it even when it isn't placed into the grid/scatter
-                    // (a freshly-captured library-only frame is otherwise absent
-                    // from the synth's wtGranularFrames table and would be
-                    // silent). Looked up fresh via currentEditingFrame() so we
-                    // never hold a stale frame pointer across a doc edit, and
-                    // it carries the exact on-screen bytes so Play matches what
-                    // you see even before the ~150ms graph rebuild. Note-offs
-                    // carry no payload.
-                    std::shared_ptr<Node::AuditionGranularFrame> gpayload;
-                    if (noteOn) {
-                        if (auto* g = dynamic_cast<GranularFrame*>(currentEditingFrame())) {
-                            gpayload = std::make_shared<Node::AuditionGranularFrame>();
-                            gpayload->source =
-                                std::make_shared<std::vector<float>>(g->source);
-                            gpayload->sourceSampleRate = g->sourceSampleRate;
-                            gpayload->grainLength      = g->grainLength;
-                            gpayload->windowStart      = g->windowStart;
-                            gpayload->windowLen        = g->windowLen;
-                            gpayload->embeddedPitchHz  = g->embeddedPitchHz;
-                            gpayload->freezeMode       = (int)g->freezeMode;
-                            gpayload->grainCount       = g->grainCount;
-                            gpayload->fftSize          = g->fftSize;
-                            gpayload->crossfadeSamples = g->crossfadeSamples;
-                            gpayload->gain             = g->gain;
-                        }
-                    }
+                auto* nd = graph.findNode(nodeId);
+                if (!nd) return;
+
+                // Stop / refresh-with-no-frame: clear the sustained audition so
+                // the synth releases its held voice on the next block.
+                if (!noteOn) {
                     std::lock_guard<std::mutex> lock(*nd->auditionMutex);
-                    nd->pendingAudition.push_back(
-                        {noteOn, pitch, velocity, std::move(pos), std::move(gpayload)});
+                    nd->heldAudition.reset();
+                    return;
                 }
+
+                // Tag the note with THIS frame's wavetable Position so the synth
+                // auditions the edited frame, not whatever the live Position knob
+                // selects. Computed fresh each call so moving the scatter dot (or
+                // editing a param) is reflected. Done before taking the lock.
+                std::vector<float> pos = currentFramePosition();
+
+                // Ship the edited frame's actual data so the synth can render it
+                // even when it isn't placed into the grid/scatter (a freshly-
+                // captured library-only frame is otherwise absent from the
+                // synth's wtGranularFrames table and would be silent). Looked up
+                // fresh via currentEditingFrame() so we never hold a stale frame
+                // pointer across a doc edit.
+                auto* g = dynamic_cast<GranularFrame*>(currentEditingFrame());
+                if (!g) {
+                    // No granular frame to audition - nothing to hold.
+                    std::lock_guard<std::mutex> lock(*nd->auditionMutex);
+                    nd->heldAudition.reset();
+                    return;
+                }
+
+                auto gpayload = std::make_shared<Node::AuditionGranularFrame>();
+                // Reuse the in-flight audition's PCM when this is a live REFRESH
+                // (band/grain/pitch edit mid-audition) rather than a fresh Play:
+                // the source bytes don't change on a param edit, so sharing the
+                // shared_ptr avoids deep-copying multi-MB of PCM on every slider
+                // tick. A fresh Play (no held audition yet) copies it once. The
+                // copy stays OUTSIDE the audio mutex so a long copy never stalls
+                // the audio thread.
+                {
+                    std::lock_guard<std::mutex> lock(*nd->auditionMutex);
+                    if (nd->heldAudition && nd->heldAudition->granularFrame
+                        && nd->heldAudition->granularFrame->source)
+                        gpayload->source = nd->heldAudition->granularFrame->source;
+                }
+                if (!gpayload->source)
+                    gpayload->source =
+                        std::make_shared<std::vector<float>>(g->source);
+                gpayload->sourceSampleRate = g->sourceSampleRate;
+                gpayload->grainLength      = g->grainLength;
+                gpayload->windowStart      = g->windowStart;
+                gpayload->windowLen        = g->windowLen;
+                gpayload->embeddedPitchHz  = g->embeddedPitchHz;
+                gpayload->freezeMode       = (int)g->freezeMode;
+                gpayload->grainCount       = g->grainCount;
+                gpayload->fftSize          = g->fftSize;
+                gpayload->crossfadeSamples = g->crossfadeSamples;
+                gpayload->gain             = g->gain;
+
+                // Publish as the sustained, level-triggered audition. The synth
+                // (re)establishes a voice from this whenever it starts, so the
+                // preview survives the debounced graph rebuild an edit fires.
+                auto ev = std::make_shared<Node::AuditionEvent>();
+                ev->isNoteOn      = true;
+                ev->pitch         = pitch;
+                ev->velocity      = velocity;
+                ev->position      = std::move(pos);
+                ev->granularFrame = std::move(gpayload);
+
+                std::lock_guard<std::mutex> lock(*nd->auditionMutex);
+                nd->heldAudition = std::move(ev);
             };
             embeddedFrameEditor = std::make_unique<GranularFrameEditorComponent>(
                 *gf, onSubApply, onRecap, onAudition);

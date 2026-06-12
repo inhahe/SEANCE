@@ -153,16 +153,19 @@ private:
     // editor's two-control grain+window model so capture and editor agree.
     juce::Slider    grainLenSlider;
     juce::Label     grainLenLabel;
-    // All sources: how many audio samples each captured waveform spans - its
+    // All sources: how long each captured waveform spans, in MILLISECONDS - its
     // freeze WINDOW (band) length, the region the freeze mode roams / loops /
-    // analyses over. Auto-tracks autoWindowMultiplier(mode) x grain (4x for the
-    // grain-cloud modes so they get roam room, 1x for loop/FFT), mirroring the
-    // editor's per-method window default, until the user drags it (windowUserSet)
-    // - then it stays a fixed sample count. With a single waveform it simply
-    // spans the whole selection (slider disabled). Drives both the produced
-    // GranularFrames' windowLen and the section bands drawn over the waveform.
-    juce::Slider    samplesPerWaveformSlider;
-    juce::Label     samplesPerWaveformLabel;
+    // analyses over. Expressed in ms (the same unit as grain length and
+    // crossfade) so the window:grain ratio is readable at a glance; converted to
+    // samples against the source rate where needed. Auto-tracks
+    // autoWindowMultiplier(mode) x grain (4x for the grain-cloud modes so they
+    // get roam room, 1x for loop/FFT), mirroring the editor's per-method window
+    // default, until the user drags it (windowUserSet) - then it stays a fixed
+    // ms value. With a single waveform it simply spans the whole selection
+    // (slider disabled). Drives both the produced GranularFrames' windowLen and
+    // the section bands drawn over the waveform.
+    juce::Slider    windowLenSlider;
+    juce::Label     windowLenLabel;
     // All sources: one-click "set the per-waveform width so the bands tile the
     // current selection with no gap or overlap" - i.e. snap the window to
     // regionLen / numFrames (what syncWindowToFitSlots does). Lets the user
@@ -255,7 +258,7 @@ private:
     // this for the GranularFrame's embeddedPitchHz.
     double capturedPitchHz = 440.0;
 
-    // Granular freeze-mode picker. Selects which "sustain the marker spot"
+    // Granular freeze-mode picker. Selects which "sustain the captured region"
     // algorithm the captured frames use (CrossfadeLoop / AsyncGranular /
     // PitchSyncGrains / SpectralFreeze - see GranularFreezeMode in
     // granular_frame.h). Drives the live audition through the shared
@@ -355,6 +358,25 @@ private:
     // section bands drawn in paint() so all three agree.
     int effectiveSrcLen() const;
 
+    // The window length the slider asks for, in samples (ms slider value
+    // converted against the tap rate), floored at the per-mode minimum and
+    // capped to the buffer length but NOT capped to the current selection.
+    // effectiveSrcLen() applies the region cap on top of this; minSelectionLen()
+    // uses the un-capped value to decide how short a resize drag may go.
+    int windowFromSlider() const;
+
+    // Minimum selection length a resize drag is allowed to reach, in samples.
+    // 0 for a single waveform (any size allowed). For 2+ it is the requested
+    // window (windowFromSlider) so a band always fits, EXCEPT when the view is
+    // zoomed in tighter than that window, in which case it is capped to the
+    // visible window length so the user can still shrink within the view.
+    int minSelectionLen() const;
+
+    // Called during a handle drag: if the selection got shorter than
+    // minSelectionLen(), push the dragged handle back out so the selection
+    // length is restored, falling back to the buffer boundary if needed.
+    void enforceMinSelectionDuringDrag();
+
     // Grain length in samples (the "Grains... ms" slider converted against the
     // tap rate, floored at 64). The size of each overlapping Hann grain the
     // cloud modes use; inert for CrossfadeLoop / SpectralFreeze. Baked into the
@@ -363,12 +385,35 @@ private:
     int effectiveGrainLen() const;
 
     // True once the user has explicitly set the per-waveform window (dragged the
-    // "Samples per waveform" slider or pressed "Fit width to selection"). While
+    // "Window length" slider or pressed "Fit width to selection"). While
     // false the window auto-tracks autoWindowMultiplier(mode) x grain via
     // syncWindowToAuto(); once true the window is a fixed sample count that
     // survives grain / mode / count changes (matching the editor's explicit-band
     // behaviour). A single waveform ignores this (its window is the selection).
     bool windowUserSet = false;
+
+    // True once the user has manually moved the Grain-length slider. While false
+    // the grain snaps to the freeze mode's default (defaultGrainMsForMode: 5 ms
+    // for Async, 40 ms for Pitch-sync) whenever the mode changes, so each cloud
+    // mode opens at a grain that sounds constant; once the user picks a grain we
+    // stop snapping and respect their value. Seeded from / written back to
+    // captureDialogPrefs so a manual choice survives re-opening.
+    bool grainUserSet = false;
+
+    // The waveform count the selection was last sized for. When the count changes
+    // the selection is resized in proportion (resizeSelectionForCountChange) so
+    // each waveform's window length and inter-band spacing stay constant - adding
+    // waveforms grows the selection instead of cramming more bands into a fixed
+    // span. Seeded to the initial slider value; updated in the count handler.
+    int lastNumFrames = 8;
+
+    // Resize the selection when the waveform count goes oldN -> newN, scaling its
+    // length in proportion (newLen = oldLen * newN / oldN) so the per-waveform
+    // window and slot spacing are preserved. Anchored at the selection start, the
+    // grown selection is shifted left to fit the buffer if it would overrun the
+    // end, and capped to the whole buffer. No-op if the buffer / selection is
+    // empty. The window itself is count-independent, so only the selection moves.
+    void resizeSelectionForCountChange(int oldN, int newN);
 
     // Source-window start index (in tap samples) for waveform i of n, given a
     // window length srcLen. Two regimes meeting continuously at an exact tiling:
@@ -395,14 +440,14 @@ private:
     // room = windowLen - grain), SpectralFreeze analyses inside it.
     std::vector<float> buildGrainSource(int startIdx, int windowLen) const;
 
-    // All sources: set the "Samples per waveform" slider to the current slot
+    // All sources: set the "Window length" slider to the current slot
     // spacing (regionLen / numFrames), so the window equals one slot and the
     // section bands tile the selection with zero gaps. Marks windowUserSet (an
     // explicit override). Invoked by the "Fit width to selection" button.
     void syncWindowToFitSlots();
 
     // All sources: while the window is in auto mode (!windowUserSet) set the
-    // "Samples per waveform" slider to autoWindowMultiplier(mode) x grain,
+    // "Window length" slider to autoWindowMultiplier(mode) x grain,
     // clamped to the available audio - the per-method window default that gives
     // the cloud modes roam room (4x) and keeps the loop/FFT modes at 1x, exactly
     // like the editor's kWindowAutoPerMethod sentinel. No-op once the user has
@@ -411,14 +456,14 @@ private:
     // changes. Uses dontSendNotification so it never trips windowUserSet.
     void syncWindowToAuto();
 
-    // All sources: enable/disable + relabel the "Samples per waveform" slider for
+    // All sources: enable/disable + relabel the "Window length" slider for
     // the current waveform count. With a single waveform there is no per-
     // waveform spacing to honour - the one window simply spans the whole
     // selection - so the slider is disabled and shown holding the selection
     // length (kept in sync as the selection is resized). With 2+ waveforms the
     // slider is the live per-waveform length control. Call wherever the count or
     // the region changes.
-    void updateSamplesPerWaveformControl();
+    void updateWindowLenControl();
 
     // All sources: keep the Crossfade slider's max at half the current freeze
     // window (effectiveSrcLen / 2, in ms) - the largest seam the CrossfadeLoop
@@ -451,6 +496,62 @@ private:
     void updateRegionInfoLabel();
     void updateSourceInfoLabel();
 
+    // ----- Zoom / scroll view window (File source only) -----
+    // A long file shows the whole buffer mapped across waveRect, which makes a
+    // useful selection a tiny sliver. To fix that the waveform view can be
+    // zoomed in and scrolled: viewZoom 1.0 shows the whole buffer, higher values
+    // show a proportionally smaller window, and viewScroll (0..1) positions that
+    // window along the buffer. Live sources (Mic / Playback) keep zoom 1 / scroll
+    // 0, so xForIdx/idxForX collapse to the whole-buffer map (no behaviour
+    // change) and the two sliders are hidden - only File exposes the controls.
+    double viewZoom   = 1.0;
+    double viewScroll = 0.0;
+    // Re-entrancy guard for reconfigureZoomForWindow(): its setRange() can clamp
+    // the zoom value and fire zoomSlider.onValueChange -> onViewChanged ->
+    // updateWindowLenControl -> reconfigureZoomForWindow again. The guard makes
+    // the nested call a no-op so the chain terminates (same pattern as
+    // syncingCrossfadeFromWindow).
+    bool reconfiguringZoom = false;
+    juce::Slider zoomSlider;
+    juce::Label  zoomLabel;
+    juce::Slider scrollSlider;
+    juce::Label  scrollLabel;
+    // Smallest window the zoom slider can shrink the view to, in samples - keeps
+    // a zoomed-in view from collapsing to nothing on a short file.
+    static constexpr int kMinViewSamples = 256;
+
+    // File only: the zoom / scroll sliders are shown; other sources hide them.
+    bool showsViewControls() const { return source == CaptureSource::File; }
+    // Number of samples shown in waveRect / index of the first shown sample,
+    // derived from viewZoom + viewScroll against the current buffer length.
+    int  viewLenSamples()   const;
+    int  viewStartSamples() const;
+    // Smallest the view is ever allowed to shrink to, in samples: kMinViewSamples
+    // normally, but at least one freeze WINDOW (windowFromSlider()) when there
+    // are 2+ waveforms - so the user can never zoom in tighter than one captured
+    // waveform spans. Capped to the buffer length. This is what guarantees the
+    // per-waveform window always fits on screen (so the min-selection drag clamp
+    // never needs a "window bigger than the view" escape hatch).
+    int  minViewLenSamples() const;
+    // Re-range the zoom slider so its maximum corresponds to minViewLenSamples()
+    // (not a fixed floor), clamping the current zoom into the new range. Called
+    // both on load and whenever the window changes (grain / mode / count / window
+    // drag), so the slider's reach tracks the live window.
+    void reconfigureZoomForWindow();
+    // Re-range the zoom slider for the current buffer length and reset the view
+    // to "whole buffer" (zoom 1 / scroll 0). Called when a file is loaded.
+    void configureViewSlidersForBuffer();
+    // Peg + cap the selection inside the current view window: a selection that
+    // would fall off an edge is translated to sit flush against it, and one
+    // longer than the visible window is shortened to it ("can't select more than
+    // you can see"). Keeps the selection usable at every zoom level - this is
+    // what makes the selection scroll with the audio yet stay pegged to a view
+    // edge once it reaches one, and what scales it down to fit when zooming in.
+    void clampSelectionToView();
+    // After a zoom / scroll change: clamp the selection to the new window,
+    // refresh dependent UI (region info, per-waveform slider, audition), repaint.
+    void onViewChanged();
+
     // Convenience: live-source modes auto-refresh; File mode does not.
     bool isLiveSource() const {
         return source == CaptureSource::Playback || source == CaptureSource::Mic;
@@ -469,24 +570,29 @@ private:
 
 // Capture-from-project dialog (v2). Replaces the live-playback ring-buffer
 // flow with one that pre-renders the whole song to PCM offline, then lets
-// the user transport-control or scrub a marker through it. The synth
+// the user transport-control it or scrub the selected region. The synth
 // engine plays back the rendered PCM at full fidelity while Playing, and
-// loops a short grain centered on the marker while Paused or Scrubbing -
-// so the user can audition the spot they're about to capture without
+// loops the Preview-selected region waveform while Paused or Scrubbing -
+// so the user can audition the waveforms they're about to capture without
 // having to commit to a Capture button blind.
 //
 // Differences from CaptureFromPlaybackDialog (Mic/File still use that):
 //   - No live ring buffer; we render the project once on dialog open via
 //     the same offline-render pattern doExportRender uses.
-//   - One save = one GranularFrame at the marker (not a batch), since
-//     the whole interaction model is "find the spot, save it". Batch
-//     capture can return as a follow-up.
+//   - The same region / N-waveform selection model as
+//     CaptureFromPlaybackDialog: drag two handles to pick a span of the
+//     rendered song, slice N equally-spaced waveforms across it (section
+//     bands), pick a per-waveform freeze window, and Capture delivers all N
+//     frames laid along the wavetable's Position dimension. The band geometry
+//     is shared with the file dialog via captureBandStartForIndex().
 //   - Transport states (Stopped / Playing / Paused / Scrubbing) drive
 //     AudioEngine::setPreviewMode so the engine mixes the appropriate
-//     stream (song PCM or grain loop) into the master output.
-//   - Save is disabled while Playing - the audible spot for the captured
-//     grain is the marker, and the marker is moving during play; tooltip
-//     explains.
+//     stream into the master output: Playing sweeps the whole rendered song
+//     PCM with a moving playhead; Paused / Scrubbing loops the
+//     Preview-waveform-selected slice of the region (the grain audition) so
+//     the user can hear what a captured waveform will sound like.
+//   - Capture is disabled while Playing - the playhead is sweeping, so pause
+//     or drag a handle to lock in the region first; the tooltip explains.
 class CaptureFromSongDialog : public juce::Component, private juce::Timer {
 public:
     using OnCapture = std::function<void(std::vector<std::unique_ptr<IWavetableFrame>>)>;
@@ -517,9 +623,9 @@ public:
     // edit. This is what makes the capture panel "always save" its metadata
     // the way the frame editor does: closing the panel can no longer silently
     // discard a pitch/freeze/crossfade change. The PCM grab itself stays an
-    // explicit "Save waveform at marker" act because it depends on the marker
-    // position and Width (capture-time params), which is inherent to capture,
-    // not a save-model discrepancy. Crossfade is reported in MILLISECONDS
+    // explicit "Capture waveforms" act because it depends on the region
+    // selection, per-waveform window, and waveform count (capture-time
+    // params), which is inherent to capture, not a save-model discrepancy. Crossfade is reported in MILLISECONDS
     // (rate-independent) so the host can convert to samples against the
     // frame's OWN sourceSampleRate rather than this dialog's render rate.
     // Left null in append mode (no pre-existing frame to write through to);
@@ -545,7 +651,7 @@ private:
     // UI-side transport state. Drives AudioEngine::setPreviewMode and
     // the enabled state of the buttons. Scrubbing is identical to Paused
     // for audio purposes (grain loop) but separately tracked so the
-    // marker keeps following the mouse instead of staying frozen.
+    // dragged handle keeps following the mouse instead of staying frozen.
     enum class TState { Stopped, Playing, Paused, Scrubbing };
     TState state = TState::Stopped;
 
@@ -556,17 +662,48 @@ private:
     std::shared_ptr<std::vector<float>> songPcm;
     double songSampleRate = 0.0;
 
-    // Current marker position in samples within songPcm. Single source
-    // of truth for "where the user is auditioning". During Playing this
-    // is updated from the engine's published preview-pos; otherwise it's
-    // driven by the user dragging.
-    int64_t markerSamplePos = 0;
+    // Playhead position in samples within songPcm, used only while Playing:
+    // it tracks the engine's published song-playback position so the moving
+    // playhead can be drawn over the waveform. The capture spot itself is the
+    // region (regionStart/regionEnd) below, not this.
+    int64_t playheadSamplePos = 0;
+
+    // Selected region in songPcm sample indices, inclusive-start /
+    // exclusive-end (so a zero-width region is unambiguous). The capture
+    // slices N waveforms across this span, exactly like
+    // CaptureFromPlaybackDialog. Defaults to a short window at the song start
+    // once the render completes; clamped into the current zoom/scroll view by
+    // clampSelectionToView().
+    int64_t regionStart = 0;
+    int64_t regionEnd   = 0;
+    // Currently-dragged handle: -1 none, 0 start handle, 1 end handle, 2 the
+    // whole region (body drag). dragAnchorSampleOffset anchors a body drag so
+    // the grabbed point doesn't jump under the mouse.
+    int     dragHandle = -1;
+    int64_t dragAnchorSampleOffset = 0;
 
     juce::TextButton playBtn  { "Play"  };
     juce::TextButton pauseBtn { "Pause" };
     juce::TextButton stopBtn  { "Stop"  };
-    juce::Slider     widthSlider;
-    juce::Label      widthLabel;
+    // Capture controls mirroring CaptureFromPlaybackDialog: how many waveforms
+    // to slice across the region, the per-grain length (ms), the per-waveform
+    // freeze WINDOW (ms), a one-click "fit window to the selection"
+    // button, a "Preview waveform" picker choosing which slice the Paused
+    // audition loops, an output Gain, and a region-geometry readout. See the
+    // matching members in CaptureFromPlaybackDialog for the full contract; the
+    // section-band geometry is shared via captureBandStartForIndex().
+    juce::Slider     numFramesSlider;
+    juce::Label      numFramesLabel;
+    juce::Slider     grainLenSlider;
+    juce::Label      grainLenLabel;
+    juce::Slider     windowLenSlider;
+    juce::Label      windowLenLabel;
+    juce::TextButton fitWidthBtn { "Fit width to selection" };
+    juce::Slider     previewIndexSlider;
+    juce::Label      previewIndexLabel;
+    juce::Slider     gainSlider;
+    juce::Label      gainLabel;
+    juce::Label      regionInfoLabel;
     // CrossfadeLoop seam crossfade length. Only meaningful when freeze
     // mode = CrossfadeLoop; left enabled in other modes so the user can
     // pre-set it before switching, but ignored by the engine for those
@@ -575,18 +712,18 @@ private:
     juce::Label      crossfadeLabel;
     // The crossfade value the user picked, in ms, independent of the
     // slider's current visible value. The visible value gets clamped down
-    // to width/2 whenever Width drops, but we keep the user's intended
-    // value here so a later Width increase restores the original
-    // crossfade rather than leaving it stuck at the clamp. Updated only
-    // when the user actually moves the crossfade slider; not updated by
-    // syncCrossfadeMaxToWidth's defensive re-set of the slider value.
+    // to half the freeze window whenever that window shrinks, but we keep the
+    // user's intended value here so a later window increase restores the
+    // original crossfade rather than leaving it stuck at the clamp. Updated
+    // only when the user actually moves the crossfade slider; not updated by
+    // syncCrossfadeMaxToWindow's defensive re-set of the slider value.
     double crossfadeDesiredMs = kXfadeDefMs;
-    // Set while syncCrossfadeMaxToWidth is mutating crossfadeSlider's
+    // Set while syncCrossfadeMaxToWindow is mutating crossfadeSlider's
     // range / value. JUCE's Slider::setRange fires onValueChange with
     // sendNotificationSync when its internal clamp shrinks the current
     // value, and we need to suppress that one path so the synthetic
     // clamped value doesn't get written back to crossfadeDesiredMs.
-    bool syncingCrossfadeFromWidth = false;
+    bool syncingCrossfadeFromWindow = false;
     juce::Label      statusLabel;
     juce::Label      hintLabel;
     // Freeze-mode picker (4 algorithms, see GranularFreezeMode docs in
@@ -598,7 +735,7 @@ private:
     // Per-waveform texture controls, mirroring CaptureFromPlaybackDialog. The
     // "Grains" slider sets the overlapping-grain count for the two grain-cloud
     // modes; the "FFT size" combo sets the SpectralFreeze FFT size. Both bake
-    // into the produced GranularFrame (buildFrameAtMarker) and drive the live
+    // into the produced GranularFrames (buildFrames) and drive the live
     // audition. Each is shown only in the modes that use it (refreshFreezeExtras),
     // with a tooltip explaining what it does, per the "grayed-out controls must
     // explain themselves" rule.
@@ -606,6 +743,14 @@ private:
     juce::Slider     grainCountSlider;
     juce::Label      fftSizeLabel;
     juce::ComboBox   fftSizeCombo;
+    // The freeze mode currently picked (defaults to CrossfadeLoop). Baked into
+    // every produced GranularFrame and drives the live audition through the
+    // shared GrainFreezeVoice. Mirrors CaptureFromPlaybackDialog.
+    GranularFreezeMode selectedFreezeMode() const {
+        const int idx = freezeModeCombo.getSelectedId() - 1;
+        return (idx >= 0) ? (GranularFreezeMode)idx
+                          : GranularFreezeMode::CrossfadeLoop;
+    }
     // Current grain count (>= 2) baked into the produced frame + the audition.
     int selectedGrainCount() const {
         return juce::jlimit(kGranularMinGrains, kGranularMaxGrains,
@@ -631,14 +776,56 @@ private:
     juce::Label      centsLabel;
     // Current embedded pitch in Hz. Updated by noteCombo / octaveCombo
     // onChange. Defaults to A4 (440 Hz) so MIDI note 69 plays the source
-    // at 1:1 if the user doesn't touch the picker. buildFrameAtMarker
-    // reads this for the GranularFrame's embeddedPitchHz.
+    // at 1:1 if the user doesn't touch the picker. buildFrames
+    // reads this for each GranularFrame's embeddedPitchHz.
     double capturedPitchHz = 440.0;
-    juce::TextButton saveBtn   { "Save waveform at marker" };
+    juce::TextButton saveBtn   { "Capture waveforms" };
     juce::TextButton cancelBtn { "Close" };
 
     juce::Rectangle<int> waveRect;
-    bool draggingMarker = false;
+
+    // ----- Zoom / scroll view window -----
+    // A long song shows its whole PCM mapped across waveRect, making precise
+    // region placement hard. The waveform view can be zoomed in and scrolled:
+    // viewZoom 1.0 shows the whole song, higher values show a proportionally
+    // smaller window, and viewScroll (0..1) positions that window along the
+    // song. The region scrolls with the audio yet is pegged to a view edge once
+    // it reaches one (clampSelectionToView), mirroring the file-capture dialog.
+    double viewZoom   = 1.0;
+    double viewScroll = 0.0;
+    // Re-entrancy guard for reconfigureZoomForWindow() (see the file dialog's
+    // member for the full rationale).
+    bool reconfiguringZoom = false;
+    juce::Slider zoomSlider;
+    juce::Label  zoomLabel;
+    juce::Slider scrollSlider;
+    juce::Label  scrollLabel;
+    static constexpr int kMinViewSamples = 256;
+
+    int64_t viewLenSamples()   const;
+    int64_t viewStartSamples() const;
+    // Smallest the view may shrink to, in samples: kMinViewSamples normally, but
+    // at least one freeze WINDOW (windowFromSlider()) with 2+ waveforms - so the
+    // user can never zoom in tighter than one captured waveform spans. Capped to
+    // the song length. Mirrors CaptureFromPlaybackDialog::minViewLenSamples.
+    int64_t minViewLenSamples() const;
+    // Re-range the zoom slider so its maximum corresponds to minViewLenSamples(),
+    // clamping the current zoom into the new range. Called on render-complete and
+    // whenever the window changes (grain / mode / count / window drag).
+    void reconfigureZoomForWindow();
+    // Re-range the zoom slider for the rendered song length and reset the view
+    // to "whole song" (zoom 1 / scroll 0). Called once the render completes.
+    void configureViewSlidersForBuffer();
+    // Peg + cap the selected region inside the current view window so the
+    // capture spot stays visible/usable after a zoom / scroll: a region that
+    // would fall off an edge is translated flush against it, and one longer
+    // than the visible window is shortened to it ("can't select more than you
+    // can see"). Mirrors CaptureFromPlaybackDialog::clampSelectionToView. Not
+    // applied while Playing (the playhead genuinely moves through the song).
+    void clampSelectionToView();
+    // After a zoom / scroll change: peg the region, refresh status/region info,
+    // re-anchor the audition, repaint.
+    void onViewChanged();
 
     // Background render job. Started in the constructor; the dialog
     // shows "Rendering..." until job->done == true and job->result has
@@ -649,9 +836,14 @@ private:
     bool renderReady = false;
 
     void onRenderComplete();
-    void regenerateGrain();
+    // (Re)publish the Preview-waveform-selected slice of the region as the
+    // engine's GrainLoop audition source. Mirrors
+    // CaptureFromPlaybackDialog::regenerateAuditionGrain - same banded source
+    // (window + seam lookahead), grain, per-method window, and output gain the
+    // captured frame will carry - so the Paused/Scrubbing audition is honest.
+    void regenerateAuditionGrain();
     // Publish the GrainLoop playback pitch ratio to the audio engine so the
-    // live marker audition is pitched to match what the synth voice will
+    // live region audition is pitched to match what the synth voice will
     // produce when the captured frame is triggered at the editor's reference
     // note (A4 = 440 Hz). ratio = 440 / capturedPitchHz. Called when the
     // "As note" picker changes and whenever the grain audition is respun.
@@ -679,7 +871,7 @@ public:
     // leave those controls at their defaults. grainCount < kGranularMinGrains
     // and fftSize < 0 likewise leave the texture controls untouched; otherwise
     // the grain-count slider and FFT-size combo are seeded to match the frame
-    // so a later "Save waveform at marker" preserves the frame's density /
+    // so a later "Capture waveforms" preserves the frame's density /
     // resolution instead of resetting it to the dialog defaults.
     void seedFromExistingFrame(double pitchHz, int freezeModeIdx,
                                double crossfadeMs, int grainCount, int fftSize);
@@ -687,32 +879,94 @@ public:
 private:
     void updateButtonsForState();
     void updateStatusLabel();
-    // Keeps the crossfade slider's range capped at half the current
-    // Width slider value. Mirrors the engine's `xfade = min(xfadeReq,
-    // grainLen/2)` clamp in the UI so the slider can't visibly point
-    // at a value the engine will quietly ignore. Snaps the current
-    // value down if it exceeds the new max.
-    void syncCrossfadeMaxToWidth();
+    // Keeps the crossfade slider's range capped at half the current freeze
+    // window (effectiveSrcLen / 2, in ms). Mirrors the engine's
+    // `xfade = min(xfadeReq, window/2)` clamp in the UI so the slider can't
+    // visibly point at a value the engine will quietly ignore. Snaps the
+    // current value down if it exceeds the new max; restores the user's intent
+    // (crossfadeDesiredMs) when the window grows back. Guards re-entrancy via
+    // syncingCrossfadeFromWindow.
+    void syncCrossfadeMaxToWindow();
     int     xForSamplePos(int64_t pos) const;
     int64_t samplePosForX(int x) const;
-    int     xForMarker() const { return xForSamplePos(markerSamplePos); }
 
-    // Build the single GranularFrame the Save button delivers. Grain
-    // length = widthSlider value (10..500 ms); source PCM = a multi-
-    // second window of the rendered song around the marker (max of
-    // 4 x grain or 1 second, clamped to song length). Wrapped in a
-    // single-element vector to match the existing on-capture signature
-    // used by the wave editor.
-    std::vector<std::unique_ptr<IWavetableFrame>> buildFrameAtMarker() const;
+    // ----- Region / per-waveform window model (shared with the file dialog) --
+    // These mirror CaptureFromPlaybackDialog's identically-named methods, in
+    // int64 sample space over songPcm instead of int over `tap`. The subtle
+    // band-layout geometry is shared via the file-scope captureBandStartForIndex
+    // helper so the two dialogs lay out their section bands the same way.
 
-    // Width slider extents. 100 ms default - small enough that the
-    // captured "moment" is recognizable, large enough that the grain
-    // loop has audible pitch under loop. Range 10..500 ms covers
-    // pad/drone-style very-long-grain frames at the upper end and
-    // single-cycle plucks near the lower.
-    static constexpr double kWidthMinMs = 10.0;
-    static constexpr double kWidthMaxMs = 500.0;
-    static constexpr double kWidthDefMs = 100.0;
+    // Per-waveform freeze-WINDOW length in samples. Single waveform: the whole
+    // selection; 2+: the "Window length" slider (auto-tracks
+    // autoWindowMultiplier(mode) x grain until overridden). Floored at the grain
+    // (cloud modes) or 256, and capped to the selection so bands never spill
+    // past the handles.
+    int64_t effectiveSrcLen() const;
+
+    // The window length the slider asks for, in samples (ms slider value
+    // converted against the song rate), floored at the per-mode minimum and
+    // capped to the buffer length but NOT capped to the current selection.
+    int64_t windowFromSlider() const;
+
+    // Minimum selection length a resize drag may reach, in samples. 0 for a
+    // single waveform; otherwise the requested window, capped to the visible
+    // window length when the view is zoomed in tighter than that window.
+    int64_t minSelectionLen() const;
+
+    // Push the dragged handle back out if a resize drag shrank the selection
+    // below minSelectionLen(), falling back to the buffer boundary if needed.
+    void    enforceMinSelectionDuringDrag();
+
+    // Grain length in samples (the "Grain length (ms)" slider against the song
+    // rate, floored at 64).
+    int     effectiveGrainLen() const;
+    // True once the user explicitly set the per-waveform window (dragged the
+    // "Window length" slider or pressed "Fit width"). While false the
+    // window auto-tracks autoWindowMultiplier(mode) x grain (syncWindowToAuto).
+    bool    windowUserSet = false;
+    // True once the user manually moved the Grain-length slider (see the file
+    // dialog's grainUserSet for the full contract). While false the grain snaps
+    // to the freeze mode's default (defaultGrainMsForMode) on a mode change.
+    bool    grainUserSet = false;
+    // The waveform count the selection was last sized for; the count handler
+    // resizes the selection in proportion when this changes so the per-waveform
+    // window stays constant (resizeSelectionForCountChange). Mirrors the file
+    // dialog. Seeded to the initial slider value.
+    int     lastNumFrames = 8;
+    // Resize the selection when the waveform count goes oldN -> newN, scaling its
+    // length in proportion so each waveform's window length and slot spacing are
+    // preserved (int64 sample space over songPcm). Anchored at the region start,
+    // shifted left to fit / capped to the song length. Mirrors the file dialog.
+    void    resizeSelectionForCountChange(int oldN, int newN);
+    // Window start index for waveform i of n given window length srcLen, via the
+    // shared captureBandStartForIndex geometry (FIT -> n+1 equal gaps; OVERLAP
+    // -> contained within the selection). Clamped to [0, songLen - srcLen].
+    int64_t bandStartForIndex(int i, int n, int64_t srcLen) const;
+    // Build a granular source buffer: the windowLen-sample band body starting at
+    // startIdx in songPcm, plus a windowLen/2 lookahead tail for the crossfade
+    // seam (zero-padded past the song end).
+    std::vector<float> buildGrainSource(int64_t startIdx, int64_t windowLen) const;
+    void syncWindowToFitSlots();
+    void syncWindowToAuto();
+    void updateWindowLenControl();
+    // Set the "Preview waveform" slider range (1..numFrames) + enabled state for
+    // the current count, clamping the current pick into range. Disabled at a
+    // single waveform.
+    void updatePreviewIndexControl();
+    void updateRegionInfoLabel();
+    // The interactive zone for the two region handles: waveRect widened by the
+    // handle hit radius on the left and right. Drawing + hit-testing + repaint
+    // all use it so an edge handle whose outer half is past the wave-view edge
+    // is still visible and grabbable.
+    juce::Rectangle<int> handleZone() const;
+    static constexpr int kHandleHitRadius = 8;
+
+    // Build the N GranularFrames the Capture button delivers - one banded
+    // GranularFrame per equally-spaced waveform across the region, exactly the
+    // geometry the section bands draw and the audition plays. Replaces the old
+    // single-marker buildFrameAtMarker(); the wave editor's on-capture path
+    // already handles N frames (append) or frames[0] (replace).
+    std::vector<std::unique_ptr<IWavetableFrame>> buildFrames(int n) const;
 
     // Crossfade slider extents. Default 50 ms = halfway between "barely
     // covers a click" and "blends the whole seam smooth"; well within

@@ -217,9 +217,11 @@ void GrainFreezeVoice::initialise(const float* src, int srcLen, int grainLen,
             if (banded) {
                 aRoamLo = std::clamp(bandStart, 0, std::max(0, srcLen - aGrain));
                 const int bandHi = std::min(srcLen, bandStart + bandLen);
+                aWindowHi = bandHi;
                 aRoamHi = std::max(aRoamLo, bandHi - aGrain);
             } else {
                 aRoamLo = 0;
+                aWindowHi = srcLen;
                 aRoamHi = std::max(0, srcLen - aGrain);
             }
             anchor  = (aRoamLo + aRoamHi) / 2;                // roam centre
@@ -422,6 +424,18 @@ float GrainFreezeVoice::pitchSyncSample(const float* src, int srcLen, float rati
 // ---------------------------------------------------------------------------
 float GrainFreezeVoice::asyncSample(const float* src, int srcLen, float ratio) {
     if (aGrain <= 0 || srcLen <= 0) return 0.0f;
+    // A grain advances its read by `ratio` per envelope sample, so over its
+    // aGrain-sample life it sweeps aGrain*ratio source samples. When pitched up
+    // (ratio > 1) a grain starting at the init-time aRoamHi (= aWindowHi-aGrain)
+    // would read aGrain*(ratio-1) samples PAST the window's upper edge, into the
+    // half-window lookahead tail (or the source's DC end) - decorrelated content
+    // the user never selected, which smears the freeze and was a contributor to
+    // "doesn't sound constant". Tighten the re-trigger high bound so the whole
+    // sped-up sweep stays inside [aRoamLo, aWindowHi). At ratio <= 1 this equals
+    // the original aRoamHi (max(1,ratio) factor), so native-pitch playback is
+    // byte-for-byte unchanged.
+    const int sweep   = (int)std::ceil((float)aGrain * std::max(1.0f, ratio));
+    const int roamHi  = std::min(aRoamHi, std::max(aRoamLo, aWindowHi - sweep));
     float out = 0.0f;
     for (int i = 0; i < numGrains; ++i) {
         const float env = 0.5f * (1.0f - std::cos(kTwoPi * aEnv[(size_t)i] / (float)aGrain));
@@ -440,7 +454,7 @@ float GrainFreezeVoice::asyncSample(const float* src, int srcLen, float ratio) {
             aEnv[(size_t)i] -= (float)aGrain;          // keep fractional remainder
             aRead[(size_t)i] = aEnv[(size_t)i] * ratio;// read consistent with leftover env
             const int off = (int)((frand01() * 2.0f - 1.0f) * (float)aJitter);
-            aStart[(size_t)i] = std::clamp(anchor + off, aRoamLo, aRoamHi);  // stay in-window
+            aStart[(size_t)i] = std::clamp(anchor + off, aRoamLo, roamHi);  // stay in-window (ratio-aware)
         }
     }
     // numGrains Hann grains at (1 - 1/numGrains) overlap sum to ~numGrains/2;

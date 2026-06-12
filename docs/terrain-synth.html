@@ -28,11 +28,30 @@
   <li><strong>1D waveform</strong> — a single cycle of audio, like the output of the Layered Waveform editor. The terrain is a 1D array of sample values, one cycle long.</li>
   <li><strong>1D audio file</strong> — a recorded sample of any length. The terrain is the entire audio file as a 1D array.</li>
   <li><strong>2D image</strong> — a grayscale image where pixel brightness becomes sample amplitude. Wide images give you a long sound; tall images give you more vertical "headroom" for traversals to wander through.</li>
+  <li><strong>3D video</strong> — a video clip. Each frame's grayscale brightness becomes a 2D amplitude surface (just like the 2D image source), and the frames stack along a third, time axis. See <a href="#video-import">Importing a video</a> below.</li>
   <li><strong>N-dimensional wavetable</strong> — multiple frames stacked into a grid (Grid mode) or scattered freely in N-D space (Scatter mode), produced by the Layered Waveform editor's wavetable feature.</li>
   <li><strong>Math expression</strong> — generated procedurally from a function like <code>sin(x*y)</code> or <code>cos(x)*exp(-y)</code>, evaluated at every grid coordinate.</li>
 </ul>
 
 <p>Whatever source you pick, the result is the same kind of N-dimensional sample array. The traversal doesn't care where it came from.</p>
+
+<h2 id="video-import">Importing a video</h2>
+
+<p>To turn a video clip into a 3D terrain, right-click an empty spot on the graph and choose <strong>Add Node → Terrain → From Video…</strong>. This opens the <strong>Import Video</strong> dialog.</p>
+
+<p><strong>Requirement:</strong> video decoding uses the free <a href="https://ffmpeg.org/">ffmpeg</a> tool, which must be installed and on your system <code>PATH</code>. If it isn't, the dialog still opens but the <em>Choose Video…</em> button is greyed out with a tooltip telling you how to fix it. ffmpeg is only needed while importing — once a clip is imported, the terrain is saved inside your project, so opening the project later needs neither ffmpeg nor the original video file.</p>
+
+<p>Step by step:</p>
+
+<ol>
+  <li>Click <strong>Choose Video…</strong> and pick a file (MP4, MOV, MKV, AVI, WebM, …). A low-resolution preview is extracted in the background.</li>
+  <li><strong>Crop in space.</strong> Drag the rectangle over the preview frame to choose which part of the picture becomes the terrain. Drag the middle to move it, the edges or corners to resize it. The area outside the box is dimmed and a live <code>W × H px</code> readout shows the cropped size.</li>
+  <li><strong>Crop in time.</strong> Use the <em>Play</em>/<em>Pause</em> button and the timeline bar below the preview. Drag the playhead (or click anywhere on the bar) to scrub. The two handles on the bar set the start and end of the part you keep — the kept span is highlighted, and playback loops within it.</li>
+  <li><strong>Set the output size.</strong> <em>Output W (px)</em> and <em>Output H (px)</em> set how finely the picture is sampled. They are linked by the crop's shape: change one and the other follows to keep the same aspect ratio, so you scale the region down without distorting it. <em>Output frames</em> sets how many time slices are sampled across your time crop — this is the depth of the 3D terrain. A live <code>Grid: W × H × frames</code> readout shows the total size.</li>
+  <li>Click <strong>Import</strong>. The clip is decoded at full quality and baked into the node.</li>
+</ol>
+
+<p>A video terrain plays like any other 3D terrain — try an <em>Orbit</em> or <em>Lissajous</em> traversal to sweep through the picture-over-time volume, or a <em>Path</em> you draw yourself. To re-crop later, right-click the node and re-open the import dialog; it remembers your file, crop, and output settings.</p>
 
 <h2>Traversal modes</h2>
 

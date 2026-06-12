@@ -63,6 +63,14 @@ cmake --build build --config Release
 build\Release\SoundShop2.exe
 ```
 
+**Required JUCE patches:** SEANCE depends on fixes to the shared JUCE install
+(`D:/JUCE-8.0.12`) that live in `patches/` and are **lost on any JUCE
+reinstall/upgrade**. Re-apply them (see `patches/README.md`) whenever JUCE is
+reinstalled — currently `juce-wasapi-ieee-float-tag.diff` (WASAPI capture: stock
+JUCE misreads devices that report the plain `WAVE_FORMAT_IEEE_FLOAT` tag, e.g.
+the Logitech C615 mic, as integer → square-wave-garbage mic). These should be
+upstreamed to JUCE; until then they're tracked in `known-issues.md`.
+
 ## MIDI Note Degree System
 
 Each MIDI note stores its scale degree (1st-7th), octave, and chromatic offset alongside the raw pitch. This enables:

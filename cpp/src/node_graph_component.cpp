@@ -17,6 +17,7 @@
 #include "drum_synth.h"
 #include "multi_sampler.h"
 #include "terrain_synth.h" // classifySynthSource for Synth Mode picker
+#include "video_import_dialog.h"
 #include "adsr_envelope_component.h"
 #include "envelope_presets.h"
 #include <cmath>
@@ -1590,11 +1591,11 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
     instMenu.addItem(110, "Wavetable");
     juce::PopupMenu terrainMenu;
     terrainMenu.addItem(120, "2D Terrain (sin*cos)");
-    terrainMenu.addItem(121, "2D Terrain (noise)");
     terrainMenu.addItem(122, "2D Terrain (custom expression...)");
     terrainMenu.addItem(125, "N-D Terrain (custom expression, 1-8D)...");
-    terrainMenu.addItem(123, "From Image...");
-    terrainMenu.addItem(124, "From Audio File...");
+    terrainMenu.addItem(124, "1D Terrain from Audio File...");
+    terrainMenu.addItem(123, "2D Terrain from Image...");
+    terrainMenu.addItem(126, "3D Terrain from Video...");
     instMenu.addSubMenu("Terrain Synth", terrainMenu);
     instMenu.addSeparator();
     instMenu.addItem(100, "Piano");
@@ -2022,7 +2023,7 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
             // Non-modal (live input surface - see the double-click path).
             SoundShop::launchNonModalToolDialog(opts);
             return;
-        } else if (result >= 120 && result <= 125) {
+        } else if (result >= 120 && result <= 126) {
             // Terrain Synth. The terrain engine and visualizer both support
             // N-dimensional terrains (1..8 axes); the visualizer's + Dim /
             // - Dim buttons add/remove axes at runtime, and
@@ -2032,15 +2033,6 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
             // varies N at create time is the formula path (result 125).
             if (result == 120) {
                 makeTerrainNode("Terrain (sin*cos)", "sin(x) * cos(y)", p);
-            } else if (result == 121) {
-                // Fractal value noise: smooth, 1/f-ish bumpy terrain. The
-                // orbit reads varying noisy texture as it moves, rather than
-                // independent random samples per cell (which is what the old
-                // expression-based "noise(0)" produced and was effectively
-                // equivalent to a noise oscillator with the terrain abstraction
-                // adding nothing). Script format documented in terrain_synth.cpp.
-                makeTerrainNode("Terrain (noise)",
-                                "__valuenoise__:256,256:4:0.55:42", p);
             } else if (result == 122) {
                 auto nodeId = makeTerrainNode("Terrain", "sin(x)*cos(y)", p).id;
                 auto* aw = new juce::AlertWindow("Terrain Expression",
@@ -2086,6 +2078,29 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
                                 nd->script = "__audio__:" + file.getFullPathName().toStdString();
                         repaint();
                     });
+                return;
+            } else if (result == 126) {
+                // Terrain from video: a 3D terrain (frames x height x width).
+                // The node starts empty; the import dialog decodes the grid and
+                // bakes it into the node script (see VideoImportDialogComponent).
+                auto nodeId = makeTerrainNode("Terrain (video)", "", p, 3).id;
+                auto* editor = new VideoImportDialogComponent(
+                    graph, nodeId,
+                    [this] {
+                        if (onNodeEdited) onNodeEdited();
+                        graph.commitSnapshot("Import video terrain");
+                        repaint();
+                    });
+                editor->setSize(760, 660);
+                juce::DialogWindow::LaunchOptions opts;
+                opts.content.setOwned(editor);
+                opts.dialogTitle = "Import Video";
+                opts.dialogBackgroundColour = juce::Colour(0xff2b2b30);
+                opts.escapeKeyTriggersCloseButton = true;
+                opts.useNativeTitleBar = false;
+                opts.resizable = true;
+                opts.componentToCentreAround = this;
+                SoundShop::launchNonModalToolDialog(opts);
                 return;
             } else if (result == 125) {
                 // N-D Terrain (custom expression). Open a dialog with a
@@ -2901,6 +2916,11 @@ void NodeGraphComponent::showNodeMenu(Node& node) {
     if (isTonalSynth)
         menu.addItem(180, "Envelope (AHDSR)...");
 
+    // Video terrains can be re-cropped / re-scaled by re-opening the import
+    // dialog, which re-seeds its controls from the node's baked __video__ script.
+    if (node.type == NodeType::TerrainSynth && node.script.rfind("__video__:", 0) == 0)
+        menu.addItem(193, "Edit Video...");
+
     // Signal Shape gets an "Edit Shape" entry (and we hide it for the
     // sibling XY Pad / Control Bank nodes, which share NodeType::SignalShape
     // but have their own dedicated editors opened via double-click).
@@ -3116,6 +3136,26 @@ void NodeGraphComponent::showNodeMenu(Node& node) {
             opts.resizable = true;
             opts.componentToCentreAround = this;
             SoundShop::launchToolDialog(opts);
+        } else if (result == 193) {
+            // Re-open the Import Video dialog on an existing video terrain. It
+            // re-seeds its crop / scale controls from the node's __video__
+            // script, so the user can re-crop without re-picking the file.
+            int captured = nodeId;
+            auto* editor = new VideoImportDialogComponent(graph, captured,
+                [this]() {
+                    if (onNodeEdited) onNodeEdited();
+                    graph.commitSnapshot("Edit video terrain");
+                    repaint();
+                });
+            juce::DialogWindow::LaunchOptions opts;
+            opts.content.setOwned(editor);
+            opts.dialogTitle = "Import Video: " + juce::String(node->name);
+            opts.dialogBackgroundColour = juce::Colour(0xff2b2b30);
+            opts.escapeKeyTriggersCloseButton = true;
+            opts.useNativeTitleBar = false;
+            opts.resizable = true;
+            opts.componentToCentreAround = this;
+            SoundShop::launchNonModalToolDialog(opts);
         } else if (result == 170) {
             // Convolution auto-merge (#33): convolve this node's IR with
             // the downstream convolution's IR, put the result in this node,

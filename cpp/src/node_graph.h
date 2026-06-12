@@ -459,6 +459,20 @@ struct Node {
         std::shared_ptr<AuditionGranularFrame> granularFrame;
     };
     std::vector<AuditionEvent> pendingAudition; // written by UI, read by audio thread
+
+    // Sustained editor audition (the granular wave editor's Play button holds a
+    // note for as long as the user listens). Unlike the momentary, edge-
+    // triggered pendingAudition events, this is LEVEL-triggered: while non-null
+    // it means "a voice should be sounding with this data." A debounced wavetable
+    // edit triggers a full graph rebuild (GraphProcessor::rebuildGraph clears and
+    // recreates every processor), which destroys all held voices - so an audition
+    // routed only through pendingAudition goes silent on the first edit ("preview
+    // stops until I press start again"). The synth re-establishes a voice from
+    // heldAudition whenever it (re)starts, so the audition survives the rebuild.
+    // The editor refreshes the snapshot (sharing the source PCM, not re-copying
+    // it) on each audible edit so the post-rebuild voice reflects the new freeze
+    // window / grain. Cleared on Stop. Accessed under auditionMutex.
+    std::shared_ptr<AuditionEvent> heldAudition;  // null = nothing held
     std::shared_ptr<std::mutex> auditionMutex = std::make_shared<std::mutex>();
 
     // MPE pass-through / MidiInput node event queue. Originally used only

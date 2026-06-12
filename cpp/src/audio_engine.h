@@ -50,6 +50,14 @@ public:
     // is picked up. Returns true if input is enabled afterwards.
     bool ensureAudioInputEnabled();
 
+    // Dump the live input device's negotiated format (driver, sample rate, bit
+    // depth, channel count/mask, channel names) to stderr -> seance.log. Used to
+    // diagnose garbled mic capture: "square-wave garbage" is almost always a
+    // format/bit-depth/channel misinterpretation, and this shows the ground
+    // truth for the user's hardware. Called from ensureAudioInputEnabled() on
+    // every path (including the early bail when input is already live).
+    void logInputDeviceDiagnostics(const char* context);
+
     // Process-wide accessor for UI tools that need read access to the
     // engine (playback-tap ring buffer, transport state, etc.) without
     // having to be plumbed an AudioEngine& through every component

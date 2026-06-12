@@ -8,8 +8,38 @@
 #include <cmath>
 #include <functional>
 #include <array>
+#include <cstdint>
 
 namespace SoundShop {
+
+// ============================================================================
+// Video terrain script (#video-import)
+// ----------------------------------------------------------------------------
+// A Terrain Synth node imported from video stores everything in node.script as:
+//   __video__:<path>|<t0>,<t1>|<cx>,<cy>,<cw>,<ch>|<outW>,<outH>,<outFrames>|<base64 gray>
+// The trailing base64 blob is the downscaled grayscale grid (frame-major,
+// row-major, 8-bit) - so reloading needs neither ffmpeg nor the original video
+// file. The source path + time/crop/scale params are retained so the import
+// dialog can be reopened to re-crop (which DOES need the video file + ffmpeg).
+// `|` is illegal in Windows paths and absent from the base64 alphabet, so it's
+// a safe field separator; the path is reassembled from all leading fields so a
+// stray `|` in a POSIX path can't break parsing.
+// ============================================================================
+struct VideoTerrainParams {
+    std::string path;
+    double t0 = 0.0, t1 = 0.0;          // time crop (seconds)
+    int cropX = 0, cropY = 0, cropW = 0, cropH = 0;   // source-pixel XY crop
+    int outW = 0, outH = 0, outFrames = 0;            // downscaled grid size
+    std::vector<uint8_t> gray;          // outW*outH*outFrames, frame-major
+};
+
+// Encode params (incl. the gray grid) into a __video__: node script.
+std::string makeVideoTerrainScript(const VideoTerrainParams& p);
+// Decode a __video__: script. When wantGray is false the (large) base64 blob
+// is skipped - useful when the dialog only needs the crop/scale params to
+// re-seed its controls. Returns false if the script isn't a video script.
+bool parseVideoTerrainScript(const std::string& script, VideoTerrainParams& out,
+                             bool wantGray = true);
 
 // ==============================================================================
 // N-dimensional terrain of audio data
@@ -35,6 +65,14 @@ public:
     void fillFromExpression(const std::string& expr);   // vars: x, y, z, w...
     void fillFromImage(const std::string& path);         // 2D, pixel brightness
     void fillFromAudioFile(const std::string& path);     // 1D, raw samples
+
+    // Build a 3D terrain {frames, h, w} from a decoded video grid: `gray` is
+    // frame-major, row-major brightness bytes (0..255) of size frames*h*w.
+    // Each cell becomes b/255*2-1, mirroring fillFromImage's mapping. The data
+    // is baked into the node script (see makeVideoTerrainScript), so this is
+    // what runs on project load - no video file or ffmpeg needed.
+    void fillFromVideoData(const std::vector<uint8_t>& gray,
+                           int frames, int h, int w);
 
     // Fractal / self-similar fill (#51): build a 1D waveform from recursive
     // wavelet coefficient patterns. The base pattern is a short seed
@@ -307,6 +345,15 @@ private:
     // detects that node.script differs, it triggers a re-parse.
     std::string cachedScript;
 
+    // Sustained editor-audition tracking (node.heldAudition). LEVEL-triggered:
+    // each block we reconcile this processor's held voice against the node's
+    // heldAudition state so the audition survives graph rebuilds (a fresh
+    // processor re-establishes the voice). heldAuditionActive is per-processor
+    // and defaults to false, so a rebuilt processor re-starts the held note;
+    // heldAuditionPitch remembers which note to release when it clears.
+    bool heldAuditionActive = false;
+    int  heldAuditionPitch  = -1;
+
     Terrain terrain;
     Traversal traversal;
     TraversalParams traversalParams;
@@ -547,6 +594,17 @@ private:
     // node - see Node::reachesOutput). Sized to the block in processBlock;
     // never read across blocks. Avoids a per-block heap allocation.
     std::vector<float> auditionScratch;
+
+    // Snapshot of the incoming control-signal channels (buffer channels 2+:
+    // the "Sig X/Y/.." coordinate drivers and the "Aftertouch" signal pin),
+    // captured at the top of processBlock BEFORE buf.clear() wipes them. The
+    // buffer is the synth's render target, so clearing it to start the voice
+    // mix also destroys the incoming signal; without this snapshot the
+    // per-sample Sig-coordinate and aftertouch readers would see only zeros
+    // (coordinate pinned to 0, aftertouch override never engaging). Channel
+    // c here mirrors buf channel c+2. Sized per block; reused to avoid a
+    // per-block heap allocation on the audio thread.
+    juce::AudioBuffer<float> controlInBuf;
 
     // Per-channel pitch bend factor (1.0 = no bend, 2^(semis/12) otherwise).
     // Default bend range is +/-2 semitones - configurable per-synth later.

@@ -80,14 +80,15 @@ inline constexpr int kWindowLegacyAuto    = -1;
 inline constexpr int kWindowAutoPerMethod = -2;
 
 // Per-method auto window-width multiplier (x grainLength) used by the
-// kWindowAutoPerMethod sentinel. The grain-cloud modes (AsyncGranular,
-// PitchSyncGrains) need multiple grain-periods of roam room or they degenerate
-// into a single repeating grain, so they default to 4x. CrossfadeLoop's window
-// IS the loop body and SpectralFreeze's window IS one analysis frame, so both
-// default to 1x (which matches the historical one-grain-wide behaviour). If you
-// retune these the change is forward-only: it affects newly captured frames
-// (which carry the -2 sentinel); frames already saved keep whatever width they
-// resolved to, so old projects never shift.
+// kWindowAutoPerMethod sentinel - applies ONLY to the grain-cloud modes
+// (AsyncGranular, PitchSyncGrains), which need multiple grain-periods of roam
+// room or they degenerate into a single repeating grain, so they default to 4x.
+// The non-grain modes (CrossfadeLoop, SpectralFreeze) do NOT derive their window
+// from the grain at all (see kNonGrainAutoWindowSamples) - their window is a
+// loop body / analysis frame whose sensible length must not shrink when the
+// grain does. If you retune this the change is forward-only: it affects newly
+// captured frames (which carry the -2 sentinel); frames already saved keep
+// whatever width they resolved to, so old projects never shift.
 inline int autoWindowMultiplier(GranularFreezeMode mode) {
     switch (mode) {
         case GranularFreezeMode::AsyncGranular:
@@ -100,6 +101,18 @@ inline int autoWindowMultiplier(GranularFreezeMode mode) {
     }
 }
 
+// Absolute default freeze-window WIDTH (in samples) for the non-grain freeze
+// modes (CrossfadeLoop / SpectralFreeze) when auto (the -2 sentinel). Their
+// window is a loop body / analysis frame, NOT a roam region, so it must not be
+// derived from the (inert, now-short) grain length: with the grain default
+// lowered to ~5 ms so the grain-cloud modes sound constant out of the box, a
+// "1x grain" crossfade window would collapse to a ~5 ms buzz. 4800 samples
+// (~100 ms @ 48 kHz) preserves the historical default loop / analysis length
+// (back when the grain default was 100 ms and the 1x multiplier produced it)
+// while decoupling it from the grain. Rate-relative (~109 ms @ 44.1 kHz), which
+// is fine for a default the user can resize.
+inline constexpr int kNonGrainAutoWindowSamples = 4800;
+
 // Resolve a (possibly sentinel) windowLen into a freeze-window WIDTH in samples.
 // Shared by the audio voice (granular_freeze) and the frame editor / capture
 // preview so audition, held notes, and the on-screen band all use an identical
@@ -107,13 +120,38 @@ inline int autoWindowMultiplier(GranularFreezeMode mode) {
 // applies its own clamps (cloud modes floor the width at grainLen; every mode
 // caps at srcLen).
 //   windowLen >= 0                    -> explicit width (returned as-is).
-//   windowLen == kWindowAutoPerMethod -> autoWindowMultiplier(mode) * grainLen.
+//   windowLen == kWindowAutoPerMethod -> grain-cloud modes:
+//                                        autoWindowMultiplier(mode) * grainLen;
+//                                        non-grain modes: kNonGrainAutoWindowSamples.
 //   anything else (incl. kWindowLegacyAuto) -> grainLen (byte-for-byte legacy).
 inline int resolveAutoWindowLen(int windowLen, GranularFreezeMode mode, int grainLen) {
     if (windowLen >= 0) return windowLen;
-    if (windowLen == kWindowAutoPerMethod)
-        return autoWindowMultiplier(mode) * grainLen;
+    if (windowLen == kWindowAutoPerMethod) {
+        switch (mode) {
+            case GranularFreezeMode::AsyncGranular:
+            case GranularFreezeMode::PitchSyncGrains:
+                return autoWindowMultiplier(mode) * grainLen;
+            default: // CrossfadeLoop, SpectralFreeze - grain-independent window
+                return kNonGrainAutoWindowSamples;
+        }
+    }
     return grainLen;
+}
+
+// Per-mode DEFAULT grain length (in milliseconds) for a fresh capture, picked so
+// each grain-cloud mode sounds like a steady, CONSTANT cloud out of the box:
+//   - Async granular sounds smoothest with very SHORT grains (~5 ms): many tiny
+//     decorrelated grains overlap into a continuous blur.
+//   - Pitch-sync grains needs a few whole pitch periods per grain to lock onto
+//     the source's pitch and sum coherently; grains that are too short can't snap
+//     to the period grid and the cloud wobbles. ~40 ms holds enough periods to
+//     be constant for typical pitched material.
+// The non-grain modes (CrossfadeLoop / SpectralFreeze) don't use the grain, so
+// their value here is irrelevant (they share the async default). Capture dialogs
+// snap the grain slider to this when the freeze mode changes, UNLESS the user has
+// manually set the grain (then their choice is respected).
+inline double defaultGrainMsForMode(GranularFreezeMode mode) {
+    return (mode == GranularFreezeMode::PitchSyncGrains) ? 40.0 : 5.0;
 }
 
 // GranularFrame holds a multi-second window of mono PCM that the synth
@@ -190,10 +228,13 @@ struct GranularFrame : public IWavetableFrame {
     // Length (in samples) of each grain envelope in the OLA stream.
     // The synth's 4-voice OLA uses voices at envelope-phase offsets of
     // grainLength/4; their Hann windows sum to constant amplitude 2.0.
-    // Typical: 0.01-0.5 seconds. Independent of how long `source` is -
-    // a 100 ms grain inside a 1 s source means the voices roam over the
-    // source picking jittered start positions.
-    int grainLength = 4800;  // ~100 ms @ 48 kHz
+    // Typical: 0.001-0.5 seconds. Independent of how long `source` is -
+    // a short grain inside a 1 s source means the voices roam over the
+    // source picking jittered start positions. Short grains (~5 ms) over a
+    // correspondingly small roam window give a smooth, CONSTANT cloud; long
+    // grains roam over a proportionally wider window and so sound more
+    // evolving / less constant - which is why the default is short.
+    int grainLength = 240;  // ~5 ms @ 48 kHz - smooth constant cloud by default
 
     // Start sample of the freeze WINDOW within `source`. The freeze window is
     // the sub-selection of the captured buffer that every freeze mode actually

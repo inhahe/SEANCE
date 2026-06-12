@@ -1,5 +1,6 @@
 #include "main_window.h"
 #include "plugin_sandbox.h"
+#include "self_test.h"
 #include <juce_gui_basics/juce_gui_basics.h>
 #include <cstdio>
 #include <ctime>
@@ -34,6 +35,21 @@ public:
             auto pipeName = args[sandboxIdx + 1].toStdString();
             int exitCode = SoundShop::runPluginSandboxChild(pipeName);
             setApplicationReturnValue(exitCode);
+            quit();
+            return;
+        }
+
+        // Headless terrain-synth self-test (#--self-test <dir>). Renders the
+        // 1D/2D/3D terrain synths against known synthetic media and writes a
+        // PASS/FAIL report plus audio to <dir>. No GUI is created.
+        int selfTestIdx = args.indexOf("--self-test");
+        if (selfTestIdx >= 0) {
+            juce::File dir = (selfTestIdx + 1 < args.size())
+                ? juce::File(args[selfTestIdx + 1])
+                : juce::File::getSpecialLocation(juce::File::currentExecutableFile)
+                      .getParentDirectory().getChildFile("selftest_out");
+            int rc = SoundShop::runSelfTest(dir);
+            setApplicationReturnValue(rc);
             quit();
             return;
         }

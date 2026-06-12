@@ -290,6 +290,68 @@ void Terrain::fillFromImage(const std::string& path) {
     fprintf(stderr, "Terrain loaded from image: %dx%d\n", w, h);
 }
 
+void Terrain::fillFromVideoData(const std::vector<uint8_t>& gray,
+                                int frames, int h, int w) {
+    if (frames < 1 || h < 1 || w < 1) return;
+    init({frames, h, w});   // dims = [time, rows, cols]
+    auto& d = getData();
+    const size_t n = std::min(d.size(), gray.size());
+    for (size_t i = 0; i < n; ++i)
+        d[i] = (float)gray[i] / 255.0f * 2.0f - 1.0f;
+    // Any tail not covered by `gray` stays at init's default (0); the encoder
+    // always writes exactly frames*h*w bytes so this is just defensive.
+    fprintf(stderr, "Terrain loaded from video: %dx%d x %d frames\n", w, h, frames);
+}
+
+// ---- Video terrain script encode / decode (see terrain_synth.h) -----------
+std::string makeVideoTerrainScript(const VideoTerrainParams& p) {
+    juce::String s;
+    s << "__video__:" << juce::String(p.path)
+      << "|" << juce::String(p.t0, 6) << "," << juce::String(p.t1, 6)
+      << "|" << p.cropX << "," << p.cropY << "," << p.cropW << "," << p.cropH
+      << "|" << p.outW << "," << p.outH << "," << p.outFrames
+      << "|" << (p.gray.empty()
+                    ? juce::String()
+                    : juce::Base64::toBase64(p.gray.data(), p.gray.size()));
+    return s.toStdString();
+}
+
+bool parseVideoTerrainScript(const std::string& script, VideoTerrainParams& out,
+                             bool wantGray) {
+    const std::string pre = "__video__:";
+    if (script.rfind(pre, 0) != 0) return false;
+    juce::StringArray toks;
+    toks.addTokens(juce::String(script.substr(pre.size())), "|", "");
+    if (toks.size() < 5) return false;
+    const int n = toks.size();
+    // The path is every leading field joined back with '|' (handles a stray '|'
+    // in a POSIX path); the trailing four fields are fixed-format.
+    juce::String pathS;
+    for (int i = 0; i < n - 4; ++i) { if (i) pathS << "|"; pathS << toks[i]; }
+    out.path = pathS.toStdString();
+
+    juce::StringArray a;
+    a.clear(); a.addTokens(toks[n - 4], ",", ""); if (a.size() < 2) return false;
+    out.t0 = a[0].getDoubleValue(); out.t1 = a[1].getDoubleValue();
+    a.clear(); a.addTokens(toks[n - 3], ",", ""); if (a.size() < 4) return false;
+    out.cropX = a[0].getIntValue(); out.cropY = a[1].getIntValue();
+    out.cropW = a[2].getIntValue(); out.cropH = a[3].getIntValue();
+    a.clear(); a.addTokens(toks[n - 2], ",", ""); if (a.size() < 3) return false;
+    out.outW = a[0].getIntValue(); out.outH = a[1].getIntValue();
+    out.outFrames = a[2].getIntValue();
+
+    if (wantGray) {
+        juce::MemoryOutputStream mos;
+        if (juce::Base64::convertFromBase64(mos, toks[n - 1])) {
+            const auto* p = (const uint8_t*)mos.getData();
+            out.gray.assign(p, p + mos.getDataSize());
+        } else {
+            out.gray.clear();
+        }
+    }
+    return true;
+}
+
 void Terrain::smooth(int passes) {
     if (dims.size() != 2 || data.empty()) return;
     int h = dims[0], w = dims[1];
@@ -690,6 +752,7 @@ SynthSourceClass classifySynthSource(const std::string& script) {
     // Explicit source-type prefixes first.
     if (script.rfind("__audio__:", 0)         == 0) return SynthSourceClass::Sample;
     if (script.rfind("__image__:", 0)         == 0) return SynthSourceClass::Surface;
+    if (script.rfind("__video__:", 0)         == 0) return SynthSourceClass::Surface;
     if (script.rfind("__layered__:", 0)       == 0) return SynthSourceClass::Wavetable;
     if (script.rfind("__wavetable__:", 0)     == 0) return SynthSourceClass::Wavetable;
     if (script.rfind("__wavetable2__:", 0)    == 0) return SynthSourceClass::Wavetable;
@@ -750,7 +813,16 @@ TerrainSynthProcessor::TerrainSynthProcessor(Node& n, Transport& t) : node(n), t
     auto& script = node.script;
     cachedScript = script;
 
-    if (script.find("__image__:") == 0) {
+    if (script.rfind("__video__:", 0) == 0) {
+        // Video terrain: the downscaled grayscale grid is baked into the script
+        // (frame-major), so we decode it directly - no ffmpeg / video file
+        // needed at load. See terrain_synth.h for the format.
+        VideoTerrainParams vp;
+        if (parseVideoTerrainScript(script, vp) && !vp.gray.empty())
+            terrain.fillFromVideoData(vp.gray, vp.outFrames, vp.outH, vp.outW);
+        else
+            terrain.init({1, 1, 1});   // empty/placeholder
+    } else if (script.find("__image__:") == 0) {
         terrain.fillFromImage(script.substr(10));
     } else if (script.find("__audio__:") == 0) {
         terrain.fillFromAudioFile(script.substr(10));
@@ -1462,26 +1534,70 @@ void TerrainSynthProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mi
     // releaseNote helpers below with no override.
     {
         std::lock_guard<std::mutex> lock(*node.auditionMutex);
-        for (auto& ev : node.pendingAudition) {
-            if (ev.isNoteOn) {
-                int vi = startVoice(ev.pitch, 1, ev.velocity);
-                if (vi >= 0 && !ev.position.empty()) {
-                    voices[vi].hasAuditionPos = true;
-                    voices[vi].auditionPos    = ev.position;
-                }
-                // Direct unplaced-frame audition: the editor's Play button on
-                // a library-only granular frame ships the frame data so the
-                // voice can render it without it being placed in the table.
-                if (vi >= 0 && ev.granularFrame && ev.granularFrame->source
-                    && !ev.granularFrame->source->empty()) {
-                    voices[vi].auditionFrame       = ev.granularFrame;
-                    voices[vi].auditionFrameStream = Voice::GranStream{};
-                }
-            } else {
-                releaseNote(ev.pitch, 1);
+        // Start a voice for one audition note-on, applying its optional
+        // Position override and direct unplaced-frame data. Shared by the
+        // momentary pendingAudition queue and the level-triggered heldAudition
+        // (sustained editor Play) below so both routes behave identically.
+        auto startAuditionVoice = [&](const Node::AuditionEvent& ev) {
+            int vi = startVoice(ev.pitch, 1, ev.velocity);
+            if (vi >= 0 && !ev.position.empty()) {
+                voices[vi].hasAuditionPos = true;
+                voices[vi].auditionPos    = ev.position;
             }
+            // Direct unplaced-frame audition: the editor's Play button on a
+            // library-only granular frame ships the frame data so the voice
+            // can render it without it being placed in the table.
+            if (vi >= 0 && ev.granularFrame && ev.granularFrame->source
+                && !ev.granularFrame->source->empty()) {
+                voices[vi].auditionFrame       = ev.granularFrame;
+                voices[vi].auditionFrameStream = Voice::GranStream{};
+            }
+        };
+
+        for (auto& ev : node.pendingAudition) {
+            if (ev.isNoteOn) startAuditionVoice(ev);
+            else             releaseNote(ev.pitch, 1);
         }
         node.pendingAudition.clear();
+
+        // Reconcile the sustained editor audition (level-triggered). A fresh
+        // processor (after a graph rebuild that destroyed every voice) has
+        // heldAuditionActive == false, so it re-establishes the held note from
+        // node.heldAudition here - that is what keeps the wave-editor preview
+        // sounding across the debounced rebuild a band-resize / param edit
+        // fires. Clearing heldAudition (editor Stop) releases the note.
+        const bool wantHeld = (bool)node.heldAudition;
+        if (wantHeld && !heldAuditionActive) {
+            startAuditionVoice(*node.heldAudition);
+            heldAuditionActive = true;
+            heldAuditionPitch  = node.heldAudition->pitch;
+        } else if (!wantHeld && heldAuditionActive) {
+            releaseNote(heldAuditionPitch, 1);
+            heldAuditionActive = false;
+            heldAuditionPitch  = -1;
+        }
+    }
+
+    // Snapshot the incoming control-signal channels (2+) BEFORE clearing the
+    // buffer. `buf` is also this synth's render target, so the buf.clear()
+    // below wipes the live signal that upstream nodes wrote into channels 2+
+    // (the "Sig X/Y/.." coordinate drivers and the "Aftertouch" pin). The
+    // per-sample readers further down must read this snapshot, not `buf`,
+    // otherwise they'd see only the post-clear zeros - which silently pinned
+    // every Sig-driven coordinate to 0 and stopped the aftertouch-signal
+    // override from ever engaging. (applySignalModulations ran above and reads
+    // sample 0 pre-clear, so Mod/Set param pins were unaffected; only these
+    // per-sample channel readers needed the snapshot.) controlInBuf channel c
+    // mirrors buf channel c+2.
+    {
+        const int nCtrl = std::max(0, buf.getNumChannels() - 2);
+        if (nCtrl > 0) {
+            controlInBuf.setSize(nCtrl, buf.getNumSamples(), false, false, true);
+            for (int c = 0; c < nCtrl; ++c)
+                controlInBuf.copyFrom(c, 0, buf, c + 2, 0, buf.getNumSamples());
+        } else {
+            controlInBuf.setSize(0, 0, false, false, true);
+        }
     }
 
     buf.clear();
@@ -1684,9 +1800,9 @@ void TerrainSynthProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mi
             ++sigIdx;
         }
         if (targetSigIdx >= 0) {
-            int chan = 2 + targetSigIdx;
-            if (chan < numChannels) {
-                const float* data = buf.getReadPointer(chan);
+            // Read the pre-clear snapshot (controlInBuf channel = buf channel - 2).
+            if (targetSigIdx < controlInBuf.getNumChannels()) {
+                const float* data = controlInBuf.getReadPointer(targetSigIdx);
                 double acc = 0.0;
                 for (int s = 0; s < numSamples; ++s) acc += std::abs(data[s]);
                 float mean = (numSamples > 0) ? (float)(acc / numSamples) : 0.0f;
@@ -1916,12 +2032,14 @@ void TerrainSynthProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mi
                 if (p.kind != PinKind::Signal && p.kind != PinKind::Param)
                     continue;
                 if (p.name.rfind("Sig ", 0) == 0 && axis < nd) {
-                    int ch = 2 + slot;
-                    if (ch < numChannels) {
+                    // Read the pre-clear control snapshot, NOT `buf` (which the
+                    // clear at the top of processBlock zeroed). controlInBuf
+                    // channel `slot` mirrors buf channel `2 + slot`.
+                    if (slot < controlInBuf.getNumChannels()) {
                         // Control signals are unipolar 0..1 on the wire (see
                         // signal_modulation.h), which maps directly onto the
                         // terrain coordinate axis (also 0..1) - no remap needed.
-                        float sigVal = buf.getSample(ch, s);
+                        float sigVal = controlInBuf.getSample(slot, s);
                         coord[axis] = juce::jlimit(0.0f, 1.0f, sigVal);
                     }
                     ++axis;

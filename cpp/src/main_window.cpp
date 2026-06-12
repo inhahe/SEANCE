@@ -3874,6 +3874,9 @@ void MainContentComponent::autosaveWorkerMain() {
             if (autosaveWorkerStop.load() && !autosaveWorkerHasJob) return;
             job = std::move(autosaveWorkerPending);
             autosaveWorkerHasJob = false;
+            // Mark busy *before* releasing the lock so quiesceAutosaveWorker()
+            // can't observe an idle gap between dequeue and the write below.
+            autosaveWorkerBusy = true;
         }
 
         // Walk the file list and write each one atomically via tmp+rename.
@@ -3899,17 +3902,40 @@ void MainContentComponent::autosaveWorkerMain() {
             meta->setAttribute("timestamp", juce::String(job.metaTimestamp));
             meta->writeTo(getAutosaveMetaFile());
         }
+
+        // Write finished. Drop the busy flag and wake any quiescing caller.
+        {
+            std::lock_guard<std::mutex> lk(autosaveWorkerMutex);
+            autosaveWorkerBusy = false;
+        }
+        autosaveWorkerIdleCv.notify_all();
     }
 }
 
+// Block until the worker is fully idle: no pending job AND not mid-write. Used
+// by discardAutosave() so a write that's queued or in flight can't recreate the
+// autosave files we're about to delete. Called from the message thread; since
+// performAutosave() (the only enqueuer) also runs on the message thread, no new
+// job can appear while we're inside here, so returning idle stays idle until we
+// return to the message loop.
+void MainContentComponent::quiesceAutosaveWorker() {
+    std::unique_lock<std::mutex> lk(autosaveWorkerMutex);
+    autosaveWorkerHasJob = false;                  // cancel anything still queued
+    autosaveWorkerIdleCv.wait(lk, [this]() {       // wait out any in-flight write
+        return !autosaveWorkerBusy;
+    });
+}
+
 void MainContentComponent::discardAutosave() {
-    // Drain any pending worker job first so it doesn't recreate the file
-    // we're about to delete. Cheap - at most one job in flight, and the
-    // worker only does a disk write so it finishes quickly.
-    {
-        std::lock_guard<std::mutex> lk(autosaveWorkerMutex);
-        autosaveWorkerHasJob = false;
-    }
+    // Fully quiesce the worker first: cancel any queued job AND wait out any
+    // write already in flight. The old version only cleared the pending flag,
+    // which left a race - if the worker had already dequeued and was mid-write
+    // (tmp.moveFileTo recreating autosave.ssp), it would resurrect the file
+    // right after we deleted it. With the 5s autosave interval this fired often
+    // enough on quit (especially while the modal "Save before quitting?" dialog
+    // pumped timer ticks) that the next launch wrongly reported an unclean
+    // shutdown. quiesceAutosaveWorker() guarantees we're the last writer.
+    quiesceAutosaveWorker();
     auto f = getAutosaveFile();
     if (f.existsAsFile()) f.deleteFile();
     auto tmp = f.getSiblingFile(f.getFileName() + ".tmp");

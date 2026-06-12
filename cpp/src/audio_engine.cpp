@@ -57,25 +57,35 @@ void AudioEngine::init() {
     //       but we set it explicitly so the intent is clear and survives any
     //       change to JUCE's ordering.
     //
-    //       WASAPI is the right default because it gives clean, low-latency
-    //       output. We previously forced DirectSound here to dodge a WASAPI
-    //       limitation - on Windows its shared-mode "default device" welds the
-    //       default input (e.g. a USB webcam mic) and the default output (e.g.
-    //       HDMI) into one device, and when those are different physical
-    //       endpoints with independent clocks the captured input is corrupted
-    //       into a square-wave-like garbage signal. But DirectSound's price for
-    //       fixing that is a polling-based output path that crackles/glitches
-    //       under load (audible "vinyl dust" clicks, worse on a busy graph),
-    //       and that hit EVERY user by default - including the large majority
-    //       who only play notes, play songs, or capture from a file and never
-    //       touch the mic-with-mismatched-devices case. Trading universal
-    //       output glitches for a mic bug most users never hit was the wrong
-    //       default, so we lead with clean WASAPI output and handle the mic
-    //       case reactively: ensureAudioInputEnabled() picks a concrete input
-    //       device, and the mic/IR capture dialogs guide the user to switch the
-    //       driver to DirectSound via the "Audio device..." button if their
-    //       input sounds garbled. The saved-settings path above always takes
-    //       precedence, so any deliberate driver choice persists across runs.
+    //       WASAPI (plain "Windows Audio" shared mode) is the right default on
+    //       both counts - output AND input:
+    //
+    //         * Output: clean and low-latency. We previously forced DirectSound
+    //           here, but its polling-based output path crackles/glitches under
+    //           load (audible "vinyl dust" clicks, worse on a busy graph) and
+    //           that hit EVERY user by default - including the majority who only
+    //           play notes/songs or capture from a file and never touch the mic.
+    //
+    //         * Input: plain shared mode is the one WASAPI mode JUCE runs with
+    //           the AUTOCONVERTPCM | SRC_DEFAULT_QUALITY stream flags set (see
+    //           supportsSampleRateConversion() in juce_WASAPI_windows.cpp). Those
+    //           flags enable WASAPI's built-in per-endpoint resampler, so a
+    //           webcam/USB mic at its own native rate and format is converted
+    //           independently of the output clock. That is what historically
+    //           corrupted the mic into square-wave garbage when the mic and
+    //           speakers were different physical devices - and it's exactly what
+    //           shared-mode SRC fixes. ensureAudioInputEnabled() opens the input
+    //           AND output as two explicitly named shared-mode endpoints so each
+    //           gets its own conversion, rather than leaning on the auto-combined
+    //           default device.
+    //
+    //       Net: clean output and a working mismatched-device mic on one driver,
+    //       no DirectSound. DirectSound remains reachable as a last resort - the
+    //       mic/IR capture dialogs point at the "Audio device..." button - for
+    //       the rare device whose format even the shared-mode SRC can't
+    //       reconcile, but it is no longer the default tradeoff. The
+    //       saved-settings path above always takes precedence, so any deliberate
+    //       driver choice persists across runs.
     std::unique_ptr<juce::XmlElement> savedState;
     {
         auto settingsFile = getAudioSettingsFile();
@@ -174,6 +184,43 @@ void AudioEngine::changeListenerCallback(juce::ChangeBroadcaster* source) {
         saveAudioSettings();
 }
 
+void AudioEngine::logInputDeviceDiagnostics(const char* context) {
+    if (!deviceManager) return;
+    auto* dev = deviceManager->getCurrentAudioDevice();
+    if (!dev) {
+        fprintf(stderr, "  [mic-diag] (%s) no current audio device\n",
+                context ? context : "");
+        fflush(stderr);
+        return;
+    }
+    const auto setup    = deviceManager->getAudioDeviceSetup();
+    const auto inNames  = dev->getInputChannelNames();
+    const auto activeIn = dev->getActiveInputChannels();
+    fprintf(stderr,
+            "  [mic-diag] (%s)\n"
+            "  [mic-diag] driver=\"%s\"  inDevice=\"%s\"  outDevice=\"%s\"\n"
+            "  [mic-diag] sampleRate=%.0f Hz  bufferSize=%d  bitDepth=%d\n"
+            "  [mic-diag] inputChannels=%d  activeInputMask=0x%s\n",
+            context ? context : "",
+            deviceManager->getCurrentAudioDeviceType().toRawUTF8(),
+            setup.inputDeviceName.toRawUTF8(),
+            setup.outputDeviceName.toRawUTF8(),
+            dev->getCurrentSampleRate(),
+            dev->getCurrentBufferSizeSamples(),
+            dev->getCurrentBitDepth(),
+            inNames.size(),
+            activeIn.toString(16).toRawUTF8());
+    for (int i = 0; i < inNames.size(); ++i)
+        fprintf(stderr, "  [mic-diag]   in[%d] = \"%s\"%s\n",
+                i, inNames[i].toRawUTF8(),
+                activeIn[i] ? " (active)" : "");
+    // stderr is block-buffered to seance.log (it's a file, not a tty), so force
+    // this diagnostic to disk now - otherwise it wouldn't appear until the app
+    // exits or the buffer fills, and the user wants to read it while SEANCE is
+    // still open after triggering a mic capture.
+    fflush(stderr);
+}
+
 bool AudioEngine::ensureAudioInputEnabled() {
     if (!deviceManager) return false;
     auto setup = deviceManager->getAudioDeviceSetup();
@@ -182,8 +229,10 @@ bool AudioEngine::ensureAudioInputEnabled() {
     // do. Bail before setAudioDeviceSetup so opening the mic dialog doesn't
     // needlessly restart the device (which would glitch audio) on the common
     // path where input is fine.
-    if (!setup.inputChannels.isZero() && setup.inputDeviceName.isNotEmpty())
+    if (!setup.inputChannels.isZero() && setup.inputDeviceName.isNotEmpty()) {
+        logInputDeviceDiagnostics("input already live");
         return true;
+    }
 
     if (auto* type = deviceManager->getCurrentDeviceTypeObject()) {
         type->scanForDevices();
@@ -191,6 +240,28 @@ bool AudioEngine::ensureAudioInputEnabled() {
         if (setup.inputDeviceName.isEmpty() && inputs.size() > 0) {
             const int defIdx = type->getDefaultDeviceIndex(true);
             setup.inputDeviceName = inputs[juce::jlimit(0, inputs.size() - 1, defIdx)];
+        }
+        // Name the output endpoint explicitly too. On the Windows Audio (WASAPI)
+        // driver this is what makes a mismatched mic+speakers pair work without
+        // falling back to DirectSound: naming the input and output as two
+        // concrete endpoints opens them as independent shared-mode clients, and
+        // plain shared mode is the one WASAPI mode JUCE runs with the
+        // AUTOCONVERTPCM | SRC_DEFAULT_QUALITY stream flags set (see
+        // supportsSampleRateConversion() in juce_WASAPI_windows.cpp - true only
+        // for WASAPIDeviceMode::shared, false for exclusive/low-latency). Those
+        // flags turn on WASAPI's built-in per-endpoint resampler/reformatter, so
+        // a webcam mic running at its own native rate/format gets converted to
+        // what we ask for independently of the output clock - no welded
+        // default-device corruption, no shared-clock requirement. Relying on the
+        // auto-combined default device instead can hand us a device that doesn't
+        // get that per-endpoint conversion, which is the square-wave-garbage
+        // input bug that historically forced DirectSound. So: be explicit.
+        if (setup.outputDeviceName.isEmpty()) {
+            const auto outputs = type->getDeviceNames(false);  // output device names
+            if (outputs.size() > 0) {
+                const int defIdx = type->getDefaultDeviceIndex(false);
+                setup.outputDeviceName = outputs[juce::jlimit(0, outputs.size() - 1, defIdx)];
+            }
         }
     }
     if (setup.inputDeviceName.isEmpty()) {
@@ -205,6 +276,7 @@ bool AudioEngine::ensureAudioInputEnabled() {
         return false;
     }
     fprintf(stderr, "Audio input enabled: %s\n", setup.inputDeviceName.toRawUTF8());
+    logInputDeviceDiagnostics("input just enabled");
     return true;
 }
 

@@ -249,11 +249,15 @@ private:
     void enqueueAutosaveJob(AutosaveJob job); // hand off to worker
     void autosaveWorkerMain();                // worker thread entry point
 
+    void quiesceAutosaveWorker();             // block until worker is idle + no pending job
+
     std::thread autosaveWorkerThread;
     std::mutex  autosaveWorkerMutex;
-    std::condition_variable autosaveWorkerCv;
+    std::condition_variable autosaveWorkerCv;     // signals the worker that a job is waiting
+    std::condition_variable autosaveWorkerIdleCv; // signals callers that the worker went idle
     AutosaveJob autosaveWorkerPending;
     bool autosaveWorkerHasJob = false;
+    bool autosaveWorkerBusy = false;          // true while the worker is mid-write (lock released)
     std::atomic<bool> autosaveWorkerStop {false};
 
     // Counts slow ticks since the last Full save of autosave.ssp. When

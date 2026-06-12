@@ -162,6 +162,13 @@ private:
     int      aRoamLo = 0;                    // min grain-start (band low)
     int      aRoamHi = 0;                    // max grain-start so reads stay
                                              // in-bounds (no DC overrun)
+    int      aWindowHi = 0;                  // window upper read bound (bandHi,
+                                             // or srcLen unbanded). aRoamHi is
+                                             // aWindowHi - aGrain at ratio 1;
+                                             // asyncSample tightens it by
+                                             // aGrain*ratio when pitched up so a
+                                             // sped-up grain read can't run past
+                                             // the band into the lookahead tail.
     uint32_t rngState = 0x9E3779B9u;
 
     // ---- SpectralFreeze ----

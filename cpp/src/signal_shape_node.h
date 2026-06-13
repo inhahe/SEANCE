@@ -109,6 +109,37 @@ struct SignalShapeDoc {
     // Number of Signal input pins (0..16). Exposed in expressions as s1..sN.
     int signalInputCount = 0;
 
+    // ---- Unified scriptable-node I/O (see node header comment) --------------
+    //
+    // The Signal Shape node is the general scriptable node: one program both
+    // assigns continuous outputs o1..oP AND emits MIDI. The four I/O dimensions:
+    //
+    //   signalInputCount   - Signal/Param INPUT pins  s1..sN  (above)
+    //   continuousOutputCount - Signal/Param OUTPUT pins, exposed as o1..oP.
+    //                        The program assigns o1..oP (o1 defaults to the
+    //                        program's last bare expression, so "curve" still
+    //                        means o1 = curve). Always >= 1.
+    //   midiOutputCount    - MIDI OUTPUT pins (0..16). 0 = pure signal source
+    //                        (no MIDI emit, classic Signal Shape). >=1 enables
+    //                        the emit functions note()/cc()/bend()/... with the
+    //                        reserved `out` variable selecting the pin.
+    //   midiInput          - whether the node has a MIDI INPUT pin (drives the
+    //                        note/vel/gate/freq variables). True by default.
+    //
+    // A node with midiOutputCount==0 behaves exactly like the old Signal Shape;
+    // continuousOutputCount==1 + a MIDI-emitting program behaves like the old
+    // MIDI Script (its single continuous output is just unused). Both > 0 is a
+    // hybrid (e.g. an arpeggiator that also outputs an envelope).
+    int continuousOutputCount = 1;
+    int midiOutputCount = 0;
+    bool midiInput = true;
+
+    // Pin kind for the continuous input/output pins: false = Signal (blue),
+    // true = Param (orange). Purely semantic - both route identically on the
+    // wire (control channels 2+). The editor's type dropdown flips this for ALL
+    // continuous pins at once.
+    bool paramKind = false;
+
     // Round-trip via node.script. Prefix: "__signalshape__:".
     // Format (newline-separated key=value, base64 where values may contain
     // structural characters):
@@ -147,7 +178,10 @@ public:
     void processBlock(juce::AudioBuffer<float>& buf, juce::MidiBuffer& midi) override;
     double getTailLengthSeconds() const override { return 0; }
     bool acceptsMidi() const override { return true; }
-    bool producesMidi() const override { return false; }
+    // Produces MIDI only when the program declares >=1 MIDI output pin. `doc` is
+    // kept in sync with node.script by reloadIfScriptChanged(); the graph reads
+    // this when wiring MIDI cables.
+    bool producesMidi() const override { return doc.midiOutputCount > 0; }
     bool isBusesLayoutSupported(const BusesLayout&) const override { return true; }
     juce::AudioProcessorEditor* createEditor() override { return nullptr; }
     bool hasEditor() const override { return false; }
@@ -160,6 +194,11 @@ public:
     void setStateInformation(const void*, int) override {}
 
     float getCurrentValue() const { return lastOutputValue; }
+
+    // How many MIDI output pins this program declares (0..16). graph_processor
+    // reads this to decide whether to insert per-cable channel filters (same
+    // mechanism as the retired MIDI Script node).
+    int getMidiOutputCount() const { return doc.midiOutputCount; }
 
     // UI-thread: queue one manual-trigger firing for the next audio block.
     // Equivalent to the user typing a rising edge on the trigger expression
@@ -212,15 +251,53 @@ private:
     // modulation"), so an idle / not-yet-triggered node holds at neutral rather
     // than pegging its target param to the minimum.
     float lastOutputValue = 0.5f;
+    // Per-continuous-output last value (o1..oP), held when the shape isn't
+    // running (envelope "stuck at the end"). Index 0 mirrors lastOutputValue.
+    // Sized lazily to continuousOutputCount; defaults to 0.5 (neutral).
+    std::vector<float> lastOuts;
     bool  wasPlaying = false;   // transport play rising edge, for the start hook
 
     std::atomic<bool> manualTriggerPending { false };
+
+    // Snapshot of the incoming control-input channels (Signal/Param inputs ride
+    // buffer channels 2+). Captured BEFORE buf.clear() because input and output
+    // channels share storage in the JUCE graph, so clearing the buffer to write
+    // outputs would otherwise zero s1..sN before the per-sample loop reads them
+    // (the same hazard the terrain synth hit). Kept as a member to avoid
+    // reallocating on the audio thread.
+    juce::AudioBuffer<float> ctrlIn;
 
     // MIDI state tracked across blocks (used by gate / freq / note / vel
     // expression variables).
     int   notesHeld = 0;
     int   lastNoteOn = -1;
     float lastVelocity = 0.0f;
+
+    bool  wasPlayingMidi = false;  // play edge for the MIDI-emit stop flush
+
+    // ---- MIDI emission (unified node, midiOutputCount > 0) ------------------
+    // Ported from the retired MIDI Script node: a note(p,v,d) call schedules a
+    // note-off `samplesRemaining` samples from the current block start; drained
+    // once per block so durations longer than one block still end correctly.
+    struct PendingNoteOff {
+        long long samplesRemaining;
+        int channel;   // 1..16 (out+1)
+        int pitch;     // 0..127
+    };
+    std::vector<PendingNoteOff> pendingOffs;
+    static constexpr size_t kMaxPendingOffs = 512;
+
+    // Emit sink implementation (see builtin_synth.h IExprEmitSink). Routes the
+    // program's emit calls into the output MIDI buffer, tagging each with
+    // channel = out+1 so graph_processor's per-cable channel filters can split
+    // the outputs. Defined in the .cpp.
+    struct Sink;
+    friend struct Sink;
+
+    // Drain note-offs scheduled by note(p,v,d). samplesRemaining is measured
+    // from the current block start; subtract the block length and emit any that
+    // came due at their within-block offset. Survivors carry to the next block.
+    void drainPendingNoteOffs(juce::MidiBuffer& midi, int numSamples);
 
     float getParam(int idx, float def) const;
 };
@@ -311,6 +388,18 @@ private:
     juce::Label   sigCountLabel   { {}, "Signal inputs (s1..sN):" };
     juce::TextEditor sigCountEditor;
 
+    // Unified-node I/O controls. continuousOutputCount (o1..oP) is always >=1;
+    // midiOutputCount 0 = pure signal source; midiInToggle adds/removes the MIDI
+    // In pin; kindCombo flips ALL continuous pins between Signal (blue) and Param
+    // (orange). All four call syncPins() then commitToNode() on change.
+    juce::Label   outCountLabel   { {}, "Signal outputs (o1..oP):" };
+    juce::TextEditor outCountEditor;
+    juce::Label   midiOutLabel    { {}, "MIDI outputs:" };
+    juce::TextEditor midiOutEditor;
+    juce::ToggleButton midiInToggle { "MIDI input" };
+    juce::Label   kindLabel       { {}, "Pin type:" };
+    juce::ComboBox kindCombo;
+
     // Speed controls. "Cycle length" and "Rate" are two views of the SAME
     // underlying node param ("Rate"): Rate = 1 / Cycle length. Editing either
     // field writes the Rate param and updates the other field to stay
@@ -363,10 +452,14 @@ private:
     void writeRate(float rate);
     // Pointer to a node param by name, or nullptr if the node/param is gone.
     Param* paramByName(const std::string& name);
-    // Rewrite node.pinsIn to "MIDI In" + N Signal pins, where N is
-    // doc.signalInputCount. Returns true if the pin list actually changed
-    // so callers know whether to fire onChanged.
-    bool syncSignalInputPins();
+    // Reconcile BOTH pin lists to the current doc:
+    //   pinsIn  = [MIDI In if doc.midiInput] + s1..sN  (ctrl kind = paramKind)
+    //   pinsOut = o1..oP (ctrl kind) + MIDI Out 1..Q  (PinKind::Midi)
+    // where N = signalInputCount, P = continuousOutputCount (>=1),
+    // Q = midiOutputCount. Pin ids are preserved by name so existing cables
+    // survive a count change; the continuous-pin kind follows doc.paramKind.
+    // Returns true if either list actually changed (callers fire onChanged).
+    bool syncPins();
 };
 
 } // namespace SoundShop

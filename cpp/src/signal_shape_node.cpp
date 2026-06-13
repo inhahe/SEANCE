@@ -53,6 +53,10 @@ SignalShapeDoc SignalShapeDoc::defaultLFO() {
     d.repeatN = 1;
     d.freeRun = false;   // default: lock phase to song position (deterministic)
     d.signalInputCount = 0;
+    d.continuousOutputCount = 1;  // one continuous output (o1)
+    d.midiOutputCount = 0;        // no MIDI emit by default (pure signal source)
+    d.midiInput = true;
+    d.paramKind = false;
     return d;
 }
 
@@ -65,6 +69,10 @@ std::string SignalShapeDoc::encode() const {
     o << "repeatN=" << repeatN << "\n";
     o << "freeRun=" << (freeRun ? 1 : 0) << "\n";
     o << "sigCount=" << signalInputCount << "\n";
+    o << "outCount=" << continuousOutputCount << "\n";
+    o << "midiOut=" << midiOutputCount << "\n";
+    o << "midiIn=" << (midiInput ? 1 : 0) << "\n";
+    o << "paramKind=" << (paramKind ? 1 : 0) << "\n";
     o << "lang=" << (int)language << "\n";
     o << "rate=" << (int)rate << "\n";
     o << "wasm=" << b64(wasmPath) << "\n";
@@ -106,6 +114,14 @@ bool SignalShapeDoc::decode(const std::string& s) {
             try { freeRun = std::stoi(val) != 0; } catch (...) {}
         } else if (key == "sigCount") {
             try { signalInputCount = juce::jlimit(0, 16, std::stoi(val)); } catch (...) {}
+        } else if (key == "outCount") {
+            try { continuousOutputCount = juce::jlimit(1, 16, std::stoi(val)); } catch (...) {}
+        } else if (key == "midiOut") {
+            try { midiOutputCount = juce::jlimit(0, 16, std::stoi(val)); } catch (...) {}
+        } else if (key == "midiIn") {
+            try { midiInput = std::stoi(val) != 0; } catch (...) {}
+        } else if (key == "paramKind") {
+            try { paramKind = std::stoi(val) != 0; } catch (...) {}
         } else if (key == "lang") {
             try { language = (ScriptLang)juce::jlimit(0, 2, std::stoi(val)); } catch (...) {}
         } else if (key == "rate") {
@@ -179,16 +195,21 @@ void SignalShapeProcessor::reloadIfScriptChanged() {
     timeSinceTrigger = 0.0;
     prevTriggerHigh = false;
     running = doc.triggerExpr.empty(); // no trigger -> free-running
+    // Reset MIDI emission state when the program changes (unified node).
+    pendingOffs.clear();
+    wasPlayingMidi = false;
 
     // (Re)create the language runtime. Effective rate from the capability matrix:
     // Builtin -> PerSample, Wasm -> PerBlock, Lua -> doc.rate.
+    // Role is Unified: the program both assigns continuous outputs o1..oP AND
+    // emits MIDI (the emit functions are no-ops when no sink / no MIDI output).
     ScriptRate effRate = doc.rate;
     if (!scriptLangSupportsRate(doc.language, effRate))
         effRate = (doc.language == ScriptLang::Wasm) ? ScriptRate::PerBlock
                                                      : ScriptRate::PerSample;
-    runtime = makeScriptRuntime(doc.language, ScriptRole::Signal, effRate);
+    runtime = makeScriptRuntime(doc.language, ScriptRole::Unified, effRate);
     if (!runtime) // language unavailable in this build -> fall back to Builtin.
-        runtime = makeScriptRuntime(ScriptLang::Builtin, ScriptRole::Signal,
+        runtime = makeScriptRuntime(ScriptLang::Builtin, ScriptRole::Unified,
                                     ScriptRate::PerSample);
     bindShape();
 
@@ -247,8 +268,79 @@ static float sampleShape(const std::vector<float>& tbl, float phase) {
     return tbl[i0] * (1.0f - t) + tbl[i1] * t;
 }
 
+// -----------------------------------------------------------------------------
+// SignalShapeProcessor::Sink - MIDI emit interface for the unified node.
+// -----------------------------------------------------------------------------
+// Ported from the retired MIDI Script node. Emit calls land at `sampleOffset`
+// (the per-sample loop's current sample) in the OUTPUT MIDI buffer; events are
+// tagged channel = out+1 so graph_processor's per-cable channel filters split
+// the multiple MIDI outputs into independent single-stream cables.
+struct SignalShapeProcessor::Sink : public IExprEmitSink {
+    juce::MidiBuffer* midi = nullptr;
+    int sampleOffset = 0;
+    double sampleRate = 44100.0;
+    int outputCount = 1;
+    std::vector<PendingNoteOff>* pendingOffs = nullptr;
+
+    int channelFor(int out) const {
+        int idx = juce::jlimit(0, juce::jmax(0, outputCount - 1), out);
+        return juce::jlimit(1, 16, idx + 1);
+    }
+    static int clampNote(float v) { return juce::jlimit(0, 127, (int)std::lround(v)); }
+
+    void setSampleOffset(int off) override { sampleOffset = off; }
+
+    void emitNote(int out, float pitch, float vel, float durSec) override {
+        if (!midi) return;
+        int ch = channelFor(out);
+        int p  = clampNote(pitch);
+        int v  = clampNote(vel);
+        if (v <= 0) return;
+        midi->addEvent(juce::MidiMessage::noteOn(ch, p, (juce::uint8)v), sampleOffset);
+        if (pendingOffs && pendingOffs->size() < kMaxPendingOffs) {
+            long long durSamples = std::max<long long>(1,
+                (long long)std::lround((double)durSec * sampleRate));
+            pendingOffs->push_back({ (long long)sampleOffset + durSamples, ch, p });
+        }
+    }
+    void emitNoteOn(int out, float pitch, float vel) override {
+        if (!midi) return;
+        int v = clampNote(vel);
+        if (v <= 0) { emitNoteOff(out, pitch); return; }
+        midi->addEvent(juce::MidiMessage::noteOn(channelFor(out), clampNote(pitch),
+                                                 (juce::uint8)v), sampleOffset);
+    }
+    void emitNoteOff(int out, float pitch) override {
+        if (!midi) return;
+        midi->addEvent(juce::MidiMessage::noteOff(channelFor(out), clampNote(pitch)),
+                       sampleOffset);
+    }
+    void emitCC(int out, float num, float value01) override {
+        if (!midi) return;
+        int n = juce::jlimit(0, 127, (int)std::lround(num));
+        int v = juce::jlimit(0, 127, (int)std::lround(juce::jlimit(0.0f, 1.0f, value01) * 127.0f));
+        midi->addEvent(juce::MidiMessage::controllerEvent(channelFor(out), n, v), sampleOffset);
+    }
+    void emitBend(int out, float value) override {
+        if (!midi) return;
+        int w = juce::jlimit(0, 16383, (int)std::lround((juce::jlimit(-1.0f, 1.0f, value) * 0.5f + 0.5f) * 16383.0f));
+        midi->addEvent(juce::MidiMessage::pitchWheel(channelFor(out), w), sampleOffset);
+    }
+};
+
+void SignalShapeProcessor::drainPendingNoteOffs(juce::MidiBuffer& midi, int numSamples) {
+    for (auto it = pendingOffs.begin(); it != pendingOffs.end();) {
+        it->samplesRemaining -= numSamples;
+        if (it->samplesRemaining <= 0) {
+            int off = juce::jlimit(0, juce::jmax(0, numSamples - 1),
+                (int)(numSamples + it->samplesRemaining));
+            midi.addEvent(juce::MidiMessage::noteOff(it->channel, it->pitch), off);
+            it = pendingOffs.erase(it);
+        } else ++it;
+    }
+}
+
 void SignalShapeProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::MidiBuffer& midi) {
-    buf.clear();
     int numSamples = buf.getNumSamples();
     int numCh = buf.getNumChannels();
 
@@ -256,6 +348,7 @@ void SignalShapeProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mid
     // "__xypad__" script tag. Three Signal output pins (X, Y, Z) driven
     // by params 0/1/2. Bypasses all shape/trigger/expression machinery.
     if (node.script == "__xypad__") {
+        buf.clear();
         const int kNumOuts = 3;
         for (int i = 0; i < kNumOuts; ++i) {
             int ch = 2 + i;
@@ -272,6 +365,7 @@ void SignalShapeProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mid
     // layout). Each output channel 2+i is driven by param i (the slider value,
     // 0..1). Like XY Pad, this bypasses all shape/trigger machinery.
     if (node.script.rfind("__controlbank__", 0) == 0) {
+        buf.clear();
         const int numOuts = (int)node.params.size();
         for (int i = 0; i < numOuts; ++i) {
             int ch = 2 + i;
@@ -282,6 +376,23 @@ void SignalShapeProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mid
         }
         return;
     }
+
+    // Snapshot the incoming control-input channels BEFORE clearing the buffer.
+    // Input and output channels share storage in the JUCE graph, and we clear
+    // the buffer below before writing our outputs, so s1..sN must be captured
+    // first or they would read as zeros (the terrain-synth control-input bug).
+    int numSigInPins = 0;
+    for (auto& pin : node.pinsIn)
+        if (pin.kind == PinKind::Signal || pin.kind == PinKind::Param) ++numSigInPins;
+    ctrlIn.setSize(juce::jmax(0, numSigInPins), juce::jmax(1, numSamples),
+                   false, false, true);
+    for (int i = 0; i < numSigInPins; ++i) {
+        int ch = 2 + i;
+        if (ch < numCh) ctrlIn.copyFrom(i, 0, buf, ch, 0, numSamples);
+        else            ctrlIn.clear(i, 0, numSamples);
+    }
+
+    buf.clear();
 
     reloadIfScriptChanged();
 
@@ -343,12 +454,13 @@ void SignalShapeProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mid
     // here since the upstream cable carries the same data either way).
     // sigCount of 0 leaves this empty - the s1..sN variables then resolve
     // to 0 via the parser's "unknown identifier" fallback.
+    // Read signal inputs from the pre-clear snapshot (ctrlIn), NOT the live
+    // buffer (which we just cleared and will overwrite with outputs).
     std::vector<const float*> sigChans;
     sigChans.reserve(sigCount);
     for (int i = 0; i < sigCount; ++i) {
-        int ch = 2 + i;
-        if (ch < numCh) sigChans.push_back(buf.getReadPointer(ch));
-        else            sigChans.push_back(nullptr);
+        sigChans.push_back((i < ctrlIn.getNumChannels()) ? ctrlIn.getReadPointer(i)
+                                                         : nullptr);
     }
 
     // Output channels: every Signal/Param OUT pin maps to channel 2+ in pin
@@ -379,6 +491,38 @@ void SignalShapeProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mid
     const bool playStart = transport.playing && !wasPlaying;
     wasPlaying = transport.playing;
 
+    // ---- MIDI emission setup (unified node) ------------------------------
+    // When the program declares >=1 MIDI output pin, this node OWNS the MIDI
+    // buffer as its output: we read the input note state above (the loop that
+    // updates note/vel/gate), then clear it and write only our emitted events.
+    // With 0 MIDI outputs the node never touches `midi` (it's a pure signal
+    // source). The Sink tags events channel = out+1 for graph_processor's
+    // per-cable channel filters.
+    const int  midiOutCount = doc.midiOutputCount;
+    const bool emitsMidi    = midiOutCount > 0;
+    Sink sink;
+    sink.midi        = &midi;
+    sink.sampleRate  = sampleRate;
+    sink.outputCount = midiOutCount;
+    sink.pendingOffs = &pendingOffs;
+    IExprEmitSink* sinkPtr = emitsMidi ? &sink : nullptr;
+
+    if (emitsMidi) {
+        const bool playStopMidi = !transport.playing && wasPlayingMidi;
+        midi.clear();  // we don't pass input MIDI through; it only drove note/vel/gate
+        if (playStopMidi) {
+            for (int ch = 1; ch <= 16; ++ch)
+                midi.addEvent(juce::MidiMessage::allNotesOff(ch), 0);
+            pendingOffs.clear();
+        }
+    }
+    wasPlayingMidi = transport.playing;
+
+    // Ensure the per-output hold buffer matches the declared output count.
+    const int outCount = juce::jmax(1, doc.continuousOutputCount);
+    if ((int)lastOuts.size() != outCount)
+        lastOuts.assign((size_t)outCount, 0.5f);
+
     // ---- Per-block dispatch (Lua block-rate / Wasm) ----------------------
     // Raw-signal mode: the script fills the whole output buffer itself. The
     // trigger / phase / repeat / curve machinery below is bypassed entirely.
@@ -396,10 +540,12 @@ void SignalShapeProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mid
             sv["gate"] = (notesHeld > 0) ? 1.0f : 0.0f;
             sv["freq"] = freqHz;
             sv["rate"] = rate;
-            runtime->onStart(sv, nullptr); // Signal role: no MIDI sink
+            sink.sampleOffset = 0;
+            runtime->onStart(sv, sinkPtr); // emit allowed when MIDI outputs exist
         }
 
         ScriptBlockCtx ctx;
+        ctx.sink       = sinkPtr;     // block-mode MIDI emit (Lua-block / Wasm)
         ctx.sampleRate = juce::jmax(1.0, sampleRate);
         ctx.numSamples = numSamples;
         ctx.bpm        = transport.bpm;
@@ -417,6 +563,8 @@ void SignalShapeProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mid
         runtime->runBlock(ctx);
 
         // Fan the single computed buffer out to every Signal/Param output channel.
+        // (Block mode produces ONE continuous signal; per-output o1..oP is a
+        // per-sample-mode feature.)
         for (int ch = outChStart; ch < outChEnd; ++ch)
             std::memcpy(buf.getWritePointer(ch), blockOut.data(),
                         sizeof(float) * (size_t)numSamples);
@@ -424,6 +572,8 @@ void SignalShapeProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mid
         lastOutputValue = (numSamples > 0) ? blockOut[numSamples - 1] : lastOutputValue;
         if ((int)node.params.size() > 3)
             node.params[3].value = lastOutputValue;
+
+        drainPendingNoteOffs(midi, numSamples);
         return;
     }
 
@@ -440,7 +590,8 @@ void SignalShapeProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mid
         sv["freq"] = (lastNoteOn >= 0)
                    ? 440.0f * std::pow(2.0f, (lastNoteOn - 69) / 12.0f) : 0.0f;
         sv["rate"] = rate;
-        runtime->onStart(sv, nullptr);
+        sink.sampleOffset = 0;
+        runtime->onStart(sv, sinkPtr);
     }
 
     // shape(pos) sampler: lets expressions resample the drawn waveform at an
@@ -554,19 +705,27 @@ void SignalShapeProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mid
             shouldAdvance = freeRunning ? true : triggerHigh;
         }
 
-        float out = 0.0f;
         if (running) {
-            // Evaluate the composition via the language runtime. For Builtin this
-            // walks `expr` (defaulting to "curve", which passes the shape through);
-            // for Lua-per-sample it runs loop() with curve/x/phase/... bound as
-            // globals. The trigger expression above is always the Builtin DSL.
-            out = runtime ? runtime->evalSignal(vars)
-                          : WaveExprParser::evaluateWithVars(expr, vars, shapeFn);
+            // Run the unified program for this sample: it emits MIDI through
+            // `sinkPtr` (when the node has MIDI outputs) AND assigns continuous
+            // outputs o1..oP, harvested into outsBuf. For Builtin this runs the
+            // multi-statement program (the default "curve" yields o1 = curve);
+            // for Lua-per-sample it runs loop(). The trigger expression above is
+            // always the Builtin DSL.
+            if (sinkPtr) sink.sampleOffset = s;
+            float outsBuf[16];
+            const int p = juce::jmin(outCount, 16);
+            if (runtime) {
+                runtime->runUnified(vars, sinkPtr, outsBuf, p);
+            } else {
+                outsBuf[0] = WaveExprParser::evaluateWithVars(expr, vars, shapeFn);
+                for (int i = 1; i < p; ++i) outsBuf[i] = 0.0f;
+            }
             // Control signals are unipolar 0..1 on the wire (see
             // signal_modulation.h). `curve` is already 0..1; bipolar math like a
-            // bare sin() will clip its negative half here unless the author
-            // wraps it (unipolar(...) / usin(...)).
-            out = juce::jlimit(0.0f, 1.0f, out);
+            // bare sin() clips its negative half unless wrapped (unipolar/usin).
+            for (int i = 0; i < p; ++i)
+                lastOuts[i] = juce::jlimit(0.0f, 1.0f, outsBuf[i]);
 
             if (shouldAdvance) {
                 phase += phaseDelta;
@@ -583,25 +742,25 @@ void SignalShapeProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mid
                     }
                 }
             }
-        } else {
-            // Hold the last computed value when not running - this gives
-            // envelope-style "stuck at the end" behaviour for Once and
-            // NTimes repeat modes.
-            out = lastOutputValue;
         }
+        // else: hold the last computed values (envelope "stuck at the end" for
+        // Once / NTimes), and do NOT run the program (no MIDI emit while held).
 
-        lastOutputValue = out;
+        lastOutputValue = lastOuts.empty() ? 0.5f : lastOuts[0];
 
-        // Write the computed value to every Signal/Param output channel.
-        // Note: outChStart..outChEnd may overlap with the input channels
-        // (signal inputs share the channel index space with outputs on
-        // the same node), but we've already read those input samples
-        // into the vars map at the top of this iteration so the
+        // Write each continuous output o1..oP to its own channel (2+i).
+        // outChStart..outChEnd may overlap input channels, but inputs were
+        // snapshotted into ctrlIn before the buffer was cleared, so the
         // overwrite is safe.
         for (int ch = outChStart; ch < outChEnd; ++ch) {
-            buf.getWritePointer(ch)[s] = out;
+            int oi = ch - outChStart;
+            buf.getWritePointer(ch)[s] = (oi < (int)lastOuts.size()) ? lastOuts[oi]
+                                                                     : lastOuts.empty() ? 0.5f
+                                                                                        : lastOuts[0];
         }
     }
+
+    drainPendingNoteOffs(midi, numSamples);
 
     // Reflect the last computed value into the node's "Output" param so
     // UI-rate consumers (e.g. param-slider feedback) can display it.
@@ -832,12 +991,80 @@ SignalShapeEditorComponent::SignalShapeEditorComponent(NodeGraph& g, int nid,
         int n = juce::jlimit(0, 16, sigCountEditor.getText().getIntValue());
         if (n != doc.signalInputCount) {
             doc.signalInputCount = n;
-            syncSignalInputPins();  // rewrites node.pinsIn
+            syncPins();  // rewrites node.pinsIn / pinsOut
             commitToNode();
         }
     };
     sigCountEditor.setTooltip("Number of incoming Signal pins exposed in "
                               "expressions as s1, s2, ... sN. 0..16.");
+
+    // Continuous-output count (o1..oP). Always >= 1.
+    addAndMakeVisible(outCountLabel);
+    addAndMakeVisible(outCountEditor);
+    outCountEditor.setInputRestrictions(2, "0123456789");
+    outCountEditor.setText(juce::String(doc.continuousOutputCount),
+                           juce::dontSendNotification);
+    outCountEditor.onTextChange = [this]() {
+        int n = juce::jlimit(1, 16, outCountEditor.getText().getIntValue());
+        if (n != doc.continuousOutputCount) {
+            doc.continuousOutputCount = n;
+            syncPins();
+            commitToNode();
+        }
+    };
+    outCountEditor.setTooltip("Number of continuous output pins, assigned in the "
+                              "program as o1, o2, ... oP. o1 defaults to the "
+                              "program's last value. 1..16.");
+
+    // MIDI-output count (0 = pure signal source).
+    addAndMakeVisible(midiOutLabel);
+    addAndMakeVisible(midiOutEditor);
+    midiOutEditor.setInputRestrictions(2, "0123456789");
+    midiOutEditor.setText(juce::String(doc.midiOutputCount),
+                          juce::dontSendNotification);
+    midiOutEditor.onTextChange = [this]() {
+        int n = juce::jlimit(0, 16, midiOutEditor.getText().getIntValue());
+        if (n != doc.midiOutputCount) {
+            doc.midiOutputCount = n;
+            syncPins();
+            commitToNode();
+        }
+    };
+    midiOutEditor.setTooltip("Number of MIDI output pins. 0 = pure signal source. "
+                             "With >=1, the program can emit MIDI with note(), "
+                             "cc(), bend()...; the `out` variable picks the pin "
+                             "(0-based). 0..16.");
+
+    // MIDI-input toggle: adds/removes the MIDI In pin (drives note/vel/gate/freq).
+    addAndMakeVisible(midiInToggle);
+    midiInToggle.setToggleState(doc.midiInput, juce::dontSendNotification);
+    midiInToggle.onClick = [this]() {
+        doc.midiInput = midiInToggle.getToggleState();
+        syncPins();
+        commitToNode();
+    };
+    midiInToggle.setTooltip("Add a MIDI input pin that drives the note / vel / "
+                            "gate / freq variables. Turn off for a node that only "
+                            "generates signal or MIDI from scratch.");
+
+    // Pin-type dropdown (Signal vs Param) for ALL continuous input/output pins.
+    addAndMakeVisible(kindLabel);
+    addAndMakeVisible(kindCombo);
+    kindCombo.addItem("Signal", 1);
+    kindCombo.addItem("Param", 2);
+    kindCombo.setSelectedId(doc.paramKind ? 2 : 1, juce::dontSendNotification);
+    kindCombo.onChange = [this]() {
+        bool param = (kindCombo.getSelectedId() == 2);
+        if (param != doc.paramKind) {
+            doc.paramKind = param;
+            syncPins();
+            commitToNode();
+        }
+    };
+    kindCombo.setTooltip("Pin type for all continuous input/output pins: Signal "
+                         "(blue, audio-rate control) or Param (orange, parameter "
+                         "automation). Both carry the same 0..1 data and "
+                         "interconvert on the wire.");
 
     // Speed controls: Cycle length <-> Rate (two views of the "Rate" param),
     // plus the Beat Sync toggle that chooses their units. See header for the
@@ -956,7 +1183,7 @@ SignalShapeEditorComponent::SignalShapeEditorComponent(NodeGraph& g, int nid,
     // row plus the summation preview without scrolling; the dialog is resizable
     // for more. The variables/functions reference is now a button (not an
     // always-visible block), freeing ~150px for the layer stack.
-    setSize(720, 952);
+    setSize(720, 1016);
 }
 
 SignalShapeEditorComponent::~SignalShapeEditorComponent() {
@@ -1107,59 +1334,75 @@ void SignalShapeEditorComponent::updateLanguageUI() {
     }
 }
 
-bool SignalShapeEditorComponent::syncSignalInputPins() {
+bool SignalShapeEditorComponent::syncPins() {
     auto* nd = graph.findNode(nodeId);
     if (!nd) return false;
 
-    // The convention for SignalShape input pins is:
-    //   [0]: "MIDI In" (Midi, target=true) - source of gate/freq/note/vel
-    //   [1..N]: "s1".."sN" Signal pins.
-    // Rebuild the list to match. We preserve the existing MIDI In pin's id
-    // (so any existing cable to it survives the rewrite).
-    std::vector<Pin> rebuilt;
-    rebuilt.reserve(1 + doc.signalInputCount);
+    // Continuous pins (s1..sN inputs, o1..oP outputs) share one user-chosen
+    // kind; MIDI pins are always PinKind::Midi.
+    const PinKind ctrlKind = doc.paramKind ? PinKind::Param : PinKind::Signal;
 
-    // Find an existing MIDI In pin to preserve its id (else allocate fresh).
-    int midiPinId = -1;
-    for (auto& p : nd->pinsIn) {
-        if (p.kind == PinKind::Midi) { midiPinId = p.id; break; }
-    }
-    if (midiPinId < 0) midiPinId = graph.allocId();
-    Pin midiIn;
-    midiIn.id      = midiPinId;
-    midiIn.name    = "MIDI In";
-    midiIn.kind    = PinKind::Midi;
-    midiIn.isInput = true;
-    rebuilt.push_back(midiIn);
+    // Find an existing pin id by name within a list (preserves cables across a
+    // rewrite). Matches a continuous pin only if it currently carries a control
+    // kind, so a name collision against a MIDI pin can't steal its id.
+    auto findId = [](const std::vector<Pin>& pins, const std::string& name,
+                     bool wantCtrl) -> int {
+        for (auto& p : pins) {
+            const bool isCtrl = (p.kind == PinKind::Signal || p.kind == PinKind::Param);
+            if (p.name == name && (wantCtrl ? isCtrl : (p.kind == PinKind::Midi)))
+                return p.id;
+        }
+        return -1;
+    };
+    auto makePin = [&](int id, const std::string& name, PinKind kind, bool input) {
+        Pin p;
+        p.id      = (id >= 0) ? id : graph.allocId();
+        p.name    = name;
+        p.kind    = kind;
+        p.isInput = input;
+        return p;
+    };
 
-    // Preserve ids of existing s1..sN pins by name so cables to "s2" stay
-    // wired even if the user adds an "s1" they didn't have before.
+    // ---- Inputs: [MIDI In if midiInput] + s1..sN (ctrlKind) --------------
+    std::vector<Pin> inRebuilt;
+    inRebuilt.reserve(1 + doc.signalInputCount);
+    if (doc.midiInput)
+        inRebuilt.push_back(makePin(findId(nd->pinsIn, "MIDI In", false),
+                                    "MIDI In", PinKind::Midi, true));
     for (int i = 0; i < doc.signalInputCount; ++i) {
         std::string name = "s" + std::to_string(i + 1);
-        int existingId = -1;
-        for (auto& p : nd->pinsIn) {
-            if (p.kind == PinKind::Signal && p.name == name) {
-                existingId = p.id; break;
-            }
-        }
-        Pin sp;
-        sp.id      = (existingId >= 0) ? existingId : graph.allocId();
-        sp.name    = name;
-        sp.kind    = PinKind::Signal;
-        sp.isInput = true;
-        rebuilt.push_back(sp);
+        inRebuilt.push_back(makePin(findId(nd->pinsIn, name, true),
+                                    name, ctrlKind, true));
     }
 
-    bool changed = (rebuilt.size() != nd->pinsIn.size());
-    if (!changed) {
-        for (size_t i = 0; i < rebuilt.size(); ++i) {
-            auto& a = rebuilt[i]; auto& b = nd->pinsIn[i];
-            if (a.id != b.id || a.name != b.name || a.kind != b.kind) {
-                changed = true; break;
-            }
-        }
+    // ---- Outputs: o1..oP (ctrlKind) + MIDI Out 1..Q ----------------------
+    const int outCount = juce::jmax(1, doc.continuousOutputCount);
+    std::vector<Pin> outRebuilt;
+    outRebuilt.reserve(outCount + doc.midiOutputCount);
+    for (int i = 0; i < outCount; ++i) {
+        std::string name = "o" + std::to_string(i + 1);
+        outRebuilt.push_back(makePin(findId(nd->pinsOut, name, true),
+                                     name, ctrlKind, false));
     }
-    if (changed) nd->pinsIn = std::move(rebuilt);
+    for (int i = 0; i < doc.midiOutputCount; ++i) {
+        std::string name = "MIDI Out " + std::to_string(i + 1);
+        outRebuilt.push_back(makePin(findId(nd->pinsOut, name, false),
+                                     name, PinKind::Midi, false));
+    }
+
+    auto differs = [](const std::vector<Pin>& a, const std::vector<Pin>& b) {
+        if (a.size() != b.size()) return true;
+        for (size_t i = 0; i < a.size(); ++i)
+            if (a[i].id != b[i].id || a[i].name != b[i].name || a[i].kind != b[i].kind)
+                return true;
+        return false;
+    };
+
+    bool changed = differs(inRebuilt, nd->pinsIn) || differs(outRebuilt, nd->pinsOut);
+    if (changed) {
+        nd->pinsIn  = std::move(inRebuilt);
+        nd->pinsOut = std::move(outRebuilt);
+    }
     return changed;
 }
 
@@ -1188,12 +1431,15 @@ void SignalShapeEditorComponent::resized() {
     const int exprH    = 18 + exprBodyH + noteH + 6;
     const int trigH    = 18 + 24 + 6;
     const int repeatH  = 24 + 8;
-    const int sigH     = 24 + 8;
+    const int sigH     = 24 + 8;   // signal-in count + signal-out count row
+    const int midiH    = 24 + 8;   // MIDI-out count + MIDI-in toggle row
+    const int kindH    = 24 + 8;   // pin-type dropdown row
     // The variables/functions reference no longer occupies a fixed block here —
     // it's a button in the bottom row, so all the space it used to take goes to
     // the layer stack.
     const int btnH     = 28;
-    const int fixedBottom = speedH + clockH + exprH + trigH + repeatH + sigH + btnH;
+    const int fixedBottom = speedH + clockH + exprH + trigH + repeatH
+                          + sigH + midiH + kindH + btnH;
 
     if (layerStack) {
         // One WaveLayerEditor row is ~238px; reserve enough that at least one
@@ -1265,11 +1511,32 @@ void SignalShapeEditorComponent::resized() {
         r.removeFromTop(8);
     }
 
-    // Signal input count row.
+    // I/O counts row: signal inputs (s1..sN) + signal outputs (o1..oP).
     {
         auto row = r.removeFromTop(24);
-        sigCountLabel.setBounds(row.removeFromLeft(160));
-        sigCountEditor.setBounds(row.removeFromLeft(60));
+        sigCountLabel .setBounds(row.removeFromLeft(150));
+        sigCountEditor.setBounds(row.removeFromLeft(54));
+        row.removeFromLeft(16);
+        outCountLabel .setBounds(row.removeFromLeft(150));
+        outCountEditor.setBounds(row.removeFromLeft(54));
+        r.removeFromTop(8);
+    }
+
+    // MIDI I/O row: MIDI output count + MIDI input toggle.
+    {
+        auto row = r.removeFromTop(24);
+        midiOutLabel .setBounds(row.removeFromLeft(100));
+        midiOutEditor.setBounds(row.removeFromLeft(54));
+        row.removeFromLeft(16);
+        midiInToggle .setBounds(row.removeFromLeft(140));
+        r.removeFromTop(8);
+    }
+
+    // Pin-type row: Signal vs Param for all continuous pins.
+    {
+        auto row = r.removeFromTop(24);
+        kindLabel.setBounds(row.removeFromLeft(60));
+        kindCombo.setBounds(row.removeFromLeft(120));
         r.removeFromTop(8);
     }
 

@@ -15,9 +15,14 @@ class BuiltinExprRuntime : public IScriptRuntime {
 public:
     explicit BuiltinExprRuntime(ScriptRole r) : role(r) {}
 
+    // Both Midi and Unified roles run a multi-statement program that may be
+    // split into init:/start:/loop: sections; the Signal role is a single
+    // composition expression.
+    bool isProgramRole() const { return role == ScriptRole::Midi || role == ScriptRole::Unified; }
+
     bool load(const std::string& src, std::string& /*error*/) override {
         source = src;
-        if (role == ScriptRole::Midi)
+        if (isProgramRole())
             splitSections();
         // Signal role: `source` IS the composition expression.
         return true; // Builtin parses lazily per evaluation; never fails here.
@@ -25,12 +30,12 @@ public:
 
     void reset() override {
         stateVars.clear();
-        if (role == ScriptRole::Midi)
+        if (isProgramRole())
             runInit();
     }
 
     void onStart(const ScriptVars& vars, IExprEmitSink* sink) override {
-        if (role != ScriptRole::Midi || startProgram.empty()) return;
+        if (!isProgramRole() || startProgram.empty()) return;
         WaveExprParser::runProgram(startProgram, vars, stateVars, sink, shape, noteToFreq);
     }
 
@@ -41,6 +46,23 @@ public:
     void runMidi(const ScriptVars& vars, IExprEmitSink* sink) override {
         if (bodyProgram.empty()) return;
         WaveExprParser::runProgram(bodyProgram, vars, stateVars, sink, shape, noteToFreq);
+    }
+
+    void runUnified(const ScriptVars& vars, IExprEmitSink* sink,
+                    float* outs, int outCount) override {
+        // Run the body program: it emits MIDI through `sink` and assigns any
+        // continuous outputs o1..oP into the persistent stateVars store. The
+        // return value is the last bare expression (so a program that is just
+        // "curve" yields curve as o1 without an explicit assignment).
+        float ret = 0.0f;
+        if (!bodyProgram.empty())
+            ret = WaveExprParser::runProgram(bodyProgram, vars, stateVars, sink, shape, noteToFreq);
+        for (int i = 0; i < outCount; ++i) {
+            auto it = stateVars.find("o" + std::to_string(i + 1));
+            if (it != stateVars.end())      outs[i] = it->second;   // explicit oN = ...
+            else if (i == 0)                outs[i] = ret;          // o1 defaults to return value
+            else                            outs[i] = 0.0f;
+        }
     }
 
     bool supportsPerSample() const override { return true; }
@@ -87,7 +109,7 @@ private:
     // for seeding persistent state). Standard transport vars are not available
     // here (init runs at reload time), so init sees a minimal var set.
     void runInit() {
-        if (role != ScriptRole::Midi || initProgram.empty()) return;
+        if (!isProgramRole() || initProgram.empty()) return;
         ScriptVars vars; // empty: unknown identifiers read as 0
         WaveExprParser::runProgram(initProgram, vars, stateVars, nullptr, shape, noteToFreq);
     }

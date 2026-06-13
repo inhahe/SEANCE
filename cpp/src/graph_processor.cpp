@@ -1105,17 +1105,18 @@ void GraphProcessor::rebuildGraph(NodeGraph& graph, Transport& transport) {
             processorGraph->addConnection({{effectiveSrc, 0}, {dstGraphId, 0}});
             processorGraph->addConnection({{effectiveSrc, 1}, {dstGraphId, 1}});
 
-            // Multi-output MIDI: a MidiScript or WASM Script node with >1 MIDI
-            // output pin tags each emitted event with channel = (output index
-            // + 1). Splice a per-output channel filter between source and
-            // destination so each output pin behaves as an independent
-            // single-stream cable. With a single MIDI output (the common case)
-            // we connect directly.
+            // Multi-output MIDI: a Script (unified SignalShape), MidiScript or
+            // WASM Script node with >1 MIDI output pin tags each emitted event
+            // with channel = (output index + 1). Splice a per-output channel
+            // filter between source and destination so each output pin behaves
+            // as an independent single-stream cable. With a single MIDI output
+            // (the common case) we connect directly.
             int midiOutCount = 0, thisMidiOutIdx = -1;
             if (srcKind == PinKind::Midi) {
                 for (auto& sn : graph.nodes) {
                     if (sn.id != srcNodeId) continue;
-                    if (sn.type == NodeType::MidiScript ||
+                    if (sn.type == NodeType::SignalShape ||
+                        sn.type == NodeType::MidiScript ||
                         sn.type == NodeType::Script) {
                         int idx = 0;
                         for (auto& pin : sn.pinsOut) {

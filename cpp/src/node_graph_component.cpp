@@ -1481,13 +1481,13 @@ void NodeGraphComponent::mouseDoubleClick(const juce::MouseEvent& e) {
                 });
             juce::DialogWindow::LaunchOptions opts;
             opts.content.setOwned(editor);
-            opts.dialogTitle = "Signal Shape: " + juce::String(node->name);
+            opts.dialogTitle = "Script: " + juce::String(node->name);
             opts.dialogBackgroundColour = juce::Colour(22, 22, 28);
             opts.escapeKeyTriggersCloseButton = true;
             opts.useNativeTitleBar = false;
             opts.resizable = true;
             opts.componentToCentreAround = this;
-            // Non-modal: a Signal Shape has a manual-trigger button and drives
+            // Non-modal: a Script node has a manual-trigger button and drives
             // params live, so it belongs in the same play-while-open family as
             // the XY Pad and Control Bank above.
             SoundShop::launchNonModalToolDialog(opts);
@@ -1664,13 +1664,14 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
     menu.addItem(6, "WASM Script...");
 
     juce::PopupMenu sigMenu;
-    // Single unified "Signal Shape" entry. Replaces the old separate LFO
-    // sine / LFO custom-expression / Envelope custom-expression items
-    // (#107) - those were just preset starting points for the same
-    // underlying node, with no behavior the user can't reach by editing
-    // the shape + trigger expression inside the SignalShape editor.
-    sigMenu.addItem(130, "Signal Shape (LFO / Envelope)");
-    sigMenu.addItem(131, "MIDI Script (algorithmic MIDI)");
+    // Single unified "Script" entry. One scriptable node now covers BOTH signal
+    // generation (LFO / Envelope, continuous o1..oP outputs) AND algorithmic
+    // MIDI (note()/cc()/bend() emit on MIDI Out pins). The old separate
+    // "Signal Shape" and "MIDI Script" items collapsed into this - choose how
+    // many signal outputs vs MIDI outputs the node has inside the editor. (A
+    // node with 0 MIDI outputs is the classic Signal Shape; 0 continuous
+    // outputs + a MIDI-emitting program is the classic MIDI Script.)
+    sigMenu.addItem(130, "Script (signal + MIDI)");
     sigMenu.addSeparator();
     sigMenu.addItem(133, "XY Pad");
     sigMenu.addItem(135, "Control Bank");
@@ -1927,61 +1928,25 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
                 n.params.push_back({"Bins",   64.0f,   16.0f, 512.0f});
             else if (result == 141)
                 n.params.push_back({"Window", 1024.0f, 256.0f, 4096.0f});
-        } else if (result == 131) {
-            // MIDI Script node - algorithmic MIDI generator. Runs a small
-            // program (statements + persistent state + MIDI emit functions)
-            // once per sample and outputs MIDI live. Default pins: one merged
-            // "MIDI In" and one "MIDI Out 1"; the editor lets the user add
-            // Signal inputs (s1..sN) and more MIDI outputs. See
-            // midi_script_node.h.
-            auto& n = graph.addNode("MIDI Script", NodeType::MidiScript,
-                {Pin{0, "MIDI In", PinKind::Midi, true}},
-                {Pin{0, "MIDI Out 1", PinKind::Midi, false}},
-                {p.x, p.y});
-
-            MidiScriptDoc seed = MidiScriptDoc::defaultDoc();
-            n.script = seed.encode();
-
-            int newNodeId = n.id;
-            auto* editor = new MidiScriptEditorComponent(graph, newNodeId,
-                [this]() {
-                    if (onNodeEdited) onNodeEdited();
-                    repaint();
-                });
-            juce::DialogWindow::LaunchOptions opts;
-            opts.content.setOwned(editor);
-            opts.dialogTitle = "MIDI Script: " + juce::String(n.name);
-            opts.dialogBackgroundColour = juce::Colour(22, 22, 28);
-            opts.escapeKeyTriggersCloseButton = true;
-            opts.useNativeTitleBar = false;
-            opts.resizable = true;
-            opts.componentToCentreAround = this;
-            SoundShop::launchToolDialog(opts);
-            return;
         } else if (result == 130) {
-            // Signal Shape node. Single menu item replacing the old
-            // LFO / LFO-expression / Envelope-expression trio - the
-            // underlying processor is the same in all three cases,
-            // distinguished only by trigger expression and repeat mode
-            // (both editable inside the SignalShape editor that opens
-            // immediately on creation).
+            // Unified Script node. One scriptable node covers signal generation
+            // (LFO / Envelope via the drawn shape + per-sample expression) AND
+            // algorithmic MIDI (note()/cc()/bend() emit). The editor opens
+            // immediately so the user can pick I/O counts and write the program.
             //
-            // Pins:
-            //   In:  "MIDI In" only. The OLD code documented its lone
-            //        MIDI input as "trigger input for envelope" but
-            //        the new processor uses MIDI for gate/freq/note/vel
-            //        VARIABLES; triggering is done via the trigger
-            //        expression (e.g. "gate"). Additional Signal input
-            //        pins (s1..sN) appear as the user dials up
-            //        signalInputCount in the editor.
-            //   Out: Param Out + Signal Out (both carry the same value;
-            //        Param Out exists for orange-cable connections to
-            //        param-arming inputs, Signal Out for audio-rate
-            //        consumers).
-            auto& n = graph.addNode("Signal Shape", NodeType::SignalShape,
+            // Pins (the default I/O matches SignalShapeDoc::defaultLFO):
+            //   In:  "MIDI In" - drives the gate/freq/note/vel VARIABLES
+            //        (NOT a trigger; trigger is the trigger expression). The
+            //        MIDI In pin can be removed via the editor's MIDI-input
+            //        toggle. Signal inputs s1..sN appear as the user dials up
+            //        signalInputCount.
+            //   Out: "o1" - the single default continuous output (Signal kind).
+            //        The editor adds o2..oP, MIDI Out pins, or flips the
+            //        continuous pins to Param kind. syncPins() keeps node pins
+            //        in sync with the doc from then on.
+            auto& n = graph.addNode("Script", NodeType::SignalShape,
                 {Pin{0, "MIDI In", PinKind::Midi, true}},
-                {Pin{0, "Param Out", PinKind::Param, false},
-                 Pin{0, "Signal Out", PinKind::Signal, false, 1}},
+                {Pin{0, "o1", PinKind::Signal, false}},
                 {p.x, p.y});
 
             // Seed node.script with a NEUTRAL default: a free-running
@@ -2014,7 +1979,7 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
                 });
             juce::DialogWindow::LaunchOptions opts;
             opts.content.setOwned(editor);
-            opts.dialogTitle = "Signal Shape: " + juce::String(n.name);
+            opts.dialogTitle = "Script: " + juce::String(n.name);
             opts.dialogBackgroundColour = juce::Colour(22, 22, 28);
             opts.escapeKeyTriggersCloseButton = true;
             opts.useNativeTitleBar = false;
@@ -2921,12 +2886,12 @@ void NodeGraphComponent::showNodeMenu(Node& node) {
     if (node.type == NodeType::TerrainSynth && node.script.rfind("__video__:", 0) == 0)
         menu.addItem(193, "Edit Video...");
 
-    // Signal Shape gets an "Edit Shape" entry (and we hide it for the
+    // The unified Script node gets an "Edit Script" entry (hidden for the
     // sibling XY Pad / Control Bank nodes, which share NodeType::SignalShape
     // but have their own dedicated editors opened via double-click).
     if (node.type == NodeType::SignalShape && node.script != "__xypad__"
         && node.script.rfind("__controlbank__", 0) != 0)
-        menu.addItem(190, "Edit Shape...");
+        menu.addItem(190, "Edit Script...");
     if (node.type == NodeType::SignalShape && node.script.rfind("__controlbank__", 0) == 0)
         menu.addItem(191, "Edit Control Bank...");
     if (node.type == NodeType::MidiScript)
@@ -3079,9 +3044,9 @@ void NodeGraphComponent::showNodeMenu(Node& node) {
             // reverts the whole edit.
             graph.commitSnapshot("Edit envelope");
         } else if (result == 190) {
-            // Open the Signal Shape editor for an existing node. Same
-            // launch flow as the "create + open" path in the menu above,
-            // including the manual-trigger lookup callback.
+            // Open the Script editor for an existing node. Same launch flow
+            // as the "create + open" path in the menu above, including the
+            // manual-trigger lookup callback.
             int captured = nodeId;
             auto* editor = new SignalShapeEditorComponent(graph, captured,
                 [this]() {
@@ -3093,7 +3058,7 @@ void NodeGraphComponent::showNodeMenu(Node& node) {
                 });
             juce::DialogWindow::LaunchOptions opts;
             opts.content.setOwned(editor);
-            opts.dialogTitle = "Signal Shape: " + juce::String(node->name);
+            opts.dialogTitle = "Script: " + juce::String(node->name);
             opts.dialogBackgroundColour = juce::Colour(22, 22, 28);
             opts.escapeKeyTriggersCloseButton = true;
             opts.useNativeTitleBar = false;

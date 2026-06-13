@@ -51,7 +51,16 @@ namespace SoundShop {
 //
 enum class ScriptLang { Builtin = 0, Lua = 1, Wasm = 2 };
 enum class ScriptRate { PerSample = 0, PerBlock = 1 };
-enum class ScriptRole { Midi, Signal };
+// Midi    - pure MIDI generator (emits via sink, no continuous output).
+// Signal  - pure continuous generator (one value per sample via evalSignal).
+// Unified - the general scriptable node: ONE program that both emits MIDI via
+//           the sink AND assigns continuous outputs o1..oP (read back after the
+//           run). Behaves like Midi for program sectioning (init:/start:/loop:)
+//           and persistent state, but also exposes runUnified() to harvest the
+//           o1..oP values. A node with 0 MIDI outputs is a pure signal source;
+//           with 0 continuous outputs it is a pure MIDI generator; both > 0 is a
+//           hybrid. See runUnified().
+enum class ScriptRole { Midi, Signal, Unified };
 
 using ScriptVars = std::unordered_map<std::string, float>;
 
@@ -134,6 +143,21 @@ struct IScriptRuntime {
     // MIDI role: run the program for one sample, emitting via `sink`
     // (sink->sampleOffset has already been set by the host).
     virtual void  runMidi(const ScriptVars& vars, IExprEmitSink* sink) { (void)vars; (void)sink; }
+    // Unified role: run the program for one sample. It may emit MIDI via `sink`
+    // (may be null when the node has no MIDI outputs) AND assign continuous
+    // outputs, which the host harvests into outs[0..outCount-1] from the
+    // program variables o1..oP. outs[0] (o1) defaults to the program's return
+    // value (the last bare expression) when not explicitly assigned, so the
+    // common single-output program `curve` still works. The default
+    // implementation falls back to evalSignal() for outs[0] and ignores the
+    // sink, so runtimes that haven't implemented the unified path still produce
+    // a continuous signal (just no MIDI).
+    virtual void runUnified(const ScriptVars& vars, IExprEmitSink* sink,
+                            float* outs, int outCount) {
+        (void)sink;
+        float v = evalSignal(vars);
+        for (int i = 0; i < outCount; ++i) outs[i] = (i == 0) ? v : 0.0f;
+    }
 
     // --- PerBlock path --------------------------------------------------------
     virtual void runBlock(const ScriptBlockCtx& ctx) { (void)ctx; }

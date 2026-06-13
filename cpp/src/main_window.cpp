@@ -1230,8 +1230,8 @@ juce::PopupMenu MainContentComponent::getMenuForIndex(int idx, const juce::Strin
         menu.addItem(309, "Trigger Node");
         menu.addItem(310, "MIDI Modulator");
         menu.addItem(311, "Convolution Filter");
-        menu.addItem(313, "Signal Shape (LFO / Envelope)");
-        menu.addItem(314, "MIDI Script (Algorithmic MIDI)");
+        menu.addItem(313, "Script (Signal + MIDI)");
+        menu.addItem(314, "Algorithmic MIDI");
         menu.addSeparator();
         menu.addItem(312, "Keyboard Shortcuts");
         menu.addSeparator();

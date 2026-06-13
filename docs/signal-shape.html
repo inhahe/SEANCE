@@ -2,13 +2,13 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<title>Signal Shape (LFO / Envelope) — SEANCE</title>
+<title>Script (signal + MIDI) — SEANCE</title>
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
 <div class="wrap">
 <header>
-<h1>Signal Shape (LFO / Envelope)</h1>
+<h1>Script (signal + MIDI)</h1>
 <nav>
   <a href="index.html">Home</a>
   <a href="graph-basics.html">Graph Basics</a>
@@ -18,15 +18,30 @@
 </nav>
 </header>
 
-<p>The <strong>Signal Shape</strong> node generates a control signal you wire into any Param or Signal pin to modulate it over time. It replaces what other DAWs split into "LFO" and "Envelope" and "macro-curve" — there's one node, and the difference between an LFO and an envelope is just which repeat mode you pick. Add one from <em>Sources → Signal Shape (LFO / Envelope)</em> in the right-click menu, wire its Signal Out into the parameter you want to modulate, and double-click the node to open the editor.</p>
+<p>The <strong>Script</strong> node is one programmable node that does two jobs: it generates <strong>control signals</strong> (LFOs, envelopes, custom curves) you wire into any Param or Signal pin, <em>and</em> it can <strong>generate MIDI</strong> (arpeggios, sequences, generative patterns). You choose which — or both — by setting its I/O counts in the editor. It replaces what other DAWs split into "LFO", "Envelope", "macro-curve" <em>and</em> "MIDI script": there's one node, and the difference between an LFO and an envelope is just which repeat mode you pick, while turning it into a MIDI generator is just adding a MIDI output. Add one from <em>Signal Shape → Script (signal + MIDI)</em> in the right-click menu, wire its outputs into whatever you want to drive, and double-click the node to open the editor.</p>
+
+<p>This single node merged the former separate <em>Signal Shape</em> and <em>MIDI Script</em> nodes. Old projects that contain a MIDI Script node still open and work; you just create everything from the one <em>Script</em> node now.</p>
 
 <p>By design the node only runs when its output is actually wired into something. An idle, unconnected shape costs no CPU.</p>
 
 <p>The editor opens in its own window that <strong>doesn't lock the rest of SEANCE</strong> — you can keep it open (along with several XY Pad or Control Bank editors) and keep playing, editing the graph, and riding multiple input nodes at once while the song runs. Close it any time; it doesn't need to be dismissed before you do anything else.</p>
 
+<h2>Deciding what it does: the I/O counts</h2>
+
+<p>Four settings near the bottom of the editor decide whether this is a signal generator, a MIDI generator, or both. Each one adds or removes pins on the node:</p>
+<ul>
+  <li><strong>Signal inputs (s1..sN)</strong> — 0–16 incoming control pins, read in your program as <code>s1</code>, <code>s2</code>, … so other signals can drive the shape.</li>
+  <li><strong>Signal outputs (o1..oP)</strong> — 1–16 outgoing control pins. Your program assigns <code>o1</code>, <code>o2</code>, … (and <code>o1</code> defaults to the curve, so a plain LFO/envelope just needs one). This is the "make a control signal" half.</li>
+  <li><strong>MIDI outputs</strong> — 0–16. Leave at <strong>0</strong> for a pure signal source (a classic LFO/envelope). Set it to <strong>1 or more</strong> and your program can emit MIDI notes and controllers — see <a href="#midi">Generating MIDI</a> below.</li>
+  <li><strong>MIDI input</strong> — a checkbox that adds the MIDI In pin (the source of the <code>note</code>/<code>vel</code>/<code>gate</code>/<code>freq</code> variables). On by default.</li>
+  <li><strong>Pin type</strong> — flips all the continuous pins between <em>Signal</em> (blue) and <em>Param</em> (orange). They carry the same values and convert freely on the wire, so this is just which colour they present as.</li>
+</ul>
+
+<p>So: 0 MIDI outputs = an LFO/envelope; a MIDI-emitting program with the signal output unused = a MIDI generator; both at once = a hybrid (say, an arpeggiator that also outputs an envelope).</p>
+
 <h2>What it outputs: a 0–1 signal</h2>
 
-<p>The output is a <strong>control signal between 0 and 1</strong>, the standard range every control signal in SEANCE uses. <strong>0.5 is the neutral "no change" level</strong>: a Signal Shape sitting at 0.5 leaves whatever it's wired to exactly where you set it, 1 pushes that parameter all the way up, 0 all the way down. That's why a brand-new, layer-less shape rests at 0.5 — it does nothing until you give it a contour.</p>
+<p>Each signal output is a <strong>control signal between 0 and 1</strong>, the standard range every control signal in SEANCE uses. <strong>0.5 is the neutral "no change" level</strong>: an output sitting at 0.5 leaves whatever it's wired to exactly where you set it, 1 pushes that parameter all the way up, 0 all the way down. That's why a brand-new, layer-less shape rests at 0.5 — it does nothing until you give it a contour.</p>
 
 <p>You mostly don't have to think about this: drop in a layer and the drawn shape's height maps straight onto 0–1, and <code>curve</code> (the variable that plays your drawing) is already 0–1. The one thing to watch is when you <em>type your own formula in the Output box</em> using trig: <code>sin</code>, <code>cos</code> and <code>tan</code> swing from −1 to 1, so a bare <code>sin(...)</code> would spend half its time below 0 and get clipped flat. Two easy fixes:</p>
 <ul>
@@ -148,16 +163,38 @@
 
 <p>Use them to make the shape react to the note. E.g. Output = <code>usin(t * 2*pi) * vel</code> makes the LFO depth scale with how hard the note was played. (<code>usin</code> keeps the result in 0–1; a bare <code>sin</code> would clip its lower half.)</p>
 
+<h2 id="midi">Generating MIDI</h2>
+
+<p>Set <strong>MIDI outputs</strong> to 1 (or more) and the node grows a MIDI Out pin and your program can emit MIDI live. Now the "Output" box is a little program that runs every sample; instead of just returning a number it can <em>do things</em>:</p>
+<ul>
+  <li><code>note(pitch, vel, durSec)</code> — play a note now and release it after <code>durSec</code> seconds. <code>pitch</code> is a MIDI number or a name like <code>"C4"</code>; <code>vel</code> is 0–127.</li>
+  <li><code>noteon(pitch, vel)</code> / <code>noteoff(pitch)</code> — start and stop a note yourself.</li>
+  <li><code>cc(number, value)</code> — send a controller (value 0–1).</li>
+  <li><code>bend(value)</code> — pitch bend (value −1..1, 0 = centre).</li>
+</ul>
+
+<p>Variables you assign <strong>stay set between samples</strong>, so you can keep a step counter or phase. A four-on-the-floor kick is just:</p>
+<pre><code>ph = beat - floor(beat)
+(ph &lt; dt*bpm/60) ? note(36, 110, 0.1) : 0</code></pre>
+
+<p>If you add <strong>several MIDI outputs</strong>, pick which one the next emits go to by setting <code>out</code> (0 = MIDI Out 1, 1 = MIDI Out 2, …). Each output is its own independent cable, so you can split a kick to one synth and a snare to another:</p>
+<pre><code>out = 0; (ph &lt; dt*bpm/60) ? note(36, 110, 0.1) : 0
+out = 1; (frac(beat*2) &lt; dt*bpm/60) ? note(38, 90, 0.1) : 0</code></pre>
+
+<p>Pressing <strong>Stop</strong> always silences any notes the program left hanging. And because signal and MIDI run in the <em>same</em> pass, one program can both <code>o1 = curve * vel</code> (an envelope out the signal pin) and <code>note(...)</code> (an arpeggio out the MIDI pin) at once. For the full MIDI vocabulary — sections (<code>init:</code>/<code>start:</code>/<code>loop:</code>), all the variables, note names, and the Lua/WebAssembly options — see the Script program reference in REFERENCE.md.</p>
+
 <h2>Presets</h2>
 
 <p>Each layer row has the same preset menu as the wavetable / layered-waveform editor — common LFO and envelope curves you can load as a starting point and then tweak. Pick a preset on a layer's row and that layer's shape and curve points are replaced with the preset's contents. Your other layers, repeat mode, trigger expression, and signal-input count are <em>not</em> touched, so you can swap one layer's contour without losing the rest of your setup.</p>
 
 <h2>Params on the node face</h2>
 
-<p>Two params live on the node itself, exposed as Param pins so you can modulate them with other shapes:</p>
+<p>Four params live on the node itself, exposed as Param pins so you can modulate them with other shapes:</p>
 <ul>
-  <li><strong>Period</strong> — how long one pass of the shape takes, in beats. Doubles the LFO/envelope's wall-clock duration when doubled.</li>
-  <li><strong>Output gain</strong> — multiplies the final shape value. Negative inverts. Use to scale the shape output without rewriting the expression.</li>
+  <li><strong>Rate</strong> — how fast the shape runs. In free mode it's in Hz (cycles per second); with <strong>Beat Sync</strong> on it's read as beats per cycle so the shape locks to the transport tempo.</li>
+  <li><strong>Beat Sync</strong> — 0 = free-running (Rate in Hz), 1 = synced to the transport (Rate in beats per cycle).</li>
+  <li><strong>Phase</strong> — phase offset, 0..1, shifts where in the cycle the shape starts.</li>
+  <li><strong>Output</strong> — read-only readout of the shape's current value, exposed as a pin so you can chain it.</li>
 </ul>
 
 <h2>Scripting it: Built-in, Lua, or WebAssembly</h2>

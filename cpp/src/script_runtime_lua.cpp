@@ -79,6 +79,31 @@ public:
         curSink = nullptr;
     }
 
+    void runUnified(const ScriptVars& vars, IExprEmitSink* sink,
+                    float* outs, int outCount) override {
+        for (int i = 0; i < outCount; ++i) outs[i] = (i == 0) ? 0.0f : 0.0f;
+        if (!L || errored || loopRef == LUA_NOREF) return;
+        curSink = sink; curCtx = nullptr;
+        setGlobals(vars);
+        lua_rawgeti(L, LUA_REGISTRYINDEX, loopRef);
+        // loop() may return o1 directly (single-output convenience) and/or set
+        // globals o1..oP for the multi-output case. Side-effect emit calls land
+        // through curSink.
+        float ret = 0.0f;
+        if (lua_pcall(L, 0, 1, 0) != LUA_OK) { handleError(); curSink = nullptr; return; }
+        if (lua_isnumber(L, -1)) ret = (float)lua_tonumber(L, -1);
+        lua_pop(L, 1);
+        curSink = nullptr;
+        for (int i = 0; i < outCount; ++i) {
+            lua_getglobal(L, ("o" + std::to_string(i + 1)).c_str());
+            float v = lua_isnumber(L, -1) ? (float)lua_tonumber(L, -1)
+                                          : (i == 0 ? ret : 0.0f);
+            lua_pop(L, 1);
+            if (!std::isfinite(v)) v = 0.0f;
+            outs[i] = juce::jlimit(0.0f, 1.0f, v);
+        }
+    }
+
     void runBlock(const ScriptBlockCtx& ctx) override {
         if (!L || errored || loopRef == LUA_NOREF) return;
         curSink = ctx.sink; curCtx = &ctx;
@@ -337,13 +362,17 @@ void LuaRuntime::registerApi() {
     lua_pushcfunction(L, l_notenum);  lua_setglobal(L, "notenum");
     lua_pushcfunction(L, l_notename); lua_setglobal(L, "notename");
     lua_pushcfunction(L, l_notefreq); lua_setglobal(L, "notefreq");
-    if (role == ScriptRole::Midi) {
+    // Midi and Unified roles can emit MIDI; Signal and Unified roles can write
+    // continuous output samples. The Unified role gets both sets so one script
+    // can emit MIDI *and* assign continuous outputs.
+    if (role == ScriptRole::Midi || role == ScriptRole::Unified) {
         lua_pushcfunction(L, l_note);    lua_setglobal(L, "note");
         lua_pushcfunction(L, l_noteon);  lua_setglobal(L, "noteon");
         lua_pushcfunction(L, l_noteoff); lua_setglobal(L, "noteoff");
         lua_pushcfunction(L, l_cc);      lua_setglobal(L, "cc");
         lua_pushcfunction(L, l_bend);    lua_setglobal(L, "bend");
-    } else {
+    }
+    if (role == ScriptRole::Signal || role == ScriptRole::Unified) {
         lua_pushcfunction(L, l_out);     lua_setglobal(L, "out_sample");
         lua_pushcfunction(L, l_out);     lua_setglobal(L, "out");  // out(i,v) in block mode
     }

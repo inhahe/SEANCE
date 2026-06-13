@@ -2,27 +2,31 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<title>MIDI Script — SEANCE</title>
+<title>Algorithmic MIDI — SEANCE</title>
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
 <div class="wrap">
 <header>
-<h1>MIDI Script</h1>
+<h1>Algorithmic MIDI</h1>
 <nav>
   <a href="index.html">Home</a>
   <a href="graph-basics.html">Graph Basics</a>
-  <a href="signal-shape.html">Signal Shape</a>
+  <a href="signal-shape.html">Script (signal + MIDI)</a>
   <a href="midi-modulator.html">MIDI Modulator</a>
   <a href="pin-kinds.html">Pin Kinds</a>
 </nav>
 </header>
 
-<p>A <strong>MIDI Script</strong> node generates MIDI by running a tiny program you write — a drum machine, a generative sequencer, an arpeggiator, an LFO-to-CC, a chord exploder, whatever you can express in a line or two of maths. The program runs <em>once for every audio sample</em> and emits MIDI live, so it stays perfectly in time and reacts instantly to the transport and to incoming signals.</p>
+<div class="tip">
+<strong>This is a mode of the <a href="signal-shape.html">Script</a> node.</strong> Generating MIDI by program used to be a separate "MIDI Script" node; it's now just what the unified <a href="signal-shape.html">Script (signal + MIDI)</a> node does when you give it one or more MIDI outputs. This page is the program tutorial — see the Script page for the node, its I/O counts, and the signal-generation half. Old projects with a standalone MIDI Script node still open and work.
+</div>
 
-<p>You don't need to install anything or know a "real" programming language — the script is the same little expression language used elsewhere in SEANCE (the same <code>sin</code>, <code>noise</code>, <code>floor</code>, <code>?:</code> you'd type into a Signal Shape), with a few extra things bolted on: you can write several statements, remember values between samples, and call functions that <em>emit MIDI</em>.</p>
+<p>You can make the Script node generate MIDI by running a tiny program you write — a drum machine, a generative sequencer, an arpeggiator, an LFO-to-CC, a chord exploder, whatever you can express in a line or two of maths. The program runs <em>once for every audio sample</em> and emits MIDI live, so it stays perfectly in time and reacts instantly to the transport and to incoming signals.</p>
 
-<p>Add one from <em>Signal Shape → MIDI Script (algorithmic MIDI)</em> in the right-click menu. The editor opens automatically; double-click the node (or right-click → <em>Edit Program…</em>) to reopen it later. Wire the node's <strong>MIDI Out</strong> into any synth.</p>
+<p>You don't need to install anything or know a "real" programming language — the script is the same little expression language used elsewhere in SEANCE (the same <code>sin</code>, <code>noise</code>, <code>floor</code>, <code>?:</code> you'd type into a signal shape), with a few extra things bolted on: you can write several statements, remember values between samples, and call functions that <em>emit MIDI</em>.</p>
+
+<p>Add a <em>Signal Shape → Script (signal + MIDI)</em> node from the right-click menu, then in the editor set <strong>MIDI outputs</strong> to <strong>1</strong> (or more). The editor opens automatically; double-click the node (or right-click → <em>Edit Script…</em>) to reopen it later. Wire the node's <strong>MIDI Out</strong> into any synth.</p>
 
 <h2>Your first beat</h2>
 

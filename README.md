@@ -192,8 +192,12 @@ live reference. **Duplicate** an asset to make one diverge (there's no detach �
 divergence is always duplicate + repoint). Archived assets are hidden from pickers
 but keep existing references valid; deleting an asset drops referencing nodes back
 to their own private copy. Assets live in the project file and participate in
-undo/redo. See [REFERENCE.md](REFERENCE.md#asset-library-project-stores) for the
-full breakdown.
+undo/redo. You can **export** a project's whole library to a standalone
+`.seancelib` file and **import** assets from another library export — or straight
+out of any saved `.seance` session — with the library dialog's Import/Export
+buttons; the merge deduplicates identical assets by content, remaps ids so
+nothing collides, and suffixes name clashes ("Bass" → "Bass 2"). See
+[REFERENCE.md](REFERENCE.md#asset-library-project-stores) for the full breakdown.
 
 ### Supported plugin and instrument formats
 

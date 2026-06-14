@@ -1,5 +1,7 @@
 #include "project_file.h"
+#include "asset_import.h"
 #include <juce_core/juce_core.h>
+#include <functional>
 #include <fstream>
 #include <sstream>
 #include <cstdio>
@@ -26,6 +28,25 @@ static void writeInt(std::ostream& f, const std::string& key, int val) {
 }
 static void writeFloat(std::ostream& f, const std::string& key, float val) {
     f << key << "=" << val << "\n";
+}
+
+// Emit one [AssetStore] section. Shared by writeProject (full save) and
+// exportAssets (library export) so the on-disk asset format has a single
+// source of truth. The opaque payload is base64-encoded so arbitrary bytes
+// (including newlines) survive the line-based format; the content hash is
+// written verbatim and trusted on load (mirroring [Blob]).
+static void writeAssetEntry(std::ostream& f, const AssetEntry& a) {
+    f << "\n[AssetStore]\n";
+    writeInt(f, "id", a.id);
+    writeStr(f, "kind", assetKindTag(a.kind));
+    writeStr(f, "name", a.name);
+    if (!a.subType.empty()) writeStr(f, "subType", a.subType);
+    writeStr(f, "hash", a.contentHash);
+    if (a.archived) writeInt(f, "archived", 1);
+    if (a.starred)  writeInt(f, "starred", 1);
+    juce::String b64 = juce::Base64::toBase64(a.payload.data(),
+                                              (int) a.payload.size());
+    writeStr(f, "payload", b64.toStdString());
 }
 
 // Collect content-store blob hashes referenced by a node script. A reference is
@@ -55,6 +76,44 @@ bool ProjectFile::save(const std::string& path, NodeGraph& graph, GraphProcessor
         fprintf(stderr, "Project saved: %s\n", path.c_str());
     }
     return ok;
+}
+
+bool ProjectFile::exportAssets(const std::string& path, const AssetLibrary& lib,
+                               const std::vector<int>& selectedIds) {
+    std::ofstream f(path);
+    if (!f) {
+        fprintf(stderr, "Failed to export asset library: %s\n", path.c_str());
+        return false;
+    }
+    // A library export is just a minimal project file carrying an [AssetStore]
+    // closure - the importer reuses the exact same readProject + merge path it
+    // uses for a full session, so there is one import code path, not two. The
+    // marker key lets a reader tell an export apart from a full project if needed.
+    f << "[Project]\n";
+    writeStr(f, "assetLibraryExport", "1");
+
+    // Expand the selection to its dependency closure (identity for leaves today;
+    // see assetChildIds). Empty selection = export every entry.
+    std::set<int> want;
+    if (!selectedIds.empty()) {
+        std::function<void(int)> expand = [&](int id) {
+            if (want.count(id)) return;
+            const AssetEntry* e = lib.find(id);
+            if (!e) return;
+            want.insert(id);
+            for (int child : assetChildIds(*e)) expand(child);
+        };
+        for (int id : selectedIds) expand(id);
+    }
+
+    int count = 0;
+    for (const auto& a : lib.all()) {
+        if (!selectedIds.empty() && !want.count(a.id)) continue;
+        writeAssetEntry(f, a);
+        ++count;
+    }
+    fprintf(stderr, "Exported %d asset(s) to: %s\n", count, path.c_str());
+    return true;
 }
 
 bool ProjectFile::writeProject(std::ostream& f, NodeGraph& graph,
@@ -123,19 +182,8 @@ bool ProjectFile::writeProject(std::ostream& f, NodeGraph& graph,
     // newlines) survives the line-based format. The content hash is saved and
     // trusted on load (not recomputed), mirroring [Blob]. Archived (soft-deleted)
     // entries are persisted too so existing references stay resolvable.
-    for (const auto& a : graph.assets.all()) {
-        f << "\n[AssetStore]\n";
-        writeInt(f, "id", a.id);
-        writeStr(f, "kind", assetKindTag(a.kind));
-        writeStr(f, "name", a.name);
-        if (!a.subType.empty()) writeStr(f, "subType", a.subType);
-        writeStr(f, "hash", a.contentHash);
-        if (a.archived) writeInt(f, "archived", 1);
-        if (a.starred)  writeInt(f, "starred", 1);
-        juce::String b64 = juce::Base64::toBase64(a.payload.data(),
-                                                  (int) a.payload.size());
-        writeStr(f, "payload", b64.toStdString());
-    }
+    for (const auto& a : graph.assets.all())
+        writeAssetEntry(f, a);
 
     writeInt(f, "nextId", 0);
     if (!graph.signalScript.empty()) {

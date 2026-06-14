@@ -2160,6 +2160,51 @@ list, a **search** box, a **Starred only** filter (built-in *curated* OR user
 choosing a **saved waveform** creates a **live reference** to it (button reads
 **Use**), so later edits propagate everywhere it's used.
 
+### Import / export between projects
+
+The bottom of the **Asset Library** dialog has **Import…** and **Export…**
+buttons that move assets between projects.
+
+- **Export…** writes the project's **entire** asset library to a standalone
+  `.seancelib` library file (a minimal project file carrying only `[AssetStore]`
+  blocks — archived and starred entries included). `ProjectFile::exportAssets`.
+- **Import…** merges the assets from another file into this project. The source
+  can be **either** a dedicated `.seancelib` export **or any saved `.seance`
+  session** — a project file already contains a full `[AssetStore]`, so there is a
+  single import path for both (`importAssets` in `asset_import.cpp`, fed by
+  `readProject` into a throwaway graph; the live project's `currentPath` is never
+  touched).
+
+The merge is **content-aware**, in three flat passes (no bottom-up ordering —
+each asset's stored hash already encodes any descendants):
+
+1. **Closure expansion** — importing a parent pulls in its dependency closure
+   (children, grandchildren). Every asset is a leaf today, so the closure is just
+   the selected set; the hook (`assetChildIds`) is in place for future composite
+   instruments.
+2. **Decide each item's final id** — for every closure item the importer
+   **re-derives** the content hash from the payload (it never trusts the source
+   file's stored hash, so a corrupt/hand-edited hash can't cause a *false merge*
+   that destroys data). On a match against an existing destination asset the
+   **existing item wins** (its id *and* name are kept) and the import deduplicates;
+   otherwise a **fresh destination id** is allocated.
+3. **Rewrite child-id references** in inserted payloads using the complete remap
+   table (no-op for leaves; hook `assetRewriteChildIds`).
+
+Other merge rules:
+
+- **Name clashes** between a genuinely-new import and an existing same-kind asset
+  get the **lowest free numeric suffix** ("Bass" → "Bass 2"). A same-name *and*
+  same-content asset just dedups (keeping the destination's name).
+- Re-importing the same file is **idempotent** — everything dedups, nothing is
+  added.
+- The post-import dialog reports how many assets were added, deduplicated, and
+  renamed. The import is one undo step (`Import assets`) only when something was
+  actually added.
+- **Bias toward not merging:** false merge destroys data, false non-merge is
+  harmless (a duplicate import). Cross-version hash-algo changes can only cause
+  harmless false *non*-merges.
+
 ### On disk and undo
 
 - Assets are written to the project file in `[AssetStore]` blocks (one per
@@ -2176,7 +2221,9 @@ choosing a **saved waveform** creates a **live reference** to it (button reads
   unused, so unreferenced wavetable payloads round-trip byte-identically.
 
 Data model: `asset_library.h/.cpp` (`AssetKind`, `AssetEntry`, `AssetLibrary`),
-owned by `NodeGraph::assets`. Management UI: `asset_library_component.h/.cpp`.
+owned by `NodeGraph::assets`. Import/merge + export: `asset_import.h/.cpp`
+(`importAssets`) and `ProjectFile::exportAssets`. Management UI:
+`asset_library_component.h/.cpp`.
 Waveform picker: `WaveformLibraryBrowser` in `layered_wave_editor.cpp`. Morph
 picker + write-back: `WarpChainEditor::LibraryContext` (`warp_editor.cpp`),
 `resolveWarpReferences` / `syncWarpParamsForNode` (`layered_wave_editor.cpp`).

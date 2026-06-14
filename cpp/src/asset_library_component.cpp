@@ -1,4 +1,8 @@
 #include "asset_library_component.h"
+#include "asset_import.h"
+#include "project_file.h"
+#include "node_graph.h"
+#include <fstream>
 
 namespace SoundShop {
 
@@ -241,20 +245,117 @@ AssetLibraryComponent::AssetLibraryComponent(
     : lib(library), onEdit(std::move(onEditCb)) {
     auto bg = juce::Colour(40, 40, 45);
     auto add = [&](const juce::String& title, AssetKind kind) {
-        tabs.addTab(title, bg, new StorePanel(lib, kind, onEdit), true);
+        auto* p = new StorePanel(lib, kind, onEdit);
+        panels.push_back(p);
+        tabs.addTab(title, bg, p, true);
     };
     add("Waveforms",   AssetKind::Waveform);
     add("Instruments", AssetKind::Instrument);
     add("ADHSR Curves", AssetKind::AhdsrCurve);
     add("Morph Algorithms", AssetKind::MorphAlgorithm);
     addAndMakeVisible(tabs);
+
+    addAndMakeVisible(importBtn);
+    addAndMakeVisible(exportBtn);
+    importBtn.onClick = [this] { doImport(); };
+    exportBtn.onClick = [this] { doExport(); };
+    importBtn.setTooltip("Merge assets from another project (.seance) or a library "
+                         "export into this project's library. Identical assets are "
+                         "deduplicated by content; new ids are assigned so nothing "
+                         "collides; name clashes get a numeric suffix.");
+    exportBtn.setTooltip("Write this project's entire asset library to a standalone "
+                         "library file you can import into another project.");
+
     setSize(680, 460);
 }
 
 AssetLibraryComponent::~AssetLibraryComponent() = default;
 
 void AssetLibraryComponent::resized() {
-    tabs.setBounds(getLocalBounds());
+    auto r = getLocalBounds();
+    auto bottom = r.removeFromBottom(38).reduced(8, 6);
+    tabs.setBounds(r);
+    exportBtn.setBounds(bottom.removeFromRight(96).reduced(2, 0));
+    bottom.removeFromRight(6);
+    importBtn.setBounds(bottom.removeFromRight(96).reduced(2, 0));
+}
+
+void AssetLibraryComponent::refreshAllPanels() {
+    for (auto* p : panels) p->refresh();
+}
+
+void AssetLibraryComponent::doExport() {
+    if (lib.size() == 0) {
+        juce::NativeMessageBox::showMessageBoxAsync(
+            juce::MessageBoxIconType::InfoIcon, "Nothing to export",
+            "The asset library is empty - there is nothing to export yet.", this);
+        return;
+    }
+    chooser = std::make_unique<juce::FileChooser>(
+        "Export asset library", juce::File(), "*.seancelib;*.seance");
+    chooser->launchAsync(
+        juce::FileBrowserComponent::saveMode
+            | juce::FileBrowserComponent::canSelectFiles
+            | juce::FileBrowserComponent::warnAboutOverwriting,
+        [this](const juce::FileChooser& fc) {
+            juce::File f = fc.getResult();
+            if (f == juce::File()) return;
+            if (f.getFileExtension().isEmpty()) f = f.withFileExtension("seancelib");
+            bool ok = ProjectFile::exportAssets(f.getFullPathName().toStdString(), lib);
+            juce::NativeMessageBox::showMessageBoxAsync(
+                ok ? juce::MessageBoxIconType::InfoIcon
+                   : juce::MessageBoxIconType::WarningIcon,
+                ok ? "Library exported" : "Export failed",
+                ok ? ("Exported " + juce::String((int) lib.size())
+                      + " asset(s) to:\n" + f.getFullPathName())
+                   : ("Could not write:\n" + f.getFullPathName()),
+                this);
+        });
+}
+
+void AssetLibraryComponent::doImport() {
+    chooser = std::make_unique<juce::FileChooser>(
+        "Import asset library", juce::File(), "*.seancelib;*.seance");
+    chooser->launchAsync(
+        juce::FileBrowserComponent::openMode
+            | juce::FileBrowserComponent::canSelectFiles,
+        [this](const juce::FileChooser& fc) {
+            juce::File f = fc.getResult();
+            if (f == juce::File()) return;
+
+            // Parse the source file into a throwaway graph via readProject (NOT
+            // load(), which would clobber ProjectFile::currentPath). We only keep
+            // its asset library; nodes/links in the temp graph are discarded.
+            std::ifstream in(f.getFullPathName().toStdString());
+            if (!in) {
+                juce::NativeMessageBox::showMessageBoxAsync(
+                    juce::MessageBoxIconType::WarningIcon, "Import failed",
+                    "Could not open:\n" + f.getFullPathName(), this);
+                return;
+            }
+            NodeGraph tmp;
+            ProjectFile::readProject(in, tmp, nullptr);
+
+            if (tmp.assets.size() == 0) {
+                juce::NativeMessageBox::showMessageBoxAsync(
+                    juce::MessageBoxIconType::InfoIcon, "No assets found",
+                    "That file contains no asset-library entries to import.", this);
+                return;
+            }
+
+            AssetImportResult res = importAssets(lib, tmp.assets.all());
+            if (res.added > 0)
+                onEdit("Import assets");   // snapshot + dirty only if something changed
+            refreshAllPanels();
+
+            juce::String msg;
+            msg << "Added " << res.added << " new asset(s).\n"
+                << res.deduped << " already existed (deduplicated by content).";
+            if (res.renamed > 0)
+                msg << "\n" << res.renamed << " renamed to avoid a name clash.";
+            juce::NativeMessageBox::showMessageBoxAsync(
+                juce::MessageBoxIconType::InfoIcon, "Import complete", msg, this);
+        });
 }
 
 } // namespace SoundShop

@@ -12,6 +12,7 @@
 #include "node_graph.h"
 #include "content_store.h"         // ContentStore - baked-blob side-store tests
 #include "project_file.h"          // serializeForUndo / writeProject - blob persistence
+#include "asset_import.h"           // importAssets - cross-project asset merge
 #include "adsr_envelope.h"
 #include "video_decoder.h"
 #include "script_runtime.h"        // ScriptLang / scriptLangAvailable - generator tests
@@ -30,6 +31,7 @@
 #include <cstring>
 #include <algorithm>
 #include <sstream>
+#include <fstream>
 
 namespace SoundShop {
 namespace {
@@ -3123,6 +3125,105 @@ void testAssetLibrary(Report& r) {
         WavetableDoc delDoc; delDoc.decode(g.findNode(nId)->script);
         r.check(delDoc.warpAssetId == -1 && delDoc.warpChain.size() == 3,
                 "assets: erased morph asset -> frame falls back to independent");
+    }
+
+    // ---- import / merge: dedup by content, id remap, name-clash suffix ------
+    {
+        // Source library (from "another project"): three assets.
+        AssetLibrary src;
+        int sShared = src.add(AssetKind::Waveform, "Warm Pad", "layered", "SHARED");
+        int sNew    = src.add(AssetKind::Waveform, "Bright",   "layered", "UNIQUE");
+        int sClash  = src.add(AssetKind::Instrument, "Bass",   "composite", "SRC_BASS");
+
+        // Destination already has a content-identical "Warm Pad" (different id) and
+        // a same-name-different-content "Bass" instrument.
+        AssetLibrary dst;
+        int dShared = dst.add(AssetKind::Waveform, "Warm Pad (mine)", "layered", "SHARED");
+        int dBass   = dst.add(AssetKind::Instrument, "Bass", "composite", "DST_BASS");
+
+        std::vector<AssetEntry> srcAll(src.all().begin(), src.all().end());
+        AssetImportResult res = importAssets(dst, srcAll);
+
+        r.checkVal(res.added == 2, "import: two genuinely-new assets added", res.added);
+        r.checkVal(res.deduped == 1, "import: one content-identical asset deduped",
+                   res.deduped);
+        r.checkVal(res.renamed == 1, "import: one name-clash renamed", res.renamed);
+
+        // Dedup: the shared waveform repoints to the EXISTING destination id+name.
+        int mappedShared = -1, mappedNew = -1, mappedClash = -1;
+        for (auto& pr : res.remap) {
+            if (pr.first == sShared) mappedShared = pr.second;
+            if (pr.first == sNew)    mappedNew    = pr.second;
+            if (pr.first == sClash)  mappedClash  = pr.second;
+        }
+        r.check(mappedShared == dShared,
+                "import: content-identical asset remaps to the existing dest id");
+        r.check(dst.find(dShared)->name == "Warm Pad (mine)",
+                "import: deduped asset keeps the destination's name (dest wins)");
+
+        // New unique waveform inserted under a fresh id, original name kept.
+        r.check(mappedNew >= AssetLibrary::kUserIdBase && dst.find(mappedNew) &&
+                    dst.find(mappedNew)->payload == "UNIQUE" &&
+                    dst.find(mappedNew)->name == "Bright",
+                "import: new asset inserted with fresh id and original name");
+
+        // Name clash: same name, different content -> imported with numeric suffix.
+        r.check(mappedClash != dBass && dst.find(mappedClash) &&
+                    dst.find(mappedClash)->name == "Bass 2" &&
+                    dst.find(mappedClash)->payload == "SRC_BASS",
+                "import: same-name different-content gets the lowest free suffix");
+        r.check(dst.find(dBass)->name == "Bass",
+                "import: the pre-existing same-name asset is untouched");
+
+        // Total = original 2 + 2 inserted (the deduped one added nothing).
+        r.checkVal((int) dst.size() == 4, "import: dest grows by exactly the new count",
+                   (int) dst.size());
+
+        // Re-importing the same source again is fully idempotent (all dedupe).
+        AssetImportResult res2 = importAssets(dst, srcAll);
+        r.check(res2.added == 0 && res2.deduped == 3 && (int) dst.size() == 4,
+                "import: re-importing identical source is idempotent");
+
+        // Selection: import only one id (closure = itself for leaves).
+        AssetLibrary dst2;
+        AssetImportResult sel = importAssets(dst2, srcAll, { sNew });
+        r.check(sel.added == 1 && (int) dst2.size() == 1 &&
+                    dst2.all().front().payload == "UNIQUE",
+                "import: selected-id import pulls only that asset");
+    }
+
+    // ---- export -> import round-trip through a library-export file ----------
+    {
+        NodeGraph g;
+        g.assets.add(AssetKind::Waveform, "exp wave", "layered", "EXP\nmulti");
+        int starred = g.assets.add(AssetKind::MorphAlgorithm, "exp morph", "", "MORPH");
+        g.assets.setStarred(starred, true);
+        int arch = g.assets.add(AssetKind::AhdsrCurve, "exp env", "", "ENV");
+        g.assets.archive(arch);
+
+        juce::File tmp = juce::File::createTempFile("seancelib");
+        bool ok = ProjectFile::exportAssets(tmp.getFullPathName().toStdString(), g.assets);
+        r.check(ok, "export: exportAssets writes a library file");
+
+        // Import it into a fresh project via the same readProject path.
+        AssetLibrary dst;
+        std::ifstream in(tmp.getFullPathName().toStdString());
+        NodeGraph tmpG;
+        ProjectFile::readProject(in, tmpG, nullptr);
+        in.close();
+        r.checkVal((int) tmpG.assets.size() == 3,
+                   "export: all three assets (incl. archived) survive the export file",
+                   (int) tmpG.assets.size());
+        std::vector<AssetEntry> all(tmpG.assets.all().begin(), tmpG.assets.all().end());
+        AssetImportResult res = importAssets(dst, all);
+        r.check(res.added == 3, "export: round-trip import adds all three");
+        const AssetEntry* m = nullptr;
+        for (auto& e : dst.all()) if (e.kind == AssetKind::MorphAlgorithm) m = &e;
+        r.check(m && m->starred, "export: starred flag survives export+import");
+        bool anyArchived = false;
+        for (auto& e : dst.all()) if (e.archived) anyArchived = true;
+        r.check(anyArchived, "export: archived flag survives export+import");
+        tmp.deleteFile();
     }
 }
 

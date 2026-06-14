@@ -69,6 +69,8 @@ target_sources(SEANCE PRIVATE
     src/hash_util.h
     src/asset_library.cpp
     src/asset_library.h
+    src/asset_import.cpp
+    src/asset_import.h
     src/asset_library_component.cpp
     src/asset_library_component.h
     src/node_graph_component.cpp

@@ -48,6 +48,14 @@ public:
     static bool loadFromString(const std::string& text, NodeGraph& graph,
                                PluginHost* pluginHost = nullptr);
 
+    // Export the project's asset library (or a selected subset, expanded to its
+    // dependency closure) to a standalone library-export file. The output is a
+    // minimal project file carrying only [AssetStore] sections, so importing it
+    // reuses the same readProject + merge path as importing a full session.
+    // selectedIds empty = export every asset. Does NOT touch currentPath.
+    static bool exportAssets(const std::string& path, const AssetLibrary& lib,
+                             const std::vector<int>& selectedIds = {});
+
     // Current project path (empty = untitled)
     static std::string currentPath;
 };

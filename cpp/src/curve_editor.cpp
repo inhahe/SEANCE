@@ -1,6 +1,7 @@
 #define _USE_MATH_DEFINES
 #include "curve_editor.h"
 #include "builtin_synth.h"   // WaveExprParser
+#include "node_graph.h"      // NodeGraph + AssetLibrary for the library menu
 #include <algorithm>
 #include <cmath>
 #include <sstream>
@@ -620,6 +621,55 @@ void SpectralCurvePanel::mouseUp(const juce::MouseEvent&) {
     draggingIdx = -1;
     freehandDrawing = false;
     lastFreehandIdx = -1;
+}
+
+// ==============================================================================
+// Shared FrequencyGraph library menu (publish / link / detach)
+// ==============================================================================
+void showFrequencyGraphLibraryMenu(juce::Component* anchor,
+                                   NodeGraph& graph,
+                                   SpectralCurve& curve,
+                                   int currentId,
+                                   const juce::String& defaultName,
+                                   std::function<void(int)> onChanged)
+{
+    juce::PopupMenu m;
+    m.addItem(1, "Add this curve to library");
+
+    juce::PopupMenu refMenu;
+    // Snapshot the current FrequencyGraph assets. Captured by value into the
+    // async callback - the user can't mutate the asset store while the popup is
+    // open, so the raw pointers stay valid for the lifetime of the menu (the
+    // same pattern the Spectrum Tap response editor uses).
+    auto graphs = graph.assets.list(AssetKind::FrequencyGraph, false);
+    const int base = 1000;
+    for (size_t i = 0; i < graphs.size(); ++i)
+        refMenu.addItem(base + (int) i,
+                        juce::String(graphs[i]->name) +
+                        " (#" + juce::String(graphs[i]->id) + ")");
+    m.addSubMenu("Link to existing frequency graph", refMenu, !graphs.empty());
+    m.addItem(2, "Detach (make independent)", currentId >= 0);
+
+    m.showMenuAsync(juce::PopupMenu::Options().withTargetComponent(anchor),
+        [&graph, &curve, defaultName, onChanged = std::move(onChanged), graphs, base]
+        (int r) {
+            if (r == 0) return;  // dismissed
+            if (r == 1) {
+                int id = graph.assets.add(AssetKind::FrequencyGraph,
+                                          defaultName.toStdString(), "",
+                                          curve.encode());
+                if (onChanged) onChanged(id);
+            } else if (r == 2) {
+                if (onChanged) onChanged(-1);  // detach, keep the curve
+            } else if (r >= base && r - base < (int) graphs.size()) {
+                const AssetEntry* e = graphs[(size_t)(r - base)];
+                SpectralCurve c;
+                if (e && SpectralCurve::decode(e->payload, c)) {
+                    curve = c;                 // mirror the shared curve
+                    if (onChanged) onChanged(e->id);
+                }
+            }
+        });
 }
 
 } // namespace SoundShop

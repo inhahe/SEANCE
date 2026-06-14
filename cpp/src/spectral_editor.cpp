@@ -3,6 +3,7 @@
 #include "fft_util.h"        // FFT for the preview
 #include "help_utils.h"
 #include "node_graph_component.h"  // launchAhdsrEnvelopeDialog for the Envelope... button
+#include "layered_wave_editor.h"   // WavetableDoc - resolve SpectralFrames nested in wavetables
 #include <cmath>
 #include <sstream>
 #include <algorithm>
@@ -38,6 +39,12 @@ std::string SpectralDoc::encode() const {
     // unchanged - the decoder only looks for parts[3] when present.
     if (!warpChain.empty())
         o << "|warp:" << encodeWarpChain(warpChain);
+    // Optional field: FrequencyGraph live-reference ids, emitted AFTER the warp
+    // block so an old decoder (which only checked parts[3] for a "warp:" prefix)
+    // still finds its warp and harmlessly ignores this trailing field. Present
+    // only when at least one curve is linked.
+    if (magAssetId >= 0 || phaseAssetId >= 0)
+        o << "|refs:" << magAssetId << ":" << phaseAssetId;
     return o.str();
 }
 
@@ -50,11 +57,22 @@ bool SpectralDoc::decode(const std::string& s) {
         try { fftSize = std::stoi(parts[0]); } catch (...) { fftSize = 2048; }
         if (!SpectralCurve::decode(parts[1], mag))   return false;
         if (!SpectralCurve::decode(parts[2], phase)) return false;
-        // Optional per-bin warp chain (4th field, "warp:<chain>"). Absent in
-        // pre-warp files, which leaves warpChain empty.
+        // Optional trailing fields (4th onward), each self-identified by a
+        // prefix so order is flexible and unknown fields are skipped:
+        //   "warp:<chain>"      - per-bin warp chain (absent in pre-warp files)
+        //   "refs:<mag>:<phase>" - FrequencyGraph live-reference asset ids
         warpChain.clear();
-        if (parts.size() >= 4 && parts[3].rfind("warp:", 0) == 0)
-            warpChain = decodeWarpChain(parts[3].substr(5));
+        magAssetId = -1;
+        phaseAssetId = -1;
+        for (size_t i = 3; i < parts.size(); ++i) {
+            if (parts[i].rfind("warp:", 0) == 0) {
+                warpChain = decodeWarpChain(parts[i].substr(5));
+            } else if (parts[i].rfind("refs:", 0) == 0) {
+                auto ids = splitChar(parts[i].substr(5), ':');
+                if (ids.size() >= 1) { try { magAssetId   = std::stoi(ids[0]); } catch (...) {} }
+                if (ids.size() >= 2) { try { phaseAssetId = std::stoi(ids[1]); } catch (...) {} }
+            }
+        }
         return true;
     }
 
@@ -100,6 +118,68 @@ SpectralDoc SpectralDoc::defaultBuiltin() {
     d.phase.mode = SpectralCurve::Equation;
     d.phase.expression = "noise()*pi";
     return d;
+}
+
+// =============================================================================
+// FrequencyGraph live-reference resolution
+// =============================================================================
+
+// Resolve one linked curve. assetId is updated in place (detached to -1 if the
+// referenced asset is gone). Returns true if anything changed. *refreshed is
+// incremented only when a live asset was actually re-decoded into the curve
+// (not when the id was detached because the asset vanished).
+static bool resolveSpectralCurveRef(NodeGraph& graph, int& assetId,
+                                    SpectralCurve& curve, int& refreshed) {
+    if (assetId < 0) return false;
+    const AssetEntry* e = graph.assets.find(assetId);
+    if (e && e->kind == AssetKind::FrequencyGraph) {
+        SpectralCurve c;
+        if (SpectralCurve::decode(e->payload, c)) {  // decode() rebakes Lua/Python
+            curve = std::move(c);
+            ++refreshed;
+            return true;
+        }
+        return false;  // malformed payload - leave the cached curve untouched
+    }
+    assetId = -1;      // referenced asset gone -> detach, keep last cached curve
+    return true;
+}
+
+// Resolve both curves of one doc. Returns true if either changed.
+static bool resolveSpectralDocRefs(NodeGraph& graph, SpectralDoc& doc, int& refreshed) {
+    bool changed = false;
+    changed |= resolveSpectralCurveRef(graph, doc.magAssetId,   doc.mag,   refreshed);
+    changed |= resolveSpectralCurveRef(graph, doc.phaseAssetId, doc.phase, refreshed);
+    return changed;
+}
+
+int resolveSpectralReferences(NodeGraph& graph) {
+    int refreshed = 0;
+    for (auto& n : graph.nodes) {
+        // Standalone Frequency Domain node - script is the SpectralDoc directly.
+        if (n.script.rfind("__spectral2__", 0) == 0 ||
+            n.script.rfind("__spectral__", 0) == 0) {
+            SpectralDoc doc;
+            if (!doc.decode(n.script)) continue;
+            if (resolveSpectralDocRefs(graph, doc, refreshed))
+                setNodeScriptSynced(n, doc.encode());
+            continue;
+        }
+        // Wavetable node - SpectralFrames can be nested in the frame library.
+        if (n.script.rfind("__wavetable", 0) == 0) {
+            WavetableDoc wt;
+            if (!wt.decode(n.script)) continue;
+            bool any = false;
+            for (auto& entry : wt.library) {
+                auto* sf = dynamic_cast<SpectralFrame*>(entry.wave.get());
+                if (sf && resolveSpectralDocRefs(graph, sf->doc, refreshed))
+                    any = true;
+            }
+            if (any)
+                setNodeScriptSynced(n, wt.encode());
+        }
+    }
+    return refreshed;
 }
 
 // =============================================================================
@@ -192,6 +272,7 @@ SpectralEditorComponent::SpectralEditorComponent(NodeGraph& g, int id,
                                                   std::function<void()> apply)
     : graph(&g), nodeId(id), externalFrame(nullptr), onApply(std::move(apply))
 {
+    assetGraph = &g;  // node-backed: library links resolve against this graph
     if (auto* nd = graph->findNode(nodeId)) {
         if (!doc.decode(nd->script))
             doc = SpectralDoc::defaultBuiltin();
@@ -202,11 +283,15 @@ SpectralEditorComponent::SpectralEditorComponent(NodeGraph& g, int id,
 }
 
 SpectralEditorComponent::SpectralEditorComponent(SpectralFrame& frame,
-                                                  std::function<void()> apply)
-    : graph(nullptr), nodeId(0), externalFrame(&frame), onApply(std::move(apply))
+                                                  std::function<void()> apply,
+                                                  NodeGraph* ag)
+    : graph(nullptr), nodeId(0), externalFrame(&frame), onApply(std::move(apply)),
+      assetGraph(ag)
 {
-    // Seed the editor from the frame's existing doc. No NodeGraph: commits
-    // mirror straight back into externalFrame->doc.
+    // Seed the editor from the frame's existing doc. No owning NodeGraph for
+    // commits (those mirror into externalFrame->doc), but `assetGraph` - when
+    // the wavetable shell passes its project graph - still drives FrequencyGraph
+    // library linking.
     doc = frame.doc;
     initUI();
 }
@@ -242,6 +327,26 @@ void SpectralEditorComponent::initUI() {
         [this]() { onCurveChanged(); });
     addAndMakeVisible(phasePanel.get());
     addAndMakeVisible(magPanel.get());
+
+    // Per-curve FrequencyGraph library link affordances. Only meaningful when
+    // there's a project graph whose asset store backs the links.
+    if (assetGraph != nullptr) {
+        auto setupLib = [this](juce::TextButton& btn, juce::Label& lbl,
+                               bool isMag, const char* which) {
+            addAndMakeVisible(btn);
+            btn.setTooltip(juce::String("Publish this ") + which +
+                " curve to the project's Frequency Graphs library, link it to an "
+                "existing library curve (edits then propagate to every node "
+                "sharing it), or detach to an independent copy.");
+            btn.onClick = [this, isMag]() { openCurveLibrary(isMag); };
+            addAndMakeVisible(lbl);
+            lbl.setFont(11.0f);
+            lbl.setColour(juce::Label::textColourId, juce::Colour(0xFFAAAAAA));
+        };
+        setupLib(phaseLibraryBtn, phaseLinkLabel, false, "phase");
+        setupLib(magLibraryBtn,   magLinkLabel,   true,  "magnitude");
+        refreshLinkLabels();
+    }
 
     // Per-bin warp chain (Bucket C). Sits in a strip below the curve panels.
     {
@@ -335,11 +440,34 @@ void SpectralEditorComponent::resized() {
         a.removeFromBottom(4);
     }
 
-    // Two stacked curve panels: phase on top, mag on bottom.
+    // Two stacked curve panels: phase on top, mag on bottom. When library
+    // linking is available (assetGraph set), each panel gets a thin row above
+    // it carrying the "Library..." button and the link-status label.
+    const int linkRowH = (assetGraph != nullptr) ? 22 : 0;
     int half = a.getHeight() / 2;
-    phasePanel->setBounds(a.removeFromTop(half - 2));
+    {
+        auto top = a.removeFromTop(half - 2);
+        if (assetGraph != nullptr) {
+            auto row = top.removeFromTop(linkRowH);
+            phaseLibraryBtn.setBounds(row.removeFromLeft(80));
+            row.removeFromLeft(6);
+            phaseLinkLabel.setBounds(row);
+            top.removeFromTop(2);
+        }
+        phasePanel->setBounds(top);
+    }
     a.removeFromTop(4);
-    magPanel->setBounds(a);
+    {
+        auto bot = a;
+        if (assetGraph != nullptr) {
+            auto row = bot.removeFromTop(linkRowH);
+            magLibraryBtn.setBounds(row.removeFromLeft(80));
+            row.removeFromLeft(6);
+            magLinkLabel.setBounds(row);
+            bot.removeFromTop(2);
+        }
+        magPanel->setBounds(bot);
+    }
 }
 
 void SpectralEditorComponent::paint(juce::Graphics& g) {
@@ -427,6 +555,9 @@ void SpectralEditorComponent::commitToNode() {
 
 void SpectralEditorComponent::onCurveChanged() {
     refreshPreview();
+    // A linked curve's edit must flow back to its asset so every other consumer
+    // sharing it updates too (the "live reference" contract).
+    writeBackLinkedCurves();
     if (externalFrame != nullptr) {
         // Embedded inside the layered-wave editor: commit immediately so the
         // parent's f->render() sees fresh data, and call onApply right away
@@ -443,6 +574,64 @@ void SpectralEditorComponent::onCurveChanged() {
     // (requestRebuild()), which is expensive — keep the 500ms debounce so
     // typing in the equation field doesn't fight the audio thread.
     startTimer(500);
+}
+
+void SpectralEditorComponent::writeBackLinkedCurves() {
+    if (assetGraph == nullptr) return;
+    bool any = false;
+    if (doc.magAssetId >= 0) {
+        assetGraph->assets.update(doc.magAssetId, "", doc.mag.encode());
+        any = true;
+    }
+    if (doc.phaseAssetId >= 0) {
+        assetGraph->assets.update(doc.phaseAssetId, "", doc.phase.encode());
+        any = true;
+    }
+    // Propagate the fresh asset payload to every other consumer (other spectrum
+    // taps, spectral nodes, wavetable frames). This re-decodes the asset back
+    // into our own doc too, which is a no-op (same content we just wrote).
+    if (any) resolveSpectralReferences(*assetGraph);
+}
+
+void SpectralEditorComponent::refreshLinkLabels() {
+    if (assetGraph == nullptr) return;
+    auto describe = [this](int assetId, juce::Label& lbl) {
+        if (assetId < 0) {
+            lbl.setText("Independent curve (not in library)",
+                        juce::dontSendNotification);
+        } else {
+            const AssetEntry* e = assetGraph->assets.find(assetId);
+            juce::String nm = e ? juce::String(e->name) : juce::String("(missing)");
+            lbl.setText("Linked: " + nm + " (#" + juce::String(assetId) +
+                        ")  - edits propagate", juce::dontSendNotification);
+        }
+    };
+    describe(doc.phaseAssetId, phaseLinkLabel);
+    describe(doc.magAssetId,   magLinkLabel);
+}
+
+void SpectralEditorComponent::openCurveLibrary(bool isMag) {
+    if (assetGraph == nullptr) return;
+    SpectralCurve&  curve     = isMag ? doc.mag : doc.phase;
+    int             currentId = isMag ? doc.magAssetId : doc.phaseAssetId;
+    juce::Component* anchor   = isMag ? (juce::Component*)&magLibraryBtn
+                                      : (juce::Component*)&phaseLibraryBtn;
+    juce::String name = juce::String(isMag ? "Magnitude" : "Phase") + " curve";
+
+    showFrequencyGraphLibraryMenu(anchor, *assetGraph, curve, currentId, name,
+        [this, isMag](int newId) {
+            (isMag ? doc.magAssetId : doc.phaseAssetId) = newId;
+            // The menu may have replaced the curve (link case); reflect it in
+            // the panel's text/toggles.
+            (isMag ? magPanel : phasePanel)->syncFromModel();
+            // Persist: re-encode our node/frame, write the (possibly new) link
+            // back to its asset, and propagate to other consumers.
+            commitToNode();
+            writeBackLinkedCurves();
+            refreshLinkLabels();
+            refreshPreview();
+            if (onApply) onApply();
+        });
 }
 
 } // namespace SoundShop

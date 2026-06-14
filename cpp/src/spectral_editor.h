@@ -30,6 +30,17 @@ struct SpectralDoc {
     SpectralCurve phase;
     int fftSize = 2048;
 
+    // Live references to project FrequencyGraph assets, mirroring the AHDSR /
+    // MorphAlgorithm / SpectrumTap "live reference" model. -1 = independent
+    // (the curve above is this doc's own). When >= 0, the corresponding curve
+    // is a cache of the asset's content, refreshed by resolveSpectralReferences()
+    // at edit/load; editing a linked curve writes back to the asset and
+    // propagates to every consumer sharing the id. Serialized in encode()/
+    // decode() under the "refs" key (after the optional "warp" block, so old
+    // decoders that only look for "warp:" at parts[3] still round-trip).
+    int magAssetId   = -1;
+    int phaseAssetId = -1;
+
     // Bucket C element warp: a chain of shape-bending ops applied to the
     // per-bin magnitude array (over the bin axis) before the IFFT. Amplitude-
     // domain ops reshape the spectral envelope (fold / clip / saturate the
@@ -42,6 +53,17 @@ struct SpectralDoc {
 
     static SpectralDoc defaultBuiltin();         // exp(-f/20) mag, random phase
 };
+
+// Resolve every SpectralDoc FrequencyGraph live reference in the graph. Walks
+// both standalone Frequency Domain nodes (script "__spectral2__:...") and
+// SpectralFrames nested inside wavetable nodes (script "__wavetable...:"). For
+// each linked curve (magAssetId / phaseAssetId >= 0): if the asset still exists
+// and is a FrequencyGraph, re-decode its payload into the cached curve; if the
+// asset is gone, detach the id to -1 (keeping the last cached curve so nothing
+// dangles). Re-encodes the node script when anything changed. Returns the number
+// of curves refreshed. Call after readProject() and after any edit that may have
+// changed an asset a curve points at (mirrors resolveAhdsr/Warp/SpectrumTap).
+int resolveSpectralReferences(NodeGraph& graph);
 
 // Render a SpectralDoc to a single-cycle time-domain waveform at the
 // requested table size (rounded up internally to the nearest power of two,
@@ -85,13 +107,17 @@ public:
                             std::function<void()> onApply);
 
     // Frame-backed mode: read/write an external SpectralFrame's SpectralDoc
-    // directly, no NodeGraph involved. Used when this editor is launched as
-    // a sub-dialog from the wavetable shell to edit a single SpectralFrame
-    // inside a mixed-type wavetable. onApply is invoked after every commit
-    // so the owning wavetable editor can re-render its preview / push the
-    // updated wavetable through to its host node.
+    // directly. Used when this editor is launched as a sub-dialog from the
+    // wavetable shell to edit a single SpectralFrame inside a mixed-type
+    // wavetable. onApply is invoked after every commit so the owning wavetable
+    // editor can re-render its preview / push the updated wavetable through to
+    // its host node. `assetGraph` (the host's project graph) is optional: when
+    // supplied it enables the per-curve FrequencyGraph library link buttons
+    // (publish / link / detach + live propagation), exactly as in node mode;
+    // when null those buttons are hidden.
     SpectralEditorComponent(SpectralFrame& externalFrame,
-                            std::function<void()> onApply);
+                            std::function<void()> onApply,
+                            NodeGraph* assetGraph = nullptr);
 
     ~SpectralEditorComponent() override;
 
@@ -105,6 +131,11 @@ private:
     int nodeId = 0;
     SpectralFrame* externalFrame = nullptr;
     std::function<void()> onApply;
+
+    // Project graph used for FrequencyGraph library linking. In node-backed
+    // mode this is `graph`; in frame-backed mode it's the optional assetGraph
+    // passed by the wavetable shell. Null => library link buttons are hidden.
+    NodeGraph* assetGraph = nullptr;
 
     void initUI();
 
@@ -123,6 +154,23 @@ private:
 
     std::unique_ptr<SpectralCurvePanel> phasePanel;  // top
     std::unique_ptr<SpectralCurvePanel> magPanel;    // bottom
+
+    // Per-curve FrequencyGraph library link affordances. Shown only when
+    // assetGraph != nullptr. Each "Library..." button opens the shared
+    // publish/link/detach menu; the label shows the current link status.
+    juce::TextButton phaseLibraryBtn { "Library..." };
+    juce::TextButton magLibraryBtn   { "Library..." };
+    juce::Label      phaseLinkLabel;
+    juce::Label      magLinkLabel;
+
+    // Open the shared library menu for the mag (isMag) or phase curve.
+    void openCurveLibrary(bool isMag);
+    // Refresh both "Independent / Linked to ..." status lines from doc ids.
+    void refreshLinkLabels();
+    // Write a linked curve's current shape back to its asset and propagate to
+    // every other consumer via resolveSpectralReferences(). No-op when the
+    // curve isn't linked or there's no assetGraph.
+    void writeBackLinkedCurves();
 
     // Per-bin warp chain editor (Bucket C). Bound to doc.warpChain; baked into
     // the spectrum at render, so its callbacks only re-render + commit (never

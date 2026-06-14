@@ -679,47 +679,18 @@ void SpectrumTapComponent::openResponseEditor(int binSlotIdx) {
                                      binLabel]() {
         if (slotCapture < 0 || slotCapture >= (int)binCurveStates.size()) return;
         auto& st = binCurveStates[slotCapture];
-
-        juce::PopupMenu m;
-        m.addItem(1, "Add this curve to library");
-        juce::PopupMenu refMenu;
-        auto graphs = graph.assets.list(AssetKind::FrequencyGraph, false);
-        int base = 1000;
-        for (size_t i = 0; i < graphs.size(); ++i)
-            refMenu.addItem(base + (int) i,
-                            juce::String(graphs[i]->name) +
-                            " (#" + juce::String(graphs[i]->id) + ")");
-        m.addSubMenu("Link to existing frequency graph", refMenu, !graphs.empty());
-        m.addItem(2, "Detach (make independent)", st.assetId >= 0);
-
-        m.showMenuAsync(juce::PopupMenu::Options().withTargetComponent(
-                            &container->libraryBtn),
-            [this, slotCapture, container, updateLinkLabel, binLabel, graphs, base]
-            (int r) {
-                if (r == 0 || slotCapture < 0 ||
-                    slotCapture >= (int)binCurveStates.size()) return;
+        // Shared publish / link / detach menu (curve_editor.cpp). It mirrors a
+        // picked asset's curve into st.curve directly; our callback persists the
+        // new link id and refreshes the UI.
+        showFrequencyGraphLibraryMenu(&container->libraryBtn, graph, st.curve,
+            st.assetId, "Response " + binLabel,
+            [this, slotCapture, container, updateLinkLabel](int newId) {
+                if (slotCapture < 0 || slotCapture >= (int)binCurveStates.size()) return;
                 auto& s = binCurveStates[slotCapture];
-                if (r == 1) {
-                    // Publish a new FrequencyGraph asset from the current curve.
-                    int id = graph.assets.add(AssetKind::FrequencyGraph,
-                                              ("Response " + binLabel).toStdString(),
-                                              "", s.curve.encode());
-                    s.assetId = id;
-                    syncCurvesToScript();
-                } else if (r == 2) {
-                    s.assetId = -1;          // keep the curve, drop the link
-                    syncCurvesToScript();
-                } else if (r >= base && r - base < (int) graphs.size()) {
-                    const AssetEntry* e = graphs[(size_t)(r - base)];
-                    SpectralCurve c;
-                    if (e && SpectralCurve::decode(e->payload, c)) {
-                        s.curve = c;         // mirror the shared curve
-                        s.assetId = e->id;
-                        s.useCustom = true;
-                        container->panel.syncFromModel();
-                        syncCurvesToScript();
-                    }
-                }
+                s.assetId = newId;
+                s.useCustom = true;   // any publish/link/detach keeps the curve active
+                container->panel.syncFromModel();
+                syncCurvesToScript();
                 updateLinkLabel();
                 container->panel.repaint();
             });

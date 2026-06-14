@@ -1,6 +1,7 @@
 #include "project_file.h"
 #include "asset_import.h"
 #include "spectrum_tap.h"   // resolveSpectrumTapReferences (FrequencyGraph refs)
+#include "spectral_editor.h"  // resolveSpectralReferences (FrequencyGraph refs)
 #include <juce_core/juce_core.h>
 #include <functional>
 #include <fstream>
@@ -1019,6 +1020,11 @@ bool ProjectFile::readProject(std::istream& f, NodeGraph& graph, PluginHost* plu
     // curve into the spectrum-tap bins that point at it, re-encoding the
     // affected node scripts. Free function in spectrum_tap.cpp.
     resolveSpectrumTapReferences(graph);
+
+    // Same FrequencyGraph assets feed the spectral (FFT) mag/phase curves -
+    // both standalone Frequency Domain nodes and SpectralFrames nested inside
+    // wavetable nodes. Free function in spectral_editor.cpp.
+    resolveSpectralReferences(graph);
 
     // Restore open editors (store IDs only - never store Node*)
     graph.openEditors.clear();

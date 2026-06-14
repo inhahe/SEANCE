@@ -10329,7 +10329,10 @@ void LayeredWaveEditorComponent::updateFrameEditorEmbed() {
     if (tid == "spectral") {
         auto* sf = dynamic_cast<SpectralFrame*>(f);
         if (sf)
-            embeddedFrameEditor = std::make_unique<SpectralEditorComponent>(*sf, onSubApply);
+            // Pass the project graph so the sub-editor can offer FrequencyGraph
+            // library linking on its mag/phase curves, same as a standalone node.
+            embeddedFrameEditor = std::make_unique<SpectralEditorComponent>(
+                *sf, onSubApply, &graph);
     } else if (tid == "wavelet") {
         auto* wf = dynamic_cast<WaveletFrame*>(f);
         if (wf)

@@ -177,13 +177,16 @@ copy-on-apply, the asset library is a *live reference*. Open it from **Edit →
 Asset Library…** to browse, rename, duplicate, **star**, archive, or delete
 entries.
 
-Three asset kinds are wired up today: **waveforms** (any wavetable frame — layered,
+Four asset kinds are wired up today: **waveforms** (any wavetable frame — layered,
 spectral, wavelet, granular, inharmonic, sample — published from the
 Layered-Waveform editor with **Save to Library**), **AHDSR curves** (published
-from the shared envelope editor), and **morph algorithms** (a frame's
+from the shared envelope editor), **morph algorithms** (a frame's
 shape-bending **warp chain**, published from the wavetable editor's warp panel with
 its own **Save to Library** button — reference one stored chain from many frames so
-a single edit re-shapes them all together). Waveforms are picked from a **unified browser**
+a single edit re-shapes them all together), and **frequency graphs** (a 1-D
+frequency-response curve, published with the **Library…** button on a Spectrum
+Tap bin's response editor or on a Spectral synth's magnitude/phase curve — link
+one stored shape from many places and a single edit re-tunes them all). Waveforms are picked from a **unified browser**
 that lists the thousands of built-in factory shapes *and* your saved waveforms in
 one place — with category, search, **Starred only**, and **Show my waveforms**
 filters, because the wave-shape library is far too big for a dropdown. Picking a

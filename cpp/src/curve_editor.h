@@ -7,6 +7,8 @@
 
 namespace SoundShop {
 
+struct NodeGraph;  // for showFrequencyGraphLibraryMenu (defined in curve_editor.cpp)
+
 // ==============================================================================
 // SpectralCurve - a reusable 1D curve over a [0, 1] x-axis with three
 // authoring modes:
@@ -122,5 +124,31 @@ private:
     void  sortPointsByX();
     void  writeFreehandSample(float x, float y);
 };
+
+// ==============================================================================
+// showFrequencyGraphLibraryMenu - the shared publish / link / detach popup for
+// any SpectralCurve that can be backed by a project FrequencyGraph asset.
+//
+// Every consumer (Spectrum Tap per-bin response, Spectral mag/phase curves,
+// and any future one) stores its asset id in a different place, so the menu is
+// parameterised by callbacks rather than owning the id:
+//   - anchor      : component the popup is positioned against.
+//   - graph       : the project graph whose `assets` store is the library.
+//   - curve       : the live curve; on "publish" its encode() seeds the new
+//                   asset, on "link" the picked asset's payload is decoded INTO
+//                   it (so the caller can immediately re-encode / refresh UI).
+//   - currentId   : the curve's current link (-1 = independent) - gates "Detach".
+//   - defaultName : name for a newly-published asset.
+//   - onChanged   : invoked after any change with the new asset id (the published
+//                   id, the linked id, or -1 on detach). The caller stores the id,
+//                   re-encodes its node script, calls resolve*References(), and
+//                   refreshes its panel. NOT called if the user dismisses the menu.
+// ==============================================================================
+void showFrequencyGraphLibraryMenu(juce::Component* anchor,
+                                   NodeGraph& graph,
+                                   SpectralCurve& curve,
+                                   int currentId,
+                                   const juce::String& defaultName,
+                                   std::function<void(int)> onChanged);
 
 } // namespace SoundShop

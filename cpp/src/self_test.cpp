@@ -3408,6 +3408,119 @@ void testAssetLibrary(Report& r) {
         }
     }
 
+    // ---- Spectral (FFT) mag/phase curves live-reference FrequencyGraph -------
+    {
+        // A) SpectralDoc encode/decode carries the two asset ids, coexists with
+        //    the optional warp block, and a script without "refs:" decodes to -1.
+        {
+            SpectralDoc d;
+            d.fftSize = 1024;
+            d.mag.expression = "exp(-f/9)";
+            d.phase.expression = "noise()*pi";
+            d.magAssetId = 4242;
+            d.phaseAssetId = 777;
+            SpectralDoc d2;
+            r.check(d2.decode(d.encode()), "spectral: doc with refs decodes");
+            r.check(d2.magAssetId == 4242 && d2.phaseAssetId == 777,
+                    "spectral: mag/phase asset ids round-trip through encode");
+
+            // Warp + refs together (refs emitted AFTER warp).
+            SpectralDoc dw;
+            dw.warpChain.push_back(WarpOp{});   // one default op -> non-empty chain
+            dw.magAssetId = 5;
+            SpectralDoc dw2;
+            r.check(dw2.decode(dw.encode()) && dw2.magAssetId == 5 &&
+                        dw2.warpChain.size() == 1,
+                    "spectral: warp block and refs coexist in encode");
+
+            // Legacy script (no refs field) -> ids default to -1.
+            SpectralDoc leg;
+            leg.decode("__spectral2__:2048|" + leg.mag.encode() + "|" +
+                       leg.phase.encode());
+            r.check(leg.magAssetId == -1 && leg.phaseAssetId == -1,
+                    "spectral: doc without refs decodes ids as -1");
+        }
+
+        // B) Standalone Frequency Domain node: publish, reference w/ stale cache,
+        //    resolve, edit propagates, save/load re-resolves, erase detaches.
+        {
+            NodeGraph g;
+            SpectralCurve shared; shared.expression = "exp(-f/4)";
+            int aid = g.assets.add(AssetKind::FrequencyGraph, "mag lib", "",
+                                   shared.encode());
+            int nId = g.addNode("spec", NodeType::Effect, {}, {}).id;
+            {
+                SpectralDoc d = SpectralDoc::defaultBuiltin();
+                d.mag.expression = "1";        // stale cache
+                d.magAssetId = aid;
+                g.findNode(nId)->script = d.encode();
+            }
+            int n = resolveSpectralReferences(g);
+            r.checkVal(n == 1, "spectral: resolve mirrors the one referenced curve", n);
+            {
+                SpectralDoc d; d.decode(g.findNode(nId)->script);
+                r.check(d.mag.expression == "exp(-f/4)" && d.magAssetId == aid,
+                        "spectral: resolved mag curve matches the published asset");
+            }
+            // Edit the asset -> propagates on next resolve.
+            SpectralCurve edited; edited.expression = "exp(-f/2)";
+            g.assets.update(aid, "", edited.encode());
+            resolveSpectralReferences(g);
+            {
+                SpectralDoc d; d.decode(g.findNode(nId)->script);
+                r.check(d.mag.expression == "exp(-f/2)",
+                        "spectral: editing the asset propagates to the node");
+            }
+            // Save/load preserves + re-resolves.
+            std::ostringstream oss;
+            ProjectFile::writeProject(oss, g, nullptr, false, true);
+            NodeGraph g2; std::istringstream iss(oss.str());
+            ProjectFile::readProject(iss, g2, nullptr);
+            {
+                SpectralDoc d; d.decode(g2.findNode(nId)->script);
+                r.check(d.magAssetId == aid && d.mag.expression == "exp(-f/2)",
+                        "spectral: node reference re-resolves after save/load");
+            }
+            // Erase asset -> detach, keep last curve.
+            g.assets.erase(aid);
+            resolveSpectralReferences(g);
+            {
+                SpectralDoc d; d.decode(g.findNode(nId)->script);
+                r.check(d.magAssetId == -1 && d.mag.expression == "exp(-f/2)",
+                        "spectral: erased asset -> node falls back to independent");
+            }
+        }
+
+        // C) SpectralFrame nested inside a wavetable node also resolves.
+        {
+            NodeGraph g;
+            SpectralCurve shared; shared.expression = "exp(-f/6)";
+            int aid = g.assets.add(AssetKind::FrequencyGraph, "frame lib", "",
+                                   shared.encode());
+            WavetableDoc wt;
+            auto sf = std::make_unique<SpectralFrame>();
+            sf->doc.mag.expression = "1";    // stale cache
+            sf->doc.magAssetId = aid;
+            wt.addLibraryEntry(std::move(sf), "spec frame");
+            int nId = g.addNode("wt", NodeType::Effect, {}, {}).id;
+            g.findNode(nId)->script = wt.encode();
+
+            int n = resolveSpectralReferences(g);
+            r.checkVal(n == 1, "spectral: resolve mirrors a wavetable-nested frame", n);
+
+            WavetableDoc back;
+            r.check(back.decode(g.findNode(nId)->script),
+                    "spectral: wavetable script still decodes after resolve");
+            bool found = false;
+            for (auto& e : back.library)
+                if (auto* s = dynamic_cast<SpectralFrame*>(e.wave.get())) {
+                    found = (s->doc.mag.expression == "exp(-f/6)" &&
+                             s->doc.magAssetId == aid);
+                }
+            r.check(found, "spectral: nested frame curve matches the published asset");
+        }
+    }
+
     // ---- import / merge: dedup by content, id remap, name-clash suffix ------
     {
         // Source library (from "another project"): three assets.

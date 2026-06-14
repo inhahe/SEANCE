@@ -916,6 +916,16 @@ The **same Built-in / Lua / Python / GLSL dropdown and bake machinery documented
 
 When a script language is selected the equation field grows into a multi-line editor (additive-style bodies that `return` a value are common for spectra). Bake errors show as a red `Script error: …` overlay on the curve canvas.
 
+### Library-linked mag/phase curves
+
+Each of the two curves has its own **Library…** button (above its canvas) that ties it into the project's [Frequency Graphs library](#frequency-graph-library-curves), using the exact same publish / link / detach popup as the Spectrum Tap (the shared `showFrequencyGraphLibraryMenu` helper):
+
+- **Add this curve to library** — publishes the magnitude (or phase) curve as a new `FrequencyGraph` asset and links it (default name `Magnitude curve` / `Phase curve`).
+- **Link to existing frequency graph** — mirrors a chosen asset's curve in and links it; editing the curve in *any* linked consumer (this node, a Spectrum Tap bin, another Spectral node/frame) writes back to the shared asset and re-resolves every reference.
+- **Detach (make independent)** — drops the link, keeps the curve.
+
+A status line under each button shows **Independent curve** or **Linked: <name> (#id) — edits propagate**. Hard-deleting the asset makes the curve fall back to its last cached shape as independent. This works both for a **standalone Frequency Domain node** and for a **Spectral frame nested inside a wavetable** (the wavetable shell passes its project graph into the sub-editor so library linking is available there too). Resolution is `resolveSpectralReferences()` (`spectral_editor.cpp`), called after `readProject()` and after each edit; it walks both standalone `__spectral2__` nodes and `__wavetable…` nodes (resolving any `SpectralFrame` in their frame library).
+
 ### SpectrumTap
 
 The **SpectrumTap** effect reuses `SpectralCurve` for a per-bin custom frequency response, so the same Equation/Drawn authoring and Built-in/Lua/Python/GLSL language choice applies there too. Right-click a bin → **Edit response curve…** opens the curve editor.
@@ -930,7 +940,7 @@ A status line under the canvas shows **Independent curve** or **Linked to librar
 
 ### Serialization
 
-`__spectral2__:<fftSize>|<mag.encode()>|<phase.encode()>` — each curve's `encode()` embeds its mode, expression (with `,`→`;` and `|`→`\x1F` escaping so it's safe inside the `|`-delimited blob), and language key. The older `__spectral__:<fftSize>:<phaseMode>:<magExpr>|<phaseExpr>` format still decodes (as Built-in equations). Baked sample buffers are transient and re-created via `SpectralCurve::rebake()` on load.
+`__spectral2__:<fftSize>|<mag.encode()>|<phase.encode()>` — each curve's `encode()` embeds its mode, expression (with `,`→`;` and `|`→`\x1F` escaping so it's safe inside the `|`-delimited blob), and language key. Two optional trailing `|`-fields follow, each self-identified by a prefix so order is flexible and unknown fields are skipped: `warp:<chain>` (the per-bin warp chain) and `refs:<magAssetId>:<phaseAssetId>` (the FrequencyGraph live-reference ids, emitted only when a curve is linked). `refs:` is written *after* `warp:` so an old decoder — which only checked `parts[3]` for a `warp:` prefix — still finds its warp and harmlessly ignores the ref field. The older `__spectral__:<fftSize>:<phaseMode>:<magExpr>|<phaseExpr>` format still decodes (as Built-in equations). Baked sample buffers are transient and re-created via `SpectralCurve::rebake()` on load.
 
 The SpectrumTap script is `__spectrumtap__|<fftSize>|<curve0>|<curve1>|…` where each `<curveK>` is empty (biquad default) or a `SpectralCurve::encode()` payload. Bins linked to a `FrequencyGraph` asset append a trailing `|#refs|<slot>:<assetId>|…` section carrying the reference ids; the cached curve still persists in its slot so a deleted asset degrades gracefully. Pre-`#refs` decoders treat the `#refs` token as an un-decodable (hence biquad) slot and ignore it, so the format is backward compatible.
 
@@ -2132,9 +2142,14 @@ has one tab per asset kind:
   frequency-domain curve (a `SpectralCurve`: an EQ/response shape over a `[0,1]`
   frequency axis). A distinct kind because a frequency curve is fundamentally
   different from a time-domain wave shape or an amplitude envelope. Shared by the
-  Spectral FFT waveform type, the EQ node, and the **Spectrum Tap** per-bin custom
-  response (published from the Spectrum Tap response editor's **Library…** button —
-  see [SpectrumTap](#spectrumtap)). The payload is **source-preserving**: the
+  **Spectral FFT** waveform type's magnitude/phase curves (both a standalone
+  Frequency Domain node and a Spectral frame nested inside a wavetable — each
+  curve has its own **Library…** button, `resolveSpectralReferences`), the EQ
+  node, and the **Spectrum Tap** per-bin custom response (published from the
+  Spectrum Tap response editor's **Library…** button — see
+  [SpectrumTap](#spectrumtap)). The publish / link / detach popup is one shared
+  helper (`showFrequencyGraphLibraryMenu` in `curve_editor.cpp`) used by every
+  consumer. The payload is **source-preserving**: the
   equation text *and* its authoring language for formula curves, the control points
   for Drawn/Points, and the per-sample buffer for Drawn/Freehand all round-trip, so
   a stored curve can always be re-edited in the form it was authored.
@@ -2158,7 +2173,9 @@ surface favourites out of a large library.
   every other reference (`resolveAhdsrReferences` for curves,
   `resolveWaveformReferences` for waveforms, `resolveWarpReferences` for morph
   algorithms, `resolveSpectrumTapReferences` for Spectrum Tap frequency-graph
-  response curves).
+  response curves, `resolveSpectralReferences` for Spectral FFT mag/phase curves
+  — both standalone Frequency Domain nodes and Spectral frames nested inside
+  wavetable nodes).
 - **No detach-in-place.** To make one copy diverge from the shared asset, use
   **Duplicate** (mints a new id) and point the node at the duplicate (e.g. via the
   waveform editor's **Use Library…** picker). There is deliberately no per-instance

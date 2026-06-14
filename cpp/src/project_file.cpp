@@ -1,5 +1,6 @@
 #include "project_file.h"
 #include "asset_import.h"
+#include "spectrum_tap.h"   // resolveSpectrumTapReferences (FrequencyGraph refs)
 #include <juce_core/juce_core.h>
 #include <functional>
 #include <fstream>
@@ -1013,6 +1014,11 @@ bool ProjectFile::readProject(std::istream& f, NodeGraph& graph, PluginHost* plu
     // reconcile the node's "Warp N" modulation params. Free function in
     // layered_wave_editor.cpp.
     resolveWarpReferences(graph);
+
+    // Same for live-referenced FrequencyGraph assets: mirror each referenced
+    // curve into the spectrum-tap bins that point at it, re-encoding the
+    // affected node scripts. Free function in spectrum_tap.cpp.
+    resolveSpectrumTapReferences(graph);
 
     // Restore open editors (store IDs only - never store Node*)
     graph.openEditors.clear();

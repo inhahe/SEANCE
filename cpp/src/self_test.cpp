@@ -13,6 +13,7 @@
 #include "content_store.h"         // ContentStore - baked-blob side-store tests
 #include "project_file.h"          // serializeForUndo / writeProject - blob persistence
 #include "asset_import.h"           // importAssets - cross-project asset merge
+#include "spectrum_tap.h"           // SpectrumTap FrequencyGraph live references
 #include "pitch_detect.h"           // detectPitchYIN / detectPitchAutocorrelation
 #include "adsr_envelope.h"
 #include "video_decoder.h"
@@ -3304,6 +3305,106 @@ void testAssetLibrary(Report& r) {
             r.check(lf && SpectralCurve::decode(lf->payload, dFh) &&
                         dFh.freehandMode && dFh.drawnSamples.size() == 512,
                     "freqgraph: freehand samples survive save/load");
+        }
+    }
+
+    // ---- Spectrum Tap live-references a FrequencyGraph asset per bin --------
+    {
+        // encode/decode must carry the per-bin asset id alongside the cached
+        // curve, and a legacy script (no #refs section) must decode to -1 ids.
+        {
+            std::vector<FrequencyBin> bins(2);
+            bins[0].useCustomResponse = true;
+            bins[0].responseCurve.expression = "exp(-f/5)";
+            bins[0].responseCurveAssetId = 1000007;
+            bins[1].useCustomResponse = true;
+            bins[1].responseCurve.expression = "f";    // independent
+            std::string script = SpectrumTapProcessor::encodeScript(
+                bins, SpectrumTapProcessor::kDefaultFftSize);
+
+            int fft; std::vector<SpectralCurve> cv; std::vector<bool> uc;
+            std::vector<int> ids;
+            SpectrumTapProcessor::decodeScript(script, fft, cv, uc, ids);
+            r.check(ids.size() == 2 && ids[0] == 1000007 && ids[1] == -1 &&
+                        uc[0] && uc[1],
+                    "spectap: per-bin asset id round-trips through script codec");
+
+            // Legacy script (no #refs) -> all ids default to -1.
+            std::string legacy = "__spectrumtap__|1024|" +
+                                 bins[1].responseCurve.encode();
+            int f2; std::vector<SpectralCurve> c2; std::vector<bool> u2;
+            std::vector<int> i2;
+            SpectrumTapProcessor::decodeScript(legacy, f2, c2, u2, i2);
+            r.check(i2.size() == 1 && i2[0] == -1 && u2[0],
+                    "spectap: legacy script (no #refs) decodes ids as -1");
+        }
+
+        // Full live-reference flow: publish a curve, reference it from a bin
+        // that caches a STALE curve, resolve, edit, save/load, erase.
+        NodeGraph g;
+        SpectralCurve shared;
+        shared.mode = SpectralCurve::Equation;
+        shared.expression = "exp(-f/7)";
+        int aid = g.assets.add(AssetKind::FrequencyGraph, "shared resp", "",
+                               shared.encode());
+
+        int nId = g.addNode("tap", NodeType::Effect, {}, {}).id;
+        {
+            std::vector<FrequencyBin> bins(1);
+            bins[0].useCustomResponse = true;
+            bins[0].responseCurve.expression = "1";          // stale cache
+            bins[0].responseCurveAssetId = aid;
+            g.findNode(nId)->script = SpectrumTapProcessor::encodeScript(
+                bins, SpectrumTapProcessor::kDefaultFftSize);
+        }
+
+        int n = resolveSpectrumTapReferences(g);
+        r.checkVal(n == 1, "spectap: resolve mirrors the one referenced curve", n);
+        {
+            int fft; std::vector<SpectralCurve> cv; std::vector<bool> uc;
+            std::vector<int> ids;
+            SpectrumTapProcessor::decodeScript(g.findNode(nId)->script, fft, cv, uc, ids);
+            r.check(cv.size() == 1 && cv[0].expression == "exp(-f/7)" &&
+                        ids[0] == aid,
+                    "spectap: resolved bin curve matches the published asset");
+        }
+
+        // Edit the asset -> propagates on next resolve.
+        SpectralCurve edited; edited.expression = "exp(-f/3)";
+        g.assets.update(aid, "", edited.encode());
+        resolveSpectrumTapReferences(g);
+        {
+            int fft; std::vector<SpectralCurve> cv; std::vector<bool> uc;
+            std::vector<int> ids;
+            SpectrumTapProcessor::decodeScript(g.findNode(nId)->script, fft, cv, uc, ids);
+            r.check(cv.size() == 1 && cv[0].expression == "exp(-f/3)",
+                    "spectap: editing the asset propagates to the referencing bin");
+        }
+
+        // Save/load preserves the reference and re-resolves on load.
+        std::ostringstream oss;
+        ProjectFile::writeProject(oss, g, nullptr, false, true);
+        NodeGraph g2; std::istringstream iss(oss.str());
+        ProjectFile::readProject(iss, g2, nullptr);
+        {
+            int fft; std::vector<SpectralCurve> cv; std::vector<bool> uc;
+            std::vector<int> ids;
+            SpectrumTapProcessor::decodeScript(g2.findNode(nId)->script, fft, cv, uc, ids);
+            r.check(cv.size() == 1 && ids[0] == aid &&
+                        cv[0].expression == "exp(-f/3)",
+                    "spectap: bin reference re-resolves after save/load");
+        }
+
+        // Erase the asset -> bin detaches to independent, keeps its last curve.
+        g.assets.erase(aid);
+        resolveSpectrumTapReferences(g);
+        {
+            int fft; std::vector<SpectralCurve> cv; std::vector<bool> uc;
+            std::vector<int> ids;
+            SpectrumTapProcessor::decodeScript(g.findNode(nId)->script, fft, cv, uc, ids);
+            r.check(cv.size() == 1 && ids[0] == -1 &&
+                        cv[0].expression == "exp(-f/3)",
+                    "spectap: erased asset -> bin falls back to independent");
         }
     }
 

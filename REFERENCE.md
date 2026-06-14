@@ -918,11 +918,21 @@ When a script language is selected the equation field grows into a multi-line ed
 
 ### SpectrumTap
 
-The **SpectrumTap** effect reuses `SpectralCurve` for a per-bin custom frequency response, so the same Equation/Drawn authoring and Built-in/Lua/Python/GLSL language choice applies there too.
+The **SpectrumTap** effect reuses `SpectralCurve` for a per-bin custom frequency response, so the same Equation/Drawn authoring and Built-in/Lua/Python/GLSL language choice applies there too. Right-click a bin → **Edit response curve…** opens the curve editor.
+
+**Library-linked response curves.** The response editor has a **Library…** button that ties a bin's response into the project's [Frequency Graphs library](#frequency-graph-library-curves):
+
+- **Add this curve to library** — publishes the bin's current curve as a new `FrequencyGraph` asset and links the bin to it (gives it a default name `Response <bin label>`; rename later in the library browser).
+- **Link to existing frequency graph** — submenu of every non-archived `FrequencyGraph` asset; picking one mirrors that asset's curve into the bin and links it. From then on, editing the curve in *any* linked bin (on this or another node) writes back to the shared asset and re-resolves every reference, so they all update together.
+- **Detach (make independent)** — drops the link but keeps the current curve as an independent copy.
+
+A status line under the canvas shows **Independent curve** or **Linked to library curve: <name> (#id) — edits propagate**. **Use Default (bandpass)** and the bin's **Delete** also detach any link. Hard-deleting the referenced asset (from the library browser) makes the bin fall back to its last cached curve as an independent curve — references never dangle. Resolution is done by `resolveSpectrumTapReferences()` (`spectrum_tap.cpp`), called after `readProject()` and after each edit, mirroring `resolveAhdsrReferences()`.
 
 ### Serialization
 
 `__spectral2__:<fftSize>|<mag.encode()>|<phase.encode()>` — each curve's `encode()` embeds its mode, expression (with `,`→`;` and `|`→`\x1F` escaping so it's safe inside the `|`-delimited blob), and language key. The older `__spectral__:<fftSize>:<phaseMode>:<magExpr>|<phaseExpr>` format still decodes (as Built-in equations). Baked sample buffers are transient and re-created via `SpectralCurve::rebake()` on load.
+
+The SpectrumTap script is `__spectrumtap__|<fftSize>|<curve0>|<curve1>|…` where each `<curveK>` is empty (biquad default) or a `SpectralCurve::encode()` payload. Bins linked to a `FrequencyGraph` asset append a trailing `|#refs|<slot>:<assetId>|…` section carrying the reference ids; the cached curve still persists in its slot so a deleted asset degrades gracefully. Pre-`#refs` decoders treat the `#refs` token as an un-decodable (hence biquad) slot and ignore it, so the format is backward compatible.
 
 ---
 
@@ -2116,6 +2126,16 @@ has one tab per asset kind:
 - **Morph Algorithms** — a frame-scope **warp chain** (a `std::vector<WarpOp>`:
   the ordered shape-bending stages applied to a wavetable frame). Published from
   the wavetable editor's warp panel.
+- <a name="frequency-graph-library-curves"></a>**Frequency Graphs** — a 1-D
+  frequency-domain curve (a `SpectralCurve`: an EQ/response shape over a `[0,1]`
+  frequency axis). A distinct kind because a frequency curve is fundamentally
+  different from a time-domain wave shape or an amplitude envelope. Shared by the
+  Spectral FFT waveform type, the EQ node, and the **Spectrum Tap** per-bin custom
+  response (published from the Spectrum Tap response editor's **Library…** button —
+  see [SpectrumTap](#spectrumtap)). The payload is **source-preserving**: the
+  equation text *and* its authoring language for formula curves, the control points
+  for Drawn/Points, and the per-sample buffer for Drawn/Freehand all round-trip, so
+  a stored curve can always be re-edited in the form it was authored.
 
 Each tab lists its assets with **Rename**, **Duplicate**, **Star** / **Unstar**,
 **Archive** (soft-delete) / **Restore**, and **Delete** (hard erase, with a
@@ -2135,7 +2155,8 @@ surface favourites out of a large library.
   node, or from this dialog — is written back to the asset and **propagated** to
   every other reference (`resolveAhdsrReferences` for curves,
   `resolveWaveformReferences` for waveforms, `resolveWarpReferences` for morph
-  algorithms).
+  algorithms, `resolveSpectrumTapReferences` for Spectrum Tap frequency-graph
+  response curves).
 - **No detach-in-place.** To make one copy diverge from the shared asset, use
   **Duplicate** (mints a new id) and point the node at the duplicate (e.g. via the
   waveform editor's **Use Library…** picker). There is deliberately no per-instance

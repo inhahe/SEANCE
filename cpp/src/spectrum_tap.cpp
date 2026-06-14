@@ -537,20 +537,11 @@ void SpectrumTapComponent::syncCurvesToScript() {
 }
 
 void SpectrumTapComponent::commitCurveEdit(int binSlotIdx) {
-    if (binSlotIdx < 0 || binSlotIdx >= (int)binCurveStates.size()) {
-        syncCurvesToScript();
-        return;
-    }
-    auto& st = binCurveStates[binSlotIdx];
-    if (st.assetId >= 0) {
-        // Live reference: push the edit into the shared asset, then propagate
-        // to every bin/node referencing it (including other slots on this node).
-        graph.assets.update(st.assetId, "", st.curve.encode());
-        syncCurvesToScript();
-        resolveSpectrumTapReferences(graph);
-    } else {
-        syncCurvesToScript();
-    }
+    // No write-back: a linked curve is read-only, so edits only happen on an
+    // independent curve with no asset to propagate to. A shared library item is
+    // changed only by editing it in the library.
+    juce::ignoreUnused(binSlotIdx);
+    syncCurvesToScript();
 }
 
 void SpectrumTapComponent::openResponseEditor(int binSlotIdx) {
@@ -608,9 +599,9 @@ void SpectrumTapComponent::openResponseEditor(int binSlotIdx) {
             linkLabel.setColour(juce::Label::textColourId, juce::Colour(0xFFAAAAAA));
             libraryBtn.setTooltip(
                 "Publish this response curve to the project's Frequency Graphs "
-                "library, link this bin to an existing library curve (edits then "
-                "propagate to every bin/node sharing it), or detach to an "
-                "independent copy.");
+                "library, load a copy of a library curve (independent), or link "
+                "this bin to one as a live, read-only mirror. A linked curve is "
+                "edited only in the library; Unlink to edit it here.");
             setSize(560, 388);
         }
         void resized() override {
@@ -657,9 +648,10 @@ void SpectrumTapComponent::openResponseEditor(int binSlotIdx) {
             const AssetEntry* e = graph.assets.find(aid);
             juce::String nm = e ? juce::String(e->name) : juce::String("(missing)");
             container->linkLabel.setText("Linked to library curve: " + nm +
-                                         " (#" + juce::String(aid) + ")  - edits propagate",
+                                         " (#" + juce::String(aid) + ")  - read only, Unlink to edit",
                                          juce::dontSendNotification);
         }
+        container->panel.setReadOnly(aid >= 0);
     };
     updateLinkLabel();
 

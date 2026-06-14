@@ -3671,6 +3671,34 @@ void testAssetLibrary(Report& r) {
             }
         }
 
+        // B2) Fork isolation (new library model): an INDEPENDENT node (assetId
+        //     -1) holding a copy of an asset's content must NOT track later edits
+        //     to that asset. This is the "load a copy forks by default" contract -
+        //     only a *linked* node propagates. Guards against any accidental
+        //     reintroduction of consumer-side write-back / auto-link.
+        {
+            NodeGraph g;
+            SpectralCurve shared; shared.expression = "exp(-f/4)";
+            int aid = g.assets.add(AssetKind::FrequencyGraph, "eq lib", "",
+                                   shared.encode());
+            // Forked node: same content, but independent (id -1).
+            int nId = g.addNode("ceq", NodeType::Effect, {}, {}).id;
+            {
+                SpectralCurve copy; copy.expression = "exp(-f/4)";
+                g.findNode(nId)->script = CurveEq::encode(copy, -1);
+            }
+            // Edit the asset and resolve: the forked node is untouched.
+            SpectralCurve edited; edited.expression = "exp(-f/2)";
+            g.assets.update(aid, "", edited.encode());
+            int n = resolveCurveEqReferences(g);
+            {
+                SpectralCurve c; int id = 0;
+                CurveEq::decode(g.findNode(nId)->script, c, id);
+                r.check(id == -1 && c.expression == "exp(-f/4)" && n == 0,
+                        "curveeq: forked (independent) node ignores asset edits");
+            }
+        }
+
         // C) DSP sanity: unity curve "1" passes audio through (central RMS ~=
         //    input); zero curve "0" silences it. Zero latency, so central
         //    samples line up with the dry signal.

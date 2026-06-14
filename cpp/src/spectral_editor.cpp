@@ -335,9 +335,10 @@ void SpectralEditorComponent::initUI() {
                                bool isMag, const char* which) {
             addAndMakeVisible(btn);
             btn.setTooltip(juce::String("Publish this ") + which +
-                " curve to the project's Frequency Graphs library, link it to an "
-                "existing library curve (edits then propagate to every node "
-                "sharing it), or detach to an independent copy.");
+                " curve to the project's Frequency Graphs library, load a copy "
+                "of a library curve (independent), or link to one as a live, "
+                "read-only mirror. A linked curve is edited only in the library; "
+                "Unlink to edit it here.");
             btn.onClick = [this, isMag]() { openCurveLibrary(isMag); };
             addAndMakeVisible(lbl);
             lbl.setFont(11.0f);
@@ -346,6 +347,7 @@ void SpectralEditorComponent::initUI() {
         setupLib(phaseLibraryBtn, phaseLinkLabel, false, "phase");
         setupLib(magLibraryBtn,   magLinkLabel,   true,  "magnitude");
         refreshLinkLabels();
+        refreshReadOnly();
     }
 
     // Per-bin warp chain (Bucket C). Sits in a strip below the curve panels.
@@ -555,9 +557,9 @@ void SpectralEditorComponent::commitToNode() {
 
 void SpectralEditorComponent::onCurveChanged() {
     refreshPreview();
-    // A linked curve's edit must flow back to its asset so every other consumer
-    // sharing it updates too (the "live reference" contract).
-    writeBackLinkedCurves();
+    // No write-back: a linked curve is read-only, so an edit can only happen on
+    // an independent (unlinked) curve, which has no asset to propagate to. The
+    // only way to change a shared library item is to edit it in the library.
     if (externalFrame != nullptr) {
         // Embedded inside the layered-wave editor: commit immediately so the
         // parent's f->render() sees fresh data, and call onApply right away
@@ -576,21 +578,10 @@ void SpectralEditorComponent::onCurveChanged() {
     startTimer(500);
 }
 
-void SpectralEditorComponent::writeBackLinkedCurves() {
+void SpectralEditorComponent::refreshReadOnly() {
     if (assetGraph == nullptr) return;
-    bool any = false;
-    if (doc.magAssetId >= 0) {
-        assetGraph->assets.update(doc.magAssetId, "", doc.mag.encode());
-        any = true;
-    }
-    if (doc.phaseAssetId >= 0) {
-        assetGraph->assets.update(doc.phaseAssetId, "", doc.phase.encode());
-        any = true;
-    }
-    // Propagate the fresh asset payload to every other consumer (other spectrum
-    // taps, spectral nodes, wavetable frames). This re-decodes the asset back
-    // into our own doc too, which is a no-op (same content we just wrote).
-    if (any) resolveSpectralReferences(*assetGraph);
+    if (phasePanel) phasePanel->setReadOnly(doc.phaseAssetId >= 0);
+    if (magPanel)   magPanel->setReadOnly(doc.magAssetId >= 0);
 }
 
 void SpectralEditorComponent::refreshLinkLabels() {
@@ -603,7 +594,7 @@ void SpectralEditorComponent::refreshLinkLabels() {
             const AssetEntry* e = assetGraph->assets.find(assetId);
             juce::String nm = e ? juce::String(e->name) : juce::String("(missing)");
             lbl.setText("Linked: " + nm + " (#" + juce::String(assetId) +
-                        ")  - edits propagate", juce::dontSendNotification);
+                        ")  - read only, Unlink to edit", juce::dontSendNotification);
         }
     };
     describe(doc.phaseAssetId, phaseLinkLabel);
@@ -621,14 +612,14 @@ void SpectralEditorComponent::openCurveLibrary(bool isMag) {
     showFrequencyGraphLibraryMenu(anchor, *assetGraph, curve, currentId, name,
         [this, isMag](int newId) {
             (isMag ? doc.magAssetId : doc.phaseAssetId) = newId;
-            // The menu may have replaced the curve (link case); reflect it in
-            // the panel's text/toggles.
+            // The menu may have replaced the curve (load-copy / link case);
+            // reflect it in the panel's text/toggles.
             (isMag ? magPanel : phasePanel)->syncFromModel();
-            // Persist: re-encode our node/frame, write the (possibly new) link
-            // back to its asset, and propagate to other consumers.
+            // Persist the new link state. No write-back: linking mirrors the
+            // asset INTO our curve (read-only); a copy/unlink is independent.
             commitToNode();
-            writeBackLinkedCurves();
             refreshLinkLabels();
+            refreshReadOnly();
             refreshPreview();
             if (onApply) onApply();
         });
@@ -669,8 +660,9 @@ CurveEQEditorComponent::CurveEQEditorComponent(NodeGraph& g, int nId,
 
     addAndMakeVisible(libraryBtn);
     libraryBtn.setTooltip("Publish this response curve to the project's Frequency "
-        "Graphs library, link it to an existing library curve (edits then "
-        "propagate to every node sharing it), or detach to an independent copy.");
+        "Graphs library, load a copy of a library curve (independent), or link to "
+        "one as a live, read-only mirror. A linked curve is edited only in the "
+        "library; Unlink to edit it here.");
     libraryBtn.onClick = [this]() { openLibrary(); };
 
     addAndMakeVisible(linkLabel);
@@ -687,6 +679,7 @@ CurveEQEditorComponent::CurveEQEditorComponent(NodeGraph& g, int nId,
     };
 
     refreshLinkLabel();
+    refreshReadOnly();
     setSize(560, 360);
 }
 
@@ -722,9 +715,9 @@ void CurveEQEditorComponent::timerCallback() {
 }
 
 void CurveEQEditorComponent::onCurveChanged() {
-    // A linked curve's edit flows back to its asset so every other consumer
-    // sharing it updates too (the "live reference" contract).
-    writeBackLinkedCurve();
+    // No write-back: a linked curve is read-only, so edits only happen on an
+    // independent curve with no asset to propagate to. A shared library item is
+    // changed only by editing it in the library.
     // Debounce the audio-graph rebuild, same as the spectral editor.
     startTimer(500);
 }
@@ -737,11 +730,8 @@ void CurveEQEditorComponent::commitToNode() {
     }
 }
 
-void CurveEQEditorComponent::writeBackLinkedCurve() {
-    if (assetId < 0) return;
-    graph.assets.update(assetId, "", curve.encode());
-    // Propagate to every other Curve EQ consumer sharing this asset.
-    resolveCurveEqReferences(graph);
+void CurveEQEditorComponent::refreshReadOnly() {
+    if (curvePanel) curvePanel->setReadOnly(assetId >= 0);
 }
 
 void CurveEQEditorComponent::refreshLinkLabel() {
@@ -752,7 +742,7 @@ void CurveEQEditorComponent::refreshLinkLabel() {
         const AssetEntry* e = graph.assets.find(assetId);
         juce::String nm = e ? juce::String(e->name) : juce::String("(missing)");
         linkLabel.setText("Linked: " + nm + " (#" + juce::String(assetId) +
-                          ")  - edits propagate", juce::dontSendNotification);
+                          ")  - read only, Unlink to edit", juce::dontSendNotification);
     }
 }
 
@@ -763,8 +753,8 @@ void CurveEQEditorComponent::openLibrary() {
             assetId = newId;
             if (curvePanel) curvePanel->syncFromModel();
             commitToNode();
-            writeBackLinkedCurve();
             refreshLinkLabel();
+            refreshReadOnly();
             if (onApply) onApply();
         });
 }

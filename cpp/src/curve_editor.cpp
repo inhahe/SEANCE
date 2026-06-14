@@ -331,6 +331,18 @@ SpectralCurvePanel::SpectralCurvePanel(SpectralCurve& curve_,
     updateModeUI();
 }
 
+void SpectralCurvePanel::setReadOnly(bool ro) {
+    if (readOnly == ro) return;
+    readOnly = ro;
+    exprEditor.setReadOnly(ro);
+    exprEditor.setCaretVisible(!ro);
+    equationBtn.setEnabled(!ro);
+    drawBtn.setEnabled(!ro);
+    freehandToggle.setEnabled(!ro);
+    langCombo.setEnabled(!ro);
+    repaint();
+}
+
 void SpectralCurvePanel::syncFromModel() {
     if (curve.mode == SpectralCurve::Equation
         && exprEditor.getText().toStdString() != curve.expression)
@@ -487,6 +499,20 @@ void SpectralCurvePanel::paint(juce::Graphics& g) {
                          cb.toNearestInt().reduced(4),
                          juce::Justification::topLeft, 3);
     }
+
+    // Read-only badge (curve is a live library link - editing happens in the
+    // library, or via "Unlink to edit").
+    if (readOnly) {
+        juce::String badge = "linked - read only";
+        g.setFont(11.0f);
+        int tw = g.getCurrentFont().getStringWidth(badge) + 12;
+        juce::Rectangle<float> r((float)(cb.getRight() - tw - 4), cb.getY() + 4.0f,
+                                 (float)tw, 16.0f);
+        g.setColour(juce::Colour(40, 60, 90).withAlpha(0.85f));
+        g.fillRoundedRectangle(r, 3.0f);
+        g.setColour(juce::Colour(0xFFAEC8E8));
+        g.drawText(badge, r, juce::Justification::centred);
+    }
 }
 
 float SpectralCurvePanel::yToPixel(float v, const juce::Rectangle<float>& cb) const {
@@ -548,6 +574,7 @@ void SpectralCurvePanel::writeFreehandSample(float x, float y) {
 }
 
 void SpectralCurvePanel::mouseDown(const juce::MouseEvent& e) {
+    if (readOnly) return;
     if (curve.mode != SpectralCurve::Drawn) return;
     float x, y;
     if (!mouseToCurveXY(e.position, x, y)) return;
@@ -588,6 +615,7 @@ void SpectralCurvePanel::mouseDown(const juce::MouseEvent& e) {
 }
 
 void SpectralCurvePanel::mouseDrag(const juce::MouseEvent& e) {
+    if (readOnly) return;
     if (curve.mode != SpectralCurve::Drawn) return;
     auto cb = getCanvasBoundsF();
     auto cp = e.position;
@@ -618,6 +646,7 @@ void SpectralCurvePanel::mouseDrag(const juce::MouseEvent& e) {
 }
 
 void SpectralCurvePanel::mouseUp(const juce::MouseEvent&) {
+    if (readOnly) return;
     draggingIdx = -1;
     freehandDrawing = false;
     lastFreehandIdx = -1;
@@ -636,36 +665,54 @@ void showFrequencyGraphLibraryMenu(juce::Component* anchor,
     juce::PopupMenu m;
     m.addItem(1, "Add this curve to library");
 
-    juce::PopupMenu refMenu;
     // Snapshot the current FrequencyGraph assets. Captured by value into the
     // async callback - the user can't mutate the asset store while the popup is
     // open, so the raw pointers stay valid for the lifetime of the menu (the
     // same pattern the Spectrum Tap response editor uses).
     auto graphs = graph.assets.list(AssetKind::FrequencyGraph, false);
-    const int base = 1000;
-    for (size_t i = 0; i < graphs.size(); ++i)
-        refMenu.addItem(base + (int) i,
-                        juce::String(graphs[i]->name) +
-                        " (#" + juce::String(graphs[i]->id) + ")");
-    m.addSubMenu("Link to existing frequency graph", refMenu, !graphs.empty());
-    m.addItem(2, "Detach (make independent)", currentId >= 0);
+    const int copyBase = 2000;   // "Load a copy" item ids
+    const int linkBase = 1000;   // "Link" item ids
+    juce::PopupMenu copyMenu, linkMenu;
+    for (size_t i = 0; i < graphs.size(); ++i) {
+        juce::String label = juce::String(graphs[i]->name) +
+                             " (#" + juce::String(graphs[i]->id) + ")";
+        copyMenu.addItem(copyBase + (int) i, label);
+        linkMenu.addItem(linkBase + (int) i, label);
+    }
+    // Loading a library curve forks by default (independent copy). Linking is
+    // the opt-in, and a linked curve is read-only until unlinked - the only way
+    // to edit a shared library item is in the library itself. See the
+    // FrequencyGraph library model in REFERENCE.md.
+    m.addSubMenu("Load a copy from library", copyMenu, !graphs.empty());
+    m.addSubMenu("Link to library curve (live, read-only)", linkMenu, !graphs.empty());
+    m.addItem(2, "Unlink to edit", currentId >= 0);
 
     m.showMenuAsync(juce::PopupMenu::Options().withTargetComponent(anchor),
-        [&graph, &curve, defaultName, onChanged = std::move(onChanged), graphs, base]
+        [&graph, &curve, defaultName, onChanged = std::move(onChanged),
+         graphs, copyBase, linkBase]
         (int r) {
             if (r == 0) return;  // dismissed
             if (r == 1) {
-                int id = graph.assets.add(AssetKind::FrequencyGraph,
-                                          defaultName.toStdString(), "",
-                                          curve.encode());
-                if (onChanged) onChanged(id);
+                // Publish a copy into the library. The node stays independent
+                // (fork model): you've deposited a copy, not handed the node's
+                // future edits to the library.
+                graph.assets.add(AssetKind::FrequencyGraph,
+                                 defaultName.toStdString(), "", curve.encode());
+                if (onChanged) onChanged(-1);
             } else if (r == 2) {
-                if (onChanged) onChanged(-1);  // detach, keep the curve
-            } else if (r >= base && r - base < (int) graphs.size()) {
-                const AssetEntry* e = graphs[(size_t)(r - base)];
+                if (onChanged) onChanged(-1);  // unlink, keep the curve
+            } else if (r >= copyBase && r - copyBase < (int) graphs.size()) {
+                const AssetEntry* e = graphs[(size_t)(r - copyBase)];
                 SpectralCurve c;
                 if (e && SpectralCurve::decode(e->payload, c)) {
-                    curve = c;                 // mirror the shared curve
+                    curve = c;                 // fork: independent copy
+                    if (onChanged) onChanged(-1);
+                }
+            } else if (r >= linkBase && r - linkBase < (int) graphs.size()) {
+                const AssetEntry* e = graphs[(size_t)(r - linkBase)];
+                SpectralCurve c;
+                if (e && SpectralCurve::decode(e->payload, c)) {
+                    curve = c;                 // mirror the shared curve (live link)
                     if (onChanged) onChanged(e->id);
                 }
             }

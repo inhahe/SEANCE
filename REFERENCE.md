@@ -928,11 +928,12 @@ When a script language is selected the equation field grows into a multi-line ed
 
 Each of the two curves has its own **Library…** button (above its canvas) that ties it into the project's [Frequency Graphs library](#frequency-graph-library-curves), using the exact same publish / link / detach popup as the Spectrum Tap (the shared `showFrequencyGraphLibraryMenu` helper):
 
-- **Add this curve to library** — publishes the magnitude (or phase) curve as a new `FrequencyGraph` asset and links it (default name `Magnitude curve` / `Phase curve`).
-- **Link to existing frequency graph** — mirrors a chosen asset's curve in and links it; editing the curve in *any* linked consumer (this node, a Spectrum Tap bin, another Spectral node/frame) writes back to the shared asset and re-resolves every reference.
-- **Detach (make independent)** — drops the link, keeps the curve.
+- **Add this curve to library** — publishes the magnitude (or phase) curve as a new `FrequencyGraph` asset (default name `Magnitude curve` / `Phase curve`). The node **stays independent** (a copy is deposited in the library; the node is not auto-linked).
+- **Load a copy from library** — mirrors a chosen asset's curve in as an **independent copy** (no link). The default, frictionless way to reuse a library curve.
+- **Link to library curve** — mirrors a chosen asset's curve in as a **live, read-only mirror**. The curve panel locks; you edit it only in the library, or **Unlink to edit**.
+- **Unlink to edit** — drops the link, keeps the curve, re-enables editing.
 
-A status line under each button shows **Independent curve** or **Linked: <name> (#id) — edits propagate**. Hard-deleting the asset makes the curve fall back to its last cached shape as independent. This works both for a **standalone Frequency Domain node** and for a **Spectral frame nested inside a wavetable** (the wavetable shell passes its project graph into the sub-editor so library linking is available there too). Resolution is `resolveSpectralReferences()` (`spectral_editor.cpp`), called after `readProject()` and after each edit; it walks both standalone `__spectral2__` nodes and `__wavetable…` nodes (resolving any `SpectralFrame` in their frame library).
+A status line under each button shows **Independent curve** or **Linked: <name> (#id) — read only, Unlink to edit**, and a linked panel shows a *linked – read only* badge. Hard-deleting the asset makes the curve fall back to its last cached shape as independent. This works both for a **standalone Frequency Domain node** and for a **Spectral frame nested inside a wavetable** (the wavetable shell passes its project graph into the sub-editor so library linking is available there too). Resolution is `resolveSpectralReferences()` (`spectral_editor.cpp`), called after `readProject()` and after each edit; it walks both standalone `__spectral2__` nodes and `__wavetable…` nodes (resolving any `SpectralFrame` in their frame library). *(See the [model-in-transition note](#asset-library-project-stores); a library-side editor for these assets is still to come.)*
 
 ### SpectrumTap
 
@@ -940,11 +941,12 @@ The **SpectrumTap** effect reuses `SpectralCurve` for a per-bin custom frequency
 
 **Library-linked response curves.** The response editor has a **Library…** button that ties a bin's response into the project's [Frequency Graphs library](#frequency-graph-library-curves):
 
-- **Add this curve to library** — publishes the bin's current curve as a new `FrequencyGraph` asset and links the bin to it (gives it a default name `Response <bin label>`; rename later in the library browser).
-- **Link to existing frequency graph** — submenu of every non-archived `FrequencyGraph` asset; picking one mirrors that asset's curve into the bin and links it. From then on, editing the curve in *any* linked bin (on this or another node) writes back to the shared asset and re-resolves every reference, so they all update together.
-- **Detach (make independent)** — drops the link but keeps the current curve as an independent copy.
+- **Add this curve to library** — publishes the bin's current curve as a new `FrequencyGraph` asset (default name `Response <bin label>`; rename later in the library browser). The bin **stays independent** (not auto-linked).
+- **Load a copy from library** — picks a `FrequencyGraph` asset and mirrors it into the bin as an **independent copy** (no link).
+- **Link to library curve** — picks an asset and makes the bin a **live, read-only mirror** of it; the curve panel locks until you Unlink.
+- **Unlink to edit** — drops the link, keeps the current curve, re-enables editing.
 
-A status line under the canvas shows **Independent curve** or **Linked to library curve: <name> (#id) — edits propagate**. **Use Default (bandpass)** and the bin's **Delete** also detach any link. Hard-deleting the referenced asset (from the library browser) makes the bin fall back to its last cached curve as an independent curve — references never dangle. Resolution is done by `resolveSpectrumTapReferences()` (`spectrum_tap.cpp`), called after `readProject()` and after each edit, mirroring `resolveAhdsrReferences()`.
+A status line under the canvas shows **Independent curve** or **Linked to library curve: <name> (#id) — read only, Unlink to edit**. **Use Default (bandpass)** and the bin's **Delete** also detach any link. Hard-deleting the referenced asset (from the library browser) makes the bin fall back to its last cached curve as an independent curve — references never dangle. Resolution is done by `resolveSpectrumTapReferences()` (`spectrum_tap.cpp`), called after `readProject()` and after each edit, mirroring `resolveAhdsrReferences()`. *(See the [model-in-transition note](#asset-library-project-stores).)*
 
 ### <a name="curve-eq"></a>Curve EQ
 
@@ -2143,8 +2145,34 @@ MIDI-to-control tap.)
 The **asset library** is a per-project collection of reusable building blocks
 that can be **published once and referenced from many places at once**. Unlike
 the app-global *preset* systems (e.g. the AHDSR preset manager), the asset
-library lives **inside the project file** and uses **live references**: editing
-a stored asset updates every node that references it, immediately.
+library lives **inside the project file**.
+
+> **⚠ MODEL IN TRANSITION (2026-06-14) — partially migrated, INCOMPLETE.**
+> The library is moving from a *bidirectional live-reference* model (any
+> referencing node could edit the shared asset, propagating to all references)
+> to a **fork-by-default + opt-in read-only link** model:
+> - **Loading** a library asset into a node **forks** by default — the node gets
+>   an **independent copy**, with no link.
+> - **Linking** is an explicit opt-in that makes the node a **live, read-only
+>   mirror** of the asset. A linked curve can't be edited in the node; you
+>   **Unlink to edit** (which forks it), or edit the shared item **in the
+>   library** (the only sanctioned action-at-distance — propagates to all active
+>   links).
+> - Consumers **never write back** to the asset on edit.
+>
+> **Migrated so far (sanity-check slice):** the three **FrequencyGraph**
+> consumers — **Curve EQ**, **Spectral FFT** mag/phase, **Spectrum Tap** per-bin
+> response. These now fork on load, lock the curve panel when linked, and offer
+> **Unlink to edit**.
+>
+> **Still on the OLD bidirectional model (not yet migrated):** **Waveforms**,
+> **AHDSR Curves**, **Morph Algorithms**. The descriptions in *Identity, ids, and
+> the live-reference model* below still describe the old behavior for those kinds.
+>
+> **Known gap in the migrated slice:** there is **no library-side editor** for
+> FrequencyGraph assets yet, so a *linked* FrequencyGraph curve currently can't
+> be edited at all except by unlinking. Building that editor (and rolling the new
+> model out to the other kinds) is pending a design decision from the user.
 
 Open it from **Edit → Asset Library…**. The dialog (`AssetLibraryComponent`)
 has one tab per asset kind:
@@ -2168,9 +2196,10 @@ has one tab per asset kind:
   **Curve EQ** node's response curve (`resolveCurveEqReferences`, see
   [Curve EQ](#curve-eq)), and the **Spectrum Tap** per-bin custom response (published from the
   Spectrum Tap response editor's **Library…** button — see
-  [SpectrumTap](#spectrumtap)). The publish / link / detach popup is one shared
-  helper (`showFrequencyGraphLibraryMenu` in `curve_editor.cpp`) used by every
-  consumer. The payload is **source-preserving**: the
+  [SpectrumTap](#spectrumtap)). The publish / load-copy / link / unlink popup is
+  one shared helper (`showFrequencyGraphLibraryMenu` in `curve_editor.cpp`) used
+  by every consumer (these three consumers are on the **new fork-by-default +
+  read-only-link** model — see the [transition note](#asset-library-project-stores)). The payload is **source-preserving**: the
   equation text *and* its authoring language for formula curves, the control points
   for Drawn/Points, and the per-sample buffer for Drawn/Freehand all round-trip, so
   a stored curve can always be re-edited in the form it was authored.
@@ -2189,14 +2218,18 @@ surface favourites out of a large library.
   so the two never collide.
 - A node **references an asset by id**, not by copying it. While referenced, the
   node keeps a local resolved copy that the audio thread reads directly (so no
-  string decoding happens per audio block), and any edit — from any referencing
-  node, or from this dialog — is written back to the asset and **propagated** to
-  every other reference (`resolveAhdsrReferences` for curves,
-  `resolveWaveformReferences` for waveforms, `resolveWarpReferences` for morph
-  algorithms, `resolveSpectrumTapReferences` for Spectrum Tap frequency-graph
-  response curves, `resolveSpectralReferences` for Spectral FFT mag/phase curves
-  — both standalone Frequency Domain nodes and Spectral frames nested inside
-  wavetable nodes).
+  string decoding happens per audio block).
+  - **Old model (Waveforms, AHDSR Curves, Morph Algorithms — still current):**
+    any edit — from any referencing node, or from this dialog — is written back
+    to the asset and **propagated** to every other reference
+    (`resolveAhdsrReferences` for curves, `resolveWaveformReferences` for
+    waveforms, `resolveWarpReferences` for morph algorithms).
+  - **New model (FrequencyGraph consumers — migrated):** a link is **read-only**;
+    consumers never write back. The resolvers (`resolveSpectralReferences`,
+    `resolveSpectrumTapReferences`, `resolveCurveEqReferences`) only mirror the
+    asset **into** linked nodes (library → consumer), so editing the asset in the
+    library propagates, but editing a node forks rather than writing back. See the
+    [transition note](#asset-library-project-stores).
 - **No detach-in-place.** To make one copy diverge from the shared asset, use
   **Duplicate** (mints a new id) and point the node at the duplicate (e.g. via the
   waveform editor's **Use Library…** picker). There is deliberately no per-instance

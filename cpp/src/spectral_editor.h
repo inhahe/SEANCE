@@ -167,10 +167,10 @@ private:
     void openCurveLibrary(bool isMag);
     // Refresh both "Independent / Linked to ..." status lines from doc ids.
     void refreshLinkLabels();
-    // Write a linked curve's current shape back to its asset and propagate to
-    // every other consumer via resolveSpectralReferences(). No-op when the
-    // curve isn't linked or there's no assetGraph.
-    void writeBackLinkedCurves();
+    // Lock each panel for editing iff its curve is a live library link. A linked
+    // curve is read-only (edit it in the library, or Unlink to edit) - consumers
+    // never write back to the asset. No-op when there's no assetGraph.
+    void refreshReadOnly();
 
     // Per-bin warp chain editor (Bucket C). Bound to doc.warpChain; baked into
     // the spectrum at render, so its callbacks only re-render + commit (never
@@ -219,7 +219,7 @@ private:
     void onCurveChanged();
     void commitToNode();          // re-encode node.script + snapshot
     void openLibrary();
-    void writeBackLinkedCurve();  // push edits to the linked asset + propagate
+    void refreshReadOnly();       // lock the panel iff the curve is a live link
     void refreshLinkLabel();
 };
 

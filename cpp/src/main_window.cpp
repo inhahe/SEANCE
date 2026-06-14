@@ -3005,6 +3005,12 @@ void MainContentComponent::openProjectFile(const juce::String& path) {
     // ProjectFile::load clears graph.nodes/links and rebuilds them from the
     // file - same batch-mutation race surface as MOD import. See the
     // mutationLock comment in node_graph.h.
+    // Collect any factory-waveform references that fail to resolve against this
+    // build's WaveformBank (e.g. the project was saved by a newer SEANCE whose
+    // waveforms.bin added cycles this build doesn't have). resolveFactoryRef()
+    // silences such layers; without this warning the song would be untrue to
+    // the original with no indication. We warn after the load completes.
+    FactoryRefResolutionScope factoryRefScope;
     {
         std::lock_guard<std::mutex> graphLk(graph.mutationLock);
         ProjectFile::load(path.toStdString(), graph, &audioEngine.getPluginHost());
@@ -3035,6 +3041,42 @@ void MainContentComponent::openProjectFile(const juce::String& path) {
     // Shared-history handling (#90): check for a sidecar and, if it
     // hasn't been seen by this user before, show the 3-option prompt.
     handleSharedHistoryOnOpen(path);
+
+    // Warn if the project referenced built-in factory waveforms this build's
+    // WaveformBank doesn't have (typically a project saved by a newer SEANCE).
+    // Those layers were silenced on load; surfacing the names lets the user
+    // know the song won't sound exactly as authored.
+    if (!factoryRefScope.unresolved.empty()) {
+        juce::StringArray names;
+        for (const auto& n : factoryRefScope.unresolved)
+            names.add(juce::String(n));
+        int extra = 0;
+        const int kMaxListed = 12;
+        if (names.size() > kMaxListed) {
+            extra = names.size() - kMaxListed;
+            names.removeRange(kMaxListed, extra);
+        }
+        juce::String msg =
+            "This project references " + juce::String(factoryRefScope.unresolved.size()) +
+            (factoryRefScope.unresolved.size() == 1
+                 ? " built-in waveform that isn't in this version of SEANCE:\n\n"
+                 : " built-in waveforms that aren't in this version of SEANCE:\n\n") +
+            names.joinIntoString("\n");
+        if (extra > 0)
+            msg += "\n+ " + juce::String(extra) + " more";
+        msg += "\n\nThis usually means the project was saved with a newer version of "
+               "SEANCE that added these waveforms. The affected layers were silenced, "
+               "so the song may not sound exactly as it was authored. Updating SEANCE "
+               "should restore them.";
+        juce::NativeMessageBox::showAsync(
+            juce::MessageBoxOptions()
+                .withIconType(juce::MessageBoxIconType::WarningIcon)
+                .withTitle("Missing built-in waveforms")
+                .withMessage(msg)
+                .withButton("OK")
+                .withAssociatedComponent(this),
+            nullptr);
+    }
 }
 
 void MainContentComponent::freezeNode(int nodeId) {

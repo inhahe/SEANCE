@@ -2005,6 +2005,24 @@ void WaveLayer::rebakeFormula() {
     formulaError = err;
 }
 
+FactoryRefResolutionScope* FactoryRefResolutionScope::active_ = nullptr;
+
+FactoryRefResolutionScope::FactoryRefResolutionScope() {
+    prev_ = active_;
+    active_ = this;
+}
+
+FactoryRefResolutionScope::~FactoryRefResolutionScope() {
+    active_ = prev_;
+}
+
+void FactoryRefResolutionScope::reportUnresolved(const std::string& name) {
+    if (!active_) return;
+    auto& list = active_->unresolved;
+    if (std::find(list.begin(), list.end(), name) == list.end())
+        list.push_back(name);
+}
+
 void WaveLayer::resolveFactoryRef() {
     if (factoryRef.empty()) return;
     shape = Drawn;
@@ -2012,10 +2030,14 @@ void WaveLayer::resolveFactoryRef() {
     auto& bank = WaveformBank::get();
     bank.ensureLoaded();
     int idx = bank.indexForName(factoryRef);
-    if (idx >= 0)
+    if (idx >= 0) {
         drawnSamples = bank.samples(idx);   // 512 samples, copied out
-    else
+    } else {
         drawnSamples.clear();               // unresolved: render silent, keep ref
+        // Notify any active load scope so the user can be warned that this
+        // factory waveform (likely added by a newer SEANCE) was silenced.
+        FactoryRefResolutionScope::reportUnresolved(factoryRef);
+    }
 }
 
 void LayeredWaveform::render(std::vector<float>& out) const {

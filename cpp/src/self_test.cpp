@@ -2048,6 +2048,32 @@ void testWarp(Report& r) {
                     && bad.shape == WaveLayer::Drawn,
                     "factory ref: unresolvable name degrades to silent, keeps ref");
         }
+
+        // Load-scoped collector: an active FactoryRefResolutionScope captures
+        // unresolved names (deduplicated) so a project load can warn the user;
+        // with no scope active, resolution failures stay silent.
+        {
+            WaveLayer a, b, c;
+            a.factoryRef = "__missing_one__";
+            b.factoryRef = "__missing_two__";
+            c.factoryRef = "__missing_one__";  // duplicate of a
+            {
+                FactoryRefResolutionScope scope;
+                a.resolveFactoryRef();
+                b.resolveFactoryRef();
+                c.resolveFactoryRef();
+                r.check(scope.unresolved.size() == 2
+                        && scope.unresolved[0] == "__missing_one__"
+                        && scope.unresolved[1] == "__missing_two__",
+                        "factory ref: scope collects unresolved names, deduped, in order");
+            }
+            // Outside any scope, resolution must not crash and reports nowhere.
+            WaveLayer d;
+            d.factoryRef = "__missing_three__";
+            d.resolveFactoryRef();
+            r.check(d.drawnSamples.empty(),
+                    "factory ref: resolve with no active scope is a silent no-op");
+        }
     }
 
     // ---- Serialization round-trip (backward-compatible warp section) ---

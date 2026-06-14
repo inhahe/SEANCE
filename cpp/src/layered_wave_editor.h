@@ -14,6 +14,42 @@
 
 namespace SoundShop {
 
+// Load-scoped collector for factory-waveform references that fail to resolve
+// against the current build's WaveformBank. A reference is a stable bank NAME
+// (see WaveLayer::factoryRef); resolveFactoryRef() looks it up via
+// WaveformBank::indexForName and, when the name is absent (e.g. the project was
+// saved by a NEWER SEANCE whose waveforms.bin added that cycle), it silences the
+// layer rather than embedding samples. That silent-zeroing would make a loaded
+// song untrue to the original with no indication, so we surface a warning.
+//
+// Usage: construct a FactoryRefResolutionScope on the stack around a project
+// load (or import). While one or more scopes are active, resolveFactoryRef()
+// reports every unresolved name into the innermost scope (deduplicated, in
+// encounter order). After the load completes, inspect `unresolved` and, if
+// non-empty, warn the user. Scopes nest (the active one is a thread-unaware
+// stack - loads happen on the message thread). When no scope is active,
+// resolution failures are simply silent as before (e.g. undo restore, library
+// preview decodes), so only user-facing project opens raise the popup.
+class FactoryRefResolutionScope {
+public:
+    FactoryRefResolutionScope();
+    ~FactoryRefResolutionScope();
+    FactoryRefResolutionScope(const FactoryRefResolutionScope&) = delete;
+    FactoryRefResolutionScope& operator=(const FactoryRefResolutionScope&) = delete;
+
+    // Names of factory waveforms that could not be resolved during this scope,
+    // unique and in the order first encountered.
+    std::vector<std::string> unresolved;
+
+    // Called by WaveLayer::resolveFactoryRef() when a name fails to resolve.
+    // No-op when no scope is active.
+    static void reportUnresolved(const std::string& name);
+
+private:
+    FactoryRefResolutionScope* prev_ = nullptr;
+    static FactoryRefResolutionScope* active_;
+};
+
 // A single layer in a layered waveform: a basic shape at a harmonic ratio,
 // with phase offset and amplitude. Layers are summed into one single-cycle
 // wavetable at edit time (bake-once, not per-note).

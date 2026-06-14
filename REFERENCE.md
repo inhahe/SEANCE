@@ -1196,7 +1196,9 @@ It is the precise successor to the legacy **Wavelet Pitch Tracker** (`__pitchtra
 
 ### How it works
 
-Incoming mono audio is accumulated into a ring buffer. Every **Hop** samples (or once per audio block when Hop = 0), the most recent **Window** samples are handed to the selected detector. The result is mapped to `0..1` and held on the Signal output until the next detection (so the signal is smooth between hops). If a hop finds no confident pitch, the previous value is held rather than dropping to zero.
+Incoming mono audio is accumulated into a ring buffer. Every **Hop** samples (or once per audio block when Hop = 0), the most recent **window** of samples is handed to the selected detector. The result is mapped to `0..1` and held on the Signal output until the next detection (so the signal is smooth between hops). If a hop finds no confident pitch, the previous value is held rather than dropping to zero.
+
+The **analysis window is not a user knob** — it's derived automatically from **Min Hz**. Pitch detection needs roughly `kAnalysisPeriods` (= **3**) full periods of the lowest note to lock on, so the window is computed as `ceil(3 · sampleRate / minHz)` and clamped to `[64, kMaxWindow]` (`kMaxWindow = 65536`). This makes Min Hz the single honest control: lowering it lets the node detect deeper notes but proportionally lengthens the window and therefore the latency. (Earlier builds exposed a redundant manual **Window** param; it was removed because the window length is physically dictated by the lowest frequency you ask it to detect — setting both independently let you pick a window that couldn't actually resolve the chosen Min Hz.)
 
 The two detectors live in `pitch_detect.h` and are shared with the self-test:
 
@@ -1206,9 +1208,9 @@ The two detectors live in `pitch_detect.h` and are shared with the self-test:
 ### Params (on-node rows)
 
 - **Algorithm** — `YIN` / `Autocorr`. Click the row to pick from a popup (it's a discrete choice, not a slider).
-- **Window** — analysis length in samples (default **4096**). A larger window lowers the lowest detectable frequency **and** raises latency; a smaller window reacts faster but can't resolve low notes.
-- **Hop** — re-run interval in samples (default **0** = once per block). Smaller = more responsive, more CPU.
-- **Min Hz** / **Max Hz** — the frequency band that maps to the `0..1` output. **Min Hz is automatically clamped up** to the floor the window can actually resolve (≈ `2·sampleRate / min(window, 0.1·sampleRate)`), since a window that can't hold ~two periods of a note can't detect it. **Max Hz can go well above 20 kHz**: the graph's internal sample rate can far exceed the audio output rate (`NodeGraph::projectSampleRate`, user-selectable up to 192 kHz), so the usable band runs higher than the audio-rate Nyquist would suggest — it's clamped to `0.45·sampleRate`.
+- **Hop** — re-run interval in samples (default **0** = once per block). Smaller = more responsive, more CPU. The output is always block-rate (the Signal pin is refreshed every block and held between detections); Hop just controls how often the detector is actually re-run.
+- **Min Hz** — the lowest note the node can detect. **This also sets the analysis window** (`window = ceil(3·sampleRate / minHz)`) and therefore the latency, so lowering it costs proportionally more delay. It's floored at `3·sampleRate / kMaxWindow` so the derived window still fits the `kMaxWindow = 65536`-sample ring buffer. Together with Max Hz it defines the band that maps to the `0..1` output.
+- **Max Hz** — the top of the output band. **Can go well above 20 kHz**: the graph's internal sample rate can far exceed the audio output rate (`NodeGraph::projectSampleRate`, user-selectable up to 192 kHz), so the usable band runs higher than the audio-rate Nyquist would suggest — it's clamped to `0.45·sampleRate`.
 - **Mapping** — `Log` (default) / `Linear`, a popup pick. **Logarithmic** spaces the output musically (an octave is the same output distance everywhere — the geometric mean of the band sits at `0.5`); **Linear** spaces by raw Hz (the arithmetic mean sits at `0.5`).
 - **Detected Hz** — read-only display of the most recent detection (updated by the audio thread).
 

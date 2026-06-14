@@ -2588,15 +2588,17 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
                     pdn.pinsOut.push_back({graph.allocId(), "Pitch Out", PinKind::Signal, false});
                     pdn.script = "__pitchdetector__";
                     pdn.params.push_back({"Algorithm",     0.0f,     0.0f,     1.0f});  // 0=YIN,1=Autocorr
-                    pdn.params.push_back({"Window",     4096.0f,    64.0f, 65536.0f});  // analysis samples
-                    pdn.params.push_back({"Hop",           0.0f,     0.0f, 16384.0f});  // 0=per block
-                    pdn.params.push_back({"Min Hz",       50.0f,    20.0f, 20000.0f});
+                    pdn.params.push_back({"Hop",           0.0f,     0.0f, 16384.0f});  // 0=per block; update rate
+                    pdn.params.push_back({"Min Hz",       50.0f,    20.0f, 20000.0f});  // also sets window/latency
                     pdn.params.push_back({"Max Hz",     2000.0f,    20.0f, 20000.0f});
                     pdn.params.push_back({"Mapping",       0.0f,     0.0f,     1.0f});  // 0=Log,1=Linear
                     pdn.params.push_back({"Detected Hz",   0.0f,     0.0f, 20000.0f});
                     pdn.pinsIn[0].tooltip =
                         "Audio to analyse. The node measures the fundamental "
-                        "pitch of this signal each block (or each Hop samples).";
+                        "pitch of this signal and emits it on Pitch Out, updating "
+                        "every block (or every Hop samples). Min Hz sets the lowest "
+                        "note it can detect and, with it, the analysis latency - "
+                        "lower Min Hz needs a longer analysis window.";
                     pdn.pinsOut[0].tooltip =
                         "Detected pitch as a 0..1 signal across [Min Hz, Max Hz]. "
                         "0 = Min Hz, 1 = Max Hz. Mapping = Logarithmic spaces the "

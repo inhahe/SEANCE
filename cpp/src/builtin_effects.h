@@ -3024,22 +3024,26 @@ public:
         if (n == 0 || buf.getNumChannels() == 0) return;
 
         int algo = (int)std::round(paramByName(node, "Algorithm", 0.0f)); // 0=YIN,1=Autocorr
-        int window = (int)std::round(paramByName(node, "Window", 4096.0f));
-        window = juce::jlimit(64, kMaxWindow, window);
         int hop = (int)std::round(paramByName(node, "Hop", 0.0f));
         if (hop <= 0) hop = n; // re-run every block
 
         bool logMap = (int)std::round(paramByName(node, "Mapping", 0.0f)) == 0; // 0=log,1=linear
 
-        // The detector analyses up to min(window, 0.1*sr) samples and needs
-        // roughly two full periods to lock on, so the lowest reliably
-        // detectable frequency is ~2*sr / effectiveWindow. Clamp Min Hz up
-        // to that floor so the displayed/used range is honest.
-        float analyzable = std::min((float)window, (float)(sampleRate * 0.1));
-        float windowFloorHz = 2.0f * (float)sampleRate / std::max(1.0f, analyzable);
-        float minHz = std::max(windowFloorHz, paramByName(node, "Min Hz", 50.0f));
         float maxHz = std::min((float)(sampleRate * 0.45), paramByName(node, "Max Hz", 2000.0f));
+
+        // The analysis window is DERIVED from the lowest frequency we must
+        // detect rather than set by hand: pitch detection needs ~kAnalysisPeriods
+        // full periods of the lowest note to lock on, so window = periods*sr/minHz.
+        // This makes "Min Hz" the single honest control - lower detects deeper
+        // notes but costs proportionally more latency (a longer window) - and
+        // removes the redundant manual window knob. Min Hz is floored so the
+        // derived window still fits kMaxWindow.
+        const float kAnalysisPeriods = 3.0f;
+        float minHzFloor = kAnalysisPeriods * (float)sampleRate / (float)kMaxWindow;
+        float minHz = std::max(minHzFloor, paramByName(node, "Min Hz", 50.0f));
         if (maxHz <= minHz) maxHz = minHz + 1.0f;
+        int window = (int)std::ceil(kAnalysisPeriods * (float)sampleRate / minHz);
+        window = juce::jlimit(64, kMaxWindow, window);
 
         // Accumulate the mono input into the ring buffer.
         const float* input = buf.getReadPointer(0);

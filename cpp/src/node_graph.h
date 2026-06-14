@@ -15,6 +15,7 @@
 #include "adsr_envelope.h"
 #include "warp.h"            // WarpOp (granular element warp on audition frames)
 #include "content_store.h"   // content-addressed side-store for baked blobs
+#include "asset_library.h"   // project-level asset stores (waveforms, instruments, ...)
 
 namespace SoundShop {
 
@@ -713,6 +714,14 @@ public:
     // a hash of their canonical .npy payload. Excluded from undo snapshots (the
     // hash travels in the snapshot, the bytes do not) - see content_store.h.
     ContentStore contentStore;
+
+    // Project-level asset library ("stores") - reusable waveforms / generators,
+    // independent instruments, ADHSR curves, and morph algorithms, each published
+    // once and referenced by a stable integer id from many places. See
+    // asset_library.h for the model (explicit add, live-reference-by-id, soft-
+    // delete, disjoint user/built-in id spaces).
+    AssetLibrary assets;
+
     // Dirty tracking - set on any mutation
     bool dirty = false;
 

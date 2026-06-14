@@ -2791,6 +2791,135 @@ static void testBuiltinMath(Report& r) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Project-level asset library ("stores"). Covers the data-model invariants:
+// disjoint user id space, add+find, content-hash dedup, soft-delete, duplicate /
+// update live-edit, and a save/load round-trip through writeProject/readProject.
+// ---------------------------------------------------------------------------
+void testAssetLibrary(Report& r) {
+    r.section("Asset library (stores)");
+
+    // ---- id allocation: user ids start at the disjoint base ----------------
+    {
+        AssetLibrary lib;
+        r.check(AssetLibrary::kUserIdBase >= 1000000,
+                "assets: user id base is in the high disjoint range");
+        int a = lib.add(AssetKind::Waveform, "saw", "layered", "BODY_A");
+        int b = lib.add(AssetKind::Waveform, "sine", "layered", "BODY_B");
+        r.check(a == AssetLibrary::kUserIdBase, "assets: first id == kUserIdBase");
+        r.check(b == a + 1, "assets: second id increments");
+        r.check(lib.find(a) && lib.find(a)->name == "saw",
+                "assets: find() returns the added entry by id");
+        r.check(lib.find(99) == nullptr, "assets: find() of unknown id is null");
+    }
+
+    // ---- content-hash dedup: identical (kind,subType,payload) -> same hash --
+    {
+        AssetLibrary lib;
+        int a = lib.add(AssetKind::Waveform, "name-one", "layered", "SAME");
+        int b = lib.add(AssetKind::Waveform, "name-two", "layered", "SAME");
+        r.check(lib.find(a)->contentHash == lib.find(b)->contentHash,
+                "assets: same content -> same hash (name/id ignored)");
+        // Different payload -> different hash.
+        int c = lib.add(AssetKind::Waveform, "name-three", "layered", "DIFF");
+        r.check(lib.find(a)->contentHash != lib.find(c)->contentHash,
+                "assets: different payload -> different hash");
+        // Different kind -> different hash even with identical subType/payload.
+        int d = lib.add(AssetKind::Instrument, "name-four", "layered", "SAME");
+        r.check(lib.find(a)->contentHash != lib.find(d)->contentHash,
+                "assets: different kind -> different hash");
+        // Field-boundary safety: subType/payload split must not alias.
+        std::string h1 = AssetLibrary::computeHash(AssetKind::Waveform, "a", "bc");
+        std::string h2 = AssetLibrary::computeHash(AssetKind::Waveform, "ab", "c");
+        r.check(h1 != h2, "assets: hash respects subType/payload boundary");
+        // findByHash resolves to a live, non-archived entry.
+        const AssetEntry* hit = lib.findByHash(lib.find(a)->contentHash);
+        r.check(hit != nullptr, "assets: findByHash finds a matching entry");
+    }
+
+    // ---- soft-delete: archive hides from list() but stays resolvable -------
+    {
+        AssetLibrary lib;
+        int a = lib.add(AssetKind::AhdsrCurve, "env1", "", "P1");
+        int b = lib.add(AssetKind::AhdsrCurve, "env2", "", "P2");
+        r.check(lib.list(AssetKind::AhdsrCurve).size() == 2,
+                "assets: list shows both before archiving");
+        r.check(lib.archive(a), "assets: archive returns true for known id");
+        r.check(lib.list(AssetKind::AhdsrCurve).size() == 1,
+                "assets: archived entry hidden from default list");
+        r.check(lib.list(AssetKind::AhdsrCurve, /*includeArchived*/true).size() == 2,
+                "assets: includeArchived re-includes the archived entry");
+        r.check(lib.find(a) != nullptr,
+                "assets: archived entry still resolvable by id (refs stay valid)");
+        r.check(lib.findByHash(lib.find(a)->contentHash) == nullptr,
+                "assets: findByHash skips archived entries");
+        r.check(lib.restore(a) && lib.list(AssetKind::AhdsrCurve).size() == 2,
+                "assets: restore un-hides");
+        (void) b;
+    }
+
+    // ---- duplicate + live update -------------------------------------------
+    {
+        AssetLibrary lib;
+        int a = lib.add(AssetKind::MorphAlgorithm, "warpA", "chain", "OPS1");
+        int dup = lib.duplicate(a, "warpA copy");
+        r.check(dup != 0 && dup != a, "assets: duplicate yields a new id");
+        r.check(lib.find(dup)->payload == "OPS1" && lib.find(dup)->name == "warpA copy",
+                "assets: duplicate copies payload, takes new name");
+        r.check(lib.find(dup)->contentHash == lib.find(a)->contentHash,
+                "assets: duplicate shares content hash (same content)");
+        // update() repoints payload in place (live edit) and rehashes.
+        std::string oldHash = lib.find(a)->contentHash;
+        r.check(lib.update(a, "chain", "OPS2"), "assets: update returns true");
+        r.check(lib.find(a)->payload == "OPS2", "assets: update changed payload in place");
+        r.check(lib.find(a)->contentHash != oldHash, "assets: update rehashed");
+        r.check(lib.find(dup)->payload == "OPS1",
+                "assets: duplicate is independent of the original after update");
+    }
+
+    // ---- save / load round-trip through project_file -----------------------
+    {
+        NodeGraph g;
+        int w = g.assets.add(AssetKind::Waveform, "my wave", "layered", "WAVE_PAYLOAD\nline2");
+        int inst = g.assets.add(AssetKind::Instrument, "my inst", "composite", "INST_PAYLOAD");
+        int arch = g.assets.add(AssetKind::AhdsrCurve, "old env", "", "ENV");
+        g.assets.archive(arch);
+
+        std::ostringstream oss;
+        ProjectFile::writeProject(oss, g, nullptr, /*includeView*/false,
+                                  /*includeBlobs*/true);
+        std::string saved = oss.str();
+        r.check(saved.find("[AssetStore]") != std::string::npos,
+                "assets: save emits [AssetStore] sections");
+
+        NodeGraph g2;
+        std::istringstream iss(saved);
+        ProjectFile::readProject(iss, g2, nullptr);
+        r.check(g2.assets.size() == 3, "assets: all three entries round-trip");
+        const AssetEntry* rw = g2.assets.find(w);
+        r.check(rw && rw->name == "my wave" && rw->subType == "layered" &&
+                    rw->payload == "WAVE_PAYLOAD\nline2",
+                "assets: waveform payload (multi-line) survives round-trip");
+        r.check(rw && rw->contentHash ==
+                    AssetLibrary::computeHash(AssetKind::Waveform, "layered",
+                                              "WAVE_PAYLOAD\nline2"),
+                "assets: loaded hash matches recomputed content hash");
+        const AssetEntry* ri = g2.assets.find(inst);
+        r.check(ri && ri->kind == AssetKind::Instrument,
+                "assets: instrument kind round-trips");
+        const AssetEntry* ra = g2.assets.find(arch);
+        r.check(ra && ra->archived, "assets: archived flag round-trips");
+        // nextId must be bumped past the loaded ids so new allocs don't collide.
+        r.check(g2.assets.allocId() > inst,
+                "assets: load bumps nextId past all loaded ids");
+
+        // Undo serialization must INCLUDE assets (store edits are undoable state).
+        std::string snap = ProjectFile::serializeForUndo(g);
+        r.check(snap.find("[AssetStore]") != std::string::npos,
+                "assets: undo snapshot includes [AssetStore] (store edits undoable)");
+    }
+}
+
 int runSelfTest(const juce::File& outDir) {
     outDir.createDirectory();
     Report r;
@@ -2804,6 +2933,7 @@ int runSelfTest(const juce::File& outDir) {
     testVideoDecode(r, outDir);
     testGlslCompute(r, outDir);
     testBuiltinMath(r);
+    testAssetLibrary(r);
 
     r.section("Summary");
     r.line("  PASSED: " + juce::String(r.passed));

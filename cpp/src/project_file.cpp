@@ -115,6 +115,27 @@ bool ProjectFile::writeProject(std::ostream& f, NodeGraph& graph,
         if (!ids.empty()) writeStr(f, "linkIds", ids);
     }
 
+    // Project-level asset library ("stores"). Each entry is one reusable asset
+    // (waveform/generator, instrument, ADHSR curve, or morph algorithm) keyed by
+    // a stable user id. Written into undo snapshots too (store edits are project
+    // state and must be undoable) - the payloads are encoded bodies, generally
+    // small. The opaque payload is base64-encoded so arbitrary content (including
+    // newlines) survives the line-based format. The content hash is saved and
+    // trusted on load (not recomputed), mirroring [Blob]. Archived (soft-deleted)
+    // entries are persisted too so existing references stay resolvable.
+    for (const auto& a : graph.assets.all()) {
+        f << "\n[AssetStore]\n";
+        writeInt(f, "id", a.id);
+        writeStr(f, "kind", assetKindTag(a.kind));
+        writeStr(f, "name", a.name);
+        if (!a.subType.empty()) writeStr(f, "subType", a.subType);
+        writeStr(f, "hash", a.contentHash);
+        if (a.archived) writeInt(f, "archived", 1);
+        juce::String b64 = juce::Base64::toBase64(a.payload.data(),
+                                                  (int) a.payload.size());
+        writeStr(f, "payload", b64.toStdString());
+    }
+
     writeInt(f, "nextId", 0);
     if (!graph.signalScript.empty()) {
         // Encode signal script with line count prefix so we know where it ends
@@ -474,6 +495,7 @@ bool ProjectFile::readProject(std::istream& f, NodeGraph& graph, PluginHost* plu
     Node* curNode = nullptr;
     Clip* curClip = nullptr;
     std::string curBlobHash;   // [Blob] section: hash read before its bytes line
+    AssetEntry curAsset;       // [AssetStore] section: built up, committed on payload
     int maxId = 0;
 
     auto getValue = [](const std::string& line) -> std::string {
@@ -529,6 +551,8 @@ bool ProjectFile::readProject(std::istream& f, NodeGraph& graph, PluginHost* plu
                 graph.waveformLibrary.push_back({});
             } else if (section == "[EffectGroup]") {
                 graph.effectGroups.push_back({});
+            } else if (section == "[AssetStore]") {
+                curAsset = AssetEntry{};   // staged, committed when payload arrives
             }
             continue;
         }
@@ -859,6 +883,27 @@ bool ProjectFile::readProject(std::istream& f, NodeGraph& graph, PluginHost* plu
                 auto comma = val.find(',');
                 if (comma != std::string::npos)
                     wf.points.push_back({std::stof(val.substr(0, comma)), std::stof(val.substr(comma + 1))});
+            }
+        }
+        else if (section == "[AssetStore]") {
+            // Project-level asset library entry (see writeProject [AssetStore]).
+            // Fields arrive in write order with payload LAST, so we stage into
+            // curAsset and commit when the payload line is seen. id/hash are
+            // trusted from the file (not recomputed), mirroring [Blob].
+            if (key == "id") curAsset.id = std::stoi(val);
+            else if (key == "kind") assetKindFromTag(val, curAsset.kind);
+            else if (key == "name") curAsset.name = val;
+            else if (key == "subType") curAsset.subType = val;
+            else if (key == "hash") curAsset.contentHash = val;
+            else if (key == "archived") curAsset.archived = (val == "1");
+            else if (key == "payload") {
+                juce::MemoryOutputStream mos;
+                if (juce::Base64::convertFromBase64(mos, val)) {
+                    const char* d = (const char*) mos.getData();
+                    curAsset.payload.assign(d, d + mos.getDataSize());
+                }
+                graph.assets.insertRaw(curAsset);   // bumps nextId past this id
+                curAsset = AssetEntry{};
             }
         }
         else if (section == "[Blob]") {

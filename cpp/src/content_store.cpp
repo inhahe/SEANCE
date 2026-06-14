@@ -1,34 +1,14 @@
 #include "content_store.h"
+#include "hash_util.h"
 #include <juce_core/juce_core.h>
 #include <cstdio>
 #include <cstring>
 
 namespace SoundShop {
+// 128-bit content hash lives in hash_util.h now (single source of truth, shared
+// with the asset library). hash128(...) call sites below resolve to it via the
+// enclosing SoundShop namespace, so they are unchanged.
 namespace {
-
-// ---- 128-bit content hash (two decorrelated FNV-1a lanes + avalanche) ------
-// Not cryptographic - this is for dedup/addressing only. A collision would load
-// the wrong blob, so we use 128 bits: birthday-safe far past any realistic blob
-// count in a project. Deterministic across runs/platforms (fixed constants,
-// byte-wise), which is what content addressing needs.
-uint64_t avalanche(uint64_t z) {
-    z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ull;
-    z = (z ^ (z >> 27)) * 0x94d049bb133111ebull;
-    return z ^ (z >> 31);
-}
-std::string hash128(const uint8_t* d, size_t n) {
-    const uint64_t prime = 0x100000001b3ull;
-    uint64_t h1 = 0xcbf29ce484222325ull;   // standard FNV-1a 64 basis
-    uint64_t h2 = 0x84222325cbf29ce4ull;   // rotated basis for lane 2
-    for (size_t i = 0; i < n; ++i) h1 = (h1 ^ d[i]) * prime;       // forward
-    for (size_t i = n; i-- > 0;)   h2 = (h2 ^ d[i]) * prime;       // reversed
-    h1 = avalanche(h1);
-    h2 = avalanche(h2);
-    char buf[33];
-    std::snprintf(buf, sizeof(buf), "%016llx%016llx",
-                  (unsigned long long) h1, (unsigned long long) h2);
-    return std::string(buf, 32);
-}
 
 // ---- byte-plane shuffle filter (4-byte elements) ---------------------------
 // Groups the 4 bytes of each float32 into separate planes so the high-entropy

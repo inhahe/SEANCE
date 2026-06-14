@@ -65,6 +65,10 @@ target_sources(SEANCE PRIVATE
     src/node_graph.h
     src/content_store.cpp
     src/content_store.h
+    src/hash_util.cpp
+    src/hash_util.h
+    src/asset_library.cpp
+    src/asset_library.h
     src/node_graph_component.cpp
     src/node_graph_component.h
     src/piano_roll_component.cpp

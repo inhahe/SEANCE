@@ -10,6 +10,9 @@
 #define HAS_WASM3 0
 #endif
 
+#include "waveform_bank.h"      // shared cross-language waveform() factory bank
+#include "warp.h"               // shared cross-language warpamp/warpphase shapers
+#include "buffer_warp.h"        // Bucket C whole-buffer spectral/wavelet warps
 #include <cstring>
 #include <cstdio>
 #include <cmath>
@@ -87,7 +90,7 @@ bool WasmScriptProcessor::loadWasm(const std::vector<uint8_t>& wasmBytes) {
     wasmEnv = m3_NewEnvironment();
     if (!wasmEnv) { fprintf(stderr, "[WASM] Failed to create environment\n"); return false; }
 
-    // 4 pages = 256 KB — plenty for audio buffers
+    // 4 pages = 256 KB - plenty for audio buffers
     wasmRuntime = m3_NewRuntime(wasmEnv, 4 * 65536, this);
     if (!wasmRuntime) { fprintf(stderr, "[WASM] Failed to create runtime\n"); return false; }
 
@@ -96,6 +99,10 @@ bool WasmScriptProcessor::loadWasm(const std::vector<uint8_t>& wasmBytes) {
 
     result = m3_LoadModule(wasmRuntime, wasmModule);
     if (result) { fprintf(stderr, "[WASM] Load error: %s\n", result); return false; }
+
+    // Warm the factory-waveform bank off the audio thread so ss_waveform() and
+    // ss_waveform_id() are allocation-free when called from ss_process().
+    { auto& bank = WaveformBank::get(); bank.ensureLoaded(); bank.indexForName(""); }
 
     // Link host imports
     m3_LinkRawFunction(wasmModule, "env", "ss_declare_param", "i(*fff)", [](IM3Runtime rt, IM3ImportContext ctx, uint64_t* sp, void* mem) -> const void* {
@@ -129,6 +136,21 @@ bool WasmScriptProcessor::loadWasm(const std::vector<uint8_t>& wasmBytes) {
         return m3Err_none;
     });
 
+    // ss_note_to_freq(midinote) -> Hz, using the project tuning system
+    // (Equal12 / Pythagorean / Just / Meantone + concert pitch). Out-of-range
+    // notes return 0. Mirrors notefreq() in the scripting languages; note-name
+    // <-> number parsing stays WASM-side (pure helpers in soundshop_wasm.h).
+    m3_LinkRawFunction(wasmModule, "env", "ss_note_to_freq", "f(i)", [](IM3Runtime rt, IM3ImportContext ctx, uint64_t* sp, void* mem) -> const void* {
+        auto* self = (WasmScriptProcessor*)m3_GetUserData(rt);
+        int n = (int)(int32_t)sp[0];
+        float hz = (n < 0 || n > 127) ? 0.0f : self->transport.noteToFreq(n);
+        *(float*)&sp[0] = hz;
+        return m3Err_none;
+    });
+
+    // ss_midi_out(samplePos, status, d1, d2): emit a MIDI event to output 0.
+    // The 8th event byte (off+7) carries the destination output index; this
+    // single-output form always tags 0.
     m3_LinkRawFunction(wasmModule, "env", "ss_midi_out", "v(iiii)", [](IM3Runtime rt, IM3ImportContext ctx, uint64_t* sp, void* mem) -> const void* {
         auto* self = (WasmScriptProcessor*)m3_GetUserData(rt);
         uint32_t count = rmem<uint32_t>(self->wasmMem, H_MIDI_OUT_COUNT);
@@ -139,8 +161,115 @@ bool WasmScriptProcessor::loadWasm(const std::vector<uint8_t>& wasmBytes) {
         self->wasmMem[off + 4] = (uint8_t)sp[1];
         self->wasmMem[off + 5] = (uint8_t)sp[2];
         self->wasmMem[off + 6] = (uint8_t)sp[3];
-        self->wasmMem[off + 7] = 0;
+        self->wasmMem[off + 7] = 0; // output index 0
         wmem<uint32_t>(self->wasmMem, H_MIDI_OUT_COUNT, count + 1);
+        return m3Err_none;
+    });
+
+    // ss_midi_out_n(out_index, samplePos, status, d1, d2): emit a MIDI event to
+    // the given output pin. Routed to an independent cable when the script also
+    // exports ss_num_midi_outputs() > 1 (see copyMidiOut + the graph's per-output
+    // channel filter). out_index is clamped to the declared output count.
+    m3_LinkRawFunction(wasmModule, "env", "ss_midi_out_n", "v(iiiii)", [](IM3Runtime rt, IM3ImportContext ctx, uint64_t* sp, void* mem) -> const void* {
+        auto* self = (WasmScriptProcessor*)m3_GetUserData(rt);
+        uint32_t count = rmem<uint32_t>(self->wasmMem, H_MIDI_OUT_COUNT);
+        if (count >= MAX_MIDI_EVENTS) return m3Err_none;
+        uint32_t off = self->midiOutOffset + count * MIDI_EVENT_SIZE;
+        if (off + MIDI_EVENT_SIZE > self->wasmMemSize) return m3Err_none;
+        int outIdx = (int)(int32_t)sp[0];
+        if (outIdx < 0) outIdx = 0;
+        if (outIdx > self->numMidiOutPins - 1) outIdx = self->numMidiOutPins - 1;
+        wmem<uint32_t>(self->wasmMem, off + 0, (uint32_t)sp[1]);
+        self->wasmMem[off + 4] = (uint8_t)sp[2];
+        self->wasmMem[off + 5] = (uint8_t)sp[3];
+        self->wasmMem[off + 6] = (uint8_t)sp[4];
+        self->wasmMem[off + 7] = (uint8_t)outIdx;
+        wmem<uint32_t>(self->wasmMem, H_MIDI_OUT_COUNT, count + 1);
+        return m3Err_none;
+    });
+
+    // ss_waveform(id, phase) -> sample from the shared factory-waveform bank
+    // (the same waveform() the Built-in/Lua/Python/GLSL formula languages use).
+    m3_LinkRawFunction(wasmModule, "env", "ss_waveform", "f(if)", [](IM3Runtime rt, IM3ImportContext ctx, uint64_t* sp, void* mem) -> const void* {
+        int id = (int)(int32_t)sp[0];
+        float phase = *(float*)&sp[1];
+        *(float*)&sp[0] = WaveformBank::get().sampleAtPhase(id, phase);
+        return m3Err_none;
+    });
+
+    // ss_waveform_id(name) -> stable entry index (-1 if unknown).
+    m3_LinkRawFunction(wasmModule, "env", "ss_waveform_id", "i(*)", [](IM3Runtime rt, IM3ImportContext ctx, uint64_t* sp, void* mem) -> const void* {
+        auto* self = (WasmScriptProcessor*)m3_GetUserData(rt);
+        uint32_t namePtr = (uint32_t)sp[0];
+        const char* name = namePtr < self->wasmMemSize ? (const char*)(self->wasmMem + namePtr) : "";
+        int id = WaveformBank::get().indexForName(name);
+        sp[0] = (uint64_t)(uint32_t)(int32_t)id;
+        return m3Err_none;
+    });
+
+    // ss_warpamp(method, x, amount) / ss_warpphase(method, phase, amount) -> the
+    // wavetable shape-bending warps as pure scalar functions, routed to the SAME
+    // warpAmpValue/warpPhaseValue primitives the editor and synth voice use.
+    // `method` is the integer WarpMethod id (resolve a name once via ss_warp_method).
+    m3_LinkRawFunction(wasmModule, "env", "ss_warpamp", "f(iff)", [](IM3Runtime rt, IM3ImportContext ctx, uint64_t* sp, void* mem) -> const void* {
+        WarpMethod m = (WarpMethod)(int)(int32_t)sp[0];
+        float x   = *(float*)&sp[1];
+        float amt = *(float*)&sp[2];
+        *(float*)&sp[0] = warpAmpValue(m, x, amt);
+        return m3Err_none;
+    });
+    m3_LinkRawFunction(wasmModule, "env", "ss_warpphase", "f(iff)", [](IM3Runtime rt, IM3ImportContext ctx, uint64_t* sp, void* mem) -> const void* {
+        WarpMethod m = (WarpMethod)(int)(int32_t)sp[0];
+        float ph  = *(float*)&sp[1];
+        float amt = *(float*)&sp[2];
+        *(float*)&sp[0] = warpPhaseValue(m, ph, amt);
+        return m3Err_none;
+    });
+    // ss_warp_method(name) -> integer WarpMethod id (0/None if unknown).
+    m3_LinkRawFunction(wasmModule, "env", "ss_warp_method", "i(*)", [](IM3Runtime rt, IM3ImportContext ctx, uint64_t* sp, void* mem) -> const void* {
+        auto* self = (WasmScriptProcessor*)m3_GetUserData(rt);
+        uint32_t namePtr = (uint32_t)sp[0];
+        const char* name = namePtr < self->wasmMemSize ? (const char*)(self->wasmMem + namePtr) : "";
+        sp[0] = (uint64_t)(uint32_t)(int32_t)warpMethodFromName(name);
+        return m3Err_none;
+    });
+
+    // ss_spectralwarp(ptr, len, method, amount) / ss_waveletwarp(ptr, len, method,
+    // amount, filterPtr, levels) -> Bucket C representation-bound warps applied IN
+    // PLACE to a float buffer in WASM linear memory (ptr = byte offset of the first
+    // float, len = sample count). Whole-buffer FFT-magnitude / DWT-coefficient
+    // shaping (see buffer_warp.h). Allocates a scratch vector - note-on/block-rate,
+    // not per-sample hot path.
+    m3_LinkRawFunction(wasmModule, "env", "ss_spectralwarp", "v(iiif)", [](IM3Runtime rt, IM3ImportContext ctx, uint64_t* sp, void* mem) -> const void* {
+        auto* self = (WasmScriptProcessor*)m3_GetUserData(rt);
+        uint32_t ptr = (uint32_t)sp[0];
+        int      len = (int)(int32_t)sp[1];
+        WarpMethod m = (WarpMethod)(int)(int32_t)sp[2];
+        float    amt = *(float*)&sp[3];
+        if (!self->wasmMem || len <= 0) return m3Err_none;
+        if ((uint64_t)ptr + (uint64_t)len * 4u > self->wasmMemSize) return m3Err_none;
+        float* base = (float*)(self->wasmMem + ptr);
+        std::vector<float> buf(base, base + len);
+        spectralWarpBuffer(buf, m, amt);
+        for (int i = 0; i < len; ++i) base[i] = buf[(size_t)i];
+        return m3Err_none;
+    });
+    m3_LinkRawFunction(wasmModule, "env", "ss_waveletwarp", "v(iiifii)", [](IM3Runtime rt, IM3ImportContext ctx, uint64_t* sp, void* mem) -> const void* {
+        auto* self = (WasmScriptProcessor*)m3_GetUserData(rt);
+        uint32_t ptr       = (uint32_t)sp[0];
+        int      len       = (int)(int32_t)sp[1];
+        WarpMethod m       = (WarpMethod)(int)(int32_t)sp[2];
+        float    amt       = *(float*)&sp[3];
+        uint32_t filterPtr = (uint32_t)sp[4];
+        int      levels    = (int)(int32_t)sp[5];
+        if (!self->wasmMem || len <= 0) return m3Err_none;
+        if ((uint64_t)ptr + (uint64_t)len * 4u > self->wasmMemSize) return m3Err_none;
+        const char* filter = (filterPtr && filterPtr < self->wasmMemSize)
+                             ? (const char*)(self->wasmMem + filterPtr) : "db4";
+        float* base = (float*)(self->wasmMem + ptr);
+        std::vector<float> buf(base, base + len);
+        waveletWarpBuffer(buf, m, amt, filter, levels);
+        for (int i = 0; i < len; ++i) base[i] = buf[(size_t)i];
         return m3Err_none;
     });
 
@@ -167,11 +296,27 @@ bool WasmScriptProcessor::loadWasm(const std::vector<uint8_t>& wasmBytes) {
     numAudioInPairs  = juce::jlimit(0, 8, numAudioInPairs);
     numAudioOutPairs = juce::jlimit(1, 8, numAudioOutPairs);
 
+    // Optional: number of independent MIDI output pins (default 1). Scripts that
+    // want to route to multiple MIDI cables export ss_num_midi_outputs() and emit
+    // via ss_midi_out_n(out_index, ...).
+    IM3Function fnNumMidiOut = nullptr;
+    m3_FindFunction(&fnNumMidiOut, wasmRuntime, "ss_num_midi_outputs");
+    if (fnNumMidiOut) { m3_CallV(fnNumMidiOut); m3_GetResultsV(fnNumMidiOut, &numMidiOutPins); }
+    numMidiOutPins = juce::jlimit(1, 16, numMidiOutPins);
+
+    // Optional: number of independent MIDI input pins (default 1). Scripts that
+    // want to distinguish several MIDI sources export ss_num_midi_inputs() and
+    // read each event's input_index (byte 7).
+    IM3Function fnNumMidiIn = nullptr;
+    m3_FindFunction(&fnNumMidiIn, wasmRuntime, "ss_num_midi_inputs");
+    if (fnNumMidiIn) { m3_CallV(fnNumMidiIn); m3_GetResultsV(fnNumMidiIn, &numMidiInPins); }
+    numMidiInPins = juce::jlimit(1, 16, numMidiInPins);
+
     // Initialize header before calling ss_init
     computeOffsets();
     writeHeader();
 
-    // Call ss_init — script declares parameters here
+    // Call ss_init - script declares parameters here
     result = m3_CallV(fnInit);
     if (result) {
         fprintf(stderr, "[WASM] ss_init error: %s\n", result);
@@ -207,8 +352,16 @@ void WasmScriptProcessor::populateNodePins(Node& n) {
         n.pinsIn.push_back({nextPinId++, name, PinKind::Audio, true, 2});
     }
 
-    // MIDI input
-    n.pinsIn.push_back({nextPinId++, "MIDI In", PinKind::Midi, true});
+    // MIDI input(s). One "MIDI In" pin by default; if the script declared
+    // ss_num_midi_inputs() > 1 we expose "MIDI In 1..N" and the graph stamps each
+    // incoming cable's channel so copyMidiIn() can tag events with input_index.
+    if (numMidiInPins <= 1) {
+        n.pinsIn.push_back({nextPinId++, "MIDI In", PinKind::Midi, true});
+    } else {
+        for (int i = 0; i < numMidiInPins; ++i)
+            n.pinsIn.push_back({nextPinId++, "MIDI In " + std::to_string(i + 1),
+                                PinKind::Midi, true});
+    }
 
     // Param inputs
     for (int i = 0; i < (int)paramDecls.size(); ++i) {
@@ -227,8 +380,16 @@ void WasmScriptProcessor::populateNodePins(Node& n) {
         n.pinsOut.push_back({nextPinId++, name, PinKind::Audio, false, 2});
     }
 
-    // MIDI output
-    n.pinsOut.push_back({nextPinId++, "MIDI Out", PinKind::Midi, false});
+    // MIDI output(s). One "MIDI Out" pin by default; if the script declared
+    // ss_num_midi_outputs() > 1 we expose "MIDI Out 1..N" and the graph splices
+    // a per-output channel filter so each behaves as an independent cable.
+    if (numMidiOutPins <= 1) {
+        n.pinsOut.push_back({nextPinId++, "MIDI Out", PinKind::Midi, false});
+    } else {
+        for (int i = 0; i < numMidiOutPins; ++i)
+            n.pinsOut.push_back({nextPinId++, "MIDI Out " + std::to_string(i + 1),
+                                 PinKind::Midi, false});
+    }
 }
 
 // ==============================================================================
@@ -269,7 +430,7 @@ void WasmScriptProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Midi
     // Call the script's process function
     M3Result result = m3_CallV(fnProcess);
     if (result) {
-        // Script error — mute output
+        // Script error - mute output
         buf.clear();
         midi.clear();
         return;
@@ -394,7 +555,11 @@ void WasmScriptProcessor::copyMidiIn(const juce::MidiBuffer& midi) {
         wasmMem[off + 4] = raw[0];
         wasmMem[off + 5] = msg.getRawDataSize() > 1 ? raw[1] : 0;
         wasmMem[off + 6] = msg.getRawDataSize() > 2 ? raw[2] : 0;
-        wasmMem[off + 7] = 0;
+        // input_index: for a multi-input node the graph stamped the channel
+        // nibble with (input-pin index + 1); recover the 0-based pin here.
+        wasmMem[off + 7] = (numMidiInPins > 1)
+            ? (uint8_t)juce::jlimit(0, numMidiInPins - 1, msg.getChannel() - 1)
+            : 0;
         count++;
     }
     wmem<uint32_t>(wasmMem, H_MIDI_IN_COUNT, count);
@@ -411,6 +576,18 @@ void WasmScriptProcessor::copyMidiOut(juce::MidiBuffer& midi) {
         uint8_t status = wasmMem[off + 4];
         uint8_t d1 = wasmMem[off + 5];
         uint8_t d2 = wasmMem[off + 6];
+        uint8_t outIdx = wasmMem[off + 7];
+
+        // Multi-output routing: re-stamp the channel nibble of channel-voice
+        // messages (status 0x80..0xEF) to (outIdx+1) so the graph's per-output
+        // MidiChannelFilterProcessor can split each output into its own cable.
+        // System messages (0xF0+) have no channel nibble and pass through.
+        // With a single output we leave the status byte untouched so the
+        // script's own channel choice survives.
+        if (numMidiOutPins > 1 && status >= 0x80 && status < 0xF0) {
+            int ch = juce::jlimit(0, numMidiOutPins - 1, (int)outIdx); // 0-based
+            status = (uint8_t)((status & 0xF0) | (ch & 0x0F));
+        }
         midi.addEvent(juce::MidiMessage(status, d1, d2), (int)samplePos);
     }
 }

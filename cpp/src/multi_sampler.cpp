@@ -3,9 +3,23 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
+#include <cstdio>
 #include <sstream>
 
 namespace SoundShop {
+
+// ---- Lanczos-4 windowed sinc interpolation helpers ----
+// sinc(x) = sin(pi*x) / (pi*x), with sinc(0) = 1.
+static inline float sinc(float x) {
+    if (std::abs(x) < 1e-6f) return 1.0f;
+    const float px = 3.14159265358979323846f * x;
+    return std::sin(px) / px;
+}
+// Lanczos window: sinc(x/a) for |x| < a, else 0. a = 4 for Lanczos-4.
+static inline float lanczos4(float x) {
+    if (std::abs(x) >= 4.0f) return 0.0f;
+    return sinc(x) * sinc(x * 0.25f);  // sinc(x) * sinc(x/4)
+}
 
 // ==============================================================================
 // SamplerEnvelope
@@ -18,7 +32,7 @@ float SamplerEnvelope::evaluate(float t, bool noteHeld) const {
     // Sustain: while the note is held, clamp playback time to the
     // sustainEnd point so the envelope freezes at that value until
     // note-off. This is the simplest interpretation of IT's "sustain
-    // loop" — IT also supports looping between sustainStart and
+    // loop" - IT also supports looping between sustainStart and
     // sustainEnd, which we could add later if needed.
     if (noteHeld && hasSustain
         && sustainEnd >= 0 && sustainEnd < (int)points.size())
@@ -30,7 +44,7 @@ float SamplerEnvelope::evaluate(float t, bool noteHeld) const {
     if (t <= points.front().time) return points.front().value;
     if (t >= points.back().time)  return points.back().value;
 
-    // Linear interpolation between adjacent points — matches
+    // Linear interpolation between adjacent points - matches
     // OpenMPT / Impulse Tracker envelope rendering.
     for (size_t i = 0; i + 1 < points.size(); ++i) {
         const auto& a = points[i];
@@ -97,7 +111,7 @@ static std::string encodeEnv(const SamplerEnvelope& e) {
 static SamplerEnvelope decodeEnv(const std::string& val) {
     SamplerEnvelope e;
     if (val.empty()) return e;
-    // First token is the expected point count (advisory — we trust the
+    // First token is the expected point count (advisory - we trust the
     // actual parsed points rather than the header).
     std::vector<std::string> toks;
     {
@@ -152,6 +166,11 @@ std::string MultiSamplerDoc::encode() const {
     s << "filterCutoff="    << filterCutoff    << "\n";
     s << "filterResonance=" << filterResonance << "\n";
     s << "filterMode="      << filterMode      << "\n";
+    if (interpMode != InterpMode::Sinc) s << "interpMode=" << (int)interpMode << "\n";
+    if (amigaFilter) {
+        s << "amigaFilter=1\n";
+        s << "amigaFilterHz=" << amigaFilterHz << "\n";
+    }
     if (!volumeEnv.empty()) s << "volumeEnv=" << encodeEnv(volumeEnv) << "\n";
     if (!panEnv.empty())    s << "panEnv="    << encodeEnv(panEnv)    << "\n";
     if (!pitchEnv.empty())  s << "pitchEnv="  << encodeEnv(pitchEnv)  << "\n";
@@ -236,6 +255,9 @@ bool MultiSamplerDoc::decode(const std::string& script) {
             else if (key == "filterCutoff")    filterCutoff    = (float)std::atof(val.c_str());
             else if (key == "filterResonance") filterResonance = (float)std::atof(val.c_str());
             else if (key == "filterMode")      filterMode      = std::atoi(val.c_str());
+            else if (key == "interpMode")      interpMode      = (InterpMode)std::atoi(val.c_str());
+            else if (key == "amigaFilter")     amigaFilter     = (val == "1" || val == "true");
+            else if (key == "amigaFilterHz")   amigaFilterHz   = (float)std::atof(val.c_str());
             else if (key == "volumeEnv")       volumeEnv       = decodeEnv(val);
             else if (key == "panEnv")          panEnv          = decodeEnv(val);
             else if (key == "pitchEnv")        pitchEnv        = decodeEnv(val);
@@ -251,15 +273,74 @@ bool MultiSamplerDoc::decode(const std::string& script) {
 
 MultiSamplerProcessor::MultiSamplerProcessor(Node& n) : node(n) {
     voices.resize(32);
+    // Silent-MOD-playback diagnostic: log every MultiSampler that gets
+    // constructed so we can see how many the project has, and what their
+    // script payload looks like at construction time. We only print the
+    // first 80 chars so the log stays scannable.
+    std::string scriptPrefix = node.script.substr(0, 80);
+    std::fprintf(stderr,
+                 "[MultiSampler] ctor: node id=%d name='%s' scriptLen=%d head='%s'\n",
+                 node.id, node.name.c_str(), (int)node.script.size(),
+                 scriptPrefix.c_str());
+    std::fflush(stderr);
 }
 
 void MultiSamplerProcessor::prepareToPlay(double sr, int /*bs*/) {
     sampleRate = sr;
     reloadIfNeeded();
+
+    // ---- Amiga reconstruction-filter coefficients ----
+    // RBJ biquad LP (Butterworth, Q = 1/sqrt(2)).  Two cascaded stages
+    // give a 4-pole 24 dB/oct rolloff, which matches the brick-wall
+    // shape that OpenMPT/Winamp produce for MOD-era output (see analysis
+    // notes in multi_sampler.h).  We compute coefs once here so the
+    // per-sample inner loop stays cheap.
+    {
+        const double kPi = 3.14159265358979323846;
+        double fc = juce::jlimit(20.0, sr * 0.45, (double)doc.amigaFilterHz);
+        double w0 = 2.0 * kPi * fc / sr;
+        double cw = std::cos(w0), sw = std::sin(w0);
+        double Q  = 0.70710678; // Butterworth
+        double alpha = sw / (2.0 * Q);
+        double b0 = (1.0 - cw) * 0.5;
+        double b1 = (1.0 - cw);
+        double b2 = (1.0 - cw) * 0.5;
+        double a0 = 1.0 + alpha;
+        double a1 = -2.0 * cw;
+        double a2 = 1.0 - alpha;
+        amigaB0 = (float)(b0 / a0);
+        amigaB1 = (float)(b1 / a0);
+        amigaB2 = (float)(b2 / a0);
+        amigaA1 = (float)(a1 / a0);
+        amigaA2 = (float)(a2 / a0);
+        for (auto& s : amigaZ1) s.fill(0.0f);
+        for (auto& s : amigaZ2) s.fill(0.0f);
+    }
 }
 
 void MultiSamplerProcessor::reloadIfNeeded() {
-    if (node.script == lastLoadedScript && !doc.zones.empty()) return;
+    // Short-circuit only when (a) the script is unchanged, AND (b) every
+    // zone actually has sample data loaded. The earlier guard checked just
+    // `!doc.zones.empty()`, which trapped us in a permanent-silence state
+    // whenever loadZoneSamples() decoded zones but failed to populate any
+    // of their dataL/dataR buffers (e.g. the WAV file was missing the
+    // first time we entered, or AudioFormatManager couldn't open it). In
+    // that state findZonesFor() skipped every zone (lengthSamples == 0)
+    // and there was no path back to a retry without the user re-importing
+    // the MOD - and even re-import only worked if it produced a different
+    // node.script, which isn't guaranteed.
+    //
+    // The corrected condition: only consider ourselves "loaded" when at
+    // least one zone has lengthSamples > 0. If every zone is still empty,
+    // we'll retry loadZoneSamples() on the next block. This is cheap
+    // (juce::File::existsAsFile is fast, and we early-exit per zone) and
+    // self-healing: once the source files exist, the next block fixes it.
+    auto anyZoneLoaded = [this]() {
+        for (auto& z : doc.zones) if (z.lengthSamples > 0) return true;
+        return false;
+    };
+    if (node.script == lastLoadedScript && !doc.zones.empty() && anyZoneLoaded())
+        return;
     if (node.script.rfind(MultiSamplerDoc::kPrefix, 0) != 0) return;
     if (!doc.decode(node.script)) return;
     lastLoadedScript = node.script;
@@ -270,6 +351,12 @@ void MultiSamplerProcessor::loadZoneSamples() {
     juce::AudioFormatManager fm;
     fm.registerBasicFormats();
 
+    // One-line per-load trace so silent-load failures are visible on the
+    // user's stderr / debug log. We don't spam every block: reloadIfNeeded
+    // only calls us when zones aren't loaded yet (or when the script
+    // changed), so this fires at most once per successful load.
+    int loaded = 0, missing = 0, unreadable = 0;
+
     for (auto& z : doc.zones) {
         z.dataL.clear();
         z.dataR.clear();
@@ -277,10 +364,22 @@ void MultiSamplerProcessor::loadZoneSamples() {
         z.fileSampleRate = sampleRate;
 
         auto file = juce::File(z.samplePath);
-        if (!file.existsAsFile()) continue;
+        if (!file.existsAsFile()) {
+            ++missing;
+            std::fprintf(stderr,
+                         "[MultiSampler] missing sample file: '%s'\n",
+                         z.samplePath.c_str());
+            continue;
+        }
 
         std::unique_ptr<juce::AudioFormatReader> reader(fm.createReaderFor(file));
-        if (!reader) continue;
+        if (!reader) {
+            ++unreadable;
+            std::fprintf(stderr,
+                         "[MultiSampler] no reader for '%s' (unknown format?)\n",
+                         z.samplePath.c_str());
+            continue;
+        }
 
         int len = (int)reader->lengthInSamples;
         int numCh = std::min<int>(2, reader->numChannels);
@@ -295,7 +394,28 @@ void MultiSamplerProcessor::loadZoneSamples() {
 
         z.fileSampleRate = reader->sampleRate;
         z.lengthSamples  = len;
+        ++loaded;
     }
+
+    // Always log the summary so we can correlate against UI state.
+    std::fprintf(stderr,
+                 "[MultiSampler] loadZoneSamples node=%d ('%s'): "
+                 "%d loaded, %d missing, %d unreadable (of %d zones)\n",
+                 node.id, node.name.c_str(),
+                 loaded, missing, unreadable, (int)doc.zones.size());
+    // For the first few zones, dump their key/vel ranges and lengthSamples
+    // so we can see whether the doc decode produced anything sensible and
+    // whether the note-on we receive can actually match a zone.
+    const int kZonesToDump = std::min<int>(4, (int)doc.zones.size());
+    for (int i = 0; i < kZonesToDump; ++i) {
+        const auto& z = doc.zones[i];
+        std::fprintf(stderr,
+                     "[MultiSampler]   zone %d: note=[%d..%d] vel=[%d..%d] "
+                     "base=%d len=%d path='%s'\n",
+                     i, z.loNote, z.hiNote, z.loVel, z.hiVel, z.baseNote,
+                     z.lengthSamples, z.samplePath.c_str());
+    }
+    std::fflush(stderr);
 }
 
 std::vector<int> MultiSamplerProcessor::findZonesFor(int note, int vel) const {
@@ -335,11 +455,37 @@ void MultiSamplerProcessor::processBlock(juce::AudioBuffer<float>& buf,
     // zones / envelopes) without needing a full graph rebuild.
     reloadIfNeeded();
 
+    // Silent-MOD-playback diagnostic: log the first block so we can confirm
+    // the graph is actually pumping this processor at all. If the sampler
+    // never logs this, the issue is upstream (graph topology / connection
+    // ordering / processor not wired to audio thread).
+    if (diagFirstProcess) {
+        diagFirstProcess = false;
+        std::fprintf(stderr,
+                     "[MultiSampler] first processBlock node=%d ('%s') "
+                     "sr=%.0f zones=%d midiEvents=%d\n",
+                     node.id, node.name.c_str(), sampleRate,
+                     (int)doc.zones.size(), midi.getNumEvents());
+        std::fflush(stderr);
+    }
+
     if (doc.zones.empty()) return;
 
     const int numSamples = buf.getNumSamples();
     const int numChannels = buf.getNumChannels();
     if (numSamples <= 0 || numChannels <= 0) return;
+
+    // Silent-MOD-playback diagnostic: log the first MIDI buffer we ever
+    // see with events on it. Distinguishes "no MIDI ever arrives" (cable
+    // not wired) from "MIDI arrives but no zones match" (zone ranges
+    // wrong vs note pitches).
+    if (!diagFirstMidiSeen && midi.getNumEvents() > 0) {
+        diagFirstMidiSeen = true;
+        std::fprintf(stderr,
+                     "[MultiSampler] first MIDI seen node=%d events=%d\n",
+                     node.id, midi.getNumEvents());
+        std::fflush(stderr);
+    }
 
     // ---- handle incoming MIDI ----
     for (const auto meta : midi) {
@@ -348,6 +494,42 @@ void MultiSamplerProcessor::processBlock(juce::AudioBuffer<float>& buf,
             int note = msg.getNoteNumber();
             int vel  = msg.getVelocity();
             auto zoneIdxs = findZonesFor(note, vel);
+
+            // Silent-MOD-playback diagnostic: log the first 4 note-ons
+            // with matched-zone counts. If matched=0 here even when the
+            // sampler has zones, the note doesn't fall in any zone's
+            // key/vel rectangle - which would point at decode or import
+            // putting wrong ranges in the zones.
+            if (diagNoteOnsLogged < 4) {
+                ++diagNoteOnsLogged;
+                std::fprintf(stderr,
+                             "[MultiSampler] note-on node=%d note=%d vel=%d "
+                             "matchedZones=%d\n",
+                             node.id, note, vel, (int)zoneIdxs.size());
+                std::fflush(stderr);
+            }
+            // Even after the first 4, log unmatched note-ons (a few of them)
+            // so a totally-quiet sampler still produces evidence.
+            if (zoneIdxs.empty() && diagUnmatchedLogged < 8) {
+                ++diagUnmatchedLogged;
+                std::fprintf(stderr,
+                             "[MultiSampler] UNMATCHED note-on node=%d note=%d "
+                             "vel=%d (zones=%d)\n",
+                             node.id, note, vel, (int)doc.zones.size());
+                // Show what the first couple of zones look like so we can
+                // see whether ranges are wrong vs the note is out-of-range.
+                int dump = std::min<int>(2, (int)doc.zones.size());
+                for (int i = 0; i < dump; ++i) {
+                    const auto& z = doc.zones[i];
+                    std::fprintf(stderr,
+                                 "[MultiSampler]   zone %d: note=[%d..%d] "
+                                 "vel=[%d..%d] base=%d len=%d\n",
+                                 i, z.loNote, z.hiNote, z.loVel, z.hiVel,
+                                 z.baseNote, z.lengthSamples);
+                }
+                std::fflush(stderr);
+            }
+
             for (int zi : zoneIdxs) {
                 auto& z = doc.zones[zi];
                 auto& v = allocateVoice();
@@ -386,7 +568,7 @@ void MultiSamplerProcessor::processBlock(juce::AudioBuffer<float>& buf,
                 }
             }
         } else if (msg.isAllSoundOff()) {
-            // CC 120 = instant silence — kill everything immediately.
+            // CC 120 = instant silence - kill everything immediately.
             for (auto& v : voices) v.active = false;
         }
     }
@@ -400,7 +582,6 @@ void MultiSamplerProcessor::processBlock(juce::AudioBuffer<float>& buf,
         return def;
     };
     const float globalVol = paramByName("Volume", 0.5f);
-    const float globalPan = juce::jlimit(-1.0f, 1.0f, paramByName("Pan", 0.0f));
 
     const double dtPerSample = 1.0 / sampleRate;
 
@@ -476,8 +657,63 @@ void MultiSamplerProcessor::processBlock(juce::AudioBuffer<float>& buf,
                 continue;
             }
             float frac = (float)(idx - (int)idx);
-            float sL = z.dataL[i0] + (z.dataL[i1] - z.dataL[i0]) * frac;
-            float sR = z.dataR[i0] + (z.dataR[i1] - z.dataR[i0]) * frac;
+
+            // ---- sample interpolation ----
+            // Mode is per-instrument: Linear for authentic tracker sound,
+            // Sinc for highest quality, Cubic as a middle ground.
+            float sL = 0.0f, sR = 0.0f;
+            bool looping = z.loopEnabled && v.noteHeld
+                           && z.loopEnd > z.loopStart
+                           && z.loopEnd <= z.lengthSamples;
+
+            auto wrapSample = [&](int si) -> int {
+                if (looping) {
+                    int loopLen = z.loopEnd - z.loopStart;
+                    while (si >= z.loopEnd)  si -= loopLen;
+                    while (si < z.loopStart) si += loopLen;
+                } else {
+                    si = std::clamp(si, 0, z.lengthSamples - 1);
+                }
+                return si;
+            };
+
+            switch (doc.interpMode) {
+            case InterpMode::Linear: {
+                // 2-point linear - authentic tracker sound.
+                int s0 = wrapSample(i0), s1 = wrapSample(i0 + 1);
+                sL = z.dataL[s0] + frac * (z.dataL[s1] - z.dataL[s0]);
+                sR = z.dataR[s0] + frac * (z.dataR[s1] - z.dataR[s0]);
+                break;
+            }
+            case InterpMode::Cubic: {
+                // 4-point Catmull-Rom (Hermite) interpolation.
+                int im1 = wrapSample(i0 - 1);
+                int si0 = wrapSample(i0);
+                int si1 = wrapSample(i0 + 1);
+                int si2 = wrapSample(i0 + 2);
+                float f2 = frac * frac, f3 = f2 * frac;
+                auto hermite = [&](const std::vector<float>& d) {
+                    float a = d[im1], b = d[si0], c = d[si1], e = d[si2];
+                    return b + 0.5f * frac * (c - a)
+                        + f2 * (a - 2.5f * b + 2.0f * c - 0.5f * e)
+                        + f3 * (1.5f * (b - c) + 0.5f * (e - a));
+                };
+                sL = hermite(z.dataL);
+                sR = hermite(z.dataR);
+                break;
+            }
+            default: // InterpMode::Sinc
+            case InterpMode::Sinc: {
+                // 8-point Lanczos-4 windowed sinc - highest quality.
+                for (int k = -3; k <= 4; ++k) {
+                    int si = wrapSample(i0 + k);
+                    float w = lanczos4(frac - (float)k);
+                    sL += z.dataL[si] * w;
+                    sR += z.dataR[si] * w;
+                }
+                break;
+            }
+            }
 
             // ---- filter (state variable) ----
             if (doc.filterMode != 3) {
@@ -536,11 +772,32 @@ void MultiSamplerProcessor::processBlock(juce::AudioBuffer<float>& buf,
             v.timeHeld += (float)dtPerSample;
         }
 
-        // ---- global volume / pan ----
-        float gpL = std::cos((globalPan + 1.0f) * 0.25f * 3.14159265358979323846f);
-        float gpR = std::sin((globalPan + 1.0f) * 0.25f * 3.14159265358979323846f);
-        outL *= globalVol * gpL * 1.41421356f;
-        outR *= globalVol * gpR * 1.41421356f;
+        // ---- global volume ----
+        // Pan is NOT applied here - the PanProcessor in the graph chain
+        // handles it, using the node's Pan param with the correct pan law
+        // (equal-power for DAW instruments, linear for tracker imports).
+        // Applying it here too would double-apply the panning.
+        outL *= globalVol;
+        outR *= globalVol;
+
+        // ---- Amiga PAULA-style reconstruction filter ----
+        // 4-pole Butterworth LP at amigaFilterHz applied to the post-mix
+        // output (two cascaded Direct-Form-II Transposed biquads per
+        // channel).  Without it, MOD/S3M imports sound markedly brighter
+        // than the OpenMPT/Winamp reference because the sampler's
+        // polyphase aliasing isn't being band-limited the way the Amiga
+        // PAULA chip's analog reconstruction filter would have done.
+        if (doc.amigaFilter) {
+            auto runStage = [&](float in, int stage, int ch) -> float {
+                float out = amigaB0 * in + amigaZ1[stage][ch];
+                amigaZ1[stage][ch] = amigaB1 * in - amigaA1 * out
+                                     + amigaZ2[stage][ch];
+                amigaZ2[stage][ch] = amigaB2 * in - amigaA2 * out;
+                return out;
+            };
+            outL = runStage(runStage(outL, 0, 0), 1, 0);
+            outR = runStage(runStage(outR, 0, 1), 1, 1);
+        }
 
         buf.setSample(0, s, outL);
         if (numChannels > 1) buf.setSample(1, s, outR);

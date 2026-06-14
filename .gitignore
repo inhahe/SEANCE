@@ -52,6 +52,20 @@ SoundShop.node_editor.json
 *~
 name.txt
 
+# Release archives (built by hand, not source)
+release.zip
+release.rar
+
+# Audio renders / capture scratch
+*.wav
+captures/
+after_j_samples/
+
+# Self-test scratch output
+cpp/selftest_out*/
+cpp/st_*.txt
+cpp/st*_err.txt
+
 # OS noise
 .DS_Store
 Thumbs.db

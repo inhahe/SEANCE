@@ -1,8 +1,12 @@
 #pragma once
 #include "node_graph.h"
 #include "wavetable_frame.h"
+#include "shape_expr.h"
+#include "warp.h"
+#include "warp_editor.h"
 #include <juce_gui_basics/juce_gui_basics.h>
 #include <vector>
+#include <map>
 #include <functional>
 #include <string>
 #include <memory>
@@ -14,11 +18,35 @@ namespace SoundShop {
 // with phase offset and amplitude. Layers are summed into one single-cycle
 // wavetable at edit time (bake-once, not per-note).
 struct WaveLayer {
-    enum Shape { Sine, Saw, Square, Triangle, Noise, Drawn, Formula };
+    // Shape ids are serialized by NAME (see shapeName/parseShape), never by
+    // ordinal, so new values can be appended freely without breaking old files.
+    // The last four (Pulse..PhaseDist) are the Bucket B "generator morphs": a
+    // built-in oscillator whose timbre is swept by a morph parameter that is
+    // part of the wave's DEFINITION (duty, sync ratio, FM index, PD amount),
+    // distinct from the Bucket A warp chain that transforms an arbitrary cycle.
+    enum Shape { Sine, Saw, Square, Triangle, Noise, Drawn, Formula,
+                 Pulse, Sync, FM, PhaseDist };
     Shape shape = Sine;
     int   ratio = 1;      // harmonic number: 1 = fundamental, 2 = octave, ...
     float phase = 0.0f;   // 0..1 (one full cycle)
     float amp   = 1.0f;   // 0..1
+
+    // Bucket B generator-morph parameters. Meaning is per-shape; ignored by the
+    // classic shapes (Sine..Formula). Stored as two generic normalised [0,1]
+    // knobs so the serializer and UI stay uniform:
+    //   Pulse     - shapeParam = duty cycle (0=thin, 1=wide; 0.5 = square).
+    //               shapeParam2 unused.
+    //   Sync      - shapeParam = hard-sync amount; the slave oscillator runs
+    //               (1 + 7*shapeParam)x the master and resets every master cycle
+    //               (the classic sync sweep). shapeParam2 unused.
+    //   FM        - shapeParam  = modulation index (0..~8 radians of phase mod).
+    //               shapeParam2 = modulator : carrier ratio (mapped to 1..8),
+    //               quantised to integers so one cycle stays periodic.
+    //   PhaseDist - shapeParam = Casio-CZ phase-distortion amount (0 = sine,
+    //               1 = hard resonant skew). shapeParam2 unused.
+    // Defaults give an immediately-audible morph at the midpoint.
+    float shapeParam  = 0.5f;
+    float shapeParam2 = 0.5f;
 
     // For Drawn shape: two sub-modes.
     //
@@ -36,19 +64,174 @@ struct WaveLayer {
     std::vector<float> drawnSamples;  // 512 samples for freehand mode
 
     // For Formula shape: a single text expression evaluated over one cycle
-    // with `x` ranging across [0, 2*pi) (radians). Reuses the WaveExprParser
-    // shared with the frequency-domain editor, so the same vocabulary works
-    // both places: sin, cos, tan, exp, log, sqrt, pow, abs, tanh, clamp,
-    // saw(x), square(x), triangle(x), noise(), random, pi, e, + - * / ^.
-    // Output is clamped to [-1, 1] by the parser.
+    // with `x` ranging across [0, 2*pi) (radians). The same vocabulary works
+    // in all three languages: sin, cos, tan, exp, log, sqrt, pow, abs, tanh,
+    // clamp, saw(x), square(x), triangle(x), noise(), pi, e, + - * / ^.
+    // Output is clamped to [-1, 1].
     std::string formulaExpr = "sin(x)";
+
+    // Authoring language for the Formula expression. Built-in is evaluated
+    // live (pure C++, thread-safe). Lua/Python are baked once into
+    // formulaSamples at edit/load time on the UI thread (the interpreters are
+    // not audio-thread safe) and sampled from there during render.
+    ShapeLang formulaLang = ShapeLang::Builtin;
+
+    // Transient (not serialized): one cycle of the Lua/Python-baked formula,
+    // and the last bake error (empty when OK). Re-baked by rebakeFormula().
+    std::vector<float> formulaSamples;
+    std::string        formulaError;
+
+    // Per-layer warp chain (Bucket A, element-scope): shape-bending ops baked
+    // into THIS layer's single cycle at render time, before it's summed into
+    // the stack. Unlike the frame-scope warp chain (WavetableDoc::warpChain,
+    // applied live per voice and modulatable), these are part of the layer's
+    // baked definition - they let one layer be folded/clipped/bent while its
+    // neighbours stay clean. Empty by default. Serialized as a trailing
+    // "warp=" field on the layer (see encodeLayer/parseLayer).
+    std::vector<WarpOp> warpChain;
+
+    // Re-bake formulaSamples from formulaExpr for the current formulaLang.
+    // No-op (clears the buffer) for Built-in. Call after any change to
+    // formulaExpr / formulaLang and after loading from a project.
+    void rebakeFormula();
+};
+
+// Editor component for a single WaveLayer. Used by the wavetable editor (one
+// row per layer in a stack) and by the SignalShape editor (one editor per
+// "layer" composing the LFO/envelope shape). The editor owns no model state
+// itself - it edits the WaveLayer pointed to by `layerPtr`, and notifies the
+// owner via callbacks whenever the user mutates anything.
+//
+// Lifetime contract: the WaveLayer pointed to must outlive the editor, and
+// must not be relocated (vector reallocation, erase, etc.) while the editor
+// holds a pointer to it. The owner is responsible for calling setLayerPtr()
+// whenever the underlying storage moves. The wavetable editor's solution is
+// to rebuild every editor whenever the layer vector mutates - that keeps the
+// pointer logic trivial at the cost of a UI rebuild per add/delete (cheap
+// since the user can't add/delete fast enough to notice).
+class WaveLayerEditor : public juce::Component {
+public:
+    struct Callbacks {
+        // Required. Called whenever the user mutates the layer through any
+        // control on this editor. The owner typically responds by re-rendering
+        // a preview / committing to the model / requesting a graph rebuild.
+        std::function<void()> onChanged;
+        // Optional. If set, a small "X" delete button appears in the top-right
+        // and invokes this when clicked. The owner is responsible for actually
+        // removing the layer from its container - this editor just signals
+        // the intent. If null, the delete button is hidden (single-layer
+        // editors that don't support deletion).
+        std::function<void()> onDelete;
+        // Optional. If set, the row label reads "Layer N" using the returned
+        // 1-based index. Called every syncFromModel(). If null, the label
+        // reads "Layer" with no index suffix.
+        std::function<int()> indexForLabel;
+        // Optional. Fired when the row's preferred height changes (the only
+        // cause is an op being added to / removed from the per-layer warp
+        // chain, which grows/shrinks the embedded warp editor). The owner
+        // re-lays-out its row stack so the rows below shift to follow. Null
+        // when per-layer warp is disabled.
+        std::function<void()> onHeightChanged;
+    };
+
+    // enableWarp embeds a per-layer warp chain editor (baked shape-bending on
+    // THIS layer's cycle, not modulatable - distinct from the doc-level
+    // frame-scope warp). Off for the LFO / Signal-Shape editor, on for the
+    // wavetable layer stack.
+    WaveLayerEditor(WaveLayer* layerPtr, Callbacks cb, bool enableWarp = false);
+
+    // Rebind to a different layer (e.g. after the owner's storage moved).
+    // Triggers a full UI sync from the new layer's state.
+    void setLayerPtr(WaveLayer* p);
+    WaveLayer* getLayerPtr() const { return layer; }
+
+    // Pull every visible control's state from the underlying layer. Call
+    // after setLayerPtr or after any external mutation (preset load,
+    // project load, ...). Internal mutations don't need it - they update
+    // both the model and the controls themselves.
+    void syncFromModel();
+
+    // Re-render the mini per-layer preview strip. Cheap (512 samples).
+    // Internal callbacks already call this; external code only needs it
+    // when the layer was mutated without going through this editor.
+    void refreshPreview();
+
+    void resized() override;
+    void paint(juce::Graphics& g) override;
+    void mouseDown(const juce::MouseEvent& e) override;
+    void mouseDrag(const juce::MouseEvent& e) override;
+    void mouseUp(const juce::MouseEvent&) override;
+
+    static constexpr int previewHeight = 92;
+    // Base row height: label + two shape-button rows (7 classic + 4 generator
+    // morph) + sub-row + 3 base slider rows + 2 generator-morph slider rows +
+    // padding + preview. This is the height of a row WITHOUT a per-layer warp
+    // editor; preferredHeight() adds the warp strip on top when present. The two
+    // morph rows are reserved always (hidden for classic shapes) so the row
+    // height stays constant when switching shapes.
+    static int rowHeight() { return 22 + 24 + 24 + 24 + 20 * 3 + 20 * 2 + 12 + previewHeight + 4; }
+
+    // Actual height this row wants: rowHeight() plus the embedded per-layer
+    // warp editor's current height (which tracks its op count) when warp is
+    // enabled. Owners lay out the row stack at this per-row pitch.
+    int preferredHeight() const;
+
+private:
+    void updateShapeButtons();
+    juce::Rectangle<float> getPreviewAreaBounds() const;
+    bool mouseToPointXY(juce::Point<float> p, float& outX, float& outY) const;
+    int findPointNear(float x, float y, float radius = 0.05f) const;
+    void sortPointsByX();
+    void writeFreehandSample(float x, float y);
+    void showPresetMenu();
+
+    WaveLayer* layer = nullptr;
+    Callbacks callbacks;
+
+    juce::Label label;
+    juce::TextButton sineBtn, sawBtn, squareBtn, triangleBtn, noiseBtn, drawnBtn, formulaBtn;
+    juce::TextButton pulseBtn, syncBtn, fmBtn, phaseDistBtn;  // Bucket B generator morphs
+    juce::TextButton freehandToggle;
+    juce::TextEditor formulaEditor;
+    juce::ComboBox   formulaLangCombo;   // Built-in / Lua / Python (Formula only)
+    juce::Slider ratioSlider, phaseSlider, ampSlider;
+    juce::Label  ratioLabel, phaseLabel, ampLabel;
+    // Generator-morph parameter sliders (visible only for Pulse/Sync/FM/PD).
+    // morphSlider drives shapeParam (duty / sync amount / FM index / PD amount);
+    // morph2Slider drives shapeParam2 (FM modulator:carrier ratio only).
+    juce::Slider morphSlider, morph2Slider;
+    juce::Label  morphLabel, morph2Label;
+    juce::TextButton presetBtn;
+    juce::TextButton deleteBtn;
+    std::vector<float> previewSamples;
+    int draggingIdx = -1;
+
+    // Per-layer warp chain editor (baked shape-bending on this layer's cycle).
+    // Null unless the owner passed enableWarp=true. Bound to layer->warpChain
+    // and rebound in setLayerPtr; its onChanged re-renders this row's preview
+    // (warp is shown applied) and forwards to callbacks.onChanged.
+    std::unique_ptr<WarpChainEditor> warpEditor;
+
+    bool freehandDrawing = false;
+    int  lastFreehandIdx = -1;
+    float lastFreehandY = 0.0f;
 };
 
 struct LayeredWaveform : public IWavetableFrame {
     std::vector<WaveLayer> layers;
     int tableSize = 2048;
 
-    // Sum layers into `out` (resized to this->tableSize). Normalized to peak 1.0.
+    // Un-hide the base-class render(int, out) wrapper. Declaring the no-arg
+    // render(out) below would otherwise hide ALL base `render` overloads by
+    // name, so callers that do lw.render(ts, out) wouldn't compile. The base
+    // wrapper (renderRaw + gain) is exactly what they want.
+    using IWavetableFrame::render;
+
+    // Sum layers into `out` (resized to this->tableSize). Normalized to peak
+    // 1.0. This is the gain-FREE primitive: it does NOT apply IWavetableFrame::
+    // gain (that's applied by the base-class render(int,out) wrapper, which
+    // renderRaw() delegates here through). Callers wanting the gained cycle
+    // should go through the IWavetableFrame render() path.
     void render(std::vector<float>& out) const;
 
     // Encode as a string stored in node.script, prefixed with "__layered__:".
@@ -66,10 +249,93 @@ struct LayeredWaveform : public IWavetableFrame {
     // size; encodeBody/decodeBody handle the body without the __layered__:
     // prefix so a container can length-prefix it inline.
     const char* typeId() const override { return "layered"; }
-    void render(int tableSize, std::vector<float>& out) const override;
+    void renderRaw(int tableSize, std::vector<float>& out) const override;
     std::string encodeBody() const override;
     bool decodeBody(const std::string& body) override;
     std::unique_ptr<IWavetableFrame> clone() const override;
+};
+
+// -----------------------------------------------------------------------------
+// LayerStackComponent
+// -----------------------------------------------------------------------------
+//
+// Reusable vertical stack of WaveLayerEditor rows + a "+ Layer" button +
+// (optionally) a summation preview pane that shows all layers summed into one
+// cycle. This is the shared layered-waveform editing surface used by BOTH the
+// Wavetable editor's right pane and the Signal Shape (LFO / envelope) editor,
+// so the add/delete/edit-a-layer experience is identical in both places.
+//
+// The component does NOT own its model: it edits the `layers` vector of a
+// LayeredWaveform supplied via setTarget() and fires onChanged after every
+// mutation. The owner decides what onChanged does (commit to node.script,
+// request a graph rebuild, re-render its own preview, ...).
+//
+// Realloc safety: the WaveLayerEditor rows hold WaveLayer* into
+// target->layers. Any add or delete that can reallocate that vector rebuilds
+// ALL rows (rebuildRows), so no row ever holds a dangling pointer - the same
+// strategy the wavetable editor used before this was extracted.
+//
+// Options let callers omit the bits that only make sense in one context (e.g.
+// the wavetable editor keeps its own multi-frame-type preview, so it turns the
+// summation preview OFF; the LFO editor turns it ON). The per-row controls
+// (shape buttons, harmonic ratio, phase, amp, draw/formula) are identical in
+// both editors and are not configurable - harmonic ratio is kept everywhere
+// because an extra-rate layer is a useful capability for an LFO too.
+class LayerStackComponent : public juce::Component {
+public:
+    struct Options {
+        // When true, a preview pane at the bottom draws the sum of all layers
+        // (peak-normalized, matching what a consumer actually renders).
+        bool showSummationPreview = false;
+        int  summationPreviewHeight = 140;
+        juce::String addLayerButtonText = "+ Layer";
+        // Shown centered over the (empty) row area when there are no layers.
+        juce::String emptyHint;
+        // Seed for a freshly added layer. Arg = current layer count. If null,
+        // a default-constructed WaveLayer (sine, ratio 1, amp 1) is used.
+        std::function<WaveLayer(int existingCount)> makeNewLayer;
+        // When true, each layer row embeds a per-layer warp chain editor
+        // (baked shape-bending on that layer's cycle). The wavetable layer
+        // stack turns this ON; the LFO / Signal-Shape editor leaves it OFF.
+        bool enablePerLayerWarp = false;
+    };
+
+    LayerStackComponent(Options opts, std::function<void()> onChanged);
+
+    // Bind to the LayeredWaveform to edit (nullptr clears the stack). Cheap to
+    // call defensively: it only rebuilds rows when the target pointer or its
+    // layer count differs from what's currently displayed.
+    void setTarget(LayeredWaveform* lw);
+    LayeredWaveform* getTarget() const { return target; }
+
+    // Force a full rebuild + re-sync from the model. Use after an external,
+    // in-place mutation that changed layer values or count without going
+    // through this component (e.g. the owner decoded a new doc into the same
+    // LayeredWaveform object).
+    void refreshFromModel();
+
+    void resized() override;
+    void paint(juce::Graphics& g) override;
+
+private:
+    void rebuildRows();
+    void addLayer();
+    void renderSummation();
+    void layoutRows();
+
+    Options opts;
+    std::function<void()> onChanged;
+    LayeredWaveform* target = nullptr;
+    int shownLayerCount = -1;   // staleness sentinel for setTarget
+
+    juce::TextButton addLayerBtn;
+    juce::Viewport   viewport;
+    juce::Component  container;
+    std::vector<std::unique_ptr<WaveLayerEditor>> rows;
+    juce::Label      emptyHintLabel;
+
+    std::vector<float> summationSamples;
+    juce::Rectangle<int> summationBounds;
 };
 
 // A wavetable can be authored in two modes:
@@ -98,6 +364,14 @@ struct LayeredWaveform : public IWavetableFrame {
 struct WaveformLibraryEntry {
     int id = -1;
     std::string name;                              // user-editable label
+    // User-picked color for this waveform. -1 = auto (derived from spectral
+    // centroid of the waveform's harmonic content, or fall back to a
+    // per-index palette rotation). >=0 indexes into the 8-color palette
+    // returned by libraryPalette(). Lives on the LIBRARY entry so every
+    // placement (grid cell or scatter dot) referencing the same waveform
+    // is the same colour - which is what the user expects when "waveform"
+    // and "colour" are conceptually one identity.
+    int colorIdx = -1;
     std::unique_ptr<IWavetableFrame> wave;
 
     WaveformLibraryEntry() = default;
@@ -105,14 +379,58 @@ struct WaveformLibraryEntry {
     WaveformLibraryEntry& operator=(WaveformLibraryEntry&&) noexcept = default;
     // unique_ptr is non-copyable, so we provide deep-copy via clone().
     WaveformLibraryEntry(const WaveformLibraryEntry& o)
-        : id(o.id), name(o.name),
+        : id(o.id), name(o.name), colorIdx(o.colorIdx),
           wave(o.wave ? o.wave->clone() : nullptr) {}
     WaveformLibraryEntry& operator=(const WaveformLibraryEntry& o) {
         if (&o == this) return *this;
-        id = o.id; name = o.name;
+        id = o.id; name = o.name; colorIdx = o.colorIdx;
         wave = o.wave ? o.wave->clone() : nullptr;
         return *this;
     }
+};
+
+// 8-colour palette shared by the library list swatch, the arrangement-view
+// dots (both Grid and Scatter modes), and the colour picker. Indices are
+// stable across save / load via WaveformLibraryEntry::colorIdx; out-of-range
+// indices wrap modulo 8.
+juce::Colour libraryPalette(int idx);
+// Number of named palette colours. (Currently 8.)
+int libraryPaletteSize();
+// Resolve the colour to actually paint for a library entry. If entry's
+// colorIdx >= 0 -> palette[colorIdx]. Otherwise derive from layered spectral
+// centroid (warm = low partials, cool = high partials), falling back to
+// palette[fallbackIdx] for non-layered / empty-info entries.
+juce::Colour libraryEntryDisplayColor(const WaveformLibraryEntry* entry,
+                                      int fallbackIdx);
+
+// Small colour-swatch button. Click pops a palette menu (Auto + 8
+// preset colours) and fires onPick(colorIdx) with -1 = Auto. Used both
+// in the editor's identity row (right pane) and the library list rows
+// in the arrangement sidebar.
+class LibraryColorSwatch : public juce::Component,
+                           public juce::SettableTooltipClient {
+public:
+    LibraryColorSwatch();
+    void paint(juce::Graphics& g) override;
+    void mouseUp(const juce::MouseEvent& e) override;
+    // Visible swatch colour (resolved via libraryEntryDisplayColor for
+    // "Auto", or libraryPalette(idx) for explicit picks). The Auto vs
+    // explicit distinction isn't surfaced as a visual badge - the colour
+    // resolves to the same palette index either way, so there's nothing
+    // for the user to disambiguate by sight. The popup picker shows
+    // "Auto" as the ticked menu item when applicable, which is enough.
+    void setSwatchColor(juce::Colour c);
+    // True if the underlying entry is on Auto. Used only by the picker
+    // popup to tick the Auto row; no longer affects the visible swatch.
+    void setIsAuto(bool a) { isAuto = a; }
+    bool getIsAuto() const { return isAuto; }
+    std::function<void(int colorIdx)> onPick; // -1 = Auto, else palette idx
+private:
+    juce::Colour col { 0xff5fb3ff };
+    bool isAuto = true;
+    bool hover = false;
+    void mouseEnter(const juce::MouseEvent&) override { hover = true;  repaint(); }
+    void mouseExit (const juce::MouseEvent&) override { hover = false; repaint(); }
 };
 
 struct ScatterFrame {
@@ -124,11 +442,13 @@ struct ScatterFrame {
     int waveformId = -1;
     std::vector<float> position;   // length = WavetableDoc::scatterDims, each in [0,1]
     std::string label;              // optional short user label shown in viewport
-    int colorIdx = -1;              // -1 = auto from spectral centroid
+    // Note: there is no per-instance colorIdx here. Colour is a property of
+    // the waveform itself (WaveformLibraryEntry::colorIdx), so every dot
+    // referencing the same library entry paints the same colour.
 
     // Trivially copyable now that the waveform data lives elsewhere. The
-    // copy/move/assign defaults handle position/label/colorIdx/waveformId
-    // correctly without bespoke clone semantics.
+    // copy/move/assign defaults handle position/label/waveformId correctly
+    // without bespoke clone semantics.
     ScatterFrame() = default;
     ScatterFrame(const ScatterFrame&) = default;
     ScatterFrame(ScatterFrame&&) noexcept = default;
@@ -180,14 +500,44 @@ struct WavetableDoc {
     std::vector<int> gridDims;             // size per dimension (e.g., {4} for 1D, {3,4} for 2D)
 
     // ---- Scatter mode ----
-    int scatterDims = 2;                   // number of N-D coord axes
+    int scatterDims = 1;                   // number of N-D coord axes (0=drop-target, 1=line, 2+=square/cube view)
     float scatterRadius = 0.45f;           // RBF cutoff (in normalized [0,1] units)
+    // "Distance fades volume" toggle, shared by both Scatter and Grid modes
+    // (the WavetableMode union of state, even though the field lives in the
+    // scatter block for historical reasons).
+    //
+    // When false (default) the blend is volume-normalized: the active weights
+    // are divided by their sum so the total output level stays constant as you
+    // morph.
+    //   - Scatter: a lone frame is always full volume regardless of distance.
+    //   - Grid: empty cells don't drain volume - the synth renormalizes the
+    //     morph over the *filled* cells, so the output stays full-volume even
+    //     when some cells are empty.
+    // When true the raw blend weight is used directly as gain:
+    //   - Scatter: moving the Position toward a frame makes it louder, away
+    //     makes it quieter, and a point outside every frame's radius is silent.
+    //     Lets a single scatter dot act as a "loudness island".
+    //   - Grid: empty cells fade volume - morphing toward an empty cell ducks
+    //     the output toward silence (the pre-renormalization grid behavior).
+    // Serialized as the optional last field of the mode spec (4th for scatter,
+    // after the dims for grid).
+    bool absoluteBlend = false;
     std::vector<ScatterFrame> scatterFrames;
 
     // Set by convertGridToScatter() and consulted by canRevertScatterToGrid().
     // Cleared whenever a scatter frame moves off its snapshot cell center,
     // or on any mode switch other than the matching reverse.
     std::optional<ScatterFromGridSnapshot> scatterFromGridSnapshot;
+
+    // ---- Frame-scope warp chain (Bucket A shape-bending) ----
+    // Ordered list of transform warps applied to the oscillator output every
+    // sample: phase-domain ops remap the read phase before the table lookup,
+    // amplitude-domain ops shape the sample after. Each op's `amount` is the
+    // resting value; once an op is exposed for modulation a "Warp N" node param
+    // drives its amount live (see syncWarpParams) so an LFO/oscillator can morph
+    // the shape. Serialized in encode()/decode() under the "warp" key. Empty by
+    // default - costs nothing when unused.
+    std::vector<WarpOp> warpChain;
 
     WavetableDoc() = default;
     WavetableDoc(WavetableDoc&&) noexcept = default;
@@ -207,9 +557,31 @@ struct WavetableDoc {
 
     // Number of position dimensions exposed to the synth as Position params.
     // Grid: number of grid axes. Scatter: scatterDims.
+    //
+    // NOTE: this is the *geometric* dimension count - it drives the
+    // visualization (rotation planes, projection combo, axis steppers) and
+    // must include inert axes. For the count of axes the user can actually
+    // *traverse* (which drives the Position params/pins), use
+    // effectiveDimCount() instead.
     int numDimensions() const {
         return mode == WavetableMode::Grid ? (int)gridDims.size() : scatterDims;
     }
+
+    // Indices of the axes the user can actually traverse - i.e. the axes for
+    // which a Position parameter / modulation pin is worth exposing. Defined
+    // in the .cpp. The rule:
+    //   Grid:    every axis whose size is >= 2 (a size-1 axis has a single
+    //            cell, so a Position along it does nothing), in axis order.
+    //   Scatter: all scatterDims axes when there's something for a position
+    //            to do - either >= 2 frames to interpolate between, OR the
+    //            "distance fades volume" blend is on (so moving toward/away
+    //            from even a single frame changes loudness). Otherwise empty
+    //            (a lone normalized frame is always full volume regardless of
+    //            position, so its axes are inert).
+    // The k-th entry maps the k-th Position parameter to its geometry axis;
+    // the synth pins all other (inert) grid axes to coordinate 0.
+    std::vector<int> effectiveAxes() const;
+    int effectiveDimCount() const { return (int)effectiveAxes().size(); }
 
     // Number of editable cells in the active mode.
     int activeFrameCount() const {
@@ -251,6 +623,9 @@ struct WavetableDoc {
 
     // Find the index of a library entry with a given id, or -1.
     int findLibraryIndexById(int id) const;
+
+    // TEMP throwaway diagnostic - dumps grid/cell/scatter/library state to file.
+    void debugDumpState(const char* tag) const;
 
     // ---- Per-cell frame access (rerouted through the library) ----
 
@@ -325,6 +700,15 @@ struct WavetableDoc {
     // calling otherwise is a no-op (asserted in debug).
     void revertScatterToGrid();
 
+    // General (lossy) Scatter -> Grid conversion, used when a lossless
+    // revertScatterToGrid() isn't possible (the wavetable was authored as
+    // Scatter, or axes/dots were edited so the snapshot no longer matches).
+    // Flattens every scatter dot into a 1D grid of N cells in frame order
+    // (one dot per cell), discarding the free-form scatter positions. The
+    // library is untouched; cells reference the same waveform ids. Always
+    // succeeds, so the editor can offer a "to Grid" path unconditionally.
+    void convertScatterToGrid();
+
     // Encode/decode
     std::string encode() const;
     bool decode(const std::string& s);
@@ -343,6 +727,27 @@ struct WavetableDoc {
 // the new waveform takes effect; it is called on a debounce timer (not on
 // every slider tick) to avoid racing JUCE's async graph rebuild.
 //
+// A horizontal slider whose *draggable* travel spans [0, dragMax] (the
+// comfortable range a user normally wants), while its underlying value range
+// and text box accept anything up to a much larger safety ceiling. Values
+// above dragMax simply pin the thumb at the right end instead of being
+// clamped, so the text field is a free numeric entry (type 6, 8, etc.) without
+// letting the drag run off to absurd values. Used for the per-waveform gain:
+// drag covers 0..4x, but you can still type a higher (or lower) figure.
+class FreeEntrySlider : public juce::Slider {
+public:
+    FreeEntrySlider()
+        : juce::Slider(juce::Slider::LinearHorizontal,
+                       juce::Slider::TextBoxRight) {}
+    double dragMax = 4.0;
+    double valueToProportionOfLength(double value) override {
+        return juce::jlimit(0.0, 1.0, value / dragMax);
+    }
+    double proportionOfLengthToValue(double proportion) override {
+        return juce::jlimit(0.0, dragMax, proportion * dragMax);
+    }
+};
+
 // The editor holds a WavetableDoc (one or more frames). Only one frame is
 // editable at a time - the current frame - selected via frame-tab buttons.
 // Inherits DragAndDropContainer so the arrangement view can accept drops
@@ -361,17 +766,40 @@ public:
     void resized() override;
     void paint(juce::Graphics& g) override;
     void timerCallback() override;
+    // Ctrl+Z / Ctrl+Shift+Z / Ctrl+Y while THIS editor's pop-out window holds
+    // keyboard focus. The editor is a separate top-level DialogWindow, so these
+    // keystrokes never reach MainContentComponent::keyPressed (the main-window
+    // undo handler) - without this override, pressing Ctrl+Z right after a
+    // capture (the dialog has focus) does nothing. Routes to the shared
+    // graph.undoTree so undo/redo works identically from inside the editor; the
+    // snapshot restore then refreshes this editor via reloadFromNode().
+    bool keyPressed(const juce::KeyPress& key) override;
 
-    // Layer access goes through these so LayerRow doesn't have to know about
-    // the current frame selection.
+    // Re-read this editor's `wave` document from its node's (restored) script
+    // and rebuild the UI WITHOUT committing. Called after an external undo/redo
+    // rewrites the node out from under the editor: the in-memory `wave` is
+    // decoded only at construction, so a snapshot restore would otherwise leave
+    // the editor showing stale data - and its debounce timer would re-commit
+    // that stale data, silently undoing the undo. Cancels the pending debounce,
+    // re-decodes, preserves the selection when it survives, and refreshes every
+    // view. Closes the window if the node itself was undone away.
+    void reloadFromNode();
+
+    // Refresh every open wavetable editor after an undo/redo snapshot restore.
+    // Iterates the live-editor registry and calls reloadFromNode() on each
+    // editor bound to `g`. Invoked from the main window's onLoadSnapshot once
+    // the graph has been reparsed from the snapshot. Static because the main
+    // window doesn't own the editors' (non-modal DialogWindow) lifetimes.
+    static void reloadOpenEditorsAfterSnapshot(NodeGraph& g);
+
+    // Layer access goes through these so the WaveLayerEditor rows don't have
+    // to know about the current frame selection.
     std::vector<WaveLayer>& currentLayers();
     const std::vector<WaveLayer>& currentLayers() const;
 
 private:
-    class LayerRow; // inner component for a single layer's controls
     class ScatterView; // inner component for the N-D scatter viewport
     class WavetableViewWindowContent; // arrangement view + sidebar (embedded)
-    friend class LayerRow;
     friend class ScatterView;
     friend class WavetableViewWindowContent;
 
@@ -406,12 +834,36 @@ private:
     // updates only currentLibraryId.
     int currentLibraryId = -1;
     int currentFrameIdx = 0;            // Grid mode: row-major cell index. Scatter mode: scatter index.
+
+    // Which surface the user most recently SELECTED on. The keyboard Delete
+    // key needs this because currentLibraryId and currentFrameIdx are both
+    // updated when you click a populated cell/dot (see Linkage above), so on
+    // its own "is a library entry highlighted?" can't tell whether the user
+    // means "delete this waveform definition" or "remove this placement".
+    //   Library = last picked a row in the Library list  -> Delete removes the
+    //             waveform DEFINITION (and every placement referencing it).
+    //   View    = last picked a cell/dot in the arrangement view or Cells list
+    //             -> Delete removes only THIS placement; the library waveform
+    //             survives so it can be re-placed.
+    // Set at the genuine click gestures only (library row onClick, Cells-list
+    // row onClick, ScatterView cell/dot mouseDown) - NOT in the programmatic
+    // switchToFrame / setEditingLibraryEntry paths - so internal navigation
+    // (capture binding, post-delete fallback, drag-swap) never silently
+    // changes which thing Delete will hit.
+    enum class SelectionSurface { Library, View };
+    SelectionSurface activeSelectionSurface = SelectionSurface::Library;
     std::vector<float> currentPosition; // Internal default placement for new Scatter frames (center of N-D cube).
     std::vector<float> previewSamples;
     // Bounds of the single-cycle preview strip on the right pane, set by
     // resized() so paint() can draw the curve without re-deriving the
     // side-by-side geometry.
     juce::Rectangle<int> previewBounds;
+    // Bounds of the "no editor for this frame type yet" placeholder area
+    // in the right pane. Non-empty only when the currently-edited library
+    // entry's frame is non-layered AND has no embedded editor (currently
+    // SampleFrame). paint() draws an explanatory message here so the user
+    // isn't staring at a blank rectangle.
+    juce::Rectangle<int> placeholderBounds;
 
     // Editor body is split side-by-side:
     //   - Left half: the WAVETABLE arrangement view (scatter / grid
@@ -437,10 +889,30 @@ private:
     // the menu is dismissed.
     void showAddWaveformMenu(juce::Component* anchor);
 
-    juce::TextButton addLayerBtn { "+ Layer" };
+    // Open the factory waveform browser (the built-in single-cycle library:
+    // category tree + search + curated ★ + Curated-only filter). On insert it
+    // adds the chosen waveform to the library as a Drawn/Freehand LayeredWaveform
+    // frame (see makeFactoryFrame) and focuses the editor on it - the same tail
+    // as showAddWaveformMenu's fresh-frame path. Anchor centres the dialog.
+    void showFactoryWaveformBrowser(juce::Component* anchor);
+
+    // Build a one-layer LayeredWaveform whose single Drawn/Freehand layer holds
+    // `cycle` (expected 512 samples in [-1,1], one cycle). This is the import
+    // path for both a factory-bank entry and a user-loaded single-cycle wav: the
+    // result is a fully editable, serialisable frame (the user can draw over it,
+    // stack layers on it, warp it). Shared so both callers stay in sync. Public
+    // (and static) so the self-test can exercise it without a live component.
+public:
+    static std::unique_ptr<IWavetableFrame> makeFactoryFrame(
+        const std::vector<float>& cycle);
+private:
+
     juce::TextButton applyBtn    { "Apply" };
     juce::TextButton closeBtn    { "Close" };
     juce::TextButton helpBtn     { "?" };
+    // Opens the shared AHDSR amplitude-envelope editor for this synth's
+    // node in a separate dialog (kept out of this already-dense editor).
+    juce::TextButton envelopeBtn { "Envelope..." };
     // Compare (#9): switch the synth between two render modes that apply
     // to a wavetable cycle, so the user can A/B audition the same waveform
     // played two different ways. Direct = the cycle is read by one
@@ -459,13 +931,52 @@ private:
     // editor - it's a wavetable arrangement space. Hides as soon as a second
     // frame is added.
     juce::Label hintLabel;
-    juce::Viewport   layersViewport;
-    juce::Component  layersContainer;
-    std::vector<std::unique_ptr<LayerRow>> rows;
+
+    // Per-waveform identity row at the top of the right pane: a colour
+    // swatch (opens the palette picker) plus a name TextEditor for the
+    // library entry the editor is currently bound to. Lives above the
+    // editor body (layer rows / spectral / wavelet) so it stays visible
+    // for every editor type. Hidden when no library entry is targeted
+    // (empty library). LibraryColorSwatch is defined at namespace scope
+    // in the cpp file and reused by the library list rows in the
+    // arrangement-view sidebar.
+    juce::Label      identityLabel { {}, "Waveform:" };
+    std::unique_ptr<LibraryColorSwatch> nameColorSwatch;
+    juce::TextEditor nameEditor;
+
+    // Per-waveform output gain (IWavetableFrame::gain). A horizontal slider on
+    // the identity row whose drag spans 0..4x (1.0 = unity); the text box
+    // accepts higher or lower typed values up to a safety ceiling. Because
+    // every frame type peak-normalises its cycle, this is the ONLY way to make
+    // one waveform louder/quieter than its neighbours; it scales the rendered
+    // samples post-normalisation, so it shows in the preview and in the baked
+    // synth output and morphs. Drag-end commits one undo step.
+    juce::Label     gainLabel { {}, "Gain:" };
+    FreeEntrySlider gainSlider;
+
+    // Push the editor's current colour / name into the library entry the
+    // editor is targeting, and reflect any change back into the library
+    // list in the arrangement sidebar. Called whenever currentLibraryId
+    // changes, the editor is constructed, or the user finishes editing.
+    void refreshIdentityRow();
+
+    // Shared layer-stack widget (the "+ Layer" header, the scrolling list of
+    // WaveLayerEditor rows, and per-layer add/delete). Identical code is used
+    // by the Signal Shape (LFO / envelope) editor. Summation preview is OFF
+    // here - the wavetable editor has its own multi-frame-type preview strip
+    // (refreshPreview / previewBounds) that handles spectral / wavelet /
+    // granular frames too, which the shared component knows nothing about.
+    // Bound to the current layered frame via setTarget(currentEditingLayeredFrame()).
+    std::unique_ptr<LayerStackComponent> layerStack;
+
+    // Frame-scope warp chain editor (Bucket A shape-bending), bound to
+    // wave.warpChain. Lives in the right pane under the layer stack. Its amounts
+    // become "Warp N" node params (syncWarpParams) so they can be modulated.
+    std::unique_ptr<WarpChainEditor> frameWarpEditor;
 
     // When the current frame is non-layered (spectral / wavelet), the
     // matching editor is embedded into the same screen area normally
-    // occupied by layersViewport, so the wavetable editor stays a single
+    // occupied by the layer stack, so the wavetable editor stays a single
     // window regardless of which frame type the user is editing.
     // Recreated whenever the user switches to a frame of a different type
     // (it's bound to a specific frame via the frame-backed ctor).
@@ -527,17 +1038,52 @@ private:
 
 
     // Show the capture flow inline in the right pane (the spectral /
-    // wavelet / layered editors live there too). Source: 0=Playback
-    // (project song), 1=Mic, 2=File. The capture component is parented
-    // into capturePanel and given the right pane's bounds; the per-frame
-    // editor is hidden while it's up. On Save the component fires
-    // OnCapture, which appends the produced frames along the wavetable's
-    // first dimension (Grid) or stretches them along the X axis
-    // (Scatter); on Close the panel tears down and the per-frame editor
-    // reappears.
-    void showCapturePanelInline(int sourceKind);  // 0=Playback, 1=Mic, 2=File
+    // wavelet / layered / granular editors live there too). Source:
+    // 0=Playback (project song), 1=Mic, 2=File. The capture component is
+    // parented into capturePanel and given the right pane's bounds; the
+    // per-frame editor is hidden while it's up. On Save the component
+    // fires OnCapture.
+    //
+    // replaceCurrentEntry: when false (default), captured frames are
+    // appended to the wavetable along the first dimension (Grid) or
+    // stretched along the X axis (Scatter) - the normal "add waveforms"
+    // flow. When true, the FIRST captured frame replaces the wave on the
+    // library entry the editor is currently bound to (currentLibraryId);
+    // any further captured frames are discarded. This is the "Re-capture"
+    // path used by GranularFrameEditorComponent, so the user can swap a
+    // captured source for a new one without piling up library entries.
+    // No-op (defaults to append) if no library entry is currently bound.
+    void showCapturePanelInline(int sourceKind,
+                                bool replaceCurrentEntry = false);
     void dismissCapturePanel();
-    void appendCapturedFramesAlongPosition(std::vector<std::unique_ptr<IWavetableFrame>> frames);
+    // Add captured waveforms to the Library list ONLY - they are not placed
+    // into the arrangement, so capturing never grows the grid's cell count
+    // or adds a scatter dot. Placement is a separate explicit step via the
+    // Library list's "Assign to selected cell". The first new entry becomes
+    // the right-pane editor's target; the cell/scatter selection is left
+    // untouched.
+    //
+    // sourceKind (0 = project song, 1 = mic, 2 = file; matches
+    // showCapturePanelInline) is used only to build each new library
+    // entry's display name - "Mic - Crossfade loop" etc. - reflecting the
+    // capture source and the granular freeze method instead of a generic
+    // "Waveform N". -1 falls back to the auto-generated default name.
+    void addCapturedFramesToLibrary(std::vector<std::unique_ptr<IWavetableFrame>> frames,
+                                    int sourceKind = -1);
+    // Build the capture panel's metadata write-through sink: commits "As
+    // note" pitch / freeze mode / crossfade edits straight to the library
+    // frame the editor currently targets (currentLibraryId, re-looked-up
+    // live so a doc mutation or a rebinding Save can never dangle). Shared by
+    // the capture panel's replace mode (bound when the panel opens) and
+    // append mode (bound after the first Save, once a frame exists to write
+    // to) so a metadata edit can't be silently lost on Close in either mode.
+    std::function<void(double, int, double, int, int)> makeCaptureMetadataSink();
+    // Replace the wave on the currently-edited library entry with the
+    // first captured frame (drops the rest). Used by re-capture flows.
+    // No-op if currentLibraryId is unset, the entry has been removed, or
+    // `frames` is empty.
+    void replaceCurrentEntryWithCapturedFrame(
+        std::vector<std::unique_ptr<IWavetableFrame>> frames);
 
     // While non-null, occupies the right pane in place of the per-frame
     // editor / Compare panel / preview. Created by showCapturePanelInline
@@ -556,12 +1102,36 @@ private:
     LayeredWaveform* currentEditingLayeredFrame();
     const LayeredWaveform* currentEditingLayeredFrame() const;
 
+    // The normalized wavetable Position [0,1]^N of the frame the editor is
+    // currently targeting (currentLibraryId), derived from the first cell /
+    // scatter dot that references it. Grid: the cell's per-axis grid coord
+    // divided by (dimSize-1). Scatter: the dot's authored position. Empty
+    // if the entry isn't placed in any cell (or no editing target). Used to
+    // tell the synth which frame to audition so a frame's Play button plays
+    // THAT frame, not whatever the live Position knob selects.
+    std::vector<float> currentFramePosition() const;
+
     // Set the right-pane editor's target. Triggers the same UI refresh as
     // switchToFrame() did in the old model: rebuilds the frame tab strip,
     // rebuilds the layer rows / embedded sub-editor, refreshes preview,
     // and pings the pop-out wavetable view. No-op if libId is the current
     // target. libId == -1 explicitly clears the target.
     void setEditingLibraryEntry(int libId);
+
+    // Pop a modal text-entry dialog to rename the library entry `libId`, then
+    // apply it via setLibraryEntryName(). The discoverable rename affordance
+    // for the Library list rows and the arrangement-view dots/cells (their
+    // right-click menus call this); the right-pane identity-row nameEditor is
+    // the inline equivalent for whichever entry the editor is currently on.
+    // No-op if libId no longer exists.
+    void renameLibraryEntry(int libId);
+
+    // Set library entry `libId`'s display name and run the full settle: commit
+    // to the node script, push an undo step, rebuild the Library list, sync the
+    // identity row if this is the current target, and ping the pop-out. Shared
+    // by renameLibraryEntry() (popup) and the identity-row nameEditor (inline).
+    // No-op if the entry is missing or the name is unchanged.
+    void setLibraryEntryName(int libId, const std::string& newName);
 
     void rebuildRows();
     void updateHintText();
@@ -575,9 +1145,44 @@ private:
     void rebuildScatterUI();        // re-evaluates rotation slider count when dim count changes
     void refreshPreview();
     void commitToNode(); // encode `wave` into node.script
+    // Push a graph undo snapshot so a settled wavetable edit enters the undo
+    // system. Without this the edit lives only in the node's script (updated
+    // by commitToNode) and is silently destroyed by any later, unrelated
+    // Ctrl+Z that restores an earlier snapshot - which then gets saved,
+    // making the waveform/cell "vanish" on reload.
+    void commitUndoStep();
     void onLayerChanged();
     void switchToFrame(int idx);
     void syncPositionParams();      // ensure node has the right number of Position params
+    // Ensure the node carries exactly one "Warp N" param per op in the frame-
+    // scope warp chain (wave.warpChain), always numbered ("Warp 1".."Warp N"),
+    // so the on-demand modulation-pin mechanism (#88) can drive each warp amount
+    // with an LFO / oscillator. Adds missing params (seeded from the op amount),
+    // removes params for deleted ops (with their mod pins / cables), and remaps
+    // surviving modPin param indices. Called on a structural warp-chain edit.
+    void syncWarpParams();
+    // Lightweight: mirror each op's current amount into its matching (un-
+    // modulated) "Warp N" param so the synth's live read tracks the editor
+    // slider without a full param rebuild. Called on every warp amount edit.
+    void pushWarpAmountsToParams();
+    // Reorder support: when two warp ops swap slots a<->b, swap the names of
+    // their positional "Warp a+1" / "Warp b+1" node params so a wired
+    // modulation cable keeps driving its op rather than the slot it vacated.
+    // The param objects (and the modPins that reference them by index) stay
+    // put in nd->params; only their names swap, so the synth's per-slot
+    // getParamByName("Warp k+1") read now resolves each op to its original
+    // (possibly modulated) param. No-op if either name is absent.
+    void swapWarpParamNames(int a, int b);
+    // Re-sync Position params/pins only when the effective dimension count has
+    // actually changed since the params were last built. Cheap to call on every
+    // structural mutation (grid axis resize, scatter frame add/remove, cell
+    // placement); skips the erase/re-add churn - and the audio-thread param read
+    // race it would otherwise expose - whenever the count is unchanged.
+    void maybeSyncPositionParams();
+    // One block-rate modulation pin per Position axis, named by axis (X/Y/Z/W).
+    // `pinToAxis` maps each existing Position pin's id to its axis index,
+    // captured before syncPositionParams() reshuffles the Position params.
+    void syncPositionModPins(Node& nd, const std::map<int, int>& pinToAxis);
 };
 
 } // namespace SoundShop

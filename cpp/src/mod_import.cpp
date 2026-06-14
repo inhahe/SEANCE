@@ -4,6 +4,8 @@
 #include <fstream>
 #include <algorithm>
 #include <cmath>
+#include <map>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -35,7 +37,7 @@ bool ModImporter::isSupported(const std::string& path) {
 // Each tracker sample is rendered to a standalone WAV by triggering it via
 // libopenmpt's interactive interface. We trigger at libopenmpt note 60 (its
 // middle C, == MIDI C4) and set the resulting Sampler node's "Base Note" to
-// MIDI 60 too — pattern note values are on the same scale, so when those raw
+// MIDI 60 too - pattern note values are on the same scale, so when those raw
 // pattern notes feed the Sampler at base 60, the resulting pitches match
 // exactly what the tracker would have played.
 // =============================================================================
@@ -60,14 +62,87 @@ static std::string sanitizeFilename(const std::string& s) {
     return out;
 }
 
-static std::string extractSampleToWav(openmpt_module_ext* modExt,
-                                      openmpt_module_ext_interface_interactive& interactive,
-                                      openmpt_module* mod,
-                                      int sampleId,
-                                      const std::string& sampleName,
-                                      const std::string& destDir) {
+// Output of sample extraction: path to the rendered WAV plus loop points
+// (in rendered-sample units) when the sample sustains forever. loopEnd == 0
+// means "not a looped sample" (one-shot - let it play to end and stop).
+struct ExtractedSample {
+    std::string path;
+    int  loopStart = 0;
+    int  loopEnd   = 0;
+};
+
+// Detect the loop period of a sustained sample by autocorrelating its tail.
+// Looped tracker samples are exactly periodic in their tail (after any
+// initial attack transient), so the autocorrelation has a sharp peak at the
+// loop length. Returns the period in rendered samples, or 0 if no clean
+// periodicity was found.
+static int detectLoopPeriod(const float* L, const float* R, int N) {
+    constexpr int   kRenderRate    = 44100;
+    constexpr float kMinFreqHz     = 30.0f;   // lowest plausible note pitch
+    constexpr float kMaxFreqHz     = 5000.0f; // highest plausible note pitch
+    constexpr float kCorrThresh    = 0.85f;   // require strong periodicity
+    const int lagMin = (int)(kRenderRate / kMaxFreqHz);  // ~9
+    const int lagMax = (int)(kRenderRate / kMinFreqHz);  // ~1470
+
+    // Analyse the last ~1s. The note has long since passed its attack.
+    int winN = std::min(N, kRenderRate);
+    if (winN < 2 * lagMax) return 0;
+    int winStart = N - winN;
+
+    // Use mono mix for analysis.
+    std::vector<float> mono(winN);
+    double meanSq = 0;
+    for (int i = 0; i < winN; ++i) {
+        mono[i] = 0.5f * (L[winStart + i] + R[winStart + i]);
+        meanSq += (double)mono[i] * mono[i];
+    }
+    if (meanSq < 1e-6) return 0;
+
+    // Pitch-detection autocorrelation: find the lag in [lagMin, lagMax]
+    // whose normalised cross-correlation is closest to 1. We use the
+    // normalised form r(tau) = sum(x[i]*x[i+tau]) / sqrt(E0 * Etau) so
+    // peaks scale to ~1 for a perfectly periodic tail regardless of
+    // amplitude drift across the window.
+    int   bestLag  = 0;
+    float bestCorr = 0;
+    for (int lag = lagMin; lag <= lagMax; ++lag) {
+        int M = winN - lag;
+        double sum = 0, e0 = 0, et = 0;
+        for (int i = 0; i < M; ++i) {
+            sum += (double)mono[i] * mono[i + lag];
+            e0  += (double)mono[i] * mono[i];
+            et  += (double)mono[i + lag] * mono[i + lag];
+        }
+        double denom = std::sqrt(e0 * et);
+        if (denom < 1e-12) continue;
+        float corr = (float)(sum / denom);
+        if (corr > bestCorr) { bestCorr = corr; bestLag = lag; }
+    }
+
+    // Reject weak matches - the sample is non-pitched, or its tail
+    // doesn't actually repeat (e.g. a free-running noise generator).
+    if (bestCorr < kCorrThresh || bestLag <= 0) return 0;
+
+    // bestLag is the period in lone sample frames. The loop window
+    // [N - K*bestLag, N] for any positive integer K is seamless; using
+    // K=1 gives the shortest seamless loop, but a longer loop sounds
+    // more natural for samples with subtle drift. Pick K so the loop
+    // is at least 100 ms long.
+    int minLoopLen = kRenderRate / 10;
+    int K = std::max(1, (minLoopLen + bestLag - 1) / bestLag);
+    return K * bestLag;
+}
+
+static ExtractedSample extractSampleToWav(openmpt_module_ext* modExt,
+                                          openmpt_module_ext_interface_interactive& interactive,
+                                          openmpt_module* mod,
+                                          int sampleId,
+                                          const std::string& sampleName,
+                                          const std::string& destDir) {
     constexpr int kRenderRate = 44100;
-    constexpr int kMaxSamples = kRenderRate * 4;
+    // 8s render cap - enough to capture any reasonable held note and
+    // give detectLoopPeriod a clean ~1s analysis window past the attack.
+    constexpr int kMaxSamples = kRenderRate * 8;
     constexpr int kSilenceMs = 250;
     constexpr float kSilenceThresh = 1e-4f;
     constexpr int kChunk = 1024;
@@ -118,6 +193,33 @@ static std::string extractSampleToWav(openmpt_module_ext* modExt,
         --tail;
     if (tail < 32) return {};
 
+    // Detect a loop. If the sample is still ringing at the time cap, the
+    // last block of audio is full-amplitude and periodic - we find the
+    // period and set the MultiSampler zone to loop within it.
+    int loopStart = 0, loopEnd = 0;
+    {
+        // "Still ringing" heuristic: did we hit the time cap without
+        // silence detection trimming us? If so, the sample is sustained.
+        // (For one-shots, kSilenceThresh trims the tail aggressively.)
+        bool hitTimeCap = ((int)left.size() >= kMaxSamples - kChunk);
+        // Tail-energy check too - guards against the case where the
+        // sample faded down past the silence threshold but still ran the
+        // full 8s (e.g., a slow-decaying pad). We only loop if there's
+        // enough signal at the end to anchor the autocorrelation.
+        int tailWin = std::min(tail, kRenderRate / 5); // 200 ms
+        double tailE = 0;
+        for (int i = tail - tailWin; i < tail; ++i)
+            tailE += (double)left[i] * left[i] + (double)right[i] * right[i];
+        float tailRms = (float)std::sqrt(tailE / (2.0 * tailWin));
+        if (hitTimeCap && tailRms > 0.01f) {
+            int period = detectLoopPeriod(left.data(), right.data(), tail);
+            if (period > 0) {
+                loopEnd   = tail;
+                loopStart = tail - period;
+            }
+        }
+    }
+
     char idxBuf[16];
     std::snprintf(idxBuf, sizeof(idxBuf), "%02d_", sampleId);
     auto safeName = sanitizeFilename(sampleName);
@@ -139,31 +241,55 @@ static std::string extractSampleToWav(openmpt_module_ext* modExt,
     std::memcpy(buf.getWritePointer(1), right.data(), sizeof(float) * tail);
     writer->writeFromAudioSampleBuffer(buf, 0, tail);
     writer.reset();
-    return outFile.getFullPathName().toStdString();
+
+    ExtractedSample out;
+    out.path = outFile.getFullPathName().toStdString();
+    out.loopStart = loopStart;
+    out.loopEnd   = loopEnd;
+    return out;
 }
 
-// Create a Sampler node — same param schema as the right-click "Sampler"
+// Create a Sampler node - same param schema as the right-click "Sampler"
 // menu item in node_graph_component.cpp.
 // Create a MultiSampler instrument node with one zone pointing at the
 // given WAV file. Base note = MIDI 60 (C4) because that's the libopenmpt
-// note we used at sample-extraction time — pattern notes from the
+// note we used at sample-extraction time - pattern notes from the
 // tracker land on the same MIDI scale so the zone's natural playback
 // matches the tracker's pitches.
 static int createSamplerNode(NodeGraph& graph, const std::string& name,
-                              const std::string& wavPath, Vec2 pos) {
+                              const ExtractedSample& sample, Vec2 pos,
+                              float pan = 0.0f,
+                              bool amigaFilter = false) {
     auto& n = graph.addNode(name, NodeType::Instrument,
         {Pin{0, "MIDI", PinKind::Midi, true}},
         {Pin{0, "Audio", PinKind::Audio, false}}, pos);
     MultiSamplerDoc doc;
+    doc.interpMode = InterpMode::Linear; // authentic tracker interpolation
+    // MOD/S3M imports route through an Amiga PAULA reconstruction filter
+    // to match the reference (OpenMPT/Winamp) output - without it sample
+    // playback aliasing produces excess high-frequency content that's
+    // audible as a harsher "texture" vs the reference.
+    doc.amigaFilter = amigaFilter;
     MultiSamplerZone z;
-    z.samplePath = wavPath;
+    z.samplePath = sample.path;
     z.loNote = 0; z.hiNote = 127;
     z.loVel = 1; z.hiVel = 127;
     z.baseNote = 60;
+    // Sustained (looped) samples: detectLoopPeriod found a clean cycle
+    // at the end of the rendered audio. Setting loopEnabled here makes
+    // MultiSampler wrap [loopStart, loopEnd] while the note is held,
+    // so a tracker-style sustained pad rings for the full note duration
+    // instead of cutting off at the end of the rendered WAV.
+    if (sample.loopEnd > sample.loopStart) {
+        z.loopEnabled = true;
+        z.loopStart   = sample.loopStart;
+        z.loopEnd     = sample.loopEnd;
+    }
     doc.zones.push_back(z);
     n.script = doc.encode();
+    n.panLaw = PanLaw::Linear; // tracker uses linear pan law
     n.params.push_back({"Volume", 0.5f,  0.0f, 1.0f});
-    n.params.push_back({"Pan",    0.0f, -1.0f, 1.0f});
+    n.params.push_back({"Pan",    pan, -1.0f, 1.0f});
     return n.id;
 }
 
@@ -234,30 +360,83 @@ ModImporter::ImportResult ModImporter::import(const std::string& path, NodeGraph
     // ------------------------------------------------------------------
     // Pass 1: extract samples to WAV via render-and-capture.
     // ------------------------------------------------------------------
-    std::vector<std::string> samplePaths(numSamples + 1);
+    std::vector<ExtractedSample> samplePaths(numSamples + 1);
     std::vector<std::string> sampleNames(numSamples + 1);
     std::string sampleDir;
+
+    // Determine which sample slots actually contain audio data. Empty
+    // slots (length-zero samples) are common in MOD files - the format
+    // reserves space for 31 sample headers and most modules leave many
+    // unused. Calling libopenmpt's interactive play_note on an empty
+    // sample with all channels muted has been observed to crash, so we
+    // skip empty slots up-front rather than relying on libopenmpt to
+    // handle the degenerate case gracefully.
+    //
+    // For MOD (M.K. and friends), the sample length lives at byte
+    // offset 22-23 of each 30-byte sample header, starting at offset 20
+    // in the file, in big-endian words (length-in-bytes = word * 2).
+    // For S3M/IT/XM we don't parse the header here - the importer falls
+    // back to "extract everything"; those formats haven't been observed
+    // to trigger the same crash but the extra `play_note` calls are
+    // harmless if the slot is empty (the silence-detection break trims
+    // the resulting near-silence quickly).
+    auto sampleHasData = [&](int s) -> bool {
+        if (fmt != Fmt::Mod && fmt != Fmt::Other) return true;
+        // s is 1-based. Need offset 20 + (s-1)*30 + 22 .. +23.
+        size_t hdrOff = 20 + (size_t)(s - 1) * 30;
+        if (hdrOff + 24 > data.size()) return false;
+        unsigned hi = (unsigned char)data[hdrOff + 22];
+        unsigned lo = (unsigned char)data[hdrOff + 23];
+        unsigned lenWords = (hi << 8) | lo;
+        return lenWords > 1;  // MOD: length 0..1 words ≡ "no sample"
+    };
 
     if (hasInteractive && numSamples > 0) {
         sampleDir = makeSampleDir(path);
         if (!sampleDir.empty()) {
-            // Stop song playback so reads only render the interactive note.
-            // Use repeat_count = -1 (infinite) so the module keeps rendering
-            // audio frames even after reaching the end — otherwise
-            // read_float_stereo returns 0 immediately and we capture silence.
+            // Silence the song so each extracted WAV captures only the
+            // interactive note we trigger via play_note. play_note allocates
+            // a channel outside the module's pattern-channel range, so muting
+            // every pattern channel leaves the interactive note audible.
+            //
+            // CRITICAL: without muting, the song's pattern playback bleeds
+            // into every sample WAV. When MultiSampler later plays back
+            // those contaminated WAVs at varying pitches, the embedded
+            // song fragments get pitch-shifted along with the actual sample
+            // content - producing phantom notes at wrong pitches in the
+            // rendered output. The previous "set_position_seconds(1e9)
+            // + repeat_count(-1)" approach was meant to skip past song
+            // playback but in practice just looped the song endlessly, so
+            // every read_float_stereo call captured live pattern audio.
+            for (int ch = 0; ch < numChannels; ++ch)
+                interactive.set_channel_mute_status(modExt, ch, 1);
+            // Repeat -1 keeps the module producing audio frames so the
+            // interactive note continues rendering even if the (silent)
+            // song internally reaches its end.
             openmpt_module_set_repeat_count(mod, -1);
-            openmpt_module_set_position_seconds(mod, 1.0e9);
+            openmpt_module_set_position_seconds(mod, 0);
+            // Use default (0) interpolation so the extracted WAVs
+            // include the tracker's high-quality sinc resampling.
+            // The old setting of 1 (no interpolation) caused harsh
+            // aliasing when upsampling Amiga-rate samples to 44100 Hz.
             openmpt_module_set_render_param(
-                mod, OPENMPT_MODULE_RENDER_INTERPOLATIONFILTER_LENGTH, 1);
+                mod, OPENMPT_MODULE_RENDER_INTERPOLATIONFILTER_LENGTH, 0);
 
             for (int s = 1; s <= numSamples; ++s) {
                 const char* sn = openmpt_module_get_sample_name(mod, s);
                 std::string name = (sn && sn[0]) ? sn : "";
                 if (name.empty()) name = "sample_" + std::to_string(s);
                 sampleNames[s] = name;
+                if (!sampleHasData(s)) continue;  // skip empty slots
                 samplePaths[s] = extractSampleToWav(modExt, interactive, mod,
                                                      s, name, sampleDir);
             }
+
+            // Restore channel mute state - the pattern walk below reads
+            // pattern data (not audio) so this isn't strictly needed for
+            // correctness, but leaves the module in a clean state.
+            for (int ch = 0; ch < numChannels; ++ch)
+                interactive.set_channel_mute_status(modExt, ch, 0);
         }
     }
 
@@ -268,7 +447,7 @@ ModImporter::ImportResult ModImporter::import(const std::string& path, NodeGraph
     // Pass 1b: parse the file bytes directly to pick up instrument-mode
     // metadata (note-sample keymap, envelopes, NNA, fadeout, filter
     // defaults). libopenmpt exposes instrument names but nothing else
-    // — see tracker_file_parser.h/cpp for the raw format parsing.
+    // - see tracker_file_parser.h/cpp for the raw format parsing.
     // ------------------------------------------------------------------
     auto parsedFile = parseTrackerFile(path);
     int numInstruments = (int)parsedFile.instruments.size();
@@ -286,24 +465,58 @@ ModImporter::ImportResult ModImporter::import(const std::string& path, NodeGraph
     const int numSlots = instrumentMode ? numInstruments : numSamples;
 
     // ------------------------------------------------------------------
-    // Build node structure: Group container, Sampler-per-slot (lazy),
-    // MIDI-track-per-slot (lazy). Notes from any tracker channel that
-    // play the same slot land in that slot's single track. Per-channel
-    // monophony is preserved by trimming the channel's previous note
-    // when a new note arrives, regardless of which slot-track it
-    // lives in.
+    // Build node structure: Group container, Sampler-per-(slot,pan) (lazy),
+    // MIDI-track-per-(slot,pan) (lazy). Notes from any tracker channel
+    // that play the same slot AND have the same effective pan land in a
+    // shared track. Channels with different panning get separate
+    // track/sampler pairs so the stereo image is preserved (e.g. MOD's
+    // classic LRRL channel layout). Per-channel monophony is preserved
+    // by trimming the channel's previous note when a new note arrives.
     // ------------------------------------------------------------------
     auto modName = juce::File(path).getFileName().toStdString();
     auto& group = graph.createGroup(modName, {posX, posY});
     int groupId = group.id;
 
-    // Slot arrays are sized by the larger of numSlots / numSamples so
-    // they index safely whether the pattern walk is using sample or
-    // instrument ids. Index 0 is reserved for the "pre-instrument"
-    // pile (notes played before any inst command on a channel).
     const int arraySize = std::max(numSlots, numSamples) + 1;
+
+    // Primary arrays: store the first-created sampler/track per slot
+    // for backward compat with layout code. Full pan-aware routing
+    // uses the maps below.
     std::vector<int> samplerNodeId(arraySize, 0);
     std::vector<int> trackNodeId(arraySize, 0);
+
+    // Pan-aware maps: (slotId, panKey) -> nodeId. panKey = round(pan*100).
+    std::map<std::pair<int,int>, int> samplerByPan;
+    std::map<std::pair<int,int>, int> trackByPan;
+
+    auto panKeyFor = [](float pan) -> int {
+        return (int)std::round(pan * 100.0f);
+    };
+
+    // Compute default panning per channel based on tracker format.
+    std::vector<float> channelDefaultPan(numChannels, 0.0f);
+    if (fmt == Fmt::Mod || fmt == Fmt::Other) {
+        // Classic Amiga LRRL pattern.
+        for (int ch = 0; ch < numChannels; ++ch) {
+            int m = ch % 4;
+            channelDefaultPan[ch] = (m == 0 || m == 3) ? -1.0f : 1.0f;
+        }
+    } else if (fmt == Fmt::S3m) {
+        // S3M typically alternates channels L/R.
+        for (int ch = 0; ch < numChannels; ++ch)
+            channelDefaultPan[ch] = (ch % 2 == 0) ? -0.75f : 0.75f;
+    }
+    // IT and XM: channels default to center (0.0); instrument default
+    // pan (if present) overrides, handled in getOrCreateSampler.
+
+    // Helper: effective pan for a (slotId, channelPan) combo. If the
+    // instrument has its own default pan, that wins over the channel pan.
+    auto effectivePanFor = [&](int slotId, float channelPan) -> float {
+        if (instrumentMode && slotId > 0 && slotId <= numInstruments)
+            if (parsedFile.instruments[slotId].hasDefaultPan)
+                return parsedFile.instruments[slotId].defaultPan;
+        return channelPan;
+    };
 
     auto wireToMasterOut = [&](int nodeId) {
         auto* src = graph.findNode(nodeId);
@@ -333,10 +546,10 @@ ModImporter::ImportResult ModImporter::import(const std::string& path, NodeGraph
                 // XM: 0..64 (32 = center).
                 q.value = (p.value - 32.0f) / 32.0f;
             } else if (isPitch) {
-                // IT pitch envelope: ±32 ≈ ±32 semitones (1 unit = 1 semi).
+                // IT pitch envelope: +/-32 ≈ +/-32 semitones (1 unit = 1 semi).
                 q.value = p.value;
             } else {
-                // Volume envelope: 0..64 → 0..1.
+                // Volume envelope: 0..64 -> 0..1.
                 q.value = p.value / 64.0f;
             }
             dst.points.push_back(q);
@@ -365,7 +578,7 @@ ModImporter::ImportResult ModImporter::import(const std::string& path, NodeGraph
         while (start < (int)inst.noteMap.size()) {
             int sample = inst.noteMap[start].sample;
             if (sample <= 0 || sample > numSamples
-                || samplePaths[sample].empty()) {
+                || samplePaths[sample].path.empty()) {
                 ++start;
                 continue;
             }
@@ -374,25 +587,37 @@ ModImporter::ImportResult ModImporter::import(const std::string& path, NodeGraph
                    && inst.noteMap[end + 1].sample == sample) {
                 ++end;
             }
+            const auto& es = samplePaths[sample];
             MultiSamplerZone z;
-            z.samplePath = samplePaths[sample];
+            z.samplePath = es.path;
             z.loNote = start;
             z.hiNote = end;
             z.loVel  = 1;
             z.hiVel  = 127;
             z.baseNote = 60;           // matches extractSampleToWav render note
+            if (es.loopEnd > es.loopStart) {
+                z.loopEnabled = true;
+                z.loopStart   = es.loopStart;
+                z.loopEnd     = es.loopEnd;
+            }
             doc.zones.push_back(z);
             start = end + 1;
         }
         // If the whole map was empty (unused instrument slot), fall
         // back to a full-range zone using sample 1 so the node still
         // makes sound if the pattern references the instrument.
-        if (doc.zones.empty() && numSamples >= 1 && !samplePaths[1].empty()) {
+        if (doc.zones.empty() && numSamples >= 1 && !samplePaths[1].path.empty()) {
+            const auto& es = samplePaths[1];
             MultiSamplerZone z;
-            z.samplePath = samplePaths[1];
+            z.samplePath = es.path;
             z.loNote = 0; z.hiNote = 127;
             z.loVel = 1;  z.hiVel = 127;
             z.baseNote = 60;
+            if (es.loopEnd > es.loopStart) {
+                z.loopEnabled = true;
+                z.loopStart   = es.loopStart;
+                z.loopEnd     = es.loopEnd;
+            }
             doc.zones.push_back(z);
         }
         doc.volumeEnv = envelopeFromTracker(inst.volumeEnv, false, false);
@@ -407,7 +632,7 @@ ModImporter::ImportResult ModImporter::import(const std::string& path, NodeGraph
         }
         if (inst.useFilterResonance)
             doc.filterResonance = inst.filterResonance / 127.0f;
-        // Fadeout → add to release so the note dies naturally after
+        // Fadeout -> add to release so the note dies naturally after
         // note-off. IT fadeout units: 0..1024, representing amount the
         // note's volume drops per tick (50 Hz). Time to fully fade:
         // 1024 / fadeOut ticks = (1024 / fadeOut) / 50 seconds.
@@ -418,50 +643,77 @@ ModImporter::ImportResult ModImporter::import(const std::string& path, NodeGraph
         return doc;
     };
 
-    // Get-or-create a MultiSampler node for a slot id. In instrument
-    // mode, the doc is populated from parsed instrument metadata. In
-    // sample mode, we build a one-zone doc pointing at the extracted
-    // sample WAV.
-    auto getOrCreateSampler = [&](int slotId) -> int {
+    // Get-or-create a MultiSampler node for a (slot, channelPan) pair.
+    // In instrument mode, the doc is populated from parsed instrument
+    // metadata. In sample mode, we build a one-zone doc pointing at the
+    // extracted sample WAV. Separate nodes are created for different
+    // effective pan positions (e.g. MOD L/R channels).
+    auto getOrCreateSampler = [&](int slotId, float channelPan) -> int {
         if (slotId <= 0 || slotId > numSlots) return -1;
-        if (samplerNodeId[slotId] != 0) return samplerNodeId[slotId];
+        float epan = effectivePanFor(slotId, channelPan);
+        int pk = panKeyFor(epan);
+        auto key = std::make_pair(slotId, pk);
+        auto it = samplerByPan.find(key);
+        if (it != samplerByPan.end()) return it->second;
 
-        Vec2 pos{posX + 460, posY + 30 + (slotId - 1) * 40};
+        Vec2 pos{posX + 460, posY + 30 + (slotId - 1) * 120};
+
+        // Label suffix when the same instrument gets split by pan.
+        auto panSuffix = [&]() -> std::string {
+            if (epan < -0.5f) return " (L)";
+            if (epan >  0.5f) return " (R)";
+            return "";
+        };
+
+        // Amiga PAULA reconstruction-filter emulation. MOD/S3M files
+        // historically rendered through the Amiga's analog low-pass and
+        // sound dull/warm compared to raw playback; OpenMPT/Winamp apply
+        // this filter by default for those formats. IT and XM are
+        // PC-tracker formats with no equivalent hardware filter, so we
+        // leave the filter off there.
+        bool useAmigaFilter = (fmt == Fmt::Mod) || (fmt == Fmt::S3m);
 
         if (instrumentMode) {
             const auto& inst = parsedFile.instruments[slotId];
             auto doc = buildInstrumentDoc(inst);
+            doc.interpMode = InterpMode::Linear; // authentic tracker interp
+            doc.amigaFilter = useAmigaFilter;
             if (doc.zones.empty()) return -1;
             std::string label = inst.name.empty()
                 ? ("Instrument " + std::to_string(slotId))
                 : inst.name;
+            label += panSuffix();
             auto& n = graph.addNode(label, NodeType::Instrument,
                 {Pin{0, "MIDI", PinKind::Midi, true}},
                 {Pin{0, "Audio", PinKind::Audio, false}}, pos);
             n.script = doc.encode();
+            n.panLaw = PanLaw::Linear; // tracker linear pan law
             float vol = inst.defaultVolume > 0 ? (inst.defaultVolume / 128.0f) : 0.5f;
-            float pan = inst.hasDefaultPan ? inst.defaultPan : 0.0f;
             n.params.push_back({"Volume", vol, 0.0f, 1.0f});
-            n.params.push_back({"Pan",    pan, -1.0f, 1.0f});
-            samplerNodeId[slotId] = n.id;
+            n.params.push_back({"Pan",    epan, -1.0f, 1.0f});
+            samplerByPan[key] = n.id;
+            if (samplerNodeId[slotId] == 0) samplerNodeId[slotId] = n.id;
             graph.addToGroup(groupId, n.id);
             wireToMasterOut(n.id);
             return n.id;
         }
 
         // Sample mode: one-zone instrument built from the extracted WAV.
-        if (slotId > numSamples || samplePaths[slotId].empty()) return -1;
+        if (slotId > numSamples || samplePaths[slotId].path.empty()) return -1;
         std::string label = sampleNames[slotId].empty()
             ? ("Sample " + std::to_string(slotId))
             : sampleNames[slotId];
-        int id = createSamplerNode(graph, label, samplePaths[slotId], pos);
-        samplerNodeId[slotId] = id;
+        label += panSuffix();
+        int id = createSamplerNode(graph, label, samplePaths[slotId],
+                                   pos, epan, useAmigaFilter);
+        samplerByPan[key] = id;
+        if (samplerNodeId[slotId] == 0) samplerNodeId[slotId] = id;
         graph.addToGroup(groupId, id);
         wireToMasterOut(id);
         return id;
     };
 
-    auto getOrCreateTrack = [&](int slotId) -> int {
+    auto getOrCreateTrack = [&](int slotId, float channelPan) -> int {
         if (slotId <= 0 || slotId > numSlots) {
             if (trackNodeId[0] != 0) return trackNodeId[0];
             auto& trk = graph.addNode("Pre-instrument", NodeType::MidiTimeline,
@@ -470,11 +722,17 @@ ModImporter::ImportResult ModImporter::import(const std::string& path, NodeGraph
             trk.clips.push_back({"Pattern", 0, 4, 0xFF6688CC});
             graph.addToGroup(groupId, trk.id);
             trackNodeId[0] = trk.id;
+            trackByPan[{0, 0}] = trk.id;
             wireToMasterOut(trk.id);
             return trk.id;
         }
-        if (trackNodeId[slotId] != 0) return trackNodeId[slotId];
-        int sampNodeId = getOrCreateSampler(slotId);
+        float epan = effectivePanFor(slotId, channelPan);
+        int pk = panKeyFor(epan);
+        auto key = std::make_pair(slotId, pk);
+        auto it = trackByPan.find(key);
+        if (it != trackByPan.end()) return it->second;
+
+        int sampNodeId = getOrCreateSampler(slotId, channelPan);
         std::string baseName;
         if (instrumentMode) {
             baseName = parsedFile.instruments[slotId].name.empty()
@@ -487,7 +745,11 @@ ModImporter::ImportResult ModImporter::import(const std::string& path, NodeGraph
         } else {
             baseName = "Slot " + std::to_string(slotId);
         }
-        Vec2 pos{posX + 200, posY + 30 + (slotId - 1) * 40};
+        // Pan suffix to distinguish L/R variants in the node graph.
+        if (epan < -0.5f) baseName += " (L)";
+        else if (epan > 0.5f) baseName += " (R)";
+
+        Vec2 pos{posX + 200, posY + 30 + (slotId - 1) * 120};
         auto& trk = graph.addNode(baseName, NodeType::MidiTimeline,
             {Pin{0, "MIDI In", PinKind::Midi, true}},
             {Pin{0, "MIDI", PinKind::Midi, false}}, pos);
@@ -508,17 +770,17 @@ ModImporter::ImportResult ModImporter::import(const std::string& path, NodeGraph
         } else {
             wireToMasterOut(trkId);
         }
-        trackNodeId[slotId] = trkId;
+        trackByPan[key] = trkId;
+        if (trackNodeId[slotId] == 0) trackNodeId[slotId] = trkId;
         return trkId;
     };
 
     // ------------------------------------------------------------------
     // Per-channel state carried during the pattern walk.
     // ------------------------------------------------------------------
-    // "slotId" means the current routing key for a channel — sample id
-    // in sample mode, instrument id in instrument mode. samplerNodeId[]
-    // and trackNodeId[] are indexed by it.
-    struct LastNoteRef { int sampleId = -1; int noteIdx = -1; }; // field name kept historical — it's really slotId
+    // "slotId" means the current routing key for a channel - sample id
+    // in sample mode, instrument id in instrument mode.
+    struct LastNoteRef { int sampleId = -1; int noteIdx = -1; int trkNodeId = 0; };
     // New-note action: decides what to do with the *previous* note on a
     // channel when a new note arrives. Cut is the default for all formats
     // (and the only behavior MOD/S3M support). IT instrument mode adds
@@ -533,6 +795,7 @@ ModImporter::ImportResult ModImporter::import(const std::string& path, NodeGraph
     enum class NNA : int { Cut = 0, Continue = 1, Off = 2, Fade = 3 };
     struct ChannelState {
         int currentSample = 0;
+        int activeSamplerNodeId = 0;  // for pan/effect automation
         int  vibratoWave = 0;
         int  tremoloWave = 0;
         int  glissandoMode = 0;
@@ -555,7 +818,7 @@ ModImporter::ImportResult ModImporter::import(const std::string& path, NodeGraph
     float globalVolume = 1.0f;
 
     // Accumulated reverb-send regions per slot. After the pattern walk,
-    // any slot that has entries gets a Sampler→Reverb link with these
+    // any slot that has entries gets a Sampler->Reverb link with these
     // regions attached as EffectRegions on the slot's track node.
     struct BeatRegion { float startBeat; float endBeat; };
     std::vector<std::vector<BeatRegion>> reverbRegions(arraySize);
@@ -571,10 +834,8 @@ ModImporter::ImportResult ModImporter::import(const std::string& path, NodeGraph
     };
 
     auto resolveLast = [&](LastNoteRef ref) -> MidiNote* {
-        if (ref.sampleId < 0 || ref.noteIdx < 0) return nullptr;
-        int trkId = trackNodeId[ref.sampleId];
-        if (trkId == 0) return nullptr;
-        auto* tn = graph.findNode(trkId);
+        if (ref.trkNodeId == 0 || ref.noteIdx < 0) return nullptr;
+        auto* tn = graph.findNode(ref.trkNodeId);
         if (!tn || tn->clips.empty()) return nullptr;
         auto& clip = tn->clips[0];
         if (ref.noteIdx >= (int)clip.notes.size()) return nullptr;
@@ -585,7 +846,7 @@ ModImporter::ImportResult ModImporter::import(const std::string& path, NodeGraph
         auto* nn = resolveLast(ref);
         if (!nn) return;
         float trkStart = 0.0f;
-        if (auto* tn = graph.findNode(trackNodeId[ref.sampleId]))
+        if (auto* tn = graph.findNode(ref.trkNodeId))
             if (!tn->clips.empty()) trkStart = tn->clips[0].startBeat;
         float relEnd = endBeat - trkStart;
         if (relEnd > nn->offset && relEnd < nn->offset + nn->duration)
@@ -633,7 +894,7 @@ ModImporter::ImportResult ModImporter::import(const std::string& path, NodeGraph
         if (auto* nn = resolveLast(chState[ch].lastNote)) nn->detune -= amt * 0.25f;
     };
     auto applyToneSlide = [&](int ch) {
-        int trkId = trackNodeId[chState[ch].lastNote.sampleId];
+        int trkId = chState[ch].lastNote.trkNodeId;
         if (trkId == 0) return;
         auto* tn = graph.findNode(trkId);
         if (!tn || tn->clips.empty()) return;
@@ -685,12 +946,11 @@ ModImporter::ImportResult ModImporter::import(const std::string& path, NodeGraph
     // creating the Sampler on demand if it doesn't exist yet. Returns
     // nullptr if there's no sampler for that id (sample extraction
     // failed). Used by both set-pan and panbrello to post points into
-    // the Pan param's automation lane — so multiple pan commands over
+    // the Pan param's automation lane - so multiple pan commands over
     // the song cumulatively form a pan curve rather than having the
     // last one win.
-    auto getSamplerPanLane = [&](int sampleId) -> AutomationLane* {
-        if (sampleId <= 0 || sampleId > numSamples) return nullptr;
-        int sampId = samplerNodeId[sampleId];
+    auto getSamplerPanLane = [&](int ch) -> AutomationLane* {
+        int sampId = chState[ch].activeSamplerNodeId;
         if (sampId == 0) return nullptr;
         auto* sn = graph.findNode(sampId);
         if (!sn) return nullptr;
@@ -703,23 +963,21 @@ ModImporter::ImportResult ModImporter::import(const std::string& path, NodeGraph
         // panVal is in tracker units (0-255 for 8xx / S8x); map to [-1,1].
         // Emit as an automation point on the sampler's Pan param at the
         // current beat so successive pan changes accumulate into a lane.
-        int sId = chState[ch].lastNote.sampleId;
-        auto* lane = getSamplerPanLane(sId);
+        auto* lane = getSamplerPanLane(ch);
         if (!lane) return;
         float pan = juce::jlimit(-1.0f, 1.0f, (panVal - 128.0f) / 128.0f);
         lane->points.push_back({currentBeat, pan});
     };
 
     // Panbrello (S3M/IT Yxx): sinusoidal (or other waveform) pan wobble.
-    // We don't have a runtime panbrello processor — instead we sample the
+    // We don't have a runtime panbrello processor - instead we sample the
     // waveform at 8 points across the current row and post them as
     // automation points on the sampler's Pan param. The channel's tremolo
-    // waveform (chState[ch].tremoloWave) isn't used — panbrello has its
+    // waveform (chState[ch].tremoloWave) isn't used - panbrello has its
     // own waveform setting via S5x, which we don't track separately; we
     // treat panbrello as always sine for the baked output.
     auto applyPanbrello = [&](int ch, uint8_t param) {
-        int sId = chState[ch].lastNote.sampleId;
-        auto* lane = getSamplerPanLane(sId);
+        auto* lane = getSamplerPanLane(ch);
         if (!lane) return;
         float speed = (float)(param >> 4) / 16.0f;
         float depth = (float)(param & 0x0F) / 15.0f;
@@ -759,7 +1017,7 @@ ModImporter::ImportResult ModImporter::import(const std::string& path, NodeGraph
     };
     auto applyRetrig = [&](int ch, int times, float beatsPerRow_) {
         if (times <= 0) return;
-        int trkId = trackNodeId[chState[ch].lastNote.sampleId];
+        int trkId = chState[ch].lastNote.trkNodeId;
         if (trkId == 0) return;
         auto* tn = graph.findNode(trkId);
         if (!tn || tn->clips.empty()) return;
@@ -781,7 +1039,7 @@ ModImporter::ImportResult ModImporter::import(const std::string& path, NodeGraph
         auto ref = chState[ch].lastNote;
         auto* base = resolveLast(ref);
         if (!base) return;
-        int trkId = trackNodeId[ref.sampleId];
+        int trkId = ref.trkNodeId;
         auto* tn = graph.findNode(trkId);
         if (!tn || tn->clips.empty()) return;
         auto& clip = tn->clips[0];
@@ -840,7 +1098,7 @@ ModImporter::ImportResult ModImporter::import(const std::string& path, NodeGraph
     // Expand a MIDI macro template string, substituting placeholder
     // tokens with the current context, and emit the resulting bytes as
     // CC events on the track for the channel's current slot. The IT
-    // default macro "F0F000z" encodes filter cutoff — we recognize that
+    // default macro "F0F000z" encodes filter cutoff - we recognize that
     // common pattern and emit CC74 (brightness / filter cutoff) instead
     // of raw SysEx, since our MultiSampler reads CC74 via automation.
     //
@@ -849,15 +1107,13 @@ ModImporter::ImportResult ModImporter::import(const std::string& path, NodeGraph
     // 'v' = velocity, 'u' = volume, 'p' = pan, others ignored.
     auto expandMidiMacro = [&](int ch, const std::string& macroStr, uint8_t zParam) {
         if (macroStr.empty()) return;
-        int slot = chState[ch].currentSample;
-        if (slot <= 0 || slot >= (int)trackNodeId.size()) return;
-        int trkId = trackNodeId[slot];
+        int trkId = chState[ch].lastNote.trkNodeId;
         if (trkId == 0) return;
         auto* tn = graph.findNode(trkId);
         if (!tn || tn->clips.empty()) return;
         auto& clip = tn->clips[0];
 
-        // Recognize the ultra-common default: "F0F000z" — IT's internal
+        // Recognize the ultra-common default: "F0F000z" - IT's internal
         // filter cutoff. Emit as CC74 (MIDI standard brightness) on the
         // track, which the MultiSampler can read via CC routing.
         if (macroStr == "F0F000z" || macroStr == "F0F000Z") {
@@ -914,7 +1170,7 @@ ModImporter::ImportResult ModImporter::import(const std::string& path, NodeGraph
 
         // Emit: if the expanded data is a 3-byte MIDI CC (Bx cc vv),
         // emit as a MidiCCEvent. Otherwise emit the first two data
-        // bytes as CC74 (heuristic — many macro expansions are
+        // bytes as CC74 (heuristic - many macro expansions are
         // filter sweeps, and CC74 is the best-effort landing target
         // until we support arbitrary SysEx routing).
         if (expanded.size() >= 3 && (expanded[0] & 0xF0) == 0xB0) {
@@ -939,7 +1195,7 @@ ModImporter::ImportResult ModImporter::import(const std::string& path, NodeGraph
         int sub = param >> 4;
         int x   = param & 0x0F;
         switch (sub) {
-            case 0x0: break; // filter (Amiga LED) — ignore
+            case 0x0: break; // filter (Amiga LED) - ignore
             case 0x1: applyFinePortaUp(ch, x); break;
             case 0x2: applyFinePortaDown(ch, x); break;
             case 0x3: chState[ch].glissandoMode = x; break;
@@ -952,21 +1208,21 @@ ModImporter::ImportResult ModImporter::import(const std::string& path, NodeGraph
                     nn->detune = cents;
                 break;
             }
-            case 0x6: // pattern loop — handled at row level via shared signal
-                // Use sharedNoteCutTicks repurposed? No — we need a dedicated
+            case 0x6: // pattern loop - handled at row level via shared signal
+                // Use sharedNoteCutTicks repurposed? No - we need a dedicated
                 // signal. Pattern loops pass through a separate path; this
                 // case is a no-op here and the row-level scan also looks
                 // directly for E6/SBx.
                 break;
             case 0x7: chState[ch].tremoloWave = x & 0x3; break;
-            case 0x8: break; // sync — ignore
+            case 0x8: break; // sync - ignore
             case 0x9: applyRetrig(ch, x, beatsPerRow); break;
             case 0xA: applyFineVolUp(ch, x); break;
             case 0xB: applyFineVolDown(ch, x); break;
             case 0xC: applyNoteCutTicks(ch, x, currentSpeed_, beatsPerRow); break;
             case 0xD: applyNoteDelayTicks(ch, x, currentSpeed_, beatsPerRow); break;
             case 0xE: patternDelayRows = std::max(patternDelayRows, x); break;
-            case 0xF: break; // invert loop — ignore
+            case 0xF: break; // invert loop - ignore
         }
     };
 
@@ -989,17 +1245,17 @@ ModImporter::ImportResult ModImporter::import(const std::string& path, NodeGraph
             case 0x5: break; // S5x panbrello waveform
             case 0x6: patternDelayRows = std::max(patternDelayRows, x); break; // S6x fine pattern delay (in ticks; we round to row)
             case 0x7: {
-                // S7x — past-note actions and new-note-action settings.
+                // S7x - past-note actions and new-note-action settings.
                 // S70 = past note cut, S71 = past note off, S72 = past note fade:
                 //   operate on the channel's currently-ringing note now.
                 // S73-S76 = set the channel's NNA for future new-notes.
-                // S77-S7F = duplicate check type/action — we don't model these.
+                // S77-S7F = duplicate check type/action - we don't model these.
                 switch (x) {
-                    case 0x0: // past note cut — trim now
+                    case 0x0: // past note cut - trim now
                         trimNote(chState[ch].lastNote, currentBeat);
                         break;
-                    case 0x1: // past note off — trim now (release envelope plays out)
-                    case 0x2: // past note fade — trim now (approximation)
+                    case 0x1: // past note off - trim now (release envelope plays out)
+                    case 0x2: // past note fade - trim now (approximation)
                         trimNote(chState[ch].lastNote, currentBeat);
                         break;
                     case 0x3: chState[ch].newNoteAction = NNA::Cut;      break;
@@ -1012,7 +1268,7 @@ ModImporter::ImportResult ModImporter::import(const std::string& path, NodeGraph
             }
             case 0x8: applySetPanning(ch, (x * 16 + 8)); break; // S8x set pan (4-bit -> 0..255)
             case 0x9: { // S9x sound control
-                // S90/S91: surround off/on — TODO surround-widener effect
+                // S90/S91: surround off/on - TODO surround-widener effect
                 // S98: reverb off for this channel
                 // S99: reverb on for this channel
                 if (x == 0x8) {
@@ -1026,7 +1282,7 @@ ModImporter::ImportResult ModImporter::import(const std::string& path, NodeGraph
                 break;
             }
             case 0xA: break; // SA0/SA1 stereo control
-            case 0xB: // SB0 / SBn pattern loop — handled at row level
+            case 0xB: // SB0 / SBn pattern loop - handled at row level
                 break;
             case 0xC: applyNoteCutTicks(ch, x, currentSpeed_, beatsPerRow); break;
             case 0xD: applyNoteDelayTicks(ch, x, currentSpeed_, beatsPerRow); break;
@@ -1052,7 +1308,7 @@ ModImporter::ImportResult ModImporter::import(const std::string& path, NodeGraph
             case 'A': applyVolumeSlide(ch, param); break;
             case 'B': posJumpTarget = param; break;
             case 'C': applySetVolume(ch, param); break;
-            case 'D': // pattern break — param is "decimal of hex" in classic MOD
+            case 'D': // pattern break - param is "decimal of hex" in classic MOD
                 patternBreakRow = ((param >> 4) * 10) + (param & 0x0F);
                 if (patternBreakRow < 0) patternBreakRow = 0;
                 break;
@@ -1086,7 +1342,7 @@ ModImporter::ImportResult ModImporter::import(const std::string& path, NodeGraph
             case 'F': applyPortaUp(ch, param); break;
             case 'G': applyToneSlide(ch); break;
             case 'H': applyVibrato(ch, param); break;
-            case 'I': // tremor — gate the note in semi-regular pulses
+            case 'I': // tremor - gate the note in semi-regular pulses
                 applyTremolo(ch, param);
                 break;
             case 'J': applyArpeggio(ch, param, beatsPerRow); break;
@@ -1097,7 +1353,7 @@ ModImporter::ImportResult ModImporter::import(const std::string& path, NodeGraph
                 break;
             case 'N': applyVolumeSlide(ch, param); break;
             case 'O': applySampleOffset(ch, param); break;
-            case 'P': // pan slide — approximate as nothing for now
+            case 'P': // pan slide - approximate as nothing for now
                 break;
             case 'Q': applyRetrig(ch, param & 0x0F, beatsPerRow); break;
             case 'R': applyTremolo(ch, param); break;
@@ -1106,7 +1362,7 @@ ModImporter::ImportResult ModImporter::import(const std::string& path, NodeGraph
                 graph.bpm = 6.0f * (float)param / initialSpeedF;
                 tempoSetThisRow = true;
                 break;
-            case 'U': applyVibrato(ch, param); break; // fine vibrato — same code, smaller depth in real engine
+            case 'U': applyVibrato(ch, param); break; // fine vibrato - same code, smaller depth in real engine
             case 'V': // set global volume. IT = 0..128, S3M = 0..64.
                 setGlobalVolAbs(param, fmt == Fmt::It ? 128 : 64);
                 break;
@@ -1114,10 +1370,10 @@ ModImporter::ImportResult ModImporter::import(const std::string& path, NodeGraph
                 applyGlobalVolSlide(param);
                 break;
             case 'X': applySetPanning(ch, param); break;
-            case 'Y': // panbrello — sinusoidal pan wobble
+            case 'Y': // panbrello - sinusoidal pan wobble
                 applyPanbrello(ch, param);
                 break;
-            case 'Z': { // MIDI macro — expand the Zxx macro template
+            case 'Z': { // MIDI macro - expand the Zxx macro template
                 // Zxx invokes the fixed macro at index param (0x00-0x7F).
                 // The macro string comes from the parsed file header.
                 if (parsedFile.hasMidiMacros && param < 128) {
@@ -1165,12 +1421,12 @@ ModImporter::ImportResult ModImporter::import(const std::string& path, NodeGraph
             case 'H': // global volume slide
                 applyGlobalVolSlide(param);
                 break;
-            case 'K': // key off — trim last note now
+            case 'K': // key off - trim last note now
                 trimNote(chState[ch].lastNote, 0); // 0 means "now" handled by trim
                 break;
-            case 'L': // set envelope position — ignore
+            case 'L': // set envelope position - ignore
                 break;
-            case 'P': // panning slide — ignore
+            case 'P': // panning slide - ignore
                 break;
             case 'R': applyRetrig(ch, param & 0x0F, beatsPerRow); break;
             case 'T': // tremor
@@ -1217,7 +1473,7 @@ ModImporter::ImportResult ModImporter::import(const std::string& path, NodeGraph
 
     // Track which orders we've already walked and the beat position each
     // one started at. When a Bxx position-jump lands on an order we've
-    // already processed, that's a whole-song loop — we don't unroll it
+    // already processed, that's a whole-song loop - we don't unroll it
     // inline. Instead we stop pattern walking, set the project's
     // songLengthBeats to the accumulated end beat, and set songRepeatMode
     // to Forever so the transport wraps back automatically at playback
@@ -1226,7 +1482,7 @@ ModImporter::ImportResult ModImporter::import(const std::string& path, NodeGraph
     // Loop points that target order 0 map exactly to the songRepeat
     // behavior (wrap back to beat 0). Loop points that target a later
     // order still wrap to beat 0, which means the intro replays on each
-    // cycle — a small fidelity loss that affects very few songs. If we
+    // cycle - a small fidelity loss that affects very few songs. If we
     // ever want to fix that perfectly we can set the user-region loop
     // (loopEnabled / loopStartBeat / loopEndBeat) instead.
     std::vector<bool> orderVisited(numOrders, false);
@@ -1278,9 +1534,9 @@ ModImporter::ImportResult ModImporter::import(const std::string& path, NodeGraph
                     chState[ch].currentSample = inst;
                     // In instrument mode, picking up a new instrument
                     // also sets the channel's default NNA from the
-                    // instrument header — unless an explicit S73-S76
+                    // instrument header - unless an explicit S73-S76
                     // row command has overridden it in the meantime.
-                    // (We don't track per-channel "was overridden" —
+                    // (We don't track per-channel "was overridden" -
                     // the override persists implicitly by being set
                     // every time the row command fires.)
                     if (instrumentMode && inst <= (int)parsedFile.instruments.size() - 1) {
@@ -1294,12 +1550,13 @@ ModImporter::ImportResult ModImporter::import(const std::string& path, NodeGraph
                     // Honor the channel's NNA: with NNA=Cut (the default
                     // and the only option in MOD/S3M), trim the previous
                     // note at the new note's start beat. With Continue /
-                    // Off / Fade, leave the previous note ringing — the
+                    // Off / Fade, leave the previous note ringing - the
                     // Sampler's voice envelope will handle release.
                     if (chState[ch].newNoteAction == NNA::Cut)
                         trimNote(chState[ch].lastNote, currentBeat);
 
-                    int trackId = getOrCreateTrack(effectiveSlot);
+                    float chPan = channelDefaultPan[ch];
+                    int trackId = getOrCreateTrack(effectiveSlot, chPan);
                     if (auto* tn = graph.findNode(trackId)) {
                         if (!tn->clips.empty()) {
                             auto& clip = tn->clips[0];
@@ -1307,11 +1564,30 @@ ModImporter::ImportResult ModImporter::import(const std::string& path, NodeGraph
                             MidiNote nn;
                             nn.offset = currentBeat - clip.startBeat;
                             nn.pitch = std::min(127, midiPitch);
-                            nn.duration = beatsPerRow;
-                            int rawVel = 100;
+                            // Tracker notes have no intrinsic duration: they
+                            // ring until either (a) a new note on the same
+                            // channel arrives and NNA::Cut trims them via
+                            // trimNote(), or (b) the sample plays through
+                            // and the MultiSampler voice naturally goes
+                            // silent past the sample's data length.
+                            //
+                            // Defaulting to beatsPerRow (one row) was
+                            // forcing every note to end after ~0.12 s,
+                            // which prematurely note-offs the voice and
+                            // chops the sample's natural decay. Use a
+                            // generous default and let trimNote() shorten
+                            // notes that have a successor - notes without
+                            // a successor extend silently past their
+                            // audible tail without harm. clip.lengthBeats
+                            // is clamped to songLength after the walk
+                            // (see "Extend each track's clip" block), so
+                            // the extended default doesn't bloat the
+                            // exported timeline.
+                            nn.duration = 64.0f;
+                            int rawVel = 127;
                             // Volume column: VOLCMD_VOLUME == 1 (set volume).
                             // Other vol-col commands (slide etc.) are not yet
-                            // mapped — treat them as no-ops for velocity.
+                            // mapped - treat them as no-ops for velocity.
                             if (volType == 1 && volVal <= 64)
                                 rawVel = (int)(volVal * 2);
                             // Bake the running global volume into velocity
@@ -1325,7 +1601,15 @@ ModImporter::ImportResult ModImporter::import(const std::string& path, NodeGraph
 
                             clip.notes.push_back(nn);
                             chState[ch].lastNote = {effectiveSlot,
-                                                     (int)clip.notes.size() - 1};
+                                                     (int)clip.notes.size() - 1,
+                                                     trackId};
+                            // Track which sampler this channel is using
+                            // so pan/effect automation routes to the right node.
+                            float epan = effectivePanFor(effectiveSlot, chPan);
+                            int pk = panKeyFor(epan);
+                            auto sit = samplerByPan.find({effectiveSlot, pk});
+                            chState[ch].activeSamplerNodeId =
+                                (sit != samplerByPan.end()) ? sit->second : 0;
                             result.numNotes++;
 
                             float noteEnd = nn.offset + nn.duration;
@@ -1339,7 +1623,7 @@ ModImporter::ImportResult ModImporter::import(const std::string& path, NodeGraph
                 }
 
                 // ---- volume column non-set-volume effects ----
-                // (vol slide / pan / vibrato in vol col — basic coverage)
+                // (vol slide / pan / vibrato in vol col - basic coverage)
                 switch (volType) {
                     case 3: // VOLCMD_VOLSLIDEUP
                         if (auto* nn = resolveLast(chState[ch].lastNote))
@@ -1371,7 +1655,7 @@ ModImporter::ImportResult ModImporter::import(const std::string& path, NodeGraph
                 char letter = (fxStr && fxStr[0] && fxStr[0] != ' ' && fxStr[0] != '.')
                                 ? fxStr[0] : 0;
 
-                // Pattern loop intercept — needs to mutate the row loop,
+                // Pattern loop intercept - needs to mutate the row loop,
                 // not just touch a note. We look directly at letter+param
                 // before the per-format dispatch.
                 bool isLoopEffect = false;
@@ -1425,7 +1709,7 @@ ModImporter::ImportResult ModImporter::import(const std::string& path, NodeGraph
                     if (loopsRemaining > 0) {
                         // Re-walk from loopStartRow. currentBeat keeps
                         // advancing so the looped notes get placed at
-                        // distinct beats — i.e. the loop is unrolled
+                        // distinct beats - i.e. the loop is unrolled
                         // inline as duplicated note data.
                         row = loopStartRow;
                         continue;
@@ -1435,13 +1719,13 @@ ModImporter::ImportResult ModImporter::import(const std::string& path, NodeGraph
                 }
             }
 
-            // Position jump (Bxx) — switch to a different order after this row.
+            // Position jump (Bxx) - switch to a different order after this row.
             if (posJumpTarget >= 0 && posJumpTarget < numOrders) {
                 order = posJumpTarget - 1;   // ++order at end of outer while
                 jumped = true;
                 continue;
             }
-            // Pattern break (Dxx) — jump to the next order at a specified row.
+            // Pattern break (Dxx) - jump to the next order at a specified row.
             if (patternBreakRow >= 0) {
                 forcedNextRow = patternBreakRow;
                 jumped = true;
@@ -1462,7 +1746,7 @@ ModImporter::ImportResult ModImporter::import(const std::string& path, NodeGraph
     // Sound-control wiring: if any slot accumulated reverb regions,
     // create a shared Reverb node and wire each affected Sampler to it
     // via a gated send link. The Reverb node is configured as a pure
-    // wet send (Mix = 1.0) — the dry path is the existing Sampler →
+    // wet send (Mix = 1.0) - the dry path is the existing Sampler ->
     // Master Out link that's already in the graph. Audio flows through
     // the send link only during the beat ranges where the tracker's
     // S99 (reverb on) command was active.
@@ -1487,39 +1771,40 @@ ModImporter::ImportResult ModImporter::import(const std::string& path, NodeGraph
             graph.addToGroup(groupId, rvNode.id);
             int rvNodeId = rvNode.id;
 
-            // Wire Reverb → Master Out.
+            // Wire Reverb -> Master Out.
             wireToMasterOut(rvNodeId);
 
-            // For each slot with reverb regions: wire Sampler → Reverb
-            // and attach EffectRegions on the slot's track node.
+            // For each slot with reverb regions: wire ALL pan variants
+            // of that Sampler -> Reverb, and attach EffectRegions on
+            // the corresponding track node.
             for (int s = 0; s < (int)reverbRegions.size(); ++s) {
                 auto& regions = reverbRegions[s];
                 if (regions.empty()) continue;
-                if (samplerNodeId[s] == 0) continue;
-                auto* sampNode = graph.findNode(samplerNodeId[s]);
-                auto* rvn      = graph.findNode(rvNodeId);
-                if (!sampNode || !rvn || sampNode->pinsOut.empty() || rvn->pinsIn.empty())
-                    continue;
-                // Create the send link.
-                graph.addLink(sampNode->pinsOut[0].id, rvn->pinsIn[0].id);
-                // Find the link we just added (it's the last one).
-                int linkId = -1;
-                if (!graph.links.empty())
-                    linkId = graph.links.back().id;
-                if (linkId < 0) continue;
-                // Attach EffectRegions to the slot's track node so the
-                // TimeGateProcessor gates the send link on/off at the
-                // right beats.
-                if (trackNodeId[s] != 0) {
-                    auto* trkNode = graph.findNode(trackNodeId[s]);
-                    if (trkNode) {
-                        for (auto& br : regions) {
-                            EffectRegion er;
-                            er.linkId    = linkId;
-                            er.startBeat = br.startBeat;
-                            er.endBeat   = br.endBeat;
-                            er.color     = 0xFF4488FF; // blueish
-                            trkNode->effectRegions.push_back(er);
+                // Wire every pan variant of this slot.
+                for (auto& [key, sampId] : samplerByPan) {
+                    if (key.first != s) continue;
+                    auto* sampNode = graph.findNode(sampId);
+                    auto* rvn      = graph.findNode(rvNodeId);
+                    if (!sampNode || !rvn || sampNode->pinsOut.empty() || rvn->pinsIn.empty())
+                        continue;
+                    graph.addLink(sampNode->pinsOut[0].id, rvn->pinsIn[0].id);
+                    int linkId = -1;
+                    if (!graph.links.empty())
+                        linkId = graph.links.back().id;
+                    if (linkId < 0) continue;
+                    // Find the matching track for this pan variant.
+                    auto tit = trackByPan.find(key);
+                    if (tit != trackByPan.end()) {
+                        auto* trkNode = graph.findNode(tit->second);
+                        if (trkNode) {
+                            for (auto& br : regions) {
+                                EffectRegion er;
+                                er.linkId    = linkId;
+                                er.startBeat = br.startBeat;
+                                er.endBeat   = br.endBeat;
+                                er.color     = 0xFF4488FF;
+                                trkNode->effectRegions.push_back(er);
+                            }
                         }
                     }
                 }
@@ -1529,9 +1814,8 @@ ModImporter::ImportResult ModImporter::import(const std::string& path, NodeGraph
 
     // Extend each track's clip to cover the full song length.
     float songLengthBeatsOut = std::ceil(currentBeat / 4.0f) * 4.0f;
-    for (int s = 0; s < (int)trackNodeId.size(); ++s) {
-        if (trackNodeId[s] == 0) continue;
-        if (auto* tn = graph.findNode(trackNodeId[s]))
+    for (auto& [key, nodeId] : trackByPan) {
+        if (auto* tn = graph.findNode(nodeId))
             if (!tn->clips.empty())
                 tn->clips[0].lengthBeats = std::max(tn->clips[0].lengthBeats,
                                                      songLengthBeatsOut);
@@ -1542,9 +1826,8 @@ ModImporter::ImportResult ModImporter::import(const std::string& path, NodeGraph
     // order-list or pattern-break path jumped around, that's not
     // guaranteed to be sorted. AutomationLane::evaluate() assumes
     // ascending beats.
-    for (int s = 1; s < (int)samplerNodeId.size(); ++s) {
-        if (samplerNodeId[s] == 0) continue;
-        if (auto* sn = graph.findNode(samplerNodeId[s])) {
+    for (auto& [key, nodeId] : samplerByPan) {
+        if (auto* sn = graph.findNode(nodeId)) {
             for (auto& p : sn->params)
                 if (!p.automation.points.empty())
                     std::sort(p.automation.points.begin(),
@@ -1555,32 +1838,170 @@ ModImporter::ImportResult ModImporter::import(const std::string& path, NodeGraph
         }
     }
 
-    // Whole-song loop detection: if the pattern walk ended because a Bxx
-    // position jump landed on an already-visited order, set the project's
-    // Song Length + Repeat so playback loops indefinitely back to beat 0.
-    // (See task #91 and the orderVisited bookkeeping above.) This replaces
-    // the old "safety counter unrolls the loop N times" hack.
-    if (wholeSongLoopTarget >= 0) {
+    // Loop handling. A Bxx position jump that lands on an already-visited
+    // order is the module's *own* loop instruction. We honour a genuine loop
+    // (and only a genuine loop - a song that simply runs off the end of the
+    // order list leaves songRepeatMode at None and plays once, which is the
+    // play-once-by-default behaviour the user wanted). How we represent the
+    // loop depends on where the module jumps back to:
+    // When we are about to override the global song settings, stash the
+    // PRE-import values on the import's root group node first, so deleting
+    // that root node later can restore them (back out the module's loop
+    // contribution while preserving whatever the user had before import).
+    auto stashPreImportSong = [&]() {
+        if (auto* grpNode = graph.findNode(groupId)) {
+            grpNode->modImportSavedSong      = true;
+            grpNode->modImportPrevRepeatMode = (int)graph.songRepeatMode;
+            grpNode->modImportPrevRepeatCount = graph.songRepeatCount;
+            grpNode->modImportPrevSongLength = graph.songLengthBeats;
+            grpNode->modImportPrevLoopEnabled = graph.loopEnabled;
+            grpNode->modImportPrevLoopStart  = graph.loopStartBeat;
+            grpNode->modImportPrevLoopEnd    = graph.loopEndBeat;
+        }
+    };
+
+    if (wholeSongLoopTarget == 0) {
+        // Jump back to the very start = "repeat the whole song" (the classic
+        // module self-repeat, e.g. a trailing B00). Represent it as Song
+        // Repeat = Forever, which wraps playback to beat 0 indefinitely -
+        // exactly the module's intent. Song Length marks the natural end.
+        stashPreImportSong();
         graph.songLengthBeats  = currentBeat;
         graph.songRepeatMode   = NodeGraph::SongRepeat::Forever;
         graph.songRepeatCount  = 1;
-        if (wholeSongLoopTarget != 0) {
-            fprintf(stderr,
-                "MOD song loop target order = %d (non-zero); loop approximates "
-                "as wrap-to-beat-0 so the intro will replay each iteration. "
-                "Use Song Length + Repeat to fine-tune if needed.\n",
-                wholeSongLoopTarget);
+    } else if (wholeSongLoopTarget > 0) {
+        // Jump back to a specific later order = "play the intro once, then
+        // loop this section forever." Song Repeat Forever can't express that
+        // (it would replay the intro every cycle), so we use the transport
+        // loop region instead: the intro [0..sectionStart) plays once, then
+        // playback wraps between the section start and the song end - matching
+        // the module. Song Length still marks the natural end for when the
+        // user turns the loop off; songRepeatMode stays None so disabling the
+        // loop yields play-once rather than a surprise whole-song repeat.
+        stashPreImportSong();
+        graph.songLengthBeats = currentBeat;
+        graph.songRepeatMode  = NodeGraph::SongRepeat::None;
+        graph.songRepeatCount = 1;
+        graph.loopStartBeat   = orderStartBeat[wholeSongLoopTarget];
+        graph.loopEndBeat     = currentBeat;
+        graph.loopEnabled     = true;
+    }
+
+    // ------------------------------------------------------------------
+    // Layout pass: reposition all imported nodes so nothing overlaps.
+    // Node dimensions match getNodeBounds() in node_graph_component.cpp:
+    //   width = 180, height = 24 + max(numRows, 1) * 20 + 8
+    // ------------------------------------------------------------------
+    {
+        constexpr float kNodeW = 180.0f;
+        constexpr float kGap   = 20.0f;
+        auto nodeH = [](const Node& n) -> float {
+            int rows = std::max((int)n.pinsIn.size(), (int)n.pinsOut.size());
+            rows += (int)n.params.size();
+            return 24.0f + std::max(rows, 1) * 20.0f + 8.0f;
+        };
+
+        // X range that the import will occupy: col1 (MIDI tracks) starts
+        // at posX, col2 (samplers) at posX + kNodeW + 60, and the Reverb
+        // Send is placed further right at posX + 700 by the wiring pass
+        // (later moved by this layout pass, but its temporary position
+        // sets the rightmost extent we care about). Total right edge =
+        // posX + 700 + kNodeW.
+        const float importLeft  = posX;
+        const float importRight = posX + 700.0f + kNodeW;
+
+        // Collect IDs of all nodes created by this import.
+        // The group node's childNodeIds list catches everything including
+        // the Reverb Send node.
+        std::vector<bool> isOurs(graph.getNextId() + 1, false);
+        isOurs[groupId] = true;
+        if (auto* grpNode = graph.findNode(groupId))
+            for (int cid : grpNode->childNodeIds)
+                if (cid >= 0 && cid < (int)isOurs.size())
+                    isOurs[cid] = true;
+
+        // Find a clear Y below all pre-existing nodes that HORIZONTALLY
+        // OVERLAP with the import's column range. Master Out (Output
+        // type), sidebar utilities, an orphaned node parked far to the
+        // right, or anything else outside [importLeft, importRight]
+        // can't push the import down - if there's no vertical conflict,
+        // the import lands at posY directly. This is what keeps a
+        // fresh import from sliding to the bottom of the canvas just
+        // because some unrelated node lives in another corner of the
+        // graph.
+        float startY = posY;
+        for (auto& n : graph.nodes) {
+            if (n.id < (int)isOurs.size() && isOurs[n.id]) continue;
+            if (n.type == NodeType::Output) continue;
+            const float nodeLeft  = n.pos.x;
+            const float nodeRight = n.pos.x + kNodeW;
+            if (nodeRight < importLeft || nodeLeft > importRight) continue;
+            float bottom = n.pos.y + nodeH(n);
+            startY = std::max(startY, bottom + kGap * 2);
+        }
+
+        // Group container at top of the import area.
+        float groupH = 0;
+        if (auto* grp = graph.findNode(groupId)) {
+            grp->pos = {posX, startY};
+            groupH = nodeH(*grp);
+        }
+
+        float col1X = posX;                    // MIDI track column
+        float col2X = posX + kNodeW + 60.0f;   // sampler / instrument column
+        float curY  = startY + groupH + kGap;
+
+        // Pre-instrument track (slot 0) if it exists.
+        if (trackNodeId[0] != 0) {
+            if (auto* trk = graph.findNode(trackNodeId[0])) {
+                trk->pos = {col1X, curY};
+                curY += nodeH(*trk) + kGap;
+            }
+        }
+
+        // Collect all positioned node IDs so the catch-all loop skips them.
+        std::set<int> positioned;
+        if (trackNodeId[0] != 0) positioned.insert(trackNodeId[0]);
+
+        // Track-sampler pairs, grouped by slot, one row per (slot,pan) pair.
+        for (int s = 1; s <= numSlots; ++s) {
+            for (auto& [key, trkId] : trackByPan) {
+                if (key.first != s) continue;
+                float rowH = 0;
+                if (auto* trk = graph.findNode(trkId)) {
+                    trk->pos = {col1X, curY};
+                    rowH = std::max(rowH, nodeH(*trk));
+                    positioned.insert(trkId);
+                }
+                auto sit = samplerByPan.find(key);
+                if (sit != samplerByPan.end()) {
+                    if (auto* smp = graph.findNode(sit->second)) {
+                        smp->pos = {col2X, curY};
+                        rowH = std::max(rowH, nodeH(*smp));
+                        positioned.insert(sit->second);
+                    }
+                }
+                curY += rowH + kGap;
+            }
+        }
+
+        // Any remaining group members (e.g. Reverb Send) go below the pairs.
+        if (auto* grpNode = graph.findNode(groupId)) {
+            for (int cid : grpNode->childNodeIds) {
+                if (cid == groupId) continue;
+                if (positioned.count(cid)) continue;
+                if (auto* n = graph.findNode(cid)) {
+                    n->pos = {col2X, curY};
+                    curY += nodeH(*n) + kGap;
+                }
+            }
         }
     }
 
     openmpt_module_ext_destroy(modExt);
 
-    int numSamplers = 0;
-    for (int s = 1; s < (int)samplerNodeId.size(); ++s)
-        if (samplerNodeId[s] != 0) numSamplers++;
-    int numTracks = 0;
-    for (int s = 0; s < (int)trackNodeId.size(); ++s)
-        if (trackNodeId[s] != 0) numTracks++;
+    int numSamplers = (int)samplerByPan.size();
+    int numTracks = (int)trackByPan.size();
 
     result.success = true;
     result.numSamplesExtracted = numSamplers;

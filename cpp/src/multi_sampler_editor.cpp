@@ -17,7 +17,7 @@ MultiSamplerEditorComponent::MultiSamplerEditorComponent(NodeGraph& g, int nid, 
         titleLabel.setText(juce::String(nd->name), juce::dontSendNotification);
 
     addAndMakeVisible(closeBtn);
-    closeBtn.setTooltip("Close the sampler editor. Changes are committed on every field edit — "
+    closeBtn.setTooltip("Close the sampler editor. Changes are committed on every field edit - "
                         "there's no separate 'Apply' step.");
     closeBtn.onClick = [this]() {
         if (auto* dw = findParentComponentOfClass<juce::DialogWindow>()) {

@@ -373,6 +373,7 @@ wasm-ld --no-entry --export-all *.o -o lua_effect.wasm
 | `ss_prepare` | `() -> void` | — | Called when sample rate or buffer size changes. |
 | `ss_num_audio_inputs` | `() -> i32` | 1 | Number of stereo input pairs. Return 0 for MIDI-only. |
 | `ss_num_audio_outputs` | `() -> i32` | 1 | Number of stereo output pairs. |
+| `ss_num_midi_outputs` | `() -> i32` | 1 | Number of independent MIDI output pins (1..16). >1 exposes "MIDI Out 1..N", each its own cable; emit to a specific one with `ss_midi_out_n`. |
 
 ### Host Functions (callable from your script)
 
@@ -380,10 +381,20 @@ wasm-ld --no-entry --export-all *.o -o lua_effect.wasm
 |----------|-----------|-------------|
 | `ss_declare_param` | `(name: *u8, def: f32, min: f32, max: f32) -> i32` | Declare a parameter. Call only during `ss_init()`. Returns param index. |
 | `ss_get_param` | `(index: i32) -> f32` | Read current parameter value. |
-| `ss_midi_out` | `(sample_offset: i32, status: u8, d1: u8, d2: u8) -> void` | Emit a MIDI event. |
+| `ss_midi_out` | `(sample_offset: i32, status: u8, d1: u8, d2: u8) -> void` | Emit a MIDI event to MIDI output 0. |
+| `ss_midi_out_n` | `(out_index: i32, sample_offset: i32, status: u8, d1: u8, d2: u8) -> void` | Emit a MIDI event to a specific MIDI output pin (needs `ss_num_midi_outputs() > 1`). With multiple outputs the host re-stamps the channel for routing, so don't rely on the channel nibble of `status` surviving. |
+| `ss_note_to_freq` | `(midinote: i32) -> f32` | Frequency in Hz of a MIDI note using the **project tuning system** (Equal Temperament / Pythagorean / Just Intonation / Meantone) and concert pitch — not a hardcoded 12-TET A440. Returns 0 for a note outside 0..127. |
+| `ss_waveform` | `(id: i32, phase: f32) -> f32` | Sample the factory waveform `id` (one of the ~4000 bundled single-cycle AKWF shapes) at `phase` in `[0,1)` (wraps), returning the raw `[-1,1]` value with linear interpolation — the same wrap+interpolate every other SEANCE language uses. An out-of-range id returns 0 for every phase (a typo degrades to silence, never an error). |
+| `ss_waveform_id` | `(name: *u8) -> i32` | Resolve a factory-waveform **name** (case-insensitive, surrounding whitespace ignored) to its **stable integer id**, or -1 if unknown. Resolve once and reuse the integer in the hot loop — the WASM analogue of Lua's `waveforms["name"]`. |
 | `ss_log` | `(msg: *u8) -> void` | Debug print (no-op in release). |
 
 All host functions are imported from module `"env"`.
+
+**Note names.** `ss_note_to_freq` is the only note helper that needs the host, because only the host knows the project's tuning. Name ↔ number conversion is pure, so `soundshop_wasm.h` provides it inline (no host round-trip): `ss_notenum("C4") -> 60`, `ss_notename(60, buf) -> "C4"`, and `ss_notefreq("C4")` (which combines `ss_notenum` with `ss_note_to_freq`). C4 = MIDI 60, A4 = 69.
+
+**Factory waveforms.** `ss_waveform` / `ss_waveform_id` give a WASM module the same ~4000-waveform bank the other languages reach via `waveform(id_or_name, phase)` (see the factory-waveform browser's dim `#N` ids). The bank is warmed off the audio thread at module-link time, so the first call is allocation-free; resolve a name once with `ss_waveform_id` (e.g. in `ss_init`) and pass the integer to `ss_waveform` each sample.
+
+**Shaping helpers (no libm).** Modules compile `-nostdlib`, so libm's transcendentals (`sinf`/`cosf`/`expf`/`tanhf`) need an explicitly linked libm or `<math.h>`. For the common GLSL-parity shaping math that *doesn't*, `soundshop_wasm.h` provides header-only inlines built on `__builtin_floorf` (so they work under `-nostdlib`): `ss_fract`, `ss_sign`, `ss_mod` (GLSL floored modulo), `ss_clamp`, `ss_min`, `ss_max`, `ss_mix`, `ss_step`, `ss_smoothstep`, `ss_radians`, `ss_degrees`, `ss_saw`, `ss_square`, `ss_triangle`, `ss_unipolar`, `ss_bipolar`. Define `SS_NO_SHAPING_HELPERS` before including the header to suppress them if you supply your own.
 
 ### Shared Memory Layout
 
@@ -426,7 +437,7 @@ MIDI EVENTS (at midi_in_offset / midi_out_offset, 8 bytes each, max 256)
   +0x04  u8   status byte
   +0x05  u8   data1
   +0x06  u8   data2
-  +0x07  u8   reserved
+  +0x07  u8   output index (out events only; ss_midi_out_n target pin, else 0)
 ```
 
 ### Constraints

@@ -97,14 +97,14 @@ void MelodyPlayer::processMidi(const juce::MidiBuffer& input, juce::MidiBuffer& 
             heldKeys.insert(incomingKey);
 
             if (wasEmpty && currentEvent < (int)events.size()) {
-                // First key pressed — trigger next event
+                // First key pressed - trigger next event
                 if (releaseMode == ReleaseMode::OnNextEvent)
                     releaseAllNotes(output, pos);
 
                 triggerEvent(currentEvent, msg.getVelocity(), output, pos);
                 currentEvent++;
             } else if (!wasEmpty && currentEvent > 0) {
-                // Additional keys pressed while holding — for multi-key mode:
+                // Additional keys pressed while holding - for multi-key mode:
                 // If the current event has more notes than keys previously pressed,
                 // we could distribute. For now, additional keys are ignored since
                 // the full chord was already triggered.
@@ -113,7 +113,7 @@ void MelodyPlayer::processMidi(const juce::MidiBuffer& input, juce::MidiBuffer& 
             heldKeys.erase(msg.getNoteNumber());
 
             if (heldKeys.empty() && releaseMode == ReleaseMode::OnKeyUp) {
-                // All keys released — stop current notes
+                // All keys released - stop current notes
                 releaseAllNotes(output, pos);
             }
         } else {

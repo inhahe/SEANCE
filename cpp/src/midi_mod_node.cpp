@@ -1,4 +1,5 @@
 #include "midi_mod_node.h"
+#include "signal_modulation.h"   // toBipolar() - control-signal range convention
 #include <sstream>
 #include <algorithm>
 #include <cmath>
@@ -100,7 +101,7 @@ void MidiModulatorProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::M
     int numSamples = buf.getNumSamples();
     int numCh = buf.getNumChannels();
 
-    // Each rule corresponds to signal input index i — which is audio
+    // Each rule corresponds to signal input index i - which is audio
     // channel (2 + i) on this processor's input buffer. Signal inputs
     // start at channel 2 because 0/1 are reserved for stereo audio.
     auto readSigAt = [&](int ruleIdx, int sampleOffset) -> float {
@@ -127,32 +128,36 @@ void MidiModulatorProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::M
 
         switch (r.target) {
             case ModTarget::PitchBend: {
-                // sig -1..+1 scales to -amount..+amount semitones around
-                // center, then back to the 14-bit range assuming ±2 semi
-                // is the typical synth bend range (value 16383 = +100%).
-                float bendFrac = juce::jlimit(-1.0f, 1.0f, sig * r.amount);
+                // Pitch bend is inherently bipolar (center = 8192), so convert
+                // the unipolar 0..1 wire signal to -1..1: 0.5 -> no bend, 0 ->
+                // -amount, 1 -> +amount. Maps back to the 14-bit range assuming
+                // the typical +/-2 semi synth bend range (value 16383 = +100%).
+                float bendFrac = juce::jlimit(-1.0f, 1.0f, toBipolar(sig) * r.amount);
                 int bendVal = 8192 + (int)std::round(bendFrac * 8191.0f);
                 bendVal = juce::jlimit(0, 16383, bendVal);
                 output.addEvent(juce::MidiMessage::pitchWheel(ch, bendVal), 0);
                 break;
             }
             case ModTarget::ModWheel: {
-                // sig -1..+1 -> 0..1 -> 0..127 scaled by amount
-                float n = juce::jlimit(0.0f, 1.0f, (sig + 1.0f) * 0.5f * r.amount);
+                // Mod wheel is unipolar (0..127). The wire signal is already
+                // unipolar 0..1, so it maps straight through, scaled by amount.
+                float n = juce::jlimit(0.0f, 1.0f, sig * r.amount);
                 int v = (int)std::round(n * 127.0f);
                 v = juce::jlimit(0, 127, v);
                 output.addEvent(juce::MidiMessage::controllerEvent(ch, 1, v), 0);
                 break;
             }
             case ModTarget::Aftertouch: {
-                float n = juce::jlimit(0.0f, 1.0f, (sig + 1.0f) * 0.5f * r.amount);
+                // Unipolar 0..127 target; wire signal is already 0..1.
+                float n = juce::jlimit(0.0f, 1.0f, sig * r.amount);
                 int v = (int)std::round(n * 127.0f);
                 v = juce::jlimit(0, 127, v);
                 output.addEvent(juce::MidiMessage::channelPressureChange(ch, v), 0);
                 break;
             }
             case ModTarget::CC: {
-                float n = juce::jlimit(0.0f, 1.0f, (sig + 1.0f) * 0.5f * r.amount);
+                // Unipolar 0..127 target; wire signal is already 0..1.
+                float n = juce::jlimit(0.0f, 1.0f, sig * r.amount);
                 int v = (int)std::round(n * 127.0f);
                 v = juce::jlimit(0, 127, v);
                 output.addEvent(juce::MidiMessage::controllerEvent(ch, r.ccNumber, v), 0);
@@ -173,8 +178,11 @@ void MidiModulatorProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::M
             float velScale = 1.0f;
             for (size_t i = 0; i < doc.rules.size(); ++i) {
                 if (doc.rules[i].target != ModTarget::Velocity) continue;
+                // Velocity scaling is bidirectional around 1.0x, so convert the
+                // unipolar 0..1 wire signal to -1..1: 0.5 -> no change, 1 ->
+                // +amount louder, 0 -> -amount quieter.
                 float sig = readSigAt((int)i, off);
-                velScale *= 1.0f + doc.rules[i].amount * sig;
+                velScale *= 1.0f + doc.rules[i].amount * toBipolar(sig);
             }
             int newVel = juce::jlimit(1, 127,
                 (int)std::round(msg.getVelocity() * velScale));
@@ -188,7 +196,7 @@ void MidiModulatorProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::M
 
     midi.swapWith(output);
 
-    // Clear audio output channels 0/1 — we don't generate audio. Leave
+    // Clear audio output channels 0/1 - we don't generate audio. Leave
     // channels 2+ alone so signal inputs downstream of this node aren't
     // corrupted (they were just read-only inputs to us anyway).
     for (int c = 0; c < std::min(numCh, 2); ++c)
@@ -197,7 +205,7 @@ void MidiModulatorProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::M
 }
 
 // ============================================================================
-// Editor — one row per rule, with target combo + amount slider + delete
+// Editor - one row per rule, with target combo + amount slider + delete
 // ============================================================================
 
 class MidiModEditorComponent::RuleRow : public juce::Component {
@@ -209,22 +217,23 @@ public:
         label.setFont(12.0f);
 
         addAndMakeVisible(targetCombo);
-        targetCombo.addItem("Velocity",    1);
-        targetCombo.addItem("Pitch Bend",  2);
-        targetCombo.addItem("Mod Wheel",   3);
-        targetCombo.addItem("Aftertouch",  4);
-        targetCombo.addItem("CC#",         5);
+        targetCombo.addItem("Velocity",         1);
+        targetCombo.addItem("Pitch Bend",       2);
+        targetCombo.addItem("Mod Wheel",        3);
+        targetCombo.addItem("Channel Pressure", 4);
+        targetCombo.addItem("CC#",              5);
         targetCombo.setTooltip("Which MIDI message this signal input modulates: "
-                               "Velocity (note loudness), Pitch Bend (note pitch ±2 semitones), "
-                               "Mod Wheel (CC#1, often vibrato depth), Aftertouch (key pressure), "
-                               "or any custom CC number.");
+                               "Velocity (note loudness), Pitch Bend (note pitch +/-2 semitones), "
+                               "Mod Wheel (CC#1, often vibrato depth), Channel Pressure "
+                               "(channel aftertouch - one value applied to ALL held notes, "
+                               "not per-note key pressure), or any custom CC number.");
         targetCombo.onChange = [this]() { applyToRule(); };
 
         addAndMakeVisible(ccSlider);
         ccSlider.setSliderStyle(juce::Slider::IncDecButtons);
         ccSlider.setTextBoxStyle(juce::Slider::TextBoxLeft, false, 40, 18);
         ccSlider.setRange(0, 127, 1);
-        ccSlider.setTooltip("CC number (0–127) when target is set to CC#. Common values: 1=mod wheel, 7=volume, 10=pan, 11=expression, 64=sustain pedal");
+        ccSlider.setTooltip("CC number (0-127) when target is set to CC#. Common values: 1=mod wheel, 7=volume, 10=pan, 11=expression, 64=sustain pedal");
         ccSlider.onValueChange = [this]() { applyToRule(); };
 
         addAndMakeVisible(amountSlider);
@@ -381,12 +390,12 @@ void MidiModEditorComponent::syncNodePins() {
     int midiInId = -1;
     for (auto& p : nd->pinsIn)
         if (p.kind == PinKind::Midi) { midiInId = p.id; break; }
-    if (midiInId < 0) midiInId = graph.getNextId();
+    if (midiInId < 0) midiInId = graph.allocId();
     newPins.push_back({midiInId, "MIDI In", PinKind::Midi, true});
 
     for (int i = 0; i < wantedSigs; ++i) {
         int id = (i < (int)existingSignalIds.size())
-                 ? existingSignalIds[i] : graph.getNextId();
+                 ? existingSignalIds[i] : graph.allocId();
         newPins.push_back({id,
             "Sig " + std::to_string(i + 1),
             PinKind::Signal, true, 1});

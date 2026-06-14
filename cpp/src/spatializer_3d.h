@@ -30,7 +30,12 @@ public:
     void prepareToPlay(double sr, int bs) override;
     void releaseResources() override {}
     void processBlock(juce::AudioBuffer<float>& buf, juce::MidiBuffer&) override;
-    double getTailLengthSeconds() const override { return 0.01; }
+    // Tail = HRTF convolution IR length / sample rate.  Once input stops,
+    // the FIR convolution buffer flushes out in HRTF_IR_LENGTH samples
+    // (the ITD delay line is shorter, so it doesn't dominate).
+    double getTailLengthSeconds() const override {
+        return (double) HRTF_IR_LENGTH / std::max(1.0, sampleRate);
+    }
     bool acceptsMidi() const override { return true; }
     bool producesMidi() const override { return true; }
     bool isBusesLayoutSupported(const BusesLayout&) const override { return true; }
@@ -75,7 +80,7 @@ private:
     int convWritePos = 0;
 
     // Measured HRTF dataset (#44). If loaded, overrides the synthetic
-    // model. Each entry is an (azimuth, elevation) → (left IR, right IR)
+    // model. Each entry is an (azimuth, elevation) -> (left IR, right IR)
     // pair. The processor interpolates between the nearest entries.
     struct HrtfEntry {
         float azimuth = 0;    // degrees, -180..180

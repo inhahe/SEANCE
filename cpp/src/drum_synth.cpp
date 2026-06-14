@@ -89,6 +89,46 @@ int DrumSynthProcessor::findSoundForNote(int midiNote) {
     return -1;
 }
 
+// Worst-case exponential-decay time constant (in seconds) for a drum
+// voice with the given config.  Mirrors the per-type `decayTime` values
+// used in renderDrumSample() - if you change a base decay there, update
+// the matching branch here.  Used by getTailLengthSeconds() and by the
+// voice auto-deactivation cutoff in processBlock().
+static double drumDecayTau(const DrumSound& s) {
+    switch (s.type) {
+        case DrumType::Kick:    return 0.4  * (double) s.decay;
+        case DrumType::Tom:     return 0.4  * (double) s.decay;  // shares Kick branch
+        case DrumType::Snare:   return 0.15 * (double) s.decay;  // noise env dominates
+        case DrumType::HiHat: {
+            double dt = 0.05 + 0.25 * ((double) s.decay - 0.5);
+            return dt * (double) s.decay;
+        }
+        case DrumType::Clap:    return 0.15 * (double) s.decay;
+        case DrumType::Cowbell: return 0.08 * (double) s.decay;
+        case DrumType::Rimshot: return 0.03 * (double) s.decay;
+        case DrumType::Cymbal: {
+            // sizeDecay = 0.3..1.8, baseDecay = 0.5..2.0 (s)
+            double sizeDecay = 0.3 + 1.5 * (double) s.size;
+            double baseDecay = 2.0 - (double) s.tone * 1.5;
+            return baseDecay * sizeDecay * (double) s.decay;
+        }
+    }
+    return 0.1;
+}
+
+// Number of time constants to wait before declaring an exponentially-
+// decaying voice inaudible.  5τ -> e^-5 ≈ 0.0067 (≈ -43 dB).
+static constexpr double kInaudibleTimeConstants = 5.0;
+
+double DrumSynthProcessor::getTailLengthSeconds() const {
+    double worst = 0.0;
+    for (const auto& s : sounds) {
+        double tau = drumDecayTau(s);
+        if (tau > worst) worst = tau;
+    }
+    return worst * kInaudibleTimeConstants;
+}
+
 float DrumSynthProcessor::renderDrumSample(int soundIdx, DrumVoice& voice) {
     auto& s = sounds[soundIdx];
     double t = voice.time;
@@ -96,7 +136,7 @@ float DrumSynthProcessor::renderDrumSample(int soundIdx, DrumVoice& voice) {
     std::uniform_real_distribution<float> noiseDist(-1.0f, 1.0f);
 
     if (s.type == DrumType::Kick || s.type == DrumType::Tom) {
-        // KICK / TOM — pitch-sweeping sine
+        // KICK / TOM - pitch-sweeping sine
         float baseFreq = (s.type == DrumType::Kick) ? 55.0f : 80.0f;
         baseFreq *= s.pitch;
         float decayTime = 0.4f * s.decay;
@@ -108,7 +148,7 @@ float DrumSynthProcessor::renderDrumSample(int soundIdx, DrumVoice& voice) {
         out = toneOut * s.tone + click * (1.0f - s.tone);
     }
     else if (s.type == DrumType::Snare) {
-        // SNARE — sine + noise
+        // SNARE - sine + noise
         float toneFreq = 180.0f * s.pitch;
         float decayTime = 0.15f * s.decay;
         float toneEnv = std::exp((float)(-t / std::max(0.01, (double)decayTime * 0.7)));
@@ -118,7 +158,7 @@ float DrumSynthProcessor::renderDrumSample(int soundIdx, DrumVoice& voice) {
         out = toneOut * s.tone + noiseOut * (1.0f - s.tone);
     }
     else if (s.type == DrumType::HiHat) {
-        // HI-HAT — metallic noise (decay controls closed vs open)
+        // HI-HAT - metallic noise (decay controls closed vs open)
         float decayTime = 0.05f + 0.25f * (s.decay - 0.5f); // short decay = closed, long = open
         decayTime *= s.decay;
         float env = std::exp((float)(-t / std::max(0.005, (double)decayTime)));
@@ -133,7 +173,7 @@ float DrumSynthProcessor::renderDrumSample(int soundIdx, DrumVoice& voice) {
         out = (metallic * s.tone + noise * (1.0f - s.tone)) * env;
     }
     else if (s.type == DrumType::Clap) {
-        // CLAP — multiple short noise bursts
+        // CLAP - multiple short noise bursts
         float decayTime = 0.15f * s.decay;
         float env = std::exp((float)(-t / std::max(0.01, (double)decayTime)));
         // 4 noise bursts at ~0, 10, 20, 30 ms
@@ -147,7 +187,7 @@ float DrumSynthProcessor::renderDrumSample(int soundIdx, DrumVoice& voice) {
         out = noiseDist(voice.rng) * burstEnv * env;
     }
     else if (s.type == DrumType::Cowbell) {
-        // COWBELL — two square waves at inharmonic frequencies
+        // COWBELL - two square waves at inharmonic frequencies
         float f1 = 540.0f * s.pitch, f2 = 800.0f * s.pitch;
         float decayTime = 0.08f * s.decay;
         float env = std::exp((float)(-t / std::max(0.01, (double)decayTime)));
@@ -156,7 +196,7 @@ float DrumSynthProcessor::renderDrumSample(int soundIdx, DrumVoice& voice) {
         out = (sq1 + sq2) * env * s.tone;
     }
     else if (s.type == DrumType::Rimshot) {
-        // RIMSHOT — short noise + tone
+        // RIMSHOT - short noise + tone
         float freq = 400.0f * s.pitch;
         float decayTime = 0.03f * s.decay;
         float env = std::exp((float)(-t / std::max(0.005, (double)decayTime)));
@@ -165,17 +205,17 @@ float DrumSynthProcessor::renderDrumSample(int soundIdx, DrumVoice& voice) {
         out = (toneOut * s.tone + noiseOut * (1.0f - s.tone)) * env;
     }
     else if (s.type == DrumType::Cymbal) {
-        // CYMBAL — crash / ride / bell controlled by tone slider
+        // CYMBAL - crash / ride / bell controlled by tone slider
         // Size sets the baseline pitch and decay (0=small 8", 0.5=medium 16", 1=large 24")
         // Pitch and Decay sliders are offsets on top of the size-derived values.
         float character = s.tone;
         float sizeVal = s.size;
 
-        // Size → base pitch multiplier: small (2.0x) → large (0.6x)
+        // Size -> base pitch multiplier: small (2.0x) -> large (0.6x)
         float sizePitch = 2.0f - sizeVal * 1.4f;
-        // Size → base decay multiplier: small (0.3x) → large (1.8x)
+        // Size -> base decay multiplier: small (0.3x) -> large (1.8x)
         float sizeDecay = 0.3f + sizeVal * 1.5f;
-        // Size → spectral density: larger cymbals have more partials active
+        // Size -> spectral density: larger cymbals have more partials active
         float sizeDensity = 0.5f + sizeVal * 0.5f; // 0.5 to 1.0
 
         // Combined with user's pitch/decay sliders (multiplicative offset)
@@ -237,6 +277,7 @@ void DrumSynthProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::MidiB
         if (msg.isNoteOn()) {
             int si = findSoundForNote(msg.getNoteNumber());
             if (si >= 0) {
+                int ch = juce::jlimit(1, 16, msg.getChannel());
                 // Find a free voice
                 int vi = -1;
                 for (int i = 0; i < MAX_DRUM_VOICES; ++i) {
@@ -245,13 +286,43 @@ void DrumSynthProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::MidiB
                 if (vi < 0) vi = 0; // steal first voice
                 voices[vi].active = true;
                 voices[vi].soundIdx = si;
+                voices[vi].midiChannel = ch;
                 voices[vi].time = 0;
+                // If the pedal is already down on this channel, the new
+                // voice is born held - its decay won't advance until the
+                // pedal comes up. Matches user expectation: "I'm holding
+                // the pedal, so anything I hit rings out."
+                voices[vi].sustainHeld = sustainPedal[ch - 1];
                 {
                     float raw = msg.getVelocity() / 127.0f;
                     voices[vi].velocity = 1.0f - velSens * (1.0f - raw);
                 }
                 voices[vi].rng.seed((unsigned)msg.getNoteNumber() * 1234 + (unsigned)(voices[vi].time * 10000));
             }
+        } else if (msg.isController() && msg.getControllerNumber() == 64) {
+            // Sustain pedal (CC#64).  Drums have no note-off-driven
+            // release stage (the decay is purely time-based), so the
+            // analogue of TerrainSynth's "defer release" is: freeze the
+            // decay envelope while the pedal is down on this channel.
+            // Pedal-down marks every active voice on the channel as held;
+            // pedal-up clears the flag so the natural decay resumes from
+            // whatever amplitude the voice was frozen at.
+            int ch = juce::jlimit(1, 16, msg.getChannel());
+            bool held = msg.getControllerValue() >= 64;
+            sustainPedal[ch - 1] = held;
+            for (int i = 0; i < MAX_DRUM_VOICES; ++i)
+                if (voices[i].active && voices[i].midiChannel == ch)
+                    voices[i].sustainHeld = held;
+        } else if (msg.isAllNotesOff() || msg.isAllSoundOff()) {
+            // Honour panic / transport-stop. AllNotesOff cuts current
+            // voices to silence; AllSoundOff also clears sustain state so
+            // a stuck pedal doesn't keep the next hit frozen.
+            for (int i = 0; i < MAX_DRUM_VOICES; ++i) {
+                voices[i].active = false;
+                voices[i].sustainHeld = false;
+            }
+            if (msg.isAllSoundOff())
+                for (int c = 0; c < 16; ++c) sustainPedal[c] = false;
         }
     }
 
@@ -264,9 +335,23 @@ void DrumSynthProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::MidiB
             if (!voices[vi].active) continue;
             float sample = renderDrumSample(voices[vi].soundIdx, voices[vi]);
             total += sample;
-            voices[vi].time += 1.0 / sampleRate;
-            // Auto-deactivate after silence
-            if (voices[vi].time > 5.0) voices[vi].active = false;
+            // Freeze the decay envelope while the sustain pedal holds
+            // this voice. The voice keeps rendering at the same amplitude
+            // (renderDrumSample is a pure function of voice.time) until
+            // the pedal comes up and time starts advancing again.
+            if (!voices[vi].sustainHeld)
+                voices[vi].time += 1.0 / sampleRate;
+            // Auto-deactivate once the voice has decayed below the
+            // inaudibility threshold (≈ -43 dB).  Uses the same per-sound
+            // decay computation as getTailLengthSeconds() so the two stay
+            // in lockstep - no magic 5-second cap. Held voices don't
+            // advance time, so they can't reach the threshold here.
+            int si = voices[vi].soundIdx;
+            if (si >= 0 && si < (int)sounds.size()) {
+                double tau = drumDecayTau(sounds[si]);
+                if (voices[vi].time > tau * kInaudibleTimeConstants)
+                    voices[vi].active = false;
+            }
         }
         total *= volume;
         total = juce::jlimit(-1.0f, 1.0f, total);
@@ -283,7 +368,7 @@ DrumSynthEditorComponent::DrumSynthEditorComponent(NodeGraph& g, int nid, AudioE
     : graph(g), nodeId(nid), audioEngine(ae)
 {
     addAndMakeVisible(addSoundBtn);
-    addSoundBtn.setTooltip("Add a new drum voice (kick, snare, hi-hat, etc.) — pick the type from the popup. "
+    addSoundBtn.setTooltip("Add a new drum voice (kick, snare, hi-hat, etc.) - pick the type from the popup. "
                            "Each voice gets its own MIDI note assignment and a row of params (pitch, decay, tone, level).");
     addSoundBtn.onClick = [this]() {
         juce::PopupMenu menu;
@@ -454,9 +539,9 @@ void DrumSynthEditorComponent::rebuildRows() {
         setupSlider(row->decaySlider, nd->params[pi+2].value, 0.1f, 4.0f);
         setupSlider(row->toneSlider,  nd->params[pi+3].value, 0.0f, 1.0f);
         setupSlider(row->levelSlider, nd->params[pi+4].value, 0.0f, 1.0f);
-        row->pitchSlider.setTooltip("Pitch multiplier — higher = brighter and 'tighter', lower = deeper and 'fatter'");
+        row->pitchSlider.setTooltip("Pitch multiplier - higher = brighter and 'tighter', lower = deeper and 'fatter'");
         row->decaySlider.setTooltip("How quickly the sound fades after being struck. Lower = short and percussive, higher = ringing tail");
-        row->toneSlider.setTooltip("Timbre shaping — varies per drum type (filter cutoff, harmonic balance, noise mix, etc.)");
+        row->toneSlider.setTooltip("Timbre shaping - varies per drum type (filter cutoff, harmonic balance, noise mix, etc.)");
         row->levelSlider.setTooltip("Output volume of this drum voice");
 
         // Check if this is a cymbal (has Size param)

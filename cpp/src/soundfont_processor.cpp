@@ -57,7 +57,7 @@ bool SFZInstrument::loadFromFile(const std::string& path) {
             else r.loopMode = 0;
         }
         else {
-            // Unknown opcode — skip gracefully but log for debugging
+            // Unknown opcode - skip gracefully but log for debugging
             juce::Logger::writeToLog("SFZ: skipping unknown opcode: " + juce::String(key) + "=" + juce::String(val));
         }
     };
@@ -206,7 +206,7 @@ void SoundFontProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::MidiB
     int numChannels = buf.getNumChannels();
     buf.clear();
 
-    // Velocity sensitivity — read from node param (default 1 = linear).
+    // Velocity sensitivity - read from node param (default 1 = linear).
     float velSensSF2 = 1.0f;
     for (auto& p : node.params)
         if (p.name == "Vel Sens") { velSensSF2 = p.value; break; }

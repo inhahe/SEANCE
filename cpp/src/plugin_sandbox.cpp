@@ -12,7 +12,7 @@
 namespace SoundShop {
 
 // ==============================================================================
-// SandboxedPluginProxy — host-side proxy
+// SandboxedPluginProxy - host-side proxy
 // ==============================================================================
 
 SandboxedPluginProxy::SandboxedPluginProxy(Node& n, const std::string& path,
@@ -169,7 +169,7 @@ void SandboxedPluginProxy::releaseResources() {
 void SandboxedPluginProxy::processBlock(juce::AudioBuffer<float>& buf,
                                          juce::MidiBuffer& midi) {
     if (!sharedMem || !childAlive) {
-        // Child not running — output silence.
+        // Child not running - output silence.
         buf.clear();
         return;
     }
@@ -228,7 +228,7 @@ void SandboxedPluginProxy::processBlock(juce::AudioBuffer<float>& buf,
                          n * sizeof(float));
         sharedMem->outputReady.store(false);
     } else {
-        // Timeout — child is lagging. Output silence this block.
+        // Timeout - child is lagging. Output silence this block.
         buf.clear();
     }
 
@@ -239,7 +239,7 @@ void SandboxedPluginProxy::processBlock(juce::AudioBuffer<float>& buf,
 void SandboxedPluginProxy::getStateInformation(juce::MemoryBlock& dest) {
     // Ask the child for the plugin's state.
     sendCommand(SandboxCommand::GetState);
-    // For now, state retrieval is async — a full implementation would
+    // For now, state retrieval is async - a full implementation would
     // wait for the child's response on the pipe. Leave empty for MVP.
     (void)dest;
 }
@@ -408,7 +408,7 @@ int runPluginSandboxChild(const std::string& pipeName) {
             buf->blockReady.store(false);
             buf->outputReady.store(true);
         } else {
-            // No work — yield CPU.
+            // No work - yield CPU.
             Sleep(0);
         }
     }

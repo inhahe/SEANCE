@@ -160,7 +160,7 @@ ConvolutionProcessor::ConvolutionProcessor(Node& n) : node(n) {
 void ConvolutionProcessor::loadIR() {
     ir = decodeIR(node.script);
     if (ir.empty()) {
-        // Default: identity (passthrough) — single impulse at t=0
+        // Default: identity (passthrough) - single impulse at t=0
         ir = {1.0f};
     }
 }

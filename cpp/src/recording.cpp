@@ -70,7 +70,7 @@ void RecordingManager::stopRecording(Node& node, Transport& transport) {
 
     // Create a clip or take lane with the recording
     if (node.takeLanes.empty()) {
-        // First recording — create a take lane
+        // First recording - create a take lane
         TakeLane lane;
         lane.name = "Take 1";
         Clip clip;
@@ -84,7 +84,7 @@ void RecordingManager::stopRecording(Node& node, Transport& transport) {
         node.takeLanes.push_back(std::move(lane));
         node.activeTakeLane = 0;
     } else {
-        // Subsequent recording — add a new take lane
+        // Subsequent recording - add a new take lane
         TakeLane lane;
         lane.name = "Take " + std::to_string(node.takeLanes.size() + 1);
         Clip clip;

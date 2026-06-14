@@ -3,6 +3,7 @@
 #include <fstream>
 #include <sstream>
 #include <cstdio>
+#include <set>
 
 namespace SoundShop {
 
@@ -12,7 +13,7 @@ std::string ProjectFile::currentPath;
 // Sections: [Project], [Node], [Pin], [Clip], [Note], [Link], [Param]
 //
 // All actual I/O goes through the stream-based writeProject/readProject
-// helpers — the path-based save()/load() are thin wrappers that open a file
+// helpers - the path-based save()/load() are thin wrappers that open a file
 // and delegate. The undo system (#84) reuses the same helpers against
 // std::ostringstream / std::istringstream to (de)serialize snapshots in
 // memory.
@@ -25,6 +26,21 @@ static void writeInt(std::ostream& f, const std::string& key, int val) {
 }
 static void writeFloat(std::ostream& f, const std::string& key, float val) {
     f << key << "=" << val << "\n";
+}
+
+// Collect content-store blob hashes referenced by a node script. A reference is
+// the trailing '#<hash>' field of a __generate__ script (and, in future, any
+// other blob-backed node tag). Used at save time so writeProject emits only the
+// blobs the current graph still references - orphans created by this session's
+// edits (each Edit Source bakes a new hash) are pruned from the file. The live
+// in-memory store keeps every blob so undo/redo can still resolve old hashes.
+static void collectBlobHashes(const std::string& script, std::set<std::string>& out) {
+    if (script.rfind("__generate__:", 0) != 0) return;
+    size_t bar = script.rfind('|');
+    if (bar == std::string::npos || bar + 2 > script.size()) return;
+    if (script[bar + 1] != '#') return;
+    std::string hash = script.substr(bar + 2);
+    if (!hash.empty()) out.insert(hash);
 }
 
 bool ProjectFile::save(const std::string& path, NodeGraph& graph, GraphProcessor* gp) {
@@ -41,7 +57,9 @@ bool ProjectFile::save(const std::string& path, NodeGraph& graph, GraphProcessor
     return ok;
 }
 
-bool ProjectFile::writeProject(std::ostream& f, NodeGraph& graph, GraphProcessor* gp) {
+bool ProjectFile::writeProject(std::ostream& f, NodeGraph& graph,
+                               GraphProcessor* gp, bool includeView,
+                               bool includeBlobs) {
 
     f << "[Project]\n";
     writeFloat(f, "bpm", graph.bpm);
@@ -54,7 +72,7 @@ bool ProjectFile::writeProject(std::ostream& f, NodeGraph& graph, GraphProcessor
     }
     if (graph.projectSampleRate > 0)
         writeFloat(f, "projectSampleRate", (float)graph.projectSampleRate);
-    // Project-wide settings (#66) — tuning, concert pitch, crossfade.
+    // Project-wide settings (#66) - tuning, concert pitch, crossfade.
     if (graph.tuningSystem != TuningSystem::Equal12)
         writeInt(f, "tuningSystem", (int)graph.tuningSystem);
     if (std::abs(graph.concertPitch - 440.0f) > 0.01f)
@@ -71,6 +89,15 @@ bool ProjectFile::writeProject(std::ostream& f, NodeGraph& graph, GraphProcessor
         writeInt(f, "songRepeatCount", graph.songRepeatCount);
     if (!graph.historyFilePath.empty())
         writeStr(f, "historyFile", graph.historyFilePath);
+    // Saved view state for the node-graph component. Skipped on undo
+    // snapshots so undo never moves the user's viewport. Only written
+    // when there's a non-default value to restore (viewZoom == 0 means
+    // "no saved view, use fit-all").
+    if (includeView && graph.viewZoom > 0.0f) {
+        writeFloat(f, "viewZoom", graph.viewZoom);
+        writeFloat(f, "viewPanX", graph.viewPanX);
+        writeFloat(f, "viewPanY", graph.viewPanY);
+    }
     // Effect group definitions (#66). Each group is a named bundle of
     // link IDs with an optional per-group crossfade override.
     for (auto& eg : graph.effectGroups) {
@@ -116,16 +143,42 @@ bool ProjectFile::writeProject(std::ostream& f, NodeGraph& graph, GraphProcessor
         writeFloat(f, "posY", node.pos.y);
         if (node.muted) writeInt(f, "muted", 1);
         if (node.soloed) writeInt(f, "soloed", 1);
-        writeStr(f, "script", node.script);
+        // node.script can be multi-line for some node types - most notably
+        // MultiSampler, whose encode() produces dozens of lines (one per
+        // zone field). The old `writeStr(f, "script", val)` form wrote
+        // `script=<val>\n` raw, so any `\n` inside val terminated the
+        // line and the load-side `getline` recovered only the first line
+        // (just the `__multisampler__:` prefix). On round-trip this
+        // wiped the entire MultiSampler payload, producing silent MOD
+        // playback after restart. The fix: detect multi-line scripts and
+        // write them in a length-prefixed `scriptLines=N\n<line>...` form,
+        // matching the existing pattern used for `signalScript` above.
+        if (node.script.find('\n') != std::string::npos) {
+            auto lines = juce::StringArray::fromLines(node.script);
+            // Trim a possible empty trailing line so round-trips are stable
+            // (StringArray::fromLines yields one extra empty element when
+            // the source string ends with '\n').
+            while (!lines.isEmpty() && lines.getReference(lines.size() - 1).isEmpty())
+                lines.remove(lines.size() - 1);
+            writeInt(f, "scriptLines", lines.size());
+            for (auto& ln : lines)
+                f << ln.toStdString() << "\n";
+        } else {
+            writeStr(f, "script", node.script);
+        }
         if (!node.midiInputSourceId.empty())
             writeStr(f, "midiInputSourceId", node.midiInputSourceId);
-        if (!node.envAttackCurve.empty()) writeStr(f, "envAttackCurve", node.envAttackCurve);
-        if (!node.envDecayCurve.empty()) writeStr(f, "envDecayCurve", node.envDecayCurve);
-        if (!node.envReleaseCurve.empty()) writeStr(f, "envReleaseCurve", node.envReleaseCurve);
-        for (auto& pt : node.envAttackPoints) f << "envAtkPt=" << pt.first << "," << pt.second << "\n";
-        for (auto& pt : node.envDecayPoints) f << "envDecPt=" << pt.first << "," << pt.second << "\n";
-        for (auto& pt : node.envReleasePoints) f << "envRelPt=" << pt.first << "," << pt.second << "\n";
+        // Shared AHDSR envelope. One line — encode() returns a single line with
+        // no newlines and length-prefixed curve fields, so it survives writeStr
+        // round-trip regardless of curve content. Saved unconditionally because
+        // it carries sensible defaults (linear ramps, 5ms / 0ms / 200ms / 0.7 /
+        // 300ms / velSens=1) — we want those defaults to persist exactly across
+        // save/load rather than relying on the constructor at load time.
+        writeStr(f, "ahdsrEnvelope", node.ahdsrEnvelope.encode());
+        if (node.aftertouchSensitivity != 0.5f)
+            writeFloat(f, "aftertouchSensitivity", node.aftertouchSensitivity);
         writeInt(f, "pluginIndex", node.pluginIndex);
+        if (node.panLaw != PanLaw::EqualPower) writeInt(f, "panLaw", (int)node.panLaw);
         if (node.pan != 0.0f) writeFloat(f, "pan", node.pan);
         if (node.spatialX != 0.0f) writeFloat(f, "spatialX", node.spatialX);
         if (node.spatialY != 0.0f) writeFloat(f, "spatialY", node.spatialY);
@@ -134,7 +187,7 @@ bool ProjectFile::writeProject(std::ostream& f, NodeGraph& graph, GraphProcessor
         // only call getStateInformation when the cache is stale, otherwise
         // reuse the cached base64 string. This avoids the expensive query
         // for plugins whose parameters haven't changed since the last
-        // save — typical case is most plugins have nothing to re-query.
+        // save - typical case is most plugins have nothing to re-query.
         // ProjectFile::save (the user-facing save path, gp != nullptr) and
         // the slow autosave path both share this cache.
         if (gp && node.pluginIndex >= 0) {
@@ -176,6 +229,17 @@ bool ProjectFile::writeProject(std::ostream& f, NodeGraph& graph, GraphProcessor
             }
             writeStr(f, "childNodeIds", ids);
         }
+        // MOD-import song-setting restore stash (only meaningful on the
+        // import's root group node; harmless/absent on others).
+        if (node.modImportSavedSong) {
+            writeInt(f, "modImportSavedSong", 1);
+            writeInt(f, "modImportPrevRepeatMode", node.modImportPrevRepeatMode);
+            writeInt(f, "modImportPrevRepeatCount", node.modImportPrevRepeatCount);
+            writeFloat(f, "modImportPrevSongLength", (float)node.modImportPrevSongLength);
+            writeInt(f, "modImportPrevLoopEnabled", node.modImportPrevLoopEnabled ? 1 : 0);
+            writeFloat(f, "modImportPrevLoopStart", (float)node.modImportPrevLoopStart);
+            writeFloat(f, "modImportPrevLoopEnd", (float)node.modImportPrevLoopEnd);
+        }
 
         for (auto& pin : node.pinsIn) {
             f << "[PinIn]\n";
@@ -206,7 +270,8 @@ bool ProjectFile::writeProject(std::ostream& f, NodeGraph& graph, GraphProcessor
         // entries just record which param each one drives.
         for (auto& mp : node.modPins) {
             f << "modPin=" << mp.paramIndex << "," << mp.pinId
-              << "," << mp.depth << "\n";
+              << "," << mp.depth
+              << "," << (mp.mode == Node::ModPin::Mode::Absolute ? 1 : 0) << "\n";
         }
         for (auto& clip : node.clips) {
             f << "[Clip]\n";
@@ -341,6 +406,29 @@ bool ProjectFile::writeProject(std::ostream& f, NodeGraph& graph, GraphProcessor
         writeInt(f, "activeEditor", graph.activeEditorNodeId);
     }
 
+    // Content-addressed blob store (baked terrain grids; later decoded video /
+    // wavetable PCM). Written on real saves but NOT into undo snapshots
+    // (serializeForUndo passes includeBlobs=false): the snapshot carries the
+    // hash inside node.script, and on undo/redo the bytes come from the live
+    // in-memory store. Only emit blobs the current graph references, pruning
+    // session orphans (each Edit Source bakes a new hash; the old one is dropped
+    // from the file but kept in memory for undo).
+    if (includeBlobs) {
+        std::set<std::string> referenced;
+        for (auto& node : graph.nodes)
+            collectBlobHashes(node.script, referenced);
+        const auto& entries = graph.contentStore.entries();
+        for (const auto& h : referenced) {
+            auto it = entries.find(h);
+            if (it == entries.end()) continue;   // dangling ref - nothing to write
+            f << "\n[Blob]\n";
+            writeStr(f, "hash", h);
+            juce::String b64 = juce::Base64::toBase64(it->second.compressed.data(),
+                                                      (int) it->second.compressed.size());
+            writeStr(f, "bytes", b64.toStdString());
+        }
+    }
+
     f << "\n[End]\n";
     return true;
 }
@@ -351,6 +439,11 @@ bool ProjectFile::load(const std::string& path, NodeGraph& graph, PluginHost* pl
         fprintf(stderr, "Failed to load project: %s\n", path.c_str());
         return false;
     }
+    // Real file open replaces the whole project, so drop the previous project's
+    // baked blobs before readProject repopulates from the file's [Blob] sections.
+    // (Undo restore goes through loadFromString, which must NOT clear the store -
+    // its snapshots carry no blobs, the bytes live in memory across undo/redo.)
+    graph.contentStore.clear();
     bool ok = readProject(f, graph, pluginHost);
     if (ok) {
         currentPath = path;
@@ -365,6 +458,14 @@ bool ProjectFile::readProject(std::istream& f, NodeGraph& graph, PluginHost* plu
     graph.nodes.clear();
     graph.links.clear();
     graph.openEditors.clear();
+    // The loop region is only serialized when enabled (writeProject omits the
+    // keys otherwise), so reset it here: parsing a snapshot or file that has no
+    // loop keys must yield "no loop", not inherit a stale loop from the graph's
+    // prior state. Without this, undo/redo of a "disable loop" edit wouldn't
+    // stick (the redo snapshot has no keys, so loopEnabled would stay true).
+    graph.loopEnabled = false;
+    graph.loopStartBeat = 0;
+    graph.loopEndBeat = 0;
 
     std::vector<int> pendingEditorIds;
     int pendingActiveEditorId = -1;
@@ -372,6 +473,7 @@ bool ProjectFile::readProject(std::istream& f, NodeGraph& graph, PluginHost* plu
     std::string line, section;
     Node* curNode = nullptr;
     Clip* curClip = nullptr;
+    std::string curBlobHash;   // [Blob] section: hash read before its bytes line
     int maxId = 0;
 
     auto getValue = [](const std::string& line) -> std::string {
@@ -455,6 +557,9 @@ bool ProjectFile::readProject(std::istream& f, NodeGraph& graph, PluginHost* plu
             }
             else if (key == "songRepeatCount") graph.songRepeatCount = std::max(1, std::stoi(val));
             else if (key == "historyFile") graph.historyFilePath = val;
+            else if (key == "viewZoom") graph.viewZoom = std::stof(val);
+            else if (key == "viewPanX") graph.viewPanX = std::stof(val);
+            else if (key == "viewPanY") graph.viewPanY = std::stof(val);
             else if (key == "signalScriptLines") {
                 int numLines = std::stoi(val);
                 graph.signalScript.clear();
@@ -472,28 +577,99 @@ bool ProjectFile::readProject(std::istream& f, NodeGraph& graph, PluginHost* plu
             else if (key == "posY") curNode->pos.y = std::stof(val);
             else if (key == "muted") curNode->muted = (val == "1");
             else if (key == "soloed") curNode->soloed = (val == "1");
-            else if (key == "script") curNode->script = val;
+            else if (key == "scriptLines") {
+                // New multi-line-safe format (see writeProject above).
+                int n = 0;
+                try { n = std::stoi(val); } catch (...) { n = 0; }
+                std::string buf;
+                for (int li = 0; li < n && std::getline(f, line); ++li) {
+                    if (!buf.empty()) buf += "\n";
+                    buf += line;
+                }
+                curNode->script = std::move(buf);
+            }
+            else if (key == "script") {
+                curNode->script = val;
+                // Backward-compatibility recovery for the silent-MOD-playback
+                // bug: pre-fix saves wrote multi-line scripts (notably
+                // MultiSampler) as plain `script=<first-line>` followed by
+                // the remaining lines as orphan `key=val` pairs at the
+                // [Node] level. Detect the MultiSampler prefix specifically
+                // and slurp continuation lines back into the script until
+                // we hit a recognised [Node]-level key or a new section
+                // header. Lines we consume here would otherwise be silently
+                // discarded by the unknown-key fallthrough.
+                if (val == "__multisampler__:" ||
+                    val.rfind("__multisampler__:", 0) == 0) {
+                    static const std::set<std::string> kNodeKeys = {
+                        "id", "name", "type", "posX", "posY", "muted",
+                        "soloed", "script", "scriptLines",
+                        "midiInputSourceId", "envAttackCurve",
+                        "envDecayCurve", "envReleaseCurve", "envAtkPt",
+                        "envDecPt", "envRelPt", "ahdsrEnvelope",
+                        "aftertouchSensitivity", "pluginIndex", "pluginState",
+                        "panLaw", "pan", "spatialX", "spatialY", "spatialZ",
+                        "performanceMode", "perfReleaseMode", "perfVelocity",
+                        "mpeEnabled", "mpePitchBendRange", "parentGroupId",
+                        "groupBeatOffset", "anchorMarker", "groupExpanded",
+                        "childNodeIds", "modPin",
+                        "modImportSavedSong", "modImportPrevRepeatMode",
+                        "modImportPrevRepeatCount", "modImportPrevSongLength",
+                        "modImportPrevLoopEnabled", "modImportPrevLoopStart",
+                        "modImportPrevLoopEnd"
+                    };
+                    // Peek ahead. We need a one-line lookahead but can't
+                    // un-read with std::getline, so do the scan inline:
+                    // consume only lines that obviously belong to the
+                    // multisampler doc, and break out the moment we see
+                    // a section marker or a node-level key.
+                    auto savePos = f.tellg();
+                    std::string peek;
+                    while (std::getline(f, peek)) {
+                        if (peek.empty()) { savePos = f.tellg(); continue; }
+                        if (peek[0] == '[') break;       // new [Section]
+                        std::string pk = getKey(peek);
+                        if (kNodeKeys.count(pk)) break;  // back to node keys
+                        // Looks like a multisampler doc continuation line -
+                        // append to script.
+                        curNode->script += "\n";
+                        curNode->script += peek;
+                        savePos = f.tellg();
+                    }
+                    // Rewind to before the line that broke the loop so the
+                    // outer while(getline) re-reads it normally.
+                    if (!f.eof()) f.seekg(savePos);
+                    else f.clear(); // EOF is fine, just clear flag
+                }
+            }
             else if (key == "midiInputSourceId") curNode->midiInputSourceId = val;
-            else if (key == "envAttackCurve") curNode->envAttackCurve = val;
-            else if (key == "envDecayCurve") curNode->envDecayCurve = val;
-            else if (key == "envReleaseCurve") curNode->envReleaseCurve = val;
-            else if (key == "envAtkPt") {
-                auto c = val.find(',');
-                if (c != std::string::npos)
-                    curNode->envAttackPoints.push_back({std::stof(val.substr(0,c)), std::stof(val.substr(c+1))});
+            // Legacy per-node envelope fields (envAttackCurve / envDecayCurve /
+            // envReleaseCurve and the envAtkPt / envDecPt / envRelPt point
+            // lists) were replaced by the shared ahdsrEnvelope. They're still
+            // recognised here so old projects load cleanly, but their values
+            // are intentionally discarded — the node now carries its amplitude
+            // shape solely in ahdsrEnvelope.
+            else if (key == "envAttackCurve" || key == "envDecayCurve" ||
+                     key == "envReleaseCurve" || key == "envAtkPt" ||
+                     key == "envDecPt" || key == "envRelPt") {
+                // discard
             }
-            else if (key == "envDecPt") {
-                auto c = val.find(',');
-                if (c != std::string::npos)
-                    curNode->envDecayPoints.push_back({std::stof(val.substr(0,c)), std::stof(val.substr(c+1))});
+            else if (key == "ahdsrEnvelope") {
+                // Failure to decode (corrupt / partial line) leaves the
+                // freshly-constructed default envelope in place rather than
+                // wiping it — better to play with default ADSR than to
+                // hard-fail the load on one bad field.
+                AHDSREnvelope tmp;
+                if (AHDSREnvelope::decode(val, tmp))
+                    curNode->ahdsrEnvelope = std::move(tmp);
             }
-            else if (key == "envRelPt") {
-                auto c = val.find(',');
-                if (c != std::string::npos)
-                    curNode->envReleasePoints.push_back({std::stof(val.substr(0,c)), std::stof(val.substr(c+1))});
+            else if (key == "aftertouchSensitivity") {
+                try { curNode->aftertouchSensitivity = std::stof(val); }
+                catch (...) {}
             }
             else if (key == "pluginIndex") curNode->pluginIndex = std::stoi(val);
             else if (key == "pluginState") curNode->pendingPluginState = val;
+            else if (key == "panLaw") curNode->panLaw = (PanLaw)std::stoi(val);
             else if (key == "pan") curNode->pan = std::stof(val);
             else if (key == "spatialX") curNode->spatialX = std::stof(val);
             else if (key == "spatialY") curNode->spatialY = std::stof(val);
@@ -507,6 +683,13 @@ bool ProjectFile::readProject(std::istream& f, NodeGraph& graph, PluginHost* plu
             else if (key == "groupBeatOffset") curNode->groupBeatOffset = std::stof(val);
             else if (key == "anchorMarker") curNode->anchorMarker = val;
             else if (key == "groupExpanded") curNode->groupExpanded = (val == "1");
+            else if (key == "modImportSavedSong") curNode->modImportSavedSong = (val == "1");
+            else if (key == "modImportPrevRepeatMode") curNode->modImportPrevRepeatMode = std::stoi(val);
+            else if (key == "modImportPrevRepeatCount") curNode->modImportPrevRepeatCount = std::stoi(val);
+            else if (key == "modImportPrevSongLength") curNode->modImportPrevSongLength = std::stof(val);
+            else if (key == "modImportPrevLoopEnabled") curNode->modImportPrevLoopEnabled = (val == "1");
+            else if (key == "modImportPrevLoopStart") curNode->modImportPrevLoopStart = std::stof(val);
+            else if (key == "modImportPrevLoopEnd") curNode->modImportPrevLoopEnd = std::stof(val);
             else if (key == "childNodeIds") {
                 // Parse comma-separated IDs
                 std::istringstream ss(val);
@@ -514,7 +697,10 @@ bool ProjectFile::readProject(std::istream& f, NodeGraph& graph, PluginHost* plu
                 while (std::getline(ss, token, ','))
                     if (!token.empty()) curNode->childNodeIds.push_back(std::stoi(token));
             }
-            // Signal modulation pin bindings (#88): "modPin=paramIdx,pinId,depth"
+            // Signal modulation pin bindings (#88):
+            // "modPin=paramIdx,pinId,depth[,mode]" where mode 0=Modulate,
+            // 1=Absolute. The mode field is optional for back-compat with
+            // older projects (missing -> Modulate).
             else if (key == "modPin") {
                 Node::ModPin mp;
                 auto c1 = val.find(',');
@@ -522,7 +708,15 @@ bool ProjectFile::readProject(std::istream& f, NodeGraph& graph, PluginHost* plu
                 if (c1 != std::string::npos && c2 != std::string::npos) {
                     mp.paramIndex = std::stoi(val.substr(0, c1));
                     mp.pinId      = std::stoi(val.substr(c1 + 1, c2 - c1 - 1));
-                    mp.depth      = std::stof(val.substr(c2 + 1));
+                    auto c3 = val.find(',', c2 + 1);
+                    if (c3 != std::string::npos) {
+                        mp.depth = std::stof(val.substr(c2 + 1, c3 - c2 - 1));
+                        mp.mode  = (std::stoi(val.substr(c3 + 1)) == 1)
+                                       ? Node::ModPin::Mode::Absolute
+                                       : Node::ModPin::Mode::Modulate;
+                    } else {
+                        mp.depth = std::stof(val.substr(c2 + 1));
+                    }
                     curNode->modPins.push_back(mp);
                 }
             }
@@ -667,6 +861,24 @@ bool ProjectFile::readProject(std::istream& f, NodeGraph& graph, PluginHost* plu
                     wf.points.push_back({std::stof(val.substr(0, comma)), std::stof(val.substr(comma + 1))});
             }
         }
+        else if (section == "[Blob]") {
+            // Content-addressed baked blob (see writeProject [Blob]). The hash is
+            // trusted from the file - not recomputed - so loading never has to
+            // decompress; integrity is checked lazily when a node resolves it.
+            if (key == "hash") curBlobHash = val;
+            else if (key == "bytes") {
+                if (!curBlobHash.empty()) {
+                    juce::MemoryOutputStream mos;
+                    if (juce::Base64::convertFromBase64(mos, val)) {
+                        const uint8_t* d = (const uint8_t*) mos.getData();
+                        graph.contentStore.insertRaw(
+                            curBlobHash,
+                            std::vector<uint8_t>(d, d + mos.getDataSize()));
+                    }
+                    curBlobHash.clear();
+                }
+            }
+        }
         else if (section == "[Editors]") {
             if (key == "openEditors") {
                 std::istringstream ss(val);
@@ -685,7 +897,7 @@ bool ProjectFile::readProject(std::istream& f, NodeGraph& graph, PluginHost* plu
     // Restore nextId so new IDs don't conflict
     graph.setNextId(maxId + 1);
 
-    // Restore open editors (store IDs only — never store Node*)
+    // Restore open editors (store IDs only - never store Node*)
     graph.openEditors.clear();
     for (int id : pendingEditorIds) {
         if (graph.findNode(id))
@@ -727,11 +939,15 @@ bool ProjectFile::readProject(std::istream& f, NodeGraph& graph, PluginHost* plu
 }
 
 std::string ProjectFile::serializeForUndo(NodeGraph& graph) {
-    // Pass nullptr for the GraphProcessor so plugin state is omitted —
+    // Pass nullptr for the GraphProcessor so plugin state is omitted -
     // that's the expensive part and undo doesn't need it (plugin internal
     // state is captured separately by the slow autosave path, task #86).
     std::ostringstream oss;
-    writeProject(oss, graph, nullptr);
+    // includeView=false: undo snapshots intentionally exclude the saved
+    // pan/zoom so undoing a graph edit doesn't also jerk the user's
+    // viewport around. The view state lives on NodeGraph but is treated
+    // as out-of-band session state for undo purposes.
+    writeProject(oss, graph, nullptr, /*includeView*/ false, /*includeBlobs*/ false);
     return oss.str();
 }
 

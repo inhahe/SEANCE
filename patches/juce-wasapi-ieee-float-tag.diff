@@ -1,0 +1,44 @@
+From: SEANCE / SoundShop2
+Subject: WASAPI: recognise plain WAVE_FORMAT_IEEE_FLOAT (0x0003) capture format
+
+Stock JUCE's WASAPIDeviceBase::tryInitialisingWithBufferSize only classifies a
+stream as float when the negotiated format is WAVE_FORMAT_EXTENSIBLE *and* its
+SubFormat is KSDATAFORMAT_SUBTYPE_IEEE_FLOAT. Some USB capture devices (notably
+the Logitech C615 HD webcam mic, and other USB-audio-class mics) report their
+Windows shared-mode mix format with the *plain* WAVE_FORMAT_IEEE_FLOAT tag
+(0x0003) instead of the EXTENSIBLE wrapper. JUCE then treats the stream as
+integer PCM and decodes genuine 32-bit float samples through the Int32
+converter, which corrupts every sample identically -> the mic records/monitors
+as square-wave garbage (and a frozen capture replays equally garbled). The same
+device captures cleanly under DirectSound because that is a different code path.
+
+Fix: accept the plain WAVE_FORMAT_IEEE_FLOAT tag as float too. This only *adds*
+a correct float case; any format that already worked (extensible-float, or
+genuine integer PCM) is unaffected, so it cannot regress other devices.
+
+Target: JUCE 8.0.12 (modules/juce_audio_devices/native/juce_WASAPI_windows.cpp).
+Apply from the JUCE root, e.g.:  patch -p1 < juce-wasapi-ieee-float-tag.diff
+(GNU patch tolerates line-number drift via context; for git use `git apply`.)
+
+--- a/modules/juce_audio_devices/native/juce_WASAPI_windows.cpp
++++ b/modules/juce_audio_devices/native/juce_WASAPI_windows.cpp
+@@ -915,9 +915,18 @@
+         if (! isInitialised)
+             return false;
+
+         actualNumChannels  = format->Format.nChannels;
+-        const bool isFloat = format->Format.wFormatTag == WAVE_FORMAT_EXTENSIBLE && format->SubFormat == KSDATAFORMAT_SUBTYPE_IEEE_FLOAT;
++        // SEANCE patch (juce-wasapi-ieee-float-tag): also recognise the plain
++        // WAVE_FORMAT_IEEE_FLOAT (0x0003) tag, not only WAVE_FORMAT_EXTENSIBLE +
++        // IEEE_FLOAT subformat. Some USB webcam / USB mics (e.g. Logitech C615)
++        // report their shared-mode mix format with the plain float tag; stock
++        // JUCE then misclassifies the stream as integer and reads genuine 32-bit
++        // float samples through the Int32 converter, producing systematic
++        // square-wave corruption on capture.
++        const bool isFloat = (format->Format.wFormatTag == WAVE_FORMAT_IEEE_FLOAT)
++                          || (format->Format.wFormatTag == WAVE_FORMAT_EXTENSIBLE
++                              && format->SubFormat == KSDATAFORMAT_SUBTYPE_IEEE_FLOAT);
+         bytesPerSample     = format->Format.wBitsPerSample / 8;
+         bytesPerFrame      = format->Format.nBlockAlign;
+
+         updateFormat (isFloat);

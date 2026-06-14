@@ -5,29 +5,33 @@
 #include "multi_sampler.h"
 #include "sfizz_processor.h"
 #include "signal_shape_node.h"
+#include "midi_script_node.h"
 #include "cache_processor.h"
 #include "pan_processor.h"
 #include "gain_processor.h"
 #include "pitch_shift_processor.h"
 #include "time_gate_processor.h"
 #include "spectrum_tap.h"
+#include "analyzer_nodes.h"
 #include "convolution_processor.h"
 #include "soundfont_processor.h"
 #include "builtin_effects.h"
 #include "trigger_node.h"
 #include "midi_mod_node.h"
 #include "midi_input_node.h"
+#include "midi_breakout_node.h"
 #include "drum_synth.h"
 #include "spatializer_3d.h"
 #include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <fstream>
+#include <unordered_set>
 
 namespace SoundShop {
 
 // ==============================================================================
-// MidiTimelineProcessor — generates MIDI from timeline clips + audition
+// MidiTimelineProcessor - generates MIDI from timeline clips + audition
 // ==============================================================================
 
 MidiTimelineProcessor::MidiTimelineProcessor(Node& n, Transport& t) : node(n), transport(t) {
@@ -43,7 +47,7 @@ MidiTimelineProcessor::MidiTimelineProcessor(Node& n, Transport& t) : node(n), t
 void MidiTimelineProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::MidiBuffer& midi) {
     buf.clear();
 
-    // Performance mode — intercept incoming MIDI, replace with melody
+    // Performance mode - intercept incoming MIDI, replace with melody
     if (node.performanceMode && melodyPlayer.isActive()) {
         juce::MidiBuffer processedMidi;
         melodyPlayer.processMidi(midi, processedMidi);
@@ -73,7 +77,7 @@ void MidiTimelineProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mi
 
     // On stop: send all-notes-off on every channel so sustained notes
     // don't keep ringing through downstream synths/plugins.
-    // Only CC 123 (all-notes-off) — CC 120 (all-sound-off) is more
+    // Only CC 123 (all-notes-off) - CC 120 (all-sound-off) is more
     // aggressive and some synths handle it by resetting internal state
     // in ways that can interfere with subsequent playback.
     if (wasPlaying && !transport.playing) {
@@ -171,7 +175,7 @@ int MidiTimelineProcessor::allocMpeChannel(int ci, int ni, int pitch) {
             return idx + 2; // MIDI channel 2-16
         }
     }
-    // All channels busy — steal the next one
+    // All channels busy - steal the next one
     int idx = nextMpeChannel;
     mpeChannels[idx] = {ci, ni, pitch, true};
     nextMpeChannel = (idx + 1) % kMpeChannels;
@@ -219,7 +223,165 @@ void MidiTimelineProcessor::emitExpression(juce::MidiBuffer& midi, int mpeIdx,
 }
 
 // ==============================================================================
-// AudioTimelineProcessor — plays audio file clips
+// MidiTuningAdapterProcessor - cable-level note->frequency delivery for plugins
+// ==============================================================================
+
+int MidiTuningAdapterProcessor::encodeBend(float semis, int rangeSemis) {
+    if (rangeSemis < 1) rangeSemis = 1;
+    int raw = 8192 + (int)std::lround((double)semis / (double)rangeSemis * 8191.0);
+    return juce::jlimit(0, 16383, raw);
+}
+
+int MidiTuningAdapterProcessor::allocVoice(int inCh, int pitch) {
+    // Round-robin over the 15 member slots, reusing a free one if available.
+    for (int i = 0; i < kMembers; ++i) {
+        int idx = (nextVoice + i) % kMembers;
+        if (!voices[idx].active) {
+            voices[idx] = {true, inCh, pitch, 0.0f};
+            nextVoice = (idx + 1) % kMembers;
+            return idx;
+        }
+    }
+    // All busy - steal the next slot.
+    int idx = nextVoice;
+    voices[idx] = {true, inCh, pitch, 0.0f};
+    nextVoice = (idx + 1) % kMembers;
+    return idx;
+}
+
+int MidiTuningAdapterProcessor::findVoice(int inCh, int pitch) const {
+    for (int i = 0; i < kMembers; ++i)
+        if (voices[i].active && voices[i].inCh == inCh && voices[i].pitch == pitch)
+            return i;
+    return -1;
+}
+
+void MidiTuningAdapterProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::MidiBuffer& midi) {
+    buf.clear();
+
+    const bool playing = transport.playing;
+    if (wasPlaying && !playing)
+        for (auto& v : voices) v = {};          // release stale channel assignments
+    if (playing && !wasPlaying)
+        rpnCountdown = 4;                         // re-arm the collapse-mode RPN
+    wasPlaying = playing;
+
+    // Default tuning (12-TET / A440): nothing to reconcile - pure pass-through.
+    if (transport.isDefaultTuning()) return;
+
+    const bool mpe = dstNode.mpeEnabled;
+    const int memberRange = juce::jlimit(1, 96, dstNode.mpePitchBendRange);
+
+    juce::MidiBuffer out;
+
+    if (!mpe) {
+        // ---- Collapse mode --------------------------------------------------
+        // Plugin is not in MPE mode: everything onto channel 1, and only the
+        // uniform concert-pitch component can be delivered (per-note temperament
+        // needs separate channels). Pin ch1's bend range to a small, near-
+        // universal value via RPN so the sub-semitone concert bend lands right
+        // on plugins that honor it; plugins that ignore the RPN and keep a fixed
+        // range are the documented "may not honor tuning" case.
+        if (rpnCountdown > 0) {
+            --rpnCountdown;
+            out.addEvent(juce::MidiMessage::controllerEvent(1, 101, 0), 0); // RPN MSB
+            out.addEvent(juce::MidiMessage::controllerEvent(1, 100, 0), 0); // RPN LSB -> 0 (bend range)
+            out.addEvent(juce::MidiMessage::controllerEvent(1, 6, kCollapseRange), 0); // data MSB = semitones
+            out.addEvent(juce::MidiMessage::controllerEvent(1, 38, 0), 0); // data LSB = cents
+        }
+
+        const float concertSemis = transport.concertCents() / 100.0f;
+        const int concertBend = encodeBend(concertSemis, kCollapseRange);
+        const int bendDelta = concertBend - 8192; // constant 14-bit offset (range matches)
+
+        // Establish the concert bend at the top of the block; incoming wheels
+        // below re-send it summed with the user's own bend.
+        out.addEvent(juce::MidiMessage::pitchWheel(1, concertBend), 0);
+
+        for (const auto meta : midi) {
+            auto m = meta.getMessage();
+            const int so = meta.samplePosition;
+            m.setChannel(1);
+            if (m.isPitchWheel()) {
+                int summed = juce::jlimit(0, 16383, m.getPitchWheelValue() + bendDelta);
+                out.addEvent(juce::MidiMessage::pitchWheel(1, summed), so);
+            } else {
+                out.addEvent(m, so);
+            }
+        }
+    } else {
+        // ---- MPE mode -------------------------------------------------------
+        // Plugin is in MPE mode: give every note its own member channel (2..16)
+        // and apply the FULL per-note tuning bend (concert pitch + temperament),
+        // summed with any expression pitch-bend already on the stream. This also
+        // spreads a single-channel source across member channels on the fly.
+        for (const auto meta : midi) {
+            auto m = meta.getMessage();
+            const int so = meta.samplePosition;
+            const int inCh = m.getChannel();
+
+            if (m.isNoteOn()) {
+                const int pitch = m.getNoteNumber();
+                const int slot = allocVoice(inCh, pitch);
+                const int outCh = slot + 2;
+                const float tuneSemis = transport.noteTuningCents(pitch) / 100.0f;
+                voices[slot].exprSemis = 0.0f;
+                out.addEvent(juce::MidiMessage::pitchWheel(outCh,
+                    encodeBend(tuneSemis, memberRange)), so);
+                out.addEvent(juce::MidiMessage::noteOn(outCh, pitch,
+                    (juce::uint8)m.getVelocity()), so);
+            } else if (m.isNoteOff()) {
+                const int pitch = m.getNoteNumber();
+                const int slot = findVoice(inCh, pitch);
+                const int outCh = (slot >= 0) ? slot + 2 : inCh;
+                out.addEvent(juce::MidiMessage::noteOff(outCh, pitch,
+                    (juce::uint8)m.getVelocity()), so);
+                if (slot >= 0) voices[slot].active = false;
+            } else if (m.isPitchWheel()) {
+                const float exprSemis =
+                    ((m.getPitchWheelValue() - 8192) / 8191.0f) * memberRange;
+                bool matched = false;
+                for (int i = 0; i < kMembers; ++i) {
+                    if (!voices[i].active || voices[i].inCh != inCh) continue;
+                    voices[i].exprSemis = exprSemis;
+                    const float tuneSemis = transport.noteTuningCents(voices[i].pitch) / 100.0f;
+                    out.addEvent(juce::MidiMessage::pitchWheel(i + 2,
+                        encodeBend(tuneSemis + exprSemis, memberRange)), so);
+                    matched = true;
+                }
+                if (!matched) {
+                    // Global bend from a single-channel source: fan out to every
+                    // active voice so the whole chord bends together.
+                    for (int i = 0; i < kMembers; ++i) {
+                        if (!voices[i].active) continue;
+                        voices[i].exprSemis = exprSemis;
+                        const float tuneSemis = transport.noteTuningCents(voices[i].pitch) / 100.0f;
+                        out.addEvent(juce::MidiMessage::pitchWheel(i + 2,
+                            encodeBend(tuneSemis + exprSemis, memberRange)), so);
+                    }
+                }
+            } else {
+                // CC / pressure / aftertouch etc: follow the note onto its member
+                // channel(s). Channel-wide messages with no live voice pass
+                // through unchanged.
+                bool matched = false;
+                for (int i = 0; i < kMembers; ++i) {
+                    if (!voices[i].active || voices[i].inCh != inCh) continue;
+                    auto mm = m;
+                    mm.setChannel(i + 2);
+                    out.addEvent(mm, so);
+                    matched = true;
+                }
+                if (!matched) out.addEvent(m, so);
+            }
+        }
+    }
+
+    midi.swapWith(out);
+}
+
+// ==============================================================================
+// AudioTimelineProcessor - plays audio file clips
 // ==============================================================================
 
 AudioTimelineProcessor::AudioTimelineProcessor(Node& n, Transport& t, NodeGraph& g)
@@ -339,7 +501,7 @@ void AudioTimelineProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::M
             int fileSample = (int)(s * fileRatio);
             if (fileSample >= fileSamplesToRead) break;
 
-            // Fade — uses effective edge-fade durations (max of user setting
+            // Fade - uses effective edge-fade durations (max of user setting
             // and the project-wide globalCrossfadeSec) so clips never start
             // or end with a hard sample edge.
             float fade = 1.0f;
@@ -363,7 +525,7 @@ void AudioTimelineProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::M
 }
 
 // ==============================================================================
-// PassthroughProcessor — for nodes without plugins (test tone on MIDI)
+// PassthroughProcessor - for nodes without plugins (test tone on MIDI)
 // ==============================================================================
 
 PassthroughProcessor::PassthroughProcessor(Node& n) : node(n) {}
@@ -411,6 +573,25 @@ void GraphProcessor::rebuildGraph(NodeGraph& graph, Transport& transport) {
     nodeMap.clear();
     nodeInputMap.clear();
 
+    // Helper: widen a built-in processor so it physically has enough audio
+    // channels to carry audio-rate control signals. Channels 0+1 are the audio
+    // pair; every Signal/Param INPUT pin needs a dedicated control INPUT channel
+    // (2, 3, ...) and every Signal/Param OUTPUT pin a control OUTPUT channel.
+    // Without this, the processor declares the JUCE default stereo (2-in/2-out)
+    // layout, AudioProcessorGraph::isConnectionLegal rejects every connection to
+    // channel index >= 2, and control cables silently never reach the node -
+    // which is why signal modulation (e.g. wavetable Position) had no effect.
+    // Hosted plugins never have Signal/Param pins, so this is a no-op for them.
+    auto widenForControl = [&](juce::AudioProcessor& p, const Node& n) {
+        int numCtrlIn = 0, numCtrlOut = 0;
+        for (auto& pin : n.pinsIn)
+            if (pin.kind == PinKind::Signal || pin.kind == PinKind::Param) ++numCtrlIn;
+        for (auto& pin : n.pinsOut)
+            if (pin.kind == PinKind::Signal || pin.kind == PinKind::Param) ++numCtrlOut;
+        if (numCtrlIn > 0 || numCtrlOut > 0)
+            p.setPlayConfigDetails(2 + numCtrlIn, 2 + numCtrlOut, sampleRate, blockSize);
+    };
+
     // Add an audio output node (graph sink)
     auto outNode = processorGraph->addNode(
         std::make_unique<juce::AudioProcessorGraph::AudioGraphIOProcessor>(
@@ -421,21 +602,34 @@ void GraphProcessor::rebuildGraph(NodeGraph& graph, Transport& transport) {
     for (auto& node : graph.nodes) {
         std::unique_ptr<juce::AudioProcessor> proc;
 
-        // Check cache: manual freeze or auto-cache
+        // Check cache: manual freeze or auto-cache.
+        // NEVER cache Output nodes. Output is a graph sink, not a source -
+        // its job is to forward audio to outputNodeId (the AudioGraphIO sink
+        // added at the top of rebuildGraph). Replacing it with a
+        // CachePlaybackProcessor would route nodeMap[Output] to the cache
+        // processor instead of outputNodeId, leaving the real sink dangling
+        // (nothing wired to it) and silencing the entire render. The Output
+        // node's cache IS populated on every Play->Stop (AudioEngine::stop
+        // dumps the live capture into it) so on offline export after any
+        // live playback this branch would otherwise fire and the WAV would
+        // come out silent - see the tracker-import export-silence bug.
         bool useCache = false;
-        if (node.cache.enabled && node.cache.valid) {
-            useCache = true;
-        } else if (node.cache.autoCache && cacheManager.isCacheValid(node, graph)) {
-            // Auto-cache hit — try loading from disk if needed
-            if (node.cache.useDisk && node.cache.left.empty())
-                cacheManager.loadFromDisk(node);
-            useCache = node.cache.hasCachedAudio();
+        if (node.type != NodeType::Output) {
+            if (node.cache.enabled && node.cache.valid) {
+                useCache = true;
+            } else if (node.cache.autoCache && cacheManager.isCacheValid(node, graph)) {
+                // Auto-cache hit - try loading from disk if needed
+                if (node.cache.useDisk && node.cache.left.empty())
+                    cacheManager.loadFromDisk(node);
+                useCache = node.cache.hasCachedAudio();
+            }
         }
 
         if (useCache) {
             proc = std::make_unique<CachePlaybackProcessor>(node, transport);
             if (proc) {
                 proc->enableAllBuses();
+                widenForControl(*proc, node);
                 auto graphNode = processorGraph->addNode(std::move(proc));
                 if (graphNode) {
                     nodeMap[node.id] = graphNode->nodeID;
@@ -445,17 +639,101 @@ void GraphProcessor::rebuildGraph(NodeGraph& graph, Transport& transport) {
             continue;
         }
 
+        // Ensure tonal / note-triggered synths carry a control input pin
+        // named "Pressure" so users can wire any signal source (an
+        // LFO, an XY pad axis, an envelope, etc.) to drive the synth's
+        // per-voice volume swell. The pin is added once and persists in the
+        // project file via the normal pin save/load. When unwired, the synth
+        // falls back to channel-pressure (aftertouch) events on its own MIDI
+        // input. (Historically this pin was named "Aftertouch"; it is migrated
+        // to "Pressure" in place below - same pin id, so old cables survive.)
+        auto isTonalSynthNodeForPin = [](const Node& n) {
+            if (n.type == NodeType::TerrainSynth) return true;
+            if (n.type == NodeType::Instrument && !n.plugin) {
+                auto isScript = [&](const char* tag) {
+                    return n.script.rfind(tag, 0) == 0;
+                };
+                if (isScript("__fmsynth__")    || isScript("__additivesynth__") ||
+                    isScript("__pdsynth__")    || isScript("__particlesynth__") ||
+                    isScript("__drumsynth__")  || isScript("__spectralgrain__:"))
+                    return true;
+                // Built-in / wavetable / layered / spectral / audio variants
+                // all live under NodeType::Instrument with various
+                // script prefixes - hand them the pin too.
+                return true;
+            }
+            return false;
+        };
+        if (isTonalSynthNodeForPin(node)) {
+            // Pressure is system-managed (auto-created here, never chosen by
+            // the user), and it's consumed as the block MEAN in terrain_synth
+            // (averaged across the whole block to stay smooth). That makes it a
+            // block-rate value, so its pin is Param (orange), not Signal
+            // (amber). Match by name regardless of kind, migrate the legacy
+            // "Aftertouch" name to "Pressure" in place (same pin id keeps old
+            // cables intact), and normalize any existing Signal pin from older
+            // projects to Param - safe precisely because this pin is
+            // system-managed, not a user-set type we'd be overriding.
+            //
+            // The tooltip warns against the one wiring that double-applies:
+            // feeding a MIDI Breakout's Pressure out into THIS synth, which
+            // already reads pressure from the same MIDI stream internally.
+            static const char* kPressureTip =
+                "Volume swell from key pressure (aftertouch). 0 = normal level, "
+                "higher = louder; amount scaled by this node's Aftertouch "
+                "sensitivity. When wired, this signal REPLACES the keyboard's "
+                "own pressure - so wire a slow signal (LFO, envelope, XY pad "
+                "axis) to drive the swell yourself. Leave unwired to let the "
+                "keyboard drive it. No need to route a MIDI Breakout's Pressure "
+                "output back in here: the synth already reads pressure from its "
+                "MIDI input, and the pin would just overwrite that same value "
+                "(read once per block instead of sample-accurate) - redundant, "
+                "and it wastes the pin.";
+            Pin* existingAT = nullptr;
+            for (auto& p : node.pinsIn)
+                if (p.name == "Pressure" || p.name == "Aftertouch") { existingAT = &p; break; }
+            if (existingAT) {
+                existingAT->name = "Pressure";
+                existingAT->kind = PinKind::Param;
+                existingAT->tooltip = kPressureTip;
+            } else {
+                Pin atPin;
+                atPin.id = graph.allocId();
+                atPin.name = "Pressure";
+                atPin.kind = PinKind::Param;
+                atPin.isInput = true;
+                atPin.channels = 1;
+                atPin.tooltip = kPressureTip;
+                node.pinsIn.push_back(atPin);
+            }
+            // Normalize pin order: keep the Pressure input AFTER every other
+            // input pin (MIDI, Position / Sig axes). It's appended here at
+            // graph-build time, but adding a Position axis in the wavetable
+            // editor later push_backs a new Position pin behind the existing
+            // Pressure pin, leaving it wedged between two Position inputs.
+            // Stable-partition moves the single Pressure pin to the end while
+            // preserving every other pin's relative order. Runs every build, so
+            // it also normalizes the order of projects saved with the old
+            // wedged layout. Links reference pins by id, so reordering never
+            // breaks a cable. Accept the legacy name too for nodes not yet
+            // migrated by the block above this build.
+            std::stable_partition(node.pinsIn.begin(), node.pinsIn.end(),
+                [](const Pin& p) {
+                    return p.name != "Pressure" && p.name != "Aftertouch";
+                });
+        }
+
         if (node.type == NodeType::MidiTimeline) {
             proc = std::make_unique<MidiTimelineProcessor>(node, transport);
         } else if (node.type == NodeType::AudioTimeline) {
             proc = std::make_unique<AudioTimelineProcessor>(node, transport, graph);
         } else if (node.type == NodeType::Output) {
-            // Our output node maps to the graph's audio output — skip creating a processor
+            // Our output node maps to the graph's audio output - skip creating a processor
             nodeMap[node.id] = outputNodeId;
             nodeInputMap[node.id] = outputNodeId;
             continue;
         } else if (node.type == NodeType::Script && !node.script.empty()) {
-            // WASM script node — load .wasm file
+            // WASM script node - load .wasm file
             auto wasmProc = std::make_unique<WasmScriptProcessor>(node, transport);
             std::ifstream wf(node.script, std::ios::binary);
             if (wf) {
@@ -466,7 +744,7 @@ void GraphProcessor::rebuildGraph(NodeGraph& graph, Transport& transport) {
             }
             proc = std::move(wasmProc);
         } else if (node.plugin && node.plugin->instance) {
-            // Real plugin — transfer ownership to the graph
+            // Real plugin - transfer ownership to the graph
             auto graphNode = processorGraph->addNode(std::move(node.plugin->instance));
             if (graphNode) {
                 nodeMap[node.id] = graphNode->nodeID;
@@ -501,13 +779,28 @@ void GraphProcessor::rebuildGraph(NodeGraph& graph, Transport& transport) {
         } else if (node.type == NodeType::TerrainSynth || node.type == NodeType::Instrument) {
             // Unified synth: TerrainSynthProcessor handles everything
             // 1D waveforms (simple synths) and N-D terrains
-            proc = std::make_unique<TerrainSynthProcessor>(node, transport);
+            proc = std::make_unique<TerrainSynthProcessor>(node, transport, &graph.contentStore);
         } else if (node.type == NodeType::SignalShape) {
             proc = std::make_unique<SignalShapeProcessor>(node, transport);
+        } else if (node.type == NodeType::MidiScript) {
+            proc = std::make_unique<MidiScriptProcessor>(node, transport);
         } else if (node.type == NodeType::MidiInput) {
             proc = std::make_unique<MidiInputProcessor>(node);
-        } else if (node.type == NodeType::Effect && node.script == "__spectrumtap__") {
+        } else if (node.type == NodeType::MidiBreakout) {
+            proc = std::make_unique<MidiBreakoutProcessor>(node);
+        } else if (node.type == NodeType::Effect && node.script.rfind("__spectrumtap__", 0) == 0) {
+            // Spectrum Tap may carry per-bin custom response curves appended
+            // to its tag as "__spectrumtap__|<curve1>|<curve2>|...", so we
+            // prefix-match rather than compare exactly.
             proc = std::make_unique<SpectrumTapProcessor>(node);
+        } else if (node.type == NodeType::Effect &&
+                   (node.script == "__spectrumanalyzer__" ||
+                    node.script == "__oscilloscope__" ||
+                    node.script == "__spectrogram__")) {
+            // Pure passthrough + capture-to-shared-ring-buffer.
+            // The editor side reads from the same AnalyzerCapture via the
+            // node-id-keyed registry.
+            proc = std::make_unique<AnalyzerProcessor>(node);
         } else if (node.type == NodeType::Effect &&
                    node.script.rfind("__convolution__:", 0) == 0) {
             proc = std::make_unique<ConvolutionProcessor>(node);
@@ -580,18 +873,30 @@ void GraphProcessor::rebuildGraph(NodeGraph& graph, Transport& transport) {
         } else if (node.type == NodeType::Effect && node.script == "__pitchshift__") {
             proc = std::make_unique<PitchShiftProcessor>(node);
         } else {
-            // No plugin — passthrough
+            // No plugin - passthrough
             proc = std::make_unique<PassthroughProcessor>(node);
         }
 
         if (proc) {
             proc->enableAllBuses();
+            widenForControl(*proc, node);
             auto graphNode = processorGraph->addNode(std::move(proc));
             if (graphNode) {
                 // Insert a pan processor after audio-producing nodes
                 if (node.type != NodeType::Output) {
+                    // Count the node's Signal/Param OUT pins up front - the pan
+                    // node must be wide enough to pass these control channels
+                    // through (channels 2..2+numCtrlOuts-1) in addition to the
+                    // stereo audio pair.
+                    int numCtrlOuts = 0;
+                    for (auto& pin : node.pinsOut)
+                        if (pin.kind == PinKind::Signal || pin.kind == PinKind::Param)
+                            ++numCtrlOuts;
                     auto panProc = std::make_unique<PanProcessor>(node, graph);
                     panProc->enableAllBuses();
+                    if (numCtrlOuts > 0)
+                        panProc->setPlayConfigDetails(2 + numCtrlOuts, 2 + numCtrlOuts,
+                                                      sampleRate, blockSize);
                     auto panNode = processorGraph->addNode(std::move(panProc));
                     if (panNode) {
                         // Chain: node -> pan -> (downstream will connect to panNode)
@@ -600,6 +905,17 @@ void GraphProcessor::rebuildGraph(NodeGraph& graph, Transport& transport) {
                         processorGraph->addConnection({
                             {graphNode->nodeID, juce::AudioProcessorGraph::midiChannelIndex},
                             {panNode->nodeID, juce::AudioProcessorGraph::midiChannelIndex}});
+                        // Wire control channels (Signal/Param outputs) through
+                        // the pan node too. Pan only manipulates channels 0+1;
+                        // control channels 2+ pass through unchanged. Without
+                        // this, a source node's Signal Out pin (which lives on
+                        // channel 2+i of the source) would dead-end at the pan
+                        // processor because downstream connections go through
+                        // nodeMap[node.id] = panNode.
+                        for (int i = 0; i < numCtrlOuts; ++i) {
+                            processorGraph->addConnection({{graphNode->nodeID, 2 + i},
+                                                           {panNode->nodeID, 2 + i}});
+                        }
                         nodeMap[node.id] = panNode->nodeID;       // downstream pulls audio from pan
                         nodeInputMap[node.id] = graphNode->nodeID; // upstream pushes MIDI/audio into the actual processor
                     } else {
@@ -613,6 +929,47 @@ void GraphProcessor::rebuildGraph(NodeGraph& graph, Transport& transport) {
             }
         }
     }
+
+    // MPE configuration: for each hosted plugin with MPE enabled, wire a small
+    // parallel MIDI generator into its input. The generator emits the MPE
+    // Configuration Message (the RPN "zone" handshake) so MPE-capable plugins
+    // interpret incoming channels 2..16 as per-note member channels. It only
+    // ADDS the RPN and never touches the note stream, so a non-MPE plugin -
+    // which ignores the unknown RPN - is byte-for-byte unaffected. Built-in
+    // synths read MPE channels natively and don't need the handshake, so this
+    // is gated on node.plugin. Injecting at the plugin's graph input (rather
+    // than on a cable) also bypasses the cable-level MIDI-Learn CC filter that
+    // could otherwise strip the RPN's CC 6/38/100/101 bytes.
+    for (auto& node : graph.nodes) {
+        if (!node.mpeEnabled) continue;
+        if (!node.plugin) continue;
+        auto it = nodeInputMap.find(node.id);
+        if (it == nodeInputMap.end()) continue;
+        auto cfgProc = std::make_unique<MpeConfigProcessor>(node, transport);
+        cfgProc->enableAllBuses();
+        auto cfgNode = processorGraph->addNode(std::move(cfgProc));
+        if (cfgNode) {
+            processorGraph->addConnection({
+                {cfgNode->nodeID, juce::AudioProcessorGraph::midiChannelIndex},
+                {it->second, juce::AudioProcessorGraph::midiChannelIndex}});
+        }
+    }
+
+    // Per-output MIDI channel filters for multi-output MidiScript nodes. Keyed
+    // by (sourceNodeId, midiOutputIndex) so all cables leaving the same output
+    // pin share one filter node. Populated lazily in the link loop below.
+    std::map<std::pair<int,int>, juce::AudioProcessorGraph::NodeID> midiOutFilters;
+
+    // Per-INPUT MIDI channel stampers for multi-INPUT script nodes (the mirror
+    // image of midiOutFilters). A SignalShape / MidiScript / Script node with
+    // >1 MIDI input pin needs to know which pin each incoming event arrived on,
+    // but JUCE merges every incoming MIDI cable into the node's single MIDI bus.
+    // So for each MIDI cable feeding input pin i (0-based) we splice a stamper
+    // that rewrites every event's channel to (i + 1); the receiving processor
+    // recovers the pin index from the channel nibble (see buildScriptMidiIn).
+    // Keyed by (destNodeId, midiInputIndex) so all cables into the same input
+    // pin share one stamper. Channel is purely an internal routing detail.
+    std::map<std::pair<int,int>, juce::AudioProcessorGraph::NodeID> midiInStamps;
 
     // Create connections based on our links
     for (auto& link : graph.links) {
@@ -651,6 +1008,17 @@ void GraphProcessor::rebuildGraph(NodeGraph& graph, Transport& transport) {
         auto srcGraphId = nodeMap[srcNodeId];
         auto dstGraphId = nodeInputMap[dstNodeId];
 
+        // Count the source node's Signal/Param OUT pins so any pass-through
+        // (gate/gain) processors we insert below also forward channels 2+.
+        int srcNumCtrlOuts = 0;
+        for (auto& sn : graph.nodes) {
+            if (sn.id != srcNodeId) continue;
+            for (auto& pin : sn.pinsOut)
+                if (pin.kind == PinKind::Signal || pin.kind == PinKind::Param)
+                    ++srcNumCtrlOuts;
+            break;
+        }
+
         // If this link has time-gated effect regions on any node, insert a
         // TimeGateProcessor that silences audio outside the active regions.
         auto effectiveSrc = srcGraphId;
@@ -680,6 +1048,9 @@ void GraphProcessor::rebuildGraph(NodeGraph& graph, Transport& transport) {
                     auto gateProc = std::make_unique<TimeGateProcessor>(
                         link.id, *srcNode, graph, transport);
                     gateProc->enableAllBuses();
+                    if (srcNumCtrlOuts > 0)
+                        gateProc->setPlayConfigDetails(2 + srcNumCtrlOuts, 2 + srcNumCtrlOuts,
+                                                       sampleRate, blockSize);
                     auto gateNode = processorGraph->addNode(std::move(gateProc));
                     if (gateNode) {
                         processorGraph->addConnection({{effectiveSrc, 0}, {gateNode->nodeID, 0}});
@@ -687,6 +1058,14 @@ void GraphProcessor::rebuildGraph(NodeGraph& graph, Transport& transport) {
                         processorGraph->addConnection({
                             {effectiveSrc, juce::AudioProcessorGraph::midiChannelIndex},
                             {gateNode->nodeID, juce::AudioProcessorGraph::midiChannelIndex}});
+                        // Forward control channels (Signal/Param outputs)
+                        // through the time-gate node too. TimeGateProcessor
+                        // only silences channels 0+1 outside active regions;
+                        // control channels pass through.
+                        for (int i = 0; i < srcNumCtrlOuts; ++i) {
+                            processorGraph->addConnection({{effectiveSrc, 2 + i},
+                                                           {gateNode->nodeID, 2 + i}});
+                        }
                         effectiveSrc = gateNode->nodeID;
                     }
                 }
@@ -697,6 +1076,9 @@ void GraphProcessor::rebuildGraph(NodeGraph& graph, Transport& transport) {
         if (link.gainDb != 0.0f) {
             auto gainProc = std::make_unique<GainProcessor>(link.gainDb);
             gainProc->enableAllBuses();
+            if (srcNumCtrlOuts > 0)
+                gainProc->setPlayConfigDetails(2 + srcNumCtrlOuts, 2 + srcNumCtrlOuts,
+                                               sampleRate, blockSize);
             auto gainNode = processorGraph->addNode(std::move(gainProc));
             if (gainNode) {
                 // Route: src -> gain -> dst
@@ -705,17 +1087,27 @@ void GraphProcessor::rebuildGraph(NodeGraph& graph, Transport& transport) {
                 processorGraph->addConnection({
                     {srcGraphId, juce::AudioProcessorGraph::midiChannelIndex},
                     {gainNode->nodeID, juce::AudioProcessorGraph::midiChannelIndex}});
+                // Forward control channels too. GainProcessor scales every
+                // channel by linkGainDb - for control links the scaling acts
+                // as a signal scale, for audio links the control channels are
+                // unused. Either way they need to traverse the gain node so
+                // downstream connections from a control-source pin still see
+                // their data.
+                for (int i = 0; i < srcNumCtrlOuts; ++i) {
+                    processorGraph->addConnection({{srcGraphId, 2 + i},
+                                                   {gainNode->nodeID, 2 + i}});
+                }
                 effectiveSrc = gainNode->nodeID;
             }
         }
 
         // Connect based on pin kind. Param and Signal both flow through the
-        // audio-rate control slot (channels 2+) — they are interchangeable at
+        // audio-rate control slot (channels 2+) - they are interchangeable at
         // the cable level (task #82). The receiver decides per-block vs
         // per-sample consumption; the channel layout is identical either way.
         bool srcIsControl = (srcKind == PinKind::Signal || srcKind == PinKind::Param);
         if (srcIsControl) {
-            // Find which control-input slot this is on the destination — count
+            // Find which control-input slot this is on the destination - count
             // Param + Signal pins encountered before the matching pin id.
             int signalChIdx = 2;
             for (auto& dstNode : graph.nodes) {
@@ -727,16 +1119,215 @@ void GraphProcessor::rebuildGraph(NodeGraph& graph, Transport& transport) {
                 }
                 break;
             }
-            processorGraph->addConnection({{effectiveSrc, 0}, {dstGraphId, signalChIdx}});
+            // Find the source channel: each Signal/Param OUT pin gets its own
+            // channel starting at 2 (channels 0+1 are reserved for audio).
+            // This lets a single node expose multiple distinct control signals
+            // simultaneously (e.g. SpectrumTap with one Signal Out per bin,
+            // or the XY pad with X/Y/Z axes on separate pins).
+            int srcSignalCh = 2;
+            for (auto& sn : graph.nodes) {
+                if (sn.id != srcNodeId) continue;
+                int sigCount = 0;
+                for (auto& pin : sn.pinsOut) {
+                    if (pin.id == link.startPin) { srcSignalCh = 2 + sigCount; break; }
+                    if (pin.kind == PinKind::Signal || pin.kind == PinKind::Param) sigCount++;
+                }
+                break;
+            }
+            processorGraph->addConnection({{effectiveSrc, srcSignalCh}, {dstGraphId, signalChIdx}});
         } else {
             // Audio + MIDI: connect as before
             processorGraph->addConnection({{effectiveSrc, 0}, {dstGraphId, 0}});
             processorGraph->addConnection({{effectiveSrc, 1}, {dstGraphId, 1}});
-            processorGraph->addConnection({
-                {effectiveSrc, juce::AudioProcessorGraph::midiChannelIndex},
-                {dstGraphId, juce::AudioProcessorGraph::midiChannelIndex}
-            });
+
+            // Multi-output MIDI: a Script (unified SignalShape), MidiScript or
+            // WASM Script node with >1 MIDI output pin tags each emitted event
+            // with channel = (output index + 1). Splice a per-output channel
+            // filter between source and destination so each output pin behaves
+            // as an independent single-stream cable. With a single MIDI output
+            // (the common case) we connect directly.
+            int midiOutCount = 0, thisMidiOutIdx = -1;
+            if (srcKind == PinKind::Midi) {
+                for (auto& sn : graph.nodes) {
+                    if (sn.id != srcNodeId) continue;
+                    if (sn.type == NodeType::SignalShape ||
+                        sn.type == NodeType::MidiScript ||
+                        sn.type == NodeType::Script) {
+                        int idx = 0;
+                        for (auto& pin : sn.pinsOut) {
+                            if (pin.kind != PinKind::Midi) continue;
+                            if (pin.id == link.startPin) thisMidiOutIdx = idx;
+                            ++idx;
+                        }
+                        midiOutCount = idx;
+                    }
+                    break;
+                }
+            }
+
+            // Resolve the final MIDI source node feeding this destination:
+            // either a per-output channel filter (multi-output script) or the
+            // direct source.
+            auto midiSrcId = effectiveSrc;
+            if (midiOutCount > 1 && thisMidiOutIdx >= 0) {
+                auto key = std::make_pair(srcNodeId, thisMidiOutIdx);
+                auto found = midiOutFilters.find(key);
+                if (found != midiOutFilters.end()) {
+                    midiSrcId = found->second;
+                } else {
+                    auto filt = std::make_unique<MidiChannelFilterProcessor>(thisMidiOutIdx + 1);
+                    filt->enableAllBuses();
+                    auto filtNode = processorGraph->addNode(std::move(filt));
+                    midiSrcId = filtNode->nodeID;
+                    midiOutFilters[key] = midiSrcId;
+                    processorGraph->addConnection({
+                        {effectiveSrc, juce::AudioProcessorGraph::midiChannelIndex},
+                        {midiSrcId, juce::AudioProcessorGraph::midiChannelIndex}});
+                }
+            }
+
+            // Cable-level tuning adapter: when this MIDI cable feeds a HOSTED
+            // plugin (vs a native synth that tunes itself), splice in a
+            // MidiTuningAdapterProcessor as the last hop. It reconciles the
+            // project tuning into pitch-bend (spread to member channels in MPE
+            // mode, or concert-only on channel 1 otherwise) and is a pure
+            // pass-through at default tuning. Native-synth and non-MIDI cables
+            // never get one.
+            bool dstIsHostedPlugin = false;
+            if (srcKind == PinKind::Midi) {
+                for (auto& dn : graph.nodes)
+                    if (dn.id == dstNodeId) { dstIsHostedPlugin = (dn.plugin != nullptr); break; }
+            }
+
+            // Multi-MIDI-input destination: a SignalShape / MidiScript / Script
+            // node with >1 MIDI input pin needs each event tagged with the input
+            // pin it arrived on. Find which MIDI input pin (0-based) this cable
+            // feeds and, when the node has more than one, splice a per-input
+            // channel stamper (channel = inIdx + 1). The receiving processor maps
+            // the channel nibble back to the input-pin index. Hosted plugins are
+            // never multi-MIDI-input script nodes, so this only affects the
+            // native-destination path below.
+            int destMidiInCount = 0, thisMidiInIdx = -1;
+            if (srcKind == PinKind::Midi) {
+                for (auto& dn : graph.nodes) {
+                    if (dn.id != dstNodeId) continue;
+                    if (dn.type == NodeType::SignalShape ||
+                        dn.type == NodeType::MidiScript ||
+                        dn.type == NodeType::Script) {
+                        int idx = 0;
+                        for (auto& pin : dn.pinsIn) {
+                            if (pin.kind != PinKind::Midi) continue;
+                            if (pin.id == link.endPin) thisMidiInIdx = idx;
+                            ++idx;
+                        }
+                        destMidiInCount = idx;
+                    }
+                    break;
+                }
+            }
+
+            if (dstIsHostedPlugin) {
+                Node* dstNodePtr = nullptr;
+                for (auto& dn : graph.nodes)
+                    if (dn.id == dstNodeId) { dstNodePtr = &dn; break; }
+                auto adapter = std::make_unique<MidiTuningAdapterProcessor>(*dstNodePtr, transport);
+                adapter->enableAllBuses();
+                auto adapterNode = processorGraph->addNode(std::move(adapter));
+                processorGraph->addConnection({
+                    {midiSrcId, juce::AudioProcessorGraph::midiChannelIndex},
+                    {adapterNode->nodeID, juce::AudioProcessorGraph::midiChannelIndex}});
+                processorGraph->addConnection({
+                    {adapterNode->nodeID, juce::AudioProcessorGraph::midiChannelIndex},
+                    {dstGraphId, juce::AudioProcessorGraph::midiChannelIndex}});
+            } else {
+                auto midiFinalSrc = midiSrcId;
+                if (destMidiInCount > 1 && thisMidiInIdx >= 0) {
+                    auto key = std::make_pair(dstNodeId, thisMidiInIdx);
+                    auto found = midiInStamps.find(key);
+                    juce::AudioProcessorGraph::NodeID stampId;
+                    if (found != midiInStamps.end()) {
+                        stampId = found->second;
+                    } else {
+                        auto stamp = std::make_unique<MidiChannelStampProcessor>(thisMidiInIdx + 1);
+                        stamp->enableAllBuses();
+                        auto stampNode = processorGraph->addNode(std::move(stamp));
+                        stampId = stampNode->nodeID;
+                        midiInStamps[key] = stampId;
+                    }
+                    processorGraph->addConnection({
+                        {midiSrcId, juce::AudioProcessorGraph::midiChannelIndex},
+                        {stampId,   juce::AudioProcessorGraph::midiChannelIndex}});
+                    midiFinalSrc = stampId;
+                }
+                processorGraph->addConnection({
+                    {midiFinalSrc, juce::AudioProcessorGraph::midiChannelIndex},
+                    {dstGraphId,   juce::AudioProcessorGraph::midiChannelIndex}});
+            }
         }
+    }
+
+    // ---- Output reachability (audition routing) ----
+    // Recompute, for every node, whether it has an audio path to an Output
+    // node. Synth audition (editor "Play" on an unplaced library frame) reads
+    // node.reachesOutput: when false, the audition voices are diverted to the
+    // AudioEngine audition-monitor bus so the preview is audible even though the
+    // node isn't wired to output; when true, the audition stays in the normal
+    // graph path so it flows through the user's downstream effects/pan exactly
+    // like a played note. Only audio-kind links carry the preview, so control
+    // (Signal/Param) and MIDI cables are ignored here.
+    {
+        std::vector<std::pair<int,int>> audioEdges; // (srcNodeId, dstNodeId)
+        for (auto& link : graph.links) {
+            int srcNodeId = -1, dstNodeId = -1;
+            PinKind srcKind = PinKind::Audio;
+            for (auto& n : graph.nodes) {
+                for (auto& p : n.pinsOut)
+                    if (p.id == link.startPin) { srcNodeId = n.id; srcKind = p.kind; }
+                for (auto& p : n.pinsIn)
+                    if (p.id == link.endPin) dstNodeId = n.id;
+            }
+            if (srcNodeId < 0 || dstNodeId < 0) continue;
+            if (srcKind != PinKind::Audio) continue;
+            audioEdges.push_back({srcNodeId, dstNodeId});
+        }
+        // Seed the frontier with Output nodes; everything else starts false.
+        std::vector<int> frontier;
+        for (auto& n : graph.nodes) {
+            n.reachesOutput = (n.type == NodeType::Output);
+            if (n.reachesOutput) frontier.push_back(n.id);
+        }
+        // Backward BFS: a node feeding (via an audio edge) any node that
+        // reaches output also reaches output.
+        while (!frontier.empty()) {
+            int cur = frontier.back();
+            frontier.pop_back();
+            for (auto& e : audioEdges) {
+                if (e.second != cur) continue;
+                if (Node* sn = graph.findNode(e.first)) {
+                    if (!sn->reachesOutput) {
+                        sn->reachesOutput = true;
+                        frontier.push_back(e.first);
+                    }
+                }
+            }
+        }
+    }
+
+    // ---- ModPin connectivity ----
+    // Recompute, for every node's modPins, whether a cable actually feeds the
+    // pin (some endPin == mp.pinId). applySignalModulations() skips modPins
+    // that aren't connected so an idle, eagerly-created control pin (e.g. a
+    // wavetable "Mod: Position" pin with no cable) doesn't read its silent
+    // control channel as a real 0.0 modulation and clobber the param's manual
+    // value. Built from the same graph.links we just wired, so it stays in
+    // lockstep with the actual connections.
+    {
+        std::unordered_set<int> connectedEndPins;
+        for (auto& link : graph.links)
+            connectedEndPins.insert(link.endPin);
+        for (auto& n : graph.nodes)
+            for (auto& mp : n.modPins)
+                mp.connected = (connectedEndPins.count(mp.pinId) > 0);
     }
 
     lastNodeCount = (int)graph.nodes.size();

@@ -9,7 +9,7 @@
 namespace SoundShop {
 
 // ==============================================================================
-// SfizzProcessor — full SFZ compliance via the sfizz library (#37)
+// SfizzProcessor - full SFZ compliance via the sfizz library (#37)
 //
 // When HAS_SFIZZ is defined (sfizz cloned into third_party/sfizz),
 // this processor uses sfizz::Sfizz to load and play any SFZ instrument
@@ -17,7 +17,7 @@ namespace SoundShop {
 // envelopes, filters, etc.).
 //
 // When HAS_SFIZZ is NOT defined, the processor logs a message and
-// passes audio/MIDI through unchanged — the built-in basic SFZ loader
+// passes audio/MIDI through unchanged - the built-in basic SFZ loader
 // still works for simple patches.
 //
 // Script format: "__sfizz__:<path>" where path is the .sfz file.
@@ -81,7 +81,14 @@ public:
 #endif
     }
 
-    double getTailLengthSeconds() const override { return 2.0; }
+    // Tail: libsfizz doesn't expose a per-instrument max-release query,
+    // so we use a named upper bound that covers typical SFZ pad / string
+    // releases.  If sfizz adds a tail-length API in a future release,
+    // replace this with the live query.
+    double getTailLengthSeconds() const override {
+        static constexpr double kSfizzMaxReleaseSeconds = 2.0;
+        return kSfizzMaxReleaseSeconds;
+    }
     bool acceptsMidi() const override { return true; }
     bool producesMidi() const override { return false; }
     bool isBusesLayoutSupported(const BusesLayout&) const override { return true; }

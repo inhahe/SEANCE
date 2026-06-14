@@ -36,7 +36,7 @@ struct HRTFEntry {
     float right[HRTF_IR_LENGTH];
 };
 
-// The full lookup table — generated at first access.
+// The full lookup table - generated at first access.
 class HRTFTable {
 public:
     static HRTFTable& instance() {

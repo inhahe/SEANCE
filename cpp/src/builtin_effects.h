@@ -19,8 +19,20 @@ inline float paramByName(const Node& node, const char* name, float def) {
     return def;
 }
 
+// Number of single-loop cycles a feedback delay takes to decay to -60 dB
+// (the standard "RT60" inaudibility threshold).  feedback is the linear
+// per-loop gain (e.g. 0.5 means each echo is half the previous one).
+// Returns 0 when feedback ≈ 0 (single tap, no tail beyond the delay).
+inline double feedbackLoopsToInaudible(double feedback) {
+    feedback = std::min(std::abs(feedback), 0.999);   // guard against runaway
+    if (feedback < 1e-4) return 1.0;                  // ~0 - just the one delay
+    // gain_after_N_loops = feedback^N.  Solve feedback^N = 10^(-60/20) = 1e-3:
+    //   N = log(1e-3) / log(feedback) = -3 * ln(10) / ln(feedback).
+    return -3.0 * std::log(10.0) / std::log(feedback);
+}
+
 // ==============================================================================
-// TREMOLO — amplitude modulation by an LFO
+// TREMOLO - amplitude modulation by an LFO
 // Params: Rate (Hz), Depth (0-1), Shape (0=sine, 1=square, 2=triangle)
 // ==============================================================================
 class TremoloProcessor : public juce::AudioProcessor {
@@ -66,7 +78,7 @@ private:
 };
 
 // ==============================================================================
-// VIBRATO — pitch modulation via modulated delay line
+// VIBRATO - pitch modulation via modulated delay line
 // Params: Rate (Hz), Depth (semitones)
 // ==============================================================================
 class VibratoProcessor : public juce::AudioProcessor {
@@ -109,7 +121,13 @@ public:
             if (phase > 1.0) phase -= 1.0;
         }
     }
-    double getTailLengthSeconds() const override { return 0.05; }
+    // Tail = the actual delay being read (depth × 0.5 ms), not the full
+    // 50 ms buffer.  No feedback, so the buffered samples flush out and
+    // there's no recirculating tail.
+    double getTailLengthSeconds() const override {
+        double depth = (double) paramByName(node, "Depth", 0.3f);
+        return depth * 0.5e-3;
+    }
     bool acceptsMidi() const override { return true; }
     bool producesMidi() const override { return true; }
     bool isBusesLayoutSupported(const BusesLayout&) const override { return true; }
@@ -130,7 +148,7 @@ private:
 };
 
 // ==============================================================================
-// FLANGER — short modulated delay with feedback, mixed with dry
+// FLANGER - short modulated delay with feedback, mixed with dry
 // Params: Rate (Hz), Depth (0-1), Feedback (0-0.95), Mix (0-1)
 // ==============================================================================
 class FlangerProcessor : public juce::AudioProcessor {
@@ -175,7 +193,11 @@ public:
             if (phase > 1.0) phase -= 1.0;
         }
     }
-    double getTailLengthSeconds() const override { return 0.1; }
+    // Tail = (15 ms max delay) × (loops until feedback decays to -60 dB).
+    double getTailLengthSeconds() const override {
+        double fb = (double) paramByName(node, "Feedback", 0.5f);
+        return 0.015 * feedbackLoopsToInaudible(fb);
+    }
     bool acceptsMidi() const override { return true; }
     bool producesMidi() const override { return true; }
     bool isBusesLayoutSupported(const BusesLayout&) const override { return true; }
@@ -196,7 +218,7 @@ private:
 };
 
 // ==============================================================================
-// PHASER — chain of allpass filters with LFO-modulated frequency
+// PHASER - chain of allpass filters with LFO-modulated frequency
 // Params: Rate (Hz), Depth (0-1), Stages (2-12), Feedback (0-0.95)
 // ==============================================================================
 class PhaserProcessor : public juce::AudioProcessor {
@@ -261,7 +283,7 @@ private:
 };
 
 // ==============================================================================
-// COMPRESSOR — dynamics processor
+// COMPRESSOR - dynamics processor
 // Params: Threshold (dB), Ratio, Attack (ms), Release (ms), Makeup Gain (dB)
 // ==============================================================================
 class CompressorProcessor : public juce::AudioProcessor {
@@ -328,7 +350,7 @@ private:
 };
 
 // ==============================================================================
-// LIMITER — brick-wall limiter (compressor with inf ratio, fast attack)
+// LIMITER - brick-wall limiter (compressor with inf ratio, fast attack)
 // Params: Ceiling (dB), Release (ms)
 // ==============================================================================
 class LimiterProcessor : public juce::AudioProcessor {
@@ -377,7 +399,7 @@ private:
 };
 
 // ==============================================================================
-// GATE — silences audio below a threshold
+// GATE - silences audio below a threshold
 // Params: Threshold (dB), Attack (ms), Release (ms)
 // ==============================================================================
 class GateProcessor : public juce::AudioProcessor {
@@ -425,7 +447,7 @@ private:
 };
 
 // ==============================================================================
-// ECHO — delay line with feedback (infinite repeats that decay)
+// ECHO - delay line with feedback (infinite repeats that decay)
 // Params: Delay (ms), Feedback (0-0.95), Mix (0-1)
 // ==============================================================================
 class EchoProcessor : public juce::AudioProcessor {
@@ -460,7 +482,15 @@ public:
             }
         }
     }
-    double getTailLengthSeconds() const override { return 5.0; }
+    // Tail = (Delay ms) × (loops until feedback decays to -60 dB).
+    // With default 300 ms delay + 0.5 feedback ≈ 3.0 s; with high
+    // feedback (0.95) it stretches to ~17 s - the old hardcoded 5 s
+    // was both wasteful at low feedback and clipping at high feedback.
+    double getTailLengthSeconds() const override {
+        double delaySec = (double) paramByName(node, "Delay", 300.0f) * 0.001;
+        double fb       = (double) paramByName(node, "Feedback", 0.5f);
+        return delaySec * feedbackLoopsToInaudible(fb);
+    }
     bool acceptsMidi() const override { return true; }
     bool producesMidi() const override { return true; }
     bool isBusesLayoutSupported(const BusesLayout&) const override { return true; }
@@ -481,7 +511,7 @@ private:
 };
 
 // ==============================================================================
-// ARPEGGIATOR — MIDI effect: hold a chord, plays notes sequentially
+// ARPEGGIATOR - MIDI effect: hold a chord, plays notes sequentially
 // Params: Rate (Hz or beat-synced), Pattern (0=up, 1=down, 2=updown, 3=random), Octaves (1-4)
 // ==============================================================================
 class ArpeggiatorProcessor : public juce::AudioProcessor {
@@ -572,7 +602,7 @@ private:
 };
 
 // ==============================================================================
-// MIXTURE — organ-style harmonics: each note triggers octaves + fifths above
+// MIXTURE - organ-style harmonics: each note triggers octaves + fifths above
 // Params: Octaves (1-4), Include Fifths (0/1), Include Thirds (0/1), Level Decay (how
 // much quieter each added harmonic is, 0-1)
 // ==============================================================================
@@ -671,22 +701,22 @@ private:
 // __velscale__ scripts are auto-upgraded by that processor.
 
 // ==============================================================================
-// REVERB — algorithmic reverberation (Freeverb / Schroeder topology)
+// REVERB - algorithmic reverberation (Freeverb / Schroeder topology)
 //
 // Eight parallel lowpass-feedback comb filters per channel with a small
 // stereo spread between left and right tunings, followed by four serial
-// allpass filters. This is the classic Freeverb arrangement — the comb
+// allpass filters. This is the classic Freeverb arrangement - the comb
 // delays simulate the average reflection density in a room, each comb's
 // feedback lowpass dulls successive reflections (so high frequencies
 // decay faster than lows, as real rooms do), and the serial allpasses
 // thicken the tail into a diffuse smear.
 //
 // Params:
-//   Mix      — dry/wet crossfade, 0=dry 1=wet
-//   Size     — room size, 0..1 (controls comb feedback gain; larger = longer tail)
-//   Damping  — high-frequency damping in the feedback path, 0..1
-//   Width    — stereo spread of the wet signal, 0..1 (0=mono, 1=full stereo)
-//   Pre-Delay — delay before reverb kicks in, in ms
+//   Mix      - dry/wet crossfade, 0=dry 1=wet
+//   Size     - room size, 0..1 (controls comb feedback gain; larger = longer tail)
+//   Damping  - high-frequency damping in the feedback path, 0..1
+//   Width    - stereo spread of the wet signal, 0..1 (0=mono, 1=full stereo)
+//   Pre-Delay - delay before reverb kicks in, in ms
 //
 // Delay lengths are the well-known Freeverb tunings (samples at 44.1 kHz).
 // They get scaled if the runtime sample rate differs, so the perceived
@@ -797,7 +827,17 @@ public:
         }
     }
 
-    double getTailLengthSeconds() const override { return 6.0; }
+    // Tail (RT60) = longest comb-filter delay × loops-to-inaudible at the
+    // current feedback.  Feedback is mapped from the Size param exactly as
+    // in processBlock (0.28..0.98).  Pre-delay adds linearly on top.
+    double getTailLengthSeconds() const override {
+        // Longest Freeverb comb tuning is 1617 samples @ 44.1 kHz.
+        constexpr double kLongestCombSec = 1617.0 / 44100.0;
+        double size     = (double) juce::jlimit(0.0f, 1.0f, paramByName(node, "Size",      0.6f));
+        double feedback = 0.28 + size * 0.70;
+        double preDel   = (double) juce::jlimit(0.0f, 200.0f, paramByName(node, "Pre-Delay", 0.0f)) * 0.001;
+        return preDel + kLongestCombSec * feedbackLoopsToInaudible(feedback);
+    }
     bool acceptsMidi() const override { return true; }
     bool producesMidi() const override { return true; }
     bool isBusesLayoutSupported(const BusesLayout&) const override { return true; }
@@ -820,7 +860,7 @@ private:
 
     // Lowpass-feedback comb filter: the filter in the feedback loop is a
     // one-pole IIR lowpass, so successive echo repetitions get progressively
-    // duller — simulating frequency-dependent absorption in real rooms.
+    // duller - simulating frequency-dependent absorption in real rooms.
     struct Comb {
         std::vector<float> buf;
         int pos = 0;
@@ -865,7 +905,7 @@ private:
 };
 
 // ==============================================================================
-// PARAMETRIC EQ — 4-band biquad equalizer
+// PARAMETRIC EQ - 4-band biquad equalizer
 //
 // Each band has its own type (Peak, Low Shelf, High Shelf, High Pass,
 // Low Pass), frequency, gain (dB, relevant for peak/shelf), and Q.
@@ -873,10 +913,10 @@ private:
 // Audio EQ Cookbook. The 4 bands cascade in series per stereo channel.
 //
 // Params (per band, N = 1..4):
-//   BN Type  — 0=Peak, 1=LowShelf, 2=HighShelf, 3=HP, 4=LP
-//   BN Freq  — center/corner frequency in Hz
-//   BN Gain  — boost/cut in dB (peak and shelf only)
-//   BN Q     — bandwidth / resonance (0.1..10)
+//   BN Type  - 0=Peak, 1=LowShelf, 2=HighShelf, 3=HP, 4=LP
+//   BN Freq  - center/corner frequency in Hz
+//   BN Gain  - boost/cut in dB (peak and shelf only)
+//   BN Q     - bandwidth / resonance (0.1..10)
 // ==============================================================================
 class ParametricEQProcessor : public juce::AudioProcessor {
 public:
@@ -1022,7 +1062,7 @@ private:
 };
 
 // ==============================================================================
-// RING MODULATOR — multiplies two audio signals
+// RING MODULATOR - multiplies two audio signals
 //
 // Takes two Audio inputs (Carrier + Modulator) and outputs their
 // sample-by-sample product. Produces metallic, bell-like, inharmonic
@@ -1048,7 +1088,7 @@ public:
         const int n = buf.getNumSamples();
         const int ch = buf.getNumChannels();
         // If the node has a second Audio input wired, the graph processor
-        // sums it into channel 0/1 alongside the first input — there's no
+        // sums it into channel 0/1 alongside the first input - there's no
         // separate channel for the modulator in the current routing model.
         // So for the two-input case we'd need a dedicated routing path.
         // For now, use the internal oscillator as the modulator source.
@@ -1089,12 +1129,12 @@ private:
 };
 
 // ==============================================================================
-// MID/SIDE ENCODE — splits stereo into Mid + Side on separate channels
-// MID/SIDE DECODE — recombines Mid + Side back into stereo
+// MID/SIDE ENCODE - splits stereo into Mid + Side on separate channels
+// MID/SIDE DECODE - recombines Mid + Side back into stereo
 //
 // Both are implemented as a single processor that reads a "Mode" param:
-//   0 = Encode (L/R → Mid/Side)
-//   1 = Decode (Mid/Side → L/R)
+//   0 = Encode (L/R -> Mid/Side)
+//   1 = Decode (Mid/Side -> L/R)
 // This lets one node type serve both halves of the utility pair.
 // ==============================================================================
 class MidSideProcessor : public juce::AudioProcessor {
@@ -1142,7 +1182,7 @@ private:
 };
 
 // ==============================================================================
-// FM SYNTHESIS — 4-operator frequency modulation synthesizer
+// FM SYNTHESIS - 4-operator frequency modulation synthesizer
 //
 // Each operator is a sine oscillator with its own frequency ratio
 // (relative to the MIDI note), level, and ADSR envelope. "Algorithm"
@@ -1151,14 +1191,14 @@ private:
 // harmonics.
 //
 // 8 algorithms (classic 4-op patterns):
-//   0: 4→3→2→1→out                (full series chain)
-//   1: (3+4)→2→1→out              (two mods into one carrier stack)
-//   2: 4→3→out, 2→1→out           (two independent mod→carrier pairs)
-//   3: 4→(1+2+3)→out              (one mod into three carriers)
-//   4: (4→3)→out, 2→out, 1→out    (one pair + two additive)
-//   5: (4→3)→out, (4→2)→out, 1→out (shared mod)
-//   6: 4→3→2→out, 1→out           (3-chain + additive)
-//   7: 1+2+3+4→out                (pure additive, no FM)
+//   0: 4->3->2->1->out                (full series chain)
+//   1: (3+4)->2->1->out              (two mods into one carrier stack)
+//   2: 4->3->out, 2->1->out           (two independent mod->carrier pairs)
+//   3: 4->(1+2+3)->out              (one mod into three carriers)
+//   4: (4->3)->out, 2->out, 1->out    (one pair + two additive)
+//   5: (4->3)->out, (4->2)->out, 1->out (shared mod)
+//   6: 4->3->2->out, 1->out           (3-chain + additive)
+//   7: 1+2+3+4->out                (pure additive, no FM)
 // ==============================================================================
 class FMSynthProcessor : public juce::AudioProcessor {
 public:
@@ -1201,6 +1241,8 @@ public:
                 v.held = true;
                 v.time = 0;
                 v.relTime = 0;
+                v.mpeChannel = msg.getChannel();
+                v.mpe = MpeVoiceState{};
                 for (int i = 0; i < 4; ++i) v.phase[i] = 0;
                 v.fb1 = v.fb2 = 0;
             } else if (msg.isNoteOff()) {
@@ -1209,6 +1251,9 @@ public:
                         { v.held = false; v.relTime = v.time; }
             }
         }
+        // Distribute MPE / per-note expression (pitch bend, channel + poly
+        // pressure, timbre) into the voices (#78).
+        distributeMpeMessages(midi, voices);
 
         const float kPi2 = 6.28318530718f;
         float volume = paramByName(node, "Volume", 0.5f);
@@ -1250,53 +1295,64 @@ public:
                 float o4 = std::sin(v.phase[3] * kPi2 + fb) * env[3];
                 v.fb2 = v.fb1; v.fb1 = o4;
                 float o3, o2, o1;
+                // Per-voice output accumulator. Earlier code added straight
+                // into the shared `out` and then did `out *= v.vel`, which
+                // scaled every already-summed voice by THIS voice's velocity
+                // (and, with the new pressure swell, by this voice's pressure)
+                // - a polyphony bug that only stayed hidden while playing one
+                // note at a time. Accumulate per voice, scale once, then add.
+                float voiceOut = 0.0f;
                 switch (algo) {
-                    case 0: // 4→3→2→1→out
+                    case 0: // 4->3->2->1->out
                         o3 = std::sin(v.phase[2]*kPi2 + o4*kPi2) * env[2];
                         o2 = std::sin(v.phase[1]*kPi2 + o3*kPi2) * env[1];
                         o1 = std::sin(v.phase[0]*kPi2 + o2*kPi2) * env[0];
-                        out += o1; break;
-                    case 1: // (3+4)→2→1→out
+                        voiceOut += o1; break;
+                    case 1: // (3+4)->2->1->out
                         o3 = std::sin(v.phase[2]*kPi2 + o4*kPi2) * env[2];
                         o2 = std::sin(v.phase[1]*kPi2 + (o3+o4)*0.5f*kPi2) * env[1];
                         o1 = std::sin(v.phase[0]*kPi2 + o2*kPi2) * env[0];
-                        out += o1; break;
-                    case 2: // 4→3→out, 2→1→out
+                        voiceOut += o1; break;
+                    case 2: // 4->3->out, 2->1->out
                         o3 = std::sin(v.phase[2]*kPi2 + o4*kPi2) * env[2];
                         o2 = std::sin(v.phase[1]*kPi2) * env[1];
                         o1 = std::sin(v.phase[0]*kPi2 + o2*kPi2) * env[0];
-                        out += (o3 + o1) * 0.5f; break;
-                    case 3: // 4→(1+2+3)→out
+                        voiceOut += (o3 + o1) * 0.5f; break;
+                    case 3: // 4->(1+2+3)->out
                         o3 = std::sin(v.phase[2]*kPi2 + o4*kPi2) * env[2];
                         o2 = std::sin(v.phase[1]*kPi2 + o4*kPi2) * env[1];
                         o1 = std::sin(v.phase[0]*kPi2 + o4*kPi2) * env[0];
-                        out += (o1 + o2 + o3) * 0.33f; break;
-                    case 4: // (4→3)→out, 2→out, 1→out
+                        voiceOut += (o1 + o2 + o3) * 0.33f; break;
+                    case 4: // (4->3)->out, 2->out, 1->out
                         o3 = std::sin(v.phase[2]*kPi2 + o4*kPi2) * env[2];
                         o2 = std::sin(v.phase[1]*kPi2) * env[1];
                         o1 = std::sin(v.phase[0]*kPi2) * env[0];
-                        out += (o1 + o2 + o3) * 0.33f; break;
-                    case 5: // (4→3)→out, (4→2)→out, 1→out
+                        voiceOut += (o1 + o2 + o3) * 0.33f; break;
+                    case 5: // (4->3)->out, (4->2)->out, 1->out
                         o3 = std::sin(v.phase[2]*kPi2 + o4*kPi2) * env[2];
                         o2 = std::sin(v.phase[1]*kPi2 + o4*kPi2) * env[1];
                         o1 = std::sin(v.phase[0]*kPi2) * env[0];
-                        out += (o1 + o2 + o3) * 0.33f; break;
-                    case 6: // 4→3→2→out, 1→out
+                        voiceOut += (o1 + o2 + o3) * 0.33f; break;
+                    case 6: // 4->3->2->out, 1->out
                         o3 = std::sin(v.phase[2]*kPi2 + o4*kPi2) * env[2];
                         o2 = std::sin(v.phase[1]*kPi2 + o3*kPi2) * env[1];
                         o1 = std::sin(v.phase[0]*kPi2) * env[0];
-                        out += (o1 + o2) * 0.5f; break;
+                        voiceOut += (o1 + o2) * 0.5f; break;
                     default: // 7: all additive
                         o3 = std::sin(v.phase[2]*kPi2) * env[2];
                         o2 = std::sin(v.phase[1]*kPi2) * env[1];
                         o1 = std::sin(v.phase[0]*kPi2) * env[0];
-                        out += (o1 + o2 + o3 + o4) * 0.25f; break;
+                        voiceOut += (o1 + o2 + o3 + o4) * 0.25f; break;
                 }
                 // Advance phases.
                 for (int i = 0; i < 4; ++i)
                     v.phase[i] += (baseFreq * ops[i].ratio) / (float)sampleRate;
                 v.time += dt;
-                out *= v.vel;
+                // Velocity + aftertouch swell (channel + poly pressure),
+                // applied to THIS voice only. Pressure defaults to 0, so this
+                // is a no-op until the controller sends aftertouch.
+                float pMul = 1.0f + node.aftertouchSensitivity * effectivePressure(v.mpe);
+                out += voiceOut * v.vel * pMul;
             }
             out *= volume;
             out = juce::jlimit(-1.0f, 1.0f, out);
@@ -1305,7 +1361,19 @@ public:
         }
     }
 
-    double getTailLengthSeconds() const override { return 5.0; }
+    // Tail = max release time across the 4 operators (FM voice ends when
+    // every op envelope reaches 0).  Names match the per-op R param the
+    // processBlock reads.
+    double getTailLengthSeconds() const override {
+        double maxR = 0.001;
+        const char* opNames[] = {"Op1","Op2","Op3","Op4"};
+        for (int i = 0; i < 4; ++i) {
+            std::string p(opNames[i]);
+            double r = (double) paramByName(node, (p+" R").c_str(), 0.3f);
+            if (r > maxR) maxR = r;
+        }
+        return maxR;
+    }
     bool acceptsMidi() const override { return true; }
     bool producesMidi() const override { return false; }
     bool isBusesLayoutSupported(const BusesLayout&) const override { return true; }
@@ -1342,7 +1410,7 @@ private:
 };
 
 // ==============================================================================
-// PHASE DISTORTION SYNTHESIS — Casio CZ-style instrument
+// PHASE DISTORTION SYNTHESIS - Casio CZ-style instrument
 //
 // Warps a sine wave's phase with a modulator function controlled by a
 // "depth" parameter to produce subtractive-like sounds. When depth=0,
@@ -1352,10 +1420,10 @@ private:
 // timbral motion without an actual filter.
 //
 // Waveform types:
-//   0=Sawtooth — phase is compressed into the first half cycle
-//   1=Square   — phase holds then snaps
-//   2=Pulse    — ultra-narrow phase concentration
-//   3=Resonant — multiplied phase creates harmonic bursts
+//   0=Sawtooth - phase is compressed into the first half cycle
+//   1=Square   - phase holds then snaps
+//   2=Pulse    - ultra-narrow phase concentration
+//   3=Resonant - multiplied phase creates harmonic bursts
 //
 // Params: Waveform, Depth, DCW Attack, DCW Decay, DCW Sustain,
 //         Attack, Decay, Sustain, Release, Volume
@@ -1379,11 +1447,11 @@ public:
         float dcwA     = std::max(0.001f, paramByName(node, "DCW Attack", 0.01f));
         float dcwD     = std::max(0.001f, paramByName(node, "DCW Decay", 0.3f));
         float dcwS     = paramByName(node, "DCW Sustain", 0.3f);
-        // Amplitude ADSR
-        float aA       = std::max(0.001f, paramByName(node, "Attack", 0.005f));
-        float aD       = std::max(0.001f, paramByName(node, "Decay", 0.1f));
-        float aS       = paramByName(node, "Sustain", 0.7f);
-        float aR       = std::max(0.001f, paramByName(node, "Release", 0.3f));
+        // Amplitude envelope: shared node AHDSR is the single source of
+        // truth (times, levels, per-segment curves, velocity sensitivity).
+        // Bake its shape curves once per block; every voice samples them.
+        effectiveEnv = node.ahdsrEnvelope;
+        ampTables.prepare(effectiveEnv);
         float volume   = paramByName(node, "Volume", 0.5f);
 
         for (auto meta : midi) {
@@ -1395,11 +1463,12 @@ public:
                 v.vel = msg.getVelocity() / 127.0f;
                 v.mpeChannel = msg.getChannel();
                 v.mpe = MpeVoiceState{};
-                v.phase = 0; v.time = 0; v.relTime = 0;
+                v.phase = 0; v.time = 0;
+                v.ampEnv.noteOn(v.vel);
             } else if (msg.isNoteOff()) {
                 for (auto& v : voices)
                     if (v.active && v.held && v.note == msg.getNoteNumber())
-                        { v.held = false; v.relTime = v.time; }
+                        { v.held = false; v.ampEnv.noteOff(); }
             }
         }
         // Distribute MPE per-channel messages to voices (#78)
@@ -1412,21 +1481,20 @@ public:
             float out = 0;
             for (auto& v : voices) {
                 if (!v.active) continue;
-                float freq = 440.0f * std::pow(2.0f, (v.note - 69) / 12.0f);
+                // Include MPE per-note pitch bend (#78); previously this
+                // synth distributed MPE messages but ignored the bend.
+                float freq = 440.0f * std::pow(2.0f, (v.note - 69 + v.mpe.pitchBend) / 12.0f);
+                // Velocity + aftertouch swell (channel + poly pressure).
+                // No-op until the controller sends pressure (defaults 0).
+                float pMul = 1.0f + node.aftertouchSensitivity * effectivePressure(v.mpe);
 
-                // Amplitude ADSR
-                float ampEnv = 0;
-                if (v.held) {
-                    if (v.time < aA) ampEnv = v.time / aA;
-                    else if (v.time < aA + aD) ampEnv = 1.0f + (aS - 1.0f) * ((v.time - aA) / aD);
-                    else ampEnv = aS;
-                } else {
-                    float rt = v.time - v.relTime;
-                    ampEnv = aS * std::max(0.0f, 1.0f - rt / aR);
-                    if (rt >= aR) { v.active = false; continue; }
-                }
+                // Amplitude envelope from the shared runtime (velocity is
+                // already folded into the peak via velocitySensitivity, so we
+                // must NOT multiply by v.vel again below).
+                float ampEnv = v.ampEnv.tick((float)sampleRate, effectiveEnv, ampTables);
+                if (!v.ampEnv.isActive()) { v.active = false; continue; }
 
-                // DCW envelope (drives depth): attack → decay → sustain level × maxDepth
+                // DCW envelope (drives depth): attack -> decay -> sustain level × maxDepth
                 float dcwEnv = 0;
                 if (v.time < dcwA) dcwEnv = v.time / dcwA;
                 else if (v.time < dcwA + dcwD) dcwEnv = 1.0f + (dcwS - 1.0f) * ((v.time - dcwA) / dcwD);
@@ -1466,15 +1534,15 @@ public:
                         // Window with original phase to create decay
                         float window = 1.0f - p;
                         distorted = std::sin(distorted * kPi2) * window;
-                        // Skip the sin() below — we already computed the output
-                        out += distorted * ampEnv * v.vel;
+                        // Skip the sin() below - we already computed the output
+                        out += distorted * ampEnv * pMul;
                         v.phase += freq / (float)sampleRate;
                         v.time += dt;
                         goto nextVoice;
                     }
                 }
 
-                out += std::sin(distorted * kPi2) * ampEnv * v.vel;
+                out += std::sin(distorted * kPi2) * ampEnv * pMul;
                 v.phase += freq / (float)sampleRate;
                 v.time += dt;
                 nextVoice:;
@@ -1486,7 +1554,11 @@ public:
         }
     }
 
-    double getTailLengthSeconds() const override { return 5.0; }
+    // Tail = the shared envelope's Release time (voice dies once the
+    // amplitude envelope reaches Off after note-off).
+    double getTailLengthSeconds() const override {
+        return (double) std::max(0.001f, node.ahdsrEnvelope.releaseMs * 0.001f);
+    }
     bool acceptsMidi() const override { return true; }
     bool producesMidi() const override { return false; }
     bool isBusesLayoutSupported(const BusesLayout&) const override { return true; }
@@ -1503,13 +1575,18 @@ public:
 private:
     Node& node;
     double sampleRate = 44100;
+    // Shared amplitude-envelope curve tables (baked once per block) + the
+    // effective envelope snapshot the voices sample against.
+    AHDSRCurveTables ampTables;
+    AHDSREnvelope effectiveEnv;
     struct Voice {
         bool active = false, held = false;
         int note = 0;
-        float vel = 0, time = 0, relTime = 0;
+        float vel = 0, time = 0;
         double phase = 0;
         int mpeChannel = 1;
         MpeVoiceState mpe;
+        AHDSREnvelopeRuntime ampEnv;  // shared amplitude envelope runtime
     };
     std::vector<Voice> voices;
     Voice& allocVoice() {
@@ -1531,12 +1608,12 @@ private:
 // MIDI note sets the base frequency; velocity sets density.
 //
 // Params:
-//   Density    — particles per second (1..200)
-//   Spread     — frequency randomization range in semitones (0..24)
-//   Grain Size — duration of each particle in ms (1..500)
-//   Attack     — per-particle attack as fraction of grain (0..1)
-//   Release    — per-particle release as fraction of grain (0..1)
-//   Shape      — particle waveform: 0=sine, 1=saw, 2=square, 3=noise
+//   Density    - particles per second (1..200)
+//   Spread     - frequency randomization range in semitones (0..24)
+//   Grain Size - duration of each particle in ms (1..500)
+//   Attack     - per-particle attack as fraction of grain (0..1)
+//   Release    - per-particle release as fraction of grain (0..1)
+//   Shape      - particle waveform: 0=sine, 1=saw, 2=square, 3=noise
 //   Volume
 // ==============================================================================
 class ParticleSynthProcessor : public juce::AudioProcessor {
@@ -1641,7 +1718,13 @@ public:
         if (grains.size() > 1024) grains.erase(grains.begin(), grains.begin() + 512);
     }
 
-    double getTailLengthSeconds() const override { return 1.0; }
+    // Tail = the grain duration.  Each particle has its own envelope that
+    // completes within the grain, so once new particles stop firing
+    // (no more held notes), the longest possible remaining audio is one
+    // full grain.
+    double getTailLengthSeconds() const override {
+        return (double) paramByName(node, "Grain Size", 50.0f) * 0.001;
+    }
     bool acceptsMidi() const override { return true; }
     bool producesMidi() const override { return false; }
     bool isBusesLayoutSupported(const BusesLayout&) const override { return true; }
@@ -1672,7 +1755,7 @@ private:
 };
 
 // ==============================================================================
-// TRANSIENT/SUSTAIN SPLIT — wavelet-based separation
+// TRANSIENT/SUSTAIN SPLIT - wavelet-based separation
 //
 // Decomposes audio into transient (attack) and sustain (body) components
 // using wavelet thresholding. The transient part captures sharp onsets
@@ -1685,10 +1768,10 @@ private:
 // transient-only signal for independent routing.
 //
 // Params:
-//   Transient  — gain multiplier for the transient component (0..2)
-//   Sustain    — gain multiplier for the sustain component (0..2)
-//   Threshold  — wavelet coefficient threshold for separation (0..1)
-//   Levels     — number of DWT decomposition levels (1..8)
+//   Transient  - gain multiplier for the transient component (0..2)
+//   Sustain    - gain multiplier for the sustain component (0..2)
+//   Threshold  - wavelet coefficient threshold for separation (0..1)
+//   Levels     - number of DWT decomposition levels (1..8)
 // ==============================================================================
 class TransientSplitProcessor : public juce::AudioProcessor {
 public:
@@ -1739,9 +1822,9 @@ public:
             std::vector<float> susSig = sig;
             for (int i = 0; i < padLen; ++i) {
                 if (std::abs(sig[i]) >= thresh) {
-                    susSig[i] = 0; // transient coefficient — zero out in sustain
+                    susSig[i] = 0; // transient coefficient - zero out in sustain
                 } else {
-                    transSig[i] = 0; // sustain coefficient — zero out in transient
+                    transSig[i] = 0; // sustain coefficient - zero out in transient
                 }
             }
 
@@ -1775,19 +1858,19 @@ private:
 };
 
 // ==============================================================================
-// WAVELET DENOISER — wavelet shrinkage noise reduction
+// WAVELET DENOISER - wavelet shrinkage noise reduction
 //
 // Uses the standard wavelet shrinkage method (Donoho & Johnstone):
 // forward DWT, soft-threshold the detail coefficients, inverse DWT.
 // Small coefficients (likely noise) are shrunk toward zero; large
 // coefficients (likely signal) are preserved. This removes broadband
-// noise while keeping transients sharp — unlike spectral gating which
+// noise while keeping transients sharp - unlike spectral gating which
 // can smear transients.
 //
 // Params:
-//   Threshold — noise floor estimate (0..1, fraction of max coefficient)
-//   Levels    — DWT decomposition depth (1..8)
-//   Mix       — dry/wet blend
+//   Threshold - noise floor estimate (0..1, fraction of max coefficient)
+//   Levels    - DWT decomposition depth (1..8)
+//   Mix       - dry/wet blend
 // ==============================================================================
 class WaveletDenoiserProcessor : public juce::AudioProcessor {
 public:
@@ -1822,7 +1905,7 @@ public:
             float maxCoeff = 0;
             for (auto v : sig) maxCoeff = std::max(maxCoeff, std::abs(v));
             float thresh = threshold * maxCoeff;
-            // Skip the approximation coefficients (lowest band) — only
+            // Skip the approximation coefficients (lowest band) - only
             // threshold the detail coefficients.
             int approxLen = padLen;
             for (int l = 0; l < actualLevels; ++l) approxLen /= 2;
@@ -1860,7 +1943,7 @@ private:
 };
 
 // ==============================================================================
-// WAVELET BITCRUSH — quantize wavelet coefficients
+// WAVELET BITCRUSH - quantize wavelet coefficients
 //
 // Reduces the precision of wavelet coefficients at selected bands,
 // producing bit-reduction artifacts that only affect the frequencies
@@ -1942,14 +2025,14 @@ private:
 };
 
 // ==============================================================================
-// DYADIC OCTAVE SHIFTER — clean octave up/down via wavelet bands
+// DYADIC OCTAVE SHIFTER - clean octave up/down via wavelet bands
 //
 // Shifts pitch by exact octaves (1 or 2 up/down) by manipulating
 // wavelet decomposition levels. Shifting down = zero-stuff the
 // approximation coefficients and reconstruct at double length (then
 // resample back). Shifting up = decimate. Since the shift is always
 // a power of 2 in the wavelet domain, there's no time-stretching
-// artifacts — the transients stay sharp.
+// artifacts - the transients stay sharp.
 //
 // For this initial implementation we use a simpler approach: the
 // wavelet bands are shifted by reassigning coefficients to different
@@ -2059,19 +2142,19 @@ private:
 };
 
 // ==============================================================================
-// WAVELET MULTIBAND COMPRESSOR — per-octave-band dynamics
+// WAVELET MULTIBAND COMPRESSOR - per-octave-band dynamics
 //
 // Decomposes audio into octave-wide bands via DWT, applies independent
 // compression to each band's coefficients, then reconstructs. The
-// octave bands are natural wavelet decomposition levels — no crossover
+// octave bands are natural wavelet decomposition levels - no crossover
 // filters needed, so the bands sum perfectly without phase artifacts.
 //
 // Params:
-//   Threshold — dB below peak to start compressing (per band, shared)
-//   Ratio     — compression ratio (shared across bands for simplicity)
-//   Levels    — number of octave bands (1..6)
-//   Low Gain  — post-compression gain for the lowest band (dB)
-//   High Gain — post-compression gain for the highest band (dB)
+//   Threshold - dB below peak to start compressing (per band, shared)
+//   Ratio     - compression ratio (shared across bands for simplicity)
+//   Levels    - number of octave bands (1..6)
+//   Low Gain  - post-compression gain for the lowest band (dB)
+//   High Gain - post-compression gain for the highest band (dB)
 //   Mix
 // ==============================================================================
 class WaveletMultibandCompProcessor : public juce::AudioProcessor {
@@ -2255,7 +2338,7 @@ private:
 // Creates a fractal-like reverb tail by scaling wavelet coefficients
 // with a 1/f power law across decomposition levels. Coarser levels
 // (lower frequencies) get more energy, finer levels (higher freq)
-// decay faster — mimicking the natural 1/f spectrum of real acoustic
+// decay faster - mimicking the natural 1/f spectrum of real acoustic
 // spaces. The result is a diffuse, organic-sounding tail that's
 // quite different from algorithmic or convolution reverbs.
 //
@@ -2322,7 +2405,12 @@ public:
         }
     }
 
-    double getTailLengthSeconds() const override { return 4.0; }
+    // Tail: when input stops, the 8192-sample shift-decay tail buffer
+    // fully cycles through to zero in bufferLen/sampleRate seconds - that
+    // bounds the tail regardless of the Decay param.  ~186 ms at 44.1 kHz.
+    double getTailLengthSeconds() const override {
+        return (double) tailBufL.size() / std::max(1.0, sampleRate);
+    }
     bool acceptsMidi() const override { return true; }
     bool producesMidi() const override { return true; }
     bool isBusesLayoutSupported(const BusesLayout&) const override { return true; }
@@ -2347,7 +2435,7 @@ private:
 // Separates audio into transient and tonal components via wavelet
 // thresholding, pitch-shifts only the tonal part, then recombines.
 // The transients (drum hits, plucks) keep their original pitch and
-// timing — only the sustained tonal content gets shifted. This gives
+// timing - only the sustained tonal content gets shifted. This gives
 // pitch shifting that preserves drum punch and percussive attacks.
 //
 // Params: Semitones (-24..+24), Threshold (transient/tonal separation),
@@ -2445,13 +2533,13 @@ private:
 };
 
 // ==============================================================================
-// WAVELET COMPLEXITY KNOB — coefficient sparsification
+// WAVELET COMPLEXITY KNOB - coefficient sparsification
 //
 // Smoothly simplifies audio by keeping only the N largest wavelet
 // coefficients and zeroing the rest, then reconstructing. At 100%
 // complexity the signal is unchanged; at 0% only the single largest
 // coefficient survives (a near-silence or pure tone). In between you
-// get progressive detail reduction — like an audio "resolution" dial.
+// get progressive detail reduction - like an audio "resolution" dial.
 //
 // Params: Complexity (0..1), Levels, Mix
 // ==============================================================================
@@ -2521,16 +2609,16 @@ private:
 };
 
 // ==============================================================================
-// ADDITIVE BANK SYNTH — per-partial sine oscillator synthesis
+// ADDITIVE BANK SYNTH - per-partial sine oscillator synthesis
 //
 // Sums N harmonic sine oscillators per voice. Each partial runs at
 // `fundamental × ratio_n` where ratio_n defaults to the harmonic
 // series (1, 2, 3, ...) but can be shifted toward inharmonic spacing
 // via the Stretch param. Amplitude per partial follows a 1/n^rolloff
-// law controlled by Brightness — 0 = all partials equal (organ),
+// law controlled by Brightness - 0 = all partials equal (organ),
 // 1 = natural rolloff (strings), 2+ = mellow (flute-like).
 //
-// Params: Partials (1..64), Stretch (harmonic→inharmonic, 0..2),
+// Params: Partials (1..64), Stretch (harmonic->inharmonic, 0..2),
 //         Brightness (amplitude rolloff exponent, 0..3),
 //         Attack, Decay, Sustain, Release, Volume
 // ==============================================================================
@@ -2558,12 +2646,11 @@ public:
             case 2: stretch = 0.25f; brightness = 2.0f; break; // Drum (inharmonic + mellow)
             case 3: stretch = 0.01f; brightness = 0.5f; break; // Stretched Piano (subtle)
             case 4: stretch = 0.0f;  brightness = 0.0f; break; // Organ (all equal)
-            default: break; // Custom — use manual Stretch/Brightness
+            default: break; // Custom - use manual Stretch/Brightness
         }
-        float aA = std::max(0.001f, paramByName(node, "Attack", 0.01f));
-        float aD = std::max(0.001f, paramByName(node, "Decay", 0.1f));
-        float aS = paramByName(node, "Sustain", 0.7f);
-        float aR = std::max(0.001f, paramByName(node, "Release", 0.3f));
+        // Amplitude envelope: shared node AHDSR (single source of truth).
+        effectiveEnv = node.ahdsrEnvelope;
+        ampTables.prepare(effectiveEnv);
         float volume = paramByName(node, "Volume", 0.5f);
 
         for (auto meta : midi) {
@@ -2573,14 +2660,18 @@ public:
                 v.active = true; v.held = true;
                 v.note = msg.getNoteNumber();
                 v.vel = msg.getVelocity() / 127.0f;
-                v.time = 0; v.relTime = 0;
+                v.time = 0;
                 v.phases.assign(64, 0.0);
+                v.mpeChannel = msg.getChannel();
+                v.mpe = MpeVoiceState{};
+                v.ampEnv.noteOn(v.vel);
             } else if (msg.isNoteOff()) {
                 for (auto& v : voices)
                     if (v.active && v.held && v.note == msg.getNoteNumber())
-                        { v.held = false; v.relTime = v.time; }
+                        { v.held = false; v.ampEnv.noteOff(); }
             }
         }
+        distributeMpeMessages(midi, voices);
 
         const float kPi2 = 6.28318530718f;
         float dt = 1.0f / (float)sampleRate;
@@ -2591,17 +2682,10 @@ public:
                 if (!v.active) continue;
                 float baseFreq = 440.0f * std::pow(2.0f, (v.note - 69 + v.mpe.pitchBend) / 12.0f);
 
-                // ADSR
-                float env;
-                if (v.held) {
-                    if (v.time < aA) env = v.time / aA;
-                    else if (v.time < aA + aD) env = 1.0f + (aS - 1.0f) * ((v.time - aA) / aD);
-                    else env = aS;
-                } else {
-                    float rt = v.time - v.relTime;
-                    env = aS * std::max(0.0f, 1.0f - rt / aR);
-                    if (rt >= aR) { v.active = false; continue; }
-                }
+                // Amplitude envelope from the shared runtime (velocity folded
+                // into the peak via velocitySensitivity - no extra v.vel below).
+                float env = v.ampEnv.tick((float)sampleRate, effectiveEnv, ampTables);
+                if (!v.ampEnv.isActive()) { v.active = false; continue; }
 
                 // Sum partials
                 float voiceOut = 0;
@@ -2618,7 +2702,8 @@ public:
                     if (v.phases[p] > 1.0) v.phases[p] -= 1.0;
                 }
 
-                out += voiceOut * env * v.vel;
+                float pMul = 1.0f + node.aftertouchSensitivity * effectivePressure(v.mpe);
+                out += voiceOut * env * pMul;
                 v.time += dt;
             }
 
@@ -2632,7 +2717,11 @@ public:
         }
     }
 
-    double getTailLengthSeconds() const override { return 5.0; }
+    // Tail = the shared envelope's Release time (voice dies once the
+    // amplitude envelope reaches Off after note-off).
+    double getTailLengthSeconds() const override {
+        return (double) std::max(0.001f, node.ahdsrEnvelope.releaseMs * 0.001f);
+    }
     bool acceptsMidi() const override { return true; }
     bool producesMidi() const override { return false; }
     bool isBusesLayoutSupported(const BusesLayout&) const override { return true; }
@@ -2649,13 +2738,17 @@ public:
 private:
     Node& node;
     double sampleRate = 44100;
+    // Shared amplitude-envelope curve tables + effective envelope snapshot.
+    AHDSRCurveTables ampTables;
+    AHDSREnvelope effectiveEnv;
     struct Voice {
         bool active = false, held = false;
         int note = 0;
-        float vel = 0, time = 0, relTime = 0;
+        float vel = 0, time = 0;
         std::vector<double> phases;
         int mpeChannel = 1;
         MpeVoiceState mpe;
+        AHDSREnvelopeRuntime ampEnv;  // shared amplitude envelope runtime
     };
     std::vector<Voice> voices;
     Voice& allocVoice() {
@@ -2668,7 +2761,7 @@ private:
 };
 
 // ==============================================================================
-// ASYMMETRIC WAVELET FILTER — non-causal / look-ahead filtering
+// ASYMMETRIC WAVELET FILTER - non-causal / look-ahead filtering
 //
 // Standard filters respond AFTER a transient happens. This wavelet-based
 // filter can "anticipate" transients by processing the wavelet domain
@@ -2758,7 +2851,10 @@ public:
         }
     }
 
-    double getTailLengthSeconds() const override { return 0.1; }
+    // Tail = 0.  Processing is per-block: transient detection and the
+    // pre/post gain envelopes only act on the current block's content,
+    // so once input stops there's nothing left to ring out.
+    double getTailLengthSeconds() const override { return 0.0; }
     bool acceptsMidi() const override { return true; }
     bool producesMidi() const override { return true; }
     bool isBusesLayoutSupported(const BusesLayout&) const override { return true; }
@@ -2910,7 +3006,7 @@ public:
         // Carrier = channel 0 (main audio in).
         // Modulator = channel 2 (Signal input, if connected).
         bool hasModulator = buf.getNumChannels() > 2;
-        if (!hasModulator) return; // no modulator → passthrough
+        if (!hasModulator) return; // no modulator -> passthrough
 
         auto filt = getWaveletFilter("db4");
         int padLen = 1;
@@ -2984,7 +3080,7 @@ private:
 };
 
 // ==============================================================================
-// FORMANT-PRESERVING PITCH SHIFT — wavelet packet approach
+// FORMANT-PRESERVING PITCH SHIFT - wavelet packet approach
 //
 // Pitch-shifts audio while preserving formants (the resonant
 // frequencies that make a voice sound like THAT voice, not a chipmunk).
@@ -2993,7 +3089,7 @@ private:
 // scaling band gains back to their original levels after the shift.
 //
 // Params: Semitones (-24..+24), Formant Lock (0..1, how much formant
-//         to preserve — 0=no preservation, 1=full), Levels, Mix
+//         to preserve - 0=no preservation, 1=full), Levels, Mix
 // ==============================================================================
 class FormantPitchShiftProcessor : public juce::AudioProcessor {
 public:
@@ -3112,7 +3208,7 @@ private:
 };
 
 // ==============================================================================
-// SPECTRAL GRAIN SYNTH — Mode C: IFFT-to-windowed-grain playback
+// SPECTRAL GRAIN SYNTH - Mode C: IFFT-to-windowed-grain playback
 //
 // Defines a spectrum via magnitude expression (same as the wavetable
 // spectral mode), but instead of playing a single IFFT cycle, it
@@ -3144,10 +3240,9 @@ public:
 
         float density   = std::max(1.0f, paramByName(node, "Density", 20.0f));
         float grainMs   = std::max(1.0f, paramByName(node, "Grain Size", 40.0f));
-        float aA = std::max(0.001f, paramByName(node, "Attack", 0.01f));
-        float aD = std::max(0.001f, paramByName(node, "Decay", 0.1f));
-        float aS = paramByName(node, "Sustain", 0.7f);
-        float aR = std::max(0.001f, paramByName(node, "Release", 0.3f));
+        // Amplitude envelope: shared node AHDSR (single source of truth).
+        effectiveEnv = node.ahdsrEnvelope;
+        ampTables.prepare(effectiveEnv);
         float volume = paramByName(node, "Volume", 0.5f);
 
         int grainSizeSamples = (int)(grainMs * 0.001f * (float)sampleRate);
@@ -3162,31 +3257,28 @@ public:
                 v.active = true; v.held = true;
                 v.note = msg.getNoteNumber();
                 v.vel = msg.getVelocity() / 127.0f;
-                v.time = 0; v.relTime = 0;
+                v.time = 0;
                 v.spawnTimer = 0;
+                v.mpeChannel = msg.getChannel();
+                v.mpe = MpeVoiceState{};
+                v.ampEnv.noteOn(v.vel);
             } else if (msg.isNoteOff()) {
                 for (auto& v : voices)
                     if (v.active && v.held && v.note == msg.getNoteNumber())
-                        { v.held = false; v.relTime = v.time; }
+                        { v.held = false; v.ampEnv.noteOff(); }
             }
         }
+        distributeMpeMessages(midi, voices);
 
         for (int s = 0; s < numSamples; ++s) {
             float out = 0;
             for (auto& v : voices) {
                 if (!v.active) continue;
 
-                // ADSR
-                float env;
-                if (v.held) {
-                    if (v.time < aA) env = v.time / aA;
-                    else if (v.time < aA + aD) env = 1.0f + (aS - 1.0f) * ((v.time - aA) / aD);
-                    else env = aS;
-                } else {
-                    float rt = v.time - v.relTime;
-                    env = aS * std::max(0.0f, 1.0f - rt / aR);
-                    if (rt >= aR) { v.active = false; continue; }
-                }
+                // Amplitude envelope from the shared runtime (velocity folded
+                // into the peak via velocitySensitivity - no extra v.vel below).
+                float env = v.ampEnv.tick((float)sampleRate, effectiveEnv, ampTables);
+                if (!v.ampEnv.isActive()) { v.active = false; continue; }
 
                 // Spawn grains
                 v.spawnTimer += dt;
@@ -3196,7 +3288,7 @@ public:
                     g.grainIdx = rng() % grainBank.size();
                     g.pos = 0;
                     g.len = grainSizeSamples;
-                    float baseFreq = 440.0f * std::pow(2.0f, (v.note - 69) / 12.0f);
+                    float baseFreq = 440.0f * std::pow(2.0f, (v.note - 69 + v.mpe.pitchBend) / 12.0f);
                     g.rate = baseFreq / 440.0f; // pitch ratio relative to A4
                     activeGrains.push_back(g);
                 }
@@ -3218,7 +3310,8 @@ public:
                     g.pos += g.rate;
                     ++it;
                 }
-                out += voiceOut * env * v.vel;
+                float pMul = 1.0f + node.aftertouchSensitivity * effectivePressure(v.mpe);
+                out += voiceOut * env * pMul;
             }
 
             if (activeGrains.size() > 1)
@@ -3233,7 +3326,14 @@ public:
             activeGrains.erase(activeGrains.begin(), activeGrains.begin() + 1024);
     }
 
-    double getTailLengthSeconds() const override { return 3.0; }
+    // Tail = AHDSR release + the longest grain still ringing out.
+    // After release, voices stop spawning grains and the envelope dies at
+    // releaseMs; any in-flight grain plays for at most grainSize ms more.
+    double getTailLengthSeconds() const override {
+        double aR     = (double) std::max(0.001f, node.ahdsrEnvelope.releaseMs * 0.001f);
+        double grainS = (double) std::max(1.0f,   paramByName(node, "Grain Size", 40.0f)) * 0.001;
+        return aR + grainS;
+    }
     bool acceptsMidi() const override { return true; }
     bool producesMidi() const override { return false; }
     bool isBusesLayoutSupported(const BusesLayout&) const override { return true; }
@@ -3293,11 +3393,17 @@ private:
         }
     }
 
+    // Shared amplitude-envelope curve tables + effective envelope snapshot.
+    AHDSRCurveTables ampTables;
+    AHDSREnvelope effectiveEnv;
     struct Voice {
         bool active = false, held = false;
         int note = 0;
-        float vel = 0, time = 0, relTime = 0;
+        float vel = 0, time = 0;
         float spawnTimer = 0;
+        int mpeChannel = 1;
+        MpeVoiceState mpe;
+        AHDSREnvelopeRuntime ampEnv;  // shared amplitude envelope runtime
     };
     std::vector<Voice> voices;
     Voice& allocVoice() {
@@ -3319,7 +3425,7 @@ private:
 };
 
 // ==============================================================================
-// SPECTRAL MODELING SYNTHESIS (SMS) — deterministic/stochastic split
+// SPECTRAL MODELING SYNTHESIS (SMS) - deterministic/stochastic split
 //
 // Decomposes audio into two components:
 //   - Deterministic (harmonic): detected spectral peaks, resynthesized

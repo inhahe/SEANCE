@@ -12,6 +12,9 @@
 #include "tuning.h"
 #include "undo.h"
 #include "plugin_host.h"
+#include "adsr_envelope.h"
+#include "warp.h"            // WarpOp (granular element warp on audition frames)
+#include "content_store.h"   // content-addressed side-store for baked blobs
 
 namespace SoundShop {
 
@@ -25,7 +28,7 @@ enum class PinKind { Audio, Midi, Param, Signal }; // Signal = audio-rate contro
 // Two pin kinds are compatible at the cable level if they're either the same
 // kind, or both control kinds (Param + Signal). Param is conceptually
 // block-rate and Signal is audio-rate, but at the routing layer we treat them
-// as a single "control" family — the conversion is implicit and free, since
+// as a single "control" family - the conversion is implicit and free, since
 // the audio-graph routing already carries them on the same channel slot. The
 // receiver decides whether to read once per block (Param semantics) or every
 // sample (Signal semantics). See task #82.
@@ -41,26 +44,57 @@ inline bool arePinKindsCompatible(PinKind a, PinKind b) {
     bool aCtrl = (a == PinKind::Param || a == PinKind::Signal);
     bool bCtrl = (b == PinKind::Param || b == PinKind::Signal);
     if (aCtrl && bCtrl) return true;
-    // Audio output → Signal input (mono downmix for sidechain etc.)
+    // Audio output -> Signal input (mono downmix for sidechain etc.)
     if (a == PinKind::Audio && b == PinKind::Signal) return true;
     return false;
 }
+// Panning law applied by PanProcessor.  EqualPower is the industry
+// standard for DAWs; Linear matches tracker behavior (MOD/IT/S3M/XM).
+enum class PanLaw { EqualPower, Linear };
+
 enum class NodeType {
     AudioTimeline, MidiTimeline, Instrument, Effect, Mixer, Output, Script, Group, TerrainSynth, SignalShape,
     // MidiInput represents a single live MIDI input source (computer keyboard,
     // hardware MIDI device, network MIDI client, virtual port, etc). It has
     // no inputs and one MIDI output. The cable wiring from the Input node to
-    // a Timeline or synth IS the live-input routing — no flags, no hidden
+    // a Timeline or synth IS the live-input routing - no flags, no hidden
     // state. See project_midi_input_architecture.md.
-    MidiInput
+    MidiInput,
+    // MidiScript: an algorithmic MIDI generator. Runs a small program (the
+    // SEANCE mini-language with statements, persistent state and MIDI emit
+    // functions) once per sample and outputs MIDI live. One merged MIDI input,
+    // N Signal inputs, and 1..16 independent MIDI outputs. See midi_script_node.h.
+    // NOTE: new enum values MUST be appended at the END - project files store
+    // node.type as a raw int, so reordering would corrupt existing saves.
+    MidiScript,
+    // MidiBreakout: taps a live MIDI stream and exposes its expression
+    // controllers as block-rate control (Signal) outputs - Velocity, Pressure
+    // (channel aftertouch), Mod Wheel (CC1) and Pitch Bend - so they can be
+    // wired anywhere a control cable is accepted (filter cutoff, wavetable
+    // position, a different synth's Pressure input, etc.). One MIDI input, four
+    // Signal outputs. See midi_breakout_node.h.
+    MidiBreakout
 };
 
 struct Pin {
-    int id;
+    // Default to -1 so an uninitialized Pin (e.g. one default-constructed
+    // by project_file.cpp's `[PinIn]` / `[PinOut]` section opener before
+    // the `id=` line is parsed) reads as a recognizable sentinel rather
+    // than as garbage from whatever memory the int happened to occupy.
+    // Real pin IDs come from NodeGraph::newId() which starts at 1.
+    int id = -1;
     std::string name;
     PinKind kind;
     bool isInput;
     int channels = 2; // 1=mono, 2=stereo, 6=5.1, etc.
+
+    // Optional hover-tooltip text shown when the mouse rests over this pin in
+    // the node graph (NodeGraphComponent::getTooltip). Empty = no tooltip.
+    // Not serialized: pins that need a tooltip (e.g. the synth "Pressure"
+    // input, the MIDI Breakout outputs) re-set it every graph build / node
+    // creation, so the text always reflects the current code, never a stale
+    // copy baked into an old project file.
+    std::string tooltip;
 };
 
 // Automation point on a parameter timeline
@@ -237,7 +271,14 @@ struct TakeLane {
 };
 
 struct Node {
-    int id;
+    // Default to -1 so an uninitialized Node (e.g. one default-constructed
+    // by project_file.cpp's `[Node]` section opener before the `id=` line
+    // is parsed, or a torn read of this field from a concurrent push_back
+    // reallocation) reads as a recognizable sentinel rather than as
+    // garbage memory. Real node IDs come from NodeGraph::newId() which
+    // starts at 1. Downstream code (graph rebuild, findNode, save) can
+    // and should skip / refuse nodes with id < 0.
+    int id = -1;
     std::string name;
     NodeType type;
     std::vector<Pin> pinsIn;
@@ -251,10 +292,21 @@ struct Node {
     // (via PanProcessor which runs after every audio-producing node).
     // Read by the UI thread at 30 Hz for drawing meter bars. Plain
     // floats (not atomic) because Node must be copyable for std::vector.
-    // The audio thread writes, the UI thread reads — a torn read is at
+    // The audio thread writes, the UI thread reads - a torn read is at
     // worst a meter glitch, never a crash. Decay is applied UI-side.
     float meterPeakL = 0.0f;
     float meterPeakR = 0.0f;
+
+    // Runtime-only (not serialized): does this node have an audio path to an
+    // Output node? Recomputed by GraphProcessor::rebuildGraph after every
+    // topology change. Used by synth audition (editor "Play" on an unplaced
+    // library frame): when a synth node can't reach an Output, its audition
+    // voices are diverted to the AudioEngine's audition-monitor bus so the
+    // preview is still audible. When the node IS routed to output, the
+    // audition stays in the normal graph path so it flows through the user's
+    // downstream effects/pan exactly like a played note. Defaults to true so
+    // the conservative "stay in graph" behavior holds before the first build.
+    bool reachesOutput = true;
     std::vector<Param> params;
 
     // On-demand signal modulation pins (#88). Each entry binds a
@@ -262,12 +314,33 @@ struct Node {
     // When a Signal cable is connected to the pin, the processor reads
     // the signal from audio channel (2 + pin's control-slot index) and
     // modulates the param each block. The pin lives in pinsIn alongside
-    // the node's static pins — it's serialized as part of the normal
+    // the node's static pins - it's serialized as part of the normal
     // pin list in project_file.cpp. The modPin just records the binding.
     struct ModPin {
+        // How an incoming control cable affects the bound param:
+        //  - Modulate ("Mod"): bipolar-additive around the knob's resting value
+        //    (baseValue). 0.5 = no change. The user can still edit the knob; the
+        //    cable swings the param around that center. Pin labelled "Mod: ".
+        //  - Absolute ("Set"): the cable's value *is* the param value, mapped
+        //    edge-to-edge across [min,max]. The knob is locked while connected.
+        //    Pin labelled "Set: ".
+        enum class Mode { Modulate, Absolute };
         int paramIndex = -1;  // index into this node's params[]
         int pinId = -1;       // matching pin id in pinsIn
-        float depth = 1.0f;   // modulation depth: 0=none, 1=full range
+        float depth = 1.0f;   // modulation depth: 0=none, 1=full range (Modulate only)
+        Mode mode = Mode::Modulate;  // default Modulate: old projects (no saved
+                                     // mode field) keep their original behaviour
+
+        // Runtime-only connectivity cache (NOT serialized). Recomputed by the
+        // graph processor at build time: true iff some link's endPin == pinId,
+        // i.e. a cable is actually feeding this modulation input. Some pins
+        // (e.g. wavetable "Mod: Position" pins) are created eagerly so the user
+        // can cable to them, but their modPin binding exists even when nothing
+        // is connected. applySignalModulations() must skip those idle bindings -
+        // otherwise it reads the pin's silent control channel (0.0) and forces
+        // the bound param to its minimum, overriding the user's manual setting.
+        // Mirrors Node::reachesOutput (same recompute-on-build discipline).
+        bool connected = false;
     };
     std::vector<ModPin> modPins;
 
@@ -280,25 +353,36 @@ struct Node {
 
     std::string script;
 
-    // Performance mode — play preset melody by pressing any keys
+    // Performance mode - play preset melody by pressing any keys
     bool performanceMode = false;
     int performanceReleaseMode = 1;   // 0=OnKeyUp, 1=OnNextEvent (legato)
     bool performanceVelocity = true;  // use incoming velocity
 
-    // Custom envelope curves (expressions mapping x in 0..1 to amplitude 0..1)
-    // Empty = default linear. x=0 is start of stage, x=1 is end.
-    // Attack: default "x" (linear rise). Try "x^0.5" for fast attack.
-    // Decay: default "1-x*(1-s)" where s is sustain. Try "1-x^2*(1-s)".
-    // Release: default "1-x" (linear fall). Try "(1-x)^3" for long tail.
-    std::string envAttackCurve;   // expression, empty = linear
-    std::string envDecayCurve;
-    std::string envReleaseCurve;
-    // Control points alternative (phase 0-1, amplitude 0-1)
-    std::vector<std::pair<float, float>> envAttackPoints;
-    std::vector<std::pair<float, float>> envDecayPoints;
-    std::vector<std::pair<float, float>> envReleasePoints;
+    // The unified AHDSR amplitude envelope used by every tonal /
+    // note-triggered synth (built-in, terrain, wavetable, layered,
+    // spectral, FM, additive, PD, particle). Stores A/H/D/S/R time
+    // values, sustain level, velocity sensitivity, and the per-segment
+    // SpectralCurve shapes for Attack / Decay / Release.
+    //
+    // Edited via the shared AHDSREnvelopeComponent (opened either inline
+    // from a synth dialog or via a right-click "Envelope..." menu on
+    // the node). Save/load and undo serialize this through encode/decode.
+    AHDSREnvelope ahdsrEnvelope;
+
+    // Per-voice pressure (aftertouch) input. When something is wired to the
+    // "Pressure" Param input pin on a synth node, the wired control's
+    // value (0..1, read as the block mean) drives the per-voice
+    // pressure swell. It's a Param (block-rate) pin because the consumer
+    // averages it over the whole block to stay smooth. When the
+    // pin is unwired, the synth uses channel-pressure (aftertouch) events
+    // from the incoming MIDI stream instead. Either way the value is exposed
+    // to every voice as a modulation source that defaults to scaling output
+    // amplitude by 1 + 0.5*pressure. (The pin was historically named
+    // "Aftertouch"; the graph builder migrates that name to "Pressure".)
+    float aftertouchSensitivity = 0.5f;  // 0 = ignore, 1 = full volume swell
 
     // Panning and spatial positioning
+    PanLaw panLaw = PanLaw::EqualPower; // panning law for PanProcessor
     float pan = 0.0f;            // stereo pan: -1.0 (full left) to 1.0 (full right), 0 = center
     float spatialX = 0.0f;       // surround: front-back (-1 = back, 1 = front)
     float spatialY = 0.0f;       // surround: left-right (-1 = left, 1 = right)
@@ -315,7 +399,7 @@ struct Node {
     // plugin's parameters change via host automation, MIDI Learn CC, or
     // any other host-driven path, this flag is set so the next autosave
     // re-queries getStateInformation. When clear, the saver reuses the
-    // cached base64 string instead — avoiding the expensive query for
+    // cached base64 string instead - avoiding the expensive query for
     // plugins whose state hasn't changed since the last save. Defaults
     // to true so a freshly loaded plugin gets queried at least once.
     //
@@ -326,7 +410,7 @@ struct Node {
     bool pluginStateDirty = true;
     std::string cachedPluginStateBase64;
 
-    // Group — contains child node IDs
+    // Group - contains child node IDs
     std::vector<int> childNodeIds;  // IDs of nodes inside this group
     int parentGroupId = -1;         // -1 = top-level (not in any group)
     float groupBeatOffset = 0.0f;   // children's timelines start at this beat in the parent
@@ -334,13 +418,106 @@ struct Node {
     float absoluteBeatOffset = 0.0f; // cached: cascading offset through all parents (updated by resolveAnchors)
     bool groupExpanded = true;      // show children in graph view
 
+    // MOD-import song-setting restore: when a module import overrides the
+    // global song settings (repeat mode, song length, loop region), the
+    // PRE-import values are stashed on the import's root group node here.
+    // Deleting that root group node (the grey node that cascades to the
+    // whole tree) restores them, backing out the module's loop contribution
+    // while preserving whatever the user had set before importing. Stored as
+    // int for the repeat mode because SongRepeat is declared later in the
+    // header (after struct Node), so Node cannot name the enum type.
+    bool   modImportSavedSong     = false;
+    int    modImportPrevRepeatMode = 0;     // (int)NodeGraph::SongRepeat
+    int    modImportPrevRepeatCount = 1;
+    double modImportPrevSongLength = 0.0;
+    bool   modImportPrevLoopEnabled = false;
+    double modImportPrevLoopStart  = 0.0;
+    double modImportPrevLoopEnd    = 0.0;
+
+    // Direct granular-frame payload carried by an audition note-on so the
+    // synth can render a SPECIFIC granular frame that isn't placed into the
+    // wavetable's grid/scatter (and therefore isn't in the synth's
+    // wtGranularFrames table). The wavetable editor's Play button uses this
+    // so a freshly-captured, library-only frame is audible immediately and
+    // faithfully (exact on-screen bytes, no wait for the ~150ms graph
+    // rebuild). Mirrors GranularFrame's fields without pulling
+    // granular_frame.h into this header. Shared so the large source PCM isn't
+    // deep-copied through the audio-thread queue.
+    struct AuditionGranularFrame {
+        std::shared_ptr<std::vector<float>> source; // mono PCM at sourceSampleRate
+        double sourceSampleRate = 0.0;
+        int    grainLength      = 4800;
+        int    windowStart      = -1;   // freeze-window start; -1 = auto-centre
+        int    windowLen        = -1;   // freeze-window width; -1 = auto (= grain)
+        float  embeddedPitchHz  = 440.0f;
+        int    freezeMode       = 0;    // 0 = CrossfadeLoop
+        int    grainCount       = 4;    // cloud-mode overlapping grains [2,16]
+        int    fftSize          = 0;    // SpectralFreeze FFT size; 0 = auto
+        int    crossfadeSamples = 2400;
+        float  gain             = 1.0f; // mirrors IWavetableFrame::gain
+        // Bucket C element warp (amplitude-domain). Mirrors GranularFrame::
+        // warpAmpOps() so the editor's Play audition carries the same
+        // waveshaping the placed-frame synth path and renderRaw apply -
+        // "what you audition = what you get". Empty = no warp.
+        std::vector<WarpOp> warpAmpOps;
+    };
+
+    // Direct inharmonic-frame payload carried by an audition note-on so the
+    // synth can render a SPECIFIC inharmonic stack that isn't placed into the
+    // wavetable's grid/scatter (and therefore isn't in the synth's
+    // wtInharmonicFrames table). The inharmonic frame editor's Play button uses
+    // this so an unplaced stack is audible immediately and faithfully, the same
+    // way AuditionGranularFrame does for granular library frames. Mirrors
+    // InharmonicFrame's partial fields without pulling inharmonic_frame.h into
+    // this header. The live voice plays one sine oscillator per partial at
+    // noteHz * ratio, sums amp*sin, scales by normGain (so it's as loud as the
+    // editor thumbnail), applies the amplitude-domain warp, then the gain.
+    struct AuditionInharmonicFrame {
+        struct Partial { float ratio = 1.0f; float amp = 1.0f; float phase = 0.0f; };
+        std::vector<Partial> partials;
+        float               gain     = 1.0f;  // mirrors IWavetableFrame::gain
+        float               normGain = 1.0f;  // InharmonicFrame::normGainFor(partials)
+        std::vector<WarpOp> warpAmpOps;        // amplitude-domain element warp
+    };
+
     // Audition MIDI events injected from the UI (thread-safe via simple flag)
     struct AuditionEvent {
         bool isNoteOn;
         int pitch;
         int velocity;
+        // Optional wavetable Position override for the voice this note-on
+        // creates. Empty = no override (voice follows the live Position
+        // params). Used by the wavetable editor so a frame's Play button
+        // auditions THAT frame regardless of where the Position knob sits.
+        // One entry per Position dimension, each in [0,1]. Ignored on
+        // note-off events.
+        std::vector<float> position;
+        // Optional direct granular frame to render for this note-on. When set
+        // (non-null), the voice plays THIS frame exclusively, bypassing both
+        // the cycle terrain and the placed-frame morph - this is how the
+        // editor auditions an unplaced library frame. Null for ordinary
+        // MIDI / timeline notes and for non-granular frame auditions.
+        std::shared_ptr<AuditionGranularFrame> granularFrame;
+        // Optional direct inharmonic frame to render for this note-on. Same
+        // role as granularFrame but for an unplaced inharmonic stack; the voice
+        // plays its oscillator bank exclusively. Null otherwise.
+        std::shared_ptr<AuditionInharmonicFrame> inharmonicFrame;
     };
     std::vector<AuditionEvent> pendingAudition; // written by UI, read by audio thread
+
+    // Sustained editor audition (the granular wave editor's Play button holds a
+    // note for as long as the user listens). Unlike the momentary, edge-
+    // triggered pendingAudition events, this is LEVEL-triggered: while non-null
+    // it means "a voice should be sounding with this data." A debounced wavetable
+    // edit triggers a full graph rebuild (GraphProcessor::rebuildGraph clears and
+    // recreates every processor), which destroys all held voices - so an audition
+    // routed only through pendingAudition goes silent on the first edit ("preview
+    // stops until I press start again"). The synth re-establishes a voice from
+    // heldAudition whenever it (re)starts, so the audition survives the rebuild.
+    // The editor refreshes the snapshot (sharing the source PCM, not re-copying
+    // it) on each audible edit so the post-rebuild voice reflects the new freeze
+    // window / grain. Cleared on Stop. Accessed under auditionMutex.
+    std::shared_ptr<AuditionEvent> heldAudition;  // null = nothing held
     std::shared_ptr<std::mutex> auditionMutex = std::make_shared<std::mutex>();
 
     // MPE pass-through / MidiInput node event queue. Originally used only
@@ -391,6 +568,28 @@ struct Node {
     bool recordArmed = false;     // armed for recording
     bool inputMonitor = false;    // pass input through to output in real-time
 };
+
+// Thread-safe write to a live node's `script`.
+//
+// Several audio-thread processors poll their owning node's `script` every
+// block to pick up live editor edits without a full graph rebuild (e.g.
+// TerrainSynthProcessor::reloadIfScriptChanged, #23). Meanwhile UI-thread
+// editors rewrite `node.script` in place when the user edits a waveform.
+// A raw `node.script = ...` assignment is therefore a data race: a
+// std::string assignment is not atomic, so the audio thread can observe the
+// new size paired with a stale/freed data pointer and copy from garbage.
+// For a multi-megabyte granular-wavetable script this reliably crashes
+// mid-copy (~1.4 MB memcpy from a bad pointer) about a second after an edit,
+// when the autosave/poll happens to land inside the write window.
+//
+// Writers that target a node which may have a running processor MUST go
+// through this helper, and the matching audio-thread reader must take the
+// same per-node mutex (`auditionMutex`) around its read. Node-creation sites
+// that build a fresh node before any processor exists don't need it.
+inline void setNodeScriptSynced(Node& node, std::string s) {
+    std::lock_guard<std::mutex> lock(*node.auditionMutex);
+    node.script = std::move(s);
+}
 
 // Named marker on the project timeline
 struct Marker {
@@ -473,12 +672,48 @@ public:
 
     std::vector<Node> nodes;
     std::vector<Link> links;
-    std::vector<int> openEditors;  // node IDs — never store Node*
+    std::vector<int> openEditors;  // node IDs - never store Node*
+
+    // Synchronization between graph-mutating threads (UI / file load /
+    // tracker import) and the audio thread, which iterates `nodes` and
+    // `links` every block (both directly for MIDI routing in
+    // AudioEngine::audioDeviceIOCallbackWithContext and indirectly via
+    // GraphProcessor::rebuildGraph when the node count changes).
+    //
+    // Why this is required: a previous tracker-import crash (SEANCE.exe
+    // .63000.dmp) was traced to a data race. MOD import calls
+    // graph.addNode() ~10 times in succession; each call may trigger a
+    // std::vector reallocation. The audio callback, observing the size
+    // change between blocks, rebuilds the JUCE processor graph by
+    // iterating graph.nodes. If reallocation happened mid-iteration, the
+    // audio thread read garbage Node::id values (observed 0 and
+    // 1132382734 in the rebuilt nodeMap), which then crashed downstream
+    // in the JUCE graph wiring.
+    //
+    // Usage pattern (audio thread): take a try-lock at the top of the
+    // audio callback and fall through to silence if the lock can't be
+    // acquired immediately - blocking on the audio thread would risk
+    // device underruns, and a single silent block during a multi-second
+    // import is barely audible compared to a crash. Usage pattern
+    // (mutators): hold a std::lock_guard for the duration of any batch
+    // that pushes more than a couple of nodes/links (tracker import,
+    // project file load, undo snapshot restore). Single-node menu
+    // additions don't strictly need it - those are one push_back and
+    // race-resolve quickly - but locking them too costs nothing and is
+    // future-safe.
+    mutable std::mutex mutationLock;
 
     float editorPanelHeight = 250.0f;
     int activeEditorNodeId = -1; // node ID of the currently focused editor
     PluginHost* pluginHost = nullptr; // set by App
-    // Dirty tracking — set on any mutation
+
+    // Content-addressed store for large immutable baked blobs (generated /
+    // imported terrain grids; later decoded video, wavetable PCM). Nodes refer
+    // to blobs by short hash in node.script; the bytes live here once, keyed by
+    // a hash of their canonical .npy payload. Excluded from undo snapshots (the
+    // hash travels in the snapshot, the bytes do not) - see content_store.h.
+    ContentStore contentStore;
+    // Dirty tracking - set on any mutation
     bool dirty = false;
 
     // Transport state
@@ -491,22 +726,38 @@ public:
     double loopEndBeat = 0;
     double projectSampleRate = 0; // 0 = use device rate
 
+    // Saved view state for the main node-graph component. Persisted to
+    // the project file so reopening the project restores the user's
+    // last pan/zoom instead of snapping back to a fit-all view.
+    //   viewZoom = 0  -> "no saved view", the component falls back to
+    //                    fitAll() on first paint (the default for new
+    //                    or pre-feature projects).
+    //   viewZoom > 0  -> restore that zoom and (viewPanX, viewPanY) as
+    //                    the screen-space offset.
+    // These are intentionally excluded from undo snapshots (writeProject
+    // is given includeView=false in serializeForUndo) so undoing graph
+    // edits does not also jerk the user's view around.
+    float viewZoom = 0.0f;
+    float viewPanX = 0.0f;
+    float viewPanY = 0.0f;
+
     // Song length and repeat behavior.
     //
-    // songLengthBeats = 0 means "no explicit end" — the transport plays
-    // until the user presses Stop, and no repeat logic fires. > 0 marks an
-    // end beat: when the playhead reaches it, the repeat policy decides
-    // what happens next.
+    // songLengthBeats = 0 means "auto" - derive the effective end from the
+    // last clip across all timeline nodes (see effectiveSongLengthBeats()).
+    // > 0 marks an explicit end beat that overrides the auto-derived value.
+    // When the playhead reaches the effective end, the repeat policy
+    // decides what happens next.
     //
     // Repeat modes:
-    //   None    — stop at songLengthBeats and halt playback.
-    //   Forever — wrap back to beat 0 and keep playing until Stop.
-    //   NTimes  — wrap back to beat 0, play the song N times total, then
+    //   None    - stop at the song end and halt playback.
+    //   Forever - wrap back to beat 0 and keep playing until Stop.
+    //   NTimes  - wrap back to beat 0, play the song N times total, then
     //             stop. N = songRepeatCount, where 1 means "play once
     //             then stop" (same as None), 2 means "play twice", etc.
     //
     // The user-region loop (loopEnabled / loopStartBeat / loopEndBeat) is
-    // an inner A-B cycler and takes precedence while active — the song-
+    // an inner A-B cycler and takes precedence while active - the song-
     // length policy only fires when the user loop is disabled or the
     // playhead is outside the user-loop range.
     //
@@ -517,12 +768,33 @@ public:
     SongRepeat songRepeatMode  = SongRepeat::None;
     int       songRepeatCount  = 1;   // only used when mode == NTimes
 
+    // Returns the effective song-end beat used by the transport.  If
+    // songLengthBeats was set explicitly (> 0), that value wins. Otherwise
+    // walks all AudioTimeline / MidiTimeline nodes and returns the largest
+    // getTimelineBeats() across them - i.e. the end of the last clip,
+    // rounded up to the next 4-beat bar. Returns 0 if there are no
+    // timelines with clips (in which case the engine treats the song as
+    // having no end and just plays until the user presses Stop).
+    double effectiveSongLengthBeats() const;
+
+    // When content is added past an explicit song-length override (e.g. the
+    // user pastes or draws notes beyond the current song end), the override
+    // would otherwise clamp playback and silently cut off the new content -
+    // the auto-derived length follows the clips, but the override doesn't.
+    // Call this after any edit that can extend a clip: in auto mode
+    // (songLengthBeats <= 0) it's a no-op (the auto value already covers the
+    // content); with an explicit override it grows the override to the new
+    // content end so the added beats actually play. Never shrinks the
+    // override, so a deliberately-longer "trailing silence" length is kept.
+    // Returns the prior override value so callers can restore it on undo.
+    double growSongLengthToContent();
+
     // Tuning system and concert pitch (project-wide)
     TuningSystem tuningSystem = TuningSystem::Equal12;
     float concertPitch = 440.0f; // Hz for A4
 
     // Global crossfade duration (seconds) used to smooth audio discontinuities
-    // anywhere the engine starts or stops a routing path mid-stream — effect
+    // anywhere the engine starts or stops a routing path mid-stream - effect
     // region edges, mute/solo toggles, plugin bypass, future child-track
     // entry/exit, etc. Per-feature overrides (e.g. EffectGroup::crossfadeSec)
     // take precedence when explicitly set.
@@ -547,6 +819,41 @@ public:
                     }
                 }
             }
+        }
+        return false;
+    }
+
+    // True if one *specific* param on a node is currently being driven by a
+    // connected Signal/Param cable - i.e. it has a modulation input pin
+    // (Node::ModPin) whose pin has a live link plugged into it. This is the
+    // per-param version of hasSignalInput(): only the actually-driven param's
+    // manual control should lock, not every param on the node.
+    bool paramHasSignalInput(int nodeId, int paramIndex) const {
+        const Node* nd = nullptr;
+        for (const auto& n : nodes) if (n.id == nodeId) { nd = &n; break; }
+        if (!nd) return false;
+        for (const auto& mp : nd->modPins) {
+            if (mp.paramIndex != paramIndex) continue;
+            for (const auto& link : links)
+                if (link.endPin == mp.pinId) return true;
+        }
+        return false;
+    }
+
+    // True if a param is driven by a connected *Absolute* ("Set") cable. Such a
+    // param is fully locked in the UI - the cable sets its value directly, so
+    // there is no resting/base value for the user to edit. A param driven only
+    // by Modulate ("Mod") cables is NOT absolute-locked: the user can still
+    // drag its knob to set the center the modulation swings around.
+    bool paramHasAbsoluteInput(int nodeId, int paramIndex) const {
+        const Node* nd = nullptr;
+        for (const auto& n : nodes) if (n.id == nodeId) { nd = &n; break; }
+        if (!nd) return false;
+        for (const auto& mp : nd->modPins) {
+            if (mp.paramIndex != paramIndex) continue;
+            if (mp.mode != Node::ModPin::Mode::Absolute) continue;
+            for (const auto& link : links)
+                if (link.endPin == mp.pinId) return true;
         }
         return false;
     }
@@ -583,7 +890,7 @@ public:
         return m ? m->beat : -1.0f;
     }
 
-    // Signal automation script — Python code that defines signal bindings
+    // Signal automation script - Python code that defines signal bindings
     // Re-executed when project is loaded
     std::string signalScript;
     UndoTree undoTree;
@@ -599,7 +906,7 @@ public:
     // machine-local userAppData/SEANCE/undo-tree.dat file.
     std::string historyFilePath;
 
-    // Shared waveform library — named waveforms usable by any synth/signal node
+    // Shared waveform library - named waveforms usable by any synth/signal node
     struct WaveformEntry {
         std::string name;
         std::string expression;    // source expression (empty if from points)
@@ -614,6 +921,13 @@ public:
 
     void setNextId(int id) { nextId = std::max(nextId, id); }
     int getNextId() const { return nextId; }
+    // Allocate and return a fresh id, bumping the internal counter so the
+    // same value isn't handed out twice. Use this when you need a NEW id
+    // for a pin you're appending from outside addNode (e.g. SignalShape's
+    // dynamic-signal-input pin rewrite). getNextId() above is the
+    // peek-without-allocate variant - useful for save/load size hints,
+    // not for actually creating ids.
+    int allocId() { return newId(); }
 
     float getTimelineBeats(const Node& node) const;
 
@@ -626,7 +940,7 @@ public:
     // Commit a snapshot of the current graph state to the undo tree as a
     // new step. The serialization is performed via ProjectFile::serializeForUndo
     // (graph-only, plugin state excluded). If the resulting text is identical
-    // to the previous step's snapshot — i.e., nothing actually changed — this
+    // to the previous step's snapshot - i.e., nothing actually changed - this
     // is a no-op, so it's safe (and intended) to call defensively from any
     // mutating function. See CLAUDE.md "Undo Strategy" for the policy on
     // when to use commitSnapshot vs. exec().

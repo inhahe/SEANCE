@@ -37,20 +37,21 @@ struct PianoRollState {
     float emptyClickBeat = 0;
     int emptyClickPitch = 0;
 
-    // Key/mode/scale — each stores its own last-selected value
+    // Scale selection for piano-roll snapping / "in key" highlighting / degree
+    // analysis. Two regimes, tracked by activeCategory:
+    //   "keymode" - Root + Key (parent scale) + Mode (rotation degree of the
+    //               parent). keyName and modeName BOTH matter; the active
+    //               interval set is rotateScale(keys()[keyName], mode index).
+    //   "scale"   - Root + a fixed non-diatonic set named by scaleName; Key and
+    //               Mode are ignored (and greyed in the UI).
+    // The actual interval set is computed by MusicTheory::activeIntervals().
     int keyRoot = 0;
-    std::string activeCategory = "key"; // which one is active: "key", "mode", "scale"
+    std::string activeCategory = "keymode"; // "keymode" or "scale"
     std::string keyName = "Major";
-    std::string modeName = "Ionian";
+    std::string modeName = "Ionian (Major)";
     std::string scaleName = "Chromatic";
-    // Helper to get the active name
-    const std::string& activeName() const {
-        if (activeCategory == "key") return keyName;
-        if (activeCategory == "mode") return modeName;
-        return scaleName;
-    }
 
-    // Compact mode — hides toolbar, everything via context menus
+    // Compact mode - hides toolbar, everything via context menus
     bool compactMode = false;
 
     // Focused clip (for per-clip key display and editing)
@@ -60,7 +61,7 @@ struct PianoRollState {
     bool showDetectResults = false;
     std::vector<MusicTheory::KeyMatch> detectResults;
 
-    // Audition — keys being previewed by clicking the piano column
+    // Audition - keys being previewed by clicking the piano column
     struct AuditionNote {
         int pitch = -1;
         double startTime = 0;   // ImGui time when pressed

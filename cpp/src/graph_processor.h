@@ -48,7 +48,7 @@ private:
     MpeChannel mpeChannels[kMpeChannels];
     int nextMpeChannel = 0;
 
-    bool wasPlaying = false;   // detects playing→stopped transition for note-off
+    bool wasPlaying = false;   // detects playing->stopped transition for note-off
 
     int allocMpeChannel(int ci, int ni, int pitch);
     void freeMpeChannel(int ci, int ni);
@@ -57,7 +57,7 @@ private:
                         const NoteExpression& expr, float beatInNote, int sampleOffset);
 };
 
-// Wraps an audio timeline node — plays audio file clips
+// Wraps an audio timeline node - plays audio file clips
 class AudioTimelineProcessor : public juce::AudioProcessor {
 public:
     AudioTimelineProcessor(Node& node, Transport& transport, NodeGraph& graph);
@@ -126,6 +126,126 @@ private:
     float phase = 0;
 };
 
+// Parallel MIDI generator that emits the MPE Configuration Message (the RPN
+// "zone" handshake) into a hosted plugin's MIDI input, so MPE-capable plugins
+// interpret incoming channels 2..16 as per-note member channels.
+//
+// Why a separate node wired *alongside* the real MIDI source (rather than
+// transforming the note stream): it only ever ADDS the RPN handshake and never
+// touches notes, so a non-MPE plugin - which simply ignores the unknown RPN -
+// is byte-for-byte unaffected. And because it injects directly at the plugin's
+// graph input, the handshake bypasses the cable-level MIDI-Learn CC filter that
+// could otherwise strip the RPN's CC 6/38/100/101 bytes.
+//
+// Lifecycle: emits for the first few blocks after construction (covers plugin
+// load, graph rebuild, and the MPE toggle - all of which recreate this node)
+// and re-arms on every transport play-start edge (covers plugins that reset
+// their zone layout when playback stops).
+class MpeConfigProcessor : public juce::AudioProcessor {
+public:
+    MpeConfigProcessor(Node& n, Transport& t) : node(n), transport(t) {}
+    const juce::String getName() const override { return "MPE Config"; }
+    void prepareToPlay(double, int) override {}
+    void releaseResources() override {}
+    void processBlock(juce::AudioBuffer<float>& buf, juce::MidiBuffer& midi) override {
+        buf.clear();
+        const bool playing = transport.playing;
+        if (playing && !wasPlaying) emitCountdown = kEmitBlocks;
+        wasPlaying = playing;
+        if (emitCountdown > 0) {
+            --emitCountdown;
+            // Lower zone: master channel 1, member channels 2..16 (15 of them).
+            // Per-note bend range from the node (default 48 semis); master bend
+            // range 2 to match the legacy/global pitch-wheel range used
+            // elsewhere (see signal_modulation.h / TerrainSynth).
+            const int pnRange = juce::jlimit(0, 96, node.mpePitchBendRange);
+            const juce::MidiBuffer mcm = juce::MPEMessages::setLowerZone(15, pnRange, 2);
+            for (const auto meta : mcm)
+                midi.addEvent(meta.getMessage(), 0);
+        }
+    }
+    double getTailLengthSeconds() const override { return 0; }
+    bool acceptsMidi() const override { return false; }
+    bool producesMidi() const override { return true; }
+    bool isBusesLayoutSupported(const BusesLayout&) const override { return true; }
+    juce::AudioProcessorEditor* createEditor() override { return nullptr; }
+    bool hasEditor() const override { return false; }
+    int getNumPrograms() override { return 1; }
+    int getCurrentProgram() override { return 0; }
+    void setCurrentProgram(int) override {}
+    const juce::String getProgramName(int) override { return {}; }
+    void changeProgramName(int, const juce::String&) override {}
+    void getStateInformation(juce::MemoryBlock&) override {}
+    void setStateInformation(const void*, int) override {}
+private:
+    Node& node;
+    Transport& transport;
+    bool wasPlaying = false;
+    static constexpr int kEmitBlocks = 4;
+    int emitCountdown = kEmitBlocks;
+};
+
+// Cable-level MIDI adapter inserted on a MIDI cable whose destination is a
+// hosted VST3/AU plugin. It is the ONLY part of the graph that knows BOTH the
+// project-wide tuning AND that the destination is a hosted plugin (vs a native
+// synth that tunes itself via Transport::noteToFreq), so per the architecture
+// this is where note->frequency delivery for plugins is reconciled.
+//
+// Responsibilities, decided per-destination from dstNode.mpeEnabled:
+//   - Plugin in MPE mode  -> ensure each note has its own member channel
+//     (2..16), spreading a single-channel source if needed, and add the FULL
+//     per-note tuning bend (concert pitch + temperament), summed with any
+//     expression pitch-bend already in the stream.
+//   - Plugin NOT in MPE   -> collapse everything to channel 1 and apply only
+//     the UNIFORM concert-pitch bend (temperament can't be per-note on a shared
+//     channel; this is the documented "needs MPE" fallback).
+// When the project is at default tuning (12-TET / A440) it is a pure pass-
+// through. Native-synth cables never get this node.
+class MidiTuningAdapterProcessor : public juce::AudioProcessor {
+public:
+    MidiTuningAdapterProcessor(Node& dstNode, Transport& transport)
+        : dstNode(dstNode), transport(transport) {}
+    const juce::String getName() const override { return "MIDI Tuning Adapter"; }
+    void prepareToPlay(double, int) override {}
+    void releaseResources() override {}
+    void processBlock(juce::AudioBuffer<float>& buf, juce::MidiBuffer& midi) override;
+    double getTailLengthSeconds() const override { return 0; }
+    bool acceptsMidi() const override { return true; }
+    bool producesMidi() const override { return true; }
+    bool isBusesLayoutSupported(const BusesLayout&) const override { return true; }
+    juce::AudioProcessorEditor* createEditor() override { return nullptr; }
+    bool hasEditor() const override { return false; }
+    int getNumPrograms() override { return 1; }
+    int getCurrentProgram() override { return 0; }
+    void setCurrentProgram(int) override {}
+    const juce::String getProgramName(int) override { return {}; }
+    void changeProgramName(int, const juce::String&) override {}
+    void getStateInformation(juce::MemoryBlock&) override {}
+    void setStateInformation(const void*, int) override {}
+private:
+    Node& dstNode;
+    Transport& transport;
+
+    // Output voice slots for MPE mode: index i -> MIDI member channel i+2.
+    // A voice maps an incoming (channel,pitch) note to the member channel we
+    // assigned it, so expression/CC/note-off on that input note follow it.
+    struct Voice { bool active = false; int inCh = 0; int pitch = -1; float exprSemis = 0.0f; };
+    static constexpr int kMembers = 15;
+    Voice voices[kMembers];
+    int nextVoice = 0;
+
+    bool wasPlaying = false;
+    // Collapse mode sends an RPN to pin the plugin's channel-1 bend range to a
+    // small, near-universal value so the (sub-semitone) concert-pitch bend is
+    // interpreted correctly even by plugins that default to +/-2.
+    static constexpr int kCollapseRange = 2; // semitones
+    int rpnCountdown = 4;
+
+    int allocVoice(int inCh, int pitch);
+    int findVoice(int inCh, int pitch) const;
+    static int encodeBend(float semis, int rangeSemis);
+};
+
 class GraphProcessor {
 public:
     GraphProcessor();
@@ -161,7 +281,7 @@ private:
     // Map our node IDs to JUCE graph node IDs.
     // nodeMap stores the OUTPUT side: the JUCE node that downstream connections
     // should pull audio FROM. For nodes with a pan inserted after them, this is
-    // the pan node — pan is where the chain ends.
+    // the pan node - pan is where the chain ends.
     // nodeInputMap stores the INPUT side: the JUCE node that upstream connections
     // should push audio/MIDI INTO. For nodes with a pan, this is the original
     // processor (not the pan), so MIDI events actually reach the synth.

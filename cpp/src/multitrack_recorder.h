@@ -42,7 +42,7 @@ public:
                            float* const* outputData, int numOutputChannels,
                            int numSamples, NodeGraph& graph);
 
-    // Stop recording on all tracks — finalize WAV files, create clips.
+    // Stop recording on all tracks - finalize WAV files, create clips.
     void stopRecording(NodeGraph& graph, Transport& transport, double sampleRate);
 
     bool isRecording() const { return recording.load(); }

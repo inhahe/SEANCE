@@ -34,7 +34,7 @@ public:
             float frac = juce::jlimit(0.0f, 1.0f, (db - minDb) / (maxDb - minDb));
             float barH = frac * area.getHeight();
 
-            // Color: blue → cyan → green → yellow → red based on magnitude.
+            // Color: blue -> cyan -> green -> yellow -> red based on magnitude.
             auto col = juce::Colour::fromHSV(0.6f - frac * 0.6f, 0.8f, 0.5f + frac * 0.5f, 1.0f);
             g.setColour(col);
             g.fillRect(area.getX() + i * barW, area.getBottom() - barH, barW - 1, barH);

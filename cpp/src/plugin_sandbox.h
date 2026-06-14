@@ -24,17 +24,17 @@ namespace SoundShop {
 // Architecture:
 //   Host process:
 //     SandboxedPluginProxy (AudioProcessor) ← sits in the JUCE graph
-//       → writes audio+MIDI to shared memory
-//       → reads processed audio from shared memory
-//       → monitors child process health
+//       -> writes audio+MIDI to shared memory
+//       -> reads processed audio from shared memory
+//       -> monitors child process health
 //
 //   Child process (SEANCE.exe --plugin-sandbox <pipe-name>):
 //     PluginSandboxChild
-//       → loads the actual VST3/AU plugin
-//       → reads audio+MIDI from shared memory
-//       → processes through the plugin
-//       → writes output to shared memory
-//       → hosts the plugin's editor window
+//       -> loads the actual VST3/AU plugin
+//       -> reads audio+MIDI from shared memory
+//       -> processes through the plugin
+//       -> writes output to shared memory
+//       -> hosts the plugin's editor window
 //
 // If the child process crashes, the proxy detects it (pipe disconnect
 // or process exit), logs the error, and outputs silence. The user can
@@ -88,7 +88,15 @@ public:
     void releaseResources() override;
     void processBlock(juce::AudioBuffer<float>& buf, juce::MidiBuffer& midi) override;
 
-    double getTailLengthSeconds() const override { return 2.0; }
+    // Tail: a sandboxed plugin runs in a separate process and we don't
+    // round-trip the host plugin's getTailLengthSeconds() across the IPC
+    // boundary.  Until that's wired, we use a named conservative upper
+    // bound that covers common synth/reverb tails (TODO: forward the
+    // real value from the child process).
+    double getTailLengthSeconds() const override {
+        static constexpr double kSandboxFallbackSeconds = 2.0;
+        return kSandboxFallbackSeconds;
+    }
     bool acceptsMidi() const override { return true; }
     bool producesMidi() const override { return true; }
     bool isBusesLayoutSupported(const BusesLayout&) const override { return true; }

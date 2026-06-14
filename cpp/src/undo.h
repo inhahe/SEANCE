@@ -16,7 +16,7 @@ public:
     virtual std::string description() const = 0;
 };
 
-// Undo tree node — stores a command and links to parent/children.
+// Undo tree node - stores a command and links to parent/children.
 //
 // snapshotText holds the full graph state at the moment this step
 // completed (post-state). It's populated regardless of whether the step
@@ -26,7 +26,7 @@ public:
 //      snapshot is the only revert mechanism that survives a restart. The
 //      persistence layer serializes nodes by their snapshotText.
 //   2. Snapshot-only commands: commitSnapshot() creates an UndoNode with
-//      no Command at all — undo/redo navigate by loading the parent's or
+//      no Command at all - undo/redo navigate by loading the parent's or
 //      target's snapshot.
 //
 // In-session, if a node HAS a Command, doUndo/doRedo prefer that fast path
@@ -48,7 +48,7 @@ public:
     UndoTree();
 
     // Execute a command and push it onto the tree. snapshotText is the
-    // state AFTER the command runs — pass an empty string if the caller
+    // state AFTER the command runs - pass an empty string if the caller
     // doesn't have a snapshot yet (cross-session undo will then be limited
     // for that step, but in-session undo via the command still works).
     void execute(std::unique_ptr<Command> cmd, std::string snapshotText = {});
@@ -67,14 +67,14 @@ public:
 
     // True iff the currently-selected undo node has no snapshot text.
     // Used by the app's onTreeChanged callback to decide whether to lazily
-    // serialize and fill in the snapshot — exec()/pushDone() typically push
+    // serialize and fill in the snapshot - exec()/pushDone() typically push
     // a Command without a snapshot, and the app fills it in afterward via
     // setCurrentSnapshot.
     bool currentSnapshotIsEmpty() const;
     void setCurrentSnapshot(std::string snapshotText);
     const std::string& currentSnapshot() const;
 
-    // Persistence — write/read the entire tree to/from a stream. The
+    // Persistence - write/read the entire tree to/from a stream. The
     // format is text-based with explicit length-prefixed blobs for the
     // snapshot text (which itself contains newlines). Used by the
     // application's undo-tree persistence layer (#84) to save the tree
@@ -93,7 +93,7 @@ public:
     int redoBranchCount() const;
     std::string currentDescription() const;
     std::string redoBranchDescription(int index) const;
-    // Walk forward along a branch and return a chain summary, e.g. "+1 octave → Move notes → x2 duration (3 steps)"
+    // Walk forward along a branch and return a chain summary, e.g. "+1 octave -> Move notes -> x2 duration (3 steps)"
     std::string redoBranchChainDescription(int index, int maxSteps = 5) const;
     int nodeCount() const { return (int)nodes.size(); }
 

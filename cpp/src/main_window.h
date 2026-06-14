@@ -55,7 +55,7 @@ public:
     void openHelpDoc(const juce::String& docRelativePath);
     void openProject();
     // onSaved fires after a successful save (sync if a current path exists,
-    // async after the file chooser if not). Cancelled file chooser → never
+    // async after the file chooser if not). Cancelled file chooser -> never
     // fires. Used by tryQuit() to defer the actual app exit until the save
     // round-trip completes.
     void saveProject(std::function<void()> onSaved = {});
@@ -90,10 +90,10 @@ private:
     // Transport bar components
     juce::TextButton playBtn{"Play"}, stopBtn{"Stop"}, recordBtn{"Play & Record"};
     juce::TextButton fitAllBtn{"Fit All"};
-    juce::TextButton metroBtn{"Metro"};
+    juce::TextButton metroBtn{"Metronome"};
     juce::TextButton loopBtn{"Loop"};
     juce::TextButton songBtn{"Song"};
-    juce::TextButton monitorBtn{"Mon"};
+    juce::TextButton monitorBtn{"Monitor"};
     juce::ComboBox timeSigCombo;
     juce::Label timeSigLabel;
     juce::Label positionLabel;
@@ -104,13 +104,13 @@ private:
     juce::TextButton captureBtn{"Capture"};
     juce::TextButton keyboardMidiBtn{"Keys"};
 
-    // Computer keyboard → MIDI mapping
+    // Computer keyboard -> MIDI mapping
     int keyToMidiNote(int keyCode) const;
     bool handleKeyboardMidi(const juce::KeyPress& key, bool isDown);
 
     // Bounce: offline-render the entire project and create an Audio Timeline node.
     void bounceToAudioTrack();
-    // Create audio track from the Output node's cache (instant — no re-render).
+    // Create audio track from the Output node's cache (instant - no re-render).
     void createAudioTrackFromOutputCache(Node& outputNode);
 
     // Real-time capture helpers (still available for arm-and-capture workflow)
@@ -129,15 +129,32 @@ private:
     struct EditorPanel {
         int nodeId;
         std::unique_ptr<PianoRollComponent> component;
+        // Per-panel height in pixels. Each panel gets its own height so
+        // the user can resize MIDI tracks independently by dragging the
+        // strip at the top of each piano roll. editorPanelHeight (the
+        // total stack height) is recomputed as the sum of these.
+        int heightPx = 200;
     };
     std::vector<std::unique_ptr<EditorPanel>> editorPanels;
     int editorPanelHeight = 250;
     void openEditor(Node& node);
     void closeEditor(int nodeId);
     void updateLayout();
+    // Resize callback wired into each PianoRollComponent's resize handle.
+    // `deltaPx` is the pixel delta from the drag (positive = handle moved
+    // down, i.e. shrink). The matching panel's heightPx is adjusted by
+    // -deltaPx (drag UP = grow); panels above it keep their heights and
+    // just shift position. Total editorPanelHeight tracks the sum.
+    void resizeEditorPanel(int nodeId, int deltaPx);
+    // Recompute editorPanelHeight as the sum of every panel's heightPx,
+    // clamped to leave at least some graph area visible. Called whenever
+    // a panel is added, removed, or resized.
+    void recalcEditorPanelHeight();
 
     bool projectDirty = false;
-    ScriptEngine scriptEngine;
+    // The embedded CPython interpreter is process-global; share the one
+    // ScriptEngine instance with the static-shape baker (shape_expr.cpp).
+    ScriptEngine& scriptEngine = ScriptEngine::instance();
     PluginWindowManager pluginWindows;
     void showScriptConsole();
     void showScriptConsoleForNode(int nodeId);
@@ -150,7 +167,14 @@ private:
     void freezeNode(int nodeId);
     void syncCCMappingsToGraph();
     void syncCCMappingsFromGraph();
-    int startupFrames = 5; // bring to front after this many timer ticks
+
+    // Heavy one-time startup init (audio device open + plugin instantiation /
+    // state restore). Scheduled via callAsync off the window's first paint so
+    // the window is on screen before the message thread blocks. The flag guards
+    // it to fire exactly once.
+    void runDeferredStartupInit();
+    bool deferredInitScheduled = false;
+
     int saveFlashFrames = 0; // countdown for "Saved!" title flash
 
     // Hotplug detection for MIDI input devices. The timer polls
@@ -178,11 +202,11 @@ private:
     // user's app-data folder and gets rewritten every autosaveIntervalSeconds
     // while the project is dirty. On a clean save or "Don't Save" quit the
     // file is deleted. On startup, if the file still exists we offer to
-    // recover it — meaning the app quit uncleanly (crash, power loss, kill).
+    // recover it - meaning the app quit uncleanly (crash, power loss, kill).
     bool autosaveEnabled = true;
     int autosaveIntervalSeconds = 60;
     // juce::Time::getMillisecondCounterHiRes() snapshot of the last attempt.
-    // 0 means "never attempted this session" — first tick defers by the full
+    // 0 means "never attempted this session" - first tick defers by the full
     // interval so we don't autosave within the first second of opening.
     double lastAutosaveAttemptMs = 0.0;
     bool autosaveRecoveryOffered = false; // gate so we only prompt once
@@ -225,11 +249,15 @@ private:
     void enqueueAutosaveJob(AutosaveJob job); // hand off to worker
     void autosaveWorkerMain();                // worker thread entry point
 
+    void quiesceAutosaveWorker();             // block until worker is idle + no pending job
+
     std::thread autosaveWorkerThread;
     std::mutex  autosaveWorkerMutex;
-    std::condition_variable autosaveWorkerCv;
+    std::condition_variable autosaveWorkerCv;     // signals the worker that a job is waiting
+    std::condition_variable autosaveWorkerIdleCv; // signals callers that the worker went idle
     AutosaveJob autosaveWorkerPending;
     bool autosaveWorkerHasJob = false;
+    bool autosaveWorkerBusy = false;          // true while the worker is mid-write (lock released)
     std::atomic<bool> autosaveWorkerStop {false};
 
     // Counts slow ticks since the last Full save of autosave.ssp. When

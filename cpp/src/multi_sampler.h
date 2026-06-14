@@ -24,7 +24,7 @@ namespace SoundShop {
 // Sampler used to do.
 //
 // Playback features:
-//   - Linear-interpolated pitch shift (source rate → triggered pitch)
+//   - Linear-interpolated pitch shift (source rate -> triggered pitch)
 //   - Per-zone loop region (start/end in source samples)
 //   - Polyphonic voice pool with ADSR envelope per voice
 //   - Multi-point volume envelope (if present, replaces ADSR decay)
@@ -50,7 +50,7 @@ struct SamplerEnvelope {
     int   loopEnd   = 0;
 
     // Evaluate at `t` seconds since note-on. `noteHeld` controls whether
-    // sustain/loop clamps are active — once the note is released, the
+    // sustain/loop clamps are active - once the note is released, the
     // envelope runs from its current position to the end without looping.
     float evaluate(float t, bool noteHeld) const;
 
@@ -77,6 +77,13 @@ struct MultiSamplerZone {
     int    lengthSamples  = 0;
 };
 
+// Interpolation quality for sample playback.
+enum class InterpMode {
+    Linear = 0,   // 2-point linear - authentic tracker sound, some aliasing
+    Cubic  = 1,   // 4-point Catmull-Rom - good balance
+    Sinc   = 2,   // 8-point Lanczos-4 - highest quality, least aliasing
+};
+
 struct MultiSamplerDoc {
     std::vector<MultiSamplerZone> zones;
 
@@ -97,7 +104,24 @@ struct MultiSamplerDoc {
     float filterResonance = 0.1f;
     int   filterMode      = 3;
 
-    // NOTE: global Volume and Pan are NOT part of the doc — they live on
+    // Interpolation mode for sample playback.  New instruments default to
+    // Sinc (highest quality); tracker imports default to Linear to match
+    // the authentic tracker sound.
+    InterpMode interpMode = InterpMode::Sinc;
+
+    // Amiga-style output lowpass - emulates the PAULA chip's analog
+    // reconstruction filter that all MOD-era trackers rendered through.
+    // When on, a 4-pole Butterworth LP is applied to the post-mix output
+    // at amigaFilterHz.  Default is off (modern instruments); MOD/S3M
+    // imports turn it on with a ~5.5 kHz cutoff which matches OpenMPT /
+    // Winamp's reference output spectrum (brick-wall rolloff ~5-7 kHz).
+    // Without this filter, sample playback above the source's Nyquist
+    // produces aliased high-frequency content that the reference doesn't
+    // have - the audible "texture" mismatch.
+    bool  amigaFilter   = false;
+    float amigaFilterHz = 5500.0f;
+
+    // NOTE: global Volume and Pan are NOT part of the doc - they live on
     // the node as real Params (node.params) so automation lanes and
     // signal cables can target them. The processor reads them via
     // getParamByName at block time.
@@ -127,7 +151,25 @@ public:
     void  prepareToPlay(double sr, int /*bs*/) override;
     void  releaseResources() override {}
     void  processBlock(juce::AudioBuffer<float>& buf, juce::MidiBuffer& midi) override;
-    double getTailLengthSeconds() const override { return 5.0; }
+    // Tail = how long the sampler can keep producing audio after the last
+    // note-off.  Derived from the doc, not a magic constant:
+    //   - ADSR path: just doc.release.
+    //   - Multi-point volumeEnv: time from sustainEnd to last envelope
+    //     point, plus the release fade - matches the voice-kill condition
+    //     in processBlock (timeHeld >= points.back().time + doc.release).
+    double getTailLengthSeconds() const override {
+        double t = (double) doc.release;
+        if (!doc.volumeEnv.empty() && doc.volumeEnv.hasSustain) {
+            const auto& pts = doc.volumeEnv.points;
+            int se = doc.volumeEnv.sustainEnd;
+            if (se >= 0 && se < (int) pts.size()) {
+                double susEndT = (double) pts[se].time;
+                double lastT   = (double) pts.back().time;
+                t = std::max(t, (lastT - susEndT) + (double) doc.release);
+            }
+        }
+        return t;
+    }
     bool  acceptsMidi() const override { return true; }
     bool  producesMidi() const override { return false; }
     bool  isBusesLayoutSupported(const BusesLayout&) const override { return true; }
@@ -162,6 +204,21 @@ private:
         std::array<float, 2> svfBand{0, 0};
     };
     std::vector<Voice> voices;
+
+    // Amiga reconstruction-filter state.  Two cascaded biquad LP sections
+    // give a 4-pole Butterworth response (~24 dB/oct).  Coefficients are
+    // recomputed in prepareToPlay so we don't allocate per block.  Per
+    // stereo channel × 2 stages × 2 state delays.
+    float amigaB0 = 1, amigaB1 = 0, amigaB2 = 0, amigaA1 = 0, amigaA2 = 0;
+    std::array<std::array<float, 2>, 2> amigaZ1 {}; // [stage][channel]
+    std::array<std::array<float, 2>, 2> amigaZ2 {};
+
+    // Diagnostic counters - rate-limit the silent-MOD-playback debug logs so
+    // the log doesn't flood. See multi_sampler.cpp comments at each use site.
+    bool diagFirstProcess = true;
+    bool diagFirstMidiSeen = false;
+    int  diagNoteOnsLogged = 0;
+    int  diagUnmatchedLogged = 0;
 
     // Re-parse the script and reload WAV files into zones if node.script
     // has changed since the last call. Called at the top of processBlock

@@ -1,0 +1,2107 @@
+# SEANCE Reference
+
+Detailed feature documentation for SEANCE. The README gives the high-level
+tour of what the app does; this file is where the granular behaviour lives —
+exact button labels, edge cases, file locations, dialog semantics, etc.
+
+If you're looking for "what is SEANCE and what can it do", start with the
+README. If you're looking for "exactly what happens when I click X", start
+here.
+
+---
+
+## Table of contents
+
+- [Graph fundamentals](#graph-fundamentals)
+- [Transport bar](#transport-bar)
+- [Computer Keyboard node](#computer-keyboard-node)
+- [MIDI input and routing](#midi-input-and-routing)
+- [Piano roll](#piano-roll)
+- [MPE (per-note expression)](#mpe-per-note-expression)
+- [Microtuning hosted plugins](#microtuning-hosted-plugins)
+- [Layered Waveform editor](#layered-waveform-editor)
+- [Waveform warp (shape-bending)](#waveform-warp-shape-bending)
+- [Frequency-domain (spectral) synth](#frequency-domain-spectral-synth)
+- [Terrain Synth](#terrain-synth)
+- [Effect layers and groups](#effect-layers-and-groups)
+- [Convolution Filter](#convolution-filter)
+- [MIDI Modulator](#midi-modulator)
+- [Trigger Node](#trigger-node)
+- [Script (signal + MIDI)](#script-signal--midi)
+- [Control Bank](#control-bank)
+- [Shared AHDSR envelope](#shared-ahdsr-envelope)
+- [Terrain-synth self-test (`--self-test`)](#terrain-synth-self-test---self-test)
+
+---
+
+## Graph fundamentals
+
+### Audio block format
+
+- **Sample format**: 32-bit float, stereo (2 channels), nominal range `-1.0..+1.0`.
+- **Block size**: defaults to 512 samples (`AudioEngine::blockSize`, `GraphProcessor::blockSize`). The audio device may negotiate a different size at startup — the engine adopts whatever `device->getCurrentBufferSizeSamples()` returns.
+- **Sample rate**: whatever the audio device reports; SEANCE doesn't pick. Most internal time-based parameters (envelope times, crossfades, IR lengths) are stored in seconds and converted per-block.
+
+### Audio device selection & persistence
+
+- **Settings dialog**: **Settings → Audio Device…** opens JUCE's `AudioDeviceSelectorComponent` (driver type, input/output device, sample rate, buffer size, and MIDI input enablement). The microphone-capture dialog reaches the same dialog via its **"Audio device…"** button — both routes call the shared `SoundShop::launchAudioDeviceSettings()` helper (`dialog_helpers.cpp`).
+- **Persistence**: SEANCE remembers your audio device choice across restarts. The full device setup (driver type, device names, sample rate, buffer size, channel selection) is saved to `soundshop_audio_settings.xml` next to the executable, written automatically whenever the device configuration changes (i.e. you pick something in the settings dialog) and on shutdown. On launch the saved XML is handed to `AudioDeviceManager::initialise()`, so your exact last-used device is restored. Implemented in `AudioEngine::saveAudioSettings()` / `changeListenerCallback()` (the engine registers as a `ChangeListener` on the `AudioDeviceManager`) and the restore path in `AudioEngine::init()`.
+- **First-run default = Windows Audio (WASAPI).** When no settings file exists yet (a fresh install), SEANCE explicitly selects the **Windows Audio** (WASAPI shared-mode) driver type before initialising. This is JUCE's out-of-the-box default anyway, but it's set explicitly so the intent is clear and survives any change to JUCE's type ordering. Plain shared-mode WASAPI is the right default on **both** counts:
+  - **Output** — clean and low-latency. Earlier builds forced DirectSound on first run, but its polling-based output path **crackles/glitches under load** — audible "vinyl-dust" clicks that get worse on a busy graph (e.g. a held piano-synth note with its release tail) — and that hit **every** user by default, including the large majority who only play notes, play songs, or capture from a file.
+  - **Input** — a mismatched mic+speakers pair (different physical devices, e.g. a USB-webcam mic and an HDMI output) works on WASAPI *without* DirectSound, because **plain shared mode is the one WASAPI mode JUCE runs with the `AUTOCONVERTPCM | SRC_DEFAULT_QUALITY` stream flags set** (`supportsSampleRateConversion()` in `juce_WASAPI_windows.cpp` returns true only for `WASAPIDeviceMode::shared`, false for exclusive/low-latency). Those flags turn on WASAPI's built-in **per-endpoint** resampler/reformatter, so a mic running at its own native rate and format is converted independently of the output clock. That per-endpoint conversion is exactly what was missing when the old "welded default device" corrupted the captured input into square-wave garbage. To make sure each endpoint gets it, `ensureAudioInputEnabled()` opens the input **and** output as two *explicitly named* shared-mode endpoints rather than leaning on the auto-combined default device.
+  - **Net:** clean output and a working mismatched-device mic on a single driver, no DirectSound tradeoff. DirectSound remains reachable as a **last resort** — via the **"Audio device…"** button — for the rare device whose format even the shared-mode SRC can't reconcile, but it is no longer the default. This is *only* a first-run default; the saved-settings path always takes precedence, so any deliberate driver choice (including DirectSound) sticks on subsequent runs.
+- **Mic-capture troubleshooting note.** The microphone-capture dialog's hint text tells the user that if the input still sounds wrong (garbled, noisy, or like the computer's own audio) on the default Windows Audio driver, they can open **"Audio device…"** and switch the driver type to DirectSound as a last-resort fallback for a device the shared-mode resampler can't reconcile.
+
+### Pin kinds (exact colors)
+
+Four kinds only. RGB values are defined in `node_graph_component.cpp:colourForPinKind`:
+
+| Kind   | Color         | RGB                | Rate                    | Carries                       |
+|--------|---------------|--------------------|-----|-------------------------------|
+| Audio  | Cornflower blue | `(100, 149, 237)` | per-sample audio        | stereo float audio            |
+| MIDI   | Lime green    | `( 85, 205,  85)` | event-driven            | note-on/off, CC, pitch bend, aftertouch, program change |
+| Param  | Orange        | `(255, 140,  40)` | one value per audio block (~700 Hz at 44.1 kHz / 512-sample blocks) | knob-modulation control signal |
+| Signal | Amber         | `(255, 205,  55)` | per-sample              | audio-rate control signal (FM, sample-accurate envelopes) |
+
+Cables inherit the color of the pin they're attached to (drawn by the same `colourForPinKind` lookup), so the wire color identifies the kind end-to-end. Param and Signal are intentionally in the same warm hue family — they're both control signals at different rates — while Audio (cool blue) and MIDI (cool green) sit in distinct hue families.
+
+Connections are kind-checked: an Audio output won't connect to a MIDI input, etc. Adapter nodes (e.g. **MIDI Modulator**, **Trigger**) are how you cross kinds.
+
+### Control signal range (0..1)
+
+Every **control signal** — anything carried on a **Param** or **Signal** pin, or on the control channels (2+) of an audio buffer — is **unipolar `0..1`**. This is uniform across *all* control-signal producers: Signal Shape, Control Bank faders, XY Pad, MIDI Modulator, the Spectrum tap's bin outputs, and Lua / Wasm / Built-in scripts in the Signal role. **`0.5` is the neutral "no change" resting value**, `0` the minimum, `1` the maximum. (This is distinct from **Audio**, channels 0/1, which is legitimately bipolar `−1..1` — the convention only governs control signals.)
+
+- **Why uniform.** A consumer never has to know which node fed it. Previously some sources emitted `−1..1` and some `0..1`, which meant e.g. a Control Bank fader dragged to `0` was misread as "−1 / push the target param to its minimum" instead of "no modulation" — the bug this convention fixes.
+- **How consumers use it.** A node that modulates a parameter applies *bipolar-additive* modulation around the param's current base value: `modulated = base + toBipolar(signal) · depth · (max − min)/2`, where `toBipolar(x) = x·2 − 1`. So `0.5` → unchanged, `1` → `+depth` toward max, `0` → `−depth` toward min. A consumer that genuinely wants the raw `0..1` (e.g. a wavetable position axis) uses the signal directly. The conversions are centralised as `toBipolar()` / `toUnipolar()` in `signal_modulation.h`.
+- **For expression / script authors.** The value you compute *is* the wire value, clamped to `0..1`. Math functions keep their natural range — `sin`/`cos`/`tan` (and `saw`/`square`/`triangle`/`noise`) return `−1..1`, so a bare `sin(...)` **clips its negative half**. Reach for the unipolar aliases `usin`/`ucos`/`utan` (and `usaw`/`usquare`/`utriangle`/`unoise`), or wrap a bipolar sub-expression in `unipolar(...)`; `bipolar(x)` converts the other way. These helpers exist in both the Built-in DSL and the Lua prelude.
+- **Back-compat.** Projects saved before this change still load. Signal Shape *shape layers* pass through the shape pipeline unchanged (they're remapped to `0..1` automatically), so a legacy LFO behaves the same. The only manual exception is a Signal Shape **composition `expr`** someone hand-typed as raw bipolar math (e.g. `expr = sin(x*6.28)`); on the `0..1` wire its negative half now clips — re-wrap it as `usin(...)` / `unipolar(...)`. The default `expr = curve` is unaffected.
+
+### Control inputs on parameters (Set vs Mod)
+
+Any parameter shown in a node's body can be given an **on-demand control input pin** so a Param/Signal cable drives it, without cluttering nodes that don't need it. Right-click the node and the menu offers, per param:
+
+- **Add Absolute Input (Set)…** — adds an input pin named **`Set: <param>`**. The cable's value *is* the parameter value, mapped edge-to-edge across the param's range: `0` → minimum, `1` → maximum (`depth` is unused). The knob is then **locked** — it greys out and can't be dragged, because there's no resting value left for the user to set; the cable owns it. This is how a host normally drives a plugin/VST3 parameter (always an absolute normalized value), and it's the **default** choice (listed first).
+- **Add Modulation Input (Mod)…** — adds an input pin named **`Mod: <param>`**. The cable *modulates* the knob's resting value rather than replacing it: `modulated = base + toBipolar(signal) · depth · (max − min)/2`, so `0.5` (the neutral resting signal) leaves the param unchanged, `1` pushes toward max, `0` toward min. The knob **stays editable** — dragging it sets the **base** (the centre the modulation swings around), and the handle/number on the row track that base value, not the jittering live value. Double-clicking the row resets the base to the range midpoint.
+
+Once a control input exists, the right-click menu also offers, for that pin:
+
+- **Switch to Modulation… / Switch to Absolute…** — flips the existing pin between the two modes, relabelling its `Set:`/`Mod:` prefix and resetting the param to its resting value. Any cable already plugged in stays connected (pins are referenced by id).
+- **Remove Input Cable Pin** — deletes the pin, any cable plugged into it, and the binding, then restores the param to its base value.
+
+These two operations are reachable two ways: from the **param row's** right-click menu (as above), and by **right-clicking the control-input pin directly**. The pin right-click hit-test covers both the **pin circle itself** and the **whole pin row** (its label text):
+
+- **The circle** is matched first via `pinAtPoint` (a generous-radius test against the real pin position) — important because the dot is drawn centred on the node's edge, so its outer half sits *outside* the node's bounding box and a plain bounds-contains test (`nodeAtPoint`) would miss a click there. A control-input pin also takes priority over the **cable plugged into it** (the cable terminates exactly at the pin, so the link hit-test would otherwise always win and there'd be no way to right-click the pin); regular pins still let the cable menu win at the endpoint.
+- **The label row** is matched second, inside the node body. A row can carry an input pin (drawn left) and/or an output pin (drawn right). When the row has **both**, the click is split at the node's horizontal centre. When it has **only one** (e.g. a wavetable's input-only `Mod: Position 1` row), the **entire row width** hits that pin — *not* split at centre. This matters because a long input label like `Mod: Position 1` extends past the node's centre; splitting at centre would make clicks on the right half of the label look for a non-existent output pin and fall through to the node menu.
+
+So you can aim at the dot, the `Mod:`/`Set:` prefix, or the axis name — anywhere on the row — and get the pin menu. Right-clicking a control-input pin opens a focused menu headed by the pin's name with just **Switch to…** and **Remove Input Cable Pin**; right-clicking any *other* (non-control) pin falls back to the node menu so a plain-pin right-click still does something useful. Both surfaces call the same shared `addControlInput` / `removeControlInput` / `switchControlInputMode` helpers, so they stay in sync and each commits one undo snapshot plus a graph rebuild.
+
+**Orphan-binding self-heal.** A control-input pin is recognised by its `Mod:`/`Set:` **name**, not only by the presence of a matching `modPin` entry. Some nodes can carry the pin on their face with no binding behind it — most commonly a wavetable's `Mod: Position X/Y/Z` pins loaded from a project saved before `modPin=` serialisation existed (or whose bindings were otherwise lost). For such a pin the binding also meant the incoming cable wasn't actually modulating anything, since `applySignalModulations` iterates `modPins`. When you right-click an orphan `Mod:`/`Set:` pin, `showPinMenu` **rebuilds the binding from the pin name on the spot**: it resolves which param the pin drives — an exact param-name match first (`Mod: Volume` → param `Volume`), then the wavetable Position quirk where the *pin* is labelled by axis letter (`Position X/Y/Z/W`) but the *params* are numbered (`Position 1…N`), mapping the letter/number to its ordinal among the `Position`-named params. It then creates the `modPin` (mode taken from the `Set:`/`Mod:` prefix), commits an undo snapshot, and requests a graph rebuild so the restored binding immediately drives audio. After this one right-click the pin behaves like any other control input.
+
+**Lock semantics.** Only an *Absolute* ("Set") input locks the knob; a *Modulate* ("Mod") input leaves it draggable (you're editing the base). Locking is per-parameter — a node with one Set-driven param keeps every other param fully editable. The lock is computed by `Graph::paramHasAbsoluteInput`; the looser `paramHasSignalInput` (any connected control pin, either mode) is no longer used for the UI lock.
+
+**Live value display on the slider.** Because the node body repaints at 30 Hz, a modulated param's slider shows what the incoming signal is doing in real time, and the two modes draw it differently because they mean different things:
+
+- **Set (Absolute):** the cable's value *is* the param value, so there's a single number to show. The fill bar and a **dimmed-orange marker** track the live driven value every frame (the knob isn't draggable while Set-locked, so the marker is orange, not the bright-white grabbable handle). Watching the orange marker sweep is the quickest confirmation that a signal is actually reaching the param.
+- **Mod (Modulate):** there are *two* values — the **resting/base** value you set (still draggable) and the **live modulated** value the signal swings it to. The bright-white handle stays at the base value; a separate **cyan marker** (a thin full-height line plus a caret at the bottom edge) shows the live modulated value. Cyan matches the "signal-modulation attached" dot drawn after the param name, so the marker and the dot read as one concept.
+
+**Idle eager pins don't clobber the value.** Some control pins are created *eagerly* even when nothing is plugged in — most notably the wavetable's `Mod: Position …` pins, which always exist so you have somewhere to drop a cable. A `modPin` binding can therefore exist with no cable feeding it. `applySignalModulations` skips any binding whose pin has no incoming cable (tracked by a runtime `ModPin::connected` flag recomputed from `graph.links` on every graph rebuild, the same recompute-on-build discipline as `Node::reachesOutput`). Without this guard the apply step would read the pin's *silent* control channel as a genuine `0.0` modulation and force the bound param to its minimum every block — which is exactly why an unconnected Position axis used to peg to 0 and make its manual slider do nothing. With the guard, an unconnected pin leaves the slider in manual control and a connected one modulates as normal; disconnecting restores the param to its base value.
+
+**Persistence.** Each binding serializes as `modPin=paramIdx,pinId,depth,mode` where `mode` is `0` (Modulate) or `1` (Absolute). The mode field is optional on load — projects saved before Set/Mod existed have no mode field and default to **Modulate**, matching the original always-modulate behaviour.
+
+The wavetable's auto-created `Mod: Position …` pins (see [Position parameters](#position-parameters)) are exactly these on-demand pins, kept in sync with the axis count; they default to Modulate but can be switched to `Set:` per axis.
+
+### Cable interaction (hover, select, gain, delete)
+
+- **Hover highlight** — moving the cursor within ~13 px of a cable lights it up: full opacity, a thicker stroke, brightened colour, and a soft glow halo drawn underneath. The highlighted cable is the exact one a click or right-click will act on, so it doubles as a "this is what you'll hit" preview. The emphasised cables (hovered *and* selected) are repainted **after the nodes**, so the highlight stays visible even where a cable runs underneath or close to a node box (short cables between adjacent nodes used to be fully occluded). The highlight also persists while the right-click cable menu is open, because emphasis is `selected || hovered` and a right-click selects the cable it targets.
+- **Closest-cable targeting** — when several cables overlap (common where an audio cable and a Signal/Param modulation cable run between the same pair of nodes), the hit-test (`linkAtPoint`) picks the cable whose curve passes *closest* to the cursor, not merely the first in draw order. This is what makes an overlapped modulation cable reachable for selecting/right-clicking/deleting. Dangling cables whose endpoint pins no longer exist are skipped (no phantom hot-spot at the canvas origin).
+- **Pin connection targeting** — when you drag a cable, the drop hit-test (`pinAtPoint`) returns the *closest* pin to the cursor and only considers pins on the **opposite side** from where the drag started (dragging from an output looks only for inputs, and vice-versa). This fixes a class of silent connection failures: previously the hit-test returned the first pin in iteration order and always preferred outputs, so dropping onto an input that happened to sit near some output pin (the source node's own output, or an adjacent node's output) resolved to that output and the direction check quietly refused the connection. It was most visible dragging `Signal Out` onto a synth's bottom-left `Aftertouch` input.
+- **Left-click** selects a cable (3 px stroke). **Delete**/**Backspace** removes the selected cable.
+- **Right-click** opens the cable menu, headed by the wire's signal type in plain language so non-musicians can tell what they're acting on: **Audio – the sound itself**, **MIDI – notes & controllers**, **Param – smooth control values**, or **Signal – fast control values**. The Param and Signal headers spell out the *exact* update rate computed from the project's live sample rate and block size — e.g. at 44.1 kHz with a 64-sample block, Param reads `updates 689x/sec, once per 64-sample block` and Signal reads `updates every sample, 44.1k/sec`. When the audio device hasn't started yet (rate unknown) a generic phrasing is used. When the two endpoints differ (an implicit Param↔Signal conversion) the header names both kinds with the rate change, e.g. `Signal → Param (resampled to 689x/sec)`. The values are sourced via the `getAudioFormat` callback wired from `main_window` to the audio engine (`getSampleRate()` / `getBlockSize()`). Below the header: **Delete Connection**; **Gain** submenu (0/−3/−6/−12/−20/+3/+6 dB presets + **Custom…**, range −60..+24 dB); **Effect Group** membership. Cable right-click takes priority over the node under it.
+- **Connection gain** inserts a gain stage on that cable. Because changing a cable's gain doesn't alter node/link counts, the gain handler explicitly requests an audio-graph rebuild so the change is audible immediately (the gain stage is only present in the rebuilt graph when `gainDb != 0`; setting it back to 0 dB removes the stage). Cables attenuated below −10 dB are drawn dimmer as a visual cue.
+
+### Node visual category
+
+Node color in the graph is **inferred from the node's pins** by `getVisualCategory`, not stored per-node-type. Add a new I/O pattern and you may need a new visual category. The categorisations seen by the user (Input / Timeline / Instrument / Effect / Signal shape / Output) are presentation; internally each is a function of pin shape.
+
+### Graph mutation threading
+
+All graph mutations (add/remove node, add/remove link, clip add) must hold `NodeGraph::mutationLock` for the duration of the change so the audio callback never iterates `graph.nodes` or `graph.links` mid-mutation. The audio callback takes a non-blocking try-lock and outputs silence if it can't acquire it; batch entry points hold a `std::lock_guard`. Single-node UI actions (right-click Add/Delete, drag-link, inline rename) are still on the to-do list — see `known-issues.md`.
+
+---
+
+## Transport bar
+
+### Position / song-length display
+
+The green monospaced readout on the transport bar shows the playback position **and** the total song length, each in two forms separated by `   ` (three spaces):
+
+```
+0:00.0/15:30.0   Bar 1:1.0/20
+```
+
+- **Left of each pair — current position:** elapsed wall-clock time as `minutes:seconds.tenths` (starts at `0:00.0`), and musical position as `Bar:Beat` (both 1-based, so a song starts at Bar 1, Beat 1.0).
+- **Right of each `/` — total length:** total time as `minutes:seconds.tenths`, and the total bar count.
+
+The total is computed from `NodeGraph::effectiveSongLengthBeats()`: the explicit length set via the **Song** button if one is set (`songLengthBeats > 0`), otherwise auto-derived from the last clip across all timeline nodes. **When the project has no clips and no explicit length, there is nothing to total, so the `/total` halves are omitted** and the readout falls back to just the current position (`0:00.0   Bar 1:1.0`).
+
+Total time is derived by converting the total beat count through the tempo map, so it respects tempo-map changes (it is not a naive `beats × 60/BPM`). The total bar count is the bar the song's end falls in; when the length lands exactly on a downbeat (beat 1.0) the song fills the *previous* bar, so an 80-beat 4/4 song reads `/20`, not `/21`.
+
+### Lit button states
+
+Two transport buttons light up with a shared blue accent (`RGB(64,132,223)`) to show an active state:
+
+- **Play** is lit blue **while audio is actually playing** and reverts to its normal look the moment playback stops — including programmatic stops, e.g. the song auto-stopping at its end. (It tracks the engine's real playing state, not just the Play/Stop clicks.)
+- **Loop** is lit blue **while looping is enabled** and unlit otherwise. The state follows every way looping can change — the button itself, a project load, undo/redo, the piano-roll loop-region menu, or a tracker import.
+
+The blue is deliberately distinct from the green/red used by the **Metro**, **Mon** (monitor), and computer-keyboard-MIDI toggles. An un-lit transport button uses the default button colour (no hardcoded grey), so it matches every other un-lit button.
+
+---
+
+## Computer Keyboard node
+
+The Computer Keyboard node turns the QWERTY rows into a MIDI controller. SEANCE auto-creates one at the top-left of every new project, pre-wired to the default MIDI Track.
+
+### Key mapping
+
+Implemented in `main_window.cpp:keyToMidiNote()` (around line 5171):
+
+| Keys                | Role                       |
+|---------------------|----------------------------|
+| `A S D F G H J K L` | white keys, starting at C  |
+| `W E   T Y U   O P` | black keys (gaps where there's no black key) |
+| `Z`                 | octave down                |
+| `X`                 | octave up                  |
+
+Octave range is clamped to **0..8**. The displayed octave is the C-row's octave; `A` plays C, `S` plays D, … `K` plays B, `L` plays the next C up.
+
+### Velocity from modifiers
+
+Defined in `main_window.cpp:5222-5224`:
+
+- Plain key — **velocity 90** (medium)
+- `Shift + key` — **velocity 120** (loud)
+- `Alt + key` — **velocity 50** (soft)
+
+These three discrete steps replace continuous velocity sensitivity; for real velocity expression, plug a hardware controller into a MIDI Input node.
+
+### Toggle and focus
+
+The **Keyboard MIDI** toggle in the main toolbar enables/disables keyboard input globally. The main window must also have keyboard focus — clicking the graph area is enough. When the toggle is off, A–Z are free for other shortcuts.
+
+---
+
+## MIDI input and routing
+
+Every input device — computer keyboard, hardware MIDI keyboards, drum pads, network/virtual MIDI clients — is a **node in the graph**. There is no separate "MIDI routing matrix"; the cable is the routing.
+
+### Hardware MIDI
+
+- On a fresh project, SEANCE pops a wizard that lists every MIDI input device currently detected. Checking devices and clicking *Add Selected* creates a MIDI Input node per device.
+- Re-open the wizard any time via **Options → Add MIDI Input Device…** — useful after plugging in a new device or after deleting an input node.
+- **Hotplug**: connecting a new MIDI device while SEANCE is running pops a small dialog asking *Add* or *Ignore*. Ignored devices stay ignored until next restart or until you re-open the wizard.
+
+### MIDI Track input
+
+Every MIDI Timeline node has a MIDI In pin on its left side. Wire an input node's MIDI Out to it and live events are merged with the track's clip playback into a single MIDI Out. To audition without recording, wire the input node directly to a synth.
+
+### MIDI Learn (CC mapping)
+
+Right-click any knob/slider → **MIDI Learn** → move the controller's knob → mapping captured. Stored per-project in `project_file.cpp` so mappings persist across save/load.
+
+**Filtering rule**: a CC that has been learned to a control is **removed from the cable stream** so it only affects the mapped control. Notes, pitch bend, aftertouch, and unmapped CCs pass through cables normally. The MIDI Modulator's outgoing CCs are *not* subject to this filter — see the [MIDI Modulator](#midi-modulator) section.
+
+### Built-in controller responses
+
+Every tonal synth is its own standalone `juce::AudioProcessor` (constructed by node type in `graph_processor.cpp:533-558`) — there is **no** single shared synth backend. Controller handling therefore lives in two places, and the coverage differs by synth:
+
+- **`TerrainSynth`** (`terrain_synth.cpp`) implements the full controller set — pitch bend, mod-wheel vibrato, sustain pedal, channel + poly aftertouch — with per-MIDI-channel state arrays (`pitchBendFactor[16]`, `modWheel[16]`, `sustainPedal[16]`, `channelAftertouch[16]`). The **Piano, Waveform, and Sampler** node types are TerrainSynth configurations, so they inherit all of it. **Drum Machine** uses its own `DrumSynthProcessor` with an analogous (freeze-the-decay) sustain path.
+- The **standalone synths** — Wavetable (`BuiltinSynthProcessor`), FM, Phase Distortion, Additive, Spectral Grain, Particle Cloud — handle the *per-note expression* subset (note on/off, pitch bend, channel pressure, polyphonic key pressure, CC#74 timbre) via the shared `distributeMpeMessages()` helper in `signal_modulation.h`. They do **not** implement mod-wheel vibrato or the sustain pedal; "Sustain" on these synths is the ADSR sustain *level*, not the CC#64 pedal.
+
+The rows below describe each controller's behavior; the "Implemented by" notes call out which path applies.
+
+| Control                 | Behavior                                                                      |
+|-------------------------|-------------------------------------------------------------------------------|
+| **Pitch bend**          | **±2 semitones** for a normal pitch wheel (channel-1 / non-MPE, and the MPE *master* channel), applied smoothly to all sustained voices. On an MPE *member* channel (2–16) the bend is per-note and uses the wide MPE range (default 48 semitones). Both `TerrainSynth` (`kPitchBendRangeSemis = 2.0f`) and the standalone synths via `distributeMpeMessages()` honor this split, so a regular pitch wheel never slams ±48 semitones. |
+| **Mod wheel (CC#1)**    | Drives a default 6 Hz vibrato; depth scales with wheel position. Set the synth's *Vibrato* param to 0 to free CC#1 for MIDI Learn elsewhere. **Implemented only in `TerrainSynth`** (`modWheel[16]`) — the standalone synths (Wavetable, FM, Phase Distortion, Additive, Spectral Grain, Particle Cloud) ignore CC#1. |
+| **Sustain pedal (CC#64)** | Holds notes through their release stage until pedal-up. Implemented by `TerrainSynth::sustainPedal[16]` (per-MIDI-channel state) in `terrain_synth.cpp:1519, 1571`. Drum Machine implements an analogous `DrumSynthProcessor::sustainPedal[16]` that *freezes the decay envelope* on held voices (drums have no note-off release stage to defer), so the drum rings at its current amplitude until pedal-up. **The standalone synths (Wavetable, FM, Phase Distortion, Additive, Spectral Grain, Particle Cloud) do not implement CC#64.** |
+| **Channel pressure / aftertouch** | Multiplies per-voice volume by the aftertouch sensitivity (default 0.5, saved per node). Also exposed as a **Param** (block-rate, orange) input pin — wire any Param or Signal source into the synth's Aftertouch pin to drive the same swell. It's a Param rather than a Signal pin because the synth consumes it as the **block mean** (averaged across the whole block) so a slow LFO drives a smooth swell instead of bleeding its audio shape into the amplitude. The pin is system-managed: it's auto-created on tonal/note-triggered synths and any project that saved it as the old amber Signal pin is silently normalized to Param on load (safe because the type was never the user's choice). |
+| **Polyphonic key pressure** | Per-*note* aftertouch (each held key can be pushed independently). Routed to the matching voice by note number, then **added** to channel pressure and clamped to 0..1 before the sensitivity multiply (`effectivePressure()` in `signal_modulation.h`). This is the one MIDI dimension that *cannot* ride a mono Signal cable — a single signal value can't say which note it belongs to — so it's consumed inside the synth voice allocator keyed by note number, never as a cable. Implemented via the shared `distributeMpeMessages()` helper across the standalone synths (Wavetable, FM, Phase Distortion, Additive, Spectral Grain); `TerrainSynth` handles it with its own equivalent inline path. |
+| **Velocity**            | Scaled by the per-synth *Vel Sens* param (0..1). 0 ignores velocity, 1 maps full range. |
+
+Drum Machine uses the separate `DrumSynthProcessor`, which also handles CC#64 — but with the freeze-the-decay semantics described above, since drum voices have no note-off-driven release stage to defer.
+
+---
+
+## MPE (per-note expression)
+
+MPE (MIDI Polyphonic Expression) is the convention that lets *each held note*
+carry its own continuous pitch bend, pressure, and timbre — so you can bend one
+note of a chord while the others stay put. Standard MIDI can't do this because
+those messages are per-channel, and a single channel holds the whole chord. MPE
+solves it by spreading notes across **member channels 2–16** (one note per
+channel) with **channel 1 as the master**, so each note's expression rides its
+own channel.
+
+SEANCE handles MPE at three points: the timeline *emits* it, hardware
+controllers are *recorded* into it, and it's *consumed* by both the built-in
+synths and (via a handshake) hosted plugins.
+
+### Timeline MPE output
+
+Right-click a **MIDI Timeline** or **Audio Timeline** node → **Enable MPE**
+(context-menu item; toggles `node.mpeEnabled`, saved per node). With MPE on, the
+`MidiTimelineProcessor` (`graph_processor.cpp`):
+
+- Allocates each played note to a free **member channel 2–16** round-robin
+  (`allocMpeChannel`, 15 channels = `kMpeChannels`; steals the oldest when all
+  are busy), instead of sending everything on channel 1.
+- Emits the note's stored **per-note expression curves** (`NoteExpression`:
+  `pitchBend`, `slide`→CC#74, `pressure`→channel pressure) on that note's
+  channel — an initial value just before note-on, then updates every ~32 samples
+  while the note is held (`emitExpression`).
+- Per-note pitch-bend range is `node.mpePitchBendRange` (default **48**
+  semitones), so the recorded normalized bend maps to a wide expressive range.
+
+With MPE off, every note goes out on channel 1 and the expression curves are not
+emitted (a non-MPE synth would smear one note's bend across the whole chord).
+
+### Recording MPE from a hardware controller
+
+`AudioEngine::handleIncomingMidiMessage` (`audio_engine.cpp:776`) watches
+channels 2–16 when `mpeRecordTargetNodeId` is armed. A note-on opens an
+`MpeRecordNote`; subsequent pitch-wheel / CC#74 / channel-pressure messages on
+that channel append timestamped `ExpressionPoint`s; note-off finalizes the note
+into the target clip's `notes` with its `expression` curves filled in. So
+playing an MPE controller (ROLI Seaboard, LinnStrument, etc.) into an armed
+track captures the per-note gestures, which then play back through the timeline
+MPE output above.
+
+### Plugin MPE handshake
+
+Built-in synths read MPE channels natively, but a **hosted VST3/AU plugin** must
+first be told to interpret channels 2–16 as an MPE zone. That's done with the
+**MPE Configuration Message (MCM)** — an RPN handshake (CC 6/38/100/101) defined
+by the MPE spec.
+
+Right-click a hosted-plugin node that has a MIDI input pin → **Enable MPE mode
+(only if plugin is in MPE mode)** (context-menu item id 181; gated on
+`node.plugin` + a `PinKind::Midi` input; toggles `node.mpeEnabled`, commits an
+undo snapshot, and rebuilds the graph). This flag is a **user assertion that the
+plugin itself is running in MPE mode** — MPE capability can't be detected
+reliably, so SEANCE can't infer it. The label spells out the caveat inline
+because JUCE `PopupMenu` items can't show hover tooltips. On rebuild,
+`GraphProcessor::rebuildGraph` wires a small parallel MIDI generator —
+`MpeConfigProcessor` (`graph_processor.h`) — into the plugin's MIDI input
+(`nodeInputMap[node.id]`). That generator emits
+`juce::MPEMessages::setLowerZone(15, mpePitchBendRange, 2)` (15 member channels,
+per-note bend range from the node, master bend range 2).
+
+Design notes:
+
+- **Why a parallel generator rather than transforming the note stream:** it only
+  *adds* the RPN and never touches notes, so the handshake itself is byte-for-
+  byte safe; the actual note spreading is done separately by the cable-level
+  tuning adapter (see [Microtuning hosted plugins](#microtuning-hosted-plugins)).
+- **Why injected at the plugin's graph input** rather than on a cable: it
+  bypasses the cable-level MIDI-Learn CC filter that could otherwise strip the
+  RPN's CC 6/38/100/101 bytes.
+- **Re-emit lifecycle:** emits for the first `kEmitBlocks` (4) blocks after
+  construction (covers plugin load, graph rebuild, and the MPE toggle — all of
+  which recreate the node) and re-arms on every transport play-start edge (covers
+  plugins that reset their zone layout when playback stops).
+- **Source-agnostic:** because the handshake rides the plugin's input, it works
+  whether notes come from an MPE-enabled timeline, a hardware MPE controller, or
+  a plain single-channel source (the cable adapter spreads the latter onto member
+  channels automatically — an MPE *source* is not required).
+
+**Why the toggle warns.** Turning MPE mode on for a plugin that is **not**
+actually in MPE mode is harmful: the cable adapter scatters one voice's notes
+across channels 2–16, which a non-MPE plugin treats as independent monophonic
+channels — so it typically misbehaves (wrong voicing, dropped polyphony) or goes
+silent. That's the opposite failure of leaving it off, so the toggle is opt-in
+and the label says **only if plugin is in MPE mode**. Rule of thumb: match this
+flag to the plugin's own MPE setting.
+
+**Authoring a plugin that responds to this.** There is *nothing SEANCE-specific*
+to implement. SEANCE hosts standard VST3/AU; the MCM it emits is the regular
+MIDI-MPE 1.0 handshake (the RPN 0x0006 zone-layout message), identical to what
+Bitwig, Logic, Cubase, GarageBand, etc. send. A plugin "supports MPE in SEANCE"
+purely by supporting standard MPE — i.e. honoring the lower-zone RPN and reading
+per-note channels 2–16. The toggle lives on the *host* side and decides only
+whether SEANCE sends that standard handshake; it is not a proprietary protocol a
+plugin must opt into. (This is why there's no SEANCE plugin-authoring guide —
+making a plugin for SEANCE is just making a normal VST3/AU plugin.)
+
+Both toggles persist via `project_file.cpp` (`mpeEnabled`,
+`mpePitchBendRange`), so saved projects reload with MPE state intact.
+
+## Microtuning hosted plugins
+
+The project-global **tuning system** (Equal Temperament / Pythagorean / Just
+Intonation / Quarter-Comma Meantone) and **concert pitch** (A4 = 440 Hz by
+default), set in *Settings → Tuning System / Concert Pitch*, change the actual
+Hz of every note. Built-in synths read this directly via `Transport::noteToFreq`.
+A **hosted VST3/AU plugin**, though, renders the raw MIDI note number at standard
+12-TET / A440 and has no idea about the project tuning — so SEANCE has to bend it
+into tune from the outside, with pitch bend.
+
+**Where the bend is applied: the cable.** A MIDI track and the instrument it
+drives are *separate nodes joined by a MIDI cable*. The cable is the only place
+that knows **both** the global tuning **and** whether the destination is a native
+synth (tunes itself) or a hosted plugin (must be bent). So a cable-level
+processor, `MidiTuningAdapterProcessor` (`graph_processor.{h,cpp}`), is spliced
+onto every MIDI cable whose destination has a loaded `node.plugin`, as the last
+hop before the plugin. Native-synth cables and non-MIDI cables never get one. At
+**default tuning (12-TET / A440)** the adapter is a pure pass-through, so it costs
+nothing until you actually pick a non-standard tuning.
+
+The split between the two tuning components decides *how* it bends:
+
+- **Concert-pitch component** — `1200·log2(concertPitch/440)`, the *same* for
+  every note. Representable on a single shared channel.
+- **Temperament component** — `tuningCentsOffset[note%12]`, *differs per pitch
+  class* (zero for Equal Temperament). Needs a separate channel per note, i.e.
+  MPE.
+
+The adapter therefore has two modes, chosen per-destination from the plugin's
+**MPE mode** toggle (see [Plugin MPE handshake](#plugin-mpe-handshake)):
+
+- **Plugin in MPE mode** — each incoming note is given its own member channel
+  (2–16, allocated round-robin, spreading a single-channel source on the fly) and
+  receives the **full** per-note tuning bend (concert + temperament), summed with
+  any expression pitch-bend already on the note. This is the only mode that can
+  deliver unequal temperaments correctly. The member-channel bend range is
+  `node.mpePitchBendRange` (default **±48 semitones** — symmetric, fixed, not
+  user-exposed; tuning only needs ≤½ semitone since we bend from the nearest
+  note, and ±48 is the MPE-spec headroom that also leaves room for expression).
+- **Plugin not in MPE mode** — everything collapses to channel 1 with only the
+  **uniform concert-pitch bend** (temperament can't be delivered per-note on one
+  shared channel). The adapter sends an RPN pinning channel 1's bend range to ±2
+  semitones so the sub-semitone concert bend lands correctly; a plugin that
+  ignores the RPN and keeps its own fixed range is the "may not honor tuning"
+  case the menu warns about. Any user pitch bend on the stream is summed in.
+
+**The Tuning System menu warns** when an unequal temperament is selected (a
+disabled multi-line note at the bottom of the submenu): the temperament only
+reaches a hosted plugin in MPE mode, plugins with a fixed bend range may still be
+off, and built-in synths are always correct.
+
+**Bend-only, deliberately no MTS-ESP.** SEANCE does *not* use MTS-ESP (the
+MIDI Tuning Standard sysex-server protocol) as a fallback. MTS is process-global,
+so it would double-tune any plugin that is both MPE- and MTS-capable, and it
+can't be set per-plugin. Pitch bend is per-cable and composes cleanly with
+expression, so it's the only mechanism used.
+
+**Overflow is not specially handled.** If expression bend + tuning bend exceeded
+the member range the adapter would just clamp, but at ±48 semitones (four
+octaves of headroom over a ≤½-semitone tuning bend) this is a non-issue in
+practice. Note-renumbering was rejected because it breaks sample-based
+instruments' key-zones and per-key timbre.
+
+### Editing recorded MPE in the piano roll
+
+When a timeline has MPE enabled, the piano roll exposes an **expression lane**
+below the grid for viewing and editing the per-note curves after the fact.
+
+- **MPE Lane dropdown** (toolbar, second row; visible only when
+  `node.mpeEnabled`): pick **Pitch Bend**, **Slide (timbre)**, or **Pressure**
+  to show that curve for the selected notes in the bottom lane. "MPE Lane: off"
+  hides it. It is mutually exclusive with the **Automate Param** dropdown next to
+  it — choosing an MPE lane clears the automation selection and vice-versa.
+- **In the lane:** click empty space to add a breakpoint, drag a point to move
+  it, right-click a point to delete it. Each gesture (add / drag-release /
+  delete) commits a `commitSnapshot` undo step ("Edit MPE expression", "Delete
+  MPE expression point"), so every edit is independently undoable and is
+  serialized into the project.
+- **Note tint:** with MPE on, each note body is tinted from its clip color toward
+  hot orange in proportion to its recorded **mean pressure**, so heavily-pressed
+  notes read at a glance without opening the lane.
+
+The note right-click menu gains an **MPE Expression** submenu (only when
+`node.mpeEnabled` and notes are selected):
+
+- **Smooth / Thin Curves** — runs a Ramer–Douglas–Peucker simplification
+  (`simplifyExprCurve`, tolerance 0.02 in normalized value units) over all three
+  curves of every selected note, collapsing the dense stream captured from a
+  controller into a handful of editable control points while preserving shape.
+  Commits "Smooth MPE expression".
+- **Clear Expression** — drops all pitch-bend / slide / pressure points on the
+  selected notes ("Clear MPE expression").
+- **Bake Pressure to Automation →** *(param list)* — copies each selected note's
+  pressure points onto the chosen parameter's automation lane, mapping the
+  normalized 0..1 pressure to the param's `[minVal, maxVal]` range at absolute
+  beat positions, then sorts the lane and opens it ("Bake pressure to
+  automation"). Useful for driving, say, a filter cutoff from how hard you
+  pressed each note.
+
+---
+
+## Piano roll
+
+Opens by double-clicking a MIDI Track node; the editor docks at the bottom of the window.
+
+### Snap
+
+The toolbar offers four snap divisions:
+
+- **1/4** — quarter-beat granularity (the fine setting)
+- **1/2** — half-beat
+- **1** — whole-beat
+- **Off** — no snap
+
+`Alt` held during a drag temporarily disables snapping regardless of mode. The **Snap to Scale** button further restricts dragged-note pitches to the chosen Key/Scale.
+
+### Key/Scale/Mode/Root
+
+Four dropdowns set the musical context. They determine which rows the piano roll background highlights as in-scale, what Snap-to-Scale snaps to, and the reference scale for degree analysis. There are **two regimes**, and the dropdowns reflect which one is active:
+
+- **Root** (C, C#, …) — the tonic, the "home" pitch. Always relevant, and the one axis that's independent of everything else.
+- **Key + Mode regime** (the default). **Key** picks a *parent scale* (Major, Natural/Harmonic/Melodic Minor, and other 7-note parents) — the set of seven notes to use. **Mode** picks which of those seven notes becomes "home" by *rotating* the parent: Mode 1 **Ionian (Major)** is the Key itself, Dorian starts on the 2nd degree, Phrygian on the 3rd, and so on through Locrian. Key and Mode work **together** — the highlighted scale is the parent rotated to the chosen mode, anchored at Root. This is why e.g. Root A + Key Major + Mode Dorian gives A Dorian, and why a non-major parent like Harmonic Minor + Mode 5 produces Phrygian Dominant. (Mechanically, the interval set is `MusicTheory::activeIntervals()` = `rotateScale(keys()[Key], modeIndex(Mode))`.)
+- **Scale regime**. **Scale** is a list of fixed, non-diatonic note sets — Pentatonic, Blues, Whole-Tone, Augmented, the octatonics, exotic scales, plus named modes of non-major parents (Phrygian Dominant, Acoustic, …), and **Chromatic** (which, covering all 12 notes, turns scale highlighting off). Picking a Scale **overrides** Key + Mode: the two dropdowns grey out (their tooltip explains why), and the highlight comes straight from the chosen set anchored at Root. Pick a Key or Mode again to return to the Key+Mode regime.
+
+> **Why Key and Mode are split this way.** A *mode* is already a complete interval pattern over a root, so "Key" here is **not** a note letter (that's Root) and **not** redundant with Mode — it's the *parent scale* that Mode rotates. The label **Ionian (Major)** makes the identity explicit: the 1st mode of the major scale *is* the major scale. Note that a *scale* (an interval set, what these dropdowns choose) is distinct from a *tuning system* (the cents/frequencies each pitch maps to, set project-wide; see the Tuning section) — "Pythagorean" is a tuning, not a scale, which is why it is deliberately absent from the Scale list.
+
+**Detect Key** runs an analyzer over the existing notes and snaps the dropdowns to the most likely match: a "key" match sets Key with Mode reset to Ionian; a "mode" match sets Mode with Major as the parent; a "scale" match switches to the Scale regime.
+
+### Selecting, copying & pasting notes
+
+- **Marquee select** — drag a selection rectangle over empty grid space to highlight every note it touches. Highlighting updates **live** as you drag: notes light up the moment the rectangle sweeps over them and un-highlight if they fall back out, so you can see exactly what you're about to select before releasing. Hold `Shift` while dragging to add the marquee'd notes to the existing selection rather than replacing it. The drag origin (beat + pitch under the cursor where the marquee began) is also remembered as the *paste anchor*.
+- **Select All** — `Ctrl+A` (or the toolbar button) selects every note in the clip.
+- **Copy** — `Ctrl+C` or right-click → *Copy*. Copies the selection to a clipboard shared across all piano-roll instances.
+- **Cut** — `Ctrl+X` or right-click → *Cut*. Copies then deletes the selection (the delete is undoable).
+- **Paste** — re-anchors the whole copied block by its **top-left corner** (earliest beat, highest pitch): that corner lands at the paste target and every other note keeps its relative position. The paste target depends on how you paste:
+  - **`Ctrl+V`** pastes at the **grid cell under the mouse cursor**. While the clipboard is non-empty, a translucent aqua **ghost preview** of the block follows the cursor over the grid, showing exactly where the notes will land before you commit — so you just move the mouse to the spot and press `Ctrl+V`. (This replaces relying on the marquee rectangle, which disappears on mouse-release and so can't serve as a persistent target.)
+  - **Right-click → *Paste*** pastes at the point where the context menu was opened.
+  - In both cases the paste start beat is snapped to the current Snap division, the notes land in the clip covering the target (or the first clip if none does), the clip auto-extends to fit, and the pasted notes become the new selection. If the project carries an explicit song-length override (see **Grid regions and song length** below) and the pasted notes land past it, the override grows to cover them (part of the same `Paste N notes` undo step). This extends the *song-length* boundary only — if a transport A-B loop is active, that still bounds playback until it's disabled or its end is dragged out.
+
+Clipboard notes are stored corner-relative — each note records its beat offset from the earliest copied note and its semitones below the highest copied note — so paste is position-independent in both axes. Both copy and paste are single undo steps (`Paste N notes`). The clipboard is `static`, shared across every open piano-roll instance, so you can copy from one MIDI Timeline and paste into another.
+
+### MIDI note degree fields
+
+Every `MidiNote` stores, alongside the raw pitch:
+
+- **Scale degree** (1st..7th)
+- **Octave**
+- **Chromatic offset** (semitones from the nearest scale degree — non-zero for accidentals)
+
+This enables the *Change Key* workflow: Analyze in the original key → change the Key/Scale dropdowns → click *Change Key* and pitches are recomputed from degrees in the new context, preserving melodic shape (C Major → D Minor keeps the contour, just transposed and re-coloured).
+
+Notes display their degree in the piano roll (e.g. `C4 (1)`, `E4 (3)`). Out-of-scale notes display sharps/flats relative to the nearest degree.
+
+### Lanes (bottom strip)
+
+One lane is shown at a time, selected from the lane buttons. Available lane types:
+
+- **Off** — hidden; maximizes note grid space.
+- **Velocity** — one vertical bar per note, bar height encodes 0..127; drag up/down to edit.
+- **Pitch Bend** — per-clip pitch-bend automation curve.
+- **Slide** — per-note legato/portamento control.
+- **Pressure** — per-clip channel pressure curve.
+- **Automate Param** — pick any parameter on the parent synth from a dropdown; the lane becomes an automation curve for that param. Click to add control points, drag to shape. Interpolation is **Catmull-Rom** between points.
+
+The automation curve is read by the synth during playback whenever the clip is playing; outside the clip the param falls back to its slider value (or to any incoming Param/Signal cable).
+
+### Toolbar transformations
+
+Operate on the selection if there is one, otherwise the whole clip:
+
+- **+Octave / -Octave** — ±12 semitones
+- **+Semitone / -Semitone** — ±1 semitone
+- **Nudge Left / Nudge Right** — ±1 snap unit in time
+- **x2 Duration / /2 Duration** — double/halve note lengths
+- **Reverse** — flip the time order of selected notes
+- **Detune** — slider in cents (1/100 of a semitone) for fine pitch offsets
+
+All of these go through `execNoteEdit` / `applyToSelUndo` (the `LambdaCommand` fast path — see CLAUDE.md).
+
+### Compact mode
+
+The `--` button at the top-left collapses most of the toolbar to free vertical space; `++` brings it back.
+
+### Mouse / keyboard
+
+- Wheel — scroll pitch axis
+- Shift+wheel — scroll time axis
+- Ctrl+wheel — zoom horizontally toward cursor
+- Bottom horizontal zoom slider — precise zoom value
+
+### Grid regions and song length
+
+The note grid can show **up to three** brightness levels. They are three *independent* overlays that happen to stack, not three degrees of one "activation" setting — which is why they can line up or diverge:
+
+1. **Plain grid (darkest)** — empty space with no clip over it.
+2. **Clip tint (middle)** — every clip fills its span with a faint wash of the clip's colour (≈6% alpha; drawn in `piano_roll_component.cpp` "Clip boundaries"). This is where notes live; the band marks the extent of actual content. Placing or pasting notes past the current clip end auto-extends the clip, so this band grows to follow your notes.
+3. **Loop region (brightest)** — when the transport A-B loop is enabled (`transport->loopEnabled`, `loopStartBeat`..`loopEndBeat`), that span is overlaid with a translucent blue wash (`RGB(60,60,150)` @ 15% alpha) plus brighter blue edge lines. Because it paints *on top of* the clip tint, the looped portion of a clip reads as "extra highlighted." This overlay is the **loop region**, not the song length.
+
+**Which one actually bounds playback?** Two separate mechanisms, and the loop wins:
+
+- **Transport A-B loop** (overlay 3). If `loopEnabled` and `loopEndBeat > loopStartBeat`, playback wraps from `loopEndBeat` back to `loopStartBeat` every pass and `applySongRepeat` is skipped for that block (`audio_engine.cpp` — "the user-region loop above takes precedence"). So whenever the blue overlay is present, **that** is the boundary the playhead obeys; any content past `loopEndBeat` (middle-tint clip with no blue over it) never plays until the loop is turned off or its end dragged out. The loop is a deliberate user-controlled cycler, so content-extending edits **do not** move it.
+- **Song length** (no overlay of its own — marked only by the orange **END** bar). Used only when no transport loop is active. Governed by `NodeGraph::effectiveSongLengthBeats()`: an explicit override (`songLengthBeats > 0`, via the **Song** button or a tracker/MOD import) else auto-derived from the last clip across all timeline nodes. In **auto** mode it tracks the clips; in **override** mode it's independent and can sit short of the content (deliberate early stop / trailing silence).
+
+A **MOD/tracker import** sets one of these depending on the module's loop target (`mod_import.cpp`): a whole-song self-repeat (`target == 0`) becomes `songRepeatMode = Forever` + a song-length override with **no** transport loop (so only two levels appear); an "intro then loop a later section" (`target > 0`) becomes a **transport A-B loop** from the section start to the song end (so all three levels appear, and the blue region is what repeats). This is the usual reason an imported project shows the third, brightest level and won't play past it.
+
+To keep the *song-length* boundary honest, every content-extending edit — note placement, paste-at-cursor, clip paste, right-click *Add Note*, and dragging the **END** bar right — calls `NodeGraph::growSongLengthToContent()`, a no-op in auto mode that in override mode pushes the override out to cover any content now extending past it (grow-only, so deliberate early-stop/trailing-silence setups survive). **Note this only affects the song-length boundary, not the transport loop** — if a blue loop overlay is bounding playback, pasting past it still won't be heard until the loop is disabled or extended. (Known gap: dragging the **END** bar *left* in override mode shortens the clip but leaves the longer override in place; the orange END bar is drawn from clip extents, so in override mode the bar and the true playback end can diverge.)
+
+#### Defining and editing the loop region from the grid
+
+The transport A-B loop can be created, adjusted, and removed entirely from the piano-roll grid (it's the same `transport->loopStartBeat`/`loopEndBeat` the transport toolbar's **Loop** button drives — they stay in sync).
+
+- **Visual** — the loop span is drawn as a thin non-occluding frame (top/bottom hairlines plus a 2px vertical handle line with inward ticks at each edge, labelled **LOOP**), *not* a filled wash, so notes inside the loop stay fully visible.
+- **Right-click → Loop Region** submenu collects every loop action:
+  - **Loop Selected Notes** — sets the loop to span the beat extent of the current note selection (start of the earliest selected note to end of the latest). Disabled when nothing is selected.
+  - **Loop Clip Under Cursor** — sets the loop to the clip the right-click landed in. Disabled when the cursor isn't over a clip.
+  - **Loop Whole Song** — sets the loop to the full project length (beat 0 to the last clip end), mirroring the transport **Loop** button.
+  - **Set Loop Start Here** / **Set Loop End Here** — place one edge at the clicked beat (the other edge is nudged to keep start < end if needed).
+  - **Clear Loop Region** — disables the loop. Disabled when no loop is active.
+- **Right-click inside an active loop** also surfaces a top-level **Disable Loop Region** item (above the submenus) for one-click removal without hunting through the submenu.
+- **Drag the loop edges** — hovering either edge line shows a left-right resize cursor; dragging moves that edge (snapped to the grid; a minimum gap is enforced so the loop can't invert). Released as a single `commitSnapshot("Move loop edge")` undo step.
+
+All loop edits commit an undo snapshot, so any of them is a single Ctrl+Z.
+
+### Song-end resize handle
+
+A draggable orange **END** bar is drawn at the end of the timeline's content — at the right edge of the rightmost clip. It spans the full height of the note grid with a small labelled tab at the top.
+
+- **Drag it left** to shorten the song. On release, any notes that now start past the new end are deleted, and notes that merely overhang the end are trimmed to fit (down to a minimum length).
+- **Drag it right** to lengthen the song, adding empty beats.
+- The drag snaps to the current Snap division; hold `Alt` to drop it at an arbitrary beat. The clip can't be dragged shorter than one snap unit (or a quarter-beat, whichever is larger).
+
+Internally the handle adjusts the rightmost clip's `lengthBeats`; because `getTimelineBeats()` derives song length from the clips, shrinking the clip shortens the whole song. The gesture captures the horizontal beat↔pixel mapping at drag start so live resizing stays smooth even as the derived timeline length changes underneath the drag. The resize is a single `commitSnapshot("Resize song end")` undo step.
+
+---
+
+## Layered Waveform editor
+
+The editor for the Waveform synth. Builds single-cycle waveforms as a sum of layered shapes, optionally stacks cycles into a multi-frame wavetable, and supports N-dimensional grids (Grid mode) or scattered free positioning (Scatter mode).
+
+### Library and Cells panels (pop-out window)
+
+The pop-out wavetable window has two list panels on its sidebar that separate *waveform existence* from *waveform placement*:
+
+- **Library** — every waveform that exists in this wavetable, whether or not it's placed in the arrangement view. This is where waveforms are created, edited, coloured, and deleted. `+ Waveform` adds a new library entry (Layered / Frequency-domain / Wavelet / capture-from-audio, plus *Duplicate current* when a waveform is selected). The newly-added entry is highlighted and, if the list scrolls, the viewport scrolls to the bottom so the new row is visible. Clicking a row makes that entry the **editor target** (`currentLibraryId`, amber highlight) — edits flow into every cell that references it — and repoints the cell/dot selection at the entry's first placement so the position section describes the right waveform.
+- **Cells / Waveforms** — the occupied placements in the arrangement view. The panel is titled **Cells** in Grid mode (one row per cell, including empty cells) and **Waveforms** in Scatter mode (one row per dot). In **Grid** mode each row shows the cell's **coordinate followed by the name of the waveform it holds** — e.g. `(0,0,0)  Bass` — or `- empty -` for an unoccupied cell; the name is resolved through the cell's `waveformId` the same way Scatter does, falling back to `Waveform N` only when the entry is unnamed or orphaned. In **Scatter** mode each row is labelled with the **library name of the waveform that dot holds** (resolved through the dot's `waveformId`), falling back to `Waveform N` only when the entry is unnamed or orphaned — so converting a named grid to Scatter keeps the real names instead of showing generic `Waveform 1…N`. Clicking a row selects that cell/dot (blue highlight); the `X` clears it (the library entry survives).
+
+**Library row interactions:**
+
+- **Click** — set as editor target.
+- **Drag onto the arrangement view** — place that waveform at the cursor (Grid: into a cell; Scatter: as a new dot).
+- **Right-click** — context menu: **Add to grid** (place into the arrangement — first empty Grid cell, growing the first axis by one if every cell is full and the axis is under 64; or a centre-of-cube Scatter dot), **Rename…** (see [Renaming a waveform](#renaming-a-waveform)), **Duplicate** (clone the waveform into a new *library-only* entry, no placement — the arrangement view's dot right-click *Duplicate waveform* behaves identically; all creation paths are library-only), **Delete**.
+- **Del / Backspace** (with the pop-out focused) — **routed by the surface you last selected on**, because clicking a populated cell/dot updates both the editor target and the cell selection, so the key alone can't tell which you mean. If your last selection was a **Library** row, Delete removes that **waveform definition** and every placement of it (same as the row's `X`). If your last selection was a **cell/dot in the arrangement view or a Cells/Waveforms-list row**, Delete removes only **that placement** (clears the Grid cell / erases the Scatter dot) and the library waveform survives — identical to the placement's `X` and to shift-clicking a dot. Deleting a placement when the selected Grid cell is already empty is a no-op. *(This split fixes the old behaviour where selecting a dot in the view and pressing Delete silently deleted the underlying library waveform.)*
+- **X button** — remove the entry from the library; every cell/dot that referenced it becomes empty. The editor target falls back to the first surviving entry, or none if the library is now empty.
+
+**"Selected waveform position" section gating.** This section's per-axis sliders/steppers only appear when the highlighted library entry is actually placed in the arrangement (at least one Grid cell or Scatter dot references it). A freshly-created library entry isn't placed yet, so showing cell coordinates for it would be meaningless — instead the section is replaced by an **Add to grid** button that places the entry (then the position controls reappear). With nothing highlighted, the section collapses entirely.
+
+### Renaming a waveform
+
+A waveform's name is a property of the **library entry**, shared by every cell/dot that references it (exactly like its colour and [gain](#per-waveform-gain)). It shows in the Library list and in the tooltips/headers wherever the waveform is placed. There are three ways to rename, all of which write the same field, commit to the node script, push one undo step, and refresh every view (Library list, identity row, arrangement-view tooltips):
+
+- **Inline name box** — the **Waveform:** text box in the right pane's identity row (top of the editor, beside the colour swatch). It's present and editable for all four frame-content editors — Layered, Frequency-domain (FFT), Wavelet, and Granular — so you can rename whatever waveform you're currently editing without leaving the editor. Type and press Enter (or click away) to commit. Empty shows the placeholder "(unnamed waveform)".
+- **Library row → Rename…** — right-click any row in the pop-out window's **Library** list. Opens a small modal text-entry dialog seeded with the current name; Enter commits, Esc cancels.
+- **Arrangement-view cell/dot → Rename waveform…** — right-click a populated Grid cell or a Scatter dot (the same menu that carries *Edit waveform* / *Duplicate waveform* / *Remove from wavetable*, under the identify header). Opens the same modal text-entry dialog.
+
+The **mic/file and song capture dialogs are creation tools, not renamers**: captured waveforms are auto-named after their source and freeze method (the *Library entry names* note in the mic/file capture section below). Rename the result afterward via any of the three paths above — the new entry lands in the Library highlighted, so it's a right-click (or an Enter in the inline box) away.
+
+### Per-waveform gain
+
+Every waveform in a wavetable is **peak-normalised** — whatever you build (a single sine, a stack of layers, a captured sample, a frequency-domain spectrum) is scaled so its loudest sample hits 1.0. That keeps frames at a consistent level, but it also means there's no way, from the shape controls alone, to make one waveform quieter or louder than its neighbours: every finished cycle has the same peak. Morphing between two frames therefore carries no volume contour.
+
+The **Gain** slider on the per-waveform identity row (directly under the **Waveform:** name/colour row, right pane) fixes that. It's a horizontal slider whose drag spans **0 – 4×** (1.00 = unchanged, double-click to reset); the attached text box accepts typed values higher or lower than the drag range, up to a 64× safety ceiling, with figures above 4 pinning the thumb at the right end. The value is multiplied onto the cycle **after** normalisation, so it:
+
+- changes the actual rendered samples (not just a playback trim),
+- shows immediately in the waveform preview strip,
+- is baked into the synth's wavetable terrain, so a 0.5-gain frame really is half as loud in the morph as a 1.0-gain frame, giving morphs an honest volume contour.
+
+Gain is a property of the **waveform** (the library entry / frame), not of a cell or dot — so every placement that references the same waveform shares its gain, exactly like name and colour. It's stored per frame and travels with the waveform through duplicate, Grid↔Scatter conversion, save/load, and undo. Dragging the slider is one undo step per sweep (committed on release); typing a value or double-click-reset commits immediately.
+
+> Gain does **not** change a waveform's *shape* — it's a pure post-normalisation level scaler. It also does not address per-cell volume gradients in the morph blend (those are controlled by the *Empty cells fade volume* / *Distance fades volume* toggles, above).
+>
+> Granular frames honour Gain too. Their grain playback is streamed from the source PCM (bypassing the normalised cycle), so the synth's granular layer multiplies the rendered grain by the frame's gain directly — a 0.5-gain granular frame is half as loud in held-note playback and in the wavetable morph, matching the cycle-frame behaviour. (Earlier builds applied Gain only to a granular frame's preview/cycle approximation, not its audible grain output; that gap is closed.)
+
+On disk this is the `__wavetable5__` script format (a per-entry gain float added to the v4 library+cell layout); older `__wavetable4__` and earlier projects load with every gain defaulting to 1.00.
+
+### Shape primitives (per layer)
+
+A layer has a shape and four knobs. Shape is one of:
+
+- **Sine**
+- **Saw**
+- **Square**
+- **Triangle**
+- **Noise**
+- **Drawn** — freehand canvas; drag in the layer's preview to draw the waveform by hand.
+- **Formula** — math expression evaluated to produce the shape over one cycle, variable `x` in radians `[0, 2π)`, result clamped to `[-1, 1]`. See [Formula authoring language](#formula-authoring-language-built-in--lua--python--glsl) below for the Built-in / Lua / Python / GLSL choice and [Terrain Synth](#terrain-synth) for the built-in expression grammar.
+
+Knobs:
+
+- **Harmonic** — integer or fractional multiple of the played pitch. 1 = fundamental; 2 = octave up; non-integer ratios produce bell/metallic inharmonic textures.
+- **Phase** — 0..1; where in the cycle the layer starts. Matters when multiple layers sum (cancellation and reshaping).
+- **Amplitude** — 0..1; loudness contribution to the sum.
+
+`+ Add Layer` stacks more; `X` removes one. The waveform preview at the top updates live.
+
+### Formula authoring language (Built-in / Lua / Python / GLSL)
+
+A **Formula** layer has a small language dropdown next to its expression field with four choices. The same dropdown (and the same baking machinery) is reused by the [frequency-domain spectral curves](#frequency-domain-spectral-synth) and the [AHDSR per-segment curves](#per-segment-shape-curves); the per-context differences are the domain of the variable and whether the result is clamped.
+
+- **Built-in** (default) — the `WaveExprParser` expression language (same vocabulary as the Terrain Synth math grammar: `sin cos tan asin acos sinh cosh atan(y[,x]) asinh acosh atanh sqrt inversesqrt exp exp2 log log2 pow abs sign floor ceil round roundEven trunc fract min max mod clamp mix step smoothstep fma saw square triangle noise radians degrees pi e`, `+ - * / ^`, ternary `? :`). The hyperbolic/inverse-hyperbolic, `exp2 log2`, `roundEven fma`, and the `mix step smoothstep fract sign mod atan(y,x) radians degrees inversesqrt` group were added for vocabulary parity with the GLSL shape dialect, so the same waveshaping idioms port between Builtin and GLSL — the Built-in language now covers the complete *scalar* slice of GLSL's Trigonometry/Exponential/Common builtins. Evaluated **live** in pure C++ at the exact resolution requested by the synth — safe from any thread, allocation-free. For a wavetable layer the variable is `x` in radians over one cycle.
+  **Multiple "wave objects" in one formula.** A Built-in formula isn't limited to a single expression: write several statements separated by newlines or `;`, assign named intermediates, and let the last statement be the result — e.g. `a = sin(x)` / `b = 0.5*sin(3*x)` / `a + b` builds two waves and sums them. This is the Built-in equivalent of using `local` variables in Lua/Python or `float` temporaries in GLSL, and works in every Formula/curve context (the bake routes a multi-statement source through program mode, evaluating each sample as an independent pure function of the sweep position — assignments don't carry over between samples).
+- **Lua** — a sandboxed Lua 5.4 program (base/table/string/math only; `dofile`/`loadfile`/`load`/`require`/`collectgarbage` stripped). The same math helpers are pre-aliased so `sin(x)`, `saw(3*x)`, `clamp(v,lo,hi)` etc. work without `math.` prefixes. Available only in builds compiled with Lua.
+- **Python** — an embedded CPython program. `math` symbols and the same helper set (`saw square triangle clamp noise pow fract`) are injected; `random` is available as the `noise()` source. Requires a Python interpreter — see [Python is optional](#python-is-optional-runtime-detection--graceful-disable). When none is present this option is greyed out (with a tooltip explaining why).
+- **GLSL** — a GPU **compute shader**: the body you write becomes the inside of `float shapeValue(float x, float f, int i, int n)`, dispatched one thread per output sample on a headless OpenGL 4.3 core context. This is **the most capable waveshaping option** — native GLSL math (`sin cos pow mix smoothstep clamp` …), `TAU`, and the same integer-indexed `waveform(int id, float phase)` factory-bank access the Terrain Synth GLSL dialect uses. The variable contract matches the other languages: `x` is radians `[0, 2π)` for a wavetable layer (normalized `[0,1]` for a spectral/AHDSR curve), `f` is always normalized `[0,1]`, `i`/`n` are the sample index and count. Requires an OpenGL 4.3 compute-capable driver; greyed out (with a reason tooltip) on machines without one. Like Lua/Python it **bakes offline** — there is no live GLSL on the audio thread.
+
+**Why bake to samples.** Lua, Python and GLSL are **not** evaluated on the audio thread. When you edit the expression (or load a project), the script is run once on the UI thread (or the GPU, for GLSL) across a fixed-resolution sweep and the result is cached as a sample buffer (`formulaSamples`, 2048 points for a wavetable layer); the audio path linearly resamples that buffer, exactly like a hand-drawn layer. Built-in stays live because it's pure C++. This is why Python and GLSL are allowed here even though they're forbidden for the real-time script *nodes* — an offline bake has no GIL/GPU-stall/real-time hazard. WebAssembly is intentionally **not** offered for static shapes (it exists for the live DSP nodes, where ahead-of-time native speed matters; an offline bake gains nothing from it, and nobody wants to compile a `.wasm` binary just to define a short curve).
+
+**Source form.** A bare expression (no newline, no `return`) is wrapped automatically — `sin(x)` becomes `return (sin(x))`. A multi-line body is used verbatim and must `return` a value (the wavetable per-layer field is single-line in practice; the spectral editor's field grows to a multi-line box when Lua/Python/GLSL is selected).
+
+**Errors.** A Lua/Python/GLSL compile or runtime error during the bake is shown as a red `Script error: …` overlay on the layer/curve preview, and the baked buffer is zero-filled until the error is fixed. An unavailable language (e.g. Lua in a build without it, or GLSL with no 4.3 driver) is greyed out in the dropdown with an explanatory tooltip.
+
+**Serialization.** The chosen language is saved alongside the expression (`builtin`/`lua`/`python`/`glsl`). Projects written before a given language existed decode as Built-in (older files never wrote `glsl`). The cached sample buffer is transient — it is re-baked on load (`rebakeFormula()` / `SpectralCurve::rebake()`), so the project file only stores the source text + language, never the baked samples.
+
+### Python is optional (runtime detection & graceful disable)
+
+Python is **not** required to build or run SEANCE. Everything else — the built-in expression language, Lua, and WebAssembly — is independent of it. Where Python fits in, and how it degrades when absent:
+
+**What uses Python.** Three surfaces embed CPython: the **Script Console** (`Tools → Script Console`, the algorithmic project-manipulation API — `import soundshop`), **Python signal evaluation** (live param-binding scripts), and the **Python shape baker** (the `Python` option in every Formula/Equation language dropdown — wavetable Formula layers, spectral magnitude/phase curves, AHDSR segment curves). Lua and Built-in never touch Python.
+
+**Can scripts import libraries?** Yes. The console runs a normal CPython interpreter, so `import` works for the standard library and any third-party package installed in the interpreter SEANCE links against (`sys.path` is also seeded with a `scripts/` folder next to the exe and relative to the working dir, so SEANCE's own `soundshop_tools` / `soundshop_music` helper modules import cleanly). There is no separate "start" call — running code in the console *is* the entry point; just `import` what you need at the top. The offline shape baker is a sandboxed subset (a fixed math vocabulary + `random`) and is not meant for arbitrary imports.
+
+**Which Python does it use?** SEANCE links one specific CPython ABI chosen at **build** time (`find_package(Python3)`, or a hardcoded fallback path on the dev machine). It does **not** scan the system for Python installs at runtime and cannot mix-and-match versions — the interpreter must match the ABI the build linked (e.g. a 3.14 build needs `python314.dll`). The DLL is located by the normal Windows loader search (its install on `PATH`, or the copy placed next to the exe — see below); there's no custom install-detection logic.
+
+**Runtime graceful-disable.** Every entry into the interpreter first checks `ScriptEngine::pythonAvailable()`, which probes the Python DLL with `LoadLibrary` (cached). If the probe fails, the Python C-API is never called, so a missing DLL can never crash a Python feature — Python scripting is simply switched off. `shapeLangAvailable(Python)` returns the same probe, so the **Python** option greys out in every language dropdown (with a tooltip telling you to install Python and restart), and the Script Console opens with an explanatory message and a disabled **Run** button instead of silently doing nothing.
+
+**Why the DLL is shipped, not delay-loaded.** SEANCE links Python at **load time** (the normal import library), and a post-build step copies `pythonXY.dll` next to the exe, so the produced build always has a matching interpreter without relying on a system-`PATH` Python (the interpreter still finds its standard library via its install/registry). We deliberately do **not** use MSVC `/DELAYLOAD` for the Python DLL: CPython's public API pulls in *data*-symbol imports (`Py_None` → `__imp__Py_NoneStruct`, `PyFloat_Type`, the `PyExc_*` exception objects, …), and the MSVC delay-load helper can only thunk *function* imports — linking with `/DELAYLOAD:pythonXY.dll` fails at link time with `LNK1194` ("cannot delay-load … due to import of data symbol"). Because the DLL is load-time-linked, the OS resolves it during process start, so a build whose `pythonXY.dll` is genuinely *deleted* will fail to launch with a loader error — the `pythonAvailable()` probe protects against Python features being *used* when the interpreter is broken, not against the bundled DLL being removed. (True launch-without-the-DLL would require resolving every Python symbol by hand via `GetProcAddress`, including the data exports, or splitting the interpreter into a separately-loaded plugin DLL; see `known-issues.md`.) The `pythonAvailable()` probe still matters: it keeps a stale/mismatched/relocated DLL or a half-broken install from taking down a Python feature, and it's the single switch the UI reads to grey things out.
+
+**Build-time gate.** If no Python is found at configure time at all, the build defines no `HAS_PYTHON`; `scripting.cpp` then compiles to stubs and the whole app still builds and runs with Python disabled (Lua/Built-in/Wasm unaffected) — *this* is the configuration that launches with no Python anywhere on the machine. When Python *is* found at configure time, the load-time link + DLL copy above applies.
+
+**Licensing.** CPython is distributed under the **PSF License Agreement**, which permits redistribution (including shipping `pythonXY.dll` alongside an application) provided Python's copyright notice is retained; it is GPL-compatible and imposes no copyleft on SEANCE. Bundling the DLL is therefore fine.
+
+**Lua and WebAssembly, by contrast, are statically linked** — Lua 5.4 and wasm3 are compiled into the SEANCE binary, so there is no external DLL to be missing and nothing to detect at runtime. They're optional only at **build** time: a build without Lua vendored (`HAS_LUA` undefined) or without wasm3 reports them unavailable via `scriptLangAvailable()` / `wasmRuntimeAvailable()`, and the corresponding dropdown options grey out exactly like Python does — but a shipped build that *was* compiled with them can never lose them on an end-user machine the way a missing Python DLL would.
+
+### Multi-frame wavetables
+
+`+ Add Frame` stacks distinct cycles. The synth gains a **Position** parameter that crossfades between frames; automate / modulate Position for timbral morphing. New frames duplicate the active frame as a starting point.
+
+### N-dimensional grids
+
+A grid starts **one-dimensional** (a single axis of cells) and renders as a **segmented line**: the `[0,1]` track is divided by short perpendicular tick marks at each cell boundary (`i/N`), with the cell's waveform shown as a coloured dot at the segment centre and a `[i]` index label below it. The cells *are* the segments — it's the 1D slice of the 2D checkerboard, so empty cells stay invisible in the viewport just as they do in higher dimensions (use the Cells list to select/assign them). The tick direction follows the projected line so the dividers stay perpendicular under any view rotation.
+
+`+ Dim` adds another axis, up to **8 dimensions** maximum (the floor is 1 — a grid always has at least one axis of cells). Two axes render as the familiar checkerboard, three as a cube, and so on. Each *traversable* axis becomes an independent Position parameter on the synth, so a 3D wavetable has Position X, Y, and Z. Most users won't go past 2D; the cap exists because higher-dimensional grids quickly become impossible to author.
+
+**Only *traversable* axes get a Position parameter.** An axis is traversable once it holds more than one cell — a grid axis that's still 1-wide has nothing for a Position to crossfade between, so it gets no slider/param/pin until you grow it to 2+. Position params are numbered contiguously over the traversable axes (so a grid that's 1×5 exposes a single `Position`, not `Position 2`). Grow an axis from 1→2 and its Position control appears; shrink it back to 1 and the control (and any cable wired into its mod pin) is removed. This keeps the synth's parameter list free of dead knobs that can't do anything.
+
+**Empty cells fade volume** (`absoluteBlend`) — a per-wavetable toggle below the axis-size sliders, the Grid-mode counterpart to Scatter's *Distance fades volume* (it's the same persisted field, relabeled). It controls what happens when the Position morph lands on or near an **empty** cell:
+
+- **Off (default)** — the morph is **renormalized over the filled cells**. The synth builds an occupancy mask (1.0 where a cell holds a frame, cycle or granular; 0.0 where empty) parallel to the wavetable terrain, samples it at the current morph coordinate to get the fraction of N-linear interpolation weight that landed on filled cells, and divides the blended sample by that fraction. The result: empty cells don't drain volume — morphing across a gap keeps the output at full level, carried by whichever filled cells are still in range. A grid with **no** empty cells is unaffected (the mask is all-ones, so the gain is exactly 1).
+- **On** — no renormalization. Empty cells are baked as silence and contribute zero to the weighted sum, so morphing toward an empty cell **ducks the output toward silence** (the original pre-renormalization grid behavior). Useful when you *want* gaps in the grid to read as rhythmic/dynamic dropouts rather than being papered over.
+
+Like the scatter toggle, this only changes the gain math — it never adds or removes a Position axis. Both the cycle and granular layers get the same renormalization gain so a granular frame next to empty cells stays full-volume too. Serialized as an optional trailing field on the grid mode spec (`g;numDims;dim0;…;flag`); files written before the toggle existed load as `false` = **renormalized** (the new full-volume default), so an old project with empty cells plays louder than it used to — flip the toggle on to restore the prior fade behavior.
+
+### Scatter mode
+
+`Mode: Grid` ↔ `Mode: Scatter` toggle in the toolbar. In Scatter mode each frame has a free position vector (X, Y, optionally Z, …) and frames are dragged in the viewport. Frames closer to the current Position blend in, distant frames contribute less — smoother and more organic than grid interpolation when frames don't lie on grid intersections.
+
+**Blend kernel.** The default normalized blend uses **scale-free inverse-distance (Shepard) weighting**: `w_i = (d_min / d_i)^p`, normalized to sum-1, where `p` (sharpness) is derived from the **Blend width** slider as `p = 2 / width`. This kernel *always* tracks Position smoothly — there is no setting that hard-switches to the nearest frame or collapses to a static average. (The earlier Wendland-C²-RBF kernel had no usable radius for this: a small radius left every frame outside each other's support so the blend fell back to a nearest-neighbour *hard switch*, while a large radius made every weight near-equal so the blend became a *static uniform average* that ignored the Position sliders — the slider had a razor-thin sweet spot that depended on frame spacing. Shepard removes the radius/scale entirely, so the slider becomes a pure sharpness control that behaves the same regardless of how the dots are spread.) The compact-support **Wendland C²** kernel is retained *only* for *Distance fades volume* mode (below), where a literal cutoff radius — silence beyond it — is the intended behaviour.
+
+**Geometric view dimension (`scatterDims`).** The `+ Dim` / `− Dim` buttons set how many coordinate axes the scatter space has, which drives what the viewport looks like — this is the *geometric* dimension, separate from how many axes are actually *traversable* (below). Scatter starts at **one axis = a line view**: dots sit on a horizontal line and drag left/right along it. `− Dim` down to **zero axes** replaces the line with a small **dashed-circle drop-target** ("Drag a waveform here") at the centre of the view — there's no line or square, just a compact affordance that you can drop a waveform to begin (dots that already exist pile at centre and blend equally). `+ Dim` to **two axes** gives the familiar square view, three the cube, and so on up to 8. The floor is 0 (Grid mode's floor stays 1, since a grid always has at least one axis of cells).
+
+Per-frame coordinate sliders below the viewport allow numeric placement when dragging isn't precise enough.
+
+**Converting between modes.** The sidebar conversion button switches a wavetable between Grid and Scatter. From Grid it reads **`Convert → Scatter`** (always available): every non-empty cell becomes a dot at its cell center, and a snapshot of the original grid layout is recorded. From Scatter the button is **always enabled** and takes one of two forms:
+
+- **`↩ Back to Grid`** (lossless) — shown when every dot is still sitting on its snapshotted cell center *and* the snapshot still matches (you converted from Grid and haven't edited axes or moved dots off-center). Restores the exact original grid layout.
+- **`Convert → Grid`** (lossy fallback) — shown otherwise: when the wavetable was authored as Scatter, or you added/removed an axis, or dragged a dot off its cell center (any axis edit resets the snapshot), or the lossless snapshot was dropped (it isn't persisted across save/load). Rather than blindly flattening, it **reconstructs the N-D grid the dots imply, preserving dimensionality**: each axis's dot coordinates are quantized into distinct sorted "tracks", and the grid is sized to those tracks (track-count per axis = cells along that axis). Each dot lands in the cell its quantized coordinates select. For dots that still form a clean Cartesian lattice — e.g. a 2×2×2 grid that was converted to scatter and never moved off-center, even after a save/load — this rebuilds the **original 2×2×2 shape exactly** (not a 1×8 line), and any holes (empty cells) survive too. The flatten-to-1D behaviour is now only a *last-resort* fallback, used when the scatter is irregular enough that the implied grid would be badly sparse (`cell count > 4·dots + 4`) or when two dots quantize into the same cell (not a clean lattice). Once back in Grid mode you can re-add axes and grow cells. This guarantees you're never stranded in Scatter mode.
+
+**Which Scatter axes are traversable is purely positional, and evaluated per-dimension** — exactly analogous to a grid axis needing ≥2 cells. A scatter dimension *d* gets a Position param **iff the dots actually span a range along *d*** — i.e. they don't all share the same coordinate on *d*. Consequences:
+
+- **0 or 1 dot → no Position params at all.** A single point has no extent to traverse. This holds **regardless of the blend mode** (normalized vs *Distance fades volume*) — the blend mode only changes the gain math, never which axes exist.
+- **2 dots differing only in X → just an X axis** (`Position`).
+- **2 dots differing only in Y → just a Y axis** (`Position`), with *no* X axis. Each dimension is judged independently and symmetrically.
+- **2 dots differing in both → both axes** (`Position 1` = X, `Position 2` = Y).
+
+Drag a dot until it stops differing on an axis and that axis's Position control (and any cable wired into its mod pin) disappears, just like shrinking a grid axis back to one cell. The re-sync happens once on **mouse-up** at the end of the drag gesture (never per drag tick — adding/removing params touches state the audio thread reads lock-free). On the synth side the query point pins every inert axis to the dots' shared coordinate on that axis, so an inert axis contributes zero to the blend distances no matter where the dots sit.
+
+The **Selected waveform position** strip in the sidebar shows one slider per **geometric** axis (`scatterDims`), *not* per traversable axis — it's an editor placement control, deliberately decoupled from the synth's Position knobs (which track the traversable set above). This is on purpose: a lone dot on a 1-D line has no traversable axis yet, but you still need a slider to place it — and moving dots apart along a geometric axis is exactly how you *create* a traversable one. Tying the strip to the traversable set instead produced a chicken-and-egg dead end (no slider on a lone dot → no way to spread a second dot away from it numerically). Dropping a second waveform via **Add to grid** offsets it along X from the existing dots (so it lands beside them and immediately yields a traversable X axis rather than stacking invisibly); drag it elsewhere afterward (e.g. to differ in Y instead) to change which axes exist.
+
+**Distance fades volume** (`absoluteBlend`) — a per-wavetable toggle below the **Blend width** slider. By default the blend weights are **normalized** (sum-to-1) Shepard weights, so the blend always equals a full-volume weighted average of the frames — moving Position around changes *which* frames you hear but never the overall loudness. With *Distance fades volume* on, the blend switches to **compact-support Wendland C²** weights used directly as **gain** (no normalization): each scatter dot becomes a "loudness island" that's loudest at its center and fades to silence at the edge of its radius (here the Blend-width slider is the literal fade radius in normalized [0,1] units), and a Position sitting in the gap outside every frame's radius is **intentionally silent**. This only affects the gain math — it does **not** create or remove any Position axis (that's purely the dots' spatial spread, above), so it's only meaningful once you have two or more dots to span an axis. The same `absoluteBlend` flag drives the Grid-mode **Empty cells fade volume** toggle (below) — the two modes share one persisted field, relabeled per mode.
+
+### 3D anaglyph viewport
+
+For 3D-or-higher scatter spaces, the toolbar's **3D** toggle enables a red/cyan anaglyph rendering of the frame positions. The projection combo selects which axes are shown when the space has more than 3 dimensions. Tuning sliders:
+
+- **IPD** — interpupillary distance; typical adult ~63 mm
+- **Viewing distance** — your eyes to the screen; typical ~60 cm
+- **Depth** — how dramatic the 3D protrusion is
+
+Visualization aid only; doesn't affect the audio.
+
+### Frame types
+
+Most frames are layered-waveform single cycles. Two specialized frame types are supported:
+
+- **Wavelet frame** — edited in `WaveletPainter`; paints wavelets at chosen time/frequency positions and reconstructs the cycle.
+- **Granular frame** — a multi-second slice of recorded audio (e.g. captured from a region via "capture from song") that the synth sustains as a held note. Edited in `GranularFrameEditorComponent`. The frame stores a **freeze mode**, a **grain length** (the size of each overlapping grain — used only by the two grain-cloud modes; set by the Width slider at capture time), a **grain count** (`grainCount` — how many overlapping grains form the cloud in the two grain-cloud modes; default 4), an **FFT size** (`fftSize` — the SpectralFreeze analysis size; `0` = auto), a **freeze-window position and width** (`windowStart` / `windowLen` — which sub-slice of the capture to freeze, and how wide; in Crossfade mode the window *is* the loop), a **crossfade length** (the seam blend), and an **embedded pitch** (the note at which the window plays back 1:1). See [Grain count & FFT size](#granular-grain-fft) for the two texture controls.
+  - **Freeze window (draggable, resizable selection band).** <a name="granular-freeze-window"></a>The capture is typically longer than one grain — **both** capture paths (song and mic/file/playback) now store one freeze **window** (`buildFrames` → `buildGrainSource`) plus a **half-window lookahead tail** for the seam, the window auto-sized per freeze mode — `autoWindowMultiplier(mode) × grain` (4×) for the grain-cloud modes, a fixed `kNonGrainAutoWindowSamples` (≈ 100 ms, **decoupled from the grain**) for Crossfade/Spectral — until you override it — leaving room to choose *where in the capture* the freeze sits and *how wide* a slice it uses. The frame editor draws an **amber selection band** over the source thumbnail: **drag the middle to move it, drag either edge to resize it**. The band is resizable in **every** mode and always sets the freeze **window** (`windowStart`/`windowLen`) — it never edits the grain length. What that window *means* depends on the mode, and only the two grain-cloud modes actually use a grain:
+    - **Async / Pitch-synced grains** — the band is the **window the grains roam over**. Its floor is the **grain length** (a grain must fit) and its ceiling is the **whole capture**. The window width is **decoupled from the grain**: the grain is the size of each overlapping Hann grain, the window is the region the grains roam over. A window *wider* than the grain gives these two modes the multi-grain roam room that makes them sound different; pinning the window to exactly one grain wide collapses both to the same near-static single grain. These are the **only** modes where the Grain-length slider does anything.
+    - **Crossfade loop** — the loop **is the whole band**, so resizing sets the **loop length** directly (a wide band = a long evolving loop; a narrow one = a short pitched buzz, down to ~5 ms). There are no grains, so the **Grain-length slider is greyed out** with a tooltip explaining why (per the "grayed-out controls must explain themselves" rule).
+    - **Spectral freeze** — the band sets the **FFT analysis region** (floor ≈ one FFT block, 256 samples). Grain length has no effect, so the **Grain-length slider is greyed out** here too.
+    
+    The **Grain length slider** (active only in the two cloud modes) is capped at the captured duration (`min(`[`kGranularMaxGrainMs`](#granular-freeze-window)` = 500 ms, capturedMs)`) since the grain must fit inside the window which fits inside the capture; growing the grain raises the cloud window's floor. A **dashed** band means *auto* (the stored `windowStart`/`windowLen` are both the sentinel `-1`); the instant you drag or resize it the band becomes **solid** (explicit `windowStart`/`windowLen ≥ 0`). A **size read-out** under the thumbnail (`updateSourceInfoLabel()`) shows the source length, sample rate, and **freeze-window width in ms** — plus the **grain length in ms** in the two grain-cloud modes — so you can directly compare *window vs grain* (e.g. `820 ms @ 44 kHz · window 240 ms · grain 60 ms`). It refreshes live as you drag the band, change the grain length, or switch freeze mode (the grain term appears only in Async / Pitch-sync, where the grain is meaningful). Dragging/resizing drives the live audition and commits on the editor's debounced undo path (one *Edit wavetable* step per gesture), exactly like the param sliders. The editor's `minWindowSamples()` is the per-mode resize floor (grain for the cloud modes, 256 for Spectral, ~5 ms for Crossfade) and mirrors the voice's `bandLen` floor in `granular_freeze.cpp`; `effectiveWindowLen()` returns the clamped `windowLen` (or one grain when auto). In Crossfade mode the **crossfade-seam cap tracks the window** (`crossfadeMaxSamples()` = window/2), so shrinking the loop shrinks the crossfade slider's range with it.
+    - **`windowStart` / `windowLen` semantics & back-compat (two auto sentinels).** `windowStart` defaults to `-1`; `windowLen` defaults to `-2` (`kWindowAutoPerMethod`). `windowStart == -1` = auto-centre: the voice positions the band with the historical centred-with-lookahead formula `max(0, (srcLen − (grain + grain/2)) / 2)`. The **width** has *two* auto markers, resolved by the shared `resolveAutoWindowLen(windowLen, mode, grain)` (`granular_frame.h`) so the voice, the editor, and all three capture dialogs agree:
+      - **`kWindowLegacyAuto` (`-1`)** = "auto = exactly one grain wide" — the original one-grain window. **Every frame captured or saved before these fields existed decodes as `-1`** and MUST keep resolving to `grain` so those frames stay **byte-for-byte identical** on reload. Never repurpose this value.
+      - **`kWindowAutoPerMethod` (`-2`)** = the per-mode auto width, recomputed whenever the grain length or freeze mode changes, resolved by `resolveAutoWindowLen`: the **grain-cloud modes** (AsyncGranular / PitchSyncGrains) resolve to `autoWindowMultiplier(mode) × grain` (**4×**, so the cloud modes get several grain-periods of roam room out of the box — a 1× window collapses them into a one-grain loop), while the **non-grain modes** (CrossfadeLoop / SpectralFreeze) resolve to a **fixed `kNonGrainAutoWindowSamples`** (4800 samples ≈ 100 ms @ 48 k, ≈ 109 ms @ 44.1 k) that is **independent of the grain length**. This decoupling is what lets the grain default drop to ~5 ms (for a smooth constant async cloud) **without** collapsing the default Crossfade loop: the Crossfade/Spectral window keeps its historical ~100 ms framing instead of shrinking to one tiny grain. (`resolveAutoWindowLen` has no sample-rate parameter — the editor, voice, and capture dialogs all share it — so the non-grain default is expressed in **samples**, not ms.) **Freshly created and freshly captured frames default to `-2`**, so a new Async/PitchSync capture no longer degenerates into a loop. Retuning `autoWindowMultiplier` is **forward-only**: it only affects new frames carrying `-2`; frames already saved keep whatever width they resolved to, so old projects never shift.
+      Either sentinel only becomes an explicit (`≥ 0`) width once the user drags/resizes the band (editor) or moves the window slider (capture). On disk the auto state rides a **dedicated flag field** so `-2` survives a round-trip without breaking the `+1`-biased width encoding (the width token itself can't represent `-2` once biased to `-1`). In auto mode each freeze mode keeps its *original* per-mode framing (e.g. Async granular roams the whole source, Spectral freeze analyses the loop centre); once banded, **all four modes confine their reads to `[windowStart, windowStart+windowLen)`** (the grain cloud roams within it, **Crossfade loops the whole window**, Spectral analyses its centre). `windowLen`'s floor is **mode-dependent**: the two grain-cloud modes clamp it to `[grainLength, srcLen]` (a grain must fit), while CrossfadeLoop and SpectralFreeze floor it at 16 samples — they don't granulate, so the window can be shorter than the (greyed-out, inert) grain. Both persist as optional header ints in the wire format (written biased by `+1` so `-1` stays a non-negative all-digit token; decode back via `token − 1`). When the band sits at the source's far edge there may be little or no lookahead tail, so the Crossfade-loop seam is clamped to whatever lookahead remains before `srcLen` (a zero-lookahead band gets a hard, un-crossfaded loop rather than a thump).
+  - **"As note" picker retunes the live audition.** Both the capture dialog and the frame editor expose a Note/Octave "As note" picker that sets the embedded pitch. The preview marker audition (and the frame editor's fallback Play) resample the grain to **`(440 Hz / embedded pitch) × (sourceSampleRate / projectRate)`** so picking a note is *immediately audible* and matches what the synth voice will produce when the frame is triggered at the editor's reference note A4 (MIDI 69). At the default A4 *and* when the capture rate equals the graph rate the ratio is 1 (native rate). The capture preview is driven by `AudioEngine::setPreviewGrainRatio` (a fractional, linearly-interpolated playhead in the GrainLoop preview).
+    - **Sample-rate reconciliation (`srRatio`).** The synth's grain reader (`terrain_synth.cpp` `renderGrainSample`) always folds a `srcSampleRate / projectRate` term into its read ratio, because captured playback frames store PCM at the **tap rate** (the device/loopback rate, e.g. 44.1 kHz) without resampling, while the synth renders at the **project/graph rate** (e.g. 48 kHz). The two previews — the capture dialog's marker audition (`regenerateAuditionGrain`) and the editor's fallback (engine-preview) Play — now fold the **same `srRatio`** in. Without it, a frame captured at 44.1 kHz and rendered at 48 kHz auditioned a few semitones **higher** in the preview than the placed synth note played (`44100/48000 ≈ 0.92`, ~1.5 semitones), which is the "plays back a few notes lower in the editor than in the capture preview" symptom (the editor/synth path was correct; the preview was sharp). The song-capture source is pre-rendered at the project rate, so its `srRatio` is naturally 1.
+  - **Unified save model — re-capture writes metadata through live.** The frame editor (`GranularFrameEditorComponent`) and the capture panels used to disagree about *when* an edit sticks: the editor commits every control change instantly (it holds the live frame by reference), while the capture panel staged everything and only committed on the **Save / Capture** button — so closing it discarded any pitch/freeze/crossfade change you'd made. They're now reconciled across **all three sources**. When you **"Re-capture from song / mic / file…"** to replace an existing frame, the capture panel — `CaptureFromSongDialog` for song, `CaptureFromPlaybackDialog` for mic/file — is **bound to that specific library frame**:
+    - Its editable controls (the "As note" picker, **Freeze** mode, the **Grains** / **FFT size** texture controls, and the **Crossfade** slider) are **seeded from the frame's current values** on open (`seedFromExistingFrame`), so the panel reflects reality instead of resetting to defaults (A4 / Crossfade loop / default grains / FFT / crossfade). Both dialogs now have a Crossfade slider, so this is symmetric across all three sources.
+    - Any change to those **commits straight through to the frame the instant you make it** — same path the editor uses (`onMetadataEdited` → frame mutation → `onLayerChanged()` → node-script commit + dirty flag + debounced undo). Closing the panel can no longer silently revert a metadata edit.
+    - Only the **PCM grab itself** still requires the explicit Save / Capture button, because it depends on capture-time params (both dialogs' region selection + per-waveform window + waveform count) — re-grabbing audio is inherent to "capture", not a save-model quirk. Closing without it keeps your committed metadata but leaves the original audio in place. (In **append** mode, where no pre-existing frame is bound, there's nothing to write through to, so creating a brand-new frame stays an explicit Save and closing legitimately creates nothing. **Neither** dialog wires an append-mode write-through sink now: both slice the selection into N waveforms per Capture, so there's no single unambiguous frame to bind to. Write-through is wired only in **replace** mode, where exactly one frame is bound.)
+    - Crossfade crosses the boundary in **milliseconds** (rate-independent); the host converts to samples against the frame's own `sourceSampleRate`, so a render rate ≠ frame rate can't misinterpret the seam length. **Both** capture dialogs now expose a Crossfade slider, so the mic/file/playback dialog seeds the frame's crossfade ms into its slider on open and writes any change back through `onMetadataEdited` — the same write-through path as pitch / freeze / grains / FFT, no longer a no-op echo.
+    - **Re-capture targets the frame's original source.** Each granular frame remembers which source produced it (`GranularFrame::captureSourceKind`: song / mic / file), so the editor's button reads **"Re-capture from song…"**, **"Re-capture from mic…"**, or **"Re-capture from file…"** to match, and clicking it re-opens that same capture panel — a mic-captured frame re-captures from the mic, not the song. The source is stamped on at capture time and **persisted** in the frame's wire format as an optional header int (written biased by +1 so it stays an all-digit token; `0` decodes to "unknown"). Frames from projects saved before this field existed — or built from scratch / duplicated — have an **unknown** source and fall back to the historical **song** default for both the label and the panel.
+  - **Freeze modes** — `CrossfadeLoop` (default), `AsyncGranular`, `PitchSyncGrains`, `SpectralFreeze`. **All four are implemented.** Crucially, the capture/freeze audition and the held synth note share **one** reader — `GrainFreezeVoice` (`granular_freeze.h`/`.cpp`) — so **what you audition is exactly what you get**: there is no separate "audition" algorithm that could drift from playback. The audition engine (`AudioEngine`) owns a single `GrainFreezeVoice`; the synth owns one per voice per granular frame (so a 3-way Position morph runs three independent streams). All four modes sustain the captured window and resample their output by a `ratio` so a held note tracks MIDI pitch — at the note matching the embedded pitch the ratio is 1 (the audition reproduced 1:1), other notes transpose. The voice re-anchors itself whenever the source, length, grain length, [freeze-window position or width](#granular-freeze-window), or mode changes, and is allocation-free in steady state (buffers and the SpectralFreeze FFT are built only on (re)initialisation, mirroring the lazy-on-note-on pattern). The four characters:
+    - **Crossfade loop** — a faithful tape loop of the captured window with a Hann crossfade across the seam (so the wrap doesn't click). The loop **is the whole selection band**, so its length is set by **resizing the amber band** (not the grain slider, which is greyed out here): a wide band is a long, evolving loop; a narrow one is a short, pitched buzz. Moving the band repositions the loop. In the voice, `loopLen = bandLen` (the band width), and an auto window (`windowLen == -1`) resolves `bandLen` to `grainLen` so pre-band frames still loop exactly one grain. *"What does this spot literally sound like."*
+    - **Async granular** — a bank of [**grain-count**](#granular-grain-fft) overlapping Hann grains (default 4, 75 % overlap at 4) that re-trigger at randomised positions jittered across the source, summed and gain-normalised for unity (the `2/N` Hann-COLA factor, = the historical `×0.5` at N = 4). A frozen blur / GRM-Freeze texture rather than an exact loop. In the legacy (un-banded) path the grain is a **short (~80 ms) "blur" grain** — capped at `min(80 ms, srcLen/2)` — *not* the full loop width, because the un-banded capture path passes the whole loop length as the grain size, which is far too long to overlap into a blur. **With an explicit [freeze window](#granular-freeze-window) the grain is the user's chosen grain length** (fit inside the band), and the grains roam over the band's width — so a band wider than the grain produces a real moving cloud, while a band pinned to the grain gives no roam room (a near-static single grain). The roam range is bounded so **every grain read stays inside the window**: un-banded `aStart ∈ [0, srcLen − grain]`; banded `aStart ∈ [bandStart, bandStart + windowLen − grain]`. *(Bug fix: the old code used a full-loop-length grain centred at `srcLen/2`, so every grain read ~25 % past the end of the 1.5×-loop capture source and clamped to the DC tail — the audition came out ~20 dB below the other modes. Now in-bounds and at a comparable level.)* **Ratio-aware roam clamp (pitched-up grains).** A grain advances its source read by the playback `ratio` per envelope sample, so over its `grain`-sample life it sweeps `grain × ratio` source samples. The init-time `aRoamHi` (`= aWindowHi − grain`) only leaves room for a `ratio = 1` sweep, so a held note played **above** the embedded pitch (`ratio > 1`) used to let grains start high enough that their sped-up sweep ran `grain × (ratio − 1)` samples **past the window's upper edge** into the half-window lookahead tail (decorrelated content the user never selected) — a contributor to the "doesn't sound constant" blur. `asyncSample` now tightens the re-trigger high bound to `aWindowHi − ⌈grain × max(1, ratio)⌉` so the whole sweep stays inside the band; at `ratio ≤ 1` it equals the original `aRoamHi`, so native-and-below playback is byte-for-byte unchanged. **Async constancy is still fundamentally governed by grain length and grain count** — a 4-grain cloud of long grains over a wide roam window is inherently a decorrelated blur, so **shorter grains** and/or **more grains** (the *Grains* control) sound smoother/more constant; that's the texture's nature, not a bug.
+    - **Pitch-sync grains** — the **pitch-coherent twin of Async granular**. It runs the *same* machinery — a bank of [**grain-count**](#granular-grain-fft) overlapping Hann grains (default 4, 75 % overlap at 4, summed and gain-normalised for unity) forming a **stationary random scatter** over the captured window (a freeze, **not** a playhead sweeping forward through the source) — with one change: every grain origin is **snapped to the source's pitch-period grid** (origin = an integer multiple of the detected period). Because overlapping grains then sit a whole number of periods apart, they read the **same waveform phase** and sum **coherently**, so the cloud has a definite, stable pitch instead of Async granular's random-phase comb-filtered blur. The many period-aligned grains are the "grains" (plural) the mode is named for; the slight timbral variation between grains drawn from different parts of the note keeps it a living grain cloud rather than a dead single cycle, while the pitch stays rock-solid. **This only differs audibly from Async granular when the [freeze window](#granular-freeze-window) is wider than the grain** — the snapping only matters when the window spans several pitch periods that grains can roam across; with the window pinned to one grain wide both modes collapse to the same near-static single grain. Grain length is a **whole number of periods** nearest the grain target — the user's grain length when banded, ~80 ms in the legacy un-banded path — (≥ two periods) so the snap grid stays clean and the Hann seams are smooth. The period is **detected from the source itself** by autocorrelation (`detectPeriodSamples` in `granular_freeze.cpp`, middle ≤100 ms, 50 Hz–5 kHz), *not* taken from the embedded-pitch label; it falls back to `sampleRate / embeddedPitch` only when no confident pitch is found (noisy / inharmonic source). A window too short to hold whole-period grains falls back to the single-cycle crossfade loop (`pitchSyncSample` with `psGrain == 0`). *(Bug fix: it previously (a) trusted the embedded pitch, which defaults to A4 and is usually wrong, so the mode buzzed at 440 Hz regardless of what was captured, and (b) merely looped one cycle — a single static tone — contradicting the "grains" name; it now detects the real period and overlap-adds a stationary cloud of period-snapped grains, coherent and full-level where the same cloud without snapping (Async granular) comb-cancels to a much quieter blur.)*
+    - **Spectral freeze** — a phase-vocoder freeze: one Hann-windowed FFT captures the magnitude spectrum, then synthesis re-randomises the phases every hop (specN/4), IFFTs in place, and overlap-adds into a streaming ring the per-sample reader resamples by `ratio`. An ethereal pad sustain decoupled from the source's time-domain identity. The FFT size follows the [**FFT-size** control](#granular-grain-fft): **Auto** (`fftSize == 0`) keeps the historical pick — the largest power-of-two ≤ min(analysis window, 2048), ≥ 256, else silent — while an explicit size requests the largest power-of-two ≤ min(chosen size, analysis window, 8192), floored at 256 (so a window smaller than the request still caps to what fits). Larger sizes give finer frequency resolution (more bins) at a coarser time window. The amber band sets the **analysis region** (resizable, like the cloud window), but **grain length has no effect in this mode, so the Grain-length slider is greyed out** with an explanatory tooltip. All FFT scratch buffers are reused across hops, so steady-state synthesis allocates nothing. The analysis window is centred on the **centre of the loop region** (`grainLen/2`), not the centre of the whole 1.5×-loop source — the extra half is a lookahead tail past the loop (the decayed end of the captured note), so centring there made the freeze far quieter than the loop modes. *(Bug fix: re-anchored to a representative spot and the OLA gain raised from 0.8 to 1.0 so the freeze sits at roughly the Crossfade-loop reference level.)*
+  - **Grain count & FFT size — per-mode texture controls.** <a name="granular-grain-fft"></a>Two controls set the *density / resolution* of the freeze, each one relevant to a different subset of modes. They appear in the frame editor (`GranularFrameEditorComponent`) and in all three capture dialogs, and bake into the frame (`GranularFrame::grainCount` / `fftSize`).
+    - **Grains** (`grainCount`, range 2–16, default **4**) — how many overlapping Hann grains make up the cloud in the two grain-cloud modes (**Async granular**, **Pitch-sync grains**). More grains = a denser, smoother cloud; fewer = sparser and more granular. The level stays constant as you change it because the voice gain-normalises by the Hann constant-overlap-add factor `2/N` (= the historical `×0.5` at N = 4, so old frames are byte-for-byte identical). The floor is **2**: at N = 1 a single Hann grain pulses in amplitude (COLA fails), so one grain isn't offered. **Greyed out / hidden** in Crossfade loop and Spectral freeze (no grains); the editor greys the slider with a tooltip, the capture dialogs hide it (it shares a row slot with the FFT-size control).
+    - **FFT size** (`fftSize`, **Auto** + {256, 512, 1024, 2048, 4096, 8192}, default **Auto** = `0`) — the FFT analysis size for **Spectral freeze** only. Auto reproduces the historical pick (largest power-of-two ≤ min(window, 2048)); an explicit size requests the largest power-of-two ≤ min(chosen size, window, 8192), floored at 256. Larger = finer frequency detail (more bins) but a coarser time window. **Greyed out / hidden** in every non-spectral mode.
+    - **In the capture dialogs** the two controls read **"Grains per waveform:"** and **"FFT size per waveform:"** — the "per waveform" wording disambiguates because a multi-waveform capture turns one dialog selection into N successive frames, each baked with the chosen count / size. In the single-frame editor they're plain **"Grains"** / **"FFT size"**. Both capture dialogs ([`CaptureFromPlaybackDialog`](#frame-types) for mic/file/playback, `CaptureFromSongDialog` for song) put the active control to the right of the **Freeze:** picker, show only the one that applies to the current mode (`refreshFreezeExtras()` toggles visibility), and drive the live **Preview / audition** through the engine's preview atomics (`AudioEngine::setPreviewGrainCount` / `setPreviewFftSize`) so what you hear before capturing matches the saved frame.
+    - **Re-capture write-through.** In **every** capture dialog's re-capture (replace) mode — song (`CaptureFromSongDialog`) **and** mic/file (`CaptureFromPlaybackDialog`) — the two controls are **seeded from the existing frame** (`seedFromExistingFrame`) and any change **commits straight through** to the bound frame (`onMetadataEdited` now carries `grainCount` / `fftSize` alongside pitch/freeze/crossfade), matching the unified save model used for the other metadata.
+    - **Wire format.** Both persist as **optional trailing header ints** in the `__wavetable2__` granular body, appended after `windowLen`: `…<windowStart+1>;<windowLen+1>;<grainCount>;<fftSize>;<s0,s1,…>`. They're plain positive ints (no `+1` bias — `grainCount ≥ 2`, `fftSize ≥ 0` are already non-negative). A frame saved before these fields existed simply lacks the tokens and decodes to the defaults (`grainCount = 4`, `fftSize = 0` = auto), so old projects sound identical. Decode clamps `grainCount` to [2, 16] and `fftSize` to `0` or [256, 8192].
+  - **Play button auditions the frame being edited.** The editor's Play/Stop button routes through the owning synth node's audition queue and plays a held note (A4) at the **edited frame's wavetable Position** — not wherever the live Position knob currently sits. So pressing Play in the "waveform 2" editor plays waveform 2, even though the synth's default Position would otherwise select waveform 1. This is implemented as a per-voice Position override carried on the audition note-on: the audition voice computes its own granular morph weights from the edited frame's normalized grid/scatter coordinate, while concurrent real MIDI/timeline notes keep following the live Position. In scatter mode the override reproduces the natural blend *at that dot's position* (i.e. exactly what you'd hear by moving Position to the dot), so neighbouring frames still contribute as they would in normal playback.
+    - **Unplaced (library-only) frames also audition.** A freshly-captured single frame lands in the **Library** but isn't placed into any grid cell / scatter dot, so it has no Position and isn't in the synth's placed-frame table. To make its Play button audible (and faithful), the audition note-on carries the **frame's actual PCM + grain params directly** (`AuditionEvent::granularFrame`, a shared copy of the on-screen bytes). When present, the voice renders *only* that frame — full envelope/Volume path, bypassing both the cycle terrain and the placed-frame morph — so the capture you just grabbed plays immediately and exactly as edited, with no wait for the ~150 ms graph rebuild. The same CrossfadeLoop reader serves both the placed-frame morph and this direct path, so audition and playback stay identical.
+    - **Audition survives a graph rebuild (live edits while playing).** Resizing the freeze-window band — or changing grain length / count / FFT size / crossfade / pitch / freeze mode — while Play is held used to **stop the preview** until you pressed Start again. The reason: every wavetable edit fires a debounced (~150 ms) `onNodeEdited → requestRebuild → GraphProcessor::rebuildGraph`, which calls `processorGraph->clear()` and **destroys every live voice**, including the held audition note. The momentary `pendingAudition` queue is **edge-triggered** (consumed once), so nothing re-established the note in the fresh post-rebuild processor. Fixed with a **level-triggered** held-audition channel: `Node::heldAudition` (a `shared_ptr<AuditionEvent>`, guarded by `auditionMutex`) means "a voice should be sounding with this data" for as long as it's non-null. `TerrainSynthProcessor` **reconciles** it each block (`heldAuditionActive` / `heldAuditionPitch` per processor): a fresh processor sees `heldAuditionActive == false` and re-arms the note from `heldAudition`, so the audition seamlessly continues across the rebuild. The editor's `applyEdit()` wrapper **re-publishes the snapshot on every audible edit** while playing (sharing the source PCM `shared_ptr` rather than deep-copying the multi-MB buffer), so the re-armed post-rebuild voice reflects the **new** band / grain / mode — you hear the change instead of silence. Stop (or closing the editor, via `stopPlay()` in the destructor) clears `heldAudition`, releasing the held note. This is separate from and additive to `pendingAudition`, which is still used for momentary piano-roll note clicks. In the **fallback** (engine-preview) Play path there is no graph rebuild and the preview atomics were already live-updated by `pushPreview*()`, so `applyEdit()` is a cheap no-op there (the freeze-mode change still goes straight to the engine preview).
+    - **Play is audible even when the synth node isn't wired to an Output.** A freshly-added synth node (or one you've disconnected) has no audio path to the speakers, so its rendered audition would normally dead-end in the graph and you'd hear nothing. To keep the preview reliable, `GraphProcessor::rebuildGraph` flags each node's `reachesOutput` (an audio-link reachability walk back from every Output node), and when a synth node *can't* reach output its audition voices are diverted to the `AudioEngine` **audition-monitor bus** — a side buffer the audio callback sums straight into the device output, independent of graph wiring. When the node *is* routed to output, the audition stays in the normal graph path so it still flows through your downstream effects/pan exactly like a played note. Only the editor-Play audition is diverted; ordinary MIDI/timeline notes on an unrouted node remain (correctly) silent.
+  - **Song capture dialog (`CaptureFromSongDialog`).** The **"From project song…"** entry pre-renders the whole project to PCM offline, then exposes the **same region / N-waveform selection model** as the mic/file dialog (two draggable start/end handles, **Waveforms to slice out**, per-waveform **Window length** (ms) window with a **Fit width to selection** button, **Preview waveform** index picker, Gain, Freeze, Grain length, Crossfade, and the embedded-pitch picker — all documented under "all sources" below) **plus a full-song Play / Pause / Stop transport**. The capture model is identical to the file dialog's: `buildFrames(n)` slices the region into N banded `GranularFrame`s using the shared `bandStartForIndex()` geometry, and **Capture waveforms** adds them to the Library. What's unique is how the transport reconciles with the region audition:
+    - **Play** = full-fidelity playback of the rendered song with a moving **playhead** (a thin vertical line) anchored at the **region start** (`setPreviewMode(SongPlay)` / `setPreviewSongPosSamples`). The playhead is drawn **only while Playing**; the region handles are left alone (not view-pegged) so the playhead can sweep freely.
+    - **Pause / Scrub** = audition the **Preview-index-selected** region band as a looping grain (`setPreviewMode(GrainLoop)` → `regenerateAuditionGrain`), the same GrainLoop mechanism the mic/file dialog uses — so what you hear before capturing matches the saved frame. Grabbing a handle while Playing drops the transport into **Scrubbing**; releasing returns it to **Paused**.
+    - **Stop** = silence (`setPreviewMode(Off)`), playhead reset to the region start.
+    - **Default region.** Because a song can be minutes long, the dialog opens with a region of ≈ 1 second at the song start (rather than the whole song) so an n≤1 capture doesn't build a multi-minute audition buffer.
+  - **Mic / file capture dialog (`CaptureFromPlaybackDialog`).** The **"From microphone / audio input…"** and **"From audio file…"** entries use a simpler shared dialog (no transport, unlike the song dialog): drag the orange handles to pick a region, set **Waveforms to slice out** (1–32, default 8 — the region is split into that many equal slots, one waveform centred in each; `1` = a single frozen snapshot), pick an embedded pitch via the Note/Octave picker, and press **Capture waveforms**.
+    - **Edge handles stay fully grabbable.** The two region handles are drawn centred on the selection's start/end sample, so when a handle sits at the very start or end of the buffer its outer half would normally be clipped to the wave-view edge — leaving a thin half-bar that's hard to grab. Instead, both the handle **rendering** and **hit-testing** use a *handle zone* (`handleZone()` = the wave rectangle widened by the `kHandleHitRadius` = 8 px hit radius on each side), and the drag/create repaints cover that same zone so the overhang never ghosts. The result: the full vertical bar (plus its ±6 px end caps) is always drawn and grabbable, even when the selection edge is pegged to the buffer start/end. The wave-view layout's 12 px side margin gives the 8 px overhang room to render and receive clicks. Body-drag and click-to-create still require the click to land inside the wave area proper, so the slop margin only ever grabs an existing handle, never starts a new selection. (Applies to all three sources of this dialog — Mic, File, Playback — and the song dialog, which now uses the same two-handle region model with the identical `handleZone()` / `kHandleHitRadius` geometry.)
+    - **Captured waveforms go to the Library only — never auto-placed.** Pressing **Capture waveforms** adds every sliced waveform to the **Library list** and binds the right-pane editor to the first one. It does **not** touch the arrangement: it never grows the grid's cell count, never resizes an axis, and never adds a scatter dot, and the current cell/scatter selection is left as-is. Placement is a separate, explicit step — select a cell (or scatter slot) and press the Library list's **Assign to selected cell**. This matches the **+ Waveform** menu's insert items, which likewise only add a library entry. (Earlier builds appended multi-slice captures along the Position axis automatically; that was removed so capturing can't silently rebuild your wavetable.) Handled by `addCapturedFramesToLibrary()` in `layered_wave_editor.cpp`.
+      - **Capturing is undoable.** A capture mutates the editor's doc (new Library entries) on the same debounced path as any other edit, so it lands in the graph undo tree as an *Edit wavetable* step — **Ctrl+Z removes the captured waveforms, Ctrl+Y restores them**. Two things make this work that previously didn't: (1) the editor is a pop-out `DialogWindow`, so its key events never reach `MainContentComponent::keyPressed`; `LayeredWaveEditorComponent::keyPressed` now handles Ctrl+Z / Ctrl+Y itself (first flushing any pending debounce as a real undo step so the capture is committed before the undo runs), and (2) on every snapshot restore the open editor re-decodes its doc from the restored `node->script` via `reloadFromNode()` — without that the editor would keep showing its stale pre-undo library even though the graph reverted. An editor registry (`reloadOpenEditorsAfterSnapshot`) is walked from the main window's `onLoadSnapshot`, so undo/redo triggered from *anywhere* (the editor or the main window) refreshes every open wavetable editor; if the editor's node was deleted by the restore, the window closes itself.
+    - **Remembered dialog settings (session-scoped).** The dialog re-opens with the **waveform count**, **Gain**, **grain length** (ms), **crossfade** (ms), and **labelled pitch** (Note + Octave) you last used, so a workflow of capturing many waveforms at the same settings doesn't reset every open. Whether you've **manually moved the grain slider** (`grainUserSet`) is remembered too, so a remembered grain value isn't silently overwritten by the mode-snap default on the next open (see [Grain length](#capture-grain-length)). The values are held in a file-static `captureDialogPrefs()` and written on **every** close — including **Cancel** — so even an aborted open updates the remembered state to whatever you'd dialled in. The prefs are **session-scoped only** (not persisted to disk), and **Window length (the freeze window, ms) is deliberately excluded** because it auto-tracks `autoWindowMultiplier(mode) × grain` for the current selection on each open (remembering a fixed value would fight the auto-default). Defaults on first open: 8 waveforms, 1.00× gain, a **mode-dependent grain** (**5 ms** in Async granular, **40 ms** in Pitch-sync grains — see [Grain length](#capture-grain-length)), 50 ms crossfade, A4.
+    - **Reversed slider fill.** The dialog's sliders use a **reversed two-tone fill** — the bright track colour sits to the **right** of the thumb and the dim colour to the **left**, the opposite of JUCE's default. This reads the slider's current `trackColourId` / `backgroundColourId` and swaps them (the same pattern used in `control_bank.cpp`), so the bright portion represents remaining **headroom** above the current value rather than the consumed amount.
+    - **Gain (all sources).** A horizontal **Gain** slider on the right half of the embedded-pitch row sets the output level applied to every captured waveform (**0–4×**, 1.00 = the raw recorded level, double-click to reset). It writes the produced `GranularFrame`'s per-frame `gain` (`IWavetableFrame::gain`) — the **same scalar the wave editor's [Gain knob](#per-waveform-gain) drives** — so it's not baked into the PCM: the recording stays at its captured level and the gain is a separate, reversible multiplier you can fine-tune later in the editor. Because granular frames now honour `gain` in the synth's granular layer (the grain reader multiplies by it), the captured level is audible in held-note playback and in the wavetable morph, not just in the preview. The **Preview reflects it live** — `regenerateAuditionGrain` bakes the gain into its throwaway preview buffer (the engine's preview reader has no per-frame gain knob), and moving the slider while a preview runs re-publishes the loop. Use it to level a quiet mic take up or a hot file down at capture time.
+    - **Freeze mode (all sources).** A **Freeze:** dropdown (its own row above the embedded-pitch row) picks which granular sustain algorithm the captured frames use — **Crossfade loop** / **Async granular** / **Pitch-sync grains** / **Spectral freeze** (see [Freeze modes](#frame-types) above for what each does). It is baked into every produced `GranularFrame` (`buildFrames` reads `selectedFreezeMode()`) and drives the live **Preview** through the same shared `GrainFreezeVoice` the synth uses, so you can **A/B the four characters before capturing** and what you hear is what a held note will play. Changing it while a preview runs re-anchors and re-publishes the audition live. Mirrors the song dialog's picker — the two were unified so all three capture types expose the full mode set rather than the song dialog alone. To its right sit the mode-specific **"Grains per waveform:"** slider and **"FFT size per waveform:"** combo — see [Grain count & FFT size](#granular-grain-fft).
+    - **Grain length (all sources, cloud modes only).** <a name="capture-grain-length"></a>A **Grain length** slider (its own row, **1–500 ms**, 0.5-ms step, seeded from the remembered prefs) sets the length of **each overlapping Hann grain** inside a captured waveform — the same quantity the wave editor's grain control drives. **Short grains make the Async-granular cloud sound constant/steady; longer grains roam over a proportionally wider window and sound more evolving / less constant.** The slider reaches **below 5 ms** (down to 1 ms) for the smoothest possible cloud, though `effectiveGrainLen()`'s 64-sample floor (`max(64, ms × sr)`, ≈ 1.33 ms @ 48 k) means the smallest few values all map to that floor (and the voice enforces a further 16-sample engine floor). It is **only used by the two grain-cloud modes** (Async / Pitch-sync grains): the ms is converted to samples, baked into every produced `GranularFrame`'s `grainLength`, and published to the live preview (`setPreviewGrainLength`).
+      - **Mode-dependent default + mode-snap.** The two grain-cloud modes want *different* grain lengths to sound constant, so the default is **per-mode** (`defaultGrainMsForMode()` in `granular_frame.h`): **5 ms for Async granular**, **40 ms for Pitch-sync grains**. Async is a decorrelated blur where many tiny grains blend into a smooth cloud, so a very short grain sounds steady; Pitch-sync snaps each grain origin to the pitch-period grid and needs a few *whole periods* per grain (~40 ms) before the periods lock and the pitch sounds coherent — at 5 ms it warbles. **While you haven't manually moved the grain slider** (`grainUserSet == false`), switching the **Freeze** mode between the two cloud modes snaps the grain to that mode's default, so each mode opens at its good value. **The instant you drag the grain slider** it sets `grainUserSet = true` and the slider **stays where you put it** — no more mode-snapping — and that manual value (plus the `grainUserSet` flag) persists across opens via the session prefs. The non-grain modes (Crossfade / Spectral) don't trigger a snap (the grain is inert there). The frame editor (which edits an existing frame, not a from-scratch default) is unaffected — only the capture dialogs apply the mode-snap. In **Crossfade loop** and **Spectral freeze** the slider is **greyed out** (not hidden) with a tooltip explaining that those modes loop / analyse the whole freeze window instead and pointing at "Window length" for the loop/analysis length — per the "grayed-out controls must explain themselves" rule. In those non-cloud modes the auto window no longer follows the grain at all — it uses the fixed `kNonGrainAutoWindowSamples` default — so a short grain doesn't shrink the loop/analysis window. This is the capture-dialog half of **Option B**: a grain slider *and* a window slider, mirroring the editor, so the two are decoupled exactly as they are in the frame editor.
+    - **Crossfade (all sources).** A **Crossfade (ms)** slider (its own row, **1 ms – half the freeze window**, default **50 ms**, seeded from the remembered prefs and double-click to reset) sets the length of the equal-power seam each captured frame uses to hide its loop boundary — the **same quantity the wave editor's and song dialog's Crossfade sliders drive**, so all three sources now expose it symmetrically. It is baked into every produced `GranularFrame`'s `crossfadeSamples` (`buildFrames` reads `crossfadeSlider.getValue() × 0.001 × sr`, still hard-clamped to `windowLen/2` so the two seam halves can't overrun the loop). The cap **tracks half the freeze window live**: `syncCrossfadeMaxToWindow()` re-runs whenever the window changes (window-slider drag, Fit, mode/grain/count change, re-capture seed) and re-ranges the slider to `effectiveSrcLen()/2`, because in the playback model the crossfade loop *is* the freeze window — matching the editor's `crossfadeMaxSamples()` for Crossfade loop and the engine's `xfade = min(req, window/2)` clamp. There is **no 500 ms ceiling** (unlike the song dialog) because the playback window can be many seconds long. The slider stores its value as `crossfadeDesiredMs` (the **intent**, surviving any temporary clamp by a narrow window) and persists/reports *that*, not the visibly-clamped value, so shrinking and re-widening the window restores the seam length you dialled. It is **only used by Crossfade loop** (the other three modes don't loop a seam), so it is **greyed out in every mode except Crossfade loop** — symmetric with how the Grain-length slider greys out in the non-grain modes, and per the "grayed-out controls must explain themselves" rule (its disabled tooltip says the seam only applies to Crossfade loop and to switch the freeze mode to set it). Its `crossfadeDesiredMs` value is **retained while greyed** and still **re-baked into every captured frame** (so a frame captured in another mode keeps a sensible seam if you later switch it to Crossfade loop in the wave editor); in re-capture mode the value still writes through `onMetadataEdited` whenever you do change it in Crossfade mode. (`refreshFreezeExtras()` owns the enable/tooltip for both grain and crossfade; in the song dialog it ANDs the mode test with the render-ready gate so neither lights up before the offline render finishes.) The **Preview reflects it live** (`regenerateAuditionGrain` bakes the same seam into its throwaway loop and re-publishes on drag).
+    - **Window length (the freeze window, all sources) + section bands.** Each captured waveform spans a *freeze window* of audio — the region the mode loops (Crossfade), roams (Async / Pitch-sync grains), or analyses (Spectral). All three sources expose it as a **Window length (ms)** slider (`kWindowMinMs` = 1 ms – `kWindowMaxMs` = 12000 ms, **1-ms step**). **It is expressed in milliseconds — the same unit as Grain length and Crossfade — so the window:grain ratio reads off directly** (the old "Samples per waveform" sample-count was hard to compare against the ms grain/crossfade controls). The slider value is converted to samples against the source rate (`windowFromSlider()` = `round(ms / 1000 × sr)`, with the song dialog using `songSampleRate` and the mic/file dialog `tapSampleRate`, fallback 48000). **Until you drag it, the slider auto-tracks the per-mode auto width** (`syncWindowToAuto()`): the grain-cloud modes track `autoWindowMultiplier(mode) × grain` (4×, so they have roam room — a plain `mult × grainMs` multiply since both window and grain are ms), while Crossfade/Spectral track the fixed `kNonGrainAutoWindowSamples` default (converted to ms against the source rate), so their window is **independent of the grain** and a short grain default doesn't collapse the loop/analysis window. It re-runs whenever the grain length, freeze mode, or waveform count changes — exactly mirroring the editor's `kWindowAutoPerMethod` per-method default. Dragging it (or pressing **Fit width to selection**) sets `windowUserSet = true`, after which it stays the explicit ms width you chose across grain/mode changes. The slider is the **source of truth** for the window length when there are **2+ waveforms**: `effectiveSrcLen()` returns `windowFromSlider()` (capped to the selection), and that span is shared by the captured frames, the region audition, and the **shaded orange section bands** drawn over the waveform. (Note the floor is **mode-dependent**: `windowFromSlider()` / `effectiveSrcLen()` floor the cloud modes at one grain — a grain must fit — and Crossfade/Spectral at 256 samples.) `effectiveSrcLen()` also **caps the window to the current selection length** (`min(window, regionLen)`): a per-waveform window can never be wider than the selection it sits in, so the section bands always stay between the two handles — this is what stops the bands from spilling outside the handles after zooming the view or when the handles are squeezed tighter than the window.
+      - **Minimum selection = one window length.** While dragging a resize handle, the selection **can't be shrunk below one window length** (`enforceMinSelectionDuringDrag()` pushes the dragged edge back out so the selection stays ≥ `minSelectionLen()` = `windowFromSlider()`). This guarantees at least one whole section band always fits inside the selection, so the bands never get clipped by an over-tight selection. The clamp applies only to the two resize handles; a body drag (which keeps a fixed span) is exempt, and a single-waveform capture (whose window *is* the selection) imposes no minimum.
+      - **Zoom can't go tighter than one window.** The view-zoom is clamped so the visible window is never smaller than one freeze window (with 2+ waveforms): `minViewLenSamples()` raises the view's lower bound from the default `kMinViewSamples` floor to `max(kMinViewSamples, windowFromSlider())`, and `reconfigureZoomForWindow()` re-ranges the zoom slider's maximum to `bufferLen / minViewLenSamples()` whenever the window changes (count, grain, mode, window-slider drag, or Fit). So you **physically can't zoom in far enough to make a whole captured waveform not fit on screen** — widening the window pulls an over-zoomed view back out, and the zoom slider simply stops at that limit. This is why the minimum-selection clamp above needs no "window bigger than the view" escape hatch: the window is always ≤ the view. (A single-waveform capture has no independent window, so its zoom keeps the plain `kMinViewSamples` floor and can zoom into a long selection freely. The re-range uses a re-entrancy guard, since `setRange` can fire the zoom slider's change handler, which itself refreshes the window controls.)
+      - **Single waveform = the whole selection.** When **Waveforms to slice out is 1**, there is no per-waveform spacing to honour: the one window simply *is* the selection. `effectiveSrcLen()` returns the selection length directly, and the **Window length slider and the Fit button are both disabled** (greyed, with a tooltip explaining the lone window spans the whole selection); the slider still tracks the selection size (shown in ms) for display as you drag the handles. Shrinking the selection shrinks the orange highlight with it.
+      - **Band geometry (2+ waveforms) — piecewise, continuous at the tiling point.** The bands are placed by `bandStartForIndex()` in two regimes that meet continuously where the windows exactly tile the selection (`freeSpace = regionLen − n·srcLen == 0`):
+        - **Windows fit (`freeSpace ≥ 0`) — uniform-gap.** The leftover space is split into **n+1 equal gaps**: one before the first band, one between each adjacent pair, and one after the last (`gap = freeSpace / (n+1)`). So the two **end margins** (leftmost band → left handle, rightmost band → right handle) always **equal the inter-band gaps** and grow/shrink together as the selection is resized.
+        - **Windows overlap (`freeSpace < 0`) — contained.** When the windows are wider than their share they must overlap; rather than let a negative end margin push the outer bands **past** the handles, the row stays **contained**: band 0 flush to the left handle, band n−1 flush to the right, the overlap distributed evenly between (`step = (regionLen − srcLen)/(n−1)`). So the selection never visibly spills its bounds even at heavy overlap.
+      - **Constant size on resize.** Because the window is a fixed sample count, **resizing the selection re-spaces the bands without rescaling them**: each band's pixel width is `srcLen × pxPerSample` (independent of region length), so growing the region opens the (uniform) gaps and shrinking it forces overlap, while the bands themselves stay the same size. `paint()` draws the bands from the same `bandStartForIndex()` geometry `buildFrames()` captures, so the drawn bands and the captured audio agree.
+      - **Changing the waveform count resizes the selection, not the windows.** When you change **Waveforms to slice out**, the **selection grows/shrinks in proportion** (`resizeSelectionForCountChange()` in both dialogs: `newLen = oldLen × newN / oldN`) so each waveform's window length **and** the inter-band slot spacing (`regionLen / n`) stay **constant** — adding waveforms extends the selection to make room for them rather than cramming more bands into a fixed span (and removing waveforms shrinks it back). The window control itself is count-independent (it tracks `autoWindowMultiplier × grain` or your fixed value), so it doesn't move on a count change — only the **two region handles** do. After the resize the dialog re-clamps the selection to the view, re-syncs the auto window, and refreshes the zoom/preview controls.
+        - **Centred on the selected preview waveform.** The resize is **centred on the band the **Preview-waveform picker** currently points at** — that band's centre (computed from the *old* count/region, since the preview slider is re-ranged only after the resize) is held fixed and the new length is laid symmetrically around it. So the waveform you're auditioning stays put under the handles while the others spread out (growing) or close in (shrinking) around it, instead of the selection always growing rightward from a fixed start.
+        - **Shrinking stays inside the old bounds.** When the new count is **smaller** (shorter selection), the result is additionally constrained to remain within the **old** selection's `[start, end]`, so a smaller count **never pushes a handle farther out than it already was** — if centring on the preview band would push an edge past where it used to be, that edge is pulled back in (the smaller window always fits inside the old one). Growing has no such cap: a larger count legitimately moves the handles outward, clamped only to the buffer ends (shifted left to fit if it would overrun, never collapsing below ~256 samples).
+      - **Per-method auto-default + Fit button.** Whenever the **grain length, freeze mode, or waveform count** changes (and when the region is first established), `syncWindowToAuto()` sets the slider to the per-method default the wave editor uses — `autoWindowMultiplier(mode) × grain` (4×) for the grain-cloud modes, the fixed `kNonGrainAutoWindowSamples` (≈ 100 ms) for Crossfade/Spectral. At that window the bands generally leave gaps or overlap rather than tiling exactly; that's intended, because the window is anchored to the *grain* (cloud modes, so they get roam room) or to a fixed default (non-grain modes) rather than to the slot spacing. The **Fit width to selection** button (next to the slider, disabled at a single waveform) instead sets the slider to exactly the slot spacing (`regionLen / n`, `syncWindowToFitSlots()`); at that window `freeSpace == 0` so all gaps are zero and the bands tile the selection edge-to-edge — handy when you want the windows to abut. Pressing Fit, like dragging the slider, marks the window as user-set so it then stays fixed across grain/mode changes until re-fit or re-dragged.
+
+      Setting the slider by hand (or pressing Fit) overrides the auto-default and is the way to deliberately dial in overlap or gaps. Every band is the same orange as the region tint with thin orange edge separators (no center line; the earlier amber center lines and blue fills were removed). The region-info line reads e.g. `Region: 2.0 s | 8 waveforms, 250 ms apart, each 1000 ms wide`.
+    - **Library entry names.** Captured entries are named after their source and freeze method rather than a generic "Waveform N": **Mic / File / Song** + the granular freeze mode (e.g. `Mic - Crossfade loop`, `File - Spectral freeze`, `Song - Crossfade loop`). The word "waveform" is dropped to keep the Library list compact. Every captured entry also gets its **stable library id appended** as a numeric suffix (e.g. `Mic - Crossfade loop 7`, `File - Spectral freeze 12`) so otherwise-identical entries stay distinguishable. The id is the monotonic creation counter (`nextLibraryId`), which is reload-safe and is **never renumbered when other entries are deleted** — so the number you see on an entry is permanent, not a positional index that shifts around as the list changes. The **"Edit from scratch"** and **"Duplicate current"** items in the **+ Waveform** menu are named the same way, after their editor type plus the id suffix: `Layered N` (time-domain), `FFT N` (frequency-domain), `Wavelet N` (wavelet-space), and `Granular N` for a duplicated capture — so all six creation paths produce a self-describing, stably-numbered name rather than the legacy generic `Waveform N`. Re-capture (replace) keeps the existing entry's name; only freshly-added entries are auto-named. Names remain user-editable. Built by `captureEntryName()` (capture base label) / `frameTypeName()` (scratch & duplicate base label) plus the shared id suffix `applyLibraryIdSuffix()` in `layered_wave_editor.cpp`. The old generic `Waveform N` default in `addLibraryEntry()` now only fires for paths that pass no name (e.g. project load fallbacks).
+    - **Mic live monitoring + Pause.** While the mic dialog is open the input is routed through the output (`AudioEngine::inputMonitoring`) so you *hear* what you're about to capture, and the display sweeps a ~10 s ring buffer at 20 Hz. A single prominent **Pause** button mutes monitoring **and** holds the display still so you can drag the region handles on a steady waveform; it toggles to **Go live** to resume both (amber while live, blue while paused). The dialog snapshots the engine's prior `inputMonitoring` state on construction and restores it in its destructor, so opening/closing it never clobbers the main-window **Mon** toggle. The source-info line shows **LIVE — use headphones to avoid feedback** while monitoring and **PAUSED** once held. The playback-tap source keeps the older plain **"Pause view"** checkbox (no monitoring — the project output is already audible via the main transport). **Why "Pause" and not "Freeze":** the word *freeze* is reserved for the granular **freeze methods** (CrossfadeLoop / AsyncGranular / PitchSyncGrains / SpectralFreeze) that sustain a captured waveform — the freeze-method picker (a **Freeze:** dropdown) now lives in **all three** capture dialogs (song, mic, file), so a "Freeze" button sitting next to a "Freeze:" method picker would be ambiguous. The pause control therefore reads **Pause** everywhere.
+      - **Input-device enablement.** On Windows the default input and output are frequently different physical devices, and JUCE's default-device init can land on an output-only setup (input channels zeroed / input device name empty) — which silently disables the mic, so capture/IR/monitoring get no signal even though the device "opened" (a freshly-plugged mic that's the default *recording* device but not the same device as the default *playback* device hits this exactly). `AudioEngine::ensureAudioInputEnabled()` detects that, picks the device type's default input device and enables its first channel, and is called both at engine `init()` **and** every time the mic capture dialog opens (so a mic plugged in mid-session is picked up). It restarts the device only when input is actually off — the common "input already live" path is a no-op with no audio glitch. Mirrors the older `inputChannels.isZero()` guard that already existed in `room_ir_capture.cpp`, hoisted to apply app-wide.
+      - **"Audio device…" button + DirectSound troubleshooting.** The mic dialog has an **"Audio device…"** button (bottom-left of the button row) that opens the standard Audio Device Settings dialog, plus a note in the hint text: if the input sounds wrong (garbled, noisy, or like the computer's own audio), switch the driver type to **DirectSound** there. This is the guided fallback for the WASAPI combined-device input-corruption bug — see [Audio device selection & persistence](#audio-device-selection--persistence) for the full explanation and why DirectSound is the first-run default.
+    - **Region audition (Mic + File).** A **Preview** button loops the selected slice through the engine's GrainLoop preview so you can *hear* the exact region under the handles before committing it to the library — the same mechanism the song dialog uses for its Pause/Scrub audition. It auditions a **representative captured frame** using the **exact geometry `buildFrames()` bakes** — the same **banded** source, grain, per-method window, and (for the cloud modes) banded preview atomics — so the preview is honest: what you hear is byte-for-byte what the synth will play:
+      - **Banded frames, not cropped grains.** Each captured frame is now a **banded `GranularFrame`**: its source PCM is one freeze **window** (`effectiveSrcLen()`) plus a half-window lookahead tail, with `windowStart = 0` / `windowLen = window`, and a **separate** `grainLength` taken from the Grain-length slider. So the voice runs its clean per-mode banded math — Crossfade loops the whole window, the **grain-cloud modes roam their grain inside the window** (a window wider than the grain = real moving cloud, which is exactly why the window auto-defaults to 4× grain), and Spectral analyses inside it. With a **single waveform** the window is the whole selection, so previewing plays back the **entire recorded sound** on repeat — record yourself saying "one", fit the selection around it, and Preview plays "one… one… one". *(This replaces the old `loopLenForWindow` model, which cropped every frame's source to a ~100 ms grain and left frames non-banded, so the cloud modes had only ~1 grain of roam room — collapsing Async/PitchSync to a near-static single grain regardless of window. The crop function is gone.)*
+      - **"Preview waveform" picker chooses which frame to audition.** A **Preview waveform** slider (its own row above the button row, 1-based) selects which of the N captured waveforms Preview plays — `1` is the first (earliest in the selection), `N` the last. `regenerateAuditionGrain` reads `value − 1` as the band index and auditions exactly that frame via `bandStartForIndex`, so what you hear is precisely the frame you'll get at that Position. Changing it **while a preview is running re-publishes the loop live** (no stop/start). The slider re-ranges and clamps its pick whenever the waveform count changes, and is **disabled at a single waveform** (nothing to choose — Preview plays the whole selection), with a tooltip saying so. Present for both Mic and File.
+      - **Loop / banded mechanics.** The source buffer is the freeze window **plus a window/2 lookahead tail** drawn from the audio past the band end (`buildGrainSource(startIdx, windowLen)`), which the `CrossfadeLoop` seam crossfade (~50 ms, clamped to window/2) reads so the wrap doesn't click. For the cloud modes the same tail gives grains roaming near the band end somewhere to read. The preview publishes the band via the engine's **banded preview atomics** — `setPreviewWindowStart(0)` / `setPreviewWindowLen(window)` alongside `setPreviewGrainLength(min(grain, window))` — so the engine's single `GrainFreezeVoice` runs the **same banded path** as the captured frame. **The published grain is clamped to the window, not just the source** (`min(grain, windowLen)`): a grain must fit inside the freeze window, because the voice floors the band width *up* to the grain length (`bandLen ≥ grain` for the cloud modes), so a grain wider than the window would swallow the whole `1.5×window` source and trip the voice's `srcLen < aGrain + 4` "band too short to roam" viability gate — zeroing the grain and producing **silence**. This bit when the selection (and thus the window) was smaller than the requested grain — e.g. a 63 ms selection with a 100 ms grain in Async granular went silent. Capping the published grain to the window keeps the cloud modes sounding (the grain just collapses to the window with no roam room). `buildFrames` applies the **same** `min(effectiveGrainLen(), windowLen)` clamp when baking each `GranularFrame`, so a captured frame is never silent for the same reason and the audition matches the capture. The non-cloud modes (Crossfade/Spectral) ignore the grain entirely and use the band. Playback ratio is `440 / capturedPitchHz` so it sounds at the editor's A4 reference. The bake (`buildFrames`) writes the same window, source layout, grain, and crossfade into the saved `GranularFrame`, and `terrain_synth`'s `renderGrainSample` plays it back with identical geometry — so audition and synth playback stay 1:1.
+      - Dragging the region handles plays it automatically and respins the source as the handles move (**scrub-to-audition**); changing the embedded-pitch picker re-pitches a running preview live. Preview toggles to **Stop**, and the engine preview is torn down (`clearPreview`) when the dialog closes. **Mic** can only audition once the display is **Paused** (a sweeping ring buffer can't loop stably) — until then the Preview button is disabled with a tooltip telling you to press Pause first; **File** can audition as soon as a file is loaded. Going **Go live** on the mic stops any running audition.
+    - **Zoom / scroll the waveform view (File source + the song dialog).** <a name="capture-zoom-scroll"></a>In a long file or song the whole buffer is mapped across the wave rectangle, so a useful selection is a one-pixel sliver. Two horizontal sliders **below the waveform** fix that: **Zoom** shrinks the visible window around the current scroll position (1× = whole buffer; the max lets the view shrink to ≈ `kMinViewSamples` = 256 samples, on a log-skewed travel) and **Scroll** slides that window left/right along the buffer. The view is a `[viewStart, viewLen]` window driven by the two slider values (`viewZoom` / `viewScroll`); `xForIdx`/`idxForX` (file) and `xForSamplePos`/`samplePosForX` (song) and the waveform render loop all map that window to the wave rectangle, so at 1× they collapse to the old whole-buffer map — **the live Mic / Playback sources keep zoom 1 / scroll 0 and hide both sliders**, so only the File and Song views show them. Zooming **stays at the current scroll value** (the scroll fraction is preserved; only `viewLen` changes), and **Scroll is disabled until you zoom in** (nothing to slide at 1×). The sliders are re-ranged for the buffer on load/render (`configureViewSlidersForBuffer`) and disabled until a file is loaded / the render completes.
+      - **Selection follows the audio, pegs at the view edges, scales with zoom (File).** The selection is a fixed audio sample range, so panning scrolls it visually with the audio. `clampSelectionToView()` keeps it usable at every zoom: a selection that would fall off a view edge is **translated to sit flush against that edge** (it "stays still, pegged" while you keep scrolling past it), and one longer than the visible window is **shortened to the window** ("can't select more than you can see") — so zooming in **scales the selection down with the view** but never larger than it. The section bands and orange region shading draw through the same view mapping, so they zoom/scroll with the waveform automatically.
+      - **Selection pegs into the view (Song).** The song dialog now uses the same two-handle region model as File, so it shares the same view-pegging logic: `clampSelectionToView()` keeps the region inside the visible window after a zoom/scroll (translating a region that would fall off an edge to sit flush against it, and shortening one longer than the visible window to fit), then re-anchors the Pause/Scrub band audition on the pegged region. The region is left alone while **Playing** — the playhead genuinely sweeps the song, so the view isn't disturbed during playback.
+
+- **Inharmonic frame** <a name="inharmonic-frame"></a>— an additive stack of **partials** with **arbitrary (non-integer) frequency ratios**, played as a **live multi-oscillator voice** (one sine per partial, per voice) rather than a baked single cycle. This is what makes bells, mallets, gongs, and metallic / detuned / stretched tones, whose overtones do **not** fall on the integer harmonic series. Edited in `InharmonicFrameEditorComponent` (`InharmonicFrame` in `inharmonic_frame.h/.cpp`). Distinct from the synth-wide **Additive bank** render mode (which FFTs one authored cycle and is therefore harmonic-by-construction): the inharmonic frame authors the partials *directly* and never constrains their ratios to integers.
+  - **Partials list.** Each partial has a **ratio** (its frequency as a multiple of the played note — `1.0` = the fundamental, `2.76` = a typical bell's first overtone; range **0.01–32**, the slider skewed around `4.0` so the musically dense low ratios get most of the travel), an **amplitude** (`0..1`), and a **phase** (`0..1` of a cycle). Up to **`kInharmonicMaxPartials` = 64** partials. **+ Partial** adds one (disabled at the cap), the **X** on a row removes it, and **Bell** resets the stack to the built-in `defaultBell()` (5 partials at the classic bell ratios). Each control has a units tooltip per the non-musician UX rule (ratio → "× the played note", etc.).
+  - **Live voice (what you hear).** When a note plays, the synth runs **one sine oscillator per partial** at `noteHz × ratio_k`, sums them, and mixes the result into the wavetable Position morph exactly like the [granular frame](#granular-freeze-window)'s live grain stream — the inharmonic frame bakes a **zero cycle** into the terrain and registers an `InharmonicLayerEntry` side-table entry that a per-voice oscillator bank (`Voice::InhStream`) reads live, weighted by the same Position blend the cycle layer would get (scatter Shepard/Wendland RBF or grid N-linear hat). Each partial whose frequency would exceed Nyquist is dropped, so the stack never aliases when pitched up. Phases re-seed from each partial's authored initial phase on note-on, so reused voices don't click.
+  - **What-you-see-equals-what-you-hear loudness.** The editor thumbnail (`renderRaw`) peak-normalises a representative cycle to 1.0, but the live additive voice has no per-sample normaliser, so it would otherwise be louder/quieter than the thumbnail suggests. `InharmonicFrame::normGainFor()` computes `1 / peak-of-the-summed-partials-over-one-period` once at build time, stored on the side-table entry and multiplied into the live voice — so the played level matches the drawn cycle. `renderRaw` uses the **same** helper for its own normalisation, so the two can't drift.
+  - **Amplitude-domain warp only.** The frame carries its own [warp chain](#waveform-warp-shape-bending), but — like the granular grain stream — a continuous live oscillator bank has **no periodic phase axis to remap**, so its warp editor is restricted to **amplitude-domain** methods (clip / fold / saturate the summed output). The picker hides the phase-domain methods and shows an explanatory empty-hint.
+  - **Save/load & undo.** Partials and the warp chain serialise into the frame body (a `;warp:` section appended only when the chain is non-empty, so old decoders never see it); a round-trip preserves every ratio/amp/phase and both warp ops. Edits commit on the editor's debounced *Edit wavetable* undo step like every other wavetable edit.
+
+- **Factory waveform library** <a name="factory-waveform-library"></a>— a built-in collection of **thousands of ready-made single-cycle oscillator shapes**, browsable from the **+ Waveform → Factory waveform...** menu item. The shapes are sourced from the public-domain [Adventure Kid Waveforms (AKWF)](https://github.com/KristofferKarlAxelEkstrand/AKWF-FREE) set (CC0) — basic geometric waves, tuned-instrument cycles (piano, electric piano, organ, guitars, strings, brass, woodwinds, theremin, voice), and character/algorithmic banks (FM, overtone, distorted, bit-reduced, chip, video-game) plus large assorted banks. Importing one is **not** a separate frame type: the chosen cycle is dropped into a **Drawn/Freehand `WaveLayer`** of a one-layer `LayeredWaveform` (`makeFactoryFrame()` in `layered_wave_editor.cpp`), so the result is a **fully editable, serialisable layered frame** — you can draw over it, stack more layers on it, apply a per-layer warp chain, everything a hand-built layered waveform supports. The new entry lands in the **Library list** (named after its source waveform plus the standard stable-id suffix) exactly like an edit-from-scratch entry; it is **not** auto-placed into a cell (use **Assign to selected cell**).
+  - **The browser.** A modal **Factory Waveforms** dialog (`FactoryWaveformBrowser` in `layered_wave_editor.cpp`, opened via `launchToolDialog` so it shares the main window's taskbar entry): a **category list** down the left (each row shows its waveform count, with an **All categories** row at the top), a **search box** across the top (filters by waveform name *or* category), a **Curated only** toggle, the filtered **waveform list** in the middle, and a **live cycle preview** along the bottom. Pick a waveform (single-click to preview, double-click or **Insert** to add) — Insert is disabled until something is selected. The dialog centres on the wavetable editor and closes on Insert / Cancel / Esc.
+  - **Curated "best of" subset (★).** A hand-picked subset of the library (the clean fundamental shapes plus a representative or two from each instrument and a sparse sampling of the character banks) is flagged **curated**. Curated waveforms show a **gold ★** in the list and are **sorted to the top of their category** (then alphabetical), mirroring the ★-and-sort-to-top treatment the warp method picker gives its recommended algorithms. The **Curated only** toggle hides everything else (and drops any category that has no curated entries), so a user who just wants a tight, vetted set never has to wade through all ~4000. (Curation is rule-based in the packer, not per-waveform auditioned — see below.)
+  - **On disk: one packed asset, not 4000 files.** The whole library ships as a single binary, `cpp/resources/waveforms.bin` (~4.4 MB), copied next to the executable by CMake (same mechanism as `docs/`) and loaded at runtime by the process-wide `WaveformBank` singleton (`waveform_bank.h/.cpp`), lazily on first browser open. We deliberately do **not** commit thousands of loose `.wav` files or embed them in the binary: a single ~4 MB read beats opening 4000 files and keeps the build fast. Each cycle is stored DC-removed, resampled to **512 samples** (the Freehand layer's native size, so import is a straight copy), peak-normalised, as `int16` (so the asset stays ~4 MB rather than ~8 MB float). The file is little-endian with a `SSWB` magic + version; the loader validates and fails cleanly (the browser shows an explanatory message) if the asset is missing or malformed. The asset is **regenerated by `cpp/tools/pack_waveforms.py`** from a local AKWF checkout (folder name → display category via a name map; curation via the rules above); a fresh repo checkout without the asset simply shows an empty browser, and the self-test treats a missing asset as a soft skip.
+  - **User single-cycle import.** `makeFactoryFrame()` is the shared import path for both a bank entry and an arbitrary user-loaded single-cycle `.wav` (any length is linearly resampled to 512), so the two stay in sync.
+
+A `SampleFrame` type exists for captured single-cycle samples but has no in-editor view yet — see `known-issues.md`.
+
+---
+
+## Waveform warp (shape-bending)
+
+<a name="waveform-warp-shape-bending"></a>**Warp** is real-time, modulatable *shape-bending* of a waveform — folding, clipping, bending, saturating, phase-distorting, and (for the generator morphs) pulse-width / sync / FM / phase-distortion shaping. The framework lives in `warp.h/.cpp` (pure std, unit-tested from `--self-test`); the reusable editor is `WarpChainEditor` (`warp_editor.h/.cpp`). The design goal is that the *amount* of each warp is a node parameter, so an LFO / oscillator / envelope wired in via the [on-demand modulation pins (#88)](#control-inputs-on-parameters-set-vs-mod) can **morph the waveform live** as a note sustains.
+
+### The three buckets
+
+Warps split into three buckets by *where* they apply:
+
+- **Bucket A — transform warps.** A function of an arbitrary cycle, applied to whatever waveform a frame produces. Two sub-domains matter per sample:
+  - **Amplitude-domain** — a nonlinear transfer on the sample value *after* the table lookup: **Soft Clip, Hard Clip, Wavefold, Wavewrap, Rectify, Quantize** (bitcrush), **Tube** (asymmetric / even-harmonic saturation), **Tape** (symmetric / odd-harmonic), **Flip, Chebyshev**.
+  - **Phase-domain** — remaps the read position *before* the lookup: **Bend +/−, Asym +/−, PWM-skew, Phase quantize, Phase distortion** (Casio-CZ style), **Vector phase shaping, Remap** (parameterised S-curve), **Self-sync** (read-restart formant sync).
+- **Bucket B — generator morphs.** The morph parameter is part of the wave's *definition*, not a post-process: PWM pulse width, hard-sync ratio, FM index, CZ phase-distortion. Implemented as **layer-shape primitives** inside the layered-waveform layer stack, not as chain ops.
+- **Bucket C — representation-bound element warps.** Applied *inside* a frame's render, per element of its representation: per-FFT-bin (spectral), per-wavelet-coefficient (wavelet), per-grain (granular), per-partial (inharmonic). These are **baked** into the rendered cycle / stream, not modulated live.
+
+### Where a warp chain can live
+
+The same `WarpChainEditor` widget drives every chain; it does **not** own the chain (the host points it at a `std::vector<WarpOp>` via `setChain`). Four host scopes:
+
+| Scope | Storage | Modulatable? | Domains offered |
+|---|---|---|---|
+| **Frame-scope** (Bucket A) | `WavetableDoc::warpChain` | **Yes** — each op becomes a `Warp N` node param | Phase + Amplitude |
+| **Per-layer** (Bucket A) | `WaveLayer::warpChain` | No (baked into the layer) | Phase + Amplitude |
+| **Spectral / Wavelet element** (Bucket C) | per-doc element chain | No (baked) | restricted |
+| **Granular / Inharmonic element** (Bucket C) | per-frame chain | No (baked) | **Amplitude only** (a live stream has no periodic phase axis) |
+
+A host that only supports some domains calls `setAllowedDomains(...)`, which filters both the picker and the default "+ Add" method and can supply an `emptyHint` explaining the restriction (per the "grayed-out controls must explain themselves" rule).
+
+### Editing a chain
+
+The editor shows the header **"Warp (shape-bending)"** and a **+ Add** button, then one row per op. Each row:
+
+- **Enable** checkbox — bypass this stage without deleting it (a bypassed op greys its amount slider).
+- **Method** button — opens a `PopupMenu` grouped by domain, with a **★ star badge** on the recommended (higher-quality) methods. Restricted hosts only list their allowed domains.
+- **Amount** slider — the `0..1` morph amount (`0` = identity). On the modulatable frame-scope chain this slider mirrors into the op's `Warp N` node param, so a wired LFO picks up the new resting value.
+- **▲ / ▼ reorder arrows** — move this stage earlier / later in the chain. **Order is part of the sound** — fold-then-clip is a different transfer curve than clip-then-fold — so the chain is processed strictly top-to-bottom and you can reorder freely. The **▲ is disabled on the first row and ▼ on the last** (each with a tooltip saying why, per the grayed-out-controls rule). Reordering is undoable on the same debounced *Edit wavetable* step as any other warp edit.
+  - **Modulation follows the op, not the slot.** On the frame-scope chain each slot is exposed as a positional `Warp 1`..`Warp N` node param (so the synth reads slot *k*'s live amount from `Warp k+1`). When you move an op, a wired LFO/oscillator stays driving **that op**, not the slot it vacated: `WarpChainEditor::moveOp` fires an `onReorder(a, b)` callback that the host (`LayeredWaveEditorComponent::swapWarpParamNames`) uses to swap the two affected params' **names** — the param objects (and the modulation pins that reference them by index) stay put, so each op keeps its own (possibly modulated) param after the move.
+- **X** — remove this stage.
+
+Adding or removing an op fires `onStructureChanged`, which on the frame-scope host re-syncs the `Warp 1`..`Warp N` params (adding a param + on-demand pin for a new op, dropping the param/pin/cables for a removed one, and remapping the surviving pins' param indices). A reorder fires `onReorder` + `onChanged` but **not** `onStructureChanged` (the op count is unchanged).
+
+### Per-sample primitives vs the buffer helper
+
+The live synth voice applies warps with the per-sample primitives `warpPhaseValue(method, phase, amount)` and `warpAmpValue(method, x, amount)` directly, so `amount` can be modulated every sample. The editor preview and the per-element bake instead call `applyWarpChain(ops, cycle)`, which composes the same primitives over a whole single-cycle buffer (phase-domain ops resample the cycle through `warpReadCycle`; amplitude-domain ops map each sample). Both paths share the same primitives, so preview, bake, and live playback agree.
+
+### Scripting the warp transfers
+
+The same warp catalogue is reachable from **scripts** (Script node, terrain/curve/wavetable bakes), so a script can shape a signal with the *exact* transfer the node-graph Warp effect uses instead of hand-rolling a saturator. Every binding routes through the `warp.h` primitives, keeping the catalogue a single source of truth. Two tiers, matching the bucket split:
+
+- **Scalar warps — every language, real-time-safe (Bucket A).** `warpamp(method, x, amount)` (amplitude transfer on one sample) and `warpphase(method, phase, amount)` (phase transfer on one phase value) are exposed in the **Built-in** parser, **Lua**, **Python**, and **WASM**. The **method comes first** (matching the rest of the warp API; the whole-buffer calls below put their buffer first instead). `method` is the stable integer id **or** a name string (`"soft clip"`, `"bend+"`, …), resolved by `warpMethodFromName` (case/space/punctuation-tolerant). `amount` is `0..1`, **0 = exact identity**, unknown method = identity, so they're safe to sweep. Being pure `float→float` they're legal in *every* mode, per-sample real time included. WASM exposes them as host imports `ss_warpamp` / `ss_warpphase` plus `ss_warp_method(const char* name)` (resolve a name to its id once, like `ss_waveform_id`); the `SS_WARP_*` id constants live in `soundshop_wasm.h`.
+- **Whole-buffer warps — bake/stream only (Bucket C).** `spectralwarp(buf, method, amount)` FFTs the buffer, warps the per-bin **magnitude** envelope (phase preserved, DC bin left alone), and inverse-FFTs back. `waveletwarp(buf, method, amount[, filter="db4", levels=5])` runs a multi-level DWT, warps every **coefficient**, and inverse-DWTs back (an exact perfect-reconstruction round trip — `amount` 0 returns the buffer unchanged). Both take a *whole buffer* (a Lua/Python list, or a `(ptr,len)` pair `ss_spectralwarp` / `ss_waveletwarp` in WASM), so they're **offline-bake or block/stream context only — never per-sample**. Both still funnel every value through `warpAmpValue`, so the catalogue stays unified. There is deliberately **no** `granularwarp` binding: a per-grain amplitude warp collapses to `warpamp` applied sample-by-sample, so a binding would just duplicate the scalar primitive over a loop (noted in `buffer_warp.h`). Implementations: `buffer_warp.cpp` (FFT `fft_util.h`, wavelet filters `getWaveletFilter()` from `wavelet.h`). The wavelet synthesis here is a **local perfect-reconstruction transform** — wavelet.h's own `idwt` is frozen for painter/saved-project compatibility and is *not* perfect-reconstruction for multi-tap filters, so a forward→warp→inverse round trip must not use it.
+
+See [SCRIPTING-LANGUAGES.md](SCRIPTING-LANGUAGES.md#waveshaping-warps--the-same-transfer-functions-every-language) for the cross-language rationale.
+
+### Save / load
+
+A warp chain serialises with `encodeWarpChain` / `decodeWarpChain`. Grammar: `<count>:<op>:<op>…` where an op is `<method>;<amount>;<aux>;<enabled>`. `:` separates ops and `;` separates fields within an op, so it never collides with the `,`/`|` field separators the host docs use. The leading count is advisory (decode trusts the actual op tokens). An empty chain encodes as `0`, and callers **omit the section entirely** when the chain is empty — so a doc saved before warp existed (or with no warp) has no warp token and old decoders never trip on it. `WarpMethod` ids are **stable** (serialized in project files) — never renumber existing values; the enum has an intentional hole at `9` (a planned-but-never-shipped "Mirror" method) to keep the surviving ids fixed.
+
+### Undo
+
+Frame-scope and per-layer warp edits (add / remove / reorder / amount / enable / method) all route through the editor's debounced commit, landing as a single *Edit wavetable* snapshot step. Bucket-C element warps commit through their own editor's apply path. Continuous amount-slider drags follow the usual "commit on release / debounce" rule rather than one step per tick.
+
+---
+
+## Frequency-domain (spectral) synth
+
+Authors a single-cycle waveform directly in the frequency domain: a **magnitude** curve and a **phase** curve over the FFT half-spectrum, IFFTed to one cycle. A `SpectralDoc` holds an `fftSize` plus two `SpectralCurve`s (`mag`, `phase`); both are evaluated at `halfBins = fftSize/2 + 1` and combined into a complex spectrum (DC and Nyquist forced real), then inverse-FFTed and peak-normalised. The phase canvas sits above the magnitude canvas; a live time-domain preview updates as you edit.
+
+### Spectral curves
+
+Each of the two curves is a `SpectralCurve` — the same reusable 1-D curve type used by the [AHDSR per-segment shapes](#per-segment-shape-curves) — with two authoring modes:
+
+- **Equation** — a formula, in one of four languages (see below).
+- **Drawn** — graphical, with **Points** (Catmull-Rom through draggable control points) and **Freehand** (per-sample painting) sub-modes, identical to the waveform editor's drawn layers.
+
+The **same Built-in / Lua / Python / GLSL dropdown and bake machinery documented under [Formula authoring language](#formula-authoring-language-built-in--lua--python--glsl)** drives the Equation mode here, with one domain difference that matters:
+
+- **Built-in:** the variable is **`f` = the integer bin index `[0, halfBins)`**, evaluated live in C++ at the synth's actual `halfBins`. So `exp(-f/20)` rolls off over ~20 bins regardless of resolution — a *bin-count-relative* contour. (The default magnitude is `exp(-f/20)`; the default phase is `noise()*pi` for a randomised phase.)
+- **Lua / Python / GLSL:** the script bakes once over a **normalized `[0, 1]`** sweep (1024 points) on the UI thread (or the GPU, for GLSL) and is resampled to `halfBins` on evaluate — it can't see the live bin count. The variable is `x`, with `f` provided as an alias of `x` (both normalized). A scripted `exp(-f/20)` is therefore *near-flat* (f ∈ [0,1]), not a 20-bin rolloff — the same text means different things in Built-in vs script mode. This seam is intrinsic to the offline bake and is tracked for the `CurveContext` unification in `known-issues.md`. (Spectral/AHDSR curve bakes are **unclamped** — the `[-1,1]` clamp applies only to wavetable waveshapes.)
+
+When a script language is selected the equation field grows into a multi-line editor (additive-style bodies that `return` a value are common for spectra). Bake errors show as a red `Script error: …` overlay on the curve canvas.
+
+### SpectrumTap
+
+The **SpectrumTap** effect reuses `SpectralCurve` for a per-bin custom frequency response, so the same Equation/Drawn authoring and Built-in/Lua/Python/GLSL language choice applies there too.
+
+### Serialization
+
+`__spectral2__:<fftSize>|<mag.encode()>|<phase.encode()>` — each curve's `encode()` embeds its mode, expression (with `,`→`;` and `|`→`\x1F` escaping so it's safe inside the `|`-delimited blob), and language key. The older `__spectral__:<fftSize>:<phaseMode>:<magExpr>|<phaseExpr>` format still decodes (as Built-in equations). Baked sample buffers are transient and re-created via `SpectralCurve::rebake()` on load.
+
+---
+
+## Terrain Synth
+
+The shared engine behind Waveform / Sampler / Piano / SoundFont and the explicit Terrain Synth node. Treats the sound source as an N-dimensional **terrain** (an array of samples in 1D-or-higher) and a **traversal** (a curve that walks the terrain over time, reading out samples as audio).
+
+### Terrain sources
+
+- **1D waveform** — a single-cycle waveform (e.g. Layered Waveform output)
+- **1D audio file** — any recorded sample; the whole file is the terrain
+- **2D image** — grayscale image where pixel brightness becomes sample amplitude; wide → long sound, tall → more vertical headroom
+- **3D video** — a clip imported via **Add Node → Terrain → From Video…**; each frame's grayscale brightness becomes a 2D amplitude surface and the time axis becomes the third dimension. See [Video import](#video-import-3d-terrain) below.
+- **N-D wavetable** — multiple frames in Grid or Scatter layout (see above)
+- **Math expression** — procedural; evaluated at every grid coordinate
+- **Programmatic (Generate)** — a terrain built by running a user **program** (Builtin math, Lua, Python, or a **GLSL compute shader** on the GPU), either once per grid cell (per-cell) or once over the whole array (whole-grid, for cross-cell effects like blur/CA/FFT — on the CPU languages, and on GLSL via **multi-pass** ping-pong), at any rank and resolution you choose. The computed grid is **baked into the project** so it never re-runs on load. See [Programmatic source](#programmatic-source-generate) below.
+
+The traversal doesn't care which source produced the terrain.
+
+### Video import (3D terrain)
+
+**Add Node → Terrain → From Video…** opens the **Import Video** dialog, which decodes a video clip into a 3-dimensional terrain `{frames, height, width}`: each frame contributes a 2D brightness surface (pixel luminance → sample amplitude, exactly like the 2D image source) and the frames stack along the time axis. The result is a 3-axis terrain you traverse like any other (Orbit/Lissajous/Path through the `{time, y, x}` volume).
+
+**Runtime requirement: ffmpeg.** Decoding is done by shelling out to the **ffmpeg / ffprobe command-line tools** via `juce::ChildProcess` (`video_decoder.cpp`) rather than linking a per-OS native decoder or vendoring libav. This is the same code path on Windows, macOS and Linux — the only requirement is that `ffmpeg` (and ideally `ffprobe`) are installed and on `PATH`. When ffmpeg is missing the **From Video…** dialog still opens but the **Choose Video…** button is disabled with a tooltip explaining how to enable it. ffmpeg is only needed at import / re-crop time; see "Baked terrain data" below.
+
+The dialog (`video_import_dialog.cpp`) gives you:
+
+- **Frame preview** with a draggable **crop rectangle** (XY spatial crop). Drag the interior to move it, the edges/corners to resize; a live `W × H px` readout shows the cropped source size and the area outside the crop is dimmed.
+- **Transport** — Play/Pause plus a **timeline bar** below the preview. The bar has a **playhead** (drag or click anywhere to scrub) and two **in/out handles** that set the **time crop**; the kept span is highlighted and playback loops within it.
+- **Output grid size** — three controls:
+  - **Output W (px)** and **Output H (px)** — the spatial resolution of the terrain grid. They are **aspect-linked** to the crop: editing one recomputes the other from the cropped region's source-pixel aspect ratio (resizing the crop rectangle also re-derives the height from the current width). This is the "scale down the selected XY region" control — one effective scale for both axes via the linked aspect.
+  - **Output frames** — the number of evenly-spaced time slices sampled across the time crop (the depth of the 3D terrain).
+  - A live `Grid: W × H × frames = N cells` readout.
+- **Import** decodes the final grid from the **original** video at full source quality (`VideoDecoder::decodeGrid`, background thread): it time-trims to the in/out range, crops the source rectangle, scales each frame to Output W × H, temporally resamples to exactly Output frames, and converts to grayscale — all in one ffmpeg filter chain.
+
+**Performance / threading.** On load the dialog extracts a low-resolution JPEG **proxy** frame sequence once (`VideoDecoder::extractProxy`) so scrubbing and playback never spawn ffmpeg per displayed frame. Both the proxy extraction and the final decode run on detached `std::thread`s writing into `std::shared_ptr` job structs with atomic flags; a `juce::Timer` polls them on the message thread, so closing the dialog mid-decode is safe (the shared_ptr outlives the component).
+
+**Baked terrain data.** Like wavetables bake their PCM into the node script, the decoded 8-bit grayscale grid is base64-encoded and stored **in the node script** itself. The script format is:
+
+```
+__video__:<path>|<t0>,<t1>|<cx>,<cy>,<cw>,<ch>|<outW>,<outH>,<outFrames>|<base64 gray>
+```
+
+(`|` is illegal in Windows paths and absent from the base64 alphabet, so the path is reassembled from all leading split fields for POSIX safety.) Because the grid is baked in, **reloading a project needs neither ffmpeg nor the original video file** — the terrain is rebuilt straight from the script in `TerrainSynthProcessor`'s constructor (`Terrain::fillFromVideoData`). The leading source fields (path / time / crop / output dims) are also what re-seed the Import Video dialog's controls when you re-open an already-imported node, so you can re-crop without re-picking the file. Right-click a video terrain node → **Edit Video…** re-opens the dialog seeded from the node's script (re-cropping does need ffmpeg and the source file again, since the final decode reads the original). Re-opening only parses those header fields (it skips the large base64 blob) and re-decodes from the source on the next Import.
+
+A video terrain classifies as a **Surface** source (`SynthSourceClass::Surface`), so its default Synth Mode is AM-sine (WaveformPerPoint), the same as the 2D image source.
+
+### Programmatic source (Generate)
+
+**Add Node → Terrain → Terrain from Program (Generate)…** opens the **Generate Terrain** dialog (`generate_dialog.cpp`), where you build a terrain of **any rank and resolution** by writing a short program that is run **once per grid cell**. This is the counterpart to importing audio/image/video: instead of decoding a file, the terrain is *computed*, which lets you reach bit depths a video/image source can't (the data is 32-bit float in memory) and dimensionalities a file can't represent.
+
+**Generation mode.** The dialog's **Mode** picker chooses how the program is run:
+
+- **Per-cell (one call per cell)** — the program runs once for every grid cell and returns that cell's value. Simple and the only mode some languages support. Each call sees the cell's coordinate (below).
+- **Whole-grid (one call, full array)** — the program runs **once** and fills the entire array itself. For CPU languages (Lua, Python) this unlocks **cross-cell algorithms a per-cell program physically cannot express** — convolution / blur, cellular automata, FFT, iterative relaxation, global normalisation — because the program can read every cell while writing every cell. Available for languages that can run block-at-a-time (**Lua**, **Python**, **GLSL**); the option is greyed for per-cell-only languages (Builtin), with a tooltip explaining why and how to enable it. **GLSL whole-grid is different**: it's a GPU "raw compute" mode where the shader's `main()` owns the writes — within a single pass every invocation runs in parallel, so it does *parallel per-output-cell* work (manual N-D indexing, multiple writes, scatter), but **true cross-cell reads of other output cells are not safe in one pass** (that needs multi-pass ping-pong — a documented future enhancement). For convolution/CA/relaxation today, use Lua or Python whole-grid.
+
+**Per-cell program model.** In per-cell mode, for each cell the program sees:
+
+- `c0 … c{nd-1}` — the cell's normalized coordinate along each axis, each in `[0,1]`. (In **GLSL** these are an array `c[16]` indexed `c[0] … c[nd-1]`, since GLSL has no dynamic global names.)
+- `x, y, z, w` — aliases of `c0 … c3` scaled to `[0, 2*pi]`, so a math expression written for the **Math expression** source (`sin(x)*cos(y)`) works unchanged here.
+- `nd` — the number of dimensions.
+- **GLSL only**, additionally: `coord[d]` — the integer cell index along axis `d`; `dims[d]` — the axis size; `TAU` — 2π. The per-cell GLSL body must `return` a `float` (it's the body of a `cellValue(…)` function).
+
+**Whole-grid program model (Lua / Python).** In whole-grid mode, the program defines a `generate()` function (rather than `loop()`) that fills the array. It sees these globals and helpers:
+
+- `dims` — a 1-based table (Lua) / 0-based list (Python) of the axis sizes; `nd` — the rank; `total` — the cell count (`product(dims)`).
+- **`getAt(c0, c1, …)` / `setAt(c0, c1, …, v)` — direct N-D pixel access (the recommended way).** Read or write a cell by its **per-axis integer coordinates**, with no manual flattening. `getAt` **edge-clamps** each coordinate to `[0, dim-1]`, so a stencil that reads past a border replicates the nearest edge cell (the useful default for blur/convolution) and never goes out of bounds; missing trailing coordinates count as `0`. `setAt` takes the value as the argument **right after the `nd` coordinates** (`setAt(r, c, v)` on a 2-D grid), clamps it to `[0,1]`, and **ignores the write if any coordinate is out of range** (unlike `getAt`'s clamped reads — this mirrors `set` so an off-by-one loop can't silently clobber an edge cell). With these you write N-D generators as nested coordinate loops — `for r…: for c…: setAt(r, c, blur_of(getAt(r-1,c), getAt(r+1,c), …))` — which is why the flat-index helpers below are rarely needed on the CPU.
+- `set(i, v)` — write **flat** cell `i` (0-based, row-major: the last axis varies fastest) to `v` (clamped to `[0,1]`). The flat-index counterpart to `setAt`, for the `for i = 0, total-1` iteration style.
+- `get(i)` — read **flat** cell `i` back (0 before it's written). Flat-index counterpart to `getAt` (note `get` zero-pads out of range whereas `getAt` edge-clamps).
+- `coord(i, axis)` — the normalized `[0,1]` position of flat cell `i` along `axis` (0-based), so you can recover coordinates from a flat index.
+- `coordAxis(i, axis)` — the *integer* coordinate of flat cell `i` along `axis` (the inverse companion to `flatten`; `coord` is just this divided by `dim-1`).
+- `flatten(c0, c1, …)` — per-axis **integer** coordinates → a flat index (row-major, last axis fastest), each coordinate **edge-clamped** to `[0, dim-1]`; missing trailing arguments count as `0`. On the CPU this is **rarely needed** now that `getAt`/`setAt` exist — it's mainly here for parity with GLSL, where the SSBO is a flat array and there is no `getAt`/`setAt`, so `data[flatten(…)]` is the *only* way to address a cell by coordinate. (`getAt`/`setAt` are literally `get`/`set` composed with this clamp.)
+- `neighbor(i, axis, delta)` — the flat index of the cell `delta` steps from `i` along `axis`, **clamped to the edge**; the flat-index way to find a neighbour (on the CPU `getAt(r, c±1)` usually reads better). Matches the GLSL whole-grid `neighbor`.
+
+`coord` / `coordAxis` / `flatten` / `neighbor` mirror the GLSL whole-grid index vocabulary exactly, so flat-index code ports between CPU and GPU unchanged; `getAt` / `setAt` are the CPU-only ergonomic layer on top (GLSL can't offer them because each shader invocation owns one output cell and cross-cell reads must come from the `prev[]` ping-pong snapshot — see the GLSL model below).
+
+**Whole-grid program model (GLSL).** GLSL whole-grid is the body of the compute shader's `main()` (not a `generate()` function). It runs once per GPU invocation (one per cell) and sees:
+
+- `data[]` — the output SSBO at binding 0 (`float`, length `total`); the shader writes `data[gid]` itself.
+- `gl_GlobalInvocationID.x` — the flat cell index for this invocation; `uTotal` — the cell count; `nd` — the rank; `uDims[16]` — the axis sizes.
+- `coordOf(idx, axis)` — the normalized `[0,1]` position of flat cell `idx` along `axis` (the GPU analogue of Lua's `coord`); `coordAxis(idx, axis)` — the *integer* coordinate along `axis`; and `TAU` (= 2π).
+- `flatten(c0, c1, …)` — the inverse of `coordAxis`: integer per-axis coordinates → a flat `data[]`/`prev[]` index. **This helper is emitted *specialised to the current terrain*:** its parameter count equals the rank `nd`, and each axis size is baked in as a *literal constant* with edge-clamping, so there's no `uDims[]` loop. A `{4,128,128}` terrain gets `int flatten(int c0,int c1,int c2)` returning `(clamp(c0,0,3)*128 + clamp(c1,0,127))*128 + clamp(c2,0,127)` (row-major: last axis varies fastest). The per-axis sizes are also exposed as literal constants `DIM0 … DIM{nd-1}`. (Generic `neighbor(idx,axis,delta)` covers single-axis stepping; `flatten` is for jumping to an arbitrary computed coordinate.)
+
+Always guard with `if (gl_GlobalInvocationID.x >= uint(uTotal)) return;` — dispatch is rounded up to a multiple of the 64-wide workgroup, so some invocations run past the end.
+
+**Multi-pass "ping-pong" (GLSL whole-grid).** A single compute pass writes each output cell **in parallel and independently**, so a cell cannot reliably read another cell's *new* value within the same pass — which rules out convolution/blur, cellular automata, diffusion/erosion, and any stencil that reads neighbours. The **Passes** field (GLSL whole-grid only; default 1) solves this with classic ping-pong: the shader runs `Passes` times over **two alternating buffers**, and on every pass it reads the **previous pass's complete output** through a read-only `prev[]` buffer (binding 1) while writing `data[]`. Because `prev[]` is a stable snapshot of the prior pass, neighbour reads are well-defined. The whole-grid model gains, in multi-pass:
+
+- `prev[]` — the previous pass's full output (binding 1); on **pass 0** it is **all zeros**.
+- `prevAt(idx)` — `prev[idx]`, returning `0` if `idx` is out of range (safe reads).
+- `neighbor(idx, axis, delta)` — the flat index of the cell `delta` steps from `idx` along `axis`, **clamped to the edge**. Compose it for diagonals/N-D stencils: `neighbor(neighbor(i, 0, dy), 1, dx)`.
+- `uPass` — the current pass index (`0 … uNumPasses-1`); `uNumPasses` — the total pass count.
+
+The idiom is **seed on `uPass == 0`, then iterate**: pass 0 writes the initial field (ignoring the all-zero `prev[]`), and later passes transform `prev[]` into `data[]`. After the last pass the most-recently-written buffer is read back and baked. `Passes = 1` is exactly the original single-pass behaviour (one pass, `prev[]` unused). Each pass is a full GPU dispatch; the pass count is capped at **4096** (`kGlslMaxPasses`). The dispatch primitive is `glslDispatchComputePingPong` (`glsl_compute.h`); `uPass` is set automatically per pass, the two buffers are zero-initialised with `glClearBufferData`, and a `GL_SHADER_STORAGE_BARRIER_BIT` memory barrier between dispatches makes each pass's writes visible to the next pass's `prev[]` reads. *(Per-cell GLSL is always single-pass and uses the single-buffer `glslDispatchCompute` path — Passes is hidden for it.)*
+
+**Factory waveforms — `waveform(id_or_name, phase)`.** Every language and mode can sample the ~4000 bundled single-cycle factory waveforms (the same AKWF bank the Layered Wave editor and the waveform browser draw from — see [Factory waveform library](#factory-waveform-library)). Every waveform has a **stable integer id** — the same integer in every language, shown as the dim **`#N`** in the factory-waveform browser and returned by `waveforms["name"]` in Lua/Python. The integer is the canonical key; names are a convenience.
+
+```
+waveform(42, c0)                 // raw sample of waveform #42 at phase c0, in [-1,1]
+waveform("AKWF_sin", c0)         // by name (Builtin/Lua/Python only)
+waveform(42, c0)*0.5 + 0.5       // mapped into the [0,1] output contract
+local w = waveforms["AKWF_sin"]  // Lua: resolve a name to its id once…
+waveform(w, c0)                  // …then reuse the fast integer in the hot loop
+```
+
+- The **first argument is the waveform id** (an integer entry index) **or a name** (where supported). An out-of-range id / unknown name resolves to "silence" (the call returns `0` for every phase) rather than erroring, so a typo degrades gracefully. There is **no source-rewriting parser** anywhere anymore — the entire bank is made available to each language and the lookup is an ordinary runtime/GPU index:
+  - **GLSL:** GPUs have no strings, so GLSL is **integer-only** — pass the id, e.g. `waveform(42, phase)`. The whole bank is uploaded **once per session** to a cached read-only std430 SSBO at **binding 2** (`glslSetCachedBuffer`, keyed by `kWaveformBankBufferId`), globally indexed (`id*512 + sampleIndex`), and the generated `float waveform(int id, float phase)` indexes straight into it with the same wrap+interpolate as the CPU path. No `waveform("…")` lexical scan, no per-bake repacking, no rewriting of your source. The function + SSBO are emitted only when the shader source mentions `waveform` (a cheap substring check, not a parse), so a shader that never calls it pays nothing. Works in per-cell and whole-grid (including multi-pass) GLSL — the cached buffer is re-bound before every dispatch and stays valid across all passes.
+  - **Lua / Python:** `waveform` is an ordinary registered runtime function (`l_waveform` / `py_waveform`) that accepts **either** an integer id **or** a name string (resolved by `WaveformBank::indexForName`, case-insensitive, leading/trailing whitespace ignored). Because it's a normal argument, the name **need not be a literal** — `waveform("AKWF_" .. n, c0)` works. Both languages also expose **`waveforms`**, a name→id map you can consult to avoid per-call name hashing: `waveforms["AKWF_sin"]` returns the same integer GLSL uses. The map **caches** each lookup (Lua `rawset`s the result into the table; Python's `dict.__missing__` stores it), so a given name hits `indexForName` only once even when read from a per-cell loop. The fast idiom is **resolve once, reuse the integer**: in Lua cache it in a `local` (at top level or in `start()` for a streaming script); in whole-grid Python cache it at top level; in per-cell Python `waveform(waveforms["name"], c0)` is already fast after the first cell (the dict hit replaces the hash).
+  - **Builtin:** the math-expression language is the *only* one SEANCE parses itself (`WaveExprParser`); the `waveform` atom reads a quoted **name literal** straight from the source (or a numeric id). The name must be a literal (the language has no string variables). The terrain path re-parses per cell, so the lookup runs per cell — fine for the simple language; use Lua/Python/GLSL for large grids that need a cached integer.
+- The **second argument is a phase in `[0,1)`** that wraps (so `1.0` ≡ `0.0`, `2.5` ≡ `0.5`); it indexes the 512-sample cycle with **linear interpolation** between adjacent samples. Passing a normalized coordinate (`c0`, `c1`, …) plays exactly one cycle of the waveform across that axis.
+- The return value is the **raw `[-1,1]` sample**. Because the terrain output contract is unipolar `[0,1]`, map it yourself when the waveform *is* the output: `waveform(id, c0)*0.5 + 0.5` (or `unipolar(waveform(id, c0))` in Builtin). Used as an *ingredient* inside a larger bipolar expression, no mapping is needed.
+- **Finding an id:** open the factory-waveform browser (Layered Wave editor → factory library) and read the dim `#N` on the right of each row, or — in Lua/Python — print/inspect `waveforms["name"]`. The id is stable as long as `waveforms.bin` doesn't change, so it's safe to type into GLSL source and save in a project.
+
+**Output contract.** Either mode produces **one value in `[0,1]`** per cell — think of it as a grayscale height / brightness — which is mapped to the terrain's bipolar `[-1,1]` as `v*2-1`, exactly like the image and video sources. (Per-cell returns the value; whole-grid writes it via `set()`.) This unipolar contract, rather than the Math-expression source's bipolar one, is dictated by the script runtime: the Signal role clamps Lua output to `[0,1]`. Builtin output is clamped to `[0,1]` here too so both languages behave identically.
+
+**Languages.** The dialog's **Language** picker lists only languages that can generate **and** are compiled into the build:
+
+- **Builtin (math expression)** — a single math expression (the same parser/functions as the Math-expression source: `sin`, `cos`, `abs`, `sqrt`, `pow`, `tanh`, `noise`). Always available, **per-cell only**.
+- **Lua** — a full function (`loop()` per-cell, or `generate()` whole-grid), so you can use locals, conditionals and loops. Listed only when Lua is vendored in the build. Supports **both** modes.
+- **Python** — a full Python program with the embedded-CPython interpreter (the same one the script console / signal scripting / shape baker use). Per-cell: a bare expression or a body that `return`s a value, seeing `c0…c7` / `x,y,z,w` / `nd` exactly like the other languages. Whole-grid: a `def generate():` that fills the array via `set(i, v)` / `get(i)` / `coord(i, axis)` with `dims` / `nd` / `total` globals (mirrors the Lua whole-grid API). Listed only when the Python DLL is available at runtime (it's delay-loaded; a missing DLL just hides the option). Supports **both** modes. **Python can't run on the audio thread** (where the terrain node is built during graph rebuild), which is the original reason the generated grid is now baked for *every* language — see "Baked data" below.
+- **GLSL (compute shader, GPU)** — the program is a GLSL **compute shader** dispatched on an **offscreen OpenGL 4.3 core context** that SEANCE stands up on demand (the app's UI is otherwise 100% software-rendered — there is no live GL context; the bake context is created lazily and used only at Generate time). Per-cell: the body of a `float cellValue(…)` that `return`s `[0,1]`, with the coordinate vocabulary above plus `coord[d]`/`dims[d]`/`TAU`. Whole-grid: the body of `main()`, which writes `data[gid]` itself, optionally **multi-pass** via the **Passes** field for cross-cell convolution/CA/diffusion (see the GLSL whole-grid model above). Listed only when a GPU/driver capable of a headless 4.3 core context is present (`glsl_compute.cpp` → `glslComputeAvailable()`); otherwise it's hidden, like a missing Python DLL. Supports **both** modes. **GLSL bakes like Python** — it can't run on the audio thread (no GL context there), so the grid is computed once at Generate time and stored. **GPU caveat:** float results can differ slightly across GPUs/drivers, so the same shader may bake to different bytes (and thus a different content-store hash) on different machines — fine for dedup, not bit-reproducible. Dimension cap is **16** (GLSL fixed-array limit); use Lua/Python for higher rank.
+
+The `GenLang` enum used by this dialog is **distinct** from `ScriptLang`: Builtin/Lua map 1:1, but `GenLang::Python` (value 2) is **not** `ScriptLang::Wasm` (value 2) — Python here goes through the embedded `ScriptEngine`, not an `IScriptRuntime` — and `GenLang::Glsl` (value 3) is **not** a `ScriptLang` at all (it dispatches a compute shader via `Terrain::fillFromGlsl` / `glsl_compute.h`, bypassing the runtime layer entirely). Never cross-cast `GenLang` to `ScriptLang`. Block-only `ScriptLang` runtimes (Wasm) are deliberately **not** offered — they have no per-cell ABI and no whole-grid generate path.
+
+**Dimensions.** The **Dimensions** field is a comma-separated list of axis sizes, so the rank is just how many numbers you type: `44100` = 1D audio, `512, 512` = a 2D image, `64, 128, 128` = 3D video `{frames, h, w}`. Any rank **up to 8** is accepted (the cell-generation backend `Terrain::fillFromScript` is itself unbounded; the 8-axis ceiling is the current node-wide limit on Sig pins / Center-Radius params, lifted everywhere at once when that cap is generalized). The total cell count is capped at 1G to avoid runaway grids.
+
+**Generate** validates the program by running it over a tiny probe grid (same rank, sizes clamped to ≤3) so syntax/runtime errors surface instantly in the status line without paying for the full grid. On success it then computes the **full-resolution** grid right there **on the message thread** (`generateGrid()` → `Terrain::fillFromScript` / `Terrain::fillFromScriptWholeGrid` for Builtin/Lua, `ScriptEngine::bakeTerrain` for Python, `Terrain::fillFromGlsl` — with the **Passes** count for whole-grid — for GLSL) and stores both the program *and* the computed float data into the node. (The probe validation runs GLSL with a single pass — it only needs to catch compile/link errors, not run the whole ping-pong iteration.)
+
+**Baked data, not just the program.** A generated terrain stores the **program + language + mode + passes + dimensions *and* the computed grid**. On load the node's constructor just deserializes the data — it never re-runs the generator. The script format is:
+
+```
+__generate__:<langInt>[:<modeInt>[:<passes>]]|<dim0>,<dim1>,…,<dimN-1>|<base64 source>|<dataField>
+```
+
+`<langInt>` is the `GenLang` enum value (Builtin 0 / Lua 1 / Python 2 / GLSL 3). The optional `:<modeInt>` is the generation mode (`0` per-cell, `1` whole-grid); when absent it defaults to per-cell, so projects saved before the mode field still load. The further-optional `:<passes>` is the GLSL whole-grid ping-pong pass count, written **only when it's `> 1`** (so non-GLSL and single-pass tags are byte-identical to before, and old projects load as `passes = 1`); a bare `<langInt>:<modeInt>:<passes>` is parsed by splitting field 0 on `:`. The program source is base64-encoded so it can contain newlines, `|`, braces, etc. without breaking the pipe-delimited layout. The **4th field** (`<dataField>`) holds the baked grid in one of two forms:
+
+- **Content-store reference (current):** `#<32-hex-hash>` — a reference into the project's content-addressed blob store ([Content store](#content-store) below). The actual bytes live once in the store, keyed by a hash of the grid's canonical `.npy` payload. The leading `#` is unambiguous because it appears in neither the base64 alphabet nor anywhere else in the pipe-delimited layout.
+- **Legacy inline blob:** the final bipolar `[-1,1]` floats (`product(dims)` of them), gzip-compressed (level 9) then base64-encoded — bit-exact. Projects written before the content store embedded the blob directly here, and still load.
+
+**Why bake for every language, not just Python?** `TerrainSynthProcessor`'s constructor runs during **graph rebuild on the audio thread**. The embedded Python interpreter is illegal there (single GIL-held interpreter, message-thread only), so a Python generator *cannot* re-run on load — it must be baked. Rather than special-case Python, **all** languages bake: this also removes a latent glitch where a large Builtin/Lua grid would re-run its per-cell loop on the audio thread during every load/undo and stall audio. Generation always happens exactly once, on the message thread, at Generate time. (The one-time cost is unavoidable regardless — the data has to be computed once either way.)
+
+**Backward compatibility.** Old projects whose tag has **no 4th field** still load: for Builtin/Lua the constructor falls back to regenerating from the program (safe, deterministic); a Python **or GLSL** node with no baked data can't regenerate on the audio thread (CPython and the GL context are both message-thread-only), so it loads as a flat grid until re-generated via Edit Source. Inline-blob (legacy) and `#hash` (current) 4th fields both decode. New saves always write the `#hash` form.
+
+<a name="content-store"></a>
+#### Content store (content-addressed blob side-store)
+
+Large immutable baked payloads — currently generated-terrain grids — live in a per-project **content store** (`content_store.{h,cpp}`, `NodeGraph::contentStore`) rather than inline in each node's script. The motivation is undo memory: `commitSnapshot` serializes the whole graph on every structural edit, and inlining multi-MB blobs into every snapshot string ballooned the in-memory undo tree (see `known-issues.md`). Nodes now carry only a short hash; the bytes are stored once and shared across every undo step that references them.
+
+- **Canonical form (what's hashed):** a NumPy `.npy` payload — `descr='<f4'`, C-order, the node's shape tuple, then the raw little-endian float32 cells. This is deterministic and compression-independent, so the same grid always hashes the same regardless of how it's stored. The hash is a 128-bit content hash (two decorrelated FNV-1a lanes + a splitmix64 avalanche), rendered as 32 lowercase hex chars. Not cryptographic — it's for addressing/dedup; 128 bits is birthday-safe far past any realistic blob count.
+- **Stored form (what's kept in RAM/on disk):** the `.npy` bytes passed through a **4-byte-plane shuffle** (groups the four bytes of each float32 into separate planes so DEFLATE sees long low-entropy runs) then **DEFLATE** (JUCE gzip, level 9). Pure permutation + lossless compression, so round-trips are bit-exact.
+- **Dedup:** identical grids hash identically and are stored once, no matter how many nodes or undo snapshots reference them.
+- **Undo exclusion:** `serializeForUndo` writes snapshots with `includeBlobs=false` — the `#hash` travels in the snapshot, the bytes never do, and they persist in the live in-memory store across undo/redo. A **real save** (`writeProject`, `includeBlobs=true`) emits the referenced blobs as `[Blob]` sections (`hash=…` + base64 `bytes=…`) just before `[End]`; `readProject` loads them back into a fresh graph's store. Only blobs actually referenced by a node are written, so orphaned entries are dropped at save time.
+
+The generated terrain classifies by rank: 1D → **Sample** source, 2D+ → **Surface** source (default Synth Mode AM-sine), matching the audio/image/video sources.
+
+**Editing.** Right-click a generated terrain node → **Edit Source…** re-opens the dialog seeded from the node's script. In edit mode the **axis count is locked** (changing the number of axes would rewire the node's Sig pins and Center/Radius params and drop cables) — you can still change dimension **sizes**, the language, the **mode**, and the program. To use a different rank, create a new generated terrain.
+
+**Export grid as.** Right-click a generated terrain node → **Export grid as ▸** offers up to three formats, depending on the grid's rank:
+
+- **NumPy `.npz` (any rank, full precision).** Writes the baked grid to a NumPy **`.npz`** file (a ZIP archive containing one `.npy` member named `terrain`, float32, C-order, at the node's full rank/shape). This is exactly the container `numpy.savez` produces (members are STORED/uncompressed), so it loads straight into the scientific-Python stack: `np.load("name.npz")["terrain"]` returns the array with its original shape. The grid is the final bipolar `[-1, 1]` data, bit-exact with what Generate produced — the same canonical `.npy` payload the [content store](#content-store) hashes (`ContentStore::makeNpy` / `makeNpz` in `content_store.cpp`). Use it to take a terrain you sculpted in SEANCE into NumPy/SciPy/Matplotlib, or any tool that reads `.npz`. Always offered.
+- **WAV (1D waveform).** Offered only when the grid is **1D**. Treats the row as a mono waveform and writes a 24-bit PCM `.wav` via the same `AudioExporter` used for project export. The sample rate is the project sample rate (or 44100 Hz when the project is set to follow the audio device). The float data is bipolar `[-1, 1]`, so it maps directly to full-scale audio — open it in any audio editor or sampler.
+- **PNG (2D grayscale image).** Offered only when the grid is **2D**. Maps each cell's float `[-1, 1]` value to 8-bit grayscale `[0, 255]` (`v*0.5+0.5` then ×255) and writes an RGB `.png` (`dims[0]` = height, `dims[1]` = width, row-major). Note this is **lossy** — 8-bit quantises the float grid; use `.npz` if you need the exact values. Handy for previewing a heightmap or pulling it into an image editor.
+
+All three appear only on generated (`__generate__`) terrains, and the menu shows a warning if there's no baked grid (a Python node that was loaded without baked data — re-run Generate first). The WAV/PNG items are hidden when the rank doesn't match (rather than greyed out), since they're meaningless for the wrong rank; `.npz` is the universal fallback.
+
+### Traversal modes
+
+Six built-in modes:
+
+- **Linear** — sweeps a single axis at constant speed. The default for 1D waveform (= standard wavetable playback) and 1D audio file (= sample player).
+- **Orbit** — circles a center point in 2D-or-higher; radius and speed are knobs. Periodically revisits each region.
+- **Lissajous** — two-axis independent oscillators with different rates; classic figure-8/lemniscate patterns drawn through the terrain. Complex periodic timbres.
+- **Path** — user-defined polyline through 2D-or-higher space. Click points in the visualizer (Click Points draw mode) or drag (Freehand). Playback modes: **Loop** (jump back at end) or **Bounce** (ping-pong).
+- **Physics** — particle-with-forces traversal.
+- **Custom** — user-defined math expression.
+
+The terrain visualizer (the colored grid in the synth editor) shows the current 2D slice with the traversal path overlaid.
+
+### Math expression grammar (Formula traversals and terrain)
+
+Variables available in expressions: `x`, `y`, `z`, `w`, `v`, `u`, `s`, `t`. Their meaning depends on context — `t` is typically time, `x..z` are spatial coordinates, etc. Standard math operators and the usual set of functions (`sin`, `cos`, `exp`, `log`, `sqrt`, `pow`, `abs`, `min`, `max`, `^` for power, …) are supported.
+
+### Voice allocation
+
+Note-on allocates a voice and starts a traversal. The note's pitch sets the traversal advance rate (higher notes traverse faster). Velocity scales amplitude through the *Vel Sens* parameter (0..1). Chords run independent traversals at different speeds, summed.
+
+### Position parameters
+
+Each *traversable* axis of a wavetable terrain becomes a **Position** parameter on the synth (a grid axis with only one cell, or a single normalized scatter frame, is not traversable and gets no param — see [N-dimensional grids](#n-dimensional-grids) and [Scatter mode](#scatter-mode)). Position params can be:
+
+- Set with the slider
+- Automated from a piano-roll automation lane
+- Driven by a Param cable (block-rate, ~700 Hz)
+- Driven by a Signal cable (audio-rate, per-sample) — for FM-style timbral effects
+
+Every traversable Position axis automatically gets its own block-rate modulation input pin labelled with its axis letter — **`Mod: Position X`**, **`Mod: Position Y`**, **`Mod: Position Z`**, **`Mod: Position W`** (and `Mod: Position 5`, `6`, … past the four named axes). Even a single-axis terrain reads `Mod: Position X` so the pin always says which axis it drives rather than leaving a bare `Mod: Position`. Adding an axis (`+ Dim`) or growing a 1-wide axis to 2+ creates the matching pin; removing an axis (or shrinking it back to a single cell) deletes the pin and any cable plugged into it. These are the same on-demand control pins you can add to any parameter (see [Control inputs on parameters](#control-inputs-on-parameters-set-vs-mod)), just kept in sync with the axis count for you — wire a slow LFO or envelope into `Mod: Position X` to morph timbre over time without touching the piano-roll automation lane. They default to **Mod** (modulate around the slider's resting position); right-click the pin and **Switch to Absolute** to make a cable drive the axis edge-to-edge instead (`Set: Position X`), which locks the slider and side-steps the resting-value-drift caveat below entirely. The pins are created when the wavetable editor is opened, so older projects gain them (and get relabelled with the axis letter) automatically on next edit.
+
+When the axis count changes, each surviving Position param keeps its **resting value** (the slider setting), not the momentary modulated reading. This matters when a Position is being signal-driven while the grid is edited: `syncPositionParams()` rebuilds the param list, and for a modulated param it carries over `baseValue` (the resting setting) rather than the live `value` (that block's modulated reading). The rebuilt param is left un-modulated, so `applySignalModulations` re-snapshots its `value` as the new base on the next block — feeding it the resting value keeps that base stable. Capturing the modulated value instead (the old bug) let the base drift off-centre every time the grid changed: because the modulation model is `base + (signal − 0.5)`, a base below 0.5 can no longer sweep the axis across its full 0..1, so e.g. growing a wavetable to 3D while a control fader held a Position low would leave that axis stuck — you'd hear both cells blended at the fader extreme instead of the far cell alone. Preserving the resting value keeps the full morph sweep intact across `+ Dim`/grid-resize edits.
+
+Note that this only prevents *new* drift. A wavetable whose Position base was already corrupted (built with the buggy code, in-memory) won't self-heal — reset it by rebuilding the grid, or by momentarily disconnecting the `Mod: Position` cable and dragging the Position slider back to centre.
+
+### MIDI controller behavior
+
+Same as the [MIDI input](#midi-input-and-routing) section's "Built-in controller responses" table. Sustain pedal, mod-wheel vibrato (6 Hz default), pitch bend (±2 semitones), velocity sensitivity, and the per-voice [Pressure input pin](#pressure-input-pin) all apply.
+
+---
+
+## Effect layers and groups
+
+Lets you mark a wire as **active only during certain beat ranges** — the routing itself becomes time-gated rather than always-on. Implemented in `effect_regions.h`, `time_gate_processor.cpp`, and surfaced in the piano roll as colored bars above the notes.
+
+### Layers (per-wire regions)
+
+A **layer** is one time range during which one specific cable is active. Stored on `Node::effectRegions`. Outside the region the wire is muted; at the region edges the wire crossfades to/from silence to prevent clicks.
+
+Create one via right-click on a wire → **Time-gate…**, then drag in the piano roll layer bar area to set start/end. The region is tied to that specific wire only.
+
+Each layer is colored to match its wire (or its effect group) so you can read routing at a glance.
+
+### Effect groups
+
+A named bag of wires that activate together. Built via right-click → **Effect Group → New Group…** then right-click → **Effect Group → Add to [group name]** on additional wires.
+
+Once layered, a group's gate opens/closes all member wires simultaneously. Member-wire visual indicators: a **circle** for individual-wire layers, a **diamond** for group membership.
+
+### Crossfade duration
+
+Global default is **50 ms** (`NodeGraph::globalCrossfadeSec = 0.05f` in `node_graph.h:624`), set via **Options → Crossfade Duration**.
+
+Per-group override: `EffectGroup::crossfadeSec`. Zero (the default) means "inherit the global value"; any positive value overrides. Stored in the project file only when non-zero (`project_file.cpp:92-93`).
+
+### Routing strip
+
+Above the piano roll, a narrow strip appears when any layers exist. Shows each gated wire as a horizontal "wire" bar with 3D shading, colored to match the wire/group. The horizontal axis matches the piano roll below — read across to see which wires are active at which beats. The strip auto-hides when there are no layers.
+
+---
+
+## Convolution Filter
+
+Audio effect that convolves input audio with a stored impulse response (IR). Add via right-click → **Effects → Convolution Filter**; double-click to open the editor.
+
+### Three ways to build an IR
+
+**1. Presets** — pick from the dropdown, tweak sliders, click **Apply Preset** to generate the IR (replaces the editor's current content; hand edits are lost).
+
+| Preset       | Knobs                                   | Ranges                              |
+|--------------|-----------------------------------------|-------------------------------------|
+| **Lowpass**  | Cutoff, Steepness                       | Cutoff 20–20000 Hz; Steepness 1–200 |
+| **Highpass** | Cutoff, Steepness                       | same                                |
+| **Bandpass** | Cutoff, Bandwidth                       | same Cutoff range                   |
+| **Echo / Delay** | Delay, Feedback, Echoes             | Delay 1–2000 ms; Feedback 0–0.99; Echoes 1–20 |
+
+**2. Drawing by hand** — two modes:
+
+- **Control points** (default) — small number of draggable points; **Catmull-Rom** smoothing between them.
+- **Freehand** — sample-by-sample mouse painting with no smoothing. For sharp transients and surgical edits.
+
+A frequency-response preview updates live as you draw.
+
+**3. Loading from a file** — **Load File…** picks a `.wav`, `.aiff`, or `.flac`. The audio becomes the IR.
+
+### IR length
+
+Maximum **4096 samples**. Longer files are truncated; the **IR Length** slider lets you trim further to reduce CPU (convolution cost is roughly proportional to IR length).
+
+### Zoom and grid
+
+- Mouse wheel — horizontal scroll
+- Ctrl+wheel — zoom in toward cursor, up to **128×**
+- When zoomed far enough that each sample is ≥ 5 pixels wide, the view switches to **sample-stems**: each sample is a vertical line with a dot at its tip, with a faint grid marking sample boundaries. Surgical sample-level editing.
+
+### Room IR capture
+
+**Tools → Capture Room IR…** opens the capture dialog. Plays a sine sweep through speakers, records the room with a microphone, deconvolves to produce an IR, and loads it into a new Convolution Filter node ready to use.
+
+---
+
+## MIDI Modulator
+
+Adapter node that uses Signal sources to modify MIDI events on the way through. Add via right-click → **Effects → MIDI Modulator**. Double-click to open the rule editor.
+
+### Pins
+
+- **MIDI In** (left) — input event stream
+- **MIDI Out** (right) — modified event stream
+- **N × Signal In** (left, dynamically allocated) — one per rule
+
+### Rules
+
+Each rule corresponds to one Signal input pin. A rule has:
+
+- **Target** — which MIDI attribute this signal modulates:
+  - **Velocity** — scales the velocity of every note-on. Sample-accurate at the moment of the event.
+  - **Pitch Bend** — sets the channel pitch-bend value continuously. Replaces any incoming pitch bend.
+  - **Mod Wheel** — sends CC#1 at the signal's current value.
+  - **Channel Pressure** — sends channel-aftertouch (`channelPressureChange`) events. Emitted as **channel pressure**, i.e. one value applied to every note held on the channel — deliberately *not* polyphonic key pressure. A Signal cable carries a single scalar per sample, which maps one-to-one onto channel pressure; per-note pressure is inherently impossible to carry on a mono signal (which note would the value belong to when several are held?), so it isn't attempted here. True per-note pressure lives inside the synth voice (`MpeVoiceState.pressure`, keyed per voice by MPE channel), not on a graph cable. *(Labeled "Channel Pressure" in the UI; older builds called this "Aftertouch". The serialized `target` is an enum index, so existing projects load unchanged.)*
+  - **CC#** — sends an arbitrary CC number, specified in the box next to the target combo.
+- **Amount** — strength; 1.0 = full, 0.5 = half, 0 = disabled, negative = inverted. Doubles as a polarity switch.
+- **X** — deletes the rule and removes its Signal input pin.
+
+`+ Add Input` adds a new rule and a corresponding Signal input pin. The node's pin layout updates immediately.
+
+### Signal mapping
+
+Inputs are the standard `0..1` control signal (see [Control signal range](#control-signal-range-01)). The **one-directional** targets — Mod Wheel, Channel Pressure, CC# — map straight through (`0 → 0`, `1 → 127`, scaled by *Amount*). The **two-directional** targets — Pitch Bend and Velocity — treat `0.5` as the neutral centre via `toBipolar(sig)`: `0.5` = no bend / unchanged velocity, `1` = `+Amount`, `0` = `−Amount`. So an LFO resting at `0.5`, or a not-yet-fired Signal Shape envelope, leaves pitch and velocity untouched until something moves the signal off centre.
+
+### Update cadence
+
+- Continuous targets (Pitch Bend, Mod Wheel, Channel Pressure, CC) emit an event each audio block when the signal changes.
+- **Velocity** is sampled at the exact sample-index of each incoming note-on, then multiplied into that note's velocity.
+
+### Rule composition
+
+Multiple rules targeting the same MIDI attribute **add together** — useful for layering modulation sources (slow LFO + per-note envelope both feeding mod wheel, say).
+
+### Interaction with MIDI Learn
+
+CCs emitted by the MIDI Modulator are **not** subject to the MIDI-Learn filter (which only strips learned CCs from incoming cable traffic). Modulator-generated CCs always reach the downstream synth.
+
+---
+
+## Trigger Node
+
+Adapter node that sits on a MIDI cable and fires additional events (MIDI and/or Signal) when notes pass through. The original note always passes through unchanged — Trigger is a *generator*, not a filter; to suppress notes use a different node.
+
+Add via right-click → **Effects → Trigger**. Pins: **MIDI In**, **Audio In** (optional — only needed for AudioThreshold rules), **MIDI Out**, **Signal Out**. Double-click to open the rule editor. Rules are stored as a serialized blob in `node.script` and decoded into a `TriggerDoc` (`trigger_node.h`).
+
+### Rule structure
+
+Every rule — MIDI or Signal — has a **match** section, a **firing condition**, and a **target action**.
+
+**Match** (which incoming events activate this rule):
+
+- **`minPitch` / `maxPitch`** — pitch range, 0..127. Default 0..127 = all pitches.
+- **`minVel` / `maxVel`** — velocity range, 1..127. Default 1..127 = all velocities.
+- **`probability`** — 0..1, stochastic gate. The rule rolls a per-fire die against this value (random engine seeded at construction); 1.0 = always fire.
+
+**Firing condition** (`TriggerEvent`):
+
+- **NoteOn** (default) — fires when a matching note-on arrives
+- **NoteOff** — fires on the matching note-off
+- **AudioThreshold** — fires when audio on the **Audio In** pin crosses `thresholdDb` (default −20 dBFS), with a minimum re-trigger gap of `retriggerMs` (default 100 ms). The processor scans channel 0 of the node's working buffer (`trigger_node.cpp:431`), which the graph processor populates from whatever's wired to Audio In. Classic side-chain use: wire a kick-drum bus into Audio In and have the rule fire a synth note on each transient.
+
+**Target** (`TriggerTarget`):
+
+- **Midi** — emit a new note on MIDI Out
+- **Signal** — schedule a signal shape on Signal Out
+
+### MIDI target action
+
+- **`pitchOffset`** — semitones relative to the incoming note. Default +12.
+- **`velocityDelta`** — *added* to the incoming velocity (not a multiplier). Default 0.
+- **`delayBeats`** — beats to wait before firing. Default 0. Delays scale with transport BPM.
+- **`lengthBeats`** — duration of the generated note. Default 0.25 (a sixteenth).
+- **`outChannel`** — MIDI channel 1..16. Default 1.
+
+### Signal target action
+
+Shape is one of (`TriggerShape`):
+
+- **Step** — instant jump to `peakValue`, hold for `holdMs`, drop to `restValue`.
+- **Envelope** — classic ADSR: `attackMs` → `peakValue`, `decayMs` → `sustainLevel × peakValue`, hold while the source note is held, then `releaseMs` to `restValue`.
+- **Ramp** — linear slew from the current output to `peakValue` over `rampDurationMs`, then return.
+- **FromVelocity** — output = `velocityScale × (incomingVelocity / 127) + velocityOffset`, held for the rule's duration. Used for "play harder = modulate further."
+- **Curve** — user-defined breakpoint list (`std::vector<CurvePoint>` of `{timeMs, value}` pairs). The curve plays from first to last point when the rule fires, then holds the last value. Linear interpolation between points. An empty list falls through to Envelope behaviour. **The Curve shape exists in the source but is not currently documented in the HTML help.**
+
+Editor labels (Min / Max, etc.) map onto these underlying fields — typically Min ↔ `restValue` and Max ↔ `peakValue`.
+
+### Overlap semantics
+
+When multiple signal shapes from the same Trigger overlap on the Signal output, **the most recent shape wins** (replace semantics — `ActiveShape` in `trigger_node.h`). A snapshot of the rule's params is taken at trigger time, so later edits to the rule don't retroactively change a running shape.
+
+### Tail length
+
+The `TriggerProcessor::getTailLengthSeconds()` is computed from the rule list rather than a magic constant — it reflects the longest possible time any rule can keep producing output (delayed MIDI events or running signal shapes) after the last input note. This is what JUCE uses to keep audio rendering after MIDI stops.
+
+### Presets
+
+Five buttons replace the current rule list with a common starting configuration (factory methods on `TriggerDoc`):
+
+- **+ Octave** (`presetOctaveDouble`) — one MIDI rule, +12 semitones, length 0.25 beats
+- **Chord** (`presetChordMajor`) — **two** MIDI rules at +4 and +7 semitones (major third and perfect fifth). Combined with the pass-through original note this forms a major triad. Change +4 → +3 for a minor triad.
+- **Flam** (`presetFlam`) — **two** MIDI ghost copies at 1/32 and 2/32 beats after the hit, with `velocityDelta` of −30 and −60 respectively, length 0.125 beats
+- **Pluck** (`presetPluckEnvelope`) — one Signal envelope rule with `attackMs=2`, `decayMs=200`, `sustainLevel=0`, `releaseMs=0`, `peakValue=1`, `restValue=0`
+- **Velocity follower** (`presetVelocityFollower`) — one Signal `FromVelocity` rule, `velocityScale=1`, `velocityOffset=0`, `holdMs=1000`
+
+### Note traffic
+
+Stacking rules multiplies note traffic: a chord rule sends 3+ notes per incoming note; chaining triggers compounds further. Watch downstream synth voice counts.
+
+---
+
+## Script program reference (algorithmic MIDI, languages)
+
+This section documents the **program model** — statements, persistent state, MIDI-emit side effects, sections, languages — used by the unified [Script](#script-signal--midi) node when it generates MIDI (and, with the same machinery, continuous output). It is the algorithmic-MIDI reference: a Script node with one or more MIDI outputs runs a small program live and emits MIDI — a generative sequencer, euclidean-rhythm engine, arpeggiator, LFO-to-CC, chord exploder, etc. By default the program is written in the same `WaveExprParser` math language used elsewhere, extended with **statements, persistent state, and MIDI-emit side effects**, and runs **once per audio sample**. A **Language** dropdown switches it to **Lua** or a **WebAssembly** module instead (see [Scripting language](#scripting-language-built-in--lua--webassembly)).
+
+> This material formerly described a separate **MIDI Script** node. That node merged into the unified Script node — set the *MIDI outputs* count to ≥1 in the [Script](#script-signal--midi) editor to get the emit functions described here. Legacy MIDI Script nodes in old projects still load and edit through their original editor.
+
+The built-in language is the **no-toolchain** path for algorithmic MIDI; Lua and WebAssembly add a real programming language (the same node can host all three) for anyone who outgrows the expression vocabulary. The rest of this section documents the **built-in** language unless noted; Lua and Wasm share the same emit functions, output routing, signal inputs and shape table.
+
+### The program
+
+Statements are separated by `;` or newlines. A statement is either an **assignment** (`name = expr`) or a bare expression evaluated for its side effects (the emit functions). **Any variable you assign persists across samples and blocks**, so you can keep a running counter, oscillator phase, or RNG seed between samples without any special declaration:
+
+```
+ph = beat - floor(beat)             # fractional beat position
+(ph < dt*bpm/60) ? note(36, 110, 0.1) : 0   # kick on each downbeat
+(noise(0) > 0.6) ? note(42, 60, 0.05) : 0   # random closed hat
+```
+
+Persistent state is reset only when the program text changes (an edit) or the node is rebuilt — at which point in-flight notes are also flushed so an edit can't leave a stuck note.
+
+### Sections: `init:`, `start:`, `loop:`
+
+Because the body runs every sample forever, doing something exactly once (seed a counter, play a single downbeat note) needs a dedicated hook. The program can be split into up to three sections by **header lines** — a line whose only content (case-insensitive, whitespace ignored) is `init:`, `start:`, or `loop:`. Lines before the first header belong to `loop:` by default, so **a program with no headers behaves exactly as before** (all per-sample).
+
+| Section | When it runs | Sink | Typical use |
+|---------|--------------|------|-------------|
+| `init:` | **Once** when the program loads or its text changes (inside `reloadIfScriptChanged()`, after state is cleared). | **Null** — emit calls are no-ops. | Seed persistent variables (counters, RNG seed, lookup tables). |
+| `start:` | **Once** per transport play rising edge (stopped → rolling), at sample offset 0. Also re-armed when the script changes mid-play, so editing while playing re-fires it. | **Live** — can emit. | A one-shot at the downbeat: a single note/chord, a reset CC. |
+| `loop:` | **Every sample** (the default body). | **Live**. | The ongoing generative pattern. |
+
+All three sections share the same persistent `stateVars`, so `init:` can set a value `loop:` reads and `start:` resets. Example — a 4-step sequencer that restarts from step 0 on every play:
+
+```
+init:
+step = 0
+
+start:
+step = 0
+
+loop:
+hit = (beat - floor(beat)) < dt*bpm/60
+hit ? (step = (step + 1) % 4) : 0
+hit ? note(48 + step*3, 100, 0.2) : 0
+```
+
+Implementation: the `init:` / `start:` / `loop:` sectioning is part of the **built-in language runtime** (`BuiltinExprRuntime` in `script_runtime_builtin.cpp`), not the processor. The runtime is created with `ScriptRole::Unified`: `BuiltinExprRuntime::splitSections()` partitions the source into `initProgram` / `startProgram` / `bodyProgram`; `reset()` runs `initProgram` with a null sink (seeding `stateVars`); `onStart()` runs `startProgram`; and `runUnified()` runs `bodyProgram` once per sample, both emitting MIDI through the sink **and** harvesting the assigned `o1`..`oP` outputs from `stateVars` (with `o1` falling back to the program's last value). The processor (`SignalShapeProcessor::processBlock()`) tracks `wasPlaying` to detect the play edge and calls `runtime->onStart()` at offset 0 before the per-sample `runUnified()` loop, then ages out any pending note-offs at end-of-block (so a `start:`-only program still releases its notes correctly). The sections are a feature of the built-in language only — Lua uses its own `start()` / `loop()` functions and top-level init code (see [Scripting language](#scripting-language-built-in--lua--webassembly) below).
+
+### Emit functions
+
+These push MIDI at the current sample; each returns 1.0 (so they compose inside `?:` / arithmetic). `pitch` and `vel` are 0..127 (rounded, clamped). Anywhere a `pitch` number is accepted you can instead write a **quoted note name** — `note("C4", 100, 0.5)` is the same as `note(60, 100, 0.5)`. See [Note names and frequency](#note-names-and-frequency) below.
+
+| Call | Effect |
+|------|--------|
+| `note(pitch, vel, durSec)` | Note-on now, auto note-off after `durSec` seconds. Scheduled note-offs survive across blocks. `vel <= 0` emits nothing. |
+| `noteon(pitch, vel)` | Note-on only (you release it yourself). `vel <= 0` becomes a note-off. |
+| `noteoff(pitch)` | Note-off now. |
+| `cc(number, value)` | Control change. `value` is **0..1**, scaled to 0..127. `number` is the CC index 0..127. |
+| `bend(value)` | Pitch bend. `value` is **-1..1** (0 = centre), mapped to the 14-bit wheel 0..16383. |
+
+`durSec` is converted to whole samples (`max(1, round(durSec × sampleRate))`); pending note-offs are capped at 512 in flight per node.
+
+### Multiple MIDI outputs
+
+The editor's *MIDI outputs* count (0..16) sets how many independent MIDI output pins the node has ("MIDI Out 1" … "MIDI Out N"). **Each output is its own MIDI cable, not a MIDI channel** — route the *following* emits to output *k* (0-based) by assigning the reserved variable `out`:
+
+```
+out = 0;  note(36, 110, 0.1)        # kick -> MIDI Out 1
+out = 1;  note(38, 90, 0.1)         # snare -> MIDI Out 2
+```
+
+`out` is just a persistent variable like any other (default 0), clamped to the declared output count. Under the hood the node tags each emitted event with channel = `out + 1` and the graph splices a per-output `MidiChannelFilterProcessor` between the node and each destination, which keeps only its channel and rewrites it back to channel 1 — so every cable downstream sees a clean single-stream MIDI feed. With a single output (the default) no filter is inserted.
+
+### Multiple MIDI inputs
+
+The editor's *MIDI inputs* count (0..16) sets how many independent MIDI input pins the node has: **0** = none (the `note` / `vel` / `gate` / `freq` variables stay idle), **1** = a single "MIDI In" pin (the classic case), **>1** = "MIDI In 1" … "MIDI In N", each its own cable. When more than one input pin is present, every incoming MIDI event reports **which input it arrived on** so one program can react to several sources independently:
+
+- `pollmidi()` and `midievent(i)` return a 1-based input index as their **last** value — `kind, offset, a, b, idx` (idx last, so the older `local kind, off, a, b = …` idiom still works).
+- The structured `pullblock()` event tables carry the same index as their `idx` field (`{kind, offset, a, b, idx}`).
+- The `note` / `vel` / `gate` / `freq` convenience variables still track the **most-recent note-on across *all* inputs** — use the per-event `idx` when you need to tell inputs apart.
+
+Under the hood this is the mirror image of the multi-output mechanism: JUCE merges every incoming MIDI cable into a node's single MIDI bus, so the graph splices a per-input `MidiChannelStampProcessor` onto each cable that rewrites its events' channel to (input index + 1); the node recovers the pin index from the channel nibble. With 0 or 1 input pins no stamper is inserted and the channel carries no routing meaning. (WASM modules declare their input-pin count by exporting `ss_num_midi_inputs()`, the input-side counterpart of `ss_num_midi_outputs()`; each delivered event's `ss_midi_event_t.input_index` holds the 0-based pin.)
+
+### Signal inputs and the shape table
+
+- **Signal inputs (s1..sN)** — the *Signal inputs* count (0..16) appends Signal/Param input pins read per-sample as `s1`, `s2`, … `sN` (0 when not wired). Pin ids are preserved across temporary shrinks. The "MIDI In" pin(s) (the editor's *MIDI inputs* count) drive the `note` / `vel` / `gate` / `freq` variables from the most-recent incoming note across all inputs — see [Multiple MIDI inputs](#multiple-midi-inputs).
+- **Shape table** — an optional embedded [Layered Waveform](#layered-waveform-editor) stack (same *+ Layer* editor as everywhere else, with a summation preview). Sample it at any phase `pos` (0..1, wraps) with `shape(pos)`. Until you add a layer, `shape()` returns 0. Useful as a hand-drawn velocity contour, melodic table, probability curve, etc.
+
+### Variable vocabulary
+
+Readable inside the program (in addition to your own persistent variables):
+
+| Variable | Meaning |
+|----------|---------|
+| `t` | Seconds since transport start (at the current sample) |
+| `beat` | Transport beat position |
+| `bar` | `beat / 4` |
+| `bpm` | Tempo (beats per minute) |
+| `playing` | 1 while transport is playing, else 0 |
+| `sr` | Sample rate (Hz) |
+| `dt` | Seconds per sample (`1 / sr`) |
+| `note` | MIDI note number of the most recent MIDI-input note-on (-1 if none) |
+| `vel` | Velocity 0..1 of that note |
+| `gate` | 1 while any MIDI-input note is held, else 0 |
+| `freq` | Frequency in Hz of the most recent note (0 if none), using the **project tuning system** (see [Note names and frequency](#note-names-and-frequency)) |
+| `s1`..`sN` | Signal input pin values at this sample |
+| `out` | (read/write) destination MIDI output index for subsequent emits |
+
+Plus the full `WaveExprParser` math vocabulary: `sin cos tan asin acos sinh cosh atan(y[,x]) asinh acosh atanh abs sign sqrt inversesqrt exp exp2 log log2 pow tanh saw square triangle noise floor ceil round roundEven trunc fract mod(a,b) min(a,b) max(a,b) clamp(v,lo,hi) mix(a,b,t) step(edge,x) smoothstep(e0,e1,x) fma(a,b,c) radians degrees if(c,a,b)`, the comparisons `< > <= >= == !=`, boolean `&& || !`, and the ternary `c ? a : b`. (The hyperbolic/inverse-hyperbolic, `exp2 log2`, `roundEven fma`, and `mix step smoothstep fract sign mod radians degrees inversesqrt` group mirror the GLSL shape dialect — the complete scalar slice of GLSL's builtins.) Unknown identifiers read as 0. `shape(pos)` samples the embedded shape table.
+
+### Note names and frequency
+
+Every MIDI-scripting surface — the built-in expression language, Lua, and the offline Python API — accepts **note names** wherever a MIDI pitch number is expected, and exposes conversion helpers. Names follow scientific-pitch convention: a letter `A`–`G` (case-insensitive), any run of accidentals (`#`/`+` = sharp, `b` = flat — so `C##4` = D4, `Cb4` = B3, `B#4` = C5), and an octave number where **C4 = MIDI 60, A4 = 69**. A name with no octave digit defaults to octave 4.
+
+| Helper | Built-in | Lua | Python | Result |
+|--------|:--------:|:---:|:------:|--------|
+| Quoted note name as a pitch | ✓ (`note("C4",…)`) | ✓ (`note("C4",…)`) | ✓ (`add_note(n,c,"C4",…)`) | the name's MIDI number |
+| `notenum(name)` / `notenum(name, octave)` | ✓¹ | ✓ | ✓ | MIDI number (`notenum("C",4)` → 60); −1 on a bad name |
+| `notename(num)` | —² | ✓ | ✓ | note-name string (`notename(60)` → `"C4"`) |
+| `notefreq(note)` / `notefreq(name, octave)` | ✓ | ✓ | ✓ | frequency in Hz |
+
+¹ In the built-in numeric language a quoted string already evaluates to its MIDI number, so `notenum(x)` there is just a readable pass-through (it doesn't take a separate octave argument — write `notenum("C4")` or the bare literal `"C4"`).
+² The built-in language has no string type, so `notename` (which returns a string) exists only in Lua and Python.
+
+**WebAssembly.** A WASM module reaches the same project tuning through the host import `ss_note_to_freq(midinote) -> float` (the one note helper that needs the host, since only the host knows the tuning). Name ↔ number conversion is pure, so `soundshop_wasm.h` ships it inline — `ss_notenum("C4")`, `ss_notename(60, buf)`, and `ss_notefreq("C4")` (which combines the two) — with no host round-trip. See [`cpp/scripts/wasm_examples/README.md`](cpp/scripts/wasm_examples/README.md).
+
+**`notefreq` uses the project tuning system.** Frequency depends on the project-global **tuning** (Equal Temperament / Pythagorean / Just Intonation / Quarter-Comma Meantone) and **concert pitch** (A4 = 440 Hz by default) set in the tuning dialog — *not* on any track's musical scale (a scale/key is a compositional constraint on the piano roll and the degree system; it never changes pitch frequencies). This is the same mapping the `freq` variable and the built-in Terrain Synth use, so `notefreq("A4")` returns exactly the concert pitch. Hosted VST3/AU instruments are tuned too, by a cable-level pitch-bend adapter — see [Microtuning hosted plugins](#microtuning-hosted-plugins).
+
+### What it outputs / passthrough
+
+In MIDI mode the Script node is a **generator, not a filter**: its MIDI input is consumed only to set the `note` / `vel` / `gate` / `freq` variables and is **not** passed through to the MIDI outputs. The audio buffer's channels 2+ carry the incoming Signal pins (the standard control-channel convention) on the way in and the continuous outputs `o1`..`oP` on the way out.
+
+**Stop flushes held notes.** When the transport stops (rolling → stopped), the node emits an all-notes-off (CC 123) on all 16 channels and drops any scheduled note-offs still in flight. This guarantees a note the script left open — e.g. a `start: noteon(64)` with no matching `noteoff` — releases on the downstream synth instead of ringing forever; pressing Stop is the reliable way to silence a script-driven drone. (This mirrors the MIDI timeline's stop behaviour.)
+
+### Scripting language (Built-in / Lua / WebAssembly)
+
+The editor's **Language** dropdown (top of the dialog) chooses which runtime executes the program. All three share the same emit functions, `out` routing, Signal inputs and shape table; they differ in language power and execution rate. The choice, the execution rate, and the `.wasm` path are stored in the doc and round-trip through save/load and undo.
+
+| Language | Source | Execution rate | Notes |
+|----------|--------|----------------|-------|
+| **Built-in** (default) | The program text, in the `WaveExprParser` expression language with `init:` / `start:` / `loop:` sections. | **Per sample**, always. | Real-time-safe, allocation-free, no setup. |
+| **Lua** | The program text, as a Lua 5.4 program. | **Per sample** *or* **per block** (a second *Run* dropdown). | A full language; sandboxed (no `io`/`os`/`package`/`debug`, no `require`/`load`/`dofile`). |
+| **WebAssembly** | A `.wasm` binary chosen via **Choose .wasm file…** (the editor shows a file picker in place of the text box). | **Per block**, always. | C / Rust / Zig / AssemblyScript — or GLSL via SPIR-V (see below) — compiled to Wasm; must implement the SEANCE script ABI. Requires a wasm3-enabled build. |
+
+The **Run** dropdown sets the execution rate and is only editable for Lua. Built-in is forced to per-sample and Wasm to per-block (both greyed out, with tooltips explaining why). Per-sample runs the program once for every audio sample (sample-accurate, but heavy Lua can stutter the audio — the editor shows an inline warning for Lua + per-sample). Per-block runs it once per audio block (cheap, scales to many instances); for sample-accurate emits the program stamps each event with a sample offset itself.
+
+**Running GLSL in real time, via WASM (power-user toolchain).** GLSL is a *bake-only* language in SEANCE — it never runs on the audio thread, because a GPU is a high-latency batch device unsuited to a real-time callback (see [SCRIPTING-LANGUAGES.md](SCRIPTING-LANGUAGES.md#why-glsl-cant-do-real-time-audio--in-any-mode) for the full rationale). But if you have a GLSL compute algorithm you genuinely want to run *live* on a Script node, you can compile it to WebAssembly offline and load the resulting `.wasm` like any other module — CPU execution sidesteps every GPU concern, and a wasm-compiled GLSL kernel is just an ordinary real-time-safe per-block program. The route is:
+
+1. **GLSL → SPIR-V**: `glslangValidator -V --target-env opengl yourkernel.comp -o kernel.spv` (or `glslc` from the Vulkan SDK). Author it as a normal compute shader whose body fills an output buffer.
+2. **SPIR-V → C**: `spirv-cross --output kernel.c kernel.spv` (SPIRV-Cross's C/C++ backend), which emits portable C that computes the same arithmetic on the CPU.
+3. **Wrap to the SEANCE ABI**: write a thin `ss_process()` that, each block, calls the generated kernel per output sample (or over the whole block) and writes the SEANCE output pins. The `soundshop_wasm.h` header (in `cpp/scripts/wasm_examples/`) provides the ABI scaffolding.
+4. **C → WASM**: compile with `clang --target=wasm32 …` (or Emscripten / `zig cc -target wasm32-freestanding`), then pick the `.wasm` in the Script node.
+
+This is deliberately a manual, offline path rather than a built-in button: it's an advanced workflow, and the resulting module is indistinguishable from any other WASM node once loaded. The reason there's no "GLSL" option in the *real-time* Language dropdown is that a CPU-executed GLSL kernel is architecturally identical to a WASM module — so WASM already *is* the real-time path for GLSL-style algorithms (see the rationale doc's [CPU-GLSL discussion](SCRIPTING-LANGUAGES.md#why-glsl-cant-do-real-time-audio--in-any-mode)). For waveshaping math (as opposed to a whole ported kernel), the **Built-in** language now covers the complete *scalar* slice of GLSL's Trigonometry/Exponential/Common builtins (`mix step smoothstep fract sign mod atan(y,x) asinh acosh atanh exp2 log2 roundEven fma radians degrees inversesqrt`, …), so many GLSL idioms port directly with no toolchain at all. The remaining gap vs GLSL is the *type system* (vectors/matrices/swizzles), not the math vocabulary — see the rationale doc's [sizing note](SCRIPTING-LANGUAGES.md#how-big-is-make-our-expression-language-exactly-glsl).
+
+**Lua program model.** Top-level code runs once at load (globals persist). Define **one body**: `function loop()` (per-sample or per-block) or `function stream()` (the streaming pull-model, per-block only — see [Streaming](#streaming-pull-model-coroutine-scripts) below). `function start()` (optional) runs once when playback starts. Emit with `note(p,v,dur[,offset])`, `noteon`, `noteoff`, `cc`, `bend` — in per-block mode the final `offset` argument (0..n-1) places the event at a precise sample. Set `out = k` to pick the output pin. The note functions accept a name string for the pitch (`note("C4", 100, 0.25)`), and `notenum` / `notename` / `notefreq` convert between names, numbers and Hz (see [Note names and frequency](#note-names-and-frequency)). Per-block variables include `n` (block length), `tStart`/`tEnd`, `beatStart`/`beatEnd`, plus `sig(k, i)` to read a signal pin at sample `i`. The math aliases (`sin`, `clamp`, `saw`, `noise`, …) and `shape(pos)` are available; `math.*` works too. The in-editor **Lua reference** button has the full vocabulary and examples (including the sample-accurate per-block loop `for i=0,n-1 do … note(p,v,d,i) end`).
+
+**Event-driven MIDI input (per-block).** Alongside the block-constant `note`/`vel`/`gate`/`freq` snapshot (the *most-recent* held-note state), a per-block program can iterate the **actual MIDI-input events** that arrived in this block, each with its own sample offset, and react to them one by one. `midiin()` returns the **count** of input events; `midievent(i)` (1-based) returns `kind, offset, a, b`:
+
+| `kind` | `offset` | `a` | `b` |
+|---|---|---|---|
+| `"on"` | sample within block | note number | velocity `0..1` |
+| `"off"` | sample within block | note number | `0` |
+| `"cc"` | sample within block | controller number | value `0..1` |
+| `"bend"` | sample within block | `0` | `−1..1` (0 = centre) |
+
+```lua
+function loop()
+  for k = 1, midiin() do
+    local kind, off, a, b = midievent(k)
+    if kind == "on" then
+      -- start a voice for note `a` at velocity `b`, sample-accurate at `off`
+    elseif kind == "off" then
+      -- release note `a`
+    end
+  end
+  -- ...then fill the block with out(i, value) as usual
+end
+```
+
+`midiin()`/`midievent()` work in any per-block program (whether it uses `loop()` or `stream()`). The list is available in every role that has a MIDI-input pin (a Signal/Unified node can react to notes too), and is in arrival order (non-decreasing `offset`). Outside per-block mode `midiin()` returns `0`, so a program that references it still runs unchanged at per-sample rate. (Per-sample programs keep using `note`/`vel`/`gate`, which already update every block.) For the streaming body, the cursor-aligned `pollmidi()` (below) is usually more convenient than counting `midiin()`.
+
+#### Streaming (pull-model) coroutine scripts
+
+`function loop()` is a *push* model: the host calls it once per block and the script addresses samples by absolute index (`out(i, v)`). That's efficient but means the program can't be written as a single continuous loop — it has to be re-entered every block and rebuild any cross-block state from globals by hand.
+
+`function stream()` is the alternative **pull model**. The program owns its own control flow: it loops forever, **pulls** input and **pushes** output, and is *suspended and resumed* at the block boundary by a Lua coroutine. "The next sample doesn't exist yet" is handled by the program *suspending* until the host hands it the next block — not by re-evaluating the whole program. Crucially, **the coroutine's local variables persist across the suspend/resume**, so a filter's running state, a delay line's history, a phase accumulator, etc. are just ordinary `local`s in the loop — no manual block bookkeeping.
+
+The stream coroutine is created **once, off the audio thread** (when the script loads), so `runBlock()` only ever resumes it — no per-block allocation. The same pull/push API serves both **audio-rate** work (grab one sample per loop iteration) and **block-rate** work (grab a whole block per iteration); the only difference is how much you take each time. Because a streaming program is inherently sample-accurate (it iterates samples itself), the **Run dropdown is ignored** for `stream()` programs — streaming always runs through the block path regardless of whether per-sample or per-block is selected.
+
+| Function | Blocking? | Returns / does |
+|---|---|---|
+| `pull()` | **blocks** (suspends at block end) | next input sample(s) — one return value per signal-in pin (`local a,b = pull()`); a node with no inputs returns a single `0` (call it just to advance the cursor) |
+| `poll()` | non-blocking | next input sample(s) if one is still available this block, else `nil` |
+| `wait()` | **suspends** | hand the block back and resume in the next one (the explicit suspend for `poll()` loops); a no-op outside streaming |
+| `out(v)` | — | write the **current** sample (the one just `pull()`ed) to output pin `o1`, clamped to `0..1`. `out(n, v)` writes pin `n` (**1-based**: `o1, o2, …`) — a streaming node drives every continuous output pin independently |
+| `pullblock(pin)` | **blocks** | the whole block's input samples for that **1-based** pin as a flat array `{…}` (single-input convenience form) |
+| `pullblock()` | **blocks** | *no arg* → two values `params, events`: `params[k]` is input pin `k`'s sample array (one list per pin — all the same length, since param inputs are synchronized), and `events` is a list of this block's MIDI-input event tables (see below) |
+| `pollblock([pin])` | non-blocking | the **remaining** input this block (same two shapes as `pullblock`), or `nil` |
+| `outblock([n,] t)` | — | write array `t` (`t[1..]`) to output pin `n` (**1-based**; `o1` default), clamped to `0..1` |
+| `pollmidi()` | non-blocking | `kind, offset, a, b, idx` for the next MIDI-input event the cursor has reached (`offset ≤` current sample), or `nil` — drains the block's events in order as the stream advances, giving event-driven MIDI consumption *inside* the loop. `idx` is the **1-based** MIDI-input pin the event arrived on, returned **last** so `local kind,off,a,b = pollmidi()` keeps working (same `kind`/`a`/`b` meanings as `midievent()`) |
+
+**Unified event format.** Both `pollmidi()` and the `events` list from `pullblock()` describe a MIDI-input event with the same fields — `kind` (`"on"`/`"off"`/`"cc"`/`"bend"`), `offset` (sample within the block), `a`/`b` (note/controller and velocity/value), and `idx` (1-based source pin). In `pullblock()`'s list each event is a table `{kind=…, offset=…, a=…, b=…, idx=…}`; `pollmidi()` returns the same fields as multiple values. Param inputs, being dense and synchronized, are delivered as the `params` list-of-lists rather than as sparse events — but if you ever represent a param change as an event it uses the same `{idx, offset, value}` shape, so the two stay consistent.
+
+`pull()`/`poll()`/`out()` share one read==write cursor, so the canonical transducer `local x = pull(); out(f(x))` is automatically sample-aligned. A one-pole low-pass is then just:
+
+```lua
+function stream()
+  local y = 0
+  while true do
+    local x = pull()
+    y = y + 0.05*(x - y)   -- `y` survives the block boundary for free
+    out(y)
+  end
+end
+```
+
+A `poll()`-based loop instead checks for input and yields explicitly when there's none left: `while true do local x = poll(); if x then out(f(x)) else wait() end end`. The block-rate style takes the whole block at once: `local t = pullblock(1); for i=1,#t do t[i]=f(t[i]) end; outblock(t)`.
+
+**Multi-I/O.** A streaming node can have any number of signal/param inputs and outputs. Inputs arrive together (`pull()` returns one value per input pin; `pullblock()` returns `params` as one list per pin), and outputs are driven independently via `out(n, v)` / `outblock(n, t)` for pin `n` (1-based). The host hands the runtime one buffer per output pin and routes each back to its own cable — there's no fan-out, so `o1` and `o2` carry whatever the script wrote to each. A node with several MIDI inputs shares one event stream tagged by `idx` (see the unified event format above).
+
+If `stream()` ever **returns** (ends its loop), the stream is finished and the output simply holds at `0` until the script is reloaded. A runtime error inside the coroutine is reported in the editor like any other script error. **Note:** the coroutine is created at *load* (not on each transport-start), so a generator that should restart on play should read the `playing` global and reset its own state. (Today every node still has a single MIDI **input** pin, so `idx` is always `1`; the wire format already carries the index so multi-MIDI-input is a routing change, not an API change.)
+
+**Wasm module.** A WebAssembly module is itself a *program-owns-the-loop* runtime — `ss_process()` fills the whole block and the module's linear memory persists between calls, so it is morally a streaming program and the host treats it as one (`isStreaming() == true`): the **Run dropdown is ignored** (audio-rate vs block-rate is the module's own internal business), and it gets the same **multi-I/O** treatment as a Lua `stream()`. The host writes each signal input pin into flat audio-in channel `k`, reads each flat audio-out channel `p` back into output pin `o(p+1)` **independently** (no fan-out — a multi-output module drives every pin), and — when the node has a MIDI input — forwards the block's MIDI-input events into the shared `midiIn` region in raw-MIDI form, where the module reads them via `ss_midi_in_events()` / `ss_midi_in_count()` (`soundshop_wasm.h`); each event's `input_index` byte carries the 0-based source pin (the same value Lua's `pollmidi()` returns as 1-based `idx`). For MIDI **output** the module emits via `ss_midi_out` / `ss_midi_out_n` with per-event sample offsets. Note helpers are available too: the host import `ss_note_to_freq(midinote)` returns the project-tuned frequency, and `soundshop_wasm.h` adds the pure `ss_notenum` / `ss_notename` / `ss_notefreq` (see [Note names and frequency](#note-names-and-frequency)). **Factory waveforms** are reachable too, closing the last cross-language gap: the host imports `ss_waveform(int id, float phase)` (the raw `[-1,1]` sample, same wrap+interpolate as every other language — see [Factory waveform library](#factory-waveform-library)) and `ss_waveform_id(const char* name)` (resolve a name to its stable integer id once, then reuse the integer in the hot loop, exactly like Lua's `waveforms[name]`). The bank is warmed off the audio thread at module-link time so the first call is allocation-free. Because the module compiles `-nostdlib` (no libm), `soundshop_wasm.h` also ships header-only GLSL-parity shaping helpers built on `__builtin_floorf` — `ss_fract`, `ss_sign`, `ss_mod` (GLSL floored modulo), `ss_clamp`, `ss_mix`, `ss_step`, `ss_smoothstep`, `ss_radians`, `ss_degrees`, `ss_saw`, `ss_square`, `ss_triangle`, `ss_unipolar`, `ss_bipolar` — under `#ifndef SS_NO_SHAPING_HELPERS`; the transcendentals (`sinf`/`cosf`/`expf`/`tanhf`) still need `<math.h>` + a linked libm. This is the same shared-memory ABI the standalone [WASM Script](../cpp/scripts/wasm_examples/README.md) node uses. If the build has no wasm3, choosing Wasm loads nothing and the node falls back to silence (the dropdown still shows the option greyed-out).
+
+### Editing, undo, save/load
+
+- Edits are written to `node.script` live (per keystroke) so the running graph hears them immediately, but a single undo step is pushed when the editor **closes** (`commitSnapshot("Edit Signal Shape")`), which also marks the project dirty. Per-keystroke edits intentionally don't each become an undo step. Changing the Language / Run dropdowns, the I/O counts, or picking a `.wasm` file commits the same way.
+- **Project file format**: the unified Script node serialises its whole state (program, layers, I/O counts, language/rate) under the `__signalshape__:v1` prefix — see [Project file format](#project-file-format) in the Script section. The legacy `__midiscript__:v1` prefix (keys `program`, `lang`, `rate`, `wasm`, `sigCount`, `outCount`, `layer`) is still decoded for old MIDI Script nodes. `NodeType::MidiScript` remains a valid enum value (kept for serialization stability of old projects), but new nodes are always `NodeType::SignalShape`.
+
+---
+
+## Script (signal + MIDI)
+
+Right-click the graph → *Signal Shape → Script (signal + MIDI)* creates a single unified **Script** node. One scriptable node now covers **both** signal generation (LFOs, envelopes, custom continuous control) **and** algorithmic MIDI generation — you decide which by setting its I/O counts in the editor. It is internally `NodeType::SignalShape` (the same node family as XY Pad and Control Bank), and the dedicated editor opens on create / double-click / right-click → *Edit Script…*.
+
+This node subsumes the former separate **Signal Shape** and **MIDI Script** nodes (themselves descendants of the even older *LFO (sine)* / *LFO (custom expression)* / *Envelope (custom expression)* trio). A Script node with **0 MIDI outputs** behaves exactly like the old Signal Shape; one with a **MIDI-emitting program and no continuous output of interest** behaves like the old MIDI Script; one with **both** is a hybrid (e.g. an arpeggiator that also outputs an envelope). Legacy MIDI Script nodes in old projects still load and edit through their original editor; you just can't create new ones (the menu item is gone).
+
+### I/O counts (what makes it signal, MIDI, or both)
+
+Four controls in the editor set the node's pin layout. Each rewrites the node's pins immediately (preserving pin ids by name so existing cables survive a count change):
+
+- **Signal inputs (s1..sN)** — 0..16 continuous input pins, read per sample as `s1`, `s2`, … `sN` (0 when not wired).
+- **Signal outputs (o1..oP)** — 1..16 continuous output pins. The program assigns `o1`..`oP`; `o1` defaults to the program's last bare value (so a program that is just `curve` still drives `o1 = curve`). Always at least one.
+- **MIDI outputs** — 0..16. **0 = pure signal source** (the node never touches MIDI). **≥1** enables the emit functions `note()` / `noteon()` / `noteoff()` / `cc()` / `bend()`, with the reserved variable `out` selecting which MIDI output pin (0-based). Each MIDI output is an independent cable (see *Multiple MIDI outputs* below).
+- **MIDI input** — a toggle adding/removing the "MIDI In" pin that drives the `note` / `vel` / `gate` / `freq` variables. On by default; turn off for a node that generates signal or MIDI from scratch with no note input.
+- **Pin type** — a dropdown flipping **all** continuous pins (inputs and outputs) between **Signal** (blue, audio-rate control) and **Param** (orange, parameter automation). Both carry the same 0..1 data and interconvert freely on the wire, so this is purely which colour/category the pins present as.
+
+### Default on create
+
+A brand-new Script node is **neutral**: it has **zero layers**, repeat mode *Forever*, `expr = curve`, and the default I/O — **one MIDI input, one Signal output (`o1`), zero MIDI outputs** — so it starts life as a classic LFO/envelope. A layer-less shape renders to a flat **0.5** — the neutral "no modulation" level on the 0..1 control wire (see [Control signal range](#control-signal-range-01)). Two consequences:
+
+- **It outputs a constant 0.5 until you add a layer**, so creating the node does not immediately start modulating whatever it's wired to. (Previously the default was a free-running sine, which began sweeping downstream params the moment the node existed — surprising when you hadn't configured anything yet.)
+- **The editor opens showing an empty layer stack** with a *+ Layer* button and a hint line ("No layers yet… until then it outputs a steady 0.5"). Click *+ Layer* to add the first sine layer, then pick *Sine* / *Saw* / *Square* / *Triangle* / *Noise* / *Drawn* / *Formula* on that layer's row, or draw / type a formula. Add more layers to sum several shapes into one contour (e.g. a slow sine plus a fast ripple).
+
+### What it outputs
+
+The continuous outputs `o1`..`oP` each carry a 0..1 value clamped to **[0, 1]** — the standard control-signal range (see [Control signal range](#control-signal-range-01); `0.5` is the neutral "no change" level). Their pin type (Signal blue / Param orange) is set by the **Pin type** dropdown; Signal and Param interconvert on the wire, so a single output can drive both audio-rate Signal consumers and orange param-arming inputs.
+
+Held-value behaviour: each `oN` holds its last value when the shape isn't running (the envelope "stuck at the end"). A program that doesn't assign a given `oN` leaves `o1` at the program's return value and the rest at 0 / their last value.
+
+If the node has **≥1 MIDI output**, those pins emit the events produced by the program's `note()` / `cc()` / `bend()` / … calls — see *MIDI emission* below.
+
+### MIDI emission
+
+With **MIDI outputs ≥ 1**, the program can emit MIDI as a side effect, exactly as the [Script program reference](#script-program-reference-algorithmic-midi-languages) documents in full. In brief: `note(pitch, vel, durSec)` (auto note-off), `noteon(pitch, vel)` / `noteoff(pitch)`, `cc(number, value)` (value 0..1) and `bend(value)` (value −1..1) push events at the current sample; assigned variables persist across samples; the `init:` / `start:` / `loop:` sections let you run code once vs every sample. The reserved `out` variable selects which MIDI output pin subsequent emits go to (0-based). **Each MIDI output is an independent cable** — under the hood events are tagged channel = `out + 1` and the graph splices a per-output `MidiChannelFilterProcessor` so every downstream cable sees a clean single-stream feed. Pressing **Stop** flushes any held/scheduled notes (all-notes-off on every channel), so a program that opens a note without releasing it can't ring forever. A node with **0 MIDI outputs** never touches the MIDI buffer at all.
+
+Signal and MIDI emission happen in the **same per-sample pass**: a single program can assign `o1 = curve * s1` (an envelope) *and* call `note(...)` (an arpeggio) in one body, which is the point of unifying the two former node types.
+
+### Anatomy of a shape
+
+Three things define one Signal Shape:
+
+1. **Shape waveform** — a `LayeredWaveform`: a stack of `WaveLayer`s (each sine / saw / square / triangle / noise / drawn points / freehand / formula) that are summed and peak-normalised into one contour, then mapped from the layer renderer's bipolar −1..1 onto the 0..1 control range (trough → 0, peak → 1) so `curve` reads as a 0..1 value. This is the **same shared layer-stack widget** (`LayerStackComponent`) the Wavetable editor uses — same *+ Layer* button, same per-row preset / harmonic-ratio / phase / amplitude controls, same drawn / freehand / formula UX. The only difference is that the Signal Shape editor shows a **"Sum of all layers" summation preview** under the stack (the Wavetable editor has its own multi-frame-type preview instead). The summed shape is sampled per audio sample from an internal phase that advances at the node's `Rate` param. A stack with **zero layers renders to a flat 0.5** (the neutral default).
+2. **Composition program** `expr` — a math expression (or, for multiple outputs / MIDI, a multi-statement program) evaluated per sample, producing the 0..1 output. Defaults to `curve` (pass the shape through unchanged). You can modulate the shape arbitrarily: `curve * gate`, `curve * vel`, `clamp(curve + s1 * 0.5, 0, 1)`, etc. With **more than one continuous output**, assign each one explicitly — `o1 = curve * vel; o2 = s1` — where `o1` defaults to the program's last bare value if you don't assign it. The same program can also emit MIDI (see [MIDI emission](#midi-emission)). **Polarity gotcha:** `curve` (and the `s1..sN` inputs) are already 0..1, but `sin`/`cos`/`tan` (and `saw`/`square`/`triangle`/`noise`) return bipolar −1..1, so a bare `sin(...)` clips its negative half on the 0..1 output. Use the unipolar forms `usin`/`ucos`/`utan` (or `usaw`/`usquare`/`utriangle`), or wrap a whole bipolar sub-expression in `unipolar(...)`; `bipolar(x)` does the reverse (0..1 → −1..1).
+3. **Trigger expression** `triggerExpr` — when this expression evaluates `> 0`, the shape advances. Rising edges (`false → true`) reset phase to 0 and start a new run. Empty trigger = always running (the LFO case).
+
+### Repeat modes
+
+When a run hits the end of one shape cycle:
+
+- **Forever** — wrap and keep cycling. The classic LFO behaviour.
+- **Once** — stop and hold the final value. The classic envelope behaviour: combine with `triggerExpr = "gate"` to fire on each note-on.
+- **N times** — repeat N cycles then hold. The N-spinner becomes editable only in this mode.
+
+### Variable vocabulary
+
+Available inside `expr` and `triggerExpr`:
+
+| Variable     | Meaning |
+|--------------|---------|
+| `curve`      | The drawn shape's height at the current phase, as 0..1 (trough → 0, peak → 1) |
+| `x`, `phase` | Current phase 0..1 through the cycle |
+| `t`          | Seconds since the last trigger fired (always advancing while running) |
+| `beat`       | Transport beat position |
+| `bpm`        | Current tempo (beats per minute) |
+| `gate`       | 1 while any MIDI note is held, 0 otherwise |
+| `freq`       | Frequency in Hz of the most-recently-pressed held note (0 if none) |
+| `note`       | MIDI note number of the most recent note-on (-1 if none) |
+| `vel`        | Velocity 0..1 of the most recent note-on |
+| `rep`        | Number of complete cycles done since the last trigger |
+| `rate`       | The node's Rate param |
+| `s1`..`sN`   | Values of the Signal input pins at this sample (resolve to 0 when not wired) |
+
+Plus the full `WaveExprParser` math vocabulary: `sin cos tan asin acos sinh cosh atan(y[,x]) asinh acosh atanh abs sign sqrt inversesqrt exp exp2 log log2 pow tanh saw square triangle noise floor ceil round roundEven trunc fract mod(a,b) min(a,b) max(a,b) clamp(v,lo,hi) mix(a,b,t) step(edge,x) smoothstep(e0,e1,x) fma(a,b,c) radians degrees if(c,a,b)`, comparison ops `<  >  <=  >=  ==  !=`, boolean `&& || !`, and the C ternary `c ? a : b`. (The hyperbolic/inverse-hyperbolic, `exp2 log2`, `roundEven fma`, and `mix step smoothstep fract sign mod radians degrees inversesqrt` group mirror the GLSL shape dialect for cross-language consistency — the full scalar slice of GLSL's builtins.) Unknown identifiers evaluate to 0. The **range helpers** `unipolar(x)` (−1..1 → 0..1) and `bipolar(x)` (0..1 → −1..1), plus the unipolar aliases `usin ucos utan usaw usquare utriangle unoise` (each the 0..1 form of its bipolar namesake), exist so bipolar math can be brought onto the 0..1 output cleanly — see the polarity gotcha above.
+
+#### `shape(pos)` — input-driven shape lookup
+
+`curve` always reads the drawn waveform at the node's *own* running phase, so it can only ever produce the LFO/envelope contour over time. When you instead want to read the drawing at a position you compute yourself — e.g. drive the lookup from an input signal, treating the drawing as a transfer function / waveshaper — use the `shape(pos)` function:
+
+| Call | Effect |
+|------|--------|
+| `shape(x)` | Identical to `curve` (reads the drawing at the current phase). |
+| `shape(s1)` | Reads the drawing at a position set by input `s1` — input-driven lookup / waveshaping. |
+| `shape(x + s1*0.1)` | The current phase, warped by input `s1`. |
+| `shape(t * 2)` | Plays the drawing through at twice the phase rate. |
+
+`pos` is a **0..1 phase that wraps** (modulo 1, same linear-interpolated sampler as `curve`). Inputs `s1..sN` are already 0..1, so `shape(s1)` spans the full drawing directly. `shape()` is bound only inside the SignalShape node's per-sample evaluation; in other contexts that reuse `WaveExprParser` it evaluates to 0. This resolves the apparent impedance mismatch between continuous inputs (no absolute sample index) and the finite drawing: the drawing is never addressed by absolute sample number — only by a normalized phase, which either the node's clock (`curve` / `x`) or any expression you write (`shape(...)`) can supply.
+
+### Signal inputs
+
+The editor's *Signal inputs (s1..sN)* field accepts 0..16. Increasing N appends `s1`, `s2`, … pins to the node's input side; decreasing N drops the trailing pins (any cables wired to dropped pins go orphan and are skipped by the graph rebuild). Pin ids are preserved when N grows back, so wiring stays stable across temporary shrinks. The same applies to the continuous outputs `o1`..`oP` and the MIDI outputs (see [I/O counts](#io-counts-what-makes-it-signal-midi-or-both) above).
+
+The MIDI input pin (`gate` / `freq` / `note` / `vel`) is present unless you turn off the *MIDI input* toggle.
+
+### Manual trigger
+
+The **Manual Trigger** button fires one rising-edge as if the trigger expression had just gone low→high. Useful for auditioning envelope-style shapes (repeat: Once) without actually wiring up a MIDI source. The button is disabled if the audio graph is in a state where the live processor can't be located (rare; only happens mid-graph-rebuild).
+
+### Speed: Cycle length and Rate (two views of one value)
+
+The editor exposes the node's speed two equivalent ways, side by side on one row, because "how fast does it oscillate" reads naturally as either a *frequency* (Rate) or a *duration* (Cycle length), and different users reach for different ones:
+
+- **Cycle length** — how long one full cycle of the shape takes.
+- **Rate** — how many cycles happen per unit time.
+
+They are **the same underlying setting** — the `Rate` node param — shown reciprocally: `Rate = 1 / Cycle length`. The `=` between the two fields is a reminder that editing one immediately rewrites the other; whichever field you type into is the one that "wins", and the other recomputes. (The field you're actively typing in is never reformatted out from under your cursor; its partner updates live.)
+
+The **Sync to beat** toggle next to them is the node's `Beat Sync` param, and it chooses the units both fields are expressed in:
+
+| Sync to beat | Cycle length unit | Rate unit |
+|---|---|---|
+| Off (free-run) | seconds | Hz (cycles/sec) |
+| On (tempo-locked) | beats | cycles per beat |
+
+So a 2-second LFO in free-run reads *Cycle length = 2 sec / Rate = 0.5 Hz*; flip Sync on and the same value is now read against the song tempo as beats / cycles-per-beat. Editing here writes the `Rate` (and `Beat Sync`) node params directly — the same params shown on the node face — so the node body sliders and the editor fields always agree. Rate is clamped to the param's range (0.01–50), i.e. cycle length spans roughly 0.02–100 in the current units.
+
+> **Note** — "Sync to beat" (above) and "Free-run (ignore song position)" (below) are independent settings. "Sync to beat" picks the *units* of the Rate (Hz vs cycles-per-beat). "Free-run" picks the *clock* the phase runs off (the song position vs a free-running oscillator). You can have a Hz-rate shape that's still locked to song position, or a beat-rate shape that free-runs.
+
+### Phase source: locked to song position (default) vs free-run
+
+A non-triggered Signal Shape (LFO — empty Trigger field) derives its phase one of two ways, chosen by the **Free-run (ignore song position)** checkbox in the editor:
+
+| Free-run | Phase source | Behaviour |
+|---|---|---|
+| **Off (default)** | The transport / song position | **Deterministic**: the same song position always produces the same phase, so what you hear matches the rendered/exported audio and replaying a section sounds identical every time. The shape also **freezes while playback is stopped** (and follows the playhead if you scrub). |
+| **On** | A free-running internal clock | The shape oscillates continuously off its own clock (analog-LFO style), **drifting independently of the song** and never stopping — livelier, but *not reproducible*: a bounce can land differently than what you heard, and two playthroughs differ. |
+
+The default is **off (locked to song position)** because for a DAW, reproducibility — *export == playback* — is normally the property you want. Free-run is offered for sound-design cases where a never-resetting, grid-independent wobble is desirable.
+
+In locked mode, **Beat Sync** chooses whether the phase tracks musical beats (`phase = frac(beats × Rate)`) or elapsed seconds (`phase = frac(seconds × Rate)`); either way it's a pure function of the song position. Finite repeat modes (*Once* / *N times*) still apply: after the allowed number of cycles the shape holds at the end of the last cycle, deterministically, regardless of where playback started.
+
+**Free-run has no effect when a Trigger expression is set** — a triggered shape already restarts deterministically on each trigger — so the checkbox is greyed out in that case.
+
+This setting is per-node and saved with the project (`freeRun` key, see *Project file format* below). Projects saved before this option existed load with free-run **off**, so older free-running LFOs become locked-to-song-position (deterministic) on load.
+
+### Params on the node face
+
+The four params shown on the node body in the graph view are also editable inline without opening the editor:
+
+- **Rate** — cycles per second. When *Beat Sync* is on, this is interpreted as cycles per beat instead. Also editable as *Rate* / *Cycle length* in the editor (see above).
+- **Beat Sync** — 0/1 toggle. Off = free-running Hz, On = tempo-locked. Also the editor's *Sync to beat* toggle.
+- **Phase** — phase offset 0..1 added before sampling the shape every block. Useful for ganging two LFOs in quadrature.
+- **Output** — read-only mirror of the last computed sample (use as a meter / for param-arming feedback).
+
+Everything else — the shape itself, the composition expression, the trigger expression, the repeat mode, the signal-input count — lives in the editor.
+
+### Scripting language (Built-in / Lua / WebAssembly)
+
+Like [MIDI Script](#scripting-language-built-in--lua--webassembly), the editor has a **Language** dropdown that picks the runtime computing the output, plus a **Run** dropdown for the execution rate (editable only for Lua). The way the script plugs into the LFO/envelope machinery depends on the rate:
+
+- **Built-in** (default) — per sample. The composition `expr` ("Output") turns the drawn `curve` into the output, exactly as documented above. The full phase / repeat / trigger machinery is in play.
+- **Lua, per sample** — the program's `loop()` runs once per sample and **returns** the output value (0..1). It can read `curve` (the drawn shape at the current phase) and every variable in the table above, so it's a drop-in for the built-in composition expression with a real language. The same range helpers (`unipolar`/`bipolar`, `usin`/`ucos`/…) are in the Lua prelude. The phase / repeat / trigger machinery still drives `curve` and the timing variables.
+- **Lua, per block** *or* **WebAssembly** — **raw-buffer mode**: the script fills the whole audio block itself (Lua via `out(i, value)`, `i = 0..n-1`; Wasm via the block ABI). The phase / repeat / trigger / curve machinery is **bypassed** — the editor greys out the Trigger, Repeat, Speed and Free-run controls and shows a note saying so. The drawn shape is still readable via `shape(pos)`, signal inputs via `sig(k, i)`, and incoming MIDI as events via `midiin()` / `midievent(i)` (see [Event-driven MIDI input](#scripting-language-built-in--lua--webassembly) above) so the block program can react to notes/CC/bend at sample accuracy. This is the mode for fully custom signal generation (sample-accurate sweeps, sequenced control, audio-rate DSP).
+
+The trigger expression, when active, is always the built-in expression language regardless of the main language. For Lua + per-sample the inline "Output" box becomes a multi-line Lua program editor; for Wasm it's replaced by the **Choose .wasm file…** picker. The in-editor **Lua reference** button documents the full per-sample and per-block models with examples.
+
+### Project file format
+
+`node.script` carries the Script-node state in a multi-line key-value format prefixed with `__signalshape__:v1`. Keys include `expr` / `trigger` (Base64), `lang` (0=Built-in, 1=Lua, 2=Wasm), `rate` (0=per-sample, 1=per-block), `wasm` (Base64 `.wasm` path), `repeat`, `repeatN`, `freeRun` (0/1 — the phase-source toggle), and the I/O counts: `sigCount` (signal inputs), `outCount` (continuous outputs `o1`..`oP`, ≥1), `midiOut` (MIDI outputs, 0..16), `midiIn` (0/1 — whether the MIDI In pin exists), `paramKind` (0=Signal / 1=Param for all continuous pins), plus `layer`. For Lua the program source is stored in `expr` (the same key the built-in composition expression uses), so switching languages keeps your text. Expression strings are Base64-encoded so they can contain newlines / `=` / `|` without breaking the framing; the **whole layer stack** is encoded inline under the `layer=` key via `LayeredWaveform::encodeBody()` (`tableSize|layer1|layer2|…`). Multi-line scripts are serialised by `project_file.cpp` via the `scriptLines=N` form so the full payload round-trips through save/load. A missing `freeRun` / `lang` / `rate` / `outCount` / `midiOut` / `midiIn` / `paramKind` key (older projects) decodes to its default (`false` / Built-in / per-sample / `1` / `0` / `true` / `false`), so a pre-unification Signal Shape loads as a 1-continuous-output, 0-MIDI-output Script — identical behaviour.
+
+Back-compat: the older single-layer Signal Shape scripts used the *same* `LayeredWaveform::encodeBody()` payload under the same `layer=` key, so they decode straight into a one-element layer stack with no migration step. Legacy plain-expression scripts (`sin(x)`, `(1 - cos(x)) * 0.5`, etc.) from before the redesign load as a single Formula layer with the old expression in `formulaExpr` — the user sees their old curve preserved and can edit it as a layer just like any other shape.
+
+---
+
+## Control Bank
+
+Right-click the graph → *Signal Shape → Control Bank* creates a Control Bank node: a bank of *N* manual macro faders, each emitting one control-signal output. It shares `NodeType::SignalShape` with Signal Shape and XY Pad (so it's the same node family on disk and in the processor), distinguished by the `__controlbank__` script tag and handled by a dedicated branch in `SignalShapeProcessor::processBlock`. The editor opens immediately on create, and via double-click or right-click → *Edit Control Bank…*.
+
+### What it outputs
+
+Each slider is a `Param` (range 0..1, default 0.5) paired 1:1 with a **Signal output pin** of the same name. The slider's value *is* the output value — written straight onto the pin's control channel every block, with no shape/trigger/phase machinery (exactly like XY Pad's X/Y/Z). This puts Control Bank squarely on the unipolar [Control signal range (0..1)](#control-signal-range-01) convention: the default of **0.5 is the neutral "no modulation" level** for bipolar-additive consumers (push a fader up to add, down to subtract), and 0/1 are the extremes for one-directional consumers. A Signal output connects to both Signal/Mod inputs and orange param-arming inputs (Param and Signal are interchangeable at the cable level), so one fader can drive any parameter on any node. A fresh node starts with **4 sliders** ("Slider 1".."Slider 4").
+
+### Editor
+
+- **Faders** — drag to set the value (0..1); double-click a fader to reset it to 0.5. The value readout sits under (vertical) or beside (horizontal) each fader. The track's filled/unfilled colours are swapped relative to JUCE's default, so the colour grows from the high end of the throw.
+- **Resize = precision.** The window is resizable, and the sliders stretch to fill it. A longer JUCE linear slider maps the same 0..1 range across more pixels, so a taller/wider fader is proportionally finer to drag. This is the intended way to get fine control: make the window bigger.
+- **+ Slider** — append a fader (and its output pin). Capped at 32.
+- **- Slider** — remove the *last* fader, its output pin, and any cables wired to it. Disabled at the 1-slider minimum. (Equivalent to the last fader's **X** button — a convenience that doesn't require reaching the specific fader.)
+- **X** (per fader) — remove that fader, its output pin, and any cables wired to it. Disabled at the 1-slider minimum.
+- **Rename** — double-click a fader's name label to rename it; the new name flows onto its output pin (so the cable endpoint label updates too).
+- **Horizontal sliders** toggle — off (default) lays the faders out as vertical faders in a row, so window *height* sets their length; on stacks horizontal sliders, so window *width* sets their length.
+- **Non-modal window.** The Control Bank editor (like the XY Pad and Signal Shape editors — the whole `SignalShape` input-node family) opens **non-modal**: it does not block the main window, the transport, or other editors. You can leave several open at once and ride multiple banks/pads live while the song plays. The editor is node-id-safe (it re-looks-up its node every access), so it stays valid even if the node is edited or deleted underneath it. (Genuinely blocking dialogs — confirmations, settings — stay modal.)
+
+### Undo / dirty
+
+Structural edits (add / remove / rename a slider, flip orientation) each push one `commitSnapshot` step. A fader drag commits a single *"Set control value"* step on release (continuous gesture → one undo step at the endpoint); wheel / typed-value edits commit immediately. A value move needs no graph rebuild — the processor reads the live `Param` value each block — but adding/removing/renaming a slider changes the pin set, so those call `onNodeEdited` → `requestRebuild`.
+
+### Project file format
+
+Nothing bespoke: the per-slider `Param`s and Signal output `Pin`s round-trip through the standard node param / pin serialisation, and the orientation lives in `node.script` (`__controlbank__` = vertical, `__controlbank__:h` = horizontal). On load the editor rebuilds its slider widgets from `node.params`, pairing each with the like-named output pin by position.
+
+---
+
+## Shared AHDSR envelope
+
+The AHDSR envelope is the amplitude envelope for the synths whose voices are
+driven by the shared `AHDSREnvelopeRuntime`: **Terrain Synth** (and its
+wavetable / frequency-domain / wavelet-space variants), **Additive**,
+**Phase Distortion**, and **Spectral Grain**. On those nodes it's edited two
+ways, both opening the *same* editor on the *same* `node.ahdsrEnvelope` (the
+single source of truth — there are no separate Attack/Decay/Sustain/Release
+params on the node):
+
+- **Right-click the node → *Envelope (AHDSR)…*** — works on every tonal synth,
+  including ones with no dedicated editor dialog (plain Terrain, Additive, PD).
+- **An *Envelope…* button inside the instrument's own editor dialog** — the
+  Wavetable / Layered editor and the Frequency-Domain (spectral) editor each
+  carry an *Envelope…* button in their top toolbar that pops the envelope
+  editor in a separate window, so you don't have to close the instrument
+  editor and hunt for the node's right-click menu. It's a separate dialog by
+  design — folding A/H/D/S/R, six sliders, three tension knobs, three curve
+  editors and the preset library into the already-dense wavetable editor would
+  bloat it. (The Frequency-Domain editor only shows the button when opened on
+  a node; in its sub-editor role inside a wavetable cell there is no node
+  envelope to edit, so the button is hidden.)
+
+Synths that carry their **own** amplitude envelope inside the engine — **FM**
+(per-operator), **Particle Cloud** (per-grain), **Drum** (per-sound), and the
+sample/region players **SoundFont**, **SFZ**, **Sfizz**, and **MultiSampler** —
+do **not** expose the shared editor, because editing it would be inert. A
+shared master-VCA stage that would let those synths honor a node-level AHDSR
+too is tracked as future work in `known-issues.md`. Raw plugin-hosting
+Instruments keep their envelope inside the plugin.
+
+### Editor controls
+
+- **Five stages**:
+  - **Attack** — fade-in time from silence to the peak level.
+  - **Hold** — a flat plateau at the peak level before the decay starts.
+    Useful for organ stabs and pad attacks. Set the Hold *time* to 0 for a
+    classic ADSR shape (the hold stage is skipped entirely).
+  - **Decay** — time for the volume to fall from peak to the sustain level.
+  - **Sustain** — the level the note holds at while the key stays pressed
+    (0..1, where 0 means the note dies after decay and 1 means it sits at
+    full volume forever).
+  - **Release** — fade-out time after the key is released.
+- All times are in milliseconds; sustain is a 0..1 level. Six vertical
+  sliders span the bottom of the editor (the sixth is **Velocity
+  Sensitivity**: 0 = organ-like uniform volume, 1 = piano-like — how hard
+  you press the key scales the envelope's peak amplitude).
+- Time sliders are skewed so the bottom half of the throw maps to the
+  0-100ms range musicians actually want fine control over; a linear
+  0-10000 slider would shove all useful values into a few pixels.
+
+### Per-segment tension (curve-bend) knobs
+
+Between the sliders and the per-segment *…Curve…* buttons sit three rotary
+**tension** knobs — **A Curve**, **D Curve**, **R Curve** — one for the
+Attack, Decay, and Release ramps. Each is the single-linear-control way to
+reshape a ramp without opening the full curve editor, matching how
+hardware/virtual-analog synths expose one "curve"/"slope" knob per stage:
+
+- **Centre (0)** = a straight line. Double-click the knob to snap back to 0.
+- **Turn right (toward +1)** = a *slow start* that accelerates — the classic
+  "exponential" attack / decay / release where the level lingers near the
+  start of the segment then rushes to the end (ease-in).
+- **Turn left (toward −1)** = a *fast start* that eases out — the level jumps
+  early then settles into the end value (logarithmic).
+
+The math is a normalized exponential time-warp,
+`warp(t) = (e^{k·t} − 1)/(e^{k} − 1)` with `k = tension·6`, applied to the
+*input* (time axis) of the segment's curve before it's baked. This is the
+"optimal" single-knob shaper in the sense that one parameter sweeps the whole
+concave ↔ linear ↔ convex range continuously, with a true linear midpoint and
+the segment's start/end levels pinned (the warp fixes `warp(0)=0`,
+`warp(1)=1`). Because it warps the *timing* of whatever curve the segment
+holds rather than replacing it, **tension composes with a custom curve**:
+freehand-draw or type an equation for the shape, then bend its timing with the
+knob; tension 0 leaves any authored curve exactly as drawn.
+
+Tension is stored per segment in `node.ahdsrEnvelope` (`attackTension`,
+`decayTension`, `releaseTension`, each `−1..1`) and round-trips through the
+`ahdsrv1:` encoding via optional `at`/`dt`/`rt` fields — projects written
+before tension existed load with all three at 0 (linear), so their sound is
+unchanged.
+
+### Per-segment shape curves
+
+Attack, Decay, and Release each have their own *…Curve…* button that
+opens the same three-mode editor used elsewhere in SEANCE:
+
+- **Equation** — type a formula in terms of `x` (the normalized stage
+  position `0..1`). The language dropdown offers **Built-in**, **Lua**,
+  **Python**, and **GLSL**, exactly as in the [layer Formula](#formula-authoring-language-built-in--lua--python--glsl)
+  and [spectral-curve](#frequency-domain-spectral-synth) editors. In all
+  four, `x` is the normalized position; `f` is available as an alias of
+  `x`. Built-in evaluates live; Lua/Python/GLSL are baked to samples when you
+  edit (a multi-line Lua/Python body must end with `return`; the GLSL body
+  becomes the inside of `float shapeValue(...)`). Examples: `x`,
+  `x^2`, `x^0.5`, `1-exp(-3*x)`, `0.5 - 0.5*cos(3.14159*x)`.
+- **Drawn Points** — Catmull-Rom interpolation through user-placed control
+  points.
+- **Freehand** — per-sample painting.
+
+The curve dialog also has quick-set buttons for the most common shapes:
+**Linear**, **Fast→slow** (`x^2`), **Slow→fast** (`x^0.5`), **S-curve**
+(`0.5 - 0.5*cos(π*x)`).
+
+The **Attack**, **Decay**, and **Release** curves shape the rising/falling
+ramp of their stage. **Hold** and **Sustain** are flat by definition (Hold
+sits at peak, Sustain at the sustain level) and have no curve editor.
+
+### Live preview
+
+A waveform at the top of the editor shows the full envelope shape at the
+current parameters, with vertical dividers and stage labels (A / H / D / S
+/ R) along the top so you can see at a glance what your sound is going to
+do over time. The preview includes a synthetic 18%-width "sustain hold"
+segment so the sustain level is visible even when the actual hold time is
+zero. The preview bakes each segment with its tension applied (the same
+`AHDSREnvelope::bakeSegment` the audio engine uses), so what you see is what
+you hear — turning a tension knob bends the drawn ramp in real time.
+
+### Preset library
+
+The preset library is project-independent and shared across every synth —
+saving a preset in one Wavetable node makes it immediately available in
+every other tonal synth in the project (and across all projects on this
+machine).
+
+- The library lives on disk at `<userdata>/SoundShop/EnvelopePresets.xml`,
+  alongside `Preferences.xml`. It persists across projects and across
+  SEANCE versions, including any deletions you've made.
+- Factory starting points cover the obvious cases: *Default*, *Pluck*,
+  *Pluck Long*, *Pad*, *Bass*, *Organ*, *Strings*, *Brass*, *Stab*. They
+  are marked with a gold ★ in the dropdown and the manage dialog so
+  they're visually distinct from anything you've authored or modified.
+- Picking a preset from the dropdown snaps the sliders, curves, and
+  velocity sensitivity to that shape. The dropdown groups factory
+  presets above a divider and user presets below it, but selecting a
+  preset doesn't lock the editor — you can keep tweaking afterwards, and
+  the preset isn't modified until you explicitly save over it.
+
+#### Save as preset…
+
+Captures whatever you currently have configured into a new entry in the
+library. Using the name of an existing preset overwrites it. If the
+overwritten entry was a factory preset, the built-in marker is dropped
+(the entry is no longer treated as factory — see the Restore semantics
+below for how to get the original back).
+
+#### Manage presets…
+
+Opens a list with four action buttons:
+
+- **Duplicate** — copies the selected preset under a new name (default
+  `"<name> copy"`, auto-disambiguated to `"<name> copy 2"`, `"<name> copy
+  3"`, etc. if the default is already taken). The text is editable before
+  you commit. The original is left untouched. Useful when you want to
+  tweak a factory preset without losing the original — duplicate it
+  first, then edit the duplicate. The duplicate is always a user preset
+  (no factory marker), even if the source was a factory preset, so the
+  factory entry's "origin" is still tied to the original.
+- **Rename** — renames the selected preset. Renaming a factory preset
+  drops its built-in marker but preserves the hidden origin tag, so
+  Restore Built-ins won't double up by re-adding the canonical entry
+  underneath. Collisions append `" (2)"`, `" (3)"`, etc.
+- **Delete** — removes the selected preset. Factory presets are no
+  longer protected from deletion; deleting one simply removes it and
+  clears its hidden origin tag, so Restore Built-ins is allowed to bring
+  the original back.
+- **Restore Built-ins** — re-adds factory presets that have been deleted
+  outright. Restore is **strictly add-only**: it never overwrites,
+  modifies, or replaces an entry that's still in the library, even if
+  you've edited the values or renamed it. The dialog previews what
+  Restore will actually do before you confirm: it counts how many
+  presets would be added vs. how many can't be added because of a name
+  collision with an unrelated entry, and tells you the difference. If
+  nothing would change, Restore tells you that too and reminds you to
+  delete the edited entry first if you want the original back.
+
+#### Restore semantics in detail
+
+Every preset carries a hidden `builtInOriginId` field that's set to the
+canonical factory name (`"Pluck"`, `"Pad"`, ...) for entries that started
+out as factory presets. The id is preserved across renames and edits and
+is cleared only by deletion. Restore uses it as the source of truth for
+"is this factory preset still represented in the library?":
+
+1. For each canonical, if any existing preset carries `builtInOriginId ==
+   canonical.name`, the canonical is considered still represented (even
+   if the user renamed it `"MyPluck"` or saved different values over it)
+   — Restore skips.
+2. Otherwise, if no preset's name collides with the canonical name,
+   Restore adds a fresh canonical copy.
+3. Otherwise (the user has a same-named entry that isn't tied to this
+   canonical's origin — e.g. they deleted `"Pluck"` and then created
+   their own preset called `"Pluck"`), Restore skips with no change.
+   Their entry is never clobbered.
+
+To get the original `"Pluck"` back after editing it in place, you have
+to delete the edited entry first; the explicit deletion is the signal
+that clears the origin marker and unblocks restoration.
+
+### Pressure input pin
+
+Every tonal synth also has a **Pressure** control input pin auto-added to
+its node. Wire any Signal source (an LFO, an envelope, an XY-pad axis, a
+[MIDI Breakout](#midi-breakout-node) Pressure output) into it and the
+per-voice volume swells with the signal value — the natural expressive
+layer once the envelope's release stage isn't doing the work. When the pin
+is left unwired, the synth falls back to the keyboard's own channel
+pressure (aftertouch), so out of the box a pressure-sensitive keyboard just
+works.
+
+**Hover tooltip.** Resting the mouse over the pin shows a reminder of what
+it does (0 = normal level, higher = louder; amount scaled by the node's
+Aftertouch sensitivity) plus a wiring note: when the pin is wired it
+**overwrites** (replaces) the keyboard's own channel pressure rather than
+adding to it, so feeding a synth its *own* pressure back via a MIDI
+Breakout is redundant — it overwrites the value with the same number (read
+once per block instead of sample-accurately) and wastes the pin. It is
+**not** a double-application (the override means the swell is applied once
+either way); the earlier wording warning of a "double swell" was wrong for
+this pin specifically and has been corrected. Tooltips are stored on
+`Pin::tooltip` and surfaced by `NodeGraphComponent::getTooltip` (the
+component is a `juce::TooltipClient`); the text is re-set on every graph
+build, never serialized, so it always reflects the current code.
+
+**Naming / migration.** This pin was historically labelled *Aftertouch*.
+It is now **Pressure** (clearer for non-musicians: it scales loudness like
+key pressure, and "Aftertouch" is MIDI jargon). Projects saved with the old
+name are migrated **in place** by the graph builder — the pin keeps its id,
+so any cable already attached to it survives the rename; only the label and
+tooltip change. Match sites accept either name for safety.
+
+Note the difference between the two pressure routes. The **control pin**
+carries a single mono value, so it maps onto **channel pressure** (one
+swell for every held note together) — exactly what a mono cable can
+express. **Polyphonic key pressure** (per-note aftertouch, where one held
+key can be pushed harder than its neighbour) *cannot* travel a mono cable,
+because a lone value can't say which of several held notes it belongs to.
+It's therefore consumed directly inside the synth voice allocator, matched
+to each voice by note number, and **added** to channel pressure before the
+sensitivity multiply (`effectivePressure()` in `signal_modulation.h`,
+distributed by `distributeMpeMessages()`). Both end up scaling the same
+per-voice volume swell.
+
+The envelope's existing peak-level math is unchanged; pressure is a
+separate multiplier on top. The aftertouch sensitivity (how strongly the
+combined pressure scales the voice volume) defaults to 0.5 and is saved
+per node.
+
+**Pin ordering.** The Pressure pin is appended at graph-build time, so on
+a wavetable synth it could end up *between* two Position inputs: a 1D
+wavetable builds as `[MIDI, Mod: Position, Pressure]`, then adding a
+second axis push-backs `Mod: Position Y` *after* the existing Pressure pin,
+leaving it wedged in the middle. Both the graph builder (`graph_processor.cpp`)
+and the wavetable editor's `syncPositionModPins` (`layered_wave_editor.cpp`)
+run a `std::stable_partition` that keeps the single Pressure pin
+**after** every other input pin while preserving all other pins' relative
+order, so the input row always reads `[MIDI, Position X, Position Y, …,
+Pressure]`. It runs on every build, so projects saved with the old wedged
+layout are normalized on load. Links reference pins by id, never by index,
+so the reorder never breaks a cable.
+
+### MIDI Breakout node
+
+**MIDI Breakout** (right-click → *Signal Shape* → *MIDI Breakout (MIDI →
+signals)*) taps a live MIDI stream and re-emits its expression controllers
+as block-rate control signals, so you can route any of them anywhere a
+control cable is accepted — a filter cutoff, a wavetable position, a
+*different* synth's Pressure input, an effect knob. It has one **MIDI In**
+pin and four Signal outputs, in the order the processor writes them:
+
+| Output | Range | Source |
+|--------|-------|--------|
+| **Velocity**   | 0..1 | last note-on velocity, held until the next note |
+| **Pressure**   | 0..1 | channel aftertouch, or the latest poly key-pressure |
+| **Mod Wheel**  | 0..1 | MIDI CC 1 |
+| **Pitch Bend** | 0..1 | 14-bit wheel normalized, **0.5 = centre** (down = 0, up = 1) |
+
+Pitch Bend's 0.5-centre convention lines up with a param's **Modulate**
+mode (where 0.5 = no change); use **Absolute/Set** mode to map it
+edge-to-edge across `[min,max]`. Values are held across blocks, so an
+unchanging controller keeps emitting its last value rather than snapping to
+zero between events. Implemented by `MidiBreakoutProcessor`
+(`midi_breakout_node.h`); the node is `NodeType::MidiBreakout`, tagged
+`__midibreakout__`, and writes each output to control channels 2.. (sized
+by `widenForControl`).
+
+**Redundancy caveat (in every output's hover tooltip).** Every tonal synth
+already reads pressure / pitch-bend / mod-wheel from its *own* MIDI input,
+so fanning the same MIDI into both a synth **and** a Breakout and then
+wiring a Breakout output back into that same synth is redundant — but the
+*kind* of redundancy differs by output, and only one of them actually
+doubles:
+
+- **Pressure** → a synth's **Pressure input pin overwrites** (replaces) the
+  keyboard's own pressure with the wired signal, so looping it back is
+  harmless but pointless: it overwrites the value with the same number (and
+  downgrades it to a once-per-block read). **Not** a double-application.
+- **Mod Wheel / Pitch Bend** → a synth has no input pin for these; it bends
+  pitch and vibratos straight from MIDI. If you wire one of these into a
+  *modulation* pin that drives the same thing, it stacks on top of the
+  synth's own handling and **is** applied twice.
+
+Either way the node is for sending a controller somewhere it would not
+otherwise reach — a filter cutoff, a wavetable position, a *different*
+synth, an effect knob — not for re-driving the synth that already gets it.
+(There is intentionally no MIDI *output* on this node; it is a pure
+MIDI-to-control tap.)
+
+## Terrain-synth self-test (`--self-test`)
+
+SEANCE has a headless, in-process test harness for the 1D / 2D / 3D terrain
+synths (audio-file, image, and video sources), run from the command line:
+
+```
+SEANCE.exe --self-test <output-dir>
+```
+
+It creates no window. It generates synthetic test media, renders audio
+through real `TerrainSynthProcessor` instances, checks the results, writes
+everything it does to `<output-dir>`, sets the process exit code (**0** = all
+passed, **1** = any failure, so it can gate CI), and quits. With no
+`<output-dir>` it defaults to a `selftest_out` folder next to the executable.
+Source: `cpp/src/self_test.{h,cpp}`, wired into `main.cpp::initialise` next to
+the `--plugin-sandbox` child-process branch. Because SEANCE is a GUI-subsystem
+binary with no reliable console, the harness writes its PASS/FAIL log to
+`<output-dir>/selftest_report.txt` (it also best-effort echoes to stdout when
+launched from a terminal it can attach to).
+
+Three layers of checks run in order:
+
+1. **Terrain data (exact).** Fills a `Terrain` from a known synthetic pattern
+   — a −1..+1 ramp WAV (1D), a left-to-right brightness gradient PNG (2D), and
+   a brightness-ramps-with-frame video grid (3D) — and asserts `Terrain::at()`
+   and the N-linear `Terrain::sample()` read back the expected values. Image
+   and video data are `uint8_t`-quantized, so those use a 1/255 tolerance; the
+   1D float WAV and the exact endpoint samples are checked tight. Also
+   round-trips a `makeVideoTerrainScript` / `parseVideoTerrainScript` pair
+   (path with spaces, time/pixel crop, grid size, base64 gray bytes).
+
+2. **Synth render (Sig-driven position → audio).** Instantiates a standalone
+   `TerrainSynthProcessor`, holds a note, and drives the **`Sig X/Y/Z`**
+   coordinate pins with ramp signals on the buffer's control channels — the
+   exact "move the read position with a signal cable" path the node graph uses.
+   For the 2D and 3D cases it uses **AM-sine** synth mode, whose output
+   amplitude is `volume·(0.5 + 0.5·terrain.sample(coord))` with the coordinate
+   *not* phase-shifted, so the rendered envelope directly traces the terrain
+   readout. It asserts the measured envelope (a) actually *moves* as the
+   position sweeps (range test — proves the Sig channels are live) and (b)
+   Pearson-correlates >0.9 with the predicted readout (typically ~0.998). Each
+   render is also exported as a `.wav` so the result is audible.
+
+3. **ffmpeg round-trip (optional).** Skipped with a note when ffmpeg isn't on
+   `PATH`. Otherwise generates a `testsrc` clip, probes it, and decodes it back
+   through `VideoDecoder::decodeGrid`, asserting a non-uniform grid.
+
+The render layer is what guards the signal-driven coordinate path:
+`TerrainSynthProcessor::processBlock` clears its render buffer near the top
+(`buf.clear()`), which also wipes the incoming control-signal channels (buffer
+channels 2+). The per-sample `Sig X/Y/Z` and Aftertouch reads happen *after*
+that clear, so they snapshot channels 2+ into a `controlInBuf` member
+**before** the clear and read from the snapshot — without that, every
+Sig-driven coordinate reads 0 and the position never moves. The range +
+correlation assertions in layer 2 fail loudly if that regresses.
+
+Artifacts written to `<output-dir>`: `selftest_report.txt`, the synthetic
+inputs (`test_audio_1d.wav`, `test_image_2d.png`, `test_video.mp4`), and the
+rendered outputs (`render_1d_direct.wav`, `render_2d_amsine_sweepY.wav`,
+`render_3d_amsine_sweepFrame.wav`).

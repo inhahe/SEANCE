@@ -4,21 +4,38 @@
 
 namespace SoundShop {
 
-class NodeGraphComponent : public juce::Component {
+class NodeGraphComponent : public juce::Component,
+                           public juce::TooltipClient {
 public:
     NodeGraphComponent(NodeGraph& graph);
 
     void paint(juce::Graphics& g) override;
     void resized() override;
 
+    // TooltipClient: when the mouse rests over a pin that carries a
+    // Pin::tooltip (e.g. a synth "Pressure" input or a MIDI Breakout output),
+    // return that text so the app's TooltipWindow shows it. Returns "" over
+    // empty space, nodes, or pins with no tooltip.
+    juce::String getTooltip() override;
+
     void mouseDown(const juce::MouseEvent& e) override;
     void mouseDrag(const juce::MouseEvent& e) override;
     void mouseUp(const juce::MouseEvent& e) override;
+    void mouseMove(const juce::MouseEvent& e) override;
+    void mouseExit(const juce::MouseEvent& e) override;
     void mouseWheelMove(const juce::MouseEvent& e, const juce::MouseWheelDetails& w) override;
     void mouseDoubleClick(const juce::MouseEvent& e) override;
     bool keyPressed(const juce::KeyPress& key) override;
 
     void fitAll();
+
+    // After a project load (or any external mutation of graph.viewZoom),
+    // re-evaluate which view to show: restore the saved pan/zoom if one was
+    // persisted (graph.viewZoom > 0), otherwise fit-all. Called by
+    // main_window after ProjectFile::load. Sets pendingInitialFit so the
+    // decision actually applies on the next paint/resized once we have a
+    // real size.
+    void notifyProjectLoaded();
 
     // Callbacks
     std::function<void(Node&)> onOpenEditor;
@@ -31,6 +48,21 @@ public:
     std::function<void(int)> onFreezeNode;        // called with node ID
     std::function<void(int)> onRunScript;         // called with node ID
     std::function<void(juce::String)> onOpenHelpDoc; // called with docs/<file> relative path
+    // Fire a one-shot manual trigger on the live SignalShape processor for
+    // node `id`. main_window wires this to GraphProcessor::getProcessorForNode
+    // + dynamic_cast<SignalShapeProcessor*> + fireManualTrigger(). No-op if
+    // the processor isn't a SignalShape (defensive - the editor only enables
+    // its Manual Trigger button when the lookup succeeds, but the audio
+    // graph may have rebuilt since the dialog opened).
+    std::function<void(int)> onSignalShapeManualTrigger;
+
+    // Returns the audio graph's live {sampleRate, blockSize}. Wired by
+    // main_window to the audio engine. Used by the cable right-click menu to
+    // show the exact Param update rate (sampleRate / blockSize) and the block
+    // size, instead of a hard-coded approximation. May be null before wiring,
+    // or return sampleRate <= 0 before the audio device has started - callers
+    // must fall back to a generic label in that case.
+    std::function<std::pair<double, int>()> getAudioFormat;
 
     // Convert between screen and canvas coordinates
     juce::Point<float> screenToCanvas(juce::Point<float> screen) const;
@@ -43,11 +75,21 @@ private:
     float zoom = 1.0f;
     juce::Point<float> panOffset{0, 0};
 
-    // True until the first resized() callback runs fitAll(). Prevents the
-    // user from briefly seeing nodes at the default zoom/pan before the
-    // initial fit, which used to look like a tacky zoom-in animation on
-    // every project load.
+    // True until the first resized()/paint() callback applies the initial
+    // view (either restoring the saved pan/zoom from graph.viewZoom/PanX/PanY
+    // or running fitAll() as a fallback). Prevents the user from briefly
+    // seeing nodes at the default zoom/pan before that decision, which used
+    // to look like a tacky zoom-in animation on every project load. Reset
+    // to true by notifyProjectLoaded() so a mid-session "Load Project"
+    // reapplies the saved view from the newly-loaded graph.
     bool pendingInitialFit = true;
+
+    // Push the live zoom/panOffset back into graph.viewZoom/PanX/PanY so
+    // the next project save records the user's current view. Called after
+    // any interaction that mutates the view (wheel zoom, pan drag,
+    // fitAll). NodeGraph itself owns the saved view; the component just
+    // mirrors its own working values into the graph as they change.
+    void publishViewState();
 
     // Interaction state
     enum class DragMode { None, Pan, MoveNode, DragLink, SelectBox, DragParam };
@@ -65,6 +107,9 @@ private:
     juce::Point<float> dragCurrent;
     int selectedNodeId = -1;
     int selectedLinkId = -1;
+    int hoveredLinkId = -1;   // cable currently within right-click distance of
+                              //   the cursor (highlighted so the user can see
+                              //   what a right-click / click will target)
 
     // Drawing helpers
     void drawGrid(juce::Graphics& g);
@@ -75,7 +120,11 @@ private:
 
     // Hit testing
     Node* nodeAtPoint(juce::Point<float> canvasPos);
-    int pinAtPoint(juce::Point<float> canvasPos, bool& isOutput);
+    // wantInput: -1 = accept any pin, 0 = only output pins, 1 = only input
+    // pins. Returns the CLOSEST matching pin to canvasPos (or -1). Drag/drop
+    // pass the opposite of the source pin's direction so a target never
+    // resolves to the wrong side / the source pin itself.
+    int pinAtPoint(juce::Point<float> canvasPos, bool& isOutput, int wantInput = -1);
     int linkAtPoint(juce::Point<float> canvasPos);
     juce::Rectangle<float> getNodeBounds(const Node& node) const;
     juce::Point<float> getPinPosition(const Node& node, const Pin& pin) const;
@@ -84,12 +133,57 @@ private:
     void showBackgroundMenu(juce::Point<float> canvasPos);
     void showNodeMenu(Node& node);
     void showLinkMenu(int linkId);
+    // Right-click menu for a single pin (triggered anywhere across the pin's
+    // row, including its label text). For a control-input pin (one bound to a
+    // ModPin) this offers Switch Set/Mod and Remove; for any other pin it
+    // falls back to showNodeMenu so a plain pin right-click still does
+    // something useful.
+    void showPinMenu(Node& node, const Pin& pin, bool isInput);
+
+    // Control-input (#88) operations, shared by the param-row menu and the
+    // pin menu so both surfaces stay in sync. All look the node up by id and
+    // address the binding by stable paramIndex (no dangling references across
+    // the async menu callback). Each commits an undo snapshot and requests a
+    // graph rebuild.
+    void addControlInput(int nodeId, int paramIdx, bool absolute);
+    void removeControlInput(int nodeId, int paramIdx);
+    void switchControlInputMode(int nodeId, int paramIdx);
 
     // Helpers
     void deleteSelectedLink();
     void deleteSelectedNode();
 
+    // Delete `rootId` along with every descendant if it's a Group
+    // container. Walks the group tree so nested groups cascade too,
+    // then removes connected links, closes any open editors, fires
+    // onNodeDeleted, unlinks the root from its parent group (if any),
+    // and removes everything from graph.nodes. Pushes one undo
+    // snapshot for the whole operation.
+    void deleteNodeAndDescendants(int rootId);
+
+    // Build a TerrainSynth node with the requested name, script, and
+    // dimensionality (1..8). Creates MIDI + N Signal input pins, an Audio
+    // output pin, and the standard envelope/volume/pan/traversal/grain
+    // params plus per-axis Radius/Center pairs. Used by both the
+    // synchronous menu paths (sin*cos, noise, image, audio) and the
+    // async N-D custom-expression dialog callback.
+    Node& makeTerrainNode(const std::string& name,
+                          const std::string& script,
+                          juce::Point<float> canvasPos,
+                          int numDims = 2);
+
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(NodeGraphComponent)
 };
+
+// Launch the shared AHDSR envelope editor (AHDSREnvelopeComponent) as a
+// tool dialog editing `graph.findNode(nodeId)->ahdsrEnvelope`. Shared by the
+// node right-click "Envelope (AHDSR)..." menu and the "Envelope..." buttons
+// inside the instrument editor dialogs (wavetable / layered / spectral, etc.)
+// so there's a single launch path. Marks the graph dirty on each edit and
+// commits one "Edit envelope" undo snapshot. `parent` is the component the
+// dialog centres around / is owned by (for taskbar parentage). No-op if the
+// node no longer exists.
+void launchAhdsrEnvelopeDialog(juce::Component* parent, NodeGraph& graph,
+                               int nodeId);
 
 } // namespace SoundShop

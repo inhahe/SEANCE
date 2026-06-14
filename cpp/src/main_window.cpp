@@ -1,12 +1,17 @@
 #include "main_window.h"
+#include "dialog_helpers.h"
 #include "terrain_synth.h"
 #include "builtin_synth.h"
 #include "layered_wave_editor.h"
+#include "spectral_editor.h"
+#include "wavelet_painter.h"
 #include "trigger_node.h"
 #include "midi_mod_node.h"
 #include "midi_device_wizard.h"
 #include "xy_pad.h"
+#include "signal_shape_node.h"
 #include "spectrum_tap.h"
+#include "analyzer_nodes.h"
 #include "convolution_processor.h"
 #include "convolution_editor.h"
 #include "sampler_editor.h"
@@ -28,13 +33,22 @@
 
 namespace SoundShop {
 
+// Shared "active/lit" accent for transport toggles. The Loop button uses it
+// while looping is enabled, and the Play button uses it while audio is
+// actually playing, so both light up the same recognisable blue (requested:
+// Play and Loop share the active colour). Distinct from the green/red used by
+// the metronome, monitor and keyboard-MIDI toggles. The resting (inactive)
+// look is the LookAndFeel default, restored via removeColour rather than a
+// hardcoded grey, so an un-lit transport button matches every other button.
+static const juce::Colour kTransportLitColour(64, 132, 223);
+
 // Returns true if this machine has a battery (laptop). JUCE 8.0.12 doesn't
 // wrap battery detection cross-platform, so we touch the OS APIs directly:
 // Win32 GetSystemPowerStatus on Windows, fall through to "no battery"
 // (desktop) on macOS / Linux until #87 adds proper per-platform paths.
 //
 // On Windows, BatteryFlag bit 128 means "no system battery" (desktop).
-// 255 means "unknown" — we treat that as desktop too, since assuming the
+// 255 means "unknown" - we treat that as desktop too, since assuming the
 // aggressive interval is the friendlier default for unknown machines.
 static bool machineHasBattery() {
 #ifdef _WIN32
@@ -55,7 +69,7 @@ static bool isOnACPower() {
     SYSTEM_POWER_STATUS sps{};
     if (GetSystemPowerStatus(&sps))
         return sps.ACLineStatus == 1; // 1 = AC online
-    return true; // unknown → assume desktop
+    return true; // unknown -> assume desktop
 #else
     return true; // #87: implement for macOS / Linux
 #endif
@@ -79,7 +93,7 @@ static bool isVirtualOrControlPort(const juce::String& name) {
     // Mackie/HUI control surface protocols
     if (lower.contains("mackie control") || lower.contains("hui")) return true;
     // Common virtual MIDI loopback drivers (user creates these intentionally
-    // and can add them via the wizard — don't auto-create)
+    // and can add them via the wizard - don't auto-create)
     if (lower.contains("loopmidi") || lower.contains("loop midi")) return true;
     // Windows built-in "Microsoft GS Wavetable Synth" (output only but
     // sometimes appears in input lists on some drivers)
@@ -107,6 +121,10 @@ MainContentComponent::MainContentComponent() {
     graphComponent->onNodeDeleted = [this](int nodeId) {
         closeEditor(nodeId);
     };
+    graphComponent->getAudioFormat = [this]() {
+        return std::make_pair(audioEngine.getSampleRate(),
+                              audioEngine.getBlockSize());
+    };
 
     // Hotkey system: register callbacks and load saved bindings
     setupHotkeyCallbacks();
@@ -125,10 +143,15 @@ MainContentComponent::MainContentComponent() {
     addAndMakeVisible(metroBtn);
     addAndMakeVisible(captureBtn);
 
-    // Play/Stop buttons skip tooltips — labels are self-explanatory and
+    // Play/Stop buttons skip tooltips - labels are self-explanatory and
     // universally understood. Keeping tooltips would just clutter the
     // hover layer over the most-used controls.
-    stopBtn.setTooltip("Stop playback and rewind to the start of the loop (or to 0 if loop is off)");
+    // Stop is only meaningful while the song is actually playing; it starts
+    // disabled (with an explanatory tooltip) and the timer enables it during
+    // playback. See the timer callback for the live enable/tooltip update.
+    stopBtn.setEnabled(false);
+    stopBtn.setTooltip("Nothing is playing right now - press Play to start. "
+                       "Stop then halts playback and rewinds.");
     recordBtn.setTooltip("Start playback while arming any tracks ready to record audio or MIDI input");
     fitAllBtn.setTooltip("Zoom and pan the node graph so every node fits in the visible area");
     metroBtn.setTooltip("Toggle the metronome click during playback and recording");
@@ -138,7 +161,7 @@ MainContentComponent::MainContentComponent() {
     playBtn.onClick = [this]() { onPlay(); };
     stopBtn.onClick = [this]() { onStop(); };
     recordBtn.onClick = [this]() { onRecord(); };
-    // Set by findPlacement when the visible area was too crowded — tells the
+    // Set by findPlacement when the visible area was too crowded - tells the
     // caller to fitAll() after the new node has been added so the refit
     // includes it.
     auto needsFitAfterPlacement = std::make_shared<bool>(false);
@@ -225,7 +248,7 @@ MainContentComponent::MainContentComponent() {
     };
 
     captureBtn.onClick = [this]() {
-        // If currently playing, stop first — bouncing while the live graph
+        // If currently playing, stop first - bouncing while the live graph
         // is running races on shared graph data and crashes.
         if (audioEngine.isPlaying()) {
             audioEngine.stop();
@@ -233,7 +256,7 @@ MainContentComponent::MainContentComponent() {
         }
 
         // If the Output node has a valid cache (populated automatically after
-        // the last Play→Stop cycle), save it instantly. Otherwise fall back to
+        // the last Play->Stop cycle), save it instantly. Otherwise fall back to
         // an offline bounce.
         Node* outNode = nullptr;
         for (auto& n : graph.nodes)
@@ -245,17 +268,23 @@ MainContentComponent::MainContentComponent() {
             bounceToAudioTrack();
     };
     // Position display
-    positionLabel.setText("1 : 1.0", juce::dontSendNotification);
+    positionLabel.setText("0:00.0   Bar 1:1.0", juce::dontSendNotification);
     positionLabel.setFont(juce::Font(juce::Font::getDefaultMonospacedFontName(), 14.0f, 0));
     positionLabel.setColour(juce::Label::textColourId, juce::Colours::limegreen);
-    positionLabel.setTooltip("Current transport position, shown as bar : beat");
+    positionLabel.setTooltip("Playback position / total song length, shown two ways:\n"
+                             "  - left: elapsed time / total time as minutes:seconds "
+                             "(e.g. 0:00.0/15:30.0)\n"
+                             "  - right: musical position / total bars as Bar:Beat "
+                             "(both 1-based, so the song starts at Bar 1, Beat 1.0)\n"
+                             "The total is shown once the song has clips (or an explicit "
+                             "length set via the Song button).");
     addAndMakeVisible(positionLabel);
 
     // Time signature
     timeSigLabel.setText("Time:", juce::dontSendNotification);
     addAndMakeVisible(timeSigLabel);
     addAndMakeVisible(timeSigCombo);
-    timeSigCombo.setTooltip("Project time signature — affects bar length, the metronome accent pattern, and the snap grid");
+    timeSigCombo.setTooltip("Project time signature - affects bar length, the metronome accent pattern, and the snap grid");
     timeSigCombo.addItem("4/4", 1);
     timeSigCombo.addItem("3/4", 2);
     timeSigCombo.addItem("6/8", 3);
@@ -277,7 +306,7 @@ MainContentComponent::MainContentComponent() {
 
     addAndMakeVisible(loopBtn);
     loopBtn.setTooltip("Toggle loop playback. When enabled, playback wraps around between the loop start and end "
-                       "(initially set to the full project length — drag the loop region in the routing strip to adjust).");
+                       "(initially set to the full project length - drag the loop region in the routing strip to adjust).");
     loopBtn.onClick = [this]() {
         if (!graph.loopEnabled) {
             // Enable loop: default to full project length
@@ -292,8 +321,10 @@ MainContentComponent::MainContentComponent() {
         } else {
             graph.loopEnabled = false;
         }
-        loopBtn.setColour(juce::TextButton::buttonColourId,
-            graph.loopEnabled ? juce::Colour(60, 60, 120) : juce::Colour(55, 55, 60));
+        if (graph.loopEnabled)
+            loopBtn.setColour(juce::TextButton::buttonColourId, kTransportLitColour);
+        else
+            loopBtn.removeColour(juce::TextButton::buttonColourId);
     };
 
     addAndMakeVisible(songBtn);
@@ -305,7 +336,7 @@ MainContentComponent::MainContentComponent() {
     songBtn.onClick = [this]() { showSongSettingsDialog(); };
 
     addAndMakeVisible(monitorBtn);
-    monitorBtn.setTooltip("Toggle input monitoring — when on, audio coming in from any input device is "
+    monitorBtn.setTooltip("Toggle input monitoring - when on, audio coming in from any input device is "
                           "routed straight through to the Output node so you can hear yourself in real time");
     monitorBtn.onClick = [this]() {
         bool on = !audioEngine.inputMonitoring.load();
@@ -328,7 +359,7 @@ MainContentComponent::MainContentComponent() {
     bpmSlider.setTextBoxStyle(juce::Slider::TextBoxLeft, false, 50, 20);
     bpmSlider.setSliderStyle(juce::Slider::LinearHorizontal);
     bpmSlider.setTooltip("Project tempo in beats per minute. Higher = faster. "
-                         "Typical pop/rock is 90–130; dance music 120–140; ballads 60–80.");
+                         "Typical pop/rock is 90-130; dance music 120-140; ballads 60-80.");
     addAndMakeVisible(bpmSlider);
     bpmSlider.onValueChange = [this]() { graph.bpm = (float)bpmSlider.getValue(); };
 
@@ -371,6 +402,11 @@ MainContentComponent::MainContentComponent() {
     graphComponent->onFreezeNode = [this](int nodeId) { freezeNode(nodeId); };
     graphComponent->onRunScript = [this](int nodeId) { showScriptConsoleForNode(nodeId); };
     graphComponent->onOpenHelpDoc = [this](juce::String rel) { openHelpDoc(rel); };
+    graphComponent->onSignalShapeManualTrigger = [this](int nodeId) {
+        if (auto* proc = dynamic_cast<SignalShapeProcessor*>(
+                audioEngine.getGraphProcessor().getProcessorForNode(nodeId)))
+            proc->fireManualTrigger();
+    };
 
     // Load prefs, plugin cache, recent projects (audio engine deferred to timer)
     pluginSettings.load("soundshop_plugins.cfg");
@@ -383,7 +419,18 @@ MainContentComponent::MainContentComponent() {
     if (autoLoadLastProject && !recentProjects.empty()) {
         auto file = juce::File(recentProjects[0]);
         if (file.existsAsFile()) {
-            ProjectFile::load(recentProjects[0].toStdString(), graph, nullptr);
+            // Lock for the batch mutation (see node_graph.h mutationLock
+            // comment). Constructor-time load typically runs before the
+            // audio device callback fires, but locking unconditionally
+            // makes the invariant "all batch graph mutations hold this
+            // lock" hold even if the device starts unusually early.
+            {
+                std::lock_guard<std::mutex> graphLk(graph.mutationLock);
+                ProjectFile::load(recentProjects[0].toStdString(), graph, nullptr);
+            }
+            // Re-apply the saved pan/zoom from the loaded graph (or fit-all
+            // if none was persisted) on the next paint.
+            if (graphComponent) graphComponent->notifyProjectLoaded();
             loaded = true;
         }
     }
@@ -392,9 +439,16 @@ MainContentComponent::MainContentComponent() {
         // Auto-create MidiInput nodes for all connected hardware devices
         // so a fresh install sees the user's controller immediately.
         auto devices = juce::MidiInput::getAvailableDevices();
-        Node* defaultTrack = nullptr;
+        // Resolve the default track's MIDI input pin ID up front - pin IDs are
+        // stable across addNode() reallocations, so we never hold a Node*/Pin*
+        // across the addNode() calls below (dangling-reference anti-pattern).
+        int defaultTrackMidiPinId = -1;
         for (auto& n : graph.nodes)
-            if (n.type == NodeType::MidiTimeline) { defaultTrack = &n; break; }
+            if (n.type == NodeType::MidiTimeline) {
+                for (auto& pin : n.pinsIn)
+                    if (pin.kind == PinKind::Midi) { defaultTrackMidiPinId = pin.id; break; }
+                break;
+            }
         float yPos = 200;
         for (auto& dev : devices) {
             if (isVirtualOrControlPort(dev.name)) continue;
@@ -406,12 +460,9 @@ MainContentComponent::MainContentComponent() {
             auto& n = graph.addNode(dev.name.toStdString(), NodeType::MidiInput,
                 {}, {Pin{0, "MIDI Out", PinKind::Midi, false}}, {80, yPos});
             n.midiInputSourceId = dev.identifier.toStdString();
-            if (defaultTrack && !n.pinsOut.empty())
-                for (auto& pin : defaultTrack->pinsIn)
-                    if (pin.kind == PinKind::Midi) {
-                        graph.addLink(n.pinsOut[0].id, pin.id);
-                        break;
-                    }
+            int outPinId = n.pinsOut.empty() ? -1 : n.pinsOut[0].id;
+            if (defaultTrackMidiPinId >= 0 && outPinId >= 0)
+                graph.addLink(outPinId, defaultTrackMidiPinId);
             yPos += 50;
         }
     } else {
@@ -424,7 +475,7 @@ MainContentComponent::MainContentComponent() {
     // value into a plugin parameter, mark that node's plugin state cache
     // stale so the next slow autosave re-queries getStateInformation.
     // Only fires from the message-thread automation path; processMidiCC
-    // (audio thread) does NOT call this — the periodic force-dirty pass
+    // (audio thread) does NOT call this - the periodic force-dirty pass
     // catches changes that route through MIDI CC mappings.
     audioEngine.getGraphProcessor().getAutomation().onPluginParamChanged =
         [this](int nodeId) {
@@ -437,17 +488,24 @@ MainContentComponent::MainContentComponent() {
     startAutosaveWorker();
 
     // Wire the snapshot-based undo system (#84). Three pieces:
-    //  1. onLoadSnapshot — when undo/redo lands on a step that has no
+    //  1. onLoadSnapshot - when undo/redo lands on a step that has no
     //     LambdaCommand (a snapshot-only step from commitSnapshot, or any
     //     step in a session restored from disk where the closures are gone),
     //     parse the snapshot back into the live graph and rebuild routing.
-    //  2. onTreeChanged — fires after every push/undo/redo. Used to lazily
+    //  2. onTreeChanged - fires after every push/undo/redo. Used to lazily
     //     fill in the snapshot text for steps pushed via exec()/pushDone()
     //     (LambdaCommand path) so they're persistable cross-session.
-    //  3. setRootSnapshot below — capture the initial state so the very
+    //  3. setRootSnapshot below - capture the initial state so the very
     //     first edit has a state to revert to.
     graph.undoTree.onLoadSnapshot = [this](const std::string& snap) {
-        ProjectFile::loadFromString(snap, graph, nullptr);
+        // Hold the graph mutation lock for the snapshot reparse: it clears
+        // graph.nodes/links and rebuilds them from the snapshot text, which
+        // is the same kind of batch mutation as MOD import. Same race risk
+        // (see mutationLock comment in node_graph.h), same fix.
+        {
+            std::lock_guard<std::mutex> graphLk(graph.mutationLock);
+            ProjectFile::loadFromString(snap, graph, nullptr);
+        }
         // Drop editor panels whose underlying node no longer exists in the
         // restored state. Surviving panels keep their state and just
         // re-render the new node data.
@@ -457,6 +515,11 @@ MainContentComponent::MainContentComponent() {
                     return graph.findNode(p->nodeId) == nullptr;
                 }),
             editorPanels.end());
+        // Refresh any open wavetable editor windows so they re-decode their
+        // doc from the restored node->script. Without this, an undo/redo
+        // (including one capturing a mic/file capture into the library) would
+        // leave the open editor showing its stale pre-undo doc.
+        LayeredWaveEditorComponent::reloadOpenEditorsAfterSnapshot(graph);
         audioEngine.getGraphProcessor().requestRebuild();
         if (graphComponent) graphComponent->repaint();
         for (auto& panel : editorPanels)
@@ -474,7 +537,7 @@ MainContentComponent::MainContentComponent() {
         // into a single disk write.
         undoTreeDirty = true;
     };
-    // Initial state for the root undo node — without this, undoing the
+    // Initial state for the root undo node - without this, undoing the
     // first user edit has nothing to revert to.
     graph.undoTree.setRootSnapshot(ProjectFile::serializeForUndo(graph));
 
@@ -493,7 +556,7 @@ MainContentComponent::MainContentComponent() {
 
     // Shared-history prompt for the auto-loaded startup project (#90).
     // openProjectFile already fires this for user-opened projects, but
-    // the autoload path bypasses it — so do it here. Deferred so the
+    // the autoload path bypasses it - so do it here. Deferred so the
     // dialog appears over the visible main window.
     if (loaded && !ProjectFile::currentPath.empty()) {
         juce::String startupPath = juce::String(ProjectFile::currentPath);
@@ -505,7 +568,7 @@ MainContentComponent::MainContentComponent() {
 
     // Laptop autosave notice (#86): on first launch on a laptop, tell the
     // user we picked a slower default to save battery and where to change
-    // it. Only shows once — saved in prefs as autosaveLaptopNoticeShown.
+    // it. Only shows once - saved in prefs as autosaveLaptopNoticeShown.
     if (!autosaveLaptopNoticeShown && machineHasBattery()) {
         juce::Component::SafePointer<MainContentComponent> safe2(this);
         int interval = autosaveIntervalSeconds;
@@ -517,7 +580,7 @@ MainContentComponent::MainContentComponent() {
                     .withTitle("Autosave on Laptop")
                     .withMessage(
                         "Detected a laptop. Autosave is set to " + juce::String(interval) +
-                        " seconds to save battery — frequent disk writes can wake the SSD "
+                        " seconds to save battery - frequent disk writes can wake the SSD "
                         "and shorten unplugged runtime.\n\n"
                         "Crash recovery still loses at most a few plugin tweaks. Graph "
                         "edits (notes, cables, parameters) are protected at gesture "
@@ -541,6 +604,96 @@ MainContentComponent::~MainContentComponent() {
 
 void MainContentComponent::paint(juce::Graphics& g) {
     g.fillAll(juce::Colour(30, 30, 35));
+
+    // First-paint trigger for the heavy startup init (audio device + plugin
+    // instantiation/state-restore). We defer it off the *first* paint rather
+    // than doing it in the constructor so the window is actually on screen
+    // before the message thread blocks - otherwise the user stares at nothing
+    // during the couple-second warm-up. callAsync posts the work to the next
+    // message-loop iteration, by which point this first frame has been flushed
+    // to the screen. Guarded so it only fires once; a SafePointer keeps it safe
+    // if the component is torn down before the async lands.
+    if (!deferredInitScheduled) {
+        deferredInitScheduled = true;
+        juce::Component::SafePointer<MainContentComponent> safeThis(this);
+        juce::MessageManager::callAsync([safeThis]() {
+            if (auto* self = safeThis.getComponent())
+                self->runDeferredStartupInit();
+        });
+    }
+}
+
+void MainContentComponent::runDeferredStartupInit() {
+    // Runs exactly once, on the message-loop iteration after the window's first
+    // paint. The audio device init + per-plugin instantiation/state-restore
+    // below run synchronously and block interaction for a couple of seconds, so
+    // we bracket the work with the OS busy cursor to signal "not ready yet".
+    // No messages are pumped during the block, so the cursor stays busy the
+    // whole time; hideWaitCursor() restores it once we're interactive.
+    juce::MouseCursor::showWaitCursor();
+
+    audioEngine.init();
+    audioEngine.getPluginHost().loadScanCache("soundshop_plugins_cache.dat");
+
+    // Reload plugins for any nodes that were loaded before the audio engine was ready
+    {
+        bool anyLoaded = false;
+        for (auto& n : graph.nodes) {
+            if (n.pluginIndex >= 0 && !n.plugin) {
+                auto loaded = audioEngine.getPluginHost().loadPlugin(
+                    n.pluginIndex, audioEngine.getSampleRate(), audioEngine.getBlockSize());
+                if (loaded) {
+                    // Restore saved plugin state
+                    if (!n.pendingPluginState.empty() && loaded->instance) {
+                        juce::MemoryBlock stateData;
+                        stateData.fromBase64Encoding(n.pendingPluginState);
+                        if (stateData.getSize() > 0)
+                            loaded->instance->setStateInformation(
+                                stateData.getData(), (int)stateData.getSize());
+                        n.pendingPluginState.clear();
+                    }
+                    n.plugin = std::move(loaded);
+                    anyLoaded = true;
+                }
+            }
+        }
+        if (anyLoaded)
+            audioEngine.getGraphProcessor().requestRebuild();
+    }
+
+    // Restore CC mappings from loaded project
+    syncCCMappingsFromGraph();
+
+    // Restore project sample rate
+    if (graph.projectSampleRate > 0)
+        audioEngine.setProjectSampleRate(graph.projectSampleRate);
+
+    // Restore editor panels from loaded project (deferred until UI is ready)
+    if (!graph.openEditors.empty()) {
+        auto editorIds = graph.openEditors;
+        graph.openEditors.clear();
+        for (int id : editorIds)
+            if (auto* node = graph.findNode(id))
+                openEditor(*node);
+    }
+    // Note: the initial fit-all happens inside NodeGraphComponent's first
+    // resized()/paint() call, *before* this runs, so the user never sees the
+    // un-fit default zoom. Don't re-fit here - that would clobber any manual
+    // pan/zoom the user has already done while the audio engine was warming up.
+
+    // Force the OS to clear any stale "Not Responding" state
+#ifdef _WIN32
+    if (auto* tlc = getTopLevelComponent())
+        if (auto* peer = tlc->getPeer())
+            if (auto hwnd = (HWND)peer->getNativeHandle()) {
+                wchar_t title[256];
+                GetWindowTextW(hwnd, title, 256);
+                SetWindowTextW(hwnd, title);
+            }
+#endif
+
+    // Heavy init done - the app is interactive now, so drop the busy cursor.
+    juce::MouseCursor::hideWaitCursor();
 }
 
 bool MainContentComponent::keyPressed(const juce::KeyPress& key) {
@@ -640,18 +793,19 @@ void MainContentComponent::resized() {
     x += 124;
     placeBtn(tapTempoBtn, 38);
     placeBtn(fitAllBtn, 50);
-    placeBtn(metroBtn, 50);
+    placeBtn(metroBtn, 80);
     placeBtn(loopBtn, 42);
     placeBtn(songBtn, 46);
-    placeBtn(monitorBtn, 40);
+    placeBtn(monitorBtn, 64);
     placeBtn(captureBtn, 60);
     placeBtn(keyboardMidiBtn, 42);
     x += 2;
-    // Time signature combo (no label — "4/4" is self-explanatory)
+    // Time signature combo (no label - "4/4" is self-explanatory)
     timeSigLabel.setBounds(0, 0, 0, 0); // hidden
-    timeSigCombo.setBounds(transport.getX() + x, transport.getY() + 4, 55, 24);
-    x += 58;
-    positionLabel.setBounds(transport.getX() + x, transport.getY() + 2, 80, 28);
+    timeSigCombo.setBounds(transport.getX() + x, transport.getY() + 4, 75, 24);
+    x += 78;
+    // Wide enough for the current/total form, e.g. "0:00.0/15:30.0   Bar 1:1.0/20".
+    positionLabel.setBounds(transport.getX() + x, transport.getY() + 2, 270, 28);
 
     // Split: graph on top, editors on bottom, routing strip between them
     if (!editorPanels.empty()) {
@@ -666,9 +820,19 @@ void MainContentComponent::resized() {
             routingStrip->setVisible(false);
         }
 
-        int perEditor = editorArea.getHeight() / std::max(1, (int)editorPanels.size());
-        for (auto& panel : editorPanels) {
-            panel->component->setBounds(editorArea.removeFromTop(perEditor));
+        // Lay out panels top-to-bottom using each panel's own heightPx.
+        // The last panel absorbs whatever rounding/remainder is left so we
+        // don't draw a sliver of unpainted area at the bottom. If the
+        // summed heights overflow the available area (heightPx wasn't
+        // recalc'd, edge case), each panel still gets its requested
+        // height and trailing panels get clipped by setBounds; that's
+        // visibly wrong but recoverable on next resize.
+        int n = (int)editorPanels.size();
+        for (int i = 0; i < n; ++i) {
+            auto& panel = editorPanels[(size_t)i];
+            int h = (i == n - 1) ? editorArea.getHeight()
+                                 : juce::jmin(editorArea.getHeight(), panel->heightPx);
+            panel->component->setBounds(editorArea.removeFromTop(h));
         }
     } else {
         routingStrip->setVisible(false);
@@ -689,7 +853,7 @@ void MainContentComponent::timerCallback() {
             int desired = ac ? 5 : 20;
             if (autosaveIntervalSeconds != desired) {
                 autosaveIntervalSeconds = desired;
-                fprintf(stderr, "Power state changed — autosave interval → %ds\n",
+                fprintf(stderr, "Power state changed - autosave interval -> %ds\n",
                         desired);
             }
         }
@@ -711,7 +875,7 @@ void MainContentComponent::timerCallback() {
                 if (n.type == NodeType::MidiInput && n.midiInputSourceId == idStd)
                     { inGraph = true; break; }
             if (inGraph) continue;
-            // Skip the initial scan — we don't want to nag about devices
+            // Skip the initial scan - we don't want to nag about devices
             // that were already there before the app started. Only offer
             // on NEW device connections after this flag is set.
             if (!midiDeviceScanInitialized) continue;
@@ -753,14 +917,51 @@ void MainContentComponent::timerCallback() {
         transport.timeSigMap.setGlobal(graph.timeSignatureNum, graph.timeSignatureDen);
     // Sync UI with audio engine's playing state. The audio thread may
     // stop playback internally (e.g., when Song Length + Song Repeat
-    // policy fires), so the button text has to reflect that — otherwise
+    // policy fires), so the button text has to reflect that - otherwise
     // it stays stuck on "Stop" after the song auto-stops.
     bool engineIsPlaying = audioEngine.isPlaying();
     if (transport.playing && !engineIsPlaying) {
-        // Transport just stopped itself — update button label.
+        // Transport just stopped itself - update button label.
         playBtn.setButtonText("Play");
     }
     transport.playing = engineIsPlaying;
+
+    // Light the Play button while audio is actually playing, sharing the Loop
+    // button's accent colour. Driven off the engine's real playing state (not
+    // just onPlay/onStop) so it also tracks programmatic stops - e.g. the song
+    // auto-stopping at its end. Guarded so we don't churn the colour every tick.
+    if (engineIsPlaying) {
+        if (playBtn.findColour(juce::TextButton::buttonColourId) != kTransportLitColour)
+            playBtn.setColour(juce::TextButton::buttonColourId, kTransportLitColour);
+    } else if (playBtn.isColourSpecified(juce::TextButton::buttonColourId)) {
+        playBtn.removeColour(juce::TextButton::buttonColourId);
+    }
+
+    // Stop is only actionable while the song is actually playing. Grey it out
+    // (with an explanatory tooltip) when stopped/paused so it's clear there's
+    // nothing to stop - and re-enable it the moment playback starts. Guarded
+    // on the current enabled state so we don't churn the tooltip every tick.
+    // (See "grayed-out controls must explain themselves" in the project rules.)
+    if (stopBtn.isEnabled() != transport.playing) {
+        stopBtn.setEnabled(transport.playing);
+        stopBtn.setTooltip(transport.playing
+            ? "Stop playback and rewind to the start of the loop (or to 0 if loop is off)"
+            : "Nothing is playing right now - press Play to start. "
+              "Stop then halts playback and rewinds.");
+    }
+
+    // Keep the Loop button's lit/unlit state in sync with the actual loop
+    // setting. The onClick handler sets the colour when the user toggles it,
+    // but looping can also be enabled programmatically - by a project load,
+    // an undo/redo, or a tracker import whose module loops back to a section.
+    // Syncing here (guarded so we don't repaint every tick) makes the button
+    // reflect all of those uniformly. Colours mirror the onClick handler.
+    if (graph.loopEnabled) {
+        if (loopBtn.findColour(juce::TextButton::buttonColourId) != kTransportLitColour)
+            loopBtn.setColour(juce::TextButton::buttonColourId, kTransportLitColour);
+    } else if (loopBtn.isColourSpecified(juce::TextButton::buttonColourId)) {
+        loopBtn.removeColour(juce::TextButton::buttonColourId);
+    }
 
     // Evaluate Python signals on UI thread and apply to plugin parameters
     if (scriptEngine.isInitialized()) {
@@ -801,83 +1002,57 @@ void MainContentComponent::timerCallback() {
             audioEngine.getGraphProcessor().applyAutomation(autoValues);
     }
 
-    // Update position display
+    // Update position display - show BOTH representations so it's clear what
+    // each value means: elapsed wall-clock time (min:sec, starts at 0:00.0,
+    // natural for non-musicians) AND musical position (Bar:Beat, 1-based, for
+    // anyone working to the grid). Each is shown as current / total so the song
+    // length is always visible, e.g. "0:00.0/15:30.0   Bar 1:1.0/20".
     {
-        auto [bar, beat] = transport.timeSigMap.beatToBarBeat(transport.positionBeats());
-        positionLabel.setText(juce::String(bar) + " : " + juce::String(beat, 1),
-                              juce::dontSendNotification);
+        auto fmtMinSec = [](double secs) {
+            if (secs < 0.0) secs = 0.0;
+            int mins = (int)(secs / 60.0);
+            double rem = secs - mins * 60.0;
+            return juce::String(mins) + ":" + juce::String(rem, 1).paddedLeft('0', 4);
+        };
+
+        double secs = (transport.sampleRate > 0.0)
+                          ? (double)transport.positionSamples / transport.sampleRate
+                          : 0.0;
+        auto bb = transport.timeSigMap.beatToBarBeat(transport.positionBeats());
+
+        // Total song length (beats). 0 = no clips / no explicit length, in which
+        // case there's no meaningful total to show.
+        double totalBeats = graph.effectiveSongLengthBeats();
+
+        juce::String timeStr = fmtMinSec(secs);
+        juce::String barStr  = "Bar " + juce::String(bb.first) + ":"
+                             + juce::String(bb.second, 1);
+
+        if (totalBeats > 0.0) {
+            double totalSecs = (transport.sampleRate > 0.0)
+                                   ? transport.beatsToSamples(totalBeats) / transport.sampleRate
+                                   : 0.0;
+            // Total bar count: the bar that the song's end falls in. When the
+            // length lands exactly on a downbeat (beat 1.0), the song fills the
+            // PREVIOUS bar, so a 20-bar song reads "/20" not "/21".
+            auto tot = transport.timeSigMap.beatToBarBeat(totalBeats);
+            int totalBars = tot.first;
+            if (tot.second <= 1.0 + 1e-6 && totalBars > 1) totalBars -= 1;
+
+            timeStr += "/" + fmtMinSec(totalSecs);
+            barStr  += "/" + juce::String(totalBars);
+        }
+
+        positionLabel.setText(timeStr + "   " + barStr, juce::dontSendNotification);
     }
 
     graphComponent->repaint();
     for (auto& panel : editorPanels)
         panel->component->repaint();
 
-    // Deferred startup: init audio engine after window is visible
-    if (startupFrames > 0) {
-        startupFrames--;
-        if (startupFrames == 0) {
-            audioEngine.init();
-            audioEngine.getPluginHost().loadScanCache("soundshop_plugins_cache.dat");
-
-            // Reload plugins for any nodes that were loaded before the audio engine was ready
-            {
-                bool anyLoaded = false;
-                for (auto& n : graph.nodes) {
-                    if (n.pluginIndex >= 0 && !n.plugin) {
-                        auto loaded = audioEngine.getPluginHost().loadPlugin(
-                            n.pluginIndex, audioEngine.getSampleRate(), audioEngine.getBlockSize());
-                        if (loaded) {
-                            // Restore saved plugin state
-                            if (!n.pendingPluginState.empty() && loaded->instance) {
-                                juce::MemoryBlock stateData;
-                                stateData.fromBase64Encoding(n.pendingPluginState);
-                                if (stateData.getSize() > 0)
-                                    loaded->instance->setStateInformation(
-                                        stateData.getData(), (int)stateData.getSize());
-                                n.pendingPluginState.clear();
-                            }
-                            n.plugin = std::move(loaded);
-                            anyLoaded = true;
-                        }
-                    }
-                }
-                if (anyLoaded)
-                    audioEngine.getGraphProcessor().requestRebuild();
-            }
-
-            // Restore CC mappings from loaded project
-            syncCCMappingsFromGraph();
-
-            // Restore project sample rate
-            if (graph.projectSampleRate > 0)
-                audioEngine.setProjectSampleRate(graph.projectSampleRate);
-
-            // Restore editor panels from loaded project (deferred until UI is ready)
-            if (!graph.openEditors.empty()) {
-                auto editorIds = graph.openEditors;
-                graph.openEditors.clear();
-                for (int id : editorIds)
-                    if (auto* node = graph.findNode(id))
-                        openEditor(*node);
-            }
-            // Note: the initial fit-all happens inside NodeGraphComponent's
-            // first resized()/paint() call, *before* this timer-deferred init
-            // runs, so the user never sees the un-fit default zoom. Don't
-            // re-fit here — that would clobber any manual pan/zoom the user
-            // has already done while audio engine was warming up.
-
-            // Force the OS to clear any stale "Not Responding" state
-#ifdef _WIN32
-            if (auto* tlc = getTopLevelComponent())
-                if (auto* peer = tlc->getPeer())
-                    if (auto hwnd = (HWND)peer->getNativeHandle()) {
-                        wchar_t title[256];
-                        GetWindowTextW(hwnd, title, 256);
-                        SetWindowTextW(hwnd, title);
-                    }
-#endif
-        }
-    }
+    // (Heavy startup init is no longer driven from here - it runs once from
+    // runDeferredStartupInit(), scheduled off the window's first paint. See
+    // MainContentComponent::paint().)
 
     // Undo-tree persistence tick. Coalesces any number of pushes/undos
     // since the previous tick into one disk write. The serializer is
@@ -908,7 +1083,7 @@ void MainContentComponent::timerCallback() {
         if (!ProjectFile::currentPath.empty())
             title = juce::File(ProjectFile::currentPath).getFileNameWithoutExtension();
         if (saveFlashFrames > 0) {
-            title += " — Saved";
+            title += " - Saved";
             saveFlashFrames--;
         } else if (projectDirty || graph.dirty) {
             title += " *";
@@ -938,7 +1113,7 @@ juce::PopupMenu MainContentComponent::getMenuForIndex(int idx, const juce::Strin
         } else {
             for (int i = 0; i < (int)recentProjects.size(); ++i) {
                 auto file = juce::File(recentProjects[i]);
-                recentMenu.addItem(60 + i, file.getFileName() + "  —  " + file.getParentDirectory().getFileName());
+                recentMenu.addItem(60 + i, file.getFileName() + "  -  " + file.getParentDirectory().getFileName());
             }
             recentMenu.addSeparator();
             recentMenu.addItem(59, "Clear Recents");
@@ -969,7 +1144,7 @@ juce::PopupMenu MainContentComponent::getMenuForIndex(int idx, const juce::Strin
             for (auto& line : lines) {
                 if (line.isNotEmpty() && ri < 10) {
                     auto f = juce::File(line);
-                    menu.addItem(900 + ri, f.getFileName() + "  —  " + f.getParentDirectory().getFileName());
+                    menu.addItem(900 + ri, f.getFileName() + "  -  " + f.getParentDirectory().getFileName());
                     ri++;
                 }
             }
@@ -999,6 +1174,21 @@ juce::PopupMenu MainContentComponent::getMenuForIndex(int idx, const juce::Strin
             for (int i = 0; i < (int)TuningSystem::COUNT; ++i)
                 tuningMenu.addItem(70 + i, tuningSystemName((TuningSystem)i),
                                    true, graph.tuningSystem == (TuningSystem)i);
+            // Unequal temperaments need per-note pitch bend, which for hosted
+            // VST3/AU plugins means MPE. Warn that the temperament only reaches
+            // a hosted plugin if that plugin is switched to MPE mode (right-click
+            // the plugin node -> Enable MPE), and that even then a plugin which
+            // ignores the bend-range message and keeps its own fixed range may
+            // not be tuned exactly. Built-in synths are always tuned correctly.
+            if (graph.tuningSystem != TuningSystem::Equal12) {
+                tuningMenu.addSeparator();
+                tuningMenu.addItem(-1, "Note: this temperament reaches a hosted plugin", false);
+                tuningMenu.addItem(-1, "only when that plugin is in MPE mode", false);
+                tuningMenu.addItem(-1, "(right-click the plugin node -> Enable MPE).", false);
+                tuningMenu.addItem(-1, "Plugins that keep their own fixed bend range", false);
+                tuningMenu.addItem(-1, "may still not be tuned exactly. Built-in", false);
+                tuningMenu.addItem(-1, "synths are always tuned correctly.", false);
+            }
             menu.addSubMenu("Tuning System", tuningMenu);
 
             juce::PopupMenu pitchMenu;
@@ -1040,6 +1230,8 @@ juce::PopupMenu MainContentComponent::getMenuForIndex(int idx, const juce::Strin
         menu.addItem(309, "Trigger Node");
         menu.addItem(310, "MIDI Modulator");
         menu.addItem(311, "Convolution Filter");
+        menu.addItem(313, "Script (Signal + MIDI)");
+        menu.addItem(314, "Algorithmic MIDI");
         menu.addSeparator();
         menu.addItem(312, "Keyboard Shortcuts");
         menu.addSeparator();
@@ -1088,7 +1280,7 @@ void MainContentComponent::menuItemSelected(int menuItemID, int) {
         case 10: juce::JUCEApplication::getInstance()->systemRequestedQuit(); break;
         case 20: graph.undoTree.doUndo(); graphComponent->repaint(); break;
         case 22: {
-            // Write Automation to Selection — uses loop region as the range
+            // Write Automation to Selection - uses loop region as the range
             if (graph.loopEnabled && graph.loopEndBeat > graph.loopStartBeat) {
                 graph.writeAutomationToSelection(
                     (float)graph.loopStartBeat, (float)graph.loopEndBeat);
@@ -1158,14 +1350,18 @@ void MainContentComponent::menuItemSelected(int menuItemID, int) {
         case 111: showMidiDeviceWizard(); break;
         case 400: {
             // Spectrum Analyzer (#10): open a floating non-modal window.
+            // Parented to the main content component so the OS doesn't give
+            // it a separate taskbar entry.
             auto* viz = new SpectrumVisualizerComponent(audioEngine);
-            auto* dw = new juce::DialogWindow(
-                "Spectrum Analyzer", juce::Colour(18, 20, 28), true);
-            dw->setContentOwned(viz, true);
-            dw->setResizable(true, false);
-            dw->setUsingNativeTitleBar(true);
-            dw->setVisible(true);
-            dw->centreWithSize(viz->getWidth(), viz->getHeight());
+            juce::DialogWindow::LaunchOptions opts;
+            opts.content.setOwned(viz);
+            opts.dialogTitle = "Spectrum Analyzer";
+            opts.dialogBackgroundColour = juce::Colour(18, 20, 28);
+            opts.escapeKeyTriggersCloseButton = true;
+            opts.useNativeTitleBar = false;
+            opts.resizable = true;
+            opts.componentToCentreAround = this;
+            SoundShop::launchNonModalToolDialog(opts);
             break;
         }
         case 300: openHelpDoc("index.html"); break;
@@ -1181,6 +1377,8 @@ void MainContentComponent::menuItemSelected(int menuItemID, int) {
         case 310: openHelpDoc("midi-modulator.html"); break;
         case 311: openHelpDoc("convolution.html"); break;
         case 312: openHelpDoc("keyboard-shortcuts.html"); break;
+        case 313: openHelpDoc("signal-shape.html"); break;
+        case 314: openHelpDoc("midi-script.html"); break;
         case 320:
             juce::AlertWindow::showMessageBoxAsync(
                 juce::MessageBoxIconType::InfoIcon,
@@ -1204,7 +1402,8 @@ void MainContentComponent::menuItemSelected(int menuItemID, int) {
             opts.escapeKeyTriggersCloseButton = true;
             opts.useNativeTitleBar = false;
             opts.resizable = true;
-            opts.launchAsync();
+            opts.componentToCentreAround = this;
+            SoundShop::launchToolDialog(opts);
             break;
         }
         case 21: {
@@ -1367,7 +1566,9 @@ public:
         removeDimBtn.setButtonText("- Dim");
         addDimBtn.setTooltip("Add a terrain dimension. Adds a new Sig input pin and Position "
                              "knobs (Center/Radius) on the synth node. The terrain extends into "
-                             "the new axis — fill it with an expression using x, y, z, w variables.");
+                             "the new axis - reference it in your expression with the axis variable "
+                             "(x, y, z, w, v, u, s, t for dims 1-8). Axes you don't reference are "
+                             "constant along that axis but still exist as inputs you can modulate.");
         removeDimBtn.setTooltip("Remove the last terrain dimension");
         addDimBtn.onClick = [this]() { changeDimCount(1); };
         removeDimBtn.onClick = [this]() { changeDimCount(-1); };
@@ -1661,8 +1862,13 @@ public:
         // Info label
         g.setColour(juce::Colours::grey);
         g.setFont(11.0f);
-        auto modeStr = proc.getMode() == TerrainSynthMode::SamplePerPoint
-            ? "Sample/Point" : "Waveform/Point";
+        const char* modeStr;
+        switch (proc.getMode()) {
+            case TerrainSynthMode::SamplePerPoint:   modeStr = "Direct";        break;
+            case TerrainSynthMode::WaveformPerPoint: modeStr = "AM-sine";       break;
+            case TerrainSynthMode::AdditiveBank:     modeStr = "Additive bank"; break;
+            default:                                 modeStr = "?";             break;
+        }
         juce::String travStr;
         switch (proc.getTraversalParams().mode) {
             case TraversalMode::Orbit: travStr = "Orbit"; break;
@@ -1812,7 +2018,8 @@ void MainContentComponent::showPluginUI(int nodeId) {
         opts.escapeKeyTriggersCloseButton = true;
         opts.useNativeTitleBar = false;
         opts.resizable = true;
-        opts.launchAsync();
+        opts.componentToCentreAround = this;
+        SoundShop::launchToolDialog(opts);
         return;
     }
 
@@ -1827,11 +2034,12 @@ void MainContentComponent::showPluginUI(int nodeId) {
         opts.escapeKeyTriggersCloseButton = true;
         opts.useNativeTitleBar = false;
         opts.resizable = true;
-        opts.launchAsync();
+        opts.componentToCentreAround = this;
+        SoundShop::launchToolDialog(opts);
         return;
     }
 
-    // Legacy single-sample Sampler editor — still supported for old
+    // Legacy single-sample Sampler editor - still supported for old
     // projects that haven't been upgraded yet. Normal load path converts
     // "__audio__:" into "__multisampler__:" so this only fires if
     // upgradeLegacyNodes() didn't run for some reason.
@@ -1845,7 +2053,8 @@ void MainContentComponent::showPluginUI(int nodeId) {
         opts.escapeKeyTriggersCloseButton = true;
         opts.useNativeTitleBar = false;
         opts.resizable = true;
-        opts.launchAsync();
+        opts.componentToCentreAround = this;
+        SoundShop::launchToolDialog(opts);
         return;
     }
 
@@ -1861,13 +2070,18 @@ void MainContentComponent::showPluginUI(int nodeId) {
         opts.escapeKeyTriggersCloseButton = true;
         opts.useNativeTitleBar = false;
         opts.resizable = true;
-        opts.launchAsync();
+        opts.componentToCentreAround = this;
+        SoundShop::launchToolDialog(opts);
         return;
     }
 
-    // Spectrum Tap: open the frequency bin editor
-    if (node && node->script == "__spectrumtap__") {
-        auto* comp = new SpectrumTapComponent(graph, node->id);
+    // Spectrum Tap: open the frequency bin editor. Match by prefix since the
+    // script may carry per-bin custom response curves after the tag.
+    if (node && node->script.rfind("__spectrumtap__", 0) == 0) {
+        auto* comp = new SpectrumTapComponent(graph, node->id, [this]() {
+            audioEngine.getGraphProcessor().requestRebuild();
+            graphComponent->repaint();
+        });
         juce::DialogWindow::LaunchOptions opts;
         opts.content.setOwned(comp);
         opts.dialogTitle = "Spectrum Tap: " + juce::String(node->name);
@@ -1875,11 +2089,45 @@ void MainContentComponent::showPluginUI(int nodeId) {
         opts.escapeKeyTriggersCloseButton = true;
         opts.useNativeTitleBar = false;
         opts.resizable = true;
-        opts.launchAsync();
+        opts.componentToCentreAround = this;
+        SoundShop::launchToolDialog(opts);
         return;
     }
 
-    // XY Pad: reopen the pad window on double-click
+    // Audio analyzer nodes (Spectrum Analyzer, Oscilloscope, Spectrogram):
+    // open the matching live visualizer in a non-modal floating window so
+    // the user can keep the song playing while watching the display.
+    if (node && (node->script == "__spectrumanalyzer__" ||
+                 node->script == "__oscilloscope__" ||
+                 node->script == "__spectrogram__")) {
+        juce::Component* viz = nullptr;
+        juce::String title;
+        if (node->script == "__spectrumanalyzer__") {
+            viz = new SpectrumAnalyzerComponent(graph, node->id);
+            title = "Spectrum Analyzer: " + juce::String(node->name);
+        } else if (node->script == "__oscilloscope__") {
+            viz = new OscilloscopeComponent(graph, node->id);
+            title = "Oscilloscope: " + juce::String(node->name);
+        } else {
+            viz = new SpectrogramComponent(graph, node->id);
+            title = "Spectrogram: " + juce::String(node->name);
+        }
+        juce::DialogWindow::LaunchOptions opts;
+        opts.content.setOwned(viz);
+        opts.dialogTitle = title;
+        opts.dialogBackgroundColour = juce::Colour(18, 20, 28);
+        opts.escapeKeyTriggersCloseButton = true;
+        opts.useNativeTitleBar = false;
+        opts.resizable = true;
+        opts.componentToCentreAround = this;
+        SoundShop::launchNonModalToolDialog(opts);
+        return;
+    }
+
+    // XY Pad: reopen the pad window on double-click. Non-modal - a live input
+    // surface must stay usable alongside the main window, the transport, and
+    // other input-node editors while the song plays (matches the graph-view
+    // open path). XYPadComponent is node-id-safe, so it survives node deletion.
     if (node && node->script == "__xypad__") {
         auto* pad = new XYPadComponent(graph, node->id);
         juce::DialogWindow::LaunchOptions opts;
@@ -1889,7 +2137,9 @@ void MainContentComponent::showPluginUI(int nodeId) {
         opts.escapeKeyTriggersCloseButton = true;
         opts.useNativeTitleBar = false;
         opts.resizable = true;
-        opts.launchAsync();
+        opts.componentToCentreAround = this;
+        if (auto* dlg = SoundShop::launchNonModalToolDialog(opts))
+            dlg->setResizeLimits(320, 400, 6000, 6000);
         return;
     }
 
@@ -1910,7 +2160,8 @@ void MainContentComponent::showPluginUI(int nodeId) {
         opts.escapeKeyTriggersCloseButton = true;
         opts.useNativeTitleBar = false;
         opts.resizable = true;
-        opts.launchAsync();
+        opts.componentToCentreAround = this;
+        SoundShop::launchToolDialog(opts);
         return;
     }
 
@@ -1927,17 +2178,83 @@ void MainContentComponent::showPluginUI(int nodeId) {
         opts.escapeKeyTriggersCloseButton = true;
         opts.useNativeTitleBar = false;
         opts.resizable = true;
-        opts.launchAsync();
+        opts.componentToCentreAround = this;
+        SoundShop::launchToolDialog(opts);
+        return;
+    }
+
+    // Wavelet-space painter for nodes authored with a DWT coefficient grid.
+    if (node && (node->type == NodeType::Instrument || node->type == NodeType::TerrainSynth)
+        && !node->plugin && node->pluginIndex < 0
+        && node->script.rfind("__waveletpaint__:", 0) == 0) {
+        auto* editor = new WaveletPainterComponent(graph, node->id, [this]() {
+            audioEngine.getGraphProcessor().requestRebuild();
+        });
+        // Use LaunchOptions + componentToCentreAround so the OS treats this as
+        // a child of the main window. With useNativeTitleBar(true) and no
+        // parent, Windows gives the dialog its own taskbar entry, which is
+        // wrong for an editor sub-window.
+        juce::DialogWindow::LaunchOptions opts;
+        opts.content.setOwned(editor);
+        opts.dialogTitle = "Wavelet Space: " + juce::String(node->name);
+        opts.dialogBackgroundColour = juce::Colour(22, 22, 28);
+        opts.escapeKeyTriggersCloseButton = true;
+        opts.useNativeTitleBar = false;
+        opts.resizable = true;
+        opts.componentToCentreAround = this;
+        SoundShop::launchToolDialog(opts);
+        return;
+    }
+
+    // Spectral (frequency-domain) editor for nodes authored with a
+    // mag/phase spectrum. Both the new `__spectral2__:` format and the
+    // legacy `__spectral__:` format open the same editor; the editor
+    // converts legacy data to the new format on save.
+    if (node && (node->type == NodeType::Instrument || node->type == NodeType::TerrainSynth)
+        && !node->plugin && node->pluginIndex < 0
+        && (node->script.rfind("__spectral__:", 0) == 0
+            || node->script.rfind("__spectral2__:", 0) == 0)) {
+        auto* editor = new SpectralEditorComponent(graph, node->id, [this]() {
+            audioEngine.getGraphProcessor().requestRebuild();
+        });
+        // Use LaunchOptions + componentToCentreAround so the OS treats this as
+        // a child of the main window (no separate taskbar entry).
+        juce::DialogWindow::LaunchOptions opts;
+        opts.content.setOwned(editor);
+        opts.dialogTitle = "Frequency Domain: " + juce::String(node->name);
+        opts.dialogBackgroundColour = juce::Colour(22, 22, 28);
+        opts.escapeKeyTriggersCloseButton = true;
+        opts.useNativeTitleBar = false;
+        opts.resizable = true;
+        opts.componentToCentreAround = this;
+        SoundShop::launchToolDialog(opts);
         return;
     }
 
     // Layered waveform editor takes priority for nodes whose script is a
-    // layered spec (single frame) or a wavetable spec (multi-frame). Both
-    // open the same editor.
+    // layered spec (single frame) or a wavetable spec (multi-frame). All
+    // five formats open the same editor:
+    //   __layered__:    single-frame legacy time-domain layered spec
+    //   __wavetable__:  legacy multi-frame wavetable (v1)
+    //   __wavetable2__: v2 multi-frame container (inline frame data per cell)
+    //   __wavetable3__: v3 library + cell-by-reference format (pre-colorIdx)
+    //   __wavetable4__: v4 library + cell-by-reference format with per-entry
+    //                   colorIdx (no gain).
+    //   __wavetable5__: current library + cell-by-reference format with
+    //                   per-entry colorIdx AND per-frame gain. This is what
+    //                   newly-created Wavetable nodes encode their script as
+    //                   (defaultEmpty().encode()), so leaving it out of the
+    //                   gate meant double-click on a freshly-added Wavetable
+    //                   node fell through to the generic visualizer with no
+    //                   way to reopen the wavetable editor.
     if (node && (node->type == NodeType::Instrument || node->type == NodeType::TerrainSynth)
         && !node->plugin && node->pluginIndex < 0
         && (node->script.rfind("__layered__:", 0) == 0
-            || node->script.rfind("__wavetable__:", 0) == 0)) {
+            || node->script.rfind("__wavetable__:", 0) == 0
+            || node->script.rfind("__wavetable2__:", 0) == 0
+            || node->script.rfind("__wavetable3__:", 0) == 0
+            || node->script.rfind("__wavetable4__:", 0) == 0
+            || node->script.rfind("__wavetable5__:", 0) == 0)) {
         auto* editor = new LayeredWaveEditorComponent(graph, node->id, [this]() {
             audioEngine.getGraphProcessor().requestRebuild();
         });
@@ -1945,14 +2262,31 @@ void MainContentComponent::showPluginUI(int nodeId) {
         // window. The user can keep working in the graph while the
         // waveform editor is open. Closing the window destroys the
         // editor. Multiple editors for different nodes can coexist.
-        auto* dw = new juce::DialogWindow(
-            "Waveform: " + juce::String(node->name),
-            juce::Colour(22, 22, 28), true);
-        dw->setContentOwned(editor, true);
-        dw->setResizable(true, false);
-        dw->setUsingNativeTitleBar(true);
-        dw->setVisible(true);
-        dw->centreWithSize(editor->getWidth(), editor->getHeight());
+        // componentToCentreAround = this parents the dialog to the main
+        // window so the OS doesn't give it a separate taskbar entry.
+        juce::DialogWindow::LaunchOptions opts;
+        opts.content.setOwned(editor);
+        opts.dialogTitle = "Wavetable: " + juce::String(node->name);
+        opts.dialogBackgroundColour = juce::Colour(22, 22, 28);
+        opts.escapeKeyTriggersCloseButton = true;
+        opts.useNativeTitleBar = false;
+        opts.resizable = true;
+        opts.componentToCentreAround = this;
+        // Single-window editor: arrangement view and per-waveform edit view
+        // are both panels of the same editor (toggled via "Edit waveform" /
+        // close in the per-waveform view).
+        //
+        // Non-modal launch (#17) is required, not just nice-to-have: the
+        // arrangement view's library list uses JUCE DragAndDropContainer
+        // to drop library entries onto grid cells / scatter positions. A
+        // modal parent dialog blocks the DragImageComponent (which lives
+        // on the desktop, outside the modal hierarchy) from receiving
+        // mouseUp via the source-component listener forwarding chain, so
+        // itemDropped never fires and the drag silently leaves a stranded
+        // drag-image bitmap on the cell. launchNonModalToolDialog keeps
+        // the delete-on-close behavior of launchToolDialog without
+        // entering modal state.
+        SoundShop::launchNonModalToolDialog(opts);
         return;
     }
 
@@ -1970,7 +2304,8 @@ void MainContentComponent::showPluginUI(int nodeId) {
             opts.escapeKeyTriggersCloseButton = true;
             opts.useNativeTitleBar = false;
             opts.resizable = true;
-            opts.launchAsync();
+            opts.componentToCentreAround = this;
+            SoundShop::launchToolDialog(opts);
         }
         return;
     }
@@ -2072,7 +2407,8 @@ void MainContentComponent::showPluginInfo(int nodeId) {
     opts.escapeKeyTriggersCloseButton = true;
     opts.useNativeTitleBar = false;
     opts.resizable = true;
-    opts.launchAsync();
+    opts.componentToCentreAround = this;
+    SoundShop::launchToolDialog(opts);
 }
 
 void MainContentComponent::showPluginPresets(int nodeId) {
@@ -2150,7 +2486,7 @@ public:
             int cc = midiLearn.lastCC.load();
             int ch = midiLearn.lastChannel.load();
             if (cc >= 0 && ch >= 0) {
-                // CC captured — create mapping
+                // CC captured - create mapping
                 midiLearn.active.store(false);
 
                 // Remove any existing mapping for this CC
@@ -2180,7 +2516,7 @@ public:
         }
     }
 
-    // ListBox delegate (inline — small enough)
+    // ListBox delegate (inline - small enough)
     struct ListModel : public juce::ListBoxModel {
         MidiMapComponent* parent = nullptr;
         int getNumRows() override { return parent ? (int)parent->paramNames.size() : 0; }
@@ -2196,7 +2532,7 @@ public:
 
             // Current CC assignment
             auto mappings = parent->automation.getCCMappings();
-            juce::String ccText = "—";
+            juce::String ccText = "-";
             for (auto& m : mappings)
                 if (m.nodeId == parent->nodeId && m.paramIdx == row)
                     ccText = "CC " + juce::String(m.ccNumber) + " (ch " + juce::String(m.midiChannel) + ")";
@@ -2204,7 +2540,7 @@ public:
             if (parent->learningParamIdx == row)
                 ccText = "Waiting...";
 
-            g.setColour(ccText == "—" ? juce::Colours::grey
+            g.setColour(ccText == "-" ? juce::Colours::grey
                         : parent->learningParamIdx == row ? juce::Colours::yellow
                         : juce::Colours::limegreen);
             g.drawText(ccText, w / 2, 0, w / 2 - 80, h, juce::Justification::centredLeft);
@@ -2278,10 +2614,19 @@ void MainContentComponent::showMidiMap(int nodeId) {
     opts.escapeKeyTriggersCloseButton = true;
     opts.useNativeTitleBar = false;
     opts.resizable = true;
-    opts.launchAsync();
+    opts.componentToCentreAround = this;
+    SoundShop::launchToolDialog(opts);
 }
 
 void MainContentComponent::onPlay() {
+    // If the playhead is parked at or past the end of the song (e.g. a previous
+    // play-once playthrough finished and left the playhead at the end), restart
+    // from the top. Otherwise Play would resume past the last note and produce
+    // silence until a loop wrapped the playhead back to the start.
+    double endBeat = graph.effectiveSongLengthBeats();
+    if (endBeat > 0.0 && transport.positionBeats() >= endBeat - 1e-6)
+        audioEngine.rewindToStart();
+
     transport.playing = true;
     audioEngine.play();
     playBtn.setButtonText("Pause");
@@ -2395,22 +2740,41 @@ void MainContentComponent::onRecord() {
 void MainContentComponent::newProject() {
     editorPanels.clear();
     editorPanelHeight = 250;
-    graph.nodes.clear();
-    graph.links.clear();
-    graph.openEditors.clear();
-    graph.setupDefaultGraph();
+    // Clearing + rebuilding the graph is a structural mutation the audio
+    // callback can race against (it iterates graph.nodes/links under a
+    // try-lock). Pair the lock here, matching the project-load path. See the
+    // mutationLock comment in node_graph.h.
+    {
+        std::lock_guard<std::mutex> graphLk(graph.mutationLock);
+        graph.nodes.clear();
+        graph.links.clear();
+        graph.openEditors.clear();
+        graph.setupDefaultGraph();
+    }
 
     // Auto-create MidiInput nodes for all currently connected hardware
-    // MIDI devices — so the user's controller is immediately wired and
+    // MIDI devices - so the user's controller is immediately wired and
     // ready on a fresh project without needing a wizard. The Computer
     // Keyboard node is already created by setupDefaultGraph(); this
     // adds hardware devices alongside it.
     {
+        // Same structural-mutation lock as the clear/rebuild above: addNode()
+        // below can reallocate graph.nodes while the audio callback iterates.
+        std::lock_guard<std::mutex> graphLk(graph.mutationLock);
+
         auto devices = juce::MidiInput::getAvailableDevices();
-        // Find the default MIDI track to wire to (the one setupDefaultGraph made).
-        Node* defaultTrack = nullptr;
+        // Resolve the default MIDI track's MIDI input PIN ID up front. Pin IDs
+        // are stable across vector reallocation, so we never hold a Node* /
+        // Pin* across the addNode() calls below (which can reallocate
+        // graph.nodes and dangle such pointers - the dangling-reference
+        // anti-pattern CLAUDE.md forbids).
+        int defaultTrackMidiPinId = -1;
         for (auto& n : graph.nodes)
-            if (n.type == NodeType::MidiTimeline) { defaultTrack = &n; break; }
+            if (n.type == NodeType::MidiTimeline) {
+                for (auto& pin : n.pinsIn)
+                    if (pin.kind == PinKind::Midi) { defaultTrackMidiPinId = pin.id; break; }
+                break;
+            }
 
         float yPos = 200; // stagger below the Computer Keyboard node
         for (auto& dev : devices) {
@@ -2427,16 +2791,12 @@ void MainContentComponent::newProject() {
             auto& n = graph.addNode(dev.name.toStdString(), NodeType::MidiInput,
                 {}, {Pin{0, "MIDI Out", PinKind::Midi, false}}, {80, yPos});
             n.midiInputSourceId = dev.identifier.toStdString();
+            int outPinId = n.pinsOut.empty() ? -1 : n.pinsOut[0].id;
 
-            // Wire to the default track so the device plays immediately.
-            if (defaultTrack && !n.pinsOut.empty()) {
-                for (auto& pin : defaultTrack->pinsIn) {
-                    if (pin.kind == PinKind::Midi) {
-                        graph.addLink(n.pinsOut[0].id, pin.id);
-                        break;
-                    }
-                }
-            }
+            // Wire to the default track so the device plays immediately. Both
+            // endpoints are referenced by stable pin ID, not by pointer.
+            if (defaultTrackMidiPinId >= 0 && outPinId >= 0)
+                graph.addLink(outPinId, defaultTrackMidiPinId);
             yPos += 50;
         }
     }
@@ -2466,7 +2826,7 @@ void MainContentComponent::openHelpDoc(const juce::String& docRelativePath) {
             + "or browse the project's docs/ folder directly.");
         return;
     }
-    // startAsProcess opens the file in its default OS handler — for .html
+    // startAsProcess opens the file in its default OS handler - for .html
     // files that's the user's browser.
     docFile.startAsProcess();
 }
@@ -2483,7 +2843,8 @@ void MainContentComponent::showMidiDeviceWizard() {
     opts.escapeKeyTriggersCloseButton = true;
     opts.useNativeTitleBar = false;
     opts.resizable = false;
-    opts.launchAsync();
+    opts.componentToCentreAround = this;
+    SoundShop::launchToolDialog(opts);
 }
 
 void MainContentComponent::openProject() {
@@ -2497,7 +2858,7 @@ void MainContentComponent::openProject() {
 
 void MainContentComponent::upgradeLegacyNodes() {
     // Upgrade legacy-format nodes in place. Runs on every project load
-    // (startup autoload, File → Open, crash recovery) so users always
+    // (startup autoload, File -> Open, crash recovery) so users always
     // get the latest behavior even from old .ssp files.
 
     // MidiInput node type predates the old "keyboard-is-a-flag" model.
@@ -2522,7 +2883,7 @@ void MainContentComponent::upgradeLegacyNodes() {
                 if (p.kind == PinKind::Midi) { hasMidiIn = true; break; }
             if (!hasMidiIn)
                 n.pinsIn.insert(n.pinsIn.begin(),
-                    {graph.getNextId(), "MIDI In", PinKind::Midi, true});
+                    {graph.allocId(), "MIDI In", PinKind::Midi, true});
         }
 
         // Legacy "Reverb" stub: Effect node with name "Reverb" and no
@@ -2530,7 +2891,7 @@ void MainContentComponent::upgradeLegacyNodes() {
         // "__reverb__" script and the default param set so the real DSP
         // takes over. Preserves the node's ID and position so existing
         // cables still connect to the right node.
-        // Legacy "EQ" stub → real parametric EQ.
+        // Legacy "EQ" stub -> real parametric EQ.
         if (n.type == NodeType::Effect && n.name == "EQ" && n.script.empty()) {
             n.script = "__eq__";
             if (n.params.empty()) {
@@ -2565,7 +2926,7 @@ void MainContentComponent::upgradeLegacyNodes() {
         }
 
         // Legacy single-sample Sampler (TerrainSynth + "__audio__:" path).
-        // The old Sampler was a subset of MultiSampler's capabilities —
+        // The old Sampler was a subset of MultiSampler's capabilities -
         // upgrade it in place to a one-zone MultiSampler pointing at the
         // same WAV file. Preserves the node's ID, position, name, and
         // existing cables, and picks up the old node's ADSR / Base Note /
@@ -2598,13 +2959,13 @@ void MainContentComponent::upgradeLegacyNodes() {
             // Strip the old flat param list (it mixed TerrainSynth-
             // specific knobs with the sampler ones we salvaged).
             n.params.clear();
-            // Keep Volume and Pan as real params — MultiSampler reads
+            // Keep Volume and Pan as real params - MultiSampler reads
             // them at block time so automation lanes and Signal cables
             // work against them.
             n.params.push_back({"Volume", foundVolume ? salvagedVolume : 0.5f,  0.0f, 1.0f});
             n.params.push_back({"Pan",    foundPan    ? salvagedPan    : 0.0f, -1.0f, 1.0f});
             // Also remove the legacy Signal pins the old Sampler had
-            // (Sig X, Sig Y) — MultiSampler uses script-embedded
+            // (Sig X, Sig Y) - MultiSampler uses script-embedded
             // envelopes instead.
             n.pinsIn.erase(std::remove_if(n.pinsIn.begin(), n.pinsIn.end(),
                 [](const Pin& p) {
@@ -2617,8 +2978,15 @@ void MainContentComponent::upgradeLegacyNodes() {
 
 void MainContentComponent::openProjectFile(const juce::String& path) {
     editorPanels.clear();
-    ProjectFile::load(path.toStdString(), graph, &audioEngine.getPluginHost());
-    upgradeLegacyNodes();
+    // Hold the graph mutation lock for the load + legacy-node fixup.
+    // ProjectFile::load clears graph.nodes/links and rebuilds them from the
+    // file - same batch-mutation race surface as MOD import. See the
+    // mutationLock comment in node_graph.h.
+    {
+        std::lock_guard<std::mutex> graphLk(graph.mutationLock);
+        ProjectFile::load(path.toStdString(), graph, &audioEngine.getPluginHost());
+        upgradeLegacyNodes();
+    }
 
     auto editorIds = graph.openEditors;
     graph.openEditors.clear();
@@ -2629,13 +2997,16 @@ void MainContentComponent::openProjectFile(const juce::String& path) {
     addToRecentProjects(path);
     // Loading a clean project on top of whatever was in memory invalidates
     // any autosave that was tracking the previous state. The undo history
-    // also no longer applies — its snapshots described the old graph.
+    // also no longer applies - its snapshots described the old graph.
     projectDirty = false;
     graph.dirty = false;
     discardAutosave();
     discardUndoTreePersist();
     lastAutosaveAttemptMs = juce::Time::getMillisecondCounterHiRes();
-    graphComponent->fitAll();
+    // Restore the saved pan/zoom from the loaded project (or fit-all if
+    // none was persisted). Replaces the unconditional fitAll() that used
+    // to clobber the user's last view on every load.
+    graphComponent->notifyProjectLoaded();
     graphComponent->repaint();
 
     // Shared-history handling (#90): check for a sidecar and, if it
@@ -2686,7 +3057,7 @@ void MainContentComponent::freezeNode(int nodeId) {
 
     // Render full project, capturing from the graph
     // We render the whole graph and then read the node's contribution
-    // For simplicity, render the full mix — the cache represents this node's output
+    // For simplicity, render the full mix - the cache represents this node's output
     for (int64_t pos = 0; pos < totalSamples; pos += blockSize) {
         int thisBlock = (int)std::min((int64_t)blockSize, totalSamples - pos);
         offlineTransport.positionSamples = pos;
@@ -2705,7 +3076,7 @@ void MainContentComponent::freezeNode(int nodeId) {
         if (proc) {
             // The processor already ran as part of the graph.
             // For the cache we store the full mix reaching this node.
-            // This is a simplification — ideally we'd tap the node's output only.
+            // This is a simplification - ideally we'd tap the node's output only.
         }
 
         // Store the mix (this captures everything up to and including this node)
@@ -2739,7 +3110,7 @@ void MainContentComponent::syncCCMappingsFromGraph() {
 
 void MainContentComponent::saveProject(std::function<void()> onSaved) {
     if (ProjectFile::currentPath.empty()) {
-        // No filename yet — defer to Save As, which will run the file chooser
+        // No filename yet - defer to Save As, which will run the file chooser
         // and call us back through onSaved on success.
         saveProjectAs(std::move(onSaved));
         return;
@@ -2774,7 +3145,7 @@ void MainContentComponent::saveProjectAs(std::function<void()> onSaved) {
     chooser->launchAsync(juce::FileBrowserComponent::saveMode,
         [this, chooser, onSaved = std::move(onSaved)](const juce::FileChooser& fc) {
             auto file = fc.getResult();
-            if (file == juce::File()) return; // user cancelled — don't fire onSaved
+            if (file == juce::File()) return; // user cancelled - don't fire onSaved
             ProjectFile::save(file.getFullPathName().toStdString(),
                               graph, &audioEngine.getGraphProcessor());
             addToRecentProjects(file.getFullPathName());
@@ -2801,7 +3172,26 @@ void MainContentComponent::importModFile() {
             auto file = fc.getResult();
             if (!file.existsAsFile()) return;
 
-            auto result = ModImporter::import(file.getFullPathName().toStdString(), graph);
+            // Stop transport before import so the newly wired graph
+            // doesn't start playing immediately on rebuild.
+            if (transport.playing) onStop();
+
+            // Hold the graph mutation lock for the entire import. Without
+            // this, the audio callback (which iterates graph.nodes and
+            // calls GraphProcessor::rebuildGraph whenever it observes a
+            // node-count change) can race with mod_import's repeated
+            // graph.addNode() calls and read torn Node::id values from a
+            // mid-reallocation vector - the root cause of the earlier
+            // tracker-import crash (SEANCE.exe.63000.dmp, observed
+            // nodeMap entries with id=0 and id=1132382734). The audio
+            // thread uses try_lock and outputs silence while we hold
+            // this, which is the right tradeoff for a few hundred ms of
+            // import work.
+            ModImporter::ImportResult result;
+            {
+                std::lock_guard<std::mutex> graphLk(graph.mutationLock);
+                result = ModImporter::import(file.getFullPathName().toStdString(), graph);
+            }
 
             juce::String msg;
             if (result.success) {
@@ -2816,15 +3206,32 @@ void MainContentComponent::importModFile() {
                     msg += "\n\nSamples saved to:\n" + juce::String(result.sampleDir);
                 projectDirty = true;
                 graph.dirty = true;
+                // Push an undo snapshot so the imported group/tracks/samplers
+                // enter the undo system. Without this the new nodes live only
+                // in the live graph and a later unrelated Ctrl+Z restores a
+                // pre-import snapshot, silently deleting the whole import -
+                // which then gets saved, so the mod "doesn't save/reload".
+                graph.commitSnapshot("Import tracker module");
                 audioEngine.getGraphProcessor().requestRebuild();
                 graphComponent->fitAll();
             } else {
                 msg = "Import failed: " + juce::String(result.error);
             }
 
-            juce::AlertWindow::showMessageBoxAsync(
-                juce::MessageBoxIconType::InfoIcon,
-                "Tracker Import", msg);
+            // NativeMessageBox (not AlertWindow) so the popup is parented
+            // to this window's HWND via the OS MessageBox() API - that's
+            // what actually prevents a second taskbar entry. JUCE's
+            // AlertWindow is a top-level desktop component without an
+            // owner HWND, so even withAssociatedComponent it still spawns
+            // its own taskbar icon.
+            juce::NativeMessageBox::showAsync(
+                juce::MessageBoxOptions()
+                    .withIconType(juce::MessageBoxIconType::InfoIcon)
+                    .withTitle("Tracker Import")
+                    .withMessage(msg)
+                    .withButton("OK")
+                    .withAssociatedComponent(this),
+                nullptr);
             graphComponent->repaint();
         });
 }
@@ -2869,166 +3276,205 @@ void MainContentComponent::exportAudio() {
 }
 
 void MainContentComponent::exportAudioWithBeat(float maxBeat) {
-    auto chooser = std::make_shared<juce::FileChooser>(
-        "Export Audio", juce::File(), AudioExporter::getFileFilter());
-    chooser->launchAsync(juce::FileBrowserComponent::saveMode,
-        [this, chooser, maxBeat](const juce::FileChooser& fc) {
-            auto file = fc.getResult();
-            if (file == juce::File()) return;
+    // Show export options dialog FIRST, then file chooser
+    auto* aw = new juce::AlertWindow("Export Options", "",
+        juce::MessageBoxIconType::NoIcon);
 
-            auto path = file.getFullPathName();
-            auto fmt = AudioExporter::formatFromExtension(path);
-            auto ext = AudioExporter::getExtension(fmt);
-            if (!path.endsWithIgnoreCase(ext))
-                file = juce::File(path + ext);
+    // Format
+    aw->addComboBox("format", {"WAV (lossless)", "FLAC (lossless)",
+                                "OGG Vorbis (lossy)", "Opus (lossy)",
+                                "M4A/AAC (lossy)", "WMA (lossy)"});
+    aw->getComboBoxComponent("format")->setSelectedItemIndex(0);
 
-            // For lossy formats, show options dialog
-            bool isLossy = (fmt == ExportFormat::OggVorbis || fmt == ExportFormat::Opus ||
-                            fmt == ExportFormat::M4A_AAC || fmt == ExportFormat::WMA);
+    // Channels
+    aw->addComboBox("channels", {"Mono", "Stereo"});
+    aw->getComboBoxComponent("channels")->setSelectedItemIndex(1);
 
+    // Sample Rate
+    aw->addComboBox("samplerate", {"44100 Hz", "48000 Hz", "88200 Hz", "96000 Hz", "192000 Hz"});
+    {
+        int srDefault = 1;
+        double projSr = audioEngine.getProjectSampleRate();
+        if (projSr <= 44100) srDefault = 0;
+        else if (projSr <= 48000) srDefault = 1;
+        else if (projSr <= 88200) srDefault = 2;
+        else if (projSr <= 96000) srDefault = 3;
+        else srDefault = 4;
+        aw->getComboBoxComponent("samplerate")->setSelectedItemIndex(srDefault);
+    }
+
+    // Bit depth (for lossless formats)
+    aw->addComboBox("bits", {"16-bit", "24-bit", "32-bit float"});
+    aw->getComboBoxComponent("bits")->setSelectedItemIndex(0);
+
+    // Quality (for OGG Vorbis)
+    aw->addComboBox("quality", {"Low (q3)", "Medium (q5)", "High (q7)", "Very High (q8)", "Maximum (q10)"});
+    aw->getComboBoxComponent("quality")->setSelectedItemIndex(2);
+
+    // Bitrate (for Opus/AAC/WMA)
+    aw->addComboBox("bitrate", {"64 kbps", "96 kbps", "128 kbps", "160 kbps",
+                                 "192 kbps", "256 kbps", "320 kbps"});
+    aw->getComboBoxComponent("bitrate")->setSelectedItemIndex(4);
+
+    // Set initial enabled state: WAV selected -> only bit depth enabled
+    aw->getComboBoxComponent("quality")->setEnabled(false);
+    aw->getComboBoxComponent("bitrate")->setEnabled(false);
+
+    // Update enabled state when format changes
+    auto* fmtBox = aw->getComboBoxComponent("format");
+    fmtBox->onChange = [aw]() {
+        int idx = aw->getComboBoxComponent("format")->getSelectedItemIndex();
+        bool isLossless = (idx <= 1);       // WAV, FLAC
+        bool isVorbis   = (idx == 2);       // OGG Vorbis
+        bool isBitrate  = (idx >= 3);       // Opus, M4A, WMA
+        aw->getComboBoxComponent("bits")->setEnabled(isLossless);
+        aw->getComboBoxComponent("quality")->setEnabled(isVorbis);
+        aw->getComboBoxComponent("bitrate")->setEnabled(isBitrate);
+    };
+
+    aw->addButton("Continue", 1, juce::KeyPress(juce::KeyPress::returnKey));
+    aw->addButton("Cancel", 0, juce::KeyPress(juce::KeyPress::escapeKey));
+
+    aw->enterModalState(true, juce::ModalCallbackFunction::create(
+        [this, aw, maxBeat](int result) {
+            if (result != 1) { delete aw; return; }
+
+            ExportOptions opts;
+
+            // Read format
+            ExportFormat formats[] = {ExportFormat::WAV, ExportFormat::FLAC,
+                ExportFormat::OggVorbis, ExportFormat::Opus,
+                ExportFormat::M4A_AAC, ExportFormat::WMA};
+            int fmtIdx = aw->getComboBoxComponent("format")->getSelectedItemIndex();
+            opts.format = formats[juce::jlimit(0, 5, fmtIdx)];
+
+            // Read channels
+            opts.numChannels = aw->getComboBoxComponent("channels")->getSelectedItemIndex() == 0 ? 1 : 2;
+
+            // Read sample rate
+            int srOptions[] = {44100, 48000, 88200, 96000, 192000};
+            int srIdx = aw->getComboBoxComponent("samplerate")->getSelectedItemIndex();
+            opts.sampleRate = srOptions[juce::jlimit(0, 4, srIdx)];
+
+            // Read format-specific options
+            bool isLossy = (opts.format == ExportFormat::OggVorbis || opts.format == ExportFormat::Opus ||
+                            opts.format == ExportFormat::M4A_AAC || opts.format == ExportFormat::WMA);
             if (isLossy) {
-                auto* aw = new juce::AlertWindow("Export Options",
-                    "Format: " + ext.substring(1).toUpperCase(),
-                    juce::MessageBoxIconType::NoIcon);
-
-                aw->addComboBox("samplerate", {"44100 Hz", "48000 Hz", "88200 Hz", "96000 Hz", "192000 Hz"});
-                // Default to project rate
-                int srDefault = 1; // 48000
-                double projSr = audioEngine.getProjectSampleRate();
-                if (projSr <= 44100) srDefault = 0;
-                else if (projSr <= 48000) srDefault = 1;
-                else if (projSr <= 88200) srDefault = 2;
-                else if (projSr <= 96000) srDefault = 3;
-                else srDefault = 4;
-                aw->getComboBoxComponent("samplerate")->setSelectedItemIndex(srDefault);
-
-                if (fmt == ExportFormat::OggVorbis) {
-                    aw->addComboBox("quality", {"Low (q3)", "Medium (q5)", "High (q7)", "Very High (q8)", "Maximum (q10)"});
-                    aw->getComboBoxComponent("quality")->setSelectedItemIndex(2);
-                    aw->addTextBlock("VBR (variable bitrate) — higher quality = larger file");
+                if (opts.format == ExportFormat::OggVorbis) {
+                    float qualities[] = {0.3f, 0.5f, 0.7f, 0.8f, 1.0f};
+                    int idx = aw->getComboBoxComponent("quality")->getSelectedItemIndex();
+                    opts.quality = qualities[juce::jlimit(0, 4, idx)];
                 } else {
-                    aw->addComboBox("bitrate", {"64 kbps", "96 kbps", "128 kbps", "160 kbps",
-                                                 "192 kbps", "256 kbps", "320 kbps"});
-                    aw->getComboBoxComponent("bitrate")->setSelectedItemIndex(4);
-                    if (fmt == ExportFormat::Opus)
-                        aw->addTextBlock("Opus uses VBR by default — bitrate is a target average");
-                    else
-                        aw->addTextBlock("CBR (constant bitrate)");
+                    int bitrates[] = {64, 96, 128, 160, 192, 256, 320};
+                    int idx = aw->getComboBoxComponent("bitrate")->getSelectedItemIndex();
+                    opts.bitrate = bitrates[juce::jlimit(0, 6, idx)];
                 }
-
-                aw->addButton("Export", 1, juce::KeyPress(juce::KeyPress::returnKey));
-                aw->addButton("Cancel", 0, juce::KeyPress(juce::KeyPress::escapeKey));
-
-                auto exportFile = file;
-                auto exportFmt = fmt;
-                auto exportMaxBeat = maxBeat;
-                aw->enterModalState(true, juce::ModalCallbackFunction::create(
-                    [this, aw, exportFile, exportFmt, exportMaxBeat](int result) {
-                        if (result == 1) {
-                            ExportOptions opts;
-                            opts.format = exportFmt;
-                            int srOptions[] = {44100, 48000, 88200, 96000, 192000};
-                            int srIdx = aw->getComboBoxComponent("samplerate")->getSelectedItemIndex();
-                            opts.sampleRate = srOptions[juce::jlimit(0, 4, srIdx)];
-
-                            if (exportFmt == ExportFormat::OggVorbis) {
-                                float qualities[] = {0.3f, 0.5f, 0.7f, 0.8f, 1.0f};
-                                int idx = aw->getComboBoxComponent("quality")->getSelectedItemIndex();
-                                opts.quality = qualities[juce::jlimit(0, 4, idx)];
-                            } else {
-                                int bitrates[] = {64, 96, 128, 160, 192, 256, 320};
-                                int idx = aw->getComboBoxComponent("bitrate")->getSelectedItemIndex();
-                                opts.bitrate = bitrates[juce::jlimit(0, 6, idx)];
-                            }
-
-                            doExportRender(exportFile, opts, exportMaxBeat);
-                        }
-                        delete aw;
-                    }), true);
             } else {
-                // Lossless — show bit depth option
-                auto* aw = new juce::AlertWindow("Export Options",
-                    "Format: " + ext.substring(1).toUpperCase(),
-                    juce::MessageBoxIconType::NoIcon);
-                aw->addComboBox("samplerate", {"44100 Hz", "48000 Hz", "88200 Hz", "96000 Hz", "192000 Hz"});
-                {
-                    int srDef = 1;
-                    double psr = audioEngine.getProjectSampleRate();
-                    if (psr <= 44100) srDef = 0;
-                    else if (psr <= 48000) srDef = 1;
-                    else if (psr <= 88200) srDef = 2;
-                    else if (psr <= 96000) srDef = 3;
-                    else srDef = 4;
-                    aw->getComboBoxComponent("samplerate")->setSelectedItemIndex(srDef);
-                }
-                aw->addComboBox("bits", {"16-bit (standard, smaller)", "24-bit (higher quality)", "32-bit float (maximum)"});
-                aw->getComboBoxComponent("bits")->setSelectedItemIndex(0);
-                aw->addButton("Export", 1, juce::KeyPress(juce::KeyPress::returnKey));
-                aw->addButton("Cancel", 0, juce::KeyPress(juce::KeyPress::escapeKey));
-
-                auto exportFile = file;
-                auto exportFmt = fmt;
-                auto exportMaxBeat = maxBeat;
-                aw->enterModalState(true, juce::ModalCallbackFunction::create(
-                    [this, aw, exportFile, exportFmt, exportMaxBeat](int result) {
-                        if (result == 1) {
-                            ExportOptions opts;
-                            opts.format = exportFmt;
-                            int srOpts[] = {44100, 48000, 88200, 96000, 192000};
-                            int srIdx = aw->getComboBoxComponent("samplerate")->getSelectedItemIndex();
-                            opts.sampleRate = srOpts[juce::jlimit(0, 4, srIdx)];
-                            int bitsOptions[] = {16, 24, 32};
-                            int idx = aw->getComboBoxComponent("bits")->getSelectedItemIndex();
-                            opts.bitsPerSample = bitsOptions[juce::jlimit(0, 2, idx)];
-                            doExportRender(exportFile, opts, exportMaxBeat);
-                        }
-                        delete aw;
-                    }), true);
+                int bitsOptions[] = {16, 24, 32};
+                int idx = aw->getComboBoxComponent("bits")->getSelectedItemIndex();
+                opts.bitsPerSample = bitsOptions[juce::jlimit(0, 2, idx)];
             }
-        });
+
+            delete aw;
+
+            // Now show file chooser with the correct extension filter
+            auto ext = AudioExporter::getExtension(opts.format);
+            auto filter = "*" + ext;
+            auto chooser = std::make_shared<juce::FileChooser>(
+                "Export Audio", juce::File(), filter);
+            chooser->launchAsync(juce::FileBrowserComponent::saveMode,
+                [this, chooser, opts, maxBeat](const juce::FileChooser& fc) {
+                    auto file = fc.getResult();
+                    if (file == juce::File()) return;
+                    auto path = file.getFullPathName();
+                    auto extension = AudioExporter::getExtension(opts.format);
+                    if (!path.endsWithIgnoreCase(extension))
+                        file = juce::File(path + extension);
+                    doExportRender(file, opts, maxBeat);
+                });
+        }), true);
 }
 
 void MainContentComponent::doExportRender(const juce::File& file, const ExportOptions& opts, float maxBeat) {
-    double sr = opts.sampleRate;
-    int blockSize = 512;
-    int numChannels = 2;
+    // Run the entire render + encode on a background thread with a progress
+    // bar so the UI stays responsive and the user can cancel.
+    struct ExportTask : juce::ThreadWithProgressWindow {
+        ExportTask(NodeGraph& g, Transport& liveTransport,
+                   const juce::File& f, const ExportOptions& o, float mb)
+            : ThreadWithProgressWindow("Exporting audio...", true, true),
+              graph(g), file(f), opts(o), maxBeat(mb)
+        {
+            offTransport.bpm = g.bpm;
+            offTransport.tempoMap = liveTransport.tempoMap;
+            offTransport.timeSigMap = liveTransport.timeSigMap;
+            offTransport.sampleRate = o.sampleRate;
+            offTransport.playing = true;
+        }
 
-    double totalSeconds = transport.tempoMap.beatsToSeconds(maxBeat);
-    int64_t totalSamples = (int64_t)(totalSeconds * sr);
+        void run() override {
+            double sr = opts.sampleRate;
+            int blockSize = 512;
+            double totalSeconds = offTransport.tempoMap.beatsToSeconds(maxBeat);
+            int64_t totalSamples = (int64_t)(totalSeconds * sr);
+            if (totalSamples <= 0) return;
 
-    Transport offlineTransport;
-    offlineTransport.bpm = graph.bpm;
-    offlineTransport.tempoMap = transport.tempoMap;
-    offlineTransport.sampleRate = sr;
-    offlineTransport.playing = true;
+            setStatusMessage("Building audio graph...");
 
-    GraphProcessor offlineGP;
-    offlineGP.prepare(graph, sr, blockSize);
-    offlineGP.rebuildGraph(graph, offlineTransport);
-    offlineGP.prepare(graph, sr, blockSize);
+            GraphProcessor offGP;
+            offGP.prepare(graph, sr, blockSize);
+            offGP.rebuildGraph(graph, offTransport);
+            offGP.prepare(graph, sr, blockSize);
 
-    juce::AudioBuffer<float> renderBuf(numChannels, (int)totalSamples);
-    renderBuf.clear();
+            // Always render in stereo - graph processor outputs stereo
+            juce::AudioBuffer<float> renderBuf(2, (int)totalSamples);
+            renderBuf.clear();
 
-    for (int64_t pos = 0; pos < totalSamples; pos += blockSize) {
-        int thisBlock = (int)std::min((int64_t)blockSize, totalSamples - pos);
-        offlineTransport.positionSamples = pos;
-        float* outPtrs[2] = {
-            renderBuf.getWritePointer(0, (int)pos),
-            renderBuf.getWritePointer(1, (int)pos)
-        };
-        offlineGP.processBlock(graph, offlineTransport, outPtrs, numChannels, thisBlock);
-    }
+            setStatusMessage("Rendering audio...");
 
-    // Apply TPDF dithering before writing if the target is a PCM format
-    // (WAV or FLAC) and the user hasn't disabled it. Lossy codecs have
-    // their own noise floors so dithering is irrelevant there.
-    if (opts.dither && (opts.format == ExportFormat::WAV
-                        || opts.format == ExportFormat::FLAC)) {
-        applyTPDFDither(renderBuf, opts.bitsPerSample);
-    }
+            for (int64_t pos = 0; pos < totalSamples; pos += blockSize) {
+                if (threadShouldExit()) return;
 
-    if (AudioExporter::exportToFile(file, renderBuf, opts)) {
+                int thisBlock = (int)std::min((int64_t)blockSize, totalSamples - pos);
+                offTransport.positionSamples = pos;
+                float* outPtrs[2] = {
+                    renderBuf.getWritePointer(0, (int)pos),
+                    renderBuf.getWritePointer(1, (int)pos)
+                };
+                offGP.processBlock(graph, offTransport, outPtrs, 2, thisBlock);
+                setProgress((double)pos / (double)totalSamples);
+            }
+
+            // Mix down to mono if requested
+            if (opts.numChannels == 1) {
+                setStatusMessage("Mixing to mono...");
+                juce::AudioBuffer<float> monoBuf(1, (int)totalSamples);
+                monoBuf.copyFrom(0, 0, renderBuf, 0, 0, (int)totalSamples);
+                monoBuf.addFrom(0, 0, renderBuf, 1, 0, (int)totalSamples);
+                monoBuf.applyGain(0.5f);
+                renderBuf = std::move(monoBuf);
+            }
+
+            // Apply TPDF dithering for PCM formats
+            if (opts.dither && (opts.format == ExportFormat::WAV
+                                || opts.format == ExportFormat::FLAC)) {
+                applyTPDFDither(renderBuf, opts.bitsPerSample);
+            }
+
+            setStatusMessage("Writing file...");
+            exportSuccess = AudioExporter::exportToFile(file, renderBuf, opts);
+        }
+
+        NodeGraph& graph;
+        Transport offTransport;
+        juce::File file;
+        ExportOptions opts;
+        float maxBeat;
+        bool exportSuccess = false;
+    };
+
+    ExportTask task(graph, transport, file, opts, maxBeat);
+
+    if (task.runThread() && task.exportSuccess) {
         saveFlashFrames = 90;
         if (auto* win = dynamic_cast<juce::DocumentWindow*>(getTopLevelComponent()))
             win->setName("Exported!");
@@ -3036,7 +3482,7 @@ void MainContentComponent::doExportRender(const juce::File& file, const ExportOp
 }
 
 void MainContentComponent::openEditor(Node& node) {
-    // Only open piano roll editors for timeline nodes — instruments,
+    // Only open piano roll editors for timeline nodes - instruments,
     // effects, etc. have their own editors (waveform editor, plugin UI).
     if (node.type != NodeType::MidiTimeline && node.type != NodeType::AudioTimeline)
         return;
@@ -3047,13 +3493,23 @@ void MainContentComponent::openEditor(Node& node) {
 
     auto panel = std::make_unique<EditorPanel>();
     panel->nodeId = node.id;
+    panel->heightPx = 200;
     panel->component = std::make_unique<PianoRollComponent>(graph, node, &transport);
     panel->component->onClose = [this](int nodeId) { closeEditor(nodeId); };
+    // Resize handle at the top of the piano roll panel. The handle's
+    // mouseDrag fires this with the per-frame screen-y delta; we adjust
+    // THIS panel's heightPx by -deltaPx (drag UP = grow). Panels above
+    // keep their own heightPx and just shift up/down as the total stack
+    // grows/shrinks.
+    int nodeIdCopy = node.id;
+    panel->component->onResizeDrag = [this, nodeIdCopy](int deltaPx) {
+        resizeEditorPanel(nodeIdCopy, deltaPx);
+    };
     addAndMakeVisible(panel->component.get());
     editorPanels.push_back(std::move(panel));
 
     graph.activeEditorNodeId = node.id;
-    editorPanelHeight = (int)editorPanels.size() * 200;
+    recalcEditorPanelHeight();
     resized();
 }
 
@@ -3062,14 +3518,53 @@ void MainContentComponent::closeEditor(int nodeId) {
         std::remove_if(editorPanels.begin(), editorPanels.end(),
             [nodeId](auto& p) { return p->nodeId == nodeId; }),
         editorPanels.end());
-    editorPanelHeight = editorPanels.empty() ? 250
-        : (int)editorPanels.size() * 200;
+    recalcEditorPanelHeight();
     resized();
+}
+
+void MainContentComponent::resizeEditorPanel(int nodeId, int deltaPx) {
+    // Find the panel being resized and bump its heightPx. Drag UP gives
+    // a negative deltaPx (cursor moves toward small Y), which should
+    // GROW the panel - so subtract.
+    //
+    // The ceiling is computed dynamically against the available window
+    // area minus the heights of the OTHER panels, so the total stack
+    // never grows past where the node graph would disappear. Without
+    // this dynamic ceiling, dragging up past the cap visually saturates
+    // but the panel's heightPx keeps growing - the user then has to drag
+    // back down the same number of pixels before anything happens.
+    int othersTotal = 0;
+    for (auto& p : editorPanels)
+        if (p->nodeId != nodeId) othersTotal += p->heightPx;
+    int maxStack = juce::jmax(120, getHeight() - 120);
+    int maxThisPanel = juce::jmax(80, maxStack - othersTotal);
+
+    for (auto& panel : editorPanels) {
+        if (panel->nodeId != nodeId) continue;
+        panel->heightPx = juce::jlimit(80, maxThisPanel, panel->heightPx - deltaPx);
+        break;
+    }
+    recalcEditorPanelHeight();
+    resized();
+}
+
+void MainContentComponent::recalcEditorPanelHeight() {
+    if (editorPanels.empty()) {
+        editorPanelHeight = 250; // keeps the empty-state default in sync
+        return;
+    }
+    int total = 0;
+    for (auto& panel : editorPanels)
+        total += panel->heightPx;
+    // Leave at least 120px for the graph area so the user can't drag the
+    // stack so tall that the node graph becomes invisible / unreachable.
+    int maxStack = juce::jmax(120, getHeight() - 120);
+    editorPanelHeight = juce::jlimit(80, maxStack, total);
 }
 
 bool MainContentComponent::tryQuit() {
     if (!projectDirty && !graph.dirty) {
-        // Clean exit with nothing to save — any leftover autosave is stale
+        // Clean exit with nothing to save - any leftover autosave is stale
         // (it would only exist if we crashed on a previous run and the user
         // already loaded a recent project past it). Sweep it away so the
         // next startup doesn't re-offer an irrelevant recovery.
@@ -3083,7 +3578,7 @@ bool MainContentComponent::tryQuit() {
         "You have unsaved changes. Save before quitting?",
         "Save", "Don't Save", "Cancel");
     if (result == 2) {                   // Don't Save
-        // User explicitly threw their edits away — autosave AND undo
+        // User explicitly threw their edits away - autosave AND undo
         // history go with them. (A clean save+quit instead would keep
         // the undo tree so the next session can continue undoing.)
         discardAutosave();
@@ -3093,12 +3588,12 @@ bool MainContentComponent::tryQuit() {
     if (result != 1) return false;       // Cancel (or window closed)
 
     // Save first, then re-request quit on completion. If the project has no
-    // current path the file chooser is async — we must NOT return true here
+    // current path the file chooser is async - we must NOT return true here
     // or the app will exit before the chooser even appears (which is the bug
     // the user hit: pressed Save, app quit, no file ever written, recent
     // projects never updated).
     saveProject([]() {
-        // The save succeeded — ask the app to quit again. This goes through
+        // The save succeeded - ask the app to quit again. This goes through
         // tryQuit a second time, sees the dirty flags cleared, and returns
         // true immediately. Defer via callAsync so we're not still inside
         // the file-chooser callback when we tear down the window.
@@ -3232,7 +3727,7 @@ void MainContentComponent::performAutosave() {
     //
     // We don't trigger Full saves on graph.dirty / projectDirty because
     // those flags are set by every kind of edit (notes, params, drags)
-    // and would cause Full saves on every tick during normal editing —
+    // and would cause Full saves on every tick during normal editing -
     // defeating the whole point of incremental saves. The fast channel
     // (#84) is the source of truth for graph state in the recovery flow,
     // so autosave.ssp's slight staleness between full saves is fine.
@@ -3253,7 +3748,7 @@ void MainContentComponent::performAutosave() {
         // Full save: rewrite autosave.ssp with graph metadata ONLY
         // (no inline plugin states). All plugin states live in the
         // per-plugin files written below. This makes the periodic full
-        // save cheap — same cost as a single fast-channel snapshot —
+        // save cheap - same cost as a single fast-channel snapshot -
         // because we're not duplicating the plugin state data that's
         // already on disk in the per-plugin files.
         //
@@ -3261,7 +3756,7 @@ void MainContentComponent::performAutosave() {
         // then walk per-plugin files for plugin state (via
         // applyPerPluginOverrides). Plugins whose per-plugin file is
         // missing fall back to whatever default state the plugin loads
-        // with — same behavior as opening a brand-new project file.
+        // with - same behavior as opening a brand-new project file.
         auto graphText = ProjectFile::serializeForUndo(graph);
         if (graphText.empty()) return;
 
@@ -3275,7 +3770,7 @@ void MainContentComponent::performAutosave() {
     }
 
     // Per-plugin files for whichever plugins are flagged dirty. The Full
-    // save above (when one happened) writes graph metadata only — it does
+    // save above (when one happened) writes graph metadata only - it does
     // NOT touch the plugin state cache or query getStateInformation. All
     // plugin state querying happens here, in this loop, exactly once per
     // dirty plugin. Clean plugins are skipped entirely (their on-disk
@@ -3308,7 +3803,7 @@ void MainContentComponent::performAutosave() {
         cleanupOrphanPluginFiles();
 
     // Note: we do NOT clear projectDirty or graph.dirty here. Autosave is
-    // invisible to normal dirty tracking — only an explicit user save
+    // invisible to normal dirty tracking - only an explicit user save
     // clears those.
 }
 
@@ -3379,6 +3874,9 @@ void MainContentComponent::autosaveWorkerMain() {
             if (autosaveWorkerStop.load() && !autosaveWorkerHasJob) return;
             job = std::move(autosaveWorkerPending);
             autosaveWorkerHasJob = false;
+            // Mark busy *before* releasing the lock so quiesceAutosaveWorker()
+            // can't observe an idle gap between dequeue and the write below.
+            autosaveWorkerBusy = true;
         }
 
         // Walk the file list and write each one atomically via tmp+rename.
@@ -3404,24 +3902,47 @@ void MainContentComponent::autosaveWorkerMain() {
             meta->setAttribute("timestamp", juce::String(job.metaTimestamp));
             meta->writeTo(getAutosaveMetaFile());
         }
+
+        // Write finished. Drop the busy flag and wake any quiescing caller.
+        {
+            std::lock_guard<std::mutex> lk(autosaveWorkerMutex);
+            autosaveWorkerBusy = false;
+        }
+        autosaveWorkerIdleCv.notify_all();
     }
 }
 
+// Block until the worker is fully idle: no pending job AND not mid-write. Used
+// by discardAutosave() so a write that's queued or in flight can't recreate the
+// autosave files we're about to delete. Called from the message thread; since
+// performAutosave() (the only enqueuer) also runs on the message thread, no new
+// job can appear while we're inside here, so returning idle stays idle until we
+// return to the message loop.
+void MainContentComponent::quiesceAutosaveWorker() {
+    std::unique_lock<std::mutex> lk(autosaveWorkerMutex);
+    autosaveWorkerHasJob = false;                  // cancel anything still queued
+    autosaveWorkerIdleCv.wait(lk, [this]() {       // wait out any in-flight write
+        return !autosaveWorkerBusy;
+    });
+}
+
 void MainContentComponent::discardAutosave() {
-    // Drain any pending worker job first so it doesn't recreate the file
-    // we're about to delete. Cheap — at most one job in flight, and the
-    // worker only does a disk write so it finishes quickly.
-    {
-        std::lock_guard<std::mutex> lk(autosaveWorkerMutex);
-        autosaveWorkerHasJob = false;
-    }
+    // Fully quiesce the worker first: cancel any queued job AND wait out any
+    // write already in flight. The old version only cleared the pending flag,
+    // which left a race - if the worker had already dequeued and was mid-write
+    // (tmp.moveFileTo recreating autosave.ssp), it would resurrect the file
+    // right after we deleted it. With the 5s autosave interval this fired often
+    // enough on quit (especially while the modal "Save before quitting?" dialog
+    // pumped timer ticks) that the next launch wrongly reported an unclean
+    // shutdown. quiesceAutosaveWorker() guarantees we're the last writer.
+    quiesceAutosaveWorker();
     auto f = getAutosaveFile();
     if (f.existsAsFile()) f.deleteFile();
     auto tmp = f.getSiblingFile(f.getFileName() + ".tmp");
     if (tmp.existsAsFile()) tmp.deleteFile();
     auto m = getAutosaveMetaFile();
     if (m.existsAsFile()) m.deleteFile();
-    // Per-plugin files are part of the autosave too — sweep them all.
+    // Per-plugin files are part of the autosave too - sweep them all.
     auto dir = getAutosaveDir();
     if (dir.exists()) {
         for (auto& f2 : dir.findChildFiles(juce::File::findFiles, false, "autosave-plugin-*.dat"))
@@ -3436,7 +3957,7 @@ void MainContentComponent::discardAutosave() {
     // tree persists across clean save+quit so the next session can
     // continue undoing past the last save point. It's only thrown away
     // on explicit "Don't Save" / "Discard" / new project / open project
-    // — those paths call discardUndoTreePersist() separately.
+    // - those paths call discardUndoTreePersist() separately.
 }
 
 void MainContentComponent::applyPerPluginOverrides() {
@@ -3449,7 +3970,7 @@ void MainContentComponent::applyPerPluginOverrides() {
         if (base64.empty()) continue;
 
         // Update the cache so the next slow autosave doesn't redundantly
-        // re-query — the cache is now in sync with what's actually on
+        // re-query - the cache is now in sync with what's actually on
         // the plugin instance.
         n.cachedPluginStateBase64 = base64;
         n.pluginStateDirty = false;
@@ -3654,7 +4175,7 @@ static bool loadUndoTreeFromFile(const juce::File& file, NodeGraph& graph) {
 
 void MainContentComponent::handleSharedHistoryOnOpen(const juce::String& projectAbsPath) {
     // The project file we just loaded may have had a historyFile= field
-    // pointing at a sidecar. If not, there's nothing to consider — bail.
+    // pointing at a sidecar. If not, there's nothing to consider - bail.
     auto sidecar = currentProjectSidecarFile();
     if (sidecar == juce::File() || !sidecar.existsAsFile()) return;
 
@@ -3708,9 +4229,9 @@ void MainContentComponent::handleSharedHistoryOnOpen(const juce::String& project
     }
 
     // Show the 3-option modal. Button indexing:
-    //   1 = Use it (adopt)     — shared tree becomes the live tree
-    //   2 = Use a copy (copy)  — duplicate to a private file, edit that
-    //   0 = Ignore             — leave the sidecar alone, no undo tree
+    //   1 = Use it (adopt)     - shared tree becomes the live tree
+    //   2 = Use a copy (copy)  - duplicate to a private file, edit that
+    //   0 = Ignore             - leave the sidecar alone, no undo tree
     juce::String projName = juce::File(projectAbsPath).getFileName();
     juce::String message =
         "This project came with a shared undo history.\n\n"
@@ -3787,7 +4308,7 @@ void MainContentComponent::offerSharedHistoryOnSaveAs(const juce::String& savedP
                 "who opens the project will be offered the history "
                 "(they can adopt it, keep a private copy, or ignore "
                 "it).\n\n"
-                "You can skip this — the undo history will still be "
+                "You can skip this - the undo history will still be "
                 "saved privately on your machine either way.")
             .withButton("Yes, Include")
             .withButton("No Thanks"),
@@ -3809,7 +4330,7 @@ void MainContentComponent::offerSharedHistoryOnSaveAs(const juce::String& savedP
                                   &safe->audioEngine.getGraphProcessor());
             }
             // Remember: on subsequent opens of this project, don't
-            // re-prompt — the user knows their own sidecar.
+            // re-prompt - the user knows their own sidecar.
             safe->recordHistoryDecision(capturedPath, HistoryDecision::Adopted);
         });
 }
@@ -3820,7 +4341,7 @@ void MainContentComponent::tryRestoreUndoTree() {
     std::ifstream in(file.getFullPathName().toStdString());
     if (!in) return;
     if (!graph.undoTree.restoreFrom(in)) {
-        // Corrupted or incompatible — drop it.
+        // Corrupted or incompatible - drop it.
         in.close();
         file.deleteFile();
         return;
@@ -3833,7 +4354,7 @@ void MainContentComponent::tryRestoreUndoTree() {
     const auto& snap = graph.undoTree.currentSnapshot();
     if (!snap.empty() && graph.undoTree.onLoadSnapshot)
         graph.undoTree.onLoadSnapshot(snap);
-    // Don't mark dirty for persistence — we just read this from disk.
+    // Don't mark dirty for persistence - we just read this from disk.
     undoTreeDirty = false;
 }
 
@@ -3843,7 +4364,7 @@ void MainContentComponent::tryRecoverAutosave() {
 
     auto autoFile = getAutosaveFile();
     if (!autoFile.existsAsFile()) {
-        // No autosave to consider — but we still want to restore the
+        // No autosave to consider - but we still want to restore the
         // persisted undo tree if one exists from a clean prior session.
         tryRestoreUndoTree();
         return;
@@ -3891,14 +4412,21 @@ void MainContentComponent::tryRecoverAutosave() {
             // Ctrl+S saves to the real file, not the autosave. Leave the
             // project dirty so the user knows there are unsaved changes.
             safe->editorPanels.clear();
-            ProjectFile::load(getAutosaveFile().getFullPathName().toStdString(),
-                              safe->graph, &safe->audioEngine.getPluginHost());
-            safe->upgradeLegacyNodes();
-            // Per-plugin override files contain newer plugin state than
-            // the (full but periodically-stale) autosave.ssp. Apply them
-            // on top so the user sees the most recent plugin tweaks.
-            safe->applyPerPluginOverrides();
-            safe->cleanupOrphanPluginFiles();
+            // Lock for the batch mutation (see node_graph.h mutationLock
+            // comment). Autosave recovery happens after the device is
+            // already running, so the audio callback is actively iterating
+            // graph.nodes and would otherwise race with the load.
+            {
+                std::lock_guard<std::mutex> graphLk(safe->graph.mutationLock);
+                ProjectFile::load(getAutosaveFile().getFullPathName().toStdString(),
+                                  safe->graph, &safe->audioEngine.getPluginHost());
+                safe->upgradeLegacyNodes();
+                // Per-plugin override files contain newer plugin state than
+                // the (full but periodically-stale) autosave.ssp. Apply them
+                // on top so the user sees the most recent plugin tweaks.
+                safe->applyPerPluginOverrides();
+                safe->cleanupOrphanPluginFiles();
+            }
             ProjectFile::currentPath = capturedOriginal.toStdString();
             safe->projectDirty = true;
             safe->graph.dirty = true;
@@ -3909,7 +4437,9 @@ void MainContentComponent::tryRecoverAutosave() {
                 if (auto* node = safe->graph.findNode(id))
                     safe->openEditor(*node);
 
-            safe->graphComponent->fitAll();
+            // Restore the saved pan/zoom from the autosave (or fit-all if
+            // none was persisted) instead of unconditionally re-fitting.
+            safe->graphComponent->notifyProjectLoaded();
             safe->graphComponent->repaint();
 
             // After loading the autosave, also restore the undo tree
@@ -4002,6 +4532,21 @@ public:
 
         loadRecentList();
 
+        // If no Python interpreter is available, the console can't run anything.
+        // Say so up front (rather than silently doing nothing on Run) and
+        // explain how to enable it — see CLAUDE.md's grayed-control rule.
+        if (!ScriptEngine::pythonAvailable()) {
+            outputEditor.setText(
+                "Python scripting is disabled: no Python interpreter was found.\n"
+                "SEANCE delay-loads Python, so it runs fine without it — but the\n"
+                "Script Console, Python signal evaluation, and the Python shape\n"
+                "baker need a Python install. Install Python (matching this build's\n"
+                "version) so its DLL is on the system PATH, then restart SEANCE.");
+            runBtn.setEnabled(false);
+            runBtn.setTooltip("Disabled — no Python interpreter was found. Install "
+                              "Python and restart SEANCE to enable scripting.");
+        }
+
         setSize(700, 550);
     }
 
@@ -4080,7 +4625,7 @@ public:
         } else {
             for (int i = 0; i < (int)recentScripts.size(); ++i) {
                 auto file = juce::File(recentScripts[i]);
-                menu.addItem(i + 1, file.getFileName() + "  —  " + file.getParentDirectory().getFileName());
+                menu.addItem(i + 1, file.getFileName() + "  -  " + file.getParentDirectory().getFileName());
             }
             menu.addSeparator();
             menu.addItem(999, "Clear Recents");
@@ -4228,7 +4773,8 @@ void MainContentComponent::showScriptConsoleForNode(int nodeId) {
     opts.escapeKeyTriggersCloseButton = true;
     opts.useNativeTitleBar = false;
     opts.resizable = true;
-    opts.launchAsync();
+    opts.componentToCentreAround = this;
+    SoundShop::launchToolDialog(opts);
 }
 
 // ==============================================================================
@@ -4445,27 +4991,9 @@ void MainContentComponent::showAudioDeviceSettings() {
     auto* dm = audioEngine.getDeviceManager();
     if (!dm) return;
 
-    // Use JUCE's built-in AudioDeviceSelectorComponent which provides full
-    // device type / input / output / sample rate / buffer size selection.
-    // This replaces our old custom info panel.
-    auto* selector = new juce::AudioDeviceSelectorComponent(
-        *dm,
-        0, 2,    // min/max input channels
-        0, 2,    // min/max output channels
-        true,    // show MIDI input options
-        false,   // don't show MIDI output options
-        true,    // show channels as stereo pairs
-        false);  // don't hide advanced options
-    selector->setSize(500, 400);
-
-    juce::DialogWindow::LaunchOptions opts;
-    opts.content.setOwned(selector);
-    opts.dialogTitle = "Audio Device Settings";
-    opts.dialogBackgroundColour = juce::Colour(40, 40, 45);
-    opts.escapeKeyTriggersCloseButton = true;
-    opts.useNativeTitleBar = false;
-    opts.resizable = true;
-    opts.launchAsync();
+    // Shared with the microphone-capture dialog's "Audio device..." button so
+    // both routes build the same AudioDeviceSelectorComponent.
+    SoundShop::launchAudioDeviceSettings(*dm, this);
     return;
 
 #if 0
@@ -4605,7 +5133,8 @@ void MainContentComponent::showAudioDeviceSettings() {
     opts.escapeKeyTriggersCloseButton = true;
     opts.useNativeTitleBar = false;
     opts.resizable = true;
-    opts.launchAsync();
+    opts.componentToCentreAround = this;
+    SoundShop::launchToolDialog(opts);
 #endif
 }
 
@@ -4619,23 +5148,35 @@ void MainContentComponent::showPluginSettingsDialog() {
     opts.escapeKeyTriggersCloseButton = true;
     opts.useNativeTitleBar = false;
     opts.resizable = true;
-    opts.launchAsync();
+    opts.componentToCentreAround = this;
+    SoundShop::launchToolDialog(opts);
 }
 
 void MainContentComponent::showSongSettingsDialog() {
     // Small modal with three inputs: Song Length (beats), Repeat Mode,
     // and Repeat Count (used only when mode == N Times).
-    auto* aw = new juce::AlertWindow("Song Length + Repeat",
+    // Build the explanatory header. If the user hasn't set an explicit
+    // length, show the auto-derived value so they can see what playback
+    // will use without having to guess.
+    juce::String header =
         "Song Length is where playback auto-stops (in beats).\n"
-        "0 = no explicit end (transport plays until you press Stop).\n\n"
-        "Repeat Mode:\n"
-        "  None    — stop at Song Length.\n"
-        "  Forever — loop back to beat 0 until Stop is pressed.\n"
-        "  N Times — loop back and play N times total, then stop.",
+        "0 = auto (derived from the last clip across all timelines).\n";
+    if (graph.songLengthBeats <= 0) {
+        double autoEnd = graph.effectiveSongLengthBeats();
+        if (autoEnd > 0)
+            header += "Current auto value: " + juce::String(autoEnd, 2) + " beats.\n";
+        else
+            header += "Current auto value: no clips yet, so playback won't auto-stop.\n";
+    }
+    header += "\nRepeat Mode:\n"
+              "  None    - stop at Song Length.\n"
+              "  Forever - loop back to beat 0 until Stop is pressed.\n"
+              "  N Times - loop back and play N times total, then stop.";
+    auto* aw = new juce::AlertWindow("Song Length + Repeat", header,
         juce::MessageBoxIconType::NoIcon);
     aw->addTextEditor("length",
         juce::String(graph.songLengthBeats, 2),
-        "Song Length (beats):");
+        "Song Length (beats, 0 = auto):");
     aw->addComboBox("mode", {"None", "Forever (until Stop)", "N Times"}, "Repeat Mode:");
     aw->getComboBoxComponent("mode")->setSelectedItemIndex((int)graph.songRepeatMode,
                                                             juce::dontSendNotification);
@@ -4754,7 +5295,7 @@ void MainContentComponent::setupHotkeyCallbacks() {
     hotkeyManager.setCallback(HotkeyAction::DisarmAllParams, [this]() {
         graph.armAllParams(false); graphComponent->repaint();
     });
-    // Piano roll actions — forward to the active editor's piano roll
+    // Piano roll actions - forward to the active editor's piano roll
     auto pianoRollAction = [this](const std::string& action) {
         for (auto& panel : editorPanels)
             if (panel->nodeId == graph.activeEditorNodeId && panel->component)
@@ -4806,7 +5347,8 @@ void MainContentComponent::openHotkeySettings() {
     opts.escapeKeyTriggersCloseButton = false; // escape is used for canceling capture
     opts.useNativeTitleBar = false;
     opts.resizable = true;
-    opts.launchAsync();
+    opts.componentToCentreAround = this;
+    SoundShop::launchToolDialog(opts);
 }
 
 bool MainContentComponent::keyStateChanged(bool isKeyDown) {
@@ -4838,13 +5380,13 @@ bool MainContentComponent::keyStateChanged(bool isKeyDown) {
 }
 
 // ==============================================================================
-// Computer Keyboard → MIDI ("Musical Typing")
+// Computer Keyboard -> MIDI ("Musical Typing")
 // ==============================================================================
 
 // Maps a key code to a MIDI note offset from C (0-11), or -1 if not a note key.
 // Layout:
-//   W E   T Y U   O P       → C# D#   F# G# A#   C# D#  (black keys)
-//   A S D F G H J K L ; '   → C  D  E  F  G  A  B  C  D  E  F  (white keys)
+//   W E   T Y U   O P       -> C# D#   F# G# A#   C# D#  (black keys)
+//   A S D F G H J K L ; '   -> C  D  E  F  G  A  B  C  D  E  F  (white keys)
 // Z/X = octave down/up
 int MainContentComponent::keyToMidiNote(int keyCode) const {
     int oct = audioEngine.keyboardOctave;
@@ -4915,7 +5457,7 @@ void MainWindow::tryQuit() {
 }
 
 // ==============================================================================
-// Output Capture → Audio Track
+// Output Capture -> Audio Track
 // ==============================================================================
 
 void MainContentComponent::bounceToAudioTrack() {

@@ -75,6 +75,22 @@ private:
     // I/O counts (from script or defaults)
     int numAudioInPairs = 1;
     int numAudioOutPairs = 1;
+    // Number of independent MIDI output pins. 1 = single "MIDI Out" pin (the
+    // common case; the script's raw MIDI channel passes through untouched).
+    // >1 = the script routes events to a specific output via ss_midi_out_n's
+    // out_index; copyMidiOut() then re-stamps each event's channel nibble to
+    // (out_index+1) so the graph's per-output MidiChannelFilterProcessor can
+    // split them into independent single-stream cables. Mirrors the built-in
+    // MIDI Script node's multi-output model. Clamped 1..16.
+    int numMidiOutPins = 1;
+
+    // Number of independent MIDI INPUT pins. 1 = single "MIDI In" pin (the
+    // common case). >1 = the script declared ss_num_midi_inputs() > 1, exposing
+    // "MIDI In 1..N"; the graph stamps each incoming cable's channel nibble with
+    // (input-pin index + 1), and copyMidiIn() writes that index into byte 7 of
+    // each event so the module can read input_index. Mirrors the multi-output
+    // model on the input side. Clamped 1..16.
+    int numMidiInPins = 1;
 
     // Direct pointer into WASM linear memory
     uint8_t* wasmMem = nullptr;

@@ -254,6 +254,42 @@ TriggerProcessor::TriggerProcessor(Node& n, Transport& t)
         doc = TriggerDoc::defaultDoc();
 }
 
+double TriggerProcessor::getTailLengthSeconds() const {
+    // Worst-case time after the last input event that this node can keep
+    // producing output: max(delay + lengthBeats) for MIDI rules,
+    // max(shape duration) for Signal rules.  Beats convert via current BPM.
+    const double secsPerBeat = 60.0 / std::max(1.0, transport.bpm);
+    double worst = 0.0;
+    for (const auto& r : doc.rules) {
+        if (r.target == TriggerTarget::Midi) {
+            double t = (double)(r.delayBeats + r.lengthBeats) * secsPerBeat;
+            worst = std::max(worst, t);
+        } else { // Signal
+            double t = 0;
+            switch (r.shape) {
+                case TriggerShape::Step:
+                    t = (double)(r.holdMs + r.releaseMs) * 0.001;
+                    break;
+                case TriggerShape::Envelope:
+                    t = (double)(r.attackMs + r.decayMs + r.releaseMs) * 0.001;
+                    break;
+                case TriggerShape::Ramp:
+                    t = (double) r.rampDurationMs * 0.001;
+                    break;
+                case TriggerShape::FromVelocity:
+                    t = 0;  // instant value, no tail
+                    break;
+                case TriggerShape::Curve:
+                    if (!r.curvePoints.empty())
+                        t = (double) r.curvePoints.back().timeMs * 0.001;
+                    break;
+            }
+            worst = std::max(worst, t);
+        }
+    }
+    return worst;
+}
+
 void TriggerProcessor::rereadDocIfChanged() {
     if (node.script != cachedScript) {
         cachedScript = node.script;
@@ -363,7 +399,7 @@ float TriggerProcessor::evalShape(const ActiveShape& s, int64_t nowSample, bool&
             return s.restValue;
         }
         case TriggerShape::Curve: {
-            // Play through the curve points (time in ms → samples).
+            // Play through the curve points (time in ms -> samples).
             if (s.curvePoints.empty()) { expired = true; return s.restValue; }
             float tMs = t / (float)(sampleRate * 0.001);
             if (tMs <= s.curvePoints.front().timeMs) return s.curvePoints.front().value;
@@ -394,7 +430,7 @@ void TriggerProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::MidiBuf
 
     // 0. Audio-threshold triggers (#109): scan the audio input for level
     //    crossings and fire matching rules. The input audio arrives on
-    //    channel 0 (the MIDI In pin carries MIDI, but if an Audio→Signal
+    //    channel 0 (the MIDI In pin carries MIDI, but if an Audio->Signal
     //    cable is wired to an input it arrives on channel 2+; for
     //    threshold we read channel 0 which carries any summed audio).
     {
@@ -477,13 +513,20 @@ void TriggerProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::MidiBuf
     }
     midi.swapWith(output);
 
-    // 3. Render signal output into audio channel 0 (the Signal out pin).
+    // 3. Render signal output into the Signal Out pin's control channel.
+    // Per the graph processor convention (graph_processor.cpp:844-854),
+    // Signal/Param OUT pins are mapped to channels starting at 2 in pin-
+    // declaration order among control pins. The Trigger node declares
+    // pinsOut = [MIDI Out, Signal Out], so Signal Out is the first (and only)
+    // control pin -> channel 2.
+    //
     // Multiple active shapes: last-added wins on overlap (replace policy).
     // If no shapes are active we emit the default rest value (0.0f via clear).
     int numCh = buf.getNumChannels();
-    if (numCh > 0) {
+    constexpr int kSignalOutCh = 2;
+    if (numCh > kSignalOutCh) {
         // Initialize to 0 (or the "rest" of the last still-active shape).
-        auto* out = buf.getWritePointer(0);
+        auto* out = buf.getWritePointer(kSignalOutCh);
         for (int i = 0; i < numSamples; ++i) out[i] = 0.0f;
 
         // Iterate shapes in order; the last write for a given sample wins.
@@ -521,7 +564,7 @@ void TriggerProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::MidiBuf
 }
 
 // ============================================================================
-// TriggerEditorComponent — minimal editor
+// TriggerEditorComponent - minimal editor
 // ============================================================================
 //
 // Each rule row shows: target label + preset params inline + delete button.
@@ -674,7 +717,7 @@ TriggerEditorComponent::TriggerEditorComponent(NodeGraph& g, int nid, std::funct
         doc = TriggerDoc::defaultDoc();
 
     addAndMakeVisible(addMidiBtn);
-    addMidiBtn.setTooltip("Add a new MIDI rule — sends a MIDI note (transposed by some number of semitones) "
+    addMidiBtn.setTooltip("Add a new MIDI rule - sends a MIDI note (transposed by some number of semitones) "
                           "in response to incoming notes. Use to create harmonies, octave doubles, chords, etc.");
     addMidiBtn.onClick = [this]() {
         TriggerRule r;
@@ -686,7 +729,7 @@ TriggerEditorComponent::TriggerEditorComponent(NodeGraph& g, int nid, std::funct
     };
 
     addAndMakeVisible(addSignalBtn);
-    addSignalBtn.setTooltip("Add a new signal rule — generates a control signal (envelope, ramp, step) "
+    addSignalBtn.setTooltip("Add a new signal rule - generates a control signal (envelope, ramp, step) "
                             "triggered by incoming MIDI notes. Wire its Signal output into a synth parameter to modulate.");
     addSignalBtn.onClick = [this]() {
         TriggerRule r;
@@ -709,9 +752,9 @@ TriggerEditorComponent::TriggerEditorComponent(NodeGraph& g, int nid, std::funct
     wirePreset(presetVelFollowBtn, &TriggerDoc::presetVelocityFollower);
     presetOctaveBtn.setTooltip("Load a preset that doubles every incoming note one octave higher");
     presetChordBtn.setTooltip("Load a preset that turns each incoming note into a major chord (root, third, fifth)");
-    presetFlamBtn.setTooltip("Load a preset that adds a quick echo of each note ~30ms later — drum 'flam' effect");
-    presetPluckBtn.setTooltip("Load a preset that fires a short envelope on every note — useful as a pluck/percussion modulator");
-    presetVelFollowBtn.setTooltip("Load a preset that outputs a signal proportional to each note's velocity — drives parameters from how hard you play");
+    presetFlamBtn.setTooltip("Load a preset that adds a quick echo of each note ~30ms later - drum 'flam' effect");
+    presetPluckBtn.setTooltip("Load a preset that fires a short envelope on every note - useful as a pluck/percussion modulator");
+    presetVelFollowBtn.setTooltip("Load a preset that outputs a signal proportional to each note's velocity - drives parameters from how hard you play");
 
     addAndMakeVisible(helpBtn);
     helpBtn.setTooltip("Open the Trigger node docs");

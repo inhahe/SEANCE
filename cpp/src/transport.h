@@ -269,6 +269,25 @@ struct Transport {
     float noteToFreq(int midiNote) const {
         return midiNoteToFrequency(midiNote, tuningSystem, concertPitch);
     }
+
+    // Cents a hosted plugin (which renders the raw note number at 12-TET/A440)
+    // must be bent to reach this project's intended frequency for the note.
+    float noteTuningCents(int midiNote) const {
+        return tuningCentsDeviation(midiNote, tuningSystem, concertPitch);
+    }
+    // The uniform concert-pitch-only component (same for every note).
+    float concertCents() const {
+        return concertPitchCents(concertPitch);
+    }
+    // True when no bending is needed at all (standard pitch, equal temperament).
+    bool isDefaultTuning() const {
+        return tuningSystem == TuningSystem::Equal12 && std::abs(concertPitch - 440.0f) < 0.01f;
+    }
+    // True when the tuning differs per pitch class (temperament != Equal12), so
+    // correct delivery needs a separate channel per note (MPE).
+    bool isUnequalTemperament() const {
+        return tuningSystem != TuningSystem::Equal12;
+    }
     int64_t positionSamples = 0;
     TempoMap tempoMap;
     TimeSignatureMap timeSigMap;

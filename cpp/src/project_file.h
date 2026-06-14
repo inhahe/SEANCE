@@ -9,23 +9,36 @@ namespace SoundShop {
 class ProjectFile {
 public:
     // Save the entire graph to a file
-    // graphProcessor is optional — if provided, plugin states are saved
+    // graphProcessor is optional - if provided, plugin states are saved
     static bool save(const std::string& path, NodeGraph& graph, GraphProcessor* gp = nullptr);
 
     // Load a graph from a file (replaces current graph contents)
-    // pluginHost is optional — if provided, plugins are reloaded
+    // pluginHost is optional - if provided, plugins are reloaded
     static bool load(const std::string& path, NodeGraph& graph, PluginHost* pluginHost = nullptr);
 
     // Stream-based variants. These do all the actual work; the path-based
     // entry points are thin wrappers that open a file. Used by the snapshot
     // undo system (#84) to (de)serialize graph state to/from in-memory text
     // without touching the filesystem.
-    static bool writeProject(std::ostream& out, NodeGraph& graph, GraphProcessor* gp);
+    // includeView controls whether the node-graph component's pan/zoom
+    // are written. True for file saves (so reopening restores the
+    // view), false for undo snapshots (so undoing graph edits doesn't
+    // also fling the user's viewport around). Defaults to true so all
+    // existing call sites get the save-style behaviour.
+    //
+    // includeBlobs controls whether the content-addressed [Blob] store
+    // (baked terrain grids etc.) is written. True for file saves (the bytes
+    // must be on disk to reload), false for undo snapshots (the hash travels
+    // in node.script; the bytes stay in the live in-memory store across
+    // undo/redo, so duplicating them into every snapshot would bloat undo).
+    static bool writeProject(std::ostream& out, NodeGraph& graph,
+                             GraphProcessor* gp, bool includeView = true,
+                             bool includeBlobs = true);
     static bool readProject(std::istream& in, NodeGraph& graph, PluginHost* pluginHost);
 
     // Convenience: serialize the graph to a string with NO plugin state.
     // This is the "fast" serializer used by commitSnapshot(). Excluding
-    // plugin state keeps it cheap regardless of how many plugins are loaded —
+    // plugin state keeps it cheap regardless of how many plugins are loaded -
     // plugin internal state is captured separately by the slow autosave path.
     static std::string serializeForUndo(NodeGraph& graph);
 

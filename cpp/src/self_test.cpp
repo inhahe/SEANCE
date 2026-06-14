@@ -1,0 +1,2696 @@
+#include "self_test.h"
+#include "terrain_synth.h"
+#include "layered_wave_editor.h"   // WavetableDoc - warp serialization round-trip
+#include "warp.h"                  // warp primitives + registry
+#include "buffer_warp.h"           // Bucket C whole-buffer spectral/wavelet warps
+#include "spectral_editor.h"       // SpectralDoc - Bucket C per-bin warp
+#include "wavelet_frame.h"         // WaveletFrame - Bucket C per-coeff warp
+#include "granular_frame.h"        // GranularFrame - Bucket C per-grain warp
+#include "inharmonic_frame.h"      // InharmonicFrame - Milestone 9 additive stack
+#include "waveform_bank.h"         // WaveformBank - factory single-cycle library
+#include "transport.h"
+#include "node_graph.h"
+#include "content_store.h"         // ContentStore - baked-blob side-store tests
+#include "project_file.h"          // serializeForUndo / writeProject - blob persistence
+#include "adsr_envelope.h"
+#include "video_decoder.h"
+#include "script_runtime.h"        // ScriptLang / scriptLangAvailable - generator tests
+#include "scripting.h"             // ScriptEngine::bakeTerrain - Python generator tests
+#include "glsl_compute.h"          // headless GL 4.3 compute - GLSL generator backend
+#include "shape_expr.h"            // bakeShapeExpr (Builtin/Lua/Python/GLSL curve bakes)
+#include "builtin_synth.h"         // WaveExprParser - Builtin expression vocabulary
+
+#include <juce_audio_formats/juce_audio_formats.h>
+#include <juce_graphics/juce_graphics.h>
+
+#include <vector>
+#include <string>
+#include <functional>
+#include <cmath>
+#include <cstring>
+#include <algorithm>
+#include <sstream>
+
+namespace SoundShop {
+namespace {
+
+// ---------------------------------------------------------------------------
+// Report accumulator. Every check funnels through check()/section() so the
+// report file and the pass/fail tally stay in sync.
+// ---------------------------------------------------------------------------
+struct Report {
+    juce::String text;
+    int passed = 0, failed = 0;
+
+    void line(const juce::String& s) { text << s << "\n"; }
+    void section(const juce::String& s) {
+        text << "\n=== " << s << " ===\n";
+    }
+    bool check(bool cond, const juce::String& what) {
+        text << (cond ? "  [PASS] " : "  [FAIL] ") << what << "\n";
+        if (cond) ++passed; else ++failed;
+        return cond;
+    }
+    // Numeric check with the measured value appended for diagnosis.
+    bool checkVal(bool cond, const juce::String& what, double value) {
+        text << (cond ? "  [PASS] " : "  [FAIL] ") << what
+             << "  (measured " << juce::String(value, 5) << ")\n";
+        if (cond) ++passed; else ++failed;
+        return cond;
+    }
+    void note(const juce::String& s) { text << "  - " << s << "\n"; }
+};
+
+// ---------------------------------------------------------------------------
+// Small numeric helpers.
+// ---------------------------------------------------------------------------
+double pearson(const std::vector<double>& a, const std::vector<double>& b) {
+    const int n = (int) std::min(a.size(), b.size());
+    if (n < 2) return 0.0;
+    double ma = 0, mb = 0;
+    for (int i = 0; i < n; ++i) { ma += a[i]; mb += b[i]; }
+    ma /= n; mb /= n;
+    double num = 0, da = 0, db = 0;
+    for (int i = 0; i < n; ++i) {
+        double x = a[i] - ma, y = b[i] - mb;
+        num += x * y; da += x * x; db += y * y;
+    }
+    if (da < 1e-20 || db < 1e-20) return 0.0;
+    return num / std::sqrt(da * db);
+}
+
+double rmsOf(const std::vector<float>& v) {
+    if (v.empty()) return 0.0;
+    double acc = 0;
+    for (float s : v) acc += (double) s * s;
+    return std::sqrt(acc / v.size());
+}
+
+float peakAbs(const std::vector<float>& v) {
+    float p = 0;
+    for (float s : v) p = std::max(p, std::abs(s));
+    return p;
+}
+
+bool allFinite(const std::vector<float>& v) {
+    for (float s : v) if (!std::isfinite(s)) return false;
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Media writers.
+// ---------------------------------------------------------------------------
+bool writeWavFloat(const juce::File& f, const std::vector<float>& samples, double sr) {
+    f.getParentDirectory().createDirectory();
+    f.deleteFile();
+    juce::WavAudioFormat fmt;
+    auto* os = f.createOutputStream().release();   // writer takes ownership on success
+    if (os == nullptr) return false;
+    std::unique_ptr<juce::AudioFormatWriter> w(
+        fmt.createWriterFor(os, sr, 1, 32, {}, 0)); // 32-bit -> IEEE float -> exact round-trip
+    if (w == nullptr) { delete os; return false; }
+    juce::AudioBuffer<float> b(1, (int) samples.size());
+    if (!samples.empty())
+        std::memcpy(b.getWritePointer(0), samples.data(), samples.size() * sizeof(float));
+    return w->writeFromAudioSampleBuffer(b, 0, (int) samples.size());
+}
+
+bool writePngGray(const juce::File& f, int w, int h,
+                  const std::function<int(int x, int y)>& valueFn) {
+    juce::Image img(juce::Image::RGB, w, h, true);
+    for (int y = 0; y < h; ++y)
+        for (int x = 0; x < w; ++x) {
+            int v = juce::jlimit(0, 255, valueFn(x, y));
+            img.setPixelAt(x, y, juce::Colour::fromRGB((juce::uint8) v,
+                                                       (juce::uint8) v,
+                                                       (juce::uint8) v));
+        }
+    f.getParentDirectory().createDirectory();
+    f.deleteFile();
+    juce::FileOutputStream os(f);
+    if (os.failedToOpen()) return false;
+    juce::PNGImageFormat png;
+    return png.writeImageToStream(img, os);
+}
+
+// ---------------------------------------------------------------------------
+// Standalone render of a held note through a real TerrainSynthProcessor.
+//
+// nd          = terrain dimensionality (1, 2, 3)
+// synthMode   = 0 Direct, 1 AM-sine, 2 Additive
+// sigAt(d, g) = the control-signal value (0..1) feeding "Sig <axis d>" at the
+//               global sample index g. This is exactly how a Signal cable
+//               drives a coordinate in the node graph.
+//
+// On return, `audio` is the mono synth output and (AM-sine only) `refEnv[g]`
+// is the amplitude envelope the output SHOULD have: volume*(0.5 + 0.5*terrain
+// .sample(sig coord at g)), i.e. the terrain readout the position sweep traces.
+// ---------------------------------------------------------------------------
+struct RenderOut {
+    std::vector<float>  audio;
+    std::vector<double> refEnv;   // empty unless AM-sine
+    double sr = 44100.0;
+    bool   built = false;         // terrain non-empty after construction
+};
+
+RenderOut renderTerrain(const std::string& script, int nd, int synthMode,
+                        const std::function<float(int, int)>& sigAt,
+                        double durSec) {
+    static const char* axisNames[] = { "X", "Y", "Z", "W", "V", "U", "S", "T" };
+
+    Transport transport;
+    transport.sampleRate = 44100.0;
+    transport.bpm = 120.0;
+
+    Node node;
+    node.id   = 1;
+    node.type = NodeType::TerrainSynth;
+    node.name = "selftest-terrain";
+    node.script = script;
+
+    node.pinsIn.push_back(Pin{ 1, "MIDI", PinKind::Midi, true, 2 });
+    for (int d = 0; d < nd; ++d)
+        node.pinsIn.push_back(Pin{ 2 + d, std::string("Sig ") + axisNames[d],
+                                   PinKind::Signal, true, 1 });
+    node.pinsOut.push_back(Pin{ 100, "Audio", PinKind::Audio, false, 2 });
+
+    node.params.push_back({ "Volume",     1.0f,            0.0f, 1.0f });
+    node.params.push_back({ "Synth Mode", (float) synthMode, 0.0f, 2.0f });
+
+    // Flat envelope: ~instant attack, very long hold at full level, full
+    // sustain. Keeps the gain effectively constant for the whole render so the
+    // measured amplitude tracks the terrain readout rather than an ADSR shape.
+    node.ahdsrEnvelope.attackMs  = 1.0f;
+    node.ahdsrEnvelope.holdMs    = (float) (durSec * 1000.0 * 4.0);
+    node.ahdsrEnvelope.decayMs   = 1.0f;
+    node.ahdsrEnvelope.sustain   = 1.0f;
+    node.ahdsrEnvelope.releaseMs = 1.0f;
+    node.ahdsrEnvelope.velocitySensitivity = 0.0f;
+    AHDSREnvelope::setDefaultCurves(node.ahdsrEnvelope);
+
+    TerrainSynthProcessor proc(node, transport);
+
+    RenderOut ro;
+    ro.sr = transport.sampleRate;
+    const int total = std::max(1, (int) (durSec * ro.sr));
+    const int block = 512;
+    const int numCh = 2 + nd;
+    proc.prepareToPlay(ro.sr, block);
+
+    ro.audio.assign((size_t) total, 0.0f);
+    Terrain& terr = proc.getTerrain();
+    ro.built = terr.totalSize() > 1;
+
+    const float volume = 1.0f;
+    const bool computeRef = (synthMode == 1);   // AM-sine has a clean envelope
+    if (computeRef) ro.refEnv.assign((size_t) total, 0.0);
+
+    juce::AudioBuffer<float> buf(numCh, block);
+
+    for (int start = 0; start < total; start += block) {
+        const int n = std::min(block, total - start);
+        buf.setSize(numCh, n, false, false, true);
+        buf.clear();
+        for (int d = 0; d < nd; ++d) {
+            float* ch = buf.getWritePointer(2 + d);
+            for (int s = 0; s < n; ++s)
+                ch[s] = juce::jlimit(0.0f, 1.0f, sigAt(d, start + s));
+        }
+        juce::MidiBuffer midi;
+        if (start == 0)
+            midi.addEvent(juce::MidiMessage::noteOn(1, 69, (juce::uint8) 100), 0);
+
+        proc.processBlock(buf, midi);
+
+        const float* out = buf.getReadPointer(0);
+        for (int s = 0; s < n; ++s) ro.audio[(size_t)(start + s)] = out[s];
+
+        if (computeRef) {
+            std::vector<float> coord((size_t) nd);
+            for (int s = 0; s < n; ++s) {
+                for (int d = 0; d < nd; ++d)
+                    coord[(size_t) d] = juce::jlimit(0.0f, 1.0f, sigAt(d, start + s));
+                float readout = terr.sample(coord);
+                ro.refEnv[(size_t)(start + s)] = (double) volume * (0.5 + 0.5 * readout);
+            }
+        }
+    }
+    return ro;
+}
+
+// Chunk-average |audio| and refEnv, trim the attack/release transients, and
+// correlate. Returns the Pearson correlation (~1.0 == the rendered amplitude
+// follows the predicted terrain readout).
+double envelopeCorrelation(const RenderOut& ro, int chunks = 200) {
+    if (ro.refEnv.empty() || ro.audio.empty()) return 0.0;
+    const int total = (int) ro.audio.size();
+    const int chunk = std::max(1, total / chunks);
+    std::vector<double> aEnv, bRef;
+    for (int c = 0; c * chunk < total; ++c) {
+        int s0 = c * chunk, s1 = std::min(total, s0 + chunk);
+        double aAcc = 0, bAcc = 0;
+        for (int s = s0; s < s1; ++s) {
+            aAcc += std::abs(ro.audio[(size_t) s]);
+            bAcc += ro.refEnv[(size_t) s];
+        }
+        int len = s1 - s0;
+        aEnv.push_back(aAcc / len);
+        bRef.push_back(bAcc / len);
+    }
+    // Trim 3 chunks at each end (attack ramp / final block edge effects).
+    const int trim = 3;
+    if ((int) aEnv.size() > 2 * trim + 2) {
+        aEnv.erase(aEnv.end() - trim, aEnv.end());
+        aEnv.erase(aEnv.begin(), aEnv.begin() + trim);
+        bRef.erase(bRef.end() - trim, bRef.end());
+        bRef.erase(bRef.begin(), bRef.begin() + trim);
+    }
+    return pearson(aEnv, bRef);
+}
+
+double envRange(const RenderOut& ro, int chunks = 200) {
+    if (ro.audio.empty()) return 0.0;
+    const int total = (int) ro.audio.size();
+    const int chunk = std::max(1, total / chunks);
+    double lo = 1e30, hi = -1e30;
+    for (int c = 0; c * chunk < total; ++c) {
+        int s0 = c * chunk, s1 = std::min(total, s0 + chunk);
+        double acc = 0;
+        for (int s = s0; s < s1; ++s) acc += std::abs(ro.audio[(size_t) s]);
+        double m = acc / std::max(1, s1 - s0);
+        lo = std::min(lo, m); hi = std::max(hi, m);
+    }
+    return hi - lo;
+}
+
+// ===========================================================================
+// LAYER 1 - exact terrain-data tests
+// ===========================================================================
+void testTerrainData(Report& r, const juce::File& dir) {
+    r.section("Layer 1: terrain data (exact)");
+
+    // ---- 1D from audio file: linear ramp -1 .. +1 -----------------------
+    {
+        const int N = 512;
+        std::vector<float> ramp((size_t) N);
+        for (int i = 0; i < N; ++i) ramp[(size_t) i] = -1.0f + 2.0f * i / (N - 1);
+        auto wav = dir.getChildFile("test_audio_1d.wav");
+        bool wrote = writeWavFloat(wav, ramp, 44100.0);
+        r.check(wrote, "1D: wrote test audio WAV");
+
+        Terrain t;
+        t.fillFromAudioFile(wav.getFullPathName().toStdString());
+        r.check(t.numDimensions() == 1 && t.totalSize() == N,
+                "1D: terrain is 1D with N samples");
+        double maxErr = 0;
+        for (int i = 0; i < N; ++i)
+            maxErr = std::max(maxErr, (double) std::abs(t.at(i) - ramp[(size_t) i]));
+        r.checkVal(maxErr < 1e-4, "1D: data matches ramp", maxErr);
+        // sample() endpoints + midpoint interpolation
+        r.checkVal(std::abs(t.sample({ 0.0f }) - (-1.0f)) < 1e-4, "1D: sample(0) == -1",
+                   t.sample({ 0.0f }));
+        r.checkVal(std::abs(t.sample({ 1.0f }) - ( 1.0f)) < 1e-4, "1D: sample(1) == +1",
+                   t.sample({ 1.0f }));
+        r.checkVal(std::abs(t.sample({ 0.5f })) < 1e-3, "1D: sample(0.5) ~ 0",
+                   t.sample({ 0.5f }));
+    }
+
+    // ---- 2D from image: column gradient (varies along x only) -----------
+    {
+        const int W = 80, H = 60;
+        auto png = dir.getChildFile("test_image_2d.png");
+        bool wrote = writePngGray(png, W, H,
+            [&](int x, int /*y*/) { return (int) std::lround(255.0 * x / (W - 1)); });
+        r.check(wrote, "2D: wrote test image PNG");
+
+        Terrain t;
+        t.fillFromImage(png.getFullPathName().toStdString());
+        r.check(t.numDimensions() == 2 && t.getDimensions() == std::vector<int>{ H, W },
+                "2D: terrain dims == {H, W}");
+        // brightness(x) = x/(W-1); data = brightness*2-1. Check a few cells.
+        double maxErr = 0;
+        for (int x = 0; x < W; x += 7)
+            for (int y = 0; y < H; y += 11) {
+                float expect = (float) x / (W - 1) * 2.0f - 1.0f;
+                maxErr = std::max(maxErr, (double) std::abs(t.at(y * W + x) - expect));
+            }
+        r.checkVal(maxErr < 2e-2, "2D: data matches gradient (1/255 quant ok)", maxErr);
+        // sample() along the column axis (coord[1]); coord[0]=row is irrelevant.
+        r.checkVal(std::abs(t.sample({ 0.5f, 0.0f }) - (-1.0f)) < 2e-2,
+                   "2D: sample(col 0) == -1", t.sample({ 0.5f, 0.0f }));
+        r.checkVal(std::abs(t.sample({ 0.5f, 1.0f }) - ( 1.0f)) < 2e-2,
+                   "2D: sample(col 1) == +1", t.sample({ 0.5f, 1.0f }));
+    }
+
+    // ---- 3D from video grid: brightness ramps with the frame (time) axis -
+    {
+        const int F = 12, H = 16, W = 16;
+        std::vector<uint8_t> gray((size_t) F * H * W);
+        for (int f = 0; f < F; ++f)
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < W; ++x)
+                    gray[(size_t)((f * H + y) * W + x)] =
+                        (uint8_t) std::lround(255.0 * f / (F - 1));
+
+        Terrain t;
+        t.fillFromVideoData(gray, F, H, W);
+        r.check(t.numDimensions() == 3 &&
+                t.getDimensions() == std::vector<int>{ F, H, W },
+                "3D: terrain dims == {F, H, W}");
+        // The gray grid is uint8_t, so each cell is quantized to 1/255 before
+        // the b/255*2-1 mapping. Intermediate frames where 255*f/(F-1) isn't an
+        // integer therefore carry up to ~0.5/255*2 (~0.004) of rounding error -
+        // the same 1/255 tolerance the 2D image test uses. (Frames 0 and F-1 map
+        // to bytes 0/255 exactly, which is why the sample() endpoint checks below
+        // can stay tight.)
+        double maxErr = 0;
+        for (int f = 0; f < F; ++f) {
+            float expect = (float) f / (F - 1) * 2.0f - 1.0f;
+            maxErr = std::max(maxErr,
+                              (double) std::abs(t.at((f * H + 3) * W + 5) - expect));
+        }
+        r.checkVal(maxErr < 2e-2, "3D: data ramps along frame axis (1/255 quant ok)",
+                   maxErr);
+        r.checkVal(std::abs(t.sample({ 0.0f, 0.5f, 0.5f }) - (-1.0f)) < 1e-3,
+                   "3D: sample(frame 0) == -1", t.sample({ 0.0f, 0.5f, 0.5f }));
+        r.checkVal(std::abs(t.sample({ 1.0f, 0.5f, 0.5f }) - ( 1.0f)) < 1e-3,
+                   "3D: sample(frame 1) == +1", t.sample({ 1.0f, 0.5f, 0.5f }));
+        r.checkVal(std::abs(t.sample({ 0.5f, 0.5f, 0.5f })) < 1e-3,
+                   "3D: sample(frame 0.5) ~ 0", t.sample({ 0.5f, 0.5f, 0.5f }));
+    }
+
+    // ---- video terrain script round-trip --------------------------------
+    {
+        VideoTerrainParams p;
+        p.path = "C:/some path/with spaces/clip.mp4";
+        p.t0 = 1.25; p.t1 = 3.75;
+        p.cropX = 4; p.cropY = 8; p.cropW = 320; p.cropH = 240;
+        p.outW = 6; p.outH = 5; p.outFrames = 4;
+        p.gray.resize((size_t) p.outW * p.outH * p.outFrames);
+        for (size_t i = 0; i < p.gray.size(); ++i)
+            p.gray[i] = (uint8_t) (i * 7 + 11);
+
+        auto s = makeVideoTerrainScript(p);
+        VideoTerrainParams q;
+        bool ok = parseVideoTerrainScript(s, q, true);
+        r.check(ok, "script: parse succeeded");
+        r.check(q.path == p.path, "script: path with spaces preserved");
+        r.check(std::abs(q.t0 - p.t0) < 1e-6 && std::abs(q.t1 - p.t1) < 1e-6,
+                "script: time crop preserved");
+        r.check(q.cropX == p.cropX && q.cropY == p.cropY &&
+                q.cropW == p.cropW && q.cropH == p.cropH, "script: pixel crop preserved");
+        r.check(q.outW == p.outW && q.outH == p.outH && q.outFrames == p.outFrames,
+                "script: grid size preserved");
+        r.check(q.gray == p.gray, "script: gray bytes round-trip exactly");
+    }
+
+    // ---- script-generated terrain (Builtin always; Lua for unbounded N-D) ----
+    // fillFromScript runs a per-cell program. Output contract: the script
+    // returns 0..1 (heightmap/brightness), mapped to the terrain's bipolar
+    // [-1,1] as v*2-1 (see Terrain::fillFromScript). Builtin source is a bare
+    // expression; Lua source defines loop() and returns its value.
+    {
+        // Builtin: constant 0.75 -> every cell 0.75*2-1 = 0.5. Validates the
+        // backend runs end-to-end without assuming coordinate-var support.
+        Terrain tb;
+        std::string err;
+        bool ok = tb.fillFromScript(ScriptLang::Builtin, "0.75", { 4, 5 }, err);
+        r.check(ok, "gen: Builtin program loads + runs");
+        if (ok) {
+            double maxErr = 0;
+            for (int i = 0; i < tb.totalSize(); ++i)
+                maxErr = std::max(maxErr, (double) std::abs(tb.at(i) - 0.5f));
+            r.checkVal(maxErr < 1e-5, "gen: Builtin constant maps 0.75 -> 0.5", maxErr);
+        }
+
+        // Block-only language can't generate per-cell: deterministic rejection
+        // (the rate check fails before any Wasm backend is needed).
+        Terrain tw;
+        std::string werr;
+        bool wok = tw.fillFromScript(ScriptLang::Wasm, "0.0", { 4 }, werr);
+        r.check(!wok && !werr.empty(), "gen: block-only language rejected with error");
+
+        // Lua: the real N-D story. Gated on the Lua backend being built in.
+        if (scriptLangAvailable(ScriptLang::Lua)) {
+            // 2D ramp along dim 0 (rows): script returns c0 (0..1) -> -1..1.
+            Terrain t2;
+            std::string e2;
+            bool ok2 = t2.fillFromScript(ScriptLang::Lua,
+                "function loop() return c0 end", { 5, 4 }, e2);
+            r.check(ok2, "gen: Lua 2D program loads + runs");
+            if (ok2) {
+                // dims = {5,4}; row r0 in [0..4], c0 = r0/4 -> cell = r0*4+c1.
+                double maxErr = 0;
+                for (int r0 = 0; r0 < 5; ++r0)
+                    for (int c1 = 0; c1 < 4; ++c1) {
+                        float expect = ((float) r0 / 4.0f) * 2.0f - 1.0f;
+                        maxErr = std::max(maxErr,
+                            (double) std::abs(t2.at(r0 * 4 + c1) - expect));
+                    }
+                r.checkVal(maxErr < 1e-5, "gen: Lua 2D ramp matches c0 (mapped)", maxErr);
+            }
+
+            // >8 dimensions: prove there is NO dimensionality cap. A rank-10
+            // terrain (every dim size 2 -> 1024 cells) reads its 10th axis:
+            // loop() returns c9, which is 0 when index9==0 (-> -1) and 1 when
+            // index9==1 (-> +1). The 8-letter Builtin axis set could never name
+            // c9, so this only works through the indexed coordinate API.
+            std::vector<int> d10(10, 2);
+            Terrain t10;
+            std::string e10;
+            bool ok10 = t10.fillFromScript(ScriptLang::Lua,
+                "function loop() return c9 end", d10, e10);
+            r.check(ok10 && t10.numDimensions() == 10,
+                    "gen: Lua rank-10 terrain builds (no D cap)");
+            if (ok10) {
+                // dim 9 is the innermost (fastest) flat axis: even flats have
+                // index9==0 (-1), odd flats index9==1 (+1).
+                double maxErr = 0;
+                for (int flat = 0; flat < t10.totalSize(); ++flat) {
+                    float expect = (flat & 1) ? 1.0f : -1.0f;
+                    maxErr = std::max(maxErr,
+                        (double) std::abs(t10.at(flat) - expect));
+                }
+                r.checkVal(maxErr < 1e-5, "gen: Lua 10-D reads c9 correctly", maxErr);
+            }
+        }
+
+        // ---- __generate__ script encode/decode round-trip ----------------
+        // The node bakes its generator into node.script and reproduces the
+        // terrain from it on load (no data stored). Verify the codec survives
+        // newlines / pipes / odd chars and that dims + lang come back intact.
+        {
+            GenerateTerrainParams gp;
+            gp.lang = (int)ScriptLang::Lua;
+            gp.dims = { 7, 9, 3 };
+            gp.source = "function loop()\n  return c0 -- pipe|brace{}newline test\nend\n";
+            std::string enc = makeGenerateTerrainScript(gp);
+            r.check(enc.rfind("__generate__:", 0) == 0,
+                    "gen: __generate__ script has correct prefix");
+
+            GenerateTerrainParams dec;
+            bool pok = parseGenerateTerrainScript(enc, dec);
+            r.check(pok, "gen: __generate__ script parses back");
+            r.check(dec.lang == gp.lang, "gen: lang round-trips");
+            r.check(dec.dims == gp.dims, "gen: dims round-trip (any rank)");
+            r.check(dec.source == gp.source,
+                    "gen: source round-trips through base64 (newlines/pipes)");
+
+            // Non-generate scripts must be rejected.
+            GenerateTerrainParams junk;
+            r.check(!parseGenerateTerrainScript("__video__:foo", junk),
+                    "gen: parser rejects non-generate scripts");
+        }
+
+        // ---- baked-data round-trip (gzip+base64 blob) --------------------
+        // Generated terrains now bake their final grid into the tag so they
+        // never re-run on load. Verify the float blob survives encode->decode
+        // bit-exactly and that the size is validated against dims.
+        {
+            GenerateTerrainParams gp;
+            gp.lang = (int)GenLang::Lua;
+            gp.dims = { 4, 5 };           // 20 cells
+            gp.source = "function loop() return 0.5 end\n";
+            gp.data.resize(20);
+            for (int i = 0; i < 20; ++i) gp.data[(size_t)i] = (float)i / 19.0f * 2.0f - 1.0f;
+
+            std::string enc = makeGenerateTerrainScript(gp);
+            GenerateTerrainParams dec;
+            r.check(parseGenerateTerrainScript(enc, dec), "gen: baked tag parses");
+            r.check(dec.data.size() == gp.data.size(),
+                    "gen: baked data count round-trips");
+            float maxErr = 0.0f;
+            for (size_t i = 0; i < dec.data.size() && i < gp.data.size(); ++i)
+                maxErr = std::max(maxErr, std::abs(dec.data[i] - gp.data[i]));
+            r.checkVal(maxErr == 0.0f, "gen: baked floats are bit-exact", maxErr);
+
+            // A blob whose float count doesn't match dims is dropped (forces the
+            // recompute fallback rather than loading a corrupt grid).
+            GenerateTerrainParams bad = gp;
+            bad.dims = { 6, 6 };          // 36 != 20
+            std::string encBad = makeGenerateTerrainScript(bad);
+            // Re-encode with mismatched dims but the 20-float blob: hand-build by
+            // swapping the dims field is awkward, so instead decode the good tag
+            // against wrong-dims by editing: simplest is to verify the validated
+            // path drops a short blob. Use a tag with dims that exceed the blob.
+            GenerateTerrainParams decBad;
+            // Build a tag: same data blob (20 floats) but dims claiming 36 cells.
+            GenerateTerrainParams mk; mk.lang = gp.lang; mk.dims = { 6, 6 };
+            mk.source = gp.source; mk.data = gp.data;        // 20 floats, dims=36
+            std::string mismatch = makeGenerateTerrainScript(mk);
+            r.check(parseGenerateTerrainScript(mismatch, decBad)
+                        && decBad.data.empty(),
+                    "gen: baked blob with wrong cell count is dropped");
+        }
+
+        // ---- mode field round-trip + backward compatibility --------------
+        // mode 1 (whole-grid) is encoded as "<lang>:<mode>"; old projects had
+        // a bare "<lang>" (no ':'), which must still parse as mode 0.
+        {
+            GenerateTerrainParams gp;
+            gp.lang = (int)ScriptLang::Lua;
+            gp.mode = 1;
+            gp.dims = { 8 };
+            gp.source = "function generate() end\n";
+            std::string enc = makeGenerateTerrainScript(gp);
+            GenerateTerrainParams dec;
+            r.check(parseGenerateTerrainScript(enc, dec) && dec.mode == 1,
+                    "gen: whole-grid mode round-trips");
+
+            // Legacy tag with no mode field defaults to per-cell (mode 0).
+            GenerateTerrainParams legacy;
+            r.check(parseGenerateTerrainScript("__generate__:1|4,5|", legacy)
+                        && legacy.mode == 0,
+                    "gen: legacy tag (no mode) defaults to per-cell");
+        }
+
+        // ---- whole-grid (Lua generate()) actually fills the array ---------
+        // The program runs ONCE and owns the whole grid via set()/coord(). Here
+        // a 1D ramp: cell i := coord(i,0). Mapped 0..1 -> bipolar like per-cell.
+        if (scriptLangAvailable(ScriptLang::Lua)) {
+            Terrain tg;
+            std::string gerr;
+            bool gok = tg.fillFromScriptWholeGrid(ScriptLang::Lua,
+                "function generate()\n"
+                "  for i = 0, total - 1 do set(i, coord(i, 0)) end\n"
+                "end\n",
+                { 5 }, gerr);
+            r.check(gok, "gen: Lua whole-grid generate() runs");
+            if (gok) {
+                const auto& d = tg.getData();
+                float maxErr = 0.0f;
+                for (int i = 0; i < (int)d.size(); ++i) {
+                    float expect = ((float)i / 4.0f) * 2.0f - 1.0f;  // coord*2-1
+                    maxErr = std::max(maxErr, std::abs(d[(size_t)i] - expect));
+                }
+                r.checkVal(maxErr < 1e-5, "gen: Lua whole-grid 1D ramp matches coord", maxErr);
+            }
+
+            // Builtin can't do whole-grid (per-cell only): must error cleanly.
+            Terrain tb2;
+            std::string berr;
+            bool bok = tb2.fillFromScriptWholeGrid(ScriptLang::Builtin, "0.5", { 4 }, berr);
+            r.check(!bok && !berr.empty(),
+                    "gen: per-cell-only language rejected for whole-grid");
+
+            // A whole-grid program missing generate() must error, not crash.
+            Terrain tn;
+            std::string nerr;
+            bool nok = tn.fillFromScriptWholeGrid(ScriptLang::Lua,
+                "function loop() return 0.5 end\n", { 4 }, nerr);
+            r.check(!nok && !nerr.empty(),
+                    "gen: whole-grid without generate() errors");
+
+            // ---- N-D index helpers (flatten / coordAxis / neighbor) ----------
+            // On a {3,4} grid each cell verifies: flatten(coordAxis(i,0),
+            // coordAxis(i,1)) round-trips to i; flatten edge-clamps out-of-range
+            // coords; neighbor steps + clamps. Each cell stores 1 iff all hold,
+            // so the whole grid must come back as bipolar +1.
+            Terrain tf;
+            std::string ferr;
+            bool fok = tf.fillFromScriptWholeGrid(ScriptLang::Lua,
+                "function generate()\n"
+                "  for i = 0, total - 1 do\n"
+                "    local r = coordAxis(i, 0)\n"
+                "    local c = coordAxis(i, 1)\n"
+                "    local ok = (flatten(r, c) == i)\n"
+                "    ok = ok and (flatten(-1, -1) == 0) and (flatten(99, 99) == total - 1)\n"
+                "    ok = ok and (neighbor(i, 1, 1) == flatten(r, math.min(c + 1, 3)))\n"
+                "    ok = ok and (neighbor(i, 0, -1) == flatten(math.max(r - 1, 0), c))\n"
+                "    set(i, ok and 1 or 0)\n"
+                "  end\n"
+                "end\n",
+                { 3, 4 }, ferr);
+            r.check(fok, "gen: Lua flatten/coordAxis/neighbor run");
+            if (fok) {
+                const auto& d = tf.getData();
+                float minV = 1.0f;
+                for (float v : d) minV = std::min(minV, v);
+                r.checkVal(d.size() == 12 && minV > 0.999f,
+                           "gen: Lua N-D index helpers round-trip", minV);
+            }
+
+            // ---- Direct N-D pixel access (getAt / setAt) ---------------------
+            // Write a known pattern with setAt(r,c,v), read it back with
+            // getAt(r,c), check getAt edge-clamps out-of-range reads, and check
+            // an out-of-range setAt is a no-op. Then overwrite the whole grid
+            // with the all-OK flag so a correct run reads back as bipolar +1.
+            Terrain tap;
+            std::string aperr;
+            bool apok = tap.fillFromScriptWholeGrid(ScriptLang::Lua,
+                "function generate()\n"
+                "  for rr = 0, 2 do for cc = 0, 3 do setAt(rr, cc, (rr*4+cc)/11) end end\n"
+                "  local ok = true\n"
+                "  for rr = 0, 2 do for cc = 0, 3 do\n"
+                "    if math.abs(getAt(rr,cc) - (rr*4+cc)/11) > 1e-4 then ok = false end\n"
+                "  end end\n"
+                "  if math.abs(getAt(-1,-1) - getAt(0,0)) > 1e-6 then ok = false end\n"
+                "  if math.abs(getAt(99,99) - getAt(2,3)) > 1e-6 then ok = false end\n"
+                "  local before = getAt(0,0)\n"
+                "  setAt(-1, 0, 1.0)\n"
+                "  if math.abs(getAt(0,0) - before) > 1e-6 then ok = false end\n"
+                "  for i = 0, total - 1 do set(i, ok and 1 or 0) end\n"
+                "end\n",
+                { 3, 4 }, aperr);
+            r.check(apok, "gen: Lua getAt/setAt run");
+            if (apok) {
+                const auto& d = tap.getData();
+                float minV = 1.0f;
+                for (float v : d) minV = std::min(minV, v);
+                r.checkVal(d.size() == 12 && minV > 0.999f,
+                           "gen: Lua getAt/setAt round-trip + clamp + OOB", minV);
+            }
+        }
+
+        // ---- Python generator backend (ScriptEngine::bakeTerrain) ----------
+        // Guarded: the test build often lacks the Python DLL, in which case
+        // bakeTerrain must fail cleanly (never touch the C API). When Python IS
+        // present we verify both modes produce the bipolar [-1,1] grid.
+        if (ScriptEngine::pythonAvailable()) {
+            ScriptEngine::instance().init();
+
+            // Per-cell: a flat 0.75 -> bipolar 0.5 in every cell.
+            {
+                std::vector<float> out;
+                std::string err;
+                bool ok = ScriptEngine::instance().bakeTerrain(
+                    "0.75", /*wholeGrid*/false, { 6 }, out, err);
+                r.check(ok, "gen: Python per-cell bakeTerrain runs");
+                if (ok) {
+                    r.check(out.size() == 6, "gen: Python per-cell fills product(dims)");
+                    float maxErr = 0.0f;
+                    for (float v : out) maxErr = std::max(maxErr, std::abs(v - 0.5f));
+                    r.checkVal(maxErr < 1e-5, "gen: Python per-cell 0.75->bipolar 0.5", maxErr);
+                }
+            }
+
+            // Per-cell coords: c0 sweeps 0..1 over a 5-cell axis -> bipolar ramp.
+            {
+                std::vector<float> out;
+                std::string err;
+                bool ok = ScriptEngine::instance().bakeTerrain(
+                    "c0", /*wholeGrid*/false, { 5 }, out, err);
+                r.check(ok && out.size() == 5, "gen: Python per-cell c0 axis runs");
+                if (ok && out.size() == 5) {
+                    float maxErr = 0.0f;
+                    for (int i = 0; i < 5; ++i) {
+                        float expect = ((float)i / 4.0f) * 2.0f - 1.0f;
+                        maxErr = std::max(maxErr, std::abs(out[(size_t)i] - expect));
+                    }
+                    r.checkVal(maxErr < 1e-5, "gen: Python per-cell c0 ramp matches coord", maxErr);
+                }
+            }
+
+            // Whole-grid: generate() fills a 1D ramp via set(i, coord(i,0)).
+            {
+                std::vector<float> out;
+                std::string err;
+                bool ok = ScriptEngine::instance().bakeTerrain(
+                    "def generate():\n"
+                    "    for i in range(total):\n"
+                    "        set(i, coord(i, 0))\n",
+                    /*wholeGrid*/true, { 5 }, out, err);
+                r.check(ok && out.size() == 5, "gen: Python whole-grid generate() runs");
+                if (ok && out.size() == 5) {
+                    float maxErr = 0.0f;
+                    for (int i = 0; i < 5; ++i) {
+                        float expect = ((float)i / 4.0f) * 2.0f - 1.0f;
+                        maxErr = std::max(maxErr, std::abs(out[(size_t)i] - expect));
+                    }
+                    r.checkVal(maxErr < 1e-5, "gen: Python whole-grid 1D ramp matches coord", maxErr);
+                }
+            }
+
+            // Whole-grid N-D index helpers: same {3,4} round-trip as the Lua test
+            // (flatten/coordAxis/neighbor), so each cell comes back as bipolar +1.
+            {
+                std::vector<float> out;
+                std::string err;
+                bool ok = ScriptEngine::instance().bakeTerrain(
+                    "def generate():\n"
+                    "    for i in range(total):\n"
+                    "        r = coordAxis(i, 0)\n"
+                    "        c = coordAxis(i, 1)\n"
+                    "        ok = (flatten(r, c) == i)\n"
+                    "        ok = ok and (flatten(-1, -1) == 0) and (flatten(99, 99) == total - 1)\n"
+                    "        ok = ok and (neighbor(i, 1, 1) == flatten(r, min(c + 1, 3)))\n"
+                    "        ok = ok and (neighbor(i, 0, -1) == flatten(max(r - 1, 0), c))\n"
+                    "        set(i, 1.0 if ok else 0.0)\n",
+                    /*wholeGrid*/true, { 3, 4 }, out, err);
+                r.check(ok && out.size() == 12, "gen: Python flatten/coordAxis/neighbor run");
+                if (ok && out.size() == 12) {
+                    float minV = 1.0f;
+                    for (float v : out) minV = std::min(minV, v);
+                    r.checkVal(minV > 0.999f, "gen: Python N-D index helpers round-trip", minV);
+                }
+            }
+
+            // Direct N-D pixel access (getAt/setAt): same checks as the Lua test -
+            // pattern round-trip, edge-clamped reads, OOB-write no-op - collapsed
+            // into an all-OK flag written across the grid (bipolar +1 on success).
+            {
+                std::vector<float> out;
+                std::string err;
+                bool ok = ScriptEngine::instance().bakeTerrain(
+                    "def generate():\n"
+                    "    for rr in range(3):\n"
+                    "        for cc in range(4):\n"
+                    "            setAt(rr, cc, (rr*4+cc)/11)\n"
+                    "    good = True\n"
+                    "    for rr in range(3):\n"
+                    "        for cc in range(4):\n"
+                    "            if abs(getAt(rr,cc) - (rr*4+cc)/11) > 1e-4: good = False\n"
+                    "    if abs(getAt(-1,-1) - getAt(0,0)) > 1e-6: good = False\n"
+                    "    if abs(getAt(99,99) - getAt(2,3)) > 1e-6: good = False\n"
+                    "    before = getAt(0,0)\n"
+                    "    setAt(-1, 0, 1.0)\n"
+                    "    if abs(getAt(0,0) - before) > 1e-6: good = False\n"
+                    "    for i in range(total):\n"
+                    "        set(i, 1.0 if good else 0.0)\n",
+                    /*wholeGrid*/true, { 3, 4 }, out, err);
+                r.check(ok && out.size() == 12, "gen: Python getAt/setAt run");
+                if (ok && out.size() == 12) {
+                    float minV = 1.0f;
+                    for (float v : out) minV = std::min(minV, v);
+                    r.checkVal(minV > 0.999f, "gen: Python getAt/setAt round-trip + clamp + OOB", minV);
+                }
+            }
+
+            // Output clamps: a per-cell value of 5.0 must clamp to 1.0 -> bipolar 1.0.
+            {
+                std::vector<float> out;
+                std::string err;
+                bool ok = ScriptEngine::instance().bakeTerrain(
+                    "5.0", /*wholeGrid*/false, { 3 }, out, err);
+                r.check(ok, "gen: Python out-of-range value bakes");
+                if (ok) {
+                    float maxErr = 0.0f;
+                    for (float v : out) maxErr = std::max(maxErr, std::abs(v - 1.0f));
+                    r.checkVal(maxErr < 1e-5, "gen: Python per-cell clamps >1 to bipolar 1", maxErr);
+                }
+            }
+
+            // A syntax error must fail cleanly with a message, not crash.
+            {
+                std::vector<float> out;
+                std::string err;
+                bool ok = ScriptEngine::instance().bakeTerrain(
+                    "this is not python", /*wholeGrid*/false, { 4 }, out, err);
+                r.check(!ok && !err.empty(), "gen: Python syntax error fails cleanly");
+            }
+        } else {
+            // No Python: bakeTerrain must refuse without touching the C API.
+            std::vector<float> out;
+            std::string err;
+            bool ok = ScriptEngine::instance().bakeTerrain(
+                "0.5", /*wholeGrid*/false, { 4 }, out, err);
+            r.check(!ok && !err.empty(),
+                    "gen: bakeTerrain fails cleanly when Python unavailable");
+        }
+
+        // ---- waveform() cross-language factory-bank reads -------------------
+        // The waveform("name", phase) helper is exposed in Builtin / Lua /
+        // Python / GLSL and all four read the SAME WaveformBank::sampleAtPhase.
+        // A terrain built with `unipolar(waveform(name, c0))` therefore
+        // reproduces the bank's cycle exactly: unipolar maps the [-1,1] sample to
+        // [0,1], and the terrain's own [0,1]->[-1,1] mapping recovers the raw
+        // sample. Gated on the factory bank actually loading (waveforms.bin sits
+        // next to the executable).
+        {
+            auto& bank = WaveformBank::get();
+            bank.ensureLoaded();
+            if (bank.numEntries() > 0) {
+                const std::string name = bank.entry(0).name;
+                const int id = bank.indexForName(name);
+                r.check(id == 0, "waveform: indexForName resolves entry 0 by name");
+
+                std::string upper = name;
+                for (char& c : upper) if (c >= 'a' && c <= 'z') c = (char)(c - 'a' + 'A');
+                r.check(bank.indexForName(upper) == 0,
+                        "waveform: name lookup is case-insensitive");
+                r.check(bank.sampleAtPhase(-1, 0.3f) == 0.0f
+                     && bank.sampleAtPhase(bank.numEntries(), 0.3f) == 0.0f,
+                        "waveform: out-of-range index reads 0");
+                {
+                    auto s0 = bank.samples(0);
+                    r.checkVal((double)std::abs(bank.sampleAtPhase(0, 0.0f) - s0[0]) < 1e-6,
+                               "waveform: phase 0 hits sample 0", 0.0);
+                }
+
+                const int DN = 16;
+                std::vector<float> ref((size_t)DN);
+                for (int i = 0; i < DN; ++i) {
+                    float c0 = (DN > 1) ? (float)i / (float)(DN - 1) : 0.0f;
+                    ref[(size_t)i] = bank.sampleAtPhase(id, c0);
+                }
+                auto cmpField = [&](const Terrain& t, const char* label) {
+                    if (t.totalSize() != DN) { r.check(false, label); return; }
+                    double maxErr = 0;
+                    for (int i = 0; i < DN; ++i)
+                        maxErr = std::max(maxErr, (double)std::abs(t.at(i) - ref[(size_t)i]));
+                    r.checkVal(maxErr < 1e-4, label, maxErr);
+                };
+                // Names carry no quotes/backslashes, but escape defensively.
+                std::string qn = "\"";
+                for (char c : name) { if (c == '"' || c == '\\') qn.push_back('\\'); qn.push_back(c); }
+                qn.push_back('"');
+
+                // Builtin per-cell.
+                {
+                    Terrain t; std::string err;
+                    bool ok = t.fillFromScript(ScriptLang::Builtin,
+                        "unipolar(waveform(" + qn + ", c0))", { DN }, err);
+                    r.check(ok, "waveform: Builtin waveform() runs");
+                    if (ok) cmpField(t, "waveform: Builtin matches bank");
+                }
+                // Lua per-cell.
+                if (scriptLangAvailable(ScriptLang::Lua)) {
+                    Terrain t; std::string err;
+                    bool ok = t.fillFromScript(ScriptLang::Lua,
+                        "function loop() return waveform(" + qn + ", c0) * 0.5 + 0.5 end",
+                        { DN }, err);
+                    r.check(ok, "waveform: Lua waveform() runs");
+                    if (ok) cmpField(t, "waveform: Lua matches bank");
+                }
+                // Python per-cell.
+                if (ScriptEngine::pythonAvailable()) {
+                    ScriptEngine::instance().init();
+                    std::vector<float> out; std::string err;
+                    bool ok = ScriptEngine::instance().bakeTerrain(
+                        "waveform(" + qn + ", c0) * 0.5 + 0.5", false, { DN }, out, err);
+                    r.check(ok, "waveform: Python waveform() runs");
+                    if (ok && (int)out.size() == DN) {
+                        double maxErr = 0;
+                        for (int i = 0; i < DN; ++i)
+                            maxErr = std::max(maxErr,
+                                (double)std::abs(out[(size_t)i] - ref[(size_t)i]));
+                        r.checkVal(maxErr < 1e-4, "waveform: Python matches bank", maxErr);
+                    }
+                }
+                // GLSL per-cell. GLSL is integer-only (no strings on the GPU):
+                // the user passes the stable entry index, which equals `id` here.
+                // The whole bank is uploaded once to the cached binding-2 SSBO; no
+                // source rewriting happens.
+                if (glslComputeAvailable(nullptr)) {
+                    Terrain t; std::string err;
+                    bool ok = t.fillFromGlsl(
+                        "return waveform(" + std::to_string(id) + ", c[0]) * 0.5 + 0.5;",
+                        false, { DN }, err, 1);
+                    r.check(ok, "waveform: GLSL waveform() runs");
+                    if (ok) cmpField(t, "waveform: GLSL matches bank");
+
+                    // Out-of-range id -> silence (0.5 -> bipolar 0).
+                    Terrain tu; std::string eu;
+                    bool oku = tu.fillFromGlsl(
+                        "return waveform(999999999, c[0]) * 0.5 + 0.5;",
+                        false, { DN }, eu, 1);
+                    r.check(oku, "waveform: GLSL out-of-range id still compiles");
+                    if (oku) {
+                        double maxErr = 0;
+                        for (int i = 0; i < DN; ++i)
+                            maxErr = std::max(maxErr, (double)std::abs(tu.at(i)));
+                        r.checkVal(maxErr < 1e-5, "waveform: GLSL out-of-range id reads silence", maxErr);
+                    }
+                }
+
+                // waveforms[name] -> stable id, identical in Lua and Python, and
+                // equal to indexForName(). Reading via the dict and via the name
+                // string must reproduce the same bank cycle.
+                if (scriptLangAvailable(ScriptLang::Lua)) {
+                    Terrain t; std::string err;
+                    bool ok = t.fillFromScript(ScriptLang::Lua,
+                        "local w = waveforms[" + qn + "]\n"
+                        "function loop() return waveform(w, c0) * 0.5 + 0.5 end",
+                        { DN }, err);
+                    r.check(ok, "waveform: Lua waveforms[name] runs");
+                    if (ok) cmpField(t, "waveform: Lua waveforms[name] matches bank");
+
+                    // Unknown name -> -1 -> silence.
+                    Terrain tu; std::string eu;
+                    bool oku = tu.fillFromScript(ScriptLang::Lua,
+                        "local w = waveforms[\"__no_such_waveform__\"]\n"
+                        "function loop() return (w == -1) and 0.5 or 0.0 end",
+                        { DN }, eu);
+                    r.check(oku && tu.totalSize() == DN
+                                && std::abs(tu.at(0)) < 1e-5,
+                            "waveform: Lua waveforms[unknown] == -1");
+                }
+                if (ScriptEngine::pythonAvailable()) {
+                    ScriptEngine::instance().init();
+                    std::vector<float> out; std::string err;
+                    bool ok = ScriptEngine::instance().bakeTerrain(
+                        "waveform(waveforms[" + qn + "], c0) * 0.5 + 0.5",
+                        false, { DN }, out, err);
+                    r.check(ok, "waveform: Python waveforms[name] runs");
+                    if (ok && (int)out.size() == DN) {
+                        double maxErr = 0;
+                        for (int i = 0; i < DN; ++i)
+                            maxErr = std::max(maxErr,
+                                (double)std::abs(out[(size_t)i] - ref[(size_t)i]));
+                        r.checkVal(maxErr < 1e-4, "waveform: Python waveforms[name] matches bank", maxErr);
+                    }
+                }
+            } else {
+                r.check(true, "waveform: factory bank unavailable (read tests skipped)");
+            }
+        }
+
+        // ---- Event-driven MIDI input (PerBlock streaming scripts) ----------
+        // A block-mode Lua signal script reads the block's MIDI-input events via
+        // midiin()/midievent() and reacts to them, instead of only polling the
+        // block-constant note/vel/gate. We feed a synthetic ScriptBlockCtx with a
+        // hand-built event list and check the script saw each event correctly.
+        if (scriptLangAvailable(ScriptLang::Lua)) {
+            auto rt = makeScriptRuntime(ScriptLang::Lua, ScriptRole::Signal,
+                                        ScriptRate::PerBlock);
+            r.check(rt != nullptr, "midiin: Lua block-mode runtime created");
+            if (rt) {
+                // Program: count events, and stamp the output buffer so we can
+                // read back what the script observed:
+                //   out(0) = number of events
+                //   out(1) = note number of the first note-on (/127)
+                //   out(2) = velocity of that note-on
+                //   out(3) = its sample offset (/n)
+                //   out(4) = CC value of the first cc event
+                //   out(5) = (bend+1)/2 of the first bend event
+                std::string err;
+                const char* prog =
+                    "function loop()\n"
+                    "  local cnt = midiin()\n"
+                    "  out(0, cnt/127)\n"
+                    "  for k=1,cnt do\n"
+                    "    local kind, off, a, b = midievent(k)\n"
+                    "    if kind=='on' and get1==nil then\n"
+                    "      get1=1; out(1, a/127); out(2, b); out(3, off/n)\n"
+                    "    elseif kind=='cc' and getc==nil then\n"
+                    "      getc=1; out(4, b)\n"
+                    "    elseif kind=='bend' and getb==nil then\n"
+                    "      getb=1; out(5, (b+1)/2)\n"
+                    "    end\n"
+                    "  end\n"
+                    "end\n";
+                bool lok = rt->load(prog, err);
+                r.check(lok, "midiin: program loads");
+
+                std::vector<ScriptMidiEvent> ev;
+                ev.push_back({ 10, 1, 64, 100.0f / 127.0f }); // note-on C, vel 100, off 10
+                ev.push_back({ 20, 2, 7, 64.0f / 127.0f });   // CC7 ~0.5
+                ev.push_back({ 30, 3, 0, 0.5f });             // bend +0.5
+                ev.push_back({ 40, 0, 64, 0.0f });            // note-off
+
+                const int N = 64;
+                std::vector<float> outBuf((size_t)N, -1.0f);
+                ScriptBlockCtx ctx;
+                ctx.sampleRate = 44100.0;
+                ctx.numSamples = N;
+                ctx.out        = outBuf.data();
+                ctx.midiIn     = &ev;
+                ctx.midiInCount = (int)ev.size();
+                rt->runBlock(ctx);
+                r.check(rt->getError().empty(),
+                        "midiin: no runtime error [" + rt->getError() + "]");
+
+                auto near = [](float a, float b) { return std::abs(a - b) < 1e-3f; };
+                r.checkVal(near(outBuf[0], 4.0f / 127.0f),
+                           "midiin: midiin() count == 4", outBuf[0] * 127.0f);
+                r.checkVal(near(outBuf[1], 64.0f / 127.0f),
+                           "midiin: first note-on note == 64", outBuf[1] * 127.0f);
+                r.checkVal(near(outBuf[2], 100.0f / 127.0f),
+                           "midiin: first note-on velocity", outBuf[2]);
+                r.checkVal(near(outBuf[3], 10.0f / N),
+                           "midiin: first note-on offset == 10", outBuf[3] * N);
+                r.checkVal(near(outBuf[4], 64.0f / 127.0f),
+                           "midiin: cc value preserved", outBuf[4]);
+                r.checkVal(near(outBuf[5], 0.75f),
+                           "midiin: bend +0.5 -> 0.75", outBuf[5]);
+
+                // Per-sample (no block ctx) -> midiin() returns 0 gracefully.
+                auto rt2 = makeScriptRuntime(ScriptLang::Lua, ScriptRole::Signal,
+                                             ScriptRate::PerSample);
+                if (rt2) {
+                    std::string err2;
+                    bool l2 = rt2->load("function loop() return midiin()*0 end", err2);
+                    ScriptVars sv;
+                    float v = rt2->evalSignal(sv);
+                    r.check(l2 && v == 0.0f,
+                            "midiin: per-sample midiin() is 0 (no block ctx)");
+                }
+            }
+        }
+
+        // ---- Streaming pull-model (coroutine stream() scripts) -------------
+        // A streaming script owns its own loop and PULLS input / PUSHES output,
+        // suspending (Lua coroutine yield) at the block boundary and resuming in
+        // the next block with its local state intact. We verify: (1) a 1-sample
+        // delay carries a value ACROSS a block boundary (proving the coroutine's
+        // locals persist across suspend/resume); (2) pollmidi() drains MIDI input
+        // event-driven as the cursor advances; (3) pullblock()/outblock() process
+        // a whole block at once and still suspend/resume correctly.
+        if (scriptLangAvailable(ScriptLang::Lua)) {
+            auto nearf = [](float a, float b) { return std::abs(a - b) < 1e-3f; };
+
+            // (1) 1-sample delay across two blocks.
+            {
+                auto rt = makeScriptRuntime(ScriptLang::Lua, ScriptRole::Signal,
+                                            ScriptRate::PerBlock);
+                r.check(rt != nullptr, "stream: Lua block-mode runtime created");
+                if (rt) {
+                    std::string err;
+                    const char* prog =
+                        "function stream()\n"
+                        "  local prev = 0\n"
+                        "  while true do\n"
+                        "    local x = pull()\n"   // next input sample (blocks at block end)
+                        "    out(prev)\n"          // output the PREVIOUS sample
+                        "    prev = x\n"
+                        "  end\n"
+                        "end\n";
+                    r.check(rt->load(prog, err), "stream: delay program loads [" + err + "]");
+
+                    const int N = 4;
+                    std::vector<float> in1 = { 0.1f, 0.2f, 0.3f, 0.4f };
+                    std::vector<float> in2 = { 0.5f, 0.6f, 0.7f, 0.8f };
+                    std::vector<float> out1((size_t)N, -1.0f), out2((size_t)N, -1.0f);
+                    std::vector<const float*> sigPtrs(1, nullptr);
+
+                    ScriptBlockCtx ctx;
+                    ctx.sampleRate = 44100.0; ctx.numSamples = N;
+                    ctx.sig = &sigPtrs; ctx.sigCount = 1;
+
+                    sigPtrs[0] = in1.data(); ctx.out = out1.data();
+                    rt->runBlock(ctx);
+                    sigPtrs[0] = in2.data(); ctx.out = out2.data();
+                    rt->runBlock(ctx);
+                    r.check(rt->getError().empty(),
+                            "stream: no runtime error [" + rt->getError() + "]");
+
+                    bool b1 = nearf(out1[0], 0.0f) && nearf(out1[1], 0.1f)
+                            && nearf(out1[2], 0.2f) && nearf(out1[3], 0.3f);
+                    r.check(b1, "stream: block1 = 1-sample delay of input");
+                    // The key assertion: out2[0] is block1's LAST input, proving
+                    // the coroutine local `prev` survived the block boundary.
+                    r.checkVal(nearf(out2[0], 0.4f),
+                               "stream: state persists across blocks (out2[0]==in1 tail)",
+                               out2[0]);
+                    bool b2 = nearf(out2[1], 0.5f) && nearf(out2[2], 0.6f)
+                            && nearf(out2[3], 0.7f);
+                    r.check(b2, "stream: block2 delayed samples");
+                }
+            }
+
+            // (2) Event-driven pollmidi() inside a streaming loop.
+            {
+                auto rt = makeScriptRuntime(ScriptLang::Lua, ScriptRole::Signal,
+                                            ScriptRate::PerBlock);
+                if (rt) {
+                    std::string err;
+                    const char* prog =
+                        "hits = 0\n"
+                        "function stream()\n"
+                        "  while true do\n"
+                        "    pull()\n"                          // advance one sample
+                        "    local k = pollmidi()\n"
+                        "    while k do\n"
+                        "      if k=='on' then hits = hits + 1 end\n"
+                        "      k = pollmidi()\n"
+                        "    end\n"
+                        "    out(hits/127)\n"
+                        "  end\n"
+                        "end\n";
+                    r.check(rt->load(prog, err), "stream: pollmidi program loads [" + err + "]");
+
+                    const int N = 4;
+                    std::vector<ScriptMidiEvent> ev;
+                    ev.push_back({ 1, 1, 60, 1.0f });   // note-on at sample 1
+                    ev.push_back({ 3, 1, 64, 1.0f });   // note-on at sample 3
+                    std::vector<float> out((size_t)N, -1.0f);
+                    ScriptBlockCtx ctx;
+                    ctx.sampleRate = 44100.0; ctx.numSamples = N;
+                    ctx.out = out.data();
+                    ctx.midiIn = &ev; ctx.midiInCount = (int)ev.size();
+                    rt->runBlock(ctx);
+                    r.check(rt->getError().empty(),
+                            "stream: pollmidi no runtime error [" + rt->getError() + "]");
+                    // Cursor reaches event 1 at sample 1, event 2 at sample 3.
+                    bool ok = nearf(out[0], 0.0f) && nearf(out[1], 1.0f / 127.0f)
+                            && nearf(out[2], 1.0f / 127.0f) && nearf(out[3], 2.0f / 127.0f);
+                    r.check(ok, "stream: pollmidi drains events at the cursor");
+                }
+            }
+
+            // (3) Whole-block pullblock()/outblock() (block-rate streaming).
+            {
+                auto rt = makeScriptRuntime(ScriptLang::Lua, ScriptRole::Signal,
+                                            ScriptRate::PerBlock);
+                if (rt) {
+                    std::string err;
+                    const char* prog =
+                        "function stream()\n"
+                        "  while true do\n"
+                        "    local t = pullblock(1)\n"      // single-pin convenience form
+                        "    for i=1,#t do t[i] = t[i]*0.5 end\n"
+                        "    outblock(t)\n"
+                        "  end\n"
+                        "end\n";
+                    r.check(rt->load(prog, err), "stream: pullblock program loads [" + err + "]");
+
+                    const int N = 4;
+                    std::vector<float> in1 = { 0.2f, 0.4f, 0.6f, 0.8f };
+                    std::vector<float> in2 = { 1.0f, 1.0f, 1.0f, 1.0f };
+                    std::vector<float> out1((size_t)N, -1.0f), out2((size_t)N, -1.0f);
+                    std::vector<const float*> sigPtrs(1, nullptr);
+                    ScriptBlockCtx ctx;
+                    ctx.sampleRate = 44100.0; ctx.numSamples = N;
+                    ctx.sig = &sigPtrs; ctx.sigCount = 1;
+
+                    sigPtrs[0] = in1.data(); ctx.out = out1.data();
+                    rt->runBlock(ctx);
+                    sigPtrs[0] = in2.data(); ctx.out = out2.data();
+                    rt->runBlock(ctx);
+                    r.check(rt->getError().empty(),
+                            "stream: pullblock no runtime error [" + rt->getError() + "]");
+                    bool b1 = nearf(out1[0], 0.1f) && nearf(out1[1], 0.2f)
+                            && nearf(out1[2], 0.3f) && nearf(out1[3], 0.4f);
+                    bool b2 = nearf(out2[0], 0.5f) && nearf(out2[3], 0.5f);
+                    r.check(b1, "stream: pullblock/outblock halves block1");
+                    r.check(b2, "stream: pullblock/outblock resumes for block2");
+                }
+            }
+
+            // (4) Multi-output: a streaming script drives two output pins
+            // independently via out(1,v)/out(2,v). The host hands it two distinct
+            // buffers through ScriptBlockCtx::outs and we verify they differ.
+            {
+                auto rt = makeScriptRuntime(ScriptLang::Lua, ScriptRole::Signal,
+                                            ScriptRate::PerBlock);
+                if (rt) {
+                    std::string err;
+                    const char* prog =
+                        "function stream()\n"
+                        "  while true do\n"
+                        "    local x = pull()\n"
+                        "    out(1, x)\n"            // pin o1 = input
+                        "    out(2, 1 - x)\n"        // pin o2 = inverted input
+                        "  end\n"
+                        "end\n";
+                    r.check(rt->load(prog, err), "stream: multi-out program loads [" + err + "]");
+
+                    const int N = 4;
+                    std::vector<float> in = { 0.1f, 0.3f, 0.6f, 0.9f };
+                    std::vector<float> o1((size_t)N, -1.0f), o2((size_t)N, -1.0f);
+                    std::vector<const float*> sigPtrs(1, in.data());
+                    std::vector<float*> outPtrs = { o1.data(), o2.data() };
+                    ScriptBlockCtx ctx;
+                    ctx.sampleRate = 44100.0; ctx.numSamples = N;
+                    ctx.sig = &sigPtrs; ctx.sigCount = 1;
+                    ctx.out = o1.data();            // out(v)/out(1,..) -> pin 0
+                    ctx.outs = &outPtrs; ctx.outCount = 2;
+                    rt->runBlock(ctx);
+                    r.check(rt->getError().empty(),
+                            "stream: multi-out no runtime error [" + rt->getError() + "]");
+                    bool ok = nearf(o1[0], 0.1f) && nearf(o1[3], 0.9f)
+                            && nearf(o2[0], 0.9f) && nearf(o2[3], 0.1f);
+                    r.check(ok, "stream: out(1,..)/out(2,..) drive separate buffers");
+                }
+            }
+
+            // (5) Structured pullblock(): no-arg form returns params (list-of-lists,
+            // one array per input pin) plus a unified MIDI event list. We feed two
+            // param inputs and one MIDI event; the script copies input pin 2 to
+            // output pin 1, and writes the first event's (note/127, idx/16) to the
+            // whole of output pin 2 — so we can assert both the param and event paths
+            // through the output buffers.
+            {
+                auto rt = makeScriptRuntime(ScriptLang::Lua, ScriptRole::Signal,
+                                            ScriptRate::PerBlock);
+                if (rt) {
+                    std::string err;
+                    const char* prog =
+                        "function stream()\n"
+                        "  while true do\n"
+                        "    local params, events = pullblock()\n"
+                        "    outblock(1, params[2])\n"      // pin o1 = input pin 2
+                        "    local note, idx = 0, 0\n"
+                        "    if #events > 0 then\n"
+                        "      note = events[1].a\n"
+                        "      idx  = events[1].idx\n"
+                        "    end\n"
+                        "    local e = {}\n"
+                        "    for i = 1, 4 do e[i] = (i <= 2) and note/127 or idx/16 end\n"
+                        "    outblock(2, e)\n"
+                        "  end\n"
+                        "end\n";
+                    r.check(rt->load(prog, err), "stream: structured pullblock loads [" + err + "]");
+
+                    const int N = 4;
+                    std::vector<float> in1 = { 0.0f, 0.0f, 0.0f, 0.0f };
+                    std::vector<float> in2 = { 0.2f, 0.4f, 0.6f, 0.8f };
+                    std::vector<const float*> sigPtrs = { in1.data(), in2.data() };
+                    std::vector<float> o1((size_t)N, -1.0f), o2((size_t)N, -1.0f);
+                    std::vector<float*> outPtrs = { o1.data(), o2.data() };
+                    std::vector<ScriptMidiEvent> ev;
+                    ev.push_back({ 0, 1, 72, 1.0f });   // note-on, note 72, at sample 0
+                    ScriptBlockCtx ctx;
+                    ctx.sampleRate = 44100.0; ctx.numSamples = N;
+                    ctx.sig = &sigPtrs; ctx.sigCount = 2;
+                    ctx.out = o1.data();
+                    ctx.outs = &outPtrs; ctx.outCount = 2;
+                    ctx.midiIn = &ev; ctx.midiInCount = (int)ev.size();
+                    rt->runBlock(ctx);
+                    r.check(rt->getError().empty(),
+                            "stream: structured pullblock no error [" + rt->getError() + "]");
+                    bool sigOk = nearf(o1[0], 0.2f) && nearf(o1[1], 0.4f)
+                               && nearf(o1[2], 0.6f) && nearf(o1[3], 0.8f);
+                    r.check(sigOk, "stream: params[2] copied to output (list-of-lists)");
+                    bool evOk = nearf(o2[0], 72.0f / 127.0f)   // event note number
+                              && nearf(o2[3], 1.0f / 16.0f);   // 1-based MIDI-input idx
+                    r.check(evOk, "stream: pullblock events list carries note + idx");
+                }
+            }
+
+            // (6) pollmidi() returns idx LAST so the kind-first idiom still works,
+            // and the idx reflects the (1-based) MIDI-input pin.
+            {
+                auto rt = makeScriptRuntime(ScriptLang::Lua, ScriptRole::Signal,
+                                            ScriptRate::PerBlock);
+                if (rt) {
+                    std::string err;
+                    const char* prog =
+                        "lastidx = 0\n"
+                        "function stream()\n"
+                        "  while true do\n"
+                        "    pull()\n"
+                        "    local k, off, a, b, idx = pollmidi()\n"
+                        "    while k do\n"
+                        "      lastidx = idx\n"
+                        "      out(a / 127)\n"
+                        "      k, off, a, b, idx = pollmidi()\n"
+                        "    end\n"
+                        "  end\n"
+                        "end\n";
+                    r.check(rt->load(prog, err), "stream: pollmidi idx program loads [" + err + "]");
+                    const int N = 4;
+                    std::vector<ScriptMidiEvent> ev;
+                    ev.push_back({ 2, 1, 64, 1.0f });   // note-on at sample 2
+                    std::vector<float> out((size_t)N, -1.0f);
+                    ScriptBlockCtx ctx;
+                    ctx.sampleRate = 44100.0; ctx.numSamples = N;
+                    ctx.out = out.data();
+                    ctx.midiIn = &ev; ctx.midiInCount = (int)ev.size();
+                    rt->runBlock(ctx);
+                    r.check(rt->getError().empty(),
+                            "stream: pollmidi idx no error [" + rt->getError() + "]");
+                    // out[2] gets 64/127 once the cursor reaches the event.
+                    r.check(nearf(out[2], 64.0f / 127.0f),
+                            "stream: pollmidi kind-first idiom intact (a==64 at sample 2)");
+                }
+            }
+        }
+
+        // ---- Multi-MIDI-input event tagging (buildScriptMidiIn) -------------
+        // A script node with >1 MIDI input pin has its incoming cables stamped by
+        // the graph so each event's channel nibble = (input-pin index + 1). The
+        // host helper buildScriptMidiIn must recover ScriptMidiEvent::inIndex from
+        // that channel. With a single input pin the channel is meaningless and
+        // inIndex stays 0. This exercises the routing contract without standing up
+        // a full audio graph (the stamping itself is a pure channel rewrite).
+        {
+            const int N = 16;
+            juce::MidiBuffer buf;
+            buf.addEvent(juce::MidiMessage::noteOn(1, 60, (juce::uint8)100), 0); // pin 0
+            buf.addEvent(juce::MidiMessage::noteOn(2, 62, (juce::uint8)100), 2); // pin 1
+            buf.addEvent(juce::MidiMessage::noteOn(3, 64, (juce::uint8)100), 4); // pin 2
+            buf.addEvent(juce::MidiMessage::controllerEvent(5, 7, 64),       6); // pin 4
+
+            // Multi-input: inIndex = channel - 1, clamped to 0..count-1.
+            std::vector<ScriptMidiEvent> ev;
+            buildScriptMidiIn(buf, N, ev, /*midiInputCount*/ 5);
+            bool countOk = (ev.size() == 4);
+            r.check(countOk, "multimidi: all 4 events converted");
+            if (countOk) {
+                r.checkVal(ev[0].inIndex == 0, "multimidi: ch1 -> input pin 0", ev[0].inIndex);
+                r.checkVal(ev[1].inIndex == 1, "multimidi: ch2 -> input pin 1", ev[1].inIndex);
+                r.checkVal(ev[2].inIndex == 2, "multimidi: ch3 -> input pin 2", ev[2].inIndex);
+                r.checkVal(ev[3].inIndex == 4, "multimidi: ch5 -> input pin 4", ev[3].inIndex);
+            }
+
+            // A channel beyond the declared count clamps to the last pin.
+            std::vector<ScriptMidiEvent> ev2;
+            buildScriptMidiIn(buf, N, ev2, /*midiInputCount*/ 2);
+            r.check(ev2.size() == 4 && ev2[0].inIndex == 0 && ev2[1].inIndex == 1
+                    && ev2[2].inIndex == 1 && ev2[3].inIndex == 1,
+                    "multimidi: channels past count clamp to last input pin");
+
+            // Single input: channel carries no routing meaning -> inIndex all 0.
+            std::vector<ScriptMidiEvent> ev1;
+            buildScriptMidiIn(buf, N, ev1, /*midiInputCount*/ 1);
+            bool allZero = true;
+            for (auto& e : ev1) if (e.inIndex != 0) allZero = false;
+            r.check(ev1.size() == 4 && allZero,
+                    "multimidi: single input -> inIndex always 0 (channel ignored)");
+        }
+
+        // ---- ContentStore: round-trip, determinism, dedup ------------------
+        // The content-addressed side-store holds baked grids out of undo
+        // snapshots (hash travels, bytes don't) and dedups identical grids.
+        {
+            ContentStore cs;
+            std::vector<float> grid(48);
+            for (int i = 0; i < 48; ++i) grid[(size_t)i] = std::sin(i * 0.3f);
+            std::vector<int> shape = { 4, 12 };
+
+            std::string h1 = cs.putFloatGrid(grid, shape);
+            r.check(h1.size() == 32, "store: hash is 32 hex chars");
+            r.check(cs.has(h1), "store: hash present after put");
+            r.check(cs.size() == 1, "store: one entry after first put");
+
+            std::vector<float> back; std::vector<int> backShape;
+            bool got = cs.getFloatGrid(h1, back, backShape);
+            r.check(got, "store: getFloatGrid resolves hash");
+            r.check(backShape == shape, "store: shape round-trips");
+            float maxErr = 0.0f;
+            for (size_t i = 0; i < back.size() && i < grid.size(); ++i)
+                maxErr = std::max(maxErr, std::abs(back[i] - grid[i]));
+            r.checkVal(back.size() == grid.size() && maxErr == 0.0f,
+                       "store: floats bit-exact through shuffle+DEFLATE", maxErr);
+
+            // Determinism + dedup: same grid -> same hash, stored once.
+            std::string h2 = cs.putFloatGrid(grid, shape);
+            r.check(h2 == h1, "store: identical grid -> identical hash");
+            r.check(cs.size() == 1, "store: dedup - identical grid stored once");
+
+            // Different data -> different hash.
+            std::vector<float> grid2 = grid; grid2[0] += 1.0f;
+            std::string h3 = cs.putFloatGrid(grid2, shape);
+            r.check(h3 != h1, "store: changed cell -> different hash");
+
+            // Same data, different shape -> different hash (shape is hashed).
+            std::string h4 = cs.putFloatGrid(grid, { 12, 4 });
+            r.check(h4 != h1, "store: same data different shape -> different hash");
+
+            // Absent hash resolves false.
+            std::vector<float> none; std::vector<int> noneShape;
+            r.check(!cs.getFloatGrid("00000000000000000000000000000000", none, noneShape),
+                    "store: absent hash resolves false");
+        }
+
+        // ---- makeNpy/parseNpy codec across ranks ---------------------------
+        {
+            std::vector<std::vector<int>> shapes = {
+                { 5 }, { 1 }, { 2, 3 }, { 4, 5, 6 }, { 2, 2, 2, 2 }
+            };
+            bool allOk = true;
+            for (auto& shp : shapes) {
+                long long n = 1; for (int d : shp) n *= d;
+                std::vector<float> data((size_t)n);
+                for (long long i = 0; i < n; ++i)
+                    data[(size_t)i] = (float)(i * 0.5 - 3.0);
+                auto npy = ContentStore::makeNpy(data, shp);
+                // header length (preamble 10 + hlen) is a multiple of 64.
+                size_t hlen = (size_t)(npy[8] | (npy[9] << 8));
+                allOk = allOk && (((10 + hlen) % 64) == 0);
+                std::vector<float> od; std::vector<int> os;
+                bool ok = ContentStore::parseNpy(npy.data(), npy.size(), od, os);
+                allOk = allOk && ok && os == shp && od.size() == data.size();
+                for (size_t i = 0; ok && i < od.size(); ++i)
+                    allOk = allOk && (od[i] == data[i]);
+            }
+            r.check(allOk, "store: makeNpy/parseNpy round-trips 1D..4D bit-exact");
+        }
+
+        // ---- .npz container: ZIP of STORED .npy members --------------------
+        // makeNpz must produce a valid ZIP (local-file + EOCD signatures) whose
+        // STORED member decodes back to the exact grid (this is what np.savez
+        // writes, so NumPy's np.load can read it).
+        {
+            std::vector<float> data = { -1.0f, -0.5f, 0.0f, 0.5f, 1.0f, 0.25f };
+            std::vector<int> shape = { 2, 3 };
+            auto npy = ContentStore::makeNpy(data, shape);
+            auto npz = ContentStore::makeNpz({ { "terrain.npy", npy } });
+
+            bool sigOk = npz.size() > 4 && npz[0] == 0x50 && npz[1] == 0x4b
+                         && npz[2] == 0x03 && npz[3] == 0x04;
+            r.check(sigOk, "store: .npz starts with ZIP local-file signature");
+
+            bool eocd = false;
+            for (size_t i = 0; i + 4 <= npz.size(); ++i)
+                if (npz[i] == 0x50 && npz[i+1] == 0x4b
+                    && npz[i+2] == 0x05 && npz[i+3] == 0x06) { eocd = true; break; }
+            r.check(eocd, "store: .npz has end-of-central-directory record");
+
+            // STORED member begins at 30 + nameLen (fixed 30-byte local header,
+            // zero extra field). Extract it and re-parse the contained .npy.
+            uint16_t nameLen = (uint16_t)(npz[26] | (npz[27] << 8));
+            size_t dataOff = 30u + nameLen;
+            std::vector<float> od; std::vector<int> os;
+            bool parsed = dataOff + npy.size() <= npz.size()
+                && ContentStore::parseNpy(npz.data() + dataOff, npy.size(), od, os);
+            r.check(parsed && os == shape && od == data,
+                    "store: .npz member round-trips back to the exact grid");
+        }
+
+        // ---- undo snapshot excludes blobs; hash travels in the script ------
+        // serializeForUndo must NOT emit the blob bytes (the whole point of the
+        // side-store), but the node's '#hash' reference must survive so undo/redo
+        // resolves the grid from the in-memory store. A real save DOES emit it.
+        {
+            NodeGraph g;
+            GenerateTerrainParams gp;
+            gp.lang = (int)GenLang::Builtin;
+            gp.dims = { 8, 8 };
+            gp.source = "0.5";
+            gp.data.resize(64);
+            for (int i = 0; i < 64; ++i)
+                gp.data[(size_t)i] = (float)i / 63.0f * 2.0f - 1.0f;
+
+            std::string script = makeGenerateTerrainScript(gp, &g.contentStore);
+            r.check(script.find("|#") != std::string::npos,
+                    "store: generate script carries '#hash' (not inline blob)");
+            r.check(g.contentStore.size() == 1, "store: bake populated the graph store");
+
+            auto& n = g.addNode("gen", NodeType::TerrainSynth, {}, {});
+            n.script = script;
+
+            std::string snap = ProjectFile::serializeForUndo(g);
+            r.check(snap.find("[Blob]") == std::string::npos,
+                    "store: undo snapshot omits [Blob] sections");
+            size_t hp = script.rfind("|#");
+            std::string hash = script.substr(hp + 2);
+            r.check(snap.find(hash) != std::string::npos,
+                    "store: undo snapshot keeps the '#hash' reference");
+
+            // Real save round-trips the blob into a fresh graph's store.
+            std::ostringstream oss;
+            ProjectFile::writeProject(oss, g, nullptr, /*includeView*/false,
+                                      /*includeBlobs*/true);
+            std::string saved = oss.str();
+            r.check(saved.find("[Blob]") != std::string::npos,
+                    "store: real save emits [Blob] section");
+
+            NodeGraph g2;
+            std::istringstream iss(saved);
+            ProjectFile::readProject(iss, g2, nullptr);
+            r.check(g2.contentStore.has(hash),
+                    "store: blob round-trips save/load into a fresh store");
+            std::vector<float> rt; std::vector<int> rtShape;
+            bool rok = g2.contentStore.getFloatGrid(hash, rt, rtShape);
+            float maxErr = 0.0f;
+            for (size_t i = 0; rok && i < rt.size() && i < gp.data.size(); ++i)
+                maxErr = std::max(maxErr, std::abs(rt[i] - gp.data[i]));
+            r.checkVal(rok && rt.size() == gp.data.size() && maxErr == 0.0f,
+                       "store: loaded blob bit-exact with baked grid", maxErr);
+        }
+
+        // ---- backward-compat: legacy inline base64 blob still loads ---------
+        // Old projects embedded the grid as gzip+base64 in the 4th field (no
+        // store). make/parse with a null store reproduce and decode that form.
+        {
+            GenerateTerrainParams gp;
+            gp.lang = (int)GenLang::Builtin;
+            gp.dims = { 4, 4 };
+            gp.source = "0.5";
+            gp.data.resize(16);
+            for (int i = 0; i < 16; ++i) gp.data[(size_t)i] = (float)i / 15.0f;
+            std::string legacy = makeGenerateTerrainScript(gp, /*store*/nullptr);
+            r.check(legacy.find("|#") == std::string::npos,
+                    "store: null-store make embeds legacy inline blob (no '#')");
+            GenerateTerrainParams dec;
+            bool ok = parseGenerateTerrainScript(legacy, dec, /*store*/nullptr);
+            float maxErr = 0.0f;
+            for (size_t i = 0; ok && i < dec.data.size() && i < gp.data.size(); ++i)
+                maxErr = std::max(maxErr, std::abs(dec.data[i] - gp.data[i]));
+            r.checkVal(ok && dec.data.size() == gp.data.size() && maxErr == 0.0f,
+                       "store: legacy inline base64 blob still decodes", maxErr);
+        }
+    }
+}
+
+// ===========================================================================
+// LAYER 2 - render through a real TerrainSynthProcessor + WAV export
+// ===========================================================================
+void testRender(Report& r, const juce::File& dir) {
+    r.section("Layer 2: synth render (Sig-driven position -> audio)");
+    const double dur = 1.0;
+
+    // ---- 1D audio: Direct-mode playback of the ramp wavetable -----------
+    {
+        auto wav = dir.getChildFile("test_audio_1d.wav");  // written in layer 1
+        std::string script = "__audio__:" + wav.getFullPathName().toStdString();
+        // 1D: the lone axis is the phase axis, so a Sig sweep mixes with the
+        // played pitch. We don't predict the waveform; we assert structural
+        // correctness and export the WAV. Drive Sig X with a slow sweep so the
+        // read position moves across the file.
+        auto ro = renderTerrain(script, 1, /*Direct*/0,
+            [](int /*d*/, int /*g*/) { return 0.0f; }, dur);
+        writeWavFloat(dir.getChildFile("render_1d_direct.wav"), ro.audio, ro.sr);
+        r.check(ro.built, "1D: terrain built from audio file");
+        r.check(allFinite(ro.audio), "1D: output is finite (no NaN/Inf)");
+        r.checkVal(rmsOf(ro.audio) > 1e-4, "1D: output non-silent", rmsOf(ro.audio));
+        r.checkVal(peakAbs(ro.audio) <= 1.001f, "1D: output bounded |x|<=1",
+                   peakAbs(ro.audio));
+    }
+
+    // ---- 2D image: AM-sine, sweep the column axis (Sig Y -> coord[1]) ----
+    {
+        auto png = dir.getChildFile("test_image_2d.png");   // from layer 1
+        std::string script = "__image__:" + png.getFullPathName().toStdString();
+        // Image brightness varies left->right; coord[1] is the column axis,
+        // driven by the 2nd Sig pin ("Sig Y"). Ramp it 0->1, hold coord[0]
+        // (row) constant. Predicted envelope swells from ~0 to full.
+        auto ro = renderTerrain(script, 2, /*AM-sine*/1,
+            [&](int d, int g) {
+                if (d == 1) return (float) g / (float) (int)(dur * 44100 - 1); // sweep col
+                return 0.5f;                                                    // row fixed
+            }, dur);
+        writeWavFloat(dir.getChildFile("render_2d_amsine_sweepY.wav"), ro.audio, ro.sr);
+        double corr = envelopeCorrelation(ro);
+        double rng  = envRange(ro);
+        r.check(ro.built, "2D: terrain built from image");
+        r.check(allFinite(ro.audio), "2D: output is finite");
+        r.checkVal(rmsOf(ro.audio) > 1e-3, "2D: output non-silent", rmsOf(ro.audio));
+        r.checkVal(rng > 0.02, "2D: amplitude moves as position sweeps (Sig routing live)",
+                   rng);
+        r.checkVal(corr > 0.9, "2D: output envelope tracks terrain readout", corr);
+    }
+
+    // ---- 3D video: AM-sine, sweep the frame/time axis (Sig X -> coord[0]) -
+    {
+        // Build the same gradient-by-frame video used in layer 1, bake it into
+        // a __video__ script, and sweep coord[0] (frame) 0->1.
+        const int F = 24, H = 16, W = 16;
+        std::vector<uint8_t> gray((size_t) F * H * W);
+        for (int f = 0; f < F; ++f)
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < W; ++x)
+                    gray[(size_t)((f * H + y) * W + x)] =
+                        (uint8_t) std::lround(255.0 * f / (F - 1));
+        VideoTerrainParams p;
+        p.path = "selftest://synthetic";
+        p.t0 = 0; p.t1 = 1; p.cropX = 0; p.cropY = 0; p.cropW = W; p.cropH = H;
+        p.outW = W; p.outH = H; p.outFrames = F; p.gray = gray;
+        std::string script = makeVideoTerrainScript(p);
+
+        auto ro = renderTerrain(script, 3, /*AM-sine*/1,
+            [&](int d, int g) {
+                if (d == 0) return (float) g / (float) (int)(dur * 44100 - 1); // sweep frame
+                return 0.5f;
+            }, dur);
+        writeWavFloat(dir.getChildFile("render_3d_amsine_sweepFrame.wav"), ro.audio, ro.sr);
+        double corr = envelopeCorrelation(ro);
+        double rng  = envRange(ro);
+        r.check(ro.built, "3D: terrain built from baked video grid");
+        r.check(allFinite(ro.audio), "3D: output is finite");
+        r.checkVal(rmsOf(ro.audio) > 1e-3, "3D: output non-silent", rmsOf(ro.audio));
+        r.checkVal(rng > 0.02, "3D: amplitude moves as position sweeps (Sig routing live)",
+                   rng);
+        r.checkVal(corr > 0.9, "3D: output envelope tracks terrain readout", corr);
+    }
+}
+
+// ===========================================================================
+// LAYER 3 - ffmpeg round-trip (optional)
+// ===========================================================================
+void testVideoDecode(Report& r, const juce::File& dir) {
+    r.section("Layer 3: ffmpeg video decode (optional)");
+    if (!VideoDecoder::available()) {
+        r.note("ffmpeg not found on PATH - skipping video decode test.");
+        return;
+    }
+
+    auto video = dir.getChildFile("test_video.mp4");
+    video.deleteFile();
+    juce::ChildProcess cp;
+    juce::StringArray cmd;
+    cmd.add(VideoDecoder::ffmpegCommand());
+    cmd.add("-y");
+    cmd.add("-f"); cmd.add("lavfi");
+    cmd.add("-i"); cmd.add("testsrc=size=64x64:rate=10:duration=1");
+    cmd.add("-pix_fmt"); cmd.add("yuv420p");
+    cmd.add(video.getFullPathName());
+    // Capture stdout+stderr and read it fully: readAllProcessOutput() blocks
+    // until ffmpeg closes its pipes (i.e. actually exits), which is a more
+    // reliable "wait for completion" than waitForProcessToFinish() followed by
+    // an immediate file-exists check (that race made this test flaky - the file
+    // could still be flushing when we looked). On failure the captured output
+    // is surfaced so a real ffmpeg error is diagnosable instead of a bare skip.
+    bool started = cp.start(cmd, juce::ChildProcess::wantStdOut | juce::ChildProcess::wantStdErr);
+    juce::String childOut;
+    if (started) childOut = cp.readAllProcessOutput();
+    bool made = video.existsAsFile() && video.getSize() > 0;
+    if (!r.check(made, "video: ffmpeg generated a test clip")) {
+        if (!started)
+            r.note("ffmpeg child process failed to start - skipping decode assertions.");
+        else
+            r.note("ffmpeg ran but produced no clip - skipping decode assertions. Output:\n"
+                   + childOut);
+        return;
+    }
+
+    auto info = VideoDecoder::probe(video);
+    r.check(info.ok && info.width == 64 && info.height == 64,
+            "video: probe reports 64x64");
+
+    std::string err;
+    auto grid = VideoDecoder::decodeGrid(video, 0.0, 1.0,
+                                         0, 0, 64, 64, /*outW*/8, /*outH*/8,
+                                         /*outFrames*/4, &err);
+    const size_t expect = (size_t) 8 * 8 * 4;
+    r.check(grid.size() == expect, "video: decodeGrid returned 8x8x4 bytes");
+    if (grid.size() == expect) {
+        // testsrc is a spatially+temporally varying pattern, so the decoded
+        // grid must not be uniform.
+        uint8_t lo = 255, hi = 0;
+        for (uint8_t v : grid) { lo = std::min(lo, v); hi = std::max(hi, v); }
+        r.check(hi > lo, "video: decoded grid is non-uniform");
+    } else if (!err.empty()) {
+        r.note("decodeGrid error: " + juce::String(err));
+    }
+}
+
+// ===========================================================================
+// LAYER 4 - warp framework (Bucket A primitives + serialization)
+// ===========================================================================
+void testWarp(Report& r) {
+    r.section("Layer 4: warp framework (shape bending)");
+
+    // ---- Identity at amount 0 (no-op contract) -------------------------
+    {
+        bool phaseId = true, ampId = true;
+        for (float p = 0.0f; p < 1.0f; p += 0.05f) {
+            for (const auto& info : warpMethodRegistry()) {
+                if (info.domain == WarpDomain::Phase) {
+                    if (std::abs(warpPhaseValue(info.method, p, 0.0f) - p) > 1e-5f)
+                        phaseId = false;
+                } else if (info.domain == WarpDomain::Amplitude) {
+                    float x = 2.0f * p - 1.0f;
+                    if (std::abs(warpAmpValue(info.method, x, 0.0f) - x) > 1e-5f)
+                        ampId = false;
+                }
+            }
+        }
+        r.check(phaseId, "warp: every phase method is identity at amount 0");
+        r.check(ampId,   "warp: every amplitude method is identity at amount 0");
+    }
+
+    // ---- All methods stay finite + phase stays in [0,1) ----------------
+    {
+        bool finiteOk = true, phaseRangeOk = true;
+        for (float a = 0.0f; a <= 1.0f; a += 0.1f) {
+            for (float p = 0.0f; p < 1.0f; p += 0.05f) {
+                for (const auto& info : warpMethodRegistry()) {
+                    if (info.domain == WarpDomain::Phase) {
+                        float wp = warpPhaseValue(info.method, p, a);
+                        if (!std::isfinite(wp)) finiteOk = false;
+                        if (wp < 0.0f || wp >= 1.0001f) phaseRangeOk = false;
+                    } else if (info.domain == WarpDomain::Amplitude) {
+                        float x = 2.0f * p - 1.0f;
+                        if (!std::isfinite(warpAmpValue(info.method, x, a)))
+                            finiteOk = false;
+                    }
+                }
+            }
+        }
+        r.check(finiteOk, "warp: all methods finite across amount/phase sweep");
+        r.check(phaseRangeOk, "warp: phase methods keep read phase in [0,1)");
+    }
+
+    // ---- Known-shape checks --------------------------------------------
+    {
+        // BendPlus pinches energy toward the end: the midpoint maps earlier.
+        float bp = warpPhaseValue(WarpMethod::BendPlus, 0.5f, 0.8f);
+        r.checkVal(bp < 0.5f, "warp: Bend+ pulls the midpoint phase earlier", bp);
+        // Flip at full amount inverts the sample.
+        float fl = warpAmpValue(WarpMethod::Flip, 0.7f, 1.0f);
+        r.checkVal(std::abs(fl + 0.7f) < 1e-5f, "warp: Flip inverts at amount 1", fl);
+        // SoftClip is normalized tanh: monotonic, maps 0->0 and 1->1, pushes
+        // mid/high values toward the rail (the harmonic-adding "warmth"), and
+        // never lets a unit input exceed the rail. Check the rail behaviour and
+        // monotonic boost of a low value.
+        float scHot = warpAmpValue(WarpMethod::SoftClip, 0.9f, 1.0f);
+        float scLow = warpAmpValue(WarpMethod::SoftClip, 0.2f, 1.0f);
+        r.checkVal(scHot > 0.9f && scHot <= 1.001f,
+                   "warp: SoftClip pushes a hot sample toward the rail", scHot);
+        r.checkVal(scLow > 0.2f && scLow < scHot,
+                   "warp: SoftClip stays monotonic (low < high)", scLow);
+    }
+
+    // ---- applyWarpChain on a buffer ------------------------------------
+    {
+        std::vector<float> cyc(64);
+        for (int i = 0; i < 64; ++i) cyc[i] = std::sin(2.0f * 3.14159265f * i / 64.0f);
+        std::vector<float> flipped = cyc;
+        std::vector<WarpOp> ops = { { WarpMethod::Flip, 1.0f, 0.0f, true } };
+        applyWarpChain(ops, flipped);
+        bool inverted = true;
+        for (int i = 0; i < 64; ++i)
+            if (std::abs(flipped[i] + cyc[i]) > 1e-4f) inverted = false;
+        r.check(inverted, "warp: applyWarpChain(Flip) inverts a sine buffer");
+    }
+
+    // ---- Chain order matters (the reason reorder controls exist) -------
+    // Wavefold-then-HardClip is not the same transfer curve as
+    // HardClip-then-Wavefold, so swapping two stages must audibly change the
+    // result. This is the invariant the up/down reorder arrows let the user
+    // exploit; if it ever became order-independent the controls would be inert.
+    {
+        std::vector<float> base(128);
+        for (int i = 0; i < 128; ++i)
+            base[i] = 1.6f * std::sin(2.0f * 3.14159265f * i / 128.0f);
+        WarpOp fold{ WarpMethod::Wavefold, 0.7f, 0.0f, true };
+        WarpOp clip{ WarpMethod::HardClip, 0.6f, 0.0f, true };
+
+        std::vector<float> ab = base, ba = base;
+        applyWarpChain({ fold, clip }, ab);   // fold then clip
+        applyWarpChain({ clip, fold }, ba);   // clip then fold
+
+        float maxDiff = 0.0f;
+        for (int i = 0; i < 128; ++i)
+            maxDiff = std::max(maxDiff, std::abs(ab[i] - ba[i]));
+        r.checkVal(maxDiff > 1e-3f,
+                   "warp: chain order changes the result (reorder is meaningful)",
+                   maxDiff);
+
+        // And a swap of the two-element chain reproduces the other ordering
+        // exactly - the operation the up/down arrows perform on the vector.
+        std::vector<WarpOp> chain = { fold, clip };
+        std::swap(chain[0], chain[1]);
+        std::vector<float> swapped = base;
+        applyWarpChain(chain, swapped);
+        bool sameAsBA = true;
+        for (int i = 0; i < 128; ++i)
+            if (std::abs(swapped[i] - ba[i]) > 1e-6f) sameAsBA = false;
+        r.check(sameAsBA, "warp: swapping two ops yields the reversed-order chain");
+    }
+
+    // ---- Factory waveform importer (makeFactoryFrame) ------------------
+    // A single cycle imported from the factory bank (or a user wav) becomes a
+    // one-layer Drawn/Freehand LayeredWaveform. Verify the importer preserves a
+    // 512-sample cycle and resamples an off-size cycle, and that the result is
+    // an editable "layered" frame that renders the shape back.
+    {
+        std::vector<float> sine512(512);
+        for (int i = 0; i < 512; ++i)
+            sine512[(size_t)i] = std::sin(2.0f * 3.14159265f * i / 512.0f);
+        auto frame = LayeredWaveEditorComponent::makeFactoryFrame(sine512);
+        r.check(frame != nullptr && std::strcmp(frame->typeId(), "layered") == 0,
+                "factory: imported cycle becomes an editable layered frame");
+        if (frame) {
+            std::vector<float> out;
+            frame->renderRaw(512, out);
+            // Rendered cycle should correlate strongly with the source sine
+            // (peak-normalisation aside). Use normalised cross-correlation.
+            double dot = 0, na = 0, nb = 0;
+            for (int i = 0; i < 512 && i < (int)out.size(); ++i) {
+                dot += (double)out[(size_t)i] * sine512[(size_t)i];
+                na += (double)out[(size_t)i] * out[(size_t)i];
+                nb += (double)sine512[(size_t)i] * sine512[(size_t)i];
+            }
+            const double corr = (na > 0 && nb > 0) ? dot / std::sqrt(na * nb) : 0;
+            r.checkVal(corr > 0.99,
+                       "factory: rendered cycle matches the imported sine", corr);
+        }
+        // Off-size (600-sample) cycle is resampled to a valid 512-sample layer.
+        std::vector<float> sine600(600);
+        for (int i = 0; i < 600; ++i)
+            sine600[(size_t)i] = std::sin(2.0f * 3.14159265f * i / 600.0f);
+        auto frame600 = LayeredWaveEditorComponent::makeFactoryFrame(sine600);
+        std::vector<float> out600;
+        if (frame600) frame600->renderRaw(512, out600);
+        r.check(frame600 != nullptr && out600.size() == 512,
+                "factory: off-size cycle resamples to a 512-sample layer");
+    }
+
+    // ---- WaveformBank packed-asset loader (soft: asset is a build artifact) --
+    // The library ships as cpp/resources/waveforms.bin, copied next to the exe.
+    // It's generated by pack_waveforms.py, so a fresh checkout without the asset
+    // shouldn't fail the suite - we note absence and pass. When present, sanity-
+    // check the structure the browser relies on.
+    {
+        auto& bank = WaveformBank::get();
+        const bool ok = bank.ensureLoaded();
+        if (!ok || bank.isEmpty()) {
+            r.note("factory bank: waveforms.bin not present (generated asset) - "
+                   "skipping structural checks");
+        } else {
+            r.check(!bank.categories().empty(),
+                    "factory bank: at least one category present");
+            r.check(bank.samples(0).size() == 512,
+                    "factory bank: entry sample buffer is 512 long");
+            int curated = 0;
+            for (int i = 0; i < bank.numEntries(); ++i)
+                if (bank.entry(i).curated) ++curated;
+            r.checkVal(curated > 0,
+                       "factory bank: at least one curated (starred) waveform",
+                       curated);
+        }
+    }
+
+    // ---- Serialization round-trip (backward-compatible warp section) ---
+    {
+        WavetableDoc doc;
+        doc.mode = WavetableMode::Grid;
+        doc.gridDims = { 1 };
+        doc.cellWaveformIds = { -1 };
+        doc.warpChain = {
+            { WarpMethod::BendPlus, 0.42f, 0.0f, true },
+            { WarpMethod::SoftClip, 0.75f, 0.1f, false },
+        };
+        std::string enc = doc.encode();
+        bool hasTag = enc.find(":warp:") != std::string::npos;
+        r.check(hasTag, "warp: encode appends a :warp: section when non-empty");
+
+        WavetableDoc back;
+        bool ok = back.decode(enc);
+        r.check(ok, "warp: doc with warp chain decodes");
+        bool match = back.warpChain.size() == 2;
+        if (match) {
+            const auto& a0 = back.warpChain[0];
+            const auto& a1 = back.warpChain[1];
+            match = a0.method == WarpMethod::BendPlus
+                 && std::abs(a0.amount - 0.42f) < 1e-4f && a0.enabled
+                 && a1.method == WarpMethod::SoftClip
+                 && std::abs(a1.amount - 0.75f) < 1e-4f
+                 && std::abs(a1.aux - 0.1f) < 1e-4f && !a1.enabled;
+        }
+        r.check(match, "warp: warp chain survives an encode->decode round trip");
+
+        // Empty chain must NOT write the tag (byte-compatible with old files).
+        WavetableDoc empt;
+        empt.mode = WavetableMode::Grid;
+        empt.gridDims = { 1 };
+        empt.cellWaveformIds = { -1 };
+        std::string encEmpty = empt.encode();
+        bool noTag = encEmpty.find(":warp:") == std::string::npos;
+        r.check(noTag, "warp: empty chain omits the :warp: section");
+        WavetableDoc emptBack;
+        emptBack.decode(encEmpty);
+        r.check(emptBack.warpChain.empty(),
+                "warp: pre-warp payload decodes to an empty chain");
+    }
+
+    // ---- AHDSR per-segment tension: warp properties + round-trip --------
+    {
+        // tensionWarp() must pin the endpoints, be the identity at 0, and be
+        // strictly monotonic across the interior for both signs of tension.
+        bool endpointsOk = std::abs(AHDSREnvelope::tensionWarp(0.0f,  0.7f)) < 1e-5f
+                        && std::abs(AHDSREnvelope::tensionWarp(1.0f,  0.7f) - 1.0f) < 1e-5f
+                        && std::abs(AHDSREnvelope::tensionWarp(0.0f, -0.7f)) < 1e-5f
+                        && std::abs(AHDSREnvelope::tensionWarp(1.0f, -0.7f) - 1.0f) < 1e-5f;
+        r.check(endpointsOk, "ahdsr tension: warp pins both endpoints for ±tension");
+
+        bool identityOk = true;
+        for (int i = 0; i <= 10; ++i) {
+            float t = (float)i / 10.0f;
+            if (std::abs(AHDSREnvelope::tensionWarp(t, 0.0f) - t) > 1e-5f) identityOk = false;
+        }
+        r.check(identityOk, "ahdsr tension: tension 0 is the identity warp");
+
+        auto monotonic = [](float tension) {
+            float prev = -1.0f;
+            for (int i = 0; i <= 64; ++i) {
+                float w = AHDSREnvelope::tensionWarp((float)i / 64.0f, tension);
+                if (w < prev - 1e-6f) return false;
+                prev = w;
+            }
+            return true;
+        };
+        r.check(monotonic(0.9f) && monotonic(-0.9f),
+                "ahdsr tension: warp is monotonic for strong ±tension");
+
+        // T>0 ("slow start") must lag below the diagonal in the interior;
+        // T<0 ("fast start") must lead above it.
+        bool slowStart = AHDSREnvelope::tensionWarp(0.5f,  0.9f) < 0.5f;
+        bool fastStart = AHDSREnvelope::tensionWarp(0.5f, -0.9f) > 0.5f;
+        r.check(slowStart && fastStart,
+                "ahdsr tension: +tension lags, -tension leads at the midpoint");
+
+        // bakeSegment with tension 0 must equal the raw curve evaluation.
+        AHDSREnvelope env0;
+        auto raw  = env0.attackCurve.evaluate(64);
+        auto bake = AHDSREnvelope::bakeSegment(env0.attackCurve, 0.0f, 64);
+        bool bakeMatch = raw.size() == bake.size();
+        if (bakeMatch)
+            for (size_t i = 0; i < raw.size(); ++i)
+                if (std::abs(raw[i] - bake[i]) > 1e-5f) bakeMatch = false;
+        r.check(bakeMatch, "ahdsr tension: bakeSegment at 0 equals curve.evaluate");
+
+        // Encode -> decode must carry the three tension fields, and old
+        // payloads without them must decode to tension 0 (back-compat).
+        AHDSREnvelope env;
+        env.attackTension  = 0.55f;
+        env.decayTension   = -0.30f;
+        env.releaseTension =  0.80f;
+        std::string enc = env.encode();
+        AHDSREnvelope back;
+        bool decOk = AHDSREnvelope::decode(enc, back);
+        bool tenMatch = decOk
+            && std::abs(back.attackTension  - 0.55f) < 1e-4f
+            && std::abs(back.decayTension   + 0.30f) < 1e-4f
+            && std::abs(back.releaseTension - 0.80f) < 1e-4f;
+        r.check(tenMatch, "ahdsr tension: at/dt/rt survive an encode->decode round trip");
+
+        // A payload with the tension fields stripped (simulating an old file)
+        // must still decode, leaving tensions at their 0 default.
+        std::string legacy = enc;
+        for (const char* key : { "at=", "dt=", "rt=" }) {
+            size_t p = legacy.find(key);
+            if (p != std::string::npos) {
+                size_t e = legacy.find(';', p);
+                if (e != std::string::npos) legacy.erase(p, e - p + 1);
+            }
+        }
+        AHDSREnvelope legacyBack;
+        bool legOk = AHDSREnvelope::decode(legacy, legacyBack);
+        bool legZero = legOk
+            && std::abs(legacyBack.attackTension)  < 1e-6f
+            && std::abs(legacyBack.decayTension)   < 1e-6f
+            && std::abs(legacyBack.releaseTension) < 1e-6f;
+        r.check(legZero, "ahdsr tension: payload without at/dt/rt decodes to tension 0");
+    }
+
+    // ---- Per-layer (element-scope) warp: serialize + render ------------
+    {
+        LayeredWaveform lw;
+        lw.tableSize = 256;
+        WaveLayer base;       // clean sine fundamental
+        base.shape = WaveLayer::Sine; base.ratio = 1; base.amp = 1.0f;
+        WaveLayer folded;     // wavefolded sine
+        folded.shape = WaveLayer::Sine; folded.ratio = 1; folded.amp = 1.0f;
+        folded.warpChain = { { WarpMethod::Wavefold, 0.8f, 0.0f, true } };
+        lw.layers = { folded };
+
+        std::string enc = lw.encode();
+        r.check(enc.find("warp=") != std::string::npos,
+                "warp: layer encode appends a warp= field");
+
+        LayeredWaveform back;
+        bool ok = back.decode(enc);
+        bool layerOk = ok && back.layers.size() == 1
+                    && back.layers[0].warpChain.size() == 1
+                    && back.layers[0].warpChain[0].method == WarpMethod::Wavefold
+                    && std::abs(back.layers[0].warpChain[0].amount - 0.8f) < 1e-4f;
+        r.check(layerOk, "warp: per-layer warp survives encode->decode");
+
+        // The warped render must differ from the clean sine render (the fold
+        // injects harmonics), proving the chain is actually applied.
+        std::vector<float> cleanOut, foldedOut;
+        LayeredWaveform clean; clean.tableSize = 256; clean.layers = { base };
+        clean.render(cleanOut);
+        lw.render(foldedOut);
+        double diff = 0.0;
+        int n = (int)std::min(cleanOut.size(), foldedOut.size());
+        for (int i = 0; i < n; ++i) diff += std::abs(cleanOut[i] - foldedOut[i]);
+        r.checkVal(diff > 1.0, "warp: per-layer Wavefold changes the rendered cycle", diff);
+
+        // A layer with NO warp must encode without the field (back-compat).
+        LayeredWaveform plain; plain.tableSize = 256; plain.layers = { base };
+        r.check(plain.encode().find("warp=") == std::string::npos,
+                "warp: un-warped layer omits the warp= field");
+    }
+
+    // ---- Bucket C: spectral (per-bin) element warp ---------------------
+    {
+        SpectralDoc doc = SpectralDoc::defaultBuiltin();
+        doc.warpChain = { { WarpMethod::Wavefold, 0.7f, 0.0f, true } };
+        std::string enc = doc.encode();
+        r.check(enc.find("warp:") != std::string::npos,
+                "warp: spectral encode appends a warp section when non-empty");
+
+        SpectralDoc back;
+        bool ok = back.decode(enc);
+        bool match = ok && back.warpChain.size() == 1
+                  && back.warpChain[0].method == WarpMethod::Wavefold
+                  && std::abs(back.warpChain[0].amount - 0.7f) < 1e-4f;
+        r.check(match, "warp: spectral per-bin warp survives encode->decode");
+
+        // Render with vs without the warp must differ (the warp reshapes the
+        // magnitude spectrum before the IFFT).
+        std::vector<float> warped, clean;
+        renderSpectralToWaveform(doc, 512, warped);
+        SpectralDoc plain = doc; plain.warpChain.clear();
+        renderSpectralToWaveform(plain, 512, clean);
+        double sdiff = 0.0;
+        int sn = (int)std::min(warped.size(), clean.size());
+        for (int i = 0; i < sn; ++i) sdiff += std::abs(warped[i] - clean[i]);
+        r.checkVal(sdiff > 1e-3, "warp: spectral warp changes the rendered cycle", sdiff);
+
+        // Empty chain omits the section (byte-compatible with old files).
+        r.check(plain.encode().find("warp:") == std::string::npos,
+                "warp: un-warped spectral doc omits the warp section");
+    }
+
+    // ---- Bucket C: wavelet (per-coefficient) element warp --------------
+    {
+        WaveletFrame f = WaveletFrame::defaultEmpty();
+        // Seed a couple of coefficients so the IDWT produces a non-trivial cycle.
+        if (f.coefficients.size() > 8) {
+            f.coefficients[2] = 0.6f;
+            f.coefficients[5] = -0.4f;
+        }
+        f.warpChain = { { WarpMethod::SoftClip, 0.8f, 0.0f, true } };
+        std::string body = f.encodeBody();
+        r.check(body.find(":warp:") != std::string::npos,
+                "warp: wavelet encode appends a :warp: section when non-empty");
+
+        WaveletFrame back;
+        bool ok = back.decodeBody(body);
+        bool match = ok && back.warpChain.size() == 1
+                  && back.warpChain[0].method == WarpMethod::SoftClip
+                  && std::abs(back.warpChain[0].amount - 0.8f) < 1e-4f;
+        r.check(match, "warp: wavelet per-coeff warp survives encode->decode");
+
+        std::vector<float> warped, clean;
+        f.renderRaw(256, warped);
+        WaveletFrame plain = f; plain.warpChain.clear();
+        plain.renderRaw(256, clean);
+        double wdiff = 0.0;
+        int wn = (int)std::min(warped.size(), clean.size());
+        for (int i = 0; i < wn; ++i) wdiff += std::abs(warped[i] - clean[i]);
+        r.checkVal(wdiff > 1e-3, "warp: wavelet warp changes the rendered cycle", wdiff);
+
+        r.check(plain.encodeBody().find(":warp:") == std::string::npos,
+                "warp: un-warped wavelet frame omits the :warp: section");
+    }
+
+    // ---- Bucket C: granular (per-grain) element warp -------------------
+    {
+        GranularFrame f = GranularFrame::defaultEmpty();   // 1 s A4 sine
+        // Granular warp is amplitude-domain only; a phase-domain op must be
+        // dropped by warpAmpOps() (it has no meaning on a grain stream).
+        f.warpChain = {
+            { WarpMethod::Wavefold, 0.8f, 0.0f, true },   // amplitude - kept
+            { WarpMethod::BendPlus, 0.5f, 0.0f, true },   // phase - dropped
+        };
+        auto amp = f.warpAmpOps();
+        r.check(amp.size() == 1 && amp[0].method == WarpMethod::Wavefold,
+                "warp: granular warpAmpOps keeps only amplitude-domain ops");
+
+        std::string body = f.encodeBody();
+        r.check(body.find(";warp:") != std::string::npos,
+                "warp: granular encode appends a ;warp: section when non-empty");
+
+        GranularFrame back;
+        bool ok = back.decodeBody(body);
+        // Round-trips the FULL chain (both ops); the amplitude filter only runs
+        // at apply time, not at serialize time.
+        bool match = ok && back.warpChain.size() == 2
+                  && back.warpChain[0].method == WarpMethod::Wavefold
+                  && back.warpChain[1].method == WarpMethod::BendPlus
+                  && (int)back.source.size() == (int)f.source.size();
+        r.check(match, "warp: granular per-grain warp survives encode->decode");
+
+        // renderRaw bakes the amplitude warp into the representative cycle.
+        std::vector<float> warped, clean;
+        f.renderRaw(256, warped);
+        GranularFrame plain = f; plain.warpChain.clear();
+        plain.renderRaw(256, clean);
+        double gdiff = 0.0;
+        int gn = (int)std::min(warped.size(), clean.size());
+        for (int i = 0; i < gn; ++i) gdiff += std::abs(warped[i] - clean[i]);
+        r.checkVal(gdiff > 1e-3, "warp: granular warp changes the representative cycle", gdiff);
+
+        r.check(plain.encodeBody().find(";warp:") == std::string::npos,
+                "warp: un-warped granular frame omits the ;warp: section");
+    }
+
+    // ---- Bucket B: generator-morph layer shapes (Pulse/Sync/FM/PD) -----
+    {
+        // Each generator must produce a non-trivial, in-range, finite cycle and
+        // the morph parameter must actually change the rendered cycle.
+        auto renderShape = [](WaveLayer::Shape s, float p1, float p2,
+                              std::vector<float>& out) {
+            LayeredWaveform lw; lw.tableSize = 512;
+            WaveLayer l; l.shape = s; l.ratio = 1; l.amp = 1.0f;
+            l.shapeParam = p1; l.shapeParam2 = p2;
+            lw.layers = { l };
+            lw.render(out);
+        };
+        struct GenCase { WaveLayer::Shape shape; const char* name; float a; float b; };
+        GenCase cases[] = {
+            { WaveLayer::Pulse,     "pulse",     0.25f, 0.75f },
+            { WaveLayer::Sync,      "sync",      0.3f,  0.7f  },
+            { WaveLayer::FM,        "fm",        0.4f,  0.6f  },
+            { WaveLayer::PhaseDist, "phasedist", 0.3f,  0.8f  },
+        };
+        for (const auto& c : cases) {
+            std::vector<float> a, b;
+            renderShape(c.shape, c.a, 0.5f, a);
+            renderShape(c.shape, c.b, 0.5f, b);
+            // Finite + in range.
+            bool finite = true, inRange = true;
+            for (float v : a) {
+                if (!std::isfinite(v)) finite = false;
+                if (std::abs(v) > 1.0001f) inRange = false;
+            }
+            r.check(finite && inRange && !a.empty(),
+                    std::string("warp: ") + c.name + " renders a finite in-range cycle");
+            // The morph parameter changes the cycle.
+            double mdiff = 0.0;
+            int mn = (int)std::min(a.size(), b.size());
+            for (int i = 0; i < mn; ++i) mdiff += std::abs(a[i] - b[i]);
+            r.checkVal(mdiff > 1e-3,
+                       std::string("warp: ") + c.name + " morph parameter changes the cycle", mdiff);
+        }
+
+        // FM's modulator:carrier ratio (shapeParam2) must also affect the cycle.
+        {
+            std::vector<float> a, b;
+            renderShape(WaveLayer::FM, 0.6f, 0.1f, a);
+            renderShape(WaveLayer::FM, 0.6f, 0.9f, b);
+            double mdiff = 0.0;
+            int mn = (int)std::min(a.size(), b.size());
+            for (int i = 0; i < mn; ++i) mdiff += std::abs(a[i] - b[i]);
+            r.checkVal(mdiff > 1e-3, "warp: FM ratio (shapeParam2) changes the cycle", mdiff);
+        }
+
+        // Serialization: shapeParam/shapeParam2 round-trip via the p1=/p2= fields.
+        {
+            LayeredWaveform lw; lw.tableSize = 256;
+            WaveLayer fm; fm.shape = WaveLayer::FM; fm.shapeParam = 0.37f; fm.shapeParam2 = 0.81f;
+            WaveLayer pw; pw.shape = WaveLayer::Pulse; pw.shapeParam = 0.22f;
+            lw.layers = { fm, pw };
+            std::string enc = lw.encode();
+            r.check(enc.find("p1=") != std::string::npos && enc.find("p2=") != std::string::npos,
+                    "warp: generator-morph layer encodes p1=/p2= fields");
+            LayeredWaveform back;
+            bool ok = back.decode(enc);
+            bool match = ok && back.layers.size() == 2
+                      && back.layers[0].shape == WaveLayer::FM
+                      && std::abs(back.layers[0].shapeParam  - 0.37f) < 1e-3f
+                      && std::abs(back.layers[0].shapeParam2 - 0.81f) < 1e-3f
+                      && back.layers[1].shape == WaveLayer::Pulse
+                      && std::abs(back.layers[1].shapeParam  - 0.22f) < 1e-3f;
+            r.check(match, "warp: generator-morph params survive encode->decode");
+
+            // A classic-shape layer must NOT emit p1=/p2= (byte-compat).
+            LayeredWaveform classic; classic.tableSize = 256;
+            WaveLayer sine; sine.shape = WaveLayer::Sine;
+            classic.layers = { sine };
+            r.check(classic.encode().find("p1=") == std::string::npos,
+                    "warp: classic-shape layer omits the p1= field");
+        }
+    }
+
+    // ---- Milestone 9: inharmonic additive stack ------------------------
+    {
+        // The default bell renders a finite, in-range, non-trivial cycle.
+        InharmonicFrame bell = InharmonicFrame::defaultBell();
+        r.check(bell.partials.size() == 5,
+                "inharmonic: defaultBell has 5 partials");
+        std::vector<float> cyc;
+        bell.renderRaw(512, cyc);
+        bool finite = true, inRange = true, nonTrivial = false;
+        float peak = 0.0f;
+        for (float v : cyc) {
+            if (!std::isfinite(v)) finite = false;
+            if (std::abs(v) > 1.0001f) inRange = false;
+            if (std::abs(v) > 1e-3f) nonTrivial = true;
+            peak = std::max(peak, std::abs(v));
+        }
+        r.check(finite && inRange && nonTrivial && !cyc.empty(),
+                "inharmonic: defaultBell renders a finite in-range non-trivial cycle");
+        // renderRaw is peak-normalised to ~1.0 (the live-voice loudness anchor).
+        r.checkVal(std::abs(peak - 1.0f) < 1e-3,
+                   "inharmonic: renderRaw peak-normalises to 1.0", peak);
+        // normGainFor agrees with that normalisation: scaling the raw sum by it
+        // yields peak ~1.0.
+        float ng = InharmonicFrame::normGainFor(bell.partials, 512);
+        r.checkVal(ng > 0.0f && std::isfinite(ng),
+                   "inharmonic: normGainFor returns a finite positive gain", ng);
+
+        // Partials + amplitude warp round-trip through encode->decode.
+        InharmonicFrame f;
+        f.partials = { {1.0f, 1.0f, 0.0f}, {2.76f, 0.6f, 0.1f}, {5.4f, 0.4f, 0.25f} };
+        f.warpChain = {
+            { WarpMethod::Wavefold, 0.7f, 0.0f, true },   // amplitude - kept
+            { WarpMethod::BendPlus, 0.5f, 0.0f, true },   // phase - dropped at apply
+        };
+        // warpAmpOps drops the phase-domain op (no meaning on an additive stream).
+        auto amp = f.warpAmpOps();
+        r.check(amp.size() == 1 && amp[0].method == WarpMethod::Wavefold,
+                "inharmonic: warpAmpOps keeps only amplitude-domain ops");
+
+        std::string body = f.encodeBody();
+        r.check(body.find(";warp:") != std::string::npos,
+                "inharmonic: encode appends a ;warp: section when non-empty");
+        InharmonicFrame back;
+        bool ok = back.decodeBody(body);
+        bool match = ok && back.partials.size() == 3
+                  && std::abs(back.partials[1].ratio - 2.76f) < 1e-3f
+                  && std::abs(back.partials[1].amp   - 0.6f)  < 1e-3f
+                  && std::abs(back.partials[2].phase - 0.25f) < 1e-3f
+                  && back.warpChain.size() == 2
+                  && back.warpChain[0].method == WarpMethod::Wavefold
+                  && back.warpChain[1].method == WarpMethod::BendPlus;
+        r.check(match, "inharmonic: partials + warp survive encode->decode");
+
+        // The amplitude warp changes the representative cycle.
+        std::vector<float> warped, clean;
+        f.renderRaw(256, warped);
+        InharmonicFrame plain = f; plain.warpChain.clear();
+        plain.renderRaw(256, clean);
+        double diff = 0.0;
+        int n = (int)std::min(warped.size(), clean.size());
+        for (int i = 0; i < n; ++i) diff += std::abs(warped[i] - clean[i]);
+        r.checkVal(diff > 1e-3, "inharmonic: amplitude warp changes the cycle", diff);
+
+        // An un-warped frame omits the ;warp: section (byte-clean round-trip).
+        r.check(plain.encodeBody().find(";warp:") == std::string::npos,
+                "inharmonic: un-warped frame omits the ;warp: section");
+    }
+
+    // ---- Bucket C: whole-buffer spectral / wavelet warps ----------------
+    // The scripting primitives behind spectralwarp()/waveletwarp() in Lua /
+    // Python / WASM. They transform the buffer into a representation, warp each
+    // bin/coefficient via warpAmpValue (single source of truth), and transform
+    // back - so amount 0 is ~identity, a hot amount changes the buffer, length
+    // is preserved, and the result stays finite.
+    {
+        auto makeSine = [](int n) {
+            std::vector<float> b((size_t)n);
+            for (int i = 0; i < n; ++i)
+                b[(size_t)i] = std::sin(6.28318530718f * (float)i / (float)n);
+            return b;
+        };
+        auto maxAbsDiff = [](const std::vector<float>& a, const std::vector<float>& b) {
+            double d = 0.0;
+            size_t n = std::min(a.size(), b.size());
+            for (size_t i = 0; i < n; ++i) d = std::max(d, (double)std::abs(a[i] - b[i]));
+            return d;
+        };
+        auto finite = [](const std::vector<float>& b) {
+            for (float v : b) if (!std::isfinite(v)) return false;
+            return true;
+        };
+
+        // --- Spectral ---
+        std::vector<float> base = makeSine(512);
+        std::vector<float> sp0 = base;
+        spectralWarpBuffer(sp0, WarpMethod::SoftClip, 0.0f);
+        r.check(sp0.size() == base.size(),
+                "buffer-warp: spectralwarp preserves length");
+        r.checkVal(maxAbsDiff(sp0, base) < 1e-3,
+                   "buffer-warp: spectralwarp at amount 0 is ~identity",
+                   maxAbsDiff(sp0, base));
+        std::vector<float> sp1 = base;
+        spectralWarpBuffer(sp1, WarpMethod::Wavefold, 0.9f);
+        r.check(finite(sp1), "buffer-warp: spectralwarp stays finite");
+        r.checkVal(maxAbsDiff(sp1, base) > 1e-4,
+                   "buffer-warp: spectralwarp at a hot amount changes the buffer",
+                   maxAbsDiff(sp1, base));
+
+        // An unknown method is identity (the warpAmpValue contract).
+        std::vector<float> spNone = base;
+        spectralWarpBuffer(spNone, WarpMethod::None, 1.0f);
+        r.checkVal(maxAbsDiff(spNone, base) < 1e-3,
+                   "buffer-warp: spectralwarp with None is identity",
+                   maxAbsDiff(spNone, base));
+
+        // --- Wavelet ---
+        std::vector<float> wv0 = base;
+        waveletWarpBuffer(wv0, WarpMethod::SoftClip, 0.0f, "db4", 5);
+        r.check(wv0.size() == base.size(),
+                "buffer-warp: waveletwarp preserves length");
+        r.checkVal(maxAbsDiff(wv0, base) < 1e-3,
+                   "buffer-warp: waveletwarp at amount 0 is ~identity",
+                   maxAbsDiff(wv0, base));
+        std::vector<float> wv1 = base;
+        waveletWarpBuffer(wv1, WarpMethod::Wavefold, 0.9f, "db4", 5);
+        r.check(finite(wv1), "buffer-warp: waveletwarp stays finite");
+        r.checkVal(maxAbsDiff(wv1, base) > 1e-4,
+                   "buffer-warp: waveletwarp at a hot amount changes the buffer",
+                   maxAbsDiff(wv1, base));
+
+        // Too-short buffers are a no-op rather than a crash.
+        std::vector<float> tiny = { 0.5f };
+        spectralWarpBuffer(tiny, WarpMethod::Wavefold, 1.0f);
+        waveletWarpBuffer(tiny, WarpMethod::Wavefold, 1.0f, "db4", 5);
+        r.check(tiny.size() == 1 && std::abs(tiny[0] - 0.5f) < 1e-6f,
+                "buffer-warp: 1-sample buffer is left untouched");
+    }
+}
+
+} // namespace
+
+// ---------------------------------------------------------------------------
+// GLSL headless compute backend. Proves we can stand up an offscreen GL 4.3
+// core context with no window, dispatch a compute shader, and read an SSBO
+// back. Gated on GL availability: a machine with no GPU/driver capable of 4.3
+// core (e.g. a headless CI box with a software rasteriser) reports the reason
+// and the GLSL checks are skipped rather than failed.
+// ---------------------------------------------------------------------------
+void testGlslCompute(Report& r, const juce::File&) {
+    r.section("GLSL compute backend (headless GL 4.3)");
+
+    std::string why;
+    bool avail = glslComputeAvailable(&why);
+    if (!avail) {
+        r.note("GL 4.3 compute unavailable on this machine: " + juce::String(why));
+        r.note("GLSL generator backend checks skipped (not a failure).");
+        return;
+    }
+    r.check(true, "headless GL 4.3 core context created");
+
+    // 1) Trivial ramp: data[gid] = gid / total. Verifies dispatch coverage +
+    //    SSBO readback for a non-multiple-of-64 size (forces a partial group).
+    {
+        const int total = 100; // not a multiple of 64
+        const char* src =
+            "#version 430\n"
+            "layout(local_size_x = 64) in;\n"
+            "layout(std430, binding = 0) buffer Out { float data[]; };\n"
+            "uniform int uTotal;\n"
+            "void main() {\n"
+            "  uint gid = gl_GlobalInvocationID.x;\n"
+            "  if (gid >= uint(uTotal)) return;\n"
+            "  data[gid] = float(gid) / float(uTotal);\n"
+            "}\n";
+        auto res = glslDispatchCompute(src, total, { { "uTotal", { total } } });
+        bool ok = r.check(res.ok, "ramp shader dispatched + read back");
+        if (!ok) r.note("error: " + juce::String(res.error));
+        if (ok) {
+            double maxErr = 0.0;
+            for (int i = 0; i < total; ++i)
+                maxErr = std::max(maxErr, std::abs((double) res.data[i] - (double) i / total));
+            r.checkVal(maxErr < 1e-6, "ramp values exact (incl. partial workgroup)", maxErr);
+        }
+    }
+
+    // 2) 2D unflatten via uniforms: data[gid] encodes column index col/(W-1),
+    //    proving int-array uniform plumbing (uDims) and row-major unflattening.
+    {
+        const int W = 7, H = 5, total = W * H;
+        const char* src =
+            "#version 430\n"
+            "layout(local_size_x = 64) in;\n"
+            "layout(std430, binding = 0) buffer Out { float data[]; };\n"
+            "uniform int uDims[2];\n"
+            "uniform int uTotal;\n"
+            "void main() {\n"
+            "  uint gid = gl_GlobalInvocationID.x;\n"
+            "  if (gid >= uint(uTotal)) return;\n"
+            "  int col = int(gid) % uDims[1];\n"      // dims = {H, W} row-major
+            "  data[gid] = float(col) / float(uDims[1] - 1);\n"
+            "}\n";
+        auto res = glslDispatchCompute(src, total,
+                                       { { "uDims", { H, W } }, { "uTotal", { total } } });
+        bool ok = r.check(res.ok, "2D uniform-array shader dispatched");
+        if (!ok) r.note("error: " + juce::String(res.error));
+        if (ok) {
+            double maxErr = 0.0;
+            for (int row = 0; row < H; ++row)
+                for (int col = 0; col < W; ++col) {
+                    double exp = (double) col / (W - 1);
+                    maxErr = std::max(maxErr, std::abs((double) res.data[row * W + col] - exp));
+                }
+            r.checkVal(maxErr < 1e-6, "2D column ramp exact via uDims uniform", maxErr);
+        }
+    }
+
+    // 3) Compile error reporting: a syntactically broken shader must come back
+    //    ok=false with a non-empty error log (not a crash).
+    {
+        const char* bad =
+            "#version 430\n"
+            "layout(local_size_x = 64) in;\n"
+            "layout(std430, binding = 0) buffer Out { float data[]; };\n"
+            "void main() { data[0] = ; }\n"; // syntax error
+        auto res = glslDispatchCompute(bad, 1);
+        r.check(!res.ok && !res.error.empty(), "broken shader reports compile error (no crash)");
+    }
+
+    // 4) Multi-pass ping-pong (low level): a 1D "shift" stencil. Pass 0 seeds a
+    //    single spike at index 2; each later pass copies the cell's LEFT neighbour
+    //    from the previous pass's snapshot (prev[]), so the spike moves right by
+    //    one cell per pass. With 4 passes total the spike lands at index 5. This
+    //    exercises the two-buffer ping-pong, the swap, prev[] (binding 1), and the
+    //    auto-set uPass uniform all at once.
+    {
+        const int total = 8, passes = 4;
+        const char* src =
+            "#version 430\n"
+            "layout(local_size_x = 64) in;\n"
+            "layout(std430, binding = 0) buffer Out  { float data[]; };\n"
+            "layout(std430, binding = 1) buffer Prev { float prev[]; };\n"
+            "uniform int uTotal;\n"
+            "uniform int uPass;\n"
+            "void main() {\n"
+            "  uint gid = gl_GlobalInvocationID.x;\n"
+            "  if (gid >= uint(uTotal)) return;\n"
+            "  int i = int(gid);\n"
+            "  if (uPass == 0) { data[gid] = (i == 2) ? 1.0 : 0.0; }\n"
+            "  else {\n"
+            "    int j = i - 1;\n"
+            "    data[gid] = (j >= 0 && j < uTotal) ? prev[j] : 0.0;\n"
+            "  }\n"
+            "}\n";
+        auto res = glslDispatchComputePingPong(src, total, passes, { { "uTotal", { total } } });
+        bool ok = r.check(res.ok, "ping-pong shift dispatched (4 passes)");
+        if (!ok) r.note("error: " + juce::String(res.error));
+        if (ok) {
+            double maxErr = 0.0;
+            for (int i = 0; i < total; ++i) {
+                double exp = (i == 5) ? 1.0 : 0.0;   // spike shifted 2 -> 5
+                maxErr = std::max(maxErr, std::abs((double) res.data[i] - exp));
+            }
+            r.checkVal(maxErr < 1e-6, "spike moved to index 5 (ping-pong + uPass + prev[])", maxErr);
+        }
+    }
+
+    // 5) End-to-end via Terrain::fillFromGlsl whole-grid + passes: this exercises
+    //    the GENERATED whole-grid template (prev[]/prevAt()/neighbor()) and the
+    //    [0,1]->[-1,1] output mapping. 4x4 grid; pass 0 seeds a spike at (row1,
+    //    col1); each later pass copies the left-column neighbour (axis 1) from the
+    //    previous pass, so the spike walks right one column per pass. 3 passes ->
+    //    spike ends at (row1, col3) = flat index 7. Output is bipolar: spike +1,
+    //    everything else -1.
+    {
+        SoundShop::Terrain t;
+        std::vector<int> dims = { 4, 4 };
+        const std::string body =
+            "uint gid = gl_GlobalInvocationID.x;\n"
+            "if (gid >= uint(uTotal)) return;\n"
+            "int i = int(gid);\n"
+            "if (uPass == 0) { data[gid] = (i == 5) ? 1.0 : 0.0; }\n"
+            "else { data[gid] = prevAt(neighbor(i, 1, -1)); }\n";
+        std::string err;
+        bool ok = t.fillFromGlsl(body, /*wholeGrid=*/true, dims, err, /*passes=*/3);
+        bool dispatched = r.check(ok, "fillFromGlsl whole-grid multi-pass (3 passes)");
+        if (!dispatched) r.note("error: " + juce::String(err));
+        if (dispatched) {
+            const auto& d = t.getData();
+            bool sizeOk = r.check(d.size() == 16, "multi-pass grid size = 16");
+            if (sizeOk) {
+                double maxErr = 0.0;
+                for (int i = 0; i < 16; ++i) {
+                    double exp = (i == 7) ? 1.0 : -1.0;  // spike (1,1)->(1,3)=idx7, bipolar
+                    maxErr = std::max(maxErr, std::abs((double) d[(size_t) i] - exp));
+                }
+                r.checkVal(maxErr < 1e-6, "neighbor()/prevAt() shift exact, mapped to [-1,1]", maxErr);
+            }
+        }
+    }
+
+    // 6) Tailored flatten(): the generated whole-grid template emits a flatten()
+    //    specialised to the terrain's rank and literal per-axis sizes. On a 3x4
+    //    grid, flatten(coordAxis(i,0), coordAxis(i,1)) must round-trip to i for
+    //    every cell, and out-of-range args must edge-clamp. Each cell writes 1.0
+    //    iff its checks pass; any mismatch shows up as a -1.0 in the bipolar grid.
+    {
+        SoundShop::Terrain t;
+        std::vector<int> dims = { 3, 4 };   // total 12; last axis varies fastest
+        const std::string body =
+            "uint gid = gl_GlobalInvocationID.x;\n"
+            "if (gid >= uint(uTotal)) return;\n"
+            "int i = int(gid);\n"
+            "int r = coordAxis(i, 0);\n"
+            "int c = coordAxis(i, 1);\n"
+            "bool ok = (flatten(r, c) == i) && (DIM0 == 3) && (DIM1 == 4);\n"
+            "if (i == 0) ok = ok && (flatten(-1, -1) == 0) && (flatten(999, 999) == uTotal - 1);\n"
+            "data[gid] = ok ? 1.0 : 0.0;\n";
+        std::string err;
+        bool ok = t.fillFromGlsl(body, /*wholeGrid=*/true, dims, err, /*passes=*/1);
+        bool dispatched = r.check(ok, "fillFromGlsl whole-grid with tailored flatten()");
+        if (!dispatched) r.note("error: " + juce::String(err));
+        if (dispatched) {
+            const auto& d = t.getData();
+            double minV = 2.0;
+            for (float v : d) minV = std::min(minV, (double) v);
+            // Every cell must be +1 (bipolar) => every flatten/DIM/clamp check passed.
+            r.check(d.size() == 12 && minV > 0.5,
+                    "flatten() round-trips every cell + clamps + DIMn constants correct");
+        }
+    }
+
+    // 6) GLSL as a wavetable/curve language (bakeShapeExpr with ShapeLang::Glsl).
+    //    Proves the curve bake path templates a per-sample GLSL body, runs it on
+    //    the GPU, and reads the cycle back with the right variable contract.
+    {
+        // Waveshape (domainRadians=true): `x` sweeps [0,2*pi); compare to sin.
+        std::vector<float> out; std::string err;
+        bool ok = bakeShapeExpr(ShapeLang::Glsl, "sin(x)", /*domainRadians=*/true,
+                                512, out, err);
+        bool dispatched = r.check(ok && (int) out.size() == 512,
+                                  "GLSL shape: sin(x) waveshape baked (512 samples)");
+        if (!dispatched) r.note("error: " + juce::String(err));
+        if (dispatched) {
+            double maxErr = 0.0;
+            for (int i = 0; i < 512; ++i) {
+                double want = std::sin((double) i / 512.0 * 6.28318530717958648);
+                maxErr = std::max(maxErr, std::abs((double) out[i] - want));
+            }
+            r.checkVal(maxErr < 1e-3, "GLSL shape: matches sin within tolerance", maxErr);
+        }
+
+        // domainRadians waveshapes clamp to [-1,1]: a body that overshoots stays bounded.
+        ok = bakeShapeExpr(ShapeLang::Glsl, "3.0 * sin(x)", /*domainRadians=*/true,
+                           256, out, err);
+        if (r.check(ok && (int) out.size() == 256, "GLSL shape: overshoot bakes")) {
+            double maxAbs = 0.0;
+            for (float v : out) maxAbs = std::max(maxAbs, (double) std::abs(v));
+            r.checkVal(maxAbs <= 1.0 + 1e-6, "GLSL shape: waveshape clamped to [-1,1]", maxAbs);
+        }
+
+        // Spectral curve (domainRadians=false): `f` is normalized [0,1], unclamped.
+        ok = bakeShapeExpr(ShapeLang::Glsl, "f * f", /*domainRadians=*/false,
+                           128, out, err);
+        if (r.check(ok && (int) out.size() == 128, "GLSL curve: f*f spectral baked")) {
+            double maxErr = 0.0;
+            for (int i = 0; i < 128; ++i) {
+                double pos = (double) i / 127.0;
+                maxErr = std::max(maxErr, std::abs((double) out[i] - pos * pos));
+            }
+            r.checkVal(maxErr < 1e-3, "GLSL curve: f*f matches (unclamped, > -1)", maxErr);
+        }
+
+        // A multi-statement body that supplies its own `return`.
+        ok = bakeShapeExpr(ShapeLang::Glsl,
+                           "float s = sin(x) + 0.5 * sin(2.0 * x);\nreturn s * 0.5;",
+                           /*domainRadians=*/true, 256, out, err);
+        if (!r.check(ok && (int) out.size() == 256, "GLSL shape: multi-statement body bakes"))
+            r.note("error: " + juce::String(err));
+    }
+}
+
+// GLSL-parity scalar builtins added to the WaveExprParser (Builtin language).
+// Each is pure and shared by the real-time Script node and the offline bakes.
+static void testBuiltinMath(Report& r) {
+    r.section("Builtin language - GLSL-parity scalar math");
+    auto eval = [](const char* e) {
+        return WaveExprParser::evaluateAt(std::string(e), 0.0f, 0.0f);
+    };
+    auto approx = [&](const char* expr, double want, const char* label) {
+        double got = (double) eval(expr);
+        r.checkVal(std::abs(got - want) < 1e-4, label, got);
+    };
+    approx("mix(2, 4, 0.25)",            2.5,  "mix(a,b,t) lerps");
+    approx("smoothstep(0, 1, 0.5)",      0.5,  "smoothstep midpoint = 0.5");
+    approx("smoothstep(0, 1, 0)",        0.0,  "smoothstep at low edge = 0");
+    approx("step(0.5, 0.4)",             0.0,  "step below edge = 0");
+    approx("step(0.5, 0.6)",             1.0,  "step at/above edge = 1");
+    approx("fract(2.25)",                0.25, "fract drops integer part");
+    approx("sign(-3)",                  -1.0,  "sign of negative = -1");
+    approx("sign(0)",                    0.0,  "sign of zero = 0");
+    approx("mod(5, 3)",                  2.0,  "mod(5,3) = 2");
+    approx("round(2.6)",                 3.0,  "round(2.6) = 3");
+    approx("trunc(2.9)",                 2.0,  "trunc(2.9) = 2");
+    approx("inversesqrt(4)",             0.5,  "inversesqrt(4) = 0.5");
+    approx("degrees(radians(90))",      90.0,  "degrees/radians round-trip");
+    approx("atan(1, 1)",  0.785398163,  "atan(y,x) = atan2 = pi/4");
+    approx("atan(1)",     0.785398163,  "atan(1) = pi/4");
+    approx("asin(1)",     1.570796327,  "asin(1) = pi/2");
+    approx("acos(1)",                    0.0,  "acos(1) = 0");
+    // Names must not collide with the prefix functions they extend.
+    approx("sinh(0)",                    0.0,  "sinh(0) = 0 (not shadowed by sin)");
+    approx("sign(2)",                    1.0,  "sign(2) = 1 (not shadowed by sin)");
+    // Remaining GLSL exponential / inverse-hyperbolic / common builtins.
+    approx("exp2(3)",                    8.0,  "exp2(3) = 8");
+    approx("log2(8)",                    3.0,  "log2(8) = 3 (not shadowed by log)");
+    approx("fma(2, 3, 4)",              10.0,  "fma(2,3,4) = 2*3+4 = 10");
+    approx("asinh(0)",                   0.0,  "asinh(0) = 0 (not shadowed by asin)");
+    approx("acosh(1)",                   0.0,  "acosh(1) = 0 (not shadowed by acos)");
+    approx("atanh(0)",                   0.0,  "atanh(0) = 0 (not shadowed by atan)");
+    approx("roundEven(2.5)",             2.0,  "roundEven(2.5) = 2 (half to even)");
+    approx("roundEven(3.5)",             4.0,  "roundEven(3.5) = 4 (half to even)");
+    approx("tanh(0)",                    0.0,  "tanh(0) = 0 (still distinct from atanh)");
+
+    // Multi-statement Built-in program: assign named "wave objects" and combine
+    // them. Must match the equivalent inline expression sample-for-sample, and
+    // the bake must route a program (newlines/assignments) through runProgram.
+    {
+        std::vector<float> prog, inlineExpr; std::string err;
+        bool ok1 = bakeShapeExpr(ShapeLang::Builtin,
+                                 "a = sin(x)\nb = 0.5 * sin(3 * x)\na + b",
+                                 /*domainRadians=*/true, 64, prog, err);
+        bool ok2 = bakeShapeExpr(ShapeLang::Builtin,
+                                 "sin(x) + 0.5 * sin(3 * x)",
+                                 /*domainRadians=*/true, 64, inlineExpr, err);
+        bool match = ok1 && ok2 && prog.size() == 64 && inlineExpr.size() == 64;
+        if (match)
+            for (int i = 0; i < 64; ++i)
+                if (std::abs(prog[i] - inlineExpr[i]) > 1e-4f) { match = false; break; }
+        r.check(match, "Builtin program (named waves summed) == inline expression");
+    }
+
+    // Bucket A warp bindings: warpamp(method, x, amount) / warpphase(method,
+    // phase, amount) must route to the SAME warpAmpValue/warpPhaseValue primitives
+    // (the shared single source of truth), whether the method is given as a numeric
+    // id or a readable name string. The expression parser evaluates with c0=c1=0,
+    // so the literal arguments below are what actually drive the warp.
+    {
+        // Numeric id form (SoftClip == 1, BendPlus == 20).
+        double ampNum = (double) eval("warpamp(1, 0.9, 1.0)");
+        r.checkVal(std::abs(ampNum - (double)warpAmpValue(WarpMethod::SoftClip, 0.9f, 1.0f)) < 1e-4,
+                   "warpamp(id): Builtin matches warpAmpValue(SoftClip)", ampNum);
+        double phNum = (double) eval("warpphase(20, 0.5, 0.8)");
+        r.checkVal(std::abs(phNum - (double)warpPhaseValue(WarpMethod::BendPlus, 0.5f, 0.8f)) < 1e-4,
+                   "warpphase(id): Builtin matches warpPhaseValue(BendPlus)", phNum);
+
+        // Name string form (case/space/punctuation tolerant via warpMethodFromName).
+        double ampName = (double) eval("warpamp(\"soft clip\", 0.9, 1.0)");
+        r.checkVal(std::abs(ampName - (double)warpAmpValue(WarpMethod::SoftClip, 0.9f, 1.0f)) < 1e-4,
+                   "warpamp(name): \"soft clip\" resolves to SoftClip", ampName);
+        double phName = (double) eval("warpphase(\"bend+\", 0.5, 0.8)");
+        r.checkVal(std::abs(phName - (double)warpPhaseValue(WarpMethod::BendPlus, 0.5f, 0.8f)) < 1e-4,
+                   "warpphase(name): \"bend+\" resolves to BendPlus", phName);
+
+        // amount 0 is identity in both domains.
+        r.checkVal(std::abs((double)eval("warpamp(3, 0.42, 0.0)") - 0.42) < 1e-4,
+                   "warpamp: amount 0 is identity", (double)eval("warpamp(3, 0.42, 0.0)"));
+        r.checkVal(std::abs((double)eval("warpphase(20, 0.42, 0.0)") - 0.42) < 1e-4,
+                   "warpphase: amount 0 is identity", (double)eval("warpphase(20, 0.42, 0.0)"));
+    }
+}
+
+int runSelfTest(const juce::File& outDir) {
+    outDir.createDirectory();
+    Report r;
+    r.line("SEANCE terrain-synth self-test");
+    r.line("Output dir: " + outDir.getFullPathName());
+    r.line("ffmpeg available: " + juce::String(VideoDecoder::available() ? "yes" : "no"));
+
+    testTerrainData(r, outDir);
+    testRender(r, outDir);
+    testWarp(r);
+    testVideoDecode(r, outDir);
+    testGlslCompute(r, outDir);
+    testBuiltinMath(r);
+
+    r.section("Summary");
+    r.line("  PASSED: " + juce::String(r.passed));
+    r.line("  FAILED: " + juce::String(r.failed));
+    r.line(r.failed == 0 ? "  RESULT: ALL TESTS PASSED" : "  RESULT: FAILURES PRESENT");
+
+    auto reportFile = outDir.getChildFile("selftest_report.txt");
+    reportFile.replaceWithText(r.text);
+
+    // Best-effort echo to the parent console (the app is a GUI-subsystem
+    // binary, so stdout is normally detached - this only shows when launched
+    // from a terminal that we can attach to).
+    fprintf(stdout, "%s\n", r.text.toRawUTF8());
+    fflush(stdout);
+
+    return r.failed == 0 ? 0 : 1;
+}
+
+} // namespace SoundShop

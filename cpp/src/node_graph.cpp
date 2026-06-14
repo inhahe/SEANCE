@@ -7,11 +7,11 @@
 namespace SoundShop {
 
 void NodeGraph::commitSnapshot(const std::string& description) {
-    // Serialize the current graph (graph-only — plugin state excluded).
+    // Serialize the current graph (graph-only - plugin state excluded).
     auto text = ProjectFile::serializeForUndo(*this);
 
     // De-dup against the previous step's snapshot. memcmp on the underlying
-    // strings (length check first, then byte compare with early exit) — fast
+    // strings (length check first, then byte compare with early exit) - fast
     // for the no-change case, which is the common case for defensive calls.
     const auto& prev = undoTree.currentSnapshot();
     if (text.size() == prev.size() && text == prev)
@@ -39,6 +39,42 @@ float NodeGraph::getTimelineBeats(const Node& node) const {
     for (auto& c : node.clips)
         end = std::max(end, c.startBeat + c.lengthBeats);
     return std::max(4.0f, std::ceil(end / 4.0f) * 4.0f);
+}
+
+double NodeGraph::effectiveSongLengthBeats() const {
+    // Explicit override wins.
+    if (songLengthBeats > 0) return songLengthBeats;
+
+    // Auto-derive: max getTimelineBeats() across all timeline nodes that
+    // actually have clips. getTimelineBeats() returns 4.0 for empty
+    // timelines, which would falsely make an empty project "4 beats long";
+    // skip them so a project with no clips at all returns 0 (= no end).
+    double maxEnd = 0.0;
+    for (const auto& n : nodes) {
+        if (n.type != NodeType::AudioTimeline &&
+            n.type != NodeType::MidiTimeline) continue;
+        if (n.clips.empty()) continue;
+        double e = (double) getTimelineBeats(n);
+        if (e > maxEnd) maxEnd = e;
+    }
+    return maxEnd;
+}
+
+double NodeGraph::growSongLengthToContent() {
+    double prior = songLengthBeats;
+    if (songLengthBeats <= 0) return prior;  // auto mode follows clips already
+    double contentEnd = 0.0;
+    for (const auto& n : nodes) {
+        if (n.type != NodeType::AudioTimeline &&
+            n.type != NodeType::MidiTimeline) continue;
+        if (n.clips.empty()) continue;
+        contentEnd = std::max(contentEnd, (double) getTimelineBeats(n));
+    }
+    if (contentEnd > songLengthBeats) {
+        songLengthBeats = contentEnd;
+        dirty = true;
+    }
+    return prior;
 }
 
 Node& NodeGraph::addNode(const std::string& name, NodeType type,
@@ -162,16 +198,16 @@ void NodeGraph::deleteTime(float fromBeat, float toBeat, int nodeId) {
             float clipEnd = clip.startBeat + clip.lengthBeats;
 
             if (clip.startBeat >= toBeat) {
-                // Entirely after the deleted region — shift back
+                // Entirely after the deleted region - shift back
                 clip.startBeat -= duration;
             } else if (clipEnd <= fromBeat) {
-                // Entirely before — no change
+                // Entirely before - no change
             } else if (clip.startBeat >= fromBeat && clipEnd <= toBeat) {
-                // Entirely within the deleted region — remove
+                // Entirely within the deleted region - remove
                 it = node.clips.erase(it);
                 continue;
             } else if (clip.startBeat < fromBeat && clipEnd > toBeat) {
-                // Straddles the entire deleted region — shrink it
+                // Straddles the entire deleted region - shrink it
                 float clipFrom = fromBeat - clip.startBeat;
                 float clipTo = toBeat - clip.startBeat;
                 // Remove notes/CC in the deleted range, shift those after
@@ -193,14 +229,14 @@ void NodeGraph::deleteTime(float fromBeat, float toBeat, int nodeId) {
                 }
                 clip.lengthBeats -= duration;
             } else if (clip.startBeat < fromBeat) {
-                // Overlaps start of deleted region — trim end
+                // Overlaps start of deleted region - trim end
                 clip.lengthBeats = fromBeat - clip.startBeat;
                 clip.notes.erase(std::remove_if(clip.notes.begin(), clip.notes.end(),
                     [&](auto& n) { return n.offset >= clip.lengthBeats; }), clip.notes.end());
                 clip.ccEvents.erase(std::remove_if(clip.ccEvents.begin(), clip.ccEvents.end(),
                     [&](auto& cc) { return cc.offset >= clip.lengthBeats; }), clip.ccEvents.end());
             } else {
-                // Overlaps end of deleted region — trim start and shift
+                // Overlaps end of deleted region - trim start and shift
                 float trimAmount = toBeat - clip.startBeat;
                 for (auto ni = clip.notes.begin(); ni != clip.notes.end(); ) {
                     ni->offset -= trimAmount;
@@ -267,7 +303,16 @@ void NodeGraph::resolveAnchors() {
 void NodeGraph::setupDefaultGraph() {
     nodes.reserve(16);
 
-    // Computer Keyboard Input — represents the on-screen / typing input
+    // Reset song-end / repeat state to defaults. Without this, switching
+    // from a loaded project (e.g. a MOD import with songLengthBeats=352
+    // and SongRepeat::Forever) to File -> New would leave those values in
+    // place, and the auto-derive from clips would be silently overridden
+    // by a stale explicit value from the previous project.
+    songLengthBeats = 0;                  // 0 = auto-derive from clips
+    songRepeatMode  = SongRepeat::None;   // halt at song end by default
+    songRepeatCount = 1;
+
+    // Computer Keyboard Input - represents the on-screen / typing input
     // device. Live MIDI from the computer keyboard is pushed into this
     // node's output buffer by AudioEngine::keyboardNoteOn. Users wire
     // this node's MIDI Out to whatever they want to play.

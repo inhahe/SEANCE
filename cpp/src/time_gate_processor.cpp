@@ -83,7 +83,7 @@ void TimeGateProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::MidiBu
     for (int ch = 0; ch < buf.getNumChannels(); ++ch)
         buf.applyGain(ch, 0, buf.getNumSamples(), wet);
 
-    // Scale MIDI velocity by wet (optional — crude but prevents loud note-ons
+    // Scale MIDI velocity by wet (optional - crude but prevents loud note-ons
     // during crossfade. Could be omitted if MIDI gating feels unnatural.)
     // For v1, just pass MIDI through unchanged during crossfade.
 }

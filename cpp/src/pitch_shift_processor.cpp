@@ -94,7 +94,7 @@ void PitchShiftProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Midi
         buf.clear();
     }
 #else
-    // No Rubber Band — pass through unchanged
+    // No Rubber Band - pass through unchanged
     (void)buf;
 #endif
 }

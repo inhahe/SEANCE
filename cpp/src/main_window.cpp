@@ -2210,6 +2210,25 @@ void MainContentComponent::showPluginUI(int nodeId) {
         return;
     }
 
+    // Curve EQ editor: an Effect node whose script is a `__curveeq__:` curve.
+    // Draws an arbitrary magnitude-response curve applied via block-local STFT.
+    if (node && node->type == NodeType::Effect
+        && node->script.rfind("__curveeq__:", 0) == 0) {
+        auto* editor = new CurveEQEditorComponent(graph, node->id, [this]() {
+            audioEngine.getGraphProcessor().requestRebuild();
+        });
+        juce::DialogWindow::LaunchOptions opts;
+        opts.content.setOwned(editor);
+        opts.dialogTitle = "Curve EQ: " + juce::String(node->name);
+        opts.dialogBackgroundColour = juce::Colour(22, 22, 28);
+        opts.escapeKeyTriggersCloseButton = true;
+        opts.useNativeTitleBar = false;
+        opts.resizable = true;
+        opts.componentToCentreAround = this;
+        SoundShop::launchToolDialog(opts);
+        return;
+    }
+
     // Spectral (frequency-domain) editor for nodes authored with a
     // mag/phase spectrum. Both the new `__spectral2__:` format and the
     // legacy `__spectral__:` format open the same editor; the editor

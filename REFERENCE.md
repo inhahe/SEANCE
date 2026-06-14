@@ -938,6 +938,18 @@ The **SpectrumTap** effect reuses `SpectralCurve` for a per-bin custom frequency
 
 A status line under the canvas shows **Independent curve** or **Linked to library curve: <name> (#id) — edits propagate**. **Use Default (bandpass)** and the bin's **Delete** also detach any link. Hard-deleting the referenced asset (from the library browser) makes the bin fall back to its last cached curve as an independent curve — references never dangle. Resolution is done by `resolveSpectrumTapReferences()` (`spectrum_tap.cpp`), called after `readProject()` and after each edit, mirroring `resolveAhdsrReferences()`.
 
+### <a name="curve-eq"></a>Curve EQ
+
+The **Curve EQ** effect is the third `FrequencyGraph` consumer (alongside the spectral synth's mag/phase curves and the Spectrum Tap). It applies a single user-drawn **frequency-response curve** — a gain *multiplier* vs. frequency — to any audio passing through it. It's the draw-a-shape complement to the biquad **Parametric EQ**: the biquad EQ is the low-CPU, minimum-phase, surgical tool (a handful of bands with type/freq/gain/Q); the Curve EQ lets you sketch an arbitrary response and applies it linearly across the whole spectrum.
+
+**Created from** the node-graph right-click → **Add effect** → **Curve EQ (draw response)** menu item. Two node params show in the body: **FFT Size** (8–12, i.e. 256–4096 bins; default 11 = 2048) and **Mix** (0–1 dry/wet). **Double-click** the node to open the curve editor — one `SpectralCurvePanel` (gain axis `0..2`, where `1.0` = unity/flat, `<1` cuts, `>1` boosts; the processor clamps the applied gain to `[0,8]`). The same Equation/Drawn authoring and Built-in/Lua/Python/GLSL language choice as every other `SpectralCurve` applies; the default curve is the flat equation `1`.
+
+**Library linking** is identical to the spectral editor: a **Library…** button + status line tie the response into the [Frequency Graphs library](#frequency-graph-library-curves) (publish / link / detach via the shared `showFrequencyGraphLibraryMenu`), so one drawn EQ shape can be live-shared with FFT wavetable frames, the Spectrum Tap, and other Curve EQ nodes. Resolution is `resolveCurveEqReferences()` (`curve_editor.cpp`), called after `readProject()` and after each edit; a hard-deleted asset detaches the node to its last cached curve.
+
+**DSP — zero latency.** `CurveEQProcessor` (`builtin_effects.h`) runs a *block-local* Hann-windowed overlap-add STFT (75% overlap, `fftSize` clamped down to fit the block), multiplies each bin's **magnitude** by the curve value (phase untouched → linear / zero-phase), and normalises each output sample by the summed synthesis window. It introduces **no latency** — SEANCE has no plugin-delay-compensation, so a latency-bearing design would misalign parallel chains. Edits commit through `commitToNode()` → `setNodeScriptSynced` + `commitSnapshot("Edit Curve EQ")` (snapshot undo; the editor debounces the audio-graph rebuild 500 ms).
+
+**Serialization:** `__curveeq__:<curve.encode()>` with an optional trailing `|refs:<assetId>` field (emitted only when linked). The `CurveEq` namespace helpers (`curve_editor.h`) are the single source of truth shared by the processor, the editor, and the resolver.
+
 ### Serialization
 
 `__spectral2__:<fftSize>|<mag.encode()>|<phase.encode()>` — each curve's `encode()` embeds its mode, expression (with `,`→`;` and `|`→`\x1F` escaping so it's safe inside the `|`-delimited blob), and language key. Two optional trailing `|`-fields follow, each self-identified by a prefix so order is flexible and unknown fields are skipped: `warp:<chain>` (the per-bin warp chain) and `refs:<magAssetId>:<phaseAssetId>` (the FrequencyGraph live-reference ids, emitted only when a curve is linked). `refs:` is written *after* `warp:` so an old decoder — which only checked `parts[3]` for a `warp:` prefix — still finds its warp and harmlessly ignores the ref field. The older `__spectral__:<fftSize>:<phaseMode>:<magExpr>|<phaseExpr>` format still decodes (as Built-in equations). Baked sample buffers are transient and re-created via `SpectralCurve::rebake()` on load.
@@ -2144,8 +2156,9 @@ has one tab per asset kind:
   different from a time-domain wave shape or an amplitude envelope. Shared by the
   **Spectral FFT** waveform type's magnitude/phase curves (both a standalone
   Frequency Domain node and a Spectral frame nested inside a wavetable — each
-  curve has its own **Library…** button, `resolveSpectralReferences`), the EQ
-  node, and the **Spectrum Tap** per-bin custom response (published from the
+  curve has its own **Library…** button, `resolveSpectralReferences`), the
+  **Curve EQ** node's response curve (`resolveCurveEqReferences`, see
+  [Curve EQ](#curve-eq)), and the **Spectrum Tap** per-bin custom response (published from the
   Spectrum Tap response editor's **Library…** button — see
   [SpectrumTap](#spectrumtap)). The publish / link / detach popup is one shared
   helper (`showFrequencyGraphLibraryMenu` in `curve_editor.cpp`) used by every

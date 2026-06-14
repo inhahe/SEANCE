@@ -672,4 +672,32 @@ void showFrequencyGraphLibraryMenu(juce::Component* anchor,
         });
 }
 
+// ==============================================================================
+// Curve EQ FrequencyGraph live-reference resolution
+// ==============================================================================
+int resolveCurveEqReferences(NodeGraph& graph) {
+    int refreshed = 0;
+    for (auto& n : graph.nodes) {
+        if (n.script.rfind(CurveEq::kPrefix(), 0) != 0) continue;
+        SpectralCurve curve;
+        int assetId = -1;
+        if (!CurveEq::decode(n.script, curve, assetId)) continue;
+        if (assetId < 0) continue;                  // independent - nothing to do
+
+        const AssetEntry* e = graph.assets.find(assetId);
+        if (e && e->kind == AssetKind::FrequencyGraph) {
+            SpectralCurve c;
+            if (SpectralCurve::decode(e->payload, c)) {  // decode() rebakes Lua/Python
+                setNodeScriptSynced(n, CurveEq::encode(c, assetId));
+                ++refreshed;
+            }
+            // malformed payload -> leave the cached curve + link untouched
+        } else {
+            // referenced asset gone -> detach, keep the last cached curve
+            setNodeScriptSynced(n, CurveEq::encode(curve, -1));
+        }
+    }
+    return refreshed;
+}
+
 } // namespace SoundShop

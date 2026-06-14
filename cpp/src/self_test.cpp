@@ -3596,6 +3596,142 @@ void testAssetLibrary(Report& r) {
                    ParametricEQProcessor::countBands(*g2.findNode(nId)));
     }
 
+    // ---- Curve EQ: script helpers, FrequencyGraph link, zero-latency DSP ----
+    {
+        // A) CurveEq::encode/decode round-trips the curve and the optional id.
+        {
+            SpectralCurve c; c.expression = "exp(-f/8)";
+            std::string s = CurveEq::encode(c, -1);
+            r.check(s.rfind("__curveeq__:", 0) == 0,
+                    "curveeq: encode carries the __curveeq__: prefix");
+            SpectralCurve c2; int id2 = 999;
+            r.check(CurveEq::decode(s, c2, id2) && id2 == -1 &&
+                        c2.expression == "exp(-f/8)",
+                    "curveeq: decode round-trips curve + independent id (-1)");
+
+            SpectralCurve c3; c3.expression = "1";
+            SpectralCurve c4; int id4 = -1;
+            r.check(CurveEq::decode(CurveEq::encode(c3, 42), c4, id4) && id4 == 42,
+                    "curveeq: decode round-trips a linked asset id");
+
+            SpectralCurve junk; int idj = 7;
+            r.check(!CurveEq::decode("__eq__", junk, idj),
+                    "curveeq: decode rejects a non-curveeq script");
+        }
+
+        // B) FrequencyGraph live reference: publish, resolve/propagate, save/load,
+        //    erase->detach. Mirrors the spectral resolver test.
+        {
+            NodeGraph g;
+            SpectralCurve shared; shared.expression = "exp(-f/4)";
+            int aid = g.assets.add(AssetKind::FrequencyGraph, "eq lib", "",
+                                   shared.encode());
+            int nId = g.addNode("ceq", NodeType::Effect, {}, {}).id;
+            {
+                SpectralCurve stale; stale.expression = "1";  // stale cache
+                g.findNode(nId)->script = CurveEq::encode(stale, aid);
+            }
+            int n = resolveCurveEqReferences(g);
+            r.checkVal(n == 1, "curveeq: resolve mirrors the referenced curve", n);
+            {
+                SpectralCurve c; int id = -1;
+                CurveEq::decode(g.findNode(nId)->script, c, id);
+                r.check(c.expression == "exp(-f/4)" && id == aid,
+                        "curveeq: resolved curve matches the published asset");
+            }
+            // Edit the asset -> propagates on next resolve.
+            SpectralCurve edited; edited.expression = "exp(-f/2)";
+            g.assets.update(aid, "", edited.encode());
+            resolveCurveEqReferences(g);
+            {
+                SpectralCurve c; int id = -1;
+                CurveEq::decode(g.findNode(nId)->script, c, id);
+                r.check(c.expression == "exp(-f/2)",
+                        "curveeq: editing the asset propagates to the node");
+            }
+            // Save/load preserves + re-resolves.
+            std::ostringstream oss;
+            ProjectFile::writeProject(oss, g, nullptr, false, true);
+            NodeGraph g2; std::istringstream iss(oss.str());
+            ProjectFile::readProject(iss, g2, nullptr);
+            {
+                SpectralCurve c; int id = -1;
+                CurveEq::decode(g2.findNode(nId)->script, c, id);
+                r.check(id == aid && c.expression == "exp(-f/2)",
+                        "curveeq: node reference re-resolves after save/load");
+            }
+            // Erase asset -> detach, keep last curve.
+            g.assets.erase(aid);
+            resolveCurveEqReferences(g);
+            {
+                SpectralCurve c; int id = 0;
+                CurveEq::decode(g.findNode(nId)->script, c, id);
+                r.check(id == -1 && c.expression == "exp(-f/2)",
+                        "curveeq: erased asset -> node falls back to independent");
+            }
+        }
+
+        // C) DSP sanity: unity curve "1" passes audio through (central RMS ~=
+        //    input); zero curve "0" silences it. Zero latency, so central
+        //    samples line up with the dry signal.
+        {
+            const int N = 8192;
+            const double sr = 44100.0;
+            const float freq = 440.0f;
+            auto makeSine = [&](juce::AudioBuffer<float>& b) {
+                b.setSize(1, N);
+                float* d = b.getWritePointer(0);
+                for (int i = 0; i < N; ++i)
+                    d[i] = 0.5f * std::sin(2.0 * 3.14159265358979 * freq * i / sr);
+            };
+            auto centralRMS = [&](const juce::AudioBuffer<float>& b) {
+                const float* d = b.getReadPointer(0);
+                double acc = 0; int cnt = 0;
+                for (int i = 2048; i < 6144; ++i) { acc += (double)d[i]*d[i]; ++cnt; }
+                return std::sqrt(acc / std::max(1, cnt));
+            };
+
+            // Unity.
+            {
+                NodeGraph g;
+                int nId = g.addNode("ceq", NodeType::Effect, {}, {}).id;
+                Node& nd = *g.findNode(nId);
+                nd.params.push_back({"FFT Size", 11.0f, 8.0f, 12.0f});
+                nd.params.push_back({"Mix",       1.0f, 0.0f,  1.0f});
+                SpectralCurve c; c.expression = "1";
+                nd.script = CurveEq::encode(c, -1);
+
+                CurveEQProcessor proc(nd);
+                proc.prepareToPlay(sr, N);
+                juce::AudioBuffer<float> buf; makeSine(buf);
+                juce::AudioBuffer<float> dry; makeSine(dry);
+                juce::MidiBuffer mb;
+                proc.processBlock(buf, mb);
+                double rWet = centralRMS(buf), rDry = centralRMS(dry);
+                r.check(rDry > 1e-3 && std::abs(rWet - rDry) / rDry < 0.1,
+                        "curveeq: unity curve preserves central RMS (zero-latency)");
+            }
+            // Zero (full cut).
+            {
+                NodeGraph g;
+                int nId = g.addNode("ceq", NodeType::Effect, {}, {}).id;
+                Node& nd = *g.findNode(nId);
+                nd.params.push_back({"FFT Size", 11.0f, 8.0f, 12.0f});
+                nd.params.push_back({"Mix",       1.0f, 0.0f,  1.0f});
+                SpectralCurve c; c.expression = "0";
+                nd.script = CurveEq::encode(c, -1);
+
+                CurveEQProcessor proc(nd);
+                proc.prepareToPlay(sr, N);
+                juce::AudioBuffer<float> buf; makeSine(buf);
+                juce::MidiBuffer mb;
+                proc.processBlock(buf, mb);
+                r.check(centralRMS(buf) < 1e-3,
+                        "curveeq: zero curve silences the central region");
+            }
+        }
+    }
+
     // ---- import / merge: dedup by content, id remap, name-clash suffix ------
     {
         // Source library (from "another project"): three assets.

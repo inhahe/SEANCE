@@ -1026,6 +1026,10 @@ bool ProjectFile::readProject(std::istream& f, NodeGraph& graph, PluginHost* plu
     // wavetable nodes. Free function in spectral_editor.cpp.
     resolveSpectralReferences(graph);
 
+    // ...and the Curve EQ nodes, the third FrequencyGraph consumer. Free
+    // function in curve_editor.cpp.
+    resolveCurveEqReferences(graph);
+
     // Restore open editors (store IDs only - never store Node*)
     graph.openEditors.clear();
     for (int id : pendingEditorIds) {

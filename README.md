@@ -238,7 +238,8 @@ All built-in effects can be combined freely with cables — pre-effect, post-eff
 **Reverb and spatial**
 
 - **Reverb** — algorithmic Freeverb: 8 parallel lowpass-feedback comb filters + 4 serial allpass filters per channel. Controls: mix, room size, damping, stereo width, pre-delay. High-frequency decay simulates real-room absorption.
-- **Parametric EQ** — multi-band biquad EQ (starts at 4 bands; right-click the node to **Add EQ Band** / **Remove Last EQ Band**, 1–12 bands). Each band has selectable type (peak / low shelf / high shelf / highpass / lowpass), frequency, gain (dB), and Q. Uses the standard RBJ Audio EQ Cookbook coefficients.
+- **Parametric EQ** — multi-band biquad EQ (starts at 4 bands; right-click the node to **Add EQ Band** / **Remove Last EQ Band**, 1–12 bands). Each band has selectable type (peak / low shelf / high shelf / highpass / lowpass), frequency, gain (dB), and Q. Uses the standard RBJ Audio EQ Cookbook coefficients. The low-CPU, surgical tool.
+- **Curve EQ** — draw an arbitrary frequency-response curve (gain multiplier vs. frequency) and the node applies it via a zero-latency overlap-add STFT, preserving phase. Double-click the node to open the curve editor. The response curve is a **Frequency Graph** library item, so the same shape can be published, linked, and live-shared with FFT wavetable frames and the Spectrum Tap. The draw-a-shape complement to the biquad Parametric EQ.
 
 **Dynamics**
 

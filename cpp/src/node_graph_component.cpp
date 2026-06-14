@@ -1676,6 +1676,7 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
     fxMenu.addItem(207, "Convolution Filter");
     fxMenu.addItem(221, "Reverb");
     fxMenu.addItem(222, "Parametric EQ");
+    fxMenu.addItem(241, "Curve EQ (draw response)");
     fxMenu.addSeparator();
     fxMenu.addItem(208, "Tremolo");
     fxMenu.addItem(209, "Vibrato");
@@ -2541,6 +2542,19 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
                     {"B4 Gain", 0.0f, -24.0f, 24.0f},
                     {"B4 Q",    0.707f, 0.1f, 10.0f},
                 }); break;
+                case 241: {
+                    // Curve EQ: draw-the-response equaliser. Default curve is
+                    // flat (unity gain at every frequency). The magnitude curve
+                    // lives in the script; FFT Size + Mix are node params.
+                    SpectralCurve c;
+                    c.expression = "1";
+                    auto& n = makeEffect("Curve EQ", "__curveeq__:", {
+                        {"FFT Size", 11.0f, 8.0f, 12.0f}, // 2^11 = 2048-bin resolution
+                        {"Mix",       1.0f, 0.0f,  1.0f},
+                    });
+                    n.script = CurveEq::encode(c, -1);
+                    break;
+                }
                 case 239: makeEffect("SMS", "__sms__", {
                     {"Threshold",     0.1f, 0.0f,  1.0f},
                     {"Harmonic Gain", 1.0f, 0.0f,  3.0f},

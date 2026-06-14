@@ -182,4 +182,45 @@ private:
     void onCurveChanged();
 };
 
+// =============================================================================
+// CurveEQEditorComponent - editor for a Curve EQ node (__curveeq__:).
+//
+// Edits the single magnitude-response SpectralCurve stored in the node script,
+// with the same FrequencyGraph library linking as the spectral editor (publish
+// / link existing / detach, with live propagation to every consumer sharing the
+// asset). Just one curve panel + a Library... button; FFT Size and Mix stay as
+// node params shown in the node body. onApply() is debounced (500 ms) to request
+// a graph rebuild, same as the spectral / waveform editors.
+// =============================================================================
+class CurveEQEditorComponent : public juce::Component, private juce::Timer {
+public:
+    CurveEQEditorComponent(NodeGraph& graph, int nodeId,
+                           std::function<void()> onApply);
+    ~CurveEQEditorComponent() override;
+
+    void resized() override;
+    void paint(juce::Graphics& g) override;
+    void timerCallback() override;
+
+private:
+    NodeGraph& graph;
+    int nodeId;
+    std::function<void()> onApply;
+
+    SpectralCurve curve;       // working copy, mirrored to node.script on commit
+    int assetId = -1;          // FrequencyGraph link (-1 = independent)
+
+    juce::Label      titleLabel;
+    std::unique_ptr<SpectralCurvePanel> curvePanel;
+    juce::TextButton libraryBtn { "Library..." };
+    juce::Label      linkLabel;
+    juce::TextButton closeBtn   { "Close" };
+
+    void onCurveChanged();
+    void commitToNode();          // re-encode node.script + snapshot
+    void openLibrary();
+    void writeBackLinkedCurve();  // push edits to the linked asset + propagate
+    void refreshLinkLabel();
+};
+
 } // namespace SoundShop

@@ -4,6 +4,7 @@
 #include <vector>
 #include <string>
 #include <functional>
+#include <cstdlib>
 
 namespace SoundShop {
 
@@ -150,5 +151,47 @@ void showFrequencyGraphLibraryMenu(juce::Component* anchor,
                                    int currentId,
                                    const juce::String& defaultName,
                                    std::function<void(int)> onChanged);
+
+// ==============================================================================
+// Curve EQ node script (`__curveeq__:`) - a single magnitude-response
+// SpectralCurve (gain multiplier vs. frequency, evaluated per FFT bin) with an
+// optional FrequencyGraph asset link. One source of truth for the format,
+// shared by the processor (builtin_effects.h), the editor (spectral_editor.cpp)
+// and the resolver below. Format:
+//   __curveeq__:<curve.encode()>[|refs:<assetId>]
+// curve.encode() never emits '|', so the optional "|refs:" tail is unambiguous.
+// ==============================================================================
+namespace CurveEq {
+    inline const char* kPrefix() { return "__curveeq__:"; }
+
+    inline std::string encode(const SpectralCurve& curve, int assetId) {
+        std::string s = std::string(kPrefix()) + curve.encode();
+        if (assetId >= 0) s += "|refs:" + std::to_string(assetId);
+        return s;
+    }
+
+    // Returns false (and leaves outCurve/outAssetId at defaults) if `script` is
+    // not a Curve EQ script. outAssetId is -1 when there is no link.
+    inline bool decode(const std::string& script, SpectralCurve& outCurve,
+                       int& outAssetId) {
+        outAssetId = -1;
+        const std::string pfx = kPrefix();
+        if (script.rfind(pfx, 0) != 0) return false;
+        std::string rest = script.substr(pfx.size());
+        std::string curveEnc = rest;
+        auto bar = rest.find("|refs:");
+        if (bar != std::string::npos) {
+            curveEnc = rest.substr(0, bar);
+            outAssetId = std::atoi(rest.substr(bar + 6).c_str());
+        }
+        return SpectralCurve::decode(curveEnc, outCurve);
+    }
+}
+
+// Re-mirror every Curve EQ node's linked FrequencyGraph asset into its live
+// curve (and re-encode the node script). Detaches (assetId -> -1, keeping the
+// last cached curve) when the asset is gone. Returns the number of curves
+// refreshed from a live asset. Call after readProject() and after edits.
+int resolveCurveEqReferences(NodeGraph& graph);
 
 } // namespace SoundShop

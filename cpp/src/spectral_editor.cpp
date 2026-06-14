@@ -634,4 +634,139 @@ void SpectralEditorComponent::openCurveLibrary(bool isMag) {
         });
 }
 
+// ==============================================================================
+// CurveEQEditorComponent - editor for a Curve EQ node (__curveeq__:).
+// A single magnitude-response curve panel + FrequencyGraph library linking.
+// ==============================================================================
+
+CurveEQEditorComponent::CurveEQEditorComponent(NodeGraph& g, int nId,
+                                               std::function<void()> apply)
+    : graph(g), nodeId(nId), onApply(std::move(apply))
+{
+    if (auto* nd = graph.findNode(nodeId)) {
+        if (!CurveEq::decode(nd->script, curve, assetId)) {
+            curve = SpectralCurve();
+            curve.expression = "1";
+            assetId = -1;
+        }
+    } else {
+        curve = SpectralCurve();
+        curve.expression = "1";
+    }
+
+    addAndMakeVisible(titleLabel);
+    titleLabel.setText("Frequency response (gain multiplier vs. frequency)",
+                       juce::dontSendNotification);
+    titleLabel.setFont(13.0f);
+    titleLabel.setColour(juce::Label::textColourId, juce::Colour(0xFFCCCCCC));
+
+    // y range 0..2: 1.0 = unity (flat), <1 cuts, >1 boosts. The processor
+    // clamps to [0,8] so a steep drawn curve can still boost hard if wanted.
+    curvePanel = std::make_unique<SpectralCurvePanel>(curve, "Gain",
+        0.0f, 2.0f, juce::Colour(150, 230, 170),
+        [this]() { onCurveChanged(); });
+    addAndMakeVisible(curvePanel.get());
+
+    addAndMakeVisible(libraryBtn);
+    libraryBtn.setTooltip("Publish this response curve to the project's Frequency "
+        "Graphs library, link it to an existing library curve (edits then "
+        "propagate to every node sharing it), or detach to an independent copy.");
+    libraryBtn.onClick = [this]() { openLibrary(); };
+
+    addAndMakeVisible(linkLabel);
+    linkLabel.setFont(11.0f);
+    linkLabel.setColour(juce::Label::textColourId, juce::Colour(0xFFAAAAAA));
+
+    addAndMakeVisible(closeBtn);
+    closeBtn.setTooltip("Close this editor. Unapplied edits are committed first.");
+    closeBtn.onClick = [this]() {
+        commitToNode();
+        if (onApply) onApply();
+        if (auto* dw = findParentComponentOfClass<juce::DialogWindow>())
+            dw->exitModalState(0);
+    };
+
+    refreshLinkLabel();
+    setSize(560, 360);
+}
+
+CurveEQEditorComponent::~CurveEQEditorComponent() {
+    stopTimer();
+}
+
+void CurveEQEditorComponent::resized() {
+    auto a = getLocalBounds().reduced(8);
+
+    auto top = a.removeFromTop(26);
+    closeBtn.setBounds(top.removeFromRight(72));
+    titleLabel.setBounds(top);
+    a.removeFromTop(4);
+
+    auto row = a.removeFromTop(22);
+    libraryBtn.setBounds(row.removeFromLeft(80));
+    row.removeFromLeft(6);
+    linkLabel.setBounds(row);
+    a.removeFromTop(2);
+
+    if (curvePanel) curvePanel->setBounds(a);
+}
+
+void CurveEQEditorComponent::paint(juce::Graphics& g) {
+    g.fillAll(juce::Colour(22, 22, 28));
+}
+
+void CurveEQEditorComponent::timerCallback() {
+    stopTimer();
+    commitToNode();
+    if (onApply) onApply();
+}
+
+void CurveEQEditorComponent::onCurveChanged() {
+    // A linked curve's edit flows back to its asset so every other consumer
+    // sharing it updates too (the "live reference" contract).
+    writeBackLinkedCurve();
+    // Debounce the audio-graph rebuild, same as the spectral editor.
+    startTimer(500);
+}
+
+void CurveEQEditorComponent::commitToNode() {
+    if (auto* nd = graph.findNode(nodeId)) {
+        setNodeScriptSynced(*nd, CurveEq::encode(curve, assetId));
+        graph.dirty = true;
+        graph.commitSnapshot("Edit Curve EQ");
+    }
+}
+
+void CurveEQEditorComponent::writeBackLinkedCurve() {
+    if (assetId < 0) return;
+    graph.assets.update(assetId, "", curve.encode());
+    // Propagate to every other Curve EQ consumer sharing this asset.
+    resolveCurveEqReferences(graph);
+}
+
+void CurveEQEditorComponent::refreshLinkLabel() {
+    if (assetId < 0) {
+        linkLabel.setText("Independent curve (not in library)",
+                          juce::dontSendNotification);
+    } else {
+        const AssetEntry* e = graph.assets.find(assetId);
+        juce::String nm = e ? juce::String(e->name) : juce::String("(missing)");
+        linkLabel.setText("Linked: " + nm + " (#" + juce::String(assetId) +
+                          ")  - edits propagate", juce::dontSendNotification);
+    }
+}
+
+void CurveEQEditorComponent::openLibrary() {
+    showFrequencyGraphLibraryMenu(&libraryBtn, graph, curve, assetId,
+        "Curve EQ response",
+        [this](int newId) {
+            assetId = newId;
+            if (curvePanel) curvePanel->syncFromModel();
+            commitToNode();
+            writeBackLinkedCurve();
+            refreshLinkLabel();
+            if (onApply) onApply();
+        });
+}
+
 } // namespace SoundShop

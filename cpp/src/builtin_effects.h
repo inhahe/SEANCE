@@ -5,6 +5,7 @@
 #include "pitch_detect.h"
 #include "fft_util.h"
 #include "builtin_synth.h"
+#include "curve_editor.h"   // SpectralCurve + CurveEq script helpers (Curve EQ)
 #include <juce_audio_processors/juce_audio_processors.h>
 #include <cmath>
 #include <vector>
@@ -2448,6 +2449,128 @@ private:
     Node& node;
     double sampleRate = 44100;
     std::vector<float> tailBufL, tailBufR;
+};
+
+// ==============================================================================
+// CURVE EQ - draw-the-response equaliser
+//
+// Applies a single magnitude-response curve (a SpectralCurve: gain multiplier
+// vs. frequency, evaluated per FFT bin) to the audio. Unlike the biquad
+// Parametric EQ (a handful of resonant bands), this lets the user draw or write
+// an arbitrary frequency response and is the third consumer of FrequencyGraph
+// library assets (alongside the Spectrum Tap and the Frequency Domain wavetable
+// node), so the same shared curve can drive all three.
+//
+// Implementation: block-local Hann overlap-add STFT (75% overlap), magnitude-
+// only multiply (phase preserved -> zero-phase / linear-phase response),
+// normalised per output sample by the summed synthesis window. Zero latency,
+// matching every other built-in effect (SEANCE has no plugin-delay
+// compensation, so a latency-bearing design would misalign parallel chains).
+//
+// Script: __curveeq__:<curve.encode()>[|refs:<assetId>]  (see CurveEq, curve_editor.h)
+// Params: FFT Size (2^exp resolution), Mix (dry/wet).
+// ==============================================================================
+class CurveEQProcessor : public juce::AudioProcessor {
+public:
+    CurveEQProcessor(Node& n) : node(n) { decodeCurve(); }
+    const juce::String getName() const override { return "Curve EQ"; }
+    void prepareToPlay(double sr, int) override { sampleRate = sr; decodeCurve(); }
+    void releaseResources() override {}
+
+    void processBlock(juce::AudioBuffer<float>& buf, juce::MidiBuffer&) override {
+        applySignalModulations(node, buf);
+        const int n = buf.getNumSamples();
+        const int ch = std::min(2, buf.getNumChannels());
+        if (n == 0 || ch == 0) return;
+
+        int fftExp = juce::jlimit(8, 12, (int)paramByName(node, "FFT Size", 11.0f));
+        float mix  = juce::jlimit(0.0f, 1.0f, paramByName(node, "Mix", 1.0f));
+
+        int fftSize = 1 << fftExp;
+        while (fftSize > n) fftSize /= 2;   // can't exceed the block
+        if (fftSize < 16) return;           // too small to filter meaningfully
+        int halfBins = fftSize / 2 + 1;
+
+        ensureGains(halfBins);
+
+        FFT fft(fftSize);
+        std::vector<float> window(fftSize);
+        for (int i = 0; i < fftSize; ++i)
+            window[i] = 0.5f * (1.0f - std::cos(6.28318530718f * i / fftSize)); // Hann
+
+        const int hop = std::max(1, fftSize / 4); // 75% overlap
+
+        for (int c = 0; c < ch; ++c) {
+            float* data = buf.getWritePointer(c);
+            std::vector<float> dry(data, data + n);
+            std::vector<float> out(n, 0.0f);
+            std::vector<float> norm(n, 0.0f);
+
+            auto processFrame = [&](int start) {
+                std::vector<float> windowed(fftSize);
+                for (int i = 0; i < fftSize; ++i)
+                    windowed[i] = data[start + i] * window[i];
+                std::vector<std::complex<float>> spec;
+                fft.forwardReal(windowed, spec);
+                for (int k = 0; k < halfBins && k < (int)spec.size(); ++k)
+                    spec[k] *= gains[(size_t)k];       // magnitude scale, phase kept
+                std::vector<float> time;
+                fft.inverseReal(spec, time);
+                for (int i = 0; i < fftSize; ++i) {
+                    out[start + i]  += time[i] * window[i];   // synthesis window
+                    norm[start + i] += window[i] * window[i];
+                }
+            };
+
+            int start = 0;
+            for (; start + fftSize <= n; start += hop) processFrame(start);
+            // Cover the block tail so the end isn't under-filtered (skip if the
+            // last hop already lands exactly on n-fftSize).
+            if (n >= fftSize && ((n - fftSize) % hop) != 0) processFrame(n - fftSize);
+
+            for (int i = 0; i < n; ++i) {
+                float wet = norm[i] > 1e-6f ? out[i] / norm[i] : dry[i];
+                data[i] = dry[i] * (1.0f - mix) + wet * mix;
+            }
+        }
+    }
+
+    double getTailLengthSeconds() const override { return 0; }
+    bool acceptsMidi() const override { return true; }
+    bool producesMidi() const override { return true; }
+    bool isBusesLayoutSupported(const BusesLayout&) const override { return true; }
+    juce::AudioProcessorEditor* createEditor() override { return nullptr; }
+    bool hasEditor() const override { return false; }
+    int getNumPrograms() override { return 1; }
+    int getCurrentProgram() override { return 0; }
+    void setCurrentProgram(int) override {}
+    const juce::String getProgramName(int) override { return {}; }
+    void changeProgramName(int, const juce::String&) override {}
+    void getStateInformation(juce::MemoryBlock&) override {}
+    void setStateInformation(const void*, int) override {}
+
+private:
+    Node& node;
+    double sampleRate = 44100;
+    SpectralCurve curve;
+    std::vector<float> gains;     // per-bin magnitude multiplier, sized halfBins
+    int gainsBins = -1;
+
+    void decodeCurve() {
+        int assetId = -1;
+        if (!CurveEq::decode(node.script, curve, assetId)) {
+            curve = SpectralCurve();
+            curve.expression = "1";   // flat (unity) fallback
+        }
+        gainsBins = -1;               // force gain recompute
+    }
+
+    void ensureGains(int halfBins) {
+        if (gainsBins == halfBins && (int)gains.size() == halfBins) return;
+        gains = curve.evaluate(halfBins);
+        for (auto& g : gains) g = juce::jlimit(0.0f, 8.0f, g); // sane magnitude range
+        gainsBins = halfBins;
+    }
 };
 
 // ==============================================================================

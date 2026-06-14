@@ -1,5 +1,6 @@
 #include "main_window.h"
 #include "dialog_helpers.h"
+#include "asset_library_component.h"
 #include "terrain_synth.h"
 #include "builtin_synth.h"
 #include "layered_wave_editor.h"
@@ -1130,6 +1131,8 @@ juce::PopupMenu MainContentComponent::getMenuForIndex(int idx, const juce::Strin
                      hasLoop); // only enabled when loop region is set
         menu.addItem(23, "Arm All Params for Write");
         menu.addItem(24, "Disarm All Params");
+        menu.addSeparator();
+        menu.addItem(26, "Asset Library...");
     } else if (name == "Scripts") {
         menu.addItem(90, "Script Console...");
         menu.addItem(91, "Run Script File...");
@@ -1293,6 +1296,7 @@ void MainContentComponent::menuItemSelected(int menuItemID, int) {
         }
         case 23: graph.armAllParams(true); graphComponent->repaint(); break;
         case 24: graph.armAllParams(false); graphComponent->repaint(); break;
+        case 26: showAssetLibraryDialog(); break;
         case 70: case 71: case 72: case 73:
             graph.tuningSystem = (TuningSystem)(menuItemID - 70);
             break;
@@ -5136,6 +5140,26 @@ void MainContentComponent::showAudioDeviceSettings() {
     opts.componentToCentreAround = this;
     SoundShop::launchToolDialog(opts);
 #endif
+}
+
+void MainContentComponent::showAssetLibraryDialog() {
+    auto* dlg = new AssetLibraryComponent(graph.assets,
+        [this](const std::string& desc) {
+            projectDirty = true;
+            graph.dirty = true;
+            graph.commitSnapshot(desc);
+            if (graphComponent) graphComponent->repaint();
+        });
+
+    juce::DialogWindow::LaunchOptions opts;
+    opts.content.setOwned(dlg);
+    opts.dialogTitle = "Asset Library";
+    opts.dialogBackgroundColour = juce::Colour(40, 40, 45);
+    opts.escapeKeyTriggersCloseButton = true;
+    opts.useNativeTitleBar = false;
+    opts.resizable = true;
+    opts.componentToCentreAround = this;
+    SoundShop::launchToolDialog(opts);
 }
 
 void MainContentComponent::showPluginSettingsDialog() {

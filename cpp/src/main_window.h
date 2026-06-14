@@ -186,6 +186,7 @@ private:
     bool midiDeviceScanInitialized = false;
     void showPluginSettingsDialog();
     void showSongSettingsDialog();
+    void showAssetLibraryDialog();
     void showAudioDeviceSettings();
 
     // Recent projects

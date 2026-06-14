@@ -150,6 +150,81 @@ void ss_waveletwarp(float* buf, int32_t len, int32_t method, float amount,
                     const char* filter, int32_t levels);
 
 // ============================================================================
+// Whole-grid TERRAIN generation (the Terrain Synth "generate" feature)
+// ============================================================================
+// A module used to GENERATE a terrain is a different shape from an audio module:
+// instead of ss_process(), it exports
+//
+//     void ss_generate(void);
+//
+// which the host calls ONCE (offline, on the message thread - never the audio
+// thread) to fill an N-D grid. The grid is HOST-owned, not in your linear memory:
+// you read/write cells by FLAT row-major index through the ss_grid_* imports
+// below. A generator module still needs an ss_init() (it may be empty) but does
+// NOT need ss_process(); an audio module is unchanged (ss_process, no
+// ss_generate). The result is one value per cell in [0,1] (a grayscale height),
+// baked and mapped to the terrain's bipolar [-1,1] as v*2-1, exactly like every
+// other generation language.
+//
+// WASM is block-only, so terrain WASM is WHOLE-GRID ONLY (no per-cell mode): the
+// whole program owns the array, which is what makes cross-cell work - blur,
+// cellular automata, FFT, global normalisation - possible. These imports mirror
+// the Lua whole-grid API (set/get/coord/coordAxis/neighbor) one-for-one.
+//
+// Minimal generator:
+//     int32_t ss_init(void) { return 0; }
+//     void ss_generate(void) {
+//         int32_t total = ss_grid_total();
+//         for (int32_t i = 0; i < total; ++i) {
+//             float x = ss_grid_coord(i, 0) * 6.2831853f;
+//             float y = ss_grid_coord(i, 1) * 6.2831853f;
+//             ss_grid_set(i, 0.5f + 0.5f * sinf(x) * cosf(y));
+//         }
+//     }
+__attribute__((import_module("env"), import_name("ss_grid_total")))
+int32_t ss_grid_total(void);                       // total cell count = product(dims)
+__attribute__((import_module("env"), import_name("ss_grid_nd")))
+int32_t ss_grid_nd(void);                          // number of dimensions (rank)
+__attribute__((import_module("env"), import_name("ss_grid_dim")))
+int32_t ss_grid_dim(int32_t axis);                 // size of `axis` (0 if out of range)
+__attribute__((import_module("env"), import_name("ss_grid_set")))
+void ss_grid_set(int32_t i, float v);              // write flat cell i (v clamped [0,1])
+__attribute__((import_module("env"), import_name("ss_grid_get")))
+float ss_grid_get(int32_t i);                      // read flat cell i (0 outside range)
+__attribute__((import_module("env"), import_name("ss_grid_coord")))
+float ss_grid_coord(int32_t i, int32_t axis);      // normalised [0,1] position along axis
+__attribute__((import_module("env"), import_name("ss_grid_coord_axis")))
+int32_t ss_grid_coord_axis(int32_t i, int32_t axis); // INTEGER coord of cell i along axis
+__attribute__((import_module("env"), import_name("ss_grid_neighbor")))
+int32_t ss_grid_neighbor(int32_t i, int32_t axis, int32_t delta); // flat idx delta steps, edge-clamped
+
+// Convenience N-D helpers (header-only; compose the imports above). `coords` is
+// an array of `nd` integer per-axis coordinates. flatten/getat clamp each coord
+// to [0,dim-1] (edge replicate); setat ignores an out-of-range write, matching
+// the Lua flatten/getAt/setAt twins. Define SS_NO_GRID_HELPERS to omit.
+#ifndef SS_NO_GRID_HELPERS
+static inline int32_t ss_grid_flatten(const int32_t* coords, int32_t nd) {
+    int32_t idx = 0;
+    for (int32_t a = 0; a < nd; ++a) {
+        int32_t sz = ss_grid_dim(a); if (sz < 1) sz = 1;
+        int32_t c = coords[a]; if (c < 0) c = 0; else if (c > sz - 1) c = sz - 1;
+        idx = idx * sz + c;                 // Horner form, last axis fastest
+    }
+    return idx;
+}
+static inline float ss_grid_getat(const int32_t* coords, int32_t nd) {
+    return ss_grid_get(ss_grid_flatten(coords, nd));
+}
+static inline void ss_grid_setat(const int32_t* coords, int32_t nd, float v) {
+    for (int32_t a = 0; a < nd; ++a) {
+        int32_t sz = ss_grid_dim(a); if (sz < 1) sz = 1;
+        if (coords[a] < 0 || coords[a] > sz - 1) return;   // OOB coord => no-op
+    }
+    ss_grid_set(ss_grid_flatten(coords, nd), v);
+}
+#endif // SS_NO_GRID_HELPERS
+
+// ============================================================================
 // GLSL-style shaping helpers (header-only, no libm)
 // ============================================================================
 // C's <math.h> has the transcendentals (sinf, cosf, expf, logf, tanhf, ...) but

@@ -41,7 +41,9 @@ public:
 private:
     void rebuildLangChoices();
     void onLanguageChanged();
-    void refreshModeAvailability();    // grey whole-grid when the language can't do it
+    void refreshModeAvailability();    // grey the mode the language can't do
+    void updateProgramUiForLanguage(); // code editor vs .wasm file picker
+    void browseForWasm();              // async file chooser for a .wasm module
     void refreshPassesVisibility();    // show Passes only for GLSL whole-grid
     int  selectedMode() const;         // 0 = per-cell, 1 = whole-grid
     int  selectedPasses() const;       // ping-pong passes (>=1), GLSL whole-grid only
@@ -74,6 +76,10 @@ private:
     juce::Label      statusLabel;
     juce::TextButton generateBtn { "Generate" };
     juce::TextButton cancelBtn   { "Cancel" };
+
+    // Async file chooser for the WASM "Browse .wasm..." button (kept alive while
+    // the native dialog is open).
+    std::unique_ptr<juce::FileChooser> chooser;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(GenerateDialogComponent)
 };

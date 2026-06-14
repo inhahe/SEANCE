@@ -60,6 +60,7 @@ release.rar
 *.wav
 captures/
 after_j_samples/
+after_j.mod
 
 # Self-test scratch output
 cpp/selftest_out*/

@@ -808,6 +808,83 @@ void testTerrainData(Report& r, const juce::File& dir) {
                     "gen: bakeTerrain fails cleanly when Python unavailable");
         }
 
+        // ---- WASM whole-grid generation (ss_generate + ss_grid_* imports) ---
+        // A terrain WASM module is chosen as a compiled .wasm FILE (not source),
+        // runs whole-grid only, and fills the host-owned grid via the ss_grid_*
+        // imports. First: a missing/empty path must fail cleanly (the routing
+        // through WasmRuntime + the load-failure message), independent of whether
+        // wasm3 is built in.
+        {
+            Terrain twe;
+            std::string weErr;
+            bool weOk = twe.fillFromScriptWholeGrid(ScriptLang::Wasm, "", { 4 }, weErr);
+            r.check(!weOk && !weErr.empty(),
+                    "gen: WASM whole-grid with no file fails cleanly");
+        }
+
+        // GenLang/ScriptLang value-collision guard: the two enums only agree on
+        // Builtin/Lua. GenLang::Python==2 collides with ScriptLang::Wasm==2 and
+        // GenLang::Wasm==4, so a blind cross-cast would mis-route - this documents
+        // why generate_dialog.cpp maps explicitly (genLangToScriptLang).
+        r.check((int)GenLang::Python == 2 && (int)ScriptLang::Wasm == 2
+                    && (int)GenLang::Wasm == 4 && (int)GenLang::Wasm != (int)GenLang::Python,
+                "gen: GenLang/ScriptLang values diverge (no cross-cast)");
+
+        // End-to-end: a real (hand-assembled) .wasm module exports ss_init (empty)
+        // and ss_generate, importing ss_grid_set. ss_generate writes cells 0,1,2 =
+        // 0.0, 0.5, 1.0; whole-grid maps v*2-1, so the {3} grid must come back as
+        // bipolar -1, 0, +1. Only runs when wasm3 is compiled in.
+        if (scriptLangAvailable(ScriptLang::Wasm)) {
+            // Minimal WebAssembly binary (see soundshop_wasm.h grid ABI):
+            //   (import "env" "ss_grid_set" (func (param i32 f32)))
+            //   (memory (export "memory") 1)
+            //   (func (export "ss_init"))
+            //   (func (export "ss_generate")
+            //     i32.const 0  f32.const 0.0  call ss_grid_set
+            //     i32.const 1  f32.const 0.5  call ss_grid_set
+            //     i32.const 2  f32.const 1.0  call ss_grid_set)
+            static const unsigned char kWasm[] = {
+                0x00,0x61,0x73,0x6D, 0x01,0x00,0x00,0x00,            // magic + version
+                0x01,0x09, 0x02, 0x60,0x02,0x7F,0x7D,0x00, 0x60,0x00,0x00, // type
+                0x02,0x13, 0x01, 0x03,0x65,0x6E,0x76,               // import: "env"
+                    0x0B,0x73,0x73,0x5F,0x67,0x72,0x69,0x64,0x5F,0x73,0x65,0x74, // "ss_grid_set"
+                    0x00,0x00,                                       // func, type 0
+                0x03,0x03, 0x02, 0x01,0x01,                          // function: 2 funcs type 1
+                0x05,0x03, 0x01, 0x00,0x01,                          // memory: min 1
+                0x07,0x22, 0x03,                                     // export: 3 entries
+                    0x06,0x6D,0x65,0x6D,0x6F,0x72,0x79, 0x02,0x00,   // "memory" mem 0
+                    0x07,0x73,0x73,0x5F,0x69,0x6E,0x69,0x74, 0x00,0x01, // "ss_init" func 1
+                    0x0B,0x73,0x73,0x5F,0x67,0x65,0x6E,0x65,0x72,0x61,0x74,0x65, 0x00,0x02, // "ss_generate" func 2
+                0x0A,0x22, 0x02,                                     // code: 2 bodies
+                    0x02, 0x00,0x0B,                                 // ss_init: empty
+                    0x1D, 0x00,                                      // ss_generate: size 29, 0 locals
+                        0x41,0x00, 0x43,0x00,0x00,0x00,0x00, 0x10,0x00, // i32.const 0, f32.const 0.0, call 0
+                        0x41,0x01, 0x43,0x00,0x00,0x00,0x3F, 0x10,0x00, // i32.const 1, f32.const 0.5, call 0
+                        0x41,0x02, 0x43,0x00,0x00,0x80,0x3F, 0x10,0x00, // i32.const 2, f32.const 1.0, call 0
+                        0x0B                                          // end
+            };
+            juce::TemporaryFile tmp(".wasm");
+            tmp.getFile().replaceWithData(kWasm, sizeof(kWasm));
+            Terrain tww;
+            std::string wwErr;
+            bool wwOk = tww.fillFromScriptWholeGrid(
+                ScriptLang::Wasm, tmp.getFile().getFullPathName().toStdString(),
+                { 3 }, wwErr);
+            r.check(wwOk, "gen: WASM whole-grid module runs (ss_generate)");
+            if (wwOk) {
+                const auto& d = tww.getData();
+                float expect[3] = { -1.0f, 0.0f, 1.0f };
+                float maxErr = (d.size() == 3) ? 0.0f : 1.0f;
+                for (int i = 0; i < (int)d.size() && i < 3; ++i)
+                    maxErr = std::max(maxErr, std::abs(d[(size_t)i] - expect[i]));
+                r.checkVal(maxErr < 1e-5f,
+                           "gen: WASM ss_grid_set fills bipolar -1/0/+1", maxErr);
+            } else {
+                // Surface the load/run error so a malformed fixture is debuggable.
+                juce::Logger::writeToLog("WASM gen test error: " + juce::String(wwErr));
+            }
+        }
+
         // ---- waveform() cross-language factory-bank reads -------------------
         // The waveform("name", phase) helper is exposed in Builtin / Lua /
         // Python / GLSL and all four read the SAME WaveformBank::sampleAtPhase.

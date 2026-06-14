@@ -13,7 +13,23 @@ static juce::String langDisplayName(GenLang lang) {
         case GenLang::Lua:     return "Lua";
         case GenLang::Python:  return "Python";
         case GenLang::Glsl:    return "GLSL (compute shader, GPU)";
+        case GenLang::Wasm:    return "WASM (.wasm module)";
         default:               return "Unknown";
+    }
+}
+
+// Map a GenLang that IS backed by a ScriptLang runtime to that ScriptLang. Only
+// Builtin/Lua/Wasm qualify; Python/Glsl are NOT ScriptLangs (they bake via their
+// own paths and are handled before this is ever reached). This REPLACES the old
+// blind (ScriptLang)(int)lang cross-cast, which was a latent trap: GenLang and
+// ScriptLang only agree on Builtin/Lua - GenLang::Python==2 collides with
+// ScriptLang::Wasm==2, and GenLang::Wasm==4 - so a cast would silently mis-route.
+static ScriptLang genLangToScriptLang(GenLang lang) {
+    switch (lang) {
+        case GenLang::Builtin: return ScriptLang::Builtin;
+        case GenLang::Lua:     return ScriptLang::Lua;
+        case GenLang::Wasm:    return ScriptLang::Wasm;
+        default:               jassertfalse; return ScriptLang::Builtin;
     }
 }
 
@@ -24,12 +40,27 @@ static bool genLangAvailable(GenLang lang) {
         case GenLang::Lua:     return scriptLangAvailable(ScriptLang::Lua);
         case GenLang::Python:  return ScriptEngine::pythonAvailable();
         case GenLang::Glsl:    return glslComputeAvailable();
+        case GenLang::Wasm:    return scriptLangAvailable(ScriptLang::Wasm);
+        default:               return false;
+    }
+}
+
+// Whether a language can run PER-CELL (one call per cell). Every language can
+// except WASM, whose ABI is block-only (it owns its own loop), so it generates
+// whole-grid only.
+static bool genLangPerCellCapable(GenLang lang) {
+    switch (lang) {
+        case GenLang::Builtin: return true;
+        case GenLang::Lua:     return scriptLangSupportsRate(ScriptLang::Lua, ScriptRate::PerSample);
+        case GenLang::Python:  return true;
+        case GenLang::Glsl:    return true;
+        case GenLang::Wasm:    return false;
         default:               return false;
     }
 }
 
 // Whether a language can do whole-grid (one call fills the array). Builtin is
-// per-cell only; Lua (block-capable runtime) and Python both can.
+// per-cell only; Lua (block-capable runtime), Python, GLSL and WASM all can.
 static bool genLangWholeGridCapable(GenLang lang) {
     switch (lang) {
         case GenLang::Lua:     return scriptLangSupportsRate(ScriptLang::Lua, ScriptRate::PerBlock);
@@ -39,10 +70,18 @@ static bool genLangWholeGridCapable(GenLang lang) {
         // reads the previous pass's full output via prev[]/prevAt()/neighbor() —
         // enabling true cross-cell convolution, cellular automata, diffusion, etc.
         case GenLang::Glsl:    return true;
+        // WASM is block-only: the whole module owns the array via ss_generate()
+        // and the ss_grid_* imports (see soundshop_wasm.h).
+        case GenLang::Wasm:    return scriptLangSupportsRate(ScriptLang::Wasm, ScriptRate::PerBlock);
         case GenLang::Builtin: return false;
         default:               return false;
     }
 }
+
+// True for languages whose "program" is a CHOSEN FILE (a pre-compiled binary),
+// not typed source. WASM is the only one: the editor field holds a .wasm path and
+// the template button becomes a file browser.
+static bool genLangIsFileBased(GenLang lang) { return lang == GenLang::Wasm; }
 
 // Default starter program for a language + mode. All produce a smooth 0..1 field
 // (mapped to the terrain's bipolar [-1,1] as v*2-1) referencing the first two
@@ -143,6 +182,12 @@ static std::string defaultSource(GenLang lang, int mode) {
                "// coord[d] = integer cell index, dims[d] = axis size.\n"
                "return 0.5 + 0.5 * sin(x) * cos(y);\n";
     }
+    if (lang == GenLang::Wasm) {
+        // WASM has no inline source - the "program" is a pre-compiled .wasm file
+        // chosen via the Browse button. The editor field holds its path, so the
+        // default is empty (a placeholder prompt is shown instead).
+        return "";
+    }
     // Builtin: a single math expression. Same coordinate vocabulary.
     return "0.5 + 0.5 * sin(x) * cos(y)";
 }
@@ -166,9 +211,13 @@ static bool generateGrid(GenLang lang, int mode, const std::string& src,
         if (ok) data = t.getData();
         return ok;
     }
+    // Builtin / Lua / WASM run through the IScriptRuntime path. Map the GenLang
+    // to its ScriptLang EXPLICITLY (never blind-cast - see genLangToScriptLang).
+    // For WASM, `src` is the chosen .wasm file PATH, not source text.
+    ScriptLang sl = genLangToScriptLang(lang);
     bool ok = (mode == 1)
-        ? t.fillFromScriptWholeGrid((ScriptLang)(int)lang, src, dims, err)
-        : t.fillFromScript((ScriptLang)(int)lang, src, dims, err);
+        ? t.fillFromScriptWholeGrid(sl, src, dims, err)
+        : t.fillFromScript(sl, src, dims, err);
     if (ok) data = t.getData();
     return ok;
 }
@@ -301,7 +350,15 @@ GenerateDialogComponent::GenerateDialogComponent(
 
     templateBtn.setTooltip("Replace the program with a fresh example for the "
                            "selected language.");
-    templateBtn.onClick = [this] { insertTemplate(); };
+    // For WASM the button browses for a .wasm file; for code languages it inserts
+    // a fresh example (updateProgramUiForLanguage swaps the label/tooltip).
+    templateBtn.onClick = [this] {
+        if (!langValues.empty()) {
+            int row = juce::jmax(0, langCombo.getSelectedItemIndex());
+            if (genLangIsFileBased((GenLang) langValues[(size_t) row])) { browseForWasm(); return; }
+        }
+        insertTemplate();
+    };
     addAndMakeVisible(templateBtn);
 
     statusLabel.setColour(juce::Label::textColourId, juce::Colours::orange);
@@ -317,6 +374,7 @@ GenerateDialogComponent::GenerateDialogComponent(
     cancelBtn.onClick = [this] { closeSelf(); };
     addAndMakeVisible(cancelBtn);
 
+    updateProgramUiForLanguage();   // sets label/button/placeholder for the seed language
     refreshPassesVisibility();
     setSize(560, 560);
 }
@@ -325,7 +383,8 @@ void GenerateDialogComponent::rebuildLangChoices() {
     langCombo.clear(juce::dontSendNotification);
     langValues.clear();
     // Offer every generation language that is available in this build.
-    const GenLang candidates[] = { GenLang::Builtin, GenLang::Lua, GenLang::Python, GenLang::Glsl };
+    const GenLang candidates[] = { GenLang::Builtin, GenLang::Lua, GenLang::Python,
+                                   GenLang::Glsl, GenLang::Wasm };
     int itemId = 1;
     for (GenLang lang : candidates) {
         if (!genLangAvailable(lang)) continue;
@@ -345,32 +404,82 @@ int GenerateDialogComponent::selectedMode() const {
 }
 
 void GenerateDialogComponent::refreshModeAvailability() {
-    // The whole-grid option (id 2) is only valid for languages that can run
-    // block-at-a-time. For per-cell-only languages (Builtin) it's greyed and the
-    // selection snaps back to per-cell. Per CLAUDE.md, a disabled control must
-    // explain why - the combo tooltip already covers the general meaning, so we
-    // add the language-specific reason here.
+    // Per-cell (id 1) and whole-grid (id 2) are each gated by the language's
+    // capability. Builtin is per-cell only (whole-grid greyed); WASM is whole-grid
+    // only (per-cell greyed); Lua/Python/GLSL do both. The selection snaps to an
+    // available mode when the current one is disabled. Per CLAUDE.md, a disabled
+    // control must explain why, so the tooltip names the language-specific reason.
     if (langValues.empty()) return;
     int row = juce::jmax(0, langCombo.getSelectedItemIndex());
     GenLang lang = (GenLang) langValues[(size_t) row];
-    bool wholeOk = genLangWholeGridCapable(lang);
+    bool perCellOk = genLangPerCellCapable(lang);
+    bool wholeOk   = genLangWholeGridCapable(lang);
+    modeCombo.setItemEnabled(1, perCellOk);
     modeCombo.setItemEnabled(2, wholeOk);
+    if (!perCellOk && modeCombo.getSelectedId() == 1)
+        modeCombo.setSelectedId(2, juce::dontSendNotification);
     if (!wholeOk && modeCombo.getSelectedId() == 2)
         modeCombo.setSelectedId(1, juce::dontSendNotification);
-    modeCombo.setTooltip(wholeOk
-        ? juce::String("Per-cell: your program runs once per cell and returns "
-                       "that cell's height. Whole-grid: it runs once and fills "
-                       "the whole terrain itself - needed for effects that read "
-                       "neighbouring cells (blur, cellular automata, FFT).")
-        : juce::String("Whole-grid is unavailable for ") + langDisplayName(lang) +
+
+    juce::String tip("Per-cell: your program runs once per cell and returns that "
+                     "cell's height. Whole-grid: it runs once and fills the whole "
+                     "terrain itself - needed for effects that read neighbouring "
+                     "cells (blur, cellular automata, FFT).");
+    if (!wholeOk)
+        tip = juce::String("Whole-grid is unavailable for ") + langDisplayName(lang) +
               " - it can only run once per cell. Choose Lua to generate the whole "
-              "grid in one pass (for blur, cellular automata, FFT, etc.).");
+              "grid in one pass (for blur, cellular automata, FFT, etc.).";
+    else if (!perCellOk)
+        tip = juce::String("Per-cell is unavailable for ") + langDisplayName(lang) +
+              " - a WASM module owns its own loop, so it always generates the "
+              "whole grid in one call (ss_generate). Use Builtin/Lua/Python/GLSL "
+              "for per-cell generation.";
+    modeCombo.setTooltip(tip);
 }
 
 void GenerateDialogComponent::onLanguageChanged() {
     refreshModeAvailability();
+    updateProgramUiForLanguage();
     insertTemplateIfDefault();
     refreshPassesVisibility();
+}
+
+// Switch the program field between "typed source" and "chosen .wasm file" modes.
+// For WASM the label/placeholder reflect a file path and the template button
+// becomes a file browser; for every other language it's the normal code editor.
+void GenerateDialogComponent::updateProgramUiForLanguage() {
+    if (langValues.empty()) return;
+    int row = juce::jmax(0, langCombo.getSelectedItemIndex());
+    GenLang lang = (GenLang) langValues[(size_t) row];
+    bool fileBased = genLangIsFileBased(lang);
+    scriptLabel.setText(fileBased ? "WASM module (.wasm file):"
+                                  : "Program (returns 0..1 per cell):",
+                        juce::dontSendNotification);
+    templateBtn.setButtonText(fileBased ? "Browse .wasm..." : "Insert example");
+    templateBtn.setTooltip(fileBased
+        ? juce::String("Choose a pre-compiled .wasm terrain module (exports "
+                       "ss_generate; see Help). Its file path is stored in the "
+                       "project; the generated grid is baked, so the module isn't "
+                       "needed when the project is reopened.")
+        : juce::String("Replace the program with a fresh example for the selected "
+                       "language."));
+    scriptEditor.setTextToShowWhenEmpty(
+        fileBased ? "Click \"Browse .wasm...\" to choose a compiled module, or paste its path."
+                  : juce::String(),
+        juce::Colours::grey);
+    scriptEditor.repaint();
+}
+
+void GenerateDialogComponent::browseForWasm() {
+    chooser = std::make_unique<juce::FileChooser>(
+        "Choose a .wasm terrain module", juce::File(), "*.wasm");
+    auto flags = juce::FileBrowserComponent::openMode
+               | juce::FileBrowserComponent::canSelectFiles;
+    chooser->launchAsync(flags, [this](const juce::FileChooser& fc) {
+        auto f = fc.getResult();
+        if (f.existsAsFile())
+            scriptEditor.setText(f.getFullPathName(), juce::dontSendNotification);
+    });
 }
 
 int GenerateDialogComponent::selectedPasses() const {
@@ -448,6 +557,14 @@ void GenerateDialogComponent::doGenerate() {
     int mode = selectedMode();
     int passes = (lang == GenLang::Glsl && mode == 1) ? selectedPasses() : 1;
     std::string src = scriptEditor.getText().toStdString();
+
+    // WASM's "source" is a chosen .wasm path; give a clear prompt if it's blank
+    // rather than the runtime's generic "No WASM file selected" load error.
+    if (genLangIsFileBased(lang) && juce::String(src).trim().isEmpty()) {
+        statusLabel.setText("Choose a .wasm module first (click \"Browse .wasm...\").",
+                            juce::dontSendNotification);
+        return;
+    }
 
     // First validate on a tiny probe grid (same rank, sizes clamped) so compile
     // errors surface instantly without paying for the full grid. Probe with a

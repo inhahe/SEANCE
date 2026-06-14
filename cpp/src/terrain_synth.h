@@ -68,17 +68,30 @@ bool parseVideoTerrainScript(const std::string& script, VideoTerrainParams& out,
 // the node falls back to recomputing from source for Builtin/Lua.
 // ============================================================================
 
-// Generation languages offered by the Generate dialog. Builtin/Lua map 1:1 to
+// Generation languages offered by the Generate dialog. Builtin/Lua map to
 // ScriptLang (so they can use the IScriptRuntime path), but Python is NOT a
 // ScriptLang (it can't run in the audio-thread per-sample/per-block runtimes) -
-// it generates via the embedded-CPython ScriptEngine and ALWAYS bakes. NOTE the
-// value 2 is Python here, whereas ScriptLang::Wasm == 2; never cross-cast.
+// it generates via the embedded-CPython ScriptEngine and ALWAYS bakes.
+//
+// CRITICAL: GenLang and ScriptLang share integer values for Builtin (0) and Lua
+// (1) ONLY. They DIVERGE past that: GenLang::Python == 2 but ScriptLang::Wasm ==
+// 2, and GenLang::Wasm == 4 (not 2). So NEVER blind-cast (ScriptLang)(int)gen -
+// it silently turns Python into Wasm. The Builtin/Lua/Wasm GenLangs that ARE
+// backed by a ScriptLang runtime must be mapped explicitly (see
+// generate_dialog.cpp genLangToScriptLang); Python/Glsl have their own bake paths
+// and must never be cast to a ScriptLang at all.
 //
 // Glsl (3) is like Python in that it can't run on the audio thread and ALWAYS
 // bakes: it dispatches a GLSL compute shader on an offscreen GL 4.3 context
-// (Terrain::fillFromGlsl / glsl_compute.h). It is NOT a ScriptLang either -
-// never cross-cast GenLang::Glsl to a ScriptLang.
-enum class GenLang { Builtin = 0, Lua = 1, Python = 2, Glsl = 3 };
+// (Terrain::fillFromGlsl / glsl_compute.h). It is NOT a ScriptLang.
+//
+// Wasm (4) runs a PRE-COMPILED .wasm module (chosen as a file, not typed source)
+// through the same WasmRuntime the Script (WASM) audio node uses, but via the
+// whole-grid runGenerate() path: the module exports ss_generate() and fills the
+// grid through ss_grid_* host imports (see script_runtime_wasm.cpp /
+// soundshop_wasm.h). WASM is block-only, so it offers WHOLE-GRID generation only
+// (no per-cell mode). The baked grid is stored like every other language.
+enum class GenLang { Builtin = 0, Lua = 1, Python = 2, Glsl = 3, Wasm = 4 };
 
 struct GenerateTerrainParams {
     int lang = 0;                  // generation language (GenLang: Builtin=0, Lua=1, Python=2, Glsl=3)

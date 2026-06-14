@@ -111,7 +111,7 @@ public:
     bool load(const std::string& path, std::string& error) override {
 #if HAS_WASM3
         // `path` is a filesystem path to the .wasm binary.
-        juce::File f(juce::String(path));
+        juce::File f{ juce::String(path) };
         if (path.empty() || !f.existsAsFile()) {
             error = "No WASM file selected";
             loaded = false; lastErr = error; return false;
@@ -143,7 +143,9 @@ public:
 
     void runBlock(const ScriptBlockCtx& ctx) override {
 #if HAS_WASM3
-        if (!loaded || !mem) {
+        if (!loaded || !mem || !fnProcess) {
+            // A terrain-only module (ss_generate but no ss_process) has nothing
+            // to run per block; emit silence rather than calling a null export.
             if (ctx.out) std::memset(ctx.out, 0, sizeof(float) * (size_t)ctx.numSamples);
             return;
         }
@@ -164,6 +166,38 @@ public:
         else                            emitMidiOut(ctx);
 #else
         if (ctx.out) std::memset(ctx.out, 0, sizeof(float) * (size_t)ctx.numSamples);
+#endif
+    }
+
+    // --- Whole-grid terrain generation (offline bake; see runGenerate above) ---
+    // Run the module's ss_generate() once; it fills `data` (length product(dims),
+    // row-major, each cell 0..1) by calling the ss_grid_* host imports. Mirrors
+    // LuaRuntime::runGenerate. Only reached for the Terrain "generate" feature -
+    // never the audio thread. The grid lives HOST-side (genData); the imports
+    // read/write it, so the module needs no shared-memory grid region.
+    bool runGenerate(const std::vector<int>& dims, float* data,
+                     std::string& error) override {
+#if HAS_WASM3
+        if (!loaded) { error = lastErr.empty() ? "WASM module not loaded" : lastErr; return false; }
+        if (!fnGenerate) {
+            error = "WASM module needs a ss_generate() export for whole-grid terrain";
+            return false;
+        }
+        long long total = 1;
+        for (int d : dims) total *= (d > 0 ? d : 1);
+        genData = data; genDims = &dims; genTotal = total;
+        M3Result res = m3_CallV(fnGenerate);
+        genData = nullptr; genDims = nullptr; genTotal = 0;
+        if (res) {
+            error = std::string("WASM ss_generate() failed: ") + res;
+            lastErr = error;
+            return false;
+        }
+        return true;
+#else
+        (void)dims; (void)data;
+        error = "WASM scripting is not available in this build (wasm3 not compiled in)";
+        return false;
 #endif
     }
 
@@ -189,7 +223,66 @@ private:
     IM3Environment env = nullptr;
     IM3Runtime     rt  = nullptr;
     IM3Module      mod = nullptr;
-    IM3Function    fnInit = nullptr, fnProcess = nullptr, fnPrepare = nullptr;
+    IM3Function    fnInit = nullptr, fnProcess = nullptr, fnPrepare = nullptr,
+                   fnGenerate = nullptr;
+
+    // Whole-grid generation state (set only for the duration of runGenerate; the
+    // ss_grid_* import trampolines read these via m3_GetUserData). The grid is
+    // HOST-owned - the module never sees it in linear memory, it pokes cells
+    // through the imports - so no extra wasm memory region is needed.
+    float*                  genData  = nullptr;
+    const std::vector<int>* genDims  = nullptr;
+    long long               genTotal = 0;
+
+    // Integer coordinate of flat cell i along `axis` (row-major: last axis is the
+    // fastest-varying). 0 outside range. Mirrors LuaRuntime's l_gen_coordAxis.
+    long long gridCoordAxis(long long i, int axis) const {
+        if (!genDims || axis < 0 || axis >= (int)genDims->size() || i < 0 || i >= genTotal)
+            return 0;
+        const auto& d = *genDims;
+        long long tmp = i, c = 0;
+        for (int a = (int)d.size() - 1; a >= 0; --a) {
+            int sz = d[(size_t)a] > 0 ? d[(size_t)a] : 1;
+            long long coordA = tmp % sz;
+            tmp /= sz;
+            if (a == axis) { c = coordA; break; }
+        }
+        return c;
+    }
+    // Normalised position [0,1] of flat cell i along `axis`. Mirrors l_gen_coord.
+    float gridCoordNorm(long long i, int axis) const {
+        if (!genDims || axis < 0 || axis >= (int)genDims->size() || i < 0 || i >= genTotal)
+            return 0.0f;
+        const auto& d = *genDims;
+        long long c = gridCoordAxis(i, axis);
+        int sz = d[(size_t)axis] > 0 ? d[(size_t)axis] : 1;
+        return (sz > 1) ? (float)((double)c / (double)(sz - 1)) : 0.0f;
+    }
+    // Flat index of the cell `delta` steps from i along `axis`, edge-clamped.
+    // Mirrors l_gen_neighbor.
+    long long gridNeighbor(long long i, int axis, long long delta) const {
+        if (!genDims || axis < 0 || axis >= (int)genDims->size() || i < 0 || i >= genTotal)
+            return i;
+        const auto& d = *genDims;
+        int n = (int)d.size();
+        std::vector<long long> co((size_t)n, 0);
+        long long tmp = i;
+        for (int a = n - 1; a >= 0; --a) {
+            int sz = d[(size_t)a] > 0 ? d[(size_t)a] : 1;
+            co[(size_t)a] = tmp % sz;
+            tmp /= sz;
+        }
+        int sz = d[(size_t)axis] > 0 ? d[(size_t)axis] : 1;
+        long long c = co[(size_t)axis] + delta;
+        if (c < 0) c = 0; else if (c > sz - 1) c = sz - 1;
+        co[(size_t)axis] = c;
+        long long idx = 0;
+        for (int a = 0; a < n; ++a) {
+            int s = d[(size_t)a] > 0 ? d[(size_t)a] : 1;
+            idx = idx * s + co[(size_t)a];
+        }
+        return idx;
+    }
 
     uint8_t* mem = nullptr;
     uint32_t memSize = 0;
@@ -227,8 +320,14 @@ private:
         m3_FindFunction(&fnInit, rt, "ss_init");
         m3_FindFunction(&fnProcess, rt, "ss_process");
         m3_FindFunction(&fnPrepare, rt, "ss_prepare");
-        if (!fnInit || !fnProcess) {
-            error = "WASM missing required exports ss_init / ss_process";
+        m3_FindFunction(&fnGenerate, rt, "ss_generate");
+        // Two valid module shapes share this loader: an AUDIO module exports
+        // ss_process() (filled per block), a TERRAIN module exports ss_generate()
+        // (fills a whole grid once via runGenerate). Either satisfies the loader;
+        // ss_init is always required (it seeds module state - may be empty).
+        if (!fnInit || (!fnProcess && !fnGenerate)) {
+            error = "WASM missing required exports: ss_init plus ss_process "
+                    "(audio) or ss_generate (terrain)";
             return false;
         }
 
@@ -392,6 +491,83 @@ private:
                 std::vector<float> buf(base, base + len);
                 waveletWarpBuffer(buf, m, amt, filter, levels);
                 for (int i = 0; i < len; ++i) base[i] = buf[(size_t)i];
+                return m3Err_none;
+            });
+
+        // ---- Whole-grid terrain generation imports (ss_grid_*) --------------
+        // Only meaningful inside ss_generate() (the offline Terrain bake path):
+        // the grid is host-owned (genData), so a module reads/writes cells by
+        // FLAT index through these calls rather than via linear memory. They
+        // mirror the Lua whole-grid API (set/get/coord/coordAxis/neighbor) so the
+        // same generator logic reads the same in either language. Outside
+        // runGenerate genData is null and every call is a safe no-op / 0.
+        m3_LinkRawFunction(mod, "env", "ss_grid_total", "i()",
+            [](IM3Runtime r, IM3ImportContext, uint64_t* sp, void*) -> const void* {
+                auto* self = (WasmRuntime*)m3_GetUserData(r);
+                sp[0] = (uint64_t)(uint32_t)(int32_t)self->genTotal;
+                return m3Err_none;
+            });
+        m3_LinkRawFunction(mod, "env", "ss_grid_nd", "i()",
+            [](IM3Runtime r, IM3ImportContext, uint64_t* sp, void*) -> const void* {
+                auto* self = (WasmRuntime*)m3_GetUserData(r);
+                int nd = self->genDims ? (int)self->genDims->size() : 0;
+                sp[0] = (uint64_t)(uint32_t)(int32_t)nd;
+                return m3Err_none;
+            });
+        m3_LinkRawFunction(mod, "env", "ss_grid_dim", "i(i)",
+            [](IM3Runtime r, IM3ImportContext, uint64_t* sp, void*) -> const void* {
+                auto* self = (WasmRuntime*)m3_GetUserData(r);
+                int axis = (int)(int32_t)sp[0];
+                int sz = 0;
+                if (self->genDims && axis >= 0 && axis < (int)self->genDims->size())
+                    sz = (*self->genDims)[(size_t)axis];
+                sp[0] = (uint64_t)(uint32_t)(int32_t)sz;
+                return m3Err_none;
+            });
+        // ss_grid_set(i, v): write flat cell i to v, clamped [0,1] (NaN->0). OOB ignored.
+        m3_LinkRawFunction(mod, "env", "ss_grid_set", "v(if)",
+            [](IM3Runtime r, IM3ImportContext, uint64_t* sp, void*) -> const void* {
+                auto* self = (WasmRuntime*)m3_GetUserData(r);
+                long long i = (long long)(int32_t)sp[0];
+                float v = *(float*)&sp[1];
+                if (self->genData && i >= 0 && i < self->genTotal)
+                    self->genData[(size_t)i] = juce::jlimit(0.0f, 1.0f, std::isfinite(v) ? v : 0.0f);
+                return m3Err_none;
+            });
+        // ss_grid_get(i): read flat cell i back (0 outside range / before written).
+        m3_LinkRawFunction(mod, "env", "ss_grid_get", "f(i)",
+            [](IM3Runtime r, IM3ImportContext, uint64_t* sp, void*) -> const void* {
+                auto* self = (WasmRuntime*)m3_GetUserData(r);
+                long long i = (long long)(int32_t)sp[0];
+                float v = 0.0f;
+                if (self->genData && i >= 0 && i < self->genTotal) v = self->genData[(size_t)i];
+                *(float*)&sp[0] = v;
+                return m3Err_none;
+            });
+        // ss_grid_coord(i, axis): normalised [0,1] position of flat cell i.
+        m3_LinkRawFunction(mod, "env", "ss_grid_coord", "f(ii)",
+            [](IM3Runtime r, IM3ImportContext, uint64_t* sp, void*) -> const void* {
+                auto* self = (WasmRuntime*)m3_GetUserData(r);
+                *(float*)&sp[0] = self->gridCoordNorm((long long)(int32_t)sp[0], (int)(int32_t)sp[1]);
+                return m3Err_none;
+            });
+        // ss_grid_coord_axis(i, axis): INTEGER coordinate of flat cell i.
+        m3_LinkRawFunction(mod, "env", "ss_grid_coord_axis", "i(ii)",
+            [](IM3Runtime r, IM3ImportContext, uint64_t* sp, void*) -> const void* {
+                auto* self = (WasmRuntime*)m3_GetUserData(r);
+                long long c = self->gridCoordAxis((long long)(int32_t)sp[0], (int)(int32_t)sp[1]);
+                sp[0] = (uint64_t)(uint32_t)(int32_t)c;
+                return m3Err_none;
+            });
+        // ss_grid_neighbor(i, axis, delta): flat index delta steps along axis,
+        // edge-clamped (compose for N-D stencils; read with ss_grid_get).
+        m3_LinkRawFunction(mod, "env", "ss_grid_neighbor", "i(iii)",
+            [](IM3Runtime r, IM3ImportContext, uint64_t* sp, void*) -> const void* {
+                auto* self = (WasmRuntime*)m3_GetUserData(r);
+                long long idx = self->gridNeighbor((long long)(int32_t)sp[0],
+                                                   (int)(int32_t)sp[1],
+                                                   (long long)(int32_t)sp[2]);
+                sp[0] = (uint64_t)(uint32_t)(int32_t)idx;
                 return m3Err_none;
             });
     }

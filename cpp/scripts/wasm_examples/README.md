@@ -396,6 +396,44 @@ All host functions are imported from module `"env"`.
 
 **Shaping helpers (no libm).** Modules compile `-nostdlib`, so libm's transcendentals (`sinf`/`cosf`/`expf`/`tanhf`) need an explicitly linked libm or `<math.h>`. For the common GLSL-parity shaping math that *doesn't*, `soundshop_wasm.h` provides header-only inlines built on `__builtin_floorf` (so they work under `-nostdlib`): `ss_fract`, `ss_sign`, `ss_mod` (GLSL floored modulo), `ss_clamp`, `ss_min`, `ss_max`, `ss_mix`, `ss_step`, `ss_smoothstep`, `ss_radians`, `ss_degrees`, `ss_saw`, `ss_square`, `ss_triangle`, `ss_unipolar`, `ss_bipolar`. Define `SS_NO_SHAPING_HELPERS` before including the header to suppress them if you supply your own.
 
+### Terrain generation (whole-grid, no audio)
+
+A WASM module can also be a **Terrain Synth generator** instead of an audio node.
+This is a completely separate role — there is **no audio path**. The host calls
+the module **once, offline** (on the message thread, never the audio thread) to
+fill an N-dimensional grid, then **bakes** the result into the project. Pick it in
+**Add Node → Terrain → Terrain from Program (Generate)…** with Language =
+**"WASM (.wasm module)"** and the **Browse .wasm…** button. WASM terrain is
+**whole-grid only** (a module owns its own loop, so it can't be re-invoked
+per-cell). See [`terrain_ripple.c`](terrain_ripple.c) for a complete, rank-agnostic example.
+
+**Exports:** `ss_init() -> i32` (re-seed hook, as usual) and `ss_generate() -> void`
+(fills the grid). A terrain module needs `ss_init` plus `ss_generate`; it does
+**not** provide `ss_process` (the same `WasmRuntime` load path serves both — a
+module supplies `ss_process` *or* `ss_generate`, or both).
+
+**Grid host functions** (imported from `"env"`, declared in `soundshop_wasm.h`).
+The grid is host-owned and addressed by **flat, row-major index** (last axis
+varies fastest), mirroring the Lua whole-grid API one-for-one:
+
+| Function | Signature | Description |
+|----------|-----------|-------------|
+| `ss_grid_total` | `() -> i32` | Total cell count = product(dims). |
+| `ss_grid_nd` | `() -> i32` | Number of axes (rank). |
+| `ss_grid_dim` | `(axis: i32) -> i32` | Size of one axis (0 if out of range). |
+| `ss_grid_set` | `(flat: i32, v: f32) -> void` | Write a cell. `v` is clamped to `[0,1]` (NaN→0); an out-of-range index is ignored. |
+| `ss_grid_get` | `(flat: i32) -> f32` | Read a cell back (0 before written / out of range). |
+| `ss_grid_coord` | `(flat: i32, axis: i32) -> f32` | Normalised `[0,1]` position of a cell along an axis. |
+| `ss_grid_coord_axis` | `(flat: i32, axis: i32) -> i32` | Integer index of a cell along an axis. |
+| `ss_grid_neighbor` | `(flat: i32, axis: i32, delta: i32) -> i32` | Flat index `delta` steps along an axis, **edge-clamped** to `[0, dim-1]`. |
+
+Each cell is one value in **`[0,1]`** (a grayscale height); the host maps it to the
+terrain's bipolar `[-1,1]` as `v*2-1`. Because the bake is offline, per-cell
+host-call overhead is irrelevant, so the grid stays host-owned (poked via these
+imports) rather than shared through linear memory. The header also ships inline
+N-D-coordinate helpers `ss_grid_flatten` / `ss_grid_getat` / `ss_grid_setat`
+(suppress with `SS_NO_GRID_HELPERS`).
+
 ### Shared Memory Layout
 
 All data exchange happens through WASM linear memory at fixed offsets:

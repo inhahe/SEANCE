@@ -11,7 +11,7 @@ If you only remember one thing: **there are two worlds.**
 | World | When it runs | What's allowed | Why |
 |---|---|---|---|
 | **Real-time** (Script node) | On the audio thread, every block forever | Builtin, Lua, WASM | Must be bounded, allocation-light, deterministic. No Python, no GLSL. |
-| **Offline / bake** (terrain, wavetable, ADHSR/spectral curves) | Once, on the UI thread, result frozen into the project | Builtin, Lua, Python, GLSL | Latency doesn't matter; result is a frozen lookup table. Anything goes. |
+| **Offline / bake** (terrain, wavetable, ADHSR/spectral curves) | Once, on the UI thread, result frozen into the project | Builtin, Lua, Python, GLSL, WASM | Latency doesn't matter; result is a frozen lookup table. Anything goes. |
 
 Everything below is just the consequences of that split.
 
@@ -23,7 +23,7 @@ Everything below is just the consequences of that split.
 |---|---|---|---|
 | **Builtin** (the custom expression language) | Script node, terrain, curves | **Yes** — allocation-free expression walker, no GC | Zero-dependency, guaranteed-safe one-liners. The default. |
 | **Lua** (5.4, embedded) | Script node, terrain, curves | **Per-block: yes. Per-sample: risky** (GC/alloc) | Full language — loops, tables, state, coroutines — when a one-liner isn't enough. |
-| **WASM** (wasm3, user-supplied `.wasm`) | Script node only | **Yes** — compiled, deterministic, persistent linear memory | Heavy DSP at native-ish speed, many instances, no GC. |
+| **WASM** (wasm3, user-supplied `.wasm`) | Script node + terrain (whole-grid bake) | **Yes** — compiled, deterministic, persistent linear memory | Heavy DSP at native-ish speed, many instances, no GC. |
 | **Python** (CPython, optional DLL) | **Offline bake only** (terrain, curves) | **No** — never on the audio thread | numpy/scipy-class algorithms to *generate* tables offline. |
 | **GLSL** (headless GL 4.3 compute) | **Offline bake only** (terrain grids, wavetable/curve formulas) | **No** — GPU, UI thread | Massively-parallel grid compute (convolution, CA, diffusion); the most capable waveshaping language for curves. |
 
@@ -46,7 +46,7 @@ is expanded in the sections below.
 |---|:--:|:--:|:--:|:--:|:--:|:--:|
 | **Builtin (custom)** | ✓ *(this **is** expression mode)* | ✓ *(the only per-sample language)* | — | — | ✓ *(per-cell only)* | ✓ |
 | **Lua** | — *(use Builtin for one-liners)* | ✓ *(with a stutter warning)* | ✓ | ✓ *(`stream()`)* | ✓ *(per-cell + whole-grid)* | ✓ |
-| **WASM** | — | —³ *(but already sample-accurate — see below)* | ✓ | ✓ *(morally — module owns its loop)* | — | — |
+| **WASM** | — | —³ *(but already sample-accurate — see below)* | ✓ | ✓ *(morally — module owns its loop)* | ✓ *(whole-grid only, offline)* | — |
 | **Python** | — | — | — | — | ✓ *(per-cell + whole-grid, offline)* | ✓ *(offline)* |
 | **GLSL** | — | — | — | — | ✓ *(per-cell + whole-grid, GPU)* | ✓ *(per-sample bake, GPU)* |
 
@@ -459,9 +459,9 @@ audio thread just reads the baked data — *no interpreter ever runs in real
 time.* That's why Python and GLSL are allowed here and nowhere else, and why
 "is it real-time safe?" is simply not a question that applies.
 
-### Terrain synthesis — Builtin, Lua, Python, GLSL
+### Terrain synthesis — Builtin, Lua, Python, GLSL, WASM
 
-Generates an N-dimensional grid. `GenLang { Builtin, Lua, Python, Glsl }`
+Generates an N-dimensional grid. `GenLang { Builtin, Lua, Python, Glsl, Wasm }`
 (`terrain_synth.h:81`). Two sub-modes: **per-cell** (a function returning one
 value per cell) and **whole-grid** (the program sees the whole array and can do
 cross-cell work — convolution, cellular automata, diffusion — optionally over
@@ -473,36 +473,56 @@ multiple passes).
 | **Lua** | ✓ | ✓ | Full scripting with neighbour access for whole-grid algorithms. The go-to when Builtin's one expression isn't enough and you don't need a GPU. |
 | **Python** | ✓ | ✓ | Same role as Lua but with the scientific stack (numpy/scipy/FFT). Heaviest startup, but it's offline so who cares. Use for genuinely complex math. |
 | **GLSL** | ✓ | ✓ | Runs on the GPU via a headless GL 4.3 compute context. Massively parallel — the right call for big grids and iterative ping-pong passes (blur, CA, diffusion). Whole-grid uses two alternating SSBOs with `prevAt()`/`neighbor()` helpers. |
+| **WASM** | — | ✓ | A pre-compiled `.wasm` module baked **once**, offline. Whole-grid only. Compiled, deterministic, no GC — for heavy procedural terrain authored in C/Rust/Zig and shipped as a binary. |
 
-**Why no WASM here?** Terrain has its own bake path and WASM was never wired
-into it. Two separate reasons, one per sub-mode:
+**Why is WASM whole-grid only (no per-cell)?** It's the mirror image of
+Builtin's "can't whole-grid":
 
 - **Per-cell is *fundamentally* impossible for WASM.** Per-cell generation
   re-invokes the program once per grid cell (the `PerSample` path), but a WASM
   module *owns its own loop* — it is never re-entered per element (this is the
   exact same property that makes it a streaming audio node; see the [WASM
   section](#wasm-and-sample-rate-resolving-the-apparent-contradiction)). So
-  per-cell WASM is correctly rejected, and always will be (the self-test asserts
-  this: `fillFromScript(ScriptLang::Wasm, …)` returns false). It is the mirror
-  image of Builtin's "can't stream" — Builtin has *no* loop, WASM *is* the loop.
-- **Whole-grid is feasible but not built.** The whole-grid path runs the program
-  *once* and hands it the array, which fits WASM's model exactly (WASM is
-  `PerBlock`-capable). The clean extension point already exists —
-  `IScriptRuntime::runGenerate(dims, data, error)` (the Lua runtime overrides it
-  with a `generate()` entry + `set/get/coord` host calls); the WASM runtime just
-  returns the default "can't generate a whole grid." Wiring it up means: a WASM
-  override of `runGenerate` with grid host-imports (`generate` export +
-  `ss_grid_set/get/coord/dims`), a `GenLang::Wasm` value (kept off the
-  `Python==2`/`ScriptLang::Wasm==2` cross-cast trap), and generate-dialog UX for
-  picking a **binary `.wasm` file** rather than typing source (the dialog is a
-  text editor today; WASM modules load by filesystem path, same as Script-node
-  WASM). It's a real feature, not a config flag — and the WASM execution path
-  can't be self-tested without a checked-in `.wasm` fixture (the repo ships only
-  `.c` example sources, no binaries).
+  per-cell WASM is correctly rejected (the self-test asserts a per-cell WASM
+  request fails). Builtin has *no* loop, WASM *is* the loop.
+- **Whole-grid fits WASM exactly, and is now built.** The whole-grid path runs
+  the program *once* and hands it the array, which matches WASM's `PerBlock`
+  model. The WASM runtime overrides `IScriptRuntime::runGenerate(dims, data,
+  error)` (`script_runtime_wasm.cpp`): it exposes the host-owned grid through
+  fixed-arity host imports and calls the module's `ss_generate` export.
+
+**The terrain WASM ABI** (declared in `cpp/include/soundshop_wasm.h`, mirrors the
+Lua whole-grid API one-for-one). The module **exports** `void ss_init(void)` and
+`void ss_generate(void)`; the host **imports** (module `"env"`):
+
+| Import | Signature | Meaning |
+|---|---|---|
+| `ss_grid_total` | `i32()` | total cell count = product(dims) |
+| `ss_grid_nd` | `i32()` | number of axes (rank) |
+| `ss_grid_dim` | `i32(i32 axis)` | size of one axis |
+| `ss_grid_set` | `(i32 flat, f32 v)` | write cell, clamped [0,1] (NaN→0), OOB ignored |
+| `ss_grid_get` | `f32(i32 flat)` | read cell |
+| `ss_grid_coord` | `f32(i32 flat, i32 axis)` | normalized coord [0,1] along an axis |
+| `ss_grid_coord_axis` | `i32(i32 flat, i32 axis)` | integer index along an axis |
+| `ss_grid_neighbor` | `i32(i32 flat, i32 axis, i32 delta)` | flat index of a neighbour `delta` steps along an axis, edge-clamped |
+
+The grid is **row-major** (last axis varies fastest). The module writes each cell
+a value in `[0,1]`; the host maps it to bipolar `[-1,1]` as `v*2-1`. The header
+also ships `#ifndef SS_NO_GRID_HELPERS` inline helpers (`ss_grid_flatten`,
+`ss_grid_getat`, `ss_grid_setat`) that take an N-D coordinate array. Because the
+bake is offline, host-call overhead per cell is irrelevant, so the grid stays
+host-owned (poked via imports) rather than shared through linear memory.
+
+In the generate dialog WASM appears as **"WASM (.wasm module)"**: instead of a
+code editor you get a **Browse .wasm…** button, the mode is forced to whole-grid,
+and the chosen module is baked into the node's `__generate__` script just like
+the other languages (so it never re-runs on load).
 
 **Pick order:** Builtin for simple analytic surfaces → Lua for scripted /
 cross-cell → GLSL when the grid is big or the algorithm is iterative and
-parallel → Python when you specifically want numpy/scipy.
+parallel → Python when you specifically want numpy/scipy → WASM when you have a
+heavy generator already written in a compiled language and want to ship it as a
+binary.
 
 ### Wavetable layers & ADHSR / spectral curves — Builtin, Lua, Python, GLSL
 

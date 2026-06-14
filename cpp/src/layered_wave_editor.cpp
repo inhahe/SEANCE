@@ -2005,6 +2005,19 @@ void WaveLayer::rebakeFormula() {
     formulaError = err;
 }
 
+void WaveLayer::resolveFactoryRef() {
+    if (factoryRef.empty()) return;
+    shape = Drawn;
+    freehandMode = true;
+    auto& bank = WaveformBank::get();
+    bank.ensureLoaded();
+    int idx = bank.indexForName(factoryRef);
+    if (idx >= 0)
+        drawnSamples = bank.samples(idx);   // 512 samples, copied out
+    else
+        drawnSamples.clear();               // unresolved: render silent, keep ref
+}
+
 void LayeredWaveform::render(std::vector<float>& out) const {
     out.assign(tableSize, 0.0f);
     if (layers.empty()) return;
@@ -2114,13 +2127,36 @@ static std::string unescapeFormula(const std::string& s) {
 
 // Emit one layer as a comma-separated field list (no trailing `|`).
 static void encodeLayer(std::ostringstream& o, const WaveLayer& l) {
+    // Can this Drawn/Freehand layer be stored as a compact reference to a
+    // built-in factory waveform (its stable bank name) instead of 512 inline
+    // samples? Only when its cycle STILL matches the bank shape byte-for-byte.
+    // This is content-addressed on purpose: even if a UI fork-trigger were
+    // missed after an edit, a diverged cycle no longer matches the bank, so we
+    // fall back to embedding the real samples and never lose the edit.
+    bool asFactory = false;
+    if (l.shape == WaveLayer::Drawn && l.freehandMode && !l.factoryRef.empty()) {
+        auto& bank = WaveformBank::get();
+        bank.ensureLoaded();
+        int idx = bank.indexForName(l.factoryRef);
+        if (idx >= 0) {
+            const float* fs = bank.sampleData(idx);
+            if (fs && (int) l.drawnSamples.size() == WaveformBank::kSampleCount
+                && std::equal(l.drawnSamples.begin(), l.drawnSamples.end(), fs))
+                asFactory = true;
+        }
+    }
+
     o << shapeName(l.shape)
       << "," << l.ratio
       << "," << l.phase
       << "," << l.amp;
     if (l.shape == WaveLayer::Drawn) {
         o << "," << (l.freehandMode ? 1 : 0);
-        if (l.freehandMode) {
+        if (asFactory) {
+            // Sample/point count 0: the cycle is resolved from the bank on load
+            // via the "factory=" field emitted below.
+            o << ",0";
+        } else if (l.freehandMode) {
             o << "," << l.drawnSamples.size();
             for (float s : l.drawnSamples)
                 o << "," << s;
@@ -2146,6 +2182,11 @@ static void encodeLayer(std::ostringstream& o, const WaveLayer& l) {
         if (l.shape == WaveLayer::FM)
             o << ",p2=" << l.shapeParam2;
     }
+    // Factory-waveform reference: the stable bank name (commas/pipes escaped),
+    // emitted only when we actually stored the cycle as a reference above. Found
+    // by the "factory=" prefix in parseLayer regardless of position.
+    if (asFactory)
+        o << ",factory=" << escapeFormula(l.factoryRef);
     // Optional trailing per-layer warp field. Appended last (after any
     // variable-length Drawn/Formula payload) so older parsers - which read a
     // fixed/counted number of fields and stop - never see it. parseLayer finds
@@ -2181,6 +2222,8 @@ static bool parseLayer(const std::string& lp, WaveLayer& out) {
             try { out.shapeParam = std::stof(field.substr(3)); } catch (...) {}
         } else if (field.rfind("p2=", 0) == 0) {
             try { out.shapeParam2 = std::stof(field.substr(3)); } catch (...) {}
+        } else if (field.rfind("factory=", 0) == 0) {
+            out.factoryRef = unescapeFormula(field.substr(8));
         }
     }
     if (out.shape == WaveLayer::Formula) {
@@ -2240,6 +2283,11 @@ static bool parseLayer(const std::string& lp, WaveLayer& out) {
             }
         }
     }
+    // A factory= reference stores no samples (count 0 above); resolve the named
+    // cycle from the built-in bank into drawnSamples now. No-op if factoryRef is
+    // empty; renders silent (but keeps the ref) if the name can't be resolved.
+    if (out.shape == WaveLayer::Drawn && !out.factoryRef.empty())
+        out.resolveFactoryRef();
     return true;
 }
 
@@ -4068,6 +4116,10 @@ WaveLayerEditor::WaveLayerEditor(WaveLayer* layerPtr, Callbacks cb, bool enableW
         b.setRadioGroupId(0); // we'll handle toggling manually
         b.onClick = [this, s]() {
             if (!layer) return;
+            // Changing to a non-Drawn shape abandons the drawn cycle, so a
+            // factory-waveform reference forks (becomes a plain generator layer).
+            if (s != WaveLayer::Drawn)
+                layer->factoryRef.clear();
             layer->shape = s;
             // Seed a fresh Drawn layer with a few points so the user has
             // something grabable instead of an empty canvas.
@@ -4107,6 +4159,10 @@ WaveLayerEditor::WaveLayerEditor(WaveLayer* layerPtr, Callbacks cb, bool enableW
                               "and Freehand mode (click and drag to draw the waveform shape directly).");
     freehandToggle.onClick = [this]() {
         if (!layer) return;
+        // Switching between Points and Freehand changes how the cycle is
+        // defined, so a factory-waveform reference forks (the cycle is now the
+        // user's, not the bank's).
+        layer->factoryRef.clear();
         layer->freehandMode = !layer->freehandMode;
         freehandToggle.setButtonText(layer->freehandMode ? "Freehand" : "Points");
         // Seed freehand samples if switching to freehand for the first time.
@@ -4387,6 +4443,8 @@ void WaveLayerEditor::showPresetMenu() {
             const auto& presets = wavePresets();
             int idx = result - 1;
             if (idx < 0 || idx >= (int)presets.size()) return;
+            // A preset redefines the cycle, so a factory-waveform reference forks.
+            layer->factoryRef.clear();
             presets[idx].apply(*layer);
             syncFromModel();
             if (callbacks.onChanged) callbacks.onChanged();
@@ -4564,6 +4622,9 @@ void WaveLayerEditor::sortPointsByX() {
 
 void WaveLayerEditor::writeFreehandSample(float x, float y) {
     if (!layer) return;
+    // Drawing over the cycle forks any factory-waveform reference: from here on
+    // the layer owns its own edited samples (serialized in full, not by name).
+    layer->factoryRef.clear();
     auto& samples = layer->drawnSamples;
     if (samples.empty()) samples = defaultFreehandSamples();
     int n = (int)samples.size();
@@ -8480,11 +8541,16 @@ static void applyLibraryIdSuffix(WavetableDoc& doc, int libId,
 // and serialises through the normal layered-frame path. Shared by the factory
 // browser and the user single-cycle .wav importer.
 std::unique_ptr<IWavetableFrame> LayeredWaveEditorComponent::makeFactoryFrame(
-    const std::vector<float>& cycle) {
+    const std::vector<float>& cycle, const std::string& factoryName) {
     auto lw = std::make_unique<LayeredWaveform>();
     WaveLayer layer;
     layer.shape = WaveLayer::Drawn;
     layer.freehandMode = true;
+    // A non-empty name marks this as a live reference to a built-in factory
+    // waveform: the samples are still copied in (so render works immediately),
+    // but the project will serialize only the name until the user edits the
+    // cycle (see WaveLayer::factoryRef). Empty name = embed the samples.
+    layer.factoryRef = factoryName;
     // Normalise the buffer length to the 512 the Freehand layer expects. The
     // bank already stores 512; a user wav of any length is linearly resampled.
     const int N = 512;
@@ -8891,7 +8957,9 @@ void LayeredWaveEditorComponent::showWaveformLibraryBrowser(juce::Component* anc
         auto& bank = WaveformBank::get();
         if (bankEntryIndex < 0 || bankEntryIndex >= bank.numEntries()) return;
         const auto& e = bank.entry(bankEntryIndex);
-        auto nf = makeFactoryFrame(bank.samples(bankEntryIndex));
+        // Insert as a live reference to the factory waveform (by stable name):
+        // the project stores just the name until the user edits the cycle.
+        auto nf = makeFactoryFrame(bank.samples(bankEntryIndex), e.name);
         if (!nf) return;
         const std::string base = e.name;
         if (replaceCurrentFrame) {

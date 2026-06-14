@@ -90,10 +90,37 @@ struct WaveLayer {
     // "warp=" field on the layer (see encodeLayer/parseLayer).
     std::vector<WarpOp> warpChain;
 
+    // When non-empty, this Drawn/Freehand layer's cycle is a REFERENCE to a
+    // built-in factory waveform, identified by its stable WaveformBank NAME
+    // (resolved via WaveformBank::indexForName). Set by the factory-waveform
+    // browser when the user inserts a stock cycle. While the reference holds,
+    // the project serializes only the NAME (a "factory=" field), NOT the 512
+    // samples - so a session that uses stock waveforms stays small. On load the
+    // samples are re-resolved from the bank into drawnSamples (resolveFactoryRef)
+    // so the render path is unchanged.
+    //
+    // The reference survives level/tuning edits (amp, phase, ratio, warp) but is
+    // dropped - "forked to a full copy" - the moment the cycle CONTENT itself is
+    // edited (drawing over it, switching to Points, changing shape). Forking is
+    // belt-and-suspenders: the UI clears factoryRef on those edits, AND the
+    // serializer is content-addressed (it only writes the name when drawnSamples
+    // still match the bank byte-for-byte), so a missed UI trigger can never
+    // silently store the wrong reference. Empty for user-drawn / captured /
+    // imported / generator cycles; only meaningful for Drawn shape.
+    std::string factoryRef;
+
     // Re-bake formulaSamples from formulaExpr for the current formulaLang.
     // No-op (clears the buffer) for Built-in. Call after any change to
     // formulaExpr / formulaLang and after loading from a project.
     void rebakeFormula();
+
+    // Resolve factoryRef -> drawnSamples from the built-in WaveformBank (also
+    // forces shape=Drawn, freehandMode=true). No-op when factoryRef is empty.
+    // If the name can't be found (e.g. waveforms.bin missing), drawnSamples is
+    // left empty - the layer renders silent - and factoryRef is kept so a
+    // re-save still references it. Defined in layered_wave_editor.cpp (needs the
+    // bank). Call after decoding a layer that carries a factory= reference.
+    void resolveFactoryRef();
 };
 
 // Editor component for a single WaveLayer. Used by the wavetable editor (one
@@ -950,8 +977,13 @@ private:
     // stack layers on it, warp it). Shared so both callers stay in sync. Public
     // (and static) so the self-test can exercise it without a live component.
 public:
+    // `factoryName` (when non-empty) marks the resulting single layer as a live
+    // reference to the named built-in factory waveform (sets WaveLayer::factoryRef
+    // so the project stores just the name, not the samples - see that field). Pass
+    // the bank entry's stable name for a factory pick; leave empty for a user-
+    // loaded single-cycle .wav (which must embed its samples).
     static std::unique_ptr<IWavetableFrame> makeFactoryFrame(
-        const std::vector<float>& cycle);
+        const std::vector<float>& cycle, const std::string& factoryName = "");
 private:
 
     juce::TextButton applyBtn    { "Apply" };

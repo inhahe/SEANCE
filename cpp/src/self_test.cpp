@@ -1979,6 +1979,77 @@ void testWarp(Report& r) {
         }
     }
 
+    // ---- Factory-waveform REFERENCE (fork-by-default / store-by-name) -------
+    // A picked factory waveform stores only its stable bank NAME in the project
+    // (a "factory=" field), not the 512 samples, and re-resolves on load. Editing
+    // the cycle forks it (the samples get embedded). Content-addressed: the
+    // serializer only writes the name while drawnSamples still match the bank.
+    {
+        auto& bank = WaveformBank::get();
+        if (bank.ensureLoaded() && !bank.isEmpty()) {
+            const std::string name = bank.entry(0).name;
+            std::vector<float> cycle = bank.samples(0);   // 512
+
+            // Build a one-layer frame referencing factory entry 0.
+            LayeredWaveform ref;
+            { WaveLayer l; l.shape = WaveLayer::Drawn; l.freehandMode = true;
+              l.drawnSamples = cycle; l.factoryRef = name; ref.layers.push_back(l); }
+            const std::string encRef = ref.encode();
+
+            // The same cycle WITHOUT the reference embeds all 512 samples.
+            LayeredWaveform emb = ref;
+            emb.layers[0].factoryRef.clear();
+            const std::string encEmb = emb.encode();
+
+            r.check(encRef.find("factory=") != std::string::npos,
+                    "factory ref: serializes the bank name, not samples");
+            r.check(encRef.size() * 4 < encEmb.size(),
+                    "factory ref: encoded form is far smaller than embedding");
+
+            // Round-trip: name decodes back, samples re-resolve from the bank.
+            LayeredWaveform back;
+            back.decode(encRef);
+            bool resolved = !back.layers.empty()
+                && back.layers[0].factoryRef == name
+                && back.layers[0].drawnSamples.size() == cycle.size()
+                && std::equal(cycle.begin(), cycle.end(),
+                              back.layers[0].drawnSamples.begin());
+            r.check(resolved,
+                    "factory ref: round-trips by name and re-resolves the cycle");
+
+            // Edit forks it: a diverged cycle (even with factoryRef still set)
+            // must embed the real samples, never the stale name.
+            LayeredWaveform edited = ref;
+            edited.layers[0].drawnSamples[10] =
+                edited.layers[0].drawnSamples[10] > 0.0f ? -0.9f : 0.9f;
+            const std::string encEd = edited.encode();
+            r.check(encEd.find("factory=") == std::string::npos,
+                    "factory ref: edited cycle forks (embeds samples, drops name)");
+            LayeredWaveform edBack;
+            edBack.decode(encEd);
+            bool forkOk = !edBack.layers.empty()
+                && edBack.layers[0].factoryRef.empty()
+                && std::abs(edBack.layers[0].drawnSamples[10]
+                            - edited.layers[0].drawnSamples[10]) < 1e-4f;
+            r.check(forkOk,
+                    "factory ref: forked cycle round-trips the edit with no ref");
+        } else {
+            r.note("factory ref: waveforms.bin not present - skipping ref round-trip");
+        }
+
+        // Unresolvable name (always runs, no bank file needed): resolve degrades
+        // to a silent cycle but KEEPS the name so a re-save still references it.
+        {
+            WaveLayer bad;
+            bad.factoryRef = "__no_such_factory_waveform_xyz__";
+            bad.resolveFactoryRef();
+            r.check(bad.drawnSamples.empty()
+                    && bad.factoryRef == "__no_such_factory_waveform_xyz__"
+                    && bad.shape == WaveLayer::Drawn,
+                    "factory ref: unresolvable name degrades to silent, keeps ref");
+        }
+    }
+
     // ---- Serialization round-trip (backward-compatible warp section) ---
     {
         WavetableDoc doc;

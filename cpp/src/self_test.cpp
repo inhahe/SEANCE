@@ -2884,6 +2884,10 @@ void testAssetLibrary(Report& r) {
         int inst = g.assets.add(AssetKind::Instrument, "my inst", "composite", "INST_PAYLOAD");
         int arch = g.assets.add(AssetKind::AhdsrCurve, "old env", "", "ENV");
         g.assets.archive(arch);
+        // Star the waveform so the starred flag is exercised through persistence.
+        r.check(g.assets.setStarred(w, true), "assets: setStarred returns true for known id");
+        r.check(!g.assets.setStarred(123456789, true),
+                "assets: setStarred returns false for unknown id");
 
         std::ostringstream oss;
         ProjectFile::writeProject(oss, g, nullptr, /*includeView*/false,
@@ -2909,6 +2913,8 @@ void testAssetLibrary(Report& r) {
                 "assets: instrument kind round-trips");
         const AssetEntry* ra = g2.assets.find(arch);
         r.check(ra && ra->archived, "assets: archived flag round-trips");
+        r.check(rw && rw->starred, "assets: starred flag round-trips");
+        r.check(ri && !ri->starred, "assets: unstarred default round-trips (no starred line)");
         // nextId must be bumped past the loaded ids so new allocs don't collide.
         r.check(g2.assets.allocId() > inst,
                 "assets: load bumps nextId past all loaded ids");

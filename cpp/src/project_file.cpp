@@ -131,6 +131,7 @@ bool ProjectFile::writeProject(std::ostream& f, NodeGraph& graph,
         if (!a.subType.empty()) writeStr(f, "subType", a.subType);
         writeStr(f, "hash", a.contentHash);
         if (a.archived) writeInt(f, "archived", 1);
+        if (a.starred)  writeInt(f, "starred", 1);
         juce::String b64 = juce::Base64::toBase64(a.payload.data(),
                                                   (int) a.payload.size());
         writeStr(f, "payload", b64.toStdString());
@@ -901,6 +902,7 @@ bool ProjectFile::readProject(std::istream& f, NodeGraph& graph, PluginHost* plu
             else if (key == "subType") curAsset.subType = val;
             else if (key == "hash") curAsset.contentHash = val;
             else if (key == "archived") curAsset.archived = (val == "1");
+            else if (key == "starred") curAsset.starred = (val == "1");
             else if (key == "payload") {
                 juce::MemoryOutputStream mos;
                 if (juce::Base64::convertFromBase64(mos, val)) {

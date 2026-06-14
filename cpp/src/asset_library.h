@@ -53,6 +53,9 @@ struct AssetEntry {
     std::string payload;     // opaque encoded body (caller decodes)
     std::string contentHash; // hash128 over (kind, subType, payload) - NOT name/id
     bool        archived = false;
+    bool        starred  = false; // user favourite; the user-side analogue of the
+                                  // built-in WaveformBank "curated" flag. Pickers
+                                  // surface a "starred only" filter over both.
 };
 
 class AssetLibrary {
@@ -82,6 +85,10 @@ public:
     // hides it from list(includeArchived=false). Returns false if id unknown.
     bool archive(int id);
     bool restore(int id);
+
+    // Toggle/set the user "starred" favourite flag (display/filter only - does not
+    // affect resolution or hashing). Returns false if id unknown.
+    bool setStarred(int id, bool starred);
 
     // Hard-remove an entry entirely (explicit purge only - callers must warn the
     // user; existing references will dangle). Returns false if id unknown.

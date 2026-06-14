@@ -101,6 +101,13 @@ bool AssetLibrary::restore(int id) {
     return true;
 }
 
+bool AssetLibrary::setStarred(int id, bool starred) {
+    AssetEntry* e = find(id);
+    if (!e) return false;
+    e->starred = starred;
+    return true;
+}
+
 bool AssetLibrary::erase(int id) {
     for (size_t i = 0; i < entries.size(); ++i) {
         if (entries[i].id == id) {

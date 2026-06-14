@@ -27,8 +27,14 @@ public:
         };
         setup(renameBtn,    "Rename");
         setup(duplicateBtn, "Duplicate");
+        setup(starBtn,      "Star");
         setup(archiveBtn,   "Archive");
         setup(deleteBtn,    "Delete");
+
+        starBtn.setTooltip("Mark the asset as a favourite (star). Pickers offer a "
+                           "\"starred only\" filter so you can surface your favourites "
+                           "out of a large library. Toggles to Unstar when already "
+                           "starred.");
 
         renameBtn.setTooltip("Rename the selected asset. Names are display-only - "
                              "everything refers to the asset by id, so renaming "
@@ -51,9 +57,10 @@ public:
         list.setBounds(r);
         showArchived.setBounds(bottom.removeFromLeft(130).withSizeKeepingCentre(130, 24));
         bottom.removeFromLeft(8);
-        const int bw = 92;
+        const int bw = 84;
         renameBtn.setBounds(bottom.removeFromLeft(bw).reduced(2, 4));
         duplicateBtn.setBounds(bottom.removeFromLeft(bw).reduced(2, 4));
+        starBtn.setBounds(bottom.removeFromLeft(bw).reduced(2, 4));
         archiveBtn.setBounds(bottom.removeFromLeft(bw).reduced(2, 4));
         deleteBtn.setBounds(bottom.removeFromLeft(bw).reduced(2, 4));
     }
@@ -68,7 +75,9 @@ public:
         if (!e) return;
         if (selected) g.fillAll(juce::Colour(60, 90, 140));
         g.setColour(e->archived ? juce::Colours::grey : juce::Colours::white);
-        juce::String label = juce::String(e->name.empty() ? "(unnamed)" : e->name);
+        juce::String label;
+        if (e->starred) label << juce::String::fromUTF8("\xe2\x98\x85 "); // star prefix
+        label << juce::String(e->name.empty() ? "(unnamed)" : e->name);
         if (e->archived) label += "   [archived]";
         g.setFont(15.0f);
         g.drawText(label, 10, 0, w - 70, h, juce::Justification::centredLeft);
@@ -104,16 +113,30 @@ private:
         bool has = e != nullptr;
         renameBtn.setEnabled(has);
         duplicateBtn.setEnabled(has);
+        starBtn.setEnabled(has);
         archiveBtn.setEnabled(has);
         deleteBtn.setEnabled(has);
         archiveBtn.setButtonText(has && e->archived ? "Restore" : "Archive");
+        starBtn.setButtonText(has && e->starred ? "Unstar" : "Star");
     }
 
     void onButton(juce::TextButton* b) {
         if (b == &renameBtn)    doRename();
         else if (b == &duplicateBtn) doDuplicate();
+        else if (b == &starBtn)      doStarToggle();
         else if (b == &archiveBtn)   doArchiveToggle();
         else if (b == &deleteBtn)    doDelete();
+    }
+
+    void doStarToggle() {
+        const AssetEntry* e = lib.find(selectedId());
+        if (!e) return;
+        int id = e->id;
+        bool wasStarred = e->starred;
+        if (lib.setStarred(id, !wasStarred)) {
+            onEdit(wasStarred ? "Unstar asset" : "Star asset");
+            refresh();
+        }
     }
 
     void doRename() {
@@ -206,7 +229,7 @@ private:
     std::function<void(const std::string&)> onEdit;
     juce::ListBox list;
     juce::ToggleButton showArchived;
-    juce::TextButton renameBtn, duplicateBtn, archiveBtn, deleteBtn;
+    juce::TextButton renameBtn, duplicateBtn, starBtn, archiveBtn, deleteBtn;
     std::vector<int> rows;   // asset ids currently displayed (stable, not Node*)
 };
 
@@ -225,7 +248,7 @@ AssetLibraryComponent::AssetLibraryComponent(
     add("ADHSR Curves", AssetKind::AhdsrCurve);
     add("Morph Algorithms", AssetKind::MorphAlgorithm);
     addAndMakeVisible(tabs);
-    setSize(620, 460);
+    setSize(680, 460);
 }
 
 AssetLibraryComponent::~AssetLibraryComponent() = default;

@@ -383,6 +383,7 @@ Wavelets give you joint time + frequency resolution that traditional FFT-based e
 - **Free dyadic octave shifter / sub-octave** — clean octave doubling and sub-bass generation.
 - **Independent transient + tonal pitch shifting** — keep drums punchy while pitching melodic content.
 - **Adaptive resolution wavelet pitch tracker** — pitch detection that handles vibrato and bends gracefully.
+- **Pitch Detector** — precise pitch-to-signal node: measures the fundamental of incoming audio (YIN or autocorrelation, your choice) and emits it as a 0..1 control signal across a frequency band you set, with log or linear mapping. Window/hop control trades latency for low-frequency reach. Wire the output into any param to pitch-follow.
 - **Formant-preserving pitch shift via wavelet packets** — vocal pitch shifting without the chipmunk effect.
 - **Wavelet-band vocoder** — vocoder using wavelet bands instead of fixed FFT bins.
 

@@ -852,6 +852,8 @@ void GraphProcessor::rebuildGraph(NodeGraph& graph, Transport& transport) {
             proc = std::make_unique<WaveletVocoderProcessor>(node);
         } else if (node.type == NodeType::Effect && node.script == "__pitchtracker__") {
             proc = std::make_unique<WaveletPitchTrackerProcessor>(node);
+        } else if (node.type == NodeType::Effect && node.script == "__pitchdetector__") {
+            proc = std::make_unique<PitchDetectorProcessor>(node);
         } else if (node.type == NodeType::Effect && node.script == "__asymfilter__") {
             proc = std::make_unique<AsymmetricFilterProcessor>(node);
         } else if (node.type == NodeType::Effect && node.script == "__waveletcomplexity__") {

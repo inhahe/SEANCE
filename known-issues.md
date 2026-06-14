@@ -5,6 +5,32 @@ top. When something is fixed, delete the entry (git history is the archive).
 
 ---
 
+## BUG: legacy Wavelet Pitch Tracker writes its signal to the wrong channel
+
+**Found:** 2026-06-14, while building the new precise **Pitch Detector** node
+(`__pitchdetector__`). The legacy **Wavelet Pitch Tracker** node
+(`__pitchtracker__`, `WaveletPitchTrackerProcessor` in `builtin_effects.h`)
+writes its normalized detected-pitch value to **channel 0** (`buf.clear();
+auto* out = buf.getWritePointer(0); ...`) instead of the Signal-output channel
+(`2 + outputPinIndex`). Every other signal-producing node writes to channel
+`2 + index` (see `spectrum_tap.cpp`, the new `PitchDetectorProcessor`). Because
+the node also exposes an "Audio Out" pin on channel 0, the pitch value leaks
+onto the audio bus while the actual "Pitch Out" Signal pin (channel 2) carries
+silence — so the node's signal output is effectively dead.
+
+**Why not fixed now:** the node is superseded by the new Pitch Detector, which
+is more accurate (true YIN/autocorrelation with parabolic interpolation vs.
+octave-band wavelet resolution), wired correctly, and offers algorithm choice,
+window/hop control, min/max band, and log/linear mapping. The legacy node is
+kept only for backward-compatibility with old projects. **Proper fix (when
+touched):** change the output write in `WaveletPitchTrackerProcessor::processBlock`
+to target channel 2 (`if (buf.getNumChannels() > 2) { auto* out =
+buf.getWritePointer(2); ... }`) and stop clearing the whole buffer, matching the
+Pitch Detector. Audio passthrough on 0/1 can then stay intact. Consider also
+adding a deprecation hint in the node's tooltip pointing users at the new node.
+
+---
+
 ## PLANNED: generated-terrain grid export — EXR format + traversal/expression dim cap >8
 
 **Found:** 2026-06-13, after shipping `.npz` / WAV / PNG grid export for

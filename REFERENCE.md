@@ -24,6 +24,7 @@ here.
 - [Frequency-domain (spectral) synth](#frequency-domain-spectral-synth)
 - [Terrain Synth](#terrain-synth)
 - [Effect layers and groups](#effect-layers-and-groups)
+- [Pitch Detector](#pitch-detector)
 - [Convolution Filter](#convolution-filter)
 - [MIDI Modulator](#midi-modulator)
 - [Trigger Node](#trigger-node)
@@ -1168,6 +1169,42 @@ Per-group override: `EffectGroup::crossfadeSec`. Zero (the default) means "inher
 ### Routing strip
 
 Above the piano roll, a narrow strip appears when any layers exist. Shows each gated wire as a horizontal "wire" bar with 3D shading, colored to match the wire/group. The horizontal axis matches the piano roll below — read across to see which wires are active at which beats. The strip auto-hides when there are no layers.
+
+---
+
+## Pitch Detector
+
+`__pitchdetector__` (an `Effect` node). Measures the **fundamental pitch** of incoming audio and emits it as a unipolar **Signal** (`0..1`) you can wire into any param's Modulate/Absolute input — pitch-to-cutoff, pitch-to-wavetable-position, auto-tune scaffolding, etc. Add via right-click → **Effects → Pitch Detector (YIN / autocorrelation)**.
+
+It is the precise successor to the legacy **Wavelet Pitch Tracker** (`__pitchtracker__`), which only resolved pitch to octave-band accuracy and had a signal-routing bug (see `known-issues.md`). The old node is kept for backward compatibility; new graphs should use this one.
+
+### Pins
+
+- **Audio In** (channel 0/1) — audio to analyse.
+- **Audio Out** (channel 0/1) — the input passes through unchanged, so the node sits inline like a Spectrum Tap; you don't have to branch the signal.
+- **Pitch Out** (Signal, channel 2) — the detected pitch normalised to `0..1` across `[Min Hz, Max Hz]`.
+
+### How it works
+
+Incoming mono audio is accumulated into a ring buffer. Every **Hop** samples (or once per audio block when Hop = 0), the most recent **Window** samples are handed to the selected detector. The result is mapped to `0..1` and held on the Signal output until the next detection (so the signal is smooth between hops). If a hop finds no confident pitch, the previous value is held rather than dropping to zero.
+
+The two detectors live in `pitch_detect.h` and are shared with the self-test:
+
+- **YIN** (default) — cumulative-mean-normalised difference function (de Cheveigné & Kawahara 2002). Robust against octave errors; the best general choice.
+- **Autocorrelation** — classic lag-correlation with **first-strong-peak** picking (it deliberately takes the earliest peak reaching 85% of the maximum, so a pure tone reports its fundamental, not a subharmonic) and parabolic interpolation for sub-sample accuracy.
+
+### Params (on-node rows)
+
+- **Algorithm** — `YIN` / `Autocorr`. Click the row to pick from a popup (it's a discrete choice, not a slider).
+- **Window** — analysis length in samples (default **4096**). A larger window lowers the lowest detectable frequency **and** raises latency; a smaller window reacts faster but can't resolve low notes.
+- **Hop** — re-run interval in samples (default **0** = once per block). Smaller = more responsive, more CPU.
+- **Min Hz** / **Max Hz** — the frequency band that maps to the `0..1` output. **Min Hz is automatically clamped up** to the floor the window can actually resolve (≈ `2·sampleRate / min(window, 0.1·sampleRate)`), since a window that can't hold ~two periods of a note can't detect it. **Max Hz can go well above 20 kHz**: the graph's internal sample rate can far exceed the audio output rate (`NodeGraph::projectSampleRate`, user-selectable up to 192 kHz), so the usable band runs higher than the audio-rate Nyquist would suggest — it's clamped to `0.45·sampleRate`.
+- **Mapping** — `Log` (default) / `Linear`, a popup pick. **Logarithmic** spaces the output musically (an octave is the same output distance everywhere — the geometric mean of the band sits at `0.5`); **Linear** spaces by raw Hz (the arithmetic mean sits at `0.5`).
+- **Detected Hz** — read-only display of the most recent detection (updated by the audio thread).
+
+### Tests
+
+`testPitchDetect` (`self_test.cpp`) covers YIN + autocorrelation accuracy within 1% across 110–1760 Hz, the `440 Hz → MIDI 69 (A4)` note mapping, the `minHz ≥ maxHz` guard, the log/linear endpoint and mid-point mapping math, and the window-floor behaviour (a short window can't resolve a low note; a large one can).
 
 ---
 

@@ -13,6 +13,7 @@
 #include "content_store.h"         // ContentStore - baked-blob side-store tests
 #include "project_file.h"          // serializeForUndo / writeProject - blob persistence
 #include "asset_import.h"           // importAssets - cross-project asset merge
+#include "pitch_detect.h"           // detectPitchYIN / detectPitchAutocorrelation
 #include "adsr_envelope.h"
 #include "video_decoder.h"
 #include "script_runtime.h"        // ScriptLang / scriptLangAvailable - generator tests
@@ -2794,6 +2795,83 @@ static void testBuiltinMath(Report& r) {
 }
 
 // ---------------------------------------------------------------------------
+// Pitch detection. Covers the two trackers (YIN + autocorrelation) used by the
+// Pitch Detector node: detection accuracy on synthetic sines across the audible
+// band, the window-implied low-frequency floor, and the log/linear 0..1 output
+// mapping math the node applies to the detected frequency.
+// ---------------------------------------------------------------------------
+void testPitchDetect(Report& r) {
+    r.section("Pitch detection (YIN / autocorrelation)");
+
+    const double sr = 48000.0;
+    auto makeSine = [&](float hz, int n) {
+        std::vector<float> v(n);
+        for (int i = 0; i < n; ++i)
+            v[i] = std::sin(2.0 * juce::MathConstants<double>::pi * hz * i / sr);
+        return v;
+    };
+
+    // Detection accuracy: a clean sine should be found within ~1% by both
+    // algorithms across a few octaves. Window of 8192 at 48k resolves down to
+    // ~12 Hz, so all these are comfortably inside the floor.
+    for (float hz : { 110.0f, 220.0f, 440.0f, 880.0f, 1760.0f }) {
+        auto sig = makeSine(hz, 8192);
+        auto y = detectPitchYIN(sig.data(), (int)sig.size(), sr, 0.15f, 50.0f, 5000.0f);
+        r.checkVal(y.frequencyHz > 0 && std::abs(y.frequencyHz - hz) / hz < 0.01,
+                   "YIN detects " + juce::String(hz, 0) + " Hz within 1%", y.frequencyHz);
+        auto a = detectPitchAutocorrelation(sig.data(), (int)sig.size(), sr, 50.0f, 5000.0f);
+        r.checkVal(a.frequencyHz > 0 && std::abs(a.frequencyHz - hz) / hz < 0.01,
+                   "Autocorr detects " + juce::String(hz, 0) + " Hz within 1%", a.frequencyHz);
+    }
+
+    // computeNoteAndCents: 440 Hz must map to MIDI 69 (A4) with ~0 cents.
+    {
+        auto sig = makeSine(440.0f, 8192);
+        auto y = detectPitchYIN(sig.data(), (int)sig.size(), sr, 0.15f, 50.0f, 5000.0f);
+        r.checkVal(y.midiNote == 69 && std::abs(y.centsOffset) < 5.0f,
+                   "440 Hz -> MIDI 69 (A4), within 5 cents", y.centsOffset);
+    }
+
+    // Band guard: minHz >= maxHz returns an empty result (no detection).
+    {
+        auto sig = makeSine(440.0f, 8192);
+        auto y = detectPitchYIN(sig.data(), (int)sig.size(), sr, 0.15f, 1000.0f, 1000.0f);
+        r.check(y.frequencyHz == 0.0f, "YIN: minHz>=maxHz yields no detection");
+    }
+
+    // Output mapping math: the node maps detected Hz to 0..1 over [minHz,maxHz].
+    // Logarithmic spacing puts the geometric mean at 0.5; linear puts the
+    // arithmetic mean at 0.5. Verify both, plus the endpoints.
+    {
+        float minHz = 50.0f, maxHz = 2000.0f;
+        auto logMap = [&](float f) {
+            return std::log(f / minHz) / std::log(maxHz / minHz);
+        };
+        auto linMap = [&](float f) { return (f - minHz) / (maxHz - minHz); };
+        float geo = std::sqrt(minHz * maxHz);          // 316.2 Hz
+        float arith = 0.5f * (minHz + maxHz);          // 1025 Hz
+        r.checkVal(std::abs(logMap(minHz) - 0.0f) < 1e-5, "log map: minHz -> 0", logMap(minHz));
+        r.checkVal(std::abs(logMap(maxHz) - 1.0f) < 1e-5, "log map: maxHz -> 1", logMap(maxHz));
+        r.checkVal(std::abs(logMap(geo) - 0.5f) < 1e-4, "log map: geo mean -> 0.5", logMap(geo));
+        r.checkVal(std::abs(linMap(arith) - 0.5f) < 1e-4, "linear map: arith mean -> 0.5", linMap(arith));
+    }
+
+    // Window floor: a window too short to hold ~2 periods of a low note can't
+    // resolve it. The node clamps Min Hz up to ~2*sr/window. With a 512-sample
+    // window at 48k the floor is ~187 Hz, so 80 Hz must be rejected while a
+    // larger window detects it.
+    {
+        auto low = makeSine(80.0f, 512);
+        auto narrow = detectPitchYIN(low.data(), (int)low.size(), sr, 0.15f, 187.0f, 5000.0f);
+        r.check(narrow.frequencyHz == 0.0f || narrow.frequencyHz >= 150.0f,
+                "Short window cannot resolve below its floor");
+        auto wide = detectPitchYIN(makeSine(80.0f, 16384).data(), 16384, sr, 0.15f, 50.0f, 5000.0f);
+        r.checkVal(wide.frequencyHz > 0 && std::abs(wide.frequencyHz - 80.0f) / 80.0f < 0.02,
+                   "Large window resolves 80 Hz within 2%", wide.frequencyHz);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Project-level asset library ("stores"). Covers the data-model invariants:
 // disjoint user id space, add+find, content-hash dedup, soft-delete, duplicate /
 // update live-edit, and a save/load round-trip through writeProject/readProject.
@@ -3240,6 +3318,7 @@ int runSelfTest(const juce::File& outDir) {
     testVideoDecode(r, outDir);
     testGlslCompute(r, outDir);
     testBuiltinMath(r);
+    testPitchDetect(r);
     testAssetLibrary(r);
 
     r.section("Summary");

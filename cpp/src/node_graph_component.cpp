@@ -501,6 +501,12 @@ void NodeGraphComponent::drawNode(juce::Graphics& g, Node& node) {
                          : (m == 1) ? "Linear"
                          : (m == 2) ? "Lissajous"
                          : juce::String("Physics");
+            } else if (p.name == "Algorithm" && node.script == "__pitchdetector__") {
+                valueStr = ((int)std::round(p.value) == 1) ? "Autocorr"
+                                                           : juce::String("YIN");
+            } else if (p.name == "Mapping" && node.script == "__pitchdetector__") {
+                valueStr = ((int)std::round(p.value) == 1) ? "Linear"
+                                                           : juce::String("Log");
             } else {
                 valueStr = juce::String(dispValue, 2);
             }
@@ -1162,6 +1168,33 @@ void NodeGraphComponent::mouseDown(const juce::MouseEvent& e) {
                         });
                         return;
                     }
+                    // Other discrete enum params (Pitch Detector's Algorithm
+                    // and Mapping) also get a popup picker rather than a
+                    // slider, for the same reason: discrete labelled states
+                    // shouldn't be drag-scrubbed or parked between values.
+                    if (p.name == "Algorithm" || p.name == "Mapping") {
+                        selectedNodeId = node->id;
+                        std::vector<const char*> labels = (p.name == "Algorithm")
+                            ? std::vector<const char*>{"YIN (robust, default)", "Autocorrelation"}
+                            : std::vector<const char*>{"Logarithmic (musical)", "Linear"};
+                        int cur = juce::jlimit(0, (int)labels.size() - 1, (int)std::round(p.value));
+                        juce::PopupMenu pm;
+                        for (int i = 0; i < (int)labels.size(); ++i)
+                            pm.addItem(i + 1, labels[i], true, i == cur);
+                        int nodeId = node->id;
+                        int paramIdx = idx;
+                        std::string desc = "Change " + p.name;
+                        pm.showMenuAsync({}, [this, nodeId, paramIdx, desc](int r) {
+                            if (r == 0) return;
+                            auto* nd = graph.findNode(nodeId);
+                            if (!nd || paramIdx >= (int)nd->params.size()) return;
+                            nd->params[paramIdx].value = (float)(r - 1);
+                            graph.dirty = true;
+                            graph.commitSnapshot(desc);
+                            repaint();
+                        });
+                        return;
+                    }
                     dragMode = DragMode::DragParam;
                     dragNodeId = node->id;
                     dragParamIdx = idx;
@@ -1670,6 +1703,7 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
     fxMenu.addItem(234, "Wavelet Complexity");
     fxMenu.addItem(235, "Asymmetric Filter");
     fxMenu.addItem(236, "Wavelet Pitch Tracker");
+    fxMenu.addItem(240, "Pitch Detector (YIN / autocorrelation)");
     fxMenu.addItem(237, "Wavelet Vocoder");
     fxMenu.addItem(238, "Formant Pitch Shift");
     fxMenu.addItem(239, "SMS (harmonic/noise split)");
@@ -2541,6 +2575,34 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
                     ptn.params.push_back({"Min Hz",      50.0f,  20.0f, 5000.0f});
                     ptn.params.push_back({"Max Hz",    2000.0f,  20.0f, 5000.0f});
                     ptn.params.push_back({"Detected Hz",  0.0f,   0.0f, 5000.0f});
+                    break;
+                }
+                case 240: {
+                    // Pitch Detector: Audio In -> Audio Out (passthrough) +
+                    // Pitch Out (Signal). Insert inline like the Spectrum Tap:
+                    // the audio continues downstream unchanged while the Signal
+                    // pin emits the detected pitch.
+                    auto& pdn = graph.addNode("Pitch Detector", NodeType::Effect,
+                        {Pin{0, "Audio In", PinKind::Audio, true}},
+                        {Pin{0, "Audio Out", PinKind::Audio, false}}, {p.x, p.y});
+                    pdn.pinsOut.push_back({graph.allocId(), "Pitch Out", PinKind::Signal, false});
+                    pdn.script = "__pitchdetector__";
+                    pdn.params.push_back({"Algorithm",     0.0f,     0.0f,     1.0f});  // 0=YIN,1=Autocorr
+                    pdn.params.push_back({"Window",     4096.0f,    64.0f, 65536.0f});  // analysis samples
+                    pdn.params.push_back({"Hop",           0.0f,     0.0f, 16384.0f});  // 0=per block
+                    pdn.params.push_back({"Min Hz",       50.0f,    20.0f, 20000.0f});
+                    pdn.params.push_back({"Max Hz",     2000.0f,    20.0f, 20000.0f});
+                    pdn.params.push_back({"Mapping",       0.0f,     0.0f,     1.0f});  // 0=Log,1=Linear
+                    pdn.params.push_back({"Detected Hz",   0.0f,     0.0f, 20000.0f});
+                    pdn.pinsIn[0].tooltip =
+                        "Audio to analyse. The node measures the fundamental "
+                        "pitch of this signal each block (or each Hop samples).";
+                    pdn.pinsOut[0].tooltip =
+                        "Detected pitch as a 0..1 signal across [Min Hz, Max Hz]. "
+                        "0 = Min Hz, 1 = Max Hz. Mapping = Logarithmic spaces the "
+                        "range musically (an octave is the same distance "
+                        "everywhere); Linear spaces it by raw Hz. Wire this into "
+                        "any param's Modulate/Absolute input to pitch-follow.";
                     break;
                 }
                 case 235: makeEffect("Asymmetric Filter", "__asymfilter__", {

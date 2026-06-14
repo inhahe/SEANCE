@@ -2,6 +2,7 @@
 #include "node_graph.h"
 #include "signal_modulation.h"
 #include "wavelet.h"
+#include "pitch_detect.h"
 #include "fft_util.h"
 #include "builtin_synth.h"
 #include <juce_audio_processors/juce_audio_processors.h>
@@ -2972,6 +2973,136 @@ public:
 private:
     Node& node;
     double sampleRate = 44100;
+};
+
+// ==============================================================================
+// PITCH DETECTOR
+//
+// Determines the fundamental pitch of an incoming audio-rate signal and
+// emits it as a unipolar Signal value (0..1) over a configurable
+// frequency range. Unlike the legacy Wavelet Pitch Tracker (octave-band
+// resolution only), this uses precise sample-accurate pitch trackers
+// (YIN or autocorrelation, selectable) with parabolic interpolation.
+//
+// The analysis window can be larger than one audio block: incoming audio
+// is accumulated into a ring buffer and analysed over the last `Window`
+// samples. A larger window lowers the lowest detectable frequency but
+// adds latency. The `Hop` option controls how often (in samples) the
+// detector re-runs; 0 means once per block.
+//
+// Because the graph's internal sample rate can far exceed the audio
+// output rate, the usable frequency band can run well above 20 kHz, so
+// Max Hz is user-selectable (clamped below Nyquist). Min Hz is clamped up
+// to the floor implied by the window size. The detected frequency is
+// mapped to 0..1 either logarithmically (default, musically even) or
+// linearly across [Min Hz, Max Hz].
+//
+// Params: Algorithm (0=YIN, 1=Autocorrelation), Window (samples),
+//         Hop (samples, 0=per block), Min Hz, Max Hz,
+//         Mapping (0=Logarithmic, 1=Linear), Detected Hz (display).
+// Audio in/out passes through on channels 0/1; Signal out on channel 2.
+// ==============================================================================
+class PitchDetectorProcessor : public juce::AudioProcessor {
+public:
+    static constexpr int kMaxWindow = 65536;
+
+    PitchDetectorProcessor(Node& n) : node(n) {}
+    const juce::String getName() const override { return "Pitch Detector"; }
+    void prepareToPlay(double sr, int) override {
+        sampleRate = sr;
+        ring.assign(kMaxWindow, 0.0f);
+        writePos = 0;
+        filled = 0;
+        sinceHop = 0;
+        lastNormalized = 0.0f;
+    }
+    void releaseResources() override {}
+
+    void processBlock(juce::AudioBuffer<float>& buf, juce::MidiBuffer&) override {
+        applySignalModulations(node, buf);
+        const int n = buf.getNumSamples();
+        if (n == 0 || buf.getNumChannels() == 0) return;
+
+        int algo = (int)std::round(paramByName(node, "Algorithm", 0.0f)); // 0=YIN,1=Autocorr
+        int window = (int)std::round(paramByName(node, "Window", 4096.0f));
+        window = juce::jlimit(64, kMaxWindow, window);
+        int hop = (int)std::round(paramByName(node, "Hop", 0.0f));
+        if (hop <= 0) hop = n; // re-run every block
+
+        bool logMap = (int)std::round(paramByName(node, "Mapping", 0.0f)) == 0; // 0=log,1=linear
+
+        // The detector analyses up to min(window, 0.1*sr) samples and needs
+        // roughly two full periods to lock on, so the lowest reliably
+        // detectable frequency is ~2*sr / effectiveWindow. Clamp Min Hz up
+        // to that floor so the displayed/used range is honest.
+        float analyzable = std::min((float)window, (float)(sampleRate * 0.1));
+        float windowFloorHz = 2.0f * (float)sampleRate / std::max(1.0f, analyzable);
+        float minHz = std::max(windowFloorHz, paramByName(node, "Min Hz", 50.0f));
+        float maxHz = std::min((float)(sampleRate * 0.45), paramByName(node, "Max Hz", 2000.0f));
+        if (maxHz <= minHz) maxHz = minHz + 1.0f;
+
+        // Accumulate the mono input into the ring buffer.
+        const float* input = buf.getReadPointer(0);
+        for (int i = 0; i < n; ++i) {
+            ring[writePos] = input[i];
+            writePos = (writePos + 1) % kMaxWindow;
+            if (filled < kMaxWindow) ++filled;
+        }
+        sinceHop += n;
+
+        // Re-run detection once a hop has elapsed and the window is full.
+        if (sinceHop >= hop && filled >= window) {
+            sinceHop = 0;
+            std::vector<float> w(window);
+            int start = ((writePos - window) % kMaxWindow + kMaxWindow) % kMaxWindow;
+            for (int i = 0; i < window; ++i)
+                w[i] = ring[(start + i) % kMaxWindow];
+
+            PitchResult pr = (algo == 1)
+                ? detectPitchAutocorrelation(w.data(), window, sampleRate, minHz, maxHz)
+                : detectPitchYIN(w.data(), window, sampleRate, 0.15f, minHz, maxHz);
+
+            if (pr.frequencyHz > 0.0f) {
+                float f = juce::jlimit(minHz, maxHz, pr.frequencyHz);
+                float norm = logMap
+                    ? std::log(f / minHz) / std::log(maxHz / minHz)
+                    : (f - minHz) / (maxHz - minHz);
+                lastNormalized = juce::jlimit(0.0f, 1.0f, norm);
+                for (auto& p : node.params)
+                    if (p.name == "Detected Hz") { p.value = pr.frequencyHz; break; }
+            }
+            // If no confident pitch this hop, hold the previous value.
+        }
+
+        // Emit the normalized pitch on the Signal output (channel 2). Audio
+        // on channels 0/1 passes through untouched so the node can sit inline.
+        if (buf.getNumChannels() > 2) {
+            float* out = buf.getWritePointer(2);
+            for (int i = 0; i < n; ++i) out[i] = lastNormalized;
+        }
+    }
+
+    double getTailLengthSeconds() const override { return 0; }
+    bool acceptsMidi() const override { return false; }
+    bool producesMidi() const override { return false; }
+    bool isBusesLayoutSupported(const BusesLayout&) const override { return true; }
+    juce::AudioProcessorEditor* createEditor() override { return nullptr; }
+    bool hasEditor() const override { return false; }
+    int getNumPrograms() override { return 1; }
+    int getCurrentProgram() override { return 0; }
+    void setCurrentProgram(int) override {}
+    const juce::String getProgramName(int) override { return {}; }
+    void changeProgramName(int, const juce::String&) override {}
+    void getStateInformation(juce::MemoryBlock&) override {}
+    void setStateInformation(const void*, int) override {}
+private:
+    Node& node;
+    double sampleRate = 44100;
+    std::vector<float> ring;
+    int writePos = 0;
+    int filled = 0;
+    int sinceHop = 0;
+    float lastNormalized = 0.0f;
 };
 
 // ==============================================================================

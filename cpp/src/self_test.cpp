@@ -2968,6 +2968,78 @@ void testAssetLibrary(Report& r) {
                 g.findNode(bId)->ahdsrAssetId == -1,
                 "assets: deleted curve -> references fall back to independent");
     }
+
+    // ---- Waveform live-reference: a wavetable library entry references a -----
+    // ---- published Waveform asset (frame lives in node.script, resolved -----
+    // ---- in place by the string-level resolver) -----------------------------
+    {
+        NodeGraph g;
+        int nId = g.addNode("wt", NodeType::TerrainSynth, {}, {}).id;
+
+        // Distinct LayeredWaveform frames keyed by harmonic ratio so their
+        // encodeBody() strings differ - lets us assert resolution swapped them.
+        auto makeLayered = [](int ratio) {
+            auto lw = std::make_unique<LayeredWaveform>();
+            WaveLayer ly; ly.shape = WaveLayer::Saw; ly.ratio = ratio;
+            lw->layers.push_back(ly);
+            return lw;
+        };
+
+        // Publish the asset frame (ratio 7).
+        std::string subType, payload;
+        { auto assetFrame = makeLayered(7);
+          waveformAssetFromFrame(assetFrame.get(), subType, payload); }
+        int wAsset = g.assets.add(AssetKind::Waveform, "shared wave", subType, payload);
+
+        // Node wavetable: one library entry that starts as a DIFFERENT local
+        // frame (ratio 2) but live-references the asset.
+        WavetableDoc doc;
+        int eid = doc.addLibraryEntry(makeLayered(2), "local");
+        doc.library[doc.findLibraryIndexById(eid)].assetId = wAsset;
+        g.findNode(nId)->script = doc.encode();
+
+        // The assetId must survive the wavetable codec round-trip.
+        WavetableDoc rt; rt.decode(g.findNode(nId)->script);
+        r.check(rt.library.size() == 1 && rt.library[0].assetId == wAsset,
+                "assets: waveform entry assetId round-trips through wavetable codec");
+
+        // Resolve -> the entry's frame becomes the asset's frame (ratio 7).
+        int nres = resolveWaveformReferences(g);
+        r.checkVal(nres == 1,
+                   "assets: resolveWaveformReferences resolves the one reference", nres);
+        WavetableDoc after; after.decode(g.findNode(nId)->script);
+        r.check(after.library.size() == 1 && after.library[0].wave &&
+                    after.library[0].wave->encodeBody() == payload,
+                "assets: resolved entry frame matches the published asset body");
+
+        // Save/load preserves the reference id and re-resolves on load.
+        std::ostringstream oss;
+        ProjectFile::writeProject(oss, g, nullptr, false, true);
+        NodeGraph g2; std::istringstream iss(oss.str());
+        ProjectFile::readProject(iss, g2, nullptr);
+        WavetableDoc loaded; loaded.decode(g2.findNode(nId)->script);
+        r.check(loaded.library.size() == 1 && loaded.library[0].assetId == wAsset &&
+                    loaded.library[0].wave &&
+                    loaded.library[0].wave->encodeBody() == payload,
+                "assets: waveform reference re-resolves after save/load");
+
+        // Edit the asset -> propagates on next resolve (ratio 3).
+        std::string sub2, pay2;
+        { auto edited = makeLayered(3); waveformAssetFromFrame(edited.get(), sub2, pay2); }
+        g.assets.update(wAsset, sub2, pay2);
+        resolveWaveformReferences(g);
+        WavetableDoc edDoc; edDoc.decode(g.findNode(nId)->script);
+        r.check(edDoc.library.size() == 1 && edDoc.library[0].wave &&
+                    edDoc.library[0].wave->encodeBody() == pay2,
+                "assets: editing waveform asset propagates to the referencing node");
+
+        // Erase the asset -> entry detaches to independent, keeps its last frame.
+        g.assets.erase(wAsset);
+        resolveWaveformReferences(g);
+        WavetableDoc delDoc; delDoc.decode(g.findNode(nId)->script);
+        r.check(delDoc.library.size() == 1 && delDoc.library[0].assetId == -1,
+                "assets: erased waveform asset -> entry falls back to independent");
+    }
 }
 
 int runSelfTest(const juce::File& outDir) {

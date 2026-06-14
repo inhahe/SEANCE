@@ -374,17 +374,27 @@ struct WaveformLibraryEntry {
     int colorIdx = -1;
     std::unique_ptr<IWavetableFrame> wave;
 
+    // Project asset-library reference. -1 = independent (this entry owns its
+    // own `wave` data). >=0 = live reference to a published Waveform asset:
+    // `wave` is a resolved copy of that asset's frame, kept in sync by
+    // resolveWaveformReferences() at edit/load time. Editing the asset
+    // propagates to every library entry (in any node) that references it.
+    // Distinct from `id`, which is the document-local entry id that cells
+    // reference; assetId points OUT to the project-global store.
+    int assetId = -1;
+
     WaveformLibraryEntry() = default;
     WaveformLibraryEntry(WaveformLibraryEntry&&) noexcept = default;
     WaveformLibraryEntry& operator=(WaveformLibraryEntry&&) noexcept = default;
     // unique_ptr is non-copyable, so we provide deep-copy via clone().
     WaveformLibraryEntry(const WaveformLibraryEntry& o)
         : id(o.id), name(o.name), colorIdx(o.colorIdx),
-          wave(o.wave ? o.wave->clone() : nullptr) {}
+          wave(o.wave ? o.wave->clone() : nullptr), assetId(o.assetId) {}
     WaveformLibraryEntry& operator=(const WaveformLibraryEntry& o) {
         if (&o == this) return *this;
         id = o.id; name = o.name; colorIdx = o.colorIdx;
         wave = o.wave ? o.wave->clone() : nullptr;
+        assetId = o.assetId;
         return *this;
     }
 };
@@ -721,6 +731,28 @@ struct WavetableDoc {
     // of getting a sine they have to delete.
     static WavetableDoc defaultEmpty();
 };
+
+// ---- Waveform asset-library bridge -----------------------------------------
+//
+// A published Waveform asset stores a single IWavetableFrame: AssetEntry.subType
+// is the frame typeId() ("layered"/"spectral"/...) and AssetEntry.payload is the
+// frame's encodeBody(). These two helpers convert between a frame and that
+// asset representation; the resolver below pushes a stored frame into every
+// library entry that references it.
+
+// Encode a frame as (subType, payload) for AssetLibrary::add/update. A null
+// frame encodes as an empty "layered" body (matching WavetableDoc::encode()).
+void waveformAssetFromFrame(const IWavetableFrame* frame,
+                            std::string& outSubType, std::string& outPayload);
+
+// Build a fresh frame from a Waveform asset's (subType, payload). Returns
+// nullptr on an unknown subType or a body that fails to decode.
+std::unique_ptr<IWavetableFrame> frameFromWaveformAsset(const std::string& subType,
+                                                        const std::string& payload);
+
+// resolveWaveformReferences(NodeGraph&) is declared in node_graph.h (so the
+// non-GUI serialization layer can call it without pulling in the editor),
+// and implemented in layered_wave_editor.cpp alongside WavetableDoc decode.
 
 // Editor window contents (paired with a juce::DialogWindow launched by the caller).
 // Edits `node.script` directly. onApply() should request a graph rebuild so

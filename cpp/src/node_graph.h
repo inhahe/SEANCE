@@ -988,4 +988,16 @@ private:
     void* editorContext = nullptr;
 };
 
+// Resolve every live Waveform asset reference in the graph. For each node whose
+// script is a wavetable, any library entry referencing a published Waveform
+// asset (assetId >= 0) has its frame replaced by a fresh copy of the asset's
+// frame, so the audio thread (which re-decodes node.script) sees the asset
+// content. A missing/erased asset detaches the entry to independent. Re-encodes
+// the affected node scripts in place. Free function (not a NodeGraph method)
+// because the implementation lives in layered_wave_editor.cpp where the
+// wavetable codec + frame factory are; declared here so the non-GUI
+// serialization layer (project_file.cpp) can call it without the editor header.
+// Returns the number of references resolved. Mirrors resolveAhdsrReferences().
+int resolveWaveformReferences(NodeGraph& graph);
+
 } // namespace SoundShop

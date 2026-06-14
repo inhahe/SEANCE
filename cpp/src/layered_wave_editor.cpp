@@ -2601,11 +2601,31 @@ std::string WavetableDoc::encode() const {
         }
     }
 
+    // Asset-reference section (optional trailing block). Maps document-local
+    // library entry ids to project AssetLibrary ids for entries that
+    // live-reference a published Waveform asset. Written BEFORE the warp block
+    // so it can use a ':'-free payload (id=asset pairs joined by ';'); the
+    // following readUntil(':') stops cleanly at the ":warp:" separator or EOF.
+    // Omitted entirely when no entry references an asset, so warp-only and
+    // bare payloads round-trip byte-identically. Older decoders stop at the
+    // cell section and never see this tag.
+    {
+        std::ostringstream refs;
+        int refCount = 0;
+        for (const auto& e : library) {
+            if (e.assetId < 0) continue;
+            if (refCount++) refs << ";";
+            refs << e.id << "=" << e.assetId;
+        }
+        if (refCount > 0) o << ":assets:" << refs.str();
+    }
+
     // Warp section (optional trailing block). Appended AFTER the cell section
     // so it's invisible to older decoders, which stop reading once they've
     // consumed cellCount cells. New decoders look for the ":warp:" tag and
     // read the frame-scope warp chain. Omitted entirely when empty so a
     // round-trip with no warps reproduces a byte-identical pre-warp payload.
+    // Must remain LAST: decodeWarpChain consumes the rest of the string.
     if (!warpChain.empty())
         o << ":warp:" << encodeWarpChain(warpChain);
     return o.str();
@@ -2850,13 +2870,39 @@ static bool decodeWavetableV4or5(WavetableDoc& doc, const std::string& body,
         if (doc.gridDims.empty()) doc.gridDims = { (int)doc.cellWaveformIds.size() };
     }
 
-    // ---- Warp section (optional trailing block) ----
-    // Older payloads end after the cell section; only read on if the writer
-    // appended the ":warp:" tag. See WavetableDoc::encode().
-    if (!r.eof()) {
+    // ---- Optional trailing blocks (assets, warp) ----
+    // Older payloads end after the cell section. Newer ones append tagged
+    // blocks: ":assets:<id=asset;...>" (library entry -> project asset refs)
+    // and/or ":warp:<chain>". The asset block has a ':'-free payload so it can
+    // be read with readUntil(':'); the warp block must be last because
+    // decodeWarpChain consumes the remainder. See WavetableDoc::encode().
+    while (!r.eof()) {
         const std::string tag = r.readUntil(':');
-        if (tag == "warp")
+        if (tag == "assets") {
+            const std::string payload = r.readUntil(':'); // ':'-free, stops at ":warp:" or EOF
+            // Pairs "<libId>=<assetId>" joined by ';'.
+            size_t p = 0;
+            while (p < payload.size()) {
+                size_t semi = payload.find(';', p);
+                if (semi == std::string::npos) semi = payload.size();
+                const std::string pair = payload.substr(p, semi - p);
+                size_t eq = pair.find('=');
+                if (eq != std::string::npos) {
+                    try {
+                        int libId   = std::stoi(pair.substr(0, eq));
+                        int assetId = std::stoi(pair.substr(eq + 1));
+                        for (auto& e : doc.library)
+                            if (e.id == libId) { e.assetId = assetId; break; }
+                    } catch (...) {}
+                }
+                p = semi + 1;
+            }
+        } else if (tag == "warp") {
             doc.warpChain = decodeWarpChain(r.s.substr(r.p));
+            break; // consumes the rest
+        } else {
+            break; // unknown tag - stop rather than spin
+        }
     }
     return true;
 }
@@ -3175,6 +3221,65 @@ bool WavetableDoc::decode(const std::string& s) {
             return decodeWavetableLegacy(*this, s.substr(prefix.size()));
     }
     return false;
+}
+
+// ---- Waveform asset-library bridge ----------------------------------------
+
+void waveformAssetFromFrame(const IWavetableFrame* frame,
+                            std::string& outSubType, std::string& outPayload) {
+    outSubType = frame ? frame->typeId() : "layered";
+    outPayload = frame ? frame->encodeBody() : "";
+}
+
+std::unique_ptr<IWavetableFrame> frameFromWaveformAsset(const std::string& subType,
+                                                        const std::string& payload) {
+    std::unique_ptr<IWavetableFrame> frame = createFrameByTypeId(subType);
+    if (frame && !frame->decodeBody(payload)) frame.reset();
+    return frame;
+}
+
+int resolveWaveformReferences(NodeGraph& graph) {
+    int resolved = 0;
+    for (auto& n : graph.nodes) {
+        // Only wavetable-encoded scripts carry a library; cheap prefix gate
+        // avoids decoding every node's script.
+        if (n.script.rfind("__wavetable", 0) != 0) continue;
+
+        bool anyRef = false;
+        WavetableDoc doc;
+        if (!doc.decode(n.script)) continue;
+
+        bool changed = false;
+        for (auto& e : doc.library) {
+            if (e.assetId < 0) continue;
+            anyRef = true;
+            const AssetEntry* a = graph.assets.find(e.assetId);
+            if (a && a->kind == AssetKind::Waveform) {
+                auto frame = frameFromWaveformAsset(a->subType, a->payload);
+                if (frame) {
+                    // Preserve the entry's own gain (a placement-level property
+                    // serialized by the container, not part of the shared
+                    // asset body) so referencing a curve doesn't reset level.
+                    float keepGain = e.wave ? e.wave->gain : 1.0f;
+                    frame->gain = keepGain;
+                    e.wave = std::move(frame);
+                    changed = true;
+                    ++resolved;
+                } else {
+                    // Asset present but undecodable -> detach to independent.
+                    e.assetId = -1;
+                    changed = true;
+                }
+            } else {
+                // Referenced asset gone (erased) -> detach, keep last frame.
+                e.assetId = -1;
+                changed = true;
+            }
+        }
+        if (changed && anyRef)
+            n.script = doc.encode();
+    }
+    return resolved;
 }
 
 // ---- Library API ----------------------------------------------------------

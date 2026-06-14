@@ -952,6 +952,12 @@ bool ProjectFile::readProject(std::istream& f, NodeGraph& graph, PluginHost* plu
     // directly). Assets are parsed before nodes, so the library is complete here.
     graph.resolveAhdsrReferences();
 
+    // Same for live-referenced Waveform assets: push each referenced asset's
+    // frame into the wavetable library entries that point at it, re-encoding
+    // the affected node scripts so the audio thread (which decodes node.script)
+    // sees the asset content. Free function in layered_wave_editor.cpp.
+    resolveWaveformReferences(graph);
+
     // Restore open editors (store IDs only - never store Node*)
     graph.openEditors.clear();
     for (int id : pendingEditorIds) {

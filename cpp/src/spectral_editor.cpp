@@ -328,6 +328,14 @@ void SpectralEditorComponent::initUI() {
     addAndMakeVisible(phasePanel.get());
     addAndMakeVisible(magPanel.get());
 
+    // Read-only badge → break the library link and fork an independent copy
+    // (the only unlink path; see SpectralCurvePanel::onUnlink). Only meaningful
+    // when an asset store backs the links.
+    if (assetGraph != nullptr) {
+        phasePanel->onUnlink = [this]() { unlinkCurveLib(false); };
+        magPanel->onUnlink   = [this]() { unlinkCurveLib(true); };
+    }
+
     // Per-curve FrequencyGraph library link affordances. Only meaningful when
     // there's a project graph whose asset store backs the links.
     if (assetGraph != nullptr) {
@@ -336,9 +344,9 @@ void SpectralEditorComponent::initUI() {
             addAndMakeVisible(btn);
             btn.setTooltip(juce::String("Publish this ") + which +
                 " curve to the project's Frequency Graphs library, load a copy "
-                "of a library curve (independent), or link to one as a live, "
-                "read-only mirror. A linked curve is edited only in the library; "
-                "Unlink to edit it here.");
+                "of a library curve (independent), or sync to one as a live, "
+                "read-only mirror. A synced curve is edited only in the library; "
+                "click the panel's read-only badge to fork an editable copy.");
             btn.onClick = [this, isMag]() { openCurveLibrary(isMag); };
             addAndMakeVisible(lbl);
             lbl.setFont(11.0f);
@@ -594,7 +602,8 @@ void SpectralEditorComponent::refreshLinkLabels() {
             const AssetEntry* e = assetGraph->assets.find(assetId);
             juce::String nm = e ? juce::String(e->name) : juce::String("(missing)");
             lbl.setText("Linked: " + nm + " (#" + juce::String(assetId) +
-                        ")  - read only, Unlink to edit", juce::dontSendNotification);
+                        ")  - read only (click the badge to edit a copy)",
+                        juce::dontSendNotification);
         }
     };
     describe(doc.phaseAssetId, phaseLinkLabel);
@@ -623,6 +632,19 @@ void SpectralEditorComponent::openCurveLibrary(bool isMag) {
             refreshPreview();
             if (onApply) onApply();
         });
+}
+
+void SpectralEditorComponent::unlinkCurveLib(bool isMag) {
+    if (assetGraph == nullptr) return;
+    // Break the live link and keep the current (now independent) curve. Mirrors
+    // the onChanged(-1) path of openCurveLibrary; invoked from the panel badge.
+    (isMag ? doc.magAssetId : doc.phaseAssetId) = -1;
+    (isMag ? magPanel : phasePanel)->syncFromModel();
+    commitToNode();
+    refreshLinkLabels();
+    refreshReadOnly();
+    refreshPreview();
+    if (onApply) onApply();
 }
 
 // ==============================================================================
@@ -657,12 +679,21 @@ CurveEQEditorComponent::CurveEQEditorComponent(NodeGraph& g, int nId,
         0.0f, 2.0f, juce::Colour(150, 230, 170),
         [this]() { onCurveChanged(); });
     addAndMakeVisible(curvePanel.get());
+    // Read-only badge → break the link and fork an independent copy.
+    curvePanel->onUnlink = [this]() {
+        assetId = -1;
+        if (curvePanel) curvePanel->syncFromModel();
+        commitToNode();
+        refreshLinkLabel();
+        refreshReadOnly();
+        if (onApply) onApply();
+    };
 
     addAndMakeVisible(libraryBtn);
     libraryBtn.setTooltip("Publish this response curve to the project's Frequency "
-        "Graphs library, load a copy of a library curve (independent), or link to "
-        "one as a live, read-only mirror. A linked curve is edited only in the "
-        "library; Unlink to edit it here.");
+        "Graphs library, load a copy of a library curve (independent), or sync to "
+        "one as a live, read-only mirror. A synced curve is edited only in the "
+        "library; click the panel's read-only badge to fork an editable copy.");
     libraryBtn.onClick = [this]() { openLibrary(); };
 
     addAndMakeVisible(linkLabel);
@@ -742,7 +773,8 @@ void CurveEQEditorComponent::refreshLinkLabel() {
         const AssetEntry* e = graph.assets.find(assetId);
         juce::String nm = e ? juce::String(e->name) : juce::String("(missing)");
         linkLabel.setText("Linked: " + nm + " (#" + juce::String(assetId) +
-                          ")  - read only, Unlink to edit", juce::dontSendNotification);
+                          ")  - read only (click the badge to edit a copy)",
+                          juce::dontSendNotification);
     }
 }
 

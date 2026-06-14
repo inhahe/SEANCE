@@ -500,18 +500,24 @@ void SpectralCurvePanel::paint(juce::Graphics& g) {
                          juce::Justification::topLeft, 3);
     }
 
-    // Read-only badge (curve is a live library link - editing happens in the
-    // library, or via "Unlink to edit").
+    // Read-only badge (curve is a live library link). When an unlink handler is
+    // wired the badge is clickable and invites forking a copy; otherwise it's a
+    // plain status label. (Unlinking lives here, not in the library popup menu.)
     if (readOnly) {
-        juce::String badge = "linked - read only";
+        bool canUnlink = (bool) onUnlink;
+        juce::String badge = canUnlink ? "linked - click to edit a copy"
+                                       : "linked - read only";
         g.setFont(11.0f);
         int tw = g.getCurrentFont().getStringWidth(badge) + 12;
         juce::Rectangle<float> r((float)(cb.getRight() - tw - 4), cb.getY() + 4.0f,
                                  (float)tw, 16.0f);
-        g.setColour(juce::Colour(40, 60, 90).withAlpha(0.85f));
+        badgeBounds = canUnlink ? r : juce::Rectangle<float>();
+        g.setColour(juce::Colour(canUnlink ? 0xD9396090 : 0xD9285A5A));
         g.fillRoundedRectangle(r, 3.0f);
         g.setColour(juce::Colour(0xFFAEC8E8));
         g.drawText(badge, r, juce::Justification::centred);
+    } else {
+        badgeBounds = {};
     }
 }
 
@@ -574,7 +580,14 @@ void SpectralCurvePanel::writeFreehandSample(float x, float y) {
 }
 
 void SpectralCurvePanel::mouseDown(const juce::MouseEvent& e) {
-    if (readOnly) return;
+    if (readOnly) {
+        // The only interactive element in read-only mode is the "click to edit
+        // a copy" badge, which breaks the library link and forks an independent
+        // copy via the consumer-supplied handler.
+        if (onUnlink && badgeBounds.contains(e.position))
+            onUnlink();
+        return;
+    }
     if (curve.mode != SpectralCurve::Drawn) return;
     float x, y;
     if (!mouseToCurveXY(e.position, x, y)) return;
@@ -684,8 +697,13 @@ void showFrequencyGraphLibraryMenu(juce::Component* anchor,
     // to edit a shared library item is in the library itself. See the
     // FrequencyGraph library model in REFERENCE.md.
     m.addSubMenu("Load a copy from library", copyMenu, !graphs.empty());
-    m.addSubMenu("Link to library curve (live, read-only)", linkMenu, !graphs.empty());
-    m.addItem(2, "Unlink to edit", currentId >= 0);
+    m.addSubMenu("Sync with library curve (read-only)", linkMenu, !graphs.empty());
+    // Unlinking is deliberately NOT here - it's a node-state action, surfaced
+    // instead via the read-only badge on the curve panel ("click to edit a
+    // copy"). The library popup only does library operations (publish / load /
+    // sync). currentId is retained in the signature for callers that still pass
+    // it but is no longer consulted here.
+    juce::ignoreUnused(currentId);
 
     m.showMenuAsync(juce::PopupMenu::Options().withTargetComponent(anchor),
         [&graph, &curve, defaultName, onChanged = std::move(onChanged),
@@ -699,8 +717,6 @@ void showFrequencyGraphLibraryMenu(juce::Component* anchor,
                 graph.assets.add(AssetKind::FrequencyGraph,
                                  defaultName.toStdString(), "", curve.encode());
                 if (onChanged) onChanged(-1);
-            } else if (r == 2) {
-                if (onChanged) onChanged(-1);  // unlink, keep the curve
             } else if (r >= copyBase && r - copyBase < (int) graphs.size()) {
                 const AssetEntry* e = graphs[(size_t)(r - copyBase)];
                 SpectralCurve c;

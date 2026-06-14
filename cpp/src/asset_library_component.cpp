@@ -102,7 +102,7 @@ public:
         // a live-linked, read-only consumer curve can actually be changed). The
         // other kinds have no library-side editor yet.
         if (kind == AssetKind::FrequencyGraph) {
-            setup(editBtn, "Edit\xe2\x80\xa6");
+            setup(editBtn, juce::String::fromUTF8("Edit\xe2\x80\xa6"));
             editBtn.setTooltip("Edit the stored frequency-graph curve. Changes "
                                "propagate live to every node that LINKS this "
                                "asset (linked curves are read-only in their own "

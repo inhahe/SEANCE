@@ -599,9 +599,10 @@ void SpectrumTapComponent::openResponseEditor(int binSlotIdx) {
             linkLabel.setColour(juce::Label::textColourId, juce::Colour(0xFFAAAAAA));
             libraryBtn.setTooltip(
                 "Publish this response curve to the project's Frequency Graphs "
-                "library, load a copy of a library curve (independent), or link "
-                "this bin to one as a live, read-only mirror. A linked curve is "
-                "edited only in the library; Unlink to edit it here.");
+                "library, load a copy of a library curve (independent), or sync "
+                "this bin to one as a live, read-only mirror. A synced curve is "
+                "edited only in the library; click the panel's read-only badge to "
+                "fork an editable copy.");
             setSize(560, 388);
         }
         void resized() override {
@@ -648,12 +649,26 @@ void SpectrumTapComponent::openResponseEditor(int binSlotIdx) {
             const AssetEntry* e = graph.assets.find(aid);
             juce::String nm = e ? juce::String(e->name) : juce::String("(missing)");
             container->linkLabel.setText("Linked to library curve: " + nm +
-                                         " (#" + juce::String(aid) + ")  - read only, Unlink to edit",
+                                         " (#" + juce::String(aid) +
+                                         ")  - read only (click the badge to edit a copy)",
                                          juce::dontSendNotification);
         }
         container->panel.setReadOnly(aid >= 0);
     };
     updateLinkLabel();
+
+    // Read-only badge → break the library link and keep an independent copy
+    // (the only unlink path; see SpectralCurvePanel::onUnlink).
+    container->panel.onUnlink = [this, slotCapture, container, updateLinkLabel]() {
+        if (slotCapture < 0 || slotCapture >= (int)binCurveStates.size()) return;
+        auto& s = binCurveStates[slotCapture];
+        s.assetId = -1;      // detach from library
+        s.useCustom = true;  // keep the (now independent) curve active
+        container->panel.syncFromModel();
+        syncCurvesToScript();
+        updateLinkLabel();
+        container->panel.repaint();
+    };
 
     container->closeBtn.onClick = [dlg]() {
         if (dlg) dlg->exitModalState(0);

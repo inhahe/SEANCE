@@ -165,10 +165,14 @@ private:
 
     // Open the shared library menu for the mag (isMag) or phase curve.
     void openCurveLibrary(bool isMag);
+    // Break the live library link for the mag (isMag) or phase curve and keep an
+    // independent copy. Wired to the panel's read-only "edit a copy" badge.
+    void unlinkCurveLib(bool isMag);
     // Refresh both "Independent / Linked to ..." status lines from doc ids.
     void refreshLinkLabels();
     // Lock each panel for editing iff its curve is a live library link. A linked
-    // curve is read-only (edit it in the library, or Unlink to edit) - consumers
+    // curve is read-only (edit it in the library, or click the panel badge to
+    // fork an editable copy) - consumers
     // never write back to the asset. No-op when there's no assetGraph.
     void refreshReadOnly();
 

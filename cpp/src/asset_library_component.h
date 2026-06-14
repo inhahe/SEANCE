@@ -47,8 +47,8 @@ private:
     AssetLibrary& lib;
     std::function<void(const std::string&)> onEdit;
     juce::TabbedComponent tabs { juce::TabbedButtonBar::TabsAtTop };
-    juce::TextButton importBtn { "Import\xe2\x80\xa6" };
-    juce::TextButton exportBtn { "Export\xe2\x80\xa6" };
+    juce::TextButton importBtn { juce::String::fromUTF8("Import\xe2\x80\xa6") };
+    juce::TextButton exportBtn { juce::String::fromUTF8("Export\xe2\x80\xa6") };
     std::vector<StorePanel*> panels;             // for refresh-after-import
     std::unique_ptr<juce::FileChooser> chooser;  // kept alive across async pick
 

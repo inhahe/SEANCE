@@ -934,10 +934,9 @@ Each of the two curves has its own **Library…** button (above its canvas) that
 
 - **Add this curve to library** — publishes the magnitude (or phase) curve as a new `FrequencyGraph` asset (default name `Magnitude curve` / `Phase curve`). The node **stays independent** (a copy is deposited in the library; the node is not auto-linked).
 - **Load a copy from library** — mirrors a chosen asset's curve in as an **independent copy** (no link). The default, frictionless way to reuse a library curve.
-- **Link to library curve** — mirrors a chosen asset's curve in as a **live, read-only mirror**. The curve panel locks; you edit it only in the library, or **Unlink to edit**.
-- **Unlink to edit** — drops the link, keeps the curve, re-enables editing.
+- **Sync with library curve (read-only)** — mirrors a chosen asset's curve in as a **live, read-only mirror**. The curve panel locks; you edit it only in the library, or break the link from the panel badge (below).
 
-A status line under each button shows **Independent curve** or **Linked: <name> (#id) — read only, Unlink to edit**, and a linked panel shows a *linked – read only* badge. Hard-deleting the asset makes the curve fall back to its last cached shape as independent. This works both for a **standalone Frequency Domain node** and for a **Spectral frame nested inside a wavetable** (the wavetable shell passes its project graph into the sub-editor so library linking is available there too). Resolution is `resolveSpectralReferences()` (`spectral_editor.cpp`), called after `readProject()` and after each edit; it walks both standalone `__spectral2__` nodes and `__wavetable…` nodes (resolving any `SpectralFrame` in their frame library). *(See the [model-in-transition note](#asset-library-project-stores); a library-side editor for these assets is still to come.)*
+Unlinking is **not** a menu item — the library popup only does library operations (publish / load / sync). To diverge from a synced curve, **click the panel's read-only badge** (it reads *linked – click to edit a copy*): that breaks the link and forks an independent, editable copy. A status line under each button shows **Independent curve** or **Linked: <name> (#id) — read only (click the badge to edit a copy)**. Hard-deleting the asset makes the curve fall back to its last cached shape as independent. This works both for a **standalone Frequency Domain node** and for a **Spectral frame nested inside a wavetable** (the wavetable shell passes its project graph into the sub-editor so library linking is available there too). Resolution is `resolveSpectralReferences()` (`spectral_editor.cpp`), called after `readProject()` and after each edit; it walks both standalone `__spectral2__` nodes and `__wavetable…` nodes (resolving any `SpectralFrame` in their frame library). *(See the [model-in-transition note](#asset-library-project-stores); a library-side editor for these assets is still to come.)*
 
 ### SpectrumTap
 
@@ -947,10 +946,9 @@ The **SpectrumTap** effect reuses `SpectralCurve` for a per-bin custom frequency
 
 - **Add this curve to library** — publishes the bin's current curve as a new `FrequencyGraph` asset (default name `Response <bin label>`; rename later in the library browser). The bin **stays independent** (not auto-linked).
 - **Load a copy from library** — picks a `FrequencyGraph` asset and mirrors it into the bin as an **independent copy** (no link).
-- **Link to library curve** — picks an asset and makes the bin a **live, read-only mirror** of it; the curve panel locks until you Unlink.
-- **Unlink to edit** — drops the link, keeps the current curve, re-enables editing.
+- **Sync with library curve (read-only)** — picks an asset and makes the bin a **live, read-only mirror** of it; the curve panel locks. Break the link from the panel badge (below).
 
-A status line under the canvas shows **Independent curve** or **Linked to library curve: <name> (#id) — read only, Unlink to edit**. **Use Default (bandpass)** and the bin's **Delete** also detach any link. Hard-deleting the referenced asset (from the library browser) makes the bin fall back to its last cached curve as an independent curve — references never dangle. Resolution is done by `resolveSpectrumTapReferences()` (`spectrum_tap.cpp`), called after `readProject()` and after each edit, mirroring `resolveAhdsrReferences()`. *(See the [model-in-transition note](#asset-library-project-stores).)*
+As with the spectral curves, unlinking isn't a menu item — **click the panel's read-only badge** (*linked – click to edit a copy*) to break the link and fork an editable copy. A status line under the canvas shows **Independent curve** or **Linked to library curve: <name> (#id) — read only (click the badge to edit a copy)**. **Use Default (bandpass)** and the bin's **Delete** also detach any link. Hard-deleting the referenced asset (from the library browser) makes the bin fall back to its last cached curve as an independent curve — references never dangle. Resolution is done by `resolveSpectrumTapReferences()` (`spectrum_tap.cpp`), called after `readProject()` and after each edit, mirroring `resolveAhdsrReferences()`. *(See the [model-in-transition note](#asset-library-project-stores).)*
 
 ### <a name="curve-eq"></a>Curve EQ
 
@@ -2157,17 +2155,21 @@ library lives **inside the project file**.
 > to a **fork-by-default + opt-in read-only link** model:
 > - **Loading** a library asset into a node **forks** by default — the node gets
 >   an **independent copy**, with no link.
-> - **Linking** is an explicit opt-in that makes the node a **live, read-only
->   mirror** of the asset. A linked curve can't be edited in the node; you
->   **Unlink to edit** (which forks it), or edit the shared item **in the
+> - **Syncing** is an explicit opt-in (the **Sync with library curve
+>   (read-only)** menu item) that makes the node a **live, read-only mirror** of
+>   the asset. A synced curve can't be edited in the node; to diverge you **click
+>   the panel's read-only badge** (*linked – click to edit a copy*), which breaks
+>   the link and forks an independent copy, or you edit the shared item **in the
 >   library** (the only sanctioned action-at-distance — propagates to all active
->   links).
+>   links). Unlinking is intentionally **not** a library-menu item: the popup only
+>   does library operations (publish / load / sync), and unlinking is a node-state
+>   action surfaced on the panel badge.
 > - Consumers **never write back** to the asset on edit.
 >
 > **Migrated so far (sanity-check slice):** the three **FrequencyGraph**
 > consumers — **Curve EQ**, **Spectral FFT** mag/phase, **Spectrum Tap** per-bin
-> response. These now fork on load, lock the curve panel when linked, and offer
-> **Unlink to edit**.
+> response. These now fork on load, lock the curve panel when synced, and surface
+> the fork-a-copy action on the panel's read-only badge.
 >
 > **Still on the OLD bidirectional model (not yet migrated):** **Waveforms**,
 > **AHDSR Curves**, **Morph Algorithms**. The descriptions in *Identity, ids, and

@@ -5,6 +5,61 @@ top. When something is fixed, delete the entry (git history is the archive).
 
 ---
 
+## Asset library + layered-wave / morph editor — bug batch (reported 2026-06-14)
+
+A batch of issues the user found while exercising the asset library and the
+layered-waveform editor. Feature requests and UI-refactor items from the same
+report live in `agent-todo.md` ("Asset library + layered-wave editor — user
+review 2026-06-14"); the items below are concrete BUGS. Several cluster around
+the morph/warp UI and will likely be resolved together by the two-morph-type
+redesign tracked in agent-todo.
+
+- **NOT A BUG (library empty — investigated 2026-06-14): the Asset Library is
+  empty by design, not a display bug.** `AssetLibrary::entries` starts empty and
+  nothing seeds built-in content; `list()` correctly returns the (empty) set.
+  Assets only appear when the user explicitly saves one (curve editor / layered-
+  wave editor → "save to library"). `kUserIdBase` (1000000) merely reserves a
+  future built-in id space that is currently unused. Resolution is the feature
+  item "seed standard library content" in agent-todo (waveforms, morph algorithms,
+  AHDSR curves), NOT a panel-population fix. Keeping this note until seeding lands.
+
+- **BUG (dialog self-dismiss): the waveform selection view closed by itself**
+  while the user was picking waveforms to view — SEANCE did not crash/quit, just
+  the picker dialog vanished. Likely an unintended close trigger (escape-key /
+  focus-loss / a click handler that dismisses the dialog) in the waveform library
+  browser. Repro: open the waveform picker, click through several waveforms to
+  preview them. Investigate the browser's close/escape handling.
+
+- **BUG (morph pulldown missing on layer 1): the "morph:" pulldown under "Warp
+  (shape-bending)" is absent for the FIRST layer but present for the second.**
+  Off-by-one / first-row special-casing in the per-layer warp editor wiring
+  (`layered_wave_editor.cpp`, the per-layer `WarpChainEditor` / morph combo
+  construction).
+
+- **BUG (independent morph "add" does nothing visible): with "(Independent)"
+  selected, clicking "add" repeatedly keeps adding input modulation pins to the
+  node but never adds anything to a visible list of applied morphs.** Also
+  "(Independent)" is the ONLY morph choice even though several morphs are supposed
+  to exist (the morph registry/library is unpopulated, or the combo isn't reading
+  it). Tied to the morph-library-seeding item and the two-morph-type redesign.
+
+- **BUG (mis-named waveform "FFT 52"): the layered-waveform dialog inside the
+  wavetable editor edits a waveform auto-named "FFT 52" even though it is not an
+  FFT/spectral waveform** (it's in the layered-waveform editor). Wrong default-
+  name source — a layered frame is being labelled with the spectral/FFT naming
+  scheme. Find where new frames get their "FFT N" name and make a layered frame
+  get a layered-appropriate name.
+
+- **BUG (formula button inert): clicking the per-layer "Formula" button does
+  nothing — no formula editor field and no language (Built-in/Lua/Python/GLSL)
+  dropdown appears.** The Formula shape's editor UI isn't being shown/created when
+  the button is pressed. (Note: this is the same Formula-layer feature whose
+  audio-thread baking was just fixed — but here the *editor surface* itself never
+  appears.) Investigate the Formula button handler in the per-layer editor
+  (`layered_wave_editor.cpp` / `WaveLayerEditor`).
+
+---
+
 ## BUG: legacy Wavelet Pitch Tracker writes its signal to the wrong channel
 
 **Found:** 2026-06-14, while building the new precise **Pitch Detector** node

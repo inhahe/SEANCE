@@ -100,10 +100,19 @@ public:
     // toggles and language combo are disabled and the canvas ignores mouse
     // edits; a "linked - read only" badge is drawn. Used while the curve is a
     // live link to a library asset: the only way to edit a linked curve is to
-    // edit it in the library (or Unlink to edit). See the FrequencyGraph
-    // library model in REFERENCE.md.
+    // edit it in the library, or to break the link and fork a copy. See the
+    // FrequencyGraph library model in REFERENCE.md.
     void setReadOnly(bool ro);
     bool isReadOnly() const { return readOnly; }
+
+    // Optional unlink affordance. When set AND the panel is read-only, the
+    // "linked" badge becomes a button reading "linked - click to edit a copy";
+    // clicking it invokes this callback (which the consumer wires to break the
+    // library link and fork an independent copy). This is the ONLY unlink path -
+    // unlinking is deliberately NOT in the library popup menu (it's a node-state
+    // action, not a library operation). When null the badge is a plain,
+    // non-interactive "linked - read only" label.
+    std::function<void()> onUnlink;
 
 private:
     SpectralCurve& curve;
@@ -112,6 +121,7 @@ private:
     juce::Colour curveColour;
     std::function<void()> onChanged;
     bool readOnly = false;
+    juce::Rectangle<float> badgeBounds;  // hit area for the unlink badge (read-only)
 
     juce::Label      titleLabel;
     juce::TextButton equationBtn, drawBtn;
@@ -137,34 +147,36 @@ private:
 };
 
 // ==============================================================================
-// showFrequencyGraphLibraryMenu - the shared publish / load-copy / link / unlink
-// popup for any SpectralCurve that can be backed by a project FrequencyGraph asset.
+// showFrequencyGraphLibraryMenu - the shared publish / load-copy / sync popup
+// for any SpectralCurve that can be backed by a project FrequencyGraph asset.
 //
 // Library model (see REFERENCE.md "FrequencyGraph library"): loading a library
-// curve FORKS by default (independent copy); linking is opt-in and makes the
+// curve FORKS by default (independent copy); syncing is opt-in and makes the
 // curve a live, READ-ONLY mirror of the asset. The only way to change a shared
-// library item is to edit it in the library; a linked consumer never writes back.
-// To diverge from a link, "Unlink to edit".
+// library item is to edit it in the library; a synced consumer never writes back.
+// To diverge from a sync, click the "linked - click to edit a copy" badge on the
+// curve panel (SpectralCurvePanel::onUnlink) - unlinking is intentionally NOT a
+// library-menu item, since it's a node-state action, not a library operation.
 //
 // Menu items:
-//   - "Add this curve to library" : publishes a copy; the node stays independent.
-//   - "Load a copy from library"  : picks an asset, copies it in (independent).
-//   - "Link to library curve"     : picks an asset, mirrors it in as a live link.
-//   - "Unlink to edit"            : drops the link, keeps the current copy.
+//   - "Add this curve to library"          : publishes a copy; node stays independent.
+//   - "Load a copy from library"           : picks an asset, copies it in (independent).
+//   - "Sync with library curve (read-only)": picks an asset, mirrors it in as a live link.
 //
 // Every consumer stores its asset id in a different place, so the menu is
 // parameterised by callbacks rather than owning the id:
 //   - anchor      : component the popup is positioned against.
 //   - graph       : the project graph whose `assets` store is the library.
 //   - curve       : the live curve; on "publish" its encode() seeds the new
-//                   asset, on "load copy"/"link" the picked asset's payload is
+//                   asset, on "load copy"/"sync" the picked asset's payload is
 //                   decoded INTO it (so the caller can re-encode / refresh UI).
-//   - currentId   : the curve's current link (-1 = independent) - gates "Unlink".
+//   - currentId   : the curve's current link (-1 = independent). Retained for API
+//                   compatibility; no longer consulted (unlink moved to the badge).
 //   - defaultName : name for a newly-published asset.
 //   - onChanged   : invoked after any change with the new asset id: the linked id
-//                   for "link", or -1 for publish / load-copy / unlink. The caller
-//                   stores the id, re-encodes its node script, refreshes its panel,
-//                   and sets the panel read-only iff the id >= 0. NOT called if the
+//                   for "sync", or -1 for publish / load-copy. The caller stores
+//                   the id, re-encodes its node script, refreshes its panel, and
+//                   sets the panel read-only iff the id >= 0. NOT called if the
 //                   user dismisses the menu.
 // ==============================================================================
 void showFrequencyGraphLibraryMenu(juce::Component* anchor,

@@ -92,6 +92,15 @@ public:
         addAndMakeVisible(showArchived);
         showArchived.setButtonText("Show archived");
         showArchived.onClick = [this] { refresh(); };
+        showArchived.setTooltip("Include soft-deleted (archived) assets in the list. "
+                                "Archived assets stay resolvable so existing references "
+                                "keep working; this just un-hides them here.");
+
+        addAndMakeVisible(starredOnly);
+        starredOnly.setButtonText("Starred only");
+        starredOnly.onClick = [this] { refresh(); };
+        starredOnly.setTooltip("Show only assets you've starred as favourites. Use the "
+                               "Star button to mark the selected asset.");
 
         auto setup = [this](juce::TextButton& b, const juce::String& t) {
             b.setButtonText(t);
@@ -113,7 +122,6 @@ public:
         setup(duplicateBtn, "Duplicate");
         setup(starBtn,      "Star");
         setup(archiveBtn,   "Archive");
-        setup(deleteBtn,    "Delete");
 
         starBtn.setTooltip("Mark the asset as a favourite (star). Pickers offer a "
                            "\"starred only\" filter so you can surface your favourites "
@@ -126,29 +134,35 @@ public:
         duplicateBtn.setTooltip("Make an independent copy under a new id. Use this "
                                 "to diverge: edit the copy while the original stays "
                                 "shared by everything that referenced it.");
-        archiveBtn.setTooltip("Soft-delete: hide the asset from pickers while keeping "
-                              "it resolvable so existing references stay valid. "
-                              "Toggles to Restore for an archived asset.");
-        deleteBtn.setTooltip("Permanently remove the asset. Any references to it will "
-                             "dangle. Cannot be undone via this list - use sparingly.");
+        archiveBtn.setTooltip("Remove the asset from pickers (soft-delete) while keeping "
+                              "it resolvable so existing references stay valid. This is "
+                              "the only removal action here - there is no hard delete, "
+                              "because assets can be referenced by id from node scripts "
+                              "and an in-UI purge would silently dangle them. Toggles to "
+                              "Restore for an archived asset.");
         refresh();
     }
 
     void resized() override {
         auto r = getLocalBounds().reduced(8);
-        auto bottom = r.removeFromBottom(34);
+        // Two filter toggles stack vertically on the left; action buttons fill
+        // the rest of the row to the right.
+        auto bottom = r.removeFromBottom(52);
         r.removeFromBottom(6);
         list.setBounds(r);
-        showArchived.setBounds(bottom.removeFromLeft(130).withSizeKeepingCentre(130, 24));
+        auto filters = bottom.removeFromLeft(120);
+        showArchived.setBounds(filters.removeFromTop(24));
+        filters.removeFromTop(4);
+        starredOnly.setBounds(filters.removeFromTop(24));
         bottom.removeFromLeft(8);
         const int bw = 84;
+        auto buttonRow = bottom.withSizeKeepingCentre(bottom.getWidth(), 32);
         if (editBtn.isVisible())
-            editBtn.setBounds(bottom.removeFromLeft(bw).reduced(2, 4));
-        renameBtn.setBounds(bottom.removeFromLeft(bw).reduced(2, 4));
-        duplicateBtn.setBounds(bottom.removeFromLeft(bw).reduced(2, 4));
-        starBtn.setBounds(bottom.removeFromLeft(bw).reduced(2, 4));
-        archiveBtn.setBounds(bottom.removeFromLeft(bw).reduced(2, 4));
-        deleteBtn.setBounds(bottom.removeFromLeft(bw).reduced(2, 4));
+            editBtn.setBounds(buttonRow.removeFromLeft(bw).reduced(2, 4));
+        renameBtn.setBounds(buttonRow.removeFromLeft(bw).reduced(2, 4));
+        duplicateBtn.setBounds(buttonRow.removeFromLeft(bw).reduced(2, 4));
+        starBtn.setBounds(buttonRow.removeFromLeft(bw).reduced(2, 4));
+        archiveBtn.setBounds(buttonRow.removeFromLeft(bw).reduced(2, 4));
     }
 
     // ---- ListBoxModel ----
@@ -180,8 +194,11 @@ public:
 
     void refresh() {
         rows.clear();
-        for (const AssetEntry* e : lib.list(kind, showArchived.getToggleState()))
+        const bool starOnly = starredOnly.getToggleState();
+        for (const AssetEntry* e : lib.list(kind, showArchived.getToggleState())) {
+            if (starOnly && !e->starred) continue;
             rows.push_back(e->id);
+        }
         list.updateContent();
         list.repaint();
         updateButtons();
@@ -202,7 +219,6 @@ private:
         duplicateBtn.setEnabled(has);
         starBtn.setEnabled(has);
         archiveBtn.setEnabled(has);
-        deleteBtn.setEnabled(has);
         archiveBtn.setButtonText(has && e->archived ? "Restore" : "Archive");
         starBtn.setButtonText(has && e->starred ? "Unstar" : "Star");
     }
@@ -213,7 +229,6 @@ private:
         else if (b == &duplicateBtn) doDuplicate();
         else if (b == &starBtn)      doStarToggle();
         else if (b == &archiveBtn)   doArchiveToggle();
-        else if (b == &deleteBtn)    doDelete();
     }
 
     void doStarToggle() {
@@ -310,27 +325,6 @@ private:
         }
     }
 
-    void doDelete() {
-        const AssetEntry* e = lib.find(selectedId());
-        if (!e) return;
-        int id = e->id;
-        juce::String nm = juce::String(e->name.empty() ? "(unnamed)" : e->name);
-        juce::NativeMessageBox::showYesNoBox(
-            juce::MessageBoxIconType::WarningIcon,
-            "Delete asset permanently?",
-            "Delete \"" + nm + "\" (#" + juce::String(id) + ") from the library?\n\n"
-            "This cannot be undone from this list. Any node or editor still "
-            "referencing this asset by id will lose it (the reference will dangle). "
-            "If you only want to hide it, use Archive instead.",
-            this,
-            juce::ModalCallbackFunction::create([this, id](int res) {
-                if (res == 1 && lib.erase(id)) {
-                    onEdit("Delete asset");
-                    refresh();
-                }
-            }));
-    }
-
     void selectId(int id) {
         for (size_t i = 0; i < rows.size(); ++i)
             if (rows[i] == id) { list.selectRow((int) i); return; }
@@ -343,8 +337,9 @@ private:
     std::function<void(const std::string&)> onEdit;
     juce::ListBox list;
     juce::ToggleButton showArchived;
+    juce::ToggleButton starredOnly;
     juce::TextButton editBtn;  // FrequencyGraph only (in-library curve editor)
-    juce::TextButton renameBtn, duplicateBtn, starBtn, archiveBtn, deleteBtn;
+    juce::TextButton renameBtn, duplicateBtn, starBtn, archiveBtn;
     std::vector<int> rows;   // asset ids currently displayed (stable, not Node*)
 };
 

@@ -12,7 +12,17 @@ struct NodeGraph;  // for editing FrequencyGraph assets + propagating to links
 // ("stores"). Opened from Edit -> Asset Library... It presents one tab per
 // AssetKind (Waveforms, Instruments, ADHSR Curves, Morph Algorithms), each
 // listing the user-published entries in that store with actions to Rename,
-// Duplicate, Archive/Restore (soft-delete), and Delete (hard purge, warned).
+// Duplicate, Star, and Archive/Restore (soft-delete).
+//
+// There is deliberately NO hard-delete button: assets can be referenced by id
+// from node scripts (waveforms, morph algorithms, frequency graphs), so an
+// in-UI purge would silently dangle those references. Removal from the UI is
+// archive-only (hides from pickers, stays resolvable). A true hard purge is
+// reserved for an explicit, warned CLI action - the model still exposes
+// AssetLibrary::erase() for that path, it just isn't wired to a button here.
+//
+// The list can be filtered by two toggles: "Show archived" (include soft-
+// deleted entries) and "Starred only" (show just the user's favourites).
 //
 // It edits the live AssetLibrary in place. Every mutation is reported through
 // the `onEdit` callback so the host (MainContentComponent) can commitSnapshot()

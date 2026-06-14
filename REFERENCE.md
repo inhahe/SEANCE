@@ -2218,12 +2218,20 @@ has one tab per asset kind:
   a stored curve can always be re-edited in the form it was authored.
 
 Each tab lists its assets with **Rename**, **Duplicate**, **Star** / **Unstar**,
-**Archive** (soft-delete) / **Restore**, and **Delete** (hard erase, with a
-confirmation), plus a **Show archived** toggle. The **Frequency Graphs** tab adds
-an **Edit…** button (see [below](#frequencygraph-asset-editor)). Starred assets
-show a ★ in the list; the **starred** flag is the user-side analogue of the
-built-in factory "curated" flag, and pickers offer a **Starred only** filter over
-both so you can surface favourites out of a large library.
+and **Archive** (soft-delete) / **Restore**, plus two filter toggles: **Show
+archived** (include soft-deleted entries) and **Starred only** (show just your
+favourites). The **Frequency Graphs** tab adds an **Edit…** button (see
+[below](#frequencygraph-asset-editor)). Starred assets show a ★ in the list; the
+**starred** flag is the user-side analogue of the built-in factory "curated"
+flag, and pickers offer a **Starred only** filter over both so you can surface
+favourites out of a large library.
+
+There is deliberately **no hard-delete button** here. Assets can be referenced by
+id from node scripts (waveforms, morph algorithms, frequency graphs), so an in-UI
+purge would silently dangle those references. Removal from the management dialog
+is **archive-only** (hides from pickers, stays resolvable). A true hard purge is
+reserved for an explicit, warned CLI action; the model still exposes
+`AssetLibrary::erase()` for that path, it just isn't wired to a button.
 
 <a name="frequencygraph-asset-editor"></a>
 ### FrequencyGraph asset editor
@@ -2275,7 +2283,10 @@ closes, iff anything changed (not one step per drag tick). Implemented as
   waveform editor's **Use Library…** picker). There is deliberately no per-instance
   "detach" button — divergence is always Duplicate + repoint.
 - **Soft-delete (Archive)** hides an asset from the pickers but keeps it
-  resolvable, so existing references stay valid. **Delete** hard-erases it; any
+  resolvable, so existing references stay valid. This is the only removal action
+  in the management dialog — there is no in-UI hard delete (it would dangle
+  id-based script references). A hard erase (`AssetLibrary::erase`) is reserved
+  for an explicit, warned CLI action; when it eventually removes an asset, any
   node still referencing it falls back to **independent** (keeps its
   last-resolved shape) on the next resolve.
 - **Content-hash dedup.** Each asset carries a content hash

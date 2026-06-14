@@ -22,6 +22,7 @@
 #include "glsl_compute.h"          // headless GL 4.3 compute - GLSL generator backend
 #include "shape_expr.h"            // bakeShapeExpr (Builtin/Lua/Python/GLSL curve bakes)
 #include "builtin_synth.h"         // WaveExprParser - Builtin expression vocabulary
+#include "builtin_effects.h"       // ParametricEQProcessor - variable EQ band count
 
 #include <juce_audio_formats/juce_audio_formats.h>
 #include <juce_graphics/juce_graphics.h>
@@ -3519,6 +3520,80 @@ void testAssetLibrary(Report& r) {
                 }
             r.check(found, "spectral: nested frame curve matches the published asset");
         }
+    }
+
+    // ---- parametric EQ: variable band count -------------------------------
+    {
+        // Helper mirroring what the node context menu does: add/remove a band's
+        // four params as a group. (The menu itself lives in
+        // node_graph_component.cpp; this exercises the same shape.)
+        auto addBand = [](Node& n) {
+            int nb = ParametricEQProcessor::countBands(n);
+            std::string pfx = "B" + std::to_string(nb + 1) + " ";
+            n.params.push_back({pfx + "Type", 0.0f, 0.0f, 4.0f});
+            n.params.push_back({pfx + "Freq", 1000.0f, 20.0f, 20000.0f});
+            n.params.push_back({pfx + "Gain", 0.0f, -24.0f, 24.0f});
+            n.params.push_back({pfx + "Q",    0.707f, 0.1f, 10.0f});
+        };
+        auto removeBand = [](Node& n) {
+            int nb = ParametricEQProcessor::countBands(n);
+            if (nb <= 0) return;
+            std::string pfx = "B" + std::to_string(nb) + " ";
+            n.params.erase(
+                std::remove_if(n.params.begin(), n.params.end(),
+                    [&](const Param& p) {
+                        return juce::String(p.name).startsWith(pfx);
+                    }),
+                n.params.end());
+        };
+
+        NodeGraph g;
+        int nId = g.addNode("EQ", NodeType::Effect, {}, {}).id;
+        g.findNode(nId)->script = "__eq__";
+
+        // Default: a freshly created EQ in the app has 4 bands; here we build it
+        // up from empty to verify the count tracks the params exactly.
+        r.checkVal(ParametricEQProcessor::countBands(*g.findNode(nId)) == 0,
+                   "eq: empty node has zero bands",
+                   ParametricEQProcessor::countBands(*g.findNode(nId)));
+        for (int i = 0; i < 4; ++i) addBand(*g.findNode(nId));
+        r.checkVal(ParametricEQProcessor::countBands(*g.findNode(nId)) == 4,
+                   "eq: four bands after four adds",
+                   ParametricEQProcessor::countBands(*g.findNode(nId)));
+
+        // Add up to the max and confirm it doesn't overrun.
+        while (ParametricEQProcessor::countBands(*g.findNode(nId))
+               < ParametricEQProcessor::kMaxBands)
+            addBand(*g.findNode(nId));
+        r.checkVal(ParametricEQProcessor::countBands(*g.findNode(nId))
+                       == ParametricEQProcessor::kMaxBands,
+                   "eq: band count saturates at kMaxBands",
+                   ParametricEQProcessor::countBands(*g.findNode(nId)));
+
+        // Remove one: count drops, and the removed group is the highest band.
+        removeBand(*g.findNode(nId));
+        r.checkVal(ParametricEQProcessor::countBands(*g.findNode(nId))
+                       == ParametricEQProcessor::kMaxBands - 1,
+                   "eq: removing a band drops the count by one",
+                   ParametricEQProcessor::countBands(*g.findNode(nId)));
+        {
+            bool topGone = true;
+            std::string gone = "B" + std::to_string(ParametricEQProcessor::kMaxBands)
+                               + " ";
+            for (auto& p : g.findNode(nId)->params)
+                if (juce::String(p.name).startsWith(gone)) topGone = false;
+            r.check(topGone, "eq: the removed band's params are gone");
+        }
+
+        // Save/load preserves the (non-default) band count.
+        int beforeCount = ParametricEQProcessor::countBands(*g.findNode(nId));
+        std::ostringstream oss;
+        ProjectFile::writeProject(oss, g, nullptr, false, true);
+        NodeGraph g2; std::istringstream iss(oss.str());
+        ProjectFile::readProject(iss, g2, nullptr);
+        r.checkVal(ParametricEQProcessor::countBands(*g2.findNode(nId)) == beforeCount,
+                   "eq: band count round-trips through save/load",
+                   ParametricEQProcessor::countBands(*g2.findNode(nId)));
     }
 
     // ---- import / merge: dedup by content, id remap, name-clash suffix ------

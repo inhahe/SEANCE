@@ -936,7 +936,7 @@ public:
 
         const int n = buf.getNumSamples();
         const int ch = buf.getNumChannels();
-        for (int b = 0; b < kNumBands; ++b) {
+        for (int b = 0; b < (int)bands.size(); ++b) {
             for (int c = 0; c < std::min(ch, 2); ++c) {
                 float* data = buf.getWritePointer(c);
                 auto& s = bands[b].state[c];
@@ -967,10 +967,30 @@ public:
     void getStateInformation(juce::MemoryBlock&) override {}
     void setStateInformation(const void*, int) override {}
 
+    // Maximum number of EQ bands the node can carry. The active count is
+    // variable: it equals the number of contiguous "B<n> Type" params present
+    // on the node (bands are added/removed via the node context menu, which
+    // pushes/pops the four B<n> Type/Freq/Gain/Q params as a group). Each band
+    // is one RBJ-cookbook biquad cascaded in series, so any count works.
+    static constexpr int kMaxBands = 12;
+
+    // Count the contiguous B1.. bands present on the node (B<n> Type present).
+    static int countBands(const Node& node) {
+        int n = 0;
+        while (n < kMaxBands) {
+            std::string key = "B" + std::to_string(n + 1) + " Type";
+            bool found = false;
+            for (const auto& p : node.params)
+                if (p.name == key) { found = true; break; }
+            if (!found) break;
+            ++n;
+        }
+        return n;
+    }
+
 private:
     Node& node;
     double sampleRate = 44100;
-    static constexpr int kNumBands = 4;
 
     struct Coeffs { float b0=1,b1=0,b2=0,a1=0,a2=0; };
     struct BiquadState { float x1=0,x2=0,y1=0,y2=0; };
@@ -979,18 +999,18 @@ private:
         BiquadState state[2]; // stereo
         void reset() { state[0] = state[1] = {}; }
     };
-    Band bands[kNumBands];
+    std::vector<Band> bands;
 
     // RBJ cookbook biquad coefficient computation.
     void updateCoefficients() {
-        const char* bandNames[] = {"B1", "B2", "B3", "B4"};
-        for (int b = 0; b < kNumBands; ++b) {
-            std::string prefix = std::string(bandNames[b]) + " ";
-            int type  = (int)paramByName(node, (prefix + "Type").c_str(),
-                                          b == 0 ? 3.0f : b == 3 ? 4.0f : 0.0f);
-            float freq = paramByName(node, (prefix + "Freq").c_str(),
-                                      b == 0 ? 80.0f : b == 1 ? 400.0f :
-                                      b == 2 ? 2500.0f : 8000.0f);
+        int nb = countBands(node);
+        // Resize preserves existing bands' filter state (no clicks when only
+        // the param values change); newly-grown bands start from a clean state.
+        if ((int)bands.size() != nb) bands.resize((size_t)nb);
+        for (int b = 0; b < nb; ++b) {
+            std::string prefix = "B" + std::to_string(b + 1) + " ";
+            int type  = (int)paramByName(node, (prefix + "Type").c_str(), 0.0f);
+            float freq = paramByName(node, (prefix + "Freq").c_str(), 1000.0f);
             float gain = paramByName(node, (prefix + "Gain").c_str(), 0.0f);
             float Q    = paramByName(node, (prefix + "Q").c_str(), 0.707f);
 

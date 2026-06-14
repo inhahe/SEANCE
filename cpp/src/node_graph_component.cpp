@@ -3076,6 +3076,16 @@ void NodeGraphComponent::showNodeMenu(Node& node) {
         menu.addSubMenu("Export grid as", exportMenu);
     }
 
+    // Parametric EQ: add/remove bands. The band count is variable - each band
+    // is one cascaded biquad. "Add" pushes the four B<n> Type/Freq/Gain/Q
+    // params; "Remove" pops the highest band's four params. The generic param
+    // panel then shows exactly the active bands (no orphan sliders).
+    if (node.type == NodeType::Effect && node.script.rfind("__eq__", 0) == 0) {
+        int nb = ParametricEQProcessor::countBands(node);
+        menu.addItem(200, "Add EQ Band", nb < ParametricEQProcessor::kMaxBands);
+        menu.addItem(201, "Remove Last EQ Band", nb > 1);
+    }
+
     // The unified Script node gets an "Edit Script" entry (hidden for the
     // sibling XY Pad / Control Bank nodes, which share NodeType::SignalShape
     // but have their own dedicated editors opened via double-click).
@@ -3180,6 +3190,32 @@ void NodeGraphComponent::showNodeMenu(Node& node) {
             graph.commitSnapshot(node->mpeEnabled ? "Enable plugin MPE"
                                                   : "Disable plugin MPE");
             if (onNodeEdited) onNodeEdited();
+        } else if (result == 200) {
+            // Add an EQ band: a new peaking band at 1 kHz, flat (0 dB).
+            int nb = ParametricEQProcessor::countBands(*node);
+            if (nb < ParametricEQProcessor::kMaxBands) {
+                std::string pfx = "B" + std::to_string(nb + 1) + " ";
+                node->params.push_back({pfx + "Type", 0.0f, 0.0f, 4.0f});
+                node->params.push_back({pfx + "Freq", 1000.0f, 20.0f, 20000.0f});
+                node->params.push_back({pfx + "Gain", 0.0f, -24.0f, 24.0f});
+                node->params.push_back({pfx + "Q",    0.707f, 0.1f, 10.0f});
+                graph.commitSnapshot("Add EQ band");
+                if (onNodeEdited) onNodeEdited();
+            }
+        } else if (result == 201) {
+            // Remove the highest-numbered EQ band (its four params).
+            int nb = ParametricEQProcessor::countBands(*node);
+            if (nb > 1) {
+                std::string pfx = "B" + std::to_string(nb) + " ";
+                node->params.erase(
+                    std::remove_if(node->params.begin(), node->params.end(),
+                        [&](const Param& p) {
+                            return juce::String(p.name).startsWith(pfx);
+                        }),
+                    node->params.end());
+                graph.commitSnapshot("Remove EQ band");
+                if (onNodeEdited) onNodeEdited();
+            }
         } else if (result == 10) {
             if (node->cache.enabled) {
                 node->cache.enabled = false;

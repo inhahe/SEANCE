@@ -278,6 +278,29 @@ private:
     double sampleRate = 44100.0;
     int blockSize = 512;
 
+    // Plugin-delay-compensation upkeep. juce::AudioProcessorGraph already
+    // inserts the compensating delay lines (it builds them from each member's
+    // getLatencySamples() when the render sequence is prepared - see
+    // RenderSequenceBuilder in juce_AudioProcessorGraph.cpp), so SEANCE gets
+    // PDC for free for hosted plugins and any built-in that reports latency.
+    // The one thing the graph does NOT do is rebuild itself when a member's
+    // latency CHANGES at runtime (e.g. a plugin toggling oversampling/lookahead,
+    // or a future built-in switching to a latency-bearing high-quality mode).
+    // JUCE notes "if the latency of a node changes, the graph should be rebuilt"
+    // and leaves that to the owner. This listener is attached to every graph
+    // node; on a latencyChanged notification it flags a rebuild so the render
+    // sequence (and thus the delay compensation) is recomputed.
+    struct LatencyChangeListener : juce::AudioProcessorListener {
+        std::atomic<bool>* rebuildFlag = nullptr;
+        void audioProcessorParameterChanged(juce::AudioProcessor*, int, float) override {}
+        void audioProcessorChanged(juce::AudioProcessor*,
+                                   const ChangeDetails& details) override {
+            if (details.latencyChanged && rebuildFlag)
+                rebuildFlag->store(true);
+        }
+    };
+    LatencyChangeListener latencyListener;
+
     // Map our node IDs to JUCE graph node IDs.
     // nodeMap stores the OUTPUT side: the JUCE node that downstream connections
     // should pull audio FROM. For nodes with a pan inserted after them, this is

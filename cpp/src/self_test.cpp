@@ -3732,6 +3732,108 @@ void testAssetLibrary(Report& r) {
         }
     }
 
+    // ---- plugin-delay-compensation: JUCE graph aligns parallel paths --------
+    {
+        // SEANCE renders the whole node graph through a juce::AudioProcessorGraph
+        // and relies on its built-in delay compensation: a node that reports
+        // latency (a hosted VST3, or a future latency-bearing built-in) must stay
+        // time-aligned with any parallel dry path it's mixed back against. This
+        // pins that behaviour so a JUCE upgrade that dropped it would fail loudly.
+        using namespace juce;
+
+        // Emits a unit impulse at sample 0 of the first block, then silence.
+        struct ImpulseSource : AudioProcessor {
+            ImpulseSource() : AudioProcessor(BusesProperties()
+                .withOutput("Out", AudioChannelSet::stereo(), true)) {}
+            const String getName() const override { return "ImpulseSrc"; }
+            void prepareToPlay(double, int) override { fired = false; }
+            void releaseResources() override {}
+            void processBlock(AudioBuffer<float>& b, MidiBuffer&) override {
+                b.clear();
+                if (!fired) {
+                    for (int c = 0; c < b.getNumChannels(); ++c) b.setSample(c, 0, 1.0f);
+                    fired = true;
+                }
+            }
+            double getTailLengthSeconds() const override { return 0; }
+            bool acceptsMidi() const override { return false; }
+            bool producesMidi() const override { return false; }
+            AudioProcessorEditor* createEditor() override { return nullptr; }
+            bool hasEditor() const override { return false; }
+            int getNumPrograms() override { return 1; }
+            int getCurrentProgram() override { return 0; }
+            void setCurrentProgram(int) override {}
+            const String getProgramName(int) override { return {}; }
+            void changeProgramName(int, const String&) override {}
+            void getStateInformation(MemoryBlock&) override {}
+            void setStateInformation(const void*, int) override {}
+            bool fired = false;
+        };
+        // Reports `lat` samples of latency and actually delays its input by that
+        // much within the (single, large) test block.
+        struct DelayProc : AudioProcessor {
+            int lat;
+            explicit DelayProc(int n) : AudioProcessor(BusesProperties()
+                .withInput("In",   AudioChannelSet::stereo(), true)
+                .withOutput("Out", AudioChannelSet::stereo(), true)), lat(n) {
+                setLatencySamples(n);
+            }
+            const String getName() const override { return "Delay"; }
+            void prepareToPlay(double, int) override {}
+            void releaseResources() override {}
+            void processBlock(AudioBuffer<float>& b, MidiBuffer&) override {
+                const int n = b.getNumSamples();
+                for (int c = 0; c < b.getNumChannels(); ++c) {
+                    float* d = b.getWritePointer(c);
+                    for (int i = n - 1; i >= 0; --i) d[i] = (i >= lat) ? d[i - lat] : 0.0f;
+                }
+            }
+            double getTailLengthSeconds() const override { return 0; }
+            bool acceptsMidi() const override { return false; }
+            bool producesMidi() const override { return false; }
+            AudioProcessorEditor* createEditor() override { return nullptr; }
+            bool hasEditor() const override { return false; }
+            int getNumPrograms() override { return 1; }
+            int getCurrentProgram() override { return 0; }
+            void setCurrentProgram(int) override {}
+            const String getProgramName(int) override { return {}; }
+            void changeProgramName(int, const String&) override {}
+            void getStateInformation(MemoryBlock&) override {}
+            void setStateInformation(const void*, int) override {}
+        };
+
+        const int kLat = 64;
+        AudioProcessorGraph g;
+        g.setPlayConfigDetails(0, 2, 44100.0, 512);
+
+        auto src = g.addNode(std::make_unique<ImpulseSource>());
+        auto dly = g.addNode(std::make_unique<DelayProc>(kLat));
+        auto out = g.addNode(std::make_unique<AudioProcessorGraph::AudioGraphIOProcessor>(
+            AudioProcessorGraph::AudioGraphIOProcessor::audioOutputNode));
+
+        // Wet path: src -> delay(64) -> out.ch0.   Dry path: src -> out.ch0.
+        using NodeAndChannel = AudioProcessorGraph::NodeAndChannel;
+        g.addConnection({ NodeAndChannel{ src->nodeID, 0 }, NodeAndChannel{ dly->nodeID, 0 } });
+        g.addConnection({ NodeAndChannel{ dly->nodeID, 0 }, NodeAndChannel{ out->nodeID, 0 } });
+        g.addConnection({ NodeAndChannel{ src->nodeID, 0 }, NodeAndChannel{ out->nodeID, 0 } });
+
+        g.prepareToPlay(44100.0, 512);
+
+        AudioBuffer<float> buf(2, 512);
+        buf.clear();
+        MidiBuffer mb;
+        g.processBlock(buf, mb);
+
+        const float* o = buf.getReadPointer(0);
+        // With PDC the dry branch is delayed by 64 to match the wet branch, so
+        // both impulses land together at sample 64 (sum ~2.0) and nothing at 0.
+        // Without PDC there would be a 1.0 spike at 0 (dry) and a 1.0 at 64 (wet).
+        r.check(std::abs(o[kLat] - 2.0f) < 0.05f && std::abs(o[0]) < 0.05f,
+                "pdc: JUCE graph delay-compensates a parallel dry path against a latency node");
+        r.checkVal(g.getLatencySamples() == kLat,
+                   "pdc: graph reports the max-path latency", g.getLatencySamples());
+    }
+
     // ---- import / merge: dedup by content, id remap, name-clash suffix ------
     {
         // Source library (from "another project"): three assets.

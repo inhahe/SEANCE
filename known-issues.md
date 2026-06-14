@@ -5,30 +5,6 @@ top. When something is fixed, delete the entry (git history is the archive).
 
 ---
 
-## FEATURE GAP: no plugin-delay-compensation (PDC) in the graph
-
-The graph processor does not compensate for per-node processing latency. The only
-place `getLatencySamples()` is read at all is `plugin_host.cpp:205` (and it isn't
-propagated into graph scheduling). Consequence: any node that introduces latency
-(a lookahead limiter, a linear-phase / large-FFT EQ, a hop-buffered STFT effect,
-etc.) shifts its branch in time relative to parallel branches, so mixing a
-processed branch back against a dry/parallel branch produces phase smearing or
-comb-filtering that the user can't fix.
-
-This actively constrains DSP design. The **Curve EQ** node
-(`CurveEQProcessor`, `builtin_effects.h`) was deliberately built as a *block-local*
-overlap-add STFT (zero latency) rather than the textbook latency-bearing design,
-specifically to avoid this — a latency-reporting Curve EQ would have misaligned
-parallel chains with no way to correct it. The same constraint will hit any future
-lookahead/linear-phase effect.
-
-Proper fix: have `GraphProcessor` query each node's reported latency, compute the
-max-latency path to each mix point, and insert compensating delay lines on the
-shorter branches (standard PDC). Until then, latency-bearing nodes must either be
-avoided or made zero-latency by construction.
-
----
-
 ## BUG: legacy Wavelet Pitch Tracker writes its signal to the wrong channel
 
 **Found:** 2026-06-14, while building the new precise **Pitch Detector** node

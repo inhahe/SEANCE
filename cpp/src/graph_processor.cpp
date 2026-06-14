@@ -559,6 +559,9 @@ void PassthroughProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mid
 
 GraphProcessor::GraphProcessor() {
     processorGraph = std::make_unique<juce::AudioProcessorGraph>();
+    // The listener flips the same atomic that requestRebuild() uses, so a
+    // runtime latency change schedules a rebuild on the next audio callback.
+    latencyListener.rebuildFlag = &rebuildRequested;
 }
 
 void GraphProcessor::prepare(NodeGraph& graph, double sr, int bs) {
@@ -1353,6 +1356,10 @@ void GraphProcessor::rebuildGraph(NodeGraph& graph, Transport& transport) {
     for (auto& kv : nodeMap) {
         if (auto* gn = processorGraph->getNodeForId(kv.second)) {
             if (auto* p = gn->getProcessor()) {
+                // Watch for runtime latency changes so JUCE's built-in delay
+                // compensation gets recomputed (addListener dedups, so a
+                // processor that survives a rebuild isn't double-registered).
+                p->addListener(&latencyListener);
                 dbg("  node " + juce::String(kv.first)
                     + " (" + p->getName() + "): inCh="
                     + juce::String(p->getTotalNumInputChannels())

@@ -2918,6 +2918,56 @@ void testAssetLibrary(Report& r) {
         r.check(snap.find("[AssetStore]") != std::string::npos,
                 "assets: undo snapshot includes [AssetStore] (store edits undoable)");
     }
+
+    // ---- AHDSR live-reference: two nodes share one stored curve -------------
+    {
+        NodeGraph g;
+        // Capture ids immediately - addNode can reallocate g.nodes, so never
+        // hold a Node& across a second addNode (would dangle).
+        int aId = g.addNode("a", NodeType::TerrainSynth, {}, {}).id;
+        int bId = g.addNode("b", NodeType::TerrainSynth, {}, {}).id;
+
+        // Publish a curve from node A, then have both nodes reference it.
+        g.findNode(aId)->ahdsrEnvelope.attackMs = 42.0f;
+        int curve = g.assets.add(AssetKind::AhdsrCurve, "shared env", "",
+                                 g.findNode(aId)->ahdsrEnvelope.encode());
+        g.findNode(aId)->ahdsrAssetId = curve;
+        g.findNode(bId)->ahdsrAssetId = curve;
+        g.resolveAhdsrReferences();
+        r.checkVal(std::abs(g.findNode(bId)->ahdsrEnvelope.attackMs - 42.0f) < 0.01f,
+                   "assets: reference resolves stored curve into the node",
+                   g.findNode(bId)->ahdsrEnvelope.attackMs);
+
+        // Edit the shared curve -> propagates to every referencing node.
+        AHDSREnvelope edited;
+        edited.attackMs = 99.0f;
+        g.assets.update(curve, "", edited.encode());
+        g.resolveAhdsrReferences();
+        r.checkVal(std::abs(g.findNode(aId)->ahdsrEnvelope.attackMs - 99.0f) < 0.01f &&
+                   std::abs(g.findNode(bId)->ahdsrEnvelope.attackMs - 99.0f) < 0.01f,
+                   "assets: editing the curve propagates to all references",
+                   g.findNode(aId)->ahdsrEnvelope.attackMs);
+
+        // Save/load preserves the reference id and re-resolves on load.
+        std::ostringstream oss;
+        ProjectFile::writeProject(oss, g, nullptr, false, true);
+        NodeGraph g2;
+        std::istringstream iss(oss.str());
+        ProjectFile::readProject(iss, g2, nullptr);
+        r.check(g2.findNode(aId) && g2.findNode(aId)->ahdsrAssetId == curve,
+                "assets: ahdsrAssetId round-trips through save/load");
+        r.checkVal(g2.findNode(aId) &&
+                   std::abs(g2.findNode(aId)->ahdsrEnvelope.attackMs - 99.0f) < 0.01f,
+                   "assets: load re-resolves referenced curve into the node",
+                   g2.findNode(aId) ? g2.findNode(aId)->ahdsrEnvelope.attackMs : 0.0f);
+
+        // Hard-deleting the curve makes referencing nodes fall back to independent.
+        g.assets.erase(curve);
+        g.resolveAhdsrReferences();
+        r.check(g.findNode(aId)->ahdsrAssetId == -1 &&
+                g.findNode(bId)->ahdsrAssetId == -1,
+                "assets: deleted curve -> references fall back to independent");
+    }
 }
 
 int runSelfTest(const juce::File& outDir) {

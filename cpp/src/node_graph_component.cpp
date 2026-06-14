@@ -3895,7 +3895,21 @@ void launchAhdsrEnvelopeDialog(juce::Component* parent, NodeGraph& graph,
         [&graph, nodeId]() {
             if (graph.findNode(nodeId)) graph.dirty = true;
         });
-    content->setSize(700, 490);
+    // Wire the project asset-library AHDSR-curve store so the dialog can
+    // reference / publish a shared curve. Closures look the node up by id each
+    // time (never capture Node* - graph.nodes can reallocate).
+    AHDSREnvelopeComponent::LibraryContext libCtx;
+    libCtx.lib = &graph.assets;
+    libCtx.getAssetId = [&graph, nodeId]() -> int {
+        Node* n = graph.findNode(nodeId);
+        return n ? n->ahdsrAssetId : -1;
+    };
+    libCtx.setAssetId = [&graph, nodeId](int id) {
+        if (Node* n = graph.findNode(nodeId)) n->ahdsrAssetId = id;
+    };
+    libCtx.propagate = [&graph]() { graph.resolveAhdsrReferences(); };
+    content->setLibraryContext(libCtx);
+    content->setSize(700, 516);
     juce::DialogWindow::LaunchOptions opt;
     opt.dialogTitle = "Envelope - " + juce::String(node->name);
     opt.content.setOwned(content);

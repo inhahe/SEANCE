@@ -1,4 +1,5 @@
 #include "adsr_envelope_component.h"
+#include "asset_library.h"
 #include <algorithm>
 #include <cmath>
 
@@ -126,6 +127,21 @@ AHDSREnvelopeComponent::AHDSREnvelopeComponent(AHDSREnvelope& e,
     saveAsBtn.onClick  = [this]() { openSaveAsDialog(); };
     manageBtn.onClick  = [this]() { openManageDialog(); };
 
+    // Library row (hidden until setLibraryContext provides a library).
+    libraryLbl.setJustificationType(juce::Justification::centredRight);
+    addChildComponent(libraryLbl);
+    addChildComponent(libraryCombo);
+    addChildComponent(addToLibBtn);
+    libraryCombo.setTooltip("Reference a shared AHDSR curve from this project's "
+        "library. Editing it here changes it for EVERY node that references the "
+        "same curve. Choose \"(Independent)\" to keep this node's envelope "
+        "private. Unlike a preset (above), a library reference is live and "
+        "project-scoped.");
+    addToLibBtn.setTooltip("Publish the current envelope shape to the project "
+        "library as a new shared AHDSR curve, and make this node reference it.");
+    libraryCombo.onChange = [this]() { onLibrarySelected(libraryCombo.getSelectedId()); };
+    addToLibBtn.onClick = [this]() { openAddToLibraryDialog(); };
+
     rebuildPresetCombo();
     // Subscribe to preset list changes so a Save-as in this component
     // (or in another instance) refreshes the dropdown.
@@ -172,8 +188,92 @@ void AHDSREnvelopeComponent::syncFromModel() {
 }
 
 void AHDSREnvelopeComponent::commitChange() {
+    // If this node currently references a library AHDSR curve, the edit IS an
+    // edit to that shared curve: write the new shape back to the asset and
+    // re-resolve so every other node sharing the id updates live.
+    if (libCtx.lib && libCtx.getAssetId) {
+        int id = libCtx.getAssetId();
+        if (id >= 0) {
+            libCtx.lib->update(id, "", env.encode());
+            if (libCtx.propagate) libCtx.propagate();
+        }
+    }
     if (onChanged) onChanged();
     repaint();
+}
+
+void AHDSREnvelopeComponent::setLibraryContext(LibraryContext ctx) {
+    libCtx = std::move(ctx);
+    libraryRowVisible = (libCtx.lib != nullptr);
+    libraryLbl.setVisible(libraryRowVisible);
+    libraryCombo.setVisible(libraryRowVisible);
+    addToLibBtn.setVisible(libraryRowVisible);
+    if (libraryRowVisible) rebuildLibraryCombo();
+    resized();
+}
+
+void AHDSREnvelopeComponent::rebuildLibraryCombo() {
+    if (!libCtx.lib) return;
+    libraryCombo.clear(juce::dontSendNotification);
+    libraryCombo.addItem("(Independent)", 1);   // reserved id 1 (user ids >= 1e6)
+    int cur = libCtx.getAssetId ? libCtx.getAssetId() : -1;
+    bool curListed = false;
+    for (const AssetEntry* e : libCtx.lib->list(AssetKind::AhdsrCurve)) {
+        juce::String nm = e->name.empty() ? ("#" + juce::String(e->id))
+                                          : juce::String(e->name);
+        libraryCombo.addItem(nm, e->id);
+        if (e->id == cur) curListed = true;
+    }
+    // If the referenced curve is archived (hidden from the normal list), still
+    // show it so the user sees what they're referencing.
+    if (cur >= 0 && !curListed) {
+        const AssetEntry* e = libCtx.lib->find(cur);
+        if (e) libraryCombo.addItem(juce::String(e->name) + "  [archived]", e->id);
+    }
+    libraryCombo.setSelectedId(cur >= 0 ? cur : 1, juce::dontSendNotification);
+}
+
+void AHDSREnvelopeComponent::onLibrarySelected(int comboId) {
+    if (!libCtx.lib || !libCtx.setAssetId) return;
+    if (comboId == 1) {
+        // Detach to independent: keep the current envelope as this node's own
+        // local copy (no payload change), just stop referencing.
+        libCtx.setAssetId(-1);
+        if (onChanged) onChanged();
+        return;
+    }
+    // Adopt the chosen library curve: mirror its shape into env and reference it.
+    libCtx.setAssetId(comboId);
+    const AssetEntry* e = libCtx.lib->find(comboId);
+    if (e) {
+        AHDSREnvelope::decode(e->payload, env);
+        syncFromModel();
+    }
+    if (libCtx.propagate) libCtx.propagate();
+    if (onChanged) onChanged();
+}
+
+void AHDSREnvelopeComponent::openAddToLibraryDialog() {
+    if (!libCtx.lib || !libCtx.setAssetId) return;
+    auto* aw = new juce::AlertWindow("Add envelope to Library",
+        "Name for the shared AHDSR curve:", juce::MessageBoxIconType::NoIcon, this);
+    aw->addTextEditor("name", "Envelope");
+    aw->addButton("OK", 1, juce::KeyPress(juce::KeyPress::returnKey));
+    aw->addButton("Cancel", 0, juce::KeyPress(juce::KeyPress::escapeKey));
+    aw->enterModalState(true, juce::ModalCallbackFunction::create(
+        [this, aw](int res) {
+            if (res == 1) {
+                auto name = aw->getTextEditorContents("name").trim().toStdString();
+                if (name.empty()) name = "Envelope";
+                int id = libCtx.lib->add(AssetKind::AhdsrCurve, name, "",
+                                         env.encode());
+                libCtx.setAssetId(id);
+                rebuildLibraryCombo();
+                libraryCombo.setSelectedId(id, juce::dontSendNotification);
+                if (onChanged) onChanged();
+            }
+            delete aw;
+        }), true);
 }
 
 // ==============================================================================
@@ -650,6 +750,16 @@ void AHDSREnvelopeComponent::resized() {
     top.removeFromLeft(4);
     manageBtn .setBounds(top.removeFromLeft(90));
     r.removeFromTop(6);
+
+    // Library row (only when the asset-library context is set).
+    if (libraryRowVisible) {
+        auto lib = r.removeFromTop(26);
+        libraryLbl.setBounds(lib.removeFromLeft(60));
+        libraryCombo.setBounds(lib.removeFromLeft(220));
+        lib.removeFromLeft(8);
+        addToLibBtn.setBounds(lib.removeFromLeft(120));
+        r.removeFromTop(6);
+    }
 
     // Slider row (~120-160px tall depending on container).
     int sliderH = juce::jmax(90, r.getHeight() / 2);

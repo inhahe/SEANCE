@@ -370,6 +370,16 @@ struct Node {
     // the node). Save/load and undo serialize this through encode/decode.
     AHDSREnvelope ahdsrEnvelope;
 
+    // Optional LIVE reference to a project asset-library AHDSR curve. -1 means
+    // "independent" - ahdsrEnvelope is this node's own local copy (the original
+    // behavior). When >= 0, this node references the AhdsrCurve asset with that
+    // id: ahdsrEnvelope is kept as a mirror of the stored curve, and editing the
+    // curve (from any referencing node's envelope dialog) propagates to every
+    // node that shares the id. See NodeGraph::resolveAhdsrReferences(). The
+    // audio thread still reads ahdsrEnvelope directly, so referencing costs it
+    // nothing - resolution happens at edit/load time, never per block.
+    int ahdsrAssetId = -1;
+
     // Per-voice pressure (aftertouch) input. When something is wired to the
     // "Pressure" Param input pin on a synth node, the wired control's
     // value (0..1, read as the block mean) drives the per-voice
@@ -957,6 +967,14 @@ public:
     // Defined in node_graph.cpp because the implementation needs project_file.h,
     // which itself includes node_graph.h.
     void commitSnapshot(const std::string& description);
+
+    // Re-resolve every node that LIVE-references an asset-library AHDSR curve
+    // (ahdsrAssetId >= 0): decode the stored curve into the node's local
+    // ahdsrEnvelope mirror so the audio thread (which reads ahdsrEnvelope
+    // directly) sees the current library curve. Call after project load and
+    // after any edit to a referenced AhdsrCurve asset. Defined in
+    // node_graph.cpp (needs adsr_envelope.h / asset_library.h, both included).
+    void resolveAhdsrReferences();
 
     std::map<int, PianoRollState> pianoRollStates;
 

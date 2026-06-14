@@ -196,6 +196,8 @@ bool ProjectFile::writeProject(std::ostream& f, NodeGraph& graph,
         // 300ms / velSens=1) — we want those defaults to persist exactly across
         // save/load rather than relying on the constructor at load time.
         writeStr(f, "ahdsrEnvelope", node.ahdsrEnvelope.encode());
+        // Live reference to a project asset-library AHDSR curve (-1 = none).
+        if (node.ahdsrAssetId >= 0) writeInt(f, "ahdsrAssetId", node.ahdsrAssetId);
         if (node.aftertouchSensitivity != 0.5f)
             writeFloat(f, "aftertouchSensitivity", node.aftertouchSensitivity);
         writeInt(f, "pluginIndex", node.pluginIndex);
@@ -687,6 +689,9 @@ bool ProjectFile::readProject(std::istream& f, NodeGraph& graph, PluginHost* plu
                 if (AHDSREnvelope::decode(val, tmp))
                     curNode->ahdsrEnvelope = std::move(tmp);
             }
+            else if (key == "ahdsrAssetId") {
+                try { curNode->ahdsrAssetId = std::stoi(val); } catch (...) {}
+            }
             else if (key == "aftertouchSensitivity") {
                 try { curNode->aftertouchSensitivity = std::stof(val); }
                 catch (...) {}
@@ -941,6 +946,11 @@ bool ProjectFile::readProject(std::istream& f, NodeGraph& graph, PluginHost* plu
 
     // Restore nextId so new IDs don't conflict
     graph.setNextId(maxId + 1);
+
+    // Mirror every live-referenced asset-library AHDSR curve into its
+    // referencing nodes' local ahdsrEnvelope (the audio thread reads that
+    // directly). Assets are parsed before nodes, so the library is complete here.
+    graph.resolveAhdsrReferences();
 
     // Restore open editors (store IDs only - never store Node*)
     graph.openEditors.clear();

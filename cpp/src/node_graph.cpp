@@ -21,6 +21,21 @@ void NodeGraph::commitSnapshot(const std::string& description) {
     dirty = true;
 }
 
+void NodeGraph::resolveAhdsrReferences() {
+    for (auto& n : nodes) {
+        if (n.ahdsrAssetId < 0) continue;
+        const AssetEntry* e = assets.find(n.ahdsrAssetId);
+        if (e && e->kind == AssetKind::AhdsrCurve) {
+            AHDSREnvelope::decode(e->payload, n.ahdsrEnvelope);
+        } else {
+            // The referenced curve is gone (hard-deleted in another project /
+            // by import). Fall back to "independent" so the node keeps its last
+            // mirrored envelope instead of silently dangling.
+            n.ahdsrAssetId = -1;
+        }
+    }
+}
+
 static const char* channelLabel(int ch) {
     switch (ch) {
         case 1: return "mono";

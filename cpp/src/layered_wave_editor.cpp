@@ -4543,6 +4543,14 @@ void WaveLayerEditor::updateShapeButtons() {
     morph2Slider.setValue(l.shapeParam2, juce::dontSendNotification);
     morph2Slider.setVisible(isFM);
     morph2Label .setVisible(isFM);
+
+    // The sub-row controls (freehand toggle, Formula editor + language combo) are
+    // only given bounds in resized() when they're visible, so flipping their
+    // visibility here without re-laying-out would leave the newly-shown control
+    // at its stale zero bounds (invisible). Our own bounds don't change on a
+    // shape switch, so JUCE won't auto-call resized() - do it explicitly so the
+    // Formula field / Draw toggle actually appears the instant the shape changes.
+    resized();
 }
 
 void WaveLayerEditor::showPresetMenu() {

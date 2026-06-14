@@ -30,11 +30,20 @@ redesign tracked in agent-todo.
   browser. Repro: open the waveform picker, click through several waveforms to
   preview them. Investigate the browser's close/escape handling.
 
-- **BUG (morph pulldown missing on layer 1): the "morph:" pulldown under "Warp
-  (shape-bending)" is absent for the FIRST layer but present for the second.**
-  Off-by-one / first-row special-casing in the per-layer warp editor wiring
-  (`layered_wave_editor.cpp`, the per-layer `WarpChainEditor` / morph combo
-  construction).
+- **NOT A BUG / DESIGN GAP (morph pulldown "missing on layer 1" — investigated
+  2026-06-14): there is no off-by-one.** Per-layer warp editors intentionally
+  have NO "Morph:" row — only the **frame-scope (summation) warp** calls
+  `WarpChainEditor::setLibraryContext` (`layered_wave_editor.cpp:8345`), which is
+  what reveals the row. Per-layer warps are *baked* (Bucket A) and carry no
+  MorphAlgorithm asset reference, so they show only the op chain. The frame-scope
+  warp's "Morph:" row renders **directly below the last layer**, so with two
+  layers it visually reads as belonging to layer 2, and with one layer there's no
+  such row at all — which is what the user perceived as "layer 1 is missing it".
+  The real fix is the **two-morph-type redesign** (agent-todo item M / todo #15):
+  give each layer its own *wave-defining* (Type-1) morph picker and keep an
+  *arbitrary-wave* (Type-2) ordered morph list on the summation. Do NOT bolt a
+  per-layer morph row on as a stop-gap — that conflicts with the planned design
+  (CLAUDE.md "no stop-gaps that conflict with the proper solution").
 
 - **BUG (independent morph "add" does nothing visible): with "(Independent)"
   selected, clicking "add" repeatedly keeps adding input modulation pins to the
@@ -50,13 +59,6 @@ redesign tracked in agent-todo.
   scheme. Find where new frames get their "FFT N" name and make a layered frame
   get a layered-appropriate name.
 
-- **BUG (formula button inert): clicking the per-layer "Formula" button does
-  nothing — no formula editor field and no language (Built-in/Lua/Python/GLSL)
-  dropdown appears.** The Formula shape's editor UI isn't being shown/created when
-  the button is pressed. (Note: this is the same Formula-layer feature whose
-  audio-thread baking was just fixed — but here the *editor surface* itself never
-  appears.) Investigate the Formula button handler in the per-layer editor
-  (`layered_wave_editor.cpp` / `WaveLayerEditor`).
 
 ---
 

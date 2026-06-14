@@ -3205,6 +3205,108 @@ void testAssetLibrary(Report& r) {
                 "assets: erased morph asset -> frame falls back to independent");
     }
 
+    // ---- FrequencyGraph asset kind: SpectralCurve payload, all source forms -
+    {
+        // The FrequencyGraph kind stores SpectralCurve::encode() payloads. It is
+        // a leaf asset (no child ids) shared by the Spectral FFT type, the EQ
+        // node, and the Spectrum Tap. The key requirement (req C) is that every
+        // authoring form survives a round-trip: the equation text + language for
+        // formula curves, the control points for Drawn/Points, and the per-sample
+        // buffer for Drawn/Freehand.
+
+        // Tag <-> kind round-trips through the stable string.
+        AssetKind k;
+        r.check(std::string(assetKindTag(AssetKind::FrequencyGraph)) == "frequency" &&
+                    assetKindFromTag("frequency", k) && k == AssetKind::FrequencyGraph,
+                "freqgraph: AssetKind <-> 'frequency' tag round-trips");
+
+        // (1) Equation form with a non-default language: expression + lang survive.
+        SpectralCurve eq;
+        eq.mode = SpectralCurve::Equation;
+        eq.expression = "exp(-f/13)";
+        eq.lang = ShapeLang::Lua;
+        {
+            SpectralCurve dec;
+            r.check(SpectralCurve::decode(eq.encode(), dec) &&
+                        dec.mode == SpectralCurve::Equation &&
+                        dec.expression == "exp(-f/13)" && dec.lang == ShapeLang::Lua,
+                    "freqgraph: equation expression + language survive encode/decode");
+        }
+
+        // (2) Drawn/Points form: control points survive (this is the source form,
+        // not just a baked array).
+        SpectralCurve pts;
+        pts.mode = SpectralCurve::Drawn;
+        pts.freehandMode = false;
+        pts.drawnPoints = { {0.0f, 1.0f}, {0.5f, 0.25f}, {1.0f, 0.0f} };
+        {
+            SpectralCurve dec;
+            r.check(SpectralCurve::decode(pts.encode(), dec) &&
+                        dec.mode == SpectralCurve::Drawn && !dec.freehandMode &&
+                        dec.drawnPoints.size() == 3 &&
+                        std::abs(dec.drawnPoints[1].first - 0.5f) < 1e-4f &&
+                        std::abs(dec.drawnPoints[1].second - 0.25f) < 1e-4f,
+                    "freqgraph: drawn control points survive encode/decode");
+        }
+
+        // (3) Drawn/Freehand form: per-sample painted buffer survives.
+        SpectralCurve fh;
+        fh.mode = SpectralCurve::Drawn;
+        fh.freehandMode = true;
+        fh.drawnSamples.assign(512, 0.0f);
+        for (int i = 0; i < 512; ++i) fh.drawnSamples[i] = (float) i / 511.0f;
+        {
+            SpectralCurve dec;
+            r.check(SpectralCurve::decode(fh.encode(), dec) &&
+                        dec.mode == SpectralCurve::Drawn && dec.freehandMode &&
+                        dec.drawnSamples.size() == 512 &&
+                        std::abs(dec.drawnSamples[256] - 256.0f / 511.0f) < 1e-3f,
+                    "freqgraph: freehand per-sample buffer survives encode/decode");
+        }
+
+        // Publish all three into a library; content-hash dedup distinguishes them.
+        NodeGraph g;
+        int idEq  = g.assets.add(AssetKind::FrequencyGraph, "EQ tilt", "", eq.encode());
+        int idPts = g.assets.add(AssetKind::FrequencyGraph, "drawn", "", pts.encode());
+        int idFh  = g.assets.add(AssetKind::FrequencyGraph, "freehand", "", fh.encode());
+        r.check(idEq != idPts && idPts != idFh && idEq != idFh,
+                "freqgraph: three distinct curves get three distinct ids");
+        r.check(g.assets.findByHash(AssetLibrary::computeHash(
+                    AssetKind::FrequencyGraph, "", eq.encode()))->id == idEq,
+                "freqgraph: findByHash locates the equation curve by content");
+
+        // Re-adding an identical equation curve hashes equal (dedup candidate).
+        r.check(AssetLibrary::computeHash(AssetKind::FrequencyGraph, "", eq.encode()) ==
+                    AssetLibrary::computeHash(AssetKind::FrequencyGraph, "", eq.encode()),
+                "freqgraph: identical content hashes equal");
+
+        // Save/load: the FrequencyGraph entries survive the project round-trip
+        // with kind + payload intact, and the decoded source forms still match.
+        std::ostringstream oss;
+        ProjectFile::writeProject(oss, g, nullptr, false, true);
+        NodeGraph g2; std::istringstream iss(oss.str());
+        ProjectFile::readProject(iss, g2, nullptr);
+        const AssetEntry* le = g2.assets.find(idEq);
+        const AssetEntry* lp = g2.assets.find(idPts);
+        const AssetEntry* lf = g2.assets.find(idFh);
+        r.check(le && le->kind == AssetKind::FrequencyGraph &&
+                lp && lp->kind == AssetKind::FrequencyGraph &&
+                lf && lf->kind == AssetKind::FrequencyGraph,
+                "freqgraph: all three entries survive save/load as FrequencyGraph");
+        {
+            SpectralCurve dEq, dPts, dFh;
+            r.check(le && SpectralCurve::decode(le->payload, dEq) &&
+                        dEq.expression == "exp(-f/13)" && dEq.lang == ShapeLang::Lua,
+                    "freqgraph: equation source form survives save/load");
+            r.check(lp && SpectralCurve::decode(lp->payload, dPts) &&
+                        dPts.drawnPoints.size() == 3,
+                    "freqgraph: drawn points survive save/load");
+            r.check(lf && SpectralCurve::decode(lf->payload, dFh) &&
+                        dFh.freehandMode && dFh.drawnSamples.size() == 512,
+                    "freqgraph: freehand samples survive save/load");
+        }
+    }
+
     // ---- import / merge: dedup by content, id remap, name-clash suffix ------
     {
         // Source library (from "another project"): three assets.

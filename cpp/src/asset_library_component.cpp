@@ -253,6 +253,7 @@ AssetLibraryComponent::AssetLibraryComponent(
     add("Instruments", AssetKind::Instrument);
     add("ADHSR Curves", AssetKind::AhdsrCurve);
     add("Morph Algorithms", AssetKind::MorphAlgorithm);
+    add("Frequency Graphs", AssetKind::FrequencyGraph);
     addAndMakeVisible(tabs);
 
     addAndMakeVisible(importBtn);

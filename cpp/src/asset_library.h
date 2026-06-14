@@ -39,7 +39,11 @@ enum class AssetKind {
     Waveform,       // IWavetableFrame generator (individual wave OR wavetable frame)
     Instrument,     // independent instrument (generator + owned ADHSR/articulation)
     AhdsrCurve,     // an AHDSR / envelope curve
-    MorphAlgorithm  // a warp / morph algorithm (WarpOp chain)
+    MorphAlgorithm, // a warp / morph algorithm (WarpOp chain)
+    FrequencyGraph  // a 1-D frequency-domain curve (SpectralCurve): EQ response,
+                    // FFT magnitude/phase, Spectrum-Tap per-bin response, etc.
+                    // Payload = SpectralCurve::encode() (source-preserving:
+                    // formula+language OR drawn points OR freehand samples).
 };
 
 const char* assetKindTag(AssetKind k);          // stable string for serialization

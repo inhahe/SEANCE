@@ -9,6 +9,7 @@ const char* assetKindTag(AssetKind k) {
         case AssetKind::Instrument:     return "instrument";
         case AssetKind::AhdsrCurve:     return "ahdsr";
         case AssetKind::MorphAlgorithm: return "morph";
+        case AssetKind::FrequencyGraph: return "frequency";
     }
     return "waveform";
 }
@@ -18,6 +19,7 @@ bool assetKindFromTag(const std::string& tag, AssetKind& out) {
     if (tag == "instrument")      { out = AssetKind::Instrument;     return true; }
     if (tag == "ahdsr")           { out = AssetKind::AhdsrCurve;     return true; }
     if (tag == "morph")           { out = AssetKind::MorphAlgorithm; return true; }
+    if (tag == "frequency")       { out = AssetKind::FrequencyGraph; return true; }
     return false;
 }
 

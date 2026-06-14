@@ -73,6 +73,26 @@ These four "modes" are all the *same* Script node — they differ in how often
 your code runs and who owns the loop. Pick the cheapest one that can express
 your idea.
 
+### Multiple I/O pins — signals and MIDI in *and* out
+
+A Script / Signal-Shape / MIDI-Script node isn't limited to one input and one
+output. You set the pin counts in the node editor (each is 0–16), and the
+program addresses each pin by a fixed binding. This is the same across the
+real-time modes; only the spelling of "read input / write output" changes per
+mode (`pull`/`pullblock`/`s1` etc.). The pin bindings:
+
+| Pins | How the program sees them |
+|---|---|
+| **Signal inputs** | `s1`, `s2`, … `sN` — the current value of each incoming Param/signal cable (one per input pin). |
+| **Signal outputs** | `o1`, `o2`, … `oP` — assign these to drive each outgoing signal pin. (A single-output node can also just `return`/`out()` its value.) |
+| **MIDI inputs** | `0` = none; `1` = the usual single MIDI-In driving `note`/`vel`/`gate`/`freq`; **`≥2` = several MIDI-In pins**. Read events with `midievent(k)` (block) or `pollmidi()` (streaming); the **last value returned is `idx`** — *which* input pin the event arrived on (`1` = MIDI In 1, `2` = MIDI In 2, …), so you can route per source. |
+| **MIDI outputs** | `0` = pure signal source; **`≥1`** enables `note(pitch,vel,durSec)` / `noteon` / `noteoff` / `cc(num,val)` / `bend(val)`. The reserved variable **`out` selects which MIDI output pin** subsequent emits go to (0-based); each MIDI output is an independent cable. |
+
+So a program can, e.g., merge two MIDI inputs while emitting on two MIDI outputs
+and reading three control signals at once. Full per-field semantics are in
+[REFERENCE.md](REFERENCE.md#script-signal--midi) and the
+**Signal Shape** / **MIDI Script** tutorials (Help menu).
+
 ### Expression mode — Builtin, per-sample
 
 **What it is:** one formula, re-evaluated every sample, returning one number

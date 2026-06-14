@@ -30,6 +30,7 @@ here.
 - [Script (signal + MIDI)](#script-signal--midi)
 - [Control Bank](#control-bank)
 - [Shared AHDSR envelope](#shared-ahdsr-envelope)
+- [Asset library (project stores)](#asset-library-project-stores)
 - [Terrain-synth self-test (`--self-test`)](#terrain-synth-self-test---self-test)
 
 ---
@@ -2057,6 +2058,81 @@ otherwise reach — a filter cutoff, a wavetable position, a *different*
 synth, an effect knob — not for re-driving the synth that already gets it.
 (There is intentionally no MIDI *output* on this node; it is a pure
 MIDI-to-control tap.)
+
+## Asset library (project stores)
+
+The **asset library** is a per-project collection of reusable building blocks
+that can be **published once and referenced from many places at once**. Unlike
+the app-global *preset* systems (e.g. the AHDSR preset manager), the asset
+library lives **inside the project file** and uses **live references**: editing
+a stored asset updates every node that references it, immediately.
+
+Open it from **Edit → Asset Library…**. The dialog (`AssetLibraryComponent`)
+has one tab per asset kind:
+
+- **Waveforms** — a single-cycle/wavetable frame (any frame type: layered,
+  spectral, wavelet, granular, inharmonic, sample). Published from the
+  Layered-Waveform editor.
+- **Instruments** — (reserved) independent instruments.
+- **ADHSR Curves** — a full AHDSR amplitude envelope shape. Published from the
+  shared AHDSR editor.
+- **Morph Algorithms** — (reserved) warp chains.
+
+Each tab lists its assets with **Rename**, **Duplicate**, **Archive**
+(soft-delete) / **Restore**, and **Delete** (hard erase, with a confirmation),
+plus a **Show archived** toggle.
+
+### Identity, ids, and the live-reference model
+
+- Every asset has a stable integer **id**. User-created ids start at
+  `1000000` (`AssetLibrary::kUserIdBase`), disjoint from any built-in id space,
+  so the two never collide.
+- A node **references an asset by id**, not by copying it. While referenced, the
+  node keeps a local resolved copy that the audio thread reads directly (so no
+  string decoding happens per audio block), and any edit — from any referencing
+  node, or from this dialog — is written back to the asset and **propagated** to
+  every other reference (`resolveAhdsrReferences` for curves,
+  `resolveWaveformReferences` for waveforms).
+- **No detach-in-place.** To make one copy diverge from the shared asset, use
+  **Duplicate** (mints a new id) and point the node at the duplicate. Choosing
+  **(Independent)** in a node's picker stops referencing and keeps the current
+  shape as that node's own private copy.
+- **Soft-delete (Archive)** hides an asset from the pickers but keeps it
+  resolvable, so existing references stay valid. **Delete** hard-erases it; any
+  node still referencing it falls back to **independent** (keeps its
+  last-resolved shape) on the next resolve.
+- **Content-hash dedup.** Each asset carries a content hash
+  (`AssetLibrary::computeHash`, shared FNV-1a from `hash_util.h`) over its
+  kind + sub-type + payload, used to detect identical content. The hash is
+  conservative — no normalization — so only byte-identical payloads dedup.
+
+### Referencing from a node
+
+- **AHDSR curves** — the shared AHDSR editor (see
+  [Shared AHDSR envelope](#shared-ahdsr-envelope)) shows a **Library:** row:
+  a picker to reference a stored curve (or **(Independent)**) and **Add to
+  Library** to publish the current shape. The reference id lives on the node as
+  `ahdsrAssetId`.
+- **Waveforms** — the Layered-Waveform editor shows a **Library:** row beneath
+  the per-waveform gain: a picker and an **Add to Library** button. The
+  reference lives on the wavetable library entry (`WaveformLibraryEntry.assetId`)
+  — a node's wavetable can hold many waveforms, so each slot references
+  independently. Adopting an asset keeps the slot's own **gain** (a
+  placement-level property, not part of the shared shape).
+
+### On disk and undo
+
+- Assets are written to the project file in `[AssetStore]` blocks (one per
+  asset: id, kind tag, name, sub-type, content hash, archived flag, and a
+  base64 payload). The block is **included in undo snapshots**, so store edits
+  participate in undo/redo like any other project state.
+- Node references serialize alongside the node: `ahdsrAssetId` for curves; an
+  optional `:assets:` block inside the wavetable script (`__wavetable5__`) maps
+  each library entry id to its asset id. Both are re-resolved on load, so a
+  reopened project sees the current asset content.
+
+Data model: `asset_library.h/.cpp` (`AssetKind`, `AssetEntry`, `AssetLibrary`),
+owned by `NodeGraph::assets`. Management UI: `asset_library_component.h/.cpp`.
 
 ## Terrain-synth self-test (`--self-test`)
 

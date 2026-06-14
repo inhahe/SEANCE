@@ -167,6 +167,27 @@ For capturing real-world impulse responses, the **Room IR Capture** tool (Tools 
 
 The synths built on the shared envelope engine — **Terrain Synth** (and its Wavetable / Frequency-domain / Wavelet-space variants), **Additive**, **Phase Distortion**, and **Spectral Grain** — all use the same amplitude envelope, edited the same way. Right-click one of those nodes → *Envelope (AHDSR)…* (or click the **Envelope…** button in the Wavetable / Frequency-Domain editor's toolbar) opens a shared editor with five stages (Attack, Hold, Decay, Sustain, Release), a per-segment **curve-bend knob** for the Attack/Decay/Release ramps (one linear knob that sweeps each ramp from ease-in through straight to ease-out, with deeper freehand/equation curve editors still available), velocity sensitivity, a live preview, and a project-independent preset library with editable factory presets. (Synths with their own built-in envelopes — FM, Particle Cloud, Drum, and the SoundFont/SFZ/MultiSampler players — keep their internal envelope and don't show this editor.) Tonal synths also get an **Aftertouch** signal input pin so MIDI channel-pressure (or any Signal source) can drive expressive per-voice volume swells on top of the envelope. See [REFERENCE.md](REFERENCE.md#shared-ahdsr-envelope) for the full feature breakdown.
 
+#### Asset library (shared building blocks)
+
+Every project has an **asset library** — a place to publish reusable building
+blocks once and **reference them live from many nodes at the same time**.
+Editing a stored asset updates every node that uses it, instantly. It's the
+project-scoped counterpart to the app-global preset systems: presets are
+copy-on-apply, the asset library is a *live reference*. Open it from **Edit →
+Asset Library…** to browse, rename, duplicate, archive, or delete entries.
+
+Two asset kinds are wired up today, each with a **Library:** row in its editor
+(a picker to reference a stored asset, plus **Add to Library** to publish the
+current one): **waveforms** (any wavetable frame — layered, spectral, wavelet,
+granular, inharmonic, sample — published from the Layered-Waveform editor) and
+**AHDSR curves** (published from the shared envelope editor). Choose
+**(Independent)** in a picker to stop sharing and keep a private copy;
+**Duplicate** an asset to make one diverge. Archived assets are hidden from
+pickers but keep existing references valid; deleting an asset drops referencing
+nodes back to their own private copy. Assets live in the project file and
+participate in undo/redo. See [REFERENCE.md](REFERENCE.md#asset-library-project-stores)
+for the full breakdown.
+
 ### Supported plugin and instrument formats
 
 | Format | Type | Platforms | Notes |

@@ -303,6 +303,16 @@ struct LayeredWaveform : public IWavetableFrame {
     // Decode from a string (with or without the prefix). Returns true on success.
     bool decode(const std::string& s);
 
+    // Transient (not serialized). Set by decode(): true when at least one
+    // non-Built-in (Lua/Python/GLSL) Formula layer arrived WITHOUT an embedded
+    // pre-baked cycle (the "bake=" field encodeLayer now writes). Such layers
+    // can only be baked on the message thread (the interpreters are not
+    // audio-thread safe), so when this is true after a project load the owner
+    // should re-encode the script on the message thread - see
+    // migrateLayeredScriptEmbedBake - so the audio thread never has to run an
+    // interpreter to reconstruct the cycle.
+    bool decodedNeedsBakeEmbed = false;
+
     // Create a default 1-layer sine.
     static LayeredWaveform defaultSine();
 
@@ -317,6 +327,15 @@ struct LayeredWaveform : public IWavetableFrame {
     bool decodeBody(const std::string& body) override;
     std::unique_ptr<IWavetableFrame> clone() const override;
 };
+
+// Message-thread migration for old projects. If `script` is a "__layered__:"
+// tag whose Lua/Python/GLSL Formula layers carry no embedded baked cycle (saved
+// before encodeLayer started embedding "bake=" data), this re-bakes the
+// formulas on the CURRENT thread and re-encodes so the audio thread can render
+// them without ever invoking an interpreter. Rewrites `script` and returns true
+// ONLY when a change was needed; otherwise it's a cheap no-op returning false.
+// MUST be called on the message thread (it may run Python/Lua to bake).
+bool migrateLayeredScriptEmbedBake(std::string& script);
 
 // -----------------------------------------------------------------------------
 // LayerStackComponent

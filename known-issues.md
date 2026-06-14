@@ -448,6 +448,65 @@ root group node also restores the exact pre-import loop state (stashed in
 
 ---
 
+## Python interpreter run on the audio thread → `python314.dll` crash — FIXED
+
+**Observed:** 2026-06-12. Two crash dumps (`SEANCE.exe.1776.dmp`,
+`SEANCE.exe.56136.dmp`) with the faulting RIP inside `python314.dll` and an
+access violation **reading `0x10`** (a near-null `PyObject*` dereference =
+CPython interpreter-state corruption). These were the most recent of nine
+recovery-prompt-triggering crashes the user hit "lately." The older dumps in
+that batch are the separate `node.script` / `graph.nodes` data races documented
+below (`-1` sentinel reads, heap ops); this entry is the *new* signature.
+
+**Root cause:** the embedded CPython interpreter is a single process-global,
+GIL-held resource that may **only** be touched from the message thread (see
+`scripting.h`). But a Terrain Synth (or Signal Shape) whose source is a layered
+waveform containing a **Lua/Python/GLSL Formula layer** re-ran the interpreter
+to bake that layer's one-cycle buffer **on the audio thread**:
+
+- `GraphProcessor::rebuildGraph` runs **inside** the audio callback
+  (`processBlock`, graph_processor.cpp:1380), so the `TerrainSynthProcessor`
+  **constructor** (terrain_synth.cpp:1358) and `reloadIfScriptChanged`
+  (terrain_synth.cpp:1211) both run on the audio thread.
+- Both call `LayeredWaveform::decode → parseLayer → WaveLayer::rebakeFormula →
+  bakeShapeExpr → ScriptEngine::bakeShapeExpr`, which executes CPython.
+- Running Python off the message thread (no GIL/thread-state handoff) corrupts
+  interpreter state; the next interpreter access faults near-null inside
+  `python314.dll`. Timing matched the user's "recovery dialog often lately"
+  with no consistent repro — it only bit when a graph rebuild coincided with a
+  Terrain/Signal node that had a non-Built-in Formula layer.
+
+**Fix shipped (2026-06-14):** the audio thread no longer runs an interpreter to
+reconstruct a formula cycle. Three coordinated changes (all in
+`layered_wave_editor.{h,cpp}`, the shared layered-waveform codec used by Terrain
+Synth, Signal Shape, and wavetable frames):
+
+1. **Embed the baked cycle in the script.** `encodeLayer` now writes a
+   `bake=<count>;<s0>;<s1>;…` field for non-Built-in Formula layers (`;`-
+   separated so the comma-split field parser keeps it as one field). `parseLayer`
+   loads it straight into `formulaSamples`, so the audio thread renders the
+   formula from data — never the interpreter. This mirrors the `__generate__`
+   terrain path, which already embeds baked grid data for the same reason.
+2. **Thread-guard the baker.** `WaveLayer::rebakeFormula()` checks
+   `juce::MessageManager` and, when called off the message thread, refuses to
+   bake (leaves `formulaSamples` untouched) instead of running Python. This is
+   the crash-safety net: any unmigrated/edge-case script that reaches the audio
+   thread renders silent rather than corrupting the interpreter.
+3. **Migrate old projects on load.** Projects saved before the embed have no
+   `bake=` field. `decode()` sets `decodedNeedsBakeEmbed`, and
+   `migrateLayeredScriptEmbedBake` (plus a Signal-Shape sibling loop) re-bakes on
+   the message thread and re-encodes in `openProjectFile` (under `mutationLock`,
+   audio thread parked) so the embed is present before the graph goes live. The
+   undo baseline snapshot is taken after this, so undo/redo also carry the embed.
+
+Covered by six self-tests (`bake:` prefix in `--self-test`). **Residual gap:**
+the migration only walks `__layered__` (Terrain Synth) and `__signalshape__`
+nodes; a Python/Lua Formula layer embedded in an old **wavetable frame**
+(`__wavetable*__`) is crash-safe via the thread-guard but renders silent until
+re-saved. Low risk (rare combination, no crash), documented here as a follow-up.
+
+---
+
 ## `node.script` live-edit data race — fixed for Terrain Synth, still raw elsewhere
 
 **Observed:** 2026-06-08. A crash (`SEANCE.exe.3596.dmp`) ~1 second after

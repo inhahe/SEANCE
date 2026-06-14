@@ -1999,6 +1999,26 @@ void WaveLayer::rebakeFormula() {
         formulaError.clear();
         return;
     }
+    // Baking a Lua/Python/GLSL formula runs an embedded interpreter. The
+    // CPython interpreter in particular is a single process-global, GIL-held
+    // resource that may ONLY be touched from the message thread (see
+    // scripting.h). This function is reachable on the AUDIO thread: a graph
+    // rebuild reconstructs a TerrainSynth / SignalShape processor INSIDE the
+    // audio callback (GraphProcessor::rebuildGraph runs from processBlock), and
+    // that constructor - plus reloadIfScriptChanged - decodes a layered script,
+    // which lands here. Running Python there corrupts interpreter state and
+    // crashes deep in python3xx.dll (SEANCE.exe.*.dmp: access violation reading
+    // 0x10). So OFF the message thread we refuse to bake and leave
+    // formulaSamples untouched. The audio thread renders whatever the message
+    // thread already embedded in the script ("bake=" field, see encodeLayer);
+    // an un-migrated old project's formula layer stays silent until the
+    // message-thread migration (migrateLayeredScriptEmbedBake) re-encodes it.
+    // When there is no MessageManager at all (headless self-test), baking is
+    // allowed - there's no audio thread to race.
+    if (auto* mm = juce::MessageManager::getInstanceWithoutCreating())
+        if (!mm->isThisTheMessageThread())
+            return;
+
     std::string err;
     bakeShapeExpr(formulaLang, formulaExpr, /*domainRadians=*/true,
                   kFormulaBakeRes, formulaSamples, err);
@@ -2194,6 +2214,20 @@ static void encodeLayer(std::ostringstream& o, const WaveLayer& l) {
         // pre-language saves, which decode as Built-in.
         o << "," << escapeFormula(l.formulaExpr)
           << "," << shapeLangKey(l.formulaLang);
+        // Embed the baked one-cycle for Lua/Python/GLSL formulas so the AUDIO
+        // thread can render them without ever re-running an interpreter (which
+        // is message-thread-only and crashes if forced onto the audio thread -
+        // see rebakeFormula). Built-in formulas evaluate live in C++ and need
+        // no embed. Found by the "bake=" prefix in parseLayer regardless of
+        // position; the count and samples are ';'-separated (NOT ',') so the
+        // comma-split field parser keeps it as one field. This mirrors the
+        // baked-data strategy the __generate__ terrain path already uses to
+        // keep Python off the audio thread.
+        if (l.formulaLang != ShapeLang::Builtin && !l.formulaSamples.empty()) {
+            o << ",bake=" << l.formulaSamples.size();
+            for (float s : l.formulaSamples)
+                o << ';' << s;
+        }
     }
     // Bucket B generator-morph parameters, emitted only for the shapes that use
     // them (keeps classic-shape saves byte-identical). Prefixed fields, found by
@@ -2246,6 +2280,27 @@ static bool parseLayer(const std::string& lp, WaveLayer& out) {
             try { out.shapeParam2 = std::stof(field.substr(3)); } catch (...) {}
         } else if (field.rfind("factory=", 0) == 0) {
             out.factoryRef = unescapeFormula(field.substr(8));
+        } else if (field.rfind("bake=", 0) == 0) {
+            // Pre-baked one-cycle for a Lua/Python/GLSL formula (see
+            // encodeLayer). Format: "bake=<count>;<s0>;<s1>;...". Loading this
+            // lets the audio thread render the formula without invoking an
+            // interpreter. The leading token is the count (ignored - we just
+            // take every sample after it).
+            std::string payload = field.substr(5);
+            out.formulaSamples.clear();
+            size_t q = 0;
+            bool first = true;
+            while (q <= payload.size()) {
+                size_t r = payload.find(';', q);
+                if (r == std::string::npos) r = payload.size();
+                if (first) {
+                    first = false;   // skip the count token
+                } else {
+                    try { out.formulaSamples.push_back(std::stof(payload.substr(q, r - q))); }
+                    catch (...) {}
+                }
+                q = r + 1;
+            }
         }
     }
     if (out.shape == WaveLayer::Formula) {
@@ -2255,7 +2310,17 @@ static bool parseLayer(const std::string& lp, WaveLayer& out) {
             out.formulaExpr = "sin(x)";
         if (f.size() > 5)
             out.formulaLang = shapeLangFromKey(f[5]);
-        out.rebakeFormula();   // populate formulaSamples for Lua/Python layers
+        // formulaSamples may already be populated from an embedded "bake=" field
+        // parsed above. If it is, we're done - no interpreter needed. If it's
+        // empty (Built-in, or an old project saved before bakes were embedded),
+        // rebakeFormula() repopulates it, but ONLY on the message thread; on the
+        // audio thread it's a no-op and the layer renders silent until the
+        // message-thread migration embeds the cycle. See rebakeFormula and
+        // migrateLayeredScriptEmbedBake.
+        if (out.formulaLang == ShapeLang::Builtin)
+            out.formulaSamples.clear();          // Built-in evaluates live; no bake
+        else if (out.formulaSamples.empty())
+            out.rebakeFormula();                 // message-thread: bake; audio-thread: no-op
         return true;
     }
     if (out.shape == WaveLayer::Drawn && f.size() > 4) {
@@ -2353,6 +2418,7 @@ std::unique_ptr<IWavetableFrame> LayeredWaveform::clone() const {
 
 bool LayeredWaveform::decode(const std::string& s) {
     layers.clear();
+    decodedNeedsBakeEmbed = false;
     std::string body = s;
     if (body.rfind("__layered__:", 0) == 0) body = body.substr(12);
     if (body.empty()) return false;
@@ -2373,10 +2439,35 @@ bool LayeredWaveform::decode(const std::string& s) {
 
     for (size_t i = 1; i < parts.size(); ++i) {
         WaveLayer layer;
-        if (parseLayer(parts[i], layer))
+        if (parseLayer(parts[i], layer)) {
+            // Flag old projects whose Lua/Python/GLSL Formula layers carry no
+            // embedded baked cycle. ",bake=" can only appear as the real field
+            // delimiter (the formula expression field has its commas escaped to
+            // ';'), so this substring test is unambiguous. When set, the owner
+            // should re-encode on the message thread (migrateLayeredScriptEmbedBake)
+            // so the audio thread never needs an interpreter.
+            if (layer.shape == WaveLayer::Formula
+                && layer.formulaLang != ShapeLang::Builtin
+                && parts[i].find(",bake=") == std::string::npos)
+                decodedNeedsBakeEmbed = true;
             layers.push_back(layer);
+        }
     }
     return !layers.empty();
+}
+
+bool migrateLayeredScriptEmbedBake(std::string& script) {
+    if (script.rfind("__layered__:", 0) != 0)
+        return false;
+    LayeredWaveform lw;
+    if (!lw.decode(script))
+        return false;
+    if (!lw.decodedNeedsBakeEmbed)
+        return false;   // already embedded, or no interpreter-backed Formula layers
+    // decode() ran on this (message) thread, so rebakeFormula populated the
+    // missing cycles. Re-encoding now embeds them as "bake=" fields.
+    script = lw.encode();
+    return true;
 }
 
 // ==============================================================================

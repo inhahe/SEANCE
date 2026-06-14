@@ -2422,6 +2422,77 @@ void testWarp(Report& r) {
         }
     }
 
+    // ---- Formula bake embedding (#crash-python314) ----------------------
+    // A Lua/Python/GLSL Formula layer must carry its baked one-cycle inside the
+    // encoded script so the audio thread can render it WITHOUT re-running an
+    // interpreter (which crashes deep in python3xx.dll when forced onto the
+    // audio thread). Old projects with no embedded bake must be detectable
+    // (decodedNeedsBakeEmbed) and re-encodable on the message thread.
+    {
+        // Build a non-Built-in Formula layer with a known baked cycle. We set
+        // formulaSamples directly rather than running an interpreter so the test
+        // is independent of which script languages this build links.
+        WaveLayer fl;
+        fl.shape = WaveLayer::Formula;
+        fl.formulaLang = ShapeLang::Python;
+        fl.formulaExpr = "sin(x)";
+        fl.formulaSamples.resize(2048);
+        const double kTwoPi = 6.283185307179586;
+        for (int i = 0; i < 2048; ++i)
+            fl.formulaSamples[i] = (float)(std::sin(kTwoPi * i / 2048.0) * 0.5);
+
+        LayeredWaveform lw; lw.tableSize = 256; lw.layers = { fl };
+        std::string enc = lw.encode();
+        r.check(enc.find(",bake=") != std::string::npos,
+                "bake: non-Built-in Formula layer embeds a bake= field");
+
+        // Round-trip: the embedded samples come back verbatim, and decode does
+        // NOT flag the script as needing migration.
+        LayeredWaveform back;
+        bool ok = back.decode(enc);
+        bool sizeOk = ok && back.layers.size() == 1
+                   && back.layers[0].formulaSamples.size() == 2048;
+        double sdiff = 0.0;
+        if (sizeOk)
+            for (int i = 0; i < 2048; ++i)
+                sdiff += std::abs(back.layers[0].formulaSamples[i] - fl.formulaSamples[i]);
+        r.checkVal(sizeOk && sdiff < 1e-2 && !back.decodedNeedsBakeEmbed,
+                   "bake: embedded cycle round-trips and needs no migration", sdiff);
+
+        // A Built-in Formula layer must NOT embed a bake= field (it evaluates
+        // live in C++), keeping classic saves compact.
+        WaveLayer bi; bi.shape = WaveLayer::Formula; bi.formulaLang = ShapeLang::Builtin;
+        bi.formulaExpr = "sin(x)";
+        LayeredWaveform lwb; lwb.tableSize = 256; lwb.layers = { bi };
+        r.check(lwb.encode().find(",bake=") == std::string::npos,
+                "bake: Built-in Formula layer omits the bake= field");
+
+        // Simulate an OLD project: strip the bake= field from the encoded
+        // script. decode must flag it for migration, and the migration helper
+        // must re-embed a bake= field (re-baking on this thread).
+        std::string old = enc;
+        size_t bpos = old.find(",bake=");
+        if (bpos != std::string::npos) {
+            size_t end = old.find('|', bpos);          // bake= is the last field
+            if (end == std::string::npos) end = old.size();
+            old.erase(bpos, end - bpos);
+        }
+        LayeredWaveform oldDec;
+        oldDec.decode(old);
+        r.check(oldDec.decodedNeedsBakeEmbed,
+                "bake: un-embedded old script is flagged as needing migration");
+
+        std::string migrated = old;
+        bool changed = migrateLayeredScriptEmbedBake(migrated);
+        r.check(changed && migrated.find(",bake=") != std::string::npos,
+                "bake: migration re-embeds a bake= field on the message thread");
+
+        // A script that already has the embed must be a no-op for the migrator.
+        std::string already = enc;
+        r.check(!migrateLayeredScriptEmbedBake(already) && already == enc,
+                "bake: migration is a no-op when the cycle is already embedded");
+    }
+
     // ---- Milestone 9: inharmonic additive stack ------------------------
     {
         // The default bell renders a finite, in-range, non-trivial cycle.

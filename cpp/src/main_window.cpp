@@ -3020,6 +3020,30 @@ void MainContentComponent::openProjectFile(const juce::String& path) {
         std::lock_guard<std::mutex> graphLk(graph.mutationLock);
         ProjectFile::load(path.toStdString(), graph, &audioEngine.getPluginHost());
         upgradeLegacyNodes();
+
+        // Embed baked formula cycles for old projects (#crash-python314). A
+        // Lua/Python/GLSL Formula layer in a Terrain Synth (__layered__) or
+        // Signal Shape script used to be re-baked by re-running the interpreter
+        // whenever the audio thread rebuilt the processor - which crashes deep
+        // in python3xx.dll because the CPython interpreter is message-thread
+        // only. encodeLayer now embeds the baked cycle ("bake=" field) so the
+        // audio thread never needs an interpreter, but projects saved before
+        // that change have no embedded cycle. Re-bake here (we're on the message
+        // thread, holding mutationLock so the audio thread is parked) and
+        // re-encode so the embed is present before the graph goes live. New
+        // edits already save with the embed, so this only ever rewrites old
+        // files. See rebakeFormula / migrateLayeredScriptEmbedBake.
+        for (auto& node : graph.nodes) {
+            std::string script = node.script;
+            if (script.rfind("__layered__:", 0) == 0) {
+                if (migrateLayeredScriptEmbedBake(script))
+                    setNodeScriptSynced(node, script);
+            } else if (SignalShapeDoc::isSignalShapeScript(script)) {
+                SignalShapeDoc d;
+                if (d.decode(script) && d.layers.decodedNeedsBakeEmbed)
+                    setNodeScriptSynced(node, d.encode());
+            }
+        }
     }
 
     auto editorIds = graph.openEditors;

@@ -5162,7 +5162,7 @@ void MainContentComponent::showAudioDeviceSettings() {
 }
 
 void MainContentComponent::showAssetLibraryDialog() {
-    auto* dlg = new AssetLibraryComponent(graph.assets,
+    auto* dlg = new AssetLibraryComponent(graph,
         [this](const std::string& desc) {
             projectDirty = true;
             graph.dirty = true;

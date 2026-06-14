@@ -2169,10 +2169,17 @@ library lives **inside the project file**.
 > **AHDSR Curves**, **Morph Algorithms**. The descriptions in *Identity, ids, and
 > the live-reference model* below still describe the old behavior for those kinds.
 >
-> **Known gap in the migrated slice:** there is **no library-side editor** for
-> FrequencyGraph assets yet, so a *linked* FrequencyGraph curve currently can't
-> be edited at all except by unlinking. Building that editor (and rolling the new
-> model out to the other kinds) is pending a design decision from the user.
+> **Library-side editor (added 2026-06-14):** the **Frequency Graphs** tab has an
+> **Edit…** button that opens the stored curve in a full `SpectralCurvePanel`.
+> Edits write back into the asset and re-run all three FrequencyGraph resolvers,
+> so they propagate live to every *linked* consumer (the sanctioned
+> action-at-distance). This closes the loop: a linked curve is read-only in its
+> own node, and the library editor is where you change the shared curve. Forked
+> (independent) copies are unaffected. One undo snapshot is committed per edit
+> session (on close). See *FrequencyGraph asset editor* below.
+>
+> **Still pending:** rolling the new fork/link model out to the other kinds
+> (Waveforms, AHDSR, Morph) is awaiting a design decision from the user.
 
 Open it from **Edit → Asset Library…**. The dialog (`AssetLibraryComponent`)
 has one tab per asset kind:
@@ -2206,10 +2213,37 @@ has one tab per asset kind:
 
 Each tab lists its assets with **Rename**, **Duplicate**, **Star** / **Unstar**,
 **Archive** (soft-delete) / **Restore**, and **Delete** (hard erase, with a
-confirmation), plus a **Show archived** toggle. Starred assets show a ★ in the
-list; the **starred** flag is the user-side analogue of the built-in factory
-"curated" flag, and pickers offer a **Starred only** filter over both so you can
-surface favourites out of a large library.
+confirmation), plus a **Show archived** toggle. The **Frequency Graphs** tab adds
+an **Edit…** button (see [below](#frequencygraph-asset-editor)). Starred assets
+show a ★ in the list; the **starred** flag is the user-side analogue of the
+built-in factory "curated" flag, and pickers offer a **Starred only** filter over
+both so you can surface favourites out of a large library.
+
+<a name="frequencygraph-asset-editor"></a>
+### FrequencyGraph asset editor
+
+The **Frequency Graphs** tab has an **Edit…** button (enabled when a
+non-archived asset is selected) that opens the stored curve in a full
+`SpectralCurvePanel` — the same editor used inside the consumer nodes (equation /
+drawn-points / freehand authoring, language selector, etc.). The panel's y-range
+is auto-detected from the stored curve: a signed curve (any negative sample)
+opens on the phase range `[-π, π]`; everything else opens on `[0, 2]`, which
+contains both magnitude (`0..1`) and gain (`0..2`) shapes.
+
+This is the **only** place a *linked* FrequencyGraph curve can be changed (a
+linked curve is read-only in its own node). Every edit:
+1. writes the curve back into the asset (`AssetLibrary::update`), and
+2. re-runs all three FrequencyGraph resolvers (`resolveCurveEqReferences`,
+   `resolveSpectralReferences`, `resolveSpectrumTapReferences`),
+
+so the change **propagates live to every node that links the asset** — the
+sanctioned action-at-distance of the new model. Forked (independent) copies are
+unaffected. The live writes keep the audio graph current during editing; a
+**single undo snapshot** ("Edit frequency graph") is committed when the editor
+closes, iff anything changed (not one step per drag tick). Implemented as
+`FrequencyGraphAssetEditor` in `asset_library_component.cpp`; the whole
+`AssetLibraryComponent` now takes the full `NodeGraph&` (not just its
+`AssetLibrary&`) so the editor can reach the resolvers.
 
 ### Identity, ids, and the live-reference model
 

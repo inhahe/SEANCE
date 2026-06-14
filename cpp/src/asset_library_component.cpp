@@ -2,9 +2,77 @@
 #include "asset_import.h"
 #include "project_file.h"
 #include "node_graph.h"
+#include "curve_editor.h"     // SpectralCurve(Panel), resolveCurveEqReferences
+#include "spectral_editor.h"  // resolveSpectralReferences
+#include "spectrum_tap.h"     // resolveSpectrumTapReferences
+#include "dialog_helpers.h"   // launchToolDialog
 #include <fstream>
 
 namespace SoundShop {
+
+// ---------------------------------------------------------------------------
+// FrequencyGraphAssetEditor - the library-side editor for a single
+// FrequencyGraph (SpectralCurve) asset. Hosts a SpectralCurvePanel bound to a
+// local copy of the asset's curve; every edit writes the curve back into the
+// library entry (lib.update) and re-runs all three FrequencyGraph resolvers so
+// any LIVE-LINKED consumer (Curve EQ, Spectral FFT mag/phase, Spectrum Tap)
+// updates in place. This is the one sanctioned action-at-a-distance in the new
+// fork-by-default / read-only-link model: a linked consumer is read-only, and
+// the only way to change the shared curve is to edit it here in the library.
+//
+// A single undo snapshot is committed (via onDone) when the editor closes, iff
+// something actually changed - the live lib.update/resolve calls during editing
+// keep the audio graph current, but we don't want one undo step per drag tick.
+// ---------------------------------------------------------------------------
+class FrequencyGraphAssetEditor : public juce::Component {
+public:
+    FrequencyGraphAssetEditor(NodeGraph& graph, int assetId,
+                              std::function<void()> onDone)
+        : graph(graph), assetId(assetId), onDone(std::move(onDone)) {
+        if (const AssetEntry* e = graph.assets.find(assetId))
+            SpectralCurve::decode(e->payload, curve);
+        curve.rebake();
+
+        // Y-range: a FrequencyGraph asset can hold a phase curve (signed,
+        // [-pi, pi]), a magnitude curve (0..1) or a gain curve (0..2). Detect a
+        // signed curve and use the phase range; otherwise the [0, 2] gain range
+        // comfortably contains both magnitude and gain shapes.
+        float yMin = 0.0f, yMax = 2.0f;
+        for (float v : curve.evaluate(256))
+            if (v < -0.0001f) { yMin = -3.14159265f; yMax = 3.14159265f; break; }
+
+        panel = std::make_unique<SpectralCurvePanel>(
+            curve, "Curve", yMin, yMax, juce::Colour(150, 230, 170),
+            [this]() { commit(); });
+        addAndMakeVisible(panel.get());
+        setSize(520, 360);
+    }
+
+    ~FrequencyGraphAssetEditor() override {
+        if (dirty && onDone) onDone();
+    }
+
+    void resized() override { panel->setBounds(getLocalBounds().reduced(8)); }
+
+private:
+    void commit() {
+        graph.assets.update(assetId, "", curve.encode());
+        // Propagate to every live link in either direction's consumers.
+        resolveCurveEqReferences(graph);
+        resolveSpectralReferences(graph);
+        resolveSpectrumTapReferences(graph);
+        dirty = true;
+    }
+
+    NodeGraph& graph;
+    int assetId;
+    std::function<void()> onDone;
+    SpectralCurve curve;
+    std::unique_ptr<SpectralCurvePanel> panel;
+    bool dirty = false;
+
+    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(FrequencyGraphAssetEditor)
+};
 
 // ---------------------------------------------------------------------------
 // StorePanel - one tab: a list of one AssetKind's entries plus action buttons.
@@ -12,9 +80,10 @@ namespace SoundShop {
 class AssetLibraryComponent::StorePanel : public juce::Component,
                                           public juce::ListBoxModel {
 public:
-    StorePanel(AssetLibrary& lib, AssetKind kind,
+    StorePanel(NodeGraph& graph, AssetKind kind,
                std::function<void(const std::string&)> onEdit)
-        : lib(lib), kind(kind), onEdit(std::move(onEdit)) {
+        : graph(graph), lib(graph.assets), kind(kind),
+          onEdit(std::move(onEdit)) {
         list.setModel(this);
         list.setRowHeight(24);
         list.setColour(juce::ListBox::backgroundColourId, juce::Colour(30, 30, 34));
@@ -29,6 +98,17 @@ public:
             addAndMakeVisible(b);
             b.onClick = [this, &b] { onButton(&b); };
         };
+        // FrequencyGraph assets get an in-library curve editor (the only place
+        // a live-linked, read-only consumer curve can actually be changed). The
+        // other kinds have no library-side editor yet.
+        if (kind == AssetKind::FrequencyGraph) {
+            setup(editBtn, "Edit\xe2\x80\xa6");
+            editBtn.setTooltip("Edit the stored frequency-graph curve. Changes "
+                               "propagate live to every node that LINKS this "
+                               "asset (linked curves are read-only in their own "
+                               "editors - this is where you change the shared "
+                               "curve). Forked copies are unaffected.");
+        }
         setup(renameBtn,    "Rename");
         setup(duplicateBtn, "Duplicate");
         setup(starBtn,      "Star");
@@ -62,6 +142,8 @@ public:
         showArchived.setBounds(bottom.removeFromLeft(130).withSizeKeepingCentre(130, 24));
         bottom.removeFromLeft(8);
         const int bw = 84;
+        if (editBtn.isVisible())
+            editBtn.setBounds(bottom.removeFromLeft(bw).reduced(2, 4));
         renameBtn.setBounds(bottom.removeFromLeft(bw).reduced(2, 4));
         duplicateBtn.setBounds(bottom.removeFromLeft(bw).reduced(2, 4));
         starBtn.setBounds(bottom.removeFromLeft(bw).reduced(2, 4));
@@ -115,6 +197,7 @@ private:
     void updateButtons() {
         const AssetEntry* e = lib.find(selectedId());
         bool has = e != nullptr;
+        if (editBtn.isVisible()) editBtn.setEnabled(has && !e->archived);
         renameBtn.setEnabled(has);
         duplicateBtn.setEnabled(has);
         starBtn.setEnabled(has);
@@ -125,7 +208,8 @@ private:
     }
 
     void onButton(juce::TextButton* b) {
-        if (b == &renameBtn)    doRename();
+        if (b == &editBtn)      doEdit();
+        else if (b == &renameBtn)    doRename();
         else if (b == &duplicateBtn) doDuplicate();
         else if (b == &starBtn)      doStarToggle();
         else if (b == &archiveBtn)   doArchiveToggle();
@@ -141,6 +225,30 @@ private:
             onEdit(wasStarred ? "Unstar asset" : "Star asset");
             refresh();
         }
+    }
+
+    void doEdit() {
+        const AssetEntry* e = lib.find(selectedId());
+        if (!e || kind != AssetKind::FrequencyGraph) return;
+        int id = e->id;
+        juce::Component::SafePointer<StorePanel> safe(this);
+        auto* editor = new FrequencyGraphAssetEditor(graph, id,
+            [safe]() mutable {
+                // Runs when the editor closes, iff it changed the curve. The
+                // live lib.update/resolve already happened during editing; this
+                // is the single undo snapshot + dirty flag for the whole edit.
+                if (safe) { safe->onEdit("Edit frequency graph"); safe->refresh(); }
+            });
+        juce::DialogWindow::LaunchOptions opts;
+        opts.content.setOwned(editor);
+        opts.dialogTitle = "Edit Frequency Graph - " +
+            juce::String(e->name.empty() ? "(unnamed)" : e->name);
+        opts.dialogBackgroundColour = juce::Colour(40, 40, 45);
+        opts.escapeKeyTriggersCloseButton = true;
+        opts.useNativeTitleBar = false;
+        opts.resizable = true;
+        opts.componentToCentreAround = this;
+        launchToolDialog(opts);
     }
 
     void doRename() {
@@ -228,11 +336,14 @@ private:
             if (rows[i] == id) { list.selectRow((int) i); return; }
     }
 
-    AssetLibrary& lib;
+    NodeGraph& graph;        // full graph: editing a FrequencyGraph asset re-
+                             // resolves every node that links to it
+    AssetLibrary& lib;       // == graph.assets
     AssetKind kind;
     std::function<void(const std::string&)> onEdit;
     juce::ListBox list;
     juce::ToggleButton showArchived;
+    juce::TextButton editBtn;  // FrequencyGraph only (in-library curve editor)
     juce::TextButton renameBtn, duplicateBtn, starBtn, archiveBtn, deleteBtn;
     std::vector<int> rows;   // asset ids currently displayed (stable, not Node*)
 };
@@ -241,11 +352,11 @@ private:
 // AssetLibraryComponent
 // ---------------------------------------------------------------------------
 AssetLibraryComponent::AssetLibraryComponent(
-        AssetLibrary& library, std::function<void(const std::string&)> onEditCb)
-    : lib(library), onEdit(std::move(onEditCb)) {
+        NodeGraph& graph, std::function<void(const std::string&)> onEditCb)
+    : graph(graph), lib(graph.assets), onEdit(std::move(onEditCb)) {
     auto bg = juce::Colour(40, 40, 45);
     auto add = [&](const juce::String& title, AssetKind kind) {
-        auto* p = new StorePanel(lib, kind, onEdit);
+        auto* p = new StorePanel(graph, kind, onEdit);
         panels.push_back(p);
         tabs.addTab(title, bg, p, true);
     };

@@ -5,6 +5,8 @@
 
 namespace SoundShop {
 
+struct NodeGraph;  // for editing FrequencyGraph assets + propagating to links
+
 // ============================================================================
 // AssetLibraryComponent - the management UI for the project-level asset library
 // ("stores"). Opened from Edit -> Asset Library... It presents one tab per
@@ -27,7 +29,9 @@ class AssetLibraryComponent : public juce::Component {
 public:
     // onEdit(description) is invoked after any mutation so the host can commit an
     // undo snapshot and set the dirty flag. Description is a short verb phrase.
-    AssetLibraryComponent(AssetLibrary& library,
+    // The full graph is taken (not just its AssetLibrary) so editing a curve
+    // asset in place can re-resolve every node that links to it.
+    AssetLibraryComponent(NodeGraph& graph,
                           std::function<void(const std::string&)> onEdit);
     ~AssetLibraryComponent() override;
 
@@ -39,6 +43,7 @@ private:
     void doExport();
     void refreshAllPanels();
 
+    NodeGraph& graph;
     AssetLibrary& lib;
     std::function<void(const std::string&)> onEdit;
     juce::TabbedComponent tabs { juce::TabbedButtonBar::TabsAtTop };

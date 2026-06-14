@@ -992,6 +992,28 @@ private:
     // changes, the editor is constructed, or the user finishes editing.
     void refreshIdentityRow();
 
+    // ---- Project asset-library reference row (below the gain row) ----------
+    // Lets the currently-edited library entry live-reference a published
+    // Waveform asset: the picker attaches/detaches; "Add to Library" publishes
+    // the current frame as a new asset and links it. While referenced, edits to
+    // this waveform write back to the asset and propagate to every other node
+    // referencing it (the live-reference model, mirroring the AHDSR row).
+    juce::Label      assetLibLbl  { {}, "Library:" };
+    juce::ComboBox   assetLibCombo;
+    juce::TextButton addToAssetLibBtn { "Add to Library" };
+    // Rebuild the picker from graph.assets (id 1 = "(Independent)"; each
+    // Waveform asset uses its asset id as the combo id). Selects the current
+    // entry's assetId.
+    void rebuildAssetLibCombo();
+    // Handle a picker choice: detach (Independent) or adopt+resolve an asset.
+    void onAssetLibSelected(int comboId);
+    // Publish the current entry's frame as a new Waveform asset and link it.
+    void publishCurrentWaveformToLibrary();
+    // After committing this node, push every asset-referencing entry's frame
+    // up to its asset and propagate to other nodes (live write-back). Called
+    // from commitToNode(). No-op when no entry references an asset.
+    void writeBackReferencedWaveforms();
+
     // Shared layer-stack widget (the "+ Layer" header, the scrolling list of
     // WaveLayerEditor rows, and per-layer add/delete). Identical code is used
     // by the Signal Shape (LFO / envelope) editor. Summation preview is OFF

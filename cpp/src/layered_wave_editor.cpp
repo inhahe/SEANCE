@@ -3277,7 +3277,10 @@ int resolveWaveformReferences(NodeGraph& graph) {
             }
         }
         if (changed && anyRef)
-            n.script = doc.encode();
+            // Synchronised write: the audio thread polls node.script live and a
+            // granular wavetable script can be multi-megabyte, so a raw assign
+            // would race the read mid-copy. encode() builds outside the lock.
+            setNodeScriptSynced(n, doc.encode());
     }
     return resolved;
 }
@@ -8294,10 +8297,36 @@ LayeredWaveEditorComponent::LayeredWaveEditorComponent(NodeGraph& g, int nid, st
     };
     gainSlider.onDragEnd = [this]() { commitUndoStep(); };
 
+    // ---- Project asset-library reference row ----
+    addAndMakeVisible(assetLibLbl);
+    assetLibLbl.setFont(11.0f);
+    assetLibLbl.setColour(juce::Label::textColourId,
+                          juce::Colours::white.withAlpha(0.75f));
+    assetLibLbl.setJustificationType(juce::Justification::centredRight);
+
+    addAndMakeVisible(assetLibCombo);
+    assetLibCombo.setTooltip(
+        "Link this waveform to a shared one in the project's Waveform library. "
+        "Pick a stored waveform to make THIS slot a live reference: editing it "
+        "here (or anywhere it's used) updates every place it appears. Choose "
+        "(Independent) to give this slot its own private copy again. Use 'Add "
+        "to Library' to publish the current waveform as a new shared entry.");
+    assetLibCombo.onChange = [this]() {
+        onAssetLibSelected(assetLibCombo.getSelectedId());
+    };
+
+    addAndMakeVisible(addToAssetLibBtn);
+    addToAssetLibBtn.setTooltip(
+        "Publish this waveform to the project's shared Waveform library and "
+        "link this slot to it. Other nodes can then reference the same "
+        "waveform, and edits propagate to all of them.");
+    addToAssetLibBtn.onClick = [this]() { publishCurrentWaveformToLibrary(); };
+
     updateHintText();
     rebuildScatterUI();
     rebuildRows();
     refreshPreview();
+    rebuildAssetLibCombo();
     syncPositionParams();
     // Sized to fit a 1080p display with room for the OS taskbar and the
     // dialog's own non-native title bar (~30px). Side-by-side layout:
@@ -9345,7 +9374,11 @@ void LayeredWaveEditorComponent::refreshIdentityRow() {
     nameEditor.setVisible(have);
     gainLabel.setVisible(have);
     gainSlider.setVisible(have);
-    if (!have) return;
+    assetLibLbl.setVisible(have);
+    assetLibCombo.setVisible(have);
+    addToAssetLibBtn.setVisible(have);
+    if (!have) { return; }
+    rebuildAssetLibCombo();
 
     // Sync the gain knob to the frame the editor is currently bound to.
     // currentEditingFrame() can differ from the library entry at libIdx in
@@ -9369,6 +9402,117 @@ void LayeredWaveEditorComponent::refreshIdentityRow() {
     const juce::String currentName(entry.name);
     if (nameEditor.getText() != currentName)
         nameEditor.setText(currentName, juce::dontSendNotification);
+}
+
+// ---- Project asset-library reference row -----------------------------------
+
+void LayeredWaveEditorComponent::rebuildAssetLibCombo() {
+    assetLibCombo.clear(juce::dontSendNotification);
+    assetLibCombo.addItem("(Independent)", 1);   // reserved id 1 (user ids >= 1e6)
+
+    const int libIdx = wave.findLibraryIndexById(currentLibraryId);
+    const int cur = (libIdx >= 0) ? wave.library[libIdx].assetId : -1;
+    bool curListed = false;
+    for (const AssetEntry* e : graph.assets.list(AssetKind::Waveform)) {
+        juce::String nm = e->name.empty() ? ("#" + juce::String(e->id))
+                                          : juce::String(e->name);
+        assetLibCombo.addItem(nm, e->id);
+        if (e->id == cur) curListed = true;
+    }
+    // Show an archived referenced asset so the user can see what's referenced.
+    if (cur >= 0 && !curListed) {
+        const AssetEntry* e = graph.assets.find(cur);
+        if (e) assetLibCombo.addItem(juce::String(e->name) + "  [archived]", e->id);
+    }
+    assetLibCombo.setSelectedId(cur >= 0 ? cur : 1, juce::dontSendNotification);
+}
+
+void LayeredWaveEditorComponent::onAssetLibSelected(int comboId) {
+    const int libIdx = wave.findLibraryIndexById(currentLibraryId);
+    if (libIdx < 0) return;
+    auto& entry = wave.library[libIdx];
+
+    if (comboId == 1) {
+        // Detach to independent: keep the current frame as this slot's own
+        // private copy (no content change), just stop referencing.
+        if (entry.assetId == -1) return;
+        entry.assetId = -1;
+        commitToNode();
+        commitUndoStep();
+        return;
+    }
+    if (comboId == entry.assetId) return; // already referencing this asset
+
+    // Adopt the chosen asset: mirror its frame into the entry and reference it.
+    const AssetEntry* e = graph.assets.find(comboId);
+    if (!e || e->kind != AssetKind::Waveform) return;
+    if (auto frame = frameFromWaveformAsset(e->subType, e->payload)) {
+        // Preserve this slot's gain (a placement-level property, not part of
+        // the shared waveform shape).
+        frame->gain = entry.wave ? entry.wave->gain : 1.0f;
+        entry.wave = std::move(frame);
+    }
+    entry.assetId = comboId;
+    rebuildRows();
+    refreshPreview();
+    refreshIdentityRow();
+    notifyPopoutDocMutated();
+    commitToNode();
+    commitUndoStep();
+}
+
+void LayeredWaveEditorComponent::publishCurrentWaveformToLibrary() {
+    const int libIdx = wave.findLibraryIndexById(currentLibraryId);
+    if (libIdx < 0) return;
+    const IWavetableFrame* frame = currentEditingFrame();
+    if (!frame) return;
+
+    juce::String defaultName = wave.library[libIdx].name.empty()
+        ? juce::String("Waveform") : juce::String(wave.library[libIdx].name);
+    auto* aw = new juce::AlertWindow("Add waveform to Library",
+        "Name for the shared waveform:", juce::MessageBoxIconType::NoIcon, this);
+    aw->addTextEditor("name", defaultName);
+    aw->addButton("OK", 1, juce::KeyPress(juce::KeyPress::returnKey));
+    aw->addButton("Cancel", 0, juce::KeyPress(juce::KeyPress::escapeKey));
+    aw->enterModalState(true, juce::ModalCallbackFunction::create(
+        [this, aw, libIdx](int res) {
+            if (res == 1) {
+                auto name = aw->getTextEditorContents("name").trim().toStdString();
+                if (name.empty()) name = "Waveform";
+                // Re-find the entry: the modal could outlive a frame switch, so
+                // never trust the captured index blindly.
+                if (libIdx >= 0 && libIdx < (int)wave.library.size()) {
+                    if (const IWavetableFrame* f = wave.library[libIdx].wave.get()) {
+                        std::string subType, payload;
+                        waveformAssetFromFrame(f, subType, payload);
+                        int id = graph.assets.add(AssetKind::Waveform, name,
+                                                  subType, payload);
+                        wave.library[libIdx].assetId = id;
+                        rebuildAssetLibCombo();
+                        assetLibCombo.setSelectedId(id, juce::dontSendNotification);
+                        commitToNode();
+                        commitUndoStep();
+                    }
+                }
+            }
+            delete aw;
+        }), true);
+}
+
+void LayeredWaveEditorComponent::writeBackReferencedWaveforms() {
+    // For every library entry that live-references a Waveform asset, push its
+    // current frame back up to the asset, then propagate to every other node
+    // referencing the same asset. Early-out (cheap) when nothing references an
+    // asset, which is the common case. Called at settled edit points only.
+    bool anyRef = false;
+    for (const auto& entry : wave.library) {
+        if (entry.assetId < 0 || !entry.wave) continue;
+        anyRef = true;
+        std::string subType, payload;
+        waveformAssetFromFrame(entry.wave.get(), subType, payload);
+        graph.assets.update(entry.assetId, subType, payload);
+    }
+    if (anyRef) resolveWaveformReferences(graph);
 }
 
 void LayeredWaveEditorComponent::switchToFrame(int idx) {
@@ -10171,6 +10315,12 @@ void LayeredWaveEditorComponent::commitToNode() {
 }
 
 void LayeredWaveEditorComponent::commitUndoStep() {
+    // If any waveform in this doc live-references a project Waveform asset, this
+    // settled edit IS an edit to the shared asset: push it back to the store
+    // and propagate to every other node referencing it BEFORE snapshotting, so
+    // the undo step captures the propagated state. Cheap no-op when nothing is
+    // referenced (the common case).
+    writeBackReferencedWaveforms();
     // commitSnapshot() de-dups against the previous snapshot, so calling this
     // on every settled edit (debounced apply, Apply/Close, rename, recolour)
     // is cheap when nothing actually changed and pushes exactly one undo step
@@ -10449,6 +10599,20 @@ void LayeredWaveEditorComponent::resized() {
         // Horizontal slider + attached text box; cap the width so it doesn't
         // sprawl across the whole pane on wide windows.
         gainSlider.setBounds(gRow.removeFromLeft(juce::jmin(gRow.getWidth(), 240)));
+    }
+
+    // Project asset-library reference row under the gain row:
+    // [Library: label][asset picker .......][Add to Library]. Same visibility
+    // gating as the identity/gain rows (refreshIdentityRow controls it).
+    {
+        const int aH = 24;
+        auto aRow = right.removeFromTop(aH);
+        right.removeFromTop(6);
+        assetLibLbl.setBounds(aRow.removeFromLeft(70));
+        aRow.removeFromLeft(2);
+        addToAssetLibBtn.setBounds(aRow.removeFromRight(110));
+        aRow.removeFromRight(6);
+        assetLibCombo.setBounds(aRow);
     }
 
     // Middle: either the layered-frame layer rows + viewport, the embedded

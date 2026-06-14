@@ -6,6 +6,15 @@ allowed combinations are not arbitrary — they fall out of one hard constraint
 (the audio thread must never block, allocate, or call an interpreter it can't
 bound) and a few capability facts about each language.
 
+> **This is the "why / which-one" doc, not the API spec.** For the exact
+> per-binding scripting **reference** — emit functions, variable vocabulary,
+> multi-pin I/O, the terrain whole-grid program model, the warp/`waveform`
+> functions, the WASM ABI — see **REFERENCE.md**: [Script program
+> reference](REFERENCE.md#script-program-reference-algorithmic-midi-languages),
+> [Script (signal + MIDI)](REFERENCE.md#script-signal--midi), and the terrain /
+> warp / wavetable sections. For task-oriented **tutorials**, see the in-app Help
+> pages (`docs/*.html`): Signal Shape, MIDI Script, Wavetables, Terrain Synth.
+
 If you only remember one thing: **there are two worlds.**
 
 | World | When it runs | What's allowed | Why |
@@ -75,23 +84,18 @@ your idea.
 
 ### Multiple I/O pins — signals and MIDI in *and* out
 
-A Script / Signal-Shape / MIDI-Script node isn't limited to one input and one
-output. You set the pin counts in the node editor (each is 0–16), and the
-program addresses each pin by a fixed binding. This is the same across the
-real-time modes; only the spelling of "read input / write output" changes per
-mode (`pull`/`pullblock`/`s1` etc.). The pin bindings:
-
-| Pins | How the program sees them |
-|---|---|
-| **Signal inputs** | `s1`, `s2`, … `sN` — the current value of each incoming Param/signal cable (one per input pin). |
-| **Signal outputs** | `o1`, `o2`, … `oP` — assign these to drive each outgoing signal pin. (A single-output node can also just `return`/`out()` its value.) |
-| **MIDI inputs** | `0` = none; `1` = the usual single MIDI-In driving `note`/`vel`/`gate`/`freq`; **`≥2` = several MIDI-In pins**. Read events with `midievent(k)` (block) or `pollmidi()` (streaming); the **last value returned is `idx`** — *which* input pin the event arrived on (`1` = MIDI In 1, `2` = MIDI In 2, …), so you can route per source. |
-| **MIDI outputs** | `0` = pure signal source; **`≥1`** enables `note(pitch,vel,durSec)` / `noteon` / `noteoff` / `cc(num,val)` / `bend(val)`. The reserved variable **`out` selects which MIDI output pin** subsequent emits go to (0-based); each MIDI output is an independent cable. |
-
-So a program can, e.g., merge two MIDI inputs while emitting on two MIDI outputs
-and reading three control signals at once. Full per-field semantics are in
-[REFERENCE.md](REFERENCE.md#script-signal--midi) and the
-**Signal Shape** / **MIDI Script** tutorials (Help menu).
+One thing the matrix above doesn't capture: a Script / Signal-Shape / MIDI-Script
+node isn't limited to one input and one output. The node's pin counts (each 0–16)
+give it several signal inputs (`s1`…`sN`), several signal outputs (`o1`…`oP`),
+several MIDI inputs (told apart by the `idx` value `midievent()`/`pollmidi()`
+returns), and several MIDI outputs (selected by the reserved `out` variable). So
+one program can merge two MIDI inputs while emitting on two MIDI outputs and
+reading three control signals at once — none of which changes *which* language is
+allowed where. **The exact per-pin binding spec lives in the API reference, not
+here:** see [Multiple MIDI outputs / inputs / Signal
+inputs](REFERENCE.md#script-program-reference-algorithmic-midi-languages) and
+[Script (signal + MIDI)](REFERENCE.md#script-signal--midi) in REFERENCE.md, and
+the **Signal Shape** / **MIDI Script** tutorials (Help menu).
 
 ### Expression mode — Builtin, per-sample
 

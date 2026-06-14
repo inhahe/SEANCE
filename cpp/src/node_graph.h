@@ -1000,4 +1000,14 @@ private:
 // Returns the number of references resolved. Mirrors resolveAhdsrReferences().
 int resolveWaveformReferences(NodeGraph& graph);
 
+// Resolve every live MorphAlgorithm (warp-chain) asset reference in the graph.
+// For each wavetable node whose WavetableDoc has warpAssetId >= 0, the frame-
+// scope warp chain is replaced by a fresh decode of the asset's stored chain,
+// and the node's "Warp N" modulation params are reconciled to the new op count
+// (resolving a chain can change its length). A missing/erased asset detaches to
+// independent (keeps the cached chain). Re-encodes affected node scripts in
+// place. Free function for the same reason as resolveWaveformReferences (codec
+// lives in layered_wave_editor.cpp). Returns the number of references resolved.
+int resolveWarpReferences(NodeGraph& graph);
+
 } // namespace SoundShop

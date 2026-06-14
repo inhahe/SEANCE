@@ -39,6 +39,112 @@ WarpChainEditor::WarpChainEditor(Callbacks callbacks) : cb(std::move(callbacks))
     addBtn.setTooltip("Add a shape-bending stage to this waveform.");
     addBtn.onClick = [this] { addOp(); };
     addAndMakeVisible(addBtn);
+
+    // Library row (hidden until setLibraryContext provides a library).
+    libraryLbl.setJustificationType(juce::Justification::centredRight);
+    addChildComponent(libraryLbl);
+    addChildComponent(libraryCombo);
+    addChildComponent(addToLibBtn);
+    libraryCombo.setTooltip("Reference a shared morph algorithm (warp chain) from "
+                            "this project's library. While referenced, editing the "
+                            "chain here updates every frame that uses it. Pick "
+                            "(Independent) to give this frame its own copy.");
+    addToLibBtn.setTooltip("Publish the current warp chain to the project library "
+                           "as a reusable morph algorithm, then reference it here.");
+    libraryCombo.onChange = [this]() { onLibrarySelected(libraryCombo.getSelectedId()); };
+    addToLibBtn.onClick   = [this]() { openAddToLibraryDialog(); };
+}
+
+void WarpChainEditor::setLibraryContext(LibraryContext ctx) {
+    libCtx = std::move(ctx);
+    libraryRowVisible = (libCtx.lib != nullptr);
+    libraryLbl.setVisible(libraryRowVisible);
+    libraryCombo.setVisible(libraryRowVisible);
+    addToLibBtn.setVisible(libraryRowVisible);
+    if (libraryRowVisible) refreshLibraryRow();
+    resized();
+}
+
+void WarpChainEditor::refreshLibraryRow() {
+    if (!libraryRowVisible) return;
+    rebuildLibraryCombo();
+    // A morph algorithm with no stages is meaningless, so only allow publishing
+    // a non-empty chain.
+    const bool haveOps = chain && !chain->empty();
+    addToLibBtn.setEnabled(haveOps);
+    addToLibBtn.setTooltip(haveOps
+        ? "Publish the current warp chain to the project library as a reusable "
+          "morph algorithm, then reference it here."
+        : "Add at least one warp stage before saving this as a shared morph "
+          "algorithm.");
+}
+
+void WarpChainEditor::rebuildLibraryCombo() {
+    if (!libCtx.lib) return;
+    libraryCombo.clear(juce::dontSendNotification);
+    libraryCombo.addItem("(Independent)", 1);   // reserved id 1 (user ids >= 1e6)
+    int cur = libCtx.getAssetId ? libCtx.getAssetId() : -1;
+    bool curListed = false;
+    for (const AssetEntry* e : libCtx.lib->list(AssetKind::MorphAlgorithm)) {
+        juce::String nm = e->name.empty() ? ("#" + juce::String(e->id))
+                                          : juce::String(e->name);
+        libraryCombo.addItem(nm, e->id);
+        if (e->id == cur) curListed = true;
+    }
+    // If the referenced algorithm is archived (hidden from the normal list),
+    // still show it so the user sees what they're referencing.
+    if (cur >= 0 && !curListed) {
+        const AssetEntry* e = libCtx.lib->find(cur);
+        if (e) libraryCombo.addItem(juce::String(e->name) + "  [archived]", e->id);
+    }
+    libraryCombo.setSelectedId(cur >= 0 ? cur : 1, juce::dontSendNotification);
+}
+
+void WarpChainEditor::onLibrarySelected(int comboId) {
+    if (!libCtx.lib || !libCtx.setAssetId || !chain) return;
+    if (comboId == 1) {
+        // Detach to independent: keep the current chain as this frame's own
+        // local copy (no payload change), just stop referencing.
+        libCtx.setAssetId(-1);
+        refreshLibraryRow();
+        if (cb.onChanged) cb.onChanged();
+        return;
+    }
+    // Adopt the chosen library chain: mirror it into the bound chain and
+    // reference it. The op count can change, so this is a structural edit -
+    // fire onStructureChanged so the host re-syncs its "Warp N" params.
+    libCtx.setAssetId(comboId);
+    if (const AssetEntry* e = libCtx.lib->find(comboId)) {
+        *chain = decodeWarpChain(e->payload);
+        rebuild();
+    }
+    refreshLibraryRow();
+    if (cb.onChanged) cb.onChanged();
+    if (cb.onStructureChanged) cb.onStructureChanged();
+}
+
+void WarpChainEditor::openAddToLibraryDialog() {
+    if (!libCtx.lib || !libCtx.setAssetId || !chain || chain->empty()) return;
+    auto* aw = new juce::AlertWindow("Add morph algorithm to Library",
+        "Name for the shared warp chain:", juce::MessageBoxIconType::NoIcon, this);
+    aw->addTextEditor("name", "Morph");
+    aw->addButton("OK", 1, juce::KeyPress(juce::KeyPress::returnKey));
+    aw->addButton("Cancel", 0, juce::KeyPress(juce::KeyPress::escapeKey));
+    aw->enterModalState(true, juce::ModalCallbackFunction::create(
+        [this, aw](int res) {
+            if (res == 1 && chain) {
+                auto name = aw->getTextEditorContents("name").trim().toStdString();
+                if (name.empty()) name = "Morph";
+                int id = libCtx.lib->add(AssetKind::MorphAlgorithm, name, "",
+                                         encodeWarpChain(*chain));
+                libCtx.setAssetId(id);
+                rebuildLibraryCombo();
+                libraryCombo.setSelectedId(id, juce::dontSendNotification);
+                refreshLibraryRow();
+                if (cb.onChanged) cb.onChanged();
+            }
+            delete aw;
+        }), true);
 }
 
 void WarpChainEditor::setChain(std::vector<WarpOp>* c) {
@@ -60,7 +166,7 @@ bool WarpChainEditor::domainAllowed(WarpDomain d) const {
 
 int WarpChainEditor::preferredHeight() const {
     const int n = chain ? (int)chain->size() : 0;
-    return kHeaderH + n * kRowH + 4;
+    return kHeaderH + (libraryRowVisible ? kRowH : 0) + n * kRowH + 4;
 }
 
 void WarpChainEditor::addOp() {
@@ -196,6 +302,7 @@ void WarpChainEditor::rebuild() {
         }
     }
     addBtn.setEnabled(chain != nullptr);
+    if (libraryRowVisible) refreshLibraryRow();
     resized();
     repaint();
 }
@@ -245,6 +352,15 @@ void WarpChainEditor::resized() {
     addBtn.setBounds(top.removeFromRight(60));
     header.setBounds(top);
 
+    if (libraryRowVisible) {
+        auto lib = a.removeFromTop(kRowH).reduced(0, 2);
+        libraryLbl.setBounds(lib.removeFromLeft(48));
+        lib.removeFromLeft(4);
+        addToLibBtn.setBounds(lib.removeFromRight(120));
+        lib.removeFromRight(6);
+        libraryCombo.setBounds(lib);
+    }
+
     for (int i = 0; i < (int)rows.size(); ++i) {
         auto r = a.removeFromTop(kRowH).reduced(0, 2);
         rows[i].enable->setBounds(r.removeFromLeft(22));
@@ -270,8 +386,9 @@ void WarpChainEditor::paint(juce::Graphics& g) {
         juce::String hint = emptyHint.isNotEmpty()
             ? emptyHint
             : "No shape-bending - press + Add to fold / clip / bend this wave.";
+        const int hintTop = kHeaderH + (libraryRowVisible ? kRowH : 0);
         g.drawText(hint,
-                   getLocalBounds().withTop(kHeaderH).reduced(6, 2),
+                   getLocalBounds().withTop(hintTop).reduced(6, 2),
                    juce::Justification::centredLeft, true);
     }
 }

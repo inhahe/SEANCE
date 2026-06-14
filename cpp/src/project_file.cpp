@@ -960,6 +960,12 @@ bool ProjectFile::readProject(std::istream& f, NodeGraph& graph, PluginHost* plu
     // sees the asset content. Free function in layered_wave_editor.cpp.
     resolveWaveformReferences(graph);
 
+    // Same for live-referenced MorphAlgorithm (warp-chain) assets: replace each
+    // referencing frame's cached warp chain with the asset's stored chain and
+    // reconcile the node's "Warp N" modulation params. Free function in
+    // layered_wave_editor.cpp.
+    resolveWarpReferences(graph);
+
     // Restore open editors (store IDs only - never store Node*)
     graph.openEditors.clear();
     for (int id : pendingEditorIds) {

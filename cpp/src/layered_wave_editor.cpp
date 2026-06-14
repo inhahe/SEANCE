@@ -2620,6 +2620,14 @@ std::string WavetableDoc::encode() const {
         if (refCount > 0) o << ":assets:" << refs.str();
     }
 
+    // Morph-algorithm asset reference (optional trailing block). When the
+    // frame-scope warp chain live-references a project MorphAlgorithm asset, its
+    // id is recorded here. ':'-free payload (a single int) so it reads with
+    // readUntil(':'). Written BEFORE the warp block (which must stay last).
+    // Omitted when independent, so unreferenced payloads round-trip identically.
+    if (warpAssetId >= 0)
+        o << ":warpAsset:" << warpAssetId;
+
     // Warp section (optional trailing block). Appended AFTER the cell section
     // so it's invisible to older decoders, which stop reading once they've
     // consumed cellCount cells. New decoders look for the ":warp:" tag and
@@ -2897,6 +2905,9 @@ static bool decodeWavetableV4or5(WavetableDoc& doc, const std::string& body,
                 }
                 p = semi + 1;
             }
+        } else if (tag == "warpAsset") {
+            // Single int (':'-free): the frame's MorphAlgorithm asset reference.
+            try { doc.warpAssetId = std::stoi(r.readUntil(':')); } catch (...) {}
         } else if (tag == "warp") {
             doc.warpChain = decodeWarpChain(r.s.substr(r.p));
             break; // consumes the rest
@@ -3281,6 +3292,109 @@ int resolveWaveformReferences(NodeGraph& graph) {
             // granular wavetable script can be multi-megabyte, so a raw assign
             // would race the read mid-copy. encode() builds outside the lock.
             setNodeScriptSynced(n, doc.encode());
+    }
+    return resolved;
+}
+
+// ---- Warp ("morph algorithm") asset-library reconciliation ----------------
+
+// Reconcile a node's "Warp N" modulation params + mod pins to match `chain`'s
+// op count. Factored out of LayeredWaveEditorComponent::syncWarpParams so the
+// asset-resolution path (resolveWarpReferences, where a referenced chain's
+// length can change) can reuse the exact same logic without the editor. Pure
+// function of (graph, nodeId, chain): adds params for new ops (seeded from the
+// op amount), removes params for deleted ops (dropping their mod pins + cables),
+// and remaps surviving modPin param indices. Idempotent.
+void syncWarpParamsForNode(NodeGraph& graph, int nodeId,
+                           const std::vector<WarpOp>& chain) {
+    Node* nd = graph.findNode(nodeId);
+    if (!nd) return;
+    const int N = (int)chain.size();
+
+    auto isWarpName = [](const std::string& s) { return s.rfind("Warp ", 0) == 0; };
+
+    // Desired param names: always numbered, even for a lone op, so a surviving
+    // op keeps its name (and its modulation pin) when ops are added/removed.
+    std::set<std::string> desired;
+    for (int i = 0; i < N; ++i) desired.insert("Warp " + std::to_string(i + 1));
+
+    // ---- 1) Remove warp params for deleted ops, plus their mod pins / cables.
+    std::set<int> removeIdx;
+    for (int i = 0; i < (int)nd->params.size(); ++i)
+        if (isWarpName(nd->params[i].name) && !desired.count(nd->params[i].name))
+            removeIdx.insert(i);
+
+    if (!removeIdx.empty()) {
+        // Drop modPins whose target param is going away, plus their pins+links.
+        std::vector<int> pinsToDrop;
+        for (auto it = nd->modPins.begin(); it != nd->modPins.end(); ) {
+            if (removeIdx.count(it->paramIndex)) {
+                pinsToDrop.push_back(it->pinId);
+                it = nd->modPins.erase(it);
+            } else ++it;
+        }
+        for (int pid : pinsToDrop) {
+            graph.links.erase(std::remove_if(graph.links.begin(), graph.links.end(),
+                [&](const Link& l) { return l.startPin == pid || l.endPin == pid; }),
+                graph.links.end());
+            nd->pinsIn.erase(std::remove_if(nd->pinsIn.begin(), nd->pinsIn.end(),
+                [&](const Pin& p) { return p.id == pid; }), nd->pinsIn.end());
+        }
+        // Erase the params, building an old->new index map to fix up the
+        // surviving modPins (their paramIndex shifts down past each removal).
+        std::vector<int> newIndexOf(nd->params.size(), -1);
+        std::vector<Param> kept;
+        kept.reserve(nd->params.size());
+        for (int i = 0; i < (int)nd->params.size(); ++i) {
+            if (removeIdx.count(i)) continue;
+            newIndexOf[i] = (int)kept.size();
+            kept.push_back(std::move(nd->params[i]));
+        }
+        nd->params = std::move(kept);
+        for (auto& mp : nd->modPins)
+            if (mp.paramIndex >= 0 && mp.paramIndex < (int)newIndexOf.size())
+                mp.paramIndex = newIndexOf[mp.paramIndex];
+    }
+
+    // ---- 2) Add params for new ops (appended at the end; existing indices stay
+    //         put so currently-bound modPins keep pointing at the right param).
+    for (int i = 0; i < N; ++i) {
+        std::string name = "Warp " + std::to_string(i + 1);
+        bool exists = false;
+        for (auto& p : nd->params) if (p.name == name) { exists = true; break; }
+        if (exists) continue;
+        Param p;
+        p.name = name;
+        p.value = p.baseValue = chain[i].amount;
+        p.minVal = 0.0f;
+        p.maxVal = 1.0f;
+        p.format = "%.2f";
+        nd->params.push_back(std::move(p));
+    }
+}
+
+int resolveWarpReferences(NodeGraph& graph) {
+    int resolved = 0;
+    for (auto& n : graph.nodes) {
+        if (n.script.rfind("__wavetable", 0) != 0) continue;
+
+        WavetableDoc doc;
+        if (!doc.decode(n.script)) continue;
+        if (doc.warpAssetId < 0) continue;  // independent frame -> nothing to do
+
+        const AssetEntry* a = graph.assets.find(doc.warpAssetId);
+        if (a && a->kind == AssetKind::MorphAlgorithm) {
+            // Replace the cached chain with a fresh decode of the asset.
+            doc.warpChain = decodeWarpChain(a->payload);
+            ++resolved;
+        } else {
+            // Referenced algorithm gone (erased) -> detach, keep last chain.
+            doc.warpAssetId = -1;
+        }
+        // Re-encode (audio thread polls node.script live) and reconcile the
+        // node's "Warp N" params to the (possibly new) op count.
+        setNodeScriptSynced(n, doc.encode());
+        syncWarpParamsForNode(graph, n.id, doc.warpChain);
     }
     return resolved;
 }
@@ -8039,6 +8153,20 @@ LayeredWaveEditorComponent::LayeredWaveEditorComponent(NodeGraph& g, int nid, st
         wcb.onReorder = [this](int a, int b) { swapWarpParamNames(a, b); };
         frameWarpEditor = std::make_unique<WarpChainEditor>(std::move(wcb));
         frameWarpEditor->setChain(&wave.warpChain);
+        // Frame-scope warp is the one warp site wired to the project
+        // MorphAlgorithm store: the picker references a shared warp chain (live)
+        // and "Save to Library" publishes the current chain. Edits write back at
+        // the host's settled-edit point (writeBackReferencedWarp, from
+        // commitUndoStep). The baked per-layer / spectral chains stay local
+        // (no library context).
+        {
+            WarpChainEditor::LibraryContext lc;
+            lc.lib        = &graph.assets;
+            lc.getAssetId = [this]() { return wave.warpAssetId; };
+            lc.setAssetId = [this](int id) { wave.warpAssetId = id; };
+            lc.propagate  = [this]() { resolveWarpReferences(graph); };
+            frameWarpEditor->setLibraryContext(std::move(lc));
+        }
         addChildComponent(*frameWarpEditor); // visibility set in resized()
     }
 
@@ -9095,70 +9223,7 @@ void LayeredWaveEditorComponent::swapWarpParamNames(int a, int b) {
 }
 
 void LayeredWaveEditorComponent::syncWarpParams() {
-    auto* nd = graph.findNode(nodeId);
-    if (!nd) return;
-    const int N = (int)wave.warpChain.size();
-
-    auto isWarpName = [](const std::string& s) { return s.rfind("Warp ", 0) == 0; };
-
-    // Desired param names: always numbered, even for a lone op, so a surviving
-    // op keeps its name (and its modulation pin) when ops are added/removed.
-    std::set<std::string> desired;
-    for (int i = 0; i < N; ++i) desired.insert("Warp " + std::to_string(i + 1));
-
-    // ---- 1) Remove warp params for deleted ops, plus their mod pins / cables.
-    std::set<int> removeIdx;
-    for (int i = 0; i < (int)nd->params.size(); ++i)
-        if (isWarpName(nd->params[i].name) && !desired.count(nd->params[i].name))
-            removeIdx.insert(i);
-
-    if (!removeIdx.empty()) {
-        // Drop modPins whose target param is going away, plus their pins+links.
-        std::vector<int> pinsToDrop;
-        for (auto it = nd->modPins.begin(); it != nd->modPins.end(); ) {
-            if (removeIdx.count(it->paramIndex)) {
-                pinsToDrop.push_back(it->pinId);
-                it = nd->modPins.erase(it);
-            } else ++it;
-        }
-        for (int pid : pinsToDrop) {
-            graph.links.erase(std::remove_if(graph.links.begin(), graph.links.end(),
-                [&](const Link& l) { return l.startPin == pid || l.endPin == pid; }),
-                graph.links.end());
-            nd->pinsIn.erase(std::remove_if(nd->pinsIn.begin(), nd->pinsIn.end(),
-                [&](const Pin& p) { return p.id == pid; }), nd->pinsIn.end());
-        }
-        // Erase the params, building an old->new index map to fix up the
-        // surviving modPins (their paramIndex shifts down past each removal).
-        std::vector<int> newIndexOf(nd->params.size(), -1);
-        std::vector<Param> kept;
-        kept.reserve(nd->params.size());
-        for (int i = 0; i < (int)nd->params.size(); ++i) {
-            if (removeIdx.count(i)) continue;
-            newIndexOf[i] = (int)kept.size();
-            kept.push_back(std::move(nd->params[i]));
-        }
-        nd->params = std::move(kept);
-        for (auto& mp : nd->modPins)
-            if (mp.paramIndex >= 0 && mp.paramIndex < (int)newIndexOf.size())
-                mp.paramIndex = newIndexOf[mp.paramIndex];
-    }
-
-    // ---- 2) Add params for new ops (appended at the end; existing indices stay
-    //         put so currently-bound modPins keep pointing at the right param).
-    for (int i = 0; i < N; ++i) {
-        std::string name = "Warp " + std::to_string(i + 1);
-        bool exists = false;
-        for (auto& p : nd->params) if (p.name == name) { exists = true; break; }
-        if (exists) continue;
-        Param p;
-        p.name = name;
-        p.value = p.baseValue = wave.warpChain[i].amount;
-        p.minVal = 0.0f;
-        p.maxVal = 1.0f;
-        p.format = "%.2f";
-        nd->params.push_back(std::move(p));
-    }
+    syncWarpParamsForNode(graph, nodeId, wave.warpChain);
 }
 
 void LayeredWaveEditorComponent::maybeSyncPositionParams() {
@@ -9658,6 +9723,16 @@ void LayeredWaveEditorComponent::writeBackReferencedWaveforms() {
         graph.assets.update(entry.assetId, subType, payload);
     }
     if (anyRef) resolveWaveformReferences(graph);
+}
+
+void LayeredWaveEditorComponent::writeBackReferencedWarp() {
+    // When the frame-scope warp chain live-references a MorphAlgorithm asset,
+    // this settled edit IS an edit to that shared chain: push the current chain
+    // back to the asset and re-resolve so every other frame sharing the id (and
+    // its "Warp N" params) updates live. No-op when independent (common case).
+    if (wave.warpAssetId < 0) return;
+    graph.assets.update(wave.warpAssetId, "", encodeWarpChain(wave.warpChain));
+    resolveWarpReferences(graph);
 }
 
 void LayeredWaveEditorComponent::switchToFrame(int idx) {
@@ -10466,6 +10541,9 @@ void LayeredWaveEditorComponent::commitUndoStep() {
     // the undo step captures the propagated state. Cheap no-op when nothing is
     // referenced (the common case).
     writeBackReferencedWaveforms();
+    // Same for the frame-scope warp chain: if it references a shared
+    // MorphAlgorithm asset, push the edited chain back and propagate.
+    writeBackReferencedWarp();
     // commitSnapshot() de-dups against the previous snapshot, so calling this
     // on every settled edit (debounced apply, Apply/Close, rename, recolour)
     // is cheap when nothing actually changed and pushes exactly one undo step

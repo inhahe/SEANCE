@@ -2076,7 +2076,9 @@ has one tab per asset kind:
 - **Instruments** — (reserved) independent instruments.
 - **ADHSR Curves** — a full AHDSR amplitude envelope shape. Published from the
   shared AHDSR editor.
-- **Morph Algorithms** — (reserved) warp chains.
+- **Morph Algorithms** — a frame-scope **warp chain** (a `std::vector<WarpOp>`:
+  the ordered shape-bending stages applied to a wavetable frame). Published from
+  the wavetable editor's warp panel.
 
 Each tab lists its assets with **Rename**, **Duplicate**, **Star** / **Unstar**,
 **Archive** (soft-delete) / **Restore**, and **Delete** (hard erase, with a
@@ -2095,7 +2097,8 @@ surface favourites out of a large library.
   string decoding happens per audio block), and any edit — from any referencing
   node, or from this dialog — is written back to the asset and **propagated** to
   every other reference (`resolveAhdsrReferences` for curves,
-  `resolveWaveformReferences` for waveforms).
+  `resolveWaveformReferences` for waveforms, `resolveWarpReferences` for morph
+  algorithms).
 - **No detach-in-place.** To make one copy diverge from the shared asset, use
   **Duplicate** (mints a new id) and point the node at the duplicate (e.g. via the
   waveform editor's **Use Library…** picker). There is deliberately no per-instance
@@ -2126,6 +2129,18 @@ surface favourites out of a large library.
   (`WaveformLibraryEntry.assetId`) — a node's wavetable can hold many waveforms,
   so each slot references independently. Adopting an asset keeps the slot's own
   **gain** (a placement-level property, not part of the shared shape).
+- **Morph algorithms (warp chains)** — the wavetable editor's frame-scope warp
+  panel (`WarpChainEditor`) shows a **Morph:** row: a picker to reference a stored
+  warp chain (or **(Independent)**) and a **Save to Library** button to publish the
+  current chain (disabled until the chain has at least one stage). While
+  referenced, editing the chain here writes back to the asset and re-resolves, so
+  every frame using the same algorithm re-shapes together. Adopting a referenced
+  chain reconciles the node's **"Warp N" modulation params** to the new stage
+  count (`syncWarpParamsForNode`), so each stage's amount stays modulatable. The
+  reference id lives on the frame's `WavetableDoc.warpAssetId`. Only the
+  frame-scope warp opts into the library; the baked per-layer / spectral / wavelet
+  warp chains stay local (no picker). The reference is the only "downward"
+  coupling — selecting or editing a chain never touches the other warp sites.
 
 ### Picking a waveform (the unified browser)
 
@@ -2154,12 +2169,17 @@ choosing a **saved waveform** creates a **live reference** to it (button reads
   store edits participate in undo/redo like any other project state.
 - Node references serialize alongside the node: `ahdsrAssetId` for curves; an
   optional `:assets:` block inside the wavetable script (`__wavetable5__`) maps
-  each library entry id to its asset id. Both are re-resolved on load, so a
-  reopened project sees the current asset content.
+  each library entry id to its asset id; an optional `:warpAsset:<id>` block
+  (written after `:assets:`, before the always-last `:warp:` block) carries the
+  frame-scope warp chain's morph-algorithm id. All are re-resolved on load, so a
+  reopened project sees the current asset content. Each block is omitted when
+  unused, so unreferenced wavetable payloads round-trip byte-identically.
 
 Data model: `asset_library.h/.cpp` (`AssetKind`, `AssetEntry`, `AssetLibrary`),
 owned by `NodeGraph::assets`. Management UI: `asset_library_component.h/.cpp`.
-Waveform picker: `WaveformLibraryBrowser` in `layered_wave_editor.cpp`.
+Waveform picker: `WaveformLibraryBrowser` in `layered_wave_editor.cpp`. Morph
+picker + write-back: `WarpChainEditor::LibraryContext` (`warp_editor.cpp`),
+`resolveWarpReferences` / `syncWarpParamsForNode` (`layered_wave_editor.cpp`).
 
 ## Terrain-synth self-test (`--self-test`)
 

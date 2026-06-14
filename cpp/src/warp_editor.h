@@ -20,6 +20,7 @@
 // =============================================================================
 
 #include "warp.h"
+#include "asset_library.h"
 #include <juce_gui_basics/juce_gui_basics.h>
 #include <vector>
 #include <memory>
@@ -66,6 +67,27 @@ public:
     void setAllowedDomains(std::vector<WarpDomain> domains,
                            juce::String emptyHint = {});
 
+    // Optional integration with the project asset library's MorphAlgorithm
+    // (warp-chain) store. When set, the editor shows a "Morph:" row: a picker to
+    // reference a stored warp chain (live) and a "Save to Library" button to
+    // publish the current chain. While a stored chain is referenced, the host's
+    // settled-edit write-back pushes edits to the asset and propagates to every
+    // frame sharing the id (the "live reference" model). "(Independent)" =
+    // the editor edits the frame's own local chain, exactly as before. Only the
+    // frame-scope warp editor opts in; the baked per-layer / spectral / wavelet
+    // chains leave this unset and behave as before. Mirrors
+    // AHDSREnvelopeComponent::LibraryContext.
+    struct LibraryContext {
+        AssetLibrary* lib = nullptr;
+        std::function<int()>     getAssetId;   // current frame warpAssetId
+        std::function<void(int)> setAssetId;   // set frame warpAssetId
+        std::function<void()>    propagate;    // re-resolve all live references
+    };
+    void setLibraryContext(LibraryContext ctx);
+    // Re-read the picker selection + Save button state from the bound asset id.
+    // Call after an external change to the referenced id (undo, frame switch).
+    void refreshLibraryRow();
+
     // Rebuild the per-op rows from the bound chain. Call after an external
     // mutation (preset load, undo restore) that changed the chain behind us.
     void rebuild();
@@ -79,6 +101,9 @@ public:
 
 private:
     void showMethodMenu(int opIndex);
+    void rebuildLibraryCombo();
+    void onLibrarySelected(int comboId);
+    void openAddToLibraryDialog();
     void addOp();
     void removeOp(int opIndex);
     // Swap op `idx` with its neighbour `idx + delta` (delta = -1 up / +1 down).
@@ -112,6 +137,13 @@ private:
     juce::Label      header;
     juce::TextButton addBtn;
     std::vector<Row> rows;
+
+    // Library row (MorphAlgorithm store). Hidden until setLibraryContext.
+    LibraryContext   libCtx;
+    bool             libraryRowVisible = false;
+    juce::Label      libraryLbl  { {}, "Morph:" };
+    juce::ComboBox   libraryCombo;
+    juce::TextButton addToLibBtn { "Save to Library" };
 };
 
 } // namespace SoundShop

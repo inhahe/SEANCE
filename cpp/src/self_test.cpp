@@ -3046,6 +3046,84 @@ void testAssetLibrary(Report& r) {
         r.check(delDoc.library.size() == 1 && delDoc.library[0].assetId == -1,
                 "assets: erased waveform asset -> entry falls back to independent");
     }
+
+    // ---- MorphAlgorithm (frame-scope warp chain) live reference -------------
+    {
+        NodeGraph g;
+        int nId = g.addNode("wt", NodeType::TerrainSynth, {}, {}).id;
+
+        auto makeChain = [](std::vector<WarpMethod> methods) {
+            std::vector<WarpOp> c;
+            for (WarpMethod m : methods) {
+                WarpOp op; op.method = m; op.amount = 0.5f; op.enabled = true;
+                c.push_back(op);
+            }
+            return c;
+        };
+
+        // Publish a 2-op morph algorithm asset.
+        const std::string assetPayload = encodeWarpChain(
+            makeChain({ WarpMethod::SoftClip, WarpMethod::HardClip }));
+        int mAsset = g.assets.add(AssetKind::MorphAlgorithm, "shared morph",
+                                  "", assetPayload);
+
+        // Node wavetable: a different cached 1-op chain that live-references the
+        // 2-op asset. (Give the node one library entry so it's a valid doc.)
+        WavetableDoc doc;
+        doc.addLibraryEntry(std::make_unique<LayeredWaveform>(), "w");
+        doc.warpChain = makeChain({ WarpMethod::Wavefold });   // stale 1-op cache
+        doc.warpAssetId = mAsset;
+        g.findNode(nId)->script = doc.encode();
+
+        // warpAssetId must survive the wavetable codec round-trip.
+        WavetableDoc rt; rt.decode(g.findNode(nId)->script);
+        r.check(rt.warpAssetId == mAsset && rt.warpChain.size() == 1,
+                "assets: warpAssetId + cached chain round-trip through wavetable codec");
+
+        // Resolve -> chain becomes the asset's 2-op chain, and the node gains
+        // two reconciled "Warp N" modulation params.
+        int nres = resolveWarpReferences(g);
+        r.checkVal(nres == 1,
+                   "assets: resolveWarpReferences resolves the one reference", nres);
+        WavetableDoc after; after.decode(g.findNode(nId)->script);
+        r.check(after.warpChain.size() == 2 &&
+                    encodeWarpChain(after.warpChain) == assetPayload,
+                "assets: resolved warp chain matches the published asset");
+        {
+            int warpParams = 0;
+            for (const auto& p : g.findNode(nId)->params)
+                if (p.name.rfind("Warp ", 0) == 0) ++warpParams;
+            r.checkVal(warpParams == 2,
+                       "assets: resolved warp chain reconciles two Warp N params",
+                       warpParams);
+        }
+
+        // Save/load preserves the reference id and re-resolves on load.
+        std::ostringstream oss;
+        ProjectFile::writeProject(oss, g, nullptr, false, true);
+        NodeGraph g2; std::istringstream iss(oss.str());
+        ProjectFile::readProject(iss, g2, nullptr);
+        WavetableDoc loaded; loaded.decode(g2.findNode(nId)->script);
+        r.check(loaded.warpAssetId == mAsset && loaded.warpChain.size() == 2 &&
+                    encodeWarpChain(loaded.warpChain) == assetPayload,
+                "assets: warp reference re-resolves after save/load");
+
+        // Edit the asset (now 3 ops) -> propagates on next resolve.
+        const std::string pay2 = encodeWarpChain(makeChain(
+            { WarpMethod::SoftClip, WarpMethod::HardClip, WarpMethod::Wavefold }));
+        g.assets.update(mAsset, "", pay2);
+        resolveWarpReferences(g);
+        WavetableDoc edDoc; edDoc.decode(g.findNode(nId)->script);
+        r.check(edDoc.warpChain.size() == 3 && encodeWarpChain(edDoc.warpChain) == pay2,
+                "assets: editing morph asset propagates to the referencing node");
+
+        // Erase the asset -> frame detaches to independent, keeps its last chain.
+        g.assets.erase(mAsset);
+        resolveWarpReferences(g);
+        WavetableDoc delDoc; delDoc.decode(g.findNode(nId)->script);
+        r.check(delDoc.warpAssetId == -1 && delDoc.warpChain.size() == 3,
+                "assets: erased morph asset -> frame falls back to independent");
+    }
 }
 
 int runSelfTest(const juce::File& outDir) {

@@ -549,6 +549,15 @@ struct WavetableDoc {
     // default - costs nothing when unused.
     std::vector<WarpOp> warpChain;
 
+    // Live reference to a project MorphAlgorithm asset (a stored warp chain).
+    // -1 = independent (the warpChain above is this frame's own). When >= 0, the
+    // warpChain is a cache of asset `warpAssetId`'s content, refreshed by
+    // resolveWarpReferences() at edit/load; editing the chain here writes back to
+    // the asset and propagates to every frame sharing the id (the "live
+    // reference" model, mirroring WaveformLibraryEntry.assetId). Serialized in
+    // encode()/decode() under the "warpAsset" key (before the "warp" block).
+    int warpAssetId = -1;
+
     WavetableDoc() = default;
     WavetableDoc(WavetableDoc&&) noexcept = default;
     WavetableDoc& operator=(WavetableDoc&&) noexcept = default;
@@ -1024,6 +1033,10 @@ private:
     // up to its asset and propagate to other nodes (live write-back). Called
     // from commitToNode(). No-op when no entry references an asset.
     void writeBackReferencedWaveforms();
+    // Same for the frame-scope warp chain: if it references a shared
+    // MorphAlgorithm asset, push the edited chain back and propagate. Called
+    // from commitUndoStep(). No-op when warpAssetId < 0 (independent).
+    void writeBackReferencedWarp();
 
     // Shared layer-stack widget (the "+ Layer" header, the scrolling list of
     // WaveLayerEditor rows, and per-layer add/delete). Identical code is used

@@ -921,12 +921,18 @@ private:
     // the menu is dismissed.
     void showAddWaveformMenu(juce::Component* anchor);
 
-    // Open the factory waveform browser (the built-in single-cycle library:
-    // category tree + search + curated ★ + Curated-only filter). On insert it
-    // adds the chosen waveform to the library as a Drawn/Freehand LayeredWaveform
-    // frame (see makeFactoryFrame) and focuses the editor on it - the same tail
-    // as showAddWaveformMenu's fresh-frame path. Anchor centres the dialog.
-    void showFactoryWaveformBrowser(juce::Component* anchor);
+    // Open the unified waveform-library browser: the built-in single-cycle
+    // library (category tree + search + curated ★) AND the project's user
+    // Waveform assets in one picker, with "starred only" and "show user items"
+    // filters. Selecting a built-in inserts an editable Drawn/Freehand
+    // LayeredWaveform copy (see makeFactoryFrame); selecting a user asset
+    // live-references it (edits propagate to every reference).
+    //   replaceCurrentFrame == false: the + Waveform flow - ADD a new frame.
+    //   replaceCurrentFrame == true:  the identity-row "Use Library..." flow -
+    //     REPLACE the current frame's content/reference in place.
+    // Anchor centres the dialog.
+    void showWaveformLibraryBrowser(juce::Component* anchor,
+                                    bool replaceCurrentFrame);
 
     // Build a one-layer LayeredWaveform whose single Drawn/Freehand layer holds
     // `cycle` (expected 512 samples in [-1,1], one cycle). This is the import
@@ -993,20 +999,25 @@ private:
     void refreshIdentityRow();
 
     // ---- Project asset-library reference row (below the gain row) ----------
-    // Lets the currently-edited library entry live-reference a published
-    // Waveform asset: the picker attaches/detaches; "Add to Library" publishes
-    // the current frame as a new asset and links it. While referenced, edits to
-    // this waveform write back to the asset and propagate to every other node
-    // referencing it (the live-reference model, mirroring the AHDSR row).
-    juce::Label      assetLibLbl  { {}, "Library:" };
-    juce::ComboBox   assetLibCombo;
-    juce::TextButton addToAssetLibBtn { "Add to Library" };
-    // Rebuild the picker from graph.assets (id 1 = "(Independent)"; each
-    // Waveform asset uses its asset id as the combo id). Selects the current
-    // entry's assetId.
-    void rebuildAssetLibCombo();
-    // Handle a picker choice: detach (Independent) or adopt+resolve an asset.
-    void onAssetLibSelected(int comboId);
+    // Shows whether the currently-edited library entry live-references a
+    // published Waveform asset, and lets the user (a) publish the current frame
+    // as a new asset ("Save to Library"), or (b) repoint THIS frame to a library
+    // waveform via the unified browser ("Use Library...", replaceCurrentFrame).
+    // While referenced, edits to this waveform write back to the asset and
+    // propagate to every other node referencing it (the live-reference model,
+    // mirroring the AHDSR row). Selection uses the same category/starred/show-
+    // user browser as the + Waveform flow, never a flat dropdown - the wave-shape
+    // library is far too large for a combo (see agent-todo design refinement #2).
+    juce::Label      assetLibStatus;
+    juce::TextButton useLibraryBtn  { juce::String::fromUTF8("Use Library\xe2\x80\xa6") };
+    juce::TextButton saveToLibBtn   { "Save to Library" };
+    // Refresh the status label + button enablement from the current entry's
+    // assetId (shows the referenced asset name, or "Independent waveform").
+    void refreshAssetLibRow();
+    // Repoint the current entry to live-reference a user Waveform asset (mirror
+    // the asset's frame in, preserving this slot's gain). Used by the identity-
+    // row "Use Library..." browser flow when a user asset is chosen.
+    void adoptWaveformAsset(int assetId);
     // Publish the current entry's frame as a new Waveform asset and link it.
     void publishCurrentWaveformToLibrary();
     // After committing this node, push every asset-referencing entry's frame

@@ -8298,35 +8298,39 @@ LayeredWaveEditorComponent::LayeredWaveEditorComponent(NodeGraph& g, int nid, st
     gainSlider.onDragEnd = [this]() { commitUndoStep(); };
 
     // ---- Project asset-library reference row ----
-    addAndMakeVisible(assetLibLbl);
-    assetLibLbl.setFont(11.0f);
-    assetLibLbl.setColour(juce::Label::textColourId,
-                          juce::Colours::white.withAlpha(0.75f));
-    assetLibLbl.setJustificationType(juce::Justification::centredRight);
+    addAndMakeVisible(assetLibStatus);
+    assetLibStatus.setFont(11.0f);
+    assetLibStatus.setColour(juce::Label::textColourId,
+                             juce::Colours::white.withAlpha(0.75f));
+    assetLibStatus.setJustificationType(juce::Justification::centredLeft);
+    assetLibStatus.setTooltip(
+        "Whether this waveform is its own private copy or a live reference to a "
+        "shared waveform in the project's library. While it references a library "
+        "waveform, editing it here updates every place that waveform is used.");
 
-    addAndMakeVisible(assetLibCombo);
-    assetLibCombo.setTooltip(
-        "Link this waveform to a shared one in the project's Waveform library. "
-        "Pick a stored waveform to make THIS slot a live reference: editing it "
-        "here (or anywhere it's used) updates every place it appears. Choose "
-        "(Independent) to give this slot its own private copy again. Use 'Add "
-        "to Library' to publish the current waveform as a new shared entry.");
-    assetLibCombo.onChange = [this]() {
-        onAssetLibSelected(assetLibCombo.getSelectedId());
+    addAndMakeVisible(useLibraryBtn);
+    useLibraryBtn.setTooltip(
+        "Replace this waveform with one from the library. Opens the waveform "
+        "browser (built-in shapes + your saved waveforms, with category / "
+        "starred / show-user filters). Picking one of your saved waveforms makes "
+        "this slot a live reference (edits propagate everywhere it's used); "
+        "picking a built-in shape drops in an editable independent copy.");
+    useLibraryBtn.onClick = [this]() {
+        showWaveformLibraryBrowser(&useLibraryBtn, /*replaceCurrentFrame*/true);
     };
 
-    addAndMakeVisible(addToAssetLibBtn);
-    addToAssetLibBtn.setTooltip(
-        "Publish this waveform to the project's shared Waveform library and "
-        "link this slot to it. Other nodes can then reference the same "
-        "waveform, and edits propagate to all of them.");
-    addToAssetLibBtn.onClick = [this]() { publishCurrentWaveformToLibrary(); };
+    addAndMakeVisible(saveToLibBtn);
+    saveToLibBtn.setTooltip(
+        "Save this waveform to the project's shared library and link this slot "
+        "to it. Other nodes (and new wavetable frames / instruments) can then "
+        "reference the same waveform, and edits propagate to all of them.");
+    saveToLibBtn.onClick = [this]() { publishCurrentWaveformToLibrary(); };
 
     updateHintText();
     rebuildScatterUI();
     rebuildRows();
     refreshPreview();
-    rebuildAssetLibCombo();
+    refreshAssetLibRow();
     syncPositionParams();
     // Sized to fit a 1080p display with room for the OS taskbar and the
     // dialog's own non-native title bar (~30px). Side-by-side layout:
@@ -8378,22 +8382,35 @@ std::unique_ptr<IWavetableFrame> LayeredWaveEditorComponent::makeFactoryFrame(
 }
 
 // ----------------------------------------------------------------------------
-// FactoryWaveformBrowser — modal picker for the built-in single-cycle library.
+// WaveformLibraryBrowser — unified modal picker for ALL selectable waveforms.
 // ----------------------------------------------------------------------------
 //
-// Layout: a category list down the left, a search box + "Curated only" toggle
-// across the top, the filtered waveform list in the middle (★ marks curated
-// entries, which the bank already sorts to the top of each category), and a live
-// cycle preview + Insert/Cancel at the bottom. Fires onInsert(entryIndex) with
-// the chosen bank entry, then closes itself.
+// Lists the built-in single-cycle factory library AND the project's user-saved
+// Waveform assets in one place (the wave-shape library is far too large for a
+// flat dropdown — see agent-todo design refinement #2). Layout: a category list
+// down the left (built-in categories + a "★ User Library" pseudo-category), a
+// search box + "Starred only" + "Show user items" toggles across the top, the
+// filtered list in the middle, and a live cycle preview + Insert/Cancel below.
+//
+// On selection it fires ONE of two callbacks: onPickBuiltin(bankIndex) for a
+// factory waveform (the caller inserts an editable copy), or onPickAsset(assetId)
+// for a user asset (the caller live-references it). "Starred" unifies the built-
+// in `curated` flag and the user-asset `starred` flag behind one filter.
 namespace {
-class FactoryWaveformBrowser : public juce::Component,
+class WaveformLibraryBrowser : public juce::Component,
                                private juce::ListBoxModel {
 public:
-    std::function<void(int bankEntryIndex)> onInsert;
+    std::function<void(int bankEntryIndex)> onPickBuiltin;
+    std::function<void(int assetId)>        onPickAsset;
 
-    FactoryWaveformBrowser() : bank(WaveformBank::get()) {
+    explicit WaveformLibraryBrowser(NodeGraph& graphRef) : bank(WaveformBank::get()) {
         bank.ensureLoaded();
+        // Snapshot the user Waveform assets up-front (the dialog is modal, so the
+        // library can't change underneath us). Archived assets are excluded — the
+        // picker shows only live entries, matching list()'s default.
+        for (const AssetEntry* a : graphRef.assets.list(AssetKind::Waveform))
+            userItems.push_back({ a->id, juce::String(a->name), a->starred,
+                                  a->subType, a->payload });
 
         addAndMakeVisible(searchBox);
         searchBox.setTextToShowWhenEmpty("Search by name or category...",
@@ -8402,11 +8419,22 @@ public:
                              "and its category.");
         searchBox.onTextChange = [this] { rebuildVisible(); };
 
-        addAndMakeVisible(curatedToggle);
-        curatedToggle.setButtonText("Curated only");
-        curatedToggle.setTooltip("Show only the hand-picked \"best of\" "
-                                 "waveforms (marked with a star).");
-        curatedToggle.onClick = [this] { rebuildCategories(); rebuildVisible(); };
+        addAndMakeVisible(starredToggle);
+        starredToggle.setButtonText("Starred only");
+        starredToggle.setTooltip("Show only starred waveforms: the hand-picked "
+                                 "\"best of\" built-in shapes plus any of your "
+                                 "saved waveforms you've starred (★).");
+        starredToggle.onClick = [this] { rebuildCategories(); rebuildVisible(); };
+
+        addAndMakeVisible(showUserToggle);
+        showUserToggle.setButtonText("Show my waveforms");
+        showUserToggle.setToggleState(true, juce::dontSendNotification);
+        showUserToggle.setTooltip("Include the waveforms you've saved to this "
+                                  "project's library, alongside the built-in "
+                                  "factory shapes. Turn off to browse built-ins "
+                                  "only.");
+        showUserToggle.setEnabled(!userItems.empty());
+        showUserToggle.onClick = [this] { rebuildCategories(); rebuildVisible(); };
 
         catModel.owner = this;
         addAndMakeVisible(catList);
@@ -8416,15 +8444,14 @@ public:
         addAndMakeVisible(waveList);
         waveList.setModel(this);
         waveList.setRowHeight(20);
-        waveList.setTooltip("Double-click to add a waveform. The dim \"#N\" on the "
-                            "right is the waveform's id for the Generate languages: "
-                            "waveform(N, phase) reads it (GLSL is id-only; Lua/Python "
-                            "also accept the name, or waveforms[\"name\"]).");
+        waveList.setTooltip("Double-click to choose a waveform. Your saved "
+                            "waveforms are tagged \"lib\" (picking one live-"
+                            "references it). For built-ins the dim \"#N\" is the "
+                            "waveform's id for the Generate languages: "
+                            "waveform(N, phase) reads it.");
 
         addAndMakeVisible(insertBtn);
         insertBtn.setEnabled(false);
-        insertBtn.setTooltip("Add the selected waveform to this wavetable's "
-                             "library as an editable frame.");
         insertBtn.onClick = [this] { doInsert(); };
 
         addAndMakeVisible(cancelBtn);
@@ -8434,7 +8461,7 @@ public:
         statusLabel.setJustificationType(juce::Justification::centredLeft);
         statusLabel.setColour(juce::Label::textColourId, juce::Colours::lightgrey);
 
-        if (bank.isEmpty()) {
+        if (bank.isEmpty() && userItems.empty()) {
             statusLabel.setText("Factory library unavailable: "
                                     + juce::String(bank.loadError()),
                                 juce::dontSendNotification);
@@ -8448,7 +8475,9 @@ public:
     void resized() override {
         auto r = getLocalBounds().reduced(10);
         auto top = r.removeFromTop(26);
-        curatedToggle.setBounds(top.removeFromRight(120));
+        showUserToggle.setBounds(top.removeFromRight(150));
+        top.removeFromRight(8);
+        starredToggle.setBounds(top.removeFromRight(110));
         top.removeFromRight(8);
         searchBox.setBounds(top);
         r.removeFromTop(8);
@@ -8463,7 +8492,7 @@ public:
         previewBounds = preview;
         r.removeFromBottom(6);
 
-        statusBoundsActive = bank.isEmpty();
+        statusBoundsActive = (bank.isEmpty() && userItems.empty());
         if (statusBoundsActive) {
             statusLabel.setBounds(r);
             catList.setBounds({});
@@ -8502,7 +8531,7 @@ public:
             }
             g.setColour(juce::Colour(0xff64c8ff));
             g.strokePath(p, juce::PathStrokeType(1.5f));
-        } else if (!bank.isEmpty()) {
+        } else if (!statusBoundsActive) {
             g.setColour(juce::Colours::grey);
             g.setFont(13.0f);
             g.drawText("Select a waveform to preview", previewBounds,
@@ -8516,35 +8545,41 @@ public:
     void paintListBoxItem(int row, juce::Graphics& g, int w, int h,
                           bool selected) override {
         if (row < 0 || row >= (int)visible.size()) return;
-        const int entryIdx = visible[(size_t)row];   // == the stable waveform id
-        const auto& e = bank.entry(entryIdx);
+        const Item it = visible[(size_t)row];
         if (selected) {
             g.setColour(juce::Colour(0xff3d5a80));
             g.fillRect(0, 0, w, h);
         }
+        const bool starred = it.user ? userItems[(size_t)it.idx].starred
+                                     : bank.entry(it.idx).curated;
+        juce::String name = it.user ? userItems[(size_t)it.idx].name
+                                    : juce::String(bank.entry(it.idx).name);
         const int starW = 18;
-        if (e.curated) {
+        if (starred) {
             g.setColour(juce::Colour(0xffffcf4d));
             g.setFont(13.0f);
             g.drawText(juce::String::fromUTF8("\xe2\x98\x85"),
                        2, 0, starW, h, juce::Justification::centred);
         }
-        // Right-aligned dim "#<id>": the integer used by waveform(id, phase) in
-        // the Generate languages (GLSL is integer-only; Lua/Python also accept
-        // the name). Documented in REFERENCE.md ("Factory waveforms").
+        // Right tag: built-ins show the dim "#<id>" (the waveform(id,phase)
+        // integer); user assets show a dim "lib" badge (they're picked by live
+        // reference, not by a Generate-language id).
         const int idW = 64;
         g.setColour(selected ? juce::Colour(0xffb0c4de) : juce::Colour(0xff707078));
         g.setFont(11.0f);
-        g.drawText("#" + juce::String(entryIdx), w - idW - 4, 0, idW, h,
-                   juce::Justification::centredRight);
+        g.drawText(it.user ? juce::String("lib") : ("#" + juce::String(it.idx)),
+                   w - idW - 4, 0, idW, h, juce::Justification::centredRight);
         g.setColour(selected ? juce::Colours::white : juce::Colours::lightgrey);
         g.setFont(13.0f);
-        g.drawText(juce::String(e.name), starW + 4, 0, w - starW - idW - 10, h,
+        if (name.isEmpty()) name = it.user ? ("#" + juce::String(userItems[(size_t)it.idx].id))
+                                           : juce::String("(unnamed)");
+        g.drawText(name, starW + 4, 0, w - starW - idW - 10, h,
                    juce::Justification::centredLeft);
     }
 
     void selectedRowsChanged(int row) override {
         insertBtn.setEnabled(row >= 0 && row < (int)visible.size());
+        updateInsertLabel(row);
         updatePreview(row);
     }
 
@@ -8554,7 +8589,7 @@ public:
 
     // ---- category list model ----
     struct CatModel : juce::ListBoxModel {
-        FactoryWaveformBrowser* owner = nullptr;
+        WaveformLibraryBrowser* owner = nullptr;
         int getNumRows() override { return (int)owner->catRows.size(); }
         void paintListBoxItem(int row, juce::Graphics& g, int w, int h,
                               bool selected) override {
@@ -8572,22 +8607,50 @@ public:
     };
 
 private:
-    struct CatRow { juce::String label; std::string name; };  // name "" == All
+    // A user Waveform asset snapshot (id + the bits the picker needs to display
+    // and decode it for preview), captured at construction.
+    struct UserItem { int id; juce::String name; bool starred;
+                      std::string subType, payload; };
+    // One visible row: user==true -> idx is an index into userItems; else idx is
+    // a WaveformBank entry index (== the waveform's stable id).
+    struct Item { bool user; int idx; };
+    // name "" == All; isUser marks the "★ User Library" pseudo-category.
+    struct CatRow { juce::String label; std::string name; bool isUser = false; };
+
+    bool userPasses(const UserItem& u, bool starOnly, const juce::String& q) const {
+        if (starOnly && !u.starred) return false;
+        if (q.isNotEmpty() && !u.name.toLowerCase().contains(q)
+            && !juce::String("user library").contains(q))
+            return false;
+        return true;
+    }
 
     void rebuildCategories() {
-        const bool curatedOnly = curatedToggle.getToggleState();
+        const bool starOnly = starredToggle.getToggleState();
+        const bool showUser = showUserToggle.getToggleState() && !userItems.empty();
         catRows.clear();
-        // "All" pseudo-category first.
-        int allCount = 0;
+
+        int userCount = 0;
+        if (showUser)
+            for (const auto& u : userItems)
+                if (!starOnly || u.starred) ++userCount;
+
+        int builtinAll = 0;
         for (int i = 0; i < bank.numEntries(); ++i)
-            if (!curatedOnly || bank.entry(i).curated) ++allCount;
-        catRows.push_back({ "All categories (" + juce::String(allCount) + ")", "" });
+            if (!starOnly || bank.entry(i).curated) ++builtinAll;
+
+        catRows.push_back({ "All (" + juce::String(builtinAll + userCount) + ")",
+                            "", false });
+        if (showUser && userCount > 0)
+            catRows.push_back({ juce::String::fromUTF8("\xe2\x98\x85 My waveforms (")
+                                + juce::String(userCount) + ")", "", true });
         for (const auto& cat : bank.categories()) {
             int cnt = 0;
             for (int idx : bank.entriesInCategory(cat))
-                if (!curatedOnly || bank.entry(idx).curated) ++cnt;
+                if (!starOnly || bank.entry(idx).curated) ++cnt;
             if (cnt == 0) continue;  // hide categories with nothing to show
-            catRows.push_back({ juce::String(cat) + " (" + juce::String(cnt) + ")", cat });
+            catRows.push_back({ juce::String(cat) + " (" + juce::String(cnt) + ")",
+                                cat, false });
         }
         if (catList.getSelectedRow() < 0) catList.selectRow(0);
         catList.updateContent();
@@ -8596,43 +8659,77 @@ private:
 
     void rebuildVisible() {
         visible.clear();
-        const bool curatedOnly = curatedToggle.getToggleState();
+        const bool starOnly = starredToggle.getToggleState();
+        const bool showUser = showUserToggle.getToggleState() && !userItems.empty();
         const juce::String q = searchBox.getText().trim().toLowerCase();
         int catRow = catList.getSelectedRow();
         if (catRow < 0 || catRow >= (int)catRows.size()) catRow = 0;
-        const std::string selCat = catRows[(size_t)catRow].name;  // "" == All
+        const CatRow& cr = catRows[(size_t)catRow];
+        const std::string selCat = cr.name;  // "" == All
+        const bool userCat = cr.isUser;
 
-        for (int i = 0; i < bank.numEntries(); ++i) {
-            const auto& e = bank.entry(i);
-            if (curatedOnly && !e.curated) continue;
-            if (!selCat.empty() && e.category != selCat) continue;
-            if (q.isNotEmpty()) {
-                const bool hit = juce::String(e.name).toLowerCase().contains(q)
-                              || juce::String(e.category).toLowerCase().contains(q);
-                if (!hit) continue;
+        // User assets first (the user's own items rise to the top of "All").
+        if (showUser && (userCat || selCat.empty()))
+            for (int i = 0; i < (int)userItems.size(); ++i)
+                if (userPasses(userItems[(size_t)i], starOnly, q))
+                    visible.push_back({ true, i });
+
+        // Built-ins (skipped when the user-library pseudo-category is selected).
+        if (!userCat)
+            for (int i = 0; i < bank.numEntries(); ++i) {
+                const auto& e = bank.entry(i);
+                if (starOnly && !e.curated) continue;
+                if (!selCat.empty() && e.category != selCat) continue;
+                if (q.isNotEmpty()) {
+                    const bool hit = juce::String(e.name).toLowerCase().contains(q)
+                                  || juce::String(e.category).toLowerCase().contains(q);
+                    if (!hit) continue;
+                }
+                visible.push_back({ false, i });
             }
-            visible.push_back(i);
-        }
+
         waveList.deselectAllRows();
         waveList.updateContent();
         waveList.repaint();
         insertBtn.setEnabled(false);
+        updateInsertLabel(-1);
         previewSamples.clear();
         repaint();
     }
 
+    void updateInsertLabel(int row) {
+        // Make the action button say what will happen: "Use" (live-reference a
+        // saved waveform) vs "Insert" (drop in an editable built-in copy).
+        bool user = (row >= 0 && row < (int)visible.size() && visible[(size_t)row].user);
+        insertBtn.setButtonText(user ? "Use" : "Insert");
+        insertBtn.setTooltip(user
+            ? "Live-reference the selected saved waveform: edits propagate to "
+              "every place it's used."
+            : "Drop the selected built-in waveform in as an editable independent "
+              "copy.");
+    }
+
     void updatePreview(int row) {
         previewSamples.clear();
-        if (row >= 0 && row < (int)visible.size())
-            previewSamples = bank.samples(visible[(size_t)row]);
+        if (row >= 0 && row < (int)visible.size()) {
+            const Item it = visible[(size_t)row];
+            if (it.user) {
+                const auto& u = userItems[(size_t)it.idx];
+                if (auto f = frameFromWaveformAsset(u.subType, u.payload))
+                    f->render(512, previewSamples);
+            } else {
+                previewSamples = bank.samples(it.idx);
+            }
+        }
         repaint();
     }
 
     void doInsert() {
         const int row = waveList.getSelectedRow();
         if (row < 0 || row >= (int)visible.size()) return;
-        const int entryIdx = visible[(size_t)row];
-        if (onInsert) onInsert(entryIdx);
+        const Item it = visible[(size_t)row];
+        if (it.user) { if (onPickAsset)   onPickAsset(userItems[(size_t)it.idx].id); }
+        else         { if (onPickBuiltin) onPickBuiltin(it.idx); }
         closeSelf();
     }
 
@@ -8642,31 +8739,52 @@ private:
     }
 
     WaveformBank& bank;
+    std::vector<UserItem> userItems;
     juce::TextEditor searchBox;
-    juce::ToggleButton curatedToggle;
+    juce::ToggleButton starredToggle, showUserToggle;
     juce::ListBox catList, waveList;
     juce::TextButton insertBtn { "Insert" }, cancelBtn { "Cancel" };
     juce::Label statusLabel;
     CatModel catModel;
     std::vector<CatRow> catRows;
-    std::vector<int> visible;            // bank entry indices currently listed
+    std::vector<Item> visible;
     std::vector<float> previewSamples;
     juce::Rectangle<int> previewBounds;
     bool statusBoundsActive = false;
 };
 } // namespace
 
-void LayeredWaveEditorComponent::showFactoryWaveformBrowser(juce::Component* anchor) {
-    auto* browser = new FactoryWaveformBrowser();
-    browser->onInsert = [this](int bankEntryIndex) {
+void LayeredWaveEditorComponent::showWaveformLibraryBrowser(juce::Component* anchor,
+                                                            bool replaceCurrentFrame) {
+    auto* browser = new WaveformLibraryBrowser(graph);
+
+    // --- Built-in waveform chosen: an editable independent copy ---
+    browser->onPickBuiltin = [this, replaceCurrentFrame](int bankEntryIndex) {
         auto& bank = WaveformBank::get();
         if (bankEntryIndex < 0 || bankEntryIndex >= bank.numEntries()) return;
         const auto& e = bank.entry(bankEntryIndex);
         auto nf = makeFactoryFrame(bank.samples(bankEntryIndex));
         if (!nf) return;
-        // Name the library entry after the factory waveform (its bank name),
-        // with the same stable-id suffix every other added entry gets.
         const std::string base = e.name;
+        if (replaceCurrentFrame) {
+            // Replace the current entry's content in place, dropping any live
+            // reference (built-ins are immutable, so they can't be referenced).
+            const int libIdx = wave.findLibraryIndexById(currentLibraryId);
+            if (libIdx < 0) return;
+            auto& entry = wave.library[libIdx];
+            nf->gain = entry.wave ? entry.wave->gain : 1.0f;  // keep per-slot gain
+            entry.wave = std::move(nf);
+            entry.assetId = -1;
+            rebuildRows();
+            refreshPreview();
+            refreshIdentityRow();
+            notifyPopoutDocMutated();
+            commitToNode();
+            commitUndoStep();
+            return;
+        }
+        // Add a new frame (the + Waveform flow), named after the factory entry
+        // with the same stable-id suffix every other added entry gets.
         const int libId = wave.addLibraryEntry(std::move(nf), base);
         applyLibraryIdSuffix(wave, libId, base);
         currentLibraryId = libId;
@@ -8678,9 +8796,37 @@ void LayeredWaveEditorComponent::showFactoryWaveformBrowser(juce::Component* anc
         notifyPopoutFrameOrPositionChanged();
     };
 
+    // --- User Waveform asset chosen: a live reference ---
+    browser->onPickAsset = [this, replaceCurrentFrame](int assetId) {
+        const AssetEntry* e = graph.assets.find(assetId);
+        if (!e || e->kind != AssetKind::Waveform) return;
+        if (replaceCurrentFrame) {
+            adoptWaveformAsset(assetId);  // repoint the current frame
+            return;
+        }
+        // Add a new frame that live-references the asset.
+        auto nf = frameFromWaveformAsset(e->subType, e->payload);
+        if (!nf) return;
+        const std::string base = e->name.empty() ? "Waveform" : e->name;
+        const int libId = wave.addLibraryEntry(std::move(nf), base);
+        applyLibraryIdSuffix(wave, libId, base);
+        if (int li = wave.findLibraryIndexById(libId); li >= 0)
+            wave.library[(size_t)li].assetId = assetId;
+        currentLibraryId = libId;
+        updateHintText();
+        if (wave.mode == WavetableMode::Scatter) repaintScatterViews();
+        rebuildRows();
+        onLayerChanged();
+        refreshPreview();
+        refreshIdentityRow();
+        notifyPopoutFrameOrPositionChanged();
+        commitToNode();
+        commitUndoStep();
+    };
+
     juce::DialogWindow::LaunchOptions opts;
     opts.content.setOwned(browser);
-    opts.dialogTitle = "Factory Waveforms";
+    opts.dialogTitle = "Waveform Library";
     opts.dialogBackgroundColour = juce::Colour(0xff2b2b30);
     opts.escapeKeyTriggersCloseButton = true;
     opts.useNativeTitleBar = false;
@@ -8717,11 +8863,11 @@ void LayeredWaveEditorComponent::showAddWaveformMenu(juce::Component* anchor) {
     m.addItem(8, "Inharmonic stack (additive)");
     m.addSeparator();
     m.addSectionHeader("Factory library");
-    // Item 9: open the built-in single-cycle waveform browser (thousands of
-    // ready-made oscillator shapes). The chosen waveform is imported as an
-    // editable Drawn/Freehand layered frame, so it slots into the library just
-    // like an edit-from-scratch entry.
-    m.addItem(9, "Factory waveform...");
+    // Item 9: open the unified waveform-library browser (thousands of built-in
+    // single-cycle shapes PLUS this project's saved waveforms). A built-in is
+    // imported as an editable Drawn/Freehand layered frame; a saved waveform is
+    // added as a live reference. Either slots into the library like a normal entry.
+    m.addItem(9, "From waveform library...");
     m.addSeparator();
     m.addSectionHeader("Capture from audio");
     // Items 5/6/7: open the capture dialog with one of three audio
@@ -8757,10 +8903,10 @@ void LayeredWaveEditorComponent::showAddWaveformMenu(juce::Component* anchor) {
         [this, makeFreshFrame, anchor](int r) {
             if (r == 0) return;
             if (r == 9) {
-                // Factory library browser. It adds the chosen waveform to the
-                // library itself (same tail as the fresh-frame path below), so
-                // there's nothing more to do here.
-                showFactoryWaveformBrowser(anchor);
+                // Waveform library browser (built-ins + user assets). It adds
+                // the chosen waveform to the library itself (same tail as the
+                // fresh-frame path below), so there's nothing more to do here.
+                showWaveformLibraryBrowser(anchor, /*replaceCurrentFrame*/false);
                 return;
             }
             if (r == 5 || r == 6 || r == 7) {
@@ -9374,11 +9520,11 @@ void LayeredWaveEditorComponent::refreshIdentityRow() {
     nameEditor.setVisible(have);
     gainLabel.setVisible(have);
     gainSlider.setVisible(have);
-    assetLibLbl.setVisible(have);
-    assetLibCombo.setVisible(have);
-    addToAssetLibBtn.setVisible(have);
+    assetLibStatus.setVisible(have);
+    useLibraryBtn.setVisible(have);
+    saveToLibBtn.setVisible(have);
     if (!have) { return; }
-    rebuildAssetLibCombo();
+    refreshAssetLibRow();
 
     // Sync the gain knob to the frame the editor is currently bound to.
     // currentEditingFrame() can differ from the library entry at libIdx in
@@ -9406,53 +9552,53 @@ void LayeredWaveEditorComponent::refreshIdentityRow() {
 
 // ---- Project asset-library reference row -----------------------------------
 
-void LayeredWaveEditorComponent::rebuildAssetLibCombo() {
-    assetLibCombo.clear(juce::dontSendNotification);
-    assetLibCombo.addItem("(Independent)", 1);   // reserved id 1 (user ids >= 1e6)
-
+void LayeredWaveEditorComponent::refreshAssetLibRow() {
     const int libIdx = wave.findLibraryIndexById(currentLibraryId);
     const int cur = (libIdx >= 0) ? wave.library[libIdx].assetId : -1;
-    bool curListed = false;
-    for (const AssetEntry* e : graph.assets.list(AssetKind::Waveform)) {
-        juce::String nm = e->name.empty() ? ("#" + juce::String(e->id))
-                                          : juce::String(e->name);
-        assetLibCombo.addItem(nm, e->id);
-        if (e->id == cur) curListed = true;
-    }
-    // Show an archived referenced asset so the user can see what's referenced.
-    if (cur >= 0 && !curListed) {
+    if (cur >= 0) {
         const AssetEntry* e = graph.assets.find(cur);
-        if (e) assetLibCombo.addItem(juce::String(e->name) + "  [archived]", e->id);
+        juce::String nm = (e && !e->name.empty()) ? juce::String(e->name)
+                          : ("#" + juce::String(cur));
+        if (e && e->archived) nm += "  [archived]";
+        assetLibStatus.setText(juce::String::fromUTF8("Library: \xe2\x86\x92 ") + nm,
+                               juce::dontSendNotification);
+        assetLibStatus.setColour(juce::Label::textColourId,
+                                 juce::Colour(0xffffcf4d).withAlpha(0.95f));
+        // Already published: re-saving would just spawn a duplicate asset, so
+        // steer the user to Duplicate-in-library for divergence instead.
+        saveToLibBtn.setEnabled(false);
+        saveToLibBtn.setTooltip(
+            "Already linked to a library waveform. To make an independent variant, "
+            "use Asset Library -> Duplicate, then pick the copy with \"Use "
+            "Library...\".");
+    } else {
+        assetLibStatus.setText("Independent waveform (not in library)",
+                               juce::dontSendNotification);
+        assetLibStatus.setColour(juce::Label::textColourId,
+                                 juce::Colours::white.withAlpha(0.6f));
+        saveToLibBtn.setEnabled(true);
+        saveToLibBtn.setTooltip(
+            "Save this waveform to the project's shared library and link this slot "
+            "to it. Other nodes (and new wavetable frames / instruments) can then "
+            "reference the same waveform, and edits propagate to all of them.");
     }
-    assetLibCombo.setSelectedId(cur >= 0 ? cur : 1, juce::dontSendNotification);
 }
 
-void LayeredWaveEditorComponent::onAssetLibSelected(int comboId) {
+// Repoint the CURRENT library entry to a user Waveform asset (live reference):
+// mirror the asset's frame into the entry, preserving this slot's gain. Shared
+// by the identity-row "Use Library..." flow.
+void LayeredWaveEditorComponent::adoptWaveformAsset(int assetId) {
     const int libIdx = wave.findLibraryIndexById(currentLibraryId);
     if (libIdx < 0) return;
     auto& entry = wave.library[libIdx];
-
-    if (comboId == 1) {
-        // Detach to independent: keep the current frame as this slot's own
-        // private copy (no content change), just stop referencing.
-        if (entry.assetId == -1) return;
-        entry.assetId = -1;
-        commitToNode();
-        commitUndoStep();
-        return;
-    }
-    if (comboId == entry.assetId) return; // already referencing this asset
-
-    // Adopt the chosen asset: mirror its frame into the entry and reference it.
-    const AssetEntry* e = graph.assets.find(comboId);
+    if (assetId == entry.assetId) return;  // already referencing this asset
+    const AssetEntry* e = graph.assets.find(assetId);
     if (!e || e->kind != AssetKind::Waveform) return;
     if (auto frame = frameFromWaveformAsset(e->subType, e->payload)) {
-        // Preserve this slot's gain (a placement-level property, not part of
-        // the shared waveform shape).
-        frame->gain = entry.wave ? entry.wave->gain : 1.0f;
+        frame->gain = entry.wave ? entry.wave->gain : 1.0f;  // gain is per-slot
         entry.wave = std::move(frame);
     }
-    entry.assetId = comboId;
+    entry.assetId = assetId;
     rebuildRows();
     refreshPreview();
     refreshIdentityRow();
@@ -9488,8 +9634,7 @@ void LayeredWaveEditorComponent::publishCurrentWaveformToLibrary() {
                         int id = graph.assets.add(AssetKind::Waveform, name,
                                                   subType, payload);
                         wave.library[libIdx].assetId = id;
-                        rebuildAssetLibCombo();
-                        assetLibCombo.setSelectedId(id, juce::dontSendNotification);
+                        refreshAssetLibRow();
                         commitToNode();
                         commitUndoStep();
                     }
@@ -10602,17 +10747,18 @@ void LayeredWaveEditorComponent::resized() {
     }
 
     // Project asset-library reference row under the gain row:
-    // [Library: label][asset picker .......][Add to Library]. Same visibility
-    // gating as the identity/gain rows (refreshIdentityRow controls it).
+    // [status: Library: -> name / Independent .....][Use Library...][Save to
+    // Library]. Same visibility gating as the identity/gain rows
+    // (refreshIdentityRow controls it).
     {
         const int aH = 24;
         auto aRow = right.removeFromTop(aH);
         right.removeFromTop(6);
-        assetLibLbl.setBounds(aRow.removeFromLeft(70));
-        aRow.removeFromLeft(2);
-        addToAssetLibBtn.setBounds(aRow.removeFromRight(110));
+        saveToLibBtn.setBounds(aRow.removeFromRight(110));
         aRow.removeFromRight(6);
-        assetLibCombo.setBounds(aRow);
+        useLibraryBtn.setBounds(aRow.removeFromRight(96));
+        aRow.removeFromRight(6);
+        assetLibStatus.setBounds(aRow);
     }
 
     // Middle: either the layered-frame layer rows + viewport, the embedded

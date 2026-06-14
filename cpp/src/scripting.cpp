@@ -41,6 +41,7 @@
 #include "buffer_warp.h"
 #include <sstream>
 #include <cstdio>
+#include <cstring>
 #include <cctype>
 
 // Bare DLL filename used for the runtime load probe (passed by CMake). Falls
@@ -1410,19 +1411,38 @@ bool ScriptEngine::bakeTerrain(const std::string& src, bool wholeGrid,
          << "__total = " << total << "\n";
 
     if (wholeGrid) {
-        // Whole-grid: expose dims/nd/total + set/get/coord, run the user's
+        // Whole-grid: expose dims/nd/total + the cell buffer, run the user's
         // generate(), then map the unipolar buffer to bipolar.
+        //
+        // Storage: when numpy is importable, the grid is a float64 ndarray
+        // `grid` shaped exactly like the terrain (dims), so a program can write
+        // `grid[r, c] = ...` or use vectorized numpy ops directly. Otherwise
+        // `grid is None` and the cells live in a private flat list. EITHER way
+        // the set/get/getAt/setAt helpers operate on the live grid, so a program
+        // can mix numpy slicing with the helpers, and reassigning `grid` to a new
+        // array (e.g. `grid = grid + 1`) is honoured at readback. Helpers keep the
+        // [0,1] clamp; raw numpy writes are clamped once at readback via np.clip.
         code << "nd = __nd\n"
                 "total = __total\n"
                 "dims = list(__dims)\n"
-                "__data = [0.0] * __total\n"
+                "try:\n"
+                "    import numpy as __np\n"
+                "except Exception:\n"
+                "    __np = None\n"
+                "if __np is not None:\n"
+                "    grid = __np.zeros(tuple(__dims), dtype=__np.float64)\n"
+                "    __store = None\n"
+                "else:\n"
+                "    grid = None\n"
+                "    __store = [0.0] * __total\n"
                 "def set(i, v):\n"
                 "    v = float(v)\n"
                 "    if v < 0.0: v = 0.0\n"
                 "    elif v > 1.0: v = 1.0\n"
-                "    __data[int(i)] = v\n"
+                "    if grid is None: __store[int(i)] = v\n"
+                "    else: grid.flat[int(i)] = v\n"
                 "def get(i):\n"
-                "    return __data[int(i)]\n"
+                "    return float(__store[int(i)] if grid is None else grid.flat[int(i)])\n"
                 "def coord(i, axis):\n"
                 "    __t = int(i)\n"
                 "    for __a in range(__nd - 1, -1, -1):\n"
@@ -1486,7 +1506,7 @@ bool ScriptEngine::bakeTerrain(const std::string& src, bool wholeGrid,
                 "        if __c < 0: __c = 0\n"
                 "        elif __c > __sz - 1: __c = __sz - 1\n"
                 "        __idx = __idx * __sz + __c\n"
-                "    return __data[__idx]\n"
+                "    return float(__store[__idx] if grid is None else grid.flat[__idx])\n"
                 // setAt(c0, ..., v): DIRECT N-D write - store v (clamped [0,1]) at
                 // the cell at the nd INTEGER coords; the value is the arg AFTER the
                 // coords (args[__nd]). An OUT-OF-RANGE coord makes the write a
@@ -1502,13 +1522,18 @@ bool ScriptEngine::bakeTerrain(const std::string& src, bool wholeGrid,
                 "        __idx = __idx * __sz + __c\n"
                 "    if __v < 0.0: __v = 0.0\n"
                 "    elif __v > 1.0: __v = 1.0\n"
-                "    __data[__idx] = __v\n";
+                "    if grid is None: __store[__idx] = __v\n"
+                "    else: grid.flat[__idx] = __v\n";
         // User source verbatim (defines generate()), then invoke it.
         std::string user = trim(src);
         if (user.empty()) user = "def generate():\n    pass";
         code << user << "\n"
              << "generate()\n"
-             << "__result = [v * 2.0 - 1.0 for v in __data]\n";
+                "if grid is None:\n"
+                "    __result = [v * 2.0 - 1.0 for v in __store]\n"
+                "else:\n"
+                "    __result = __np.ascontiguousarray("
+                "__np.clip(grid, 0.0, 1.0) * 2.0 - 1.0, dtype=__np.float64).reshape(-1)\n";
     } else {
         // Per-cell: wrap the user expression/body into __cell(...) and loop.
         std::string trimmed = trim(src);
@@ -1557,18 +1582,39 @@ bool ScriptEngine::bakeTerrain(const std::string& src, bool wholeGrid,
     }
     Py_DECREF(res);
 
-    PyObject* list = PyDict_GetItemString(globals, "__result"); // borrowed
+    PyObject* result = PyDict_GetItemString(globals, "__result"); // borrowed
     bool ok = false;
-    if (list && PyList_Check(list) && PyList_Size(list) == (Py_ssize_t)total) {
+    if (result && PyList_Check(result) && PyList_Size(result) == (Py_ssize_t)total) {
+        // Flat-list path (no numpy, or per-cell mode).
         ok = true;
         out.resize((size_t)total);
         for (long long i = 0; i < total; ++i) {
-            PyObject* item = PyList_GetItem(list, (Py_ssize_t)i); // borrowed
+            PyObject* item = PyList_GetItem(result, (Py_ssize_t)i); // borrowed
             double v = item ? PyFloat_AsDouble(item) : 0.0;
             if (PyErr_Occurred()) { PyErr_Clear(); v = 0.0; }
             out[(size_t)i] = (float)v;
         }
-    } else {
+    } else if (result && PyObject_CheckBuffer(result)) {
+        // numpy path: __result is a C-contiguous float64 1-D ndarray. Read it
+        // straight out of its buffer (no per-element Python calls).
+        Py_buffer view;
+        if (PyObject_GetBuffer(result, &view,
+                               PyBUF_C_CONTIGUOUS | PyBUF_FORMAT) == 0) {
+            if (view.itemsize == (Py_ssize_t)sizeof(double) &&
+                view.format && std::strchr(view.format, 'd') &&
+                view.len == (Py_ssize_t)(total * (long long)sizeof(double)) &&
+                view.buf) {
+                ok = true;
+                out.resize((size_t)total);
+                const double* d = (const double*)view.buf;
+                for (long long i = 0; i < total; ++i) out[(size_t)i] = (float)d[i];
+            }
+            PyBuffer_Release(&view);
+        } else {
+            PyErr_Clear();
+        }
+    }
+    if (!ok) {
         error = "program did not produce " + std::to_string(total) + " cells "
                 "(whole-grid programs must define generate())";
     }

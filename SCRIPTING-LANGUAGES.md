@@ -475,6 +475,39 @@ multiple passes).
 | **GLSL** | ✓ | ✓ | Runs on the GPU via a headless GL 4.3 compute context. Massively parallel — the right call for big grids and iterative ping-pong passes (blur, CA, diffusion). Whole-grid uses two alternating SSBOs with `prevAt()`/`neighbor()` helpers. |
 | **WASM** | — | ✓ | A pre-compiled `.wasm` module baked **once**, offline. Whole-grid only. Compiled, deterministic, no GC — for heavy procedural terrain authored in C/Rust/Zig and shipped as a binary. |
 
+**The whole-grid program API** (Lua / Python). All three expose the same
+read-only shape facts and the same cell helpers, so a Lua program and a Python
+program read almost identically:
+
+- `nd` — rank; `dims` — per-axis sizes (Lua: 1-indexed table; Python: 0-indexed
+  list); `total` — product(dims). These are **fixed by the dialog's Dimensions
+  field** and injected read-only — the program reads them to decide what to draw,
+  it does not define them.
+- `set(i, v)` / `get(i)` — flat-index write/read (`v` clamped to [0,1]).
+- `coord(i, axis)` — normalized [0,1] position; `coordAxis(i, axis)` — the integer
+  index; `flatten(c0, …)` — N-D integer coords → flat index (each clamped to the
+  axis); `neighbor(i, axis, delta)` — flat index of an edge-clamped neighbour.
+- `getAt(c0, …)` / `setAt(c0, …, v)` — direct N-D pixel read/write, no manual
+  `flatten()`. Reads edge-clamp; an out-of-range write is a no-op.
+
+**Python gets a real N-D array.** When numpy is importable, the whole-grid Python
+program is also handed **`grid`** — a `float64` ndarray shaped exactly like the
+terrain (`grid.shape == tuple(dims)`). So instead of flat indices you can write
+`grid[r, c] = …`, slice (`grid[0, :] = ramp`), or run fully vectorized numpy/scipy
+ops over the whole field, and the result is read back through the buffer protocol
+(no per-cell Python calls). The `set/get/getAt/setAt` helpers operate on the same
+live `grid`, so you can freely mix helper calls with numpy slicing; reassigning
+`grid` wholesale (`grid = grid + 1`) is honoured at readback. Raw numpy writes
+skip the helper clamp, so out-of-range values are clamped once at the end via
+`np.clip(grid, 0, 1)`. If numpy is **not** installed, `grid is None` and the cells
+live in a flat list reached through the helpers — write your generator to branch
+on `grid is not None` if you want it to run in both environments. *(Lua and WASM
+have no native N-D array type — Lua only has nested tables, which are 1-indexed
+and allocation/GC-heavy, and WASM has only flat linear memory — so for those two
+the flat-buffer + `getAt`/`setAt` helpers are the right model. numpy is the one
+scripting stack here with a true native N-D container, so Python is the only one
+that gets `grid`.)*
+
 **Why is WASM whole-grid only (no per-cell)?** It's the mirror image of
 Builtin's "can't whole-grid":
 

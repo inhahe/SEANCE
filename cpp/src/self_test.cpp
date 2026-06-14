@@ -776,6 +776,58 @@ void testTerrainData(Report& r, const juce::File& dir) {
                 }
             }
 
+            // numpy ndarray store: when numpy is importable, `grid` is a 2-D
+            // float64 ndarray shaped like the terrain, so `grid[r, c] = ...`
+            // writes the cell directly (read back via the buffer protocol). The
+            // program degrades to setAt when numpy is absent, so this test passes
+            // in BOTH environments and produces the same i/11 ramp either way.
+            {
+                std::vector<float> out;
+                std::string err;
+                bool ok = ScriptEngine::instance().bakeTerrain(
+                    "def generate():\n"
+                    "    if grid is not None:\n"
+                    "        for rr in range(3):\n"
+                    "            for cc in range(4):\n"
+                    "                grid[rr, cc] = (rr*4+cc)/11.0\n"
+                    "    else:\n"
+                    "        for rr in range(3):\n"
+                    "            for cc in range(4):\n"
+                    "                setAt(rr, cc, (rr*4+cc)/11.0)\n",
+                    /*wholeGrid*/true, { 3, 4 }, out, err);
+                r.check(ok && out.size() == 12, "gen: Python numpy grid[r,c] runs");
+                if (ok && out.size() == 12) {
+                    float maxErr = 0.0f;
+                    for (int i = 0; i < 12; ++i) {
+                        float expect = ((float)i / 11.0f) * 2.0f - 1.0f;
+                        maxErr = std::max(maxErr, std::abs(out[(size_t)i] - expect));
+                    }
+                    r.checkVal(maxErr < 1e-4, "gen: Python numpy grid[r,c] ramp round-trips", maxErr);
+                }
+            }
+
+            // numpy out-of-range clamp: raw numpy writes bypass the helper clamp,
+            // so a cell set to 5.0 must be clamped to bipolar 1.0 at readback
+            // (np.clip). When numpy is absent this is a no-op pass.
+            {
+                std::vector<float> out;
+                std::string err;
+                bool ok = ScriptEngine::instance().bakeTerrain(
+                    "def generate():\n"
+                    "    if grid is not None:\n"
+                    "        grid[:] = 5.0\n"
+                    "    else:\n"
+                    "        for i in range(total):\n"
+                    "            set(i, 5.0)\n",
+                    /*wholeGrid*/true, { 3, 4 }, out, err);
+                r.check(ok && out.size() == 12, "gen: Python numpy clamp runs");
+                if (ok && out.size() == 12) {
+                    float maxErr = 0.0f;
+                    for (float v : out) maxErr = std::max(maxErr, std::abs(v - 1.0f));
+                    r.checkVal(maxErr < 1e-5, "gen: Python numpy raw write clamps >1 at readback", maxErr);
+                }
+            }
+
             // Output clamps: a per-cell value of 5.0 must clamp to 1.0 -> bipolar 1.0.
             {
                 std::vector<float> out;

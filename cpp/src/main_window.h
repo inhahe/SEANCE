@@ -22,6 +22,21 @@
 
 namespace SoundShop {
 
+// Ephemeral-session mode (--ephemeral). When enabled, all crash-recovery /
+// session-state files (autosave.ssp, autosave.meta.xml, undo-tree.dat, the
+// per-plugin autosave-plugin-*.dat blobs) are redirected from the user's real
+// app-data folder to an isolated throwaway directory that is wiped on every
+// launch, and the "didn't shut down cleanly - recover?" prompt therefore never
+// fires for these runs. Purpose: automated / test launches (e.g. opening the
+// app to verify a feature, then killing the process) must not leave a stale
+// autosave that makes the user's NEXT normal launch falsely report a crash. A
+// genuine crash in a normal (non-ephemeral) launch still leaves the real
+// autosave, so the recovery prompt continues to mean "something went wrong".
+// Must be called before MainContentComponent is constructed. isEphemeralSession
+// reflects the current state (false by default).
+void setEphemeralSession(bool on);
+bool isEphemeralSession();
+
 class MainContentComponent : public juce::Component,
                               public juce::MenuBarModel,
                               public juce::Timer {

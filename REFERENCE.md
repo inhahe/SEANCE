@@ -33,6 +33,7 @@ here.
 - [Shared AHDSR envelope](#shared-ahdsr-envelope)
 - [Asset library (project stores)](#asset-library-project-stores)
 - [Terrain-synth self-test (`--self-test`)](#terrain-synth-self-test---self-test)
+- [Ephemeral session (`--ephemeral`)](#ephemeral-session---ephemeral)
 
 ---
 
@@ -2456,3 +2457,43 @@ Artifacts written to `<output-dir>`: `selftest_report.txt`, the synthetic
 inputs (`test_audio_1d.wav`, `test_image_2d.png`, `test_video.mp4`), and the
 rendered outputs (`render_1d_direct.wav`, `render_2d_amsine_sweepY.wav`,
 `render_3d_amsine_sweepFrame.wav`).
+
+## Ephemeral session (`--ephemeral`)
+
+<a name="ephemeral-session---ephemeral"></a>A flag for **throwaway / test launches** of the
+full GUI:
+
+```
+SEANCE.exe --ephemeral
+```
+
+It runs the app exactly as normal **except** that every crash-recovery /
+session-state file is redirected away from the user's real app-data folder
+(`%APPDATA%/SoundShop`) into an isolated throwaway directory
+(`<temp>/SEANCE-ephemeral`), which is **wiped at the start of each ephemeral
+launch**. The redirected set is the whole autosave family — `autosave.ssp`, its
+`autosave.meta.xml` sidecar, the `undo-tree.dat` persistence, and the
+per-plugin `autosave-plugin-*.dat` blobs (everything under `getAutosaveDir()`).
+
+**Why it exists.** SEANCE detects an unclean shutdown by finding a leftover
+`autosave.ssp` at startup and shows the *"didn't shut down cleanly — recover?"*
+prompt. Automated / test launches (e.g. opening the app to verify a feature,
+then killing the process) would otherwise leave that file behind and make the
+**next normal launch falsely report a crash**, making a real crash
+indistinguishable from a killed test run. With `--ephemeral`, a killed test run
+only ever leaves an autosave inside the throwaway temp dir, so:
+
+- A genuine crash in a normal (non-ephemeral) launch still leaves the real
+  `autosave.ssp` → the recovery prompt fires and **means something went wrong**.
+- A killed `--ephemeral` launch leaves nothing in the real dir → no spurious
+  prompt, and (because the temp dir is wiped on entry) no recovery prompt within
+  ephemeral runs either.
+
+The window title is suffixed with **`[ephemeral session]`** so the mode is
+obvious at a glance and the absence of a recovery prompt is explained. The flag
+does **not** isolate the preferences file (`soundshop_prefs.xml`, kept next to
+the exe) — only the crash-recovery state. Parsed in `main.cpp::initialise`;
+implemented by `SoundShop::setEphemeralSession()` (`main_window.cpp`), which the
+`getAutosaveDir()` family consults. (`--self-test` and `--plugin-sandbox` never
+create a window or run the autosave machinery, so they were already safe;
+`--ephemeral` covers the GUI-launch case.)

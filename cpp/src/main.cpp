@@ -54,6 +54,15 @@ public:
             return;
         }
 
+        // Ephemeral session (--ephemeral): isolate all crash-recovery /
+        // session-state files into a throwaway temp dir and suppress the
+        // recovery prompt, so automated / test launches that get killed never
+        // make the user's next normal launch falsely report an unclean
+        // shutdown. Must run before the window (and its autosave machinery)
+        // is constructed. See setEphemeralSession in main_window.h.
+        if (args.contains("--ephemeral"))
+            SoundShop::setEphemeralSession(true);
+
         initLogging();
 
         mainWindow = std::make_unique<SoundShop::MainWindow>(getApplicationName());

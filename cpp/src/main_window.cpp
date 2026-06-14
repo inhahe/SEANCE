@@ -1089,6 +1089,11 @@ void MainContentComponent::timerCallback() {
         } else if (projectDirty || graph.dirty) {
             title += " *";
         }
+        // Make ephemeral (test) sessions obvious so they're never mistaken for
+        // a real working session - and so the absence of a recovery prompt is
+        // clearly explained.
+        if (isEphemeralSession())
+            title += "  [ephemeral session]";
         win->setName(title);
     }
 }
@@ -3748,7 +3753,29 @@ void MainContentComponent::savePreferences() {
 // Autosave
 // ==============================================================================
 
+// Ephemeral-session state (see setEphemeralSession in main_window.h). File-
+// local so the getAutosaveDir() family below can consult it; toggled through
+// the namespace-scoped setter that main.cpp calls when --ephemeral is parsed.
+static bool g_ephemeralSession = false;
+
+bool isEphemeralSession() { return g_ephemeralSession; }
+void setEphemeralSession(bool on) {
+    g_ephemeralSession = on;
+    if (on) {
+        // Start every ephemeral launch from a clean slate so a previously
+        // killed ephemeral run can't leave an autosave that makes the NEXT
+        // ephemeral run prompt for recovery. (The user's real session dir is
+        // never touched in this mode.)
+        juce::File::getSpecialLocation(juce::File::tempDirectory)
+            .getChildFile("SEANCE-ephemeral")
+            .deleteRecursively();
+    }
+}
+
 static juce::File getAutosaveDir() {
+    if (g_ephemeralSession)
+        return juce::File::getSpecialLocation(juce::File::tempDirectory)
+                   .getChildFile("SEANCE-ephemeral");
     return juce::File::getSpecialLocation(juce::File::userApplicationDataDirectory)
                .getChildFile("SoundShop");
 }

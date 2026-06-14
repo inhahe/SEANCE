@@ -2078,9 +2078,12 @@ has one tab per asset kind:
   shared AHDSR editor.
 - **Morph Algorithms** — (reserved) warp chains.
 
-Each tab lists its assets with **Rename**, **Duplicate**, **Archive**
-(soft-delete) / **Restore**, and **Delete** (hard erase, with a confirmation),
-plus a **Show archived** toggle.
+Each tab lists its assets with **Rename**, **Duplicate**, **Star** / **Unstar**,
+**Archive** (soft-delete) / **Restore**, and **Delete** (hard erase, with a
+confirmation), plus a **Show archived** toggle. Starred assets show a ★ in the
+list; the **starred** flag is the user-side analogue of the built-in factory
+"curated" flag, and pickers offer a **Starred only** filter over both so you can
+surface favourites out of a large library.
 
 ### Identity, ids, and the live-reference model
 
@@ -2094,9 +2097,9 @@ plus a **Show archived** toggle.
   every other reference (`resolveAhdsrReferences` for curves,
   `resolveWaveformReferences` for waveforms).
 - **No detach-in-place.** To make one copy diverge from the shared asset, use
-  **Duplicate** (mints a new id) and point the node at the duplicate. Choosing
-  **(Independent)** in a node's picker stops referencing and keeps the current
-  shape as that node's own private copy.
+  **Duplicate** (mints a new id) and point the node at the duplicate (e.g. via the
+  waveform editor's **Use Library…** picker). There is deliberately no per-instance
+  "detach" button — divergence is always Duplicate + repoint.
 - **Soft-delete (Archive)** hides an asset from the pickers but keeps it
   resolvable, so existing references stay valid. **Delete** hard-erases it; any
   node still referencing it falls back to **independent** (keeps its
@@ -2113,19 +2116,42 @@ plus a **Show archived** toggle.
   a picker to reference a stored curve (or **(Independent)**) and **Add to
   Library** to publish the current shape. The reference id lives on the node as
   `ahdsrAssetId`.
-- **Waveforms** — the Layered-Waveform editor shows a **Library:** row beneath
-  the per-waveform gain: a picker and an **Add to Library** button. The
-  reference lives on the wavetable library entry (`WaveformLibraryEntry.assetId`)
-  — a node's wavetable can hold many waveforms, so each slot references
-  independently. Adopting an asset keeps the slot's own **gain** (a
-  placement-level property, not part of the shared shape).
+- **Waveforms** — the Layered-Waveform editor shows a reference row beneath the
+  per-waveform gain: a read-only status (**Library: → name**, or **Independent
+  waveform**), a **Use Library…** button, and a **Save to Library** button.
+  **Save to Library** publishes the current waveform as a new asset and links this
+  slot to it (disabled once linked — diverge via Duplicate instead). **Use
+  Library…** opens the unified [waveform-library browser](#picking-a-waveform-the-unified-browser)
+  to repoint this slot. The reference lives on the wavetable library entry
+  (`WaveformLibraryEntry.assetId`) — a node's wavetable can hold many waveforms,
+  so each slot references independently. Adopting an asset keeps the slot's own
+  **gain** (a placement-level property, not part of the shared shape).
+
+### Picking a waveform (the unified browser)
+
+Selecting a waveform — whether adding a new wavetable frame (**+ Waveform → From
+waveform library…**) or repointing an existing slot (**Use Library…**) — opens one
+picker, `WaveformLibraryBrowser`, that lists **both**:
+
+- the **built-in factory single-cycle library** (thousands of shapes, grouped into
+  categories, curated entries marked ★), and
+- this project's **saved Waveform assets** (under a **★ My waveforms**
+  pseudo-category; archived assets are hidden).
+
+The library is far too large for a flat dropdown, so the browser offers a category
+list, a **search** box, a **Starred only** filter (built-in *curated* OR user
+*starred*), a **Show my waveforms** toggle, and a live cycle preview. Choosing a
+**built-in** drops in an editable independent copy (button reads **Insert**);
+choosing a **saved waveform** creates a **live reference** to it (button reads
+**Use**), so later edits propagate everywhere it's used.
 
 ### On disk and undo
 
 - Assets are written to the project file in `[AssetStore]` blocks (one per
-  asset: id, kind tag, name, sub-type, content hash, archived flag, and a
-  base64 payload). The block is **included in undo snapshots**, so store edits
-  participate in undo/redo like any other project state.
+  asset: id, kind tag, name, sub-type, content hash, archived flag, starred flag,
+  and a base64 payload — the archived/starred lines are omitted when false, so
+  older files load unchanged). The block is **included in undo snapshots**, so
+  store edits participate in undo/redo like any other project state.
 - Node references serialize alongside the node: `ahdsrAssetId` for curves; an
   optional `:assets:` block inside the wavetable script (`__wavetable5__`) maps
   each library entry id to its asset id. Both are re-resolved on load, so a
@@ -2133,6 +2159,7 @@ plus a **Show archived** toggle.
 
 Data model: `asset_library.h/.cpp` (`AssetKind`, `AssetEntry`, `AssetLibrary`),
 owned by `NodeGraph::assets`. Management UI: `asset_library_component.h/.cpp`.
+Waveform picker: `WaveformLibraryBrowser` in `layered_wave_editor.cpp`.
 
 ## Terrain-synth self-test (`--self-test`)
 

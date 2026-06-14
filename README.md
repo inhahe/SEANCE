@@ -174,19 +174,23 @@ blocks once and **reference them live from many nodes at the same time**.
 Editing a stored asset updates every node that uses it, instantly. It's the
 project-scoped counterpart to the app-global preset systems: presets are
 copy-on-apply, the asset library is a *live reference*. Open it from **Edit →
-Asset Library…** to browse, rename, duplicate, archive, or delete entries.
+Asset Library…** to browse, rename, duplicate, **star**, archive, or delete
+entries.
 
-Two asset kinds are wired up today, each with a **Library:** row in its editor
-(a picker to reference a stored asset, plus **Add to Library** to publish the
-current one): **waveforms** (any wavetable frame — layered, spectral, wavelet,
-granular, inharmonic, sample — published from the Layered-Waveform editor) and
-**AHDSR curves** (published from the shared envelope editor). Choose
-**(Independent)** in a picker to stop sharing and keep a private copy;
-**Duplicate** an asset to make one diverge. Archived assets are hidden from
-pickers but keep existing references valid; deleting an asset drops referencing
-nodes back to their own private copy. Assets live in the project file and
-participate in undo/redo. See [REFERENCE.md](REFERENCE.md#asset-library-project-stores)
-for the full breakdown.
+Two asset kinds are wired up today: **waveforms** (any wavetable frame — layered,
+spectral, wavelet, granular, inharmonic, sample — published from the
+Layered-Waveform editor with **Save to Library**) and **AHDSR curves** (published
+from the shared envelope editor). Waveforms are picked from a **unified browser**
+that lists the thousands of built-in factory shapes *and* your saved waveforms in
+one place — with category, search, **Starred only**, and **Show my waveforms**
+filters, because the wave-shape library is far too big for a dropdown. Picking a
+built-in drops in an editable copy; picking one of your saved waveforms makes a
+live reference. **Duplicate** an asset to make one diverge (there's no detach —
+divergence is always duplicate + repoint). Archived assets are hidden from pickers
+but keep existing references valid; deleting an asset drops referencing nodes back
+to their own private copy. Assets live in the project file and participate in
+undo/redo. See [REFERENCE.md](REFERENCE.md#asset-library-project-stores) for the
+full breakdown.
 
 ### Supported plugin and instrument formats
 

@@ -484,6 +484,11 @@ MainContentComponent::MainContentComponent() {
                 n->pluginStateDirty = true;
         };
 
+    // Crash detection (must run before tryRecoverAutosave is scheduled and
+    // before the autosave worker can touch the dir): note whether a session
+    // lock survived from a previous run, then drop a fresh lock for this run.
+    setupSessionLock();
+
     // Background worker for slow autosave (#86). Runs the disk write
     // off the UI thread so larger projects don't hiccup during the save.
     startAutosaveWorker();
@@ -3812,6 +3817,15 @@ static juce::File getAutosaveMetaFile() {
 static juce::File getUndoTreeFile() {
     return getAutosaveDir().getChildFile("undo-tree.dat");
 }
+// Session-lock sentinel. Created on startup, deleted on clean shutdown. Its
+// presence at the next startup means the previous run never reached a clean
+// shutdown (crash, force-kill, power loss, or a quit sequence that didn't
+// finish). This is the crash signal - decoupled from autosave.ssp, which a
+// normal idle session also writes and which a clean exit only *usually*
+// manages to sweep before the process dies.
+static juce::File getSessionLockFile() {
+    return getAutosaveDir().getChildFile("session.lock");
+}
 static juce::File getPluginStateFile(int nodeId) {
     return getAutosaveDir().getChildFile("autosave-plugin-" + juce::String(nodeId) + ".dat");
 }
@@ -4040,6 +4054,23 @@ void MainContentComponent::quiesceAutosaveWorker() {
     autosaveWorkerIdleCv.wait(lk, [this]() {       // wait out any in-flight write
         return !autosaveWorkerBusy;
     });
+}
+
+void MainContentComponent::setupSessionLock() {
+    auto dir = getAutosaveDir();
+    if (!dir.exists()) dir.createDirectory();
+    auto lock = getSessionLockFile();
+    // If the lock is already here, the previous run never reached a clean
+    // shutdown - that's our crash signal, independent of whether autosave.ssp
+    // happens to exist. (For an --ephemeral run the whole dir was just wiped,
+    // so the lock is absent and this run is correctly treated as clean.)
+    startupWasUncleanShutdown = lock.existsAsFile();
+    lock.replaceWithText(juce::Time::getCurrentTime().toISO8601(true));
+}
+
+void MainContentComponent::markCleanShutdown() {
+    auto lock = getSessionLockFile();
+    if (lock.existsAsFile()) lock.deleteFile();
 }
 
 void MainContentComponent::discardAutosave() {
@@ -4479,9 +4510,22 @@ void MainContentComponent::tryRecoverAutosave() {
     autosaveRecoveryOffered = true;
 
     auto autoFile = getAutosaveFile();
+
+    // The previous run exited cleanly (its session lock was removed). Any
+    // autosave still on disk is therefore stale - a clean exit normally sweeps
+    // it, but a leftover (e.g. the autosave worker re-wrote autosave.ssp in the
+    // last few milliseconds before the process exited, after discardAutosave
+    // already ran) must NOT trigger a false "didn't shut down cleanly" prompt.
+    // Sweep any straggler silently and just restore the persisted undo tree.
+    if (!startupWasUncleanShutdown) {
+        if (autoFile.existsAsFile()) discardAutosave();
+        tryRestoreUndoTree();
+        return;
+    }
+
     if (!autoFile.existsAsFile()) {
-        // No autosave to consider - but we still want to restore the
-        // persisted undo tree if one exists from a clean prior session.
+        // Unclean shutdown, but nothing was autosaved (e.g. crashed before the
+        // first autosave tick). Still restore the persisted undo tree if any.
         tryRestoreUndoTree();
         return;
     }
@@ -5588,8 +5632,16 @@ bool MainContentComponent::handleKeyboardMidi(const juce::KeyPress& key, bool is
 
 void MainWindow::tryQuit() {
     auto* content = dynamic_cast<MainContentComponent*>(getContentComponent());
-    if (content && content->tryQuit())
+    if (content && content->tryQuit()) {
+        // We're definitely quitting cleanly now: drop the session lock so the
+        // next launch knows this shutdown was clean and won't offer to recover
+        // a stale autosave. This is the single chokepoint every clean quit
+        // funnels through (window close button, File -> Quit, OS quit request,
+        // and the deferred re-quit after an async Save). A crash or force-kill
+        // never reaches here, so the lock survives and recovery is offered.
+        content->markCleanShutdown();
         juce::JUCEApplication::getInstance()->quit();
+    }
 }
 
 // ==============================================================================

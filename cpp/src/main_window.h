@@ -227,9 +227,23 @@ private:
     double lastAutosaveAttemptMs = 0.0;
     bool autosaveRecoveryOffered = false; // gate so we only prompt once
     bool autosaveLaptopNoticeShown = false; // first-launch laptop notice gate
+    // Crash detection: true if a session-lock sentinel was already present at
+    // startup, meaning the previous run never reached a clean shutdown. This is
+    // what decides whether to offer autosave recovery - NOT the mere presence of
+    // autosave.ssp (a normal idle session writes that file too). Captured in the
+    // constructor before we (re)create our own lock.
+    bool startupWasUncleanShutdown = false;
     void performAutosave();
     void discardAutosave();
     void tryRecoverAutosave(); // called after window is visible on startup
+    // Capture whether a session lock was left over from a previous run (-> set
+    // startupWasUncleanShutdown), then (re)create our own lock for this run.
+    // Called once from the constructor.
+    void setupSessionLock();
+    // Delete the session-lock sentinel to record that this run exited cleanly,
+    // so the next launch won't offer to recover a now-stale autosave. Called
+    // from MainWindow::tryQuit at the single clean-quit chokepoint.
+    void markCleanShutdown();
 
     // Slow autosave background worker (#86). Owns a single-slot mailbox
     // that the UI thread fills with the next save's content; the worker

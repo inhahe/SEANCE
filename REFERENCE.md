@@ -2533,22 +2533,42 @@ session-state file is redirected away from the user's real app-data folder
 (`%APPDATA%/SoundShop`) into an isolated throwaway directory
 (`<temp>/SEANCE-ephemeral`), which is **wiped at the start of each ephemeral
 launch**. The redirected set is the whole autosave family — `autosave.ssp`, its
-`autosave.meta.xml` sidecar, the `undo-tree.dat` persistence, and the
-per-plugin `autosave-plugin-*.dat` blobs (everything under `getAutosaveDir()`).
+`autosave.meta.xml` sidecar, the `undo-tree.dat` persistence, the per-plugin
+`autosave-plugin-*.dat` blobs, and the `session.lock` crash sentinel (everything
+under `getAutosaveDir()`).
 
-**Why it exists.** SEANCE detects an unclean shutdown by finding a leftover
-`autosave.ssp` at startup and shows the *"didn't shut down cleanly — recover?"*
-prompt. Automated / test launches (e.g. opening the app to verify a feature,
-then killing the process) would otherwise leave that file behind and make the
-**next normal launch falsely report a crash**, making a real crash
-indistinguishable from a killed test run. With `--ephemeral`, a killed test run
-only ever leaves an autosave inside the throwaway temp dir, so:
+**How crash detection works (the `session.lock` sentinel).** SEANCE does **not**
+treat the mere presence of `autosave.ssp` as a crash — a normal idle session
+also writes that file periodically (the slow autosave does a full save whenever
+`autosave.ssp` is missing or the refresh interval elapses), so basing crash
+detection on it produced **false "didn't shut down cleanly" prompts on every
+launch** whenever any abnormal exit (force-kill, a crash during shutdown, power
+loss, or even the autosave worker re-writing the file in the last milliseconds
+before exit) left the file behind. Instead, the constructor drops a
+`session.lock` file (`setupSessionLock()`) and remembers whether one was
+**already** there from a previous run (`startupWasUncleanShutdown`). A clean quit
+deletes the lock (`markCleanShutdown()`, called from the single clean-quit
+chokepoint `MainWindow::tryQuit` after `tryQuit()` returns true). So at startup:
+
+- **Lock present** → the previous run never reached a clean shutdown → if an
+  `autosave.ssp` exists, `tryRecoverAutosave()` shows the *"didn't shut down
+  cleanly — recover?"* prompt. **This is the only thing that fires the prompt.**
+- **Lock absent** → the previous run exited cleanly → any leftover `autosave.ssp`
+  is stale and is **swept silently** (no prompt), and the persisted undo tree is
+  restored as usual.
+
+**Why `--ephemeral` exists.** Automated / test launches (e.g. opening the app to
+verify a feature, then killing the process) leave a `session.lock` behind — which
+would make the **next normal launch correctly but unhelpfully report a crash** for
+what was really just a killed test run. With `--ephemeral`, the lock (and any
+autosave) only ever lands inside the throwaway temp dir, which is wiped on entry,
+so:
 
 - A genuine crash in a normal (non-ephemeral) launch still leaves the real
-  `autosave.ssp` → the recovery prompt fires and **means something went wrong**.
+  `session.lock` → the recovery prompt fires and **means something went wrong**.
 - A killed `--ephemeral` launch leaves nothing in the real dir → no spurious
-  prompt, and (because the temp dir is wiped on entry) no recovery prompt within
-  ephemeral runs either.
+  prompt, and (because the temp dir is wiped on entry, erasing any lock) no
+  recovery prompt within ephemeral runs either.
 
 The window title is suffixed with **`[ephemeral session]`** so the mode is
 obvious at a glance and the absence of a recovery prompt is explained. The flag

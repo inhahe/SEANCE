@@ -46,6 +46,19 @@ public:
         // always-firing onChanged re-bakes them in the new order. onChanged
         // fires after this on every reorder.
         std::function<void(int, int)> onReorder;
+
+        // Optional. The unified warp/morph model: each op's amount param can opt
+        // into an on-demand modulation pin (#88) so an LFO/oscillator can drive
+        // the morph live. The per-row "Mod" checkbox reflects/toggles that pin.
+        // `isModulated(opIndex)` returns whether op `opIndex` currently has a
+        // modulation pin; `setModulated(opIndex, on)` adds/removes it. Hosts that
+        // back the chain with node params (the frame-scope warp editor) implement
+        // both, mapping op i -> its "Warp N" param -> add/removeParamModPin. Baked
+        // chains (per-layer / spectral / wavelet / granular) leave these unset and
+        // the "Mod" checkbox is hidden for those rows. Toggling fires onChanged
+        // after setModulated so the host can re-commit.
+        std::function<bool(int)>      isModulated;
+        std::function<void(int,bool)> setModulated;
     };
 
     explicit WarpChainEditor(Callbacks cb);
@@ -124,6 +137,7 @@ private:
         std::unique_ptr<juce::ToggleButton> enable;  // op on/off
         std::unique_ptr<juce::TextButton>   method;   // name + badge, opens picker
         std::unique_ptr<juce::Slider>       amount;   // 0..1 morph amount
+        std::unique_ptr<juce::ToggleButton> mod;      // opt into a modulation pin
         std::unique_ptr<juce::TextButton>   up;       // move this stage earlier
         std::unique_ptr<juce::TextButton>   down;     // move this stage later
         std::unique_ptr<juce::TextButton>   del;      // remove this op

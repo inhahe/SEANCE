@@ -2810,22 +2810,10 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
 // dangles across the async menu callback even if the pin/param vectors moved.
 // ----------------------------------------------------------------------------
 void NodeGraphComponent::addControlInput(int nodeId, int paramIdx, bool absolute) {
-    auto* nd = graph.findNode(nodeId);
-    if (!nd || paramIdx < 0 || paramIdx >= (int)nd->params.size()) return;
-    // Consumed block-rate (applySignalModulations reads sample 0), so the pin
-    // is a Param (block-rate, orange) - NOT a Signal. The receiver decides the
-    // rate; Param/Signal cables are interchangeable.
-    std::string pinName = (absolute ? "Set: " : "Mod: ") + nd->params[paramIdx].name;
-    int newPinId = graph.allocId();
-    nd->pinsIn.push_back({newPinId, pinName, PinKind::Param, true, 1});
-    Node::ModPin mp;
-    mp.paramIndex = paramIdx;
-    mp.pinId      = newPinId;
-    mp.depth      = 1.0f;
-    mp.mode       = absolute ? Node::ModPin::Mode::Absolute
-                             : Node::ModPin::Mode::Modulate;
-    nd->modPins.push_back(mp);
-    graph.dirty = true;
+    // Pure data-model mutation lives in the shared graph helper (#88) so the
+    // node right-click menu and the warp/morph editor's per-param "modulate"
+    // checkbox behave identically. This surface owns the commit + rebuild.
+    if (addParamModPin(graph, nodeId, paramIdx, absolute) < 0) return;
     graph.commitSnapshot(absolute ? "Add absolute input" : "Add modulation input");
     // Topology changed: the node gained an input pin (and needs a wider input
     // bus to carry the new control channel). Force a rebuild now - the
@@ -2837,28 +2825,9 @@ void NodeGraphComponent::addControlInput(int nodeId, int paramIdx, bool absolute
 }
 
 void NodeGraphComponent::removeControlInput(int nodeId, int paramIdx) {
-    auto* nd = graph.findNode(nodeId);
-    if (!nd) return;
-    for (auto it = nd->modPins.begin(); it != nd->modPins.end(); ++it) {
-        if (it->paramIndex != paramIdx) continue;
-        int pinId = it->pinId;
-        nd->pinsIn.erase(
-            std::remove_if(nd->pinsIn.begin(), nd->pinsIn.end(),
-                [pinId](const Pin& p) { return p.id == pinId; }),
-            nd->pinsIn.end());
-        graph.links.erase(
-            std::remove_if(graph.links.begin(), graph.links.end(),
-                [pinId](const auto& lk) { return lk.endPin == pinId; }),
-            graph.links.end());
-        nd->modPins.erase(it);
-        break;
-    }
-    // Clear modulation state on the param so it returns to its resting value.
-    if (paramIdx >= 0 && paramIdx < (int)nd->params.size()) {
-        auto& p = nd->params[paramIdx];
-        if (p.modulated) { p.value = p.baseValue; p.modulated = false; }
-    }
-    graph.dirty = true;
+    // Shared graph helper does the data-model removal (#88); this surface owns
+    // the commit + rebuild. No-op (no commit) if there was no pin to remove.
+    if (!removeParamModPin(graph, nodeId, paramIdx)) return;
     graph.commitSnapshot("Remove control input");
     if (onNodeEdited) onNodeEdited();
     repaint();

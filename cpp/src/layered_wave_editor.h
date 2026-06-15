@@ -1338,6 +1338,11 @@ private:
     // getParamByName("Warp k+1") read now resolves each op to its original
     // (possibly modulated) param. No-op if either name is absent.
     void swapWarpParamNames(int a, int b);
+    // Map frame-scope warp op `opIndex` to the index of its "Warp opIndex+1" node
+    // param (the unified warp/morph model: the op's amount is a node param that
+    // can opt into a modulation pin). Returns -1 if the param isn't present yet.
+    // Used by the warp editor's per-row "Mod" checkbox callbacks.
+    int warpParamIndexForOp(int opIndex) const;
     // Re-sync Position params/pins only when the effective dimension count has
     // actually changed since the params were last built. Cheap to call on every
     // structural mutation (grid axis resize, scatter frame add/remove, cell

@@ -355,4 +355,73 @@ void NodeGraph::setupDefaultGraph() {
     dirty = false; // don't count initial setup as a change
 }
 
+// ---------------------------------------------------------------------------
+// On-demand modulation pins (#88) - graph-level helpers. Pure data-model: they
+// mutate `graph` and leave commit/undo/rebuild to the caller. NodeGraphComponent
+// wraps these with commitSnapshot()+onNodeEdited()+repaint(); the warp/morph
+// editor folds them into its settled-edit commit. Addressing is by stable
+// (nodeId, paramIndex) so nothing dangles across an async menu/checkbox callback.
+// ---------------------------------------------------------------------------
+
+bool hasParamModPin(const NodeGraph& graph, int nodeId, int paramIndex) {
+    // findNode has no const overload; we only read, so iterate the const vector.
+    for (const Node& nd : graph.nodes) {
+        if (nd.id != nodeId) continue;
+        for (const auto& mp : nd.modPins)
+            if (mp.paramIndex == paramIndex) return true;
+        return false;
+    }
+    return false;
+}
+
+int addParamModPin(NodeGraph& graph, int nodeId, int paramIndex, bool absolute) {
+    Node* nd = graph.findNode(nodeId);
+    if (!nd || paramIndex < 0 || paramIndex >= (int)nd->params.size()) return -1;
+    // Idempotent: if a pin already exists for this param, return it unchanged.
+    for (const auto& mp : nd->modPins)
+        if (mp.paramIndex == paramIndex) return mp.pinId;
+    // Consumed block-rate (applySignalModulations reads sample 0), so the pin is
+    // a Param (block-rate, orange) - NOT a Signal. The receiver decides the rate.
+    std::string pinName = (absolute ? "Set: " : "Mod: ") + nd->params[paramIndex].name;
+    int newPinId = graph.allocId();
+    nd->pinsIn.push_back({newPinId, pinName, PinKind::Param, true, 1});
+    Node::ModPin mp;
+    mp.paramIndex = paramIndex;
+    mp.pinId      = newPinId;
+    mp.depth      = 1.0f;
+    mp.mode       = absolute ? Node::ModPin::Mode::Absolute
+                             : Node::ModPin::Mode::Modulate;
+    nd->modPins.push_back(mp);
+    graph.dirty = true;
+    return newPinId;
+}
+
+bool removeParamModPin(NodeGraph& graph, int nodeId, int paramIndex) {
+    Node* nd = graph.findNode(nodeId);
+    if (!nd) return false;
+    bool removed = false;
+    for (auto it = nd->modPins.begin(); it != nd->modPins.end(); ++it) {
+        if (it->paramIndex != paramIndex) continue;
+        int pinId = it->pinId;
+        nd->pinsIn.erase(
+            std::remove_if(nd->pinsIn.begin(), nd->pinsIn.end(),
+                [pinId](const Pin& p) { return p.id == pinId; }),
+            nd->pinsIn.end());
+        graph.links.erase(
+            std::remove_if(graph.links.begin(), graph.links.end(),
+                [pinId](const auto& lk) { return lk.endPin == pinId; }),
+            graph.links.end());
+        nd->modPins.erase(it);
+        removed = true;
+        break;
+    }
+    // Clear modulation state on the param so it returns to its resting value.
+    if (removed && paramIndex >= 0 && paramIndex < (int)nd->params.size()) {
+        auto& p = nd->params[paramIndex];
+        if (p.modulated) { p.value = p.baseValue; p.modulated = false; }
+    }
+    if (removed) graph.dirty = true;
+    return removed;
+}
+
 } // namespace SoundShop

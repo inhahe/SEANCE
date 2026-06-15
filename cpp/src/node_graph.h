@@ -1010,4 +1010,30 @@ int resolveWaveformReferences(NodeGraph& graph);
 // lives in layered_wave_editor.cpp). Returns the number of references resolved.
 int resolveWarpReferences(NodeGraph& graph);
 
+// ---------------------------------------------------------------------------
+// On-demand modulation pins (#88) - graph-level helpers.
+//
+// These are the pure data-model operations behind the node-graph right-click
+// "Add/Remove modulation input" menu AND the warp/morph editor's per-param
+// "modulate" checkbox (the unified warp/morph model: any shaping param can opt
+// into a modulation pin). They mutate the graph ONLY - no snapshot, no repaint,
+// no rebuild callback - so every caller drives its own commit/undo/rebuild flow
+// (NodeGraphComponent does its commitSnapshot()+onNodeEdited(); the layered-wave
+// editor folds the change into its settled-edit commit). Addressing is by stable
+// (nodeId, paramIndex) so nothing dangles across the call.
+// ---------------------------------------------------------------------------
+
+// True iff node `nodeId` has a ModPin bound to param `paramIndex`.
+bool hasParamModPin(const NodeGraph& graph, int nodeId, int paramIndex);
+
+// Add a modulation pin for (nodeId, paramIndex) if one doesn't already exist.
+// `absolute` chooses Set (true) vs Modulate (false) mode. Returns the new (or
+// existing) pin id, or -1 if the node/param is invalid. Does NOT commit/rebuild.
+int addParamModPin(NodeGraph& graph, int nodeId, int paramIndex, bool absolute);
+
+// Remove the modulation pin bound to (nodeId, paramIndex) - dropping its input
+// pin and any cables into it, and clearing the param's modulated state so it
+// returns to its resting value. Returns true if a pin was removed. No commit.
+bool removeParamModPin(NodeGraph& graph, int nodeId, int paramIndex);
+
 } // namespace SoundShop

@@ -8333,6 +8333,22 @@ LayeredWaveEditorComponent::LayeredWaveEditorComponent(NodeGraph& g, int nid, st
         // always-firing onChanged then mirrors the (now reordered) amounts and
         // commits via onLayerChanged.
         wcb.onReorder = [this](int a, int b) { swapWarpParamNames(a, b); };
+        // Unified warp/morph: the per-row "Mod" checkbox opts an op's amount into
+        // an on-demand modulation pin (#88). Map op i -> its "Warp i+1" param ->
+        // add/remove the pin via the shared graph helpers. syncWarpParams has
+        // already created the "Warp N" param by the time a row exists, so the
+        // lookup is stable. The host owns the commit (onChanged -> onLayerChanged
+        // fires right after setModulated).
+        wcb.isModulated = [this](int opIndex) -> bool {
+            int pi = warpParamIndexForOp(opIndex);
+            return pi >= 0 && hasParamModPin(graph, nodeId, pi);
+        };
+        wcb.setModulated = [this](int opIndex, bool on) {
+            int pi = warpParamIndexForOp(opIndex);
+            if (pi < 0) return;
+            if (on) addParamModPin(graph, nodeId, pi, /*absolute=*/false);
+            else    removeParamModPin(graph, nodeId, pi);
+        };
         frameWarpEditor = std::make_unique<WarpChainEditor>(std::move(wcb));
         frameWarpEditor->setChain(&wave.warpChain);
         // Frame-scope warp is the one warp site wired to the project
@@ -9409,6 +9425,15 @@ void LayeredWaveEditorComponent::swapWarpParamNames(int a, int b) {
     // Both must exist for the swap to be meaningful; if a slot never got a
     // param (shouldn't happen post-syncWarpParams) leave things untouched.
     if (pa && pb) std::swap(pa->name, pb->name);
+}
+
+int LayeredWaveEditorComponent::warpParamIndexForOp(int opIndex) const {
+    auto* nd = graph.findNode(nodeId);
+    if (!nd) return -1;
+    const std::string name = "Warp " + std::to_string(opIndex + 1);
+    for (int i = 0; i < (int)nd->params.size(); ++i)
+        if (nd->params[i].name == name) return i;
+    return -1;
 }
 
 void LayeredWaveEditorComponent::syncWarpParams() {

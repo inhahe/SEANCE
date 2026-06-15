@@ -223,8 +223,23 @@ void WarpChainEditor::refreshRowVisuals(int idx) {
     if (const auto* info = warpMethodInfo(op.method))
         row.method->setTooltip(info->tooltip);
     row.enable->setToggleState(op.enabled, juce::dontSendNotification);
-    // Disabled op = greyed amount slider so the bypass is visible.
-    row.amount->setEnabled(op.enabled);
+    // Reflect whether this op's amount is being driven by a modulation pin. When
+    // modulated, the manual amount slider is signal-locked (greyed) so the user
+    // knows the cable is in control - matching the node-graph "Mod:" pin behaviour.
+    bool modulated = false;
+    if (row.mod && cb.isModulated) {
+        modulated = cb.isModulated(idx);
+        row.mod->setToggleState(modulated, juce::dontSendNotification);
+    }
+    // Disabled op = greyed amount slider so the bypass is visible. A modulated
+    // amount is also greyed (driven by the incoming cable, not the slider).
+    row.amount->setEnabled(op.enabled && !modulated);
+    if (row.amount)
+        row.amount->setTooltip(modulated
+            ? "Signal-locked - this stage's amount is driven by an incoming "
+              "modulation cable. Uncheck Mod to edit it by hand."
+            : "Morph amount (0 = no effect, 1 = full). Check Mod to drive this "
+              "with an LFO / oscillator instead.");
 }
 
 void WarpChainEditor::rebuild() {
@@ -262,6 +277,24 @@ void WarpChainEditor::rebuild() {
                 if (cb.onChanged) cb.onChanged();
             };
             addAndMakeVisible(*row.amount);
+
+            // "Mod" checkbox - opt this op's amount into a live modulation pin
+            // (#88), the unified warp/morph model. Only meaningful when the host
+            // backs the chain with node params (frame-scope editor implements the
+            // callbacks); hidden on baked chains that leave the callbacks unset.
+            row.mod = std::make_unique<juce::ToggleButton>("Mod");
+            row.mod->setTooltip("Add a modulation input pin for this stage's "
+                                "amount, so an LFO / oscillator cable can drive "
+                                "the morph live. Uncheck to remove the pin and "
+                                "edit the amount by hand.");
+            row.mod->setVisible((bool)cb.isModulated && (bool)cb.setModulated);
+            row.mod->onClick = [this, i] {
+                if (!cb.setModulated || i >= (int)rows.size()) return;
+                cb.setModulated(i, rows[i].mod->getToggleState());
+                refreshRowVisuals(i);
+                if (cb.onChanged) cb.onChanged();
+            };
+            addAndMakeVisible(*row.mod);
 
             // Reorder arrows. Shape-bending stages are applied in list order, so
             // the order is part of the sound (fold-then-clip != clip-then-fold).
@@ -373,6 +406,12 @@ void WarpChainEditor::resized() {
         rows[i].down->setBounds(r.removeFromRight(20));
         rows[i].up->setBounds(r.removeFromRight(20));
         r.removeFromRight(4);
+        // "Mod" checkbox sits between the arrows and the amount slider. Only
+        // takes layout space when the host wired up the modulation callbacks.
+        if (rows[i].mod && rows[i].mod->isVisible()) {
+            rows[i].mod->setBounds(r.removeFromRight(52));
+            r.removeFromRight(4);
+        }
         rows[i].amount->setBounds(r.removeFromRight(150));
         r.removeFromRight(4);
         rows[i].method->setBounds(r);

@@ -195,6 +195,12 @@ public:
         // re-lays-out its row stack so the rows below shift to follow. Null
         // when per-layer warp is disabled.
         std::function<void()> onHeightChanged;
+        // Optional. Fired when the user picks "From Library..." in the wave-
+        // source picker. The owner opens the waveform library browser and, on
+        // a pick, loads the chosen single cycle into THIS layer (the owner
+        // re-fetches the layer by its stable index and calls refreshFromModel).
+        // If null, the "From Library..." menu entry is omitted.
+        std::function<void()> onPickFromLibrary;
     };
 
     // enableWarp embeds a per-layer warp chain editor (baked shape-bending on
@@ -226,13 +232,13 @@ public:
     void mouseUp(const juce::MouseEvent&) override;
 
     static constexpr int previewHeight = 92;
-    // Base row height: label + two shape-button rows (7 classic + 4 generator
-    // morph) + sub-row + 3 base slider rows + 2 generator-morph slider rows +
-    // padding + preview. This is the height of a row WITHOUT a per-layer warp
-    // editor; preferredHeight() adds the warp strip on top when present. The two
-    // morph rows are reserved always (hidden for classic shapes) so the row
-    // height stays constant when switching shapes.
-    static int rowHeight() { return 22 + 24 + 24 + 24 + 20 * 3 + 20 * 2 + 12 + previewHeight + 4; }
+    // Base row height: label + one wave-source picker row + sub-row + 3 base
+    // slider rows + 2 generator-morph slider rows + padding + preview. This is
+    // the height of a row WITHOUT a per-layer warp editor; preferredHeight()
+    // adds the warp strip on top when present. The two morph rows are reserved
+    // always (hidden for classic shapes) so the row height stays constant when
+    // switching shapes.
+    static int rowHeight() { return 22 + 24 + 24 + 20 * 3 + 20 * 2 + 12 + previewHeight + 4; }
 
     // Actual height this row wants: rowHeight() plus the embedded per-layer
     // warp editor's current height (which tracks its op count) when warp is
@@ -240,20 +246,22 @@ public:
     int preferredHeight() const;
 
 private:
-    void updateShapeButtons();
+    void updateSourceControls();
     juce::Rectangle<float> getPreviewAreaBounds() const;
     bool mouseToPointXY(juce::Point<float> p, float& outX, float& outY) const;
     int findPointNear(float x, float y, float radius = 0.05f) const;
     void sortPointsByX();
     void writeFreehandSample(float x, float y);
-    void showPresetMenu();
+    void showWaveSourceMenu();
 
     WaveLayer* layer = nullptr;
     Callbacks callbacks;
 
     juce::Label label;
-    juce::TextButton sineBtn, sawBtn, squareBtn, triangleBtn, noiseBtn, drawnBtn, formulaBtn;
-    juce::TextButton pulseBtn, syncBtn, fmBtn, phaseDistBtn;  // Bucket B generator morphs
+    // One unified wave-source picker replaces the old 11 shape buttons + the
+    // separate Preset button. Opens a single menu: static shapes -> Draw ->
+    // Formula -> wave-defining (Type-1) morphs -> Presets -> From Library.
+    juce::TextButton waveSourceBtn;
     juce::TextButton freehandToggle;
     juce::TextEditor formulaEditor;
     juce::ComboBox   formulaLangCombo;   // Built-in / Lua / Python (Formula only)
@@ -264,7 +272,6 @@ private:
     // morph2Slider drives shapeParam2 (FM modulator:carrier ratio only).
     juce::Slider morphSlider, morph2Slider;
     juce::Label  morphLabel, morph2Label;
-    juce::TextButton presetBtn;
     juce::TextButton deleteBtn;
     std::vector<float> previewSamples;
     int draggingIdx = -1;
@@ -380,6 +387,12 @@ public:
         // (baked shape-bending on that layer's cycle). The wavetable layer
         // stack turns this ON; the LFO / Signal-Shape editor leaves it OFF.
         bool enablePerLayerWarp = false;
+        // Optional. When set, each layer row's wave-source picker offers a
+        // "From Library..." entry. The arg is the row's (stable) layer index;
+        // the owner opens the waveform browser and, on a pick, loads the
+        // chosen single cycle into target->layers[index] then calls
+        // refreshFromModel(). Null = no library entry on the picker.
+        std::function<void(int layerIndex)> onPickFromLibrary;
     };
 
     LayerStackComponent(Options opts, std::function<void()> onChanged);
@@ -1024,6 +1037,12 @@ private:
     // Anchor centres the dialog.
     void showWaveformLibraryBrowser(juce::Component* anchor,
                                     bool replaceCurrentFrame);
+
+    // Per-layer "From Library..." loader: opens the waveform browser and, on a
+    // pick, loads the chosen single cycle into layer `layerIndex` of the frame
+    // currently bound to the layer stack (preserving that layer's ratio/phase/
+    // amp). Wired into LayerStackComponent::Options::onPickFromLibrary.
+    void showWaveformLibraryBrowserForLayer(int layerIndex);
 
     // Build a one-layer LayeredWaveform whose single Drawn/Freehand layer holds
     // `cycle` (expected 512 samples in [-1,1], one cycle). This is the import

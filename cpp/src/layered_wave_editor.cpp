@@ -2540,6 +2540,17 @@ void LayerStackComponent::rebuildRows() {
             // A per-layer warp op add/remove changes this row's height; re-flow
             // the whole stack so the rows below shift to follow.
             cb.onHeightChanged = [this]() { layoutRows(); };
+            // "From Library..." in the wave-source picker: forward the stable
+            // row index to the owner, who opens the browser and loads the
+            // chosen cycle into target->layers[i]. Only wired when the owner
+            // supplied a loader (it needs browser + asset access this component
+            // doesn't have).
+            if (opts.onPickFromLibrary)
+                cb.onPickFromLibrary = [this, i]() {
+                    if (!target) return;
+                    if (i < 0 || i >= (int)target->layers.size()) return;
+                    opts.onPickFromLibrary(i);
+                };
             auto row = std::make_unique<WaveLayerEditor>(
                 &target->layers[i], std::move(cb), opts.enablePerLayerWarp);
             const int rh = row->preferredHeight();
@@ -4282,49 +4293,18 @@ WaveLayerEditor::WaveLayerEditor(WaveLayer* layerPtr, Callbacks cb, bool enableW
     label.setJustificationType(juce::Justification::centredLeft);
     label.setFont(13.0f);
 
-    auto addShapeBtn = [this](juce::TextButton& b, const char* name, WaveLayer::Shape s) {
-        addAndMakeVisible(b);
-        b.setButtonText(name);
-        b.setClickingTogglesState(true);
-        b.setRadioGroupId(0); // we'll handle toggling manually
-        b.onClick = [this, s]() {
-            if (!layer) return;
-            // Changing to a non-Drawn shape abandons the drawn cycle, so a
-            // factory-waveform reference forks (becomes a plain generator layer).
-            if (s != WaveLayer::Drawn)
-                layer->factoryRef.clear();
-            layer->shape = s;
-            // Seed a fresh Drawn layer with a few points so the user has
-            // something grabable instead of an empty canvas.
-            if (s == WaveLayer::Drawn && layer->drawnPoints.empty())
-                layer->drawnPoints = defaultDrawnPoints();
-            updateShapeButtons();
-            refreshPreview();
-            if (callbacks.onChanged) callbacks.onChanged();
-        };
-    };
-    addShapeBtn(sineBtn,     "Sine",     WaveLayer::Sine);
-    addShapeBtn(sawBtn,      "Saw",      WaveLayer::Saw);
-    addShapeBtn(squareBtn,   "Square",   WaveLayer::Square);
-    addShapeBtn(triangleBtn, "Triangle", WaveLayer::Triangle);
-    addShapeBtn(noiseBtn,    "Noise",    WaveLayer::Noise);
-    addShapeBtn(drawnBtn,    "Draw",     WaveLayer::Drawn);
-    addShapeBtn(formulaBtn,  "Formula",  WaveLayer::Formula);
-    addShapeBtn(pulseBtn,    "Pulse",    WaveLayer::Pulse);
-    addShapeBtn(syncBtn,     "Sync",     WaveLayer::Sync);
-    addShapeBtn(fmBtn,       "FM",       WaveLayer::FM);
-    addShapeBtn(phaseDistBtn,"PD",       WaveLayer::PhaseDist);
-    pulseBtn.setTooltip("Variable-width pulse oscillator. The Duty slider sweeps "
-                        "the pulse width (0.5 = square, narrower = thinner/brighter).");
-    syncBtn.setTooltip("Hard-sync oscillator. The Amount slider drives the classic "
-                       "sync sweep: a faster slave oscillator is reset every master "
-                       "cycle, growing a moving formant.");
-    fmBtn.setTooltip("2-operator FM (phase modulation). Index sets modulation depth; "
-                     "Ratio sets the modulator:carrier frequency ratio (1-8, integer "
-                     "so one cycle stays periodic).");
-    phaseDistBtn.setTooltip("Casio-CZ phase distortion. The Amount slider skews the "
-                            "phase readout of a cosine, growing a resonant formant "
-                            "(0 = pure sine).");
+    // Unified wave-source picker. One button opens a single menu offering every
+    // way to define this layer's cycle: static shapes, Draw, Formula, the
+    // wave-defining (Type-1) generator morphs, factory Presets, and (when the
+    // owner wires it) "From Library...". The button text shows the current
+    // source. Replaces the old grid of 11 shape buttons + the Preset button.
+    addAndMakeVisible(waveSourceBtn);
+    waveSourceBtn.setButtonText("Sine");
+    waveSourceBtn.setTooltip("Wave source for this layer: the static shape, Formula, "
+                             "or wave-defining morph (PWM / Hard Sync / FM / Phase "
+                             "Distortion) that generates the layer's cycle. A layer has "
+                             "exactly one wave source - picking one replaces the previous.");
+    waveSourceBtn.onClick = [this]() { showWaveSourceMenu(); };
 
     addAndMakeVisible(freehandToggle);
     freehandToggle.setButtonText("Points");
@@ -4444,7 +4424,7 @@ WaveLayerEditor::WaveLayerEditor(WaveLayer* layerPtr, Callbacks cb, bool enableW
 
     // Generator-morph parameter sliders. Both are normalised 0..1 (the per-shape
     // mapping happens in evalGeneratorMorph); the label text is updated per shape
-    // in updateShapeButtons(). Hidden for the classic shapes.
+    // in updateSourceControls(). Hidden for the classic shapes.
     auto setupMorphSlider = [this](juce::Slider& sl, bool isSecond) {
         addChildComponent(sl);
         sl.setSliderStyle(juce::Slider::LinearHorizontal);
@@ -4466,12 +4446,6 @@ WaveLayerEditor::WaveLayerEditor(WaveLayer* layerPtr, Callbacks cb, bool enableW
     morph2Label.setFont(11.0f);
     morphLabel .setJustificationType(juce::Justification::centredLeft);
     morph2Label.setJustificationType(juce::Justification::centredLeft);
-
-    addAndMakeVisible(presetBtn);
-    presetBtn.setButtonText("Preset");
-    presetBtn.setTooltip("Pick a starting waveform. Replaces the layer's shape with a preset; "
-                         "you can edit it further from there.");
-    presetBtn.onClick = [this]() { showPresetMenu(); };
 
     addAndMakeVisible(deleteBtn);
     deleteBtn.setButtonText("X");
@@ -4530,7 +4504,7 @@ void WaveLayerEditor::syncFromModel() {
     ratioSlider.setValue(l.ratio, juce::dontSendNotification);
     phaseSlider.setValue(l.phase, juce::dontSendNotification);
     ampSlider  .setValue(l.amp,   juce::dontSendNotification);
-    updateShapeButtons();
+    updateSourceControls();
     freehandToggle.setVisible(l.shape == WaveLayer::Drawn);
     freehandToggle.setButtonText(l.freehandMode ? "Freehand" : "Points");
     formulaEditor.setVisible(l.shape == WaveLayer::Formula);
@@ -4556,20 +4530,31 @@ void WaveLayerEditor::refreshPreview() {
     repaint();
 }
 
-void WaveLayerEditor::updateShapeButtons() {
+// Display label for the current wave source, shown on the picker button.
+static juce::String waveSourceLabel(const WaveLayer& l) {
+    switch (l.shape) {
+        case WaveLayer::Sine:      return "Sine";
+        case WaveLayer::Saw:       return "Saw";
+        case WaveLayer::Square:    return "Square";
+        case WaveLayer::Triangle:  return "Triangle";
+        case WaveLayer::Noise:     return "Noise";
+        case WaveLayer::Drawn:
+            return l.factoryRef.empty()
+                ? juce::String("Drawn")
+                : "Lib: " + juce::String(l.factoryRef);
+        case WaveLayer::Formula:   return "Formula";
+        case WaveLayer::Pulse:     return "Pulse (PWM)";
+        case WaveLayer::Sync:      return "Hard Sync";
+        case WaveLayer::FM:        return "FM";
+        case WaveLayer::PhaseDist: return "Phase Distortion";
+    }
+    return "Sine";
+}
+
+void WaveLayerEditor::updateSourceControls() {
     if (!layer) return;
     auto& l = *layer;
-    sineBtn    .setToggleState(l.shape == WaveLayer::Sine,     juce::dontSendNotification);
-    sawBtn     .setToggleState(l.shape == WaveLayer::Saw,      juce::dontSendNotification);
-    squareBtn  .setToggleState(l.shape == WaveLayer::Square,   juce::dontSendNotification);
-    triangleBtn.setToggleState(l.shape == WaveLayer::Triangle, juce::dontSendNotification);
-    noiseBtn   .setToggleState(l.shape == WaveLayer::Noise,    juce::dontSendNotification);
-    drawnBtn   .setToggleState(l.shape == WaveLayer::Drawn,    juce::dontSendNotification);
-    formulaBtn .setToggleState(l.shape == WaveLayer::Formula,  juce::dontSendNotification);
-    pulseBtn    .setToggleState(l.shape == WaveLayer::Pulse,     juce::dontSendNotification);
-    syncBtn     .setToggleState(l.shape == WaveLayer::Sync,      juce::dontSendNotification);
-    fmBtn       .setToggleState(l.shape == WaveLayer::FM,        juce::dontSendNotification);
-    phaseDistBtn.setToggleState(l.shape == WaveLayer::PhaseDist, juce::dontSendNotification);
+    waveSourceBtn.setButtonText(waveSourceLabel(l));
     freehandToggle.setVisible(l.shape == WaveLayer::Drawn);
     freehandToggle.setButtonText(l.freehandMode ? "Freehand" : "Points");
     formulaEditor.setVisible(l.shape == WaveLayer::Formula);
@@ -4613,20 +4598,92 @@ void WaveLayerEditor::updateShapeButtons() {
     resized();
 }
 
-void WaveLayerEditor::showPresetMenu() {
+// Menu-item ID scheme for the wave-source picker. Shape items map 1:1 onto the
+// WaveLayer::Shape enum (offset by 1 so 0 stays "nothing chosen"); presets and
+// the library entry use disjoint high ranges.
+namespace {
+    constexpr int kShapeIdBase   = 1;     // shape id = enum + 1
+    constexpr int kFromLibraryId = 900;
+    constexpr int kPresetIdBase  = 1000;  // preset id = 1000 + index
+
+    void addShapeItem(juce::PopupMenu& m, WaveLayer::Shape cur,
+                      WaveLayer::Shape s, const juce::String& label) {
+        m.addItem(kShapeIdBase + (int)s, label, /*enabled*/true, /*ticked*/cur == s);
+    }
+}
+
+void WaveLayerEditor::showWaveSourceMenu() {
+    if (!layer) return;
+    const WaveLayer::Shape cur = layer->shape;
     juce::PopupMenu m;
+
+    m.addSectionHeader("Static shapes");
+    addShapeItem(m, cur, WaveLayer::Sine,     "Sine");
+    addShapeItem(m, cur, WaveLayer::Saw,      "Saw");
+    addShapeItem(m, cur, WaveLayer::Square,   "Square");
+    addShapeItem(m, cur, WaveLayer::Triangle, "Triangle");
+    addShapeItem(m, cur, WaveLayer::Noise,    "Noise");
+    addShapeItem(m, cur, WaveLayer::Drawn,    "Draw your own");
+    addShapeItem(m, cur, WaveLayer::Formula,  "Formula");
+
+    // Wave-defining (Type-1) morphs: a generator IS the wave source, so it is
+    // single-select and mutually exclusive with the static shapes above -
+    // hence one flat list, not an "+ Add" chain (that is the Type-2 warp editor).
+    m.addSeparator();
+    m.addSectionHeader("Wave-defining morphs");
+    addShapeItem(m, cur, WaveLayer::Pulse,     "Pulse (PWM)");
+    addShapeItem(m, cur, WaveLayer::Sync,      "Hard Sync");
+    addShapeItem(m, cur, WaveLayer::FM,        "FM");
+    addShapeItem(m, cur, WaveLayer::PhaseDist, "Phase Distortion");
+
+    // Factory presets (a starting cycle the user can edit further).
+    m.addSeparator();
+    juce::PopupMenu presetSub;
     const auto& presets = wavePresets();
     for (int i = 0; i < (int)presets.size(); ++i)
-        m.addItem(i + 1, presets[i].name);
-    m.showMenuAsync(juce::PopupMenu::Options().withTargetComponent(&presetBtn),
+        presetSub.addItem(kPresetIdBase + i, presets[i].name);
+    m.addSubMenu("Presets", presetSub);
+
+    // From Library: a single cycle pulled from the waveform library. Only
+    // offered when the owner wired the loader (the layer stack with browser
+    // access); omitted for the LFO / Signal-Shape editor.
+    if (callbacks.onPickFromLibrary) {
+        m.addSeparator();
+        m.addItem(kFromLibraryId, juce::String::fromUTF8("From Library\xe2\x80\xa6"));
+    }
+
+    m.showMenuAsync(juce::PopupMenu::Options().withTargetComponent(&waveSourceBtn),
         [this](int result) {
             if (result <= 0 || !layer) return;
-            const auto& presets = wavePresets();
-            int idx = result - 1;
-            if (idx < 0 || idx >= (int)presets.size()) return;
-            // A preset redefines the cycle, so a factory-waveform reference forks.
-            layer->factoryRef.clear();
-            presets[idx].apply(*layer);
+
+            if (result == kFromLibraryId) {
+                if (callbacks.onPickFromLibrary) callbacks.onPickFromLibrary();
+                return;
+            }
+
+            if (result >= kPresetIdBase) {
+                const auto& ps = wavePresets();
+                int idx = result - kPresetIdBase;
+                if (idx < 0 || idx >= (int)ps.size()) return;
+                // A preset redefines the cycle, so a factory reference forks.
+                layer->factoryRef.clear();
+                ps[idx].apply(*layer);
+                syncFromModel();
+                if (callbacks.onChanged) callbacks.onChanged();
+                return;
+            }
+
+            // Otherwise a shape / Type-1 generator was chosen.
+            auto s = (WaveLayer::Shape)(result - kShapeIdBase);
+            // Changing to a non-Drawn shape abandons the drawn cycle, so a
+            // factory-waveform reference forks (becomes a plain generator layer).
+            if (s != WaveLayer::Drawn)
+                layer->factoryRef.clear();
+            layer->shape = s;
+            // Seed a fresh Drawn layer with a few points so the user has
+            // something grabable instead of an empty canvas.
+            if (s == WaveLayer::Drawn && layer->drawnPoints.empty())
+                layer->drawnPoints = defaultDrawnPoints();
             syncFromModel();
             if (callbacks.onChanged) callbacks.onChanged();
         });
@@ -4638,29 +4695,9 @@ void WaveLayerEditor::resized() {
     label.setBounds(top.removeFromLeft(70));
     if (deleteBtn.isVisible())
         deleteBtn.setBounds(top.removeFromRight(22));
-    // Preset button sits to the left of the (optional) delete button.
-    presetBtn.setBounds(top.removeFromRight(72));
 
-    // Shape button row 1 - 7 classic shapes (sine/saw/square/triangle/noise/
-    // draw/formula).
-    auto btnRow = a.removeFromTop(24);
-    int bw = btnRow.getWidth() / 7;
-    sineBtn    .setBounds(btnRow.removeFromLeft(bw));
-    sawBtn     .setBounds(btnRow.removeFromLeft(bw));
-    squareBtn  .setBounds(btnRow.removeFromLeft(bw));
-    triangleBtn.setBounds(btnRow.removeFromLeft(bw));
-    noiseBtn   .setBounds(btnRow.removeFromLeft(bw));
-    drawnBtn   .setBounds(btnRow.removeFromLeft(bw));
-    formulaBtn .setBounds(btnRow);
-
-    // Shape button row 2 - 4 generator morphs (Pulse/Sync/FM/PD). Kept on their
-    // own row so the labels stay readable and the classic row layout is stable.
-    auto btnRow2 = a.removeFromTop(24);
-    int bw2 = btnRow2.getWidth() / 4;
-    pulseBtn    .setBounds(btnRow2.removeFromLeft(bw2));
-    syncBtn     .setBounds(btnRow2.removeFromLeft(bw2));
-    fmBtn       .setBounds(btnRow2.removeFromLeft(bw2));
-    phaseDistBtn.setBounds(btnRow2);
+    // Single wave-source picker row replaces the old two rows of shape buttons.
+    waveSourceBtn.setBounds(a.removeFromTop(24));
 
     // Sub-row: Freehand/Points toggle (Drawn) or Formula text editor (Formula).
     // Always reserve the height so the slider rows below don't jump when
@@ -4695,7 +4732,7 @@ void WaveLayerEditor::resized() {
     sliderRow(phaseLabel, phaseSlider);
     sliderRow(ampLabel,   ampSlider);
     // Two reserved generator-morph slider rows (visibility toggled per shape in
-    // updateShapeButtons; bounds always assigned so they appear in place).
+    // updateSourceControls; bounds always assigned so they appear in place).
     sliderRow(morphLabel,  morphSlider);
     sliderRow(morph2Label, morph2Slider);
 }
@@ -8361,6 +8398,11 @@ LayeredWaveEditorComponent::LayeredWaveEditorComponent(NodeGraph& g, int nid, st
             l.amp   = 0.5f;
             return l;
         };
+        // "From Library..." on a layer's wave-source picker loads a single
+        // library cycle into that layer (this owner has the browser + assets).
+        lsOpts.onPickFromLibrary = [this](int layerIndex) {
+            showWaveformLibraryBrowserForLayer(layerIndex);
+        };
         layerStack = std::make_unique<LayerStackComponent>(
             std::move(lsOpts), [this]() { onLayerChanged(); });
         addChildComponent(*layerStack); // visibility toggled in resized()
@@ -8737,16 +8779,16 @@ static void applyLibraryIdSuffix(WavetableDoc& doc, int libId,
 // waveform is fully editable afterwards (draw over it, stack layers, warp it)
 // and serialises through the normal layered-frame path. Shared by the factory
 // browser and the user single-cycle .wav importer.
-std::unique_ptr<IWavetableFrame> LayeredWaveEditorComponent::makeFactoryFrame(
-    const std::vector<float>& cycle, const std::string& factoryName) {
-    auto lw = std::make_unique<LayeredWaveform>();
-    WaveLayer layer;
+// Load a single cycle into an EXISTING layer as a Drawn/Freehand shape,
+// preserving the layer's ratio/phase/amp. A non-empty factoryName marks the
+// cycle as a live reference to a built-in factory waveform (the project stores
+// just the name until the cycle is edited); an empty name embeds the samples.
+// Shared by makeFactoryFrame (fresh frame) and the per-layer "From Library..."
+// loader (existing layer).
+static void fillLayerCycle(WaveLayer& layer, const std::vector<float>& cycle,
+                           const std::string& factoryName) {
     layer.shape = WaveLayer::Drawn;
     layer.freehandMode = true;
-    // A non-empty name marks this as a live reference to a built-in factory
-    // waveform: the samples are still copied in (so render works immediately),
-    // but the project will serialize only the name until the user edits the
-    // cycle (see WaveLayer::factoryRef). Empty name = embed the samples.
     layer.factoryRef = factoryName;
     // Normalise the buffer length to the 512 the Freehand layer expects. The
     // bank already stores 512; a user wav of any length is linearly resampled.
@@ -8767,6 +8809,13 @@ std::unique_ptr<IWavetableFrame> LayeredWaveEditorComponent::makeFactoryFrame(
             layer.drawnSamples[(size_t)i] = a + (b - a) * frac;
         }
     }
+}
+
+std::unique_ptr<IWavetableFrame> LayeredWaveEditorComponent::makeFactoryFrame(
+    const std::vector<float>& cycle, const std::string& factoryName) {
+    auto lw = std::make_unique<LayeredWaveform>();
+    WaveLayer layer;
+    fillLayerCycle(layer, cycle, factoryName);
     layer.amp = 1.0f;
     lw->layers.push_back(std::move(layer));
     return lw;
@@ -9225,6 +9274,48 @@ void LayeredWaveEditorComponent::showWaveformLibraryBrowser(juce::Component* anc
     opts.useNativeTitleBar = false;
     opts.resizable = true;
     opts.componentToCentreAround = anchor != nullptr ? anchor : this;
+    SoundShop::launchToolDialog(opts);
+}
+
+void LayeredWaveEditorComponent::showWaveformLibraryBrowserForLayer(int layerIndex) {
+    auto* browser = new WaveformLibraryBrowser(graph);
+
+    // Load the chosen single cycle into ONE layer of the frame currently bound
+    // to the layer stack, preserving that layer's ratio/phase/amp. Re-fetch the
+    // layer by its stable index at pick time (the browser is async).
+    auto loadCycle = [this, layerIndex](const std::vector<float>& cycle,
+                                        const std::string& factoryName) {
+        auto* lw = layerStack ? layerStack->getTarget() : nullptr;
+        if (!lw || layerIndex < 0 || layerIndex >= (int)lw->layers.size()) return;
+        fillLayerCycle(lw->layers[(size_t)layerIndex], cycle, factoryName);
+        layerStack->refreshFromModel();
+        onLayerChanged();   // preview + commit + debounced undo step
+    };
+
+    browser->onPickBuiltin = [loadCycle](int bankEntryIndex) {
+        auto& bank = WaveformBank::get();
+        if (bankEntryIndex < 0 || bankEntryIndex >= bank.numEntries()) return;
+        const auto& e = bank.entry(bankEntryIndex);
+        loadCycle(bank.samples(bankEntryIndex), e.name);  // live factory ref
+    };
+    browser->onPickAsset = [this, loadCycle](int assetId) {
+        const AssetEntry* e = graph.assets.find(assetId);
+        if (!e || e->kind != AssetKind::Waveform) return;
+        auto nf = frameFromWaveformAsset(e->subType, e->payload);
+        if (!nf) return;
+        std::vector<float> buf;
+        nf->render(512, buf);
+        loadCycle(buf, "");   // embed the cycle (an asset cycle isn't a factory ref)
+    };
+
+    juce::DialogWindow::LaunchOptions opts;
+    opts.content.setOwned(browser);
+    opts.dialogTitle = "Layer Wave Source";
+    opts.dialogBackgroundColour = juce::Colour(0xff2b2b30);
+    opts.escapeKeyTriggersCloseButton = true;
+    opts.useNativeTitleBar = false;
+    opts.resizable = true;
+    opts.componentToCentreAround = this;
     SoundShop::launchToolDialog(opts);
 }
 

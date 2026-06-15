@@ -407,6 +407,15 @@ including per-sample real time. In WASM they're the host imports
 to its id once (the `warpMethodFromName` analogue, same pattern as
 `ss_waveform_id`). The `SS_WARP_*` id constants are in `soundshop_wasm.h`.
 
+The method names accepted here are the **same catalogue** the node-graph morph
+editor offers (the registry in `warp.h`). Each method also carries a human label
+for its `amount` — *Drive*, *Fold*, *Width*, *Crush*, *Bend*, … — which the UI
+shows on a modulated op (so a pinned Soft-Clip reads "Soft Clip Drive"); from a
+script the parameter is just the same `0..1 amount` regardless of that label.
+Note the catalogue is **Type-2 (arbitrary-wave) warps only** — the wave-defining
+**Type-1** generators (PWM / sync / FM / phase-distortion) are *layer wave
+sources*, not warp methods, and aren't reachable through `warpamp`/`warpphase`.
+
 **Whole-buffer warps — offline/streaming only.** Two transforms operate on a
 whole buffer rather than a single sample, because they warp a *representation* of
 the signal, not its instantaneous amplitude:

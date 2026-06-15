@@ -3,6 +3,7 @@
 #include "transport.h"
 #include "granular_freeze.h"   // GrainFreezeVoice - shared freeze-mode reader
 #include "warp.h"              // WarpOp / WarpMethod - frame-scope shape bending
+#include "wavetable_frame.h"   // IWavetableFrame - cached frame for live re-bake
 #include <juce_audio_processors/juce_audio_processors.h>
 #include <vector>
 #include <string>
@@ -569,6 +570,23 @@ private:
     // after. Disabled / None ops are filtered out during the split.
     std::vector<WarpOp> wtWarpPhaseOps;
     std::vector<WarpOp> wtWarpAmpOps;
+
+    // Single-frame layered wavetable: live per-layer warp re-bake (#88, item-M).
+    // When the table is exactly ONE layered frame whose layers carry warp chains,
+    // we cache a clone of that frame (typeId "layered") so processBlock can
+    // re-render the cycle each block with live warp amounts pulled from per-layer
+    // warp params (Param::warpLayer >= 0, addressed by (warpLayer, warpSlot)).
+    // This mirrors the frame-scope warp path but re-bakes the whole cycle instead
+    // of shaping per sample, because a per-layer warp op composes inside a single
+    // layer's sum, not over the blended result. Null/empty when the table isn't a
+    // single warp-bearing layered frame, in which case the baked terrain from the
+    // rebuild plays unchanged (the "bake whatever isn't pinned" engine fork).
+    std::unique_ptr<IWavetableFrame> wtLayeredFrame;
+    int wtLayeredTableSize = 0;
+    // Last per-layer override grid pushed into the re-bake. Lets us skip the
+    // (tableSize x layers) re-render when no per-layer warp amount changed, so an
+    // unmodulated table costs only the cheap per-block param scan.
+    std::vector<std::vector<float>> wtLastLayerOverrides;
 
     // Scatter wavetable: instead of a rectilinear terrain, frames are stored
     // explicitly with their N-D positions. Each block we compute a Wendland

@@ -1578,6 +1578,30 @@ TerrainSynthProcessor::TerrainSynthProcessor(Node& n, Transport& t, ContentStore
             wtFrameCount = nf;
             wtNumDims = doc.numDimensions();
             wtEffectiveAxes = doc.effectiveAxes();
+
+            // Cache a single warp-bearing layered frame for live per-layer warp
+            // re-bake (#88, item-M). Only a one-cell table can be re-baked in
+            // place this way (the frame occupies terrain.data[0..ts) contiguously);
+            // multi-cell grids would need per-cell rewrites we don't support yet.
+            // We only bother when a layer actually carries a warp chain - without
+            // one there's nothing to modulate and the baked terrain is final.
+            wtLayeredFrame.reset();
+            wtLayeredTableSize = 0;
+            wtLastLayerOverrides.clear();
+            if (nf == 1) {
+                IWavetableFrame* w0 = doc.frameAt(0);
+                if (w0 && std::string(w0->typeId()) == "layered") {
+                    auto* lw0 = static_cast<LayeredWaveform*>(w0);
+                    bool anyWarp = false;
+                    for (const auto& L : lw0->layers)
+                        if (!L.warpChain.empty()) { anyWarp = true; break; }
+                    if (anyWarp) {
+                        wtLayeredFrame = w0->clone();
+                        static_cast<LayeredWaveform*>(wtLayeredFrame.get())->tableSize = ts;
+                        wtLayeredTableSize = ts;
+                    }
+                }
+            }
         } else {
             terrain.init({2048});
             terrain.fillFromExpression("sin(x)");
@@ -1722,6 +1746,17 @@ static float getParamByName(const Node& node, const std::string& name, float def
 static float getParamByWarpSlot(const Node& node, int slot, float def) {
     for (const auto& p : node.params)
         if (p.warpSlot == slot && p.warpLayer == -1) return p.value;  // frame-scope only
+    return def;
+}
+
+// Read a per-layer warp op's live amount by its (warpLayer, warpSlot) key.
+// Per-layer warp params (Param::warpLayer >= 0) only exist when the user opts a
+// layer's warp op into modulation, so this returns `def` whenever no such param
+// is present. Callers pass def = -1 so "no param" reads as "keep the baked
+// amount" in the renderWithLiveWarp override convention.
+static float getParamByWarpLayerSlot(const Node& node, int layer, int slot, float def) {
+    for (const auto& p : node.params)
+        if (p.warpLayer == layer && p.warpSlot == slot) return p.value;
     return def;
 }
 
@@ -2582,6 +2617,40 @@ void TerrainSynthProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mi
     }
     const bool hasPhaseWarp = !wtWarpPhaseOps.empty();
     const bool hasAmpWarp   = !wtWarpAmpOps.empty();
+
+    // Single-frame layered wavetable: re-bake the cycle into terrain.data with
+    // live per-layer warp amounts (#88, item-M). Block-rate, voice-shared - the
+    // same cadence the frame-scope warp uses. We rebuild the override grid from
+    // the per-layer warp params each block, but only re-render when an amount
+    // actually changed (or differs from the baked value), so a static table pays
+    // only for the cheap param scan. The negative sentinel (-1) means "no param
+    // -> keep the op's baked amount", so a partially-pinned chain mixes live and
+    // baked ops correctly. gain is re-applied here to match the baked render()
+    // path (renderWithLiveWarp is the gain-free primitive).
+    if (wtLayeredFrame && wtLayeredTableSize > 0) {
+        auto* lw = static_cast<LayeredWaveform*>(wtLayeredFrame.get());
+        std::vector<std::vector<float>> overrides(lw->layers.size());
+        bool anyPerLayer = false;
+        for (size_t li = 0; li < lw->layers.size(); ++li) {
+            const auto& chain = lw->layers[li].warpChain;
+            overrides[li].assign(chain.size(), -1.0f);
+            for (size_t slot = 0; slot < chain.size(); ++slot) {
+                float v = getParamByWarpLayerSlot(node, (int)li, (int)slot, -1.0f);
+                overrides[li][slot] = v;
+                if (v >= 0.0f) anyPerLayer = true;
+            }
+        }
+        if (anyPerLayer && overrides != wtLastLayerOverrides) {
+            std::vector<float> samples;
+            lw->renderWithLiveWarp(overrides, samples);
+            const float g = lw->gain;
+            auto& data = terrain.getData();
+            int n = std::min((int)samples.size(), (int)data.size());
+            for (int i = 0; i < n; ++i)
+                data[i] = (g != 1.0f) ? samples[i] * g : samples[i];
+            wtLastLayerOverrides = std::move(overrides);
+        }
+    }
 
     for (int s = 0; s < numSamples; ++s) {
         double currentBeat = beatPos + s * beatsPerSample;

@@ -1721,7 +1721,7 @@ static float getParamByName(const Node& node, const std::string& name, float def
 // exists yet (the common case until a warp is opted into modulation).
 static float getParamByWarpSlot(const Node& node, int slot, float def) {
     for (const auto& p : node.params)
-        if (p.warpSlot == slot) return p.value;
+        if (p.warpSlot == slot && p.warpLayer == -1) return p.value;  // frame-scope only
     return def;
 }
 

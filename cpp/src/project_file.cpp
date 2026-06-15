@@ -336,6 +336,9 @@ bool ProjectFile::writeProject(std::ostream& f, NodeGraph& graph,
             writeFloat(f, "min", param.minVal);
             writeFloat(f, "max", param.maxVal);
             writeStr(f, "format", param.format);
+            // Warp-slot key (unified warp/morph). Only emitted for warp params so
+            // ordinary params stay unchanged; absent => -1 (not a warp param).
+            if (param.warpSlot >= 0) writeInt(f, "warpSlot", param.warpSlot);
             for (auto& ap : param.automation.points)
                 f << "auto=" << ap.beat << "," << ap.value << "\n";
         }
@@ -818,6 +821,7 @@ bool ProjectFile::readProject(std::istream& f, NodeGraph& graph, PluginHost* plu
             else if (key == "min") p.minVal = std::stof(val);
             else if (key == "max") p.maxVal = std::stof(val);
             else if (key == "format") p.format = val;
+            else if (key == "warpSlot") p.warpSlot = std::stoi(val);
             else if (key == "auto") {
                 auto comma = val.find(',');
                 if (comma != std::string::npos)
@@ -1012,9 +1016,15 @@ bool ProjectFile::readProject(std::istream& f, NodeGraph& graph, PluginHost* plu
 
     // Same for live-referenced MorphAlgorithm (warp-chain) assets: replace each
     // referencing frame's cached warp chain with the asset's stored chain and
-    // reconcile the node's "Warp N" modulation params. Free function in
+    // reconcile the node's warp modulation params. Free function in
     // layered_wave_editor.cpp.
     resolveWarpReferences(graph);
+
+    // resolveWarpReferences only touches asset-referenced frames; independent
+    // frames (the common case) need their warp params reconciled too so legacy
+    // "Warp N" params migrate to the warpSlot key + named-morph labels and the
+    // synth (reads warp amounts by warpSlot) finds them. Idempotent.
+    reconcileAllWarpParams(graph);
 
     // Same for live-referenced FrequencyGraph assets: mirror each referenced
     // curve into the spectrum-tap bins that point at it, re-encoding the

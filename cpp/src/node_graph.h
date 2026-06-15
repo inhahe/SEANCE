@@ -162,6 +162,15 @@ struct Param {
     // baseValue/value are split or identical this block.
     float baseValue = 0.0f;
     bool  modulated = false;
+
+    // Frame-scope warp slot key (unified warp/morph model). >= 0 marks this as
+    // the modulation param for warp-chain op `warpSlot` (0-based); -1 = not a
+    // warp param. This is the STABLE key the synth + reconcile logic address the
+    // op by, DECOUPLED from `name` - which is now a human label that follows the
+    // op's method (e.g. "Soft Clip Drive 1"), so renaming on a method change
+    // never disturbs which op a wired modulation pin drives. See
+    // syncWarpParamsForNode / warpParamIndexForOp.
+    int warpSlot = -1;
 };
 
 // Rational fraction for exact beat subdivisions (e.g., triplets)
@@ -1009,6 +1018,13 @@ int resolveWaveformReferences(NodeGraph& graph);
 // place. Free function for the same reason as resolveWaveformReferences (codec
 // lives in layered_wave_editor.cpp). Returns the number of references resolved.
 int resolveWarpReferences(NodeGraph& graph);
+
+// Load-time reconcile of frame-scope warp modulation params across EVERY
+// wavetable node (not just asset-referenced ones). Migrates legacy "Warp N"
+// params to the warpSlot key + named-morph display labels and ensures the synth
+// (which reads warp amounts by warpSlot) always finds them. Idempotent. Defined
+// in layered_wave_editor.cpp (needs the WavetableDoc codec). Call after load.
+void reconcileAllWarpParams(NodeGraph& graph);
 
 // ---------------------------------------------------------------------------
 // On-demand modulation pins (#88) - graph-level helpers.

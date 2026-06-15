@@ -3342,10 +3342,21 @@ void testAssetLibrary(Report& r) {
         {
             int warpParams = 0;
             for (const auto& p : g.findNode(nId)->params)
-                if (p.name.rfind("Warp ", 0) == 0) ++warpParams;
+                if (p.warpSlot >= 0) ++warpParams;
             r.checkVal(warpParams == 2,
-                       "assets: resolved warp chain reconciles two Warp N params",
+                       "assets: resolved warp chain reconciles two warp-slot params",
                        warpParams);
+            // Named morph params (inc 2): the slot params carry their method's
+            // human label, not "Warp N". The asset chain is {SoftClip, HardClip},
+            // both labelled "Drive", numbered by slot.
+            const Param* s0 = nullptr;
+            const Param* s1 = nullptr;
+            for (const auto& p : g.findNode(nId)->params) {
+                if (p.warpSlot == 0) s0 = &p;
+                else if (p.warpSlot == 1) s1 = &p;
+            }
+            r.check(s0 && s1 && s0->name == "Drive 1" && s1->name == "Drive 2",
+                    "assets: warp slot params use named-morph labels (Drive 1/2)");
         }
 
         // Save/load preserves the reference id and re-resolves on load.
@@ -3373,6 +3384,62 @@ void testAssetLibrary(Report& r) {
         WavetableDoc delDoc; delDoc.decode(g.findNode(nId)->script);
         r.check(delDoc.warpAssetId == -1 && delDoc.warpChain.size() == 3,
                 "assets: erased morph asset -> frame falls back to independent");
+    }
+
+    // ---- Named morph params: legacy "Warp N" migration (inc 2) --------------
+    {
+        // A pre-warpSlot project stored warp params as "Warp 1"/"Warp 2" with
+        // warpSlot == -1, and a modulation pin could be bound to one. The
+        // load-time reconcileAllWarpParams pass must adopt them by parsing the
+        // slot (so a bound modPin stays attached) and rename them to the named-
+        // morph label, WITHOUT moving the modPin's paramIndex.
+        NodeGraph g;
+        int nId = g.addNode("wt", NodeType::TerrainSynth, {}, {}).id;
+        WavetableDoc doc;
+        doc.addLibraryEntry(std::make_unique<LayeredWaveform>(), "w");
+        WarpOp o0; o0.method = WarpMethod::Wavefold; o0.amount = 0.3f; o0.enabled = true;
+        WarpOp o1; o1.method = WarpMethod::PwmSkew;  o1.amount = 0.7f; o1.enabled = true;
+        doc.warpChain = { o0, o1 };
+        Node* nd = g.findNode(nId);
+        nd->script = doc.encode();
+        // Inject legacy params (warpSlot defaults to -1) + a modPin on "Warp 2".
+        // Real legacy params load from disk with warpSlot == -1 (the key didn't
+        // exist pre-inc-2); set it explicitly so the test simulates that exactly.
+        Param lp0{}; lp0.name = "Warp 1"; lp0.value = lp0.baseValue = 0.3f;
+        lp0.minVal = 0; lp0.maxVal = 1; lp0.format = "%.2f"; lp0.warpSlot = -1;
+        Param lp1{}; lp1.name = "Warp 2"; lp1.value = lp1.baseValue = 0.7f;
+        lp1.minVal = 0; lp1.maxVal = 1; lp1.format = "%.2f"; lp1.warpSlot = -1;
+        nd->params.push_back(lp0);
+        nd->params.push_back(lp1);
+        const int legacyIdx1 = (int)nd->params.size() - 1; // index of "Warp 2"
+        int pinId = g.allocId();
+        nd->pinsIn.push_back({pinId, "Mod: Warp 2", PinKind::Param, true, 1});
+        Node::ModPin mp; mp.paramIndex = legacyIdx1; mp.pinId = pinId;
+        mp.mode = Node::ModPin::Mode::Modulate;
+        nd->modPins.push_back(mp);
+
+        reconcileAllWarpParams(g);
+
+        nd = g.findNode(nId);
+        const Param* s0 = nullptr; const Param* s1 = nullptr;
+        int s1Idx = -1;
+        for (int i = 0; i < (int)nd->params.size(); ++i) {
+            if (nd->params[i].warpSlot == 0) s0 = &nd->params[i];
+            else if (nd->params[i].warpSlot == 1) { s1 = &nd->params[i]; s1Idx = i; }
+        }
+        r.check(s0 && s1 && s0->name == "Fold 1" && s1->name == "Width 2",
+                "named-morph: legacy 'Warp N' params adopt warpSlot + named labels");
+        // The modPin must still point at the (renamed) slot-1 param, and its pin
+        // label must follow the new name.
+        bool pinOk = false;
+        for (const auto& m : nd->modPins)
+            if (m.paramIndex == s1Idx && m.pinId == pinId) pinOk = true;
+        const Pin* movedPin = nullptr;
+        for (const auto& p : nd->pinsIn) if (p.id == pinId) movedPin = &p;
+        r.check(pinOk, "named-morph: migrated modPin stays bound to slot-1 param");
+        r.check(movedPin && movedPin->name == "Mod: Width 2",
+                std::string("named-morph: migrated modPin pin relabelled (got '") +
+                (movedPin ? movedPin->name : std::string("<none>")) + "')");
     }
 
     // ---- FrequencyGraph asset kind: SpectralCurve payload, all source forms -

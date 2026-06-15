@@ -3459,31 +3459,66 @@ int resolveWaveformReferences(NodeGraph& graph) {
 
 // ---- Warp ("morph algorithm") asset-library reconciliation ----------------
 
-// Reconcile a node's "Warp N" modulation params + mod pins to match `chain`'s
-// op count. Factored out of LayeredWaveEditorComponent::syncWarpParams so the
-// asset-resolution path (resolveWarpReferences, where a referenced chain's
-// length can change) can reuse the exact same logic without the editor. Pure
-// function of (graph, nodeId, chain): adds params for new ops (seeded from the
-// op amount), removes params for deleted ops (dropping their mod pins + cables),
-// and remaps surviving modPin param indices. Idempotent.
+// Display name for warp slot `i` (0-based), driven by its op's method - the
+// "named morph parameter" (e.g. "Drive 1", "Fold 2", "Width 1"). The trailing
+// number disambiguates two ops of the same method and shows the chain position;
+// the STABLE key is Param::warpSlot, not this string, so a method change can
+// freely rename without disturbing which op a modulation pin drives.
+static std::string warpSlotParamName(const WarpOp& op, int slot) {
+    return std::string(warpParamLabel(op.method)) + " " + std::to_string(slot + 1);
+}
+
+// Relabel the modulation pin bound to param index `pi` so it follows the param's
+// current display name (keeping the Mod:/Set: prefix). No-op if the param has no
+// pin. Called after a rename so a wired "Mod: Soft Clip Drive 1" pin tracks a
+// later method change instead of showing a stale label.
+static void relabelWarpModPin(Node& nd, int pi) {
+    if (pi < 0 || pi >= (int)nd.params.size()) return;
+    for (const auto& mp : nd.modPins) {
+        if (mp.paramIndex != pi) continue;
+        const char* prefix =
+            (mp.mode == Node::ModPin::Mode::Absolute) ? "Set: " : "Mod: ";
+        for (auto& pin : nd.pinsIn)
+            if (pin.id == mp.pinId) pin.name = std::string(prefix) + nd.params[pi].name;
+        break;
+    }
+}
+
+// Reconcile a node's frame-scope warp modulation params + mod pins to match
+// `chain`. Factored out of LayeredWaveEditorComponent::syncWarpParams so the
+// asset-resolution path (resolveWarpReferences) and load-time migration reuse
+// the exact same logic without the editor. Pure function of (graph, nodeId,
+// chain): adds params for new ops (seeded from the op amount), removes params
+// for deleted ops (dropping their mod pins + cables), remaps surviving modPin
+// param indices, and renames each surviving param to its op's named-morph label
+// (relabelling its pin). Addresses ops by the stable Param::warpSlot key, so a
+// method change renames freely without moving a wired pin. Idempotent.
 void syncWarpParamsForNode(NodeGraph& graph, int nodeId,
                            const std::vector<WarpOp>& chain) {
     Node* nd = graph.findNode(nodeId);
     if (!nd) return;
     const int N = (int)chain.size();
 
-    auto isWarpName = [](const std::string& s) { return s.rfind("Warp ", 0) == 0; };
+    // ---- 0) Legacy migration. Pre-warpSlot projects stored warp params named
+    //         "Warp <k>" with warpSlot == -1; adopt them by parsing the slot so
+    //         their bound modPins stay attached and they get renamed below.
+    for (auto& p : nd->params) {
+        if (p.warpSlot >= 0) continue;
+        if (p.name.rfind("Warp ", 0) != 0) continue;
+        const std::string num = p.name.substr(5);
+        bool allDigit = !num.empty();
+        for (char c : num) if (c < '0' || c > '9') { allDigit = false; break; }
+        if (allDigit) p.warpSlot = std::stoi(num) - 1;
+    }
 
-    // Desired param names: always numbered, even for a lone op, so a surviving
-    // op keeps its name (and its modulation pin) when ops are added/removed.
-    std::set<std::string> desired;
-    for (int i = 0; i < N; ++i) desired.insert("Warp " + std::to_string(i + 1));
-
-    // ---- 1) Remove warp params for deleted ops, plus their mod pins / cables.
+    // ---- 1) Remove warp params for deleted ops (warpSlot outside [0,N)), plus
+    //         their mod pins / cables; remap surviving modPin param indices.
     std::set<int> removeIdx;
-    for (int i = 0; i < (int)nd->params.size(); ++i)
-        if (isWarpName(nd->params[i].name) && !desired.count(nd->params[i].name))
-            removeIdx.insert(i);
+    for (int i = 0; i < (int)nd->params.size(); ++i) {
+        // slot < 0 = not a warp param (kept); slot in [0,N) = live op (kept);
+        // slot >= N = a warp param for an op that no longer exists (remove).
+        if (nd->params[i].warpSlot >= N) removeIdx.insert(i);
+    }
 
     if (!removeIdx.empty()) {
         // Drop modPins whose target param is going away, plus their pins+links.
@@ -3517,20 +3552,45 @@ void syncWarpParamsForNode(NodeGraph& graph, int nodeId,
                 mp.paramIndex = newIndexOf[mp.paramIndex];
     }
 
-    // ---- 2) Add params for new ops (appended at the end; existing indices stay
-    //         put so currently-bound modPins keep pointing at the right param).
+    // ---- 2) Add params for slots that have no param yet (appended at the end;
+    //         existing indices stay put so bound modPins keep their target).
     for (int i = 0; i < N; ++i) {
-        std::string name = "Warp " + std::to_string(i + 1);
         bool exists = false;
-        for (auto& p : nd->params) if (p.name == name) { exists = true; break; }
+        for (auto& p : nd->params) if (p.warpSlot == i) { exists = true; break; }
         if (exists) continue;
         Param p;
-        p.name = name;
+        p.warpSlot = i;
+        p.name = warpSlotParamName(chain[i], i);
         p.value = p.baseValue = chain[i].amount;
         p.minVal = 0.0f;
         p.maxVal = 1.0f;
         p.format = "%.2f";
         nd->params.push_back(std::move(p));
+    }
+
+    // ---- 3) Reconcile each surviving warp param's display name to its op's
+    //         current method (a method change renames "Drive 1" -> "Fold 1")
+    //         and relabel its modulation pin to match.
+    for (int pi = 0; pi < (int)nd->params.size(); ++pi) {
+        const int slot = nd->params[pi].warpSlot;
+        if (slot < 0 || slot >= N) continue;
+        nd->params[pi].name = warpSlotParamName(chain[slot], slot);
+        relabelWarpModPin(*nd, pi);
+    }
+}
+
+// Load-time reconcile across EVERY wavetable node: resolveWarpReferences only
+// touches frames that reference a library MorphAlgorithm, so independent frames
+// (the common case) never had their warp params reconciled on load. This pass
+// runs syncWarpParamsForNode for all "__wavetable" nodes so legacy "Warp N"
+// params are migrated to the warpSlot key + named-morph labels, and the synth
+// (which now reads by warpSlot) always finds them. Idempotent on new projects.
+void reconcileAllWarpParams(NodeGraph& graph) {
+    for (auto& n : graph.nodes) {
+        if (n.script.rfind("__wavetable", 0) != 0) continue;
+        WavetableDoc doc;
+        if (!doc.decode(n.script)) continue;
+        syncWarpParamsForNode(graph, n.id, doc.warpChain);
     }
 }
 
@@ -9396,16 +9456,21 @@ void LayeredWaveEditorComponent::syncPositionParams() {
 void LayeredWaveEditorComponent::pushWarpAmountsToParams() {
     auto* nd = graph.findNode(nodeId);
     if (!nd) return;
-    // Mirror each op's editor amount into its matching "Warp N" param so the
-    // synth's live read (getParamByName) tracks the slider. A modulated param's
-    // live value is owned by the modulation system, so write the resting value
-    // through baseValue and leave `value` alone while it's being driven.
+    // Mirror each op's editor amount into its matching warp-slot param so the
+    // synth's live read (getParamByWarpSlot) tracks the slider. A modulated
+    // param's live value is owned by the modulation system, so write the resting
+    // value through baseValue and leave `value` alone while it's being driven.
+    // Also reconcile the param's display name + pin label to its op's current
+    // method here (onChanged fires for a method change too), so picking a new
+    // method renames "Drive 1" -> "Fold 1" without a structural re-sync.
     for (int k = 0; k < (int)wave.warpChain.size(); ++k) {
-        std::string name = "Warp " + std::to_string(k + 1);
-        for (auto& p : nd->params) {
-            if (p.name != name) continue;
+        for (int pi = 0; pi < (int)nd->params.size(); ++pi) {
+            Param& p = nd->params[pi];
+            if (p.warpSlot != k) continue;
             if (p.modulated) p.baseValue = wave.warpChain[k].amount;
             else             p.value = p.baseValue = wave.warpChain[k].amount;
+            p.name = warpSlotParamName(wave.warpChain[k], k);
+            relabelWarpModPin(*nd, pi);
             break;
         }
     }
@@ -9414,25 +9479,36 @@ void LayeredWaveEditorComponent::pushWarpAmountsToParams() {
 void LayeredWaveEditorComponent::swapWarpParamNames(int a, int b) {
     auto* nd = graph.findNode(nodeId);
     if (!nd || a == b) return;
-    const std::string na = "Warp " + std::to_string(a + 1);
-    const std::string nb = "Warp " + std::to_string(b + 1);
-    Param* pa = nullptr;
-    Param* pb = nullptr;
-    for (auto& p : nd->params) {
-        if (p.name == na) pa = &p;
-        else if (p.name == nb) pb = &p;
+    // Reorder fix-up: the chain ops at slots a and b have already been swapped by
+    // moveOp. Swap the two params' stable warpSlot keys so each param (and the
+    // modulation pin bound to it) follows its op to the new slot. The param
+    // objects + their modPin paramIndex stay put in nd->params; only the warpSlot
+    // moves. Display names are reconciled right after (pushWarpAmountsToParams via
+    // onChanged), but reconcile here too so a no-onChanged caller stays correct.
+    Param* pa = nullptr; int ia = -1;
+    Param* pb = nullptr; int ib = -1;
+    for (int i = 0; i < (int)nd->params.size(); ++i) {
+        if (nd->params[i].warpSlot == a) { pa = &nd->params[i]; ia = i; }
+        else if (nd->params[i].warpSlot == b) { pb = &nd->params[i]; ib = i; }
     }
-    // Both must exist for the swap to be meaningful; if a slot never got a
-    // param (shouldn't happen post-syncWarpParams) leave things untouched.
-    if (pa && pb) std::swap(pa->name, pb->name);
+    if (pa) { pa->warpSlot = b; }
+    if (pb) { pb->warpSlot = a; }
+    // Rename both to their new slots' methods + relabel pins.
+    if (pa && b >= 0 && b < (int)wave.warpChain.size()) {
+        pa->name = warpSlotParamName(wave.warpChain[b], b);
+        relabelWarpModPin(*nd, ia);
+    }
+    if (pb && a >= 0 && a < (int)wave.warpChain.size()) {
+        pb->name = warpSlotParamName(wave.warpChain[a], a);
+        relabelWarpModPin(*nd, ib);
+    }
 }
 
 int LayeredWaveEditorComponent::warpParamIndexForOp(int opIndex) const {
     auto* nd = graph.findNode(nodeId);
     if (!nd) return -1;
-    const std::string name = "Warp " + std::to_string(opIndex + 1);
     for (int i = 0; i < (int)nd->params.size(); ++i)
-        if (nd->params[i].name == name) return i;
+        if (nd->params[i].warpSlot == opIndex) return i;
     return -1;
 }
 

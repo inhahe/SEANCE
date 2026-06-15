@@ -86,6 +86,11 @@ struct WarpMethodInfo {
     const char* name;        // display name in the picker
     bool        recommended; // quality badge (high-quality / popular methods)
     const char* tooltip;     // 1-line description for the picker / node tooltip
+    const char* paramName;   // human label for this method's amount param (the
+                             // "named morph parameter": "Drive", "Fold", "Width"
+                             // ...). Drives the node param / modulation-pin label
+                             // and the library picker instead of a bare "Warp N".
+                             // Falls back to "Amount" when null/empty.
 };
 
 // The full registry - "the array of shapeshifting methods to choose from".
@@ -98,6 +103,12 @@ const WarpMethodInfo* warpMethodInfo(WarpMethod m);
 // Convenience.
 WarpDomain warpDomainOf(WarpMethod m);
 const char* warpMethodName(WarpMethod m);
+
+// Human label for a method's amount param ("Drive", "Fold", "Width", ...) - the
+// named morph parameter. Returns "Amount" for None / unknown methods. Used to
+// name the node's modulation param + pin and the library picker, so a modulated
+// warp reads as "Soft Clip Drive" rather than an opaque "Warp 1".
+const char* warpParamLabel(WarpMethod m);
 
 // Resolve a method NAME to its enum (the inverse of warpMethodName), tolerant of
 // spelling: case-insensitive, spaces / underscores / parenthetical qualifiers

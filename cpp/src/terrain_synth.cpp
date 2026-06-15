@@ -1714,6 +1714,17 @@ static float getParamByName(const Node& node, const std::string& name, float def
     return def;
 }
 
+// Read a frame-scope warp op's live amount by its stable warpSlot key (the
+// unified warp/morph model). The param's display name follows its method
+// ("Soft Clip Drive 1", ...) so it can't be addressed by a fixed string; the
+// warpSlot is the stable identity. Falls back to `def` when no such param
+// exists yet (the common case until a warp is opted into modulation).
+static float getParamByWarpSlot(const Node& node, int slot, float def) {
+    for (const auto& p : node.params)
+        if (p.warpSlot == slot) return p.value;
+    return def;
+}
+
 // Extract harmonic magnitudes and phases from the current 1D wavetable
 // cycle, by FFT'ing it. Cached in partialBank so we only recompute when
 // the cycle data changes (which we detect via a cheap fingerprint hash).
@@ -2543,25 +2554,25 @@ void TerrainSynthProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mi
     const bool collectAudition = divertAudition && anyAuditionVoice;
 
     // Resolve the frame-scope warp amounts for this block. Each op's amount is
-    // exposed as a "Warp N" node param (or "Warp" for a lone op), so a wired
-    // Param/Signal cable - or an on-demand "Mod: Warp N" pin (#88) - can sweep
-    // the shape live. When no such param exists yet (the common case until the
-    // user opts a warp into modulation) we fall back to the static amount baked
-    // from the editor. Held flat across the block; per-sample cost is the warp
-    // chain application only. Skipped entirely when the chain is empty.
+    // exposed as a node param keyed by warpSlot (display name follows its method,
+    // e.g. "Soft Clip Drive 1"), so a wired Param/Signal cable - or an on-demand
+    // "Mod:" pin (#88) - can sweep the shape live. When no such param exists yet
+    // (the common case until the user opts a warp into modulation) we fall back
+    // to the static amount baked from the editor. Held flat across the block;
+    // per-sample cost is the warp chain application only. Skipped when empty.
     const int warpCount = (int)wtWarpChain.size();
     wtWarpPhaseOps.clear();
     wtWarpAmpOps.clear();
     for (int k = 0; k < warpCount; ++k) {
         const WarpOp& def = wtWarpChain[k];
         if (!def.enabled || def.method == WarpMethod::None) continue;
-        // Always-numbered ("Warp 1".."Warp N", even for a lone op) so a surviving
-        // op keeps its param name when ops are added/removed - no rename churn for
-        // the modulation pins bound to it (mirrors syncWarpParams).
-        std::string pname = std::string("Warp ") + std::to_string(k + 1);
+        // Read the live amount by the stable warpSlot key (k). The param's name
+        // follows its method ("Soft Clip Drive 1"), so it's addressed by slot,
+        // not string - a surviving op keeps its modulation pin across add/remove
+        // and method changes (mirrors syncWarpParamsForNode).
         WarpOp op = def;
         op.amount = juce::jlimit(0.0f, 1.0f,
-            getParamByName(node, pname.c_str(), def.amount));
+            getParamByWarpSlot(node, k, def.amount));
         if (warpDomainOf(op.method) == WarpDomain::Phase)
             wtWarpPhaseOps.push_back(op);
         else if (warpDomainOf(op.method) == WarpDomain::Amplitude)

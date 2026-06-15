@@ -41,32 +41,32 @@ inline float wrapBi(float y) {
 // ---------------------------------------------------------------------------
 const std::vector<WarpMethodInfo>& warpMethodRegistry() {
     static const std::vector<WarpMethodInfo> reg = {
-        // method,                      domain,                name,                 recommended, tooltip
-        { WarpMethod::None,             WarpDomain::Phase,     "None",               false, "No shaping." },
+        // method,                      domain,                name,                 recommended, tooltip,                                                                paramName
+        { WarpMethod::None,             WarpDomain::Phase,     "None",               false, "No shaping.",                                                             "Amount" },
 
         // --- Amplitude-domain (waveshaping) ---
-        { WarpMethod::SoftClip,         WarpDomain::Amplitude, "Soft Clip",          true,  "Smooth saturation - rounds peaks, adds warmth." },
-        { WarpMethod::HardClip,         WarpDomain::Amplitude, "Hard Clip",          false, "Flattens peaks past a threshold - aggressive edge." },
-        { WarpMethod::Wavefold,         WarpDomain::Amplitude, "Wavefold",           true,  "Folds peaks back inward - dense West-Coast harmonics." },
-        { WarpMethod::Wavewrap,         WarpDomain::Amplitude, "Wavewrap",           false, "Wraps peaks around instead of folding - harsh, glitchy." },
-        { WarpMethod::Rectify,          WarpDomain::Amplitude, "Rectify",            false, "Folds the negative half up - octave-up / even harmonics." },
-        { WarpMethod::Quantize,         WarpDomain::Amplitude, "Quantize (bitcrush)",true,  "Steps the amplitude - 8-bit / lo-fi character." },
-        { WarpMethod::TubeSat,          WarpDomain::Amplitude, "Tube Saturate",      true,  "Asymmetric drive - even-harmonic, tube-like warmth." },
-        { WarpMethod::TapeSat,          WarpDomain::Amplitude, "Tape Saturate",      false, "Symmetric soft drive - odd-harmonic, tape-like glue." },
-        { WarpMethod::Flip,             WarpDomain::Amplitude, "Flip (invert)",      false, "Crossfades toward the vertically inverted wave." },
-        { WarpMethod::Chebyshev,        WarpDomain::Amplitude, "Chebyshev",          false, "Polynomial shaper - injects a specific harmonic (best on simple waves)." },
+        { WarpMethod::SoftClip,         WarpDomain::Amplitude, "Soft Clip",          true,  "Smooth saturation - rounds peaks, adds warmth.",                          "Drive" },
+        { WarpMethod::HardClip,         WarpDomain::Amplitude, "Hard Clip",          false, "Flattens peaks past a threshold - aggressive edge.",                      "Drive" },
+        { WarpMethod::Wavefold,         WarpDomain::Amplitude, "Wavefold",           true,  "Folds peaks back inward - dense West-Coast harmonics.",                   "Fold" },
+        { WarpMethod::Wavewrap,         WarpDomain::Amplitude, "Wavewrap",           false, "Wraps peaks around instead of folding - harsh, glitchy.",                 "Wrap" },
+        { WarpMethod::Rectify,          WarpDomain::Amplitude, "Rectify",            false, "Folds the negative half up - octave-up / even harmonics.",                "Amount" },
+        { WarpMethod::Quantize,         WarpDomain::Amplitude, "Quantize (bitcrush)",true,  "Steps the amplitude - 8-bit / lo-fi character.",                          "Crush" },
+        { WarpMethod::TubeSat,          WarpDomain::Amplitude, "Tube Saturate",      true,  "Asymmetric drive - even-harmonic, tube-like warmth.",                     "Drive" },
+        { WarpMethod::TapeSat,          WarpDomain::Amplitude, "Tape Saturate",      false, "Symmetric soft drive - odd-harmonic, tape-like glue.",                    "Drive" },
+        { WarpMethod::Flip,             WarpDomain::Amplitude, "Flip (invert)",      false, "Crossfades toward the vertically inverted wave.",                         "Amount" },
+        { WarpMethod::Chebyshev,        WarpDomain::Amplitude, "Chebyshev",          false, "Polynomial shaper - injects a specific harmonic (best on simple waves).", "Amount" },
 
         // --- Phase-domain (read-position remap) ---
-        { WarpMethod::BendPlus,         WarpDomain::Phase,     "Bend +",             true,  "Pinches the cycle - pushes energy toward the end." },
-        { WarpMethod::BendMinus,        WarpDomain::Phase,     "Bend -",             true,  "Pinches the cycle - pulls energy toward the start." },
-        { WarpMethod::AsymPlus,         WarpDomain::Phase,     "Asym +",             true,  "Stretches one half, squeezes the other (rightward)." },
-        { WarpMethod::AsymMinus,        WarpDomain::Phase,     "Asym -",             true,  "Stretches one half, squeezes the other (leftward)." },
-        { WarpMethod::PwmSkew,          WarpDomain::Phase,     "PWM Skew",           true,  "Duty-cycle skew - pulse-width-modulation feel on any wave." },
-        { WarpMethod::PhaseQuantize,    WarpDomain::Phase,     "Phase Quantize",     false, "Stair-steps the read position - stepped, gritty motion." },
-        { WarpMethod::PhaseDistortion,  WarpDomain::Phase,     "Phase Distortion",   true,  "Casio-CZ-style phase warp - sine toward saw/square." },
-        { WarpMethod::VectorPhaseShaping,WarpDomain::Phase,    "Vector Phase Shape", false, "VPS - two-segment phase warp with a movable control point." },
-        { WarpMethod::Remap,            WarpDomain::Phase,     "Remap (S-curve)",    true,  "Remaps the cycle through a curve (S-curve here; full editor soon)." },
-        { WarpMethod::SelfSync,         WarpDomain::Phase,     "Self-Sync",          true,  "Plays extra cycles per period - formant-shift / sync sweep." },
+        { WarpMethod::BendPlus,         WarpDomain::Phase,     "Bend +",             true,  "Pinches the cycle - pushes energy toward the end.",                       "Bend" },
+        { WarpMethod::BendMinus,        WarpDomain::Phase,     "Bend -",             true,  "Pinches the cycle - pulls energy toward the start.",                      "Bend" },
+        { WarpMethod::AsymPlus,         WarpDomain::Phase,     "Asym +",             true,  "Stretches one half, squeezes the other (rightward).",                     "Skew" },
+        { WarpMethod::AsymMinus,        WarpDomain::Phase,     "Asym -",             true,  "Stretches one half, squeezes the other (leftward).",                      "Skew" },
+        { WarpMethod::PwmSkew,          WarpDomain::Phase,     "PWM Skew",           true,  "Duty-cycle skew - pulse-width-modulation feel on any wave.",              "Width" },
+        { WarpMethod::PhaseQuantize,    WarpDomain::Phase,     "Phase Quantize",     false, "Stair-steps the read position - stepped, gritty motion.",                 "Steps" },
+        { WarpMethod::PhaseDistortion,  WarpDomain::Phase,     "Phase Distortion",   true,  "Casio-CZ-style phase warp - sine toward saw/square.",                     "Amount" },
+        { WarpMethod::VectorPhaseShaping,WarpDomain::Phase,    "Vector Phase Shape", false, "VPS - two-segment phase warp with a movable control point.",              "Amount" },
+        { WarpMethod::Remap,            WarpDomain::Phase,     "Remap (S-curve)",    true,  "Remaps the cycle through a curve (S-curve here; full editor soon).",      "Curve" },
+        { WarpMethod::SelfSync,         WarpDomain::Phase,     "Self-Sync",          true,  "Plays extra cycles per period - formant-shift / sync sweep.",             "Sync" },
     };
     return reg;
 }
@@ -85,6 +85,12 @@ WarpDomain warpDomainOf(WarpMethod m) {
 const char* warpMethodName(WarpMethod m) {
     const auto* info = warpMethodInfo(m);
     return info ? info->name : "?";
+}
+
+const char* warpParamLabel(WarpMethod m) {
+    const auto* info = warpMethodInfo(m);
+    if (info && info->paramName && *info->paramName) return info->paramName;
+    return "Amount";
 }
 
 namespace {

@@ -4634,7 +4634,10 @@ WaveLayerEditor::WaveLayerEditor(WaveLayer* layerPtr, Callbacks cb, bool enableW
 }
 
 int WaveLayerEditor::preferredHeight() const {
-    int h = rowHeight();
+    int h = baseRowHeight;
+    // Generator-morph rows only occupy space for the shapes that show them.
+    if (morphSlider.isVisible())  h += 20;
+    if (morph2Slider.isVisible()) h += 20;
     if (warpEditor) h += 4 + warpEditor->preferredHeight();
     return h;
 }
@@ -4732,6 +4735,12 @@ void WaveLayerEditor::updateSourceControls() {
         case WaveLayer::PhaseDist: morphName = "Amount"; break;
         default: break;
     }
+    // Remember how many morph rows were visible so we can tell whether this
+    // shape switch changed our preferredHeight() and the owner needs to reflow
+    // the whole layer stack (not just our own resized()).
+    const int prevMorphRows = (morphSlider.isVisible() ? 1 : 0)
+                            + (morph2Slider.isVisible() ? 1 : 0);
+
     morphLabel.setText(morphName, juce::dontSendNotification);
     morphSlider.setValue(l.shapeParam, juce::dontSendNotification);
     morphSlider.setVisible(isGen);
@@ -4741,6 +4750,14 @@ void WaveLayerEditor::updateSourceControls() {
     morph2Slider.setValue(l.shapeParam2, juce::dontSendNotification);
     morph2Slider.setVisible(isFM);
     morph2Label .setVisible(isFM);
+
+    const int newMorphRows = (isGen ? 1 : 0) + (isFM ? 1 : 0);
+    if (newMorphRows != prevMorphRows && callbacks.onHeightChanged) {
+        // Our height changed - ask the owner to re-lay-out the stack. That
+        // re-sets our bounds and triggers resized(), so we can return here.
+        callbacks.onHeightChanged();
+        return;
+    }
 
     // The sub-row controls (freehand toggle, Formula editor + language combo) are
     // only given bounds in resized() when they're visible, so flipping their
@@ -4884,10 +4901,11 @@ void WaveLayerEditor::resized() {
     sliderRow(ratioLabel, ratioSlider);
     sliderRow(phaseLabel, phaseSlider);
     sliderRow(ampLabel,   ampSlider);
-    // Two reserved generator-morph slider rows (visibility toggled per shape in
-    // updateSourceControls; bounds always assigned so they appear in place).
-    sliderRow(morphLabel,  morphSlider);
-    sliderRow(morph2Label, morph2Slider);
+    // Generator-morph slider rows: only consume vertical space when their shape
+    // shows them (kept in sync with preferredHeight()). Reserving them when
+    // hidden was the source of the empty gap above the Layer Morph strip.
+    if (morphSlider.isVisible())  sliderRow(morphLabel,  morphSlider);
+    if (morph2Slider.isVisible()) sliderRow(morph2Label, morph2Slider);
 }
 
 void WaveLayerEditor::paint(juce::Graphics& g) {

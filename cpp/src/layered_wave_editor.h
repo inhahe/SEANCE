@@ -247,17 +247,22 @@ public:
     void mouseUp(const juce::MouseEvent&) override;
 
     static constexpr int previewHeight = 92;
-    // Base row height: label + one wave-source picker row + sub-row + 3 base
-    // slider rows + 2 generator-morph slider rows + padding + preview. This is
-    // the height of a row WITHOUT a per-layer warp editor; preferredHeight()
-    // adds the warp strip on top when present. The two morph rows are reserved
-    // always (hidden for classic shapes) so the row height stays constant when
-    // switching shapes.
-    static int rowHeight() { return 22 + 24 + 24 + 20 * 3 + 20 * 2 + 12 + previewHeight + 4; }
+    // Fixed part of a layer row, the same for every wave-source shape: outer
+    // margin (reduced(4) top+bottom) + label + wave-source picker + sub-row +
+    // the 3 base slider rows (Harmonic / Phase / Amplitude) + the mini preview.
+    // The generator-morph slider rows are NOT included here - they exist only
+    // for the generator shapes (Pulse / Sync / FM / PhaseDist), so
+    // preferredHeight() adds them on demand. Reserving them unconditionally
+    // (the old behaviour) left a large empty gap above the Layer Morph strip
+    // for the classic shapes, which is exactly the wasted space we're removing.
+    static constexpr int baseRowHeight = 8 + 22 + 24 + 24 + 20 * 3 + previewHeight;
 
-    // Actual height this row wants: rowHeight() plus the embedded per-layer
-    // warp editor's current height (which tracks its op count) when warp is
-    // enabled. Owners lay out the row stack at this per-row pitch.
+    // Actual height this row wants: baseRowHeight, plus one row per VISIBLE
+    // generator-morph slider, plus the embedded per-layer warp editor's current
+    // height (which tracks its op count) when warp is enabled. Owners lay out
+    // the row stack at this per-row pitch; updateSourceControls() fires
+    // onHeightChanged when the visible-morph-row count changes so the stack
+    // reflows on a shape switch.
     int preferredHeight() const;
 
 private:

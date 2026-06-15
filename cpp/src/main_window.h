@@ -44,6 +44,12 @@ public:
     MainContentComponent();
     ~MainContentComponent() override;
 
+    // Delete the session-lock sentinel to record that this run exited cleanly,
+    // so the next launch won't offer to recover a now-stale autosave. Called
+    // from MainWindow::tryQuit at the single clean-quit chokepoint (public so
+    // the owning MainWindow can invoke it).
+    void markCleanShutdown();
+
     void paint(juce::Graphics& g) override;
     void resized() override;
     void timerCallback() override;
@@ -240,10 +246,6 @@ private:
     // startupWasUncleanShutdown), then (re)create our own lock for this run.
     // Called once from the constructor.
     void setupSessionLock();
-    // Delete the session-lock sentinel to record that this run exited cleanly,
-    // so the next launch won't offer to recover a now-stale autosave. Called
-    // from MainWindow::tryQuit at the single clean-quit chokepoint.
-    void markCleanShutdown();
 
     // Slow autosave background worker (#86). Owns a single-slot mailbox
     // that the UI thread fills with the next save's content; the worker

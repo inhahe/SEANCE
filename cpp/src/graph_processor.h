@@ -8,6 +8,7 @@
 #include <juce_audio_formats/juce_audio_formats.h>
 #include <unordered_map>
 #include <map>
+#include <mutex>
 
 namespace SoundShop {
 
@@ -290,13 +291,52 @@ private:
     // and leaves that to the owner. This listener is attached to every graph
     // node; on a latencyChanged notification it flags a rebuild so the render
     // sequence (and thus the delay compensation) is recomputed.
+    //
+    // CRITICAL: JUCE fires audioProcessorChanged(latencyChanged=true) on every
+    // re-prepare, even when the latency value is identical. Acting on that
+    // blindly creates an infinite loop: rebuild -> prepareToPlay -> latencyChanged
+    // -> flag rebuild -> rebuild... (observed at 1736 rebuilds/session, saturating
+    // the CPU and hanging the app). So we only flag a rebuild when the latency
+    // VALUE actually changes. Because rebuildGraph recreates every processor (new
+    // pointers each time), the value cache is keyed by STABLE node id, not by
+    // processor pointer. procNodeId maps the current processors to their node ids
+    // (rebuilt each rebuild via beginRebuild/track); lastLatencyByNode persists
+    // the last settled latency per node and is refreshed by commitLatencies()
+    // AFTER prepareToPlay, so the post-prepare notification converges to a no-op.
     struct LatencyChangeListener : juce::AudioProcessorListener {
         std::atomic<bool>* rebuildFlag = nullptr;
+        std::mutex mtx;
+        std::unordered_map<juce::AudioProcessor*, int> procNodeId; // rebuilt each rebuild
+        std::unordered_map<int, int> lastLatencyByNode;            // persists across rebuilds
+
+        void beginRebuild() {
+            std::lock_guard<std::mutex> lk(mtx);
+            procNodeId.clear();
+        }
+        void track(juce::AudioProcessor* p, int nodeId) {
+            if (!p) return;
+            std::lock_guard<std::mutex> lk(mtx);
+            procNodeId[p] = nodeId;
+        }
+        void commitLatencies() {
+            std::lock_guard<std::mutex> lk(mtx);
+            for (auto& kv : procNodeId)
+                lastLatencyByNode[kv.second] = kv.first->getLatencySamples();
+        }
         void audioProcessorParameterChanged(juce::AudioProcessor*, int, float) override {}
-        void audioProcessorChanged(juce::AudioProcessor*,
+        void audioProcessorChanged(juce::AudioProcessor* p,
                                    const ChangeDetails& details) override {
-            if (details.latencyChanged && rebuildFlag)
-                rebuildFlag->store(true);
+            if (!details.latencyChanged || !rebuildFlag || !p) return;
+            int now = p->getLatencySamples();
+            {
+                std::lock_guard<std::mutex> lk(mtx);
+                auto it = procNodeId.find(p);
+                if (it == procNodeId.end()) return; // unknown processor - ignore
+                auto lit = lastLatencyByNode.find(it->second);
+                if (lit != lastLatencyByNode.end() && lit->second == now)
+                    return; // latency unchanged - no rebuild (breaks the loop)
+            }
+            rebuildFlag->store(true);
         }
     };
     LatencyChangeListener latencyListener;

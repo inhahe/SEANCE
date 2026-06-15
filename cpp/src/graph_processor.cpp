@@ -573,6 +573,7 @@ void GraphProcessor::prepare(NodeGraph& graph, double sr, int bs) {
 
 void GraphProcessor::rebuildGraph(NodeGraph& graph, Transport& transport) {
     processorGraph->clear();
+    latencyListener.beginRebuild(); // forget old processor->nodeId mappings (pointers are stale)
     nodeMap.clear();
     nodeInputMap.clear();
 
@@ -1360,6 +1361,7 @@ void GraphProcessor::rebuildGraph(NodeGraph& graph, Transport& transport) {
                 // compensation gets recomputed (addListener dedups, so a
                 // processor that survives a rebuild isn't double-registered).
                 p->addListener(&latencyListener);
+                latencyListener.track(p, kv.first); // map this processor to its stable node id
                 dbg("  node " + juce::String(kv.first)
                     + " (" + p->getName() + "): inCh="
                     + juce::String(p->getTotalNumInputChannels())
@@ -1380,6 +1382,10 @@ void GraphProcessor::processBlock(NodeGraph& graph, Transport& transport,
         rebuildGraph(graph, transport);
         if (sampleRate > 0)
             processorGraph->prepareToPlay(sampleRate, numSamples);
+        // Record settled latencies AFTER prepare so the latencyChanged
+        // notification that prepareToPlay emits converges to a no-op instead
+        // of re-flagging a rebuild (which would loop forever).
+        latencyListener.commitLatencies();
     }
 
     // Process the graph

@@ -201,6 +201,21 @@ public:
         // re-fetches the layer by its stable index and calls refreshFromModel).
         // If null, the "From Library..." menu entry is omitted.
         std::function<void()> onPickFromLibrary;
+
+        // Optional. Per-layer warp modulation (#88, item-M). The embedded
+        // per-layer warp editor's "Mod" checkbox routes through these so the
+        // owner can create/destroy a per-layer warp Param + modulation pin for
+        // warp op `opIndex` on THIS layer. The layer identity is resolved by the
+        // owner (the LayerStackComponent closure that captures the row index);
+        // only the warp slot `opIndex` is passed here. Left unset when per-layer
+        // warp is disabled - the "Mod" checkbox then stays hidden.
+        std::function<bool(int opIndex)>      isWarpOpModulated;
+        std::function<void(int opIndex,bool)> setWarpOpModulated;
+        // Optional. Mirrors WarpChainEditor::Callbacks::modDisabledReason for the
+        // per-layer chain: a non-empty return disables the op's "Mod" checkbox and
+        // shows the string as its tooltip. Used to gate per-layer warp modulation
+        // to single-frame wavetables (the only shape the synth re-bakes live).
+        std::function<juce::String(int opIndex)> warpModDisabledReason;
     };
 
     // enableWarp embeds a per-layer warp chain editor (baked shape-bending on
@@ -408,6 +423,18 @@ public:
         // chosen single cycle into target->layers[index] then calls
         // refreshFromModel(). Null = no library entry on the picker.
         std::function<void(int layerIndex)> onPickFromLibrary;
+
+        // Optional. Per-layer warp modulation (#88, item-M). The per-layer warp
+        // editor's "Mod" checkbox routes (layerIndex, opIndex) to the owner, which
+        // creates/destroys a per-layer warp Param + modulation pin so an LFO /
+        // oscillator cable can drive that op's amount live. isLayerWarpOpModulated
+        // queries the current pin state; setLayerWarpOpModulated toggles it;
+        // layerWarpModDisabledReason returns a non-empty string to disable the
+        // checkbox with an explanation (used to gate modulation to single-frame
+        // wavetables). All null = the "Mod" checkbox stays hidden (baked-only).
+        std::function<bool(int layerIndex,int opIndex)>      isLayerWarpOpModulated;
+        std::function<void(int layerIndex,int opIndex,bool)> setLayerWarpOpModulated;
+        std::function<juce::String(int layerIndex,int opIndex)> layerWarpModDisabledReason;
     };
 
     LayerStackComponent(Options opts, std::function<void()> onChanged);
@@ -1377,6 +1404,33 @@ private:
     // can opt into a modulation pin). Returns -1 if the param isn't present yet.
     // Used by the warp editor's per-row "Mod" checkbox callbacks.
     int warpParamIndexForOp(int opIndex) const;
+
+    // ---- Per-layer warp modulation (#88, item-M) --------------------------
+    // The layer stack's per-layer "Mod" checkbox routes (layer, opIndex) here.
+    // A per-layer warp param is keyed by (Param::warpLayer == layer,
+    // Param::warpSlot == opIndex) and exists ONLY while modulated (created on
+    // check, destroyed on uncheck) - distinct from the always-present frame-
+    // scope "Warp N" params. The synth re-bakes the modulated op's amount live
+    // for a SINGLE-frame wavetable only, so the checkbox is gated to that case.
+    //
+    // perLayerWarpParamIndex: find the (layer, op) param's index, or -1.
+    int  perLayerWarpParamIndex(int layer, int op) const;
+    // True when per-layer warp modulation is offered (the wavetable holds exactly
+    // one frame, the only shape the synth re-bakes live).
+    bool perLayerWarpModSupported() const;
+    // Query/toggle the (layer, op) per-layer warp modulation pin. Toggling on
+    // creates the param (seeded from the op amount) + a mod pin; toggling off
+    // drops the pin and the now-orphan param. No-op when unsupported.
+    bool isLayerWarpOpModulated(int layer, int op) const;
+    void setLayerWarpOpModulated(int layer, int op, bool on);
+    // Reconcile every per-layer warp param against the current editing frame's
+    // chains (remove params for deleted ops + their pins, relabel survivors).
+    // Called from onLayerChanged on every edit; early-outs when no per-layer warp
+    // param exists. Drops all per-layer params when the table isn't single-frame.
+    void reconcilePerLayerWarpParamsNow();
+    // Empty when the (layer, op) op can be modulated; otherwise the reason its
+    // "Mod" checkbox is disabled (the grayed-control-explains-itself rule).
+    juce::String layerWarpModDisabledReason(int layer, int op) const;
     // Re-sync Position params/pins only when the effective dimension count has
     // actually changed since the params were last built. Cheap to call on every
     // structural mutation (grid axis resize, scatter frame add/remove, cell

@@ -59,6 +59,15 @@ public:
         // after setModulated so the host can re-commit.
         std::function<bool(int)>      isModulated;
         std::function<void(int,bool)> setModulated;
+
+        // Optional. When set and it returns a NON-empty string for op `opIndex`,
+        // the per-row "Mod" checkbox is shown but DISABLED, with that string as
+        // its tooltip (the grayed-control-explains-itself rule). Returns empty
+        // when the op can be modulated (checkbox enabled). Hosts that only allow
+        // modulation in some states - e.g. per-layer warp, which the synth only
+        // re-bakes live for a single-frame wavetable - use this to explain why
+        // the checkbox is unavailable instead of silently doing nothing.
+        std::function<juce::String(int)> modDisabledReason;
     };
 
     explicit WarpChainEditor(Callbacks cb);

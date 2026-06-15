@@ -230,6 +230,20 @@ void WarpChainEditor::refreshRowVisuals(int idx) {
     if (row.mod && cb.isModulated) {
         modulated = cb.isModulated(idx);
         row.mod->setToggleState(modulated, juce::dontSendNotification);
+        // Grayed-control-explains-itself: when the host reports a reason this op
+        // can't be modulated right now (e.g. per-layer warp only re-bakes a
+        // single-frame wavetable), disable the checkbox and surface the reason as
+        // its tooltip instead of the generic "add a pin" copy. Empty reason (the
+        // common case) = enabled.
+        juce::String reason =
+            cb.modDisabledReason ? cb.modDisabledReason(idx) : juce::String();
+        const bool modAvail = reason.isEmpty();
+        row.mod->setEnabled(modAvail);
+        row.mod->setTooltip(modAvail
+            ? "Add a modulation input pin for this stage's amount, so an LFO / "
+              "oscillator cable can drive the morph live. Uncheck to remove the "
+              "pin and edit the amount by hand."
+            : reason);
     }
     // Disabled op = greyed amount slider so the bypass is visible. A modulated
     // amount is also greyed (driven by the incoming cable, not the slider).

@@ -2575,6 +2575,24 @@ void LayerStackComponent::rebuildRows() {
                     if (i < 0 || i >= (int)target->layers.size()) return;
                     opts.onPickFromLibrary(i);
                 };
+            // Per-layer warp modulation: bind the stable row index `i` and forward
+            // (i, opIndex) to the owner. Wired only when the owner supplied the
+            // callbacks, so the "Mod" checkbox stays hidden otherwise.
+            if (opts.isLayerWarpOpModulated)
+                cb.isWarpOpModulated = [this, i](int op) {
+                    return opts.isLayerWarpOpModulated
+                        && opts.isLayerWarpOpModulated(i, op);
+                };
+            if (opts.setLayerWarpOpModulated)
+                cb.setWarpOpModulated = [this, i](int op, bool on) {
+                    if (opts.setLayerWarpOpModulated)
+                        opts.setLayerWarpOpModulated(i, op, on);
+                };
+            if (opts.layerWarpModDisabledReason)
+                cb.warpModDisabledReason = [this, i](int op) -> juce::String {
+                    return opts.layerWarpModDisabledReason
+                         ? opts.layerWarpModDisabledReason(i, op) : juce::String();
+                };
             auto row = std::make_unique<WaveLayerEditor>(
                 &target->layers[i], std::move(cb), opts.enablePerLayerWarp);
             const int rh = row->preferredHeight();
@@ -3503,6 +3521,16 @@ static std::string warpSlotParamName(const WarpOp& op, int slot) {
     return std::string(warpParamLabel(op.method)) + " " + std::to_string(slot + 1);
 }
 
+// Display name for a PER-LAYER warp op's modulation param. Per-layer ops live
+// inside one layer's sum (distinct from the frame-scope chain), so two layers -
+// or a layer and the frame-scope chain - can hold the same method+slot and would
+// otherwise produce identical "Drive 1" pin labels. The "L<n> " prefix (1-based
+// layer) disambiguates them on the node graph, e.g. "L2 Drive 1". The stable key
+// is still (Param::warpLayer, Param::warpSlot); this is only the label.
+static std::string perLayerWarpParamName(const WarpOp& op, int layer, int slot) {
+    return "L" + std::to_string(layer + 1) + " " + warpSlotParamName(op, slot);
+}
+
 // Relabel the modulation pin bound to param index `pi` so it follows the param's
 // current display name (keeping the Mod:/Set: prefix). No-op if the param has no
 // pin. Called after a rename so a wired "Mod: Soft Clip Drive 1" pin tracks a
@@ -3680,8 +3708,8 @@ void reconcilePerLayerWarpParams(NodeGraph& graph, int nodeId,
         if (p.warpLayer < 0) continue;
         if (!opValid(p.warpLayer, p.warpSlot)) continue;
         nd->params[pi].name =
-            warpSlotParamName(layerChains[(size_t)p.warpLayer][(size_t)p.warpSlot],
-                              p.warpSlot);
+            perLayerWarpParamName(layerChains[(size_t)p.warpLayer][(size_t)p.warpSlot],
+                                  p.warpLayer, p.warpSlot);
         relabelWarpModPin(*nd, pi);
     }
 }
@@ -4553,10 +4581,12 @@ WaveLayerEditor::WaveLayerEditor(WaveLayer* layerPtr, Callbacks cb, bool enableW
     deleteBtn.setVisible((bool) callbacks.onDelete);
 
     // Per-layer warp chain editor (baked shape-bending on this layer's cycle).
-    // Only built when the owner opts in. Unlike the doc-level frame-scope warp,
-    // this is NOT modulatable - it's baked into the layer's contribution at
-    // render time - so its callbacks only re-render and signal onChanged; they
-    // never touch node params.
+    // Only built when the owner opts in. A per-layer warp op is baked into the
+    // layer's contribution at render time UNLESS the owner opts it into a
+    // modulation pin (the unified warp/morph model, #88) - the "Mod" checkbox,
+    // wired through callbacks.isWarpOpModulated / setWarpOpModulated, makes the
+    // synth re-bake that op's amount live from a cable. The checkbox stays hidden
+    // when the owner leaves those callbacks unset.
     if (enableWarp) {
         WarpChainEditor::Callbacks wcb;
         wcb.onChanged = [this]() {
@@ -4570,6 +4600,23 @@ WaveLayerEditor::WaveLayerEditor(WaveLayer* layerPtr, Callbacks cb, bool enableW
             refreshPreview();
             if (callbacks.onChanged) callbacks.onChanged();
         };
+        // Per-layer warp modulation: forward the op index to the owner, which
+        // resolves this layer's index and creates/destroys the (warpLayer,
+        // warpSlot) Param + mod pin. Only wired when the owner supplied the
+        // callbacks; otherwise the "Mod" checkbox stays hidden (baked-only).
+        if (callbacks.isWarpOpModulated)
+            wcb.isModulated = [this](int op) {
+                return callbacks.isWarpOpModulated && callbacks.isWarpOpModulated(op);
+            };
+        if (callbacks.setWarpOpModulated)
+            wcb.setModulated = [this](int op, bool on) {
+                if (callbacks.setWarpOpModulated) callbacks.setWarpOpModulated(op, on);
+            };
+        if (callbacks.warpModDisabledReason)
+            wcb.modDisabledReason = [this](int op) -> juce::String {
+                return callbacks.warpModDisabledReason
+                     ? callbacks.warpModDisabledReason(op) : juce::String();
+            };
         warpEditor = std::make_unique<WarpChainEditor>(std::move(wcb));
         if (layer) warpEditor->setChain(&layer->warpChain);
         addAndMakeVisible(*warpEditor);
@@ -8499,6 +8546,20 @@ LayeredWaveEditorComponent::LayeredWaveEditorComponent(NodeGraph& g, int nid, st
         lsOpts.onPickFromLibrary = [this](int layerIndex) {
             showWaveformLibraryBrowserForLayer(layerIndex);
         };
+        // Per-layer warp modulation (#88, item-M): the per-layer "Mod" checkbox
+        // creates/destroys a (warpLayer, warpSlot) param + pin so a cable can
+        // drive that op's morph amount live. Gated to single-frame wavetables
+        // (the only shape the synth re-bakes live); the disabled-reason callback
+        // explains the gate on multi-frame tables.
+        lsOpts.isLayerWarpOpModulated = [this](int layer, int op) {
+            return isLayerWarpOpModulated(layer, op);
+        };
+        lsOpts.setLayerWarpOpModulated = [this](int layer, int op, bool on) {
+            setLayerWarpOpModulated(layer, op, on);
+        };
+        lsOpts.layerWarpModDisabledReason = [this](int layer, int op) {
+            return layerWarpModDisabledReason(layer, op);
+        };
         layerStack = std::make_unique<LayerStackComponent>(
             std::move(lsOpts), [this]() { onLayerChanged(); });
         addChildComponent(*layerStack); // visibility toggled in resized()
@@ -9694,9 +9755,105 @@ void LayeredWaveEditorComponent::swapWarpParamNames(int a, int b) {
 int LayeredWaveEditorComponent::warpParamIndexForOp(int opIndex) const {
     auto* nd = graph.findNode(nodeId);
     if (!nd) return -1;
+    // Frame-scope only: per-layer warp params (warpLayer >= 0) share the warpSlot
+    // numbering but belong to a different chain, so they must not be returned here.
     for (int i = 0; i < (int)nd->params.size(); ++i)
-        if (nd->params[i].warpSlot == opIndex) return i;
+        if (nd->params[i].warpLayer == -1 && nd->params[i].warpSlot == opIndex) return i;
     return -1;
+}
+
+int LayeredWaveEditorComponent::perLayerWarpParamIndex(int layer, int op) const {
+    auto* nd = graph.findNode(nodeId);
+    if (!nd) return -1;
+    for (int i = 0; i < (int)nd->params.size(); ++i)
+        if (nd->params[i].warpLayer == layer && nd->params[i].warpSlot == op) return i;
+    return -1;
+}
+
+bool LayeredWaveEditorComponent::perLayerWarpModSupported() const {
+    // The synth re-bakes a modulated per-layer warp op live only for a single-
+    // frame wavetable (one cell occupies terrain.data contiguously). Multi-frame
+    // grids can't be re-baked in place and (warpLayer, warpSlot) can't address a
+    // specific frame's layer, so per-layer modulation is offered single-frame only.
+    return wave.cellWaveformIds.size() == 1;
+}
+
+bool LayeredWaveEditorComponent::isLayerWarpOpModulated(int layer, int op) const {
+    if (!perLayerWarpModSupported()) return false;
+    int pi = perLayerWarpParamIndex(layer, op);
+    return pi >= 0 && hasParamModPin(graph, nodeId, pi);
+}
+
+juce::String LayeredWaveEditorComponent::layerWarpModDisabledReason(int layer, int op) const {
+    juce::ignoreUnused(layer, op);
+    if (!perLayerWarpModSupported())
+        return "Per-layer morph modulation works on a single-waveform table. "
+               "This wavetable has multiple frames, so morph each one by hand "
+               "or drive the frame-scope morph instead.";
+    return {};
+}
+
+void LayeredWaveEditorComponent::reconcilePerLayerWarpParamsNow() {
+    Node* nd = graph.findNode(nodeId);
+    if (!nd) return;
+    // Early-out: nothing to do unless at least one per-layer warp param exists.
+    bool anyPerLayer = false;
+    for (const auto& p : nd->params)
+        if (p.warpLayer >= 0) { anyPerLayer = true; break; }
+    if (!anyPerLayer) return;
+    // Per-layer warp is only ever created single-frame; if the table grew to
+    // multiple frames the lone editing frame's chains no longer address those
+    // params, so reconcile against an empty set to drop every per-layer param.
+    std::vector<std::vector<WarpOp>> chains;
+    if (perLayerWarpModSupported()) {
+        if (const LayeredWaveform* lw = currentEditingLayeredFrame()) {
+            chains.reserve(lw->layers.size());
+            for (const auto& L : lw->layers) chains.push_back(L.warpChain);
+        }
+    }
+    reconcilePerLayerWarpParams(graph, nodeId, chains);
+}
+
+void LayeredWaveEditorComponent::setLayerWarpOpModulated(int layer, int op, bool on) {
+    if (!perLayerWarpModSupported()) return;
+    Node* nd = graph.findNode(nodeId);
+    if (!nd) return;
+    LayeredWaveform* lw = currentEditingLayeredFrame();
+    if (!lw || layer < 0 || layer >= (int)lw->layers.size()) return;
+    const auto& chain = lw->layers[(size_t)layer].warpChain;
+    if (op < 0 || op >= (int)chain.size()) return;
+
+    if (on) {
+        int pi = perLayerWarpParamIndex(layer, op);
+        if (pi < 0) {
+            // Create the on-demand per-layer warp param, seeded from the op's
+            // baked amount and keyed by (warpLayer, warpSlot) so the synth's
+            // live re-bake addresses it (getParamByWarpLayerSlot).
+            Param p;
+            p.warpLayer = layer;
+            p.warpSlot  = op;
+            p.name      = perLayerWarpParamName(chain[(size_t)op], layer, op);
+            p.value = p.baseValue = chain[(size_t)op].amount;
+            p.minVal = 0.0f; p.maxVal = 1.0f; p.format = "%.2f";
+            nd->params.push_back(std::move(p));
+            pi = (int)nd->params.size() - 1;
+        }
+        addParamModPin(graph, nodeId, pi, /*absolute=*/false);
+    } else {
+        int pi = perLayerWarpParamIndex(layer, op);
+        if (pi < 0) return;
+        // Drop the pin + cable, then erase the now-orphan param and shift every
+        // higher modPin paramIndex down to keep the bindings valid.
+        removeParamModPin(graph, nodeId, pi);
+        pi = perLayerWarpParamIndex(layer, op);   // unchanged by pin removal
+        if (pi < 0) return;
+        nd->params.erase(nd->params.begin() + pi);
+        for (auto& mp : nd->modPins)
+            if (mp.paramIndex > pi) --mp.paramIndex;
+    }
+    // The warp editor's onClick fires onChanged right after this, which routes to
+    // onLayerChanged() -> commit + debounced undo snapshot + audio-graph rebuild,
+    // so the new pin/param take effect. Nothing more to do here.
 }
 
 void LayeredWaveEditorComponent::syncWarpParams() {
@@ -11145,6 +11302,12 @@ void LayeredWaveEditorComponent::reloadFromNode() {
 }
 
 void LayeredWaveEditorComponent::onLayerChanged() {
+    // Keep per-layer warp modulation params consistent with the live chains:
+    // removing/reordering a per-layer warp op must drop or relabel its (warpLayer,
+    // warpSlot) param + pin. Cheap, idempotent, and a no-op unless a per-layer
+    // warp param actually exists - so the common (un-modulated) path skips the
+    // chain copy entirely. Single-frame only, matching where the synth re-bakes.
+    reconcilePerLayerWarpParamsNow();
     // Live visual preview every tick; audio rebuild is debounced so we don't
     // race JUCE's AudioProcessorGraph async rebuild (which crashes on rapid
     // concurrent rebuilds).

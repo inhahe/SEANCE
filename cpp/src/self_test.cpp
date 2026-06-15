@@ -3580,7 +3580,7 @@ void testAssetLibrary(Report& r) {
         // Width param must still be addressable by (1,0) with a sane index.
         const Param* widthP = nullptr;
         for (auto& q : nd->params) if (q.warpLayer == 1 && q.warpSlot == 0) widthP = &q;
-        r.check(widthP && widthP->name == "Width 1",
+        r.check(widthP && widthP->name == "L2 Width 1",
                 "per-layer reconcile: remapped survivor keeps its identity");
 
         // (c) Method change on layer0 slot0 (Wavefold -> SoftClip) relabels the
@@ -3590,7 +3590,7 @@ void testAssetLibrary(Report& r) {
         nd = g.findNode(nId);
         const Param* relabelled = nullptr;
         for (auto& q : nd->params) if (q.warpLayer == 0 && q.warpSlot == 0) relabelled = &q;
-        r.check(relabelled && relabelled->name == "Drive 1",
+        r.check(relabelled && relabelled->name == "L1 Drive 1",
                 "per-layer reconcile: method change relabels survivor by op method");
     }
 

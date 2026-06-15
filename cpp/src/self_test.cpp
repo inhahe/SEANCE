@@ -3442,6 +3442,116 @@ void testAssetLibrary(Report& r) {
                 (movedPin ? movedPin->name : std::string("<none>")) + "')");
     }
 
+    // ---- Per-layer warp params: warpLayer round-trip (inc 4) ----------------
+    {
+        // A per-layer Type-2 warp param carries warpLayer >= 0 (which layer's
+        // chain it indexes) alongside warpSlot. Both must survive save/load so a
+        // pinned per-layer morph reattaches to the right op after reload.
+        NodeGraph g;
+        int nId = g.addNode("wt", NodeType::TerrainSynth, {}, {}).id;
+        Node* nd = g.findNode(nId);
+        Param p; p.name = "Fold 1"; p.value = p.baseValue = 0.4f;
+        p.minVal = 0; p.maxVal = 1; p.format = "%.2f";
+        p.warpSlot = 0; p.warpLayer = 2;   // op 0 of layer 2
+        nd->params.push_back(p);
+
+        std::ostringstream oss;
+        ProjectFile::writeProject(oss, g, nullptr, /*includeView*/false,
+                                  /*includeBlobs*/true);
+        std::string saved = oss.str();
+        r.check(saved.find("warpLayer=2") != std::string::npos,
+                "per-layer warp: save emits warpLayer for a per-layer param");
+
+        NodeGraph g2;
+        std::istringstream iss(saved);
+        ProjectFile::readProject(iss, g2, nullptr);
+        Node* nd2 = g2.findNode(nId);
+        const Param* rp = nullptr;
+        if (nd2) for (auto& q : nd2->params) if (q.name == "Fold 1") rp = &q;
+        r.check(rp && rp->warpSlot == 0 && rp->warpLayer == 2,
+                "per-layer warp: warpSlot + warpLayer survive round-trip");
+    }
+
+    // ---- Per-layer warp params: reconcilePerLayerWarpParams (inc 4) ---------
+    {
+        // reconcilePerLayerWarpParams keys per-layer params by (warpLayer,
+        // warpSlot) against a 2-D set of layer chains. It NEVER adds (per-layer
+        // params are created on demand); it removes params whose op is gone
+        // (dropping their mod pins + cables, remapping survivors) and relabels
+        // survivors from the op method. Frame-scope params (warpLayer == -1) are
+        // left untouched.
+        NodeGraph g;
+        int nId = g.addNode("wt", NodeType::TerrainSynth, {}, {}).id;
+        Node* nd = g.findNode(nId);
+
+        auto makeParam = [](const char* name, int layer, int slot, float v) {
+            Param p; p.name = name; p.value = p.baseValue = v;
+            p.minVal = 0; p.maxVal = 1; p.format = "%.2f";
+            p.warpSlot = slot; p.warpLayer = layer;
+            return p;
+        };
+        // A frame-scope warp param (must be ignored by the per-layer reconcile).
+        nd->params.push_back(makeParam("Fold 1", -1, 0, 0.2f));
+        // Per-layer params: layer0 slot0 (Fold), layer0 slot1 (Drive),
+        // layer1 slot0 (Width). Give layer0 slot1 a bound modPin.
+        nd->params.push_back(makeParam("Fold 1",  0, 0, 0.3f)); // idx 1
+        nd->params.push_back(makeParam("Drive 2", 0, 1, 0.5f)); // idx 2  (pinned)
+        nd->params.push_back(makeParam("Width 1", 1, 0, 0.7f)); // idx 3
+        const int pinnedIdx = 2;
+        int pinId = g.allocId();
+        nd->pinsIn.push_back({pinId, "Mod: Drive 2", PinKind::Param, true, 1});
+        Node::ModPin mp; mp.paramIndex = pinnedIdx; mp.pinId = pinId;
+        mp.mode = Node::ModPin::Mode::Modulate;
+        nd->modPins.push_back(mp);
+
+        // (a) All ops live -> nothing removed, survivors relabelled to method.
+        std::vector<std::vector<WarpOp>> chains(2);
+        auto op = [](WarpMethod m) { WarpOp o; o.method = m; o.amount = 0.5f; o.enabled = true; return o; };
+        chains[0] = { op(WarpMethod::Wavefold), op(WarpMethod::SoftClip) };
+        chains[1] = { op(WarpMethod::PwmSkew) };
+        reconcilePerLayerWarpParams(g, nId, chains);
+        nd = g.findNode(nId);
+        r.check(nd->params.size() == 4,
+                "per-layer reconcile: all-live keeps every param (no add, no remove)");
+
+        // (b) Drop layer0 slot1 (SoftClip) -> its param removed, modPin + pin +
+        //     cable dropped, the layer1 param's index remapped past the hole.
+        chains[0] = { op(WarpMethod::Wavefold) };  // slot1 gone
+        reconcilePerLayerWarpParams(g, nId, chains);
+        nd = g.findNode(nId);
+        bool drivePresent = false, foldPL = false, widthPL = false, foldFrame = false;
+        for (auto& q : nd->params) {
+            if (q.warpLayer == 0 && q.warpSlot == 1) drivePresent = true;
+            if (q.warpLayer == 0 && q.warpSlot == 0) foldPL = true;
+            if (q.warpLayer == 1 && q.warpSlot == 0) widthPL = true;
+            if (q.warpLayer == -1) foldFrame = true;
+        }
+        r.check(!drivePresent && foldPL && widthPL && foldFrame,
+                "per-layer reconcile: dead op's param removed; others (incl frame-scope) kept");
+        bool pinGone = true;
+        for (auto& p : nd->pinsIn) if (p.id == pinId) pinGone = false;
+        bool modPinGone = true;
+        for (auto& m : nd->modPins) if (m.pinId == pinId) modPinGone = false;
+        r.check(pinGone && modPinGone,
+                "per-layer reconcile: removed param's mod pin + cable are dropped");
+        // The surviving modPins (none here) must still point at valid params; the
+        // Width param must still be addressable by (1,0) with a sane index.
+        const Param* widthP = nullptr;
+        for (auto& q : nd->params) if (q.warpLayer == 1 && q.warpSlot == 0) widthP = &q;
+        r.check(widthP && widthP->name == "Width 1",
+                "per-layer reconcile: remapped survivor keeps its identity");
+
+        // (c) Method change on layer0 slot0 (Wavefold -> SoftClip) relabels the
+        //     surviving per-layer param "Fold 1" -> "Drive 1" without moving it.
+        chains[0] = { op(WarpMethod::SoftClip) };
+        reconcilePerLayerWarpParams(g, nId, chains);
+        nd = g.findNode(nId);
+        const Param* relabelled = nullptr;
+        for (auto& q : nd->params) if (q.warpLayer == 0 && q.warpSlot == 0) relabelled = &q;
+        r.check(relabelled && relabelled->name == "Drive 1",
+                "per-layer reconcile: method change relabels survivor by op method");
+    }
+
     // ---- FrequencyGraph asset kind: SpectralCurve payload, all source forms -
     {
         // The FrequencyGraph kind stores SpectralCurve::encode() payloads. It is

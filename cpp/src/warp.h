@@ -168,3 +168,34 @@ float warpReadCycle(const std::vector<float>& cycle, float phase);
 // decoders never see it).
 std::string encodeWarpChain(const std::vector<WarpOp>& chain);
 std::vector<WarpOp> decodeWarpChain(const std::string& s);
+
+// ---- Built-in morph presets (curated Type-2 / Bucket A chains) --------------
+//
+// Code-defined starting points for the morph (warp-chain) picker - the Type-2
+// analogue of the built-in factory waveform bank. A handful of musically-useful
+// chains (warm saturation, wavefold, lo-fi crush, ...) so the morph library
+// picker is never empty in a fresh project. These are TEMPLATES, not
+// live-reference assets: choosing one COPIES its ops into the editor's chain (the
+// frame then owns an independent copy), exactly as a factory waveform is copied
+// into a layer. User-saved chains (AssetLibrary MorphAlgorithm) are the
+// live-reference assets. All ops are Bucket A (Type-2), so a built-in can never
+// introduce a Type-1 wave-defining generator at a summation/transfer stage.
+struct BuiltinMorphChain {
+    int                 id;          // stable built-in id (kBuiltinMorphIdBase + n)
+    const char*         name;        // display name in the morph picker
+    const char*         description; // one-line tooltip
+    std::vector<WarpOp> ops;         // the Type-2 chain (all Bucket A methods)
+};
+
+// Reserved built-in id base - far below AssetLibrary::kUserIdBase (1e6) and the
+// morph combo's reserved id 1 (Independent), so a built-in id never collides
+// with a user MorphAlgorithm id or the Independent sentinel. (See the "DISJOINT
+// ID SPACE" note in asset_library.h.)
+constexpr int kBuiltinMorphIdBase = 200000;
+
+// The curated built-in chains, in display order. Stable for the process; the ops
+// are assembled once on first call.
+const std::vector<BuiltinMorphChain>& builtinMorphChains();
+
+// Look up a built-in chain by id, or nullptr if `id` is not a built-in morph id.
+const BuiltinMorphChain* builtinMorphChain(int id);

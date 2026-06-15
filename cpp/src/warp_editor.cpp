@@ -87,7 +87,22 @@ void WarpChainEditor::rebuildLibraryCombo() {
     libraryCombo.addItem("(Independent)", 1);   // reserved id 1 (user ids >= 1e6)
     int cur = libCtx.getAssetId ? libCtx.getAssetId() : -1;
     bool curListed = false;
-    for (const AssetEntry* e : libCtx.lib->list(AssetKind::MorphAlgorithm)) {
+
+    // Built-in curated chains (code, not user data) - the Type-2 analogue of the
+    // factory waveform bank. Selecting one COPIES its ops into the chain and
+    // detaches to Independent (a template, not a live reference), so a built-in id
+    // is never stored as the assetId - it only ever appears as a transient combo
+    // pick. Listed first so a fresh project's picker is never just "(Independent)".
+    const auto& builtins = builtinMorphChains();
+    if (!builtins.empty()) {
+        libraryCombo.addSectionHeading("Built-in");
+        for (const auto& b : builtins)
+            libraryCombo.addItem(juce::String(b.name), b.id);
+    }
+
+    auto userEntries = libCtx.lib->list(AssetKind::MorphAlgorithm);
+    if (!userEntries.empty()) libraryCombo.addSectionHeading("Saved");
+    for (const AssetEntry* e : userEntries) {
         juce::String nm = e->name.empty() ? ("#" + juce::String(e->id))
                                           : juce::String(e->name);
         libraryCombo.addItem(nm, e->id);
@@ -110,6 +125,21 @@ void WarpChainEditor::onLibrarySelected(int comboId) {
         libCtx.setAssetId(-1);
         refreshLibraryRow();
         if (cb.onChanged) cb.onChanged();
+        return;
+    }
+    if (const BuiltinMorphChain* b = builtinMorphChain(comboId)) {
+        // Built-in template: COPY its ops in and stay Independent (built-ins are
+        // immutable starting points, not live-reference assets - the same model
+        // as copying a factory waveform into a layer). The op count changes, so
+        // this is a structural edit: fire onStructureChanged so the host re-syncs
+        // its "Warp N" params. refreshLibraryRow resets the combo to "(Independent)"
+        // since the assetId is now -1.
+        *chain = b->ops;
+        libCtx.setAssetId(-1);
+        rebuild();
+        refreshLibraryRow();
+        if (cb.onChanged) cb.onChanged();
+        if (cb.onStructureChanged) cb.onStructureChanged();
         return;
     }
     // Adopt the chosen library chain: mirror it into the bound chain and

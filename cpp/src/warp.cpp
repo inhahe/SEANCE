@@ -351,3 +351,53 @@ std::vector<WarpOp> decodeWarpChain(const std::string& s) {
     }
     return chain;
 }
+
+// ---------------------------------------------------------------------------
+// Built-in morph presets (curated Type-2 / Bucket A chains)
+// ---------------------------------------------------------------------------
+const std::vector<BuiltinMorphChain>& builtinMorphChains() {
+    auto op = [](WarpMethod m, float amount, float aux = 0.0f) {
+        WarpOp w; w.method = m; w.amount = amount; w.aux = aux; w.enabled = true;
+        return w;
+    };
+    static const std::vector<BuiltinMorphChain> chains = {
+        { kBuiltinMorphIdBase + 0, "Warm Saturation",
+          "Gentle tube + soft-clip drive - rounds peaks and adds even-harmonic warmth.",
+          { op(WarpMethod::TubeSat, 0.35f), op(WarpMethod::SoftClip, 0.30f) } },
+
+        { kBuiltinMorphIdBase + 1, "West Coast Fold",
+          "Wavefolder into a touch of soft clip - dense, metallic Buchla-style harmonics.",
+          { op(WarpMethod::Wavefold, 0.55f), op(WarpMethod::SoftClip, 0.20f) } },
+
+        { kBuiltinMorphIdBase + 2, "Lo-Fi Crush",
+          "Bit/sample-style amplitude quantize plus hard clip - gritty 8-bit character.",
+          { op(WarpMethod::Quantize, 0.45f), op(WarpMethod::HardClip, 0.25f) } },
+
+        { kBuiltinMorphIdBase + 3, "Tape Glue",
+          "Symmetric tape-style soft saturation - odd-harmonic glue, subtle thickening.",
+          { op(WarpMethod::TapeSat, 0.40f) } },
+
+        { kBuiltinMorphIdBase + 4, "Pulse Width",
+          "Duty-cycle skew - a PWM-style pulse-width feel on any waveform.",
+          { op(WarpMethod::PwmSkew, 0.50f) } },
+
+        { kBuiltinMorphIdBase + 5, "Soft Bend",
+          "Pinches the cycle toward its end - asymmetric, vowel-like brightening.",
+          { op(WarpMethod::BendPlus, 0.45f) } },
+
+        { kBuiltinMorphIdBase + 6, "Formant Sync",
+          "Self-sync read-restart - formant-shift / hard-sync sweep on the existing wave.",
+          { op(WarpMethod::SelfSync, 0.40f) } },
+
+        { kBuiltinMorphIdBase + 7, "Rectify Octave",
+          "Folds the negative half up then warms it - octave-up even-harmonic edge.",
+          { op(WarpMethod::Rectify, 0.60f), op(WarpMethod::SoftClip, 0.20f) } },
+    };
+    return chains;
+}
+
+const BuiltinMorphChain* builtinMorphChain(int id) {
+    for (const auto& c : builtinMorphChains())
+        if (c.id == id) return &c;
+    return nullptr;
+}

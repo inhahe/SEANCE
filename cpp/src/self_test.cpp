@@ -35,6 +35,7 @@
 #include <algorithm>
 #include <sstream>
 #include <fstream>
+#include <set>
 
 namespace SoundShop {
 namespace {
@@ -2117,6 +2118,46 @@ void testWarp(Report& r) {
         emptBack.decode(encEmpty);
         r.check(emptBack.warpChain.empty(),
                 "warp: pre-warp payload decodes to an empty chain");
+    }
+
+    // ---- Built-in morph presets (curated Type-2 chains) ----------------
+    {
+        const auto& builtins = builtinMorphChains();
+        r.check(!builtins.empty(),
+                "morph-presets: at least one built-in chain is registered");
+
+        bool idsOk = true, idsDisjoint = true, opsOk = true, lookupOk = true;
+        bool allType2 = true, nonEmptyOps = true;
+        std::set<int> seen;
+        for (const auto& b : builtins) {
+            // Ids in the reserved built-in range, disjoint from the user id space
+            // and the Independent sentinel (1).
+            if (b.id < kBuiltinMorphIdBase || b.id >= AssetLibrary::kUserIdBase || b.id == 1)
+                idsOk = false;
+            if (!seen.insert(b.id).second) idsDisjoint = false;
+            if (b.ops.empty()) nonEmptyOps = false;
+            // Every op must be a real Bucket A (Type-2) method - phase or
+            // amplitude domain. A built-in must never carry a Type-1 generator
+            // (those aren't in the WarpMethod enum at all) or a Bucket C domain.
+            for (const auto& op : b.ops) {
+                WarpDomain d = warpDomainOf(op.method);
+                if (op.method == WarpMethod::None) opsOk = false;
+                if (d != WarpDomain::Phase && d != WarpDomain::Amplitude)
+                    allType2 = false;
+            }
+            // Lookup by id resolves back to the same chain.
+            const BuiltinMorphChain* found = builtinMorphChain(b.id);
+            if (found != &b) lookupOk = false;
+        }
+        r.check(idsOk,       "morph-presets: ids sit in the reserved built-in range");
+        r.check(idsDisjoint, "morph-presets: built-in ids are unique");
+        r.check(nonEmptyOps, "morph-presets: every built-in has at least one op");
+        r.check(opsOk,       "morph-presets: no built-in op is None");
+        r.check(allType2,    "morph-presets: every built-in op is Type-2 (phase/amplitude)");
+        r.check(lookupOk,    "morph-presets: builtinMorphChain(id) resolves each entry");
+        // An unknown id resolves to nullptr.
+        r.check(builtinMorphChain(424242) == nullptr,
+                "morph-presets: unknown id resolves to nullptr");
     }
 
     // ---- AHDSR per-segment tension: warp properties + round-trip --------

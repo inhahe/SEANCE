@@ -304,6 +304,21 @@ struct LayeredWaveform : public IWavetableFrame {
     // should go through the IWavetableFrame render() path.
     void render(std::vector<float>& out) const;
 
+    // Render like render(), but with each layer's per-layer warp-op amounts
+    // overridden by live values (the unified warp/morph model: a per-layer warp
+    // op can opt into a modulation pin, so its amount is driven by a cable). The
+    // synth calls this at block rate to re-bake the cycle when any per-layer warp
+    // op is modulated; the editor's baked path stays on plain render().
+    //   overrides[layerIdx][opSlot] = live amount in [0,1], or < 0 to keep the
+    //   op's baked amount. overrides[layerIdx] may be shorter than the layer's
+    //   warp chain (trailing ops keep their baked amount) or empty (no override
+    //   for that layer). `overrides` itself may be shorter than `layers`.
+    // With an empty `overrides` this is byte-for-byte identical to render() -
+    // render() delegates here - so there is a single summation/normalization
+    // code path.
+    void renderWithLiveWarp(const std::vector<std::vector<float>>& overrides,
+                            std::vector<float>& out) const;
+
     // Encode as a string stored in node.script, prefixed with "__layered__:".
     std::string encode() const;
 

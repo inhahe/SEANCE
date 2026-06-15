@@ -2061,16 +2061,40 @@ void WaveLayer::resolveFactoryRef() {
 }
 
 void LayeredWaveform::render(std::vector<float>& out) const {
+    renderWithLiveWarp({}, out);  // single summation/normalization code path
+}
+
+void LayeredWaveform::renderWithLiveWarp(
+    const std::vector<std::vector<float>>& overrides,
+    std::vector<float>& out) const {
     out.assign(tableSize, 0.0f);
     if (layers.empty()) return;
 
-    for (const auto& layer : layers) {
+    for (size_t li = 0; li < layers.size(); ++li) {
+        const auto& layer = layers[li];
         // Use a layer-specific deterministic seed so noise layers are stable
         // across renders (not changing on every edit).
         std::mt19937 rng(1234u + (unsigned)layer.ratio * 31u + (unsigned)layer.shape * 7u);
         int r = std::max(1, layer.ratio);
 
-        if (layer.warpChain.empty()) {
+        // Resolve this layer's effective warp chain: when a live override is
+        // supplied for one of its ops (a per-layer warp op opted into
+        // modulation), substitute that amount; otherwise the op keeps its baked
+        // amount. The fast path (no warp / no live override) shares the baked
+        // chain pointer so render() with empty overrides allocates nothing extra.
+        const std::vector<WarpOp>* chain = &layer.warpChain;
+        std::vector<WarpOp> liveChain;
+        if (!layer.warpChain.empty() && li < overrides.size()
+            && !overrides[li].empty()) {
+            liveChain = layer.warpChain;
+            const auto& ov = overrides[li];
+            for (size_t i = 0; i < liveChain.size() && i < ov.size(); ++i)
+                if (ov[i] >= 0.0f)
+                    liveChain[i].amount = juce::jlimit(0.0f, 1.0f, ov[i]);
+            chain = &liveChain;
+        }
+
+        if (chain->empty()) {
             // Fast path: no per-layer warp - accumulate directly.
             for (int i = 0; i < tableSize; ++i) {
                 float phase = (float)i / (float)tableSize;  // 0..1 over base period
@@ -2090,7 +2114,7 @@ void LayeredWaveform::render(std::vector<float>& out) const {
                 float x = phase * (float)r + layer.phase;
                 buf[(size_t)i] = sampleLayer(layer, x, rng);
             }
-            applyWarpChain(layer.warpChain, buf);
+            applyWarpChain(*chain, buf);
             for (int i = 0; i < tableSize; ++i)
                 out[i] += layer.amp * buf[(size_t)i];
         }

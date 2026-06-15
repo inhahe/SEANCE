@@ -2237,6 +2237,48 @@ void testWarp(Report& r) {
         LayeredWaveform plain; plain.tableSize = 256; plain.layers = { base };
         r.check(plain.encode().find("warp=") == std::string::npos,
                 "warp: un-warped layer omits the warp= field");
+
+        // renderWithLiveWarp (inc 4): the block-rate re-bake path the synth uses
+        // when a per-layer warp op is opted into live modulation.
+        // (1) Empty overrides -> byte-for-byte identical to render() (held value).
+        std::vector<float> bakedOut, liveOut;
+        lw.render(bakedOut);
+        lw.renderWithLiveWarp({}, liveOut);
+        bool identical = bakedOut.size() == liveOut.size();
+        for (size_t i = 0; identical && i < bakedOut.size(); ++i)
+            identical = bakedOut[i] == liveOut[i];
+        r.check(identical,
+                "warp: renderWithLiveWarp({}) == render() (held value identity)");
+
+        // (2) An override matching the baked amount (0.8) reproduces the baked
+        //     cycle exactly - the substitution itself introduces no drift.
+        std::vector<float> heldOut;
+        lw.renderWithLiveWarp({ { 0.8f } }, heldOut);
+        bool heldIdentical = heldOut.size() == bakedOut.size();
+        for (size_t i = 0; heldIdentical && i < heldOut.size(); ++i)
+            heldIdentical = std::abs(heldOut[i] - bakedOut[i]) < 1e-6f;
+        r.check(heldIdentical,
+                "warp: live override == baked amount reproduces the baked cycle");
+
+        // (3) A different override amount (0.2 vs baked 0.8) actually changes the
+        //     cycle, proving the live amount feeds applyWarpChain.
+        std::vector<float> modOut;
+        lw.renderWithLiveWarp({ { 0.2f } }, modOut);
+        double modDiff = 0.0;
+        int mn = (int)std::min(modOut.size(), bakedOut.size());
+        for (int i = 0; i < mn; ++i) modDiff += std::abs(modOut[i] - bakedOut[i]);
+        r.checkVal(modDiff > 1.0,
+                   "warp: live override amount changes the re-baked cycle", modDiff);
+
+        // (4) A negative sentinel in the override keeps the baked amount (so an
+        //     un-modulated op in a partially-modulated layer is untouched).
+        std::vector<float> sentinelOut;
+        lw.renderWithLiveWarp({ { -1.0f } }, sentinelOut);
+        bool sentinelHeld = sentinelOut.size() == bakedOut.size();
+        for (size_t i = 0; sentinelHeld && i < sentinelOut.size(); ++i)
+            sentinelHeld = std::abs(sentinelOut[i] - bakedOut[i]) < 1e-6f;
+        r.check(sentinelHeld,
+                "warp: negative override sentinel keeps the baked amount");
     }
 
     // ---- Bucket C: spectral (per-bin) element warp ---------------------

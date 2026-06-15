@@ -4618,6 +4618,16 @@ WaveLayerEditor::WaveLayerEditor(WaveLayer* layerPtr, Callbacks cb, bool enableW
                      ? callbacks.warpModDisabledReason(op) : juce::String();
             };
         warpEditor = std::make_unique<WarpChainEditor>(std::move(wcb));
+        // Per-layer Type-2 (arbitrary-wave) morph: reshapes THIS layer's wave
+        // before it joins the summation. User-facing "Layer Morph" matches the
+        // frame-scope "Summation Morph"; both are the same Bucket A chain at
+        // different scopes.
+        warpEditor->setHeaderText(
+            "Layer Morph",
+            "Morph stages applied to this layer's wave, in order (soft clip, fold, "
+            "bend, saturate, ...) before it sums with the other layers. Starred "
+            "methods are the higher-quality picks. Tick a stage's \"Mod\" box to "
+            "drive its amount live with an LFO or oscillator.");
         if (layer) warpEditor->setChain(&layer->warpChain);
         addAndMakeVisible(*warpEditor);
     }
@@ -8609,6 +8619,18 @@ LayeredWaveEditorComponent::LayeredWaveEditorComponent(NodeGraph& g, int nid, st
             else    removeParamModPin(graph, nodeId, pi);
         };
         frameWarpEditor = std::make_unique<WarpChainEditor>(std::move(wcb));
+        // Frame-scope = the Type-2 (arbitrary-wave) summation morph: it reshapes
+        // the COMBINED output of all layers, in order, so it reads as "Summation
+        // Morph" rather than the generic "Warp" header the baked per-element
+        // editors use. There is no Type-1 (wave-defining) generator here - a
+        // generator needs a cycle to define, and the summed wave already exists;
+        // the picker only ever offers Bucket A methods, so this stays Type-2 only.
+        frameWarpEditor->setHeaderText(
+            "Summation Morph",
+            "Morph stages applied to the combined output of every layer, in order "
+            "(soft clip, fold, bend, saturate, ...). Each reshapes the summed wave; "
+            "starred methods are the higher-quality picks. Tick a stage's \"Mod\" "
+            "box to drive its amount live with an LFO or oscillator.");
         frameWarpEditor->setChain(&wave.warpChain);
         // Frame-scope warp is the one warp site wired to the project
         // MorphAlgorithm store: the picker references a shared warp chain (live)

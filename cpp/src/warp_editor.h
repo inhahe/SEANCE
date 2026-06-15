@@ -72,6 +72,15 @@ public:
 
     explicit WarpChainEditor(Callbacks cb);
 
+    // Override the default "Warp  (shape-bending)" header title (and, optionally,
+    // its tooltip). Hosts use this to give the editor a context-appropriate
+    // user-facing name - e.g. the frame-scope summation editor reads "Summation
+    // Morph" because it reshapes the combined output of every layer, not one
+    // frame. "Morph" is the user-facing word for a shaping op (see the unified
+    // warp/morph model); "warp" is the mechanism term. Pass an empty tooltip to
+    // leave the existing one. Safe to call before or after setChain().
+    void setHeaderText(juce::String title, juce::String tooltip = {});
+
     // Point the editor at the chain it edits. nullptr = nothing to edit (the
     // Add button is disabled). Triggers a full rebuild of the row widgets.
     void setChain(std::vector<WarpOp>* chain);

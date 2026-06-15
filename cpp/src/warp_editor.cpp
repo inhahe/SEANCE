@@ -149,6 +149,11 @@ void WarpChainEditor::openAddToLibraryDialog() {
         }), true);
 }
 
+void WarpChainEditor::setHeaderText(juce::String title, juce::String tooltip) {
+    header.setText(title, juce::dontSendNotification);
+    if (tooltip.isNotEmpty()) header.setTooltip(tooltip);
+}
+
 void WarpChainEditor::setChain(std::vector<WarpOp>* c) {
     chain = c;
     rebuild();

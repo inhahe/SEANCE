@@ -163,14 +163,23 @@ struct Param {
     float baseValue = 0.0f;
     bool  modulated = false;
 
-    // Frame-scope warp slot key (unified warp/morph model). >= 0 marks this as
-    // the modulation param for warp-chain op `warpSlot` (0-based); -1 = not a
-    // warp param. This is the STABLE key the synth + reconcile logic address the
-    // op by, DECOUPLED from `name` - which is now a human label that follows the
+    // Warp slot key (unified warp/morph model). >= 0 marks this as the
+    // modulation param for warp-chain op `warpSlot` (0-based); -1 = not a warp
+    // param. This is the STABLE key the synth + reconcile logic address the op
+    // by, DECOUPLED from `name` - which is now a human label that follows the
     // op's method (e.g. "Soft Clip Drive 1"), so renaming on a method change
     // never disturbs which op a wired modulation pin drives. See
     // syncWarpParamsForNode / warpParamIndexForOp.
     int warpSlot = -1;
+    // Warp scope: which warp chain `warpSlot` indexes into.
+    //   -1 = the frame-scope (doc-level) chain  (WavetableDoc::warpChain)
+    //   >=0 = the per-layer chain of layer `warpLayer`  (WaveLayer::warpChain)
+    // Per-layer warp params exist ON DEMAND - one is created only when the user
+    // opts a per-layer op into modulation (the "Mod" checkbox), and removed when
+    // they opt out or the op/layer goes away. Frame-scope params (warpLayer==-1)
+    // exist for every op so the amount is always modulatable. Only meaningful
+    // when warpSlot >= 0.
+    int warpLayer = -1;
 };
 
 // Rational fraction for exact beat subdivisions (e.g., triplets)
@@ -1025,6 +1034,15 @@ int resolveWarpReferences(NodeGraph& graph);
 // (which reads warp amounts by warpSlot) always finds them. Idempotent. Defined
 // in layered_wave_editor.cpp (needs the WavetableDoc codec). Call after load.
 void reconcileAllWarpParams(NodeGraph& graph);
+
+// Reconcile the per-layer (warpLayer >= 0) Type-2 warp params for a single
+// wavetable node against the live per-layer warp chains. Removes params whose
+// (warpLayer, warpSlot) no longer addresses a live op (dropping their modPins,
+// pins and links), remaps survivors to their new positional slot, and relabels
+// them from the method name. `layerChains[layerIndex]` is the ordered warp chain
+// of that layer. Defined in layered_wave_editor.cpp. Idempotent.
+void reconcilePerLayerWarpParams(NodeGraph& graph, int nodeId,
+                                 const std::vector<std::vector<WarpOp>>& layerChains);
 
 // ---------------------------------------------------------------------------
 // On-demand modulation pins (#88) - graph-level helpers.

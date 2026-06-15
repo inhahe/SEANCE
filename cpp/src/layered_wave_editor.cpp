@@ -3524,8 +3524,12 @@ void syncWarpParamsForNode(NodeGraph& graph, int nodeId,
 
     // ---- 1) Remove warp params for deleted ops (warpSlot outside [0,N)), plus
     //         their mod pins / cables; remap surviving modPin param indices.
+    //         Only FRAME-SCOPE params (warpLayer == -1) are reconciled here;
+    //         per-layer params (warpLayer >= 0) belong to a different chain and
+    //         are reconciled by reconcilePerLayerWarpParams - leave them alone.
     std::set<int> removeIdx;
     for (int i = 0; i < (int)nd->params.size(); ++i) {
+        if (nd->params[i].warpLayer != -1) continue;  // per-layer: not ours
         // slot < 0 = not a warp param (kept); slot in [0,N) = live op (kept);
         // slot >= N = a warp param for an op that no longer exists (remove).
         if (nd->params[i].warpSlot >= N) removeIdx.insert(i);
@@ -3567,10 +3571,11 @@ void syncWarpParamsForNode(NodeGraph& graph, int nodeId,
     //         existing indices stay put so bound modPins keep their target).
     for (int i = 0; i < N; ++i) {
         bool exists = false;
-        for (auto& p : nd->params) if (p.warpSlot == i) { exists = true; break; }
+        for (auto& p : nd->params)
+            if (p.warpLayer == -1 && p.warpSlot == i) { exists = true; break; }
         if (exists) continue;
         Param p;
-        p.warpSlot = i;
+        p.warpSlot = i;  // warpLayer stays -1 (frame-scope)
         p.name = warpSlotParamName(chain[i], i);
         p.value = p.baseValue = chain[i].amount;
         p.minVal = 0.0f;
@@ -3583,9 +3588,76 @@ void syncWarpParamsForNode(NodeGraph& graph, int nodeId,
     //         current method (a method change renames "Drive 1" -> "Fold 1")
     //         and relabel its modulation pin to match.
     for (int pi = 0; pi < (int)nd->params.size(); ++pi) {
+        if (nd->params[pi].warpLayer != -1) continue;  // per-layer: not ours
         const int slot = nd->params[pi].warpSlot;
         if (slot < 0 || slot >= N) continue;
         nd->params[pi].name = warpSlotParamName(chain[slot], slot);
+        relabelWarpModPin(*nd, pi);
+    }
+}
+
+// Reconcile a node's PER-LAYER warp modulation params + mod pins against the
+// current set of per-layer warp chains (layerChains[L] = layer L's chain).
+// Per-layer params are created on demand (the "Mod" checkbox), so this never
+// ADDS - it only (a) removes params whose (warpLayer, warpSlot) no longer
+// addresses a live op (dropping their mod pins + cables, remapping survivors),
+// and (b) relabels surviving params + their pins to follow the op's method.
+// Mirrors syncWarpParamsForNode steps 1+3 but scoped per layer with a 2-D
+// (layer, slot) validity test. Idempotent.
+void reconcilePerLayerWarpParams(NodeGraph& graph, int nodeId,
+                                 const std::vector<std::vector<WarpOp>>& layerChains) {
+    Node* nd = graph.findNode(nodeId);
+    if (!nd) return;
+
+    auto opValid = [&](int layer, int slot) {
+        return layer >= 0 && layer < (int)layerChains.size()
+            && slot >= 0 && slot < (int)layerChains[(size_t)layer].size();
+    };
+
+    // ---- 1) Remove per-layer params that no longer address a live op.
+    std::set<int> removeIdx;
+    for (int i = 0; i < (int)nd->params.size(); ++i) {
+        const Param& p = nd->params[i];
+        if (p.warpLayer < 0) continue;                 // frame-scope / not ours
+        if (!opValid(p.warpLayer, p.warpSlot)) removeIdx.insert(i);
+    }
+    if (!removeIdx.empty()) {
+        std::vector<int> pinsToDrop;
+        for (auto it = nd->modPins.begin(); it != nd->modPins.end(); ) {
+            if (removeIdx.count(it->paramIndex)) {
+                pinsToDrop.push_back(it->pinId);
+                it = nd->modPins.erase(it);
+            } else ++it;
+        }
+        for (int pid : pinsToDrop) {
+            graph.links.erase(std::remove_if(graph.links.begin(), graph.links.end(),
+                [&](const Link& l) { return l.startPin == pid || l.endPin == pid; }),
+                graph.links.end());
+            nd->pinsIn.erase(std::remove_if(nd->pinsIn.begin(), nd->pinsIn.end(),
+                [&](const Pin& p) { return p.id == pid; }), nd->pinsIn.end());
+        }
+        std::vector<int> newIndexOf(nd->params.size(), -1);
+        std::vector<Param> kept;
+        kept.reserve(nd->params.size());
+        for (int i = 0; i < (int)nd->params.size(); ++i) {
+            if (removeIdx.count(i)) continue;
+            newIndexOf[i] = (int)kept.size();
+            kept.push_back(std::move(nd->params[i]));
+        }
+        nd->params = std::move(kept);
+        for (auto& mp : nd->modPins)
+            if (mp.paramIndex >= 0 && mp.paramIndex < (int)newIndexOf.size())
+                mp.paramIndex = newIndexOf[mp.paramIndex];
+    }
+
+    // ---- 2) Relabel survivors to follow their op's current method.
+    for (int pi = 0; pi < (int)nd->params.size(); ++pi) {
+        const Param& p = nd->params[pi];
+        if (p.warpLayer < 0) continue;
+        if (!opValid(p.warpLayer, p.warpSlot)) continue;
+        nd->params[pi].name =
+            warpSlotParamName(layerChains[(size_t)p.warpLayer][(size_t)p.warpSlot],
+                              p.warpSlot);
         relabelWarpModPin(*nd, pi);
     }
 }

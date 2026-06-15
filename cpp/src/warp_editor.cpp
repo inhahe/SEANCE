@@ -36,7 +36,9 @@ WarpChainEditor::WarpChainEditor(Callbacks callbacks) : cb(std::move(callbacks))
     addAndMakeVisible(header);
 
     addBtn.setButtonText("+ Add");
-    addBtn.setTooltip("Add a shape-bending stage to this waveform.");
+    addBtn.setTooltip("Add a shape-bending stage: pick a method from the list and "
+                      "it's appended as a new stage. Each stage has its own amount "
+                      "and can be reordered or removed.");
     addBtn.onClick = [this] { addOp(); };
     addAndMakeVisible(addBtn);
 
@@ -171,30 +173,23 @@ int WarpChainEditor::preferredHeight() const {
 
 void WarpChainEditor::addOp() {
     if (!chain) return;
-    WarpOp op;
-    // Default to the first recommended method (within the allowed domains, if
-    // restricted) so a fresh stage does something audible immediately rather
-    // than None / identity. Fall back to the first allowed method of any
-    // quality, then to SoftClip.
-    op.method = WarpMethod::SoftClip;
-    bool picked = false;
-    for (const auto& info : warpMethodRegistry()) {
-        if (info.method == WarpMethod::None) continue;
-        if (!domainAllowed(info.domain)) continue;
-        if (info.recommended) { op.method = info.method; picked = true; break; }
-    }
-    if (!picked)
-        for (const auto& info : warpMethodRegistry()) {
-            if (info.method == WarpMethod::None) continue;
-            if (!domainAllowed(info.domain)) continue;
-            op.method = info.method; break;
-        }
-    op.amount = 0.5f;
-    op.enabled = true;
-    chain->push_back(op);
-    rebuild();
-    if (cb.onChanged) cb.onChanged();
-    if (cb.onStructureChanged) cb.onStructureChanged();
+    // Open the method picker straight away so each "+ Add" lets the user choose
+    // WHICH shape-bender to append. (Previously Add silently appended an op
+    // pre-set to the first recommended method, so clicking Add again just added
+    // another copy of that same default with no obvious way to pick a different
+    // one - you had to know to click the row's method button afterwards.) The op
+    // is created only once a method is chosen; cancelling adds nothing.
+    showMethodPicker(&addBtn, WarpMethod::None, [this](WarpMethod chosen) {
+        if (!chain || chosen == WarpMethod::None) return;
+        WarpOp op;
+        op.method  = chosen;
+        op.amount  = 0.5f;
+        op.enabled = true;
+        chain->push_back(op);
+        rebuild();
+        if (cb.onChanged) cb.onChanged();
+        if (cb.onStructureChanged) cb.onStructureChanged();
+    });
 }
 
 void WarpChainEditor::removeOp(int idx) {
@@ -309,7 +304,17 @@ void WarpChainEditor::rebuild() {
 
 void WarpChainEditor::showMethodMenu(int idx) {
     if (!chain || idx < 0 || idx >= (int)chain->size()) return;
+    showMethodPicker(rows[idx].method.get(), (*chain)[idx].method,
+        [this, idx](WarpMethod chosen) {
+            if (!chain || idx >= (int)chain->size()) return;
+            (*chain)[idx].method = chosen;
+            refreshRowVisuals(idx);
+            if (cb.onChanged) cb.onChanged();
+        });
+}
 
+void WarpChainEditor::showMethodPicker(juce::Component* target, WarpMethod current,
+                                       std::function<void(WarpMethod)> onPick) {
     // Group methods by domain, preserving registry order within each group.
     std::map<WarpDomain, std::vector<const WarpMethodInfo*>> byDomain;
     std::vector<WarpDomain> domainOrder;
@@ -325,7 +330,7 @@ void WarpChainEditor::showMethodMenu(int idx) {
     for (WarpDomain d : domainOrder) {
         menu.addSectionHeader(domainLabel(d));
         for (const auto* info : byDomain[d]) {
-            const bool ticked = (info->method == (*chain)[idx].method);
+            const bool ticked = (info->method == current);
             juce::String txt = info->name;
             if (info->recommended)
                 txt += "   " + juce::String(juce::CharPointer_UTF8("\xe2\x98\x85"));
@@ -333,15 +338,15 @@ void WarpChainEditor::showMethodMenu(int idx) {
         }
     }
 
-    auto* self = this;
+    // SafePointer-guard so a menu that closes after this editor is destroyed (a
+    // frame/layer switch tearing the chain down) can't call back into a dead
+    // object. While `safe` is alive, the onPick lambda's captured `this` is valid.
+    juce::Component::SafePointer<WarpChainEditor> safe(this);
     menu.showMenuAsync(
-        juce::PopupMenu::Options().withTargetComponent(rows[idx].method.get()),
-        [self, idx](int chosen) {
-            if (chosen <= 0) return;
-            if (!self->chain || idx >= (int)self->chain->size()) return;
-            (*self->chain)[idx].method = (WarpMethod)(chosen - 1);
-            self->refreshRowVisuals(idx);
-            if (self->cb.onChanged) self->cb.onChanged();
+        juce::PopupMenu::Options().withTargetComponent(target),
+        [safe, onPick = std::move(onPick)](int chosen) {
+            if (chosen <= 0 || safe == nullptr) return;
+            onPick((WarpMethod)(chosen - 1));
         });
 }
 

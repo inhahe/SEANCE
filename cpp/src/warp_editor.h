@@ -101,6 +101,13 @@ public:
 
 private:
     void showMethodMenu(int opIndex);
+    // Shared method-picker popup. Builds the domain-grouped menu (respecting the
+    // allowed-domain filter), ticks `current`, and calls `onPick` with the chosen
+    // method. Used both by the per-row method button (change an existing op) and
+    // by "+ Add" (append a new op of the chosen method). Guarded by a SafePointer
+    // so a closed-late menu can't call back into a destroyed editor.
+    void showMethodPicker(juce::Component* target, WarpMethod current,
+                          std::function<void(WarpMethod)> onPick);
     void rebuildLibraryCombo();
     void onLibrarySelected(int comboId);
     void openAddToLibraryDialog();

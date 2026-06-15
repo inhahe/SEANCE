@@ -872,11 +872,11 @@ The same `WarpChainEditor` widget drives every chain; it does **not** own the ch
 | **Spectral / Wavelet element** (Bucket C) | per-doc element chain | No (baked) | restricted |
 | **Granular / Inharmonic element** (Bucket C) | per-frame chain | No (baked) | **Amplitude only** (a live stream has no periodic phase axis) |
 
-A host that only supports some domains calls `setAllowedDomains(...)`, which filters both the picker and the default "+ Add" method and can supply an `emptyHint` explaining the restriction (per the "grayed-out controls must explain themselves" rule).
+A host that only supports some domains calls `setAllowedDomains(...)`, which filters both the picker and the "+ Add" method list and can supply an `emptyHint` explaining the restriction (per the "grayed-out controls must explain themselves" rule).
 
 ### Editing a chain
 
-The editor shows the header **"Warp (shape-bending)"** and a **+ Add** button, then one row per op. Each row:
+The editor shows the header **"Warp (shape-bending)"** and a **+ Add** button, then one row per op. Clicking **+ Add** opens the same domain-grouped method picker the per-row Method button uses; the new op is appended only once you choose a method (cancelling adds nothing). This lets you pick *which* shape-bender to add each time — earlier builds instead appended an op pre-set to the first recommended method, so repeated Add clicks just stacked copies of that default. Each row:
 
 - **Enable** checkbox — bypass this stage without deleting it (a bypassed op greys its amount slider).
 - **Method** button — opens a `PopupMenu` grouped by domain, with a **★ star badge** on the recommended (higher-quality) methods. Restricted hosts only list their allowed domains.

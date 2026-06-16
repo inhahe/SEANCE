@@ -39,6 +39,8 @@
 #include <string>
 #include <cstdint>
 
+#include "asset_library.h"   // seed the built-in morph chains into the project store
+
 enum class WarpDomain {
     Phase,        // remap read position
     Amplitude,    // nonlinear transfer on the sample value
@@ -199,3 +201,25 @@ const std::vector<BuiltinMorphChain>& builtinMorphChains();
 
 // Look up a built-in chain by id, or nullptr if `id` is not a built-in morph id.
 const BuiltinMorphChain* builtinMorphChain(int id);
+
+// True when `id` is in the reserved built-in morph id range (kBuiltinMorphIdBase
+// .. AssetLibrary::kUserIdBase). Distinguishes a seeded built-in morph asset from
+// a user-published one without consulting the library. Used by the picker (to
+// group "Built-in" vs "Saved") and by serialization (built-ins are code-owned and
+// must NOT be written to project files - see seedBuiltinMorphLibrary).
+bool isBuiltinMorphAssetId(int id);
+
+// Seed the curated built-in morph chains (builtinMorphChains) into a project's
+// AssetLibrary as MorphAlgorithm entries at their fixed built-in ids, so the morph
+// picker and the Asset Library panel both source them from ONE place: the library.
+//
+// CODE-OWNED, NOT SERIALIZED. Built-ins are inserted at ids in the reserved
+// built-in range (kBuiltinMorphIdBase, below AssetLibrary::kUserIdBase), are
+// re-seeded on every new project and every project load, and are skipped by
+// project-file serialization. This keeps them improvable across app versions,
+// keeps project files free of boilerplate, and makes them effectively
+// undeletable (a deletion is undone by the next re-seed) - matching the asset
+// library's "DISJOINT ID SPACE" + "divergence = duplicate" design. Idempotent:
+// an entry is only inserted if its id is not already present, so calling this
+// repeatedly (new project, load, undo restore) never duplicates.
+void seedBuiltinMorphLibrary(SoundShop::AssetLibrary& lib);

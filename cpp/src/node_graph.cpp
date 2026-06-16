@@ -1,5 +1,6 @@
 #include "node_graph.h"
 #include "project_file.h"
+#include "warp.h"
 #include <algorithm>
 #include <cmath>
 #include <set>
@@ -317,6 +318,11 @@ void NodeGraph::resolveAnchors() {
 
 void NodeGraph::setupDefaultGraph() {
     nodes.reserve(16);
+
+    // Seed the curated built-in morph chains into the project's asset library so
+    // the morph picker (and the Asset Library panel) are never empty on a fresh
+    // project. Idempotent + code-owned: see seedBuiltinMorphLibrary in warp.h.
+    seedBuiltinMorphLibrary(assets);
 
     // Reset song-end / repeat state to defaults. Without this, switching
     // from a loaded project (e.g. a MOD import with songLengthBeats=352

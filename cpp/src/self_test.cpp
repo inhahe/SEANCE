@@ -2160,6 +2160,70 @@ void testWarp(Report& r) {
                 "morph-presets: unknown id resolves to nullptr");
     }
 
+    // ---- Built-in morph chains are seeded into the library --------------
+    {
+        // seedBuiltinMorphLibrary populates an empty library with one
+        // MorphAlgorithm entry per built-in chain, at its fixed built-in id.
+        AssetLibrary lib;
+        seedBuiltinMorphLibrary(lib);
+        const auto& builtins = builtinMorphChains();
+        auto seeded = lib.list(AssetKind::MorphAlgorithm);
+        r.check(seeded.size() == builtins.size(),
+                "morph-seed: every built-in chain becomes a library entry");
+
+        bool payloadOk = true, idOk = true, kindOk = true, starredOk = true;
+        for (const auto& b : builtins) {
+            const AssetEntry* e = lib.find(b.id);
+            if (!e) { idOk = false; continue; }
+            if (e->kind != AssetKind::MorphAlgorithm) kindOk = false;
+            if (e->payload != encodeWarpChain(b.ops)) payloadOk = false;
+            if (!e->starred) starredOk = false;
+            if (!isBuiltinMorphAssetId(e->id)) idOk = false;
+        }
+        r.check(idOk,       "morph-seed: each built-in id resolves in the library");
+        r.check(kindOk,     "morph-seed: seeded entries are MorphAlgorithm");
+        r.check(payloadOk,  "morph-seed: seeded payload matches the chain ops");
+        r.check(starredOk,  "morph-seed: built-ins are seeded as starred");
+
+        // Idempotent: re-seeding never duplicates, and user ids stay disjoint.
+        seedBuiltinMorphLibrary(lib);
+        seedBuiltinMorphLibrary(lib);
+        r.check(lib.list(AssetKind::MorphAlgorithm).size() == builtins.size(),
+                "morph-seed: re-seeding is idempotent (no duplicates)");
+        int uid = lib.add(AssetKind::MorphAlgorithm, "user morph", "", "X");
+        r.check(uid >= AssetLibrary::kUserIdBase,
+                "morph-seed: user-published ids stay in the user space (>= 1e6)");
+    }
+
+    // ---- Built-in morph chains are NOT serialized -----------------------
+    {
+        // A fresh graph seeds built-ins; saving + reloading must keep exactly the
+        // built-in set (re-seeded on load), not double them, and must persist
+        // user-published morphs alongside.
+        NodeGraph g;
+        seedBuiltinMorphLibrary(g.assets);
+        const size_t nBuiltin = builtinMorphChains().size();
+        int uid = g.assets.add(AssetKind::MorphAlgorithm, "keep me", "", "USEROPS");
+
+        std::string saved = ProjectFile::serializeForUndo(g);
+
+        NodeGraph g2;
+        bool ld = ProjectFile::loadFromString(saved, g2);
+        r.check(ld, "morph-seed: project with seeded built-ins round-trips");
+
+        auto morphs = g2.assets.list(AssetKind::MorphAlgorithm);
+        size_t nB = 0, nU = 0;
+        const AssetEntry* user = nullptr;
+        for (const AssetEntry* e : morphs) {
+            if (isBuiltinMorphAssetId(e->id)) ++nB;
+            else { ++nU; user = e; }
+        }
+        r.check(nB == nBuiltin,
+                "morph-seed: built-ins re-seed on load (no duplication)");
+        r.check(nU == 1 && user && user->id == uid && user->payload == "USEROPS",
+                "morph-seed: user-published morph survives save/load");
+    }
+
     // ---- AHDSR per-segment tension: warp properties + round-trip --------
     {
         // tensionWarp() must pin the endpoints, be the identity at 0, and be
@@ -3307,7 +3371,13 @@ void testAssetLibrary(Report& r) {
         NodeGraph g2;
         std::istringstream iss(saved);
         ProjectFile::readProject(iss, g2, nullptr);
-        r.check(g2.assets.size() == 3, "assets: all three entries round-trip");
+        // readProject re-seeds the code-owned built-in morph chains, which are not
+        // part of this project's saved content - count only the user assets.
+        size_t userAssetCount = 0;
+        for (const auto& e : g2.assets.all())
+            if (!(e.kind == AssetKind::MorphAlgorithm && isBuiltinMorphAssetId(e.id)))
+                ++userAssetCount;
+        r.check(userAssetCount == 3, "assets: all three entries round-trip");
         const AssetEntry* rw = g2.assets.find(w);
         r.check(rw && rw->name == "my wave" && rw->subType == "layered" &&
                     rw->payload == "WAVE_PAYLOAD\nline2",
@@ -4449,10 +4519,15 @@ void testAssetLibrary(Report& r) {
         NodeGraph tmpG;
         ProjectFile::readProject(in, tmpG, nullptr);
         in.close();
-        r.checkVal((int) tmpG.assets.size() == 3,
+        // readProject re-seeds the code-owned built-in morph chains (not part of
+        // the export file's content), so count/import only the user assets.
+        std::vector<AssetEntry> all;
+        for (const auto& e : tmpG.assets.all())
+            if (!(e.kind == AssetKind::MorphAlgorithm && isBuiltinMorphAssetId(e.id)))
+                all.push_back(e);
+        r.checkVal((int) all.size() == 3,
                    "export: all three assets (incl. archived) survive the export file",
-                   (int) tmpG.assets.size());
-        std::vector<AssetEntry> all(tmpG.assets.all().begin(), tmpG.assets.all().end());
+                   (int) all.size());
         AssetImportResult res = importAssets(dst, all);
         r.check(res.added == 3, "export: round-trip import adds all three");
         const AssetEntry* m = nullptr;

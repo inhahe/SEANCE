@@ -1,5 +1,6 @@
 #include "project_file.h"
 #include "asset_import.h"
+#include "warp.h"           // seedBuiltinMorphLibrary, isBuiltinMorphAssetId
 #include "spectrum_tap.h"   // resolveSpectrumTapReferences (FrequencyGraph refs)
 #include "spectral_editor.h"  // resolveSpectralReferences (FrequencyGraph refs)
 #include <juce_core/juce_core.h>
@@ -111,6 +112,11 @@ bool ProjectFile::exportAssets(const std::string& path, const AssetLibrary& lib,
     int count = 0;
     for (const auto& a : lib.all()) {
         if (!selectedIds.empty() && !want.count(a.id)) continue;
+        // Built-in morph chains are code-owned and seeded into every project, so
+        // exporting them is meaningless boilerplate (the destination already has
+        // them). Skip, matching writeProject.
+        if (a.kind == AssetKind::MorphAlgorithm && isBuiltinMorphAssetId(a.id))
+            continue;
         writeAssetEntry(f, a);
         ++count;
     }
@@ -184,8 +190,18 @@ bool ProjectFile::writeProject(std::ostream& f, NodeGraph& graph,
     // newlines) survives the line-based format. The content hash is saved and
     // trusted on load (not recomputed), mirroring [Blob]. Archived (soft-deleted)
     // entries are persisted too so existing references stay resolvable.
-    for (const auto& a : graph.assets.all())
+    //
+    // EXCEPTION: the curated built-in morph chains are code-owned (seeded into
+    // every project by seedBuiltinMorphLibrary) and must NOT be written - that
+    // keeps project files free of boilerplate and lets the built-ins improve
+    // across app versions. They are re-seeded on load, so skipping them here is
+    // safe. (Frames never live-reference a built-in - the picker copies a
+    // built-in to an Independent chain - so this never orphans a reference.)
+    for (const auto& a : graph.assets.all()) {
+        if (a.kind == AssetKind::MorphAlgorithm && isBuiltinMorphAssetId(a.id))
+            continue;
         writeAssetEntry(f, a);
+    }
 
     writeInt(f, "nextId", 0);
     if (!graph.signalScript.empty()) {
@@ -1011,6 +1027,14 @@ bool ProjectFile::readProject(std::istream& f, NodeGraph& graph, PluginHost* plu
 
     // Restore nextId so new IDs don't conflict
     graph.setNextId(maxId + 1);
+
+    // Re-seed the code-owned built-in morph chains. They are deliberately NOT
+    // serialized (writeProject skips them), so a loaded file - and every undo
+    // snapshot restored through this same path - arrives without them; re-seeding
+    // here makes them present and keeps any frame that references a built-in id
+    // resolvable below. Idempotent, so a file that somehow already carries them
+    // (or a back-to-back load) never duplicates. See seedBuiltinMorphLibrary.
+    seedBuiltinMorphLibrary(graph.assets);
 
     // Mirror every live-referenced asset-library AHDSR curve into its
     // referencing nodes' local ahdsrEnvelope (the audio thread reads that

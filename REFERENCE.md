@@ -927,11 +927,11 @@ Every op defaults to **baked** (no pin, no live cost). Ticking a row's **Mod** b
 
 ### Built-in & saved morphs (the Library row)
 
-The frame-scope Summation Morph editor shows a **Morph:** library row (the per-layer and element editors don't). Its picker lists, under section headings:
+The frame-scope Summation Morph editor shows a **Morph:** library row (the per-layer and element editors don't). The picker **sources every chain from the one project asset library** — the curated built-ins are *seeded* into that library, not listed from a separate code path — and partitions it under section headings:
 
 - **(Independent)** — the frame edits its own local chain (the default).
-- **Built-in** — curated Type-2 chains shipped in code (`builtinMorphChains()` in `warp.h`): *Warm Saturation, West Coast Fold, Lo-Fi Crush, Tape Glue, Pulse Width, Soft Bend, Formant Sync, Rectify Octave*. These are **templates, not live references** — picking one **copies** its ops into the chain and detaches to *(Independent)*, exactly as picking a factory waveform copies it into a layer. Their ids live in a reserved range (`kBuiltinMorphIdBase = 200000`) disjoint from the user asset id space and are never serialized.
-- **Saved** — user-published [Morph Algorithm assets](#asset-library-project-stores) (live references): editing the chain while one is referenced updates every frame that points at it. **Save to Library** publishes the current chain as a new Morph Algorithm asset.
+- **Built-in** — the curated Type-2 chains, **seeded into the project's [asset library](#asset-library-project-stores) as Morph Algorithm entries** (`seedBuiltinMorphLibrary` in `warp.h`, from `builtinMorphChains()`): *Warm Saturation, West Coast Fold, Lo-Fi Crush, Tape Glue, Pulse Width, Soft Bend, Formant Sync, Rectify Octave*. They appear in both this picker and the **Asset Library panel** (flagged ★ starred). They remain **templates, not live references** — picking one **copies** its ops into the chain and detaches to *(Independent)*, exactly as picking a factory waveform copies it into a layer (so an edit can never silently mutate a shared built-in). **Code-owned and not serialized:** their ids sit in a reserved range (`kBuiltinMorphIdBase = 200000`, below the user id base `1000000`, so `isBuiltinMorphAssetId` tells the two apart) and are **skipped by project-file save/export**; they are **re-seeded idempotently on every new project and every project load**, which keeps them improvable across app versions, keeps project files free of boilerplate, and makes them effectively undeletable (a deletion is undone by the next re-seed) — matching the asset library's *disjoint id space* + *divergence = duplicate* design.
+- **Saved** — user-published [Morph Algorithm assets](#asset-library-project-stores) (live references, ids ≥ `1000000`): editing the chain while one is referenced updates every frame that points at it. **Save to Library** publishes the current chain as a new Morph Algorithm asset.
 
 ### Per-sample primitives vs the buffer helper
 
@@ -2244,7 +2244,12 @@ has one tab per asset kind:
   shared AHDSR editor.
 - **Morph Algorithms** — a frame-scope **warp chain** (a `std::vector<WarpOp>`:
   the ordered shape-bending stages applied to a wavetable frame). Published from
-  the wavetable editor's warp panel.
+  the wavetable editor's warp panel. **Every project is seeded with the curated
+  built-in chains** (Warm Saturation, West Coast Fold, Lo-Fi Crush, …) so this tab
+  and the [Summation Morph picker](#built-in--saved-morphs-the-library-row) are
+  never empty — they show ★ starred and are **code-owned** (re-seeded on new
+  project / load, not written to the project file, in a reserved id range below
+  the user id base). See [Built-in & saved morphs](#built-in--saved-morphs-the-library-row).
 - <a name="frequency-graph-library-curves"></a>**Frequency Graphs** — a 1-D
   frequency-domain curve (a `SpectralCurve`: an EQ/response shape over a `[0,1]`
   frequency axis). A distinct kind because a frequency curve is fundamentally

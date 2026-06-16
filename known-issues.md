@@ -5,6 +5,45 @@ top. When something is fixed, delete the entry (git history is the archive).
 
 ---
 
+## BUG: asset library is never cleared on New Project / file load (assets merge/duplicate)
+
+**Found:** 2026-06-15, while seeding the built-in morph chains into the library
+(#3B). `NodeGraph::assets` (the project asset library) is **never cleared** on
+either `File → New` or a real project load:
+
+- `MainContentComponent::newProject()` (`main_window.cpp` ~2773) clears
+  `graph.nodes/links/openEditors` but NOT `graph.assets` or `graph.contentStore`.
+- `ProjectFile::readProject()` (`project_file.cpp` ~540) clears
+  `nodes/links/openEditors` (and `load()` clears `contentStore` at ~530) but
+  NEVER clears `graph.assets`; it only `insertRaw`s the file's `[AssetStore]`
+  entries on top of whatever was already there.
+
+Consequences:
+- **New Project** keeps the previous project's user assets (waveforms,
+  instruments, ADHSR curves, morph chains) in the "fresh" library.
+- **Load project B after A** MERGES A's assets into B instead of replacing.
+- **Undo restore** (`loadFromString` → `readProject`) re-`insertRaw`s the
+  snapshot's assets without clearing, so an asset id can end up duplicated in the
+  vector (two entries with the same id; `find` returns the first, `list` returns
+  both).
+
+The seeded built-in morphs are immune (seeding is idempotent by id), so this was
+latent before content reliably lived in the library; it's now more user-visible.
+
+**Proper fix** (mirror the `contentStore` pattern's real-load-vs-undo split):
+- `newProject()`: `graph.assets.clear()` before `setupDefaultGraph()` (which
+  re-seeds built-ins), and `graph.contentStore.clear()` too.
+- Real file `load()`: `graph.assets.clear()` before `readProject` (same spot as
+  the existing `contentStore.clear()` at ~530) — but NOT in `loadFromString`
+  (undo restore), whose snapshots are authoritative and must replace cleanly.
+  Cleanest is to clear `assets` inside `readProject` itself the way
+  `nodes/links` are cleared, since undo snapshots DO carry the full asset set
+  (writeProject writes `graph.assets.all()`), so clearing-then-repopulating is
+  correct for both the file and undo paths. Verify a save→load→save round-trip
+  and an undo/redo cycle don't grow or drop assets.
+
+---
+
 ## Asset library + layered-wave / morph editor — bug batch (reported 2026-06-14)
 
 A batch of issues the user found while exercising the asset library and the
@@ -14,14 +53,15 @@ review 2026-06-14"); the items below are concrete BUGS. Several cluster around
 the morph/warp UI and will likely be resolved together by the two-morph-type
 redesign tracked in agent-todo.
 
-- **NOT A BUG (library empty — investigated 2026-06-14): the Asset Library is
-  empty by design, not a display bug.** `AssetLibrary::entries` starts empty and
-  nothing seeds built-in content; `list()` correctly returns the (empty) set.
-  Assets only appear when the user explicitly saves one (curve editor / layered-
-  wave editor → "save to library"). `kUserIdBase` (1000000) merely reserves a
-  future built-in id space that is currently unused. Resolution is the feature
-  item "seed standard library content" in agent-todo (waveforms, morph algorithms,
-  AHDSR curves), NOT a panel-population fix. Keeping this note until seeding lands.
+- **PARTIALLY RESOLVED (library seeding — 2026-06-15): Morph Algorithms now seed;
+  Waveforms + AHDSR still don't.** The original report ("Asset Library is empty")
+  was *by design* — nothing seeded built-in content. **Morph Algorithms are now
+  seeded** (`seedBuiltinMorphLibrary` runs on new project + load), so the Morph
+  Algorithms tab and the Summation Morph picker are populated with the 8 curated
+  built-in chains. **Still unseeded: Waveforms and AHDSR Curves** — the
+  agent-todo "seed standard library content" item is only morph-complete. Built-in
+  factory waveforms still live in `WaveformBank` (not the asset library) and
+  AHDSR has no curated starter set. Keep this note until those two kinds seed too.
 
 - **BUG (dialog self-dismiss): the waveform selection view closed by itself**
   while the user was picking waveforms to view — SEANCE did not crash/quit, just
@@ -30,12 +70,17 @@ redesign tracked in agent-todo.
   browser. Repro: open the waveform picker, click through several waveforms to
   preview them. Investigate the browser's close/escape handling.
 
-- **BUG (independent morph "add" does nothing visible): with "(Independent)"
-  selected, clicking "add" repeatedly keeps adding input modulation pins to the
-  node but never adds anything to a visible list of applied morphs.** Also
-  "(Independent)" is the ONLY morph choice even though several morphs are supposed
-  to exist (the morph registry/library is unpopulated, or the combo isn't reading
-  it). Tied to the morph-library-seeding item and the two-morph-type redesign.
+- **BUG (independent morph "add" does nothing visible — partly resolved): with
+  "(Independent)" selected, clicking "add" repeatedly keeps adding input
+  modulation pins to the node but never adds anything to a visible list of applied
+  morphs.** The **"(Independent) is the ONLY morph choice"** half is **resolved**:
+  the morph library is now seeded with the 8 built-in chains and the picker sources
+  the list from it (`seedBuiltinMorphLibrary` + `rebuildLibraryCombo`). The
+  **"+ Add does nothing visible"** half should also be resolved by the
+  2026-06-15 fix that made **+ Add** open the method picker and append a visible
+  op row (`warp_editor.cpp`), and by #3A removing the confusing per-layer chain —
+  but **re-test on the frame-scope Summation Morph** to confirm an added op shows
+  a row and the pin-add no longer happens without a visible stage.
 
 - **BUG (mis-named waveform "FFT 52"): the layered-waveform dialog inside the
   wavetable editor edits a waveform auto-named "FFT 52" even though it is not an

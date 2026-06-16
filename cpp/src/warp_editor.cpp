@@ -88,19 +88,28 @@ void WarpChainEditor::rebuildLibraryCombo() {
     int cur = libCtx.getAssetId ? libCtx.getAssetId() : -1;
     bool curListed = false;
 
-    // Built-in curated chains (code, not user data) - the Type-2 analogue of the
-    // factory waveform bank. Selecting one COPIES its ops into the chain and
-    // detaches to Independent (a template, not a live reference), so a built-in id
-    // is never stored as the assetId - it only ever appears as a transient combo
-    // pick. Listed first so a fresh project's picker is never just "(Independent)".
-    const auto& builtins = builtinMorphChains();
+    // Every morph chain now lives in the project library: the curated built-ins
+    // are seeded there (seedBuiltinMorphLibrary), and the user's saved chains are
+    // published there. Source the picker from that ONE list and partition it into
+    // "Built-in" (reserved id range) and "Saved" (user ids) so the two groups
+    // still read distinctly. Selecting a built-in COPIES its ops into an
+    // Independent chain (a template, not a live reference - see onLibrarySelected),
+    // so a built-in id is never stored as a frame's assetId; it only appears as a
+    // transient combo pick. Listing built-ins first keeps a fresh project's picker
+    // from being just "(Independent)".
+    auto allMorphs = libCtx.lib->list(AssetKind::MorphAlgorithm);
+    std::vector<const AssetEntry*> builtins, userEntries;
+    for (const AssetEntry* e : allMorphs)
+        (isBuiltinMorphAssetId(e->id) ? builtins : userEntries).push_back(e);
+
     if (!builtins.empty()) {
         libraryCombo.addSectionHeading("Built-in");
-        for (const auto& b : builtins)
-            libraryCombo.addItem(juce::String(b.name), b.id);
+        for (const AssetEntry* e : builtins) {
+            libraryCombo.addItem(juce::String(e->name), e->id);
+            if (e->id == cur) curListed = true;
+        }
     }
 
-    auto userEntries = libCtx.lib->list(AssetKind::MorphAlgorithm);
     if (!userEntries.empty()) libraryCombo.addSectionHeading("Saved");
     for (const AssetEntry* e : userEntries) {
         juce::String nm = e->name.empty() ? ("#" + juce::String(e->id))

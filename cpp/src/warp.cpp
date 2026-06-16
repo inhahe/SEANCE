@@ -401,3 +401,25 @@ const BuiltinMorphChain* builtinMorphChain(int id) {
         if (c.id == id) return &c;
     return nullptr;
 }
+
+bool isBuiltinMorphAssetId(int id) {
+    return id >= kBuiltinMorphIdBase
+        && id <  SoundShop::AssetLibrary::kUserIdBase;
+}
+
+void seedBuiltinMorphLibrary(SoundShop::AssetLibrary& lib) {
+    using namespace SoundShop;
+    for (const auto& c : builtinMorphChains()) {
+        if (lib.find(c.id)) continue;   // idempotent: already seeded
+        AssetEntry e;
+        e.id          = c.id;
+        e.kind        = AssetKind::MorphAlgorithm;
+        e.name        = c.name;
+        e.subType     = "";
+        e.payload     = encodeWarpChain(c.ops);
+        e.contentHash = AssetLibrary::computeHash(e.kind, e.subType, e.payload);
+        e.archived    = false;
+        e.starred     = true;   // built-ins are curated favourites
+        lib.insertRaw(std::move(e));
+    }
+}

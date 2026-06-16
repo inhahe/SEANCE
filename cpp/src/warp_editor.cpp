@@ -284,9 +284,10 @@ void WarpChainEditor::refreshRowVisuals(int idx) {
         const bool modAvail = reason.isEmpty();
         row.mod->setEnabled(modAvail);
         row.mod->setTooltip(modAvail
-            ? "Add a modulation input pin for this stage's amount, so an LFO / "
-              "oscillator cable can drive the morph live. Uncheck to remove the "
-              "pin and edit the amount by hand."
+            ? "Add an input pin for this stage's amount, so a cable (LFO, "
+              "oscillator, automation) can drive the morph live. The pin can run "
+              "in Mod or Set mode. Uncheck to remove the pin and edit the amount "
+              "by hand."
             : reason);
     }
     // Disabled op = greyed amount slider so the bypass is visible. A modulated
@@ -295,9 +296,9 @@ void WarpChainEditor::refreshRowVisuals(int idx) {
     if (row.amount)
         row.amount->setTooltip(modulated
             ? "Signal-locked - this stage's amount is driven by an incoming "
-              "modulation cable. Uncheck Mod to edit it by hand."
-            : "Morph amount (0 = no effect, 1 = full). Check Mod to drive this "
-              "with an LFO / oscillator instead.");
+              "modulation cable. Uncheck Pin to edit it by hand."
+            : "Morph amount (0 = no effect, 1 = full). Check Pin to drive this "
+              "with a cable (LFO / oscillator / automation) instead.");
 }
 
 void WarpChainEditor::rebuild() {
@@ -336,15 +337,19 @@ void WarpChainEditor::rebuild() {
             };
             addAndMakeVisible(*row.amount);
 
-            // "Mod" checkbox - opt this op's amount into a live modulation pin
-            // (#88), the unified warp/morph model. Only meaningful when the host
-            // backs the chain with node params (frame-scope editor implements the
-            // callbacks); hidden on baked chains that leave the callbacks unset.
-            row.mod = std::make_unique<juce::ToggleButton>("Mod");
-            row.mod->setTooltip("Add a modulation input pin for this stage's "
-                                "amount, so an LFO / oscillator cable can drive "
-                                "the morph live. Uncheck to remove the pin and "
-                                "edit the amount by hand.");
+            // "Pin" checkbox - opt this op's amount into a live modulation input
+            // pin (#88), the unified warp/morph model. Labelled "Pin" rather than
+            // "Mod" because the pin it creates can run in either Mod or Set mode
+            // (those are the node-graph pin types) - the checkbox just exposes the
+            // input. Only meaningful when the host backs the chain with node params
+            // (frame-scope editor implements the callbacks); hidden on baked chains
+            // that leave the callbacks unset.
+            row.mod = std::make_unique<juce::ToggleButton>("Pin");
+            row.mod->setTooltip("Add an input pin for this stage's amount, so a "
+                                "cable (LFO, oscillator, automation) can drive the "
+                                "morph live. The pin can run in Mod or Set mode. "
+                                "Uncheck to remove the pin and edit the amount by "
+                                "hand.");
             row.mod->setVisible((bool)cb.isModulated && (bool)cb.setModulated);
             row.mod->onClick = [this, i] {
                 if (!cb.setModulated || i >= (int)rows.size()) return;

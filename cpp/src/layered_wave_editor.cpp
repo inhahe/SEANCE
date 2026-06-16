@@ -2067,16 +2067,18 @@ void LayeredWaveform::render(std::vector<float>& out) const {
 void LayeredWaveform::renderWithLiveWarp(
     const std::vector<std::vector<float>>& overrides,
     std::vector<float>& out) const {
-    // Delegate to the unified path with no phase/amp overrides, so render(),
+    // Delegate to the unified path with no phase/amp/shape overrides, so render(),
     // the warp-only re-bake, and the full phase/amp re-bake all share one
     // summation/normalization routine.
-    renderWithLiveOverrides(overrides, {}, {}, out);
+    renderWithLiveOverrides(overrides, {}, {}, {}, {}, out);
 }
 
 void LayeredWaveform::renderWithLiveOverrides(
     const std::vector<std::vector<float>>& warpOverrides,
     const std::vector<float>& phaseOverrides,
     const std::vector<float>& ampOverrides,
+    const std::vector<float>& shapeOverrides,
+    const std::vector<float>& shape2Overrides,
     std::vector<float>& out) const {
     out.assign(tableSize, 0.0f);
     if (layers.empty()) return;
@@ -2100,6 +2102,28 @@ void LayeredWaveform::renderWithLiveOverrides(
         if (li < ampOverrides.size() && !std::isnan(ampOverrides[li]))
             effAmp = juce::jlimit(0.0f, 1.0f, ampOverrides[li]);
 
+        // Resolve this layer's effective generator parameters (shapeParam /
+        // shapeParam2). Only the parameter-bearing generators use them; for the
+        // rest the override is harmless. When either differs from the stored
+        // value, render through a patched copy so sampleLayer sees the live value;
+        // the common (un-modulated) path keeps the original layer and copies
+        // nothing.
+        float effShape  = layer.shapeParam;
+        if (li < shapeOverrides.size() && !std::isnan(shapeOverrides[li]))
+            effShape = juce::jlimit(0.0f, 1.0f, shapeOverrides[li]);
+        float effShape2 = layer.shapeParam2;
+        if (li < shape2Overrides.size() && !std::isnan(shape2Overrides[li]))
+            effShape2 = juce::jlimit(0.0f, 1.0f, shape2Overrides[li]);
+        const WaveLayer* effLayerPtr = &layer;
+        WaveLayer patched;
+        if (effShape != layer.shapeParam || effShape2 != layer.shapeParam2) {
+            patched = layer;
+            patched.shapeParam  = effShape;
+            patched.shapeParam2 = effShape2;
+            effLayerPtr = &patched;
+        }
+        const WaveLayer& effLayer = *effLayerPtr;
+
         // Resolve this layer's effective warp chain: when a live override is
         // supplied for one of its ops (a per-layer warp op opted into
         // modulation), substitute that amount; otherwise the op keeps its baked
@@ -2122,7 +2146,7 @@ void LayeredWaveform::renderWithLiveOverrides(
             for (int i = 0; i < tableSize; ++i) {
                 float phase = (float)i / (float)tableSize;  // 0..1 over base period
                 float x = phase * (float)r + effPhase;      // ratio + phase offset
-                out[i] += effAmp * sampleLayer(layer, x, rng);
+                out[i] += effAmp * sampleLayer(effLayer, x, rng);
             }
         } else {
             // Element-scope warp (Bucket A): render the layer's RAW cycle (unit
@@ -2135,7 +2159,7 @@ void LayeredWaveform::renderWithLiveOverrides(
             for (int i = 0; i < tableSize; ++i) {
                 float phase = (float)i / (float)tableSize;
                 float x = phase * (float)r + effPhase;
-                buf[(size_t)i] = sampleLayer(layer, x, rng);
+                buf[(size_t)i] = sampleLayer(effLayer, x, rng);
             }
             applyWarpChain(*chain, buf);
             for (int i = 0; i < tableSize; ++i)
@@ -4388,20 +4412,59 @@ static void renderSingleLayer(const WaveLayer& layer, int tableSize,
 namespace {
 struct WaveLayerPreset {
     const char* name;
+    // Presets fall into two groups in the picker. Simple = a baked cycle with no
+    // extra controls beyond the standard harmonic/phase/amplitude (drawn or
+    // formula shapes). WithParams = a generator whose defining parameter(s) -
+    // duty, sync amount, FM index/ratio, phase-distortion amount - show as extra
+    // sliders the user can keep tweaking. The two groups read as separate
+    // sections so the user knows which presets carry extra knobs.
+    enum Group { Simple, WithParams };
+    Group group;
     std::function<void(WaveLayer&)> apply;
 };
 
 static const std::vector<WaveLayerPreset>& wavePresets() {
+    using G = WaveLayerPreset;
+    // The bare static shapes (Sine/Saw/Square/Triangle/Noise) are NOT presets -
+    // they live at the top level of the wave-source menu under "Static shapes".
+    // Listing them here too would just duplicate that section, so presets only
+    // carry the shapes you can't pick directly up top: baked drawn/formula cycles
+    // and the parameter-bearing generators.
     static const std::vector<WaveLayerPreset> presets = {
-        { "Sine",         [](WaveLayer& l) { l.shape = WaveLayer::Sine; } },
-        { "Saw",          [](WaveLayer& l) { l.shape = WaveLayer::Saw; } },
-        { "Square",       [](WaveLayer& l) { l.shape = WaveLayer::Square; } },
-        { "Triangle",     [](WaveLayer& l) { l.shape = WaveLayer::Triangle; } },
-        { "Noise",        [](WaveLayer& l) { l.shape = WaveLayer::Noise; } },
-        // Pulse 25%: drawn as a single rectangle: high for first quarter,
-        // low for remainder. Two points isn't enough for cubic interpolation
-        // to render a flat pulse, so use a denser set.
-        { "Pulse 25%",    [](WaveLayer& l) {
+        // ---- Simple (no extra controls) ----
+        // Half-sine: rectified sine, useful as an envelope curve.
+        { "Half-sine",    G::Simple, [](WaveLayer& l) {
+            l.shape = WaveLayer::Formula;
+            l.formulaExpr = "if(sin(x) > 0, sin(x), 0)";
+        }},
+        // Ramp shapes via Drawn so the user can grab points to reshape.
+        { "Ramp up",      G::Simple, [](WaveLayer& l) {
+            l.shape = WaveLayer::Drawn;
+            l.freehandMode = false;
+            l.drawnPoints = { {0.0f, -1.0f}, {0.999f, 1.0f} };
+        }},
+        { "Ramp down",    G::Simple, [](WaveLayer& l) {
+            l.shape = WaveLayer::Drawn;
+            l.freehandMode = false;
+            l.drawnPoints = { {0.0f, 1.0f}, {0.999f, -1.0f} };
+        }},
+        // Formula presets for common analog-flavored shapes.
+        { "Soft saw",     G::Simple, [](WaveLayer& l) {
+            l.shape = WaveLayer::Formula;
+            l.formulaExpr = "tanh(2 * saw(x))";
+        }},
+        { "FM bell",      G::Simple, [](WaveLayer& l) {
+            l.shape = WaveLayer::Formula;
+            l.formulaExpr = "sin(x + 0.7 * sin(2.4 * x))";
+        }},
+        { "Organ-ish",    G::Simple, [](WaveLayer& l) {
+            l.shape = WaveLayer::Formula;
+            l.formulaExpr = "0.6*sin(x) + 0.3*sin(2*x) + 0.1*sin(4*x)";
+        }},
+        // Pulse 25%/75%: drawn as a single rectangle: high for first quarter (or
+        // three-quarters), low for the remainder. Two points isn't enough for
+        // cubic interpolation to render a flat pulse, so use a denser set.
+        { "Pulse 25%",    G::Simple, [](WaveLayer& l) {
             l.shape = WaveLayer::Drawn;
             l.freehandMode = false;
             l.drawnPoints = {
@@ -4409,7 +4472,7 @@ static const std::vector<WaveLayerPreset>& wavePresets() {
                 {0.25f, -1.0f}, {0.99f, -1.0f}
             };
         }},
-        { "Pulse 75%",    [](WaveLayer& l) {
+        { "Pulse 75%",    G::Simple, [](WaveLayer& l) {
             l.shape = WaveLayer::Drawn;
             l.freehandMode = false;
             l.drawnPoints = {
@@ -4417,47 +4480,21 @@ static const std::vector<WaveLayerPreset>& wavePresets() {
                 {0.75f, -1.0f}, {0.99f, -1.0f}
             };
         }},
-        // Half-sine: rectified sine, useful as an envelope curve.
-        { "Half-sine",    [](WaveLayer& l) {
-            l.shape = WaveLayer::Formula;
-            l.formulaExpr = "if(sin(x) > 0, sin(x), 0)";
-        }},
-        // Ramp shapes via Drawn so the user can grab points to reshape.
-        { "Ramp up",      [](WaveLayer& l) {
-            l.shape = WaveLayer::Drawn;
-            l.freehandMode = false;
-            l.drawnPoints = { {0.0f, -1.0f}, {0.999f, 1.0f} };
-        }},
-        { "Ramp down",    [](WaveLayer& l) {
-            l.shape = WaveLayer::Drawn;
-            l.freehandMode = false;
-            l.drawnPoints = { {0.0f, 1.0f}, {0.999f, -1.0f} };
-        }},
-        // Formula presets for common analog-flavored shapes.
-        { "Soft saw",     [](WaveLayer& l) {
-            l.shape = WaveLayer::Formula;
-            l.formulaExpr = "tanh(2 * saw(x))";
-        }},
-        { "FM bell",      [](WaveLayer& l) {
-            l.shape = WaveLayer::Formula;
-            l.formulaExpr = "sin(x + 0.7 * sin(2.4 * x))";
-        }},
-        { "Organ-ish",    [](WaveLayer& l) {
-            l.shape = WaveLayer::Formula;
-            l.formulaExpr = "0.6*sin(x) + 0.3*sin(2*x) + 0.1*sin(4*x)";
-        }},
-        // Bucket B generator-morph oscillators (live morph parameters, not
-        // baked geometry) - stamped at a musically useful midpoint.
-        { "Pulse (morph)", [](WaveLayer& l) {
+        // ---- With parameters (generator oscillators) ----
+        // Generator-morph oscillators (live morph parameters, not baked
+        // geometry) - stamped at a musically useful midpoint. These are the
+        // wave-defining ("Type-1") generators; selecting one exposes its extra
+        // parameter slider(s) (Duty / Amount / Index+Ratio).
+        { "Pulse (PWM)",       G::WithParams, [](WaveLayer& l) {
             l.shape = WaveLayer::Pulse; l.shapeParam = 0.3f;
         }},
-        { "Hard sync",     [](WaveLayer& l) {
+        { "Hard Sync",         G::WithParams, [](WaveLayer& l) {
             l.shape = WaveLayer::Sync;  l.shapeParam = 0.45f;
         }},
-        { "FM 2-op",       [](WaveLayer& l) {
+        { "FM",                G::WithParams, [](WaveLayer& l) {
             l.shape = WaveLayer::FM; l.shapeParam = 0.5f; l.shapeParam2 = 0.15f;
         }},
-        { "CZ phase dist", [](WaveLayer& l) {
+        { "Phase Distortion",  G::WithParams, [](WaveLayer& l) {
             l.shape = WaveLayer::PhaseDist; l.shapeParam = 0.6f;
         }},
     };
@@ -4603,14 +4640,22 @@ WaveLayerEditor::WaveLayerEditor(WaveLayer* layerPtr, Callbacks cb, bool enableW
         l->setJustificationType(juce::Justification::centredLeft);
     }
 
-    // Per-layer Phase / Amplitude modulation "Mod" checkboxes (#88, item-M).
-    // Shown only when the owner wired the field-modulation callbacks (the
-    // wavetable layer stack); hidden for the LFO / Signal-Shape editor. Ticking
-    // one creates an on-demand modulation pin so a cable can drive that value
-    // live; unticking removes it. field: 0 = Phase, 1 = Amplitude.
+    // Per-layer parameter-modulation "Pin" checkboxes (#88, item-M). Shown only
+    // when the owner wired the field-modulation callbacks (the wavetable layer
+    // stack); hidden for the LFO / Signal-Shape editor. Ticking one adds an
+    // on-demand input pin so a cable (LFO, oscillator, automation) can drive that
+    // value live; unticking removes it. It is labelled "Pin" rather than "Mod"
+    // because the pin it creates can run in either Mod or Set mode (those are the
+    // two pin types in the node graph) - the checkbox just exposes the input.
+    // field: 0 = Phase, 1 = Amplitude, 2 = generator param (Duty/Amount/Index),
+    // 3 = FM ratio (the second generator param).
     auto setupModBtn = [this](juce::ToggleButton& btn, int field) {
         addChildComponent(btn);
-        btn.setButtonText("Mod");
+        btn.setButtonText("Pin");
+        btn.setTooltip("Add an input pin for this parameter so a cable (LFO, "
+                       "oscillator, automation) can drive it live. The pin can run "
+                       "in Mod or Set mode in the node graph. Uncheck to remove the "
+                       "pin and edit the value by hand.");
         btn.onClick = [this, &btn, field]() {
             if (callbacks.setFieldModulated)
                 callbacks.setFieldModulated(field, btn.getToggleState());
@@ -4621,8 +4666,10 @@ WaveLayerEditor::WaveLayerEditor(WaveLayer* layerPtr, Callbacks cb, bool enableW
             syncFieldModState();
         };
     };
-    setupModBtn(phaseModBtn, 0);
-    setupModBtn(ampModBtn,   1);
+    setupModBtn(phaseModBtn,  0);
+    setupModBtn(ampModBtn,    1);
+    setupModBtn(morphModBtn,  2);
+    setupModBtn(morph2ModBtn, 3);
 
     // Generator-morph parameter sliders. Both are normalised 0..1 (the per-shape
     // mapping happens in evalGeneratorMorph); the label text is updated per shape
@@ -4762,17 +4809,29 @@ void WaveLayerEditor::syncFieldModState() {
     const bool wired = (bool)callbacks.setFieldModulated;
     phaseModBtn.setVisible(wired);
     ampModBtn.setVisible(wired);
+    // The generator-param Pin buttons only apply to the parameter-bearing
+    // generators, so they follow their slider's visibility as well as `wired`.
+    morphModBtn .setVisible(wired && morphSlider.isVisible());
+    morph2ModBtn.setVisible(wired && morph2Slider.isVisible());
     if (!wired) {
         phaseSlider.setEnabled(true);
         ampSlider.setEnabled(true);
+        morphSlider.setEnabled(true);
+        morph2Slider.setEnabled(true);
         return;
     }
-    struct FieldRef { juce::ToggleButton& btn; juce::Slider& sl; int field; const char* name; };
+    // The generator param's display name (Duty / Amount / Index) is set per shape
+    // in updateSourceControls(); reuse the slider label so tooltips read right.
+    const juce::String morphName  = morphLabel.getText();
+    struct FieldRef { juce::ToggleButton& btn; juce::Slider& sl; int field; juce::String name; bool active; };
     FieldRef refs[] = {
-        { phaseModBtn, phaseSlider, 0, "Phase" },
-        { ampModBtn,   ampSlider,   1, "Amplitude" },
+        { phaseModBtn,  phaseSlider,  0, "Phase",      true },
+        { ampModBtn,    ampSlider,    1, "Amplitude",  true },
+        { morphModBtn,  morphSlider,  2, morphName,    morphSlider.isVisible() },
+        { morph2ModBtn, morph2Slider, 3, "Ratio",      morph2Slider.isVisible() },
     };
     for (auto& r : refs) {
+        if (!r.active) continue;  // hidden generator-param row: nothing to sync
         const bool modulated = callbacks.isFieldModulated && callbacks.isFieldModulated(r.field);
         juce::String disabledReason = callbacks.fieldModDisabledReason
                                           ? callbacks.fieldModDisabledReason(r.field)
@@ -4783,23 +4842,26 @@ void WaveLayerEditor::syncFieldModState() {
             r.btn.setTooltip(disabledReason);
         else
             r.btn.setTooltip(juce::String(r.name)
-                + " modulation: tick to expose a modulation pin on the node so a "
+                + " modulation: tick to expose an input pin on the node so a "
                   "cable (LFO, envelope, another signal) can drive this layer's "
                 + juce::String(r.name).toLowerCase()
-                + " live. Untick to go back to the baked value.");
+                + " live. The pin can run in Mod or Set mode. Untick to go back to "
+                  "the baked value.");
         // Grayed-control-explains-itself: when a cable drives the value, the
         // slider is signal-locked (the synth rewrites it each block).
         r.sl.setEnabled(!modulated);
         if (modulated)
             r.sl.setTooltip("Signal-locked - this " + juce::String(r.name).toLowerCase()
-                + " is being driven by an incoming modulation cable. Untick Mod or "
+                + " is being driven by an incoming modulation cable. Untick Pin or "
                   "disconnect the cable to edit it manually.");
         else if (r.field == 0)
             r.sl.setTooltip("Phase offset (0 to 1): shifts where in its cycle this layer starts. "
                             "Affects how layers add up when summed - different phases give different timbres.");
-        else
+        else if (r.field == 1)
             r.sl.setTooltip("Amplitude (0 to 1): how loud this layer is in the final sum. 0 = silent, 1 = full volume. "
                             "Use to balance layers against each other.");
+        // fields 2/3 (generator params): the per-shape tooltip is set in
+        // updateSourceControls(); leave it untouched when not signal-locked.
     }
 }
 
@@ -4872,11 +4934,34 @@ void WaveLayerEditor::updateSourceControls() {
     morphSlider.setValue(l.shapeParam, juce::dontSendNotification);
     morphSlider.setVisible(isGen);
     morphLabel .setVisible(isGen);
+    // Per-shape tooltip for the generator parameter so its meaning is clear.
+    switch (l.shape) {
+        case WaveLayer::Pulse:
+            morphSlider.setTooltip("Duty cycle (0 to 1): pulse width. 0.5 = square; "
+                                   "lower/higher narrows the high or low part."); break;
+        case WaveLayer::Sync:
+            morphSlider.setTooltip("Sync amount (0 to 1): how much faster the synced "
+                                   "copy runs - higher = brighter, more formant sweep."); break;
+        case WaveLayer::FM:
+            morphSlider.setTooltip("FM index (0 to 1): modulation depth - higher adds "
+                                   "more sidebands / brightness."); break;
+        case WaveLayer::PhaseDist:
+            morphSlider.setTooltip("Phase-distortion amount (0 to 1): bends a sine "
+                                   "toward saw/square (Casio-CZ style)."); break;
+        default: break;
+    }
     bool isFM = (l.shape == WaveLayer::FM);
     morph2Label.setText("Ratio", juce::dontSendNotification);
     morph2Slider.setValue(l.shapeParam2, juce::dontSendNotification);
     morph2Slider.setVisible(isFM);
     morph2Label .setVisible(isFM);
+    morph2Slider.setTooltip("Modulator : carrier ratio (0 to 1, mapped to 1..8): "
+                            "integer ratios give harmonic FM tones.");
+    // Keep the generator-param Pin checkboxes' visibility in lock-step with their
+    // sliders here (syncFieldModState fills in toggle state / enable / tooltips).
+    const bool fieldWired = (bool)callbacks.setFieldModulated;
+    morphModBtn .setVisible(fieldWired && isGen);
+    morph2ModBtn.setVisible(fieldWired && isFM);
 
     const int newMorphRows = (isGen ? 1 : 0) + (isFM ? 1 : 0);
     if (newMorphRows != prevMorphRows && callbacks.onHeightChanged) {
@@ -4914,6 +4999,11 @@ void WaveLayerEditor::showWaveSourceMenu() {
     const WaveLayer::Shape cur = layer->shape;
     juce::PopupMenu m;
 
+    // Static shapes: fixed-waveform sources whose fundamental shape doesn't
+    // change (the standard harmonic/phase/amplitude controls don't redefine the
+    // wave). "Draw your own" and "Formula" live here too - they're authored once
+    // and then static. The waveform Library is also just a bank of static cycles,
+    // so its picker sits in this same section rather than off on its own.
     m.addSectionHeader("Static shapes");
     addShapeItem(m, cur, WaveLayer::Sine,     "Sine");
     addShapeItem(m, cur, WaveLayer::Saw,      "Saw");
@@ -4922,32 +5012,32 @@ void WaveLayerEditor::showWaveSourceMenu() {
     addShapeItem(m, cur, WaveLayer::Noise,    "Noise");
     addShapeItem(m, cur, WaveLayer::Drawn,    "Draw your own");
     addShapeItem(m, cur, WaveLayer::Formula,  "Formula");
-
-    // Wave-defining (Type-1) morphs: a generator IS the wave source, so it is
-    // single-select and mutually exclusive with the static shapes above -
-    // hence one flat list, not an "+ Add" chain (that is the Type-2 warp editor).
-    m.addSeparator();
-    m.addSectionHeader("Wave-defining morphs");
-    addShapeItem(m, cur, WaveLayer::Pulse,     "Pulse (PWM)");
-    addShapeItem(m, cur, WaveLayer::Sync,      "Hard Sync");
-    addShapeItem(m, cur, WaveLayer::FM,        "FM");
-    addShapeItem(m, cur, WaveLayer::PhaseDist, "Phase Distortion");
-
-    // Factory presets (a starting cycle the user can edit further).
-    m.addSeparator();
-    juce::PopupMenu presetSub;
-    const auto& presets = wavePresets();
-    for (int i = 0; i < (int)presets.size(); ++i)
-        presetSub.addItem(kPresetIdBase + i, presets[i].name);
-    m.addSubMenu("Presets", presetSub);
-
     // From Library: a single cycle pulled from the waveform library. Only
     // offered when the owner wired the loader (the layer stack with browser
     // access); omitted for the LFO / Signal-Shape editor.
-    if (callbacks.onPickFromLibrary) {
-        m.addSeparator();
+    if (callbacks.onPickFromLibrary)
         m.addItem(kFromLibraryId, juce::String::fromUTF8("From Library\xe2\x80\xa6"));
+
+    // Presets: ready-made starting cycles the user can edit further. Split into
+    // "Simple" (no extra controls) and "With parameters" (generator oscillators
+    // that expose extra sliders - duty, sync amount, FM index/ratio, phase-dist
+    // amount). The bare static shapes are NOT duplicated here; they're up top.
+    m.addSeparator();
+    juce::PopupMenu presetSub;
+    const auto& presets = wavePresets();
+    bool addedSimple = false, addedWithParams = false;
+    for (int i = 0; i < (int)presets.size(); ++i) {
+        if (presets[i].group == WaveLayerPreset::Simple && !addedSimple) {
+            presetSub.addSectionHeader("Simple");
+            addedSimple = true;
+        }
+        if (presets[i].group == WaveLayerPreset::WithParams && !addedWithParams) {
+            presetSub.addSectionHeader("With parameters");
+            addedWithParams = true;
+        }
+        presetSub.addItem(kPresetIdBase + i, presets[i].name);
     }
+    m.addSubMenu("Presets", presetSub);
 
     m.showMenuAsync(juce::PopupMenu::Options().withTargetComponent(&waveSourceBtn),
         [this](int result) {
@@ -5019,23 +5109,32 @@ void WaveLayerEditor::resized() {
         a.removeFromBottom(4);
     }
 
-    // Slider rows. `modBtn` (optional) is a per-row "Mod" checkbox laid out at
-    // the right edge of the row; when visible the slider shrinks to make room.
+    // Slider rows. `modBtn` (optional) is a per-row "Pin" checkbox laid out at the
+    // right edge of the row. When the editor is wired for parameter modulation
+    // (the wavetable layer stack), EVERY row reserves the Pin column so all the
+    // sliders end at the same x - even rows whose parameter has no Pin option
+    // (the harmonic/ratio row) keep an empty column rather than letting the slider
+    // run long and break the alignment. Editors with no field-modulation (the LFO
+    // / Signal-Shape editor) reserve nothing, so their sliders use the full width.
+    const bool reservePinColumn = (bool)callbacks.setFieldModulated;
     auto sliderRow = [&](juce::Label& lab, juce::Slider& sl, juce::ToggleButton* modBtn = nullptr) {
         auto r = a.removeFromTop(20);
         lab.setBounds(r.removeFromLeft(70));
-        if (modBtn && modBtn->isVisible())
-            modBtn->setBounds(r.removeFromRight(52));
+        if (reservePinColumn) {
+            auto pinCol = r.removeFromRight(52);
+            if (modBtn && modBtn->isVisible()) modBtn->setBounds(pinCol);
+        }
         sl.setBounds(r);
     };
-    sliderRow(ratioLabel, ratioSlider);
+    sliderRow(ratioLabel, ratioSlider);   // harmonic: the one row with no Pin option
     sliderRow(phaseLabel, phaseSlider, &phaseModBtn);
     sliderRow(ampLabel,   ampSlider,   &ampModBtn);
     // Generator-morph slider rows: only consume vertical space when their shape
     // shows them (kept in sync with preferredHeight()). Reserving them when
-    // hidden was the source of the empty gap above the Layer Morph strip.
-    if (morphSlider.isVisible())  sliderRow(morphLabel,  morphSlider);
-    if (morph2Slider.isVisible()) sliderRow(morph2Label, morph2Slider);
+    // hidden was the source of the empty gap above the Layer Morph strip. These
+    // carry a Pin checkbox too (the extra parameter is modulatable like phase/amp).
+    if (morphSlider.isVisible())  sliderRow(morphLabel,  morphSlider,  &morphModBtn);
+    if (morph2Slider.isVisible()) sliderRow(morph2Label, morph2Slider, &morph2ModBtn);
 }
 
 void WaveLayerEditor::paint(juce::Graphics& g) {
@@ -8770,6 +8869,11 @@ LayeredWaveEditorComponent::LayeredWaveEditorComponent(NodeGraph& g, int nid, st
         };
         wcb.onStructureChanged = [this]() {
             syncWarpParams();
+            // The op count changed, so the editor's preferredHeight() changed too.
+            // Re-run our layout so frameWarpEditor is re-sized to fit the new row
+            // count - otherwise an added stage is laid out inside the old (too
+            // short) bounds and clipped, which read as "Add does nothing".
+            resized();
             onLayerChanged();
         };
         // Reorder: keep each op's modulation pin following the op, not the slot
@@ -10088,7 +10192,9 @@ void LayeredWaveEditorComponent::setLayerFieldModulated(int layer, int field, bo
     if (!nd) return;
     LayeredWaveform* lw = currentEditingLayeredFrame();
     if (!lw || layer < 0 || layer >= (int)lw->layers.size()) return;
-    if (field != 0 && field != 1) return;
+    // field 0 = Phase, 1 = Amplitude, 2 = generator param (shapeParam:
+    // duty/amount/index), 3 = FM ratio (shapeParam2).
+    if (field < 0 || field > 3) return;
     const auto& L = lw->layers[(size_t)layer];
 
     if (on) {
@@ -10101,10 +10207,29 @@ void LayeredWaveEditorComponent::setLayerFieldModulated(int layer, int field, bo
             p.warpLayer  = layer;
             p.warpSlot   = -1;
             p.layerField = field;
-            const bool isPhase = (field == 0);
-            p.name   = "Layer " + std::to_string(layer + 1)
-                     + (isPhase ? " Phase" : " Amp");
-            p.value = p.baseValue = (isPhase ? L.phase : L.amp);
+            // Suffix names the modulated value. The generator param (field 2)
+            // takes its per-shape name (Duty/Amount/Index) so the node's pin
+            // reads meaningfully; field 3 is FM's Ratio.
+            const char* suffix = " Phase";
+            float seed = L.phase;
+            switch (field) {
+                case 0: suffix = " Phase"; seed = L.phase; break;
+                case 1: suffix = " Amp";   seed = L.amp;   break;
+                case 2:
+                    seed = L.shapeParam;
+                    switch (L.shape) {
+                        case WaveLayer::Pulse:     suffix = " Duty";   break;
+                        case WaveLayer::Sync:      suffix = " Amount"; break;
+                        case WaveLayer::FM:        suffix = " Index";  break;
+                        case WaveLayer::PhaseDist: suffix = " Amount"; break;
+                        default:                   suffix = " Param";  break;
+                    }
+                    break;
+                case 3: suffix = " Ratio"; seed = L.shapeParam2; break;
+                default: break;
+            }
+            p.name   = "Layer " + std::to_string(layer + 1) + suffix;
+            p.value = p.baseValue = seed;
             p.minVal = 0.0f; p.maxVal = 1.0f; p.format = "%.2f";
             nd->params.push_back(std::move(p));
             pi = (int)nd->params.size() - 1;

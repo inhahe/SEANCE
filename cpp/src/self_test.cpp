@@ -2399,7 +2399,7 @@ void testWarp(Report& r) {
 
         // (1) All-NaN phase/amp overrides reproduce the baked cycle exactly.
         std::vector<float> heldOut;
-        lw.renderWithLiveOverrides({}, { kNaN, kNaN }, { kNaN, kNaN }, heldOut);
+        lw.renderWithLiveOverrides({}, { kNaN, kNaN }, { kNaN, kNaN }, {}, {}, heldOut);
         bool held = heldOut.size() == baked.size();
         for (size_t i = 0; held && i < heldOut.size(); ++i)
             held = std::abs(heldOut[i] - baked[i]) < 1e-6f;
@@ -2408,12 +2408,12 @@ void testWarp(Report& r) {
         // (2) An amp override that matches the stored amp reproduces the cycle;
         //     a different amp changes it (proving amp override feeds the mix).
         std::vector<float> ampHeld, ampMod;
-        lw.renderWithLiveOverrides({}, { kNaN, kNaN }, { kNaN, 0.5f }, ampHeld);
+        lw.renderWithLiveOverrides({}, { kNaN, kNaN }, { kNaN, 0.5f }, {}, {}, ampHeld);
         bool ampSame = ampHeld.size() == baked.size();
         for (size_t i = 0; ampSame && i < ampHeld.size(); ++i)
             ampSame = std::abs(ampHeld[i] - baked[i]) < 1e-6f;
         r.check(ampSame, "layerfield: amp override == stored amp reproduces the cycle");
-        lw.renderWithLiveOverrides({}, { kNaN, kNaN }, { kNaN, 0.0f }, ampMod);
+        lw.renderWithLiveOverrides({}, { kNaN, kNaN }, { kNaN, 0.0f }, {}, {}, ampMod);
         double ampDiff = 0.0;
         int an = (int)std::min(ampMod.size(), baked.size());
         for (int i = 0; i < an; ++i) ampDiff += std::abs(ampMod[i] - baked[i]);
@@ -2422,11 +2422,45 @@ void testWarp(Report& r) {
         // (3) A phase override on layer 0 changes the summed cycle (the two
         //     layers add up differently once the phase relationship shifts).
         std::vector<float> phaseMod;
-        lw.renderWithLiveOverrides({}, { 0.25f, kNaN }, { kNaN, kNaN }, phaseMod);
+        lw.renderWithLiveOverrides({}, { 0.25f, kNaN }, { kNaN, kNaN }, {}, {}, phaseMod);
         double phaseDiff = 0.0;
         int pn = (int)std::min(phaseMod.size(), baked.size());
         for (int i = 0; i < pn; ++i) phaseDiff += std::abs(phaseMod[i] - baked[i]);
         r.checkVal(phaseDiff > 1.0, "layerfield: phase override changes the re-baked cycle", phaseDiff);
+
+        // (3b) A generator-parameter override (field 2 = shapeParam) changes a
+        //      Pulse layer's cycle, proving duty/amount/index is modulatable like
+        //      phase/amp. A matching override reproduces it; a different one moves
+        //      it. field 3 (shapeParam2) is exercised for FM below.
+        {
+            WaveLayer pg; pg.shape = WaveLayer::Pulse; pg.ratio = 1; pg.amp = 1.0f;
+            pg.shapeParam = 0.5f;  // square
+            LayeredWaveform plw; plw.tableSize = 256; plw.layers = { pg };
+            std::vector<float> pBaked; plw.render(pBaked);
+            std::vector<float> pHeld, pMod;
+            plw.renderWithLiveOverrides({}, {}, {}, { 0.5f }, {}, pHeld);
+            bool pSame = pHeld.size() == pBaked.size();
+            for (size_t i = 0; pSame && i < pHeld.size(); ++i)
+                pSame = std::abs(pHeld[i] - pBaked[i]) < 1e-6f;
+            r.check(pSame, "layerfield: shapeParam override == stored reproduces the cycle");
+            plw.renderWithLiveOverrides({}, {}, {}, { 0.1f }, {}, pMod);
+            double spDiff = 0.0;
+            int spn = (int)std::min(pMod.size(), pBaked.size());
+            for (int i = 0; i < spn; ++i) spDiff += std::abs(pMod[i] - pBaked[i]);
+            r.checkVal(spDiff > 1.0, "layerfield: shapeParam override changes the re-baked cycle", spDiff);
+
+            // (3c) FM ratio (field 3 = shapeParam2) modulation changes an FM layer.
+            WaveLayer fg; fg.shape = WaveLayer::FM; fg.ratio = 1; fg.amp = 1.0f;
+            fg.shapeParam = 0.5f; fg.shapeParam2 = 0.15f;
+            LayeredWaveform flw; flw.tableSize = 256; flw.layers = { fg };
+            std::vector<float> fBaked; flw.render(fBaked);
+            std::vector<float> fMod;
+            flw.renderWithLiveOverrides({}, {}, {}, {}, { 0.8f }, fMod);
+            double f2Diff = 0.0;
+            int fn = (int)std::min(fMod.size(), fBaked.size());
+            for (int i = 0; i < fn; ++i) f2Diff += std::abs(fMod[i] - fBaked[i]);
+            r.checkVal(f2Diff > 1.0, "layerfield: shapeParam2 (FM ratio) override changes the cycle", f2Diff);
+        }
 
         // (4) renderWithLiveWarp delegates here with empty phase/amp -> identical
         //     to render() (the back-compat path the synth's warp-only loop uses).

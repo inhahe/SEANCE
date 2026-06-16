@@ -304,10 +304,12 @@ private:
     juce::ComboBox   formulaLangCombo;   // Built-in / Lua / Python (Formula only)
     juce::Slider ratioSlider, phaseSlider, ampSlider;
     juce::Label  ratioLabel, phaseLabel, ampLabel;
-    // Per-layer Phase / Amplitude modulation toggles (#88, item-M). Visible only
-    // when callbacks.setFieldModulated is wired (the wavetable layer stack);
-    // hidden for the LFO / Signal-Shape editor. field 0 = phase, 1 = amplitude.
-    juce::ToggleButton phaseModBtn, ampModBtn;
+    // Per-parameter modulation "Pin" toggles (#88, item-M). Visible only when
+    // callbacks.setFieldModulated is wired (the wavetable layer stack); hidden for
+    // the LFO / Signal-Shape editor. field 0 = phase, 1 = amplitude, 2 = generator
+    // param (Duty/Amount/Index), 3 = FM ratio. morph/morph2 buttons additionally
+    // follow their slider's visibility (only the parameter-bearing generators).
+    juce::ToggleButton phaseModBtn, ampModBtn, morphModBtn, morph2ModBtn;
     // Generator-morph parameter sliders (visible only for Pulse/Sync/FM/PD).
     // morphSlider drives shapeParam (duty / sync amount / FM index / PD amount);
     // morph2Slider drives shapeParam2 (FM modulator:carrier ratio only).
@@ -373,11 +375,19 @@ struct LayeredWaveform : public IWavetableFrame {
     //                  keep stored phase).
     //   ampOverrides[layerIdx]   = live amplitude in [0,1], or NaN to keep the
     //                  layer's stored amp. Same length rules.
-    // renderWithLiveWarp delegates here with empty phase/amp overrides, so the
+    //   shapeOverrides[layerIdx] = live generator parameter (shapeParam: duty /
+    //                  sync amount / FM index / phase-dist amount) in [0,1], or NaN
+    //                  to keep the layer's stored value. Only affects the
+    //                  parameter-bearing generator shapes; ignored otherwise.
+    //   shape2Overrides[layerIdx]= live second generator parameter (shapeParam2:
+    //                  FM modulator:carrier ratio) in [0,1], or NaN. FM only.
+    // renderWithLiveWarp delegates here with empty overrides, so the
     // summation/normalization code path stays unified.
     void renderWithLiveOverrides(const std::vector<std::vector<float>>& warpOverrides,
                                  const std::vector<float>& phaseOverrides,
                                  const std::vector<float>& ampOverrides,
+                                 const std::vector<float>& shapeOverrides,
+                                 const std::vector<float>& shape2Overrides,
                                  std::vector<float>& out) const;
 
     // Encode as a string stored in node.script, prefixed with "__layered__:".

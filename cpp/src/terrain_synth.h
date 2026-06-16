@@ -592,6 +592,10 @@ private:
     // phase/amp only re-renders when a value actually moves.
     std::vector<float> wtLastLayerPhaseOverrides;
     std::vector<float> wtLastLayerAmpOverrides;
+    // Last per-layer generator-parameter override grids (NaN = unmodulated):
+    // shapeParam (duty/amount/index) and shapeParam2 (FM ratio).
+    std::vector<float> wtLastLayerShapeOverrides;
+    std::vector<float> wtLastLayerShape2Overrides;
 
     // Scatter wavetable: instead of a rectilinear terrain, frames are stored
     // explicitly with their N-D positions. Each block we compute a Wendland

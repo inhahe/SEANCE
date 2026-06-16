@@ -1594,6 +1594,8 @@ TerrainSynthProcessor::TerrainSynthProcessor(Node& n, Transport& t, ContentStore
             wtLastLayerOverrides.clear();
             wtLastLayerPhaseOverrides.clear();
             wtLastLayerAmpOverrides.clear();
+            wtLastLayerShapeOverrides.clear();
+            wtLastLayerShape2Overrides.clear();
             if (nf == 1) {
                 IWavetableFrame* w0 = doc.frameAt(0);
                 if (w0 && std::string(w0->typeId()) == "layered") {
@@ -2644,6 +2646,8 @@ void TerrainSynthProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mi
         std::vector<std::vector<float>> overrides(lw->layers.size());
         std::vector<float> phaseOv(lw->layers.size(), std::numeric_limits<float>::quiet_NaN());
         std::vector<float> ampOv(lw->layers.size(), std::numeric_limits<float>::quiet_NaN());
+        std::vector<float> shapeOv(lw->layers.size(), std::numeric_limits<float>::quiet_NaN());
+        std::vector<float> shape2Ov(lw->layers.size(), std::numeric_limits<float>::quiet_NaN());
         bool anyPerLayer = false;
         const float kNaN = std::numeric_limits<float>::quiet_NaN();
         for (size_t li = 0; li < lw->layers.size(); ++li) {
@@ -2654,13 +2658,20 @@ void TerrainSynthProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mi
                 overrides[li][slot] = v;
                 if (v >= 0.0f) anyPerLayer = true;
             }
-            // Per-layer Phase (field 0) and Amplitude (field 1) modulation. The
-            // NaN sentinel means "no param -> keep the layer's stored value".
+            // Per-layer Phase (field 0), Amplitude (field 1) and the generator
+            // parameters (field 2 = shapeParam: duty/amount/index; field 3 =
+            // shapeParam2: FM ratio) modulation. The NaN sentinel means "no
+            // param -> keep the layer's stored value".
             float ph = getParamByLayerField(node, (int)li, 0, kNaN);
             float am = getParamByLayerField(node, (int)li, 1, kNaN);
+            float sp = getParamByLayerField(node, (int)li, 2, kNaN);
+            float sp2 = getParamByLayerField(node, (int)li, 3, kNaN);
             phaseOv[li] = ph;
             ampOv[li] = am;
-            if (!std::isnan(ph) || !std::isnan(am)) anyPerLayer = true;
+            shapeOv[li] = sp;
+            shape2Ov[li] = sp2;
+            if (!std::isnan(ph) || !std::isnan(am) || !std::isnan(sp) || !std::isnan(sp2))
+                anyPerLayer = true;
         }
         // NaN != NaN, so a plain `==` comparison of the override grids would
         // never match when an unmodulated layer carries the NaN sentinel,
@@ -2677,10 +2688,12 @@ void TerrainSynthProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mi
         };
         bool changed = (overrides != wtLastLayerOverrides)
                     || !sameF(phaseOv, wtLastLayerPhaseOverrides)
-                    || !sameF(ampOv, wtLastLayerAmpOverrides);
+                    || !sameF(ampOv, wtLastLayerAmpOverrides)
+                    || !sameF(shapeOv, wtLastLayerShapeOverrides)
+                    || !sameF(shape2Ov, wtLastLayerShape2Overrides);
         if (anyPerLayer && changed) {
             std::vector<float> samples;
-            lw->renderWithLiveOverrides(overrides, phaseOv, ampOv, samples);
+            lw->renderWithLiveOverrides(overrides, phaseOv, ampOv, shapeOv, shape2Ov, samples);
             const float g = lw->gain;
             auto& data = terrain.getData();
             int n = std::min((int)samples.size(), (int)data.size());
@@ -2689,6 +2702,8 @@ void TerrainSynthProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mi
             wtLastLayerOverrides = std::move(overrides);
             wtLastLayerPhaseOverrides = std::move(phaseOv);
             wtLastLayerAmpOverrides = std::move(ampOv);
+            wtLastLayerShapeOverrides = std::move(shapeOv);
+            wtLastLayerShape2Overrides = std::move(shape2Ov);
         }
     }
 

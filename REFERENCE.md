@@ -635,20 +635,27 @@ On disk this is the `__wavetable5__` script format (a per-entry gain float added
 
 Each layer has **exactly one wave source** — what generates its cycle — chosen from a single **wave-source picker** button (showing the current source's name). One menu consolidates every way to define the cycle; picking one **replaces** the previous source (this single picker replaced the old grid of shape buttons + separate *Preset* pulldown + *Use Library…* button). The menu groups:
 
-- **Static shapes** — **Sine, Saw, Square, Triangle, Noise**, plus:
+- **Static shapes** — fixed-waveform sources whose fundamental shape doesn't change (the standard harmonic/phase/amplitude controls don't redefine the wave). **Sine, Saw, Square, Triangle, Noise**, plus:
   - **Draw your own** — freehand canvas; a **Points / Freehand** toggle appears (Points = draggable control points with smooth interpolation; Freehand = drag to paint the shape directly).
   - **Formula** — math expression over one cycle, variable `x` in radians `[0, 2π)`, result clamped to `[-1, 1]`. A language dropdown (Built-in / Lua / Python / GLSL) appears next to the field. See [Formula authoring language](#formula-authoring-language-built-in--lua--python--glsl) and [Terrain Synth](#terrain-synth) for the grammar.
-- **Wave-defining morphs (Type 1)** — generators where the morph parameter **is** the wave (see [the two types](#one-mechanism-two-user-facing-types)): **Pulse (PWM)**, **Hard Sync**, **FM**, **Phase Distortion**. These are single-select and mutually exclusive with a static shape (a generator *is* the shape source). A layer's morph is now **only** this wave-defining (Type-1) generator — the per-layer arbitrary-wave (Type-2) "+ Add" chain was removed (see the note under the knobs below); Type-2 reshaping lives only at the frame-scope [Summation Morph](#where-a-warp-chain-can-live). Selecting a generator reveals its **named morph knob(s)**: *Duty* (Pulse), *Amount* (Sync / Phase Distortion), *Index* + *Ratio* (FM).
-- **Presets** — a submenu of factory starting cycles you can then edit further.
-- **From Library…** — pull a single cycle from the project's waveform library (only when the host wired it; omitted in the LFO / Signal-Shape editor).
+  - **From Library…** — pull a single cycle from the project's waveform library (only when the host wired it; omitted in the LFO / Signal-Shape editor). A library cycle is itself just a static cycle, so it lives in this section rather than off on its own.
+- **Presets** — a submenu of ready-made starting cycles you can then edit further, split into two sections so you can see at a glance which ones carry extra knobs:
+  - **Simple** — baked drawn/formula cycles with no extra controls beyond the standard harmonic/phase/amplitude (Half-sine, Ramp up/down, Soft saw, FM bell, Organ-ish, Pulse 25%/75%).
+  - **With parameters** — the **wave-defining generators (Type 1)**, where the morph parameter **is** the wave (see [the two types](#one-mechanism-two-user-facing-types)): **Pulse (PWM)**, **Hard Sync**, **FM**, **Phase Distortion**. Picking one is mutually exclusive with a static shape (a generator *is* the shape source) and reveals its **named morph knob(s)**: *Duty* (Pulse), *Amount* (Sync / Phase Distortion), *Index* + *Ratio* (FM). Each of those extra knobs carries its own opt-in **Pin** checkbox (below) so it can be modulated live. The per-layer arbitrary-wave (Type-2) "+ Add" chain was removed (see the note under the knobs below); Type-2 reshaping lives only at the frame-scope [Summation Morph](#where-a-warp-chain-can-live).
+
+> The bare static shapes are **not** duplicated under Presets, and the generators are **not** a separate top-level menu section — both used to appear in two places. Everything param-free that you can pick directly is under **Static shapes**; everything that's a ready-made starting cycle (with or without extra knobs) is under **Presets**.
 
 Knobs (all sources):
 
 - **Harmonic** — integer or fractional multiple of the played pitch. 1 = fundamental; 2 = octave up; non-integer ratios produce bell/metallic inharmonic textures.
-- **Phase** — 0..1; where in the cycle the layer starts. Matters when multiple layers sum (cancellation and reshaping). Carries an opt-in **Mod** checkbox (see below).
-- **Amplitude** — 0..1; loudness contribution to the sum. Carries an opt-in **Mod** checkbox (see below).
+- **Phase** — 0..1; where in the cycle the layer starts. Matters when multiple layers sum (cancellation and reshaping). Carries an opt-in **Pin** checkbox (see below).
+- **Amplitude** — 0..1; loudness contribution to the sum. Carries an opt-in **Pin** checkbox (see below).
 
-**Per-layer Phase / Amplitude modulation.** On a **single-frame** layered wavetable each layer's **Phase** and **Amplitude** slider has a small **Mod** checkbox. Ticking it exposes an on-demand modulation pin on the node so a cable (LFO, envelope, another signal) can drive that value live as the note sustains; the slider then shows **signal-locked** (greyed, with a tooltip) because the synth rewrites it each block. Unticking removes the pin and returns to the baked value. As with op modulation this is **single-frame only** — on a multi-frame table the box is disabled with a tooltip explaining why (the synth re-bakes the lone frame in place per voice; it can't re-bake one frame of a multi-frame grid). See [Modulating an op](#modulating-an-op-the-mod-checkbox) for the shared mechanism. *(A non-harmonic layered mode where each layer's frequency is also modulable is planned but not yet built.)*
+Every parameter row is laid out in aligned columns — the sliders are the same length and the **Pin** checkboxes line up in a single column, which simply stays blank for rows that have no Pin option (only **Harmonic**, which isn't modulable here).
+
+**The "Pin" checkbox (was "Mod").** The per-parameter checkbox is labelled **Pin** rather than *Mod*: ticking it adds a control-**input pin** to the node, and that pin can run in either **Mod** or **Set** mode (the two [pin types](#control-inputs-on-parameters-set-vs-mod)) — so "Mod" was a misleading name for the checkbox itself. The checkbox just exposes the input; the pin's mode is chosen on the pin like any other.
+
+**Per-layer Phase / Amplitude / generator-param modulation.** On a **single-frame** layered wavetable each layer's **Phase** and **Amplitude** slider — and, for a generator layer (Pulse / Sync / FM / Phase Distortion), its extra morph knob(s) **Duty / Amount / Index / Ratio** — has a small **Pin** checkbox. Ticking it exposes an on-demand modulation pin on the node so a cable (LFO, envelope, another signal) can drive that value live as the note sustains; the slider then shows **signal-locked** (greyed, with a tooltip) because the synth rewrites it each block. Unticking removes the pin and returns to the baked value. As with op modulation this is **single-frame only** — on a multi-frame table the box is disabled with a tooltip explaining why (the synth re-bakes the lone frame in place per voice; it can't re-bake one frame of a multi-frame grid). Under the hood each pinned field becomes an on-demand **layer-field** `Param` (keyed by layer index and a field code: 0 Phase, 1 Amplitude, 2 the generator's primary param, 3 the FM ratio) that the synth reads via `getParamByLayerField` and feeds into `LayeredWaveform::renderWithLiveOverrides`. See [Modulating an op](#modulating-an-op-the-pin-checkbox) for the shared mechanism. *(A non-harmonic layered mode where each layer's frequency is also modulable is planned but not yet built.)*
 
 > **Per-layer arbitrary-wave morph removed.** Earlier builds put a Type-2 "+ Add" **Layer Morph** chain under each layer (soft-clip / fold / bend / saturate the layer's own cycle before it sums). That was removed: a layer's per-layer morph is now **only its wave-defining (Type-1) generator** (Pulse / Sync / FM / Phase Distortion, chosen in the wave-source picker). Arbitrary-wave (Type-2) reshaping lives **only** at the frame-scope [Summation Morph](#where-a-warp-chain-can-live). The removed chain is kept dormant behind the `enablePerLayerWarp` flag (`layered_wave_editor.cpp`, set `false`) so it can be restored wholesale if wanted.
 
@@ -871,7 +878,7 @@ In code there is a single shaping mechanism: a *shaping parameter* (a chain op's
 
 A **Type 1** generator is *not* a `WarpMethod` enum value and never appears in a chain editor — it is the layer's **shape + `shapeParam`** (Pulse/Sync/FM/PD), selected from the per-layer wave-source picker. The chain editors (`WarpChainEditor`) only ever offer **Type 2** (Bucket A) methods, so a wave-defining generator can never leak into a transfer/summation stage.
 
-**Pin explosion is solved by opt-in.** Every shaping param defaults to **no pin** (baked, zero live cost). A per-op **"Mod" checkbox** adds/removes the `ModPin` (the #88 mechanism). Checking it makes that one param live-modulatable; unchecking removes the pin (and, for per-layer ops, the on-demand param itself). See [Modulating an op](#modulating-an-op-the-mod-checkbox) below.
+**Pin explosion is solved by opt-in.** Every shaping param defaults to **no pin** (baked, zero live cost). A per-op **"Pin" checkbox** adds/removes the `ModPin` (the #88 mechanism). Checking it makes that one param live-modulatable; unchecking removes the pin (and, for per-layer ops, the on-demand param itself). See [Modulating an op](#modulating-an-op-the-pin-checkbox) below.
 
 ### The three buckets
 
@@ -906,7 +913,7 @@ The editor shows a context header (**"Summation Morph"** frame-scope, **"Warp"**
 - **Enable** checkbox — bypass this stage without deleting it (a bypassed op greys its amount slider).
 - **Method** button — opens a `PopupMenu` grouped by domain, with a **★ star badge** on the recommended (higher-quality) methods. Restricted hosts only list their allowed domains.
 - **Amount** slider — the `0..1` morph amount (`0` = identity). On a modulatable chain this slider mirrors into the op's node param, so a wired LFO picks up the new resting value.
-- **Mod** checkbox — see [Modulating an op](#modulating-an-op-the-mod-checkbox) below.
+- **Pin** checkbox — see [Modulating an op](#modulating-an-op-the-pin-checkbox) below.
 - **▲ / ▼ reorder arrows** — move this stage earlier / later in the chain. **Order is part of the sound** — fold-then-clip is a different transfer curve than clip-then-fold — so the chain is processed strictly top-to-bottom and you can reorder freely. The **▲ is disabled on the first row and ▼ on the last** (each with a tooltip saying why, per the grayed-out-controls rule). Reordering is undoable on the same debounced *Edit wavetable* step as any other warp edit.
   - **Modulation follows the op, not the slot.** On the frame-scope chain each slot is exposed as a positional `Warp 1`..`Warp N` node param (so the synth reads slot *k*'s live amount from `Warp k+1`). When you move an op, a wired LFO/oscillator stays driving **that op**, not the slot it vacated: `WarpChainEditor::moveOp` fires an `onReorder(a, b)` callback that the host (`LayeredWaveEditorComponent::swapWarpParamNames`) uses to swap the two affected params' **names** — the param objects (and the modulation pins that reference them by index) stay put, so each op keeps its own (possibly modulated) param after the move.
 - **X** — remove this stage.
@@ -917,19 +924,21 @@ Adding or removing an op fires `onStructureChanged`, which on the frame-scope ho
 
 Each method carries a **human label** for its amount param — *Drive* (Soft Clip / Tube / Tape), *Fold* (Wavefold), *Width* (PWM-skew), *Crush* (Quantize), *Bend*, *Skew*, *Sync*, *Curve*, … — defined in the `warp.h` registry (`WarpMethodInfo::paramName`, surfaced by `warpParamLabel`). The node param a modulated op creates, the modulation pin, and the library picker all use this label, so a pinned Soft-Clip op reads as **"Soft Clip Drive"** rather than an opaque "Warp 1". Internally the param is keyed by a stable **`warpSlot`** (its position in the chain) decoupled from the label, so re-picking a method relabels the param without breaking a wired pin.
 
-### Modulating an op (the "Mod" checkbox)
+### Modulating an op (the "Pin" checkbox)
 
-Every op defaults to **baked** (no pin, no live cost). Ticking a row's **Mod** box opts that op's amount into an [on-demand modulation pin (#88)](#control-inputs-on-parameters-set-vs-mod): a `Param`/`ModPin` is created so an LFO, oscillator, or envelope can drive the morph live as the note sustains; unticking removes it. The checkbox reflects the current pin state.
+> The per-row checkbox is labelled **Pin** (it used to read *Mod*): ticking it adds a control-**input pin** whose mode can be either **Mod** or **Set**, so labelling the checkbox "Mod" was misleading. The anchor name keeps the old slug for stable links.
+
+Every op defaults to **baked** (no pin, no live cost). Ticking a row's **Pin** box opts that op's amount into an [on-demand modulation pin (#88)](#control-inputs-on-parameters-set-vs-mod): a `Param`/`ModPin` is created so an LFO, oscillator, or envelope can drive the morph live as the note sustains; unticking removes it. The checkbox reflects the current pin state.
 
 - **Frame-scope (Summation Morph):** the op maps to its positional `Warp N` param (created up-front by `syncWarpParams`); checking adds the pin, unchecking removes it.
 - **Per-layer Phase / Amplitude:** the same opt-in mechanism drives each layer's **Phase** and **Amplitude** slider (the per-layer arbitrary-wave chain itself was removed). The param exists **only while pinned**. Checking creates a layer-field param named e.g. *"Layer 2 Phase"* (keyed by `warpLayer` = layer index, `layerField` = 0 Phase / 1 Amplitude) and adds the pin; unchecking removes the pin and **erases the param**, and the slider unlocks. On a **multi-frame** table the box is **disabled** with a tooltip explaining that per-layer modulation only works on a single-frame wavetable (the synth re-bakes the layer in place per voice — see the engine fork above).
-- **Baked element chains** (spectral / wavelet / granular / inharmonic) hide the Mod box entirely — they have no node params to pin.
+- **Baked element chains** (spectral / wavelet / granular / inharmonic) hide the Pin box entirely — they have no node params to pin.
 
 ### Built-in & saved morphs (the Library row)
 
-The frame-scope Summation Morph editor shows a **Morph:** library row (the per-layer and element editors don't). The picker **sources every chain from the one project asset library** — the curated built-ins are *seeded* into that library, not listed from a separate code path — and partitions it under section headings:
+The frame-scope Summation Morph editor shows a **Library:** row (the per-layer and element editors don't) — relabelled from the old "Morph:" because it sat inside a panel already headed *Summation Morph*, so "Morph:" read as redundant. The combo is the **Load** half of a Load/Save pair (the **Save to Library** button is the Save); "+ Add" instead builds a stack one stage at a time. The picker **sources every chain from the one project asset library** — the curated built-ins are *seeded* into that library, not listed from a separate code path — and partitions it under section headings:
 
-- **(Independent)** — the frame edits its own local chain (the default).
+- **(Independent — this frame's own morph)** — the frame edits its own local chain (the default).
 - **Built-in** — the curated Type-2 chains, **seeded into the project's [asset library](#asset-library-project-stores) as Morph Algorithm entries** (`seedBuiltinMorphLibrary` in `warp.h`, from `builtinMorphChains()`): *Warm Saturation, West Coast Fold, Lo-Fi Crush, Tape Glue, Pulse Width, Soft Bend, Formant Sync, Rectify Octave*. They appear in both this picker and the **Asset Library panel** (flagged ★ starred). They remain **templates, not live references** — picking one **copies** its ops into the chain and detaches to *(Independent)*, exactly as picking a factory waveform copies it into a layer (so an edit can never silently mutate a shared built-in). **Code-owned and not serialized:** their ids sit in a reserved range (`kBuiltinMorphIdBase = 200000`, below the user id base `1000000`, so `isBuiltinMorphAssetId` tells the two apart) and are **skipped by project-file save/export**; they are **re-seeded idempotently on every new project and every project load**, which keeps them improvable across app versions, keeps project files free of boilerplate, and makes them effectively undeletable (a deletion is undone by the next re-seed) — matching the asset library's *disjoint id space* + *divergence = duplicate* design.
 - **Saved** — user-published [Morph Algorithm assets](#asset-library-project-stores) (live references, ids ≥ `1000000`): editing the chain while one is referenced updates every frame that points at it. **Save to Library** publishes the current chain as a new Morph Algorithm asset.
 
@@ -2364,7 +2373,7 @@ closes, iff anything changed (not one step per drag tick). Implemented as
   **gain** (a placement-level property, not part of the shared shape).
 - **Morph algorithms (warp chains)** — the wavetable editor's frame-scope
   [Summation Morph](#built-in--saved-morphs-the-library-row) panel (`WarpChainEditor`)
-  shows a **Morph:** row. Its picker lists three sections: **(Independent)** (edit
+  shows a **Library:** row (formerly "Morph:"). Its picker lists three sections: **(Independent)** (edit
   the frame's own chain), **Built-in** (curated code-defined Type-2 chains —
   `builtinMorphChains()` — that **copy in** as a template and detach to
   Independent, *not* live references), and **Saved** (user-published Morph

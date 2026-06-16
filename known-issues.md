@@ -5,6 +5,83 @@ top. When something is fixed, delete the entry (git history is the archive).
 
 ---
 
+## BUG (minor): pinned generator param leaks a dead pin when the layer changes shape
+
+**Found:** 2026-06-16, adding live modulation for generator extra-params
+(`shapeParam` / `shapeParam2`, layer-field codes 2 and 3) in the layered wave
+editor.
+
+The per-layer **Pin** checkbox for a generator's extra knob (Pulse *Duty*,
+Sync/PhaseDist *Amount*, FM *Index* / *Ratio*) is only **visible** while the
+layer is a generator shape (`morphModBtn`/`morph2ModBtn` visibility is gated on
+`isGen`/`isFM` in `updateSourceControls`). If the user:
+
+1. Picks a generator (e.g. FM), ticks **Pin** on *Index* (field 2) — this
+   creates an on-demand layer-field `Param` + modulation pin, and
+2. Switches the same layer back to a non-generator shape (Sine/Saw/…),
+
+then the Pin checkbox hides but the **param + pin are not removed**. The pin
+stays on the node face with nothing in the UI to untick it. It is **harmless to
+the audio** — `sampleLayer` ignores `shapeParam` for static shapes, so the dead
+param drives nothing — but its mere presence makes
+`terrain_synth.cpp`'s `anyPerLayer` field-override gather see a pinned field and
+keep the voice on the **live re-bake path** (`renderWithLiveOverrides`) every
+block instead of the cheaper baked path, a small constant CPU cost until the
+project is reloaded.
+
+**Proper fix:** when a layer's shape changes away from a generator (or FM→non-FM
+for field 3), call `setLayerFieldModulated(layer, 2/3, false)` for any pinned
+generator field so the param + pin are torn down with the control that owned
+them — mirror how switching shapes already forks `factoryRef`. Do it in the
+shape-change handler in `WaveLayerEditor::showWaveSourceMenu`'s callback (and the
+preset-apply path), routed through the owner so the node param is actually
+removed. Low priority (audio-correct, only a perf/clutter nit).
+
+---
+
+## UX DECISION NEEDED: Summation Morph — "+ Add" vs the Library row, and the live-reference model
+
+**Raised:** 2026-06-16 review of the layered-wave / morph editor.
+
+The frame-scope **Summation Morph** editor (`WarpChainEditor` with a
+`LibraryContext`) currently offers **two** ways to populate the morph stack, and
+users find the relationship unclear:
+
+- **"+ Add"** — appends ONE stage at a time, picked from the full domain-grouped
+  method list (~21 Bucket-A methods). This is the "build your own" path.
+- **Library row** (relabelled "Library:" from "Morph:" in this batch) — a combo
+  that LOADS a whole ready-made chain. Built-in presets (`builtinMorphChains()`,
+  8 curated combos) **copy** their ops in and detach to *(Independent)*; a
+  user-**Saved** chain loads as a **live reference** (editing it propagates to
+  every frame sharing the `warpAssetId`). "Save to Library" publishes the
+  current stack.
+
+This batch fixed the two concrete "it's broken" complaints (both were the same
+relayout bug — `onStructureChanged` didn't re-run `resized()`, so a populated
+stack was clipped invisible whether it came from "+ Add" or a built-in pick) and
+did a non-destructive clarity pass on the labels/tooltips. **Left open** is the
+deeper design question the user asked: *"I don't know what the Morph pulldown is
+for — I'd think Add handles everything."*
+
+Two candidate resolutions, both bigger than a tooltip and needing the user's
+call (don't build a smaller version of the wrong thing — CLAUDE.md):
+
+1. **Unify under "+ Add":** make "+ Add" the single entry point, its picker
+   offering both individual *Methods* and ready-made *Presets* (built-in +
+   saved). Drop the separate Library combo. Keeps Save-to-Library. The
+   **live-reference** behaviour (edit-propagates-to-all-frames) would either be
+   dropped (every load becomes a copy — simpler, matches "Add handles
+   everything") or moved to an explicit "link" affordance.
+2. **Keep both but make the split obvious:** "+ Add" = stages; Library = whole
+   chains; surface the live-vs-copy distinction in the UI rather than only the
+   tooltip.
+
+Removing live-reference touches `warpAssetId` (serialization), `resolveWarpReferences`,
+`writeBackReferencedWarp`, and the multi-frame "shared morph" feature — a real
+architectural change, not a quick edit. Decide before implementing.
+
+---
+
 ## BUG: asset library is never cleared on New Project / file load (assets merge/duplicate)
 
 **Found:** 2026-06-15, while seeding the built-in morph chains into the library

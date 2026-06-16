@@ -47,12 +47,15 @@ WarpChainEditor::WarpChainEditor(Callbacks callbacks) : cb(std::move(callbacks))
     addChildComponent(libraryLbl);
     addChildComponent(libraryCombo);
     addChildComponent(addToLibBtn);
-    libraryCombo.setTooltip("Reference a shared morph algorithm (warp chain) from "
-                            "this project's library. While referenced, editing the "
-                            "chain here updates every frame that uses it. Pick "
-                            "(Independent) to give this frame its own copy.");
-    addToLibBtn.setTooltip("Publish the current warp chain to the project library "
-                           "as a reusable morph algorithm, then reference it here.");
+    libraryCombo.setTooltip(
+        "Load a ready-made morph from this project's library into the stack above. "
+        "Built-in presets load a COPY you can freely tweak. A morph you Saved loads "
+        "as a live link - editing it here updates every frame that uses it. Pick "
+        "(Independent) to keep this frame's own private morph. This is the load half "
+        "of the Load/Save pair; \"+ Add\" instead builds a stack stage by stage.");
+    addToLibBtn.setTooltip("Save the current morph stack to this project's library as "
+                           "a reusable preset, so you can load it on other frames from "
+                           "the picker on the left. (The picker is the matching Load.)");
     libraryCombo.onChange = [this]() { onLibrarySelected(libraryCombo.getSelectedId()); };
     addToLibBtn.onClick   = [this]() { openAddToLibraryDialog(); };
 }
@@ -84,7 +87,10 @@ void WarpChainEditor::refreshLibraryRow() {
 void WarpChainEditor::rebuildLibraryCombo() {
     if (!libCtx.lib) return;
     libraryCombo.clear(juce::dontSendNotification);
-    libraryCombo.addItem("(Independent)", 1);   // reserved id 1 (user ids >= 1e6)
+    // reserved id 1 (user ids >= 1e6). "Independent" = this frame edits its own
+    // private morph stack (the default); the label spells that out so it doesn't
+    // read as jargon next to the named presets/saved chains below it.
+    libraryCombo.addItem("(Independent - this frame's own morph)", 1);
     int cur = libCtx.getAssetId ? libCtx.getAssetId() : -1;
     bool curListed = false;
 

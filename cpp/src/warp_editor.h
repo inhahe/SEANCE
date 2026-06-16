@@ -180,7 +180,7 @@ private:
     // Library row (MorphAlgorithm store). Hidden until setLibraryContext.
     LibraryContext   libCtx;
     bool             libraryRowVisible = false;
-    juce::Label      libraryLbl  { {}, "Morph:" };
+    juce::Label      libraryLbl  { {}, "Library:" };
     juce::ComboBox   libraryCombo;
     juce::TextButton addToLibBtn { "Save to Library" };
 };

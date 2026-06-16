@@ -2067,6 +2067,17 @@ void LayeredWaveform::render(std::vector<float>& out) const {
 void LayeredWaveform::renderWithLiveWarp(
     const std::vector<std::vector<float>>& overrides,
     std::vector<float>& out) const {
+    // Delegate to the unified path with no phase/amp overrides, so render(),
+    // the warp-only re-bake, and the full phase/amp re-bake all share one
+    // summation/normalization routine.
+    renderWithLiveOverrides(overrides, {}, {}, out);
+}
+
+void LayeredWaveform::renderWithLiveOverrides(
+    const std::vector<std::vector<float>>& warpOverrides,
+    const std::vector<float>& phaseOverrides,
+    const std::vector<float>& ampOverrides,
+    std::vector<float>& out) const {
     out.assign(tableSize, 0.0f);
     if (layers.empty()) return;
 
@@ -2077,6 +2088,18 @@ void LayeredWaveform::renderWithLiveWarp(
         std::mt19937 rng(1234u + (unsigned)layer.ratio * 31u + (unsigned)layer.shape * 7u);
         int r = std::max(1, layer.ratio);
 
+        // Resolve this layer's effective Phase and Amplitude: when a live
+        // override is supplied (a per-layer Phase/Amp slider opted into a
+        // modulation cable), substitute it; otherwise keep the stored value. The
+        // NaN sentinel means "no override" (a < 0 sentinel can't be used for
+        // phase, which can legitimately be negative when modulated).
+        float effPhase = layer.phase;
+        if (li < phaseOverrides.size() && !std::isnan(phaseOverrides[li]))
+            effPhase = phaseOverrides[li];
+        float effAmp = layer.amp;
+        if (li < ampOverrides.size() && !std::isnan(ampOverrides[li]))
+            effAmp = juce::jlimit(0.0f, 1.0f, ampOverrides[li]);
+
         // Resolve this layer's effective warp chain: when a live override is
         // supplied for one of its ops (a per-layer warp op opted into
         // modulation), substitute that amount; otherwise the op keeps its baked
@@ -2084,10 +2107,10 @@ void LayeredWaveform::renderWithLiveWarp(
         // chain pointer so render() with empty overrides allocates nothing extra.
         const std::vector<WarpOp>* chain = &layer.warpChain;
         std::vector<WarpOp> liveChain;
-        if (!layer.warpChain.empty() && li < overrides.size()
-            && !overrides[li].empty()) {
+        if (!layer.warpChain.empty() && li < warpOverrides.size()
+            && !warpOverrides[li].empty()) {
             liveChain = layer.warpChain;
-            const auto& ov = overrides[li];
+            const auto& ov = warpOverrides[li];
             for (size_t i = 0; i < liveChain.size() && i < ov.size(); ++i)
                 if (ov[i] >= 0.0f)
                     liveChain[i].amount = juce::jlimit(0.0f, 1.0f, ov[i]);
@@ -2098,8 +2121,8 @@ void LayeredWaveform::renderWithLiveWarp(
             // Fast path: no per-layer warp - accumulate directly.
             for (int i = 0; i < tableSize; ++i) {
                 float phase = (float)i / (float)tableSize;  // 0..1 over base period
-                float x = phase * (float)r + layer.phase;   // ratio + phase offset
-                out[i] += layer.amp * sampleLayer(layer, x, rng);
+                float x = phase * (float)r + effPhase;      // ratio + phase offset
+                out[i] += effAmp * sampleLayer(layer, x, rng);
             }
         } else {
             // Element-scope warp (Bucket A): render the layer's RAW cycle (unit
@@ -2111,12 +2134,12 @@ void LayeredWaveform::renderWithLiveWarp(
             std::vector<float> buf((size_t)tableSize);
             for (int i = 0; i < tableSize; ++i) {
                 float phase = (float)i / (float)tableSize;
-                float x = phase * (float)r + layer.phase;
+                float x = phase * (float)r + effPhase;
                 buf[(size_t)i] = sampleLayer(layer, x, rng);
             }
             applyWarpChain(*chain, buf);
             for (int i = 0; i < tableSize; ++i)
-                out[i] += layer.amp * buf[(size_t)i];
+                out[i] += effAmp * buf[(size_t)i];
         }
     }
 
@@ -2592,6 +2615,23 @@ void LayerStackComponent::rebuildRows() {
                 cb.warpModDisabledReason = [this, i](int op) -> juce::String {
                     return opts.layerWarpModDisabledReason
                          ? opts.layerWarpModDisabledReason(i, op) : juce::String();
+                };
+            // Per-layer Phase / Amplitude modulation: same binding pattern, but
+            // routes (i, field) where field 0 = Phase, 1 = Amplitude.
+            if (opts.isLayerFieldModulated)
+                cb.isFieldModulated = [this, i](int field) {
+                    return opts.isLayerFieldModulated
+                        && opts.isLayerFieldModulated(i, field);
+                };
+            if (opts.setLayerFieldModulated)
+                cb.setFieldModulated = [this, i](int field, bool on) {
+                    if (opts.setLayerFieldModulated)
+                        opts.setLayerFieldModulated(i, field, on);
+                };
+            if (opts.layerFieldModDisabledReason)
+                cb.fieldModDisabledReason = [this, i](int field) -> juce::String {
+                    return opts.layerFieldModDisabledReason
+                         ? opts.layerFieldModDisabledReason(i, field) : juce::String();
                 };
             auto row = std::make_unique<WaveLayerEditor>(
                 &target->layers[i], std::move(cb), opts.enablePerLayerWarp);
@@ -3666,10 +3706,24 @@ void reconcilePerLayerWarpParams(NodeGraph& graph, int nodeId,
             && slot >= 0 && slot < (int)layerChains[(size_t)layer].size();
     };
 
-    // ---- 1) Remove per-layer params that no longer address a live op.
+    // A layer-field (Phase/Amp) param is valid iff its layer still exists. The
+    // editing frame contributes one layerChains entry per layer (even empty
+    // chains), so the layer count is layerChains.size(); when the table is no
+    // longer single-frame layerChains is empty and every layer-field param is
+    // dropped, matching the warp behaviour.
+    auto layerValid = [&](int layer) {
+        return layer >= 0 && layer < (int)layerChains.size();
+    };
+
+    // ---- 1) Remove per-layer params that no longer address a live op (warp)
+    //         or live layer (Phase/Amp).
     std::set<int> removeIdx;
     for (int i = 0; i < (int)nd->params.size(); ++i) {
         const Param& p = nd->params[i];
+        if (p.layerField >= 0) {                       // per-layer Phase/Amp param
+            if (!layerValid(p.warpLayer)) removeIdx.insert(i);
+            continue;
+        }
         if (p.warpLayer < 0) continue;                 // frame-scope / not ours
         if (!opValid(p.warpLayer, p.warpSlot)) removeIdx.insert(i);
     }
@@ -3702,9 +3756,12 @@ void reconcilePerLayerWarpParams(NodeGraph& graph, int nodeId,
                 mp.paramIndex = newIndexOf[mp.paramIndex];
     }
 
-    // ---- 2) Relabel survivors to follow their op's current method.
+    // ---- 2) Relabel survivors to follow their op's current method. Layer-field
+    //         (Phase/Amp) params keep a fixed "Layer N Phase/Amp" name (keyed by
+    //         the stable layer index), so they need no relabel.
     for (int pi = 0; pi < (int)nd->params.size(); ++pi) {
         const Param& p = nd->params[pi];
+        if (p.layerField >= 0) continue;
         if (p.warpLayer < 0) continue;
         if (!opValid(p.warpLayer, p.warpSlot)) continue;
         nd->params[pi].name =
@@ -4546,6 +4603,27 @@ WaveLayerEditor::WaveLayerEditor(WaveLayer* layerPtr, Callbacks cb, bool enableW
         l->setJustificationType(juce::Justification::centredLeft);
     }
 
+    // Per-layer Phase / Amplitude modulation "Mod" checkboxes (#88, item-M).
+    // Shown only when the owner wired the field-modulation callbacks (the
+    // wavetable layer stack); hidden for the LFO / Signal-Shape editor. Ticking
+    // one creates an on-demand modulation pin so a cable can drive that value
+    // live; unticking removes it. field: 0 = Phase, 1 = Amplitude.
+    auto setupModBtn = [this](juce::ToggleButton& btn, int field) {
+        addChildComponent(btn);
+        btn.setButtonText("Mod");
+        btn.onClick = [this, &btn, field]() {
+            if (callbacks.setFieldModulated)
+                callbacks.setFieldModulated(field, btn.getToggleState());
+            // Commit + rebuild the audio graph so the new pin/param take effect
+            // (mirrors the warp checkbox, whose WarpChainEditor fires onChanged).
+            if (callbacks.onChanged) callbacks.onChanged();
+            // Refresh the disabled-slider visual immediately.
+            syncFieldModState();
+        };
+    };
+    setupModBtn(phaseModBtn, 0);
+    setupModBtn(ampModBtn,   1);
+
     // Generator-morph parameter sliders. Both are normalised 0..1 (the per-shape
     // mapping happens in evalGeneratorMorph); the label text is updated per shape
     // in updateSourceControls(). Hidden for the classic shapes.
@@ -4673,7 +4751,56 @@ void WaveLayerEditor::syncFromModel() {
     // Per-layer warp chain may have changed behind us (preset stamp, doc
     // reload) - rebuild its rows from the (possibly rebound) chain.
     if (warpEditor) warpEditor->rebuild();
+    syncFieldModState();
     refreshPreview();
+}
+
+void WaveLayerEditor::syncFieldModState() {
+    // Visible only when the owner wired field modulation (the wavetable layer
+    // stack). The LFO / Signal-Shape editor leaves these unset, so the checkboxes
+    // stay hidden and the sliders behave exactly as before.
+    const bool wired = (bool)callbacks.setFieldModulated;
+    phaseModBtn.setVisible(wired);
+    ampModBtn.setVisible(wired);
+    if (!wired) {
+        phaseSlider.setEnabled(true);
+        ampSlider.setEnabled(true);
+        return;
+    }
+    struct FieldRef { juce::ToggleButton& btn; juce::Slider& sl; int field; const char* name; };
+    FieldRef refs[] = {
+        { phaseModBtn, phaseSlider, 0, "Phase" },
+        { ampModBtn,   ampSlider,   1, "Amplitude" },
+    };
+    for (auto& r : refs) {
+        const bool modulated = callbacks.isFieldModulated && callbacks.isFieldModulated(r.field);
+        juce::String disabledReason = callbacks.fieldModDisabledReason
+                                          ? callbacks.fieldModDisabledReason(r.field)
+                                          : juce::String();
+        r.btn.setToggleState(modulated, juce::dontSendNotification);
+        r.btn.setEnabled(disabledReason.isEmpty());
+        if (!disabledReason.isEmpty())
+            r.btn.setTooltip(disabledReason);
+        else
+            r.btn.setTooltip(juce::String(r.name)
+                + " modulation: tick to expose a modulation pin on the node so a "
+                  "cable (LFO, envelope, another signal) can drive this layer's "
+                + juce::String(r.name).toLowerCase()
+                + " live. Untick to go back to the baked value.");
+        // Grayed-control-explains-itself: when a cable drives the value, the
+        // slider is signal-locked (the synth rewrites it each block).
+        r.sl.setEnabled(!modulated);
+        if (modulated)
+            r.sl.setTooltip("Signal-locked - this " + juce::String(r.name).toLowerCase()
+                + " is being driven by an incoming modulation cable. Untick Mod or "
+                  "disconnect the cable to edit it manually.");
+        else if (r.field == 0)
+            r.sl.setTooltip("Phase offset (0 to 1): shifts where in its cycle this layer starts. "
+                            "Affects how layers add up when summed - different phases give different timbres.");
+        else
+            r.sl.setTooltip("Amplitude (0 to 1): how loud this layer is in the final sum. 0 = silent, 1 = full volume. "
+                            "Use to balance layers against each other.");
+    }
 }
 
 void WaveLayerEditor::refreshPreview() {
@@ -4892,15 +5019,18 @@ void WaveLayerEditor::resized() {
         a.removeFromBottom(4);
     }
 
-    // Slider rows
-    auto sliderRow = [&](juce::Label& lab, juce::Slider& sl) {
+    // Slider rows. `modBtn` (optional) is a per-row "Mod" checkbox laid out at
+    // the right edge of the row; when visible the slider shrinks to make room.
+    auto sliderRow = [&](juce::Label& lab, juce::Slider& sl, juce::ToggleButton* modBtn = nullptr) {
         auto r = a.removeFromTop(20);
         lab.setBounds(r.removeFromLeft(70));
+        if (modBtn && modBtn->isVisible())
+            modBtn->setBounds(r.removeFromRight(52));
         sl.setBounds(r);
     };
     sliderRow(ratioLabel, ratioSlider);
-    sliderRow(phaseLabel, phaseSlider);
-    sliderRow(ampLabel,   ampSlider);
+    sliderRow(phaseLabel, phaseSlider, &phaseModBtn);
+    sliderRow(ampLabel,   ampSlider,   &ampModBtn);
     // Generator-morph slider rows: only consume vertical space when their shape
     // shows them (kept in sync with preferredHeight()). Reserving them when
     // hidden was the source of the empty gap above the Layer Morph strip.
@@ -8602,6 +8732,19 @@ LayeredWaveEditorComponent::LayeredWaveEditorComponent(NodeGraph& g, int nid, st
         lsOpts.layerWarpModDisabledReason = [this](int layer, int op) {
             return layerWarpModDisabledReason(layer, op);
         };
+        // Per-layer Phase / Amplitude modulation (#88, item-M): each layer's
+        // Phase/Amp "Mod" checkbox creates/destroys a (warpLayer=layer,
+        // layerField=0|1) param + pin so a cable can drive that value live. Same
+        // single-frame gate as warp.
+        lsOpts.isLayerFieldModulated = [this](int layer, int field) {
+            return isLayerFieldModulated(layer, field);
+        };
+        lsOpts.setLayerFieldModulated = [this](int layer, int field, bool on) {
+            setLayerFieldModulated(layer, field, on);
+        };
+        lsOpts.layerFieldModDisabledReason = [this](int layer, int field) {
+            return layerFieldModDisabledReason(layer, field);
+        };
         layerStack = std::make_unique<LayerStackComponent>(
             std::move(lsOpts), [this]() { onLayerChanged(); });
         addChildComponent(*layerStack); // visibility toggled in resized()
@@ -9908,6 +10051,77 @@ void LayeredWaveEditorComponent::setLayerWarpOpModulated(int layer, int op, bool
     // The warp editor's onClick fires onChanged right after this, which routes to
     // onLayerChanged() -> commit + debounced undo snapshot + audio-graph rebuild,
     // so the new pin/param take effect. Nothing more to do here.
+}
+
+// ---- Per-layer Phase / Amplitude modulation (#88, item-M) -----------------
+
+int LayeredWaveEditorComponent::layerFieldParamIndex(int layer, int field) const {
+    auto* nd = graph.findNode(nodeId);
+    if (!nd) return -1;
+    for (int i = 0; i < (int)nd->params.size(); ++i)
+        if (nd->params[i].layerField == field
+            && nd->params[i].warpLayer == layer
+            && nd->params[i].warpSlot == -1) return i;
+    return -1;
+}
+
+bool LayeredWaveEditorComponent::isLayerFieldModulated(int layer, int field) const {
+    // Reuse the warp single-frame gate - phase/amp re-bake has the same
+    // single-cell constraint (the synth re-bakes the lone frame in place).
+    if (!perLayerWarpModSupported()) return false;
+    int pi = layerFieldParamIndex(layer, field);
+    return pi >= 0 && hasParamModPin(graph, nodeId, pi);
+}
+
+juce::String LayeredWaveEditorComponent::layerFieldModDisabledReason(int layer, int field) const {
+    juce::ignoreUnused(layer, field);
+    if (!perLayerWarpModSupported())
+        return "Per-layer Phase/Amplitude modulation works on a single-waveform "
+               "table. This wavetable has multiple frames, so adjust each one by "
+               "hand or drive a frame-scope parameter instead.";
+    return {};
+}
+
+void LayeredWaveEditorComponent::setLayerFieldModulated(int layer, int field, bool on) {
+    if (!perLayerWarpModSupported()) return;
+    Node* nd = graph.findNode(nodeId);
+    if (!nd) return;
+    LayeredWaveform* lw = currentEditingLayeredFrame();
+    if (!lw || layer < 0 || layer >= (int)lw->layers.size()) return;
+    if (field != 0 && field != 1) return;
+    const auto& L = lw->layers[(size_t)layer];
+
+    if (on) {
+        int pi = layerFieldParamIndex(layer, field);
+        if (pi < 0) {
+            // Create the on-demand layer-field param, seeded from the layer's
+            // current value and keyed by (warpLayer, layerField) so the synth's
+            // live re-bake addresses it (getParamByLayerField).
+            Param p;
+            p.warpLayer  = layer;
+            p.warpSlot   = -1;
+            p.layerField = field;
+            const bool isPhase = (field == 0);
+            p.name   = "Layer " + std::to_string(layer + 1)
+                     + (isPhase ? " Phase" : " Amp");
+            p.value = p.baseValue = (isPhase ? L.phase : L.amp);
+            p.minVal = 0.0f; p.maxVal = 1.0f; p.format = "%.2f";
+            nd->params.push_back(std::move(p));
+            pi = (int)nd->params.size() - 1;
+        }
+        addParamModPin(graph, nodeId, pi, /*absolute=*/false);
+    } else {
+        int pi = layerFieldParamIndex(layer, field);
+        if (pi < 0) return;
+        // Drop the pin + cable, then erase the now-orphan param and shift every
+        // higher modPin paramIndex down to keep the bindings valid.
+        removeParamModPin(graph, nodeId, pi);
+        pi = layerFieldParamIndex(layer, field);   // unchanged by pin removal
+        if (pi < 0) return;
+        nd->params.erase(nd->params.begin() + pi);
+        for (auto& mp : nd->modPins)
+            if (mp.paramIndex > pi) --mp.paramIndex;
+    }
 }
 
 void LayeredWaveEditorComponent::syncWarpParams() {

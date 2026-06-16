@@ -638,17 +638,19 @@ Each layer has **exactly one wave source** — what generates its cycle — chos
 - **Static shapes** — **Sine, Saw, Square, Triangle, Noise**, plus:
   - **Draw your own** — freehand canvas; a **Points / Freehand** toggle appears (Points = draggable control points with smooth interpolation; Freehand = drag to paint the shape directly).
   - **Formula** — math expression over one cycle, variable `x` in radians `[0, 2π)`, result clamped to `[-1, 1]`. A language dropdown (Built-in / Lua / Python / GLSL) appears next to the field. See [Formula authoring language](#formula-authoring-language-built-in--lua--python--glsl) and [Terrain Synth](#terrain-synth) for the grammar.
-- **Wave-defining morphs (Type 1)** — generators where the morph parameter **is** the wave (see [the two types](#one-mechanism-two-user-facing-types)): **Pulse (PWM)**, **Hard Sync**, **FM**, **Phase Distortion**. These are single-select and mutually exclusive with a static shape (a generator *is* the shape source — there is no "+ Add" chain for them; that is the Type-2 [Layer Morph](#where-a-warp-chain-can-live) below). Selecting one reveals its **named morph knob(s)**: *Duty* (Pulse), *Amount* (Sync / Phase Distortion), *Index* + *Ratio* (FM).
+- **Wave-defining morphs (Type 1)** — generators where the morph parameter **is** the wave (see [the two types](#one-mechanism-two-user-facing-types)): **Pulse (PWM)**, **Hard Sync**, **FM**, **Phase Distortion**. These are single-select and mutually exclusive with a static shape (a generator *is* the shape source). A layer's morph is now **only** this wave-defining (Type-1) generator — the per-layer arbitrary-wave (Type-2) "+ Add" chain was removed (see the note under the knobs below); Type-2 reshaping lives only at the frame-scope [Summation Morph](#where-a-warp-chain-can-live). Selecting a generator reveals its **named morph knob(s)**: *Duty* (Pulse), *Amount* (Sync / Phase Distortion), *Index* + *Ratio* (FM).
 - **Presets** — a submenu of factory starting cycles you can then edit further.
 - **From Library…** — pull a single cycle from the project's waveform library (only when the host wired it; omitted in the LFO / Signal-Shape editor).
 
 Knobs (all sources):
 
 - **Harmonic** — integer or fractional multiple of the played pitch. 1 = fundamental; 2 = octave up; non-integer ratios produce bell/metallic inharmonic textures.
-- **Phase** — 0..1; where in the cycle the layer starts. Matters when multiple layers sum (cancellation and reshaping).
-- **Amplitude** — 0..1; loudness contribution to the sum.
+- **Phase** — 0..1; where in the cycle the layer starts. Matters when multiple layers sum (cancellation and reshaping). Carries an opt-in **Mod** checkbox (see below).
+- **Amplitude** — 0..1; loudness contribution to the sum. Carries an opt-in **Mod** checkbox (see below).
 
-Below the wave source sits the per-layer **[Layer Morph](#where-a-warp-chain-can-live)** — a Type-2 "+ Add" chain that reshapes this layer's wave before it sums (each op carries the opt-in [Mod checkbox](#modulating-an-op-the-mod-checkbox)).
+**Per-layer Phase / Amplitude modulation.** On a **single-frame** layered wavetable each layer's **Phase** and **Amplitude** slider has a small **Mod** checkbox. Ticking it exposes an on-demand modulation pin on the node so a cable (LFO, envelope, another signal) can drive that value live as the note sustains; the slider then shows **signal-locked** (greyed, with a tooltip) because the synth rewrites it each block. Unticking removes the pin and returns to the baked value. As with op modulation this is **single-frame only** — on a multi-frame table the box is disabled with a tooltip explaining why (the synth re-bakes the lone frame in place per voice; it can't re-bake one frame of a multi-frame grid). See [Modulating an op](#modulating-an-op-the-mod-checkbox) for the shared mechanism. *(A non-harmonic layered mode where each layer's frequency is also modulable is planned but not yet built.)*
+
+> **Per-layer arbitrary-wave morph removed.** Earlier builds put a Type-2 "+ Add" **Layer Morph** chain under each layer (soft-clip / fold / bend / saturate the layer's own cycle before it sums). That was removed: a layer's per-layer morph is now **only its wave-defining (Type-1) generator** (Pulse / Sync / FM / Phase Distortion, chosen in the wave-source picker). Arbitrary-wave (Type-2) reshaping lives **only** at the frame-scope [Summation Morph](#where-a-warp-chain-can-live). The removed chain is kept dormant behind the `enablePerLayerWarp` flag (`layered_wave_editor.cpp`, set `false`) so it can be restored wholesale if wanted.
 
 `+ Add Layer` stacks more; `X` removes one. The waveform preview at the top updates live.
 
@@ -863,7 +865,7 @@ In code there is a single shaping mechanism: a *shaping parameter* (a chain op's
 | Code bucket | **B** (generator, inside the oscillator) | **A** (transfer on the output) |
 | Cardinality | exactly **one** per layer | an **ordered "+ Add" chain** |
 | Relationship to shape | **mutually exclusive** with a static shape/preset (it *is* the shape source) | needs an existing shape to act on |
-| Where offered | per layer (one option in the [wave-source picker](#per-layer-wave-source-picker)) | per layer **and** frame-scope summation |
+| Where offered | per layer (one option in the [wave-source picker](#per-layer-wave-source-picker)) | frame-scope summation only (the per-layer Type-2 chain was removed) |
 | UI control | single-select pulldown | ordered list built with **+ Add** |
 | Examples | PWM, Hard Sync, FM, Phase Distortion | Soft Clip, Wavefold, Bend, Saturate |
 
@@ -883,22 +885,23 @@ Warps split into three buckets by *where* they apply:
 
 ### Where a warp chain can live
 
-The same `WarpChainEditor` widget drives every chain; it does **not** own the chain (the host points it at a `std::vector<WarpOp>` via `setChain`). Each host gives the editor a context-appropriate header via `setHeaderText` — so the frame-scope editor reads **"Summation Morph"** and the per-layer editor reads **"Layer Morph"** (the baked element editors keep the generic *"Warp"* header). Host scopes:
+The same `WarpChainEditor` widget drives every chain; it does **not** own the chain (the host points it at a `std::vector<WarpOp>` via `setChain`). Each host gives the editor a context-appropriate header via `setHeaderText` — so the frame-scope editor reads **"Summation Morph"** (the baked element editors keep the generic *"Warp"* header). The **per-layer Type-2 "Layer Morph" chain was removed** — a layer reshapes its own cycle only through its wave-defining (Type-1) generator; arbitrary-wave (Type-2) reshaping happens only at the frame-scope summation. Host scopes:
 
 | Scope (header) | Storage | Modulatable? | Domains offered |
 |---|---|---|---|
 | **Frame-scope** — *"Summation Morph"* (Bucket A) | `WavetableDoc::warpChain` | **Yes** — each op opts into a positional `Warp N` node param | Phase + Amplitude |
-| **Per-layer** — *"Layer Morph"* (Bucket A) | `WaveLayer::warpChain` | **On-demand, single-frame only** — each op can opt into a `(warpLayer, warpSlot)` param; baked when no op is pinned | Phase + Amplitude |
 | **Spectral / Wavelet element** (Bucket C) | per-doc element chain | No (baked) | restricted |
 | **Granular / Inharmonic element** (Bucket C) | per-frame chain | No (baked) | **Amplitude only** (a live stream has no periodic phase axis) |
 
 A host that only supports some domains calls `setAllowedDomains(...)`, which filters both the picker and the "+ Add" method list and can supply an `emptyHint` explaining the restriction (per the "grayed-out controls must explain themselves" rule).
 
-**Per-layer baked vs live (the engine fork).** A per-layer chain with **no pinned ops** is **baked** into the layer's table at edit time — the common case, zero live cost. The moment any op on a layer is pinned (its "Mod" box checked), that layer must render **live per-voice**: the synth re-bakes the layer's cycle at block rate from the current modulated amounts (`LayeredWaveform::renderWithLiveWarp`, driven by the per-layer `(warpLayer, warpSlot)` params the synth reads via `getParamByWarpLayerSlot`). Per-layer modulation is therefore **single-frame only** — a multi-frame table can't be re-baked in place, and `(warpLayer, warpSlot)` can't address a specific frame. On a multi-frame table the per-layer "Mod" box is **disabled with a tooltip explaining why** (the grayed-control rule); the frame-scope Summation Morph still modulates freely. The on-demand per-layer params exist **only while pinned** — checking "Mod" creates the `Param` + pin; unchecking removes the pin *and* erases the param.
+**Per-layer Phase / Amplitude modulation (the engine fork).** A layer's **Phase** and **Amplitude** can each opt into an on-demand modulation pin via a **Mod** checkbox next to its slider. With **no pinned field**, the layer is **baked** into the table at edit time — the common case, zero live cost. The moment a layer's Phase or Amp is pinned, the table renders **live per-voice**: the synth re-bakes the cycle at block rate from the current modulated values (`LayeredWaveform::renderWithLiveOverrides`, driven by per-layer **layer-field** params the synth reads via `getParamByLayerField`). This is **single-frame only** — a multi-frame table can't be re-baked in place, so on a multi-frame table the per-layer Mod box is **disabled with a tooltip explaining why** (the grayed-control rule); the frame-scope Summation Morph still modulates freely. The on-demand layer-field params exist **only while pinned** — checking "Mod" creates the `Param` (keyed by `warpLayer` = layer index, `layerField` = 0 Phase / 1 Amplitude, `warpSlot` = −1) + pin; unchecking removes the pin *and* erases the param.
+
+> The dormant per-layer warp re-bake path (`renderWithLiveWarp` → `getParamByWarpLayerSlot`, `(warpLayer, warpSlot)` params) is retained behind the disabled `enablePerLayerWarp` flag for a possible wholesale restore of the removed per-layer Type-2 chain; `renderWithLiveWarp` now just delegates to `renderWithLiveOverrides` with no phase/amp overrides.
 
 ### Editing a chain
 
-The editor shows a context header (**"Summation Morph"** frame-scope, **"Layer Morph"** per-layer, **"Warp"** for baked element chains) and a **+ Add** button, then one row per op. Clicking **+ Add** opens the same domain-grouped method picker the per-row Method button uses; the new op is appended only once you choose a method (cancelling adds nothing). This lets you pick *which* shape-bender to add each time — earlier builds instead appended an op pre-set to the first recommended method, so repeated Add clicks just stacked copies of that default. Each row:
+The editor shows a context header (**"Summation Morph"** frame-scope, **"Warp"** for baked element chains) and a **+ Add** button, then one row per op. Clicking **+ Add** opens the same domain-grouped method picker the per-row Method button uses; the new op is appended only once you choose a method (cancelling adds nothing). This lets you pick *which* shape-bender to add each time — earlier builds instead appended an op pre-set to the first recommended method, so repeated Add clicks just stacked copies of that default. Each row:
 
 - **Enable** checkbox — bypass this stage without deleting it (a bypassed op greys its amount slider).
 - **Method** button — opens a `PopupMenu` grouped by domain, with a **★ star badge** on the recommended (higher-quality) methods. Restricted hosts only list their allowed domains.
@@ -919,7 +922,7 @@ Each method carries a **human label** for its amount param — *Drive* (Soft Cli
 Every op defaults to **baked** (no pin, no live cost). Ticking a row's **Mod** box opts that op's amount into an [on-demand modulation pin (#88)](#control-inputs-on-parameters-set-vs-mod): a `Param`/`ModPin` is created so an LFO, oscillator, or envelope can drive the morph live as the note sustains; unticking removes it. The checkbox reflects the current pin state.
 
 - **Frame-scope (Summation Morph):** the op maps to its positional `Warp N` param (created up-front by `syncWarpParams`); checking adds the pin, unchecking removes it.
-- **Per-layer (Layer Morph):** the param exists **only while pinned**. Checking creates a `(warpLayer, warpSlot)` param named e.g. *"L2 Drive 1"* (the `L<n>` prefix disambiguates per-layer from frame-scope and across layers) and adds the pin; unchecking removes the pin and **erases the param**. On a **multi-frame** table the box is **disabled** with a tooltip explaining that per-layer modulation only works on a single-frame wavetable (the synth re-bakes the layer in place per voice — see the engine fork above).
+- **Per-layer Phase / Amplitude:** the same opt-in mechanism drives each layer's **Phase** and **Amplitude** slider (the per-layer arbitrary-wave chain itself was removed). The param exists **only while pinned**. Checking creates a layer-field param named e.g. *"Layer 2 Phase"* (keyed by `warpLayer` = layer index, `layerField` = 0 Phase / 1 Amplitude) and adds the pin; unchecking removes the pin and **erases the param**, and the slider unlocks. On a **multi-frame** table the box is **disabled** with a tooltip explaining that per-layer modulation only works on a single-frame wavetable (the synth re-bakes the layer in place per voice — see the engine fork above).
 - **Baked element chains** (spectral / wavelet / granular / inharmonic) hide the Mod box entirely — they have no node params to pin.
 
 ### Built-in & saved morphs (the Library row)

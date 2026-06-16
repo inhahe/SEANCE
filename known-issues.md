@@ -30,21 +30,6 @@ redesign tracked in agent-todo.
   browser. Repro: open the waveform picker, click through several waveforms to
   preview them. Investigate the browser's close/escape handling.
 
-- **NOT A BUG / DESIGN GAP (morph pulldown "missing on layer 1" — investigated
-  2026-06-14): there is no off-by-one.** Per-layer warp editors intentionally
-  have NO "Morph:" row — only the **frame-scope (summation) warp** calls
-  `WarpChainEditor::setLibraryContext` (`layered_wave_editor.cpp:8345`), which is
-  what reveals the row. Per-layer warps are *baked* (Bucket A) and carry no
-  MorphAlgorithm asset reference, so they show only the op chain. The frame-scope
-  warp's "Morph:" row renders **directly below the last layer**, so with two
-  layers it visually reads as belonging to layer 2, and with one layer there's no
-  such row at all — which is what the user perceived as "layer 1 is missing it".
-  The real fix is the **two-morph-type redesign** (agent-todo item M / todo #15):
-  give each layer its own *wave-defining* (Type-1) morph picker and keep an
-  *arbitrary-wave* (Type-2) ordered morph list on the summation. Do NOT bolt a
-  per-layer morph row on as a stop-gap — that conflicts with the planned design
-  (CLAUDE.md "no stop-gaps that conflict with the proper solution").
-
 - **BUG (independent morph "add" does nothing visible): with "(Independent)"
   selected, clicking "add" repeatedly keeps adding input modulation pins to the
   node but never adds anything to a visible list of applied morphs.** Also

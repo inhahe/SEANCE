@@ -21,6 +21,7 @@
 #include <fstream>
 #include <complex>
 #include <cmath>
+#include <limits>
 
 namespace SoundShop {
 
@@ -1579,27 +1580,26 @@ TerrainSynthProcessor::TerrainSynthProcessor(Node& n, Transport& t, ContentStore
             wtNumDims = doc.numDimensions();
             wtEffectiveAxes = doc.effectiveAxes();
 
-            // Cache a single warp-bearing layered frame for live per-layer warp
-            // re-bake (#88, item-M). Only a one-cell table can be re-baked in
-            // place this way (the frame occupies terrain.data[0..ts) contiguously);
-            // multi-cell grids would need per-cell rewrites we don't support yet.
-            // We only bother when a layer actually carries a warp chain - without
-            // one there's nothing to modulate and the baked terrain is final.
+            // Cache a single-frame layered frame for live per-layer re-bake (#88,
+            // item-M). Only a one-cell table can be re-baked in place this way (the
+            // frame occupies terrain.data[0..ts) contiguously); multi-cell grids
+            // would need per-cell rewrites we don't support yet. We cache for ANY
+            // single-frame layered table - not just warp-bearing ones - because
+            // every layer always carries a Phase and Amplitude that can be opted
+            // into modulation, even with an empty warp chain. The per-block cost
+            // when nothing is actually pinned is just the cheap param scan in the
+            // re-bake loop; the re-render only fires once a value moves.
             wtLayeredFrame.reset();
             wtLayeredTableSize = 0;
             wtLastLayerOverrides.clear();
+            wtLastLayerPhaseOverrides.clear();
+            wtLastLayerAmpOverrides.clear();
             if (nf == 1) {
                 IWavetableFrame* w0 = doc.frameAt(0);
                 if (w0 && std::string(w0->typeId()) == "layered") {
-                    auto* lw0 = static_cast<LayeredWaveform*>(w0);
-                    bool anyWarp = false;
-                    for (const auto& L : lw0->layers)
-                        if (!L.warpChain.empty()) { anyWarp = true; break; }
-                    if (anyWarp) {
-                        wtLayeredFrame = w0->clone();
-                        static_cast<LayeredWaveform*>(wtLayeredFrame.get())->tableSize = ts;
-                        wtLayeredTableSize = ts;
-                    }
+                    wtLayeredFrame = w0->clone();
+                    static_cast<LayeredWaveform*>(wtLayeredFrame.get())->tableSize = ts;
+                    wtLayeredTableSize = ts;
                 }
             }
         } else {
@@ -1757,6 +1757,18 @@ static float getParamByWarpSlot(const Node& node, int slot, float def) {
 static float getParamByWarpLayerSlot(const Node& node, int layer, int slot, float def) {
     for (const auto& p : node.params)
         if (p.warpLayer == layer && p.warpSlot == slot) return p.value;
+    return def;
+}
+
+// Read a per-layer Phase/Amplitude modulation param by its (layer, field) key.
+// Layer-field params (Param::layerField >= 0, with warpLayer holding the layer
+// index and warpSlot == -1) only exist when the user opts a layer's Phase (0) or
+// Amplitude (1) slider into modulation, so this returns `def` whenever no such
+// param is present. Callers pass the NaN sentinel for def so "no param" reads as
+// "keep the layer's stored value" in the renderWithLiveOverrides convention.
+static float getParamByLayerField(const Node& node, int layer, int field, float def) {
+    for (const auto& p : node.params)
+        if (p.layerField == field && p.warpLayer == layer && p.warpSlot == -1) return p.value;
     return def;
 }
 
@@ -2630,7 +2642,10 @@ void TerrainSynthProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mi
     if (wtLayeredFrame && wtLayeredTableSize > 0) {
         auto* lw = static_cast<LayeredWaveform*>(wtLayeredFrame.get());
         std::vector<std::vector<float>> overrides(lw->layers.size());
+        std::vector<float> phaseOv(lw->layers.size(), std::numeric_limits<float>::quiet_NaN());
+        std::vector<float> ampOv(lw->layers.size(), std::numeric_limits<float>::quiet_NaN());
         bool anyPerLayer = false;
+        const float kNaN = std::numeric_limits<float>::quiet_NaN();
         for (size_t li = 0; li < lw->layers.size(); ++li) {
             const auto& chain = lw->layers[li].warpChain;
             overrides[li].assign(chain.size(), -1.0f);
@@ -2639,16 +2654,41 @@ void TerrainSynthProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mi
                 overrides[li][slot] = v;
                 if (v >= 0.0f) anyPerLayer = true;
             }
+            // Per-layer Phase (field 0) and Amplitude (field 1) modulation. The
+            // NaN sentinel means "no param -> keep the layer's stored value".
+            float ph = getParamByLayerField(node, (int)li, 0, kNaN);
+            float am = getParamByLayerField(node, (int)li, 1, kNaN);
+            phaseOv[li] = ph;
+            ampOv[li] = am;
+            if (!std::isnan(ph) || !std::isnan(am)) anyPerLayer = true;
         }
-        if (anyPerLayer && overrides != wtLastLayerOverrides) {
+        // NaN != NaN, so a plain `==` comparison of the override grids would
+        // never match when an unmodulated layer carries the NaN sentinel,
+        // forcing a needless re-render every block. Compare with a NaN-aware
+        // helper so a steady (even fully-unmodulated) grid skips the re-render.
+        auto sameF = [](const std::vector<float>& a, const std::vector<float>& b) {
+            if (a.size() != b.size()) return false;
+            for (size_t i = 0; i < a.size(); ++i) {
+                bool an = std::isnan(a[i]), bn = std::isnan(b[i]);
+                if (an != bn) return false;
+                if (!an && a[i] != b[i]) return false;
+            }
+            return true;
+        };
+        bool changed = (overrides != wtLastLayerOverrides)
+                    || !sameF(phaseOv, wtLastLayerPhaseOverrides)
+                    || !sameF(ampOv, wtLastLayerAmpOverrides);
+        if (anyPerLayer && changed) {
             std::vector<float> samples;
-            lw->renderWithLiveWarp(overrides, samples);
+            lw->renderWithLiveOverrides(overrides, phaseOv, ampOv, samples);
             const float g = lw->gain;
             auto& data = terrain.getData();
             int n = std::min((int)samples.size(), (int)data.size());
             for (int i = 0; i < n; ++i)
                 data[i] = (g != 1.0f) ? samples[i] * g : samples[i];
             wtLastLayerOverrides = std::move(overrides);
+            wtLastLayerPhaseOverrides = std::move(phaseOv);
+            wtLastLayerAmpOverrides = std::move(ampOv);
         }
     }
 

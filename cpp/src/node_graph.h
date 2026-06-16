@@ -180,6 +180,18 @@ struct Param {
     // exist for every op so the amount is always modulatable. Only meaningful
     // when warpSlot >= 0.
     int warpLayer = -1;
+
+    // Per-layer field modulation key (layered wavetable). Marks this as the
+    // on-demand modulation param for a layer's Phase or Amplitude slider:
+    //   -1 = not a layer-field param (default)
+    //    0 = layer Phase
+    //    1 = layer Amplitude
+    // When layerField >= 0, `warpLayer` holds the 0-based layer index and
+    // `warpSlot` stays -1 - so a layer-field param never collides with warp
+    // param lookups (which require warpSlot >= 0). Created on demand when the
+    // user ticks the per-layer Phase/Amp "Mod" checkbox, removed when unticked
+    // or the layer goes away. See setLayerFieldModulated / renderWithLiveOverrides.
+    int layerField = -1;
 };
 
 // Rational fraction for exact beat subdivisions (e.g., triplets)

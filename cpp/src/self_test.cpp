@@ -2322,6 +2322,81 @@ void testWarp(Report& r) {
                 "warp: negative override sentinel keeps the baked amount");
     }
 
+    // ---- Per-layer Phase / Amplitude live modulation (#88, item-M) ---------
+    // renderWithLiveOverrides drives a layer's Phase/Amp from a live (modulated)
+    // value, with a NaN sentinel meaning "keep the layer's stored value".
+    {
+        WaveLayer a; a.shape = WaveLayer::Sine; a.ratio = 1; a.amp = 1.0f; a.phase = 0.0f;
+        WaveLayer b; b.shape = WaveLayer::Sine; b.ratio = 2; b.amp = 0.5f; b.phase = 0.0f;
+        LayeredWaveform lw; lw.tableSize = 256; lw.layers = { a, b };
+
+        const float kNaN = std::numeric_limits<float>::quiet_NaN();
+        std::vector<float> baked; lw.render(baked);
+
+        // (1) All-NaN phase/amp overrides reproduce the baked cycle exactly.
+        std::vector<float> heldOut;
+        lw.renderWithLiveOverrides({}, { kNaN, kNaN }, { kNaN, kNaN }, heldOut);
+        bool held = heldOut.size() == baked.size();
+        for (size_t i = 0; held && i < heldOut.size(); ++i)
+            held = std::abs(heldOut[i] - baked[i]) < 1e-6f;
+        r.check(held, "layerfield: NaN phase/amp overrides reproduce the baked cycle");
+
+        // (2) An amp override that matches the stored amp reproduces the cycle;
+        //     a different amp changes it (proving amp override feeds the mix).
+        std::vector<float> ampHeld, ampMod;
+        lw.renderWithLiveOverrides({}, { kNaN, kNaN }, { kNaN, 0.5f }, ampHeld);
+        bool ampSame = ampHeld.size() == baked.size();
+        for (size_t i = 0; ampSame && i < ampHeld.size(); ++i)
+            ampSame = std::abs(ampHeld[i] - baked[i]) < 1e-6f;
+        r.check(ampSame, "layerfield: amp override == stored amp reproduces the cycle");
+        lw.renderWithLiveOverrides({}, { kNaN, kNaN }, { kNaN, 0.0f }, ampMod);
+        double ampDiff = 0.0;
+        int an = (int)std::min(ampMod.size(), baked.size());
+        for (int i = 0; i < an; ++i) ampDiff += std::abs(ampMod[i] - baked[i]);
+        r.checkVal(ampDiff > 1.0, "layerfield: amp override changes the re-baked cycle", ampDiff);
+
+        // (3) A phase override on layer 0 changes the summed cycle (the two
+        //     layers add up differently once the phase relationship shifts).
+        std::vector<float> phaseMod;
+        lw.renderWithLiveOverrides({}, { 0.25f, kNaN }, { kNaN, kNaN }, phaseMod);
+        double phaseDiff = 0.0;
+        int pn = (int)std::min(phaseMod.size(), baked.size());
+        for (int i = 0; i < pn; ++i) phaseDiff += std::abs(phaseMod[i] - baked[i]);
+        r.checkVal(phaseDiff > 1.0, "layerfield: phase override changes the re-baked cycle", phaseDiff);
+
+        // (4) renderWithLiveWarp delegates here with empty phase/amp -> identical
+        //     to render() (the back-compat path the synth's warp-only loop uses).
+        std::vector<float> warpDelegate;
+        lw.renderWithLiveWarp({}, warpDelegate);
+        bool delegateSame = warpDelegate.size() == baked.size();
+        for (size_t i = 0; delegateSame && i < warpDelegate.size(); ++i)
+            delegateSame = warpDelegate[i] == baked[i];
+        r.check(delegateSame, "layerfield: renderWithLiveWarp delegates to render() identity");
+    }
+
+    // ---- Per-layer field Param key round-trips save/load --------------------
+    {
+        NodeGraph g;
+        int nId = g.addNode("wt", NodeType::TerrainSynth, {}, {}).id;
+        Param p;
+        p.name = "Layer 1 Phase"; p.warpLayer = 0; p.warpSlot = -1; p.layerField = 0;
+        p.value = p.baseValue = 0.3f; p.minVal = 0.0f; p.maxVal = 1.0f;
+        g.findNode(nId)->params.push_back(p);
+        std::string saved = ProjectFile::serializeForUndo(g);
+        NodeGraph g2;
+        bool ld = ProjectFile::loadFromString(saved, g2);
+        Node* nd2 = g2.findNode(nId);
+        const Param* fp = nullptr;
+        if (nd2)
+            for (const auto& q : nd2->params)
+                if (q.layerField == 0) { fp = &q; break; }
+        bool fieldOk = ld && fp
+                    && fp->warpLayer == 0
+                    && fp->warpSlot == -1
+                    && std::abs(fp->value - 0.3f) < 1e-4f;
+        r.check(fieldOk, "layerfield: Param layerField key survives save/load");
+    }
+
     // ---- Bucket C: spectral (per-bin) element warp ---------------------
     {
         SpectralDoc doc = SpectralDoc::defaultBuiltin();

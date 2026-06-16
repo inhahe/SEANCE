@@ -341,7 +341,11 @@ bool ProjectFile::writeProject(std::ostream& f, NodeGraph& graph,
             if (param.warpSlot >= 0) writeInt(f, "warpSlot", param.warpSlot);
             // Warp scope: which chain the slot indexes. Only emitted for per-
             // layer warp params (>=0); absent => -1 (frame-scope / not a warp).
+            // Also used as the layer index for layer-field (phase/amp) params.
             if (param.warpLayer >= 0) writeInt(f, "warpLayer", param.warpLayer);
+            // Per-layer field key (0=phase, 1=amplitude). Only emitted for
+            // layer-field modulation params; absent => -1 (not a layer field).
+            if (param.layerField >= 0) writeInt(f, "layerField", param.layerField);
             for (auto& ap : param.automation.points)
                 f << "auto=" << ap.beat << "," << ap.value << "\n";
         }
@@ -826,6 +830,7 @@ bool ProjectFile::readProject(std::istream& f, NodeGraph& graph, PluginHost* plu
             else if (key == "format") p.format = val;
             else if (key == "warpSlot") p.warpSlot = std::stoi(val);
             else if (key == "warpLayer") p.warpLayer = std::stoi(val);
+            else if (key == "layerField") p.layerField = std::stoi(val);
             else if (key == "auto") {
                 auto comma = val.find(',');
                 if (comma != std::string::npos)

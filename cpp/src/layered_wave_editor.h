@@ -216,6 +216,19 @@ public:
         // shows the string as its tooltip. Used to gate per-layer warp modulation
         // to single-frame wavetables (the only shape the synth re-bakes live).
         std::function<juce::String(int opIndex)> warpModDisabledReason;
+
+        // Optional. Per-layer field modulation (#88, item-M). A "Mod" checkbox
+        // next to this layer's Phase and Amplitude slider routes through these so
+        // the owner can create/destroy a layer-field Param + modulation pin so a
+        // cable can drive that value live. field: 0 = Phase, 1 = Amplitude. The
+        // layer identity is resolved by the owner (the LayerStackComponent closure
+        // capturing the row index); only the field is passed here. Left unset when
+        // per-layer field modulation is disabled - the checkboxes stay hidden.
+        std::function<bool(int field)>      isFieldModulated;
+        std::function<void(int field,bool)> setFieldModulated;
+        // Optional. A non-empty return disables the field's "Mod" checkbox and
+        // shows the string as its tooltip (gates to single-frame wavetables).
+        std::function<juce::String(int field)> fieldModDisabledReason;
     };
 
     // enableWarp embeds a per-layer warp chain editor (baked shape-bending on
@@ -267,6 +280,10 @@ public:
 
 private:
     void updateSourceControls();
+    // Refresh the Phase/Amp "Mod" checkbox visibility, toggle state, enabled
+    // state (+ disabled-reason tooltip), and whether the corresponding slider is
+    // signal-locked (greyed) because a modulation cable is driving it.
+    void syncFieldModState();
     juce::Rectangle<float> getPreviewAreaBounds() const;
     bool mouseToPointXY(juce::Point<float> p, float& outX, float& outY) const;
     int findPointNear(float x, float y, float radius = 0.05f) const;
@@ -287,6 +304,10 @@ private:
     juce::ComboBox   formulaLangCombo;   // Built-in / Lua / Python (Formula only)
     juce::Slider ratioSlider, phaseSlider, ampSlider;
     juce::Label  ratioLabel, phaseLabel, ampLabel;
+    // Per-layer Phase / Amplitude modulation toggles (#88, item-M). Visible only
+    // when callbacks.setFieldModulated is wired (the wavetable layer stack);
+    // hidden for the LFO / Signal-Shape editor. field 0 = phase, 1 = amplitude.
+    juce::ToggleButton phaseModBtn, ampModBtn;
     // Generator-morph parameter sliders (visible only for Pulse/Sync/FM/PD).
     // morphSlider drives shapeParam (duty / sync amount / FM index / PD amount);
     // morph2Slider drives shapeParam2 (FM modulator:carrier ratio only).
@@ -338,6 +359,26 @@ struct LayeredWaveform : public IWavetableFrame {
     // code path.
     void renderWithLiveWarp(const std::vector<std::vector<float>>& overrides,
                             std::vector<float>& out) const;
+
+    // Render like renderWithLiveWarp(), but ALSO override each layer's Phase
+    // and/or Amplitude with live (modulated) values. These are the per-layer
+    // field modulation pins (#88): a layer's Phase or Amp slider can opt into a
+    // modulation cable, so its value is driven at block rate.
+    //   warpOverrides  - same convention as renderWithLiveWarp's `overrides`.
+    //   phaseOverrides[layerIdx] = live phase offset (any value, including
+    //                  negative - phase wraps into the layer's sample lookup), or
+    //                  NaN to keep the layer's stored phase. (A < 0 sentinel can't
+    //                  be used here: a modulated phase can legitimately be
+    //                  negative.) May be shorter than `layers` (trailing layers
+    //                  keep stored phase).
+    //   ampOverrides[layerIdx]   = live amplitude in [0,1], or NaN to keep the
+    //                  layer's stored amp. Same length rules.
+    // renderWithLiveWarp delegates here with empty phase/amp overrides, so the
+    // summation/normalization code path stays unified.
+    void renderWithLiveOverrides(const std::vector<std::vector<float>>& warpOverrides,
+                                 const std::vector<float>& phaseOverrides,
+                                 const std::vector<float>& ampOverrides,
+                                 std::vector<float>& out) const;
 
     // Encode as a string stored in node.script, prefixed with "__layered__:".
     std::string encode() const;
@@ -440,6 +481,19 @@ public:
         std::function<bool(int layerIndex,int opIndex)>      isLayerWarpOpModulated;
         std::function<void(int layerIndex,int opIndex,bool)> setLayerWarpOpModulated;
         std::function<juce::String(int layerIndex,int opIndex)> layerWarpModDisabledReason;
+
+        // Optional. Per-layer field modulation (#88, item-M). A "Mod" checkbox
+        // next to each layer's Phase and Amplitude slider routes (layerIndex,
+        // field) to the owner, which creates/destroys a layer-field Param +
+        // modulation pin so an LFO / oscillator cable can drive that value live.
+        // field: 0 = Phase, 1 = Amplitude. isLayerFieldModulated queries the
+        // current pin state; setLayerFieldModulated toggles it;
+        // layerFieldModDisabledReason returns a non-empty string to disable the
+        // checkbox with an explanation (gates modulation to single-frame tables,
+        // same as warp). All null = the "Mod" checkboxes stay hidden (baked-only).
+        std::function<bool(int layerIndex,int field)>      isLayerFieldModulated;
+        std::function<void(int layerIndex,int field,bool)> setLayerFieldModulated;
+        std::function<juce::String(int layerIndex,int field)> layerFieldModDisabledReason;
     };
 
     LayerStackComponent(Options opts, std::function<void()> onChanged);
@@ -1436,6 +1490,17 @@ private:
     // Empty when the (layer, op) op can be modulated; otherwise the reason its
     // "Mod" checkbox is disabled (the grayed-control-explains-itself rule).
     juce::String layerWarpModDisabledReason(int layer, int op) const;
+
+    // ---- Per-layer Phase / Amplitude modulation (#88, item-M) -------------
+    // Each layer's Phase/Amp "Mod" checkbox routes (layer, field) here, where
+    // field 0 = Phase, 1 = Amplitude. A layer-field param is keyed by
+    // (Param::warpLayer == layer, Param::layerField == field, Param::warpSlot ==
+    // -1) and exists ONLY while modulated. The synth re-bakes the modulated
+    // phase/amp live for a SINGLE-frame wavetable only (same gate as warp).
+    int  layerFieldParamIndex(int layer, int field) const;
+    bool isLayerFieldModulated(int layer, int field) const;
+    void setLayerFieldModulated(int layer, int field, bool on);
+    juce::String layerFieldModDisabledReason(int layer, int field) const;
     // Re-sync Position params/pins only when the effective dimension count has
     // actually changed since the params were last built. Cheap to call on every
     // structural mutation (grid axis resize, scatter frame add/remove, cell

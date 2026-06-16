@@ -587,6 +587,11 @@ private:
     // (tableSize x layers) re-render when no per-layer warp amount changed, so an
     // unmodulated table costs only the cheap per-block param scan.
     std::vector<std::vector<float>> wtLastLayerOverrides;
+    // Last per-layer Phase / Amplitude override grids (NaN = unmodulated). Same
+    // change-detection role as wtLastLayerOverrides so a table with modulated
+    // phase/amp only re-renders when a value actually moves.
+    std::vector<float> wtLastLayerPhaseOverrides;
+    std::vector<float> wtLastLayerAmpOverrides;
 
     // Scatter wavetable: instead of a rectilinear terrain, frames are stored
     // explicitly with their N-D positions. Each block we compute a Wendland

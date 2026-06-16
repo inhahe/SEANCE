@@ -8560,7 +8560,21 @@ LayeredWaveEditorComponent::LayeredWaveEditorComponent(NodeGraph& g, int nid, st
         LayerStackComponent::Options lsOpts;
         lsOpts.showSummationPreview = false;
         lsOpts.addLayerButtonText = "+ Layer";
-        lsOpts.enablePerLayerWarp = true; // wavetable layers can be shape-bent
+        // Per-layer Type-2 (arbitrary-wave) morph REMOVED from the layer editor.
+        // A layer now contributes only the wave its generator/source defines;
+        // arbitrary-waveform morphing (soft clip, fold, bend, saturate, ...)
+        // lives solely at the Summation Morph (it reshapes the combined output,
+        // which is the only place an "arbitrary wave to reshape" actually
+        // exists). This removes the per-layer "Layer Morph" strip, its
+        // "+ Add" button and op list, and the per-op Mod checkboxes.
+        //
+        // The whole per-layer warp implementation is intentionally LEFT IN PLACE
+        // and merely gated off by this one flag (WaveLayerEditor only builds its
+        // warpEditor when enableWarp is true; the modulation callbacks below are
+        // never reached without it). Flip this back to true to restore the
+        // feature wholesale - nothing else was deleted. See REFERENCE.md ->
+        // "Per-layer morph (removed)".
+        lsOpts.enablePerLayerWarp = false;
         lsOpts.makeNewLayer = [](int count) {
             WaveLayer l;
             l.shape = WaveLayer::Sine;

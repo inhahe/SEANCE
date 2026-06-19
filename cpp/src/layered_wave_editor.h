@@ -1206,6 +1206,7 @@ private:
     // arrangement-view sidebar.
     juce::Label      identityLabel { {}, "Waveform:" };
     std::unique_ptr<LibraryColorSwatch> nameColorSwatch;
+    juce::Label      nameFieldLabel { {}, "Name:" };
     juce::TextEditor nameEditor;
 
     // Per-waveform output gain (IWavetableFrame::gain). A horizontal slider on

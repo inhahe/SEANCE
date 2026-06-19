@@ -4999,17 +4999,12 @@ void WaveLayerEditor::showWaveSourceMenu() {
     const WaveLayer::Shape cur = layer->shape;
     juce::PopupMenu m;
 
-    // Static shapes: fixed-waveform sources whose fundamental shape doesn't
-    // change (the standard harmonic/phase/amplitude controls don't redefine the
-    // wave). "Draw your own" and "Formula" live here too - they're authored once
-    // and then static. The waveform Library is also just a bank of static cycles,
-    // so its picker sits in this same section rather than off on its own.
-    m.addSectionHeader("Static shapes");
-    addShapeItem(m, cur, WaveLayer::Sine,     "Sine");
-    addShapeItem(m, cur, WaveLayer::Saw,      "Saw");
-    addShapeItem(m, cur, WaveLayer::Square,   "Square");
-    addShapeItem(m, cur, WaveLayer::Triangle, "Triangle");
-    addShapeItem(m, cur, WaveLayer::Noise,    "Noise");
+    // Custom shapes: user-authored static sources - "Draw your own", "Formula",
+    // and the waveform Library (a bank of static cycles). The five bare basic
+    // shapes (Sine/Saw/Square/Triangle/Noise) used to live here too but now sit
+    // at the top of the Presets -> Simple group, since they're really just the
+    // simplest ready-made starting cycles.
+    m.addSectionHeader("Custom shapes");
     addShapeItem(m, cur, WaveLayer::Drawn,    "Draw your own");
     addShapeItem(m, cur, WaveLayer::Formula,  "Formula");
     // From Library: a single cycle pulled from the waveform library. Only
@@ -5019,18 +5014,23 @@ void WaveLayerEditor::showWaveSourceMenu() {
         m.addItem(kFromLibraryId, juce::String::fromUTF8("From Library\xe2\x80\xa6"));
 
     // Presets: ready-made starting cycles the user can edit further. Split into
-    // "Simple" (no extra controls) and "With parameters" (generator oscillators
-    // that expose extra sliders - duty, sync amount, FM index/ratio, phase-dist
-    // amount). The bare static shapes are NOT duplicated here; they're up top.
+    // "Simple" (no extra controls - includes the five basic static shapes) and
+    // "With parameters" (generator oscillators that expose extra sliders - duty,
+    // sync amount, FM index/ratio, phase-dist amount).
     m.addSeparator();
     juce::PopupMenu presetSub;
     const auto& presets = wavePresets();
-    bool addedSimple = false, addedWithParams = false;
+    // The five basic static shapes lead the Simple group (moved out of the
+    // former top-level "Static shapes" section). They're plain shape items, so
+    // the menu handler routes them through the shape-id path like before.
+    presetSub.addSectionHeader("Simple");
+    addShapeItem(presetSub, cur, WaveLayer::Sine,     "Sine");
+    addShapeItem(presetSub, cur, WaveLayer::Saw,      "Saw");
+    addShapeItem(presetSub, cur, WaveLayer::Square,   "Square");
+    addShapeItem(presetSub, cur, WaveLayer::Triangle, "Triangle");
+    addShapeItem(presetSub, cur, WaveLayer::Noise,    "Noise");
+    bool addedWithParams = false;
     for (int i = 0; i < (int)presets.size(); ++i) {
-        if (presets[i].group == WaveLayerPreset::Simple && !addedSimple) {
-            presetSub.addSectionHeader("Simple");
-            addedSimple = true;
-        }
         if (presets[i].group == WaveLayerPreset::WithParams && !addedWithParams) {
             presetSub.addSectionHeader("With parameters");
             addedWithParams = true;
@@ -9116,6 +9116,12 @@ LayeredWaveEditorComponent::LayeredWaveEditorComponent(NodeGraph& g, int nid, st
         notifyPopoutDocMutated();
     };
 
+    addAndMakeVisible(nameFieldLabel);
+    nameFieldLabel.setFont(11.0f);
+    nameFieldLabel.setColour(juce::Label::textColourId,
+                             juce::Colours::white.withAlpha(0.75f));
+    nameFieldLabel.setJustificationType(juce::Justification::centredRight);
+
     addAndMakeVisible(nameEditor);
     nameEditor.setMultiLine(false);
     nameEditor.setReturnKeyStartsNewLine(false);
@@ -10609,6 +10615,7 @@ void LayeredWaveEditorComponent::refreshIdentityRow() {
     const bool have = (libIdx >= 0);
     identityLabel.setVisible(have);
     if (nameColorSwatch) nameColorSwatch->setVisible(have);
+    nameFieldLabel.setVisible(have);
     nameEditor.setVisible(have);
     gainLabel.setVisible(have);
     gainSlider.setVisible(have);
@@ -11753,9 +11760,9 @@ void LayeredWaveEditorComponent::resized() {
     applyBtn.setBounds(top.removeFromRight(60));
     top.removeFromRight(4);
     helpBtn.setBounds(top.removeFromRight(26));
-    top.removeFromRight(8);
-    envelopeBtn.setBounds(top.removeFromRight(90));
     top.removeFromRight(12); // separator gap from the right-side cluster
+    // (Envelope... used to live here; it's wavetable-wide so it now sits at the
+    // bottom of the whole-wavetable column on the left - see the body split.)
 
     compareLabel.setVisible(true);
     compareDirectBtn.setVisible(true);
@@ -11784,7 +11791,16 @@ void LayeredWaveEditorComponent::resized() {
 
     if (arrangementView) {
         arrangementView->setVisible(true);
-        arrangementView->setBounds(a);
+        // Envelope... is a wavetable-wide control (it edits the synth node's
+        // AHDSR amplitude envelope, not the per-frame waveform), so it anchors
+        // the bottom of the whole-wavetable column rather than the per-frame
+        // right pane. Reserve a strip here and give the rest to the list.
+        auto leftCol = a;
+        auto envRow = leftCol.removeFromBottom(28);
+        leftCol.removeFromBottom(6);
+        envelopeBtn.setVisible(true);
+        envelopeBtn.setBounds(envRow.removeFromLeft(juce::jmin(140, envRow.getWidth())));
+        arrangementView->setBounds(leftCol);
     }
 
     // ---- Right pane: capture flow OR (editor body + preview) ----
@@ -11842,6 +11858,8 @@ void LayeredWaveEditorComponent::resized() {
             nameColorSwatch->setBounds(idRow.removeFromLeft(idH).reduced(2));
             idRow.removeFromLeft(4);
         }
+        nameFieldLabel.setBounds(idRow.removeFromLeft(40));
+        idRow.removeFromLeft(2);
         nameEditor.setBounds(idRow);
     }
 

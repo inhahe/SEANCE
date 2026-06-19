@@ -5,34 +5,48 @@ top. When something is fixed, delete the entry (git history is the archive).
 
 ---
 
-## ⚠️ TEMPORARY (REMOVE ME): Full Page Heap is enabled for SEANCE.exe
+## TECH DEBT / LANDMINE: incremental build can silently leave an ODR layout mismatch (heap corruption)
 
-**Enabled:** 2026-06-19, to catch a startup heap-corruption / buffer-overrun bug
-(`STATUS_HEAP_CORRUPTION 0xC0000374`, detected on the plugin-scan-cache load path
-`PluginHost::loadScanCache` → first `availablePlugins` vector reallocation; the
-free is the *victim*, an earlier overrun is the cause). Page heap puts a guard
-page after every allocation so the overrunning write faults at the exact
-instruction with a live SEANCE stack.
+**Hit:** 2026-06-19. SEANCE was crashing at startup with
+`STATUS_HEAP_CORRUPTION (0xC0000374)`. Root cause was **not** a source bug — it
+was a **stale incremental build** producing an ODR / object-layout mismatch:
 
-**This makes SEANCE slower and far more memory-hungry while active. It MUST be
-turned off again once the overrun is found and fixed.** Do not ship / leave this
-on.
+- `terrain_synth.h` was changed (commit `7f62357`, which grew
+  `TerrainSynthProcessor` — `sizeof` is now `0x3600`, last member `partialBank`
+  at offset `0x35C0`).
+- `terrain_synth.obj` recompiled with the new layout, but
+  `graph_processor.obj` (which `#include`s `terrain_synth.h` and does
+  `make_unique<TerrainSynthProcessor>` in `rebuildGraph`) was **never
+  recompiled** — its `.obj` was 10 h older than the header. MSBuild's header
+  dependency tracking missed it; a plain `cmake --build` only relinked.
+- Result: `make_unique` allocated the **old, smaller** `sizeof`, the freshly
+  built constructor wrote `partialBank` past the old end → heap buffer overflow
+  → corruption that later tripped the heap manager on an unrelated free
+  (the original dump faulted in `PluginHost::loadScanCache`, a red-herring
+  *victim* of the corruption, not the cause).
 
-**Where it's set (Image File Execution Options, machine-wide, needs admin):**
-`HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\SEANCE.exe`
-- `GlobalFlag` = `0x02000000` (FLG_HEAP_PAGE_ALLOCS)
-- `PageHeapFlags` = `0x3` (enable full page heap + stack-trace collection)
+**Fix that was applied:** full clean rebuild
+(`cmake --build build --config Release --target SEANCE --clean-first`) so every
+TU shares one layout. Verified under Application Verifier full page heap: the
+overflow faulted instantly at `terrain_synth.cpp:1300` before the rebuild, and
+SEANCE ran cleanly (audio thread live, TerrainSynth node constructed) for 75 s
+with page heap on after the rebuild.
 
-**How to REMOVE it (do this when the bug is fixed):**
-```
-reg delete "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\SEANCE.exe" /v GlobalFlag /f
-reg delete "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\SEANCE.exe" /v PageHeapFlags /f
-```
-(Or delete the whole `SEANCE.exe` IFEO subkey if it holds nothing else.) Verify
-with `reg query "HKLM\...\Image File Execution Options\SEANCE.exe"` returning no
-GlobalFlag, and a fresh `!analyze`/dump showing `NTGLOBALFLAG: 0` again.
+**Why it's still tracked:** the *trigger* (MSBuild not recompiling a `.cpp`
+when a core header it includes changes) can recur and is silent + catastrophic
+(memory corruption, not a compile error). Mitigations / proper fix to consider:
 
-**Once page heap is removed, DELETE THIS ENTRY.**
+- **Rule of thumb until understood:** after editing a widely-included core
+  header (`terrain_synth.h`, `node_graph.h`, `warp.h`, `transport.h`, …) or after
+  any interrupted build, do a `--clean-first` rebuild before trusting a run.
+- Investigate why MSBuild's `.tlog` dependency tracking dropped
+  `graph_processor.cpp`'s dependency on `terrain_synth.h` (possible corrupted
+  incremental state from a build killed mid-flight).
+- Consider a cheap guard: a `static_assert(sizeof(TerrainSynthProcessor) == …)`
+  is *not* cross-TU safe, but adding a one-line `extern` size probe, or
+  preferring out-of-line factory functions in a single TU, would localize
+  allocation+construction so the two can't disagree. Lower priority than just
+  remembering to clean-build after core-header edits.
 
 ---
 

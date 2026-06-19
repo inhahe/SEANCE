@@ -1,4 +1,5 @@
 #include "warp_editor.h"
+#include "dialog_helpers.h"
 
 #include <map>
 
@@ -25,6 +26,166 @@ juce::String methodButtonText(WarpMethod m) {
     if (info->recommended) t += "   " + juce::String(juce::CharPointer_UTF8("\xe2\x98\x85")); // U+2605 star
     return t;
 }
+
+// =============================================================================
+// MorphLibraryBrowser - modal picker for the summation-morph "Use Library..."
+// button. Replaces the old library combo. Lists three groups:
+//   * Independent (this frame's own local chain) - assetId -1
+//   * Built-in presets (immutable templates; load a COPY, stay Independent)
+//   * Saved morphs    (user MorphAlgorithm assets; can live-link when "Sync")
+// A "Sync to library" checkbox is enabled only when a Saved entry is selected:
+// built-ins are immutable starting points and Independent has nothing to sync.
+// Fires onPick(assetId, sync); onCancel on dismissal. Mirrors the waveform
+// picker's sync model so all three scopes (frame / layer / morph) read alike.
+// =============================================================================
+class MorphLibraryBrowser : public juce::Component,
+                            public juce::ListBoxModel {
+public:
+    std::function<void(int assetId, bool sync)> onPick;
+
+    MorphLibraryBrowser(AssetLibrary& lib, int currentId) {
+        rows.push_back({ -1, "Independent (this frame's own)",
+                         "Edit only this frame's local morph - not shared.",
+                         false, false });
+        auto all = lib.list(AssetKind::MorphAlgorithm);
+        std::vector<const AssetEntry*> builtins, users;
+        for (auto* e : all)
+            (isBuiltinMorphAssetId(e->id) ? builtins : users).push_back(e);
+        if (!builtins.empty()) {
+            rows.push_back({ -2, "Built-in presets", {}, true, false });
+            for (auto* e : builtins)
+                rows.push_back({ e->id, juce::String(e->name), {}, false, false });
+        }
+        if (!users.empty()) {
+            rows.push_back({ -2, "Saved morphs", {}, true, false });
+            for (auto* e : users)
+                rows.push_back({ e->id, juce::String(e->name)
+                                    + (e->archived ? "  [archived]" : ""),
+                                {}, false, true });
+        }
+
+        list.setModel(this);
+        list.setRowHeight(24);
+        list.setColour(juce::ListBox::backgroundColourId,
+                       juce::Colour(0xff202024));
+        addAndMakeVisible(list);
+
+        syncToggle.setButtonText("Sync to library");
+        syncToggle.setTooltip(
+            "Live-link this frame to the picked saved morph: editing the morph "
+            "here updates every frame that references it, and vice versa. Off = "
+            "load a one-time independent copy.");
+        addAndMakeVisible(syncToggle);
+
+        useBtn.setButtonText("Use");
+        useBtn.onClick = [this] { commit(); };
+        addAndMakeVisible(useBtn);
+        cancelBtn.setButtonText("Cancel");
+        cancelBtn.onClick = [this] { close(); };
+        addAndMakeVisible(cancelBtn);
+
+        // Pre-select the current reference (or Independent).
+        int sel = 0;
+        for (int i = 0; i < (int)rows.size(); ++i)
+            if (!rows[i].isHeader && rows[i].assetId == currentId) { sel = i; break; }
+        list.selectRow(sel);
+        updateSyncEnabled();
+
+        setSize(440, 380);
+    }
+
+    // ListBoxModel -----------------------------------------------------------
+    int getNumRows() override { return (int)rows.size(); }
+
+    void paintListBoxItem(int row, juce::Graphics& g, int w, int h,
+                          bool selected) override {
+        if (row < 0 || row >= (int)rows.size()) return;
+        const auto& r = rows[row];
+        if (r.isHeader) {
+            g.setColour(juce::Colours::white.withAlpha(0.45f));
+            g.setFont(juce::FontOptions(11.0f, juce::Font::bold));
+            g.drawText(r.name.toUpperCase(),
+                       juce::Rectangle<int>(8, 0, w - 12, h),
+                       juce::Justification::centredLeft, true);
+            return;
+        }
+        if (selected) {
+            g.setColour(juce::Colour(0xff3a6ea5));
+            g.fillRect(0, 0, w, h);
+        }
+        g.setColour(juce::Colours::white.withAlpha(r.isUser ? 0.95f : 0.85f));
+        g.setFont(juce::FontOptions(13.0f));
+        g.drawText("    " + r.name,
+                   juce::Rectangle<int>(8, 0, w - 12, h),
+                   juce::Justification::centredLeft, true);
+    }
+
+    void selectedRowsChanged(int) override { updateSyncEnabled(); }
+    void listBoxItemDoubleClicked(int, const juce::MouseEvent&) override { commit(); }
+
+    void resized() override {
+        auto a = getLocalBounds().reduced(10);
+        auto bottom = a.removeFromBottom(30);
+        cancelBtn.setBounds(bottom.removeFromRight(90));
+        bottom.removeFromRight(8);
+        useBtn.setBounds(bottom.removeFromRight(90));
+        syncToggle.setBounds(bottom.removeFromLeft(160));
+        a.removeFromBottom(8);
+        list.setBounds(a);
+    }
+
+private:
+    struct MorphRow {
+        int          assetId;   // -1 Independent; -2 header; builtin/user id
+        juce::String name;
+        juce::String desc;
+        bool         isHeader = false;
+        bool         isUser   = false;
+    };
+
+    void updateSyncEnabled() {
+        int sel = list.getSelectedRow();
+        const bool isUser = (sel >= 0 && sel < (int)rows.size()
+                             && rows[sel].isUser);
+        syncToggle.setEnabled(isUser);
+        if (!isUser) {
+            syncToggle.setToggleState(false, juce::dontSendNotification);
+            int sel2 = list.getSelectedRow();
+            const bool builtin = (sel2 >= 0 && sel2 < (int)rows.size()
+                                  && !rows[sel2].isHeader
+                                  && rows[sel2].assetId >= 0);
+            syncToggle.setTooltip(builtin
+                ? "Built-in presets are immutable templates - they always load as "
+                  "an independent copy, so there is nothing to sync."
+                : "Pick a saved morph to enable live-linking. Independent has "
+                  "nothing to sync.");
+        } else {
+            syncToggle.setTooltip(
+                "Live-link this frame to the picked saved morph: editing the morph "
+                "here updates every frame that references it, and vice versa. Off = "
+                "load a one-time independent copy.");
+        }
+    }
+
+    void commit() {
+        int sel = list.getSelectedRow();
+        if (sel < 0 || sel >= (int)rows.size() || rows[sel].isHeader) return;
+        const int id = rows[sel].assetId;
+        const bool sync = syncToggle.isEnabled() && syncToggle.getToggleState();
+        if (onPick) onPick(id, sync);
+        close();
+    }
+
+    void close() {
+        if (auto* dw = findParentComponentOfClass<juce::DialogWindow>())
+            dw->exitModalState(0);
+    }
+
+    juce::ListBox        list;
+    juce::ToggleButton   syncToggle;
+    juce::TextButton     useBtn, cancelBtn;
+    std::vector<MorphRow> rows;
+};
 } // namespace
 
 WarpChainEditor::WarpChainEditor(Callbacks callbacks) : cb(std::move(callbacks)) {
@@ -43,28 +204,28 @@ WarpChainEditor::WarpChainEditor(Callbacks callbacks) : cb(std::move(callbacks))
     addAndMakeVisible(addBtn);
 
     // Library row (hidden until setLibraryContext provides a library).
-    libraryLbl.setJustificationType(juce::Justification::centredRight);
+    libraryLbl.setJustificationType(juce::Justification::centredLeft);
     addChildComponent(libraryLbl);
-    addChildComponent(libraryCombo);
+    addChildComponent(useLibBtn);
     addChildComponent(addToLibBtn);
-    libraryCombo.setTooltip(
+    useLibBtn.setTooltip(
         "Load a ready-made morph from this project's library into the stack above. "
-        "Built-in presets load a COPY you can freely tweak. A morph you Saved loads "
-        "as a live link - editing it here updates every frame that uses it. Pick "
-        "(Independent) to keep this frame's own private morph. This is the load half "
-        "of the Load/Save pair; \"+ Add\" instead builds a stack stage by stage.");
+        "Built-in presets load a COPY you can freely tweak. A morph you Saved can "
+        "load as a live link - check \"Sync to library\" in the picker and editing "
+        "it here updates every frame that uses it. This is the load half of the "
+        "Load/Save pair; \"+ Add\" instead builds a stack stage by stage.");
     addToLibBtn.setTooltip("Save the current morph stack to this project's library as "
                            "a reusable preset, so you can load it on other frames from "
-                           "the picker on the left. (The picker is the matching Load.)");
-    libraryCombo.onChange = [this]() { onLibrarySelected(libraryCombo.getSelectedId()); };
-    addToLibBtn.onClick   = [this]() { openAddToLibraryDialog(); };
+                           "\"Use Library...\". (That picker is the matching Load.)");
+    useLibBtn.onClick   = [this]() { showMorphLibraryBrowser(); };
+    addToLibBtn.onClick = [this]() { openAddToLibraryDialog(); };
 }
 
 void WarpChainEditor::setLibraryContext(LibraryContext ctx) {
     libCtx = std::move(ctx);
     libraryRowVisible = (libCtx.lib != nullptr);
     libraryLbl.setVisible(libraryRowVisible);
-    libraryCombo.setVisible(libraryRowVisible);
+    useLibBtn.setVisible(libraryRowVisible);
     addToLibBtn.setVisible(libraryRowVisible);
     if (libraryRowVisible) refreshLibraryRow();
     resized();
@@ -72,7 +233,24 @@ void WarpChainEditor::setLibraryContext(LibraryContext ctx) {
 
 void WarpChainEditor::refreshLibraryRow() {
     if (!libraryRowVisible) return;
-    rebuildLibraryCombo();
+    // Status label: show whether this frame's morph is Independent or live-linked
+    // to a named library morph (mirrors the waveform asset-row status text).
+    int cur = libCtx.getAssetId ? libCtx.getAssetId() : -1;
+    if (cur >= 0 && libCtx.lib) {
+        const AssetEntry* e = libCtx.lib->find(cur);
+        juce::String nm = (e && !e->name.empty()) ? juce::String(e->name)
+                          : ("#" + juce::String(cur));
+        if (e && e->archived) nm += "  [archived]";
+        libraryLbl.setText(juce::String::fromUTF8("Morph: \xe2\x86\x92 ") + nm,
+                           juce::dontSendNotification);
+        libraryLbl.setColour(juce::Label::textColourId,
+                             juce::Colour(0xffffcf4d).withAlpha(0.95f));
+    } else {
+        libraryLbl.setText("Morph: Independent (this frame's own)",
+                           juce::dontSendNotification);
+        libraryLbl.setColour(juce::Label::textColourId,
+                             juce::Colours::white.withAlpha(0.6f));
+    }
     // A morph algorithm with no stages is meaningless, so only allow publishing
     // a non-empty chain.
     const bool haveOps = chain && !chain->empty();
@@ -84,57 +262,9 @@ void WarpChainEditor::refreshLibraryRow() {
           "algorithm.");
 }
 
-void WarpChainEditor::rebuildLibraryCombo() {
-    if (!libCtx.lib) return;
-    libraryCombo.clear(juce::dontSendNotification);
-    // reserved id 1 (user ids >= 1e6). "Independent" = this frame edits its own
-    // private morph stack (the default); the label spells that out so it doesn't
-    // read as jargon next to the named presets/saved chains below it.
-    libraryCombo.addItem("(Independent - this frame's own morph)", 1);
-    int cur = libCtx.getAssetId ? libCtx.getAssetId() : -1;
-    bool curListed = false;
-
-    // Every morph chain now lives in the project library: the curated built-ins
-    // are seeded there (seedBuiltinMorphLibrary), and the user's saved chains are
-    // published there. Source the picker from that ONE list and partition it into
-    // "Built-in" (reserved id range) and "Saved" (user ids) so the two groups
-    // still read distinctly. Selecting a built-in COPIES its ops into an
-    // Independent chain (a template, not a live reference - see onLibrarySelected),
-    // so a built-in id is never stored as a frame's assetId; it only appears as a
-    // transient combo pick. Listing built-ins first keeps a fresh project's picker
-    // from being just "(Independent)".
-    auto allMorphs = libCtx.lib->list(AssetKind::MorphAlgorithm);
-    std::vector<const AssetEntry*> builtins, userEntries;
-    for (const AssetEntry* e : allMorphs)
-        (isBuiltinMorphAssetId(e->id) ? builtins : userEntries).push_back(e);
-
-    if (!builtins.empty()) {
-        libraryCombo.addSectionHeading("Built-in");
-        for (const AssetEntry* e : builtins) {
-            libraryCombo.addItem(juce::String(e->name), e->id);
-            if (e->id == cur) curListed = true;
-        }
-    }
-
-    if (!userEntries.empty()) libraryCombo.addSectionHeading("Saved");
-    for (const AssetEntry* e : userEntries) {
-        juce::String nm = e->name.empty() ? ("#" + juce::String(e->id))
-                                          : juce::String(e->name);
-        libraryCombo.addItem(nm, e->id);
-        if (e->id == cur) curListed = true;
-    }
-    // If the referenced algorithm is archived (hidden from the normal list),
-    // still show it so the user sees what they're referencing.
-    if (cur >= 0 && !curListed) {
-        const AssetEntry* e = libCtx.lib->find(cur);
-        if (e) libraryCombo.addItem(juce::String(e->name) + "  [archived]", e->id);
-    }
-    libraryCombo.setSelectedId(cur >= 0 ? cur : 1, juce::dontSendNotification);
-}
-
-void WarpChainEditor::onLibrarySelected(int comboId) {
+void WarpChainEditor::onMorphPicked(int assetId, bool sync) {
     if (!libCtx.lib || !libCtx.setAssetId || !chain) return;
-    if (comboId == 1) {
+    if (assetId < 0) {
         // Detach to independent: keep the current chain as this frame's own
         // local copy (no payload change), just stop referencing.
         libCtx.setAssetId(-1);
@@ -142,13 +272,12 @@ void WarpChainEditor::onLibrarySelected(int comboId) {
         if (cb.onChanged) cb.onChanged();
         return;
     }
-    if (const BuiltinMorphChain* b = builtinMorphChain(comboId)) {
+    if (const BuiltinMorphChain* b = builtinMorphChain(assetId)) {
         // Built-in template: COPY its ops in and stay Independent (built-ins are
         // immutable starting points, not live-reference assets - the same model
         // as copying a factory waveform into a layer). The op count changes, so
         // this is a structural edit: fire onStructureChanged so the host re-syncs
-        // its "Warp N" params. refreshLibraryRow resets the combo to "(Independent)"
-        // since the assetId is now -1.
+        // its "Warp N" params.
         *chain = b->ops;
         libCtx.setAssetId(-1);
         rebuild();
@@ -157,17 +286,37 @@ void WarpChainEditor::onLibrarySelected(int comboId) {
         if (cb.onStructureChanged) cb.onStructureChanged();
         return;
     }
-    // Adopt the chosen library chain: mirror it into the bound chain and
-    // reference it. The op count can change, so this is a structural edit -
-    // fire onStructureChanged so the host re-syncs its "Warp N" params.
-    libCtx.setAssetId(comboId);
-    if (const AssetEntry* e = libCtx.lib->find(comboId)) {
+    // User-saved chain. Mirror its ops into the bound chain. When `sync` is set,
+    // also live-reference it (edits propagate to every frame sharing the id);
+    // otherwise load a one-time independent copy. Either way the op count can
+    // change, so fire onStructureChanged so the host re-syncs its "Warp N" params.
+    libCtx.setAssetId(sync ? assetId : -1);
+    if (const AssetEntry* e = libCtx.lib->find(assetId)) {
         *chain = decodeWarpChain(e->payload);
         rebuild();
     }
     refreshLibraryRow();
     if (cb.onChanged) cb.onChanged();
     if (cb.onStructureChanged) cb.onStructureChanged();
+}
+
+void WarpChainEditor::showMorphLibraryBrowser() {
+    if (!libCtx.lib || !libCtx.setAssetId) return;
+    int cur = libCtx.getAssetId ? libCtx.getAssetId() : -1;
+    auto* browser = new MorphLibraryBrowser(*libCtx.lib, cur);
+    juce::Component::SafePointer<WarpChainEditor> safe(this);
+    browser->onPick = [safe](int assetId, bool sync) {
+        if (safe != nullptr) safe->onMorphPicked(assetId, sync);
+    };
+    juce::DialogWindow::LaunchOptions opts;
+    opts.content.setOwned(browser);
+    opts.dialogTitle = "Use morph from Library";
+    opts.dialogBackgroundColour = juce::Colour(0xff202024);
+    opts.escapeKeyTriggersCloseButton = true;
+    opts.useNativeTitleBar = true;
+    opts.resizable = false;
+    opts.componentToCentreAround = this;
+    launchToolDialog(opts);
 }
 
 void WarpChainEditor::openAddToLibraryDialog() {
@@ -185,8 +334,6 @@ void WarpChainEditor::openAddToLibraryDialog() {
                 int id = libCtx.lib->add(AssetKind::MorphAlgorithm, name, "",
                                          encodeWarpChain(*chain));
                 libCtx.setAssetId(id);
-                rebuildLibraryCombo();
-                libraryCombo.setSelectedId(id, juce::dontSendNotification);
                 refreshLibraryRow();
                 if (cb.onChanged) cb.onChanged();
             }
@@ -461,11 +608,13 @@ void WarpChainEditor::resized() {
 
     if (libraryRowVisible) {
         auto lib = a.removeFromTop(kRowH).reduced(0, 2);
-        libraryLbl.setBounds(lib.removeFromLeft(48));
-        lib.removeFromLeft(4);
-        addToLibBtn.setBounds(lib.removeFromRight(120));
-        lib.removeFromRight(6);
-        libraryCombo.setBounds(lib);
+        // Two buttons on the right (Save | Use Library), status label fills the
+        // rest on the left. Mirrors the waveform asset-row "status + load/save".
+        addToLibBtn.setBounds(lib.removeFromRight(110));
+        lib.removeFromRight(4);
+        useLibBtn.setBounds(lib.removeFromRight(110));
+        lib.removeFromRight(8);
+        libraryLbl.setBounds(lib);
     }
 
     for (int i = 0; i < (int)rows.size(); ++i) {

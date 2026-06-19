@@ -139,8 +139,12 @@ private:
     // so a closed-late menu can't call back into a destroyed editor.
     void showMethodPicker(juce::Component* target, WarpMethod current,
                           std::function<void(WarpMethod)> onPick);
-    void rebuildLibraryCombo();
-    void onLibrarySelected(int comboId);
+    // Open the morph-library picker dialog ("Use Library..."), and apply the
+    // user's choice. assetId -1 = detach to Independent; a built-in id = copy its
+    // ops in (stays Independent); a user id = adopt the chain, live-linking it
+    // when `sync` is true (edits propagate) or copying it when `sync` is false.
+    void showMorphLibraryBrowser();
+    void onMorphPicked(int assetId, bool sync);
     void openAddToLibraryDialog();
     void addOp();
     void removeOp(int opIndex);
@@ -178,10 +182,13 @@ private:
     std::vector<Row> rows;
 
     // Library row (MorphAlgorithm store). Hidden until setLibraryContext.
+    // A status label showing the current reference plus a "Use Library..." /
+    // "Save to Library" button pair (the load/save halves), replacing the old
+    // combo so the picker dialog can host a "Sync to library" choice.
     LibraryContext   libCtx;
     bool             libraryRowVisible = false;
-    juce::Label      libraryLbl  { {}, "Library:" };
-    juce::ComboBox   libraryCombo;
+    juce::Label      libraryLbl;
+    juce::TextButton useLibBtn   { juce::String::fromUTF8("Use Library\xe2\x80\xa6") };
     juce::TextButton addToLibBtn { "Save to Library" };
 };
 

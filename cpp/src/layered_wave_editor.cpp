@@ -9304,8 +9304,13 @@ namespace {
 class WaveformLibraryBrowser : public juce::Component,
                                private juce::ListBoxModel {
 public:
-    std::function<void(int bankEntryIndex)> onPickBuiltin;
-    std::function<void(int assetId)>        onPickAsset;
+    // The bool is the "Sync to library" choice: for a USER asset (onPickAsset)
+    // true = live-link (edits propagate both ways), false = load a one-time
+    // independent copy. Built-in waveforms are immutable templates so they always
+    // load as a copy; onPickBuiltin's bool is supplied for signature symmetry but
+    // callers ignore it.
+    std::function<void(int bankEntryIndex, bool sync)> onPickBuiltin;
+    std::function<void(int assetId, bool sync)>        onPickAsset;
 
     explicit WaveformLibraryBrowser(NodeGraph& graphRef) : bank(WaveformBank::get()) {
         bank.ensureLoaded();
@@ -9354,6 +9359,15 @@ public:
                             "waveform's id for the Generate languages: "
                             "waveform(N, phase) reads it.");
 
+        addAndMakeVisible(syncToggle);
+        syncToggle.setButtonText("Sync to library");
+        syncToggle.setToggleState(true, juce::dontSendNotification);
+        // Default off (greyed) until a syncable user asset is selected; the
+        // grayed-control-explains-itself rule means the tooltip always says why.
+        syncToggle.setEnabled(false);
+        syncToggle.setTooltip(
+            "Pick a saved waveform to choose whether to sync. Built-in shapes "
+            "always load as an editable copy.");
         addAndMakeVisible(insertBtn);
         insertBtn.setEnabled(false);
         insertBtn.onClick = [this] { doInsert(); };
@@ -9376,6 +9390,15 @@ public:
         setSize(760, 540);
     }
 
+    // Some pick contexts can live-link a chosen user asset (frame slot); others
+    // can only embed a one-time copy. When false, the "Sync to library" checkbox
+    // is hidden entirely (there's nothing for it to control).
+    void setSyncSupported(bool on) {
+        syncSupported = on;
+        syncToggle.setVisible(on);
+        resized();
+    }
+
     void resized() override {
         auto r = getLocalBounds().reduced(10);
         auto top = r.removeFromTop(26);
@@ -9390,6 +9413,12 @@ public:
         insertBtn.setBounds(bottom.removeFromRight(110));
         bottom.removeFromRight(8);
         cancelBtn.setBounds(bottom.removeFromRight(90));
+        if (syncSupported) {
+            bottom.removeFromLeft(2);
+            syncToggle.setBounds(bottom.removeFromLeft(150));
+        } else {
+            syncToggle.setBounds({});
+        }
         r.removeFromBottom(6);
 
         auto preview = r.removeFromBottom(90);
@@ -9607,10 +9636,20 @@ private:
         bool user = (row >= 0 && row < (int)visible.size() && visible[(size_t)row].user);
         insertBtn.setButtonText(user ? "Use" : "Insert");
         insertBtn.setTooltip(user
-            ? "Live-reference the selected saved waveform: edits propagate to "
-              "every place it's used."
+            ? "Bring in the selected saved waveform. Check \"Sync to library\" to "
+              "live-link it (edits propagate everywhere); uncheck for a one-time "
+              "editable copy."
             : "Drop the selected built-in waveform in as an editable independent "
               "copy.");
+        // Sync only applies to saved (user) waveforms - built-ins are read-only
+        // templates that always load as a copy. Enable/disable + explain.
+        syncToggle.setEnabled(user && syncSupported);
+        syncToggle.setTooltip(user
+            ? "Keep this slot live-linked to the saved waveform: editing either "
+              "place updates the other and every other slot that references it. "
+              "Uncheck to load a one-time independent copy instead."
+            : "Built-in waveforms are read-only templates - they always load as an "
+              "editable copy. Select one of your saved waveforms to enable syncing.");
     }
 
     void updatePreview(int row) {
@@ -9632,8 +9671,9 @@ private:
         const int row = waveList.getSelectedRow();
         if (row < 0 || row >= (int)visible.size()) return;
         const Item it = visible[(size_t)row];
-        if (it.user) { if (onPickAsset)   onPickAsset(userItems[(size_t)it.idx].id); }
-        else         { if (onPickBuiltin) onPickBuiltin(it.idx); }
+        const bool sync = syncToggle.isEnabled() && syncToggle.getToggleState();
+        if (it.user) { if (onPickAsset)   onPickAsset(userItems[(size_t)it.idx].id, sync); }
+        else         { if (onPickBuiltin) onPickBuiltin(it.idx, sync); }
         closeSelf();
     }
 
@@ -9645,7 +9685,8 @@ private:
     WaveformBank& bank;
     std::vector<UserItem> userItems;
     juce::TextEditor searchBox;
-    juce::ToggleButton starredToggle, showUserToggle;
+    juce::ToggleButton starredToggle, showUserToggle, syncToggle;
+    bool syncSupported = true;
     juce::ListBox catList, waveList;
     juce::TextButton insertBtn { "Insert" }, cancelBtn { "Cancel" };
     juce::Label statusLabel;
@@ -9663,7 +9704,8 @@ void LayeredWaveEditorComponent::showWaveformLibraryBrowser(juce::Component* anc
     auto* browser = new WaveformLibraryBrowser(graph);
 
     // --- Built-in waveform chosen: an editable independent copy ---
-    browser->onPickBuiltin = [this, replaceCurrentFrame](int bankEntryIndex) {
+    // (Built-ins are immutable templates, so the sync flag never applies.)
+    browser->onPickBuiltin = [this, replaceCurrentFrame](int bankEntryIndex, bool /*sync*/) {
         auto& bank = WaveformBank::get();
         if (bankEntryIndex < 0 || bankEntryIndex >= bank.numEntries()) return;
         const auto& e = bank.entry(bankEntryIndex);
@@ -9702,22 +9744,43 @@ void LayeredWaveEditorComponent::showWaveformLibraryBrowser(juce::Component* anc
         notifyPopoutFrameOrPositionChanged();
     };
 
-    // --- User Waveform asset chosen: a live reference ---
-    browser->onPickAsset = [this, replaceCurrentFrame](int assetId) {
+    // --- User Waveform asset chosen ---
+    // sync=true: live-reference (edits propagate). sync=false: load a one-time
+    // independent copy of the whole frame (all layers), leaving assetId = -1.
+    browser->onPickAsset = [this, replaceCurrentFrame](int assetId, bool sync) {
         const AssetEntry* e = graph.assets.find(assetId);
         if (!e || e->kind != AssetKind::Waveform) return;
         if (replaceCurrentFrame) {
-            adoptWaveformAsset(assetId);  // repoint the current frame
+            if (sync) {
+                adoptWaveformAsset(assetId);  // repoint the current frame (live)
+                return;
+            }
+            // Independent copy: mirror the asset's frame in but DON'T reference.
+            auto nf = frameFromWaveformAsset(e->subType, e->payload);
+            if (!nf) return;
+            const int libIdx = wave.findLibraryIndexById(currentLibraryId);
+            if (libIdx < 0) return;
+            auto& entry = wave.library[libIdx];
+            nf->gain = entry.wave ? entry.wave->gain : 1.0f;  // keep per-slot gain
+            entry.wave = std::move(nf);
+            entry.assetId = -1;
+            rebuildRows();
+            refreshPreview();
+            refreshIdentityRow();
+            notifyPopoutDocMutated();
+            commitToNode();
+            commitUndoStep();
             return;
         }
-        // Add a new frame that live-references the asset.
+        // Add a new frame, live-referencing the asset (sync) or as a copy.
         auto nf = frameFromWaveformAsset(e->subType, e->payload);
         if (!nf) return;
         const std::string base = e->name.empty() ? "Waveform" : e->name;
         const int libId = wave.addLibraryEntry(std::move(nf), base);
         applyLibraryIdSuffix(wave, libId, base);
-        if (int li = wave.findLibraryIndexById(libId); li >= 0)
-            wave.library[(size_t)li].assetId = assetId;
+        if (sync)
+            if (int li = wave.findLibraryIndexById(libId); li >= 0)
+                wave.library[(size_t)li].assetId = assetId;
         currentLibraryId = libId;
         updateHintText();
         if (wave.mode == WavetableMode::Scatter) repaintScatterViews();
@@ -9743,6 +9806,10 @@ void LayeredWaveEditorComponent::showWaveformLibraryBrowser(juce::Component* anc
 
 void LayeredWaveEditorComponent::showWaveformLibraryBrowserForLayer(int layerIndex) {
     auto* browser = new WaveformLibraryBrowser(graph);
+    // Per-layer live-linking isn't wired up yet (a layer has no assetId), so the
+    // layer picker embeds a one-time copy only - hide the Sync checkbox until the
+    // per-layer asset-reference model lands.
+    browser->setSyncSupported(false);
 
     // Load the chosen single cycle into ONE layer of the frame currently bound
     // to the layer stack, preserving that layer's ratio/phase/amp. Re-fetch the
@@ -9756,13 +9823,13 @@ void LayeredWaveEditorComponent::showWaveformLibraryBrowserForLayer(int layerInd
         onLayerChanged();   // preview + commit + debounced undo step
     };
 
-    browser->onPickBuiltin = [loadCycle](int bankEntryIndex) {
+    browser->onPickBuiltin = [loadCycle](int bankEntryIndex, bool /*sync*/) {
         auto& bank = WaveformBank::get();
         if (bankEntryIndex < 0 || bankEntryIndex >= bank.numEntries()) return;
         const auto& e = bank.entry(bankEntryIndex);
         loadCycle(bank.samples(bankEntryIndex), e.name);  // live factory ref
     };
-    browser->onPickAsset = [this, loadCycle](int assetId) {
+    browser->onPickAsset = [this, loadCycle](int assetId, bool /*sync*/) {
         const AssetEntry* e = graph.assets.find(assetId);
         if (!e || e->kind != AssetKind::Waveform) return;
         auto nf = frameFromWaveformAsset(e->subType, e->payload);

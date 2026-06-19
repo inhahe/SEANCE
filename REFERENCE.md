@@ -606,7 +606,7 @@ The pop-out wavetable window has two list panels on its sidebar that separate *w
 
 A waveform's name is a property of the **library entry**, shared by every cell/dot that references it (exactly like its colour and [gain](#per-waveform-gain)). It shows in the Library list and in the tooltips/headers wherever the waveform is placed. There are three ways to rename, all of which write the same field, commit to the node script, push one undo step, and refresh every view (Library list, identity row, arrangement-view tooltips):
 
-- **Inline name box** — the **Waveform:** text box in the right pane's identity row (top of the editor, beside the colour swatch). It's present and editable for all four frame-content editors — Layered, Frequency-domain (FFT), Wavelet, and Granular — so you can rename whatever waveform you're currently editing without leaving the editor. Type and press Enter (or click away) to commit. Empty shows the placeholder "(unnamed waveform)".
+- **Inline name box** — the name text box in the right pane's identity row (top of the editor), preceded by a **colour swatch** and a **"Name:"** label. It's present and editable for all four frame-content editors — Layered, Frequency-domain (FFT), Wavelet, and Granular — so you can rename whatever waveform you're currently editing without leaving the editor. Type and press Enter (or click away) to commit. Empty shows the placeholder "(unnamed waveform)".
 - **Library row → Rename…** — right-click any row in the pop-out window's **Library** list. Opens a small modal text-entry dialog seeded with the current name; Enter commits, Esc cancels.
 - **Arrangement-view cell/dot → Rename waveform…** — right-click a populated Grid cell or a Scatter dot (the same menu that carries *Edit waveform* / *Duplicate waveform* / *Remove from wavetable*, under the identify header). Opens the same modal text-entry dialog.
 
@@ -635,15 +635,16 @@ On disk this is the `__wavetable5__` script format (a per-entry gain float added
 
 Each layer has **exactly one wave source** — what generates its cycle — chosen from a single **wave-source picker** button (showing the current source's name). One menu consolidates every way to define the cycle; picking one **replaces** the previous source (this single picker replaced the old grid of shape buttons + separate *Preset* pulldown + *Use Library…* button). The menu groups:
 
-- **Static shapes** — fixed-waveform sources whose fundamental shape doesn't change (the standard harmonic/phase/amplitude controls don't redefine the wave). **Sine, Saw, Square, Triangle, Noise**, plus:
+- **Custom shapes** — user-authored sources whose cycle you define directly:
   - **Draw your own** — freehand canvas; a **Points / Freehand** toggle appears (Points = draggable control points with smooth interpolation; Freehand = drag to paint the shape directly).
   - **Formula** — math expression over one cycle, variable `x` in radians `[0, 2π)`, result clamped to `[-1, 1]`. A language dropdown (Built-in / Lua / Python / GLSL) appears next to the field. See [Formula authoring language](#formula-authoring-language-built-in--lua--python--glsl) and [Terrain Synth](#terrain-synth) for the grammar.
-  - **From Library…** — pull a single cycle from the project's waveform library (only when the host wired it; omitted in the LFO / Signal-Shape editor). A library cycle is itself just a static cycle, so it lives in this section rather than off on its own.
+  - **Use Library…** — pull a shape from the project's waveform library into this layer (only when the host wired it; omitted in the LFO / Signal-Shape editor). Opens the waveform browser; a built-in single cycle loads as an independent **copy** (a live *factory reference* until you edit the cycle), and a **saved** waveform loads as a one-time copy *unless* you tick **Sync to library** in the picker, which **live-links** the layer to the asset (later edits to either propagate — the per-layer analogue of the frame-scope Use Library, backed by `WaveLayer::assetId`). The Sync checkbox is enabled only for saved entries (built-ins are immutable templates).
+  - **Save to Library…** — publish this layer as a reusable single-layer **Waveform asset** and live-link the layer to it, so further edits propagate to every layer/frame that references it. The per-layer **Save** half of the Use/Save pair (mirrors the frame-scope and Summation-Morph Save buttons).
 - **Presets** — a submenu of ready-made starting cycles you can then edit further, split into two sections so you can see at a glance which ones carry extra knobs:
-  - **Simple** — baked drawn/formula cycles with no extra controls beyond the standard harmonic/phase/amplitude (Half-sine, Ramp up/down, Soft saw, FM bell, Organ-ish, Pulse 25%/75%).
+  - **Simple** — the five basic static shapes (**Sine, Saw, Square, Triangle, Noise** — moved here from the former top-level *Static shapes* section, since they're just the simplest ready-made cycles) followed by baked drawn/formula cycles with no extra controls beyond the standard harmonic/phase/amplitude (Half-sine, Ramp up/down, Soft saw, FM bell, Organ-ish, Pulse 25%/75%).
   - **With parameters** — the **wave-defining generators (Type 1)**, where the morph parameter **is** the wave (see [the two types](#one-mechanism-two-user-facing-types)): **Pulse (PWM)**, **Hard Sync**, **FM**, **Phase Distortion**. Picking one is mutually exclusive with a static shape (a generator *is* the shape source) and reveals its **named morph knob(s)**: *Duty* (Pulse), *Amount* (Sync / Phase Distortion), *Index* + *Ratio* (FM). Each of those extra knobs carries its own opt-in **Pin** checkbox (below) so it can be modulated live. The per-layer arbitrary-wave (Type-2) "+ Add" chain was removed (see the note under the knobs below); Type-2 reshaping lives only at the frame-scope [Summation Morph](#where-a-warp-chain-can-live).
 
-> The bare static shapes are **not** duplicated under Presets, and the generators are **not** a separate top-level menu section — both used to appear in two places. Everything param-free that you can pick directly is under **Static shapes**; everything that's a ready-made starting cycle (with or without extra knobs) is under **Presets**.
+> The five bare static shapes (Sine, Saw, Square, Triangle, Noise) now live under **Presets → Simple** rather than a top-level section — they're just the simplest ready-made cycles, so they sit with the other presets instead of in their own list. The top-level **Custom shapes** section holds only the make-it-yourself sources (Draw, Formula, Use/Save Library). The generators are **not** a separate top-level menu section either — they're under **Presets → With parameters**. So everything that's a ready-made starting cycle (with or without extra knobs) is under **Presets**, and everything you author yourself is under **Custom shapes**.
 
 Knobs (all sources):
 
@@ -936,11 +937,11 @@ Every op defaults to **baked** (no pin, no live cost). Ticking a row's **Pin** b
 
 ### Built-in & saved morphs (the Library row)
 
-The frame-scope Summation Morph editor shows a **Library:** row (the per-layer and element editors don't) — relabelled from the old "Morph:" because it sat inside a panel already headed *Summation Morph*, so "Morph:" read as redundant. The combo is the **Load** half of a Load/Save pair (the **Save to Library** button is the Save); "+ Add" instead builds a stack one stage at a time. The picker **sources every chain from the one project asset library** — the curated built-ins are *seeded* into that library, not listed from a separate code path — and partitions it under section headings:
+The frame-scope Summation Morph editor shows a **Library row** (the per-layer and element editors don't): a status label (showing *Independent* or the live-linked morph's name) plus a **Use Library…** / **Save to Library** button pair — the same Load/Save layout the frame and per-layer waveform rows use (it replaced the old inline combo so the picker can host a *Sync to library* choice). **Use Library…** opens a modal **morph picker** (`MorphLibraryBrowser`); **Save to Library** publishes the current stack; "+ Add" instead builds a stack one stage at a time. The picker **sources every chain from the one project asset library** — the curated built-ins are *seeded* into that library, not listed from a separate code path — and partitions it under section headings:
 
 - **(Independent — this frame's own morph)** — the frame edits its own local chain (the default).
 - **Built-in** — the curated Type-2 chains, **seeded into the project's [asset library](#asset-library-project-stores) as Morph Algorithm entries** (`seedBuiltinMorphLibrary` in `warp.h`, from `builtinMorphChains()`): *Warm Saturation, West Coast Fold, Lo-Fi Crush, Tape Glue, Pulse Width, Soft Bend, Formant Sync, Rectify Octave*. They appear in both this picker and the **Asset Library panel** (flagged ★ starred). They remain **templates, not live references** — picking one **copies** its ops into the chain and detaches to *(Independent)*, exactly as picking a factory waveform copies it into a layer (so an edit can never silently mutate a shared built-in). **Code-owned and not serialized:** their ids sit in a reserved range (`kBuiltinMorphIdBase = 200000`, below the user id base `1000000`, so `isBuiltinMorphAssetId` tells the two apart) and are **skipped by project-file save/export**; they are **re-seeded idempotently on every new project and every project load**, which keeps them improvable across app versions, keeps project files free of boilerplate, and makes them effectively undeletable (a deletion is undone by the next re-seed) — matching the asset library's *disjoint id space* + *divergence = duplicate* design.
-- **Saved** — user-published [Morph Algorithm assets](#asset-library-project-stores) (live references, ids ≥ `1000000`): editing the chain while one is referenced updates every frame that points at it. **Save to Library** publishes the current chain as a new Morph Algorithm asset.
+- **Saved** — user-published [Morph Algorithm assets](#asset-library-project-stores) (ids ≥ `1000000`). Picking one applies its ops to the chain; tick **Sync to library** in the picker to **live-link** it (editing the chain then updates every frame that points at it) or leave it off to load a one-time independent copy. The Sync checkbox is enabled only for Saved entries (Independent has nothing to sync; built-ins are immutable templates that always copy). **Save to Library** publishes the current chain as a new Morph Algorithm asset.
 
 ### Per-sample primitives vs the buffer helper
 
@@ -2371,13 +2372,26 @@ closes, iff anything changed (not one step per drag tick). Implemented as
   (`WaveformLibraryEntry.assetId`) — a node's wavetable can hold many waveforms,
   so each slot references independently. Adopting an asset keeps the slot's own
   **gain** (a placement-level property, not part of the shared shape).
+- **Waveforms (per layer)** — each **layer** inside a Layered-Waveform frame can
+  *also* live-link to a Waveform asset, via **Use Library…** / **Save to Library…**
+  in the layer's [wave-source picker](#wave-source-per-layer). **Use
+  Library…** opens the same browser; ticking **Sync to library** adopts the asset
+  as a live reference (else it loads a copy), and **Save to Library…** publishes
+  the layer as a single-layer Waveform asset and links it. The reference lives on
+  `WaveLayer::assetId`; the shared unit is the layer's **shape** (its **amp** is a
+  per-slot property preserved across resolves, like a frame slot's gain).
+  `resolvePerLayerWaveformReferences` pulls each referenced asset into its layer on
+  load and after settled edits; `writeBackPerLayerWaveforms` pushes layer edits
+  back. A layer pointed at a **multi-layer** asset is flattened to that frame's
+  summed cycle (so multi-layer assets are best used by *copy* at the layer scope).
 - **Morph algorithms (warp chains)** — the wavetable editor's frame-scope
   [Summation Morph](#built-in--saved-morphs-the-library-row) panel (`WarpChainEditor`)
-  shows a **Library:** row (formerly "Morph:"). Its picker lists three sections: **(Independent)** (edit
+  shows a **Library row** (a status label + **Use Library…** / **Save to Library** buttons). Its picker lists three sections: **(Independent)** (edit
   the frame's own chain), **Built-in** (curated code-defined Type-2 chains —
   `builtinMorphChains()` — that **copy in** as a template and detach to
   Independent, *not* live references), and **Saved** (user-published Morph
-  Algorithm assets, live references). **Save to Library** publishes the current
+  Algorithm assets — live-linked only when **Sync to library** is ticked in the
+  picker, else copied in). **Save to Library** publishes the current
   chain as a new asset (disabled until the chain has at least one stage). While a
   *Saved* asset is referenced, editing the chain here writes back to the asset and
   re-resolves, so every frame using the same algorithm re-shapes together. Adopting
@@ -2404,8 +2418,13 @@ The library is far too large for a flat dropdown, so the browser offers a catego
 list, a **search** box, a **Starred only** filter (built-in *curated* OR user
 *starred*), a **Show my waveforms** toggle, and a live cycle preview. Choosing a
 **built-in** drops in an editable independent copy (button reads **Insert**);
-choosing a **saved waveform** creates a **live reference** to it (button reads
-**Use**), so later edits propagate everywhere it's used.
+choosing a **saved waveform** can either copy it in or create a **live reference**,
+governed by the **Sync to library** checkbox (enabled only when a saved waveform is
+selected — built-ins are immutable templates that always copy). With Sync on, later
+edits propagate everywhere it's used. The same browser + Sync checkbox drives all
+three waveform entry points (the **+ Waveform** add flow, the frame-scope **Use
+Library…**, and the per-layer **Use Library…**); per-layer picks set
+`WaveLayer::assetId` instead of the frame slot's `assetId`.
 
 ### Import / export between projects
 

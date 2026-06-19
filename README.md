@@ -70,7 +70,7 @@ The per-waveform editor (the right half of the window — always visible) shows 
 
 SEANCE has **one** shaping mechanism with **two user-facing types**, kept visually distinct because they do different things:
 
-- **Wave-defining morphs (Type 1)** — generators where the morph *is* the wave: **PWM, Hard Sync, FM, Phase Distortion**. Each layer picks exactly one wave source from a single **wave-source picker** (static shapes, Draw, Formula, a Type-1 generator, factory presets, or a library waveform), so a generator is just another kind of wave source.
+- **Wave-defining morphs (Type 1)** — generators where the morph *is* the wave: **PWM, Hard Sync, FM, Phase Distortion**. Each layer picks exactly one wave source from a single **wave-source picker** (custom shapes, Draw, Formula, a Type-1 generator, presets — basic shapes like sine/saw/square/triangle/noise live under **Presets → Simple** — or a library waveform via **Use Library…**), so a generator is just another kind of wave source.
 - **Arbitrary-wave morphs (Type 2)** — an ordered chain of *warp* stages that reshapes whatever wave already exists: fold, clip, saturate, rectify, bitcrush, bend, phase-distort, sync, and more. Press **+ Add** to stack a stage; each has an enable checkbox, a method picker (grouped by kind, ★ on the higher-quality picks), an amount slider, a **Pin** checkbox (adds a control input so an LFO/oscillator/automation cable can drive the amount live), **▲ / ▼ arrows to reorder**, and an **X** to remove it. **Order matters** — fold-then-clip sounds different from clip-then-fold. A Type-2 chain lives at **frame scope** (the *Summation Morph*, reshaping the combined output of all layers). *(Per layer, a layer's morph is just its wave-defining Type-1 generator — the per-layer Type-2 chain was removed; arbitrary-wave reshaping happens only at the summation.)*
 
 The real point is **live morphing**: tick a stage's **Mod** box and its amount becomes a node parameter you can drive with an **LFO, oscillator, or envelope** to morph the waveform as a note sustains — pins are opt-in, so unmodulated stages stay baked at zero cost. The same opt-in **Mod** checkbox sits next to each layer's **Phase** and **Amplitude** slider on a single-frame table, so you can drive a layer's phase or level live too. Reorder an op and any modulation you wired follows that op, not the slot it left. The frame-scope Morph picker ships **built-in starter chains** (Warm Saturation, West Coast Fold, Lo-Fi Crush, …) — seeded into every project's asset library, so they show in the Asset Library panel (★) right alongside any chains you save there yourself. Live-stream waveforms (granular captures and inharmonic stacks) offer the amplitude-domain warps only, since a continuous stream has no read-position to bend. The same warp transfers are also callable straight from **scripts and formulas** — `warpamp(method, x, amount)` / `warpphase(method, phase, amount)` (per sample, in the Built-in, Lua, Python and WASM dialects) and the whole-buffer `spectralwarp` / `waveletwarp` (offline bakes) — so a formula can clip, fold or saturate with the exact same curve the node uses. See the [REFERENCE](REFERENCE.md#waveform-warp-shape-bending) for the full method list, the two types, and the three "buckets" of warp.
@@ -195,9 +195,13 @@ one stored shape from many places and a single edit re-tunes them all). Waveform
 that lists the thousands of built-in factory shapes *and* your saved waveforms in
 one place — with category, search, **Starred only**, and **Show my waveforms**
 filters, because the wave-shape library is far too big for a dropdown. Picking a
-built-in drops in an editable copy; picking one of your saved waveforms makes a
-live reference. **Duplicate** an asset to make one diverge (there's no detach —
-divergence is always duplicate + repoint). Archived assets are hidden from pickers
+built-in always drops in an editable copy; picking one of your saved waveforms
+gives you the choice via a **Sync to library** checkbox in the picker — leave it
+on for a live reference (edits flow both ways), turn it off for a one-time
+independent copy. The same Use Library… / Save to Library buttons and Sync option
+are available at three scopes — the whole frame, an individual layer, and the
+summation morph chain. **Duplicate** an asset to make one diverge (there's no
+detach — divergence is always duplicate + repoint). Archived assets are hidden from pickers
 but keep existing references valid; deleting an asset drops referencing nodes back
 to their own private copy. Assets live in the project file and participate in
 undo/redo. You can **export** a project's whole library to a standalone

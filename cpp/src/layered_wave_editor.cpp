@@ -2631,6 +2631,12 @@ void LayerStackComponent::rebuildRows() {
                     if (i < 0 || i >= (int)target->layers.size()) return;
                     opts.onPickFromLibrary(i);
                 };
+            if (opts.onSaveToLibrary)
+                cb.onSaveToLibrary = [this, i]() {
+                    if (!target) return;
+                    if (i < 0 || i >= (int)target->layers.size()) return;
+                    opts.onSaveToLibrary(i);
+                };
             // Per-layer warp modulation: bind the stable row index `i` and forward
             // (i, opIndex) to the owner. Wired only when the owner supplied the
             // callbacks, so the "Mod" checkbox stays hidden otherwise.
@@ -5082,9 +5088,10 @@ void WaveLayerEditor::updateSourceControls() {
 // WaveLayer::Shape enum (offset by 1 so 0 stays "nothing chosen"); presets and
 // the library entry use disjoint high ranges.
 namespace {
-    constexpr int kShapeIdBase   = 1;     // shape id = enum + 1
-    constexpr int kFromLibraryId = 900;
-    constexpr int kPresetIdBase  = 1000;  // preset id = 1000 + index
+    constexpr int kShapeIdBase    = 1;     // shape id = enum + 1
+    constexpr int kFromLibraryId  = 900;
+    constexpr int kSaveToLibraryId= 901;
+    constexpr int kPresetIdBase   = 1000;  // preset id = 1000 + index
 
     void addShapeItem(juce::PopupMenu& m, WaveLayer::Shape cur,
                       WaveLayer::Shape s, const juce::String& label) {
@@ -5105,11 +5112,16 @@ void WaveLayerEditor::showWaveSourceMenu() {
     m.addSectionHeader("Custom shapes");
     addShapeItem(m, cur, WaveLayer::Drawn,    "Draw your own");
     addShapeItem(m, cur, WaveLayer::Formula,  "Formula");
-    // From Library: a single cycle pulled from the waveform library. Only
-    // offered when the owner wired the loader (the layer stack with browser
-    // access); omitted for the LFO / Signal-Shape editor.
+    // Use Library: pull a shape from the project's waveform library into THIS
+    // layer (a built-in single cycle, or a saved waveform - live-linked when you
+    // tick "Sync to library" in the picker). Save to Library publishes this
+    // layer as a reusable Waveform asset. Both only offered when the owner wired
+    // the loader (the layer stack with browser access); omitted for the LFO /
+    // Signal-Shape editor.
     if (callbacks.onPickFromLibrary)
-        m.addItem(kFromLibraryId, juce::String::fromUTF8("From Library\xe2\x80\xa6"));
+        m.addItem(kFromLibraryId, juce::String::fromUTF8("Use Library\xe2\x80\xa6"));
+    if (callbacks.onSaveToLibrary)
+        m.addItem(kSaveToLibraryId, juce::String::fromUTF8("Save to Library\xe2\x80\xa6"));
 
     // Presets: ready-made starting cycles the user can edit further. Split into
     // "Simple" (no extra controls - includes the five basic static shapes) and
@@ -5143,6 +5155,10 @@ void WaveLayerEditor::showWaveSourceMenu() {
 
             if (result == kFromLibraryId) {
                 if (callbacks.onPickFromLibrary) callbacks.onPickFromLibrary();
+                return;
+            }
+            if (result == kSaveToLibraryId) {
+                if (callbacks.onSaveToLibrary) callbacks.onSaveToLibrary();
                 return;
             }
 
@@ -8915,6 +8931,11 @@ LayeredWaveEditorComponent::LayeredWaveEditorComponent(NodeGraph& g, int nid, st
         lsOpts.onPickFromLibrary = [this](int layerIndex) {
             showWaveformLibraryBrowserForLayer(layerIndex);
         };
+        // "Save to Library..." publishes this layer as a reusable Waveform asset
+        // and live-links the layer to it (the per-layer Save half).
+        lsOpts.onSaveToLibrary = [this](int layerIndex) {
+            publishLayerToLibrary(layerIndex);
+        };
         // Per-layer warp modulation (#88, item-M): the per-layer "Mod" checkbox
         // creates/destroys a (warpLayer, warpSlot) param + pin so a cable can
         // drive that op's morph amount live. Gated to single-frame wavetables
@@ -9904,19 +9925,22 @@ void LayeredWaveEditorComponent::showWaveformLibraryBrowser(juce::Component* anc
 
 void LayeredWaveEditorComponent::showWaveformLibraryBrowserForLayer(int layerIndex) {
     auto* browser = new WaveformLibraryBrowser(graph);
-    // Per-layer live-linking isn't wired up yet (a layer has no assetId), so the
-    // layer picker embeds a one-time copy only - hide the Sync checkbox until the
-    // per-layer asset-reference model lands.
-    browser->setSyncSupported(false);
+    // Per-layer live-linking is now supported (WaveLayer::assetId): a saved
+    // waveform can be adopted as a live reference when the user ticks "Sync to
+    // library". Built-ins still load as an independent copy (handled per-row by
+    // the browser - the Sync checkbox enables only for user assets).
+    browser->setSyncSupported(true);
 
-    // Load the chosen single cycle into ONE layer of the frame currently bound
-    // to the layer stack, preserving that layer's ratio/phase/amp. Re-fetch the
-    // layer by its stable index at pick time (the browser is async).
+    // Load a one-time COPY of a cycle into ONE layer (built-in factory pick, or a
+    // user asset with Sync off), preserving that layer's ratio/phase/amp and
+    // detaching any prior live link. Re-fetch the layer by its stable index at
+    // pick time (the browser is async).
     auto loadCycle = [this, layerIndex](const std::vector<float>& cycle,
                                         const std::string& factoryName) {
         auto* lw = layerStack ? layerStack->getTarget() : nullptr;
         if (!lw || layerIndex < 0 || layerIndex >= (int)lw->layers.size()) return;
         fillLayerCycle(lw->layers[(size_t)layerIndex], cycle, factoryName);
+        lw->layers[(size_t)layerIndex].assetId = -1;   // copy = independent
         layerStack->refreshFromModel();
         onLayerChanged();   // preview + commit + debounced undo step
     };
@@ -9927,9 +9951,23 @@ void LayeredWaveEditorComponent::showWaveformLibraryBrowserForLayer(int layerInd
         const auto& e = bank.entry(bankEntryIndex);
         loadCycle(bank.samples(bankEntryIndex), e.name);  // live factory ref
     };
-    browser->onPickAsset = [this, loadCycle](int assetId, bool /*sync*/) {
+    browser->onPickAsset = [this, layerIndex, loadCycle](int assetId, bool sync) {
         const AssetEntry* e = graph.assets.find(assetId);
         if (!e || e->kind != AssetKind::Waveform) return;
+        if (sync) {
+            // Adopt as a live reference: pull the asset's shape into the layer
+            // (preserving amp), record the assetId, and commit. Edits then
+            // propagate to every layer/frame sharing the id.
+            auto* lw = layerStack ? layerStack->getTarget() : nullptr;
+            if (!lw || layerIndex < 0 || layerIndex >= (int)lw->layers.size()) return;
+            WaveLayer& layer = lw->layers[(size_t)layerIndex];
+            layer.assetId = assetId;
+            applyWaveformAssetToLayer(e->subType, e->payload, layer);
+            layerStack->refreshFromModel();
+            onLayerChanged();
+            return;
+        }
+        // Independent copy: flatten the asset to a single cycle and embed it.
         auto nf = frameFromWaveformAsset(e->subType, e->payload);
         if (!nf) return;
         std::vector<float> buf;
@@ -9946,6 +9984,40 @@ void LayeredWaveEditorComponent::showWaveformLibraryBrowserForLayer(int layerInd
     opts.resizable = true;
     opts.componentToCentreAround = this;
     SoundShop::launchToolDialog(opts);
+}
+
+void LayeredWaveEditorComponent::publishLayerToLibrary(int layerIndex) {
+    auto* lw = layerStack ? layerStack->getTarget() : nullptr;
+    if (!lw || layerIndex < 0 || layerIndex >= (int)lw->layers.size()) return;
+
+    auto* aw = new juce::AlertWindow("Save layer to Library",
+        "Name for the shared waveform:", juce::MessageBoxIconType::NoIcon, this);
+    aw->addTextEditor("name", "Layer");
+    aw->addButton("OK", 1, juce::KeyPress(juce::KeyPress::returnKey));
+    aw->addButton("Cancel", 0, juce::KeyPress(juce::KeyPress::escapeKey));
+    aw->enterModalState(true, juce::ModalCallbackFunction::create(
+        [this, aw, layerIndex](int res) {
+            if (res == 1) {
+                auto name = aw->getTextEditorContents("name").trim().toStdString();
+                if (name.empty()) name = "Layer";
+                // Re-fetch the layer: the modal could outlive a frame switch, so
+                // never trust the captured target/index blindly.
+                auto* lw2 = layerStack ? layerStack->getTarget() : nullptr;
+                if (lw2 && layerIndex >= 0 && layerIndex < (int)lw2->layers.size()) {
+                    WaveLayer& layer = lw2->layers[(size_t)layerIndex];
+                    std::string subType, payload;
+                    layerToWaveformAsset(layer, subType, payload);
+                    int id = graph.assets.add(AssetKind::Waveform, name,
+                                              subType, payload);
+                    // Live-link the layer to the asset it was just published as,
+                    // so further edits propagate (matches the frame-scope publish).
+                    layer.assetId = id;
+                    layerStack->refreshFromModel();
+                    onLayerChanged();
+                }
+            }
+            delete aw;
+        }), true);
 }
 
 void LayeredWaveEditorComponent::showAddWaveformMenu(juce::Component* anchor) {

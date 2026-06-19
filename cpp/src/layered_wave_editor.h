@@ -219,8 +219,13 @@ public:
         // source picker. The owner opens the waveform library browser and, on
         // a pick, loads the chosen single cycle into THIS layer (the owner
         // re-fetches the layer by its stable index and calls refreshFromModel).
-        // If null, the "From Library..." menu entry is omitted.
+        // If null, the "Use Library..." menu entry is omitted.
         std::function<void()> onPickFromLibrary;
+        // Optional. Fired when the user picks "Save to Library..." in the wave-
+        // source picker. The owner publishes THIS layer as a reusable Waveform
+        // asset (a single-layer LayeredWaveform) and live-links the layer to it.
+        // If null, the "Save to Library..." menu entry is omitted.
+        std::function<void()> onSaveToLibrary;
 
         // Optional. Per-layer warp modulation (#88, item-M). The embedded
         // per-layer warp editor's "Mod" checkbox routes through these so the
@@ -499,6 +504,11 @@ public:
         // chosen single cycle into target->layers[index] then calls
         // refreshFromModel(). Null = no library entry on the picker.
         std::function<void(int layerIndex)> onPickFromLibrary;
+        // Optional. When set, each layer row's wave-source picker also offers a
+        // "Save to Library..." entry. The arg is the row's (stable) layer index;
+        // the owner publishes target->layers[index] as a Waveform asset and
+        // live-links the layer to it. Null = no save entry on the picker.
+        std::function<void(int layerIndex)> onSaveToLibrary;
 
         // Optional. Per-layer warp modulation (#88, item-M). The per-layer warp
         // editor's "Mod" checkbox routes (layerIndex, opIndex) to the owner, which
@@ -1185,6 +1195,13 @@ private:
     // currently bound to the layer stack (preserving that layer's ratio/phase/
     // amp). Wired into LayerStackComponent::Options::onPickFromLibrary.
     void showWaveformLibraryBrowserForLayer(int layerIndex);
+
+    // Per-layer "Save to Library..." publisher: prompts for a name, publishes
+    // layer `layerIndex` of the frame currently bound to the layer stack as a
+    // single-layer Waveform asset, and live-links that layer to the new asset
+    // (so subsequent edits propagate). Wired into LayerStackComponent::Options::
+    // onSaveToLibrary.
+    void publishLayerToLibrary(int layerIndex);
 
     // Build a one-layer LayeredWaveform whose single Drawn/Freehand layer holds
     // `cycle` (expected 512 samples in [-1,1], one cycle). This is the import

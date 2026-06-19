@@ -1030,6 +1030,16 @@ private:
 // Returns the number of references resolved. Mirrors resolveAhdsrReferences().
 int resolveWaveformReferences(NodeGraph& graph);
 
+// Resolve every live PER-LAYER Waveform asset reference in the graph: the
+// per-layer analogue of resolveWaveformReferences. For each wavetable node, any
+// WaveLayer with assetId >= 0 (inside a LayeredWaveform library entry) has its
+// shape content replaced by a fresh decode of the referenced asset, preserving
+// the layer's own amp (slot volume). A missing/erased asset detaches that layer
+// to independent. Re-encodes affected node scripts in place. Free function for
+// the same reason as resolveWaveformReferences (codec lives in
+// layered_wave_editor.cpp). Returns the number of layer references resolved.
+int resolvePerLayerWaveformReferences(NodeGraph& graph);
+
 // Resolve every live MorphAlgorithm (warp-chain) asset reference in the graph.
 // For each wavetable node whose WavetableDoc has warpAssetId >= 0, the frame-
 // scope warp chain is replaced by a fresh decode of the asset's stored chain,

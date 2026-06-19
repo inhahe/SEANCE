@@ -2314,6 +2314,13 @@ static void encodeLayer(std::ostringstream& o, const WaveLayer& l) {
     // by the "factory=" prefix in parseLayer regardless of position.
     if (asFactory)
         o << ",factory=" << escapeFormula(l.factoryRef);
+    // Optional per-layer library reference (live-link to a user Waveform asset).
+    // Emitted as a prefixed "asset=" field found by parseLayer regardless of
+    // position. The layer's resolved cycle content is still serialized above (so
+    // an offline/standalone load renders); the asset id just records the live
+    // link, re-resolved on load by resolvePerLayerWaveformReferences().
+    if (l.assetId >= 0)
+        o << ",asset=" << l.assetId;
     // Optional trailing per-layer warp field. Appended last (after any
     // variable-length Drawn/Formula payload) so older parsers - which read a
     // fixed/counted number of fields and stop - never see it. parseLayer finds
@@ -2351,6 +2358,8 @@ static bool parseLayer(const std::string& lp, WaveLayer& out) {
             try { out.shapeParam2 = std::stof(field.substr(3)); } catch (...) {}
         } else if (field.rfind("factory=", 0) == 0) {
             out.factoryRef = unescapeFormula(field.substr(8));
+        } else if (field.rfind("asset=", 0) == 0) {
+            try { out.assetId = std::stoi(field.substr(6)); } catch (...) {}
         } else if (field.rfind("bake=", 0) == 0) {
             // Pre-baked one-cycle for a Lua/Python/GLSL formula (see
             // encodeLayer). Format: "bake=<count>;<s0>;<s1>;...". Loading this
@@ -3569,6 +3578,95 @@ int resolveWaveformReferences(NodeGraph& graph) {
             // Synchronised write: the audio thread polls node.script live and a
             // granular wavetable script can be multi-megabyte, so a raw assign
             // would race the read mid-copy. encode() builds outside the lock.
+            setNodeScriptSynced(n, doc.encode());
+    }
+    return resolved;
+}
+
+// ---- Per-layer Waveform asset-library bridge ------------------------------
+
+// Encode a single WaveLayer as a Waveform asset (subType/payload), wrapping it
+// in a one-layer LayeredWaveform. amp is normalised to 1 because it's a per-slot
+// placement property, not part of the shared shape (mirrors how a frame entry's
+// gain is excluded from the asset body). The layer's own assetId is NOT carried
+// into the asset (the asset is the target of the reference, not a referencer).
+void layerToWaveformAsset(const WaveLayer& layer,
+                          std::string& outSubType, std::string& outPayload) {
+    LayeredWaveform lw;
+    lw.tableSize = 2048;
+    lw.layers.push_back(layer);
+    lw.layers[0].amp = 1.0f;
+    lw.layers[0].assetId = -1;
+    waveformAssetFromFrame(&lw, outSubType, outPayload);
+}
+
+// Pull a Waveform asset's body into a single layer. The shared unit is the
+// layer's SHAPE content; the live layer's amp (slot volume) and assetId are
+// preserved. If the asset decodes to a single-layer LayeredWaveform the layer
+// becomes a faithful, fully-editable copy of that layer. Otherwise (a multi-
+// layer frame, or a non-layered frame type) the frame is flattened to its summed
+// 512-sample cycle and the layer becomes a freehand Drawn cycle - audibly
+// faithful but no longer per-feature editable. Returns false if the asset can't
+// be decoded.
+bool applyWaveformAssetToLayer(const std::string& subType,
+                               const std::string& payload, WaveLayer& layer) {
+    auto frame = frameFromWaveformAsset(subType, payload);
+    if (!frame) return false;
+    const float keepAmp = layer.amp;
+    const int   keepAssetId = layer.assetId;
+    if (std::string(frame->typeId()) == "layered") {
+        auto* lw = static_cast<LayeredWaveform*>(frame.get());
+        if (lw->layers.size() == 1) {
+            layer = lw->layers[0];
+            layer.amp = keepAmp;
+            layer.assetId = keepAssetId;
+            return true;
+        }
+    }
+    // Multi-layer / non-layered: flatten to a single freehand cycle.
+    std::vector<float> cyc;
+    frame->render(512, cyc);
+    layer = WaveLayer{};
+    layer.shape = WaveLayer::Drawn;
+    layer.freehandMode = true;
+    layer.drawnSamples = std::move(cyc);
+    layer.amp = keepAmp;
+    layer.assetId = keepAssetId;
+    return true;
+}
+
+int resolvePerLayerWaveformReferences(NodeGraph& graph) {
+    int resolved = 0;
+    for (auto& n : graph.nodes) {
+        if (n.script.rfind("__wavetable", 0) != 0) continue;
+
+        WavetableDoc doc;
+        if (!doc.decode(n.script)) continue;
+
+        bool changed = false;
+        bool anyRef  = false;
+        for (auto& e : doc.library) {
+            if (!e.wave || std::string(e.wave->typeId()) != "layered") continue;
+            auto* lw = static_cast<LayeredWaveform*>(e.wave.get());
+            for (auto& layer : lw->layers) {
+                if (layer.assetId < 0) continue;
+                anyRef = true;
+                const AssetEntry* a = graph.assets.find(layer.assetId);
+                if (a && a->kind == AssetKind::Waveform) {
+                    if (applyWaveformAssetToLayer(a->subType, a->payload, layer)) {
+                        changed = true;
+                        ++resolved;
+                    } else {
+                        layer.assetId = -1;   // undecodable -> detach
+                        changed = true;
+                    }
+                } else {
+                    layer.assetId = -1;       // erased -> detach, keep cycle
+                    changed = true;
+                }
+            }
+        }
+        if (changed && anyRef)
             setNodeScriptSynced(n, doc.encode());
     }
     return resolved;
@@ -10826,6 +10924,26 @@ void LayeredWaveEditorComponent::writeBackReferencedWaveforms() {
     if (anyRef) resolveWaveformReferences(graph);
 }
 
+void LayeredWaveEditorComponent::writeBackPerLayerWaveforms() {
+    // For every layer (in every library entry's LayeredWaveform) that live-
+    // references a Waveform asset, push its current cycle back up to the asset,
+    // then propagate to every other layer/frame sharing the id. Early-out (cheap)
+    // when nothing references an asset, the common case. Settled edit points only.
+    bool anyRef = false;
+    for (const auto& entry : wave.library) {
+        if (!entry.wave || std::string(entry.wave->typeId()) != "layered") continue;
+        auto* lw = static_cast<LayeredWaveform*>(entry.wave.get());
+        for (const auto& layer : lw->layers) {
+            if (layer.assetId < 0) continue;
+            anyRef = true;
+            std::string subType, payload;
+            layerToWaveformAsset(layer, subType, payload);
+            graph.assets.update(layer.assetId, subType, payload);
+        }
+    }
+    if (anyRef) resolvePerLayerWaveformReferences(graph);
+}
+
 void LayeredWaveEditorComponent::writeBackReferencedWarp() {
     // When the frame-scope warp chain live-references a MorphAlgorithm asset,
     // this settled edit IS an edit to that shared chain: push the current chain
@@ -11645,6 +11763,9 @@ void LayeredWaveEditorComponent::commitUndoStep() {
     // the undo step captures the propagated state. Cheap no-op when nothing is
     // referenced (the common case).
     writeBackReferencedWaveforms();
+    // Per-layer analogue: a layer that live-references a Waveform asset pushes
+    // its edited cycle back and propagates to every layer/frame sharing the id.
+    writeBackPerLayerWaveforms();
     // Same for the frame-scope warp chain: if it references a shared
     // MorphAlgorithm asset, push the edited chain back and propagate.
     writeBackReferencedWarp();

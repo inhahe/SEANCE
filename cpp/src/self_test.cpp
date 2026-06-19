@@ -3559,6 +3559,81 @@ void testAssetLibrary(Report& r) {
                 "assets: erased waveform asset -> entry falls back to independent");
     }
 
+    // ---- Per-layer Waveform live-reference: an individual WaveLayer inside a -
+    // ---- LayeredWaveform entry references a published single-layer asset -----
+    {
+        NodeGraph g;
+        int nId = g.addNode("wt", NodeType::TerrainSynth, {}, {}).id;
+
+        auto makeLayer = [](int ratio) {
+            WaveLayer ly; ly.shape = WaveLayer::Saw; ly.ratio = ratio; ly.amp = 1.0f;
+            return ly;
+        };
+
+        // Publish a single-layer asset from a Saw ratio-7 layer.
+        std::string subType, payload;
+        layerToWaveformAsset(makeLayer(7), subType, payload);
+        int wAsset = g.assets.add(AssetKind::Waveform, "shared layer", subType, payload);
+
+        // Doc entry = a 2-layer stack; layer 1 references the asset but starts as a
+        // different local shape (ratio 2) with a distinct amp (0.3) to prove amp
+        // (a per-slot property) is preserved across resolves; layer 0 is untouched.
+        auto lw = std::make_unique<LayeredWaveform>();
+        lw->layers.push_back(makeLayer(1));
+        { WaveLayer ref; ref.shape = WaveLayer::Saw; ref.ratio = 2; ref.amp = 0.3f;
+          ref.assetId = wAsset; lw->layers.push_back(ref); }
+        WavetableDoc doc;
+        doc.addLibraryEntry(std::move(lw), "stack");
+        g.findNode(nId)->script = doc.encode();
+
+        // layer.assetId survives the codec round-trip.
+        WavetableDoc rt; rt.decode(g.findNode(nId)->script);
+        auto* rtlw = rt.library.empty() ? nullptr
+                     : dynamic_cast<LayeredWaveform*>(rt.library[0].wave.get());
+        r.check(rtlw && rtlw->layers.size() == 2 && rtlw->layers[1].assetId == wAsset,
+                "assets: per-layer assetId round-trips through wavetable codec");
+
+        // Resolve -> layer 1 becomes the asset's layer (ratio 7), amp preserved
+        // (0.3); layer 0 untouched (ratio 1).
+        int nres = resolvePerLayerWaveformReferences(g);
+        r.checkVal(nres == 1,
+                   "assets: resolvePerLayerWaveformReferences resolves one ref", nres);
+        WavetableDoc after; after.decode(g.findNode(nId)->script);
+        auto* alw = dynamic_cast<LayeredWaveform*>(after.library[0].wave.get());
+        r.check(alw && alw->layers.size() == 2 &&
+                    alw->layers[0].ratio == 1 && alw->layers[1].ratio == 7 &&
+                    std::abs(alw->layers[1].amp - 0.3f) < 1e-6f,
+                "assets: per-layer resolve pulls asset shape, preserves layer amp");
+
+        // Save/load re-resolves.
+        std::ostringstream oss;
+        ProjectFile::writeProject(oss, g, nullptr, false, true);
+        NodeGraph g2; std::istringstream iss(oss.str());
+        ProjectFile::readProject(iss, g2, nullptr);
+        WavetableDoc loaded; loaded.decode(g2.findNode(nId)->script);
+        auto* llw = dynamic_cast<LayeredWaveform*>(loaded.library[0].wave.get());
+        r.check(llw && llw->layers.size() == 2 && llw->layers[1].assetId == wAsset &&
+                    llw->layers[1].ratio == 7,
+                "assets: per-layer reference re-resolves after save/load");
+
+        // Edit the asset -> propagates to the referencing layer (ratio 5).
+        std::string sub2, pay2; layerToWaveformAsset(makeLayer(5), sub2, pay2);
+        g.assets.update(wAsset, sub2, pay2);
+        resolvePerLayerWaveformReferences(g);
+        WavetableDoc edDoc; edDoc.decode(g.findNode(nId)->script);
+        auto* elw = dynamic_cast<LayeredWaveform*>(edDoc.library[0].wave.get());
+        r.check(elw && elw->layers.size() == 2 && elw->layers[1].ratio == 5,
+                "assets: editing the asset propagates to the referencing layer");
+
+        // Erase the asset -> the referencing layer detaches to independent.
+        g.assets.erase(wAsset);
+        resolvePerLayerWaveformReferences(g);
+        WavetableDoc delDoc; delDoc.decode(g.findNode(nId)->script);
+        auto* dlw = dynamic_cast<LayeredWaveform*>(delDoc.library[0].wave.get());
+        r.check(dlw && dlw->layers.size() == 2 && dlw->layers[1].assetId == -1,
+                "assets: erased asset -> referencing layer falls back to independent");
+    }
+
     // ---- MorphAlgorithm (frame-scope warp chain) live reference -------------
     {
         NodeGraph g;

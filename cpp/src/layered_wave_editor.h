@@ -145,6 +145,26 @@ struct WaveLayer {
     // imported / generator cycles; only meaningful for Drawn shape.
     std::string factoryRef;
 
+    // When >= 0, this layer LIVE-REFERENCES a user Waveform asset in the project
+    // library (AssetLibrary id), the per-layer analogue of the frame-scope
+    // WaveformLibraryEntry::assetId. While the reference holds, the layer's cycle
+    // content is kept in sync with the asset: on load (and after any settled edit
+    // elsewhere) resolvePerLayerWaveformReferences() pulls the asset's body into
+    // this layer, and a settled edit to THIS layer is pushed back to the asset by
+    // writeBackPerLayerWaveforms(), propagating to every layer/frame that shares
+    // the id (the "live reference" model). -1 = independent (the layer owns its
+    // cycle outright), exactly as before.
+    //
+    // The shared unit is the layer's SHAPE content, not its mix placement: amp is
+    // a per-slot property preserved across resolves (like a frame entry's gain).
+    // A per-layer asset is stored as a single-layer LayeredWaveform; if a layer is
+    // pointed at a MULTI-layer asset (one saved from frame scope) it is flattened
+    // to that frame's summed cycle on resolve, and a write-back would shrink the
+    // asset to that single flattened cycle - so multi-layer assets are best used
+    // by COPY (sync off) at the layer scope. See layerToWaveformAsset /
+    // applyWaveformAssetToLayer. Serialized as a trailing "asset=" field.
+    int assetId = -1;
+
     // Re-bake formulaSamples from formulaExpr for the current formulaLang.
     // No-op (clears the buffer) for Built-in. Call after any change to
     // formulaExpr / formulaLang and after loading from a project.
@@ -965,6 +985,17 @@ void waveformAssetFromFrame(const IWavetableFrame* frame,
 std::unique_ptr<IWavetableFrame> frameFromWaveformAsset(const std::string& subType,
                                                         const std::string& payload);
 
+// Per-layer Waveform asset bridge (the per-layer analogue of the above). A layer
+// is shared as a single-layer LayeredWaveform; amp is excluded (a per-slot
+// property). layerToWaveformAsset encodes one layer into (subType, payload);
+// applyWaveformAssetToLayer pulls an asset body back into a layer, preserving the
+// layer's amp + assetId and flattening multi-layer/non-layered assets to a
+// freehand cycle. See WaveLayer::assetId and resolvePerLayerWaveformReferences().
+void layerToWaveformAsset(const WaveLayer& layer,
+                          std::string& outSubType, std::string& outPayload);
+bool applyWaveformAssetToLayer(const std::string& subType,
+                               const std::string& payload, WaveLayer& layer);
+
 // resolveWaveformReferences(NodeGraph&) is declared in node_graph.h (so the
 // non-GUI serialization layer can call it without pulling in the editor),
 // and implemented in layered_wave_editor.cpp alongside WavetableDoc decode.
@@ -1251,6 +1282,12 @@ private:
     // up to its asset and propagate to other nodes (live write-back). Called
     // from commitToNode(). No-op when no entry references an asset.
     void writeBackReferencedWaveforms();
+    // Per-layer analogue: push every layer that live-references a Waveform asset
+    // (WaveLayer::assetId >= 0) back up to its asset and propagate to every other
+    // layer/frame sharing the id. Called from commitToNode(). No-op when no layer
+    // references an asset. A layer linked to a multi-layer asset writes back a
+    // single flattened cycle (see WaveLayer::assetId / layerToWaveformAsset).
+    void writeBackPerLayerWaveforms();
     // Same for the frame-scope warp chain: if it references a shared
     // MorphAlgorithm asset, push the edited chain back and propagate. Called
     // from commitUndoStep(). No-op when warpAssetId < 0 (independent).

@@ -1047,6 +1047,12 @@ bool ProjectFile::readProject(std::istream& f, NodeGraph& graph, PluginHost* plu
     // sees the asset content. Free function in layered_wave_editor.cpp.
     resolveWaveformReferences(graph);
 
+    // Per-layer analogue: any individual WaveLayer that live-references a Waveform
+    // asset (WaveLayer::assetId >= 0) has its cycle pulled from the asset, after
+    // the frame-scope pass so a frame entry that itself came from an asset already
+    // has its layers in place. Free function in layered_wave_editor.cpp.
+    resolvePerLayerWaveformReferences(graph);
+
     // Same for live-referenced MorphAlgorithm (warp-chain) assets: replace each
     // referencing frame's cached warp chain with the asset's stored chain and
     // reconcile the node's warp modulation params. Free function in

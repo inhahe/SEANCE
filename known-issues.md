@@ -5,6 +5,37 @@ top. When something is fixed, delete the entry (git history is the archive).
 
 ---
 
+## ⚠️ TEMPORARY (REMOVE ME): Full Page Heap is enabled for SEANCE.exe
+
+**Enabled:** 2026-06-19, to catch a startup heap-corruption / buffer-overrun bug
+(`STATUS_HEAP_CORRUPTION 0xC0000374`, detected on the plugin-scan-cache load path
+`PluginHost::loadScanCache` → first `availablePlugins` vector reallocation; the
+free is the *victim*, an earlier overrun is the cause). Page heap puts a guard
+page after every allocation so the overrunning write faults at the exact
+instruction with a live SEANCE stack.
+
+**This makes SEANCE slower and far more memory-hungry while active. It MUST be
+turned off again once the overrun is found and fixed.** Do not ship / leave this
+on.
+
+**Where it's set (Image File Execution Options, machine-wide, needs admin):**
+`HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\SEANCE.exe`
+- `GlobalFlag` = `0x02000000` (FLG_HEAP_PAGE_ALLOCS)
+- `PageHeapFlags` = `0x3` (enable full page heap + stack-trace collection)
+
+**How to REMOVE it (do this when the bug is fixed):**
+```
+reg delete "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\SEANCE.exe" /v GlobalFlag /f
+reg delete "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\SEANCE.exe" /v PageHeapFlags /f
+```
+(Or delete the whole `SEANCE.exe` IFEO subkey if it holds nothing else.) Verify
+with `reg query "HKLM\...\Image File Execution Options\SEANCE.exe"` returning no
+GlobalFlag, and a fresh `!analyze`/dump showing `NTGLOBALFLAG: 0` again.
+
+**Once page heap is removed, DELETE THIS ENTRY.**
+
+---
+
 ## BUG (minor): pinned generator param leaks a dead pin when the layer changes shape
 
 **Found:** 2026-06-16, adding live modulation for generator extra-params

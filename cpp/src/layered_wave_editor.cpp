@@ -9525,6 +9525,13 @@ public:
         statusLabel.setJustificationType(juce::Justification::centredLeft);
         statusLabel.setColour(juce::Label::textColourId, juce::Colours::lightgrey);
 
+        // Overlay hint for an empty wave list (e.g. "My saved frames" selected
+        // before the user has saved any). Hidden unless rebuildVisible shows it.
+        addChildComponent(listEmptyHint);
+        listEmptyHint.setJustificationType(juce::Justification::centred);
+        listEmptyHint.setColour(juce::Label::textColourId, juce::Colour(0xff808088));
+        listEmptyHint.setInterceptsMouseClicks(false, false);
+
         if (bank.isEmpty() && userItems.empty()) {
             statusLabel.setText("Factory library unavailable: "
                                     + juce::String(bank.loadError()),
@@ -9604,6 +9611,7 @@ public:
         catList.setBounds(left);
         r.removeFromLeft(8);
         waveList.setBounds(r);
+        listEmptyHint.setBounds(r.reduced(16));
     }
 
     void paint(juce::Graphics& g) override {
@@ -9771,10 +9779,14 @@ private:
             if (!starOnly || bank.entry(i).curated) ++builtinAll;
 
         if (frameScope) {
-            // Saved frames lead. When the user has any, they get their own
-            // category at the top (the default view) followed by a non-selectable
-            // divider that introduces the demoted factory single-cycle catalog.
-            if (showUser && userCount > 0) {
+            // Saved frames always lead in frame scope - the category and the
+            // "Start over with a single cycle" divider stay visible even when
+            // the user has none saved yet, so the two ways to start a frame
+            // (reuse a saved frame vs. begin from a single cycle) are always
+            // spelled out. (The factory catalog alone would otherwise look
+            // identical to the per-layer browser, which is the bug this fixes.)
+            // The divider is gated only on the "Show my frames" toggle.
+            if (showUserToggle.getToggleState()) {
                 catRows.push_back(
                     { juce::String::fromUTF8("\xe2\x98\x85 My saved frames (")
                       + juce::String(userCount) + ")", "", /*isUser*/true });
@@ -9866,6 +9878,26 @@ private:
         waveList.deselectAllRows();
         waveList.updateContent();
         waveList.repaint();
+
+        // Empty-state hint. In frame scope an empty "My saved frames" view is
+        // expected before the user has saved any, so explain it rather than
+        // showing a blank pane; otherwise stay silent (search/category misses
+        // are self-evident).
+        if (visible.empty()) {
+            if (frameScope && userCat && userItems.empty() && q.isEmpty())
+                listEmptyHint.setText(
+                    "No saved frames yet.\n\nSave one with \"Save to Library\" on "
+                    "the editor's name row, or pick \"Start over with a single "
+                    "cycle\" below to build a frame from a factory shape.",
+                    juce::dontSendNotification);
+            else
+                listEmptyHint.setText("Nothing matches.", juce::dontSendNotification);
+            listEmptyHint.setVisible(true);
+            listEmptyHint.toFront(false);
+        } else {
+            listEmptyHint.setVisible(false);
+        }
+
         insertBtn.setEnabled(false);
         updateInsertLabel(-1);
         previewSamples.clear();
@@ -9933,6 +9965,7 @@ private:
     juce::ListBox catList, waveList;
     juce::TextButton insertBtn { "Insert" }, cancelBtn { "Cancel" };
     juce::Label statusLabel;
+    juce::Label listEmptyHint;
     CatModel catModel;
     std::vector<CatRow> catRows;
     std::vector<Item> visible;

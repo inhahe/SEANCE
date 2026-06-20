@@ -2458,8 +2458,11 @@ copy or live reference per **Sync**); picking a factory single cycle replaces th
 frame with a fresh single-layer copy ("start over"). The dialog title reads
 **"Replace frame from Library"**. The per-layer and **+ Waveform** flows keep the
 flat factory-first layout — there a single cycle genuinely *is* the unit being
-chosen. When you have no saved frames yet, the frame picker has nothing to lead
-with, so it shows the factory catalog directly (no divider).
+chosen. The **★ My saved frames** category and the **"Start over with a single
+cycle"** divider stay present even before you've saved any frames (the category
+shows **(0)** and an empty list explains how to save one) — they're structural,
+so the two ways to start a frame are always spelled out rather than appearing
+only once you happen to have saved something.
 
 ### Import / export between projects
 

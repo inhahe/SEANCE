@@ -200,8 +200,10 @@ gives you the choice via a **Sync to library** checkbox in the picker — leave 
 on for a live reference (edits flow both ways), turn it off for a one-time
 independent copy. The same Use Library… / Save to Library buttons and Sync option
 are available at three scopes — the whole frame, an individual layer, and the
-summation morph chain. **Duplicate** an asset to make one diverge (there's no
-detach — divergence is always duplicate + repoint). Archived assets are hidden from pickers
+summation morph chain — and each scope has an **Unlink** control that breaks a live
+link in place, keeping the current content as an independent copy that no longer
+propagates. **Duplicate** an asset instead when you want a *separate* library entry
+to diverge into. Archived assets are hidden from pickers
 but keep existing references valid; deleting an asset drops referencing nodes back
 to their own private copy. Assets live in the project file and participate in
 undo/redo. You can **export** a project's whole library to a standalone

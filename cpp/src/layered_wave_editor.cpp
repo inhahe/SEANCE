@@ -2637,6 +2637,12 @@ void LayerStackComponent::rebuildRows() {
                     if (i < 0 || i >= (int)target->layers.size()) return;
                     opts.onSaveToLibrary(i);
                 };
+            if (opts.onDesyncFromLibrary)
+                cb.onDesyncFromLibrary = [this, i]() {
+                    if (!target) return;
+                    if (i < 0 || i >= (int)target->layers.size()) return;
+                    opts.onDesyncFromLibrary(i);
+                };
             // Per-layer warp modulation: bind the stable row index `i` and forward
             // (i, opIndex) to the owner. Wired only when the owner supplied the
             // callbacks, so the "Mod" checkbox stays hidden otherwise.
@@ -5091,6 +5097,7 @@ namespace {
     constexpr int kShapeIdBase    = 1;     // shape id = enum + 1
     constexpr int kFromLibraryId  = 900;
     constexpr int kSaveToLibraryId= 901;
+    constexpr int kDesyncLibraryId= 902;
     constexpr int kPresetIdBase   = 1000;  // preset id = 1000 + index
 
     void addShapeItem(juce::PopupMenu& m, WaveLayer::Shape cur,
@@ -5122,6 +5129,14 @@ void WaveLayerEditor::showWaveSourceMenu() {
         m.addItem(kFromLibraryId, juce::String::fromUTF8("Use Library\xe2\x80\xa6"));
     if (callbacks.onSaveToLibrary)
         m.addItem(kSaveToLibraryId, juce::String::fromUTF8("Save to Library\xe2\x80\xa6"));
+    // Unlink from Library: detach this layer's live link to a saved waveform
+    // (WaveLayer::assetId = -1) while keeping the current cycle as an
+    // independent editable copy. Only meaningful while the layer references an
+    // asset, so it's shown disabled (with an explaining tooltip is N/A for menu
+    // items - we simply grey it) when the layer isn't currently linked.
+    if (callbacks.onDesyncFromLibrary)
+        m.addItem(kDesyncLibraryId, "Unlink from Library",
+                  /*enabled*/ layer->assetId >= 0, /*ticked*/false);
 
     // Presets: ready-made starting cycles the user can edit further. Split into
     // "Simple" (no extra controls - includes the five basic static shapes) and
@@ -5159,6 +5174,10 @@ void WaveLayerEditor::showWaveSourceMenu() {
             }
             if (result == kSaveToLibraryId) {
                 if (callbacks.onSaveToLibrary) callbacks.onSaveToLibrary();
+                return;
+            }
+            if (result == kDesyncLibraryId) {
+                if (callbacks.onDesyncFromLibrary) callbacks.onDesyncFromLibrary();
                 return;
             }
 
@@ -8936,6 +8955,11 @@ LayeredWaveEditorComponent::LayeredWaveEditorComponent(NodeGraph& g, int nid, st
         lsOpts.onSaveToLibrary = [this](int layerIndex) {
             publishLayerToLibrary(layerIndex);
         };
+        // "Unlink from Library" detaches this layer's live link (assetId = -1)
+        // while keeping the current cycle as an independent editable copy.
+        lsOpts.onDesyncFromLibrary = [this](int layerIndex) {
+            desyncLayerFromLibrary(layerIndex);
+        };
         // Per-layer warp modulation (#88, item-M): the per-layer "Mod" checkbox
         // creates/destroys a (warpLayer, warpSlot) param + pin so a cable can
         // drive that op's morph amount live. Gated to single-frame wavetables
@@ -9336,6 +9360,9 @@ LayeredWaveEditorComponent::LayeredWaveEditorComponent(NodeGraph& g, int nid, st
         "to it. Other nodes (and new wavetable frames / instruments) can then "
         "reference the same waveform, and edits propagate to all of them.");
     saveToLibBtn.onClick = [this]() { publishCurrentWaveformToLibrary(); };
+
+    addAndMakeVisible(desyncFromLibBtn);
+    desyncFromLibBtn.onClick = [this]() { desyncCurrentWaveformFromLibrary(); };
 
     updateHintText();
     rebuildScatterUI();
@@ -10018,6 +10045,19 @@ void LayeredWaveEditorComponent::publishLayerToLibrary(int layerIndex) {
             }
             delete aw;
         }), true);
+}
+
+void LayeredWaveEditorComponent::desyncLayerFromLibrary(int layerIndex) {
+    auto* lw = layerStack ? layerStack->getTarget() : nullptr;
+    if (!lw || layerIndex < 0 || layerIndex >= (int)lw->layers.size()) return;
+    WaveLayer& layer = lw->layers[(size_t)layerIndex];
+    if (layer.assetId < 0) return; // already independent - nothing to detach
+    // Detach the live link but keep the cycle exactly as it is: the layer
+    // becomes an independent editable copy that no longer propagates to/from
+    // the asset. The shape/points/etc. are untouched.
+    layer.assetId = -1;
+    layerStack->refreshFromModel();
+    onLayerChanged();
 }
 
 void LayeredWaveEditorComponent::showAddWaveformMenu(juce::Component* anchor) {
@@ -10859,6 +10899,7 @@ void LayeredWaveEditorComponent::refreshIdentityRow() {
     assetLibStatus.setVisible(have);
     useLibraryBtn.setVisible(have);
     saveToLibBtn.setVisible(have);
+    desyncFromLibBtn.setVisible(have);
     if (!have) { return; }
     refreshAssetLibRow();
 
@@ -10918,6 +10959,16 @@ void LayeredWaveEditorComponent::refreshAssetLibRow() {
             "to it. Other nodes (and new wavetable frames / instruments) can then "
             "reference the same waveform, and edits propagate to all of them.");
     }
+    // Unlink only does something while live-linked to a library waveform.
+    // Disabled-but-explained when already independent (grayed-control rule).
+    const bool linked = (cur >= 0);
+    desyncFromLibBtn.setEnabled(linked);
+    desyncFromLibBtn.setTooltip(linked
+        ? "Detach this slot's live link to the library waveform, keeping the "
+          "current frame as an independent editable copy. Edits stop propagating "
+          "to/from the shared waveform."
+        : "This waveform is already independent - there's no library link to "
+          "unlink. Use \"Use Library...\" to live-reference one.");
 }
 
 // Repoint the CURRENT library entry to a user Waveform asset (live reference):
@@ -10978,6 +11029,19 @@ void LayeredWaveEditorComponent::publishCurrentWaveformToLibrary() {
             }
             delete aw;
         }), true);
+}
+
+void LayeredWaveEditorComponent::desyncCurrentWaveformFromLibrary() {
+    const int libIdx = wave.findLibraryIndexById(currentLibraryId);
+    if (libIdx < 0 || libIdx >= (int)wave.library.size()) return;
+    auto& entry = wave.library[libIdx];
+    if (entry.assetId < 0) return; // already independent
+    // Keep the current frame exactly as-is; just stop referencing the asset so
+    // edits no longer propagate to/from the shared waveform.
+    entry.assetId = -1;
+    refreshAssetLibRow();
+    commitToNode();
+    commitUndoStep();
 }
 
 void LayeredWaveEditorComponent::writeBackReferencedWaveforms() {
@@ -12149,6 +12213,8 @@ void LayeredWaveEditorComponent::resized() {
         saveToLibBtn.setBounds(aRow.removeFromRight(110));
         aRow.removeFromRight(6);
         useLibraryBtn.setBounds(aRow.removeFromRight(96));
+        aRow.removeFromRight(6);
+        desyncFromLibBtn.setBounds(aRow.removeFromRight(64));
         aRow.removeFromRight(6);
         assetLibStatus.setBounds(aRow);
     }

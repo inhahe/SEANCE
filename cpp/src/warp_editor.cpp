@@ -44,9 +44,10 @@ public:
     std::function<void(int assetId, bool sync)> onPick;
 
     MorphLibraryBrowser(AssetLibrary& lib, int currentId) {
-        rows.push_back({ -1, "Independent (this frame's own)",
-                         "Edit only this frame's local morph - not shared.",
-                         false, false });
+        // No "Independent" row: this picker exists to LOAD a morph, so every
+        // selectable row must populate the chain. Detaching to an independent
+        // copy is done by the dedicated "Unlink from Library" button on the
+        // editor, not by a no-op pick here (which used to silently load nothing).
         auto all = lib.list(AssetKind::MorphAlgorithm);
         std::vector<const AssetEntry*> builtins, users;
         for (auto* e : all)
@@ -84,11 +85,15 @@ public:
         cancelBtn.onClick = [this] { close(); };
         addAndMakeVisible(cancelBtn);
 
-        // Pre-select the current reference (or Independent).
-        int sel = 0;
+        // Pre-select the current reference if it's in the list; otherwise the
+        // first selectable (non-header) row, so "Use" always loads something.
+        int sel = -1;
         for (int i = 0; i < (int)rows.size(); ++i)
             if (!rows[i].isHeader && rows[i].assetId == currentId) { sel = i; break; }
-        list.selectRow(sel);
+        if (sel < 0)
+            for (int i = 0; i < (int)rows.size(); ++i)
+                if (!rows[i].isHeader) { sel = i; break; }
+        if (sel >= 0) list.selectRow(sel);
         updateSyncEnabled();
 
         setSize(440, 380);
@@ -157,8 +162,7 @@ private:
             syncToggle.setTooltip(builtin
                 ? "Built-in presets are immutable templates - they always load as "
                   "an independent copy, so there is nothing to sync."
-                : "Pick a saved morph to enable live-linking. Independent has "
-                  "nothing to sync.");
+                : "Pick a saved morph to enable live-linking.");
         } else {
             syncToggle.setTooltip(
                 "Live-link this frame to the picked saved morph: editing the morph "
@@ -208,6 +212,7 @@ WarpChainEditor::WarpChainEditor(Callbacks callbacks) : cb(std::move(callbacks))
     addChildComponent(libraryLbl);
     addChildComponent(useLibBtn);
     addChildComponent(addToLibBtn);
+    addChildComponent(unlinkLibBtn);
     useLibBtn.setTooltip(
         "Load a ready-made morph from this project's library into the stack above. "
         "Built-in presets load a COPY you can freely tweak. A morph you Saved can "
@@ -217,6 +222,7 @@ WarpChainEditor::WarpChainEditor(Callbacks callbacks) : cb(std::move(callbacks))
     addToLibBtn.setTooltip("Save the current morph stack to this project's library as "
                            "a reusable preset, so you can load it on other frames from "
                            "\"Use Library...\". (That picker is the matching Load.)");
+    unlinkLibBtn.onClick = [this]() { detachFromLibrary(); };
     useLibBtn.onClick   = [this]() { showMorphLibraryBrowser(); };
     addToLibBtn.onClick = [this]() { openAddToLibraryDialog(); };
 }
@@ -227,6 +233,7 @@ void WarpChainEditor::setLibraryContext(LibraryContext ctx) {
     libraryLbl.setVisible(libraryRowVisible);
     useLibBtn.setVisible(libraryRowVisible);
     addToLibBtn.setVisible(libraryRowVisible);
+    unlinkLibBtn.setVisible(libraryRowVisible);
     if (libraryRowVisible) refreshLibraryRow();
     resized();
 }
@@ -260,6 +267,16 @@ void WarpChainEditor::refreshLibraryRow() {
           "morph algorithm, then reference it here."
         : "Add at least one warp stage before saving this as a shared morph "
           "algorithm.");
+    // Unlink only does something while live-linked to a saved morph (cur >= 0).
+    // Disabled-but-explained when already independent (grayed-control rule).
+    const bool linked = (cur >= 0);
+    unlinkLibBtn.setEnabled(linked);
+    unlinkLibBtn.setTooltip(linked
+        ? "Detach this frame's live link to the saved morph, keeping the current "
+          "stack as an independent editable copy. Edits stop propagating to/from "
+          "the library morph."
+        : "This frame's morph is already independent - there's no library link to "
+          "unlink. Use \"Use Library...\" and Sync to live-link it.");
 }
 
 void WarpChainEditor::onMorphPicked(int assetId, bool sync) {
@@ -298,6 +315,17 @@ void WarpChainEditor::onMorphPicked(int assetId, bool sync) {
     refreshLibraryRow();
     if (cb.onChanged) cb.onChanged();
     if (cb.onStructureChanged) cb.onStructureChanged();
+}
+
+void WarpChainEditor::detachFromLibrary() {
+    if (!libCtx.lib || !libCtx.setAssetId) return;
+    int cur = libCtx.getAssetId ? libCtx.getAssetId() : -1;
+    if (cur < 0) return; // already independent
+    // Keep the current chain exactly as-is; just stop referencing the asset.
+    // No structural change (op count is unchanged), so no onStructureChanged.
+    libCtx.setAssetId(-1);
+    refreshLibraryRow();
+    if (cb.onChanged) cb.onChanged();
 }
 
 void WarpChainEditor::showMorphLibraryBrowser() {
@@ -608,11 +636,13 @@ void WarpChainEditor::resized() {
 
     if (libraryRowVisible) {
         auto lib = a.removeFromTop(kRowH).reduced(0, 2);
-        // Two buttons on the right (Save | Use Library), status label fills the
-        // rest on the left. Mirrors the waveform asset-row "status + load/save".
+        // Three buttons on the right (Save | Use Library | Unlink), status label
+        // fills the rest on the left. Mirrors the waveform asset-row layout.
         addToLibBtn.setBounds(lib.removeFromRight(110));
         lib.removeFromRight(4);
         useLibBtn.setBounds(lib.removeFromRight(110));
+        lib.removeFromRight(4);
+        unlinkLibBtn.setBounds(lib.removeFromRight(64));
         lib.removeFromRight(8);
         libraryLbl.setBounds(lib);
     }

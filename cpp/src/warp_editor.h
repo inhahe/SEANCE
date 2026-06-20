@@ -145,6 +145,11 @@ private:
     // when `sync` is true (edits propagate) or copying it when `sync` is false.
     void showMorphLibraryBrowser();
     void onMorphPicked(int assetId, bool sync);
+    // "Unlink from Library": detach the live link to a saved morph (set the
+    // bound warpAssetId to -1) while keeping the current chain as an independent
+    // editable copy. No-op (and the button stays disabled) when already
+    // independent. Mirrors the per-layer / frame Unlink affordances.
+    void detachFromLibrary();
     void openAddToLibraryDialog();
     void addOp();
     void removeOp(int opIndex);
@@ -190,6 +195,7 @@ private:
     juce::Label      libraryLbl;
     juce::TextButton useLibBtn   { juce::String::fromUTF8("Use Library\xe2\x80\xa6") };
     juce::TextButton addToLibBtn { "Save to Library" };
+    juce::TextButton unlinkLibBtn{ "Unlink" };
 };
 
 } // namespace SoundShop

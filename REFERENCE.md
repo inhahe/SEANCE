@@ -640,6 +640,7 @@ Each layer has **exactly one wave source** — what generates its cycle — chos
   - **Formula** — math expression over one cycle, variable `x` in radians `[0, 2π)`, result clamped to `[-1, 1]`. A language dropdown (Built-in / Lua / Python / GLSL) appears next to the field. See [Formula authoring language](#formula-authoring-language-built-in--lua--python--glsl) and [Terrain Synth](#terrain-synth) for the grammar.
   - **Use Library…** — pull a shape from the project's waveform library into this layer (only when the host wired it; omitted in the LFO / Signal-Shape editor). Opens the waveform browser; a built-in single cycle loads as an independent **copy** (a live *factory reference* until you edit the cycle), and a **saved** waveform loads as a one-time copy *unless* you tick **Sync to library** in the picker, which **live-links** the layer to the asset (later edits to either propagate — the per-layer analogue of the frame-scope Use Library, backed by `WaveLayer::assetId`). The Sync checkbox is enabled only for saved entries (built-ins are immutable templates).
   - **Save to Library…** — publish this layer as a reusable single-layer **Waveform asset** and live-link the layer to it, so further edits propagate to every layer/frame that references it. The per-layer **Save** half of the Use/Save pair (mirrors the frame-scope and Summation-Morph Save buttons).
+  - **Unlink from Library** — detach this layer's live link to a saved waveform (`WaveLayer::assetId = -1`) while keeping the current cycle as an independent editable copy, so edits stop propagating to/from the asset. Shown **disabled** (greyed) while the layer isn't currently linked. The per-layer member of the three Unlink affordances (frame / layer / morph).
 - **Presets** — a submenu of ready-made starting cycles you can then edit further, split into two sections so you can see at a glance which ones carry extra knobs:
   - **Simple** — the five basic static shapes (**Sine, Saw, Square, Triangle, Noise** — moved here from the former top-level *Static shapes* section, since they're just the simplest ready-made cycles) followed by baked drawn/formula cycles with no extra controls beyond the standard harmonic/phase/amplitude (Half-sine, Ramp up/down, Soft saw, FM bell, Organ-ish, Pulse 25%/75%).
   - **With parameters** — the **wave-defining generators (Type 1)**, where the morph parameter **is** the wave (see [the two types](#one-mechanism-two-user-facing-types)): **Pulse (PWM)**, **Hard Sync**, **FM**, **Phase Distortion**. Picking one is mutually exclusive with a static shape (a generator *is* the shape source) and reveals its **named morph knob(s)**: *Duty* (Pulse), *Amount* (Sync / Phase Distortion), *Index* + *Ratio* (FM). Each of those extra knobs carries its own opt-in **Pin** checkbox (below) so it can be modulated live. The per-layer arbitrary-wave (Type-2) "+ Add" chain was removed (see the note under the knobs below); Type-2 reshaping lives only at the frame-scope [Summation Morph](#where-a-warp-chain-can-live).
@@ -937,11 +938,12 @@ Every op defaults to **baked** (no pin, no live cost). Ticking a row's **Pin** b
 
 ### Built-in & saved morphs (the Library row)
 
-The frame-scope Summation Morph editor shows a **Library row** (the per-layer and element editors don't): a status label (showing *Independent* or the live-linked morph's name) plus a **Use Library…** / **Save to Library** button pair — the same Load/Save layout the frame and per-layer waveform rows use (it replaced the old inline combo so the picker can host a *Sync to library* choice). **Use Library…** opens a modal **morph picker** (`MorphLibraryBrowser`); **Save to Library** publishes the current stack; "+ Add" instead builds a stack one stage at a time. The picker **sources every chain from the one project asset library** — the curated built-ins are *seeded* into that library, not listed from a separate code path — and partitions it under section headings:
+The frame-scope Summation Morph editor shows a **Library row** (the per-layer and element editors don't): a status label (showing *Independent* or the live-linked morph's name) plus an **Unlink** / **Use Library…** / **Save to Library** button trio — the same Load/Save layout the frame and per-layer waveform rows use, with an added Unlink (it replaced the old inline combo so the picker can host a *Sync to library* choice). **Use Library…** opens a modal **morph picker** (`MorphLibraryBrowser`); **Save to Library** publishes the current stack; **Unlink** detaches a live link while keeping the chain (see below); "+ Add" instead builds a stack one stage at a time. The picker **sources every chain from the one project asset library** — the curated built-ins are *seeded* into that library, not listed from a separate code path — and partitions it under section headings. Every row in the picker **loads** a chain — there is deliberately **no** no-op "Independent" row (an earlier version had one; selecting it loaded nothing, which looked like a broken picker). To go back to an independent, unlinked chain you use the **Unlink** button on the Library row, not a picker entry. The sections are:
 
-- **(Independent — this frame's own morph)** — the frame edits its own local chain (the default).
 - **Built-in** — the curated Type-2 chains, **seeded into the project's [asset library](#asset-library-project-stores) as Morph Algorithm entries** (`seedBuiltinMorphLibrary` in `warp.h`, from `builtinMorphChains()`): *Warm Saturation, West Coast Fold, Lo-Fi Crush, Tape Glue, Pulse Width, Soft Bend, Formant Sync, Rectify Octave*. They appear in both this picker and the **Asset Library panel** (flagged ★ starred). They remain **templates, not live references** — picking one **copies** its ops into the chain and detaches to *(Independent)*, exactly as picking a factory waveform copies it into a layer (so an edit can never silently mutate a shared built-in). **Code-owned and not serialized:** their ids sit in a reserved range (`kBuiltinMorphIdBase = 200000`, below the user id base `1000000`, so `isBuiltinMorphAssetId` tells the two apart) and are **skipped by project-file save/export**; they are **re-seeded idempotently on every new project and every project load**, which keeps them improvable across app versions, keeps project files free of boilerplate, and makes them effectively undeletable (a deletion is undone by the next re-seed) — matching the asset library's *disjoint id space* + *divergence = duplicate* design.
-- **Saved** — user-published [Morph Algorithm assets](#asset-library-project-stores) (ids ≥ `1000000`). Picking one applies its ops to the chain; tick **Sync to library** in the picker to **live-link** it (editing the chain then updates every frame that points at it) or leave it off to load a one-time independent copy. The Sync checkbox is enabled only for Saved entries (Independent has nothing to sync; built-ins are immutable templates that always copy). **Save to Library** publishes the current chain as a new Morph Algorithm asset.
+- **Saved** — user-published [Morph Algorithm assets](#asset-library-project-stores) (ids ≥ `1000000`). Picking one applies its ops to the chain; tick **Sync to library** in the picker to **live-link** it (editing the chain then updates every frame that points at it) or leave it off to load a one-time independent copy. The Sync checkbox is enabled only for Saved entries (built-ins are immutable templates that always copy). **Save to Library** publishes the current chain as a new Morph Algorithm asset.
+
+**Unlink** (the Library-row button) detaches the frame's live link to a Saved morph (`warpAssetId = -1`) while keeping the current chain exactly as-is — an independent editable copy whose edits no longer propagate to/from the asset. It's **disabled** (greyed, with an explaining tooltip) while the frame's morph is already independent. This is the morph member of the three **Unlink from Library** affordances (frame waveform / per-layer / morph), all of which set their respective `assetId` to `-1` and freeze the current content.
 
 ### Per-sample primitives vs the buffer helper
 
@@ -2364,20 +2366,27 @@ closes, iff anything changed (not one step per drag tick). Implemented as
   `ahdsrAssetId`.
 - **Waveforms** — the Layered-Waveform editor shows a reference row beneath the
   per-waveform gain: a read-only status (**Library: → name**, or **Independent
-  waveform**), a **Use Library…** button, and a **Save to Library** button.
+  waveform**), an **Unlink** button, a **Use Library…** button, and a **Save to
+  Library** button.
   **Save to Library** publishes the current waveform as a new asset and links this
   slot to it (disabled once linked — diverge via Duplicate instead). **Use
   Library…** opens the unified [waveform-library browser](#picking-a-waveform-the-unified-browser)
-  to repoint this slot. The reference lives on the wavetable library entry
+  to repoint this slot. **Unlink** detaches the slot's live link (sets
+  `assetId = -1`) while keeping the current frame as an independent editable copy,
+  so edits stop propagating to/from the shared waveform; it's **disabled** (greyed,
+  with an explaining tooltip) while the slot is already independent. The reference
+  lives on the wavetable library entry
   (`WaveformLibraryEntry.assetId`) — a node's wavetable can hold many waveforms,
   so each slot references independently. Adopting an asset keeps the slot's own
   **gain** (a placement-level property, not part of the shared shape).
 - **Waveforms (per layer)** — each **layer** inside a Layered-Waveform frame can
   *also* live-link to a Waveform asset, via **Use Library…** / **Save to Library…**
-  in the layer's [wave-source picker](#wave-source-per-layer). **Use
+  / **Unlink from Library** in the layer's [wave-source picker](#wave-source-per-layer). **Use
   Library…** opens the same browser; ticking **Sync to library** adopts the asset
   as a live reference (else it loads a copy), and **Save to Library…** publishes
-  the layer as a single-layer Waveform asset and links it. The reference lives on
+  the layer as a single-layer Waveform asset and links it. **Unlink from Library**
+  detaches the layer's link (`assetId = -1`) keeping the current cycle as an
+  independent copy (greyed in the menu while the layer is unlinked). The reference lives on
   `WaveLayer::assetId`; the shared unit is the layer's **shape** (its **amp** is a
   per-slot property preserved across resolves, like a frame slot's gain).
   `resolvePerLayerWaveformReferences` pulls each referenced asset into its layer on
@@ -2386,13 +2395,18 @@ closes, iff anything changed (not one step per drag tick). Implemented as
   summed cycle (so multi-layer assets are best used by *copy* at the layer scope).
 - **Morph algorithms (warp chains)** — the wavetable editor's frame-scope
   [Summation Morph](#built-in--saved-morphs-the-library-row) panel (`WarpChainEditor`)
-  shows a **Library row** (a status label + **Use Library…** / **Save to Library** buttons). Its picker lists three sections: **(Independent)** (edit
-  the frame's own chain), **Built-in** (curated code-defined Type-2 chains —
-  `builtinMorphChains()` — that **copy in** as a template and detach to
-  Independent, *not* live references), and **Saved** (user-published Morph
+  shows a **Library row** (a status label + **Unlink** / **Use Library…** /
+  **Save to Library** buttons). Its picker lists two sections (every row **loads** a
+  chain — there is intentionally no no-op "Independent" row; detaching is done with
+  the dedicated **Unlink** button instead): **Built-in** (curated code-defined
+  Type-2 chains — `builtinMorphChains()` — that **copy in** as a template and detach
+  to Independent, *not* live references), and **Saved** (user-published Morph
   Algorithm assets — live-linked only when **Sync to library** is ticked in the
   picker, else copied in). **Save to Library** publishes the current
-  chain as a new asset (disabled until the chain has at least one stage). While a
+  chain as a new asset (disabled until the chain has at least one stage).
+  **Unlink** detaches the frame's live link (`warpAssetId = -1`) while keeping the
+  current chain as an independent editable copy; it's **disabled** (greyed, with an
+  explaining tooltip) while the frame's morph is already independent. While a
   *Saved* asset is referenced, editing the chain here writes back to the asset and
   re-resolves, so every frame using the same algorithm re-shapes together. Adopting
   a referenced chain reconciles the node's modulation params to the new stage count
@@ -2424,7 +2438,10 @@ selected — built-ins are immutable templates that always copy). With Sync on, 
 edits propagate everywhere it's used. The same browser + Sync checkbox drives all
 three waveform entry points (the **+ Waveform** add flow, the frame-scope **Use
 Library…**, and the per-layer **Use Library…**); per-layer picks set
-`WaveLayer::assetId` instead of the frame slot's `assetId`.
+`WaveLayer::assetId` instead of the frame slot's `assetId`. To later break a live
+reference without changing the current content, use the **Unlink** button (frame
+row) or **Unlink from Library** menu item (per-layer picker) — see the per-scope
+bullets above.
 
 ### Import / export between projects
 

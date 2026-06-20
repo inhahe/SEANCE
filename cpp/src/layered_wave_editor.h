@@ -226,6 +226,13 @@ public:
         // asset (a single-layer LayeredWaveform) and live-links the layer to it.
         // If null, the "Save to Library..." menu entry is omitted.
         std::function<void()> onSaveToLibrary;
+        // Optional. Fired when the user picks "Unlink from Library" in the wave-
+        // source picker. The owner detaches THIS layer's live link (sets
+        // WaveLayer::assetId = -1) while KEEPING the current cycle content, so the
+        // layer becomes an independent editable copy that no longer propagates to
+        // or from the asset. Only meaningful (and only shown enabled) when the
+        // layer currently references an asset. If null, the entry is omitted.
+        std::function<void()> onDesyncFromLibrary;
 
         // Optional. Per-layer warp modulation (#88, item-M). The embedded
         // per-layer warp editor's "Mod" checkbox routes through these so the
@@ -509,6 +516,12 @@ public:
         // the owner publishes target->layers[index] as a Waveform asset and
         // live-links the layer to it. Null = no save entry on the picker.
         std::function<void(int layerIndex)> onSaveToLibrary;
+        // Optional. When set, each layer row's wave-source picker offers an
+        // "Unlink from Library" entry (enabled only while that layer references
+        // an asset). The arg is the row's (stable) layer index; the owner clears
+        // target->layers[index].assetId, keeping the current cycle as an
+        // independent copy. Null = no unlink entry on the picker.
+        std::function<void(int layerIndex)> onDesyncFromLibrary;
 
         // Optional. Per-layer warp modulation (#88, item-M). The per-layer warp
         // editor's "Mod" checkbox routes (layerIndex, opIndex) to the owner, which
@@ -1203,6 +1216,12 @@ private:
     // onSaveToLibrary.
     void publishLayerToLibrary(int layerIndex);
 
+    // Per-layer "Unlink from Library" handler: clears layer `layerIndex`'s
+    // assetId (detaching the live link) while keeping the current cycle as an
+    // independent editable copy. Wired into LayerStackComponent::Options::
+    // onDesyncFromLibrary.
+    void desyncLayerFromLibrary(int layerIndex);
+
     // Build a one-layer LayeredWaveform whose single Drawn/Freehand layer holds
     // `cycle` (expected 512 samples in [-1,1], one cycle). This is the import
     // path for both a factory-bank entry and a user-loaded single-cycle wav: the
@@ -1286,6 +1305,7 @@ private:
     juce::Label      assetLibStatus;
     juce::TextButton useLibraryBtn  { juce::String::fromUTF8("Use Library\xe2\x80\xa6") };
     juce::TextButton saveToLibBtn   { "Save to Library" };
+    juce::TextButton desyncFromLibBtn { "Unlink" };
     // Refresh the status label + button enablement from the current entry's
     // assetId (shows the referenced asset name, or "Independent waveform").
     void refreshAssetLibRow();
@@ -1295,6 +1315,10 @@ private:
     void adoptWaveformAsset(int assetId);
     // Publish the current entry's frame as a new Waveform asset and link it.
     void publishCurrentWaveformToLibrary();
+    // Detach the current entry's live link to a Waveform asset (set assetId = -1)
+    // while keeping the current frame as an independent editable copy. Used by
+    // the identity-row "Unlink" button; no-op when already independent.
+    void desyncCurrentWaveformFromLibrary();
     // After committing this node, push every asset-referencing entry's frame
     // up to its asset and propagate to other nodes (live write-back). Called
     // from commitToNode(). No-op when no entry references an asset.

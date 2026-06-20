@@ -3634,6 +3634,108 @@ void testAssetLibrary(Report& r) {
                 "assets: erased asset -> referencing layer falls back to independent");
     }
 
+    // ---- Desync / Unlink: detaching (assetId = -1) keeps the current content --
+    // ---- and stops propagation FROM the still-existing asset. This is the -----
+    // ---- data-model contract behind the three "Unlink from Library" buttons. --
+    {
+        NodeGraph g;
+        int nId = g.addNode("wt", NodeType::TerrainSynth, {}, {}).id;
+
+        auto makeLayered = [](int ratio) {
+            auto lw = std::make_unique<LayeredWaveform>();
+            WaveLayer ly; ly.shape = WaveLayer::Saw; ly.ratio = ratio; ly.amp = 1.0f;
+            lw->layers.push_back(ly);
+            return lw;
+        };
+
+        // Frame-scope: an entry live-linked to a Waveform asset, then unlinked.
+        std::string subType, payload;
+        { auto f = makeLayered(7); waveformAssetFromFrame(f.get(), subType, payload); }
+        int wAsset = g.assets.add(AssetKind::Waveform, "shared", subType, payload);
+        WavetableDoc doc;
+        int eid = doc.addLibraryEntry(makeLayered(7), "linked");
+        doc.library[doc.findLibraryIndexById(eid)].assetId = wAsset;
+        g.findNode(nId)->script = doc.encode();
+        resolveWaveformReferences(g);
+
+        // Simulate the Unlink button: clear assetId, keep the frame as-is.
+        WavetableDoc d1; d1.decode(g.findNode(nId)->script);
+        d1.library[0].assetId = -1;
+        g.findNode(nId)->script = d1.encode();
+
+        // Now change the asset and re-resolve. The detached entry must NOT update.
+        std::string sub2, pay2;
+        { auto f2 = makeLayered(3); waveformAssetFromFrame(f2.get(), sub2, pay2); }
+        g.assets.update(wAsset, sub2, pay2);
+        resolveWaveformReferences(g);
+        WavetableDoc d2; d2.decode(g.findNode(nId)->script);
+        r.check(d2.library.size() == 1 && d2.library[0].assetId == -1 &&
+                    d2.library[0].wave &&
+                    d2.library[0].wave->encodeBody() == payload,
+                "assets: frame Unlink detaches and stops propagation from the asset");
+
+        // Per-layer scope: same contract on a single WaveLayer.
+        std::string lsub, lpay;
+        { WaveLayer ly; ly.shape = WaveLayer::Saw; ly.ratio = 7; ly.amp = 1.0f;
+          layerToWaveformAsset(ly, lsub, lpay); }
+        int lAsset = g.assets.add(AssetKind::Waveform, "shared layer", lsub, lpay);
+        auto lw = std::make_unique<LayeredWaveform>();
+        { WaveLayer ref; ref.shape = WaveLayer::Saw; ref.ratio = 7; ref.amp = 0.5f;
+          ref.assetId = lAsset; lw->layers.push_back(ref); }
+        WavetableDoc ldoc; ldoc.addLibraryEntry(std::move(lw), "stack");
+        int lnId = g.addNode("wt2", NodeType::TerrainSynth, {}, {}).id;
+        g.findNode(lnId)->script = ldoc.encode();
+        resolvePerLayerWaveformReferences(g);
+
+        // Unlink the layer, then mutate the asset + re-resolve.
+        WavetableDoc l1; l1.decode(g.findNode(lnId)->script);
+        auto* l1lw = dynamic_cast<LayeredWaveform*>(l1.library[0].wave.get());
+        l1lw->layers[0].assetId = -1;
+        g.findNode(lnId)->script = l1.encode();
+        std::string lsub2, lpay2;
+        { WaveLayer ly; ly.shape = WaveLayer::Saw; ly.ratio = 2; ly.amp = 1.0f;
+          layerToWaveformAsset(ly, lsub2, lpay2); }
+        g.assets.update(lAsset, lsub2, lpay2);
+        resolvePerLayerWaveformReferences(g);
+        WavetableDoc l2; l2.decode(g.findNode(lnId)->script);
+        auto* l2lw = dynamic_cast<LayeredWaveform*>(l2.library[0].wave.get());
+        r.check(l2lw && l2lw->layers.size() == 1 && l2lw->layers[0].assetId == -1 &&
+                    l2lw->layers[0].ratio == 7,
+                "assets: layer Unlink detaches and stops propagation from the asset");
+
+        // Morph scope: detaching warpAssetId keeps the cached chain frozen.
+        auto makeChain = [](std::vector<WarpMethod> methods) {
+            std::vector<WarpOp> c;
+            for (WarpMethod m : methods) {
+                WarpOp op; op.method = m; op.amount = 0.5f; op.enabled = true;
+                c.push_back(op);
+            }
+            return c;
+        };
+        const std::string mPayload = encodeWarpChain(
+            makeChain({ WarpMethod::SoftClip, WarpMethod::HardClip }));
+        int mAsset = g.assets.add(AssetKind::MorphAlgorithm, "shared morph",
+                                  "", mPayload);
+        WavetableDoc mdoc;
+        mdoc.addLibraryEntry(std::make_unique<LayeredWaveform>(), "w");
+        mdoc.warpChain = makeChain({ WarpMethod::SoftClip, WarpMethod::HardClip });
+        mdoc.warpAssetId = mAsset;
+        int mnId = g.addNode("wt3", NodeType::TerrainSynth, {}, {}).id;
+        g.findNode(mnId)->script = mdoc.encode();
+        resolveWarpReferences(g);
+
+        // Unlink: clear warpAssetId, keep the chain.
+        WavetableDoc m1; m1.decode(g.findNode(mnId)->script);
+        m1.warpAssetId = -1;
+        g.findNode(mnId)->script = m1.encode();
+        g.assets.update(mAsset, "", encodeWarpChain(makeChain({ WarpMethod::Wavefold })));
+        resolveWarpReferences(g);
+        WavetableDoc m2; m2.decode(g.findNode(mnId)->script);
+        r.check(m2.warpAssetId == -1 && m2.warpChain.size() == 2 &&
+                    encodeWarpChain(m2.warpChain) == mPayload,
+                "assets: morph Unlink detaches and stops propagation from the asset");
+    }
+
     // ---- MorphAlgorithm (frame-scope warp chain) live reference -------------
     {
         NodeGraph g;

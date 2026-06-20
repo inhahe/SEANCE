@@ -1743,6 +1743,123 @@ void testRender(Report& r, const juce::File& dir) {
 }
 
 // ===========================================================================
+// Direct single-cycle audition (the layered-frame editor's Play button)
+// ===========================================================================
+//
+// The Play button ships the edited frame's rendered single cycle as a
+// Node::AuditionCycleFrame on node.heldAudition; the synth voice must read
+// ONLY that cycle (as a wavetable oscillator), replacing the cycle terrain
+// entirely - so the audition is faithful even for an unplaced frame. We drive
+// a real TerrainSynthProcessor with no MIDI, only a held audition, and assert:
+//   - a non-trivial cycle produces finite, bounded, non-silent output, and
+//   - an all-zero cycle produces silence (proving the override replaces the
+//     terrain rather than leaking it), and
+//   - clearing heldAudition releases the note (output decays to silence).
+void testFrameAudition(Report& r, const juce::File& dir) {
+    r.section("Frame audition (layered-editor Play: direct single-cycle override)");
+
+    auto wav = dir.getChildFile("test_audio_1d.wav");   // written in layer 1
+    if (!wav.existsAsFile()) {
+        r.note("test_audio_1d.wav missing (layer 1 did not run) - skipping.");
+        return;
+    }
+    const std::string script =
+        "__audio__:" + wav.getFullPathName().toStdString();
+
+    Transport transport;
+    transport.sampleRate = 44100.0;
+    transport.bpm = 120.0;
+
+    auto makeNode = [&]() {
+        Node node;
+        node.id = 1;
+        node.type = NodeType::TerrainSynth;
+        node.name = "selftest-audition";
+        node.script = script;
+        node.pinsIn.push_back(Pin{ 1, "MIDI", PinKind::Midi, true, 2 });
+        node.pinsIn.push_back(Pin{ 2, "Sig X", PinKind::Signal, true, 1 });
+        node.pinsOut.push_back(Pin{ 100, "Audio", PinKind::Audio, false, 2 });
+        node.params.push_back({ "Volume", 1.0f, 0.0f, 1.0f });
+        node.params.push_back({ "Synth Mode", 0.0f, 0.0f, 2.0f }); // Direct
+        node.ahdsrEnvelope.attackMs = 1.0f;
+        node.ahdsrEnvelope.holdMs = 4000.0f;
+        node.ahdsrEnvelope.decayMs = 1.0f;
+        node.ahdsrEnvelope.sustain = 1.0f;
+        node.ahdsrEnvelope.releaseMs = 1.0f;
+        node.ahdsrEnvelope.velocitySensitivity = 0.0f;
+        AHDSREnvelope::setDefaultCurves(node.ahdsrEnvelope);
+        return node;
+    };
+
+    // Render `blocks` blocks of 512 frames through the processor, holding the
+    // supplied audition the whole time (or clearing it mid-way if clearAt >= 0).
+    auto runHeld = [&](std::shared_ptr<Node::AuditionCycleFrame> cyc,
+                       int blocks, int clearAt) {
+        Node node = makeNode();
+        TerrainSynthProcessor proc(node, transport);
+        proc.prepareToPlay(44100.0, 512);
+
+        auto ev = std::make_shared<Node::AuditionEvent>();
+        ev->isNoteOn = true;
+        ev->pitch = 69;
+        ev->velocity = 127;
+        ev->cycleFrame = cyc;
+        node.heldAudition = ev;
+
+        std::vector<float> out;
+        juce::AudioBuffer<float> buf(3, 512); // 2 audio + 1 sig
+        for (int b = 0; b < blocks; ++b) {
+            if (clearAt >= 0 && b == clearAt) node.heldAudition.reset();
+            buf.setSize(3, 512, false, false, true);
+            buf.clear();
+            juce::MidiBuffer midi;
+            proc.processBlock(buf, midi);
+            const float* p = buf.getReadPointer(0);
+            for (int s = 0; s < 512; ++s) out.push_back(p[s]);
+        }
+        return out;
+    };
+
+    // A non-trivial single cycle (one period of a sine, 256 samples).
+    auto sineCyc = std::make_shared<Node::AuditionCycleFrame>();
+    sineCyc->cycle.resize(256);
+    for (int i = 0; i < 256; ++i)
+        sineCyc->cycle[(size_t)i] = std::sin(2.0 * 3.14159265358979 * i / 256.0);
+
+    {
+        auto out = runHeld(sineCyc, 8, -1);
+        r.check(allFinite(out), "audition: output is finite (no NaN/Inf)");
+        r.checkVal(peakAbs(out) <= 1.001f, "audition: output bounded |x|<=1",
+                   peakAbs(out));
+        r.checkVal(rmsOf(out) > 1e-3, "audition: non-trivial cycle is audible",
+                   rmsOf(out));
+    }
+
+    {
+        // All-zero cycle: the override replaces the terrain with silence, so the
+        // output must be silent - this is what proves the audition cycle (not
+        // the underlying terrain) drives the voice.
+        auto zeroCyc = std::make_shared<Node::AuditionCycleFrame>();
+        zeroCyc->cycle.assign(256, 0.0f);
+        auto out = runHeld(zeroCyc, 8, -1);
+        r.checkVal(rmsOf(out) < 1e-5,
+                   "audition: zero cycle is silent (override replaces terrain)",
+                   rmsOf(out));
+    }
+
+    {
+        // Clearing heldAudition mid-render releases the note; with a 1ms release
+        // the tail must fall to silence well before the end.
+        auto out = runHeld(sineCyc, 16, /*clearAt*/4);
+        const int n = (int)out.size();
+        std::vector<float> tail(out.begin() + (size_t)(n - 512), out.end());
+        r.checkVal(rmsOf(tail) < 1e-4,
+                   "audition: clearing heldAudition releases the voice",
+                   rmsOf(tail));
+    }
+}
+
+// ===========================================================================
 // LAYER 3 - ffmpeg round-trip (optional)
 // ===========================================================================
 void testVideoDecode(Report& r, const juce::File& dir) {
@@ -4760,6 +4877,7 @@ int runSelfTest(const juce::File& outDir) {
 
     testTerrainData(r, outDir);
     testRender(r, outDir);
+    testFrameAudition(r, outDir);
     testWarp(r);
     testVideoDecode(r, outDir);
     testGlslCompute(r, outDir);

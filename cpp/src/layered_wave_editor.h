@@ -1241,6 +1241,14 @@ private:
     juce::TextButton applyBtn    { "Apply" };
     juce::TextButton closeBtn    { "Close" };
     juce::TextButton helpBtn     { "?" };
+    // Play/Stop: audition the currently-edited frame through the owning synth's
+    // voice path (envelope + Volume + downstream chain), exactly like the
+    // granular ("from audio file") and inharmonic frame editors. Ships the
+    // frame's rendered single cycle as a direct audition payload so it's
+    // audible even when it isn't placed into the wavetable grid, and refreshes
+    // live as the frame is edited (so you hear changes while a note sustains).
+    juce::TextButton playBtn     { "Play" };
+    bool framePlaying = false;
     // Opens the shared AHDSR amplitude-envelope editor for this synth's
     // node in a separate dialog (kept out of this already-dense editor).
     juce::TextButton envelopeBtn { "Envelope..." };
@@ -1518,6 +1526,20 @@ private:
     void updateFrameEditorEmbed();
     void rebuildScatterUI();        // re-evaluates rotation slider count when dim count changes
     void refreshPreview();
+    // ---- Frame audition (Play button) --------------------------------------
+    // toggleFramePlay flips between start/stop. startFramePlay holds a
+    // level-triggered audition on the owning synth node (Node::heldAudition)
+    // carrying the current frame's rendered single cycle, so the synth voice
+    // sustains it across the debounced graph rebuild an edit fires. stop clears
+    // the held note. refreshHeldFrameAudition re-ships the cycle when the frame
+    // is edited mid-play (or the editor target changes) so the sustained note
+    // tracks the edit - "what you see = what you hear". All three look the node
+    // up fresh via graph.findNode(nodeId) so a graph.nodes reallocation can
+    // never leave a stale Node*.
+    void toggleFramePlay();
+    void startFramePlay();
+    void stopFramePlay();
+    void refreshHeldFrameAudition();
     void commitToNode(); // encode `wave` into node.script
     // Push a graph undo snapshot so a settled wavetable edit enters the undo
     // system. Without this the edit lives only in the node's script (updated

@@ -521,6 +521,21 @@ struct Node {
         std::vector<WarpOp> warpAmpOps;        // amplitude-domain element warp
     };
 
+    // Direct single-cycle payload carried by an audition note-on so the synth
+    // can render a SPECIFIC wavetable cycle that isn't placed into the grid/
+    // scatter. This is the generic, frame-type-agnostic audition path used by
+    // the layered-waveform editor's Play button (and, eventually, every frame
+    // editor): any IWavetableFrame::render(tableSize, out) produces one final
+    // single cycle with the frame's gain and internal warps already baked in,
+    // so the voice just reads it as a wavetable oscillator (linear-interpolated
+    // at the played pitch), bypassing the cycle terrain / granular / inharmonic
+    // layers entirely. That makes the edited frame audible immediately and
+    // faithfully - "what the editor previews = what you hear" - even before
+    // it's dropped into a cell. Empty cycle = nothing to audition.
+    struct AuditionCycleFrame {
+        std::vector<float> cycle;  // final single cycle, gain + warps baked in
+    };
+
     // Audition MIDI events injected from the UI (thread-safe via simple flag)
     struct AuditionEvent {
         bool isNoteOn;
@@ -543,6 +558,11 @@ struct Node {
         // role as granularFrame but for an unplaced inharmonic stack; the voice
         // plays its oscillator bank exclusively. Null otherwise.
         std::shared_ptr<AuditionInharmonicFrame> inharmonicFrame;
+        // Optional direct single cycle to render for this note-on. Same role as
+        // granularFrame / inharmonicFrame but for an unplaced wavetable cycle
+        // (layered / spectral / wavelet / sample frames); the voice reads this
+        // cycle exclusively as a wavetable oscillator. Null otherwise.
+        std::shared_ptr<AuditionCycleFrame> cycleFrame;
     };
     std::vector<AuditionEvent> pendingAudition; // written by UI, read by audio thread
 

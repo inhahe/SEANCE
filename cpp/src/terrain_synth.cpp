@@ -2125,6 +2125,8 @@ int TerrainSynthProcessor::startVoice(int noteNumber, int channel, int velocity)
     v.inhStreams.clear();
     v.auditionInhFrame.reset();
     v.auditionInhFrameStream = Voice::InhStream{};
+    // Clear any unplaced single-cycle audition override (layered-frame Play).
+    v.auditionCycleFrame.reset();
     return vi;
 }
 
@@ -2182,6 +2184,13 @@ void TerrainSynthProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mi
                 && !ev.inharmonicFrame->partials.empty()) {
                 voices[vi].auditionInhFrame       = ev.inharmonicFrame;
                 voices[vi].auditionInhFrameStream = Voice::InhStream{};
+            }
+            // Direct unplaced single-cycle audition (layered-frame Play, and
+            // eventually every frame editor). The voice reads this cycle as a
+            // wavetable oscillator via the existing v.phase accumulator, so no
+            // extra per-voice stream state is needed.
+            if (vi >= 0 && ev.cycleFrame && !ev.cycleFrame->cycle.empty()) {
+                voices[vi].auditionCycleFrame = ev.cycleFrame;
             }
         };
 
@@ -2593,7 +2602,8 @@ void TerrainSynthProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mi
     bool anyAuditionVoice = false;
     if (divertAudition) {
         for (auto& v : voices)
-            if (v.env.isActive() && (v.auditionFrame || v.auditionInhFrame)) {
+            if (v.env.isActive()
+                && (v.auditionFrame || v.auditionInhFrame || v.auditionCycleFrame)) {
                 anyAuditionVoice = true; break;
             }
         if (anyAuditionVoice) {
@@ -2999,7 +3009,25 @@ void TerrainSynthProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mi
                     return outv;
                 };
 
-                if (v.auditionFrame && v.auditionFrame->source
+                if (v.auditionCycleFrame && !v.auditionCycleFrame->cycle.empty()) {
+                    // Unplaced single-cycle audition (layered-frame editor Play,
+                    // and eventually every frame editor). Read ONLY this cycle as
+                    // a wavetable oscillator, replacing the cycle terrain so the
+                    // user hears exactly the edited frame regardless of what's
+                    // placed in the table or where the Position knob sits. The
+                    // cycle already has the frame's gain + internal warps baked in
+                    // (IWavetableFrame::render), so it's read straight - matching
+                    // the editor's on-screen single-cycle preview byte-for-byte.
+                    const auto& cyc = v.auditionCycleFrame->cycle;
+                    const int N = (int)cyc.size();
+                    float ph = v.phase - std::floor(v.phase);  // [0,1)
+                    float fpos = ph * (float)N;
+                    int i0 = (int)fpos;
+                    if (i0 >= N) i0 = N - 1;
+                    const int i1 = (i0 + 1) % N;
+                    const float frac = fpos - (float)i0;
+                    sample = cyc[(size_t)i0] + (cyc[(size_t)i1] - cyc[(size_t)i0]) * frac;
+                } else if (v.auditionFrame && v.auditionFrame->source
                     && !v.auditionFrame->source->empty()) {
                     // Unplaced-frame audition (wavetable editor Play on a
                     // library-only granular frame). Render ONLY this frame,
@@ -3087,7 +3115,8 @@ void TerrainSynthProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mi
                 // audition frame (granular or inharmonic) owns the voice - those
                 // branches above already set `sample` to play only themselves.
                 if (!wtInharmonicFrames.empty() && isWavetable
-                    && !v.auditionFrame && !v.auditionInhFrame) {
+                    && !v.auditionFrame && !v.auditionInhFrame
+                    && !v.auditionCycleFrame) {
                     // Lazy-allocate the per-voice oscillator-bank state on first
                     // use (cleared at note-on so phases restart cleanly).
                     if ((int)v.inhStreams.size() != (int)wtInharmonicFrames.size())
@@ -3188,7 +3217,8 @@ void TerrainSynthProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mi
             // Divert this voice's contribution to the audition-monitor bus
             // when it's an unrouted-node audition voice (see collectAudition).
             // Otherwise it joins the normal mix bound for the graph output.
-            if (collectAudition && (v.auditionFrame || v.auditionInhFrame)) {
+            if (collectAudition
+                && (v.auditionFrame || v.auditionInhFrame || v.auditionCycleFrame)) {
                 auditionSample += contrib;
                 auditionVoiceCount++;
             } else {

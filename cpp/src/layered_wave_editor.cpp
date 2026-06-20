@@ -9206,6 +9206,18 @@ LayeredWaveEditorComponent::LayeredWaveEditorComponent(NodeGraph& g, int nid, st
         launchAhdsrEnvelopeDialog(this, graph, nodeId);
     };
 
+    // Play/Stop: audition the frame currently being edited through the synth's
+    // own voice path (envelope, Volume, downstream effects), the same way the
+    // granular / inharmonic embedded editors do. The note sustains until Stop.
+    addAndMakeVisible(playBtn);
+    playBtn.setTooltip(
+        "Audition the waveform you're editing: it plays a sustained note "
+        "through this synth (with its envelope and volume) so you can hear the "
+        "frame on its own, even before it's placed in the wavetable. Edits you "
+        "make while it's playing are heard live. Click again to stop.");
+    playBtn.setColour(juce::TextButton::buttonColourId, juce::Colour(60, 110, 70));
+    playBtn.onClick = [this]() { toggleFramePlay(); };
+
     addAndMakeVisible(closeBtn);
     closeBtn.setButtonText("Close");
     closeBtn.onClick = [this]() {
@@ -9323,6 +9335,7 @@ LayeredWaveEditorComponent::LayeredWaveEditorComponent(NodeGraph& g, int nid, st
         // dragging.
         refreshPreview();
         commitToNode();
+        refreshHeldFrameAudition();   // track gain live if a Play is sustaining
         notifyPopoutDocMutated();
         // Undo: during a drag, defer the snapshot to drag end (one Ctrl+Z per
         // sweep). For non-drag changes (textbox typing, double-click reset)
@@ -10975,6 +10988,10 @@ void LayeredWaveEditorComponent::setEditingLibraryEntry(int libId) {
     rebuildRows();
     refreshPreview();
     refreshIdentityRow();
+    // If a Play is sustaining, switch the held note to the newly-targeted
+    // frame so the audition follows the editor target (no-op when not playing,
+    // and clears the note if the new target can't be resolved).
+    refreshHeldFrameAudition();
     notifyPopoutFrameOrPositionChanged();
 }
 
@@ -11034,11 +11051,17 @@ void LayeredWaveEditorComponent::refreshIdentityRow() {
     nameEditor.setVisible(have);
     gainLabel.setVisible(have);
     gainSlider.setVisible(have);
+    playBtn.setVisible(have);
     assetLibStatus.setVisible(have);
     useLibraryBtn.setVisible(have);
     saveToLibBtn.setVisible(have);
     desyncFromLibBtn.setVisible(have);
-    if (!have) { return; }
+    if (!have) {
+        // No editing target: a sustaining audition has nothing to play, so stop
+        // it (also resets the button label/colour).
+        if (framePlaying) stopFramePlay();
+        return;
+    }
     refreshAssetLibRow();
 
     // Sync the gain knob to the frame the editor is currently bound to.
@@ -11315,6 +11338,10 @@ void LayeredWaveEditorComponent::updateHintText() {
 }
 
 LayeredWaveEditorComponent::~LayeredWaveEditorComponent() {
+    // Release any sustaining frame audition so the held note doesn't dangle on
+    // the synth node after this editor is gone (it would otherwise keep
+    // sounding until the next graph rebuild).
+    if (framePlaying) stopFramePlay();
     // Drop out of the live-editor registry so a concurrent snapshot restore
     // never dereferences this dying editor.
     {
@@ -12013,6 +12040,68 @@ void LayeredWaveEditorComponent::refreshPreview() {
     repaint();
 }
 
+void LayeredWaveEditorComponent::toggleFramePlay() {
+    if (framePlaying) stopFramePlay();
+    else              startFramePlay();
+}
+
+void LayeredWaveEditorComponent::startFramePlay() {
+    // Nothing to play if the editor has no resolvable frame target.
+    if (!currentEditingFrame()) return;
+    framePlaying = true;
+    refreshHeldFrameAudition();      // ships the held note
+    playBtn.setButtonText("Stop");
+    playBtn.setColour(juce::TextButton::buttonColourId, juce::Colour(140, 70, 70));
+}
+
+void LayeredWaveEditorComponent::stopFramePlay() {
+    framePlaying = false;
+    if (auto* nd = graph.findNode(nodeId)) {
+        std::lock_guard<std::mutex> lock(*nd->auditionMutex);
+        nd->heldAudition.reset();    // synth releases the voice next block
+    }
+    playBtn.setButtonText("Play");
+    playBtn.setColour(juce::TextButton::buttonColourId, juce::Colour(60, 110, 70));
+}
+
+void LayeredWaveEditorComponent::refreshHeldFrameAudition() {
+    if (!framePlaying) return;       // no-op unless a Play is active
+    auto* nd = graph.findNode(nodeId);
+    if (!nd) return;
+
+    auto* f = currentEditingFrame();
+    if (!f) {                        // target vanished (deleted entry, empty lib)
+        std::lock_guard<std::mutex> lock(*nd->auditionMutex);
+        nd->heldAudition.reset();
+        return;
+    }
+
+    // Render the frame to its final single cycle - gain and the frame's own
+    // warps are baked in by IWavetableFrame::render, so the synth reads it
+    // straight and the audition matches the on-screen preview byte-for-byte.
+    // Built outside the audio mutex so the render never stalls the audio thread.
+    auto cyc = std::make_shared<Node::AuditionCycleFrame>();
+    f->render(wave.tableSize, cyc->cycle);
+    if (cyc->cycle.empty()) {
+        std::lock_guard<std::mutex> lock(*nd->auditionMutex);
+        nd->heldAudition.reset();
+        return;
+    }
+
+    // Level-triggered held audition: the synth (re)establishes a voice from
+    // this whenever it (re)starts, so the preview survives the debounced graph
+    // rebuild that a wavetable edit fires. A4 (note 69) at full velocity, the
+    // same fixed audition pitch the granular / inharmonic editors use.
+    auto ev = std::make_shared<Node::AuditionEvent>();
+    ev->isNoteOn   = true;
+    ev->pitch      = 69;
+    ev->velocity   = 127;
+    ev->cycleFrame = std::move(cyc);
+
+    std::lock_guard<std::mutex> lock(*nd->auditionMutex);
+    nd->heldAudition = std::move(ev);
+}
+
 void LayeredWaveEditorComponent::commitToNode() {
     if (auto* nd = graph.findNode(nodeId)) {
         // Synchronised write: the audio thread (TerrainSynthProcessor) polls
@@ -12160,6 +12249,11 @@ void LayeredWaveEditorComponent::reloadFromNode() {
     }
     notifyPopoutFrameOrPositionChanged();
     notifyPopoutDocMutated();
+    // The snapshot restore rebuilt the graph (destroying voices) and replaced
+    // the doc. If a Play was sustaining, re-ship the restored frame's cycle so
+    // the held note re-establishes against the reloaded data instead of going
+    // silent. No-op when not playing; clears the note if the target vanished.
+    refreshHeldFrameAudition();
     repaint();
 }
 
@@ -12175,6 +12269,10 @@ void LayeredWaveEditorComponent::onLayerChanged() {
     // concurrent rebuilds).
     refreshPreview();
     commitToNode();
+    // If a frame audition is sustaining, re-ship the rendered cycle so the held
+    // note tracks this edit live ("what you see = what you hear"). No-op unless
+    // Play is active.
+    refreshHeldFrameAudition();
     // Any doc mutation can invalidate the lossless "Back to Grid" round-trip
     // (a dragged dot, an added/removed axis, a placed/deleted frame all reset
     // or break the scatter->grid snapshot). onLayerChanged() is the universal
@@ -12282,6 +12380,7 @@ void LayeredWaveEditorComponent::resized() {
         nameEditor.setVisible(false);
         gainLabel.setVisible(false);
         gainSlider.setVisible(false);
+        playBtn.setVisible(false);
         previewBounds = juce::Rectangle<int>();  // suppresses preview paint
         capturePanel->setBounds(right);
         return;
@@ -12335,6 +12434,10 @@ void LayeredWaveEditorComponent::resized() {
         right.removeFromTop(6);
         gainLabel.setBounds(gRow.removeFromLeft(70));
         gRow.removeFromLeft(2);
+        // Play/Stop sits at the right end of the gain row - it auditions THIS
+        // frame, so it belongs on the per-frame row with the name/colour/gain.
+        playBtn.setBounds(gRow.removeFromRight(70));
+        gRow.removeFromRight(8);
         // Horizontal slider + attached text box; cap the width so it doesn't
         // sprawl across the whole pane on wide windows.
         gainSlider.setBounds(gRow.removeFromLeft(juce::jmin(gRow.getWidth(), 240)));

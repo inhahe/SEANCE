@@ -887,6 +887,16 @@ private:
         std::shared_ptr<Node::AuditionInharmonicFrame> auditionInhFrame;
         InhStream                                       auditionInhFrameStream;
 
+        // Direct single-cycle audition (the layered-waveform editor's Play
+        // button, generalisable to every frame editor). When set, the voice
+        // reads ONLY this cycle as a wavetable oscillator at the played pitch
+        // (using the same v.phase accumulator the placed-cycle path uses),
+        // bypassing the cycle terrain + granular + inharmonic layers, so an
+        // unplaced edited frame is audible exactly as the editor previews it.
+        // Null on every ordinary note. Reset on voice (re)allocation alongside
+        // auditionFrame / auditionInhFrame.
+        std::shared_ptr<Node::AuditionCycleFrame> auditionCycleFrame;
+
     };
     static constexpr int MAX_VOICES = 16;
     Voice voices[MAX_VOICES];

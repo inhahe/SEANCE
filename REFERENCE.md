@@ -2371,7 +2371,9 @@ closes, iff anything changed (not one step per drag tick). Implemented as
   **Save to Library** publishes the current waveform as a new asset and links this
   slot to it (disabled once linked — diverge via Duplicate instead). **Use
   Library…** opens the unified [waveform-library browser](#picking-a-waveform-the-unified-browser)
-  to repoint this slot. **Unlink** detaches the slot's live link (sets
+  to repoint this slot — at the frame scope it opens in **frame mode** (leads with
+  your saved frames, factory single-cycles demoted under a divider; see the browser
+  section). **Unlink** detaches the slot's live link (sets
   `assetId = -1`) while keeping the current frame as an independent editable copy,
   so edits stop propagating to/from the shared waveform; it's **disabled** (greyed,
   with an explaining tooltip) while the slot is already independent. The reference
@@ -2442,6 +2444,22 @@ Library…**, and the per-layer **Use Library…**); per-layer picks set
 reference without changing the current content, use the **Unlink** button (frame
 row) or **Unlink from Library** menu item (per-layer picker) — see the per-scope
 bullets above.
+
+**Frame scope vs. layer scope — the same browser, re-ordered.** A *frame* is a
+whole stack of layers, whereas the factory `AKWF_*` entries are single cycles
+(layer-level primitives), so the frame-scope **Use Library…** (`setFrameScope(true)`,
+only on the identity-row button — *not* the per-layer picker or the **+ Waveform**
+add flow) **leads with your saved frames and demotes the factory catalog**: the
+category list starts with a **★ My saved frames** category (the default view), then
+a non-selectable **"Start over with a single cycle"** divider, then **All single
+cycles** + the factory categories (listed factory-only, since your frames are the
+category above). Picking a saved frame still replaces the whole frame (all layers,
+copy or live reference per **Sync**); picking a factory single cycle replaces the
+frame with a fresh single-layer copy ("start over"). The dialog title reads
+**"Replace frame from Library"**. The per-layer and **+ Waveform** flows keep the
+flat factory-first layout — there a single cycle genuinely *is* the unit being
+chosen. When you have no saved frames yet, the frame picker has nothing to lead
+with, so it shows the factory catalog directly (no divider).
 
 ### Import / export between projects
 

@@ -9545,6 +9545,27 @@ public:
         resized();
     }
 
+    // Frame-scope mode: this picker replaces a WHOLE frame (all layers), so a
+    // saved Waveform asset is a whole frame and the factory entries are single
+    // cycles that "start the frame over" with one layer. In this mode the
+    // category list leads with the user's saved frames and demotes the factory
+    // single-cycle catalog beneath a non-selectable "Start over with a single
+    // cycle" divider, so saved frames are the default view. The per-layer and
+    // + Waveform flows leave this off - there a single cycle IS the unit, so the
+    // flat factory-first browser is correct.
+    void setFrameScope(bool on) {
+        frameScope = on;
+        if (on) {
+            showUserToggle.setButtonText("Show my frames");
+            showUserToggle.setTooltip("Include the whole-frame waveforms you've "
+                                      "saved to this project's library. Turn off "
+                                      "to browse only the factory single-cycle "
+                                      "shapes.");
+        }
+        rebuildCategories();
+        rebuildVisible();
+    }
+
     void resized() override {
         auto r = getLocalBounds().reduced(10);
         auto top = r.removeFromTop(26);
@@ -9673,16 +9694,42 @@ public:
         void paintListBoxItem(int row, juce::Graphics& g, int w, int h,
                               bool selected) override {
             if (row < 0 || row >= (int)owner->catRows.size()) return;
+            const auto& cr = owner->catRows[(size_t)row];
+            if (cr.isHeader) {
+                // Non-selectable section divider: dim, small, uppercase, never
+                // highlighted - reads as a label between groups, not a row.
+                g.setColour(juce::Colours::white.withAlpha(0.40f));
+                g.setFont(juce::FontOptions(10.5f, juce::Font::bold));
+                g.drawText(cr.label.toUpperCase(), 6, 0, w - 10, h,
+                           juce::Justification::centredLeft, true);
+                return;
+            }
             if (selected) {
                 g.setColour(juce::Colour(0xff3d5a80));
                 g.fillRect(0, 0, w, h);
             }
             g.setColour(selected ? juce::Colours::white : juce::Colours::lightgrey);
             g.setFont(13.0f);
-            g.drawText(owner->catRows[(size_t)row].label, 6, 0, w - 10, h,
+            g.drawText(cr.label, 6, 0, w - 10, h,
                        juce::Justification::centredLeft);
         }
-        void selectedRowsChanged(int) override { owner->rebuildVisible(); }
+        void selectedRowsChanged(int lastRow) override {
+            // Headers aren't real categories. If the user clicks one, bounce the
+            // selection to the next selectable row (or the previous, if the header
+            // is last) so we never sit on a divider.
+            if (lastRow >= 0 && lastRow < (int)owner->catRows.size()
+                && owner->catRows[(size_t)lastRow].isHeader) {
+                int n = (int)owner->catRows.size();
+                int next = lastRow + 1;
+                while (next < n && owner->catRows[(size_t)next].isHeader) ++next;
+                if (next >= n) {
+                    next = lastRow - 1;
+                    while (next >= 0 && owner->catRows[(size_t)next].isHeader) --next;
+                }
+                if (next >= 0 && next < n) { owner->catList.selectRow(next); return; }
+            }
+            owner->rebuildVisible();
+        }
     };
 
 private:
@@ -9694,7 +9741,12 @@ private:
     // a WaveformBank entry index (== the waveform's stable id).
     struct Item { bool user; int idx; };
     // name "" == All; isUser marks the "★ User Library" pseudo-category.
-    struct CatRow { juce::String label; std::string name; bool isUser = false; };
+    // isHeader marks a non-selectable section divider (frame scope only);
+    // builtinOnly marks an "All" row that should list factory single-cycles
+    // *only* (no user assets), used by the frame-scope "All shapes" row whose
+    // user frames already live in their own category above the divider.
+    struct CatRow { juce::String label; std::string name; bool isUser = false;
+                    bool isHeader = false; bool builtinOnly = false; };
 
     bool userPasses(const UserItem& u, bool starOnly, const juce::String& q) const {
         if (starOnly && !u.starred) return false;
@@ -9718,20 +9770,54 @@ private:
         for (int i = 0; i < bank.numEntries(); ++i)
             if (!starOnly || bank.entry(i).curated) ++builtinAll;
 
-        catRows.push_back({ "All (" + juce::String(builtinAll + userCount) + ")",
-                            "", false });
-        if (showUser && userCount > 0)
-            catRows.push_back({ juce::String::fromUTF8("\xe2\x98\x85 My waveforms (")
-                                + juce::String(userCount) + ")", "", true });
-        for (const auto& cat : bank.categories()) {
-            int cnt = 0;
-            for (int idx : bank.entriesInCategory(cat))
-                if (!starOnly || bank.entry(idx).curated) ++cnt;
-            if (cnt == 0) continue;  // hide categories with nothing to show
-            catRows.push_back({ juce::String(cat) + " (" + juce::String(cnt) + ")",
-                                cat, false });
+        if (frameScope) {
+            // Saved frames lead. When the user has any, they get their own
+            // category at the top (the default view) followed by a non-selectable
+            // divider that introduces the demoted factory single-cycle catalog.
+            if (showUser && userCount > 0) {
+                catRows.push_back(
+                    { juce::String::fromUTF8("\xe2\x98\x85 My saved frames (")
+                      + juce::String(userCount) + ")", "", /*isUser*/true });
+                catRows.push_back(
+                    { "Start over with a single cycle", "",
+                      /*isUser*/false, /*isHeader*/true });
+            }
+            // "All shapes" lists factory single cycles ONLY (user frames are the
+            // category above); then the per-category factory breakdown.
+            catRows.push_back({ "All single cycles (" + juce::String(builtinAll) + ")",
+                                "", /*isUser*/false, /*isHeader*/false,
+                                /*builtinOnly*/true });
+            for (const auto& cat : bank.categories()) {
+                int cnt = 0;
+                for (int idx : bank.entriesInCategory(cat))
+                    if (!starOnly || bank.entry(idx).curated) ++cnt;
+                if (cnt == 0) continue;
+                catRows.push_back({ juce::String(cat) + " (" + juce::String(cnt) + ")",
+                                    cat, false });
+            }
+        } else {
+            catRows.push_back({ "All (" + juce::String(builtinAll + userCount) + ")",
+                                "", false });
+            if (showUser && userCount > 0)
+                catRows.push_back({ juce::String::fromUTF8("\xe2\x98\x85 My waveforms (")
+                                    + juce::String(userCount) + ")", "", true });
+            for (const auto& cat : bank.categories()) {
+                int cnt = 0;
+                for (int idx : bank.entriesInCategory(cat))
+                    if (!starOnly || bank.entry(idx).curated) ++cnt;
+                if (cnt == 0) continue;  // hide categories with nothing to show
+                catRows.push_back({ juce::String(cat) + " (" + juce::String(cnt) + ")",
+                                    cat, false });
+            }
         }
-        if (catList.getSelectedRow() < 0) catList.selectRow(0);
+        // Default to the first selectable (non-header) row. In frame scope that's
+        // "My saved frames" when present, else "All single cycles".
+        if (catList.getSelectedRow() < 0) {
+            int firstSel = 0;
+            while (firstSel < (int)catRows.size() && catRows[(size_t)firstSel].isHeader)
+                ++firstSel;
+            if (firstSel < (int)catRows.size()) catList.selectRow(firstSel);
+        }
         catList.updateContent();
         catList.repaint();
     }
@@ -9743,12 +9829,22 @@ private:
         const juce::String q = searchBox.getText().trim().toLowerCase();
         int catRow = catList.getSelectedRow();
         if (catRow < 0 || catRow >= (int)catRows.size()) catRow = 0;
+        // A header divider is never a real category; if one is somehow current,
+        // fall back to the first selectable row so the list still populates.
+        if (catRows[(size_t)catRow].isHeader) {
+            int s = 0;
+            while (s < (int)catRows.size() && catRows[(size_t)s].isHeader) ++s;
+            if (s < (int)catRows.size()) catRow = s;
+        }
         const CatRow& cr = catRows[(size_t)catRow];
         const std::string selCat = cr.name;  // "" == All
         const bool userCat = cr.isUser;
+        const bool builtinOnly = cr.builtinOnly;  // frame-scope "All single cycles"
 
         // User assets first (the user's own items rise to the top of "All").
-        if (showUser && (userCat || selCat.empty()))
+        // builtinOnly suppresses them: in frame scope the user's saved frames
+        // have their own category, so the factory "All" must stay factory-only.
+        if (showUser && !builtinOnly && (userCat || selCat.empty()))
             for (int i = 0; i < (int)userItems.size(); ++i)
                 if (userPasses(userItems[(size_t)i], starOnly, q))
                     visible.push_back({ true, i });
@@ -9833,6 +9929,7 @@ private:
     juce::TextEditor searchBox;
     juce::ToggleButton starredToggle, showUserToggle, syncToggle;
     bool syncSupported = true;
+    bool frameScope = false;
     juce::ListBox catList, waveList;
     juce::TextButton insertBtn { "Insert" }, cancelBtn { "Cancel" };
     juce::Label statusLabel;
@@ -9939,9 +10036,17 @@ void LayeredWaveEditorComponent::showWaveformLibraryBrowser(juce::Component* anc
         commitUndoStep();
     };
 
+    // Frame-scope picker (replaceCurrentFrame): a pick swaps the WHOLE frame, so
+    // lead with the user's saved frames and demote the factory single-cycle
+    // catalog under a divider. The + Waveform add flow (replaceCurrentFrame=false)
+    // is genuinely creating a new frame from a single cycle, so it stays flat.
+    if (replaceCurrentFrame)
+        browser->setFrameScope(true);
+
     juce::DialogWindow::LaunchOptions opts;
     opts.content.setOwned(browser);
-    opts.dialogTitle = "Waveform Library";
+    opts.dialogTitle = replaceCurrentFrame ? "Replace frame from Library"
+                                           : "Waveform Library";
     opts.dialogBackgroundColour = juce::Colour(0xff2b2b30);
     opts.escapeKeyTriggersCloseButton = true;
     opts.useNativeTitleBar = false;

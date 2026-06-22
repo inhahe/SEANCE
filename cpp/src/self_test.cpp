@@ -2280,6 +2280,64 @@ void testWarp(Report& r) {
                 "morph: no-morph payload decodes to an empty chain");
     }
 
+    // ---- Standalone single-frame instruments ("__framesynth__:") -------------
+    // The six frame types as their own node type wrap one frame in a 1x1-grid
+    // WavetableDoc behind a __framesynth__ prefix, then reuse the entire
+    // wavetable render path. Validate the wrapper helpers, the prefix strip, and
+    // that a frame synth classifies / decodes identically to the equivalent
+    // single-frame wavetable (the "not a 1-frame wavetable in disguise to the
+    // USER, but identical DSP under the hood" guarantee).
+    {
+        const char* kTypeIds[] = { "layered", "spectral", "wavelet",
+                                   "sample", "granular", "inharmonic" };
+        for (const char* tid : kTypeIds) {
+            std::string script = defaultFrameSynthScriptForType(tid);
+            r.check(!script.empty(),
+                    std::string("framesynth: defaultFrameSynthScriptForType('") + tid + "') is non-empty");
+            r.check(isFrameSynthScript(script),
+                    std::string("framesynth: '") + tid + "' script carries the __framesynth__ prefix");
+
+            // The effective (prefix-stripped) body is a plain wavetable encode,
+            // so it must NOT itself look like a frame synth and must decode as a
+            // WavetableDoc.
+            std::string body = effectiveSynthScript(script);
+            r.check(!isFrameSynthScript(body),
+                    std::string("framesynth: '") + tid + "' effective body has the prefix stripped");
+            WavetableDoc bodyDoc;
+            r.check(bodyDoc.decode(body),
+                    std::string("framesynth: '") + tid + "' effective body decodes as a WavetableDoc");
+
+            // decodeFrameSynthScript yields the single frame of the right type.
+            WavetableDoc outDoc;
+            std::unique_ptr<IWavetableFrame> frame = decodeFrameSynthScript(script, &outDoc);
+            r.check(frame != nullptr,
+                    std::string("framesynth: '") + tid + "' decodes back to a frame");
+            r.check(frame && frame->typeId() == std::string(tid),
+                    std::string("framesynth: '") + tid + "' decoded frame keeps its type id");
+            r.check(outDoc.library.size() == 1 && outDoc.cellWaveformIds.size() == 1,
+                    std::string("framesynth: '") + tid + "' is exactly one frame in a 1-cell grid");
+
+            // A frame synth must classify the same as the equivalent single-frame
+            // wavetable (the synth dispatch treats the wrapped body identically).
+            // Build the bare wavetable from a freshly-decoded clone of the frame.
+            std::unique_ptr<IWavetableFrame> frameForBare = decodeFrameSynthScript(script);
+            std::string bareWavetable =
+                frameForBare ? makeSingleFrameWavetable(std::move(frameForBare)).encode()
+                             : std::string();
+            r.check(!bareWavetable.empty()
+                        && classifySynthSource(script) == classifySynthSource(bareWavetable),
+                    std::string("framesynth: '") + tid + "' classifies like its bare single-frame wavetable");
+        }
+
+        // effectiveSynthScript is a no-op for a plain (non-prefixed) script, so
+        // the wavetable path is untouched by the frame-synth machinery.
+        std::string plainWt = WavetableDoc::defaultSingleSine().encode();
+        r.check(effectiveSynthScript(plainWt) == plainWt,
+                "framesynth: effectiveSynthScript leaves a plain wavetable script unchanged");
+        r.check(!isFrameSynthScript(plainWt),
+                "framesynth: a plain wavetable script is not a frame synth");
+    }
+
     // ---- Per-frame morph: two frames carry INDEPENDENT chains ----------------
     {
         // The whole point of moving the morph chain onto the frame: editing one

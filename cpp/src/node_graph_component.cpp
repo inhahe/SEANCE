@@ -1802,6 +1802,17 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
     // redundant. Collapsed into one entry; pick frame types after the
     // editor opens.
     instMenu.addItem(110, "Wavetable");
+    // Standalone single-frame instruments: each of the six wavetable frame
+    // types as its own focused node (all the per-frame controls, none of the
+    // multi-frame wavetable machinery - no grid, no Position morph, no library).
+    juce::PopupMenu frameInstMenu;
+    frameInstMenu.addItem(250, "Layered Waveform");
+    frameInstMenu.addItem(251, "Frequency Domain");
+    frameInstMenu.addItem(252, "Wavelet Space");
+    frameInstMenu.addItem(253, "Inharmonic");
+    frameInstMenu.addItem(254, "Sample (single cycle)");
+    frameInstMenu.addItem(255, "Granular");
+    instMenu.addSubMenu("Single-Frame Instruments", frameInstMenu);
     juce::PopupMenu terrainMenu;
     terrainMenu.addItem(120, "2D Terrain (sin*cos)");
     terrainMenu.addItem(122, "2D Terrain (custom expression...)");
@@ -2049,6 +2060,64 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
             opts.resizable = true;
             opts.componentToCentreAround = this;
             SoundShop::launchNonModalToolDialog(opts);
+            (void)nodeId;
+            return;
+        } else if (result >= 250 && result <= 255) {
+            // Standalone single-frame instrument nodes. One per wavetable frame
+            // type, but presented as a distinct instrument (not a 1-frame
+            // wavetable): the script is a __framesynth__ wrapper, and the editor
+            // opens in focused mode (no grid / library / Position morph). They
+            // reuse the entire wavetable render + sub-editor path under the hood.
+            struct FrameInst { const char* typeId; const char* name; };
+            const FrameInst kFrameInst[] = {
+                { "layered",    "Layered Waveform" },   // 250
+                { "spectral",   "Frequency Domain" },   // 251
+                { "wavelet",    "Wavelet Space" },      // 252
+                { "inharmonic", "Inharmonic" },         // 253
+                { "sample",     "Sample" },             // 254
+                { "granular",   "Granular" },           // 255
+            };
+            const FrameInst& fi = kFrameInst[result - 250];
+            std::string script = SoundShop::defaultFrameSynthScriptForType(fi.typeId);
+            if (script.empty()) return;  // unknown type id (shouldn't happen)
+
+            auto& n = graph.addNode(fi.name, NodeType::Instrument,
+                {Pin{0, "MIDI", PinKind::Midi, true}},
+                {Pin{0, "Audio", PinKind::Audio, false}}, {p.x, p.y});
+            n.script = std::move(script);
+
+            // Same generic synth voice character + param set as the Wavetable
+            // node, MINUS the Position param: a single-frame instrument has no
+            // morph axis, so a Position knob would do nothing (and the
+            // wavetable-only controls are exactly what these nodes drop).
+            n.ahdsrEnvelope.attackMs  = 10.0f;
+            n.ahdsrEnvelope.decayMs   = 100.0f;
+            n.ahdsrEnvelope.sustain   = 0.7f;
+            n.ahdsrEnvelope.releaseMs = 300.0f;
+            n.params.push_back({"Volume",  1.0f,  0.0f, 1.0f});
+            n.params.push_back({"Pan",     0.0f, -1.0f, 1.0f});
+            n.params.push_back({"Vibrato", 1.0f,  0.0f, 1.0f});
+
+            // Commit the new node before opening its editor so undo/redo and
+            // save/load see a consistent graph.
+            graph.commitSnapshot("Add instrument");
+
+            auto nodeId = n.id;
+            auto* editor = new LayeredWaveEditorComponent(graph, nodeId, [this]() {
+                if (onNodeEdited) onNodeEdited();
+                repaint();
+            });
+            juce::DialogWindow::LaunchOptions opts;
+            opts.content.setOwned(editor);
+            opts.dialogTitle = "Instrument: " + juce::String(n.name);
+            opts.dialogBackgroundColour = juce::Colour(22, 22, 28);
+            opts.escapeKeyTriggersCloseButton = true;
+            opts.useNativeTitleBar = false;
+            opts.resizable = true;
+            opts.componentToCentreAround = this;
+            SoundShop::launchNonModalToolDialog(opts);
+            if (onNodeEdited) onNodeEdited();
+            repaint();
             (void)nodeId;
             return;
         } else if (result == 133) {

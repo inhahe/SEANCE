@@ -6,6 +6,7 @@
 #include "sample_frame.h"         // SampleFrame for capture-from-playback frames
 #include "granular_frame.h"       // GranularFrame for granular capture frames
 #include "inharmonic_frame.h"     // InharmonicFrame for the additive inharmonic stack
+#include "terrain_synth.h"         // kFrameSynthPrefix / effectiveSynthScript for standalone single-frame nodes
 #include "waveform_bank.h"        // WaveformBank: the built-in factory single-cycle library
 #include "builtin_synth.h"   // WaveExprParser for Formula shape
 #include "help_utils.h"
@@ -3626,6 +3627,71 @@ std::unique_ptr<IWavetableFrame> frameFromWaveformAsset(const std::string& subTy
     std::unique_ptr<IWavetableFrame> frame = createFrameByTypeId(subType);
     if (frame && !frame->decodeBody(payload)) frame.reset();
     return frame;
+}
+
+// ---- Standalone single-frame instrument ("__framesynth__:") wrapper ---------
+
+WavetableDoc makeSingleFrameWavetable(std::unique_ptr<IWavetableFrame> frame) {
+    WavetableDoc doc;
+    doc.mode      = WavetableMode::Grid;
+    doc.tableSize = 2048;
+    doc.gridDims  = {1};
+    if (!frame) frame = std::make_unique<LayeredWaveform>(LayeredWaveform::defaultSine());
+    int id = doc.addLibraryEntry(std::move(frame));
+    doc.cellWaveformIds = {id};
+    return doc;
+}
+
+std::string encodeFrameSynthScript(std::unique_ptr<IWavetableFrame> frame) {
+    WavetableDoc doc = makeSingleFrameWavetable(std::move(frame));
+    return std::string(kFrameSynthPrefix) + doc.encode();
+}
+
+std::string defaultFrameSynthScriptForType(const std::string& typeId) {
+    // Use each type's PROPER default factory, not the bare createFrameByTypeId
+    // ctor: a bare WaveletFrame / SampleFrame / GranularFrame has no content, so
+    // its encodeBody() is non-round-trippable (decodeBody rejects an empty
+    // coefficient / cycle / source list and falls back to a layered frame, which
+    // would silently change the node's type on the first save/load). The
+    // defaultEmpty()/defaultBuiltin()/defaultBell() factories - the same ones the
+    // wavetable "+ Waveform" menu uses - all produce a valid, serialisable frame.
+    std::unique_ptr<IWavetableFrame> frame;
+    if (typeId == "layered")
+        frame = std::make_unique<LayeredWaveform>(LayeredWaveform::defaultSine());
+    else if (typeId == "spectral")
+        frame = std::make_unique<SpectralFrame>(SpectralDoc::defaultBuiltin());
+    else if (typeId == "wavelet")
+        frame = std::make_unique<WaveletFrame>(WaveletFrame::defaultEmpty());
+    else if (typeId == "inharmonic")
+        frame = std::make_unique<InharmonicFrame>(InharmonicFrame::defaultBell());
+    else if (typeId == "sample")
+        frame = std::make_unique<SampleFrame>(SampleFrame::defaultEmpty());
+    else if (typeId == "granular")
+        frame = std::make_unique<GranularFrame>(GranularFrame::defaultEmpty());
+    if (!frame) return {};
+    return encodeFrameSynthScript(std::move(frame));
+}
+
+std::unique_ptr<IWavetableFrame> decodeFrameSynthScript(const std::string& script,
+                                                        WavetableDoc* outDoc) {
+    if (!isFrameSynthScript(script)) return nullptr;
+    WavetableDoc doc;
+    if (!doc.decode(effectiveSynthScript(script))) return nullptr;
+    // The single frame is whatever the (only) cell references; fall back to the
+    // first library entry so a hand-edited / cell-less doc still yields a frame.
+    const IWavetableFrame* src = nullptr;
+    if (!doc.cellWaveformIds.empty()) {
+        int id = doc.cellWaveformIds[0];
+        for (const auto& e : doc.library)
+            if (e.id == id && e.wave) { src = e.wave.get(); break; }
+    }
+    if (!src) {
+        for (const auto& e : doc.library)
+            if (e.wave) { src = e.wave.get(); break; }
+    }
+    std::unique_ptr<IWavetableFrame> out = src ? src->clone() : nullptr;
+    if (outDoc) *outDoc = std::move(doc);
+    return out;
 }
 
 int resolveWaveformReferences(NodeGraph& graph) {
@@ -9060,7 +9126,16 @@ LayeredWaveEditorComponent::LayeredWaveEditorComponent(NodeGraph& g, int nid, st
     // Decode existing state. Try wavetable first, then fall back to single
     // layered waveform (wrapped as a 1-frame wavetable), then default sine.
     auto* nd = graph.findNode(nodeId);
-    std::string script = nd ? nd->script : "";
+    std::string rawScript = nd ? nd->script : "";
+    // Standalone single-frame "frame synth" nodes wrap the WavetableDoc encode
+    // in a __framesynth__ prefix. Detect it, remember the prefix so commits
+    // re-emit it, and decode the wrapped body. effectiveSynthScript() strips the
+    // prefix when present and is a no-op for a real wavetable script.
+    if (isFrameSynthScript(rawScript)) {
+        frameSynthMode = true;
+        scriptPrefix   = kFrameSynthPrefix;
+    }
+    std::string script = effectiveSynthScript(rawScript);
     if (!wave.decode(script)) {
         LayeredWaveform single;
         if (single.decode(script)) {
@@ -11364,17 +11439,23 @@ void LayeredWaveEditorComponent::setLibraryEntryName(int libId,
 void LayeredWaveEditorComponent::refreshIdentityRow() {
     const int libIdx = wave.findLibraryIndexById(currentLibraryId);
     const bool have = (libIdx >= 0);
-    identityLabel.setVisible(have);
-    if (nameColorSwatch) nameColorSwatch->setVisible(have);
-    nameFieldLabel.setVisible(have);
-    nameEditor.setVisible(have);
+    // In focused frame-synth mode the per-waveform NAME / COLOUR identity row and
+    // the project asset-library link row are wavetable-only surfaces (a single-
+    // oscillator instrument has no named library of waveforms), so they stay
+    // hidden. Gain, Preview and the embedded frame editor remain. resized() also
+    // skips reserving their strips in focused mode so nothing leaves a gap.
+    const bool showIdentity = have && !frameSynthMode;
+    identityLabel.setVisible(showIdentity);
+    if (nameColorSwatch) nameColorSwatch->setVisible(showIdentity);
+    nameFieldLabel.setVisible(showIdentity);
+    nameEditor.setVisible(showIdentity);
     gainLabel.setVisible(have);
     gainSlider.setVisible(have);
     playBtn.setVisible(have);
-    assetLibStatus.setVisible(have);
-    useLibraryBtn.setVisible(have);
-    saveToLibBtn.setVisible(have);
-    desyncFromLibBtn.setVisible(have);
+    assetLibStatus.setVisible(showIdentity);
+    useLibraryBtn.setVisible(showIdentity);
+    saveToLibBtn.setVisible(showIdentity);
+    desyncFromLibBtn.setVisible(showIdentity);
     if (!have) {
         // No editing target: a sustaining audition has nothing to play, so stop
         // it (also resets the button label/colour).
@@ -11635,7 +11716,9 @@ void LayeredWaveEditorComponent::updateHintText() {
     // so a fresh user sees the basic interactions (add a waveform, click
     // a cell, click a row). Hides once the library has a couple of
     // entries (the multi-waveform nature is visible at that point).
-    const bool showHint = (wave.library.size() <= 1);
+    // Focused frame-synth mode has no + Waveform / cells / library, so the
+    // wavetable discoverability tip would be actively misleading - keep it hidden.
+    const bool showHint = !frameSynthMode && (wave.library.size() <= 1);
     if (wave.mode == WavetableMode::Grid) {
         hintLabel.setText(
             "Tip: this is a wavetable. Click  + Waveform  to add a waveform to the "
@@ -12532,7 +12615,10 @@ void LayeredWaveEditorComponent::commitToNode() {
         // megabyte, so a raw assignment races the audio read and crashes mid-
         // copy. encode() builds the string outside the lock; the helper only
         // holds the per-node mutex for the (cheap) move-assignment.
-        setNodeScriptSynced(*nd, wave.encode());
+        // scriptPrefix is "" for a real wavetable and kFrameSynthPrefix for a
+        // standalone frame synth, so the __framesynth__ wrapper survives every
+        // edit round-trip while the wavetable path keeps writing a bare encode().
+        setNodeScriptSynced(*nd, scriptPrefix + wave.encode());
         // Bump the project-dirty flag so quit-without-save prompts and
         // autosave both pick up wavetable-editor edits. Without this, the
         // user can spend a session sculpting waveforms, close SEANCE, and
@@ -12623,7 +12709,9 @@ void LayeredWaveEditorComponent::reloadFromNode() {
     const std::vector<float> prevPosition = currentPosition;
 
     WavetableDoc fresh;
-    if (!fresh.decode(nd->script)) {
+    // effectiveSynthScript strips a __framesynth__ prefix (no-op for a plain
+    // wavetable), so a snapshot restore of a frame synth node re-decodes cleanly.
+    if (!fresh.decode(effectiveSynthScript(nd->script))) {
         // Node script is no longer an editable wavetable (shouldn't happen for a
         // synth we had open). Leave the editor as-is rather than blanking it -
         // the stale state is at least self-consistent.
@@ -12766,8 +12854,15 @@ void LayeredWaveEditorComponent::resized() {
     top.removeFromRight(4);
     helpBtn.setBounds(top.removeFromRight(26));
     top.removeFromRight(12); // separator gap from the right-side cluster
-    // (Envelope... used to live here; it's wavetable-wide so it now sits at the
-    // bottom of the whole-wavetable column on the left - see the body split.)
+    // Envelope...: in a real wavetable it's wavetable-wide and anchors the
+    // bottom of the left column (see the body split). In focused frame-synth
+    // mode there is no left column, so it lives in the top toolbar's right
+    // cluster instead.
+    if (frameSynthMode) {
+        envelopeBtn.setVisible(true);
+        envelopeBtn.setBounds(top.removeFromRight(100));
+        top.removeFromRight(12);
+    }
 
     compareLabel.setVisible(true);
     compareDirectBtn.setVisible(true);
@@ -12790,22 +12885,32 @@ void LayeredWaveEditorComponent::resized() {
     // Both are always visible. Right pane is sized to give the editor enough
     // room (~440 px) without starving the arrangement view; on narrow dialogs
     // it falls back to half-and-half.
-    const int rightPaneW = juce::jlimit(360, 560, a.getWidth() / 2);
-    auto right = a.removeFromRight(rightPaneW);
-    a.removeFromRight(8); // gap between the two halves
+    juce::Rectangle<int> right;
+    if (frameSynthMode) {
+        // Focused single-frame synth: no arrangement view, no left column. The
+        // frame editor + generic toolbar own the whole body. The Envelope button
+        // was relocated into the top toolbar above.
+        if (arrangementView) arrangementView->setVisible(false);
+        right = a;
+    } else {
+        const int rightPaneW = juce::jlimit(360, 560, a.getWidth() / 2);
+        right = a.removeFromRight(rightPaneW);
+        a.removeFromRight(8); // gap between the two halves
 
-    if (arrangementView) {
-        arrangementView->setVisible(true);
-        // Envelope... is a wavetable-wide control (it edits the synth node's
-        // AHDSR amplitude envelope, not the per-frame waveform), so it anchors
-        // the bottom of the whole-wavetable column rather than the per-frame
-        // right pane. Reserve a strip here and give the rest to the list.
-        auto leftCol = a;
-        auto envRow = leftCol.removeFromBottom(28);
-        leftCol.removeFromBottom(6);
-        envelopeBtn.setVisible(true);
-        envelopeBtn.setBounds(envRow.removeFromLeft(juce::jmin(140, envRow.getWidth())));
-        arrangementView->setBounds(leftCol);
+        if (arrangementView) {
+            arrangementView->setVisible(true);
+            // Envelope... is a wavetable-wide control (it edits the synth node's
+            // AHDSR amplitude envelope, not the per-frame waveform), so it
+            // anchors the bottom of the whole-wavetable column rather than the
+            // per-frame right pane. Reserve a strip here and give the rest to
+            // the list.
+            auto leftCol = a;
+            auto envRow = leftCol.removeFromBottom(28);
+            leftCol.removeFromBottom(6);
+            envelopeBtn.setVisible(true);
+            envelopeBtn.setBounds(envRow.removeFromLeft(juce::jmin(140, envRow.getWidth())));
+            arrangementView->setBounds(leftCol);
+        }
     }
 
     // ---- Right pane: capture flow OR (editor body + preview) ----
@@ -12866,7 +12971,7 @@ void LayeredWaveEditorComponent::resized() {
     // visible across editor types (layered / spectral / wavelet) so the
     // name and colour live in one stable spot. Hidden when no library
     // entry is targeted - refreshIdentityRow controls visibility.
-    {
+    if (!frameSynthMode) {
         const int idH = 24;
         auto idRow = right.removeFromTop(idH);
         right.removeFromTop(6);
@@ -12900,7 +13005,7 @@ void LayeredWaveEditorComponent::resized() {
     // [status: Library: -> name / Independent .....][Use Library...][Save to
     // Library]. Same visibility gating as the identity/gain rows
     // (refreshIdentityRow controls it).
-    {
+    if (!frameSynthMode) {
         const int aH = 24;
         auto aRow = right.removeFromTop(aH);
         right.removeFromTop(6);

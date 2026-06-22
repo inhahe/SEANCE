@@ -1224,7 +1224,10 @@ void TerrainSynthProcessor::reloadIfScriptChanged() {
 // detection chain in the TerrainSynthProcessor constructor / reload path
 // so the node-graph UI can filter the Synth Mode picker without holding
 // a pointer to the live audio processor.
-SynthSourceClass classifySynthSource(const std::string& script) {
+SynthSourceClass classifySynthSource(const std::string& rawScript) {
+    // A "__framesynth__:" standalone node is classified by its wrapped body.
+    const std::string script = effectiveSynthScript(rawScript);
+
     // Explicit source-type prefixes first.
     if (script.rfind("__audio__:", 0)         == 0) return SynthSourceClass::Sample;
     if (script.rfind("__image__:", 0)         == 0) return SynthSourceClass::Surface;
@@ -1298,8 +1301,13 @@ SynthModeAvailability synthModeAvailabilityFor(SynthSourceClass cls) {
 }
 
 TerrainSynthProcessor::TerrainSynthProcessor(Node& n, Transport& t, ContentStore* store) : node(n), transport(t) {
-    auto& script = node.script;
-    cachedScript = script;
+    // cachedScript tracks the RAW node.script (used for change-detection in
+    // reloadIfScriptChanged). The dispatch below works off the EFFECTIVE script
+    // - for a "__framesynth__:" standalone single-frame node that is the wrapped
+    // "__wavetable5__:..." body, so the entire wavetable render path is reused
+    // verbatim (granular / inharmonic / cycle voices) with no duplication.
+    cachedScript = node.script;
+    const std::string script = effectiveSynthScript(node.script);
 
     if (script.rfind("__video__:", 0) == 0) {
         // Video terrain: the downscaled grayscale grid is baked into the script

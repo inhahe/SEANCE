@@ -2264,6 +2264,34 @@ void MainContentComponent::showPluginUI(int nodeId) {
         return;
     }
 
+    // Standalone single-frame "frame synth" instrument nodes (#- the six
+    // capture/synthesis frame types as their own node type). The script is a
+    // __framesynth__ wrapper around a one-frame WavetableDoc; it opens the SAME
+    // LayeredWaveEditorComponent, which detects the prefix and runs in FOCUSED
+    // mode (no grid / library / Position morph - just the one frame's editor
+    // plus Gain / Preview / Envelope / Morph). This must be checked before the
+    // wavetable gate below: the wrapped body is itself a __wavetable5__ encode,
+    // so without this earlier gate a frame synth would open as a full wavetable.
+    if (node && (node->type == NodeType::Instrument || node->type == NodeType::TerrainSynth)
+        && !node->plugin && node->pluginIndex < 0
+        && node->script.rfind("__framesynth__:", 0) == 0) {
+        auto* editor = new LayeredWaveEditorComponent(graph, node->id, [this]() {
+            audioEngine.getGraphProcessor().requestRebuild();
+        });
+        juce::DialogWindow::LaunchOptions opts;
+        opts.content.setOwned(editor);
+        opts.dialogTitle = "Instrument: " + juce::String(node->name);
+        opts.dialogBackgroundColour = juce::Colour(22, 22, 28);
+        opts.escapeKeyTriggersCloseButton = true;
+        opts.useNativeTitleBar = false;
+        opts.resizable = true;
+        opts.componentToCentreAround = this;
+        // Non-modal for the same drag-and-drop reason as the wavetable editor
+        // (the focused editor still hosts library-capable sub-editors).
+        SoundShop::launchNonModalToolDialog(opts);
+        return;
+    }
+
     // Layered waveform editor takes priority for nodes whose script is a
     // layered spec (single frame) or a wavetable spec (multi-frame). All
     // five formats open the same editor:

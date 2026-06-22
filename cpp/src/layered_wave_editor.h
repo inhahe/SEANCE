@@ -1021,6 +1021,38 @@ void layerToWaveformAsset(const WaveLayer& layer,
 bool applyWaveformAssetToLayer(const std::string& subType,
                                const std::string& payload, WaveLayer& layer);
 
+// ---- Standalone single-frame instrument ("__framesynth__:") ----------------
+//
+// A standalone single-frame instrument node (Layered / Frequency Domain /
+// Wavelet Space / Inharmonic / Sample / Granular) wraps ONE IWavetableFrame in
+// a 1x1-grid WavetableDoc and stores it as "__framesynth__:" + doc.encode().
+// The synth strips the prefix and renders it through the normal wavetable path
+// (see terrain_synth.h kFrameSynthPrefix / effectiveSynthScript); the editor
+// dispatch routes the prefix to LayeredWaveEditorComponent, which detects the
+// wrapper and runs in FOCUSED mode (the wavetable-only surfaces hidden). These
+// helpers are the single source of truth for building / reading that wrapper so
+// the menu-creation code, the editor, and the self-tests all agree.
+
+// Wrap one frame as a 1x1-grid WavetableDoc (the canonical single-frame doc).
+WavetableDoc makeSingleFrameWavetable(std::unique_ptr<IWavetableFrame> frame);
+
+// Encode a single frame as a "__framesynth__:" standalone node script.
+std::string encodeFrameSynthScript(std::unique_ptr<IWavetableFrame> frame);
+
+// Build a default (factory) "__framesynth__:" script for one of the six frame
+// types (typeId is "layered" / "spectral" / "wavelet" / "sample" / "granular" /
+// "inharmonic"). Returns an empty string for an unknown id. Used by the
+// node-graph Add-node menu so frame-instrument creation lives behind one helper
+// that knows how to construct each frame type's default.
+std::string defaultFrameSynthScriptForType(const std::string& typeId);
+
+// Decode a "__framesynth__:" script back to its single frame (a clone), or
+// nullptr if `script` is not a framesynth script / fails to decode. `outDoc`,
+// when non-null, receives the full decoded doc (for the editor, which keeps the
+// doc as its edit buffer).
+std::unique_ptr<IWavetableFrame> decodeFrameSynthScript(const std::string& script,
+                                                        WavetableDoc* outDoc = nullptr);
+
 // resolveWaveformReferences(NodeGraph&) is declared in node_graph.h (so the
 // non-GUI serialization layer can call it without pulling in the editor),
 // and implemented in layered_wave_editor.cpp alongside WavetableDoc decode.
@@ -1109,6 +1141,26 @@ private:
     NodeGraph& graph;
     int nodeId;
     std::function<void()> onApply;
+
+    // ---- Standalone single-frame "frame synth" focus mode ----
+    // When the node's script is a __framesynth__ wrapper (a single-frame
+    // WavetableDoc representing one of the six standalone instrument node
+    // types - Layered / Spectral / Wavelet / Inharmonic / Sample / Granular),
+    // this editor runs in a FOCUSED mode: the wavetable-only surfaces (grid /
+    // scatter arrangement view, library list, + Waveform, multi-frame Position
+    // morph, mode conversion, the asset-library row) are hidden, leaving just
+    // the single frame's editor plus the generic Gain / Preview / Envelope /
+    // Morph toolbar. The underlying WavetableDoc still holds exactly one frame
+    // and the entire wavetable render path is reused unchanged - the frame
+    // synth is a distinct node type to the user, never a "1-frame wavetable in
+    // disguise", but shares 100% of the DSP and sub-editor code.
+    //   frameSynthMode : true when opened on a __framesynth__ node.
+    //   scriptPrefix   : "" for a real wavetable, kFrameSynthPrefix for a frame
+    //                    synth. Re-prepended on every commitToNode() so the
+    //                    wrapper survives round-trips; decode paths always strip
+    //                    it via effectiveSynthScript().
+    bool frameSynthMode = false;
+    std::string scriptPrefix;
 
     WavetableDoc wave;
     // ---- Editor target vs. arrangement-view selection (two separate things) ----

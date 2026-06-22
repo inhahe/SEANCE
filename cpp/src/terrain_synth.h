@@ -459,10 +459,38 @@ struct SynthModeAvailability {
     }
 };
 
+// ---- Standalone single-frame synth ("__framesynth__:") ----------------------
+//
+// A standalone single-frame instrument node (Layered / Frequency Domain /
+// Wavelet Space / Inharmonic / Sample / Granular) stores its script as
+//   "__framesynth__:" + <a complete single-frame WavetableDoc encode>
+// i.e. the body after the prefix is a normal "__wavetable5__:..." string with
+// exactly one library entry placed in a 1x1 grid. The prefix exists only to
+// route the node to its focused single-frame editor (no grid / library / multi-
+// frame morph UI); for *rendering* the synth simply strips the prefix and runs
+// the existing wavetable path verbatim - so every per-frame-type voice
+// (granular OLA, inharmonic additive, cycle terrain) is shared with zero
+// duplication. effectiveSynthScript() does that strip; isFrameSynthScript()
+// tests for the prefix.
+inline constexpr const char* kFrameSynthPrefix = "__framesynth__:";
+
+inline bool isFrameSynthScript(const std::string& script) {
+    return script.rfind(kFrameSynthPrefix, 0) == 0;
+}
+
+// Return the script the synth should actually render: for a "__framesynth__:"
+// node, the wrapped wavetable body; otherwise the script unchanged.
+inline std::string effectiveSynthScript(const std::string& script) {
+    if (isFrameSynthScript(script))
+        return script.substr(std::char_traits<char>::length(kFrameSynthPrefix));
+    return script;
+}
+
 // Classify a TerrainSynthProcessor source by its script prefix. Mirrors
 // the source-detection chain in TerrainSynthProcessor::reloadIfScriptChanged,
 // kept as a free function so the node-graph UI can filter the Synth Mode
 // picker without holding a pointer to the audio processor.
+// "__framesynth__:" wrappers are classified by their wrapped body.
 SynthSourceClass     classifySynthSource(const std::string& script);
 SynthModeAvailability synthModeAvailabilityFor(SynthSourceClass cls);
 

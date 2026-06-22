@@ -1241,13 +1241,16 @@ private:
     juce::TextButton applyBtn    { "Apply" };
     juce::TextButton closeBtn    { "Close" };
     juce::TextButton helpBtn     { "?" };
-    // Play/Stop: audition the currently-edited frame through the owning synth's
-    // voice path (envelope + Volume + downstream chain), exactly like the
-    // granular ("from audio file") and inharmonic frame editors. Ships the
-    // frame's rendered single cycle as a direct audition payload so it's
-    // audible even when it isn't placed into the wavetable grid, and refreshes
-    // live as the frame is edited (so you hear changes while a note sustains).
-    juce::TextButton playBtn     { "Play" };
+    // Preview/Stop: audition the currently-edited frame through the owning
+    // synth's voice path (envelope + Volume + downstream chain), exactly like
+    // the granular ("from audio file") and inharmonic frame editors and the
+    // capture dialogs. Ships the frame's rendered single cycle as a direct
+    // audition payload so it's audible even when it isn't placed into the
+    // wavetable grid, and refreshes live as the frame is edited (so you hear
+    // changes while a note sustains). Labelled "Preview" (toggling to "Stop")
+    // and sits in a button row near the bottom of the editor, matching every
+    // other audition control in the app.
+    juce::TextButton playBtn     { "Preview" };
     bool framePlaying = false;
     // Opens the shared AHDSR amplitude-envelope editor for this synth's
     // node in a separate dialog (kept out of this already-dense editor).

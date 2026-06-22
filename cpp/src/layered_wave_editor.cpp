@@ -387,7 +387,7 @@ public:
         freezeModeCombo.onChange = [this]() { onFreezeModeChanged(); };
 
         addAndMakeVisible(playBtn);
-        playBtn.setButtonText("Play");
+        playBtn.setButtonText("Preview");
         playBtn.setTooltip(
             "Audition this captured waveform - feeds the source PCM into "
             "the engine's granular preview path with this editor's current "
@@ -1419,7 +1419,7 @@ private:
             if (auto* eng = AudioEngine::getInstance())
                 eng->clearPreview();
         }
-        playBtn.setButtonText("Play");
+        playBtn.setButtonText("Preview");
         playBtn.setColour(juce::TextButton::buttonColourId,
                           juce::Colour(60, 110, 70));
     }
@@ -1509,7 +1509,7 @@ public:
         bellBtn.onClick = [this]() { resetToBell(); };
 
         addAndMakeVisible(playBtn);
-        playBtn.setButtonText("Play");
+        playBtn.setButtonText("Preview");
         playBtn.setTooltip(
             "Audition this stack through the synth's voice / envelope / Volume "
             "path - exactly what a played note hits. Click again to stop.");
@@ -1801,7 +1801,7 @@ private:
         if (!playing) return;
         playing = false;
         if (sendAudition) sendAudition(false, kAuditionPitch, 0);
-        playBtn.setButtonText("Play");
+        playBtn.setButtonText("Preview");
         playBtn.setColour(juce::TextButton::buttonColourId,
                           juce::Colour(60, 110, 70));
     }
@@ -9206,9 +9206,11 @@ LayeredWaveEditorComponent::LayeredWaveEditorComponent(NodeGraph& g, int nid, st
         launchAhdsrEnvelopeDialog(this, graph, nodeId);
     };
 
-    // Play/Stop: audition the frame currently being edited through the synth's
-    // own voice path (envelope, Volume, downstream effects), the same way the
-    // granular / inharmonic embedded editors do. The note sustains until Stop.
+    // Preview/Stop: audition the frame currently being edited through the
+    // synth's own voice path (envelope, Volume, downstream effects), the same
+    // way the granular / inharmonic embedded editors and the capture dialogs
+    // do. The note sustains until Stop. Labelled "Preview" and placed in a
+    // button row near the bottom (see resized()) for app-wide consistency.
     addAndMakeVisible(playBtn);
     playBtn.setTooltip(
         "Audition the waveform you're editing: it plays a sustained note "
@@ -12060,7 +12062,7 @@ void LayeredWaveEditorComponent::stopFramePlay() {
         std::lock_guard<std::mutex> lock(*nd->auditionMutex);
         nd->heldAudition.reset();    // synth releases the voice next block
     }
-    playBtn.setButtonText("Play");
+    playBtn.setButtonText("Preview");
     playBtn.setColour(juce::TextButton::buttonColourId, juce::Colour(60, 110, 70));
 }
 
@@ -12404,6 +12406,18 @@ void LayeredWaveEditorComponent::resized() {
         right.removeFromBottom(6);
     }
 
+    // Audition button row near the bottom of the right pane (just above the
+    // frame-warp strip + preview). The "Preview" button auditions THIS frame
+    // through the synth; it sits at the bottom-left to match the granular /
+    // inharmonic frame editors and the capture dialogs' Preview button, rather
+    // than up in the identity/gain rows.
+    {
+        const int pH = 26;
+        auto pRow = right.removeFromBottom(pH);
+        right.removeFromBottom(6);
+        playBtn.setBounds(pRow.removeFromLeft(90).withHeight(pH));
+    }
+
     // Identity row at the very top of the right pane (above the editor
     // body): [Waveform: label] [colour swatch] [name TextEditor]. Stays
     // visible across editor types (layered / spectral / wavelet) so the
@@ -12434,10 +12448,6 @@ void LayeredWaveEditorComponent::resized() {
         right.removeFromTop(6);
         gainLabel.setBounds(gRow.removeFromLeft(70));
         gRow.removeFromLeft(2);
-        // Play/Stop sits at the right end of the gain row - it auditions THIS
-        // frame, so it belongs on the per-frame row with the name/colour/gain.
-        playBtn.setBounds(gRow.removeFromRight(70));
-        gRow.removeFromRight(8);
         // Horizontal slider + attached text box; cap the width so it doesn't
         // sprawl across the whole pane on wide windows.
         gainSlider.setBounds(gRow.removeFromLeft(juce::jmin(gRow.getWidth(), 240)));

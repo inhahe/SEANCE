@@ -94,10 +94,51 @@ juce::Point<float> NodeGraphComponent::canvasToScreen(juce::Point<float> canvas)
     return canvas * zoom + panOffset;
 }
 
+// ---------------------------------------------------------------------------
+// Node row layout helpers.
+//
+// A node body (below the header) has two stacked regions:
+//   1. TOP PIN REGION  - structural I/O pins (audio / MIDI / signal that aren't
+//      bound to a param), interleaved input-left / output-right, one per row.
+//   2. PARAM REGION    - one row per param. A param that owns an on-demand
+//      modulation pin (#88) renders that pin IN PLACE on the left edge of its
+//      own row, rather than as a separate top-region row. So pinning a param
+//      no longer shoves a pin to the top and grows the node - the slider just
+//      grows a connector on its own row, and the node stays the same height.
+//
+// These helpers are the single source of truth shared by getNodeBounds /
+// getPinPosition / drawNode and every hit-test, so the drawn layout and the
+// click targets can never drift apart.
+// ---------------------------------------------------------------------------
+
+// True if pinId is a param-modulation pin (folded into its param's row) rather
+// than a structural top-region pin. A "Mod:/Set:" pin with no live modPin
+// binding (legacy / orphaned) returns false and stays a structural pin until
+// its binding is repaired on right-click (showPinMenu self-heal).
+static bool isParamModPinId(const Node& node, int pinId) {
+    for (const auto& mp : node.modPins)
+        if (mp.pinId == pinId) return true;
+    return false;
+}
+
+// Structural (non-param-mod) input pins, in pinsIn order.
+static std::vector<const Pin*> structuralInputPins(const Node& node) {
+    std::vector<const Pin*> v;
+    v.reserve(node.pinsIn.size());
+    for (const auto& p : node.pinsIn)
+        if (!isParamModPinId(node, p.id)) v.push_back(&p);
+    return v;
+}
+
+// Rows in the top pin region = max(structural inputs, outputs).
+static int numTopPinRows(const Node& node) {
+    return std::max((int)structuralInputPins(node).size(),
+                    (int)node.pinsOut.size());
+}
+
 // Node bounds in canvas coordinates
 juce::Rectangle<float> NodeGraphComponent::getNodeBounds(const Node& node) const {
-    int numRows = std::max((int)node.pinsIn.size(), (int)node.pinsOut.size());
-    if (!node.params.empty()) numRows += (int)node.params.size();
+    int numRows = numTopPinRows(node) + (int)node.params.size();
     float h = HEADER_HEIGHT + std::max(numRows, 1) * PIN_ROW_HEIGHT + 8;
     return {node.pos.x, node.pos.y, NODE_WIDTH, h};
 }
@@ -105,17 +146,33 @@ juce::Rectangle<float> NodeGraphComponent::getNodeBounds(const Node& node) const
 // Pin position in canvas coordinates
 juce::Point<float> NodeGraphComponent::getPinPosition(const Node& node, const Pin& pin) const {
     auto bounds = getNodeBounds(node);
-    float y = bounds.getY() + HEADER_HEIGHT;
+    const float topY = bounds.getY() + HEADER_HEIGHT;
 
     if (pin.isInput) {
-        for (auto& p : node.pinsIn) {
-            y += PIN_ROW_HEIGHT;
-            if (p.id == pin.id) return {bounds.getX(), y - PIN_ROW_HEIGHT / 2};
+        // A param-modulation pin lives ON its bound param's row, not in the top
+        // region. Compute that row's centre on the node's left edge.
+        for (const auto& mp : node.modPins) {
+            if (mp.pinId == pin.id && mp.paramIndex >= 0
+                && mp.paramIndex < (int)node.params.size()) {
+                float y = topY + (numTopPinRows(node) + mp.paramIndex) * PIN_ROW_HEIGHT
+                          + PIN_ROW_HEIGHT / 2;
+                return {bounds.getX(), y};
+            }
+        }
+        // Structural input pin: row index among structural inputs (mod pins skipped).
+        int idx = 0;
+        for (const auto& p : node.pinsIn) {
+            if (isParamModPinId(node, p.id)) continue;
+            if (p.id == pin.id)
+                return {bounds.getX(), topY + idx * PIN_ROW_HEIGHT + PIN_ROW_HEIGHT / 2};
+            ++idx;
         }
     } else {
-        for (auto& p : node.pinsOut) {
-            y += PIN_ROW_HEIGHT;
-            if (p.id == pin.id) return {bounds.getRight(), y - PIN_ROW_HEIGHT / 2};
+        int idx = 0;
+        for (const auto& p : node.pinsOut) {
+            if (p.id == pin.id)
+                return {bounds.getRight(), topY + idx * PIN_ROW_HEIGHT + PIN_ROW_HEIGHT / 2};
+            ++idx;
         }
     }
     return bounds.getCentre();
@@ -318,7 +375,7 @@ void NodeGraphComponent::drawNode(juce::Graphics& g, Node& node) {
 
     // Pins
     float pinY = bounds.getY() + HEADER_HEIGHT;
-    auto drawPin = [&](const Pin& pin, bool isInput, bool hasOpposite) {
+    auto drawPin = [&](const Pin& pin, bool isInput, bool hasOpposite, bool withLabel = true) {
         auto pos = canvasToScreen({isInput ? bounds.getX() : bounds.getRight(), pinY + PIN_ROW_HEIGHT / 2});
         float r = PIN_RADIUS * zoom;
 
@@ -340,6 +397,12 @@ void NodeGraphComponent::drawNode(juce::Graphics& g, Node& node) {
             g.setColour(colourForPinKind(pin.kind));
             g.fillEllipse(pos.x - r, pos.y - r, r * 2, r * 2);
         }
+
+        // A param-modulation pin folded onto its param row needs no label: the
+        // param row already shows the param name. Drawing "Mod: <param>" again
+        // would just collide with it. So the param-row caller passes withLabel
+        // = false and we draw only the connector dot.
+        if (!withLabel) return;
 
         // Label. Give it the full width from the pin to the node's far edge so a
         // long control-pin name ("Mod: Tape Saturate") shows in full and only
@@ -371,12 +434,15 @@ void NodeGraphComponent::drawNode(juce::Graphics& g, Node& node) {
                     isInput ? juce::Justification::centredLeft : juce::Justification::centredRight);
     };
 
-    int maxPins = std::max((int)node.pinsIn.size(), (int)node.pinsOut.size());
-    for (int i = 0; i < maxPins; ++i) {
-        bool inHas  = i < (int)node.pinsIn.size();
+    // Top pin region: structural input pins (left) + output pins (right). Param-
+    // modulation pins are NOT drawn here - they render on their param's row below.
+    auto structIns = structuralInputPins(node);
+    int topRows = std::max((int)structIns.size(), (int)node.pinsOut.size());
+    for (int i = 0; i < topRows; ++i) {
+        bool inHas  = i < (int)structIns.size();
         bool outHas = i < (int)node.pinsOut.size();
-        if (inHas)  drawPin(node.pinsIn[i],  true,  outHas);
-        if (outHas) drawPin(node.pinsOut[i], false, inHas);
+        if (inHas)  drawPin(*structIns[(size_t)i], true,  outHas);
+        if (outHas) drawPin(node.pinsOut[(size_t)i], false, inHas);
         pinY += PIN_ROW_HEIGHT;
     }
 
@@ -396,6 +462,16 @@ void NodeGraphComponent::drawNode(juce::Graphics& g, Node& node) {
             // value while the cable modulates around it), so it renders like
             // a normal editable row.
             bool paramLocked = graph.paramHasAbsoluteInput(node.id, pi);
+            // Does this param own an on-demand modulation pin? If so its
+            // connector is drawn IN PLACE on this row's left edge (below),
+            // not in the top pin region.
+            const Pin* modPinPin = nullptr;
+            for (const auto& mp : node.modPins)
+                if (mp.paramIndex == pi) {
+                    for (const auto& ip : node.pinsIn)
+                        if (ip.id == mp.pinId) { modPinPin = &ip; break; }
+                    break;
+                }
             float rowTop    = pinY + 2;
             float rowBottom = pinY + PIN_ROW_HEIGHT - 2;
             auto rowTL = canvasToScreen({bounds.getX() + 6, rowTop});
@@ -490,9 +566,12 @@ void NodeGraphComponent::drawNode(juce::Graphics& g, Node& node) {
                 g.fillEllipse(dotX, dotY, 5.0f, 5.0f);
             }
 
-            // Name (left) and value (right)
+            // Name (left) and value (right). When this row carries a modulation
+            // connector on its left edge, nudge the name right so it clears the
+            // pin dot.
             g.setColour(paramLocked ? juce::Colours::grey : juce::Colours::white);
             auto labelRect = rowRect.reduced(p.autoWriteArmed ? 10.0f : 4.0f, 0.0f);
+            if (modPinPin) labelRect = labelRect.withTrimmedLeft(7.0f * zoom);
             g.drawText(p.name, labelRect, juce::Justification::centredLeft, false);
             // Enum-typed params get their numeric value translated into a
             // readable label, so the user sees the meaning rather than a
@@ -558,6 +637,14 @@ void NodeGraphComponent::drawNode(juce::Graphics& g, Node& node) {
                     }
                 }
             }
+
+            // In-place modulation connector: the param's mod pin renders on the
+            // left edge of its own row (drawPin reads the current pinY, which is
+            // this row's top). No label - the param name above already names it.
+            // Drawn after the row content so the dot/halo sit on top.
+            if (modPinPin)
+                drawPin(*modPinPin, /*isInput=*/true, /*hasOpposite=*/false,
+                        /*withLabel=*/false);
 
             pinY += PIN_ROW_HEIGHT;
         }
@@ -989,14 +1076,17 @@ void NodeGraphComponent::mouseDown(const juce::MouseEvent& e) {
             // output pin on that row and fell through to the node menu.
             {
                 auto bounds = getNodeBounds(*node);
-                int maxPins = std::max((int)node->pinsIn.size(),
+                // Top region holds structural input pins (mod pins live on their
+                // param rows below), so index against the structural list.
+                auto structIns = structuralInputPins(*node);
+                int topRows = std::max((int)structIns.size(),
                                        (int)node->pinsOut.size());
                 float pinRowsTop   = bounds.getY() + HEADER_HEIGHT;
-                float paramRowsTop = pinRowsTop + maxPins * PIN_ROW_HEIGHT;
+                float paramRowsTop = pinRowsTop + topRows * PIN_ROW_HEIGHT;
                 if (canvasPos.y >= pinRowsTop && canvasPos.y < paramRowsTop) {
                     int row = (int)((canvasPos.y - pinRowsTop) / PIN_ROW_HEIGHT);
-                    const Pin* inPin  = (row < (int)node->pinsIn.size())
-                                            ? &node->pinsIn[(size_t)row]  : nullptr;
+                    const Pin* inPin  = (row < (int)structIns.size())
+                                            ? structIns[(size_t)row]  : nullptr;
                     const Pin* outPin = (row < (int)node->pinsOut.size())
                                             ? &node->pinsOut[(size_t)row] : nullptr;
                     const Pin* pin = nullptr;
@@ -1016,11 +1106,27 @@ void NodeGraphComponent::mouseDown(const juce::MouseEvent& e) {
             // Check if right-click is on a param row - show arm/disarm menu
             if (!node->params.empty()) {
                 auto bounds = getNodeBounds(*node);
-                int maxPins = std::max((int)node->pinsIn.size(), (int)node->pinsOut.size());
-                float paramRowsTop = bounds.getY() + HEADER_HEIGHT + maxPins * PIN_ROW_HEIGHT;
+                int topRows = numTopPinRows(*node);
+                float paramRowsTop = bounds.getY() + HEADER_HEIGHT + topRows * PIN_ROW_HEIGHT;
                 if (canvasPos.y >= paramRowsTop) {
                     int idx = (int)((canvasPos.y - paramRowsTop) / PIN_ROW_HEIGHT);
                     if (idx >= 0 && idx < (int)node->params.size()) {
+                        // Right-click landed ON the in-place modulation connector
+                        // (left edge of the row)? Show the pin menu (disconnect /
+                        // switch Set-Mod / remove), same as a structural pin.
+                        for (auto& mp : node->modPins) {
+                            if (mp.paramIndex != idx) continue;
+                            const Pin* mpin = nullptr;
+                            for (auto& ip : node->pinsIn)
+                                if (ip.id == mp.pinId) { mpin = &ip; break; }
+                            if (!mpin) break;
+                            auto pinPos = getPinPosition(*node, *mpin);
+                            if (canvasPos.getDistanceFrom(pinPos) <= PIN_RADIUS * 2) {
+                                showPinMenu(*node, *mpin, /*isInput=*/true);
+                                return;
+                            }
+                            break;
+                        }
                         auto& p = node->params[idx];
                         juce::PopupMenu pm;
                         pm.addItem(1, p.autoWriteArmed ? "Disarm for Auto-Write" : "Arm for Auto-Write");
@@ -1112,8 +1218,8 @@ void NodeGraphComponent::mouseDown(const juce::MouseEvent& e) {
         // specific param, not the rest of the node's params.
         if (!node->params.empty()) {
             auto bounds = getNodeBounds(*node);
-            int maxPins = std::max((int)node->pinsIn.size(), (int)node->pinsOut.size());
-            float paramRowsTop = bounds.getY() + HEADER_HEIGHT + maxPins * PIN_ROW_HEIGHT;
+            int topRows = numTopPinRows(*node);
+            float paramRowsTop = bounds.getY() + HEADER_HEIGHT + topRows * PIN_ROW_HEIGHT;
             float paramRowsLeft  = bounds.getX() + 6;
             float paramRowsRight = bounds.getRight() - 6;
             if (canvasPos.x >= paramRowsLeft && canvasPos.x <= paramRowsRight
@@ -1450,8 +1556,8 @@ void NodeGraphComponent::mouseDoubleClick(const juce::MouseEvent& e) {
     // locked (per-param), so it can't be reset by double-click either.
     if (!node->params.empty()) {
         auto bounds = getNodeBounds(*node);
-        int maxPins = std::max((int)node->pinsIn.size(), (int)node->pinsOut.size());
-        float paramRowsTop = bounds.getY() + HEADER_HEIGHT + maxPins * PIN_ROW_HEIGHT;
+        int topRows = numTopPinRows(*node);
+        float paramRowsTop = bounds.getY() + HEADER_HEIGHT + topRows * PIN_ROW_HEIGHT;
         float paramRowsLeft  = bounds.getX() + 6;
         float paramRowsRight = bounds.getRight() - 6;
         if (canvasPos.x >= paramRowsLeft && canvasPos.x <= paramRowsRight

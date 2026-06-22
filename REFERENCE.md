@@ -21,6 +21,8 @@ here.
 - [Microtuning hosted plugins](#microtuning-hosted-plugins)
 - [Layered Waveform editor](#layered-waveform-editor)
 - [Waveform warp (shape-bending)](#waveform-warp-shape-bending)
+- [Waveshaper (amplitude morph) effects](#waveshaper-amplitude-morph-effects)
+- [Standalone single-cycle oscillators (frame synths)](#standalone-single-cycle-oscillators-frame-synths)
 - [Frequency-domain (spectral) synth](#frequency-domain-spectral-synth)
 - [Terrain Synth](#terrain-synth)
 - [Effect layers and groups](#effect-layers-and-groups)
@@ -997,6 +999,54 @@ A warp chain serialises with `encodeWarpChain` / `decodeWarpChain`. Grammar: `<c
 ### Undo
 
 Frame-scope and per-layer warp edits (add / remove / reorder / amount / enable / method) all route through the editor's debounced commit, landing as a single *Edit wavetable* snapshot step. Bucket-C element warps commit through their own editor's apply path. Continuous amount-slider drags follow the usual "commit on release / debounce" rule rather than one step per tick.
+
+---
+
+## Waveshaper (amplitude morph) effects
+
+A family of ten **amplitude-domain waveshaping effect nodes** — one per Bucket-A amplitude-domain `WarpMethod` — that let you apply the wavetable synth's per-frame shaping curves as a standalone effect anywhere on the wire. They exist because the same shaping a user can dial into a wavetable frame's [morph chain](#waveform-warp-shape-bending) is also useful as a plain insert effect on an arbitrary audio signal, and building one node per curve (rather than one node with a method dropdown) keeps each node self-describing in the graph — the node's title says exactly what it does, and its single knob is labelled for that curve.
+
+### The ten methods
+
+Added from the node menu under **Waveshaper (amplitude morph)**, which lists (in this order): **Soft Clip**, **Hard Clip**, **Wavefold**, **Wavewrap**, **Rectify**, **Quantize (bitcrush)**, **Tube Saturate**, **Tape Saturate**, **Flip (invert)**, **Chebyshev**. These are exactly the `WarpMethod` values returned by `waveshaperMethods()` (`warp.h`) — the amplitude-domain sub-bucket of [Bucket A](#the-three-buckets), and the same primitives the synth uses for live per-frame amplitude morphing.
+
+### One processor, keyed by script token
+
+Identity rides the node's `script` string, **not** a per-method C++ class. `waveshaperScriptFor(method)` produces `"__waveshaper:<token>__"` (e.g. `__waveshaper:wavefold__`); `isWaveshaperScript()` / `waveshaperMethodFromScript()` recover the method. A single `WaveshaperProcessor` (`builtin_effects.h`) reads the method from its node's script in the constructor and applies `warpAmpValue(method, x, amount)` sample-by-sample across every channel — so the effect node and a wavetable frame's morph chain produce **byte-identical** shaping for the same method and amount. `GraphProcessor::rebuildGraph` instantiates it via `isWaveshaperScript(node.script)` before the rest of the built-in-effect if-else chain.
+
+### The amount knob
+
+Each node carries **one** parameter whose label is the method's own warp-parameter name from `warpParamLabel(method)` — **Drive** (Soft/Hard Clip, Tube, Tape), **Fold** (Wavefold), **Wrap** (Wavewrap), **Amount** (Rectify, Flip, Chebyshev), or **Crush** (Quantize) — ranged `0..1`, default `0.5`. The processor looks the value up by that same label, so the creation handler and the DSP can never disagree about the param name. At `amount == 0` (or method `None`) the node is a pass-through. Like every built-in effect it calls `applySignalModulations(node, buf)` first, so the knob can be Param/Signal-cable driven via the standard [Set/Mod control-input](#control-inputs-on-parameters-set-vs-mod) mechanism.
+
+### Save / load, undo
+
+No special serialization — the node persists through the normal `node.script` + `node.params` path in `project_file.cpp`, and `waveshaperMethodFromScript` re-derives the method on load. Adding/removing the node is a graph-topology change, so it commits via `commitSnapshot()` like any other node; the amount knob follows the standard slider-drag undo rule (commit on release). A self-test (`--self-test`, "fs/ws save-load") round-trips a Wavefold waveshaper through `serializeForUndo` → `loadFromString` and checks the script identity and param value survive.
+
+---
+
+## Standalone single-cycle oscillators (frame synths)
+
+Each of the six ways to author a single wavetable frame is also available as a **standalone instrument node** that plays that one cycle as a fixed-timbre oscillator: **Layered**, **Spectral** (frequency-domain), **Wavelet Space**, **Inharmonic**, **Sample**, and **Granular**. They are the wavetable's per-frame authoring methods promoted to first-class one-shot synths — for when you want a single fixed timbre authored your favourite way, without the multi-frame morph machinery.
+
+### Not a one-frame wavetable in disguise — but it reuses the engine
+
+The design constraint was *"don't just make 1-frame wavetables in disguise"* while *"sharing code between the frames and the independent instruments as much as reasonable"*. The resolution: a frame-synth node's `script` is `kFrameSynthPrefix` (`__framesynth__:`) followed by a complete single-frame WavetableDoc encode (one library entry, a 1×1 grid). The synth strips the prefix via `effectiveSynthScript()` and runs the **entire existing wavetable render path** on the lone frame, so there's zero duplicated DSP — but the node presents as its own instrument type with a focused editor, no Position axis, and no "number of waveforms" control. Helpers live in `warp.h`-adjacent code: `defaultFrameSynthScriptForType(typeId)` builds the default script for each of the six types, `isFrameSynthScript()` / `decodeFrameSynthScript()` recover the frame type, and `effectiveSynthScript()` yields the wavetable-engine view.
+
+### Focused editor
+
+Opening a frame-synth node opens `LayeredWaveEditorComponent` in **`frameSynthMode`** — it detects the prefix and hides everything that only makes sense for a multi-frame wavetable (the Library/Cells panels, the Position/morph arrangement, the "number of waveforms" control). What remains is the focused authoring surface for that one cycle plus a toolbar with **Gain**, **Preview** (holds a sustained A4 through the node's own voice; the on-screen cycle *is* the audition, re-shipped on every edit — see [Auditioning the frame](#auditioning-the-frame-preview-button)), **Envelope…** (the shared [AHDSR envelope](#shared-ahdsr-envelope)), and the **Morph** (warp-chain) panel.
+
+### Envelope on all six
+
+All six route through the wavetable/`TerrainSynth` voice path, so they get the **shared node AHDSR envelope** exactly like the wavetable synth: right-click → *Envelope (AHDSR)…* (gated by `isTonalSynth`) or the editor toolbar's **Envelope…** button. This is what satisfied the request to put the envelope feature on every one of the six.
+
+### Sample type — capture not yet wired
+
+The **Sample** single-cycle oscillator currently plays a **default sine cycle**: there is no live single-cycle capture/import path yet (the capture dialogs only emit multi-second `GranularFrame`s, not one-cycle `SampleFrame`s). The focused-mode placeholder says so honestly. Building it properly needs a dedicated single-cycle extraction pipeline (pitch-detect → one period → resample → loop-boundary clean) that must be ear-validated; it's tracked in `known-issues.md` rather than stubbed in. See also the asset-library note that a `SampleFrame` type exists but has no in-editor view yet.
+
+### Save / load, undo
+
+The node persists through the standard `node.script` path (the script *is* the full frame encode), so round-tripping a project preserves the instrument and its authored cycle. Adding the node is a graph-topology change (`commitSnapshot()`); edits inside the focused editor land on the editor's debounced *Edit wavetable* path, identical to editing a frame inside a real wavetable. A self-test (`--self-test`, "fs/ws save-load") round-trips a Granular frame-synth through `serializeForUndo` → `loadFromString` and checks the frame-type identity and Volume param survive.
 
 ---
 

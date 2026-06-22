@@ -197,6 +197,16 @@ a + b</code></pre>
 
 <p>Each of the three ramps (Attack, Decay, Release) has a <strong>curve knob</strong> right under the sliders: leave it centred for a straight line, turn it <em>right</em> for a slow start that speeds up (the classic "exponential" feel), or <em>left</em> for a fast start that eases out. Double-click a curve knob to snap it back to straight. It's one knob that bends the whole shape — you almost never need the deeper <em>…Curve…</em> editors beside it. The little preview at the top of the envelope window updates as you turn the knobs, so you can see the shape you're making. (The same Envelope… button lives in the Frequency-Domain editor, and every tonal synth node also has it on its right-click menu.)</p>
 
+<h2>One fixed timbre? Use a single-cycle oscillator instead</h2>
+
+<p>Everything above is about building a <em>wavetable</em> — several cycles the synth morphs between. But sometimes you just want <em>one</em> waveform, authored your favourite way, played as a plain oscillator with no morphing. For that, each of the six ways to build a single cycle is also available as its own instrument node: <strong>Layered</strong>, <strong>Spectral</strong> (frequency-domain), <strong>Wavelet Space</strong>, <strong>Inharmonic</strong>, <strong>Sample</strong>, and <strong>Granular</strong>. Add one from the node menu just like any other instrument.</p>
+
+<p>These open a <strong>focused editor</strong> — the same authoring surface as the matching wavetable frame type, minus the wavetable-only parts (no Library/Cells panels, no Position morph, no "number of waveforms"). You still get a <strong>Gain</strong> control, a <strong>Preview</strong> button, the <strong>Envelope…</strong> button (the same Attack/Hold/Decay/Sustain/Release shape described above), and the <strong>Morph</strong> (shape-bending) panel. Reach for these when you want one solid timbre; reach for the full Waveform synth when you want that timbre to <em>move</em>. (Note: the <strong>Sample</strong> oscillator currently plays a default sine — capturing a single cycle from audio isn't wired up yet.)</p>
+
+<h2>Bending a sound on the wire — the Waveshaper effects</h2>
+
+<p>The same shape-bending curves you can apply inside a wavetable frame (Soft Clip, Wavefold, Tube Saturate, Bitcrush, and so on) are also available as standalone <strong>Waveshaper (amplitude morph)</strong> effect nodes — one per curve, found in the node menu. Drop one anywhere in your signal chain and turn its single knob to dial in the amount. It's the same math as the in-frame morph, so a sound you shape inside a wavetable and one you shape on the wire come out identical — handy when you want to add grit or fold to a whole mix rather than to one instrument's waveform.</p>
+
 <h2>Workflow tips</h2>
 
 <ul>

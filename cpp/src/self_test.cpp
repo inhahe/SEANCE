@@ -2194,47 +2194,102 @@ void testWarp(Report& r) {
         }
     }
 
-    // ---- Serialization round-trip (backward-compatible warp section) ---
+    // ---- Serialization round-trip (per-frame morph chain) ---
     {
         WavetableDoc doc;
         doc.mode = WavetableMode::Grid;
-        doc.gridDims = { 1 };
-        doc.cellWaveformIds = { -1 };
-        doc.warpChain = {
+        int fid = doc.addLibraryEntry(std::make_unique<LayeredWaveform>(), "F");
+        doc.libraryFrameById(fid)->morphChain = {
             { WarpMethod::BendPlus, 0.42f, 0.0f, true },
             { WarpMethod::SoftClip, 0.75f, 0.1f, false },
         };
+        doc.gridDims = { 1 };
+        doc.cellWaveformIds = { fid };
         std::string enc = doc.encode();
-        bool hasTag = enc.find(":warp:") != std::string::npos;
-        r.check(hasTag, "warp: encode appends a :warp: section when non-empty");
+        bool hasTag = enc.find(":morph:") != std::string::npos;
+        r.check(hasTag, "morph: encode appends a :morph: section when a frame carries a chain");
 
         WavetableDoc back;
         bool ok = back.decode(enc);
-        r.check(ok, "warp: doc with warp chain decodes");
-        bool match = back.warpChain.size() == 2;
+        r.check(ok, "morph: doc with per-frame morph chain decodes");
+        const IWavetableFrame* bf = back.libraryFrameById(fid);
+        bool match = bf && bf->morphChain.size() == 2;
         if (match) {
-            const auto& a0 = back.warpChain[0];
-            const auto& a1 = back.warpChain[1];
+            const auto& a0 = bf->morphChain[0];
+            const auto& a1 = bf->morphChain[1];
             match = a0.method == WarpMethod::BendPlus
                  && std::abs(a0.amount - 0.42f) < 1e-4f && a0.enabled
                  && a1.method == WarpMethod::SoftClip
                  && std::abs(a1.amount - 0.75f) < 1e-4f
                  && std::abs(a1.aux - 0.1f) < 1e-4f && !a1.enabled;
         }
-        r.check(match, "warp: warp chain survives an encode->decode round trip");
+        r.check(match, "morph: per-frame morph chain survives an encode->decode round trip");
 
-        // Empty chain must NOT write the tag (byte-compatible with old files).
+        // A frame with an empty chain must NOT write the morph tag (byte-
+        // compatible with files whose frames have no morph chain).
         WavetableDoc empt;
         empt.mode = WavetableMode::Grid;
+        int efid = empt.addLibraryEntry(std::make_unique<LayeredWaveform>(), "E");
         empt.gridDims = { 1 };
-        empt.cellWaveformIds = { -1 };
+        empt.cellWaveformIds = { efid };
         std::string encEmpty = empt.encode();
-        bool noTag = encEmpty.find(":warp:") == std::string::npos;
-        r.check(noTag, "warp: empty chain omits the :warp: section");
+        bool noTag = encEmpty.find(":morph:") == std::string::npos;
+        r.check(noTag, "morph: a frame with an empty chain omits the :morph: section");
         WavetableDoc emptBack;
         emptBack.decode(encEmpty);
-        r.check(emptBack.warpChain.empty(),
-                "warp: pre-warp payload decodes to an empty chain");
+        const IWavetableFrame* ebf = emptBack.libraryFrameById(efid);
+        r.check(ebf && ebf->morphChain.empty(),
+                "morph: no-morph payload decodes to an empty chain");
+    }
+
+    // ---- Per-frame morph: two frames carry INDEPENDENT chains ----------------
+    {
+        // The whole point of moving the morph chain onto the frame: editing one
+        // frame's chain must not touch another's. Build a 2-frame grid where each
+        // frame has a distinct chain, round-trip, and verify each frame keeps its
+        // own ops. Also verify the node's frame-scope warp params are keyed by
+        // warpFrameId so the two frames' params don't collide.
+        NodeGraph g;
+        int nId = g.addNode("wt", NodeType::TerrainSynth, {}, {}).id;
+        WavetableDoc doc;
+        doc.mode = WavetableMode::Grid;
+        int fA = doc.addLibraryEntry(std::make_unique<LayeredWaveform>(), "A");
+        int fB = doc.addLibraryEntry(std::make_unique<LayeredWaveform>(), "B");
+        doc.libraryFrameById(fA)->morphChain = {
+            { WarpMethod::SoftClip, 0.30f, 0.0f, true } };
+        doc.libraryFrameById(fB)->morphChain = {
+            { WarpMethod::Wavefold, 0.60f, 0.0f, true },
+            { WarpMethod::BendPlus, 0.20f, 0.0f, true } };
+        doc.gridDims = { 2 };
+        doc.cellWaveformIds = { fA, fB };
+        g.findNode(nId)->script = doc.encode();
+
+        WavetableDoc back; back.decode(g.findNode(nId)->script);
+        const IWavetableFrame* bA = back.libraryFrameById(fA);
+        const IWavetableFrame* bB = back.libraryFrameById(fB);
+        r.check(bA && bA->morphChain.size() == 1 &&
+                bA->morphChain[0].method == WarpMethod::SoftClip,
+                "per-frame morph: frame A keeps its own 1-op chain");
+        r.check(bB && bB->morphChain.size() == 2 &&
+                bB->morphChain[0].method == WarpMethod::Wavefold &&
+                bB->morphChain[1].method == WarpMethod::BendPlus,
+                "per-frame morph: frame B keeps its own 2-op chain (independent of A)");
+
+        // Reconcile node params: frame A -> 1 param keyed to fA, frame B -> 2
+        // params keyed to fB. None should share a (warpFrameId, warpSlot) key.
+        reconcileAllWarpParams(g);
+        Node* nd = g.findNode(nId);
+        int nA = 0, nB = 0;
+        bool prefixedA = false, prefixedB = false;
+        for (const auto& p : nd->params) {
+            if (p.warpLayer != -1 || p.warpSlot < 0) continue;
+            if (p.warpFrameId == fA) { ++nA; if (p.name.rfind("A:", 0) == 0) prefixedA = true; }
+            if (p.warpFrameId == fB) { ++nB; if (p.name.rfind("B:", 0) == 0) prefixedB = true; }
+        }
+        r.checkVal(nA == 1, "per-frame morph: frame A gets exactly one frame-scope param", nA);
+        r.checkVal(nB == 2, "per-frame morph: frame B gets exactly two frame-scope params", nB);
+        r.check(prefixedA && prefixedB,
+                "per-frame morph: params are name-prefixed per frame when >1 frame morphs");
     }
 
     // ---- Built-in morph presets (curated Type-2 chains) ----------------
@@ -3834,22 +3889,24 @@ void testAssetLibrary(Report& r) {
         int mAsset = g.assets.add(AssetKind::MorphAlgorithm, "shared morph",
                                   "", mPayload);
         WavetableDoc mdoc;
-        mdoc.addLibraryEntry(std::make_unique<LayeredWaveform>(), "w");
-        mdoc.warpChain = makeChain({ WarpMethod::SoftClip, WarpMethod::HardClip });
-        mdoc.warpAssetId = mAsset;
+        int mfid = mdoc.addLibraryEntry(std::make_unique<LayeredWaveform>(), "w");
+        mdoc.libraryFrameById(mfid)->morphChain =
+            makeChain({ WarpMethod::SoftClip, WarpMethod::HardClip });
+        mdoc.libraryFrameById(mfid)->morphAssetId = mAsset;
         int mnId = g.addNode("wt3", NodeType::TerrainSynth, {}, {}).id;
         g.findNode(mnId)->script = mdoc.encode();
         resolveWarpReferences(g);
 
-        // Unlink: clear warpAssetId, keep the chain.
+        // Unlink: clear morphAssetId, keep the chain.
         WavetableDoc m1; m1.decode(g.findNode(mnId)->script);
-        m1.warpAssetId = -1;
+        m1.libraryFrameById(mfid)->morphAssetId = -1;
         g.findNode(mnId)->script = m1.encode();
         g.assets.update(mAsset, "", encodeWarpChain(makeChain({ WarpMethod::Wavefold })));
         resolveWarpReferences(g);
         WavetableDoc m2; m2.decode(g.findNode(mnId)->script);
-        r.check(m2.warpAssetId == -1 && m2.warpChain.size() == 2 &&
-                    encodeWarpChain(m2.warpChain) == mPayload,
+        const IWavetableFrame* m2f = m2.libraryFrameById(mfid);
+        r.check(m2f && m2f->morphAssetId == -1 && m2f->morphChain.size() == 2 &&
+                    encodeWarpChain(m2f->morphChain) == mPayload,
                 "assets: morph Unlink detaches and stops propagation from the asset");
     }
 
@@ -3873,27 +3930,29 @@ void testAssetLibrary(Report& r) {
         int mAsset = g.assets.add(AssetKind::MorphAlgorithm, "shared morph",
                                   "", assetPayload);
 
-        // Node wavetable: a different cached 1-op chain that live-references the
-        // 2-op asset. (Give the node one library entry so it's a valid doc.)
+        // Node wavetable: a frame whose morph chain is a stale 1-op cache that
+        // live-references the 2-op asset.
         WavetableDoc doc;
-        doc.addLibraryEntry(std::make_unique<LayeredWaveform>(), "w");
-        doc.warpChain = makeChain({ WarpMethod::Wavefold });   // stale 1-op cache
-        doc.warpAssetId = mAsset;
+        int fid = doc.addLibraryEntry(std::make_unique<LayeredWaveform>(), "w");
+        doc.libraryFrameById(fid)->morphChain = makeChain({ WarpMethod::Wavefold }); // stale 1-op cache
+        doc.libraryFrameById(fid)->morphAssetId = mAsset;
         g.findNode(nId)->script = doc.encode();
 
-        // warpAssetId must survive the wavetable codec round-trip.
+        // morphAssetId must survive the wavetable codec round-trip.
         WavetableDoc rt; rt.decode(g.findNode(nId)->script);
-        r.check(rt.warpAssetId == mAsset && rt.warpChain.size() == 1,
-                "assets: warpAssetId + cached chain round-trip through wavetable codec");
+        const IWavetableFrame* rtf = rt.libraryFrameById(fid);
+        r.check(rtf && rtf->morphAssetId == mAsset && rtf->morphChain.size() == 1,
+                "assets: morphAssetId + cached chain round-trip through wavetable codec");
 
         // Resolve -> chain becomes the asset's 2-op chain, and the node gains
-        // two reconciled "Warp N" modulation params.
+        // two reconciled morph modulation params.
         int nres = resolveWarpReferences(g);
         r.checkVal(nres == 1,
                    "assets: resolveWarpReferences resolves the one reference", nres);
         WavetableDoc after; after.decode(g.findNode(nId)->script);
-        r.check(after.warpChain.size() == 2 &&
-                    encodeWarpChain(after.warpChain) == assetPayload,
+        const IWavetableFrame* af = after.libraryFrameById(fid);
+        r.check(af && af->morphChain.size() == 2 &&
+                    encodeWarpChain(af->morphChain) == assetPayload,
                 "assets: resolved warp chain matches the published asset");
         {
             int warpParams = 0;
@@ -3921,8 +3980,9 @@ void testAssetLibrary(Report& r) {
         NodeGraph g2; std::istringstream iss(oss.str());
         ProjectFile::readProject(iss, g2, nullptr);
         WavetableDoc loaded; loaded.decode(g2.findNode(nId)->script);
-        r.check(loaded.warpAssetId == mAsset && loaded.warpChain.size() == 2 &&
-                    encodeWarpChain(loaded.warpChain) == assetPayload,
+        const IWavetableFrame* lf = loaded.libraryFrameById(fid);
+        r.check(lf && lf->morphAssetId == mAsset && lf->morphChain.size() == 2 &&
+                    encodeWarpChain(lf->morphChain) == assetPayload,
                 "assets: warp reference re-resolves after save/load");
 
         // Edit the asset (now 3 ops) -> propagates on next resolve.
@@ -3931,14 +3991,16 @@ void testAssetLibrary(Report& r) {
         g.assets.update(mAsset, "", pay2);
         resolveWarpReferences(g);
         WavetableDoc edDoc; edDoc.decode(g.findNode(nId)->script);
-        r.check(edDoc.warpChain.size() == 3 && encodeWarpChain(edDoc.warpChain) == pay2,
+        const IWavetableFrame* ef = edDoc.libraryFrameById(fid);
+        r.check(ef && ef->morphChain.size() == 3 && encodeWarpChain(ef->morphChain) == pay2,
                 "assets: editing morph asset propagates to the referencing node");
 
         // Erase the asset -> frame detaches to independent, keeps its last chain.
         g.assets.erase(mAsset);
         resolveWarpReferences(g);
         WavetableDoc delDoc; delDoc.decode(g.findNode(nId)->script);
-        r.check(delDoc.warpAssetId == -1 && delDoc.warpChain.size() == 3,
+        const IWavetableFrame* df = delDoc.libraryFrameById(fid);
+        r.check(df && df->morphAssetId == -1 && df->morphChain.size() == 3,
                 "assets: erased morph asset -> frame falls back to independent");
     }
 
@@ -3952,10 +4014,10 @@ void testAssetLibrary(Report& r) {
         NodeGraph g;
         int nId = g.addNode("wt", NodeType::TerrainSynth, {}, {}).id;
         WavetableDoc doc;
-        doc.addLibraryEntry(std::make_unique<LayeredWaveform>(), "w");
+        int fid = doc.addLibraryEntry(std::make_unique<LayeredWaveform>(), "w");
         WarpOp o0; o0.method = WarpMethod::Wavefold; o0.amount = 0.3f; o0.enabled = true;
         WarpOp o1; o1.method = WarpMethod::PwmSkew;  o1.amount = 0.7f; o1.enabled = true;
-        doc.warpChain = { o0, o1 };
+        doc.libraryFrameById(fid)->morphChain = { o0, o1 };
         Node* nd = g.findNode(nId);
         nd->script = doc.encode();
         // Inject legacy params (warpSlot defaults to -1) + a modPin on "Warp 2".
@@ -4009,9 +4071,9 @@ void testAssetLibrary(Report& r) {
         NodeGraph g;
         int nId = g.addNode("wt", NodeType::TerrainSynth, {}, {}).id;
         WavetableDoc doc;
-        doc.addLibraryEntry(std::make_unique<LayeredWaveform>(), "w");
+        int fid = doc.addLibraryEntry(std::make_unique<LayeredWaveform>(), "w");
         WarpOp o0; o0.method = WarpMethod::SoftClip; o0.amount = 0.4f; o0.enabled = true;
-        doc.warpChain = { o0 };   // single op -> one "Drive 1" param at slot 0
+        doc.libraryFrameById(fid)->morphChain = { o0 };   // single op -> one "Drive 1" param at slot 0
         Node* nd = g.findNode(nId);
         nd->script = doc.encode();
 
@@ -4096,10 +4158,13 @@ void testAssetLibrary(Report& r) {
         int nId = g.addNode("wt", NodeType::TerrainSynth, {}, {}).id;
         Node* nd = g.findNode(nId);
 
-        auto makeParam = [](const char* name, int layer, int slot, float v) {
+        // All params belong to one frame (library id 7); the per-layer reconcile
+        // is keyed by (warpFrameId, warpLayer, warpSlot).
+        const int frameId = 7;
+        auto makeParam = [frameId](const char* name, int layer, int slot, float v) {
             Param p; p.name = name; p.value = p.baseValue = v;
             p.minVal = 0; p.maxVal = 1; p.format = "%.2f";
-            p.warpSlot = slot; p.warpLayer = layer;
+            p.warpSlot = slot; p.warpLayer = layer; p.warpFrameId = frameId;
             return p;
         };
         // A frame-scope warp param (must be ignored by the per-layer reconcile).
@@ -4121,7 +4186,7 @@ void testAssetLibrary(Report& r) {
         auto op = [](WarpMethod m) { WarpOp o; o.method = m; o.amount = 0.5f; o.enabled = true; return o; };
         chains[0] = { op(WarpMethod::Wavefold), op(WarpMethod::SoftClip) };
         chains[1] = { op(WarpMethod::PwmSkew) };
-        reconcilePerLayerWarpParams(g, nId, chains);
+        reconcilePerLayerWarpParams(g, nId, frameId, chains);
         nd = g.findNode(nId);
         r.check(nd->params.size() == 4,
                 "per-layer reconcile: all-live keeps every param (no add, no remove)");
@@ -4129,7 +4194,7 @@ void testAssetLibrary(Report& r) {
         // (b) Drop layer0 slot1 (SoftClip) -> its param removed, modPin + pin +
         //     cable dropped, the layer1 param's index remapped past the hole.
         chains[0] = { op(WarpMethod::Wavefold) };  // slot1 gone
-        reconcilePerLayerWarpParams(g, nId, chains);
+        reconcilePerLayerWarpParams(g, nId, frameId, chains);
         nd = g.findNode(nId);
         bool drivePresent = false, foldPL = false, widthPL = false, foldFrame = false;
         for (auto& q : nd->params) {
@@ -4156,7 +4221,7 @@ void testAssetLibrary(Report& r) {
         // (c) Method change on layer0 slot0 (Wavefold -> SoftClip) relabels the
         //     surviving per-layer param "Fold 1" -> "Drive 1" without moving it.
         chains[0] = { op(WarpMethod::SoftClip) };
-        reconcilePerLayerWarpParams(g, nId, chains);
+        reconcilePerLayerWarpParams(g, nId, frameId, chains);
         nd = g.findNode(nId);
         const Param* relabelled = nullptr;
         for (auto& q : nd->params) if (q.warpLayer == 0 && q.warpSlot == 0) relabelled = &q;

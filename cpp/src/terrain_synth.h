@@ -554,48 +554,44 @@ private:
     // all dims (when traversable) or empty (single frame, normalized blend).
     std::vector<int> wtEffectiveAxes;
 
-    // Frame-scope warp chain (Bucket A): shape-bending ops applied per sample
-    // in the voice loop, AFTER the terrain blend - phase-domain ops remap the
-    // read phase (coord[0]) before the cycle lookup, amplitude-domain ops shape
-    // the sampled value. Mirror of WavetableDoc::warpChain, captured on rebuild.
-    // Each op's `amount` is the static value baked at rebuild; a live modulated
-    // amount comes from a "Warp N" node param resolved per block (see
-    // wtWarpAmount). Empty = no warp (zero per-sample cost).
-    std::vector<WarpOp> wtWarpChain;
-    // Per-block resolved + domain-split op lists, refreshed at the top of the
-    // render from the "Warp N" params (each op's `amount` here is the live
-    // resolved value). Splitting by domain once per block keeps the per-sample
-    // voice loop free of warpDomainOf() registry lookups: phase ops compose
-    // onto the read phase before the cycle lookup, amp ops shape the value
-    // after. Disabled / None ops are filtered out during the split.
-    std::vector<WarpOp> wtWarpPhaseOps;
-    std::vector<WarpOp> wtWarpAmpOps;
+    // ---- Per-frame live morph re-bake (per-frame morph chains + #88) ----
+    //
+    // Each layered frame in the wavetable owns its OWN summation-morph chain
+    // (IWavetableFrame::morphChain) plus per-layer warp ops. At rebuild we bake
+    // every frame's RESTING morph into the terrain/scatter table via
+    // renderMorphed(). For frames whose morph amounts or per-layer warp ops are
+    // wired to live node params, we ALSO keep a RebakeFrame entry so processBlock
+    // can re-render that one frame's cycle each block with the live amounts and
+    // write it back into its slot - BEFORE the cross-frame blend, so each frame
+    // shapes independently and morphs blend the shaped cycles.
+    //
+    // This replaces the old doc-level frame-scope warp (one chain shared by ALL
+    // frames, applied per sample AFTER the blend) and the single-frame-only
+    // wtLayeredFrame re-bake. Per-frame morph genuinely requires per-frame bake.
+    struct RebakeFrame {
+        std::unique_ptr<IWavetableFrame> frame; // clone (typeId "layered"), tableSize set
+        int frameId   = -1;   // library id - param lookup key (Param::warpFrameId)
+        int tableSize = 0;
+        // Destination. scatterIndex >= 0 -> wtScatterFrameSamples[scatterIndex];
+        // otherwise grid: terrain.data[i * gridStride + gridOffset], i in [0,ts).
+        int scatterIndex = -1;
+        int gridOffset   = 0;
+        int gridStride   = 0;
+        // This frame's morph chain (resting amounts); live amounts come from
+        // (warpFrameId, warpLayer == -1, warpSlot) params each block.
+        std::vector<WarpOp> morphChain;
+        // Change-detection caches so an unmodulated frame skips the re-render
+        // after the first priming block. NaN-aware compare (see rebakeFramesIfNeeded).
+        std::vector<std::vector<float>> lastLayerOverrides;
+        std::vector<float> lastPhaseOv, lastAmpOv, lastShapeOv, lastShape2Ov;
+        std::vector<float> lastMorphAmounts;
+    };
+    std::vector<RebakeFrame> wtRebakeFrames;
 
-    // Single-frame layered wavetable: live per-layer warp re-bake (#88, item-M).
-    // When the table is exactly ONE layered frame whose layers carry warp chains,
-    // we cache a clone of that frame (typeId "layered") so processBlock can
-    // re-render the cycle each block with live warp amounts pulled from per-layer
-    // warp params (Param::warpLayer >= 0, addressed by (warpLayer, warpSlot)).
-    // This mirrors the frame-scope warp path but re-bakes the whole cycle instead
-    // of shaping per sample, because a per-layer warp op composes inside a single
-    // layer's sum, not over the blended result. Null/empty when the table isn't a
-    // single warp-bearing layered frame, in which case the baked terrain from the
-    // rebuild plays unchanged (the "bake whatever isn't pinned" engine fork).
-    std::unique_ptr<IWavetableFrame> wtLayeredFrame;
-    int wtLayeredTableSize = 0;
-    // Last per-layer override grid pushed into the re-bake. Lets us skip the
-    // (tableSize x layers) re-render when no per-layer warp amount changed, so an
-    // unmodulated table costs only the cheap per-block param scan.
-    std::vector<std::vector<float>> wtLastLayerOverrides;
-    // Last per-layer Phase / Amplitude override grids (NaN = unmodulated). Same
-    // change-detection role as wtLastLayerOverrides so a table with modulated
-    // phase/amp only re-renders when a value actually moves.
-    std::vector<float> wtLastLayerPhaseOverrides;
-    std::vector<float> wtLastLayerAmpOverrides;
-    // Last per-layer generator-parameter override grids (NaN = unmodulated):
-    // shapeParam (duty/amount/index) and shapeParam2 (FM ratio).
-    std::vector<float> wtLastLayerShapeOverrides;
-    std::vector<float> wtLastLayerShape2Overrides;
+    // Re-render each modulated frame's cycle with live morph/per-layer amounts
+    // and write it back into its terrain/scatter slot. Called once per block,
+    // before the cross-frame blend. No-op when wtRebakeFrames is empty.
+    void rebakeFramesIfNeeded(const Node& node);
 
     // Scatter wavetable: instead of a rectilinear terrain, frames are stored
     // explicitly with their N-D positions. Each block we compute a Wendland

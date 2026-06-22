@@ -2,6 +2,7 @@
 #include <vector>
 #include <string>
 #include <memory>
+#include "warp.h"
 
 namespace SoundShop {
 
@@ -54,6 +55,35 @@ public:
     // wavetable container (WavetableDoc), not per-subclass.
     float gain = 1.0f;
 
+    // ---- Per-frame summation-morph chain (Bucket A shape-bending) ----
+    //
+    // Ordered list of transform warps that shape THIS frame's cycle: phase-
+    // domain ops remap the read phase before the cycle lookup, amplitude-domain
+    // ops shape the sample after. Applied to render() output and baked into the
+    // synth terrain BEFORE the cross-frame morph blend, so every frame in a
+    // wavetable can carry its own independent shaping ("make a pad bright in one
+    // frame, gritty in the next, and morph between them"). This is the chain the
+    // editor's per-frame "Morph" editor (frameWarpEditor) edits and the user
+    // calls the "morph chain".
+    //
+    // Was WavetableDoc::warpChain (a single chain shared by ALL frames) before
+    // 2026-06; moved here so it is genuinely per-frame. Distinct from the
+    // element-scope `warpChain` that some concrete frame types (Granular,
+    // Inharmonic, Spectral, Wavelet) bake into their own body via renderRaw -
+    // morphChain layers on TOP of whatever render() produces. Empty by default,
+    // costs nothing when unused. Serialised once by the wavetable container
+    // (WavetableDoc) in a trailing per-frame block, like `gain`.
+    std::vector<WarpOp> morphChain;
+
+    // Live reference to a project MorphAlgorithm asset (a stored warp chain).
+    // -1 = independent (the morphChain above is this frame's own). When >= 0, the
+    // morphChain is a cache of asset `morphAssetId`'s content, refreshed by
+    // resolveWarpReferences() at edit/load; editing the chain writes back to the
+    // asset and propagates to every frame sharing the id (the "live reference"
+    // model, mirroring WaveformLibraryEntry.assetId). Was WavetableDoc::
+    // warpAssetId before 2026-06.
+    int morphAssetId = -1;
+
     // Render one cycle of the waveform into `out`, WITHOUT the per-frame
     // `gain` applied. Implementations resize `out` to `tableSize` and fill
     // it with samples in [-1, 1]. Peak-normalisation policy is up to the
@@ -70,6 +100,19 @@ public:
         renderRaw(tableSize, out);
         if (gain != 1.0f)
             for (auto& v : out) v *= gain;
+    }
+
+    // render() with the per-frame summation-morph chain baked on top, at the
+    // chain's RESTING amounts. This is the cycle the user sees in the editor
+    // preview and what the synth bakes into the terrain when no warp op is being
+    // modulated. The live synth path bakes render() then applies the chain with
+    // per-block modulated amounts instead (so an LFO can sweep the shape), which
+    // is why morph is NOT folded into render() itself. No-op fast path when the
+    // chain is empty (the common case), so unwarped frames pay nothing.
+    void renderMorphed(int tableSize, std::vector<float>& out) const {
+        render(tableSize, out);
+        if (!morphChain.empty())
+            applyWarpChain(morphChain, out);
     }
 
     // Serialise the frame body (no type tag, no length prefix - just the

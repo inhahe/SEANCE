@@ -5,33 +5,6 @@ top. When something is fixed, delete the entry (git history is the archive).
 
 ---
 
-## OPEN: Summation Morph is doc-level but presented as per-frame (misleading labels)
-
-**Reported:** 2026-06-22. User expected the wavetable "Summation Morph" chain to
-be per-frame; picking a morph for one frame shows it on the other frame, and the
-status label reads "(independent)" after "Use Library...".
-
-**Root cause (confirmed in code, not a bug per se):** `WavetableDoc::warpChain` and
-`WavetableDoc::warpAssetId` are **doc-level** — one morph chain shared by every
-frame of the wavetable (`layered_wave_editor.h:799,808`; editor binds with
-`setChain(&wave.warpChain)` at `layered_wave_editor.cpp:9064`). So:
-- **Cross-frame "leak" is by design** — there is literally one chain for the table.
-- **"(independent)" after Use Library is correct** when the "Sync to library"
-  toggle is off (default) or a built-in preset is picked — both load a one-time
-  copy (`warp_editor.cpp:310`, `onMorphPicked`). Only a *saved* morph with Sync
-  ticked live-links and changes the label.
-
-**What's actually wrong:** the UI wording. The field is *named* "frame-scope" and
-the picker/status text says "this frame" / "every frame that references it"
-(`warp_editor.cpp:74-78,256,275-279`), implying per-frame scope that doesn't exist.
-The copy-by-default + hidden-Sync-toggle flow also makes "Use Library" feel broken.
-
-**Decision needed before fixing** (don't pick unilaterally — CLAUDE.md no-stop-gap
-rule): keep the morph **table-wide** (then just fix "this frame" → "this wavetable"
-labels + improve the Use-Library/Sync discoverability), OR make it **truly
-per-frame** (move `warpChain`/`warpAssetId` into each `IWavetableFrame`, per-frame
-warp in the synth voice, save/load + morph-blend changes — a sizable feature).
-
 ## OPEN (unreproduced): "adding a morph + clicking its Pin checkbox adds no pin/slider"
 
 **Reported:** 2026-06-22. The data path is provably correct (self_test

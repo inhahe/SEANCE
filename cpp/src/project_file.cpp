@@ -362,6 +362,11 @@ bool ProjectFile::writeProject(std::ostream& f, NodeGraph& graph,
             // Per-layer field key (0=phase, 1=amplitude). Only emitted for
             // layer-field modulation params; absent => -1 (not a layer field).
             if (param.layerField >= 0) writeInt(f, "layerField", param.layerField);
+            // Owning wavetable frame (library id) for warp / layer-field params.
+            // Only emitted when set (>=0); absent => -1 (legacy whole-node, the
+            // pre-per-frame layout). Lets two frames carry the same warp op
+            // without their modulation params colliding on (warpLayer,warpSlot).
+            if (param.warpFrameId >= 0) writeInt(f, "warpFrameId", param.warpFrameId);
             for (auto& ap : param.automation.points)
                 f << "auto=" << ap.beat << "," << ap.value << "\n";
         }
@@ -847,6 +852,7 @@ bool ProjectFile::readProject(std::istream& f, NodeGraph& graph, PluginHost* plu
             else if (key == "warpSlot") p.warpSlot = std::stoi(val);
             else if (key == "warpLayer") p.warpLayer = std::stoi(val);
             else if (key == "layerField") p.layerField = std::stoi(val);
+            else if (key == "warpFrameId") p.warpFrameId = std::stoi(val);
             else if (key == "auto") {
                 auto comma = val.find(',');
                 if (comma != std::string::npos)

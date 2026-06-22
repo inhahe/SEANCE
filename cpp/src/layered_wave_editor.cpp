@@ -2919,22 +2919,43 @@ std::string WavetableDoc::encode() const {
         if (refCount > 0) o << ":assets:" << refs.str();
     }
 
-    // Morph-algorithm asset reference (optional trailing block). When the
-    // frame-scope warp chain live-references a project MorphAlgorithm asset, its
-    // id is recorded here. ':'-free payload (a single int) so it reads with
-    // readUntil(':'). Written BEFORE the warp block (which must stay last).
-    // Omitted when independent, so unreferenced payloads round-trip identically.
-    if (warpAssetId >= 0)
-        o << ":warpAsset:" << warpAssetId;
+    // Per-frame summation-morph asset references (optional trailing block).
+    // Each frame (library entry) whose morph chain live-references a project
+    // MorphAlgorithm asset records "<libId>=<assetId>"; pairs joined by ';'.
+    // ':'-free payload so it reads with readUntil(':'). Written BEFORE the morph
+    // chains (which contain ':' and are length-prefixed). Omitted when no frame
+    // references an asset, so unreferenced payloads round-trip identically.
+    {
+        std::ostringstream refs;
+        int n = 0;
+        for (const auto& e : library) {
+            if (!e.wave || e.wave->morphAssetId < 0) continue;
+            if (n++) refs << ";";
+            refs << e.id << "=" << e.wave->morphAssetId;
+        }
+        if (n > 0) o << ":morphAsset:" << refs.str();
+    }
 
-    // Warp section (optional trailing block). Appended AFTER the cell section
-    // so it's invisible to older decoders, which stop reading once they've
-    // consumed cellCount cells. New decoders look for the ":warp:" tag and
-    // read the frame-scope warp chain. Omitted entirely when empty so a
-    // round-trip with no warps reproduces a byte-identical pre-warp payload.
-    // Must remain LAST: decodeWarpChain consumes the rest of the string.
-    if (!warpChain.empty())
-        o << ":warp:" << encodeWarpChain(warpChain);
+    // Per-frame summation-morph chains (optional trailing block). One length-
+    // prefixed entry per frame whose chain is non-empty:
+    //   :morph:<count>:<libId>:<len>:<chainStr>:<libId>:<len>:<chainStr>...
+    // Each chainStr (encodeWarpChain) contains ':' internally, so it is length-
+    // prefixed and read back with readN(len) - which is why this block, unlike
+    // the old doc-level ":warp:", does NOT have to be last. Appended after the
+    // cell section so older decoders (which stop at unknown tags) ignore it.
+    // Omitted when no frame carries a chain, so an unwarped wavetable round-
+    // trips to a byte-identical pre-morph payload.
+    {
+        std::ostringstream chains;
+        int n = 0;
+        for (const auto& e : library) {
+            if (!e.wave || e.wave->morphChain.empty()) continue;
+            std::string cs = encodeWarpChain(e.wave->morphChain);
+            chains << ":" << e.id << ":" << cs.size() << ":" << cs;
+            ++n;
+        }
+        if (n > 0) o << ":morph:" << n << chains.str();
+    }
     return o.str();
 }
 
@@ -3177,16 +3198,23 @@ static bool decodeWavetableV4or5(WavetableDoc& doc, const std::string& body,
         if (doc.gridDims.empty()) doc.gridDims = { (int)doc.cellWaveformIds.size() };
     }
 
-    // ---- Optional trailing blocks (assets, warp) ----
+    // ---- Optional trailing blocks (assets, morph, legacy warp) ----
     // Older payloads end after the cell section. Newer ones append tagged
-    // blocks: ":assets:<id=asset;...>" (library entry -> project asset refs)
-    // and/or ":warp:<chain>". The asset block has a ':'-free payload so it can
-    // be read with readUntil(':'); the warp block must be last because
-    // decodeWarpChain consumes the remainder. See WavetableDoc::encode().
+    // blocks. Current tags:
+    //   ":assets:<id=asset;...>"       library entry -> project Waveform asset
+    //   ":morphAsset:<id=asset;...>"   frame -> project MorphAlgorithm asset
+    //   ":morph:<count>:<id:len:chain>...>"  per-frame summation-morph chains
+    // Legacy tags (single doc-level chain, pre-2026-06) are migrated into EVERY
+    // frame here so the new per-frame model reproduces the old shared-chain
+    // sound:
+    //   ":warpAsset:<int>"             old doc-level MorphAlgorithm ref
+    //   ":warp:<chain>"                old doc-level chain (was last)
+    // ':'-free payloads read with readUntil(':'); the morph chains are length-
+    // prefixed (they contain ':'); the legacy warp block consumes the rest.
     while (!r.eof()) {
         const std::string tag = r.readUntil(':');
         if (tag == "assets") {
-            const std::string payload = r.readUntil(':'); // ':'-free, stops at ":warp:" or EOF
+            const std::string payload = r.readUntil(':'); // ':'-free, stops at next tag or EOF
             // Pairs "<libId>=<assetId>" joined by ';'.
             size_t p = 0;
             while (p < payload.size()) {
@@ -3204,11 +3232,52 @@ static bool decodeWavetableV4or5(WavetableDoc& doc, const std::string& body,
                 }
                 p = semi + 1;
             }
+        } else if (tag == "morphAsset") {
+            // Per-frame MorphAlgorithm asset refs: "<libId>=<assetId>" by ';'.
+            const std::string payload = r.readUntil(':');
+            size_t p = 0;
+            while (p < payload.size()) {
+                size_t semi = payload.find(';', p);
+                if (semi == std::string::npos) semi = payload.size();
+                const std::string pair = payload.substr(p, semi - p);
+                size_t eq = pair.find('=');
+                if (eq != std::string::npos) {
+                    try {
+                        int libId   = std::stoi(pair.substr(0, eq));
+                        int assetId = std::stoi(pair.substr(eq + 1));
+                        for (auto& e : doc.library)
+                            if (e.id == libId && e.wave) { e.wave->morphAssetId = assetId; break; }
+                    } catch (...) {}
+                }
+                p = semi + 1;
+            }
+        } else if (tag == "morph") {
+            // Length-prefixed per-frame chains: count, then count x (id:len:chain).
+            int n = 0;
+            try { n = std::stoi(r.readUntil(':')); } catch (...) {}
+            for (int i = 0; i < n && !r.eof(); ++i) {
+                int libId = -1; size_t len = 0;
+                try { libId = std::stoi(r.readUntil(':')); } catch (...) { break; }
+                try { len = (size_t)std::stoul(r.readUntil(':')); } catch (...) { break; }
+                std::string cs = r.readN(len);
+                if (cs.size() != len) break;
+                r.consume(':');
+                for (auto& e : doc.library)
+                    if (e.id == libId && e.wave) { e.wave->morphChain = decodeWarpChain(cs); break; }
+            }
         } else if (tag == "warpAsset") {
-            // Single int (':'-free): the frame's MorphAlgorithm asset reference.
-            try { doc.warpAssetId = std::stoi(r.readUntil(':')); } catch (...) {}
+            // Legacy doc-level MorphAlgorithm ref shared by all frames: copy into
+            // every frame so each now independently references the same asset.
+            int legacyAsset = -1;
+            try { legacyAsset = std::stoi(r.readUntil(':')); } catch (...) {}
+            if (legacyAsset >= 0)
+                for (auto& e : doc.library) if (e.wave) e.wave->morphAssetId = legacyAsset;
         } else if (tag == "warp") {
-            doc.warpChain = decodeWarpChain(r.s.substr(r.p));
+            // Legacy doc-level chain shared by all frames: copy into every frame
+            // so the per-frame model reproduces the old sound (every frame shaped
+            // by the same chain), now independently editable per frame.
+            std::vector<WarpOp> legacy = decodeWarpChain(r.s.substr(r.p));
+            for (auto& e : doc.library) if (e.wave) e.wave->morphChain = legacy;
             break; // consumes the rest
         } else {
             break; // unknown tag - stop rather than spin
@@ -3695,6 +3764,27 @@ static std::string warpSlotParamName(const WarpOp& op, int slot) {
     return std::string(warpParamLabel(op.method)) + " " + std::to_string(slot + 1);
 }
 
+// Disambiguating prefix for a frame's frame-scope ("Summation Morph") params.
+// Each wavetable frame now carries its OWN morph chain, so two frames can each
+// hold a "Drive 1" op and would otherwise produce identical, indistinguishable
+// node sliders / pin labels. When more than one frame contributes morph params
+// we prefix each with the owning frame's library name (e.g. "Bright Pad: Drive
+// 1"), or "Frame <n>" when the entry is unnamed. With only a single morphing
+// frame the prefix is empty (no disambiguation needed). frameId is the library
+// entry id stored in Param::warpFrameId; the count drives whether to prefix.
+static std::string frameWarpPrefix(const WavetableDoc& doc, int frameId) {
+    int morphing = 0;
+    for (const auto& e : doc.library)
+        if (e.wave && !e.wave->morphChain.empty()) ++morphing;
+    if (morphing <= 1) return "";
+    for (size_t i = 0; i < doc.library.size(); ++i) {
+        if (doc.library[i].id != frameId) continue;
+        const std::string& nm = doc.library[i].name;
+        return (nm.empty() ? ("Frame " + std::to_string((int)i + 1)) : nm) + ": ";
+    }
+    return "";
+}
+
 // Display name for a PER-LAYER warp op's modulation param. Per-layer ops live
 // inside one layer's sum (distinct from the frame-scope chain), so two layers -
 // or a layer and the frame-scope chain - can hold the same method+slot and would
@@ -3721,25 +3811,37 @@ static void relabelWarpModPin(Node& nd, int pi) {
     }
 }
 
-// Reconcile a node's frame-scope warp modulation params + mod pins to match
-// `chain`. Factored out of LayeredWaveEditorComponent::syncWarpParams so the
-// asset-resolution path (resolveWarpReferences) and load-time migration reuse
-// the exact same logic without the editor. Pure function of (graph, nodeId,
-// chain): adds params for new ops (seeded from the op amount), removes params
-// for deleted ops (dropping their mod pins + cables), remaps surviving modPin
-// param indices, and renames each surviving param to its op's named-morph label
-// (relabelling its pin). Addresses ops by the stable Param::warpSlot key, so a
-// method change renames freely without moving a wired pin. Idempotent.
-void syncWarpParamsForNode(NodeGraph& graph, int nodeId,
-                           const std::vector<WarpOp>& chain) {
+// Reconcile a node's frame-scope ("Summation Morph") warp modulation params +
+// mod pins to match EVERY frame's per-frame morph chain. Each wavetable frame
+// (library entry with a wave) carries its own IWavetableFrame::morphChain, so a
+// frame-scope warp param is keyed by (warpLayer == -1, warpFrameId = owning
+// frame's library id, warpSlot = position in that frame's chain). Pure function
+// of (graph, nodeId, doc): adds params for new ops (seeded from the op amount),
+// removes params for deleted ops / deleted frames (dropping their mod pins +
+// cables), remaps surviving modPin param indices, and renames each surviving
+// param to its op's named-morph label with a per-frame disambiguating prefix.
+// Addresses ops by the stable (warpFrameId, warpSlot) key, so a method change
+// renames freely without moving a wired pin. Idempotent. Factored out of
+// LayeredWaveEditorComponent::syncWarpParams so the asset-resolution path
+// (resolveWarpReferences) and load-time migration reuse the exact same logic.
+void syncWarpParamsForNode(NodeGraph& graph, int nodeId, const WavetableDoc& doc) {
     Node* nd = graph.findNode(nodeId);
     if (!nd) return;
-    const int N = (int)chain.size();
 
-    // ---- 0) Legacy migration. Pre-warpSlot projects stored warp params named
-    //         "Warp <k>" with warpSlot == -1; adopt them by parsing the slot so
-    //         their bound modPins stay attached and they get renamed below.
+    // Resolve a frame's morph chain by its library id (nullptr if no such frame
+    // / it has no wave). Used both as the validity test and for relabel.
+    auto chainFor = [&](int fid) -> const std::vector<WarpOp>* {
+        for (const auto& e : doc.library)
+            if (e.id == fid && e.wave) return &e.wave->morphChain;
+        return nullptr;
+    };
+
+    // ---- 0a) Legacy "Warp <k>" naming migration. Pre-warpSlot projects stored
+    //          frame-scope warp params named "Warp <k>" with warpSlot == -1;
+    //          adopt them by parsing the slot so their bound modPins stay
+    //          attached and they get renamed below.
     for (auto& p : nd->params) {
+        if (p.warpLayer != -1) continue;
         if (p.warpSlot >= 0) continue;
         if (p.name.rfind("Warp ", 0) != 0) continue;
         const std::string num = p.name.substr(5);
@@ -3748,17 +3850,35 @@ void syncWarpParamsForNode(NodeGraph& graph, int nodeId,
         if (allDigit) p.warpSlot = std::stoi(num) - 1;
     }
 
-    // ---- 1) Remove warp params for deleted ops (warpSlot outside [0,N)), plus
+    // ---- 0b) Legacy doc-level chain migration. Old projects stored a SINGLE
+    //          frame-scope chain shared by every frame (warpFrameId didn't
+    //          exist, so those params have warpFrameId == -1). On decode that
+    //          chain was copied into every frame's morphChain; adopt the legacy
+    //          params into the lowest-id frame that carries a chain so their
+    //          wired mod pins survive. The other frames' (identical) chains get
+    //          fresh params in step 2.
+    int adoptFrameId = -1;
+    for (const auto& e : doc.library)
+        if (e.wave && !e.wave->morphChain.empty())
+            if (adoptFrameId < 0 || e.id < adoptFrameId) adoptFrameId = e.id;
+    if (adoptFrameId >= 0)
+        for (auto& p : nd->params)
+            if (p.warpLayer == -1 && p.warpSlot >= 0 && p.warpFrameId < 0)
+                p.warpFrameId = adoptFrameId;
+
+    // ---- 1) Remove frame-scope warp params that no longer address a live op
+    //         (frame deleted, or warpSlot past that frame's chain end), plus
     //         their mod pins / cables; remap surviving modPin param indices.
-    //         Only FRAME-SCOPE params (warpLayer == -1) are reconciled here;
-    //         per-layer params (warpLayer >= 0) belong to a different chain and
-    //         are reconciled by reconcilePerLayerWarpParams - leave them alone.
+    //         Only FRAME-SCOPE params (warpLayer == -1, warpSlot >= 0) are
+    //         reconciled here; per-layer params (warpLayer >= 0) belong to a
+    //         different chain and are reconciled by reconcilePerLayerWarpParams.
     std::set<int> removeIdx;
     for (int i = 0; i < (int)nd->params.size(); ++i) {
-        if (nd->params[i].warpLayer != -1) continue;  // per-layer: not ours
-        // slot < 0 = not a warp param (kept); slot in [0,N) = live op (kept);
-        // slot >= N = a warp param for an op that no longer exists (remove).
-        if (nd->params[i].warpSlot >= N) removeIdx.insert(i);
+        const Param& p = nd->params[i];
+        if (p.warpLayer != -1) continue;       // per-layer: not ours
+        if (p.warpSlot < 0) continue;          // not a warp param
+        const std::vector<WarpOp>* ch = chainFor(p.warpFrameId);
+        if (!ch || p.warpSlot >= (int)ch->size()) removeIdx.insert(i);
     }
 
     if (!removeIdx.empty()) {
@@ -3793,31 +3913,44 @@ void syncWarpParamsForNode(NodeGraph& graph, int nodeId,
                 mp.paramIndex = newIndexOf[mp.paramIndex];
     }
 
-    // ---- 2) Add params for slots that have no param yet (appended at the end;
-    //         existing indices stay put so bound modPins keep their target).
-    for (int i = 0; i < N; ++i) {
-        bool exists = false;
-        for (auto& p : nd->params)
-            if (p.warpLayer == -1 && p.warpSlot == i) { exists = true; break; }
-        if (exists) continue;
-        Param p;
-        p.warpSlot = i;  // warpLayer stays -1 (frame-scope)
-        p.name = warpSlotParamName(chain[i], i);
-        p.value = p.baseValue = chain[i].amount;
-        p.minVal = 0.0f;
-        p.maxVal = 1.0f;
-        p.format = "%.2f";
-        nd->params.push_back(std::move(p));
+    // ---- 2) Add params for (frame, slot) pairs that have no param yet
+    //         (appended at the end; existing indices stay put so bound modPins
+    //         keep their target). Iterate frames in library order for stable
+    //         param ordering across reconciles.
+    for (const auto& e : doc.library) {
+        if (!e.wave) continue;
+        const auto& ch = e.wave->morphChain;
+        for (int s = 0; s < (int)ch.size(); ++s) {
+            bool exists = false;
+            for (auto& p : nd->params)
+                if (p.warpLayer == -1 && p.warpFrameId == e.id && p.warpSlot == s) {
+                    exists = true; break;
+                }
+            if (exists) continue;
+            Param p;
+            p.warpSlot    = s;       // warpLayer stays -1 (frame-scope)
+            p.warpFrameId = e.id;    // owning frame's library id
+            p.name  = frameWarpPrefix(doc, e.id) + warpSlotParamName(ch[s], s);
+            p.value = p.baseValue = ch[s].amount;
+            p.minVal = 0.0f;
+            p.maxVal = 1.0f;
+            p.format = "%.2f";
+            nd->params.push_back(std::move(p));
+        }
     }
 
     // ---- 3) Reconcile each surviving warp param's display name to its op's
-    //         current method (a method change renames "Drive 1" -> "Fold 1")
-    //         and relabel its modulation pin to match.
+    //         current method + per-frame prefix (a method change renames
+    //         "Drive 1" -> "Fold 1"; adding a chain to a second frame adds the
+    //         "<frame>: " prefix) and relabel its modulation pin to match.
     for (int pi = 0; pi < (int)nd->params.size(); ++pi) {
-        if (nd->params[pi].warpLayer != -1) continue;  // per-layer: not ours
-        const int slot = nd->params[pi].warpSlot;
-        if (slot < 0 || slot >= N) continue;
-        nd->params[pi].name = warpSlotParamName(chain[slot], slot);
+        const Param& p = nd->params[pi];
+        if (p.warpLayer != -1) continue;       // per-layer: not ours
+        if (p.warpSlot < 0) continue;          // not a warp param
+        const std::vector<WarpOp>* ch = chainFor(p.warpFrameId);
+        if (!ch || p.warpSlot >= (int)ch->size()) continue;
+        nd->params[pi].name =
+            frameWarpPrefix(doc, p.warpFrameId) + warpSlotParamName((*ch)[p.warpSlot], p.warpSlot);
         relabelWarpModPin(*nd, pi);
     }
 
@@ -3832,14 +3965,17 @@ void syncWarpParamsForNode(NodeGraph& graph, int nodeId,
 }
 
 // Reconcile a node's PER-LAYER warp modulation params + mod pins against the
-// current set of per-layer warp chains (layerChains[L] = layer L's chain).
-// Per-layer params are created on demand (the "Mod" checkbox), so this never
-// ADDS - it only (a) removes params whose (warpLayer, warpSlot) no longer
-// addresses a live op (dropping their mod pins + cables, remapping survivors),
-// and (b) relabels surviving params + their pins to follow the op's method.
-// Mirrors syncWarpParamsForNode steps 1+3 but scoped per layer with a 2-D
-// (layer, slot) validity test. Idempotent.
-void reconcilePerLayerWarpParams(NodeGraph& graph, int nodeId,
+// current set of per-layer warp chains (layerChains[L] = layer L's chain) of ONE
+// frame, identified by `frameId` (the owning library entry id, stored in
+// Param::warpFrameId). Per-layer params are created on demand (the "Mod"
+// checkbox), so this never ADDS - it only (a) removes params of THIS frame whose
+// (warpLayer, warpSlot) no longer addresses a live op (dropping their mod pins +
+// cables, remapping survivors), and (b) relabels this frame's surviving params +
+// their pins to follow the op's method. Params belonging to OTHER frames
+// (different warpFrameId) are never touched, since the editor reconciles one
+// frame at a time. Mirrors syncWarpParamsForNode steps 1+3 but scoped per layer
+// with a 2-D (layer, slot) validity test. Idempotent.
+void reconcilePerLayerWarpParams(NodeGraph& graph, int nodeId, int frameId,
                                  const std::vector<std::vector<WarpOp>>& layerChains) {
     Node* nd = graph.findNode(nodeId);
     if (!nd) return;
@@ -3851,18 +3987,19 @@ void reconcilePerLayerWarpParams(NodeGraph& graph, int nodeId,
 
     // A layer-field (Phase/Amp) param is valid iff its layer still exists. The
     // editing frame contributes one layerChains entry per layer (even empty
-    // chains), so the layer count is layerChains.size(); when the table is no
-    // longer single-frame layerChains is empty and every layer-field param is
-    // dropped, matching the warp behaviour.
+    // chains), so the layer count is layerChains.size(); when this frame is no
+    // longer the editing target (or its layer count shrank) layerChains is empty
+    // / shorter and the affected layer-field params are dropped.
     auto layerValid = [&](int layer) {
         return layer >= 0 && layer < (int)layerChains.size();
     };
 
-    // ---- 1) Remove per-layer params that no longer address a live op (warp)
-    //         or live layer (Phase/Amp).
+    // ---- 1) Remove per-layer params (of THIS frame) that no longer address a
+    //         live op (warp) or live layer (Phase/Amp).
     std::set<int> removeIdx;
     for (int i = 0; i < (int)nd->params.size(); ++i) {
         const Param& p = nd->params[i];
+        if (p.warpFrameId != frameId) continue;        // another frame: not ours
         if (p.layerField >= 0) {                       // per-layer Phase/Amp param
             if (!layerValid(p.warpLayer)) removeIdx.insert(i);
             continue;
@@ -3904,6 +4041,7 @@ void reconcilePerLayerWarpParams(NodeGraph& graph, int nodeId,
     //         the stable layer index), so they need no relabel.
     for (int pi = 0; pi < (int)nd->params.size(); ++pi) {
         const Param& p = nd->params[pi];
+        if (p.warpFrameId != frameId) continue;        // another frame: not ours
         if (p.layerField >= 0) continue;
         if (p.warpLayer < 0) continue;
         if (!opValid(p.warpLayer, p.warpSlot)) continue;
@@ -3917,15 +4055,16 @@ void reconcilePerLayerWarpParams(NodeGraph& graph, int nodeId,
 // Load-time reconcile across EVERY wavetable node: resolveWarpReferences only
 // touches frames that reference a library MorphAlgorithm, so independent frames
 // (the common case) never had their warp params reconciled on load. This pass
-// runs syncWarpParamsForNode for all "__wavetable" nodes so legacy "Warp N"
-// params are migrated to the warpSlot key + named-morph labels, and the synth
-// (which now reads by warpSlot) always finds them. Idempotent on new projects.
+// runs syncWarpParamsForNode for all "__wavetable" nodes so legacy "Warp N" /
+// legacy doc-level (warpFrameId == -1) params are migrated to the per-frame
+// (warpFrameId, warpSlot) key + named-morph labels, and the synth (which now
+// reads by that key) always finds them. Idempotent on new projects.
 void reconcileAllWarpParams(NodeGraph& graph) {
     for (auto& n : graph.nodes) {
         if (n.script.rfind("__wavetable", 0) != 0) continue;
         WavetableDoc doc;
         if (!doc.decode(n.script)) continue;
-        syncWarpParamsForNode(graph, n.id, doc.warpChain);
+        syncWarpParamsForNode(graph, n.id, doc);
     }
 }
 
@@ -3936,21 +4075,31 @@ int resolveWarpReferences(NodeGraph& graph) {
 
         WavetableDoc doc;
         if (!doc.decode(n.script)) continue;
-        if (doc.warpAssetId < 0) continue;  // independent frame -> nothing to do
 
-        const AssetEntry* a = graph.assets.find(doc.warpAssetId);
-        if (a && a->kind == AssetKind::MorphAlgorithm) {
-            // Replace the cached chain with a fresh decode of the asset.
-            doc.warpChain = decodeWarpChain(a->payload);
-            ++resolved;
-        } else {
-            // Referenced algorithm gone (erased) -> detach, keep last chain.
-            doc.warpAssetId = -1;
+        // Per-frame morph asset links: each frame may reference a project
+        // MorphAlgorithm asset (IWavetableFrame::morphAssetId). Refresh every
+        // referencing frame's cached chain from its asset; detach frames whose
+        // referenced algorithm was erased (keeping their last chain).
+        bool anyRef = false, changed = false;
+        for (auto& e : doc.library) {
+            if (!e.wave || e.wave->morphAssetId < 0) continue;  // independent
+            anyRef = true;
+            const AssetEntry* a = graph.assets.find(e.wave->morphAssetId);
+            if (a && a->kind == AssetKind::MorphAlgorithm) {
+                e.wave->morphChain = decodeWarpChain(a->payload);
+                ++resolved;
+            } else {
+                e.wave->morphAssetId = -1;  // erased -> detach, keep last chain
+            }
+            changed = true;
         }
         // Re-encode (audio thread polls node.script live) and reconcile the
-        // node's "Warp N" params to the (possibly new) op count.
-        setNodeScriptSynced(n, doc.encode());
-        syncWarpParamsForNode(graph, n.id, doc.warpChain);
+        // node's frame-scope morph params to the (possibly new) op counts. We
+        // reconcile unconditionally so a frame whose chain didn't change via an
+        // asset still gets its params migrated/relabelled on load.
+        if (changed && anyRef)
+            setNodeScriptSynced(n, doc.encode());
+        syncWarpParamsForNode(graph, n.id, doc);
     }
     return resolved;
 }
@@ -9009,10 +9158,12 @@ LayeredWaveEditorComponent::LayeredWaveEditorComponent(NodeGraph& g, int nid, st
         addChildComponent(*layerStack); // visibility toggled in resized()
     }
 
-    // Frame-scope warp chain editor (Bucket A shape-bending). Bound to the
-    // doc-level chain (wave.warpChain), which the synth voice applies as it
-    // reads the wavetable - so it is independent of which frame is being
-    // edited and lives in a fixed strip above the preview for every type.
+    // Per-frame summation-morph chain editor (Bucket A shape-bending). Bound to
+    // the CURRENT frame's chain (currentEditingFrame()->morphChain), which the
+    // synth bakes into that frame's cycle before the cross-frame blend - so it is
+    // rebound whenever the editor target changes (rebindFrameWarpEditor, from
+    // rebuildRows / setEditingLibraryEntry). Lives in a fixed strip above the
+    // preview for every frame type.
     //
     //   onChanged          (amount slider, enable toggle): mirror the op
     //                      amount into its "Warp N" node param so a connected
@@ -9066,22 +9217,30 @@ LayeredWaveEditorComponent::LayeredWaveEditorComponent(NodeGraph& g, int nid, st
         // the picker only ever offers Bucket A methods, so this stays Type-2 only.
         frameWarpEditor->setHeaderText(
             "Summation Morph",
-            "Morph stages applied to the combined output of every layer, in order "
+            "Morph stages applied to THIS frame's combined layer output, in order "
             "(soft clip, fold, bend, saturate, ...). Each reshapes the summed wave; "
             "starred methods are the higher-quality picks. Tick a stage's \"Mod\" "
-            "box to drive its amount live with an LFO or oscillator.");
-        frameWarpEditor->setChain(&wave.warpChain);
-        // Frame-scope warp is the one warp site wired to the project
-        // MorphAlgorithm store: the picker references a shared warp chain (live)
+            "box to drive its amount live with an LFO or oscillator. Each frame "
+            "carries its own morph chain.");
+        // Bound to the current frame below via rebindFrameWarpEditor(); the
+        // initial bind happens in the first rebuildRows().
+        // Per-frame morph is the one warp site wired to the project
+        // MorphAlgorithm store: the picker references a shared morph chain (live)
         // and "Save to Library" publishes the current chain. Edits write back at
         // the host's settled-edit point (writeBackReferencedWarp, from
         // commitUndoStep). The baked per-layer / spectral chains stay local
-        // (no library context).
+        // (no library context). The getAssetId/setAssetId lambdas look up the
+        // current frame each call (no dangling across a library reallocation).
         {
             WarpChainEditor::LibraryContext lc;
             lc.lib        = &graph.assets;
-            lc.getAssetId = [this]() { return wave.warpAssetId; };
-            lc.setAssetId = [this](int id) { wave.warpAssetId = id; };
+            lc.getAssetId = [this]() {
+                const IWavetableFrame* f = currentEditingFrame();
+                return f ? f->morphAssetId : -1;
+            };
+            lc.setAssetId = [this](int id) {
+                if (IWavetableFrame* f = currentEditingFrame()) f->morphAssetId = id;
+            };
             lc.propagate  = [this]() { resolveWarpReferences(graph); };
             frameWarpEditor->setLibraryContext(std::move(lc));
         }
@@ -10458,20 +10617,25 @@ void LayeredWaveEditorComponent::syncPositionParams() {
 void LayeredWaveEditorComponent::pushWarpAmountsToParams() {
     auto* nd = graph.findNode(nodeId);
     if (!nd) return;
-    // Mirror each op's editor amount into its matching warp-slot param so the
-    // synth's live read (getParamByWarpSlot) tracks the slider. A modulated
-    // param's live value is owned by the modulation system, so write the resting
-    // value through baseValue and leave `value` alone while it's being driven.
+    const IWavetableFrame* f = currentEditingFrame();
+    if (!f) return;
+    const auto& chain = f->morphChain;
+    const int fid = currentLibraryId;
+    // Mirror each op's editor amount into its matching (frame-scope) warp-slot
+    // param so the synth's live read (getParamByWarpSlot) tracks the slider. A
+    // modulated param's live value is owned by the modulation system, so write
+    // the resting value through baseValue and leave `value` alone while driven.
     // Also reconcile the param's display name + pin label to its op's current
     // method here (onChanged fires for a method change too), so picking a new
-    // method renames "Drive 1" -> "Fold 1" without a structural re-sync.
-    for (int k = 0; k < (int)wave.warpChain.size(); ++k) {
+    // method renames "Drive 1" -> "Fold 1" without a structural re-sync. The
+    // per-frame name prefix is reconciled by the heavier syncWarpParams path.
+    for (int k = 0; k < (int)chain.size(); ++k) {
         for (int pi = 0; pi < (int)nd->params.size(); ++pi) {
             Param& p = nd->params[pi];
-            if (p.warpSlot != k) continue;
-            if (p.modulated) p.baseValue = wave.warpChain[k].amount;
-            else             p.value = p.baseValue = wave.warpChain[k].amount;
-            p.name = warpSlotParamName(wave.warpChain[k], k);
+            if (p.warpLayer != -1 || p.warpFrameId != fid || p.warpSlot != k) continue;
+            if (p.modulated) p.baseValue = chain[k].amount;
+            else             p.value = p.baseValue = chain[k].amount;
+            p.name = frameWarpPrefix(wave, fid) + warpSlotParamName(chain[k], k);
             relabelWarpModPin(*nd, pi);
             break;
         }
@@ -10481,27 +10645,35 @@ void LayeredWaveEditorComponent::pushWarpAmountsToParams() {
 void LayeredWaveEditorComponent::swapWarpParamNames(int a, int b) {
     auto* nd = graph.findNode(nodeId);
     if (!nd || a == b) return;
+    const IWavetableFrame* f = currentEditingFrame();
+    if (!f) return;
+    const auto& chain = f->morphChain;
+    const int fid = currentLibraryId;
     // Reorder fix-up: the chain ops at slots a and b have already been swapped by
     // moveOp. Swap the two params' stable warpSlot keys so each param (and the
-    // modulation pin bound to it) follows its op to the new slot. The param
-    // objects + their modPin paramIndex stay put in nd->params; only the warpSlot
-    // moves. Display names are reconciled right after (pushWarpAmountsToParams via
-    // onChanged), but reconcile here too so a no-onChanged caller stays correct.
+    // modulation pin bound to it) follows its op to the new slot. Scoped to THIS
+    // frame's params (warpFrameId == fid); other frames' params are untouched.
+    // The param objects + their modPin paramIndex stay put in nd->params; only
+    // the warpSlot moves. Display names are reconciled right after
+    // (pushWarpAmountsToParams via onChanged), but reconcile here too so a
+    // no-onChanged caller stays correct.
     Param* pa = nullptr; int ia = -1;
     Param* pb = nullptr; int ib = -1;
     for (int i = 0; i < (int)nd->params.size(); ++i) {
-        if (nd->params[i].warpSlot == a) { pa = &nd->params[i]; ia = i; }
-        else if (nd->params[i].warpSlot == b) { pb = &nd->params[i]; ib = i; }
+        Param& p = nd->params[i];
+        if (p.warpLayer != -1 || p.warpFrameId != fid) continue;
+        if (p.warpSlot == a) { pa = &p; ia = i; }
+        else if (p.warpSlot == b) { pb = &p; ib = i; }
     }
     if (pa) { pa->warpSlot = b; }
     if (pb) { pb->warpSlot = a; }
     // Rename both to their new slots' methods + relabel pins.
-    if (pa && b >= 0 && b < (int)wave.warpChain.size()) {
-        pa->name = warpSlotParamName(wave.warpChain[b], b);
+    if (pa && b >= 0 && b < (int)chain.size()) {
+        pa->name = frameWarpPrefix(wave, fid) + warpSlotParamName(chain[b], b);
         relabelWarpModPin(*nd, ia);
     }
-    if (pb && a >= 0 && a < (int)wave.warpChain.size()) {
-        pb->name = warpSlotParamName(wave.warpChain[a], a);
+    if (pb && a >= 0 && a < (int)chain.size()) {
+        pb->name = frameWarpPrefix(wave, fid) + warpSlotParamName(chain[a], a);
         relabelWarpModPin(*nd, ib);
     }
 }
@@ -10509,10 +10681,14 @@ void LayeredWaveEditorComponent::swapWarpParamNames(int a, int b) {
 int LayeredWaveEditorComponent::warpParamIndexForOp(int opIndex) const {
     auto* nd = graph.findNode(nodeId);
     if (!nd) return -1;
-    // Frame-scope only: per-layer warp params (warpLayer >= 0) share the warpSlot
-    // numbering but belong to a different chain, so they must not be returned here.
+    // Frame-scope param of the CURRENTLY-EDITED frame: per-layer params (warpLayer
+    // >= 0) share the warpSlot numbering but belong to a different chain, and
+    // other frames' frame-scope params share warpSlot but a different warpFrameId,
+    // so both must be excluded.
     for (int i = 0; i < (int)nd->params.size(); ++i)
-        if (nd->params[i].warpLayer == -1 && nd->params[i].warpSlot == opIndex) return i;
+        if (nd->params[i].warpLayer == -1
+            && nd->params[i].warpFrameId == currentLibraryId
+            && nd->params[i].warpSlot == opIndex) return i;
     return -1;
 }
 
@@ -10520,16 +10696,18 @@ int LayeredWaveEditorComponent::perLayerWarpParamIndex(int layer, int op) const 
     auto* nd = graph.findNode(nodeId);
     if (!nd) return -1;
     for (int i = 0; i < (int)nd->params.size(); ++i)
-        if (nd->params[i].warpLayer == layer && nd->params[i].warpSlot == op) return i;
+        if (nd->params[i].warpFrameId == currentLibraryId
+            && nd->params[i].warpLayer == layer
+            && nd->params[i].warpSlot == op) return i;
     return -1;
 }
 
 bool LayeredWaveEditorComponent::perLayerWarpModSupported() const {
-    // The synth re-bakes a modulated per-layer warp op live only for a single-
-    // frame wavetable (one cell occupies terrain.data contiguously). Multi-frame
-    // grids can't be re-baked in place and (warpLayer, warpSlot) can't address a
-    // specific frame's layer, so per-layer modulation is offered single-frame only.
-    return wave.cellWaveformIds.size() == 1;
+    // Per-layer modulation re-bakes the edited frame's cycle live. The synth now
+    // re-bakes ANY frame in place (keyed by its library id - see wtRebakeFrames in
+    // terrain_synth.cpp), so this is offered whenever there's a live layered
+    // editing target, regardless of how many frames the wavetable holds.
+    return currentEditingLayeredFrame() != nullptr;
 }
 
 bool LayeredWaveEditorComponent::isLayerWarpOpModulated(int layer, int op) const {
@@ -10541,31 +10719,33 @@ bool LayeredWaveEditorComponent::isLayerWarpOpModulated(int layer, int op) const
 juce::String LayeredWaveEditorComponent::layerWarpModDisabledReason(int layer, int op) const {
     juce::ignoreUnused(layer, op);
     if (!perLayerWarpModSupported())
-        return "Per-layer morph modulation works on a single-waveform table. "
-               "This wavetable has multiple frames, so morph each one by hand "
-               "or drive the frame-scope morph instead.";
+        return "Per-layer morph modulation needs a layered waveform in the editor. "
+               "Select a layered frame to enable it.";
     return {};
 }
 
 void LayeredWaveEditorComponent::reconcilePerLayerWarpParamsNow() {
     Node* nd = graph.findNode(nodeId);
     if (!nd) return;
-    // Early-out: nothing to do unless at least one per-layer warp param exists.
+    // Early-out: nothing to do unless at least one per-layer param exists for the
+    // current frame (per-layer warp params, warpLayer >= 0, or layer-field params,
+    // layerField >= 0) owned by the editing frame.
+    const int fid = currentLibraryId;
     bool anyPerLayer = false;
     for (const auto& p : nd->params)
-        if (p.warpLayer >= 0) { anyPerLayer = true; break; }
-    if (!anyPerLayer) return;
-    // Per-layer warp is only ever created single-frame; if the table grew to
-    // multiple frames the lone editing frame's chains no longer address those
-    // params, so reconcile against an empty set to drop every per-layer param.
-    std::vector<std::vector<WarpOp>> chains;
-    if (perLayerWarpModSupported()) {
-        if (const LayeredWaveform* lw = currentEditingLayeredFrame()) {
-            chains.reserve(lw->layers.size());
-            for (const auto& L : lw->layers) chains.push_back(L.warpChain);
+        if (p.warpFrameId == fid && (p.warpLayer >= 0 || p.layerField >= 0)) {
+            anyPerLayer = true; break;
         }
+    if (!anyPerLayer) return;
+    // Reconcile this frame's per-layer params against its layers' chains. If the
+    // editing frame is no longer layered (or gone) chains is empty and every
+    // per-layer param of this frame is dropped.
+    std::vector<std::vector<WarpOp>> chains;
+    if (const LayeredWaveform* lw = currentEditingLayeredFrame()) {
+        chains.reserve(lw->layers.size());
+        for (const auto& L : lw->layers) chains.push_back(L.warpChain);
     }
-    reconcilePerLayerWarpParams(graph, nodeId, chains);
+    reconcilePerLayerWarpParams(graph, nodeId, fid, chains);
 }
 
 void LayeredWaveEditorComponent::setLayerWarpOpModulated(int layer, int op, bool on) {
@@ -10581,9 +10761,10 @@ void LayeredWaveEditorComponent::setLayerWarpOpModulated(int layer, int op, bool
         int pi = perLayerWarpParamIndex(layer, op);
         if (pi < 0) {
             // Create the on-demand per-layer warp param, seeded from the op's
-            // baked amount and keyed by (warpLayer, warpSlot) so the synth's
-            // live re-bake addresses it (getParamByWarpLayerSlot).
+            // baked amount and keyed by (warpFrameId, warpLayer, warpSlot) so the
+            // synth's live re-bake addresses it (getParamByWarpLayerSlot).
             Param p;
+            p.warpFrameId = currentLibraryId;
             p.warpLayer = layer;
             p.warpSlot  = op;
             p.name      = perLayerWarpParamName(chain[(size_t)op], layer, op);
@@ -10617,14 +10798,15 @@ int LayeredWaveEditorComponent::layerFieldParamIndex(int layer, int field) const
     if (!nd) return -1;
     for (int i = 0; i < (int)nd->params.size(); ++i)
         if (nd->params[i].layerField == field
+            && nd->params[i].warpFrameId == currentLibraryId
             && nd->params[i].warpLayer == layer
             && nd->params[i].warpSlot == -1) return i;
     return -1;
 }
 
 bool LayeredWaveEditorComponent::isLayerFieldModulated(int layer, int field) const {
-    // Reuse the warp single-frame gate - phase/amp re-bake has the same
-    // single-cell constraint (the synth re-bakes the lone frame in place).
+    // Reuse the per-layer gate - phase/amp re-bake has the same requirement (a
+    // live layered editing frame the synth can re-bake in place).
     if (!perLayerWarpModSupported()) return false;
     int pi = layerFieldParamIndex(layer, field);
     return pi >= 0 && hasParamModPin(graph, nodeId, pi);
@@ -10633,9 +10815,8 @@ bool LayeredWaveEditorComponent::isLayerFieldModulated(int layer, int field) con
 juce::String LayeredWaveEditorComponent::layerFieldModDisabledReason(int layer, int field) const {
     juce::ignoreUnused(layer, field);
     if (!perLayerWarpModSupported())
-        return "Per-layer Phase/Amplitude modulation works on a single-waveform "
-               "table. This wavetable has multiple frames, so adjust each one by "
-               "hand or drive a frame-scope parameter instead.";
+        return "Per-layer Phase/Amplitude modulation needs a layered waveform in "
+               "the editor. Select a layered frame to enable it.";
     return {};
 }
 
@@ -10657,6 +10838,7 @@ void LayeredWaveEditorComponent::setLayerFieldModulated(int layer, int field, bo
             // current value and keyed by (warpLayer, layerField) so the synth's
             // live re-bake addresses it (getParamByLayerField).
             Param p;
+            p.warpFrameId = currentLibraryId;
             p.warpLayer  = layer;
             p.warpSlot   = -1;
             p.layerField = field;
@@ -10703,7 +10885,19 @@ void LayeredWaveEditorComponent::setLayerFieldModulated(int layer, int field, bo
 }
 
 void LayeredWaveEditorComponent::syncWarpParams() {
-    syncWarpParamsForNode(graph, nodeId, wave.warpChain);
+    syncWarpParamsForNode(graph, nodeId, wave);
+}
+
+void LayeredWaveEditorComponent::rebindFrameWarpEditor() {
+    if (!frameWarpEditor) return;
+    // The summation-morph chain is per-frame: point the editor at the current
+    // frame's morphChain (nullptr when there's no editing target -> the Add
+    // button disables) and refresh the library row from the frame's
+    // morphAssetId. Called from every flow that changes the editor target
+    // (rebuildRows) or the underlying storage (undo restore).
+    IWavetableFrame* f = currentEditingFrame();
+    frameWarpEditor->setChain(f ? &f->morphChain : nullptr);
+    frameWarpEditor->refreshLibraryRow();
 }
 
 void LayeredWaveEditorComponent::maybeSyncPositionParams() {
@@ -11261,12 +11455,14 @@ void LayeredWaveEditorComponent::writeBackPerLayerWaveforms() {
 }
 
 void LayeredWaveEditorComponent::writeBackReferencedWarp() {
-    // When the frame-scope warp chain live-references a MorphAlgorithm asset,
-    // this settled edit IS an edit to that shared chain: push the current chain
-    // back to the asset and re-resolve so every other frame sharing the id (and
-    // its "Warp N" params) updates live. No-op when independent (common case).
-    if (wave.warpAssetId < 0) return;
-    graph.assets.update(wave.warpAssetId, "", encodeWarpChain(wave.warpChain));
+    // When the CURRENT frame's summation-morph chain live-references a
+    // MorphAlgorithm asset, this settled edit IS an edit to that shared chain:
+    // push the current chain back to the asset and re-resolve so every other
+    // frame sharing the id (and its morph params) updates live. No-op when the
+    // frame is independent (the common case) or there's no editing target.
+    const IWavetableFrame* f = currentEditingFrame();
+    if (!f || f->morphAssetId < 0) return;
+    graph.assets.update(f->morphAssetId, "", encodeWarpChain(f->morphChain));
     resolveWarpReferences(graph);
 }
 
@@ -11806,6 +12002,11 @@ void LayeredWaveEditorComponent::rebuildRows() {
     // rows under the embedded editor for a flicker frame.
     updateFrameEditorEmbed();
 
+    // Re-point the per-frame summation-morph editor at the newly-targeted
+    // frame's morphChain (and refresh its library row from morphAssetId). The
+    // morph chain is per-frame now, so every (re)binding flow must rebind it.
+    rebindFrameWarpEditor();
+
     // The per-waveform name+colour row at the top of the right pane
     // tracks whichever library entry the editor is bound to. Rebuilding
     // rows is the universal "the editor just (re)bound to a frame" path,
@@ -12255,10 +12456,11 @@ void LayeredWaveEditorComponent::reloadFromNode() {
     // view refreshers rebuild everything visible without writing anything back.
     updateHintText();
     rebuildRows();
-    // The doc's warp chain storage moved with the `wave = std::move(fresh)`
-    // above; the editor still points at the stable &wave.warpChain, but its
-    // row widgets reflect the OLD chain, so rebuild them. resized() re-sizes
-    // the strip to the (possibly different) op count on the next layout pass.
+    // The frame morph-chain storage moved with the `wave = std::move(fresh)`
+    // above, so re-point the editor at the current frame's morphChain (and
+    // refresh the library row from its morphAssetId), then rebuild the rows.
+    // resized() re-sizes the strip to the new op count on the next layout pass.
+    rebindFrameWarpEditor();
     if (frameWarpEditor) frameWarpEditor->rebuild();
     refreshPreview();
     resized();

@@ -907,13 +907,19 @@ The same `WarpChainEditor` widget drives every chain; it does **not** own the ch
 
 | Scope (header) | Storage | Modulatable? | Domains offered |
 |---|---|---|---|
-| **Frame-scope** — *"Summation Morph"* (Bucket A) | `WavetableDoc::warpChain` | **Yes** — each op opts into a positional `Warp N` node param | Phase + Amplitude |
+| **Frame-scope** — *"Summation Morph"* (Bucket A) | `IWavetableFrame::morphChain` (**per frame**) | **Yes** — each op opts into a positional `Warp N` node param keyed to that frame | Phase + Amplitude |
 | **Spectral / Wavelet element** (Bucket C) | per-doc element chain | No (baked) | restricted |
 | **Granular / Inharmonic element** (Bucket C) | per-frame chain | No (baked) | **Amplitude only** (a live stream has no periodic phase axis) |
 
 A host that only supports some domains calls `setAllowedDomains(...)`, which filters both the picker and the "+ Add" method list and can supply an `emptyHint` explaining the restriction (per the "grayed-out controls must explain themselves" rule).
 
-**Per-layer Phase / Amplitude modulation (the engine fork).** A layer's **Phase** and **Amplitude** can each opt into an on-demand modulation pin via a **Mod** checkbox next to its slider. With **no pinned field**, the layer is **baked** into the table at edit time — the common case, zero live cost. The moment a layer's Phase or Amp is pinned, the table renders **live per-voice**: the synth re-bakes the cycle at block rate from the current modulated values (`LayeredWaveform::renderWithLiveOverrides`, driven by per-layer **layer-field** params the synth reads via `getParamByLayerField`). This is **single-frame only** — a multi-frame table can't be re-baked in place, so on a multi-frame table the per-layer Mod box is **disabled with a tooltip explaining why** (the grayed-control rule); the frame-scope Summation Morph still modulates freely. The on-demand layer-field params exist **only while pinned** — checking "Mod" creates the `Param` (keyed by `warpLayer` = layer index, `layerField` = 0 Phase / 1 Amplitude, `warpSlot` = −1) + pin; unchecking removes the pin *and* erases the param.
+**The Summation Morph chain is per-frame.** Each frame (each library entry's `IWavetableFrame`) carries its **own** `morphChain` + `morphAssetId` — the chain shapes *that frame's* cycle, **before** the cross-frame Position blend. Two frames in the same table hold genuinely independent chains: setting frame A to *Soft Clip* doesn't touch frame B. The editor binds to the **currently-edited frame's** chain; switching frames re-points the `WarpChainEditor` at the new frame's vector. (Earlier builds stored a single `WavetableDoc::warpChain` shared across all frames, which is why picking a morph for one frame appeared to mirror onto the others — that bug is the reason this is now per-frame.)
+
+- **Per-frame param keying.** Each frame-scope op's node param carries the owning frame's library id in `Param::warpFrameId`, so frame A's *Warp 1* and frame B's *Warp 1* are distinct params with distinct pins. `syncWarpParamsForNode` walks every morphing frame in `doc.library` and reconciles `(warpFrameId, warpSlot)`-keyed params; the synth reads each frame's live amounts via `getParamByWarpSlot(node, frameId, slot, …)`.
+- **Per-frame name prefix.** When **more than one** frame in a table carries a non-empty morph chain, each frame's morph params get a disambiguating name prefix (`frameWarpPrefix`, e.g. `"A: "`, `"B: "`) so the node sliders read *"A: Soft Clip Drive"* vs *"B: Wavefold Fold"*. With only one morphing frame the prefix is empty (no clutter).
+- **Synth bake.** The static terrain/scatter bake renders each frame through `IWavetableFrame::renderMorphed` (render + `applyWarpChain(morphChain)` at resting amounts). When a frame's morph (or per-layer field) is modulated, the synth re-bakes **just that frame's** cycle per block via `rebakeFramesIfNeeded` / the `wtRebakeFrames` table (each entry records the frame's destination — a Scatter slot or a Grid stride/offset — and only re-renders when a modulated value changes vs its cache).
+
+**Per-layer Phase / Amplitude modulation (the engine fork).** A layer's **Phase** and **Amplitude** can each opt into an on-demand modulation pin via a **Mod** checkbox next to its slider. With **no pinned field**, the layer is **baked** into the table at edit time — the common case, zero live cost. The moment a layer's Phase or Amp is pinned, the synth re-bakes that frame's cycle at block rate from the current modulated values (`LayeredWaveform::renderWithLiveOverrides`, driven by per-layer **layer-field** params the synth reads via `getParamByLayerField`). This now works on **multi-frame tables too** — the per-frame `wtRebakeFrames` infrastructure re-bakes each affected frame in place (Scatter slot or Grid stride/offset), so the per-layer **Mod box is enabled regardless of frame count**. (Earlier builds gated this behind a single-frame-only `perLayerWarpModSupported()` check and disabled the box on multi-frame tables; lifting that gate is part of the per-frame re-bake work.) The on-demand layer-field params exist **only while pinned** — checking "Mod" creates the `Param` (keyed by `warpFrameId` = owning frame id, `warpLayer` = layer index, `layerField` = 0 Phase / 1 Amplitude, `warpSlot` = −1) + pin; unchecking removes the pin *and* erases the param.
 
 > The dormant per-layer warp re-bake path (`renderWithLiveWarp` → `getParamByWarpLayerSlot`, `(warpLayer, warpSlot)` params) is retained behind the disabled `enablePerLayerWarp` flag for a possible wholesale restore of the removed per-layer Type-2 chain; `renderWithLiveWarp` now just delegates to `renderWithLiveOverrides` with no phase/amp overrides.
 
@@ -942,7 +948,7 @@ Each method carries a **human label** for its amount param — *Drive* (Soft Cli
 Every op defaults to **baked** (no pin, no live cost). Ticking a row's **Pin** box opts that op's amount into an [on-demand modulation pin (#88)](#control-inputs-on-parameters-set-vs-mod): a `Param`/`ModPin` is created so an LFO, oscillator, or envelope can drive the morph live as the note sustains; unticking removes it. The checkbox reflects the current pin state.
 
 - **Frame-scope (Summation Morph):** the op maps to its positional `Warp N` param (created up-front by `syncWarpParams`); checking adds the pin, unchecking removes it.
-- **Per-layer Phase / Amplitude:** the same opt-in mechanism drives each layer's **Phase** and **Amplitude** slider (the per-layer arbitrary-wave chain itself was removed). The param exists **only while pinned**. Checking creates a layer-field param named e.g. *"Layer 2 Phase"* (keyed by `warpLayer` = layer index, `layerField` = 0 Phase / 1 Amplitude) and adds the pin; unchecking removes the pin and **erases the param**, and the slider unlocks. On a **multi-frame** table the box is **disabled** with a tooltip explaining that per-layer modulation only works on a single-frame wavetable (the synth re-bakes the layer in place per voice — see the engine fork above).
+- **Per-layer Phase / Amplitude:** the same opt-in mechanism drives each layer's **Phase** and **Amplitude** slider (the per-layer arbitrary-wave chain itself was removed). The param exists **only while pinned**. Checking creates a layer-field param named e.g. *"Layer 2 Phase"* (keyed by `warpFrameId` = owning frame id, `warpLayer` = layer index, `layerField` = 0 Phase / 1 Amplitude) and adds the pin; unchecking removes the pin and **erases the param**, and the slider unlocks. This works on **single- and multi-frame** tables alike — the synth re-bakes the affected frame in place per voice via the per-frame `wtRebakeFrames` path (see the engine fork above). (The box used to be disabled on multi-frame tables; that gate was lifted with the per-frame re-bake work.)
 - **Baked element chains** (spectral / wavelet / granular / inharmonic) hide the Pin box entirely — they have no node params to pin.
 
 ### Built-in & saved morphs (the Library row)
@@ -952,7 +958,7 @@ The frame-scope Summation Morph editor shows a **Library row** (the per-layer an
 - **Built-in** — the curated Type-2 chains, **seeded into the project's [asset library](#asset-library-project-stores) as Morph Algorithm entries** (`seedBuiltinMorphLibrary` in `warp.h`, from `builtinMorphChains()`): *Warm Saturation, West Coast Fold, Lo-Fi Crush, Tape Glue, Pulse Width, Soft Bend, Formant Sync, Rectify Octave*. They appear in both this picker and the **Asset Library panel** (flagged ★ starred). They remain **templates, not live references** — picking one **copies** its ops into the chain and detaches to *(Independent)*, exactly as picking a factory waveform copies it into a layer (so an edit can never silently mutate a shared built-in). **Code-owned and not serialized:** their ids sit in a reserved range (`kBuiltinMorphIdBase = 200000`, below the user id base `1000000`, so `isBuiltinMorphAssetId` tells the two apart) and are **skipped by project-file save/export**; they are **re-seeded idempotently on every new project and every project load**, which keeps them improvable across app versions, keeps project files free of boilerplate, and makes them effectively undeletable (a deletion is undone by the next re-seed) — matching the asset library's *disjoint id space* + *divergence = duplicate* design.
 - **Saved** — user-published [Morph Algorithm assets](#asset-library-project-stores) (ids ≥ `1000000`). Picking one applies its ops to the chain; tick **Sync to library** in the picker to **live-link** it (editing the chain then updates every frame that points at it) or leave it off to load a one-time independent copy. The Sync checkbox is enabled only for Saved entries (built-ins are immutable templates that always copy). **Save to Library** publishes the current chain as a new Morph Algorithm asset.
 
-**Unlink** (the Library-row button) detaches the frame's live link to a Saved morph (`warpAssetId = -1`) while keeping the current chain exactly as-is — an independent editable copy whose edits no longer propagate to/from the asset. It's **disabled** (greyed, with an explaining tooltip) while the frame's morph is already independent. This is the morph member of the three **Unlink from Library** affordances (frame waveform / per-layer / morph), all of which set their respective `assetId` to `-1` and freeze the current content.
+**Unlink** (the Library-row button) detaches the frame's live link to a Saved morph (`IWavetableFrame::morphAssetId = -1`) while keeping the current chain exactly as-is — an independent editable copy whose edits no longer propagate to/from the asset. It's **disabled** (greyed, with an explaining tooltip) while the frame's morph is already independent. Because the link is per-frame, unlinking one frame's morph leaves any other frame's live link intact. This is the morph member of the three **Unlink from Library** affordances (frame waveform / per-layer / morph), all of which set their respective `assetId` to `-1` and freeze the current content.
 
 ### Per-sample primitives vs the buffer helper
 
@@ -970,6 +976,13 @@ See [SCRIPTING-LANGUAGES.md](SCRIPTING-LANGUAGES.md#waveshaping-warps--the-same-
 ### Save / load
 
 A warp chain serialises with `encodeWarpChain` / `decodeWarpChain`. Grammar: `<count>:<op>:<op>…` where an op is `<method>;<amount>;<aux>;<enabled>`. `:` separates ops and `;` separates fields within an op, so it never collides with the `,`/`|` field separators the host docs use. The leading count is advisory (decode trusts the actual op tokens). An empty chain encodes as `0`, and callers **omit the section entirely** when the chain is empty — so a doc saved before warp existed (or with no warp) has no warp token and old decoders never trip on it. `WarpMethod` ids are **stable** (serialized in project files) — never renumber existing values; the enum has an intentional hole at `9` (a planned-but-never-shipped "Mirror" method) to keep the surviving ids fixed.
+
+**Per-frame morph blocks (`__wavetable5__`).** Because the chain is per-frame, a wavetable doc serialises the morph data as two trailing, length-tagged blocks rather than a single doc-level chain:
+
+- **`:morph:<count>:<libId>:<len>:<chainStr>…`** — one `(libId, len, chainStr)` triple per frame that has a non-empty chain. `libId` is the frame's library entry id; `chainStr` is the `encodeWarpChain` output (which itself contains `:`), so it's **length-prefixed** (`<len>` = its character count) and the decoder slices exactly that many characters rather than splitting on `:`.
+- **`:morphAsset:<libId>=<assetId>:…`** — the per-frame morph live-links (`morphAssetId`), one `libId=assetId` pair per linked frame.
+
+**Backward-compatible migration.** A project saved under the old single-chain model carries doc-level `:warp:` / `:warpAsset:` blocks. On decode these are **migrated into every frame** of the table (each frame adopts a copy of the legacy chain and the legacy asset link), so old projects open with the same audible result and then re-save in the per-frame format. Decoders that predate the per-frame blocks ignore the unknown `:morph:` / `:morphAsset:` tokens.
 
 ### Undo
 
@@ -2415,15 +2428,17 @@ closes, iff anything changed (not one step per drag tick). Implemented as
   Algorithm assets — live-linked only when **Sync to library** is ticked in the
   picker, else copied in). **Save to Library** publishes the current
   chain as a new asset (disabled until the chain has at least one stage).
-  **Unlink** detaches the frame's live link (`warpAssetId = -1`) while keeping the
+  **Unlink** detaches the frame's live link (`morphAssetId = -1`) while keeping the
   current chain as an independent editable copy; it's **disabled** (greyed, with an
   explaining tooltip) while the frame's morph is already independent. While a
   *Saved* asset is referenced, editing the chain here writes back to the asset and
   re-resolves, so every frame using the same algorithm re-shapes together. Adopting
   a referenced chain reconciles the node's modulation params to the new stage count
   (`syncWarpParamsForNode`), so each stage's amount stays modulatable. The
-  reference id lives on the frame's `WavetableDoc.warpAssetId` (built-in ids are
-  never stored — picking one detaches to Independent). Only the frame-scope warp
+  reference id lives **per-frame** on `IWavetableFrame::morphAssetId` (built-in ids are
+  never stored — picking one detaches to Independent); each frame links independently,
+  so two frames can reference different morph assets or one can be linked while
+  another is independent. Only the frame-scope warp
   opts into the library; the baked per-layer / spectral / wavelet warp chains stay
   local (no picker). The reference is the only "downward" coupling — selecting or
   editing a chain never touches the other warp sites.

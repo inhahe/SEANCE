@@ -1384,10 +1384,10 @@ TerrainSynthProcessor::TerrainSynthProcessor(Node& n, Transport& t, ContentStore
         // colorIdx), __wavetable2__, and legacy __wavetable__ payloads.
         WavetableDoc doc;
         bool decoded = doc.decode(script);
-        // Capture the frame-scope warp chain (Bucket A). Applied per sample in
-        // the voice loop; amounts are resolved per block from "Warp N" params so
-        // they can be modulated. Empty unless the editor saved a warp section.
-        if (decoded) wtWarpChain = doc.warpChain;
+        // Per-frame morph is baked into each frame's cycle below (renderMorphed),
+        // not applied post-blend. Reset the live re-bake table; the bake loops
+        // populate it for frames carrying a morph chain or per-layer warp ops.
+        wtRebakeFrames.clear();
         if (decoded && doc.mode == WavetableMode::Scatter && !doc.scatterFrames.empty()) {
             int ts = doc.tableSize;
             wtScatterFrameSamples.clear();
@@ -1406,10 +1406,26 @@ TerrainSynthProcessor::TerrainSynthProcessor(Node& n, Transport& t, ContentStore
                 bool isGran = (w && std::string(w->typeId()) == "granular");
                 bool isInh  = (w && std::string(w->typeId()) == "inharmonic");
                 std::vector<float> samples;
-                if (w && !isGran && !isInh) w->render(ts, samples);
+                // Bake the frame's RESTING per-frame morph into its cycle (each
+                // frame shapes independently before the cross-frame RBF blend).
+                if (w && !isGran && !isInh) w->renderMorphed(ts, samples);
                 if ((int)samples.size() != ts) samples.resize(ts, 0.0f);
+                int scatterIdx = (int)wtScatterFrameSamples.size();
                 wtScatterFrameSamples.push_back(std::move(samples));
                 wtScatterFramePositions.push_back(sf.position);
+
+                // Layered frames support live per-block re-bake (morph amounts /
+                // per-layer warp wired to node params). Register a RebakeFrame.
+                if (w && std::string(w->typeId()) == "layered") {
+                    RebakeFrame rb;
+                    rb.frame = w->clone();
+                    static_cast<LayeredWaveform*>(rb.frame.get())->tableSize = ts;
+                    rb.frameId      = sf.waveformId;
+                    rb.tableSize    = ts;
+                    rb.scatterIndex = scatterIdx;
+                    rb.morphChain   = w->morphChain;
+                    wtRebakeFrames.push_back(std::move(rb));
+                }
 
                 if (isInh) {
                     auto* inf = static_cast<InharmonicFrame*>(w);
@@ -1489,8 +1505,10 @@ TerrainSynthProcessor::TerrainSynthProcessor(Node& n, Transport& t, ContentStore
                 bool isGran = (w && std::string(w->typeId()) == "granular");
                 bool isInh  = (w && std::string(w->typeId()) == "inharmonic");
                 std::vector<float> samples;
+                // Bake the frame's RESTING per-frame morph into its cycle (each
+                // frame shapes independently before the cross-frame grid blend).
                 if (w && !isGran && !isInh)
-                    w->render(ts, samples);
+                    w->renderMorphed(ts, samples);
                 if ((int)samples.size() != ts) samples.resize(ts, 0.0f);
 
                 // Compute the flat terrain offset for this frame.
@@ -1529,6 +1547,25 @@ TerrainSynthProcessor::TerrainSynthProcessor(Node& n, Transport& t, ContentStore
                     int flatIdx = terrain.coordToFlatIndex(fullIdx);
                     if (flatIdx >= 0 && flatIdx < terrain.totalSize())
                         data[flatIdx] = samples[i];
+                }
+
+                // Layered cells support live per-block re-bake. The terrain layout
+                // is {ts, dim0, ...} with phase outermost, so this cell occupies
+                // data[i * gridStride + gridOffset] for i in [0,ts): gridStride =
+                // totalSize/ts (= product of gridDims), gridOffset = the flat index
+                // of (phase 0, gridCoord).
+                if (w && std::string(w->typeId()) == "layered") {
+                    std::vector<int> baseIdx = {0};
+                    baseIdx.insert(baseIdx.end(), gridCoord.begin(), gridCoord.end());
+                    RebakeFrame rb;
+                    rb.frame = w->clone();
+                    static_cast<LayeredWaveform*>(rb.frame.get())->tableSize = ts;
+                    rb.frameId    = doc.cellWaveformIds[f];
+                    rb.tableSize  = ts;
+                    rb.gridStride = (ts > 0) ? terrain.totalSize() / ts : 0;
+                    rb.gridOffset = terrain.coordToFlatIndex(baseIdx);
+                    rb.morphChain = w->morphChain;
+                    wtRebakeFrames.push_back(std::move(rb));
                 }
 
                 // Normalize gridCoord into [0,1] per dim so the per-block
@@ -1579,31 +1616,10 @@ TerrainSynthProcessor::TerrainSynthProcessor(Node& n, Transport& t, ContentStore
             wtFrameCount = nf;
             wtNumDims = doc.numDimensions();
             wtEffectiveAxes = doc.effectiveAxes();
-
-            // Cache a single-frame layered frame for live per-layer re-bake (#88,
-            // item-M). Only a one-cell table can be re-baked in place this way (the
-            // frame occupies terrain.data[0..ts) contiguously); multi-cell grids
-            // would need per-cell rewrites we don't support yet. We cache for ANY
-            // single-frame layered table - not just warp-bearing ones - because
-            // every layer always carries a Phase and Amplitude that can be opted
-            // into modulation, even with an empty warp chain. The per-block cost
-            // when nothing is actually pinned is just the cheap param scan in the
-            // re-bake loop; the re-render only fires once a value moves.
-            wtLayeredFrame.reset();
-            wtLayeredTableSize = 0;
-            wtLastLayerOverrides.clear();
-            wtLastLayerPhaseOverrides.clear();
-            wtLastLayerAmpOverrides.clear();
-            wtLastLayerShapeOverrides.clear();
-            wtLastLayerShape2Overrides.clear();
-            if (nf == 1) {
-                IWavetableFrame* w0 = doc.frameAt(0);
-                if (w0 && std::string(w0->typeId()) == "layered") {
-                    wtLayeredFrame = w0->clone();
-                    static_cast<LayeredWaveform*>(wtLayeredFrame.get())->tableSize = ts;
-                    wtLayeredTableSize = ts;
-                }
-            }
+            // Per-frame live re-bake entries were registered per cell in the bake
+            // loop above (each layered cell knows its own grid destination), so
+            // multi-cell grids now re-bake every modulated frame independently -
+            // the old single-cell-only restriction is gone.
         } else {
             terrain.init({2048});
             terrain.fillFromExpression("sin(x)");
@@ -1745,9 +1761,10 @@ static float getParamByName(const Node& node, const std::string& name, float def
 // ("Soft Clip Drive 1", ...) so it can't be addressed by a fixed string; the
 // warpSlot is the stable identity. Falls back to `def` when no such param
 // exists yet (the common case until a warp is opted into modulation).
-static float getParamByWarpSlot(const Node& node, int slot, float def) {
+static float getParamByWarpSlot(const Node& node, int frameId, int slot, float def) {
     for (const auto& p : node.params)
-        if (p.warpSlot == slot && p.warpLayer == -1) return p.value;  // frame-scope only
+        if (p.warpSlot == slot && p.warpLayer == -1 && p.warpFrameId == frameId)
+            return p.value;  // frame-scope morph of frame `frameId`
     return def;
 }
 
@@ -1756,9 +1773,10 @@ static float getParamByWarpSlot(const Node& node, int slot, float def) {
 // layer's warp op into modulation, so this returns `def` whenever no such param
 // is present. Callers pass def = -1 so "no param" reads as "keep the baked
 // amount" in the renderWithLiveWarp override convention.
-static float getParamByWarpLayerSlot(const Node& node, int layer, int slot, float def) {
+static float getParamByWarpLayerSlot(const Node& node, int frameId, int layer, int slot, float def) {
     for (const auto& p : node.params)
-        if (p.warpLayer == layer && p.warpSlot == slot) return p.value;
+        if (p.warpLayer == layer && p.warpSlot == slot && p.warpFrameId == frameId)
+            return p.value;
     return def;
 }
 
@@ -1768,10 +1786,143 @@ static float getParamByWarpLayerSlot(const Node& node, int layer, int slot, floa
 // Amplitude (1) slider into modulation, so this returns `def` whenever no such
 // param is present. Callers pass the NaN sentinel for def so "no param" reads as
 // "keep the layer's stored value" in the renderWithLiveOverrides convention.
-static float getParamByLayerField(const Node& node, int layer, int field, float def) {
+static float getParamByLayerField(const Node& node, int frameId, int layer, int field, float def) {
     for (const auto& p : node.params)
-        if (p.layerField == field && p.warpLayer == layer && p.warpSlot == -1) return p.value;
+        if (p.layerField == field && p.warpLayer == layer && p.warpSlot == -1
+            && p.warpFrameId == frameId)
+            return p.value;
     return def;
+}
+
+// Per-frame live morph re-bake (per-frame morph chains + #88). For each layered
+// frame registered at rebuild, gather this block's live per-layer warp overrides
+// and live frame-scope morph-chain amounts from the node params (keyed by the
+// frame's library id via Param::warpFrameId), re-render the cycle, and write it
+// back into the frame's terrain/scatter slot. A NaN-aware change check skips the
+// re-render whenever a frame's modulation inputs are steady, so an unmodulated
+// table costs only the per-block param scan after one priming block. When a
+// frame's inputs return to resting (e.g. a Mod cable is unplugged), the override
+// grid reverts to the all-(-1)/NaN sentinels and this re-renders the static
+// renderMorphed cycle, restoring the rebuild bake without needing a script reload.
+void TerrainSynthProcessor::rebakeFramesIfNeeded(const Node& node) {
+    if (wtRebakeFrames.empty()) return;
+    // Fast path: with no morph / per-layer / layer-field modulation params on the
+    // node at all, every frame is at its resting bake (already in the terrain from
+    // rebuild's renderMorphed). A warp op only vanishes from node.params alongside
+    // a script edit -> rebuild, so there's no stale modulated cycle to restore;
+    // skip the whole per-frame scan. This keeps the common "nothing wired" case
+    // O(params) once, not O(frames x params) every block.
+    {
+        bool anyMod = false;
+        for (const auto& p : node.params)
+            if (p.warpSlot >= 0 || p.layerField >= 0) { anyMod = true; break; }
+        if (!anyMod) return;
+    }
+    const float kNaN = std::numeric_limits<float>::quiet_NaN();
+    // NaN != NaN, so a plain `==` of override grids would never match an
+    // unmodulated (NaN-sentinel) layer and force a needless re-render every
+    // block. Compare NaN-aware so a steady grid skips the re-render.
+    auto sameF = [](const std::vector<float>& a, const std::vector<float>& b) {
+        if (a.size() != b.size()) return false;
+        for (size_t i = 0; i < a.size(); ++i) {
+            bool an = std::isnan(a[i]), bn = std::isnan(b[i]);
+            if (an != bn) return false;
+            if (!an && a[i] != b[i]) return false;
+        }
+        return true;
+    };
+    for (auto& rb : wtRebakeFrames) {
+        auto* lw = static_cast<LayeredWaveform*>(rb.frame.get());
+        if (!lw || rb.tableSize <= 0) continue;
+
+        // ---- gather live per-layer warp / field overrides ----
+        // -1 sentinel = "no param -> keep the op's baked amount"; NaN sentinel
+        // for Phase/Amplitude/shape fields = "no param -> keep stored value".
+        std::vector<std::vector<float>> overrides(lw->layers.size());
+        std::vector<float> phaseOv(lw->layers.size(), kNaN);
+        std::vector<float> ampOv(lw->layers.size(), kNaN);
+        std::vector<float> shapeOv(lw->layers.size(), kNaN);
+        std::vector<float> shape2Ov(lw->layers.size(), kNaN);
+        bool anyPerLayer = false;
+        for (size_t li = 0; li < lw->layers.size(); ++li) {
+            const auto& chain = lw->layers[li].warpChain;
+            overrides[li].assign(chain.size(), -1.0f);
+            for (size_t slot = 0; slot < chain.size(); ++slot) {
+                float v = getParamByWarpLayerSlot(node, rb.frameId, (int)li, (int)slot, -1.0f);
+                overrides[li][slot] = v;
+                if (v >= 0.0f) anyPerLayer = true;
+            }
+            float ph  = getParamByLayerField(node, rb.frameId, (int)li, 0, kNaN);
+            float am  = getParamByLayerField(node, rb.frameId, (int)li, 1, kNaN);
+            float sp  = getParamByLayerField(node, rb.frameId, (int)li, 2, kNaN);
+            float sp2 = getParamByLayerField(node, rb.frameId, (int)li, 3, kNaN);
+            phaseOv[li] = ph; ampOv[li] = am; shapeOv[li] = sp; shape2Ov[li] = sp2;
+            if (!std::isnan(ph) || !std::isnan(am) || !std::isnan(sp) || !std::isnan(sp2))
+                anyPerLayer = true;
+        }
+
+        // ---- gather live frame-scope morph amounts ----
+        // NaN = "no param -> keep the op's resting amount baked at rebuild".
+        std::vector<float> morphAmounts(rb.morphChain.size(), kNaN);
+        for (size_t k = 0; k < rb.morphChain.size(); ++k) {
+            const WarpOp& def = rb.morphChain[k];
+            if (!def.enabled || def.method == WarpMethod::None) continue;
+            morphAmounts[k] = getParamByWarpSlot(node, rb.frameId, (int)k, kNaN);
+        }
+
+        // Skip the re-render when nothing moved since the last bake. Caches start
+        // empty, so the first block always renders (priming the slot to exactly
+        // the static renderMorphed bake when nothing is modulated).
+        bool changed = (overrides != rb.lastLayerOverrides)
+                    || !sameF(phaseOv,  rb.lastPhaseOv)
+                    || !sameF(ampOv,    rb.lastAmpOv)
+                    || !sameF(shapeOv,  rb.lastShapeOv)
+                    || !sameF(shape2Ov, rb.lastShape2Ov)
+                    || !sameF(morphAmounts, rb.lastMorphAmounts);
+        if (!changed) continue;
+
+        // ---- re-render the cycle ----
+        std::vector<float> cycle;
+        if (anyPerLayer)
+            lw->renderWithLiveOverrides(overrides, phaseOv, ampOv, shapeOv, shape2Ov, cycle);
+        else
+            lw->renderRaw(rb.tableSize, cycle); // gain-free; applied below
+        const float g = lw->gain;
+        if (g != 1.0f) for (auto& sv : cycle) sv *= g;
+
+        // Per-frame morph chain on top, at live amounts where wired, resting
+        // otherwise - matches the renderMorphed() static bake when unmodulated.
+        if (!rb.morphChain.empty()) {
+            std::vector<WarpOp> live = rb.morphChain;
+            for (size_t k = 0; k < live.size() && k < morphAmounts.size(); ++k)
+                if (!std::isnan(morphAmounts[k]))
+                    live[k].amount = juce::jlimit(0.0f, 1.0f, morphAmounts[k]);
+            applyWarpChain(live, cycle);
+        }
+
+        // ---- write back into the frame's slot ----
+        if (rb.scatterIndex >= 0) {
+            if (rb.scatterIndex < (int)wtScatterFrameSamples.size()) {
+                auto& dst = wtScatterFrameSamples[rb.scatterIndex];
+                int n = std::min((int)cycle.size(), (int)dst.size());
+                for (int i = 0; i < n; ++i) dst[i] = cycle[i];
+            }
+        } else {
+            auto& data = terrain.getData();
+            int n = std::min((int)cycle.size(), rb.tableSize);
+            for (int i = 0; i < n; ++i) {
+                int flat = i * rb.gridStride + rb.gridOffset;
+                if (flat >= 0 && flat < (int)data.size()) data[flat] = cycle[i];
+            }
+        }
+
+        rb.lastLayerOverrides = std::move(overrides);
+        rb.lastPhaseOv        = std::move(phaseOv);
+        rb.lastAmpOv          = std::move(ampOv);
+        rb.lastShapeOv        = std::move(shapeOv);
+        rb.lastShape2Ov       = std::move(shape2Ov);
+        rb.lastMorphAmounts   = std::move(morphAmounts);
+    }
 }
 
 // Extract harmonic magnitudes and phases from the current 1D wavetable
@@ -2486,6 +2637,13 @@ void TerrainSynthProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mi
         }
     }
 
+    // Per-frame live morph re-bake: re-render any frame whose morph amounts or
+    // per-layer warp ops are wired to node params, writing the shaped cycle back
+    // into its scatter/terrain slot. MUST run before the scatter blend below and
+    // before the per-sample grid lookup, so the shaped cycles feed the blend.
+    // Frames with nothing modulated keep the static renderMorphed bake from rebuild.
+    rebakeFramesIfNeeded(node);
+
     // Scatter wavetable: blend frames into the 1D terrain at block start
     // using a Wendland C^2 RBF over the current Position. The per-sample
     // path then reads terrain.sample(phase) unchanged.
@@ -2611,111 +2769,6 @@ void TerrainSynthProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mi
         }
     }
     const bool collectAudition = divertAudition && anyAuditionVoice;
-
-    // Resolve the frame-scope warp amounts for this block. Each op's amount is
-    // exposed as a node param keyed by warpSlot (display name follows its method,
-    // e.g. "Soft Clip Drive 1"), so a wired Param/Signal cable - or an on-demand
-    // "Mod:" pin (#88) - can sweep the shape live. When no such param exists yet
-    // (the common case until the user opts a warp into modulation) we fall back
-    // to the static amount baked from the editor. Held flat across the block;
-    // per-sample cost is the warp chain application only. Skipped when empty.
-    const int warpCount = (int)wtWarpChain.size();
-    wtWarpPhaseOps.clear();
-    wtWarpAmpOps.clear();
-    for (int k = 0; k < warpCount; ++k) {
-        const WarpOp& def = wtWarpChain[k];
-        if (!def.enabled || def.method == WarpMethod::None) continue;
-        // Read the live amount by the stable warpSlot key (k). The param's name
-        // follows its method ("Soft Clip Drive 1"), so it's addressed by slot,
-        // not string - a surviving op keeps its modulation pin across add/remove
-        // and method changes (mirrors syncWarpParamsForNode).
-        WarpOp op = def;
-        op.amount = juce::jlimit(0.0f, 1.0f,
-            getParamByWarpSlot(node, k, def.amount));
-        if (warpDomainOf(op.method) == WarpDomain::Phase)
-            wtWarpPhaseOps.push_back(op);
-        else if (warpDomainOf(op.method) == WarpDomain::Amplitude)
-            wtWarpAmpOps.push_back(op);
-        // Other domains (Modulation/Spectral/Wavelet/Granular) are element-
-        // scope (Bucket B/C) and are not applied in this generic voice loop.
-    }
-    const bool hasPhaseWarp = !wtWarpPhaseOps.empty();
-    const bool hasAmpWarp   = !wtWarpAmpOps.empty();
-
-    // Single-frame layered wavetable: re-bake the cycle into terrain.data with
-    // live per-layer warp amounts (#88, item-M). Block-rate, voice-shared - the
-    // same cadence the frame-scope warp uses. We rebuild the override grid from
-    // the per-layer warp params each block, but only re-render when an amount
-    // actually changed (or differs from the baked value), so a static table pays
-    // only for the cheap param scan. The negative sentinel (-1) means "no param
-    // -> keep the op's baked amount", so a partially-pinned chain mixes live and
-    // baked ops correctly. gain is re-applied here to match the baked render()
-    // path (renderWithLiveWarp is the gain-free primitive).
-    if (wtLayeredFrame && wtLayeredTableSize > 0) {
-        auto* lw = static_cast<LayeredWaveform*>(wtLayeredFrame.get());
-        std::vector<std::vector<float>> overrides(lw->layers.size());
-        std::vector<float> phaseOv(lw->layers.size(), std::numeric_limits<float>::quiet_NaN());
-        std::vector<float> ampOv(lw->layers.size(), std::numeric_limits<float>::quiet_NaN());
-        std::vector<float> shapeOv(lw->layers.size(), std::numeric_limits<float>::quiet_NaN());
-        std::vector<float> shape2Ov(lw->layers.size(), std::numeric_limits<float>::quiet_NaN());
-        bool anyPerLayer = false;
-        const float kNaN = std::numeric_limits<float>::quiet_NaN();
-        for (size_t li = 0; li < lw->layers.size(); ++li) {
-            const auto& chain = lw->layers[li].warpChain;
-            overrides[li].assign(chain.size(), -1.0f);
-            for (size_t slot = 0; slot < chain.size(); ++slot) {
-                float v = getParamByWarpLayerSlot(node, (int)li, (int)slot, -1.0f);
-                overrides[li][slot] = v;
-                if (v >= 0.0f) anyPerLayer = true;
-            }
-            // Per-layer Phase (field 0), Amplitude (field 1) and the generator
-            // parameters (field 2 = shapeParam: duty/amount/index; field 3 =
-            // shapeParam2: FM ratio) modulation. The NaN sentinel means "no
-            // param -> keep the layer's stored value".
-            float ph = getParamByLayerField(node, (int)li, 0, kNaN);
-            float am = getParamByLayerField(node, (int)li, 1, kNaN);
-            float sp = getParamByLayerField(node, (int)li, 2, kNaN);
-            float sp2 = getParamByLayerField(node, (int)li, 3, kNaN);
-            phaseOv[li] = ph;
-            ampOv[li] = am;
-            shapeOv[li] = sp;
-            shape2Ov[li] = sp2;
-            if (!std::isnan(ph) || !std::isnan(am) || !std::isnan(sp) || !std::isnan(sp2))
-                anyPerLayer = true;
-        }
-        // NaN != NaN, so a plain `==` comparison of the override grids would
-        // never match when an unmodulated layer carries the NaN sentinel,
-        // forcing a needless re-render every block. Compare with a NaN-aware
-        // helper so a steady (even fully-unmodulated) grid skips the re-render.
-        auto sameF = [](const std::vector<float>& a, const std::vector<float>& b) {
-            if (a.size() != b.size()) return false;
-            for (size_t i = 0; i < a.size(); ++i) {
-                bool an = std::isnan(a[i]), bn = std::isnan(b[i]);
-                if (an != bn) return false;
-                if (!an && a[i] != b[i]) return false;
-            }
-            return true;
-        };
-        bool changed = (overrides != wtLastLayerOverrides)
-                    || !sameF(phaseOv, wtLastLayerPhaseOverrides)
-                    || !sameF(ampOv, wtLastLayerAmpOverrides)
-                    || !sameF(shapeOv, wtLastLayerShapeOverrides)
-                    || !sameF(shape2Ov, wtLastLayerShape2Overrides);
-        if (anyPerLayer && changed) {
-            std::vector<float> samples;
-            lw->renderWithLiveOverrides(overrides, phaseOv, ampOv, shapeOv, shape2Ov, samples);
-            const float g = lw->gain;
-            auto& data = terrain.getData();
-            int n = std::min((int)samples.size(), (int)data.size());
-            for (int i = 0; i < n; ++i)
-                data[i] = (g != 1.0f) ? samples[i] * g : samples[i];
-            wtLastLayerOverrides = std::move(overrides);
-            wtLastLayerPhaseOverrides = std::move(phaseOv);
-            wtLastLayerAmpOverrides = std::move(ampOv);
-            wtLastLayerShapeOverrides = std::move(shapeOv);
-            wtLastLayerShape2Overrides = std::move(shape2Ov);
-        }
-    }
 
     for (int s = 0; s < numSamples; ++s) {
         double currentBeat = beatPos + s * beatsPerSample;
@@ -2876,17 +2929,10 @@ void TerrainSynthProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mi
                 if (!pitchCoord.empty())
                     pitchCoord[0] = std::fmod(pitchCoord[0] + v.phase, 1.0f);
 
-                // Frame-scope phase warp (Bucket A): compose every phase-domain
-                // warp onto the read phase before the cycle lookup. Cheap per-
-                // sample remap so the amount can be modulated live ("morph the
-                // waveform with an oscillator"). Applied before the grain
-                // offset so both the raw and grain-crossfade paths inherit it.
-                if (hasPhaseWarp && !pitchCoord.empty()) {
-                    float wp = pitchCoord[0];
-                    for (const auto& op : wtWarpPhaseOps)
-                        wp = warpPhaseValue(op.method, wp, op.amount);
-                    pitchCoord[0] = wp;
-                }
+                // Per-frame morph (phase- and amplitude-domain warps) is baked
+                // into each frame's cycle at rebuild / per-block re-bake, NOT
+                // applied here - so a phase warp shapes its own frame before the
+                // cross-frame blend rather than smearing the blended result.
 
                 if (grainSizeSamples > 0) {
                     // Graintable mode: crossfade between overlapping grains
@@ -2919,12 +2965,7 @@ void TerrainSynthProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mi
                 // empty cells don't drain volume (no-op when gain == 1).
                 sample *= gridRenormGain;
 
-                // Frame-scope amplitude warp (Bucket A): shape the sampled
-                // value through every amplitude-domain warp, in chain order,
-                // after the lookup (clip / fold / saturate / quantize / ...).
-                if (hasAmpWarp)
-                    for (const auto& op : wtWarpAmpOps)
-                        sample = warpAmpValue(op.method, sample, op.amount);
+                // (Amplitude-domain morph is baked into the frame cycle, see above.)
 
                 // ---- Granular layer mix ----
                 //

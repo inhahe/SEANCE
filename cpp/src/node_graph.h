@@ -172,7 +172,7 @@ struct Param {
     // syncWarpParamsForNode / warpParamIndexForOp.
     int warpSlot = -1;
     // Warp scope: which warp chain `warpSlot` indexes into.
-    //   -1 = the frame-scope (doc-level) chain  (WavetableDoc::warpChain)
+    //   -1 = the frame-scope (summation-morph) chain  (IWavetableFrame::warpChain)
     //   >=0 = the per-layer chain of layer `warpLayer`  (WaveLayer::warpChain)
     // Per-layer warp params exist ON DEMAND - one is created only when the user
     // opts a per-layer op into modulation (the "Mod" checkbox), and removed when
@@ -180,6 +180,20 @@ struct Param {
     // exist for every op so the amount is always modulatable. Only meaningful
     // when warpSlot >= 0.
     int warpLayer = -1;
+
+    // Which wavetable FRAME (library entry id) this warp/layer-field param
+    // belongs to. The summation-morph warp chain, the per-layer warp chains,
+    // and the per-layer Phase/Amp fields all live PER FRAME now (a wavetable
+    // node can hold several frames, each shaping its own cycle before the
+    // cross-frame morph blend), so a warp param must record which frame it
+    // drives or two frames carrying the same op (e.g. both a "Drive" at slot 0)
+    // would collide on the (warpLayer, warpSlot) key. >= 0 = the owning frame's
+    // library id. -1 = legacy/whole-node: pre-per-frame projects stored a single
+    // shared chain with no frame id; on load those params keep -1 until the
+    // migration in syncWarpParamsForNode reassigns them. Only meaningful when
+    // warpSlot >= 0 or layerField >= 0. Serialized as the optional "warpFrameId"
+    // field (omitted when -1, so old projects round-trip unchanged).
+    int warpFrameId = -1;
 
     // Per-layer field modulation key (layered wavetable). Marks this as the
     // on-demand modulation param for a layer's Phase or Amplitude slider:
@@ -1077,13 +1091,16 @@ int resolveWarpReferences(NodeGraph& graph);
 // in layered_wave_editor.cpp (needs the WavetableDoc codec). Call after load.
 void reconcileAllWarpParams(NodeGraph& graph);
 
-// Reconcile the per-layer (warpLayer >= 0) Type-2 warp params for a single
-// wavetable node against the live per-layer warp chains. Removes params whose
-// (warpLayer, warpSlot) no longer addresses a live op (dropping their modPins,
-// pins and links), remaps survivors to their new positional slot, and relabels
-// them from the method name. `layerChains[layerIndex]` is the ordered warp chain
-// of that layer. Defined in layered_wave_editor.cpp. Idempotent.
-void reconcilePerLayerWarpParams(NodeGraph& graph, int nodeId,
+// Reconcile the per-layer (warpLayer >= 0) Type-2 warp params of ONE frame
+// (identified by `frameId`, the owning library entry id stored in
+// Param::warpFrameId) for a single wavetable node against that frame's live
+// per-layer warp chains. Removes params of this frame whose (warpLayer,
+// warpSlot) no longer addresses a live op (dropping their modPins, pins and
+// links), remaps survivors to their new positional slot, and relabels them from
+// the method name. Params of OTHER frames are left untouched. `layerChains[L]`
+// is the ordered warp chain of layer L. Defined in layered_wave_editor.cpp.
+// Idempotent.
+void reconcilePerLayerWarpParams(NodeGraph& graph, int nodeId, int frameId,
                                  const std::vector<std::vector<WarpOp>>& layerChains);
 
 // ---------------------------------------------------------------------------

@@ -788,24 +788,13 @@ struct WavetableDoc {
     // or on any mode switch other than the matching reverse.
     std::optional<ScatterFromGridSnapshot> scatterFromGridSnapshot;
 
-    // ---- Frame-scope warp chain (Bucket A shape-bending) ----
-    // Ordered list of transform warps applied to the oscillator output every
-    // sample: phase-domain ops remap the read phase before the table lookup,
-    // amplitude-domain ops shape the sample after. Each op's `amount` is the
-    // resting value; once an op is exposed for modulation a "Warp N" node param
-    // drives its amount live (see syncWarpParams) so an LFO/oscillator can morph
-    // the shape. Serialized in encode()/decode() under the "warp" key. Empty by
-    // default - costs nothing when unused.
-    std::vector<WarpOp> warpChain;
-
-    // Live reference to a project MorphAlgorithm asset (a stored warp chain).
-    // -1 = independent (the warpChain above is this frame's own). When >= 0, the
-    // warpChain is a cache of asset `warpAssetId`'s content, refreshed by
-    // resolveWarpReferences() at edit/load; editing the chain here writes back to
-    // the asset and propagates to every frame sharing the id (the "live
-    // reference" model, mirroring WaveformLibraryEntry.assetId). Serialized in
-    // encode()/decode() under the "warpAsset" key (before the "warp" block).
-    int warpAssetId = -1;
+    // NOTE: the frame-scope ("Summation Morph") warp chain and its asset
+    // reference USED to live here as doc-level fields (warpChain / warpAssetId)
+    // shared by every frame. As of 2026-06 they are PER FRAME: see
+    // IWavetableFrame::morphChain / morphAssetId. Each library entry's frame
+    // carries its own chain, baked into its cycle before the cross-frame morph
+    // blend. Old projects that stored the single doc-level chain are migrated
+    // into every frame on decode (see WavetableDoc::decode).
 
     WavetableDoc() = default;
     WavetableDoc(WavetableDoc&&) noexcept = default;
@@ -1553,13 +1542,19 @@ private:
     void onLayerChanged();
     void switchToFrame(int idx);
     void syncPositionParams();      // ensure node has the right number of Position params
-    // Ensure the node carries exactly one "Warp N" param per op in the frame-
-    // scope warp chain (wave.warpChain), always numbered ("Warp 1".."Warp N"),
-    // so the on-demand modulation-pin mechanism (#88) can drive each warp amount
-    // with an LFO / oscillator. Adds missing params (seeded from the op amount),
-    // removes params for deleted ops (with their mod pins / cables), and remaps
-    // surviving modPin param indices. Called on a structural warp-chain edit.
+    // Ensure the node carries exactly one frame-scope morph param per op across
+    // EVERY frame's per-frame morph chain (IWavetableFrame::morphChain), keyed by
+    // (warpFrameId, warpSlot), so the on-demand modulation-pin mechanism (#88)
+    // can drive each morph amount with an LFO / oscillator. Adds missing params
+    // (seeded from the op amount), removes params for deleted ops / frames (with
+    // their mod pins / cables), and remaps surviving modPin param indices. Called
+    // on a structural morph-chain edit. Delegates to syncWarpParamsForNode(doc).
     void syncWarpParams();
+    // Re-point the per-frame summation-morph editor (frameWarpEditor) at the
+    // current frame's morphChain + morphAssetId. Called from every flow that
+    // changes the editor target (rebuildRows) or moves the storage (undo
+    // restore). The chain is per-frame, so the editor must rebind on each switch.
+    void rebindFrameWarpEditor();
     // Lightweight: mirror each op's current amount into its matching (un-
     // modulated) "Warp N" param so the synth's live read tracks the editor
     // slider without a full param rebuild. Called on every warp amount edit.

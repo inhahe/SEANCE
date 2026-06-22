@@ -2362,6 +2362,25 @@ void TerrainSynthProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mi
             startAuditionVoice(*node.heldAudition);
             heldAuditionActive = true;
             heldAuditionPitch  = node.heldAudition->pitch;
+        } else if (wantHeld && heldAuditionActive) {
+            // The editor re-ships node.heldAudition with a freshly rendered
+            // single cycle on every morph/gain edit (refreshHeldFrameAudition,
+            // from onLayerChanged) so the sustained Preview tracks the slider.
+            // But the voice captured its cycle ONLY at note-on, so without this
+            // the audition stepped to the new cycle only when the debounced
+            // graph rebuild recreated this processor (~150 ms) - which read as
+            // the preview updating "periodically, not continuously" while
+            // dragging. Update the live voice's cycle in place so the Preview
+            // tracks a slider drag as smoothly as a modulation signal does
+            // (the synth rebakes the terrain every block in the signal case).
+            // Consecutive cycles differ only by the slider delta, so swapping
+            // the wavetable the phase accumulator reads is click-free.
+            if (node.heldAudition->cycleFrame)
+                for (auto& v : voices)
+                    if (v.env.isActive() && v.noteNumber == heldAuditionPitch
+                        && v.auditionCycleFrame
+                        && v.auditionCycleFrame != node.heldAudition->cycleFrame)
+                        v.auditionCycleFrame = node.heldAudition->cycleFrame;
         } else if (!wantHeld && heldAuditionActive) {
             releaseNote(heldAuditionPitch, 1);
             heldAuditionActive = false;

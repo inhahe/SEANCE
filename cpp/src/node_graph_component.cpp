@@ -1846,6 +1846,18 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
     fxMenu.addItem(221, "Reverb");
     fxMenu.addItem(222, "Parametric EQ");
     fxMenu.addItem(241, "Curve EQ (draw response)");
+    // Waveshaper submenu: one entry per amplitude-domain morph method. Built
+    // from the shared registry (warp.h) so labels/tooltips stay in sync with
+    // the synth's morph picker. IDs 260 + index (260..269); see the matching
+    // creation handler. These apply warpAmpValue() to the audio stream - the
+    // same transfer the synth's amplitude morphs use.
+    {
+        juce::PopupMenu wsMenu;
+        const auto& wm = waveshaperMethods();
+        for (int i = 0; i < (int)wm.size(); ++i)
+            wsMenu.addItem(260 + i, warpMethodName(wm[i]));
+        fxMenu.addSubMenu("Waveshaper (amplitude morph)", wsMenu);
+    }
     fxMenu.addSeparator();
     fxMenu.addItem(208, "Tremolo");
     fxMenu.addItem(209, "Vibrato");
@@ -2687,6 +2699,28 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
             n.params.push_back({"Pitch (semi)", 0.0f, -24.0f, 24.0f});
             n.params.push_back({"Time Ratio",   1.0f, 0.25f,  4.0f});
             n.params.push_back({"Formant",       1.0f, 0.0f,   1.0f});
+        } else if (result >= 260 && result <= 269) {
+            // Waveshaper (amplitude morph): one node per Bucket-A warp method.
+            // The DSP is WaveshaperProcessor, which reads its method from the
+            // "__waveshaper:<token>__" script. A single amount param, labelled
+            // with the method's named morph parameter ("Drive"/"Fold"/"Crush"/
+            // ...) so it reads naturally and the on-demand modulation pin (#88)
+            // inherits the right name; WaveshaperProcessor derives the same
+            // label from the method to read it back.
+            const auto& wm = waveshaperMethods();
+            const int idx = result - 260;
+            if (idx >= 0 && idx < (int)wm.size()) {
+                const WarpMethod method = wm[idx];
+                const juce::String label =
+                    juce::String("Waveshaper: ") + warpMethodName(method);
+                auto& n = graph.addNode(label.toStdString(), NodeType::Effect,
+                    {Pin{0, "Audio In", PinKind::Audio, true}},
+                    {Pin{0, "Audio Out", PinKind::Audio, false}}, {p.x, p.y});
+                n.script = waveshaperScriptFor(method);
+                const char* pl = warpParamLabel(method);
+                n.params.push_back({ (pl && *pl) ? pl : "Amount",
+                                     0.5f, 0.0f, 1.0f });
+            }
         } else if (result == 207) {
             // Convolution Filter
             auto& n = graph.addNode("Convolution", NodeType::Effect,

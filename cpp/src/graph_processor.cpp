@@ -808,6 +808,10 @@ void GraphProcessor::rebuildGraph(NodeGraph& graph, Transport& transport) {
         } else if (node.type == NodeType::Effect &&
                    node.script.rfind("__convolution__:", 0) == 0) {
             proc = std::make_unique<ConvolutionProcessor>(node);
+        } else if (node.type == NodeType::Effect && isWaveshaperScript(node.script)) {
+            // One generic processor for all ten amplitude-domain Waveshaper
+            // variants; it reads its WarpMethod from the script prefix.
+            proc = std::make_unique<WaveshaperProcessor>(node);
         } else if (node.type == NodeType::Effect && node.script == "__tremolo__") {
             proc = std::make_unique<TremoloProcessor>(node);
         } else if (node.type == NodeType::Effect && node.script == "__vibrato__") {

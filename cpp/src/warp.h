@@ -124,6 +124,74 @@ const char* warpParamLabel(WarpMethod m);
 // magic integer; the integer enum value is still accepted directly everywhere.
 WarpMethod warpMethodFromName(const char* name);
 
+// ---- Standalone Waveshaper effect-node identity ----------------------------
+//
+// A Waveshaper is a built-in audio Effect node that applies ONE amplitude-
+// domain (Bucket A) warp transfer to its input, with a single modulatable
+// "Amount" param. Its identity lives in node.script as
+//     "__waveshaper:" <token> "__"      e.g. "__waveshaper:softclip__"
+// where <token> is a stable, lowercase, separator-free spelling that the
+// tolerant warpMethodFromName() parses. ONE node type, ten menu entries (one
+// per amplitude method). Phase-domain morphs stay inside the synth (they need
+// the read position before the table lookup), so only amplitude methods - pure
+// per-sample transfers that work on any incoming audio - get an effect node.
+constexpr const char* kWaveshaperScriptPrefix = "__waveshaper:";
+constexpr const char* kWaveshaperScriptSuffix = "__";
+
+// The amplitude-domain (Bucket A) methods exposed as Waveshaper nodes, in menu
+// order. Mirrors the WarpMethod amplitude group; keep in sync if methods are
+// added (id 9 stays a hole - see WarpMethod).
+inline const std::vector<WarpMethod>& waveshaperMethods() {
+    static const std::vector<WarpMethod> v = {
+        WarpMethod::SoftClip, WarpMethod::HardClip, WarpMethod::Wavefold,
+        WarpMethod::Wavewrap, WarpMethod::Rectify,  WarpMethod::Quantize,
+        WarpMethod::TubeSat,  WarpMethod::TapeSat,  WarpMethod::Flip,
+        WarpMethod::Chebyshev
+    };
+    return v;
+}
+
+// Stable serialization token for a Waveshaper method (lowercase, no spaces).
+// These are exact aliases warpMethodFromName() already understands, so the
+// round-trip is robust. NEVER change an existing token (it's in project files).
+inline const char* waveshaperToken(WarpMethod m) {
+    switch (m) {
+        case WarpMethod::SoftClip:  return "softclip";
+        case WarpMethod::HardClip:  return "hardclip";
+        case WarpMethod::Wavefold:  return "wavefold";
+        case WarpMethod::Wavewrap:  return "wavewrap";
+        case WarpMethod::Rectify:   return "rectify";
+        case WarpMethod::Quantize:  return "quantize";
+        case WarpMethod::TubeSat:   return "tubesat";
+        case WarpMethod::TapeSat:   return "tapesat";
+        case WarpMethod::Flip:      return "flip";
+        case WarpMethod::Chebyshev: return "chebyshev";
+        default:                    return "";
+    }
+}
+
+inline std::string waveshaperScriptFor(WarpMethod m) {
+    return std::string(kWaveshaperScriptPrefix) + waveshaperToken(m)
+         + kWaveshaperScriptSuffix;
+}
+
+inline bool isWaveshaperScript(const std::string& script) {
+    return script.rfind(kWaveshaperScriptPrefix, 0) == 0;
+}
+
+// Parse the method from a Waveshaper node.script; returns None if it isn't a
+// waveshaper script or the token is unknown (callers treat None as an identity
+// passthrough, so an unrecognized token degrades to "no shaping" not a crash).
+inline WarpMethod waveshaperMethodFromScript(const std::string& script) {
+    if (!isWaveshaperScript(script)) return WarpMethod::None;
+    std::string body = script.substr(std::string(kWaveshaperScriptPrefix).size());
+    const std::string suf = kWaveshaperScriptSuffix;
+    if (body.size() >= suf.size()
+        && body.compare(body.size() - suf.size(), suf.size(), suf) == 0)
+        body.erase(body.size() - suf.size());
+    return warpMethodFromName(body.c_str());
+}
+
 // ---- Per-sample primitives (the modulatable foundation) --------------------
 //
 // amount is normalized 0..1 (0 = identity / no effect). Methods that are

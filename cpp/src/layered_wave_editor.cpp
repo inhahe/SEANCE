@@ -13106,10 +13106,21 @@ void LayeredWaveEditorComponent::paint(juce::Graphics& g) {
         const juce::String tid = fr ? juce::String(fr->typeId())
                                     : juce::String("?");
         juce::String msg;
-        msg << "Captured " << tid << " waveform.\n"
-            << "This frame type doesn't have an in-editor view yet.\n"
-            << "You can replace it via + Waveform, or delete it from the "
-            << "Library list and re-capture.";
+        if (frameSynthMode) {
+            // Focused single-frame instrument: there is no + Waveform button
+            // or Library list to point the user at, so don't reference them.
+            // The Sample instrument currently plays a default single-cycle
+            // sine; single-cycle capture/import is tracked as follow-up work
+            // (see known-issues.md "Sample single-cycle capture").
+            msg << "Single-cycle " << tid << " oscillator.\n"
+                << "Capturing/importing a single cycle from audio isn't wired "
+                << "up yet - this instrument plays a default sine for now.";
+        } else {
+            msg << "Captured " << tid << " waveform.\n"
+                << "This frame type doesn't have an in-editor view yet.\n"
+                << "You can replace it via + Waveform, or delete it from the "
+                << "Library list and re-capture.";
+        }
         g.setColour(juce::Colours::white.withAlpha(0.75f));
         g.setFont(12.0f);
         g.drawText(msg, pr.reduced(12.0f).toNearestInt(),

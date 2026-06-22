@@ -2338,6 +2338,37 @@ void testWarp(Report& r) {
                 "framesynth: a plain wavetable script is not a frame synth");
     }
 
+    // ---- Waveshaper effect-node identity round-trip --------------------------
+    // Each amplitude-domain Waveshaper node stores its method as a
+    // "__waveshaper:<token>__" script; the processor parses it back. Verify the
+    // script<->method round-trip for every exposed method, and that a plain /
+    // unknown script is treated as identity (None).
+    {
+        const auto& wm = waveshaperMethods();
+        r.check(wm.size() == 10,
+                "waveshaper: exactly ten amplitude-domain methods exposed");
+        for (WarpMethod m : wm) {
+            std::string script = waveshaperScriptFor(m);
+            r.check(isWaveshaperScript(script),
+                    std::string("waveshaper: script for '") + warpMethodName(m)
+                        + "' carries the __waveshaper: prefix");
+            r.check(waveshaperMethodFromScript(script) == m,
+                    std::string("waveshaper: '") + warpMethodName(m)
+                        + "' round-trips script -> method");
+            // Every exposed method must be amplitude-domain (phase warps can't
+            // be standalone effect nodes - they need the synth read position).
+            r.check(warpDomainOf(m) == WarpDomain::Amplitude,
+                    std::string("waveshaper: '") + warpMethodName(m)
+                        + "' is an amplitude-domain method");
+        }
+        r.check(!isWaveshaperScript("__tremolo__"),
+                "waveshaper: a non-waveshaper script is not a waveshaper");
+        r.check(waveshaperMethodFromScript("__tremolo__") == WarpMethod::None,
+                "waveshaper: a non-waveshaper script parses to None (identity)");
+        r.check(waveshaperMethodFromScript("__waveshaper:bogus__") == WarpMethod::None,
+                "waveshaper: an unknown token parses to None (identity passthrough)");
+    }
+
     // ---- Per-frame morph: two frames carry INDEPENDENT chains ----------------
     {
         // The whole point of moving the morph chain onto the frame: editing one

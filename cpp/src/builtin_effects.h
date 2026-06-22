@@ -6,6 +6,7 @@
 #include "fft_util.h"
 #include "builtin_synth.h"
 #include "curve_editor.h"   // SpectralCurve + CurveEq script helpers (Curve EQ)
+#include "warp.h"           // warpAmpValue + Waveshaper script helpers (Waveshaper FX)
 #include <juce_audio_processors/juce_audio_processors.h>
 #include <cmath>
 #include <vector>
@@ -77,6 +78,66 @@ public:
 private:
     Node& node;
     double sampleRate = 44100, phase = 0;
+};
+
+// ==============================================================================
+// WAVESHAPER - amplitude-domain transfer (Bucket A warp) on the input signal.
+//
+// One method per node, chosen at creation and stored in node.script
+// ("__waveshaper:<token>__"; see warp.h). A single modulatable "Amount" param
+// (0..1, 0 = passthrough). The DSP is the shared per-sample primitive
+// warpAmpValue() - the exact transfer the synth's amplitude morphs use - so the
+// node and the in-synth morph sound identical for the same method/amount.
+//
+// Phase-domain warps are intentionally NOT exposed as effect nodes: they remap
+// the read position before a table lookup, which only exists inside an
+// oscillator, not on an arbitrary audio stream.
+// ==============================================================================
+class WaveshaperProcessor : public juce::AudioProcessor {
+public:
+    WaveshaperProcessor(Node& n)
+        : node(n), method(waveshaperMethodFromScript(n.script)) {
+        // The single amount param is labelled with the method's named morph
+        // parameter ("Drive"/"Fold"/"Crush"/...) at creation time. Derive the
+        // SAME label here from the method so paramByName() finds it regardless
+        // of which variant this is.
+        const char* pl = warpParamLabel(method);
+        amountParamName = (pl && *pl) ? pl : "Amount";
+    }
+    const juce::String getName() const override { return "Waveshaper"; }
+    void prepareToPlay(double, int) override {}
+    void releaseResources() override {}
+    void processBlock(juce::AudioBuffer<float>& buf, juce::MidiBuffer&) override {
+        applySignalModulations(node, buf);
+        const float amount = juce::jlimit(
+            0.0f, 1.0f,
+            paramByName(node, amountParamName.toRawUTF8(), 0.5f));
+        // None (unknown token) or zero amount = identity: leave audio untouched.
+        if (method == WarpMethod::None || amount <= 0.0f) return;
+        const int ns = buf.getNumSamples();
+        for (int c = 0; c < buf.getNumChannels(); ++c) {
+            float* d = buf.getWritePointer(c);
+            for (int s = 0; s < ns; ++s)
+                d[s] = warpAmpValue(method, d[s], amount);
+        }
+    }
+    double getTailLengthSeconds() const override { return 0; }
+    bool acceptsMidi() const override { return true; }
+    bool producesMidi() const override { return true; }
+    bool isBusesLayoutSupported(const BusesLayout&) const override { return true; }
+    juce::AudioProcessorEditor* createEditor() override { return nullptr; }
+    bool hasEditor() const override { return false; }
+    int getNumPrograms() override { return 1; }
+    int getCurrentProgram() override { return 0; }
+    void setCurrentProgram(int) override {}
+    const juce::String getProgramName(int) override { return {}; }
+    void changeProgramName(int, const juce::String&) override {}
+    void getStateInformation(juce::MemoryBlock&) override {}
+    void setStateInformation(const void*, int) override {}
+private:
+    Node& node;
+    WarpMethod method = WarpMethod::None;
+    juce::String amountParamName { "Amount" };
 };
 
 // ==============================================================================

@@ -5,6 +5,38 @@ top. When something is fixed, delete the entry (git history is the archive).
 
 ---
 
+## OPEN: Sample single-cycle capture/import not wired up
+
+**Noticed:** 2026-06-22, building the six standalone single-frame instruments
+(`__framesynth__:`). Five of the six (Layered, Frequency Domain, Wavelet Space,
+Inharmonic, Granular) have fully functional focused-mode editors. The sixth,
+**Sample (single cycle)** (`SampleFrame`, typeId `"sample"`), has **no live
+capture/import path**: the entire capture machinery
+(`CaptureFromPlaybackDialog` / `CaptureFromSongDialog` in
+`capture_from_playback.cpp`) only ever emits `GranularFrame`s — see the two
+`std::make_unique<GranularFrame>` sites (~lines 2063, 4178). Nothing in the live
+app constructs a `SampleFrame` from real audio (the comment in `sample_frame.h`
+claiming "the capture dialog produces many SampleFrames" is aspirational/stale).
+
+So the Sample instrument currently plays only its default single-cycle sine
+(`SampleFrame::defaultEmpty()`) and shows a focused-mode placeholder explaining
+that. It round-trips through save/load fine; it just can't yet load a real
+single cycle.
+
+**Proper fix (needs a small design decision + audio validation):** give
+`SampleFrame` a dedicated embedded editor (mirroring
+`GranularFrameEditorComponent`: waveform display + a "Capture / Import single
+cycle…" button) backed by a single-cycle extraction path: pitch-detect the
+source → grab exactly one period → resample to `tableSize` → `cleanLoopBoundaries()`
+(the FFT integer-bin conditioner already exists on `SampleFrame`). The source
+picker mirrors granular (project song / mic / file). This is real audio-DSP
+work that needs to be validated by ear, so it was deliberately NOT rushed in the
+framesynth pass. Until then, the Sample instrument is a single-cycle sine
+oscillator. Decision still open: whether single-cycle capture should be a new
+lean path or an emit-mode flag on the existing granular capture dialog.
+
+---
+
 ## OPEN (latent): baked-chain "Pin" checkbox shows but does nothing
 
 **Noticed:** 2026-06-22, while investigating the morph-pin reports.
@@ -523,6 +555,35 @@ it would be inert, which the "no silent lies" rule forbids.
 applied **after** the synth's own internal envelope. Then the editor can be
 offered universally, with a note that it stacks on top of the engine's native
 shaping. Until then, those synths intentionally show no AHDSR editor.
+
+**Update 2026-06-22 (framesynth instruments):** the six new standalone
+single-frame instruments (`__framesynth__:` — Layered / Frequency Domain /
+Wavelet Space / Inharmonic / Sample / Granular) route through the wavetable
+render path, so they already honor `node.ahdsrEnvelope` and correctly get the
+*Envelope (AHDSR)…* editor (right-click item 180 + the focused-editor toolbar
+"Envelope…" button). That fully satisfies "envelope on all six new instruments."
+
+The user also asked for "the envelope feature for every other existing
+instrument that doesn't already have it." Audit result (2026-06-22):
+- **MultiSampler** already exposes a full A/D/S/R editor in
+  `MultiSamplerEditorComponent` (its own per-voice envelope).
+- **FM** (per-operator A/D/S/R), **Particle** (grain attack/release), and
+  **Drum** (per-sound decay) expose their native envelope params on the node.
+- **SF2 / SFZ / Sfizz** have envelopes baked into the loaded soundfont/.sfz
+  file — there is no SEANCE-synthesized envelope to edit; a node AHDSR could
+  only act as a master-VCA on top.
+
+So the *only* way to give these synths a SEANCE-level AHDSR is the shared
+master-VCA above. That is a cross-cutting DSP change (per-voice access doesn't
+even exist for the library synths SF2/Sfizz, whose voices live inside
+tinysoundfont/libsfizz — a node AHDSR there can only be a node-global VCA on the
+summed output, which retriggers wrongly under overlapping notes). It also has a
+real musical-behavior decision (does a master VCA at non-default settings gate a
+held kick drum? is that desired?). Because it's not a clear mechanical fix and
+the default-settings transparency vs. per-voice-vs-node-global tradeoff needs a
+product call, it stays tracked here rather than being built blind. **Build the
+master-VCA properly (per-voice where voices exist, documented node-global
+fallback for library synths) when picked up — do not add a partial stop-gap.**
 
 ## FIXED 2026-06-09: Terrain Pan param off-by-one
 

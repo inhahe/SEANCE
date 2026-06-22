@@ -644,6 +644,40 @@ bool ProjectFile::readProject(std::istream& f, NodeGraph& graph, PluginHost* plu
         auto key = getKey(line);
         auto val = getValue(line);
 
+        // Signal modulation pin bindings (#88): "modPin=paramIdx,pinId,depth[,mode]"
+        // (mode 0=Modulate, 1=Absolute; optional for back-compat -> Modulate).
+        //
+        // These are written right after the node's [Param] blocks with NO section
+        // header of their own, so by the time the parser reaches them `section` is
+        // still "[Param]" - NOT "[Node]". A historical bug handled `modPin` only
+        // inside the "[Node]" branch, so the key never matched and EVERY saved
+        // modulation-pin binding (a pinned morph/layer param, a wired LFO, ...) was
+        // silently dropped on load: the [Param] survived but its pin + binding
+        // vanished, so reopening a project lost all its pins. Handle it here, ahead
+        // of the section dispatch, so it's recognised regardless of section - which
+        // fixes both newly-saved and already-saved (old) projects.
+        if (key == "modPin" && curNode) {
+            Node::ModPin mp;
+            auto c1 = val.find(',');
+            auto c2 = (c1 == std::string::npos) ? std::string::npos
+                                                : val.find(',', c1 + 1);
+            if (c1 != std::string::npos && c2 != std::string::npos) {
+                mp.paramIndex = std::stoi(val.substr(0, c1));
+                mp.pinId      = std::stoi(val.substr(c1 + 1, c2 - c1 - 1));
+                auto c3 = val.find(',', c2 + 1);
+                if (c3 != std::string::npos) {
+                    mp.depth = std::stof(val.substr(c2 + 1, c3 - c2 - 1));
+                    mp.mode  = (std::stoi(val.substr(c3 + 1)) == 1)
+                                   ? Node::ModPin::Mode::Absolute
+                                   : Node::ModPin::Mode::Modulate;
+                } else {
+                    mp.depth = std::stof(val.substr(c2 + 1));
+                }
+                curNode->modPins.push_back(mp);
+            }
+            continue;
+        }
+
         if (section == "[Project]") {
             if (key == "bpm") graph.bpm = std::stof(val);
             else if (key == "timeSigNum") graph.timeSignatureNum = std::stoi(val);
@@ -808,29 +842,10 @@ bool ProjectFile::readProject(std::istream& f, NodeGraph& graph, PluginHost* plu
                 while (std::getline(ss, token, ','))
                     if (!token.empty()) curNode->childNodeIds.push_back(std::stoi(token));
             }
-            // Signal modulation pin bindings (#88):
-            // "modPin=paramIdx,pinId,depth[,mode]" where mode 0=Modulate,
-            // 1=Absolute. The mode field is optional for back-compat with
-            // older projects (missing -> Modulate).
-            else if (key == "modPin") {
-                Node::ModPin mp;
-                auto c1 = val.find(',');
-                auto c2 = val.find(',', c1 + 1);
-                if (c1 != std::string::npos && c2 != std::string::npos) {
-                    mp.paramIndex = std::stoi(val.substr(0, c1));
-                    mp.pinId      = std::stoi(val.substr(c1 + 1, c2 - c1 - 1));
-                    auto c3 = val.find(',', c2 + 1);
-                    if (c3 != std::string::npos) {
-                        mp.depth = std::stof(val.substr(c2 + 1, c3 - c2 - 1));
-                        mp.mode  = (std::stoi(val.substr(c3 + 1)) == 1)
-                                       ? Node::ModPin::Mode::Absolute
-                                       : Node::ModPin::Mode::Modulate;
-                    } else {
-                        mp.depth = std::stof(val.substr(c2 + 1));
-                    }
-                    curNode->modPins.push_back(mp);
-                }
-            }
+            // NOTE: "modPin=" lines are parsed earlier (before the section
+            // dispatch) because they are written after the [Param] blocks, so
+            // the active section is "[Param]" — not "[Node]" — when they're
+            // read. See the hoisted handler near the top of this loop.
         }
         else if ((section == "[PinIn]" || section == "[PinOut]") && curNode) {
             auto& pins = (section == "[PinIn]") ? curNode->pinsIn : curNode->pinsOut;

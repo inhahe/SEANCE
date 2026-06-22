@@ -4181,6 +4181,58 @@ void testAssetLibrary(Report& r) {
                 (movedPin ? movedPin->name : std::string("<none>")) + "')");
     }
 
+    // ---- Pinned morph param survives a full save/load round-trip (regression) ----
+    {
+        // User report: pinning a morph (or layer) param, saving, and reloading
+        // dropped the pin. A frame-scope warp param is reconciled on load by
+        // syncWarpParamsForNode, which REMOVES any warp param whose (warpFrameId,
+        // warpSlot) no longer addresses a live op in the decoded doc - taking its
+        // modPin + "Mod:" pin with it. So the pin survives only if the node script
+        // round-trips the morph chain AND warpFrameId round-trips and still matches
+        // the decoded library entry id. Exercise the FULL writeProject->readProject
+        // path (the earlier per-layer test had no chain + no pin, so it missed this).
+        NodeGraph g;
+        int nId = g.addNode("wt", NodeType::TerrainSynth, {}, {}).id;
+        WavetableDoc doc;
+        int fid = doc.addLibraryEntry(std::make_unique<LayeredWaveform>(), "w");
+        WarpOp op; op.method = WarpMethod::HardClip; op.amount = 0.5f; op.enabled = true;
+        doc.libraryFrameById(fid)->morphChain = { op };
+        Node* nd = g.findNode(nId);
+        nd->script = doc.encode();
+        Param wp; wp.name = "HardClip"; wp.value = wp.baseValue = 0.5f;
+        wp.minVal = 0; wp.maxVal = 1; wp.format = "%.2f";
+        wp.warpLayer = -1; wp.warpSlot = 0; wp.warpFrameId = fid;
+        nd->params.push_back(wp);
+        const int wpIdx = (int)nd->params.size() - 1;
+        int pinId = g.allocId();
+        nd->pinsIn.push_back({pinId, "Mod: HardClip", PinKind::Param, true, 1});
+        { Node::ModPin mp; mp.paramIndex = wpIdx; mp.pinId = pinId;
+          mp.mode = Node::ModPin::Mode::Modulate; nd->modPins.push_back(mp); }
+
+        std::ostringstream oss;
+        ProjectFile::writeProject(oss, g, nullptr, /*includeView*/false,
+                                  /*includeBlobs*/true);
+        NodeGraph g2;
+        std::istringstream iss(oss.str());
+        ProjectFile::readProject(iss, g2, nullptr);
+        Node* nd2 = g2.findNode(nId);
+        const Param* rp = nullptr; int rpIdx = -1;
+        if (nd2) for (int i = 0; i < (int)nd2->params.size(); ++i)
+            if (nd2->params[i].warpLayer == -1 && nd2->params[i].warpSlot == 0) {
+                rp = &nd2->params[i]; rpIdx = i;
+            }
+        r.check(rp != nullptr,
+                "pin round-trip: frame-scope warp param survives save/load");
+        bool modOk = false;
+        if (nd2) for (auto& m : nd2->modPins)
+            if (m.paramIndex == rpIdx && m.pinId == pinId) modOk = true;
+        r.check(modOk, "pin round-trip: modPin survives and stays bound to the param");
+        bool pinOk = false;
+        if (nd2) for (auto& p : nd2->pinsIn)
+            if (p.id == pinId && p.name.rfind("Mod:", 0) == 0) pinOk = true;
+        r.check(pinOk, "pin round-trip: 'Mod:' input pin survives");
+    }
+
     // ---- Dangling modulation pin: prune orphan "Mod:"/"Set:" pins -----------
     {
         // Reproduces a real corrupted project (after_j.ssp): a warp param "Drive 1"

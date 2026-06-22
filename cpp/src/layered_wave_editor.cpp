@@ -3820,6 +3820,15 @@ void syncWarpParamsForNode(NodeGraph& graph, int nodeId,
         nd->params[pi].name = warpSlotParamName(chain[slot], slot);
         relabelWarpModPin(*nd, pi);
     }
+
+    // ---- 4) Structural integrity: drop any dangling "Mod:"/"Set:" pin left
+    //         without a backing modPin (and any modPin pointing at a dead param /
+    //         missing pin). A historical reconcile/remap bug could strand such a
+    //         ghost pin - e.g. a duplicate "Mod: Drive 1" input that no modPin
+    //         references - which round-trips through save/load as an unremovable
+    //         phantom modulation input. Idempotent no-op on a clean node, so it's
+    //         safe to run on every reconcile (load + each warp edit).
+    pruneOrphanModPins(graph, nodeId);
 }
 
 // Reconcile a node's PER-LAYER warp modulation params + mod pins against the

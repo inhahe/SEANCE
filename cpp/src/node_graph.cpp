@@ -430,4 +430,62 @@ bool removeParamModPin(NodeGraph& graph, int nodeId, int paramIndex) {
     return removed;
 }
 
+int pruneOrphanModPins(NodeGraph& graph, int nodeId) {
+    Node* nd = graph.findNode(nodeId);
+    if (!nd) return 0;
+    int removed = 0;
+
+    auto pinExists = [&](int pinId) {
+        for (const auto& p : nd->pinsIn) if (p.id == pinId) return true;
+        return false;
+    };
+    auto dropPinAndLinks = [&](int pinId) {
+        graph.links.erase(std::remove_if(graph.links.begin(), graph.links.end(),
+            [&](const Link& l) { return l.startPin == pinId || l.endPin == pinId; }),
+            graph.links.end());
+        nd->pinsIn.erase(std::remove_if(nd->pinsIn.begin(), nd->pinsIn.end(),
+            [&](const Pin& p) { return p.id == pinId; }), nd->pinsIn.end());
+    };
+
+    // Invariant: every "Mod:"/"Set:" Param input pin is backed by exactly one
+    // modPin, and every modPin references an in-range param + a live pin.
+    // addParamModPin / removeParamModPin maintain both sides in lockstep, but a
+    // historical reconcile/remap bug could strand a pin without its modPin (a
+    // dangling "Mod: X" input pin) - which then round-trips through save/load as
+    // a ghost modulation input the user can't explain or remove. This restores
+    // the invariant on both sides; it's a no-op (returns 0) on a consistent node,
+    // which is the common case.
+
+    // 1) Drop modPins whose param is out of range (dead binding). The pin they
+    //    point at is meaningless without a param, so drop it too when present.
+    //    A modPin whose pin is already missing just loses the stale modPin.
+    for (auto it = nd->modPins.begin(); it != nd->modPins.end(); ) {
+        const bool badParam = it->paramIndex < 0
+                            || it->paramIndex >= (int)nd->params.size();
+        const bool noPin = !pinExists(it->pinId);
+        if (badParam || noPin) {
+            if (!noPin) dropPinAndLinks(it->pinId);
+            it = nd->modPins.erase(it);
+            ++removed;
+        } else {
+            ++it;
+        }
+    }
+
+    // 2) Drop "Mod:"/"Set:" Param input pins that no surviving modPin backs.
+    std::set<int> backed;
+    for (const auto& mp : nd->modPins) backed.insert(mp.pinId);
+    std::vector<int> orphanPins;
+    for (const auto& p : nd->pinsIn) {
+        if (p.kind != PinKind::Param) continue;
+        const bool modLabel = p.name.rfind("Mod: ", 0) == 0
+                           || p.name.rfind("Set: ", 0) == 0;
+        if (modLabel && !backed.count(p.id)) orphanPins.push_back(p.id);
+    }
+    for (int pid : orphanPins) { dropPinAndLinks(pid); ++removed; }
+
+    if (removed) graph.dirty = true;
+    return removed;
+}
+
 } // namespace SoundShop

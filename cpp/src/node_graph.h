@@ -1112,4 +1112,12 @@ int addParamModPin(NodeGraph& graph, int nodeId, int paramIndex, bool absolute);
 // returns to its resting value. Returns true if a pin was removed. No commit.
 bool removeParamModPin(NodeGraph& graph, int nodeId, int paramIndex);
 
+// Restore the pin<->modPin invariant on `nodeId`: drop any "Mod:"/"Set:" Param
+// input pin with no backing modPin (a dangling ghost modulation input), and any
+// modPin whose param is out of range or whose pin is gone. Returns the count
+// removed (0 = already consistent, the common case). Idempotent. No commit.
+// Run wherever a node's params/pins are reconciled (e.g. syncWarpParamsForNode,
+// which fires on load + every warp edit) so historical corruption self-heals.
+int pruneOrphanModPins(NodeGraph& graph, int nodeId);
+
 } // namespace SoundShop

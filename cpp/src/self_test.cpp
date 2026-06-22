@@ -3998,6 +3998,62 @@ void testAssetLibrary(Report& r) {
                 (movedPin ? movedPin->name : std::string("<none>")) + "')");
     }
 
+    // ---- Dangling modulation pin: prune orphan "Mod:"/"Set:" pins -----------
+    {
+        // Reproduces a real corrupted project (after_j.ssp): a warp param "Drive 1"
+        // with a VALID backing modPin/pin (851), plus a DUPLICATE "Mod: Drive 1"
+        // input pin (847) that NO modPin references - a ghost modulation input
+        // stranded by a historical reconcile/remap bug, then preserved by
+        // save/load. reconcileAllWarpParams must prune the orphan while leaving the
+        // valid pin (and an unrelated valid Position pin) untouched.
+        NodeGraph g;
+        int nId = g.addNode("wt", NodeType::TerrainSynth, {}, {}).id;
+        WavetableDoc doc;
+        doc.addLibraryEntry(std::make_unique<LayeredWaveform>(), "w");
+        WarpOp o0; o0.method = WarpMethod::SoftClip; o0.amount = 0.4f; o0.enabled = true;
+        doc.warpChain = { o0 };   // single op -> one "Drive 1" param at slot 0
+        Node* nd = g.findNode(nId);
+        nd->script = doc.encode();
+
+        // The warp-slot param (index 0 here) that the valid pin will bind to.
+        Param dp{}; dp.name = "Drive 1"; dp.value = dp.baseValue = 0.4f;
+        dp.minVal = 0; dp.maxVal = 1; dp.format = "%.2f"; dp.warpSlot = 0;
+        nd->params.push_back(dp);
+        const int driveIdx = (int)nd->params.size() - 1;
+        // An unrelated, correctly-backed Position param + pin (must NOT be pruned).
+        Param pp{}; pp.name = "Position"; pp.value = pp.baseValue = 0.5f;
+        pp.minVal = 0; pp.maxVal = 1; pp.format = "%.2f";
+        nd->params.push_back(pp);
+        const int posIdx = (int)nd->params.size() - 1;
+
+        int ghostPin = g.allocId();   // 847-analogue: no modPin backs it
+        nd->pinsIn.push_back({ghostPin, "Mod: Drive 1", PinKind::Param, true, 1});
+        int validPin = g.allocId();   // 851-analogue: backed by a modPin
+        nd->pinsIn.push_back({validPin, "Mod: Drive 1", PinKind::Param, true, 1});
+        int posPin = g.allocId();
+        nd->pinsIn.push_back({posPin, "Mod: Position X", PinKind::Param, true, 1});
+        { Node::ModPin m; m.paramIndex = driveIdx; m.pinId = validPin; nd->modPins.push_back(m); }
+        { Node::ModPin m; m.paramIndex = posIdx;   m.pinId = posPin;   nd->modPins.push_back(m); }
+
+        reconcileAllWarpParams(g);   // -> syncWarpParamsForNode -> pruneOrphanModPins
+
+        nd = g.findNode(nId);
+        auto hasPin = [&](int id) {
+            for (const auto& p : nd->pinsIn) if (p.id == id) return true;
+            return false;
+        };
+        r.check(!hasPin(ghostPin),
+                "prune: dangling 'Mod: Drive 1' pin (no backing modPin) is removed");
+        r.check(hasPin(validPin) && hasPin(posPin),
+                "prune: validly-backed Mod pins survive the prune");
+        int modPinCount = (int)nd->modPins.size();
+        r.checkVal(modPinCount == 2,
+                   "prune: both valid modPins are retained", modPinCount);
+        // Idempotent: a second pass removes nothing.
+        int again = pruneOrphanModPins(g, nId);
+        r.checkVal(again == 0, "prune: idempotent on an already-consistent node", again);
+    }
+
     // ---- Per-layer warp params: warpLayer round-trip (inc 4) ----------------
     {
         // A per-layer Type-2 warp param carries warpLayer >= 0 (which layer's

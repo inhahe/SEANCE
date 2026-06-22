@@ -4005,6 +4005,126 @@ void testAssetLibrary(Report& r) {
                 "assets: erased morph asset -> frame falls back to independent");
     }
 
+    // ---- Frame-scope morph param actually modulates the synth output --------
+    // Regression for "sliding a pinned morph's node slider does nothing": a
+    // frame-scope warp-slot Param on a layered scatter frame must drive the
+    // per-block re-bake (rebakeFramesIfNeeded -> getParamByWarpSlot), so two
+    // renders at different param values produce different audio. This exercises
+    // the real synth path, not just the editor preview.
+    {
+        Transport transport;
+        transport.sampleRate = 44100.0;
+        transport.bpm = 120.0;
+
+        // One layered frame (single Sine layer) placed as a lone scatter dot,
+        // carrying a 1-op HardClip morph chain (amplitude warp: identity at
+        // amount 0, hard-clipped at high amount -> clearly different cycle).
+        auto buildScript = [&](int& fidOut) {
+            WavetableDoc doc;
+            doc.mode = WavetableMode::Scatter;
+            doc.scatterDims = 1;
+            doc.tableSize = 2048;
+            auto lw = std::make_unique<LayeredWaveform>();
+            lw->layers.push_back(WaveLayer{});             // default Sine
+            int fid = doc.addLibraryEntry(std::move(lw), "w");
+            WarpOp op; op.method = WarpMethod::HardClip; op.amount = 0.5f; op.enabled = true;
+            doc.libraryFrameById(fid)->morphChain = { op };
+            ScatterFrame sf; sf.waveformId = fid; sf.position = { 0.5f };
+            doc.scatterFrames.push_back(sf);
+            fidOut = fid;
+            return doc.encode();
+        };
+
+        // Render a held A4 through a fresh processor whose frame-scope warp
+        // param (warpSlot 0) is pinned to `morphAmt`. Returns mono output.
+        auto renderWithMorph = [&](float morphAmt) {
+            int fid = -1;
+            std::string script = buildScript(fid);
+
+            Node node;
+            node.id = 1;
+            node.type = NodeType::TerrainSynth;
+            node.name = "selftest-morph-mod";
+            node.script = script;
+            node.pinsIn.push_back(Pin{ 1, "MIDI", PinKind::Midi, true, 2 });
+            node.pinsIn.push_back(Pin{ 2, "Sig X", PinKind::Signal, true, 1 });
+            node.pinsOut.push_back(Pin{ 100, "Audio", PinKind::Audio, false, 2 });
+            node.params.push_back({ "Volume", 1.0f, 0.0f, 1.0f });
+            node.params.push_back({ "Synth Mode", 0.0f, 0.0f, 2.0f }); // Direct
+            // The pinned frame-scope morph param: warpLayer -1 (frame-scope),
+            // warpSlot 0, warpFrameId = owning library frame id.
+            Param mp;
+            mp.name = "HardClip"; mp.value = mp.baseValue = morphAmt;
+            mp.minVal = 0.0f; mp.maxVal = 1.0f;
+            mp.warpLayer = -1; mp.warpSlot = 0; mp.warpFrameId = fid;
+            node.params.push_back(mp);
+            // Simulate the op being PINNED: an on-demand modulation input pin +
+            // ModPin binding exist, but no cable feeds it (connected == false).
+            // applySignalModulations must skip it so the manual param value (the
+            // node slider) still reaches the synth. This is exactly the state the
+            // user reported sliding "did nothing" in.
+            const int paramIdx = (int)node.params.size() - 1;
+            const int modPinId = 200;
+            node.pinsIn.push_back(Pin{ modPinId, "Mod: HardClip", PinKind::Param, true, 1 });
+            Node::ModPin mpin;
+            mpin.paramIndex = paramIdx;
+            mpin.pinId = modPinId;
+            mpin.mode = Node::ModPin::Mode::Modulate;
+            mpin.connected = false; // no cable
+            node.modPins.push_back(mpin);
+
+            node.ahdsrEnvelope.attackMs = 1.0f;
+            node.ahdsrEnvelope.holdMs = 4000.0f;
+            node.ahdsrEnvelope.decayMs = 1.0f;
+            node.ahdsrEnvelope.sustain = 1.0f;
+            node.ahdsrEnvelope.releaseMs = 1.0f;
+            node.ahdsrEnvelope.velocitySensitivity = 0.0f;
+            AHDSREnvelope::setDefaultCurves(node.ahdsrEnvelope);
+
+            TerrainSynthProcessor proc(node, transport);
+            proc.prepareToPlay(44100.0, 512);
+
+            std::vector<float> out;
+            juce::AudioBuffer<float> buf(3, 512); // 2 audio + 1 sig
+            for (int b = 0; b < 16; ++b) {
+                buf.setSize(3, 512, false, false, true);
+                buf.clear();
+                juce::MidiBuffer midi;
+                if (b == 0)
+                    midi.addEvent(juce::MidiMessage::noteOn(1, 69, (juce::uint8)100), 0);
+                proc.processBlock(buf, midi);
+                const float* p = buf.getReadPointer(0);
+                // Skip the attack ramp: collect from block 4 onward (steady state).
+                if (b >= 4) for (int s = 0; s < 512; ++s) out.push_back(p[s]);
+            }
+            return out;
+        };
+
+        auto lo = renderWithMorph(0.0f);   // identity -> clean sine
+        auto hi = renderWithMorph(0.95f);  // hard-clipped -> flat-topped
+
+        r.check(allFinite(lo) && allFinite(hi),
+                "morph-mod: synth output finite at both morph amounts");
+        r.check(rmsOf(lo) > 1e-3 && rmsOf(hi) > 1e-3,
+                "morph-mod: synth audible at both morph amounts");
+
+        // The two renders must differ: compute the normalized RMS of their
+        // sample-wise difference relative to the louder render. A working morph
+        // param yields a large difference; a broken one (param ignored) yields
+        // ~0 because both bakes use the same resting amount.
+        double diffSq = 0.0, refSq = 0.0;
+        size_t n = std::min(lo.size(), hi.size());
+        for (size_t i = 0; i < n; ++i) {
+            double d = (double)lo[i] - (double)hi[i];
+            diffSq += d * d;
+            refSq  += (double)hi[i] * (double)hi[i];
+        }
+        double relDiff = (refSq > 1e-12) ? std::sqrt(diffSq / refSq) : 0.0;
+        r.checkVal(relDiff > 0.05,
+                   "morph-mod: frame-scope morph param changes the synth output",
+                   relDiff);
+    }
+
     // ---- Named morph params: legacy "Warp N" migration (inc 2) --------------
     {
         // A pre-warpSlot project stored warp params as "Warp 1"/"Warp 2" with

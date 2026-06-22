@@ -5,21 +5,17 @@ top. When something is fixed, delete the entry (git history is the archive).
 
 ---
 
-## OPEN (unreproduced): "adding a morph + clicking its Pin checkbox adds no pin/slider"
+## OPEN (latent): baked-chain "Pin" checkbox shows but does nothing
 
-**Reported:** 2026-06-22. The data path is provably correct (self_test
-`assets: resolved warp chain reconciles two warp-slot params` and the new
-`prune:` tests; `addOp → onStructureChanged → syncWarpParams` creates the param,
-`setModulated → warpParamIndexForOp → addParamModPin` then binds it). Could not
-reproduce headlessly — needs a live repro of the exact editor/frame state.
-Candidate: `warp_editor.cpp:534` sets the Pin checkbox visibility from the
-callbacks, but line 541 `addAndMakeVisible(*row.mod)` force-overrides it to
-visible — so on a **baked** warp chain (callbacks unset, e.g. a granular/spectral
-per-element editor) the Pin checkbox SHOWS but its onClick early-returns
+**Noticed:** 2026-06-22, while investigating the morph-pin reports.
+`warp_editor.cpp:534` sets the Pin checkbox visibility from the callbacks, but
+line 541 `addAndMakeVisible(*row.mod)` force-overrides it to visible — so on a
+**baked** warp chain (callbacks unset, e.g. a granular/spectral per-element
+editor) the Pin checkbox SHOWS but its onClick early-returns
 (`if (!cb.setModulated) return;`) → "clicking does nothing." Harmless on the
-Summation Morph editor (callbacks wired). Fix: use `addChildComponent` +
-explicit `setVisible(cond)` so unwired editors hide the box. Hold until repro
-confirms this is the path the user hit.
+frame-scope Summation Morph editor (callbacks wired). Fix: use
+`addChildComponent` + explicit `setVisible(cond)` so unwired editors hide the
+box. Low priority (cosmetic on editors that have no pinnable params anyway).
 
 ---
 

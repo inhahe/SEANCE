@@ -1241,6 +1241,25 @@ private:
     // other audition control in the app.
     juce::TextButton playBtn     { "Preview" };
     bool framePlaying = false;
+
+    // Continuous low-rate poll that watches the LIVE node-param amounts for the
+    // current frame's summation-morph (warp) slots and re-ships the preview +
+    // held audition whenever they change underneath the editor - e.g. the user
+    // drags the node-graph param slider of a PINNED morph op while this editor
+    // is open. The preview/audition render at the live node-param amount
+    // (renderEditingFrameLiveCycle), but only refresh on editor-originated
+    // events; without this poll a node-side drag would appear to "do nothing"
+    // (the held audition keeps overriding the synth terrain with the stale
+    // cycle). A decoupled poll - rather than storing this editor's pointer in
+    // the node graph for push notification - avoids any dangling-pointer risk
+    // across graph.nodes reallocations.
+    struct CallbackTimer : juce::Timer {
+        std::function<void()> fn;
+        void timerCallback() override { if (fn) fn(); }
+    };
+    CallbackTimer paramWatchTimer;
+    std::vector<float> lastPolledWarpAmounts;
+    void pollNodeParamChanges();
     // Opens the shared AHDSR amplitude-envelope editor for this synth's
     // node in a separate dialog (kept out of this already-dense editor).
     juce::TextButton envelopeBtn { "Envelope..." };
@@ -1532,6 +1551,14 @@ private:
     void startFramePlay();
     void stopFramePlay();
     void refreshHeldFrameAudition();
+    // Render the currently-edited frame to a single cycle the way the SYNTH
+    // sees it: the frame's summation-morph chain applied at the LIVE node-param
+    // amounts (so a PINNED op reflects the value dialled in on the node-graph
+    // param slider, not the frozen editor amount). For unpinned ops the param
+    // mirrors the editor amount, so the result matches renderMorphed. Used by
+    // the preview and the held audition so "what you see / hear" tracks the node
+    // param slider for pinned morph stages. Returns false if there's no frame.
+    bool renderEditingFrameLiveCycle(std::vector<float>& out);
     void commitToNode(); // encode `wave` into node.script
     // Push a graph undo snapshot so a settled wavetable edit enters the undo
     // system. Without this the edit lives only in the node's script (updated

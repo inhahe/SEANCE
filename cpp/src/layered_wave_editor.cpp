@@ -9580,6 +9580,13 @@ LayeredWaveEditorComponent::LayeredWaveEditorComponent(NodeGraph& g, int nid, st
     // arrangement view (~960 px) on the left, per-waveform editor on
     // the right (~440 px), with margins and a gap.
     setSize(1500, 780);
+
+    // Watch the live node-param morph amounts so a node-graph slider drag on a
+    // pinned morph op refreshes this editor's preview + held audition. See the
+    // member comment on paramWatchTimer. 20 Hz is plenty for a UI poll and the
+    // tick is a no-op (cheap compare) whenever the amounts are unchanged.
+    paramWatchTimer.fn = [this]() { pollNodeParamChanges(); };
+    paramWatchTimer.startTimerHz(20);
 }
 
 // Library-name helpers defined later in this file (after the capture code).
@@ -10636,19 +10643,30 @@ void LayeredWaveEditorComponent::pushWarpAmountsToParams() {
     const auto& chain = f->morphChain;
     const int fid = currentLibraryId;
     // Mirror each op's editor amount into its matching (frame-scope) warp-slot
-    // param so the synth's live read (getParamByWarpSlot) tracks the slider. A
-    // modulated param's live value is owned by the modulation system, so write
-    // the resting value through baseValue and leave `value` alone while driven.
+    // param so the synth's live read (getParamByWarpSlot) tracks the slider.
+    //
+    // Ownership rule: once an op is PINNED (a modulation pin exists on its
+    // param), the editor's amount slider is disabled and the node-graph param
+    // slider / modulation system owns the value. The editor's `chain[k].amount`
+    // is frozen at whatever it was when pinned, so mirroring it into `p.value`
+    // here would silently clobber the value the user dials in on the node param
+    // slider every time onChanged fires - which read as "the node morph slider
+    // does nothing". So for a pinned op we leave value/baseValue untouched and
+    // only refresh the display name. We key off "has a modPin" rather than
+    // `p.modulated` because a pinned-but-uncabled op is still node-owned even
+    // though no cable is actively driving it (p.modulated is false until a cable
+    // connects). Only an UNPINNED op mirrors the editor slider into the param.
+    //
     // Also reconcile the param's display name + pin label to its op's current
     // method here (onChanged fires for a method change too), so picking a new
-    // method renames "Drive 1" -> "Fold 1" without a structural re-sync. The
-    // per-frame name prefix is reconciled by the heavier syncWarpParams path.
+    // method renames the param without a structural re-sync. The per-frame name
+    // prefix is reconciled by the heavier syncWarpParams path.
     for (int k = 0; k < (int)chain.size(); ++k) {
         for (int pi = 0; pi < (int)nd->params.size(); ++pi) {
             Param& p = nd->params[pi];
             if (p.warpLayer != -1 || p.warpFrameId != fid || p.warpSlot != k) continue;
-            if (p.modulated) p.baseValue = chain[k].amount;
-            else             p.value = p.baseValue = chain[k].amount;
+            if (!hasParamModPin(graph, nodeId, pi))
+                p.value = p.baseValue = chain[k].amount;
             p.name = frameWarpPrefix(wave, fid) + warpSlotParamName(chain, k);
             relabelWarpModPin(*nd, pi);
             break;
@@ -11567,6 +11585,8 @@ void LayeredWaveEditorComponent::updateHintText() {
 }
 
 LayeredWaveEditorComponent::~LayeredWaveEditorComponent() {
+    // Stop the live node-param poll before anything else tears down.
+    paramWatchTimer.stopTimer();
     // Release any sustaining frame audition so the held note doesn't dangle on
     // the synth node after this editor is gone (it would otherwise keep
     // sounding until the next graph rebuild).
@@ -12262,18 +12282,52 @@ void LayeredWaveEditorComponent::updateFrameEditorEmbed() {
     resized();
 }
 
+bool LayeredWaveEditorComponent::renderEditingFrameLiveCycle(std::vector<float>& out) {
+    auto* f = currentEditingFrame();
+    if (!f) { out.clear(); return false; }
+
+    // The synth reads each frame-scope morph op's amount from its node param
+    // (getParamByWarpSlot -> Param::value), not from the frame's stored
+    // op.amount. For an UNPINNED op those agree (pushWarpAmountsToParams mirrors
+    // the editor slider into the param), but for a PINNED op the editor slider
+    // is frozen and the node-graph param slider owns the live amount. To make
+    // the preview / audition track that slider (so it isn't "doing nothing"),
+    // render a clone whose morph amounts are overridden with the live param
+    // values wherever a matching param exists. Cheap enough off the audio thread.
+    const auto& chain = f->morphChain;
+    const Node* nd = graph.findNode(nodeId);
+    bool needOverride = false;
+    if (nd && !chain.empty()) {
+        for (const auto& p : nd->params)
+            if (p.warpLayer == -1 && p.warpFrameId == currentLibraryId
+                && p.warpSlot >= 0 && p.warpSlot < (int)chain.size()
+                && p.value != chain[(size_t)p.warpSlot].amount) {
+                needOverride = true; break;
+            }
+    }
+    if (!needOverride) {                 // fast path: amounts already match
+        f->renderMorphed(wave.tableSize, out);
+        return true;
+    }
+    auto clone = f->clone();
+    for (const auto& p : nd->params)
+        if (p.warpLayer == -1 && p.warpFrameId == currentLibraryId
+            && p.warpSlot >= 0 && p.warpSlot < (int)clone->morphChain.size())
+            clone->morphChain[(size_t)p.warpSlot].amount =
+                juce::jlimit(0.0f, 1.0f, p.value);
+    clone->renderMorphed(wave.tableSize, out);
+    return true;
+}
+
 void LayeredWaveEditorComponent::refreshPreview() {
     // Render the LIBRARY ENTRY the editor is currently targeting (NOT the
-    // selected cell - they can be different now). Every concrete frame type
-    // knows how to produce a tableSize-sample cycle. Use renderMorphed so the
-    // frame-scope Summation Morph chain is baked into the on-screen preview (the
-    // synth bakes the same renderMorphed cycle into the terrain), otherwise
-    // sliding a morph amount would visibly do nothing here.
-    if (auto* f = currentEditingFrame()) {
-        f->renderMorphed(wave.tableSize, previewSamples);
-    } else {
+    // selected cell - they can be different now). renderEditingFrameLiveCycle
+    // applies the frame-scope Summation Morph chain at the LIVE node-param
+    // amounts (the synth bakes the same cycle into the terrain), so sliding a
+    // morph amount - including a PINNED stage driven from the node param slider -
+    // visibly changes the preview here.
+    if (!renderEditingFrameLiveCycle(previewSamples))
         previewSamples.clear();
-    }
     repaint();
 }
 
@@ -12314,13 +12368,14 @@ void LayeredWaveEditorComponent::refreshHeldFrameAudition() {
     }
 
     // Render the frame to its final single cycle - gain AND the frame's own
-    // summation-morph chain are baked in by IWavetableFrame::renderMorphed (the
-    // same cycle the synth bakes into the terrain), so the audition matches the
-    // on-screen preview byte-for-byte and a morph the user dialled in is actually
-    // audible. Built outside the audio mutex so the render never stalls the audio
-    // thread.
+    // summation-morph chain (at the LIVE node-param amounts, so a PINNED stage
+    // tracks the node param slider) are baked in by renderEditingFrameLiveCycle,
+    // the same cycle the synth bakes into the terrain. So the audition matches
+    // the on-screen preview byte-for-byte and a morph the user dialled in - or
+    // pinned and drives from the node param - is actually audible. Built outside
+    // the audio mutex so the render never stalls the audio thread.
     auto cyc = std::make_shared<Node::AuditionCycleFrame>();
-    f->renderMorphed(wave.tableSize, cyc->cycle);
+    renderEditingFrameLiveCycle(cyc->cycle);
     if (cyc->cycle.empty()) {
         std::lock_guard<std::mutex> lock(*nd->auditionMutex);
         nd->heldAudition.reset();
@@ -12339,6 +12394,36 @@ void LayeredWaveEditorComponent::refreshHeldFrameAudition() {
 
     std::lock_guard<std::mutex> lock(*nd->auditionMutex);
     nd->heldAudition = std::move(ev);
+}
+
+void LayeredWaveEditorComponent::pollNodeParamChanges() {
+    const Node* nd = graph.findNode(nodeId);
+    if (!nd) return;
+    auto* f = currentEditingFrame();
+    if (!f) { lastPolledWarpAmounts.clear(); return; }
+
+    // Snapshot the amount that drives each frame-scope morph slot. Default to
+    // the op's own editor amount (unpinned ops mirror the editor amount), then
+    // override with the live node-param value for any slot that has a frame-
+    // scope warp param - that is what the synth and renderEditingFrameLiveCycle
+    // actually read.
+    const size_t n = f->morphChain.size();
+    std::vector<float> cur(n);
+    for (size_t k = 0; k < n; ++k) cur[k] = f->morphChain[k].amount;
+    for (const auto& p : nd->params)
+        if (p.warpLayer == -1 && p.warpFrameId == currentLibraryId
+            && p.warpSlot >= 0 && p.warpSlot < (int)n)
+            cur[(size_t)p.warpSlot] = p.value;
+
+    if (cur == lastPolledWarpAmounts) return;          // nothing moved
+    const bool baseline = lastPolledWarpAmounts.empty() && !cur.empty();
+    lastPolledWarpAmounts = std::move(cur);
+    if (baseline) return;                              // first tick records only
+    // A morph amount changed underneath the editor (node-graph slider drag,
+    // modulation cable, undo, ...). Re-render the preview and re-ship the held
+    // audition so "what you see / hear" follows the node param.
+    refreshPreview();
+    refreshHeldFrameAudition();
 }
 
 void LayeredWaveEditorComponent::commitToNode() {

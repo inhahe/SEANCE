@@ -474,11 +474,11 @@ void NodeGraphComponent::drawNode(juce::Graphics& g, Node& node) {
                     modPinIsAbsolute = (mp.mode == Node::ModPin::Mode::Absolute);
                     break;
                 }
-            // A folded-in control pin shows a compact "Set"/"Mod" tag right after
-            // its dot, so the user can still tell the pin's mode at a glance even
-            // though the full "Set:/Mod: <param>" pin label isn't drawn on the row
-            // (the param name already occupies it). Sized to the tag so the param
-            // name insets past both the dot and the tag.
+            // A folded-in control pin shows a compact "Set"/"Mod" tag (drawn
+            // right-aligned just left of the value, below) so the user can still
+            // tell the pin's mode at a glance even though the full "Set:/Mod:
+            // <param>" pin label isn't drawn on the row (the param name already
+            // occupies the left). Measure its width here for that placement.
             juce::String modTag = modPinPin ? (modPinIsAbsolute ? "Set" : "Mod")
                                             : juce::String();
             float modTagW = 0.0f;
@@ -580,22 +580,15 @@ void NodeGraphComponent::drawNode(juce::Graphics& g, Node& node) {
                 g.fillEllipse(dotX, dotY, 5.0f, 5.0f);
             }
 
-            // Name (left) and value (right). When this row carries a modulation
-            // connector on its left edge, nudge the name right so it clears the
-            // pin dot.
+            // Name (left) and value (right). The in-place modulation connector
+            // dot sits in the row's 6px left margin (rowRect starts at
+            // bounds.getX()+6, the dot is drawn at bounds.getX()), so it never
+            // overlaps the label - the param name stays left-aligned with every
+            // other row, pinned or not. The Set/Mod mode tag is drawn separately,
+            // right-aligned just left of the value (below), so it doesn't push the
+            // name in either.
             g.setColour(paramLocked ? juce::Colours::grey : juce::Colours::white);
             auto labelRect = rowRect.reduced(p.autoWriteArmed ? 10.0f : 4.0f, 0.0f);
-            if (modPinPin) {
-                // Inset the name past the dot (7px) + the mode tag, then draw the
-                // tag in the pin's wire colour so it reads as part of the pin.
-                float dotInset = 7.0f * zoom;
-                auto tagRect = labelRect.withTrimmedLeft(dotInset).withWidth(modTagW);
-                g.setColour(colourForPinKind(modPinPin->kind).withAlpha(paramLocked ? 0.6f : 0.95f));
-                g.setFont(juce::Font(paramFontSize));
-                g.drawText(modTag, tagRect, juce::Justification::centredLeft, false);
-                labelRect = labelRect.withTrimmedLeft(dotInset + modTagW);
-                g.setColour(paramLocked ? juce::Colours::grey : juce::Colours::white);
-            }
             g.drawText(p.name, labelRect, juce::Justification::centredLeft, false);
             // Enum-typed params get their numeric value translated into a
             // readable label, so the user sees the meaning rather than a
@@ -633,6 +626,22 @@ void NodeGraphComponent::drawNode(juce::Graphics& g, Node& node) {
                 valueStr = juce::String(dispValue, 2);
             }
             g.drawText(valueStr, rowRect.reduced(4, 0), juce::Justification::centredRight, false);
+
+            // Set/Mod tag: when this row carries a modulation pin, label which
+            // mode it's in (Set = an Absolute cable fully owns the value; Mod =
+            // bipolar modulation around the base). Drawn in the pin's wire colour,
+            // right-aligned just left of the value text so it reads as part of the
+            // row without indenting the param name.
+            if (modPinPin) {
+                g.setFont(juce::Font(paramFontSize));
+                float valW = g.getCurrentFont().getStringWidthFloat(valueStr);
+                auto tagRect = rowRect.reduced(4, 0)
+                                   .withTrimmedRight(valW + 6.0f)
+                                   .removeFromRight(modTagW);
+                g.setColour(colourForPinKind(modPinPin->kind)
+                                .withAlpha(paramLocked ? 0.6f : 0.95f));
+                g.drawText(modTag, tagRect, juce::Justification::centredRight, false);
+            }
 
             // Modulation indicators (#29): small colored dots after the
             // param name showing what's driving this param.

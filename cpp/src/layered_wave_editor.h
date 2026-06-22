@@ -1580,6 +1580,13 @@ private:
     // making the waveform/cell "vanish" on reload.
     void commitUndoStep();
     void onLayerChanged();
+    // Lighter sibling of onLayerChanged() for a continuous frame-scope morph
+    // amount-slider drag: refreshes the on-screen preview and restarts the
+    // debounce, but does NOT rewrite the node script or synchronously re-ship the
+    // held audition every tick (the amount already flows to the synth via its
+    // live-read "Warp N" param, and the 20 Hz poll re-ships the audition at a
+    // de-clickable rate). The settled script commit happens in timerCallback.
+    void onFrameWarpAmountDragged();
     void switchToFrame(int idx);
     void syncPositionParams();      // ensure node has the right number of Position params
     // Ensure the node carries exactly one frame-scope morph param per op across

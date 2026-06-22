@@ -9223,6 +9223,22 @@ LayeredWaveEditorComponent::LayeredWaveEditorComponent(NodeGraph& g, int nid, st
             pushWarpAmountsToParams();
             onLayerChanged();
         };
+        // Amount-slider drag: a continuous gesture. The amount flows to the synth
+        // through the op's live-read "Warp N" node param (pushWarpAmountsToParams
+        // mirrors the slider into it), so - exactly like a modulation cable
+        // driving that param - we do NOT need to rewrite the node script or re-ship
+        // the held-audition cycle on every tick. Doing so was the cause of the
+        // audible "breaks": each synchronous re-ship swapped the audition cycle
+        // mid-crossfade (faster than the ~6 ms de-click), stacking discontinuities.
+        // Instead we just update the param + the cheap on-screen preview here and
+        // let the 20 Hz pollNodeParamChanges re-ship the audition at a throttled
+        // rate (≥50 ms apart, so each crossfade completes first) - the same path
+        // the smooth cable case already uses. The settled script commit + undo
+        // step happen once when the debounce fires (timerCallback).
+        wcb.onAmountChanged = [this]() {
+            pushWarpAmountsToParams();
+            onFrameWarpAmountDragged();
+        };
         wcb.onStructureChanged = [this]() {
             syncWarpParams();
             // The op count changed, so the editor's preferredHeight() changed too.
@@ -10685,17 +10701,18 @@ void LayeredWaveEditorComponent::pushWarpAmountsToParams() {
     // Mirror each op's editor amount into its matching (frame-scope) warp-slot
     // param so the synth's live read (getParamByWarpSlot) tracks the slider.
     //
-    // Ownership rule: once an op is PINNED (a modulation pin exists on its
-    // param), the editor's amount slider is disabled and the node-graph param
-    // slider / modulation system owns the value. The editor's `chain[k].amount`
-    // is frozen at whatever it was when pinned, so mirroring it into `p.value`
-    // here would silently clobber the value the user dials in on the node param
-    // slider every time onChanged fires - which read as "the node morph slider
-    // does nothing". So for a pinned op we leave value/baseValue untouched and
-    // only refresh the display name. We key off "has a modPin" rather than
-    // `p.modulated` because a pinned-but-uncabled op is still node-owned even
-    // though no cable is actively driving it (p.modulated is false until a cable
-    // connects). Only an UNPINNED op mirrors the editor slider into the param.
+    // Ownership rule: the editor's amount slider mirrors into the node param
+    // EXCEPT when an Absolute ("Set") cable is actively driving the param - in
+    // that case the cable fully owns the value and the editor slider is locked,
+    // so mirroring chain[k].amount (frozen at the moment the cable took over)
+    // would fight the cable. For a merely PINNED-but-not-Set op (Modulate mode,
+    // or a pin with no cable yet), the editor slider is still live and the user
+    // expects dragging it to change the sound/waveform, so we DO mirror it into
+    // p.value/baseValue. (Earlier this keyed off `hasParamModPin`, which froze
+    // the editor slider for any pinned op and made dragging it do nothing - the
+    // user-reported bug.) The reverse direction (node param -> chain.amount, to
+    // keep the editor slider visually synced when the node slider / a Mod cable
+    // moves the value) is handled in pollNodeParamChanges.
     //
     // Also reconcile the param's display name + pin label to its op's current
     // method here (onChanged fires for a method change too), so picking a new
@@ -10705,7 +10722,7 @@ void LayeredWaveEditorComponent::pushWarpAmountsToParams() {
         for (int pi = 0; pi < (int)nd->params.size(); ++pi) {
             Param& p = nd->params[pi];
             if (p.warpLayer != -1 || p.warpFrameId != fid || p.warpSlot != k) continue;
-            if (!hasParamModPin(graph, nodeId, pi))
+            if (!graph.paramHasAbsoluteInput(nodeId, pi))
                 p.value = p.baseValue = chain[k].amount;
             p.name = frameWarpPrefix(wave, fid) + warpSlotParamName(chain, k);
             relabelWarpModPin(*nd, pi);
@@ -12476,9 +12493,34 @@ void LayeredWaveEditorComponent::pollNodeParamChanges() {
     const bool baseline = lastPolledWarpAmounts.empty() && !cur.empty();
     lastPolledWarpAmounts = std::move(cur);
     if (baseline) return;                              // first tick records only
-    // A morph amount changed underneath the editor (node-graph slider drag,
-    // modulation cable, undo, ...). Re-render the preview and re-ship the held
-    // audition so "what you see / hear" follows the node param.
+
+    // Reverse sync (node param -> chain.amount): a frame-scope morph amount
+    // changed underneath the editor (node-graph slider drag, a "Mod" modulation
+    // cable, undo, ...). Mirror the live node-param value back into the editor's
+    // chain.amount so (a) the editor's amount slider follows it visually and
+    // (b) the NEXT onChanged -> pushWarpAmountsToParams doesn't re-write a now-
+    // stale chain.amount over the node param. Skip ops under an active Absolute
+    // ("Set") cable: there the cable owns the value and the editor slider is
+    // locked, so we leave chain.amount frozen (the resting value to fall back to
+    // when the cable detaches). The forward direction (editor slider -> param)
+    // lives in pushWarpAmountsToParams.
+    bool chainTouched = false;
+    for (const auto& p : nd->params) {
+        if (p.warpLayer != -1 || p.warpFrameId != currentLibraryId
+            || p.warpSlot < 0 || p.warpSlot >= (int)n)
+            continue;
+        // p is found by index in nd->params; need its index for paramHasAbsoluteInput.
+        const int pi = (int)(&p - &nd->params[0]);
+        if (graph.paramHasAbsoluteInput(nodeId, pi)) continue;
+        if (f->morphChain[(size_t)p.warpSlot].amount != p.value) {
+            f->morphChain[(size_t)p.warpSlot].amount = p.value;
+            chainTouched = true;
+        }
+    }
+    if (chainTouched && frameWarpEditor) frameWarpEditor->refreshAmounts();
+
+    // Re-render the preview and re-ship the held audition so "what you see /
+    // hear" follows the node param.
     refreshPreview();
     refreshHeldFrameAudition();
 }
@@ -12666,8 +12708,29 @@ void LayeredWaveEditorComponent::onLayerChanged() {
     startTimer(150);
 }
 
+void LayeredWaveEditorComponent::onFrameWarpAmountDragged() {
+    // Live visual preview every tick (cheap; renders the in-memory frame with the
+    // live param amounts overridden). We deliberately do NOT commitToNode() or
+    // refreshHeldFrameAudition() here - see the onAmountChanged wiring comment.
+    // The audio preview tracks via pollNodeParamChanges (throttled, de-clicked);
+    // the node script is rewritten once when the debounce settles (timerCallback).
+    refreshPreview();
+    if (arrangementView) arrangementView->updateConvertButton();
+    // The amount lives in the node param now (pushWarpAmountsToParams) but the
+    // settled script + undo step are still pending, so flag the project dirty so
+    // a quit-before-debounce still prompts to save.
+    graph.dirty = true;
+    startTimer(150);
+}
+
 void LayeredWaveEditorComponent::timerCallback() {
     stopTimer();
+    // Write the settled wave (including any morph-amount drag that took the light
+    // onFrameWarpAmountDragged() path, which skips the per-tick script rewrite)
+    // into the node script BEFORE the host applies/rebuilds the graph from it, so
+    // save/undo and the rebuilt graph capture the final state. Idempotent when the
+    // script already matches (the normal onLayerChanged path commits each tick).
+    commitToNode();
     if (onApply) onApply();
     // The debounce has settled - this is the natural commit point for the
     // bulk of wavetable edits (waveform sculpting, cell placement, grid

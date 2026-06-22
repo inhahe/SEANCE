@@ -492,6 +492,16 @@ void WarpChainEditor::refreshRowVisuals(int idx) {
               "with a cable (LFO / oscillator / automation) instead.");
 }
 
+void WarpChainEditor::refreshAmounts() {
+    if (!chain) return;
+    const int n = juce::jmin((int)rows.size(), (int)chain->size());
+    for (int i = 0; i < n; ++i) {
+        if (rows[i].amount)
+            rows[i].amount->setValue((*chain)[i].amount, juce::dontSendNotification);
+        refreshRowVisuals(i);
+    }
+}
+
 void WarpChainEditor::rebuild() {
     rows.clear();
     if (chain) {
@@ -524,7 +534,11 @@ void WarpChainEditor::rebuild() {
             row.amount->onValueChange = [this, i] {
                 if (!chain || i >= (int)chain->size()) return;
                 (*chain)[i].amount = (float)rows[i].amount->getValue();
-                if (cb.onChanged) cb.onChanged();
+                // Amount is a continuous gesture: prefer the lighter
+                // onAmountChanged path when the host provides it, so a drag
+                // doesn't re-commit / re-ship the audio preview every tick.
+                if (cb.onAmountChanged)   cb.onAmountChanged();
+                else if (cb.onChanged)    cb.onChanged();
             };
             addAndMakeVisible(*row.amount);
 

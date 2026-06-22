@@ -31,8 +31,20 @@ namespace SoundShop {
 class WarpChainEditor : public juce::Component {
 public:
     struct Callbacks {
-        // Required. Fired on every mutation (op added/removed/enabled/amount).
+        // Required. Fired on every mutation (op added/removed/enabled/method),
+        // EXCEPT a bare amount-slider drag when onAmountChanged is also set (see
+        // below).
         std::function<void()> onChanged;
+        // Optional. Fired specifically when an amount SLIDER moves, instead of
+        // onChanged. An amount is a continuous, high-frequency gesture and (for
+        // hosts that back the chain with live-read node params) flows to the
+        // synth through the modulatable param without a script rewrite - so those
+        // hosts route it here to run a lighter path (update the param + visual
+        // preview only) and avoid re-committing / re-shipping the audio preview on
+        // every drag tick, which clicks. A method/enable/structure change still
+        // goes through onChanged (those ARE baked into the script). When unset,
+        // the amount slider falls back to onChanged (the baked-chain default).
+        std::function<void()> onAmountChanged;
         // Optional. Fired only when the op LIST changes (add/remove). Hosts use
         // this to re-sync node "Warp N" params + re-layout the surrounding view.
         std::function<void()> onStructureChanged;
@@ -132,6 +144,16 @@ public:
     // Rebuild the per-op rows from the bound chain. Call after an external
     // mutation (preset load, undo restore) that changed the chain behind us.
     void rebuild();
+
+    // Lightweight re-sync of every row's amount slider value + lock/enable state
+    // from the bound chain, WITHOUT recreating the row widgets (so it won't
+    // interrupt an in-flight interaction the way rebuild() would). Hosts call
+    // this when the chain's amounts were changed underneath the editor by an
+    // outside agent - e.g. the frame-scope editor mirrors a node-graph param
+    // slider drag / a "Mod" modulation cable back into chain.amount and needs
+    // the editor slider to follow. Slider updates use dontSendNotification so
+    // this does not re-fire onChanged.
+    void refreshAmounts();
 
     // Height this editor wants for the current op count - hosts use it to size
     // the slot they place the editor in (a vertical stack / scroll viewport).

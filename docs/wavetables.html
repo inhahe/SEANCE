@@ -30,7 +30,7 @@
   <li><strong>Amplitude</strong> — how loud this layer is in the sum (0 to 1). Use to balance layers against each other. Also carries a <strong>Mod</strong> box so you can drive a layer's level live.</li>
 </ul>
 
-<p>When you tick a Phase or Amplitude <strong>Mod</strong> box, the slider is driven by an incoming cable and shows greyed (signal-locked); untick it to edit by hand again. This works on single- and multi-frame tables alike — the synth re-bakes just that frame as the modulation moves.</p>
+<p>Ticking a Phase or Amplitude <strong>Mod</strong> box exposes an input pin on the node so a cable can drive that value live. The slider stays editable — dragging it sets the <em>resting</em> value the modulation swings around — and only greys out (signal-locked) if you wire a <strong>Set</strong> (absolute) cable to the pin, which fully takes over the value; disconnect it or switch the pin to <strong>Mod</strong> to edit by hand again. This works on single- and multi-frame tables alike — the synth re-bakes just that frame as the modulation moves.</p>
 
 <p>A layer reshapes its own cycle only through its <strong>wave source</strong> (a Type-1 generator like Pulse / FM / Phase Distortion). To reshape the combined sound of all layers, use the <strong>Summation Morph</strong> strip below the preview (see <a href="#morphing-shape-bending-warp">Morphing &amp; shape-bending</a> below).</p>
 

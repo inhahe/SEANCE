@@ -2278,6 +2278,8 @@ int TerrainSynthProcessor::startVoice(int noteNumber, int channel, int velocity)
     v.auditionInhFrameStream = Voice::InhStream{};
     // Clear any unplaced single-cycle audition override (layered-frame Play).
     v.auditionCycleFrame.reset();
+    v.auditionCyclePrev.reset();
+    v.auditionCycleFade = 1.0f;
     return vi;
 }
 
@@ -2373,14 +2375,22 @@ void TerrainSynthProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mi
             // dragging. Update the live voice's cycle in place so the Preview
             // tracks a slider drag as smoothly as a modulation signal does
             // (the synth rebakes the terrain every block in the signal case).
-            // Consecutive cycles differ only by the slider delta, so swapping
-            // the wavetable the phase accumulator reads is click-free.
+            // Reading a new table mid-phase steps the output (a click), even for
+            // a small slider delta if the morph reshapes the wave near the read
+            // point. So we don't swap hard: stash the old cycle as the crossfade
+            // source and ramp auditionCycleFade 0->1 over a few ms (the read path
+            // blends prev->current), matching the smooth per-sample signal path.
+            // A swap arriving mid-fade re-bases the fade on the cycle we were
+            // heading to, so prev is always a real table and the deltas stay tiny.
             if (node.heldAudition->cycleFrame)
                 for (auto& v : voices)
                     if (v.env.isActive() && v.noteNumber == heldAuditionPitch
                         && v.auditionCycleFrame
-                        && v.auditionCycleFrame != node.heldAudition->cycleFrame)
+                        && v.auditionCycleFrame != node.heldAudition->cycleFrame) {
+                        v.auditionCyclePrev  = v.auditionCycleFrame;
                         v.auditionCycleFrame = node.heldAudition->cycleFrame;
+                        v.auditionCycleFade  = 0.0f;
+                    }
         } else if (!wantHeld && heldAuditionActive) {
             releaseNote(heldAuditionPitch, 1);
             heldAuditionActive = false;
@@ -3078,15 +3088,36 @@ void TerrainSynthProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mi
                     // cycle already has the frame's gain + internal warps baked in
                     // (IWavetableFrame::render), so it's read straight - matching
                     // the editor's on-screen single-cycle preview byte-for-byte.
-                    const auto& cyc = v.auditionCycleFrame->cycle;
-                    const int N = (int)cyc.size();
-                    float ph = v.phase - std::floor(v.phase);  // [0,1)
-                    float fpos = ph * (float)N;
-                    int i0 = (int)fpos;
-                    if (i0 >= N) i0 = N - 1;
-                    const int i1 = (i0 + 1) % N;
-                    const float frac = fpos - (float)i0;
-                    sample = cyc[(size_t)i0] + (cyc[(size_t)i1] - cyc[(size_t)i0]) * frac;
+                    const float ph = v.phase - std::floor(v.phase);  // [0,1)
+                    // Read one single-cycle table at the current phase (linear
+                    // interp). Shared by the current cycle and, during a de-click
+                    // crossfade, the previous cycle.
+                    auto readCycle = [ph](const std::vector<float>& cyc) -> float {
+                        const int N = (int)cyc.size();
+                        float fpos = ph * (float)N;
+                        int i0 = (int)fpos;
+                        if (i0 >= N) i0 = N - 1;
+                        const int i1 = (i0 + 1) % N;
+                        const float frac = fpos - (float)i0;
+                        return cyc[(size_t)i0] + (cyc[(size_t)i1] - cyc[(size_t)i0]) * frac;
+                    };
+                    float curS = readCycle(v.auditionCycleFrame->cycle);
+                    // De-click a live cycle swap: crossfade prev->current over a
+                    // few ms so a morph-slider drag tracks smoothly instead of
+                    // stepping. ~6 ms; advances one step per output sample.
+                    if (v.auditionCycleFade < 1.0f && v.auditionCyclePrev
+                        && !v.auditionCyclePrev->cycle.empty()) {
+                        float prevS = readCycle(v.auditionCyclePrev->cycle);
+                        sample = prevS + (curS - prevS) * v.auditionCycleFade;
+                        const float fadeInc = (float)(1.0 / std::max(1.0, sampleRate * 0.006));
+                        v.auditionCycleFade += fadeInc;
+                        if (v.auditionCycleFade >= 1.0f) {
+                            v.auditionCycleFade = 1.0f;
+                            v.auditionCyclePrev.reset();
+                        }
+                    } else {
+                        sample = curS;
+                    }
                 } else if (v.auditionFrame && v.auditionFrame->source
                     && !v.auditionFrame->source->empty()) {
                     // Unplaced-frame audition (wavetable editor Play on a

@@ -893,6 +893,16 @@ private:
         // auditionFrame / auditionInhFrame.
         std::shared_ptr<Node::AuditionCycleFrame> auditionCycleFrame;
 
+        // De-click crossfade for live cycle swaps. When the editor re-ships a
+        // freshly rendered cycle while the held Preview note sustains (dragging a
+        // morph slider), the synth swaps auditionCycleFrame in place. Reading a
+        // new table mid-phase steps the output -> a click. To match the smooth
+        // per-sample signal path, we keep the previous cycle and equal-linearly
+        // crossfade from it to the new one over a few ms: auditionCyclePrev holds
+        // the cycle we're fading FROM, auditionCycleFade ramps 0->1 (1 = fully on
+        // the current cycle). Reset alongside auditionCycleFrame.
+        std::shared_ptr<Node::AuditionCycleFrame> auditionCyclePrev;
+        float                                     auditionCycleFade = 1.0f;
     };
     static constexpr int MAX_VOICES = 16;
     Voice voices[MAX_VOICES];

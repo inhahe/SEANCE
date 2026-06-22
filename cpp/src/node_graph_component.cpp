@@ -466,12 +466,26 @@ void NodeGraphComponent::drawNode(juce::Graphics& g, Node& node) {
             // connector is drawn IN PLACE on this row's left edge (below),
             // not in the top pin region.
             const Pin* modPinPin = nullptr;
+            bool modPinIsAbsolute = false;
             for (const auto& mp : node.modPins)
                 if (mp.paramIndex == pi) {
                     for (const auto& ip : node.pinsIn)
                         if (ip.id == mp.pinId) { modPinPin = &ip; break; }
+                    modPinIsAbsolute = (mp.mode == Node::ModPin::Mode::Absolute);
                     break;
                 }
+            // A folded-in control pin shows a compact "Set"/"Mod" tag right after
+            // its dot, so the user can still tell the pin's mode at a glance even
+            // though the full "Set:/Mod: <param>" pin label isn't drawn on the row
+            // (the param name already occupies it). Sized to the tag so the param
+            // name insets past both the dot and the tag.
+            juce::String modTag = modPinPin ? (modPinIsAbsolute ? "Set" : "Mod")
+                                            : juce::String();
+            float modTagW = 0.0f;
+            if (modPinPin) {
+                g.setFont(juce::Font(paramFontSize));
+                modTagW = g.getCurrentFont().getStringWidthFloat(modTag) + 4.0f;
+            }
             float rowTop    = pinY + 2;
             float rowBottom = pinY + PIN_ROW_HEIGHT - 2;
             auto rowTL = canvasToScreen({bounds.getX() + 6, rowTop});
@@ -571,7 +585,17 @@ void NodeGraphComponent::drawNode(juce::Graphics& g, Node& node) {
             // pin dot.
             g.setColour(paramLocked ? juce::Colours::grey : juce::Colours::white);
             auto labelRect = rowRect.reduced(p.autoWriteArmed ? 10.0f : 4.0f, 0.0f);
-            if (modPinPin) labelRect = labelRect.withTrimmedLeft(7.0f * zoom);
+            if (modPinPin) {
+                // Inset the name past the dot (7px) + the mode tag, then draw the
+                // tag in the pin's wire colour so it reads as part of the pin.
+                float dotInset = 7.0f * zoom;
+                auto tagRect = labelRect.withTrimmedLeft(dotInset).withWidth(modTagW);
+                g.setColour(colourForPinKind(modPinPin->kind).withAlpha(paramLocked ? 0.6f : 0.95f));
+                g.setFont(juce::Font(paramFontSize));
+                g.drawText(modTag, tagRect, juce::Justification::centredLeft, false);
+                labelRect = labelRect.withTrimmedLeft(dotInset + modTagW);
+                g.setColour(paramLocked ? juce::Colours::grey : juce::Colours::white);
+            }
             g.drawText(p.name, labelRect, juce::Justification::centredLeft, false);
             // Enum-typed params get their numeric value translated into a
             // readable label, so the user sees the meaning rather than a

@@ -471,13 +471,23 @@ void WarpChainEditor::refreshRowVisuals(int idx) {
               "by hand."
             : reason);
     }
-    // Disabled op = greyed amount slider so the bypass is visible. A modulated
-    // amount is also greyed (driven by the incoming cable, not the slider).
-    row.amount->setEnabled(op.enabled && !modulated);
+    // Disabled op = greyed amount slider so the bypass is visible. The amount is
+    // ALSO locked when an active *Absolute* ("Set") cable owns the value - but a
+    // mere pin (no cable, or a "Mod" cable) leaves the slider editable: dragging
+    // then sets the base amount the modulation swings around, exactly like the
+    // node-graph slider. Hosts that don't supply isAmountLocked fall back to the
+    // legacy "locked whenever pinned" rule.
+    bool amountLocked = cb.isAmountLocked ? cb.isAmountLocked(idx) : modulated;
+    row.amount->setEnabled(op.enabled && !amountLocked);
     if (row.amount)
-        row.amount->setTooltip(modulated
+        row.amount->setTooltip(amountLocked
             ? "Signal-locked - this stage's amount is driven by an incoming "
-              "modulation cable. Uncheck Pin to edit it by hand."
+              "Set (absolute) cable. Disconnect it (or switch the pin to Mod) to "
+              "edit the amount by hand."
+            : modulated
+            ? "Morph amount base (0 = no effect, 1 = full). A modulation cable "
+              "swings the live amount around this resting value - drag to set the "
+              "centre it modulates around."
             : "Morph amount (0 = no effect, 1 = full). Check Pin to drive this "
               "with a cable (LFO / oscillator / automation) instead.");
 }

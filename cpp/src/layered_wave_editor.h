@@ -243,6 +243,9 @@ public:
         // warp is disabled - the "Mod" checkbox then stays hidden.
         std::function<bool(int opIndex)>      isWarpOpModulated;
         std::function<void(int opIndex,bool)> setWarpOpModulated;
+        // Optional. Absolute-only amount lock for this layer's warp op (forwarded
+        // to WarpChainEditor::Callbacks::isAmountLocked). Unset = lock when pinned.
+        std::function<bool(int opIndex)>      isWarpOpAmountLocked;
         // Optional. Mirrors WarpChainEditor::Callbacks::modDisabledReason for the
         // per-layer chain: a non-empty return disables the op's "Mod" checkbox and
         // shows the string as its tooltip. Used to gate per-layer warp modulation
@@ -258,6 +261,9 @@ public:
         // per-layer field modulation is disabled - the checkboxes stay hidden.
         std::function<bool(int field)>      isFieldModulated;
         std::function<void(int field,bool)> setFieldModulated;
+        // Optional. Absolute-only lock for the Phase/Amp/generator slider. Unset =
+        // lock whenever the field is pinned (legacy).
+        std::function<bool(int field)>      isFieldAmountLocked;
         // Optional. A non-empty return disables the field's "Mod" checkbox and
         // shows the string as its tooltip (gates to single-frame wavetables).
         std::function<juce::String(int field)> fieldModDisabledReason;
@@ -534,6 +540,10 @@ public:
         std::function<bool(int layerIndex,int opIndex)>      isLayerWarpOpModulated;
         std::function<void(int layerIndex,int opIndex,bool)> setLayerWarpOpModulated;
         std::function<juce::String(int layerIndex,int opIndex)> layerWarpModDisabledReason;
+        // Optional. Returns whether (layerIndex, opIndex)'s amount slider should be
+        // LOCKED - true only under an active Absolute ("Set") cable. Unset = lock
+        // whenever pinned (legacy).
+        std::function<bool(int layerIndex,int opIndex)>      isLayerWarpOpAmountLocked;
 
         // Optional. Per-layer field modulation (#88, item-M). A "Mod" checkbox
         // next to each layer's Phase and Amplitude slider routes (layerIndex,
@@ -547,6 +557,9 @@ public:
         std::function<bool(int layerIndex,int field)>      isLayerFieldModulated;
         std::function<void(int layerIndex,int field,bool)> setLayerFieldModulated;
         std::function<juce::String(int layerIndex,int field)> layerFieldModDisabledReason;
+        // Optional. Absolute-only lock for the Phase/Amp/generator slider (twin of
+        // isLayerWarpOpAmountLocked). Unset = lock whenever pinned (legacy).
+        std::function<bool(int layerIndex,int field)>      isLayerFieldAmountLocked;
     };
 
     LayerStackComponent(Options opts, std::function<void()> onChanged);
@@ -1618,6 +1631,10 @@ private:
     // drops the pin and the now-orphan param. No-op when unsupported.
     bool isLayerWarpOpModulated(int layer, int op) const;
     void setLayerWarpOpModulated(int layer, int op, bool on);
+    // True only when an active Absolute ("Set") cable drives this (layer, op)'s
+    // amount - the single condition that locks its slider. A bare pin or a "Mod"
+    // cable leaves it editable (drag sets the base).
+    bool isLayerWarpOpAmountLocked(int layer, int op) const;
     // Reconcile every per-layer warp param against the current editing frame's
     // chains (remove params for deleted ops + their pins, relabel survivors).
     // Called from onLayerChanged on every edit; early-outs when no per-layer warp
@@ -1636,6 +1653,8 @@ private:
     int  layerFieldParamIndex(int layer, int field) const;
     bool isLayerFieldModulated(int layer, int field) const;
     void setLayerFieldModulated(int layer, int field, bool on);
+    // Absolute-only lock for the Phase/Amp/generator slider (see warp-op twin).
+    bool isLayerFieldAmountLocked(int layer, int field) const;
     juce::String layerFieldModDisabledReason(int layer, int field) const;
     // Re-sync Position params/pins only when the effective dimension count has
     // actually changed since the params were last built. Cheap to call on every

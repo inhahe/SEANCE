@@ -2662,6 +2662,11 @@ void LayerStackComponent::rebuildRows() {
                     return opts.layerWarpModDisabledReason
                          ? opts.layerWarpModDisabledReason(i, op) : juce::String();
                 };
+            if (opts.isLayerWarpOpAmountLocked)
+                cb.isWarpOpAmountLocked = [this, i](int op) {
+                    return opts.isLayerWarpOpAmountLocked
+                        && opts.isLayerWarpOpAmountLocked(i, op);
+                };
             // Per-layer Phase / Amplitude modulation: same binding pattern, but
             // routes (i, field) where field 0 = Phase, 1 = Amplitude.
             if (opts.isLayerFieldModulated)
@@ -2678,6 +2683,11 @@ void LayerStackComponent::rebuildRows() {
                 cb.fieldModDisabledReason = [this, i](int field) -> juce::String {
                     return opts.layerFieldModDisabledReason
                          ? opts.layerFieldModDisabledReason(i, field) : juce::String();
+                };
+            if (opts.isLayerFieldAmountLocked)
+                cb.isFieldAmountLocked = [this, i](int field) {
+                    return opts.isLayerFieldAmountLocked
+                        && opts.isLayerFieldAmountLocked(i, field);
                 };
             auto row = std::make_unique<WaveLayerEditor>(
                 &target->layers[i], std::move(cb), opts.enablePerLayerWarp);
@@ -5024,6 +5034,10 @@ WaveLayerEditor::WaveLayerEditor(WaveLayer* layerPtr, Callbacks cb, bool enableW
                 return callbacks.warpModDisabledReason
                      ? callbacks.warpModDisabledReason(op) : juce::String();
             };
+        if (callbacks.isWarpOpAmountLocked)
+            wcb.isAmountLocked = [this](int op) {
+                return callbacks.isWarpOpAmountLocked && callbacks.isWarpOpAmountLocked(op);
+            };
         warpEditor = std::make_unique<WarpChainEditor>(std::move(wcb));
         // Per-layer Type-2 (arbitrary-wave) morph: reshapes THIS layer's wave
         // before it joins the summation. User-facing "Layer Morph" matches the
@@ -5129,13 +5143,24 @@ void WaveLayerEditor::syncFieldModState() {
                 + juce::String(r.name).toLowerCase()
                 + " live. The pin can run in Mod or Set mode. Untick to go back to "
                   "the baked value.");
-        // Grayed-control-explains-itself: when a cable drives the value, the
-        // slider is signal-locked (the synth rewrites it each block).
-        r.sl.setEnabled(!modulated);
-        if (modulated)
+        // Grayed-control-explains-itself: the slider locks ONLY under an active
+        // Absolute ("Set") cable (which fully owns the value). A bare pin, or a
+        // "Mod" cable, leaves it editable - dragging sets the base the modulation
+        // swings around (mirrors the node-graph slider). Hosts that don't supply
+        // isFieldAmountLocked fall back to the legacy lock-when-pinned rule.
+        const bool amountLocked = callbacks.isFieldAmountLocked
+                                      ? callbacks.isFieldAmountLocked(r.field)
+                                      : modulated;
+        r.sl.setEnabled(!amountLocked);
+        if (amountLocked)
             r.sl.setTooltip("Signal-locked - this " + juce::String(r.name).toLowerCase()
-                + " is being driven by an incoming modulation cable. Untick Pin or "
-                  "disconnect the cable to edit it manually.");
+                + " is driven by an incoming Set (absolute) cable. Disconnect it "
+                  "(or switch the pin to Mod) to edit it manually.");
+        else if (modulated)
+            r.sl.setTooltip(juce::String(r.name) + " base value - a modulation cable "
+                "swings the live " + juce::String(r.name).toLowerCase()
+                + " around this resting value. Drag to set the centre it modulates "
+                  "around.");
         else if (r.field == 0)
             r.sl.setTooltip("Phase offset (0 to 1): shifts where in its cycle this layer starts. "
                             "Affects how layers add up when summed - different phases give different timbres.");
@@ -9154,6 +9179,9 @@ LayeredWaveEditorComponent::LayeredWaveEditorComponent(NodeGraph& g, int nid, st
         lsOpts.layerWarpModDisabledReason = [this](int layer, int op) {
             return layerWarpModDisabledReason(layer, op);
         };
+        lsOpts.isLayerWarpOpAmountLocked = [this](int layer, int op) {
+            return isLayerWarpOpAmountLocked(layer, op);
+        };
         // Per-layer Phase / Amplitude modulation (#88, item-M): each layer's
         // Phase/Amp "Mod" checkbox creates/destroys a (warpLayer=layer,
         // layerField=0|1) param + pin so a cable can drive that value live. Same
@@ -9166,6 +9194,9 @@ LayeredWaveEditorComponent::LayeredWaveEditorComponent(NodeGraph& g, int nid, st
         };
         lsOpts.layerFieldModDisabledReason = [this](int layer, int field) {
             return layerFieldModDisabledReason(layer, field);
+        };
+        lsOpts.isLayerFieldAmountLocked = [this](int layer, int field) {
+            return isLayerFieldAmountLocked(layer, field);
         };
         layerStack = std::make_unique<LayerStackComponent>(
             std::move(lsOpts), [this]() { onLayerChanged(); });
@@ -9221,6 +9252,15 @@ LayeredWaveEditorComponent::LayeredWaveEditorComponent(NodeGraph& g, int nid, st
             if (pi < 0) return;
             if (on) addParamModPin(graph, nodeId, pi, /*absolute=*/false);
             else    removeParamModPin(graph, nodeId, pi);
+        };
+        // Lock the amount slider only when an *Absolute* ("Set") cable actively
+        // drives this op's "Warp N" param. A bare pin, or a "Mod" cable, leaves
+        // the slider editable (it sets the base the modulation swings around),
+        // matching the node-graph slider. This is what lets a pinned-but-uncabled
+        // op still be dragged in the editor.
+        wcb.isAmountLocked = [this](int opIndex) -> bool {
+            int pi = warpParamIndexForOp(opIndex);
+            return pi >= 0 && graph.paramHasAbsoluteInput(nodeId, pi);
         };
         frameWarpEditor = std::make_unique<WarpChainEditor>(std::move(wcb));
         // Frame-scope = the Type-2 (arbitrary-wave) summation morph: it reshapes
@@ -10748,6 +10788,15 @@ bool LayeredWaveEditorComponent::isLayerWarpOpModulated(int layer, int op) const
     return pi >= 0 && hasParamModPin(graph, nodeId, pi);
 }
 
+bool LayeredWaveEditorComponent::isLayerWarpOpAmountLocked(int layer, int op) const {
+    // Only an active Absolute ("Set") cable locks the amount slider; a bare pin
+    // or a "Mod" cable leaves it editable (sets the base). Mirrors the frame-
+    // scope rule and the node-graph slider.
+    if (!perLayerWarpModSupported()) return false;
+    int pi = perLayerWarpParamIndex(layer, op);
+    return pi >= 0 && graph.paramHasAbsoluteInput(nodeId, pi);
+}
+
 juce::String LayeredWaveEditorComponent::layerWarpModDisabledReason(int layer, int op) const {
     juce::ignoreUnused(layer, op);
     if (!perLayerWarpModSupported())
@@ -10842,6 +10891,14 @@ bool LayeredWaveEditorComponent::isLayerFieldModulated(int layer, int field) con
     if (!perLayerWarpModSupported()) return false;
     int pi = layerFieldParamIndex(layer, field);
     return pi >= 0 && hasParamModPin(graph, nodeId, pi);
+}
+
+bool LayeredWaveEditorComponent::isLayerFieldAmountLocked(int layer, int field) const {
+    // Same absolute-only locking rule as the warp-op amount: a pinned-but-
+    // uncabled (or Mod-cabled) Phase/Amplitude/generator slider stays editable.
+    if (!perLayerWarpModSupported()) return false;
+    int pi = layerFieldParamIndex(layer, field);
+    return pi >= 0 && graph.paramHasAbsoluteInput(nodeId, pi);
 }
 
 juce::String LayeredWaveEditorComponent::layerFieldModDisabledReason(int layer, int field) const {

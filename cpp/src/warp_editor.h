@@ -68,6 +68,16 @@ public:
         // re-bakes live for a single-frame wavetable - use this to explain why
         // the checkbox is unavailable instead of silently doing nothing.
         std::function<juce::String(int)> modDisabledReason;
+
+        // Optional. Returns whether op `opIndex`'s amount slider should be LOCKED
+        // (non-draggable) right now. Pinning an op alone does NOT lock its slider:
+        // a pinned-but-uncabled op, or one driven by a *Modulate* ("Mod") cable,
+        // stays editable - dragging sets the base/resting amount the modulation
+        // swings around (mirrors the node-graph slider semantics). Only an active
+        // *Absolute* ("Set") cable, which fully owns the value, locks the slider.
+        // When unset, the editor falls back to locking whenever the op is pinned
+        // (legacy behaviour) - so hosts that want the looser rule must provide it.
+        std::function<bool(int)> isAmountLocked;
     };
 
     explicit WarpChainEditor(Callbacks cb);

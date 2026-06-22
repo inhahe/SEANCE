@@ -5255,7 +5255,15 @@ void WaveLayerEditor::resized() {
         lab.setBounds(r.removeFromLeft(70));
         if (reservePinColumn) {
             auto pinCol = r.removeFromRight(52);
-            if (modBtn && modBtn->isVisible()) modBtn->setBounds(pinCol);
+            // Position the Pin button unconditionally - do NOT gate on
+            // isVisible(). The buttons are created invisible (addChildComponent)
+            // and only made visible later by syncFieldModState(), but resized()
+            // can run BEFORE that sync (rebuildRows() setBounds()es the row,
+            // firing resized(), then calls syncFromModel()). Gating on isVisible
+            // left the button stranded at (0,0,0,0) - the slider showed but the
+            // Pin checkbox was gone. Always give it the slot; visibility toggles
+            // it in place.
+            if (modBtn) modBtn->setBounds(pinCol);
         }
         sl.setBounds(r);
     };

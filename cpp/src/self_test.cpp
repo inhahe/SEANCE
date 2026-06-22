@@ -2369,6 +2369,60 @@ void testWarp(Report& r) {
                 "waveshaper: an unknown token parses to None (identity passthrough)");
     }
 
+    // ---- Project save/load: framesynth instrument + waveshaper node ----------
+    // Both new node kinds round-trip through nothing but node.script + params, so
+    // a full project save/load must preserve them. Build a graph with one
+    // single-frame instrument and one waveshaper, serialize, reload, and verify
+    // each node survives with its identity and a non-default param value intact.
+    {
+        NodeGraph g;
+        // Single-frame Granular instrument (the framesynth-wrapped wavetable).
+        int instId = g.addNode("Granular Inst", NodeType::Instrument, {}, {}).id;
+        if (Node* inst = g.findNode(instId)) {
+            inst->script = defaultFrameSynthScriptForType("granular");
+            inst->params.push_back({ "Volume", 0.8f, 0.0f, 1.0f }); // non-default
+        }
+        // Waveshaper effect node (Wavefold), non-default Fold amount.
+        int wsId = g.addNode("Waveshaper", NodeType::Effect,
+                             { Pin{0, "Audio In", PinKind::Audio, true} },
+                             { Pin{0, "Audio Out", PinKind::Audio, false} }).id;
+        if (Node* ws = g.findNode(wsId)) {
+            ws->script = waveshaperScriptFor(WarpMethod::Wavefold);
+            const char* pl = warpParamLabel(WarpMethod::Wavefold);
+            ws->params.push_back({ (pl && *pl) ? pl : "Amount", 0.42f, 0.0f, 1.0f });
+        }
+
+        std::string saved = ProjectFile::serializeForUndo(g);
+        NodeGraph g2;
+        bool ld = ProjectFile::loadFromString(saved, g2);
+        r.check(ld, "fs/ws save-load: project round-trips");
+
+        const Node* inst2 = g2.findNode(instId);
+        r.check(inst2 && isFrameSynthScript(inst2->script),
+                "fs/ws save-load: framesynth instrument keeps its script");
+        if (inst2) {
+            std::unique_ptr<IWavetableFrame> fr =
+                decodeFrameSynthScript(inst2->script);
+            r.check(fr && std::string(fr->typeId()) == "granular",
+                    "fs/ws save-load: framesynth body still decodes to its frame type");
+            float vol = -1.0f;
+            for (const auto& p : inst2->params) if (p.name == "Volume") vol = p.value;
+            r.checkVal(std::abs(vol - 0.8f) < 1e-4,
+                       "fs/ws save-load: framesynth param value survives", vol);
+        }
+
+        const Node* ws2 = g2.findNode(wsId);
+        r.check(ws2 && waveshaperMethodFromScript(ws2->script) == WarpMethod::Wavefold,
+                "fs/ws save-load: waveshaper keeps its method");
+        if (ws2) {
+            const char* pl = warpParamLabel(WarpMethod::Wavefold);
+            float amt = -1.0f;
+            for (const auto& p : ws2->params) if (p.name == pl) amt = p.value;
+            r.checkVal(std::abs(amt - 0.42f) < 1e-4,
+                       "fs/ws save-load: waveshaper amount value survives", amt);
+        }
+    }
+
     // ---- Per-frame morph: two frames carry INDEPENDENT chains ----------------
     {
         // The whole point of moving the morph chain onto the frame: editing one

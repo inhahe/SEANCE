@@ -394,6 +394,15 @@ void SpectralEditorComponent::initUI() {
             envelopeBtn.onClick = [this]() {
                 if (graph) launchAhdsrEnvelopeDialog(this, *graph, nodeId);
             };
+
+            // Held audition (Preview): plays the edited spectrum as a sustained
+            // note through this node's voice, refreshing live as you edit.
+            addAndMakeVisible(playBtn);
+            playBtn.setColour(juce::TextButton::buttonColourId, juce::Colour(60, 110, 70));
+            playBtn.setTooltip("Audition this waveform: holds a sustained A4 note through this "
+                               "node's voice so you hear edits live. The node must reach an Output "
+                               "to be heard. Click again to stop.");
+            playBtn.onClick = [this]() { togglePreview(); };
         }
     }
     addAndMakeVisible(helpBtn);
@@ -406,6 +415,10 @@ void SpectralEditorComponent::initUI() {
 
 SpectralEditorComponent::~SpectralEditorComponent() {
     stopTimer();
+    // Release any held audition so the synth voice doesn't keep sounding after
+    // the editor closes.
+    if (framePlaying && graph)
+        if (auto* nd = graph->findNode(nodeId)) clearNodeHeldAudition(*nd);
 }
 
 void SpectralEditorComponent::resized() {
@@ -424,6 +437,8 @@ void SpectralEditorComponent::resized() {
         top.removeFromRight(4);
         if (graph != nullptr) {
             envelopeBtn.setBounds(top.removeFromRight(90));
+            top.removeFromRight(8);
+            playBtn.setBounds(top.removeFromRight(80));
             top.removeFromRight(8);
         }
     }
@@ -540,6 +555,35 @@ void SpectralEditorComponent::refreshPreview() {
     // a power of two inside renderSpectralToWaveform, same as the synth side.
     renderSpectralToWaveform(doc, doc.fftSize, previewSamples);
     repaint();
+    // Keep a running Preview in sync: the on-screen waveform IS the cycle we
+    // audition, so ship the freshly-rendered one whenever it changes.
+    refreshPreviewAudition();
+}
+
+void SpectralEditorComponent::togglePreview() {
+    if (graph == nullptr) return;   // node-backed only
+    auto* nd = graph->findNode(nodeId);
+    if (!nd) return;
+    if (framePlaying) {
+        framePlaying = false;
+        clearNodeHeldAudition(*nd);
+        playBtn.setButtonText("Preview");
+        playBtn.setColour(juce::TextButton::buttonColourId, juce::Colour(60, 110, 70));
+    } else {
+        framePlaying = true;
+        playBtn.setButtonText("Stop");
+        playBtn.setColour(juce::TextButton::buttonColourId, juce::Colour(140, 70, 70));
+        refreshPreviewAudition();   // ships the held note
+    }
+}
+
+void SpectralEditorComponent::refreshPreviewAudition() {
+    if (!framePlaying || graph == nullptr) return;
+    auto* nd = graph->findNode(nodeId);
+    if (!nd) return;
+    // previewSamples is the final single cycle (peak-normalised IFFT, with the
+    // per-bin warp baked in) - exactly what the synth bakes into its terrain.
+    setNodeHeldAuditionCycle(*nd, previewSamples);
 }
 
 void SpectralEditorComponent::commitToNode() {

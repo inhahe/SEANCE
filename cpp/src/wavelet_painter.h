@@ -87,6 +87,14 @@ private:
     juce::Label      levelsLabel;
     juce::TextButton clearBtn { "Clear" };
     juce::TextButton helpBtn  { "?" };
+    // Opens the shared AHDSR amplitude-envelope editor for this node in a
+    // separate dialog. Node-backed mode only (graph != nullptr); in frame-backed
+    // sub-editor mode the wavetable shell owns the envelope button instead.
+    juce::TextButton envelopeBtn { "Envelope..." };
+    // Sustained held audition (the generic editor "Preview" button - same role
+    // as the wavetable shell's playBtn). Node-backed mode only.
+    juce::TextButton playBtn { "Preview" };
+    bool framePlaying = false;
 
     // Bucket C element warp (frame-backed mode only). Edits the owning
     // WaveletFrame's warpChain, baked into the coefficient grid before the IDWT
@@ -106,6 +114,12 @@ private:
     void commitToNode();
     void paintCoeff(const juce::MouseEvent& e);
     void seedDefaultCoefficients();
+
+    // Held-audition (Preview) control. togglePreview starts/stops; ship re-sends
+    // the freshly-rendered cycle whenever an edit changes it (no-op unless a
+    // Preview is active). Both no-op in frame-backed mode (graph == nullptr).
+    void togglePreview();
+    void refreshPreviewAudition();
 };
 
 } // namespace SoundShop

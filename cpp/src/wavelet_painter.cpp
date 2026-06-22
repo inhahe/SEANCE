@@ -1,5 +1,6 @@
 #include "wavelet_painter.h"
 #include "help_utils.h"
+#include "node_graph_component.h"  // launchAhdsrEnvelopeDialog for the Envelope... button
 #include <algorithm>
 #include <cmath>
 
@@ -145,6 +146,28 @@ void WaveletPainterComponent::initUI() {
     helpBtn.setTooltip("Open documentation for the wavelet painter.");
     helpBtn.onClick = []() { openHelpDocFile("wavetables.html"); };
 
+    // Node-backed-only controls (a standalone Wavelet Space node). In
+    // frame-backed mode the wavetable shell already provides Envelope + Preview.
+    if (graph != nullptr && externalFrame == nullptr) {
+        // Amplitude-envelope editor (matches the spectral / wavetable editors).
+        addAndMakeVisible(envelopeBtn);
+        envelopeBtn.setTooltip("Edit the amplitude envelope (Attack/Hold/Decay/Sustain/Release "
+                               "shape, per-stage curve, velocity sensitivity) that controls how "
+                               "each note fades in and out. Opens in a separate window.");
+        envelopeBtn.onClick = [this]() {
+            if (graph) launchAhdsrEnvelopeDialog(this, *graph, nodeId);
+        };
+
+        // Held audition (Preview): plays the painted waveform as a sustained
+        // note through this node's voice, refreshing live as you paint.
+        addAndMakeVisible(playBtn);
+        playBtn.setColour(juce::TextButton::buttonColourId, juce::Colour(60, 110, 70));
+        playBtn.setTooltip("Audition this waveform: holds a sustained A4 note through this "
+                           "node's voice so you hear edits live. The node must reach an Output "
+                           "to be heard. Click again to stop.");
+        playBtn.onClick = [this]() { togglePreview(); };
+    }
+
     // Bucket C element warp editor - frame-backed mode only. A standalone
     // wavelet node (graph-backed) has no WaveletFrame to carry a warp chain, so
     // the editor isn't shown there. Warp the coefficient grid before the IDWT,
@@ -169,6 +192,10 @@ void WaveletPainterComponent::initUI() {
 
 WaveletPainterComponent::~WaveletPainterComponent() {
     stopTimer();
+    // Release any held audition so the synth voice doesn't keep sounding after
+    // the painter closes.
+    if (framePlaying && graph)
+        if (auto* nd = graph->findNode(nodeId)) clearNodeHeldAudition(*nd);
 }
 
 // ==============================================================================
@@ -195,7 +222,7 @@ void WaveletPainterComponent::resized() {
 
     auto top = a.removeFromTop(28);
     ampLabel    .setBounds(top.removeFromLeft(30));
-    ampSlider   .setBounds(top.removeFromLeft(220));
+    ampSlider   .setBounds(top.removeFromLeft(180));
     top.removeFromLeft(8);
     filterLabel .setBounds(top.removeFromLeft(38));
     filterCombo .setBounds(top.removeFromLeft(110));
@@ -205,6 +232,13 @@ void WaveletPainterComponent::resized() {
     top.removeFromLeft(8);
     clearBtn    .setBounds(top.removeFromLeft(60));
     helpBtn     .setBounds(top.removeFromRight(24));
+    // Node-backed-only buttons, right-aligned beside Help.
+    if (graph != nullptr && externalFrame == nullptr) {
+        top.removeFromRight(8);
+        envelopeBtn.setBounds(top.removeFromRight(90));
+        top.removeFromRight(6);
+        playBtn.setBounds(top.removeFromRight(80));
+    }
     toolbarBounds = a; // currently unused for hit-tests, but kept for clarity
 
     a.removeFromTop(6);
@@ -388,6 +422,35 @@ void WaveletPainterComponent::updateWaveform() {
     if (externalFrame && !externalFrame->warpChain.empty())
         applyWarpChain(externalFrame->warpChain, coeffs);
     waveform = waveletPaintToWaveform(coeffs, numLevels, filterName);
+    // Keep a running Preview in sync: the on-screen waveform IS the cycle we
+    // audition, so ship the freshly-rendered one whenever it changes.
+    refreshPreviewAudition();
+}
+
+void WaveletPainterComponent::togglePreview() {
+    if (graph == nullptr) return;   // node-backed only
+    auto* nd = graph->findNode(nodeId);
+    if (!nd) return;
+    if (framePlaying) {
+        framePlaying = false;
+        clearNodeHeldAudition(*nd);
+        playBtn.setButtonText("Preview");
+        playBtn.setColour(juce::TextButton::buttonColourId, juce::Colour(60, 110, 70));
+    } else {
+        framePlaying = true;
+        playBtn.setButtonText("Stop");
+        playBtn.setColour(juce::TextButton::buttonColourId, juce::Colour(140, 70, 70));
+        refreshPreviewAudition();   // ships the held note
+    }
+}
+
+void WaveletPainterComponent::refreshPreviewAudition() {
+    if (!framePlaying || graph == nullptr) return;
+    auto* nd = graph->findNode(nodeId);
+    if (!nd) return;
+    // `waveform` is the final single cycle (IDWT of the painted grid) - exactly
+    // what the synth bakes into its terrain.
+    setNodeHeldAuditionCycle(*nd, waveform);
 }
 
 void WaveletPainterComponent::commitToNode() {

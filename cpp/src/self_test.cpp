@@ -1860,6 +1860,44 @@ void testFrameAudition(Report& r, const juce::File& dir) {
 }
 
 // ===========================================================================
+// Held-audition helpers (setNodeHeldAuditionCycle / clearNodeHeldAudition)
+// ===========================================================================
+//
+// The standalone Frequency Domain / Wavelet Space editors' Preview buttons
+// ship their rendered cycle through these shared helpers (node_graph.h). Verify
+// the helper packages the cycle into a held A4 note-on and that empty-cycle /
+// clear both release it. Pure data checks - no synth needed.
+void testHeldAuditionHelpers(Report& r) {
+    r.section("Held audition helpers (editor Preview path)");
+
+    Node node;
+    node.id = 1;
+
+    std::vector<float> cyc(64);
+    for (int i = 0; i < 64; ++i) cyc[(size_t)i] = (float)i / 63.0f;
+
+    setNodeHeldAuditionCycle(node, cyc);
+    r.check((bool)node.heldAudition, "held audition: ship sets heldAudition");
+    if (node.heldAudition) {
+        r.check(node.heldAudition->isNoteOn, "held audition: event is a note-on");
+        r.checkVal(node.heldAudition->pitch == 69, "held audition: pitch is A4 (69)",
+                   node.heldAudition->pitch);
+        r.checkVal(node.heldAudition->velocity == 127, "held audition: full velocity",
+                   node.heldAudition->velocity);
+        bool cycOk = node.heldAudition->cycleFrame
+                     && node.heldAudition->cycleFrame->cycle.size() == cyc.size();
+        r.check(cycOk, "held audition: cycle carried through unchanged");
+    }
+
+    setNodeHeldAuditionCycle(node, std::vector<float>{});
+    r.check(!node.heldAudition, "held audition: empty cycle clears it");
+
+    setNodeHeldAuditionCycle(node, cyc);
+    clearNodeHeldAudition(node);
+    r.check(!node.heldAudition, "held audition: clearNodeHeldAudition releases it");
+}
+
+// ===========================================================================
 // LAYER 3 - ffmpeg round-trip (optional)
 // ===========================================================================
 void testVideoDecode(Report& r, const juce::File& dir) {
@@ -5172,6 +5210,7 @@ int runSelfTest(const juce::File& outDir) {
     testTerrainData(r, outDir);
     testRender(r, outDir);
     testFrameAudition(r, outDir);
+    testHeldAuditionHelpers(r);
     testWarp(r);
     testVideoDecode(r, outDir);
     testGlslCompute(r, outDir);

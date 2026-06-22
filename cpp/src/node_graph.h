@@ -666,6 +666,38 @@ inline void setNodeScriptSynced(Node& node, std::string s) {
     node.script = std::move(s);
 }
 
+// Ship one final single cycle to a node's level-triggered held audition - the
+// generic "Preview" path used by the waveform/frame editors (see
+// Node::heldAudition / AuditionCycleFrame). The voice reads `cycle` as a
+// wavetable oscillator at a fixed A4 (note 69) while held, so the edited
+// waveform is audible immediately and survives the debounced graph rebuild an
+// edit fires. Re-call on every audible edit to keep the audition in sync; an
+// empty cycle clears it. Thread-safe via the node's auditionMutex. The node
+// must reach an Output node for the audition to actually be heard.
+inline void setNodeHeldAuditionCycle(Node& node, std::vector<float> cycle) {
+    if (cycle.empty()) {
+        std::lock_guard<std::mutex> lock(*node.auditionMutex);
+        node.heldAudition.reset();
+        return;
+    }
+    auto cyc = std::make_shared<Node::AuditionCycleFrame>();
+    cyc->cycle = std::move(cycle);
+    auto ev = std::make_shared<Node::AuditionEvent>();
+    ev->isNoteOn   = true;
+    ev->pitch      = 69;   // A4, the same fixed audition pitch the shell uses
+    ev->velocity   = 127;
+    ev->cycleFrame = std::move(cyc);
+    std::lock_guard<std::mutex> lock(*node.auditionMutex);
+    node.heldAudition = std::move(ev);
+}
+
+// Stop a node's held audition (editor Preview -> Stop / editor close). The
+// synth releases the voice on its next block. Thread-safe via auditionMutex.
+inline void clearNodeHeldAudition(Node& node) {
+    std::lock_guard<std::mutex> lock(*node.auditionMutex);
+    node.heldAudition.reset();
+}
+
 // Named marker on the project timeline
 struct Marker {
     int id;

@@ -151,6 +151,11 @@ private:
     // separate dialog. Only shown in node-backed mode (graph != nullptr);
     // in frame-backed sub-editor mode there is no node envelope to edit.
     juce::TextButton envelopeBtn { "Envelope..." };
+    // Sustained held audition (the generic editor "Preview" button - same role
+    // as the wavetable shell's playBtn). Node-backed mode only; in frame-backed
+    // mode the wavetable shell owns the Preview button instead.
+    juce::TextButton playBtn { "Preview" };
+    bool framePlaying = false;
 
     std::unique_ptr<SpectralCurvePanel> phasePanel;  // top
     std::unique_ptr<SpectralCurvePanel> magPanel;    // bottom
@@ -184,6 +189,12 @@ private:
     void refreshPreview();
     void commitToNode();
     void onCurveChanged();
+
+    // Held-audition (Preview) control. togglePreview starts/stops; ship re-sends
+    // the freshly-rendered cycle whenever an edit changes it (no-op unless a
+    // Preview is active). Both no-op in frame-backed mode (graph == nullptr).
+    void togglePreview();
+    void refreshPreviewAudition();
 };
 
 // =============================================================================

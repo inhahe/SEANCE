@@ -318,7 +318,7 @@ void NodeGraphComponent::drawNode(juce::Graphics& g, Node& node) {
 
     // Pins
     float pinY = bounds.getY() + HEADER_HEIGHT;
-    auto drawPin = [&](const Pin& pin, bool isInput) {
+    auto drawPin = [&](const Pin& pin, bool isInput, bool hasOpposite) {
         auto pos = canvasToScreen({isInput ? bounds.getX() : bounds.getRight(), pinY + PIN_ROW_HEIGHT / 2});
         float r = PIN_RADIUS * zoom;
 
@@ -341,14 +341,31 @@ void NodeGraphComponent::drawNode(juce::Graphics& g, Node& node) {
             g.fillEllipse(pos.x - r, pos.y - r, r * 2, r * 2);
         }
 
-        // Label
+        // Label. Give it the full width from the pin to the node's far edge so a
+        // long control-pin name ("Mod: Tape Saturate") shows in full and only
+        // ellipsizes when it actually reaches the node's edge (matching the param
+        // sliders below). When the row carries BOTH an input and an output pin,
+        // split at the node centre so the two labels never overlap.
         float labelFontSize = std::max(8.0f, 11.0f * zoom);
         g.setFont(juce::Font(labelFontSize));
         g.setColour(juce::Colours::white.withAlpha(0.8f));
+        float nodeLeftX  = canvasToScreen({bounds.getX(),     pinY + PIN_ROW_HEIGHT / 2.0f}).x;
+        float nodeRightX = canvasToScreen({bounds.getRight(), pinY + PIN_ROW_HEIGHT / 2.0f}).x;
+        float margin     = 4 * zoom;
+        float centreX    = (nodeLeftX + nodeRightX) * 0.5f;
+        float labelX, labelW;
+        if (isInput) {
+            labelX = pos.x + r + 3 * zoom;
+            float rightLimit = hasOpposite ? (centreX - margin) : (nodeRightX - margin);
+            labelW = std::max(10.0f * zoom, rightLimit - labelX);
+        } else {
+            float leftLimit  = hasOpposite ? (centreX + margin) : (nodeLeftX + margin);
+            float rightEdge  = pos.x - r - 3 * zoom;
+            labelX = leftLimit;
+            labelW = std::max(10.0f * zoom, rightEdge - leftLimit);
+        }
         auto labelRect = juce::Rectangle<float>(
-            isInput ? pos.x + r + 3 * zoom : pos.x - r - 80 * zoom,
-            pos.y - labelFontSize / 2,
-            75 * zoom, labelFontSize + 2);
+            labelX, pos.y - labelFontSize / 2, labelW, labelFontSize + 2);
         g.drawText(pin.name,
                     labelRect,
                     isInput ? juce::Justification::centredLeft : juce::Justification::centredRight);
@@ -356,8 +373,10 @@ void NodeGraphComponent::drawNode(juce::Graphics& g, Node& node) {
 
     int maxPins = std::max((int)node.pinsIn.size(), (int)node.pinsOut.size());
     for (int i = 0; i < maxPins; ++i) {
-        if (i < (int)node.pinsIn.size()) drawPin(node.pinsIn[i], true);
-        if (i < (int)node.pinsOut.size()) drawPin(node.pinsOut[i], false);
+        bool inHas  = i < (int)node.pinsIn.size();
+        bool outHas = i < (int)node.pinsOut.size();
+        if (inHas)  drawPin(node.pinsIn[i],  true,  outHas);
+        if (outHas) drawPin(node.pinsOut[i], false, inHas);
         pinY += PIN_ROW_HEIGHT;
     }
 

@@ -1546,12 +1546,13 @@ public:
         g.setColour(juce::Colour(70, 70, 90));
         g.drawRoundedRectangle(r, 4.0f, 1.0f);
 
-        // Representative single-cycle thumbnail (peak-normalised, the same one
-        // renderRaw bakes into the terrain fallback). Inharmonic partials don't
+        // Representative single-cycle thumbnail (peak-normalised, the morphed
+        // cycle the synth bakes into the terrain). Inharmonic partials don't
         // share the fundamental period, so this is a faithful snapshot rather
-        // than a loop-clean cycle - the live voice is the true timbre.
+        // than a loop-clean cycle - the live voice is the true timbre. Uses
+        // renderMorphed so a frame's summation-morph chain shows in the thumbnail.
         std::vector<float> cyc;
-        frame.render(512, cyc);
+        frame.renderMorphed(512, cyc);
         if (cyc.empty()) return;
         const float midY = r.getCentreY();
         const float halfH = r.getHeight() * 0.45f;
@@ -3755,13 +3756,26 @@ int resolvePerLayerWaveformReferences(NodeGraph& graph) {
 
 // ---- Warp ("morph algorithm") asset-library reconciliation ----------------
 
-// Display name for warp slot `i` (0-based), driven by its op's method - the
-// "named morph parameter" (e.g. "Drive 1", "Fold 2", "Width 1"). The trailing
-// number disambiguates two ops of the same method and shows the chain position;
-// the STABLE key is Param::warpSlot, not this string, so a method change can
-// freely rename without disturbing which op a modulation pin drives.
-static std::string warpSlotParamName(const WarpOp& op, int slot) {
-    return std::string(warpParamLabel(op.method)) + " " + std::to_string(slot + 1);
+// Display name for warp slot `slot` (0-based) within its chain, driven by its
+// op's method - the FULL method name (e.g. "Tape Saturate", "Wavefold", "PWM
+// Skew"), so the node slider reads what the morph actually is rather than an
+// abstract amount label ("Drive"). A 1-based occurrence number is appended ONLY
+// when the same method appears more than once in the chain ("Wavefold 1",
+// "Wavefold 2"); a lone op of its kind reads as just its name. The STABLE key is
+// Param::warpSlot, not this string, so a method change can freely rename without
+// disturbing which op a modulation pin drives.
+static std::string warpSlotParamName(const std::vector<WarpOp>& chain, int slot) {
+    if (slot < 0 || slot >= (int)chain.size()) return "Morph";
+    const WarpMethod m = chain[(size_t)slot].method;
+    std::string name = warpMethodName(m);
+    int total = 0, occ = 0;
+    for (int i = 0; i < (int)chain.size(); ++i) {
+        if (chain[(size_t)i].method != m) continue;
+        ++total;
+        if (i <= slot) ++occ;
+    }
+    if (total > 1) name += " " + std::to_string(occ);
+    return name;
 }
 
 // Disambiguating prefix for a frame's frame-scope ("Summation Morph") params.
@@ -3791,8 +3805,8 @@ static std::string frameWarpPrefix(const WavetableDoc& doc, int frameId) {
 // otherwise produce identical "Drive 1" pin labels. The "L<n> " prefix (1-based
 // layer) disambiguates them on the node graph, e.g. "L2 Drive 1". The stable key
 // is still (Param::warpLayer, Param::warpSlot); this is only the label.
-static std::string perLayerWarpParamName(const WarpOp& op, int layer, int slot) {
-    return "L" + std::to_string(layer + 1) + " " + warpSlotParamName(op, slot);
+static std::string perLayerWarpParamName(const std::vector<WarpOp>& chain, int layer, int slot) {
+    return "L" + std::to_string(layer + 1) + " " + warpSlotParamName(chain, slot);
 }
 
 // Relabel the modulation pin bound to param index `pi` so it follows the param's
@@ -3930,7 +3944,7 @@ void syncWarpParamsForNode(NodeGraph& graph, int nodeId, const WavetableDoc& doc
             Param p;
             p.warpSlot    = s;       // warpLayer stays -1 (frame-scope)
             p.warpFrameId = e.id;    // owning frame's library id
-            p.name  = frameWarpPrefix(doc, e.id) + warpSlotParamName(ch[s], s);
+            p.name  = frameWarpPrefix(doc, e.id) + warpSlotParamName(ch, s);
             p.value = p.baseValue = ch[s].amount;
             p.minVal = 0.0f;
             p.maxVal = 1.0f;
@@ -3950,7 +3964,7 @@ void syncWarpParamsForNode(NodeGraph& graph, int nodeId, const WavetableDoc& doc
         const std::vector<WarpOp>* ch = chainFor(p.warpFrameId);
         if (!ch || p.warpSlot >= (int)ch->size()) continue;
         nd->params[pi].name =
-            frameWarpPrefix(doc, p.warpFrameId) + warpSlotParamName((*ch)[p.warpSlot], p.warpSlot);
+            frameWarpPrefix(doc, p.warpFrameId) + warpSlotParamName(*ch, p.warpSlot);
         relabelWarpModPin(*nd, pi);
     }
 
@@ -4046,7 +4060,7 @@ void reconcilePerLayerWarpParams(NodeGraph& graph, int nodeId, int frameId,
         if (p.warpLayer < 0) continue;
         if (!opValid(p.warpLayer, p.warpSlot)) continue;
         nd->params[pi].name =
-            perLayerWarpParamName(layerChains[(size_t)p.warpLayer][(size_t)p.warpSlot],
+            perLayerWarpParamName(layerChains[(size_t)p.warpLayer],
                                   p.warpLayer, p.warpSlot);
         relabelWarpModPin(*nd, pi);
     }
@@ -10635,7 +10649,7 @@ void LayeredWaveEditorComponent::pushWarpAmountsToParams() {
             if (p.warpLayer != -1 || p.warpFrameId != fid || p.warpSlot != k) continue;
             if (p.modulated) p.baseValue = chain[k].amount;
             else             p.value = p.baseValue = chain[k].amount;
-            p.name = frameWarpPrefix(wave, fid) + warpSlotParamName(chain[k], k);
+            p.name = frameWarpPrefix(wave, fid) + warpSlotParamName(chain, k);
             relabelWarpModPin(*nd, pi);
             break;
         }
@@ -10669,11 +10683,11 @@ void LayeredWaveEditorComponent::swapWarpParamNames(int a, int b) {
     if (pb) { pb->warpSlot = a; }
     // Rename both to their new slots' methods + relabel pins.
     if (pa && b >= 0 && b < (int)chain.size()) {
-        pa->name = frameWarpPrefix(wave, fid) + warpSlotParamName(chain[b], b);
+        pa->name = frameWarpPrefix(wave, fid) + warpSlotParamName(chain, b);
         relabelWarpModPin(*nd, ia);
     }
     if (pb && a >= 0 && a < (int)chain.size()) {
-        pb->name = frameWarpPrefix(wave, fid) + warpSlotParamName(chain[a], a);
+        pb->name = frameWarpPrefix(wave, fid) + warpSlotParamName(chain, a);
         relabelWarpModPin(*nd, ib);
     }
 }
@@ -10767,7 +10781,7 @@ void LayeredWaveEditorComponent::setLayerWarpOpModulated(int layer, int op, bool
             p.warpFrameId = currentLibraryId;
             p.warpLayer = layer;
             p.warpSlot  = op;
-            p.name      = perLayerWarpParamName(chain[(size_t)op], layer, op);
+            p.name      = perLayerWarpParamName(chain, layer, op);
             p.value = p.baseValue = chain[(size_t)op].amount;
             p.minVal = 0.0f; p.maxVal = 1.0f; p.format = "%.2f";
             nd->params.push_back(std::move(p));
@@ -12251,9 +12265,12 @@ void LayeredWaveEditorComponent::updateFrameEditorEmbed() {
 void LayeredWaveEditorComponent::refreshPreview() {
     // Render the LIBRARY ENTRY the editor is currently targeting (NOT the
     // selected cell - they can be different now). Every concrete frame type
-    // knows how to produce a tableSize-sample cycle.
+    // knows how to produce a tableSize-sample cycle. Use renderMorphed so the
+    // frame-scope Summation Morph chain is baked into the on-screen preview (the
+    // synth bakes the same renderMorphed cycle into the terrain), otherwise
+    // sliding a morph amount would visibly do nothing here.
     if (auto* f = currentEditingFrame()) {
-        f->render(wave.tableSize, previewSamples);
+        f->renderMorphed(wave.tableSize, previewSamples);
     } else {
         previewSamples.clear();
     }
@@ -12296,12 +12313,14 @@ void LayeredWaveEditorComponent::refreshHeldFrameAudition() {
         return;
     }
 
-    // Render the frame to its final single cycle - gain and the frame's own
-    // warps are baked in by IWavetableFrame::render, so the synth reads it
-    // straight and the audition matches the on-screen preview byte-for-byte.
-    // Built outside the audio mutex so the render never stalls the audio thread.
+    // Render the frame to its final single cycle - gain AND the frame's own
+    // summation-morph chain are baked in by IWavetableFrame::renderMorphed (the
+    // same cycle the synth bakes into the terrain), so the audition matches the
+    // on-screen preview byte-for-byte and a morph the user dialled in is actually
+    // audible. Built outside the audio mutex so the render never stalls the audio
+    // thread.
     auto cyc = std::make_shared<Node::AuditionCycleFrame>();
-    f->render(wave.tableSize, cyc->cycle);
+    f->renderMorphed(wave.tableSize, cyc->cycle);
     if (cyc->cycle.empty()) {
         std::lock_guard<std::mutex> lock(*nd->auditionMutex);
         nd->heldAudition.reset();

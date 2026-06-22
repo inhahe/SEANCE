@@ -3962,16 +3962,17 @@ void testAssetLibrary(Report& r) {
                        "assets: resolved warp chain reconciles two warp-slot params",
                        warpParams);
             // Named morph params (inc 2): the slot params carry their method's
-            // human label, not "Warp N". The asset chain is {SoftClip, HardClip},
-            // both labelled "Drive", numbered by slot.
+            // full name, not "Warp N". The asset chain is {SoftClip, HardClip},
+            // two DIFFERENT methods, so each reads as its method name with no
+            // disambiguating number ("Soft Clip", "Hard Clip").
             const Param* s0 = nullptr;
             const Param* s1 = nullptr;
             for (const auto& p : g.findNode(nId)->params) {
                 if (p.warpSlot == 0) s0 = &p;
                 else if (p.warpSlot == 1) s1 = &p;
             }
-            r.check(s0 && s1 && s0->name == "Drive 1" && s1->name == "Drive 2",
-                    "assets: warp slot params use named-morph labels (Drive 1/2)");
+            r.check(s0 && s1 && s0->name == "Soft Clip" && s1->name == "Hard Clip",
+                    "assets: warp slot params use method-name labels (Soft Clip / Hard Clip)");
         }
 
         // Save/load preserves the reference id and re-resolves on load.
@@ -4045,8 +4046,8 @@ void testAssetLibrary(Report& r) {
             if (nd->params[i].warpSlot == 0) s0 = &nd->params[i];
             else if (nd->params[i].warpSlot == 1) { s1 = &nd->params[i]; s1Idx = i; }
         }
-        r.check(s0 && s1 && s0->name == "Fold 1" && s1->name == "Width 2",
-                "named-morph: legacy 'Warp N' params adopt warpSlot + named labels");
+        r.check(s0 && s1 && s0->name == "Wavefold" && s1->name == "PWM Skew",
+                "named-morph: legacy 'Warp N' params adopt warpSlot + method-name labels");
         // The modPin must still point at the (renamed) slot-1 param, and its pin
         // label must follow the new name.
         bool pinOk = false;
@@ -4055,7 +4056,7 @@ void testAssetLibrary(Report& r) {
         const Pin* movedPin = nullptr;
         for (const auto& p : nd->pinsIn) if (p.id == pinId) movedPin = &p;
         r.check(pinOk, "named-morph: migrated modPin stays bound to slot-1 param");
-        r.check(movedPin && movedPin->name == "Mod: Width 2",
+        r.check(movedPin && movedPin->name == "Mod: PWM Skew",
                 std::string("named-morph: migrated modPin pin relabelled (got '") +
                 (movedPin ? movedPin->name : std::string("<none>")) + "')");
     }
@@ -4215,17 +4216,17 @@ void testAssetLibrary(Report& r) {
         // Width param must still be addressable by (1,0) with a sane index.
         const Param* widthP = nullptr;
         for (auto& q : nd->params) if (q.warpLayer == 1 && q.warpSlot == 0) widthP = &q;
-        r.check(widthP && widthP->name == "L2 Width 1",
+        r.check(widthP && widthP->name == "L2 PWM Skew",
                 "per-layer reconcile: remapped survivor keeps its identity");
 
         // (c) Method change on layer0 slot0 (Wavefold -> SoftClip) relabels the
-        //     surviving per-layer param "Fold 1" -> "Drive 1" without moving it.
+        //     surviving per-layer param "L1 Wavefold" -> "L1 Soft Clip" in place.
         chains[0] = { op(WarpMethod::SoftClip) };
         reconcilePerLayerWarpParams(g, nId, frameId, chains);
         nd = g.findNode(nId);
         const Param* relabelled = nullptr;
         for (auto& q : nd->params) if (q.warpLayer == 0 && q.warpSlot == 0) relabelled = &q;
-        r.check(relabelled && relabelled->name == "L1 Drive 1",
+        r.check(relabelled && relabelled->name == "L1 Soft Clip",
                 "per-layer reconcile: method change relabels survivor by op method");
     }
 

@@ -424,6 +424,19 @@ struct Node {
     // nothing - resolution happens at edit/load time, never per block.
     int ahdsrAssetId = -1;
 
+    // Additional per-component AHDSR envelopes for instruments that need more
+    // than one envelope per voice. Empty for almost every node type. The FM
+    // synth populates exactly 4 (one full AHDSR per operator), replacing the
+    // old per-operator "Op{i} A/D/S/R" linear-ramp params with the shared
+    // AHDSR model (hold stage, per-segment curves, tension, velocity
+    // sensitivity). Edited via the multi-tab operator-envelope dialog
+    // (launchOpEnvelopesDialog). Serialized as opEnvelope0..N in project
+    // files; on load, projects predating this field rebuild the 4 entries
+    // from the legacy "Op{i} A/D/S/R" params. Each entry is "independent"
+    // (no asset-library reference - that single-id model only fits the main
+    // ahdsrEnvelope). The audio thread reads these directly per block.
+    std::vector<AHDSREnvelope> opEnvelopes;
+
     // Per-voice pressure (aftertouch) input. When something is wired to the
     // "Pressure" Param input pin on a synth node, the wired control's
     // value (0..1, read as the block mean) drives the per-voice
@@ -1168,5 +1181,14 @@ bool removeParamModPin(NodeGraph& graph, int nodeId, int paramIndex);
 // Run wherever a node's params/pins are reconciled (e.g. syncWarpParamsForNode,
 // which fires on load + every warp edit) so historical corruption self-heals.
 int pruneOrphanModPins(NodeGraph& graph, int nodeId);
+
+// FM operator envelopes. Ensures an FM synth node (`script == "__fmsynth__"`)
+// carries exactly 4 per-operator AHDSREnvelopes in `node.opEnvelopes`,
+// migrating any legacy "Op{i} A/D/S/R" linear-ramp params into them (and
+// stripping those params) the first time. A no-op for non-FM nodes and for FM
+// nodes already holding 4 envelopes. Called both at node creation (seeds
+// defaults) and after project load (migrates old files). Safe to call
+// repeatedly.
+void ensureFmOpEnvelopes(Node& node);
 
 } // namespace SoundShop

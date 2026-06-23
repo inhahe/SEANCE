@@ -3734,6 +3734,101 @@ void testGranularFreeze(Report& r) {
 }
 
 // ---------------------------------------------------------------------------
+// FM synth per-operator AHDSR envelopes (node.opEnvelopes). Covers the
+// ensureFmOpEnvelopes seed/migration helper (legacy "Op{i} A/D/S/R" params ->
+// 4 AHDSR envelopes, with the old params stripped) and a save/load round-trip
+// proving the 4 envelopes survive serialization with per-index fidelity.
+// ---------------------------------------------------------------------------
+void testFmOpEnvelopes(Report& r) {
+    r.section("FM operator envelopes (AHDSR migration + round-trip)");
+
+    // (1) Migration from a legacy project carrying "Op{i} A/D/S/R" params.
+    {
+        NodeGraph g;
+        int id = g.addNode("FM", NodeType::Instrument, {}, {}).id;
+        Node* n = g.findNode(id);
+        n->script = "__fmsynth__";
+        for (int i = 1; i <= 4; ++i) {
+            std::string p = "Op" + std::to_string(i) + " ";
+            n->params.push_back({p + "Ratio", (float)i, 0.1f, 16.0f});
+            n->params.push_back({p + "Level", 0.5f, 0.0f, 1.0f});
+            n->params.push_back({p + "A", 0.02f * i, 0.001f, 2.0f});
+            n->params.push_back({p + "D", 0.15f, 0.001f, 5.0f});
+            n->params.push_back({p + "S", 0.6f, 0.0f, 1.0f});
+            n->params.push_back({p + "R", 0.4f, 0.001f, 10.0f});
+        }
+        ensureFmOpEnvelopes(*n);
+        r.check(n->opEnvelopes.size() == 4, "migration builds 4 op envelopes");
+
+        bool anyADSR = false, hasRatio = false, hasLevel = false;
+        for (auto& p : n->params) {
+            const char last = p.name.back();
+            const char sep  = p.name.size() >= 2 ? p.name[p.name.size() - 2] : 0;
+            if (p.name.rfind("Op", 0) == 0 && sep == ' ' &&
+                (last == 'A' || last == 'D' || last == 'S' || last == 'R'))
+                anyADSR = true;
+            if (p.name == "Op1 Ratio") hasRatio = true;
+            if (p.name == "Op3 Level") hasLevel = true;
+        }
+        r.check(!anyADSR, "migration strips legacy A/D/S/R params");
+        r.check(hasRatio && hasLevel, "migration keeps Ratio/Level params");
+
+        if (n->opEnvelopes.size() == 4) {
+            // Op1 A=0.02s -> 20ms; S=0.6; R=0.4s -> 400ms; velSens forced to 0.
+            r.checkVal(std::abs(n->opEnvelopes[0].attackMs - 20.0f) < 0.5,
+                       "migrated attack matches legacy A param",
+                       n->opEnvelopes[0].attackMs);
+            r.checkVal(std::abs(n->opEnvelopes[0].sustain - 0.6f) < 0.01,
+                       "migrated sustain matches legacy S param",
+                       n->opEnvelopes[0].sustain);
+            r.checkVal(std::abs(n->opEnvelopes[3].releaseMs - 400.0f) < 0.5,
+                       "migrated release matches legacy R param",
+                       n->opEnvelopes[3].releaseMs);
+            r.check(n->opEnvelopes[0].velocitySensitivity == 0.0f,
+                    "migrated op envelope has velocitySensitivity 0 (master applies velocity)");
+        }
+
+        ensureFmOpEnvelopes(*n);  // idempotent: already 4, no-op
+        r.check(n->opEnvelopes.size() == 4, "ensureFmOpEnvelopes is idempotent");
+    }
+
+    // (2) Save/load round-trip preserves the 4 envelopes with per-index fidelity.
+    {
+        NodeGraph g;
+        int id = g.addNode("FM", NodeType::Instrument, {}, {}).id;
+        Node* n = g.findNode(id);
+        n->script = "__fmsynth__";
+        ensureFmOpEnvelopes(*n);   // seed 4 defaults
+        for (int i = 0; i < 4; ++i) {
+            n->opEnvelopes[(size_t)i].attackMs  = 5.0f + 10.0f * i;
+            n->opEnvelopes[(size_t)i].decayMs   = 100.0f + 20.0f * i;
+            n->opEnvelopes[(size_t)i].sustain   = 0.2f + 0.1f * i;
+            n->opEnvelopes[(size_t)i].releaseMs = 200.0f + 50.0f * i;
+        }
+        std::string saved = ProjectFile::serializeForUndo(g);
+        NodeGraph g2;
+        bool ld = ProjectFile::loadFromString(saved, g2);
+        r.check(ld, "FM project round-trip loads");
+        Node* n2 = g2.findNode(id);
+        r.check(n2 != nullptr, "FM node survives round-trip");
+        if (n2) {
+            r.check(n2->opEnvelopes.size() == 4,
+                    "round-trip preserves 4 op envelopes");
+            if (n2->opEnvelopes.size() == 4) {
+                double err = 0;
+                for (int i = 0; i < 4; ++i) {
+                    err += std::abs(n2->opEnvelopes[(size_t)i].attackMs - (5.0f + 10.0f * i));
+                    err += std::abs(n2->opEnvelopes[(size_t)i].releaseMs - (200.0f + 50.0f * i));
+                    err += std::abs(n2->opEnvelopes[(size_t)i].sustain - (0.2f + 0.1f * i));
+                }
+                r.checkVal(err < 0.5,
+                           "round-trip preserves per-op envelope values", err);
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Project-level asset library ("stores"). Covers the data-model invariants:
 // disjoint user id space, add+find, content-hash dedup, soft-delete, duplicate /
 // update live-edit, and a save/load round-trip through writeProject/readProject.
@@ -5443,6 +5538,7 @@ int runSelfTest(const juce::File& outDir) {
     testBuiltinMath(r);
     testPitchDetect(r);
     testGranularFreeze(r);
+    testFmOpEnvelopes(r);
     testAssetLibrary(r);
 
     r.section("Summary");

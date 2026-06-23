@@ -488,4 +488,51 @@ int pruneOrphanModPins(NodeGraph& graph, int nodeId) {
     return removed;
 }
 
+// ----------------------------------------------------------------------------
+// FM operator envelopes - seed / migrate.
+// ----------------------------------------------------------------------------
+void ensureFmOpEnvelopes(Node& node) {
+    if (node.script != "__fmsynth__") return;
+    if (node.opEnvelopes.size() == 4) return;   // already seeded / migrated
+
+    // Legacy per-operator linear-ADSR defaults (the values the old inline
+    // FMSynthProcessor used when a param was absent). When a project predates
+    // node.opEnvelopes it still carries "Op{i} A/D/S/R" params; we read those
+    // so the migrated AHDSR reproduces the old sound. For a brand-new node the
+    // params are absent and these defaults apply.
+    const float defA = 0.01f, defD = 0.1f, defS = 0.7f, defR = 0.3f;
+    auto paramVal = [&](const std::string& nm, float def) -> float {
+        for (const auto& p : node.params) if (p.name == nm) return p.value;
+        return def;
+    };
+
+    node.opEnvelopes.assign(4, AHDSREnvelope{});   // 4x default linear curves
+    for (int i = 0; i < 4; ++i) {
+        const std::string pre = "Op" + std::to_string(i + 1) + " ";
+        AHDSREnvelope& e = node.opEnvelopes[(size_t)i];
+        e.attackMs  = std::max(0.001f, paramVal(pre + "A", defA)) * 1000.0f;
+        e.holdMs    = 0.0f;
+        e.decayMs   = std::max(0.001f, paramVal(pre + "D", defD)) * 1000.0f;
+        e.sustain   = paramVal(pre + "S", defS);
+        e.releaseMs = std::max(0.001f, paramVal(pre + "R", defR)) * 1000.0f;
+        // The FM master output applies note velocity once (out *= v.vel), so the
+        // per-operator envelopes must NOT also velocity-scale or velocity would
+        // be applied twice. The user can raise this per operator in the editor
+        // to get the velocity->brightness behaviour that's idiomatic for FM.
+        e.velocitySensitivity = 0.0f;
+        e.attackTension = e.decayTension = e.releaseTension = 0.0f;
+    }
+
+    // Strip the now-migrated legacy params (keep "Op{i} Ratio" / "Op{i} Level").
+    // Matches exactly the names "Op<n> A", "Op<n> D", "Op<n> S", "Op<n> R".
+    node.params.erase(std::remove_if(node.params.begin(), node.params.end(),
+        [](const Param& p) {
+            if (p.name.size() < 4 || p.name.rfind("Op", 0) != 0) return false;
+            const char last = p.name.back();
+            const char sep  = p.name[p.name.size() - 2];
+            return sep == ' ' &&
+                   (last == 'A' || last == 'D' || last == 'S' || last == 'R');
+        }), node.params.end());
+}
+
 } // namespace SoundShop

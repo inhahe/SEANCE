@@ -2005,14 +2005,31 @@ params on the node):
   a node; in its sub-editor role inside a wavetable cell there is no node
   envelope to edit, so the button is hidden.)
 
-Synths that carry their **own** amplitude envelope inside the engine — **FM**
-(per-operator) and **Drum** (per-sound) — plus the sample/region players
-**SoundFont**, **SFZ**, **Sfizz**, and **MultiSampler** do **not** expose the
-shared editor, because editing it would be inert. (Particle Cloud used to be in
-this list, but it now layers the shared envelope on as a note-level VCA — see
-above.) A shared master-VCA stage that would let the remaining synths honor a
-node-level AHDSR too is tracked as future work in `known-issues.md`. Raw
-plugin-hosting Instruments keep their envelope inside the plugin.
+The **FM** synth is a special case: it has **four** envelopes (one per
+operator), not one node-level envelope, so the single-envelope editor above
+would be the wrong shape for it. Instead it gets its own item — **right-click
+the FM node → *Operator Envelopes (AHDSR)…*** — which opens a tabbed dialog
+(**Op 1 – Op 4**) with one full AHDSR editor per tab. Each operator envelope is
+the same model as everywhere else (Attack / Hold / Decay / Sustain / Release,
+per-segment curves, tension, velocity sensitivity), so an FM operator can now
+have a hold plateau, curved ramps, etc. — things the old per-operator linear
+A/D/S/R couldn't do. The old `Op{i} A/D/S/R` param sliders are gone (replaced by
+the envelopes); the `Op{i} Ratio` and `Op{i} Level` sliders stay on the node.
+Projects saved before this change migrate automatically on load: the four
+linear A/D/S/R settings become four AHDSR envelopes that reproduce the old
+sound. **Velocity** note: the FM master output scales each voice by note
+velocity once, so the per-operator envelopes default to **Velocity Sensitivity
+= 0** (raising it on an operator adds the classic FM velocity→brightness
+behaviour on top, which is intentional).
+
+The remaining synths that carry their **own** amplitude envelope inside the
+engine — **Drum** (per-sound) — plus the sample/region players **SoundFont**,
+**SFZ**, **Sfizz**, and **MultiSampler** do **not** expose the shared editor,
+because editing it would be inert. (Particle Cloud used to be in this list, but
+it now layers the shared envelope on as a note-level VCA — see above.) A shared
+master-VCA stage that would let the remaining synths honor a node-level AHDSR
+too is tracked as future work in `known-issues.md`. Raw plugin-hosting
+Instruments keep their envelope inside the plugin.
 
 ### Editor controls
 

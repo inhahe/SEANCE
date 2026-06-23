@@ -511,8 +511,9 @@ frequency-domain / wavelet-space variants), Additive, Phase Distortion, and
 Spectral Grain. Those nodes read `node.ahdsrEnvelope` directly and have **no**
 A/D/S/R params on the node.
 
-The remaining synths — FM (per-operator envelopes), Particle Cloud (per-grain
-mini-envelopes), Drum (per-sound envelopes), and the sample/region players
+The remaining synths — FM (four per-operator AHDSR envelopes — see the
+2026-06-23 update below), Particle Cloud (per-grain mini-envelopes), Drum
+(per-sound envelopes), and the sample/region players
 (SoundFont, SFZ, Sfizz, MultiSampler) — generate their own amplitude shaping
 internally, so the node-level *Envelope (AHDSR)…* editor is deliberately **not**
 offered for them (gating at `node_graph_component.cpp` ~line 2513-2534). Editing
@@ -535,8 +536,10 @@ The user also asked for "the envelope feature for every other existing
 instrument that doesn't already have it." Audit result (2026-06-22):
 - **MultiSampler** already exposes a full A/D/S/R editor in
   `MultiSamplerEditorComponent` (its own per-voice envelope).
-- **FM** (per-operator A/D/S/R), **Particle** (grain attack/release), and
-  **Drum** (per-sound decay) expose their native envelope params on the node.
+- **FM** (four per-operator AHDSR envelopes as of 2026-06-23 — see update
+  below; previously per-operator linear A/D/S/R params), **Particle** (grain
+  attack/release), and **Drum** (per-sound decay) expose their native envelope
+  shaping on the node.
 - **SF2 / SFZ / Sfizz** have envelopes baked into the loaded soundfont/.sfz
   file — there is no SEANCE-synthesized envelope to edit; a node AHDSR could
   only act as a master-VCA on top.
@@ -552,6 +555,26 @@ the default-settings transparency vs. per-voice-vs-node-global tradeoff needs a
 product call, it stays tracked here rather than being built blind. **Build the
 master-VCA properly (per-voice where voices exist, documented node-global
 fallback for library synths) when picked up — do not add a partial stop-gap.**
+
+**Update 2026-06-23 (FM operators upgraded to the shared AHDSR):** the FM
+synth's four operators no longer use the old per-operator linear `Op{i} A/D/S/R`
+params. Each operator now carries a full `AHDSREnvelope` (Attack / Hold / Decay
+/ Sustain / Release + per-segment curves + tension + velocity sensitivity), held
+in the new `Node::opEnvelopes` vector (4 entries for FM). The new data model:
+`std::vector<AHDSREnvelope> opEnvelopes` on `Node` (general-purpose multi-
+envelope container; empty for every non-FM node), serialized as
+`opEnvelope0..N` in project files, migrated from the legacy params on load via
+`ensureFmOpEnvelopes()` (`node_graph.cpp`). `FMSynthProcessor` runs 4×
+`AHDSRCurveTables` (one per operator, baked once per block) + 4×
+`AHDSREnvelopeRuntime` per voice. Edited via the tabbed *Operator Envelopes
+(AHDSR)…* dialog (`launchOpEnvelopesDialog`, right-click item 182) which hosts
+one `AHDSREnvelopeComponent` per operator tab — a reusable multi-envelope editor
+available to any future multi-envelope instrument. This does **not** change the
+master-VCA decision above (FM still has its own per-operator envelopes and is
+not a candidate for a node-global master VCA); it just replaces FM's crude
+linear ADSR with the good shared one. Velocity is applied once at the FM master
+output, so the operator envelopes default to `velocitySensitivity = 0` (raising
+it per operator opts into FM-style velocity→brightness).
 
 ## FIXED 2026-06-09: Terrain Pan param off-by-one
 

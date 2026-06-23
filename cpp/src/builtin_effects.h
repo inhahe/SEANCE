@@ -1299,18 +1299,27 @@ public:
         int algo    = (int)paramByName(node, "Algorithm", 0.0f);
         float fbAmt = paramByName(node, "Feedback", 0.3f);
 
-        // Per-operator params.
-        struct OpParams { float ratio, level, a, d, s, r; };
+        // Per-operator ratio + output level (the envelope is now a full AHDSR
+        // per operator, held in node.opEnvelopes - see below).
+        struct OpParams { float ratio, level; };
         OpParams ops[4];
         const char* opNames[] = {"Op1","Op2","Op3","Op4"};
         for (int i = 0; i < 4; ++i) {
             std::string p(opNames[i]);
             ops[i].ratio = paramByName(node, (p+" Ratio").c_str(), (float)(i+1));
             ops[i].level = paramByName(node, (p+" Level").c_str(), i==0?1.0f:0.5f);
-            ops[i].a     = std::max(0.001f, paramByName(node, (p+" A").c_str(), 0.01f));
-            ops[i].d     = std::max(0.001f, paramByName(node, (p+" D").c_str(), 0.1f));
-            ops[i].s     = paramByName(node, (p+" S").c_str(), 0.7f);
-            ops[i].r     = std::max(0.001f, paramByName(node, (p+" R").c_str(), 0.3f));
+        }
+
+        // Per-operator AHDSR envelopes. node.opEnvelopes holds exactly 4 once
+        // the node has been created / migrated (ensureFmOpEnvelopes). If a
+        // graph somehow arrives without them (defensive), fall back to a
+        // default envelope so the synth still sounds. Bake each operator's
+        // shape curves once per block; every voice samples these tables.
+        for (int i = 0; i < 4; ++i) {
+            opEnv[i] = (i < (int)node.opEnvelopes.size())
+                         ? node.opEnvelopes[(size_t)i]
+                         : AHDSREnvelope{};
+            opTables[i].prepare(opEnv[i]);
         }
 
         // Handle MIDI.
@@ -1326,12 +1335,13 @@ public:
                 v.relTime = 0;
                 v.mpeChannel = msg.getChannel();
                 v.mpe = MpeVoiceState{};
-                for (int i = 0; i < 4; ++i) v.phase[i] = 0;
+                for (int i = 0; i < 4; ++i) { v.phase[i] = 0; v.opEnvRt[i].noteOn(v.vel); }
                 v.fb1 = v.fb2 = 0;
             } else if (msg.isNoteOff()) {
                 for (auto& v : voices)
                     if (v.active && v.held && v.note == msg.getNoteNumber())
-                        { v.held = false; v.relTime = v.time; }
+                        { v.held = false; v.relTime = v.time;
+                          for (int i = 0; i < 4; ++i) v.opEnvRt[i].noteOff(); }
             }
         }
         // Distribute MPE / per-note expression (pitch bend, channel + poly
@@ -1348,30 +1358,22 @@ public:
                 if (!v.active) continue;
                 // MPE per-note pitch bend (#78)
                 float baseFreq = 440.0f * std::pow(2.0f, (v.note - 69 + v.mpe.pitchBend) / 12.0f);
-                // Compute per-operator envelopes.
+                // Per-operator AHDSR envelopes (shared runtime: hold stage,
+                // per-segment curves, tension, optional velocity sensitivity).
+                // Velocity is folded into each runtime's peak only when that
+                // operator's velocitySensitivity > 0; the default 0 keeps the
+                // master out *= v.vel below as the single velocity scaling.
                 float env[4];
+                bool anyActive = false;
                 for (int i = 0; i < 4; ++i) {
-                    float t = v.time;
-                    if (v.held) {
-                        if (t < ops[i].a) env[i] = t / ops[i].a;
-                        else if (t < ops[i].a + ops[i].d)
-                            env[i] = 1.0f + (ops[i].s - 1.0f) * ((t - ops[i].a) / ops[i].d);
-                        else env[i] = ops[i].s;
-                    } else {
-                        float envAtRel = ops[i].s;
-                        float rt = v.time - v.relTime;
-                        env[i] = envAtRel * std::max(0.0f, 1.0f - rt / ops[i].r);
-                        if (rt >= ops[i].r) env[i] = 0;
-                    }
-                    env[i] *= ops[i].level;
+                    env[i] = v.opEnvRt[i].tick((float)sampleRate, opEnv[i], opTables[i])
+                             * ops[i].level;
+                    if (v.opEnvRt[i].isActive()) anyActive = true;
                 }
-                // Check if all envelopes are done.
-                if (!v.held) {
-                    bool allDone = true;
-                    for (int i = 0; i < 4; ++i)
-                        if (env[i] > 0.0001f) { allDone = false; break; }
-                    if (allDone) { v.active = false; continue; }
-                }
+                // Voice ends once every operator envelope has reached Off
+                // (only possible after note-off; during hold the sustain stage
+                // keeps each runtime active).
+                if (!anyActive) { v.active = false; continue; }
                 // Compute operators with algorithm routing.
                 // Op4 with feedback.
                 float fb = (v.fb1 + v.fb2) * 0.5f * fbAmt;
@@ -1444,17 +1446,12 @@ public:
         }
     }
 
-    // Tail = max release time across the 4 operators (FM voice ends when
-    // every op envelope reaches 0).  Names match the per-op R param the
-    // processBlock reads.
+    // Tail = max release time across the 4 operator envelopes (FM voice ends
+    // when every op envelope reaches Off after note-off).
     double getTailLengthSeconds() const override {
         double maxR = 0.001;
-        const char* opNames[] = {"Op1","Op2","Op3","Op4"};
-        for (int i = 0; i < 4; ++i) {
-            std::string p(opNames[i]);
-            double r = (double) paramByName(node, (p+" R").c_str(), 0.3f);
-            if (r > maxR) maxR = r;
-        }
+        for (const auto& e : node.opEnvelopes)
+            maxR = std::max(maxR, (double) e.releaseMs * 0.001);
         return maxR;
     }
     bool acceptsMidi() const override { return true; }
@@ -1473,6 +1470,10 @@ public:
 private:
     Node& node;
     double sampleRate = 44100;
+    // Per-operator baked shape-curve tables + the effective envelope snapshots
+    // the voices sample against (refreshed once per block from node.opEnvelopes).
+    AHDSRCurveTables opTables[4];
+    AHDSREnvelope    opEnv[4];
     struct Voice {
         bool active = false, held = false;
         int note = 0;
@@ -1481,6 +1482,7 @@ private:
         float fb1 = 0, fb2 = 0;
         int mpeChannel = 1;     // MPE per-note channel (#78)
         MpeVoiceState mpe;
+        AHDSREnvelopeRuntime opEnvRt[4]; // one AHDSR runtime per operator
     };
     std::vector<Voice> voices;
     Voice& allocVoice() {

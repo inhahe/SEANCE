@@ -186,4 +186,16 @@ private:
 void launchAhdsrEnvelopeDialog(juce::Component* parent, NodeGraph& graph,
                                int nodeId);
 
+// Open a multi-tab AHDSR editor over node.opEnvelopes - one tab per envelope,
+// each hosting an AHDSREnvelopeComponent bound to opEnvelopes[i] by reference.
+// `tabNames` gives the tab labels and also fixes the expected count: the node's
+// opEnvelopes vector is resized to tabNames.size() if needed so the dialog
+// always has something to edit. Used by the FM synth (4 operator envelopes) and
+// available to any future multi-envelope instrument. Marks the graph dirty on
+// each edit and commits one undo snapshot when the (modal) dialog closes. No-op
+// if the node no longer exists. `parent` provides taskbar parentage.
+void launchOpEnvelopesDialog(juce::Component* parent, NodeGraph& graph,
+                             int nodeId,
+                             const std::vector<juce::String>& tabNames);
+
 } // namespace SoundShop

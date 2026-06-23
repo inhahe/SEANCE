@@ -265,6 +265,15 @@ bool ProjectFile::writeProject(std::ostream& f, NodeGraph& graph,
         writeStr(f, "ahdsrEnvelope", node.ahdsrEnvelope.encode());
         // Live reference to a project asset-library AHDSR curve (-1 = none).
         if (node.ahdsrAssetId >= 0) writeInt(f, "ahdsrAssetId", node.ahdsrAssetId);
+        // Additional per-component AHDSR envelopes (FM operators etc.). Saved
+        // only when present so non-FM nodes stay clean. Count first, then one
+        // encoded line per envelope keyed opEnvelope0..N.
+        if (!node.opEnvelopes.empty()) {
+            writeInt(f, "opEnvelopeCount", (int)node.opEnvelopes.size());
+            for (size_t i = 0; i < node.opEnvelopes.size(); ++i)
+                writeStr(f, "opEnvelope" + std::to_string(i),
+                         node.opEnvelopes[i].encode());
+        }
         if (node.aftertouchSensitivity != 0.5f)
             writeFloat(f, "aftertouchSensitivity", node.aftertouchSensitivity);
         writeInt(f, "pluginIndex", node.pluginIndex);
@@ -808,6 +817,30 @@ bool ProjectFile::readProject(std::istream& f, NodeGraph& graph, PluginHost* plu
             else if (key == "ahdsrAssetId") {
                 try { curNode->ahdsrAssetId = std::stoi(val); } catch (...) {}
             }
+            // Additional per-component AHDSR envelopes (FM operators etc.).
+            // opEnvelopeCount is written first and pre-sizes the vector; the
+            // opEnvelopeN lines that follow fill each slot. We tolerate either
+            // order (decode resizes on demand) so a hand-edited file can't lose
+            // an envelope to ordering.
+            else if (key == "opEnvelopeCount") {
+                try {
+                    int n = std::stoi(val);
+                    if (n > 0 && n <= 64 && (int)curNode->opEnvelopes.size() < n)
+                        curNode->opEnvelopes.resize(n);
+                } catch (...) {}
+            }
+            else if (key.rfind("opEnvelope", 0) == 0 && key != "opEnvelopeCount") {
+                try {
+                    int idx = std::stoi(key.substr(std::string("opEnvelope").size()));
+                    if (idx >= 0 && idx < 64) {
+                        if ((int)curNode->opEnvelopes.size() <= idx)
+                            curNode->opEnvelopes.resize(idx + 1);
+                        AHDSREnvelope tmp;
+                        if (AHDSREnvelope::decode(val, tmp))
+                            curNode->opEnvelopes[idx] = std::move(tmp);
+                    }
+                } catch (...) {}
+            }
             else if (key == "aftertouchSensitivity") {
                 try { curNode->aftertouchSensitivity = std::stof(val); }
                 catch (...) {}
@@ -1061,6 +1094,13 @@ bool ProjectFile::readProject(std::istream& f, NodeGraph& graph, PluginHost* plu
     // referencing nodes' local ahdsrEnvelope (the audio thread reads that
     // directly). Assets are parsed before nodes, so the library is complete here.
     graph.resolveAhdsrReferences();
+
+    // FM synth: migrate any project that predates node.opEnvelopes. Old files
+    // carry "Op{i} A/D/S/R" linear-ramp params and no opEnvelopes; this rebuilds
+    // the 4 per-operator AHDSR envelopes from them (and strips the old params).
+    // No-op for files already carrying the 4 envelopes and for non-FM nodes.
+    for (auto& n : graph.nodes)
+        ensureFmOpEnvelopes(n);
 
     // Same for live-referenced Waveform assets: push each referenced asset's
     // frame into the wavetable library entries that point at it, re-encoding

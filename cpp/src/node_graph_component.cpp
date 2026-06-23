@@ -2593,11 +2593,12 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
                 auto p2 = "Op" + std::to_string(i) + " ";
                 n.params.push_back({p2 + "Ratio", (float)i, 0.1f, 16.0f});
                 n.params.push_back({p2 + "Level", i == 1 ? 1.0f : 0.5f, 0.0f, 1.0f});
-                n.params.push_back({p2 + "A",     0.01f, 0.001f, 2.0f});
-                n.params.push_back({p2 + "D",     0.1f,  0.001f, 5.0f});
-                n.params.push_back({p2 + "S",     0.7f,  0.0f,   1.0f});
-                n.params.push_back({p2 + "R",     0.3f,  0.001f, 10.0f});
             }
+            // Per-operator A/D/S/R is now a full AHDSR envelope per operator
+            // (hold stage, per-segment curves, tension, velocity sensitivity),
+            // edited via the multi-tab operator-envelope dialog. Seed the 4
+            // default envelopes here (replaces the old "Op{i} A/D/S/R" params).
+            ensureFmOpEnvelopes(n);
             repaint();
         } else if (result == 111) {
             // Spectral Grain Synth
@@ -3310,6 +3311,13 @@ void NodeGraphComponent::showNodeMenu(Node& node) {
     if (isTonalSynth)
         menu.addItem(180, "Envelope (AHDSR)...");
 
+    // FM synth: 4 per-operator AHDSR envelopes (one per operator), edited in
+    // a single tabbed dialog. FM is excluded from the generic single-envelope
+    // item above because its amplitude shape is per-operator, not node-global.
+    if (node.type == NodeType::Instrument && node.pluginIndex < 0 &&
+        node.script.rfind("__fmsynth__", 0) == 0)
+        menu.addItem(182, "Operator Envelopes (AHDSR)...");
+
     // Video terrains can be re-cropped / re-scaled by re-opening the import
     // dialog, which re-seeds its controls from the node's baked __video__ script.
     if (node.type == NodeType::TerrainSynth && node.script.rfind("__video__:", 0) == 0)
@@ -3503,6 +3511,11 @@ void NodeGraphComponent::showNodeMenu(Node& node) {
             // single shared launch path (also used by the instrument
             // editors' "Envelope..." buttons).
             launchAhdsrEnvelopeDialog(this, graph, nodeId);
+        } else if (result == 182) {
+            // FM: open the multi-tab operator-envelope editor (one AHDSR per
+            // operator). Reuses the same AHDSREnvelopeComponent, one per tab.
+            launchOpEnvelopesDialog(this, graph, nodeId,
+                                    {"Op 1", "Op 2", "Op 3", "Op 4"});
         } else if (result == 190) {
             // Open the Script editor for an existing node. Same launch flow
             // as the "create + open" path in the menu above, including the
@@ -4277,6 +4290,65 @@ void launchAhdsrEnvelopeDialog(juce::Component* parent, NodeGraph& graph,
     opt.componentToCentreAround = parent;
     launchToolDialog(opt);   // no separate taskbar entry
     graph.commitSnapshot("Edit envelope");
+}
+
+// ----------------------------------------------------------------------------
+// Multi-tab AHDSR editor (declared in node_graph_component.h). Hosts one
+// AHDSREnvelopeComponent per tab, each editing node.opEnvelopes[i] by
+// reference. Modal, so the references stay valid for the dialog's lifetime
+// (the user can't restructure the graph while it's up) and one undo snapshot
+// is committed after it closes - mirroring launchAhdsrEnvelopeDialog.
+// ----------------------------------------------------------------------------
+namespace {
+class OpEnvelopesContent : public juce::Component {
+public:
+    OpEnvelopesContent(NodeGraph& graph, int nodeId,
+                       const std::vector<juce::String>& tabNames)
+        : tabs(juce::TabbedButtonBar::TabsAtTop) {
+        Node* node = graph.findNode(nodeId);
+        jassert(node != nullptr);
+        // Guarantee one envelope per requested tab.
+        if (node->opEnvelopes.size() < tabNames.size())
+            node->opEnvelopes.resize(tabNames.size());
+
+        auto tabColour = getLookAndFeel().findColour(
+            juce::ResizableWindow::backgroundColourId);
+        for (size_t i = 0; i < tabNames.size(); ++i) {
+            // Bind by reference to the i-th envelope; the onChanged callback
+            // looks the node up by id (never captures Node*) and only marks
+            // the graph dirty - the undo snapshot is committed by the caller.
+            auto* editor = new AHDSREnvelopeComponent(
+                node->opEnvelopes[i],
+                [&graph, nodeId]() {
+                    if (graph.findNode(nodeId)) graph.dirty = true;
+                });
+            tabs.addTab(tabNames[i], tabColour, editor, true);
+        }
+        addAndMakeVisible(tabs);
+    }
+    void resized() override { tabs.setBounds(getLocalBounds()); }
+private:
+    juce::TabbedComponent tabs;
+};
+} // anonymous namespace
+
+void launchOpEnvelopesDialog(juce::Component* parent, NodeGraph& graph,
+                             int nodeId,
+                             const std::vector<juce::String>& tabNames) {
+    Node* node = graph.findNode(nodeId);
+    if (!node || tabNames.empty()) return;
+    auto* content = new OpEnvelopesContent(graph, nodeId, tabNames);
+    // Single editor is 700x516; add tab-bar height for the tabbed wrapper.
+    content->setSize(700, 552);
+    juce::DialogWindow::LaunchOptions opt;
+    opt.dialogTitle = "Operator Envelopes - " + juce::String(node->name);
+    opt.content.setOwned(content);
+    opt.escapeKeyTriggersCloseButton = true;
+    opt.useNativeTitleBar = true;
+    opt.resizable = true;
+    opt.componentToCentreAround = parent;
+    launchToolDialog(opt);   // modal, no separate taskbar entry
+    graph.commitSnapshot("Edit operator envelopes");
 }
 
 } // namespace SoundShop

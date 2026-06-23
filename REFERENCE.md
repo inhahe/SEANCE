@@ -1979,7 +1979,11 @@ Nothing bespoke: the per-slider `Param`s and Signal output `Pin`s round-trip thr
 The AHDSR envelope is the amplitude envelope for the synths whose voices are
 driven by the shared `AHDSREnvelopeRuntime`: **Terrain Synth** (and its
 wavetable / frequency-domain / wavelet-space variants), **Additive**,
-**Phase Distortion**, and **Spectral Grain**. On those nodes it's edited two
+**Phase Distortion**, **Spectral Grain**, and **Particle Cloud**. On Particle
+Cloud the shared envelope is a **note-level VCA** over the whole grain cloud —
+it sits *alongside*, not instead of, each grain's own attack/release window, so
+you get cloud-level shaping (attack swell, sustain, release tail) on top of the
+per-grain envelope. On those nodes it's edited two
 ways, both opening the *same* editor on the *same* `node.ahdsrEnvelope` (the
 single source of truth — there are no separate Attack/Decay/Sustain/Release
 params on the node):
@@ -1998,12 +2002,13 @@ params on the node):
   envelope to edit, so the button is hidden.)
 
 Synths that carry their **own** amplitude envelope inside the engine — **FM**
-(per-operator), **Particle Cloud** (per-grain), **Drum** (per-sound), and the
-sample/region players **SoundFont**, **SFZ**, **Sfizz**, and **MultiSampler** —
-do **not** expose the shared editor, because editing it would be inert. A
-shared master-VCA stage that would let those synths honor a node-level AHDSR
-too is tracked as future work in `known-issues.md`. Raw plugin-hosting
-Instruments keep their envelope inside the plugin.
+(per-operator) and **Drum** (per-sound) — plus the sample/region players
+**SoundFont**, **SFZ**, **Sfizz**, and **MultiSampler** do **not** expose the
+shared editor, because editing it would be inert. (Particle Cloud used to be in
+this list, but it now layers the shared envelope on as a note-level VCA — see
+above.) A shared master-VCA stage that would let the remaining synths honor a
+node-level AHDSR too is tracked as future work in `known-issues.md`. Raw
+plugin-hosting Instruments keep their envelope inside the plugin.
 
 ### Editor controls
 

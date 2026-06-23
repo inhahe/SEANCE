@@ -3272,13 +3272,16 @@ void NodeGraphComponent::showNodeMenu(Node& node) {
     // Envelope editor on synths whose amplitude envelope IS the shared node
     // AHDSR. These read node.ahdsrEnvelope directly through the shared
     // AHDSREnvelopeRuntime: the Terrain/wavetable engine plus the Additive,
-    // PD, and Spectral Grain synths. Synths that supply their own amplitude
-    // envelope - FM (per-operator), Particle (per-grain), Drum (per-sound),
-    // and the sample/region-file players (SoundFont, SFZ, Sfizz,
-    // MultiSampler) - are NOT offered the editor, because editing it would be
-    // inert (a silent lie). Extending a shared master-VCA to those synths is
-    // tracked as future work in known-issues.md. Raw plugin-hosting
-    // Instruments (pluginIndex >= 0) have their envelope inside the plugin.
+    // PD, Spectral Grain, and Particle Cloud synths. (Particle's per-grain
+    // attack/release shapes each grain; the node AHDSR is its separate
+    // note-level VCA - a true addition, not a double of the grain envelope.)
+    // Synths that supply their own integral amplitude envelope - FM
+    // (per-operator, edited via its own operator-envelope menu), Drum
+    // (one-shot per-sound decay, no sustain stage), and the sample/region-file
+    // players (SoundFont, SFZ, Sfizz, MultiSampler) - are NOT offered this
+    // editor, because a generic AHDSR can't subsume what they already have.
+    // Raw plugin-hosting Instruments (pluginIndex >= 0) have their envelope
+    // inside the plugin.
     bool isTonalSynth = false;
     if (node.type == NodeType::TerrainSynth) {
         isTonalSynth = true;
@@ -3287,7 +3290,7 @@ void NodeGraphComponent::showNodeMenu(Node& node) {
             return node.script.rfind(tag, 0) == 0;
         };
         bool ownEnvelope =
-            isScript("__fmsynth__") || isScript("__particlesynth__") ||
+            isScript("__fmsynth__") ||
             isScript("__drumsynth__") || isScript("__sf2__") ||
             isScript("__sfz__") || isScript("__sfizz__") ||
             isScript(MultiSamplerDoc::kPrefix);

@@ -1720,6 +1720,12 @@ public:
         int   shape      = (int)paramByName(node, "Shape", 0.0f);
         float volume     = paramByName(node, "Volume", 0.5f);
 
+        // Note-level amplitude envelope: the shared node AHDSR is a VCA over
+        // the whole grain cloud (orthogonal to each grain's own attack/release
+        // shaping below). Bake the shape curves once per block.
+        effectiveEnv = node.ahdsrEnvelope;
+        ampTables.prepare(effectiveEnv);
+
         // Handle MIDI
         for (auto meta : midi) {
             auto msg = meta.getMessage();
@@ -1727,8 +1733,10 @@ public:
                 heldNote = msg.getNoteNumber();
                 heldVel = msg.getVelocity() / 127.0f;
                 noteActive = true;
+                noteAmpEnv.noteOn(heldVel);
             } else if (msg.isNoteOff() && msg.getNoteNumber() == heldNote) {
                 noteActive = false;
+                noteAmpEnv.noteOff();
             }
         }
 
@@ -1738,8 +1746,10 @@ public:
         const float kPi2 = 6.28318530718f;
 
         for (int s = 0; s < numSamples; ++s) {
-            // Spawn new grains when a note is held
-            if (noteActive) {
+            // Keep spawning grains while the note envelope is sounding - this
+            // includes the release stage, so the cloud sustains through the
+            // AHDSR release rather than cutting off one grain after note-off.
+            if (noteAmpEnv.isActive()) {
                 spawnTimer += dt;
                 while (spawnTimer >= spawnInterval) {
                     spawnTimer -= spawnInterval;
@@ -1777,7 +1787,7 @@ public:
                     case 2: sample = ph < 0.5f ? 1.0f : -1.0f; break;
                     default: sample = ((float)rng() / (float)rng.max()) * 2.0f - 1.0f; break;
                 }
-                sample *= env * g.vel;
+                sample *= env;  // velocity now lives in the note-level AHDSR VCA
                 float panL = std::cos((g.pan + 1.0f) * 0.25f * 3.14159f);
                 float panR = std::sin((g.pan + 1.0f) * 0.25f * 3.14159f);
                 outL += sample * panL;
@@ -1793,6 +1803,11 @@ public:
             if (gc > 1) { outL /= std::sqrt(gc); outR /= std::sqrt(gc); }
             outL *= volume; outR *= volume;
 
+            // Note-level AHDSR VCA (velocity already folded into its peak via
+            // velocitySensitivity, so the grains no longer scale by velocity).
+            float ne = noteAmpEnv.tick((float)sampleRate, effectiveEnv, ampTables);
+            outL *= ne; outR *= ne;
+
             if (buf.getNumChannels() >= 1) buf.addSample(0, s, outL);
             if (buf.getNumChannels() >= 2) buf.addSample(1, s, outR);
         }
@@ -1801,12 +1816,12 @@ public:
         if (grains.size() > 1024) grains.erase(grains.begin(), grains.begin() + 512);
     }
 
-    // Tail = the grain duration.  Each particle has its own envelope that
-    // completes within the grain, so once new particles stop firing
-    // (no more held notes), the longest possible remaining audio is one
-    // full grain.
+    // Tail = the note-level AHDSR release (grains keep spawning through it)
+    // plus one grain duration for the final grains to finish their own
+    // envelopes after the cloud stops spawning.
     double getTailLengthSeconds() const override {
-        return (double) paramByName(node, "Grain Size", 50.0f) * 0.001;
+        return (double) paramByName(node, "Grain Size", 50.0f) * 0.001
+             + (double) node.ahdsrEnvelope.releaseMs * 0.001;
     }
     bool acceptsMidi() const override { return true; }
     bool producesMidi() const override { return false; }
@@ -1835,6 +1850,11 @@ private:
     float heldVel = 0.8f;
     float spawnTimer = 0;
     std::mt19937 rng{42};
+    // Note-level amplitude envelope (shared node AHDSR), separate from the
+    // per-grain attack/release that shapes each individual grain.
+    AHDSREnvelopeRuntime noteAmpEnv;
+    AHDSREnvelope effectiveEnv;
+    AHDSRCurveTables ampTables;
 };
 
 // ==============================================================================

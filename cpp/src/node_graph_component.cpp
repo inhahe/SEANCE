@@ -1802,15 +1802,21 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
     // redundant. Collapsed into one entry; pick frame types after the
     // editor opens.
     instMenu.addItem(110, "Wavetable");
-    // Standalone single-frame instruments: each of the six wavetable frame
-    // types as its own focused node (all the per-frame controls, none of the
-    // multi-frame wavetable machinery - no grid, no Position morph, no library).
+    // Standalone single-frame instruments: a focused node per wavetable frame
+    // type (all the per-frame controls, none of the multi-frame wavetable
+    // machinery - no grid, no Position morph, no library).
+    //
+    // The old "Sample (single cycle)" instrument (id 254) was removed: a single
+    // cycle extracted from captured audio is now available as the Granular
+    // node's "Single cycle" freeze mode (autocorrelation period detect + clean
+    // crossfaded loop), which is strictly more robust than the SampleFrame's
+    // zero-crossing collapse. Id 254 is intentionally left as a gap (the
+    // SampleFrame *type* itself stays for project/back-compat decode).
     juce::PopupMenu frameInstMenu;
     frameInstMenu.addItem(250, "Layered Waveform");
     frameInstMenu.addItem(251, "Frequency Domain");
     frameInstMenu.addItem(252, "Wavelet Space");
     frameInstMenu.addItem(253, "Inharmonic");
-    frameInstMenu.addItem(254, "Sample (single cycle)");
     frameInstMenu.addItem(255, "Granular");
     instMenu.addSubMenu("Single-Frame Instruments", frameInstMenu);
     juce::PopupMenu terrainMenu;
@@ -2080,16 +2086,21 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
             // wavetable): the script is a __framesynth__ wrapper, and the editor
             // opens in focused mode (no grid / library / Position morph). They
             // reuse the entire wavetable render + sub-editor path under the hood.
-            struct FrameInst { const char* typeId; const char* name; };
+            // Explicit id -> type map (NOT result-250 indexing) so the removed
+            // "Sample" instrument leaves a harmless gap at id 254 without
+            // shifting Granular (255) out of bounds.
+            struct FrameInst { int id; const char* typeId; const char* name; };
             const FrameInst kFrameInst[] = {
-                { "layered",    "Layered Waveform" },   // 250
-                { "spectral",   "Frequency Domain" },   // 251
-                { "wavelet",    "Wavelet Space" },      // 252
-                { "inharmonic", "Inharmonic" },         // 253
-                { "sample",     "Sample" },             // 254
-                { "granular",   "Granular" },           // 255
+                { 250, "layered",    "Layered Waveform" },
+                { 251, "spectral",   "Frequency Domain" },
+                { 252, "wavelet",    "Wavelet Space" },
+                { 253, "inharmonic", "Inharmonic" },
+                { 255, "granular",   "Granular" },
             };
-            const FrameInst& fi = kFrameInst[result - 250];
+            const FrameInst* fip = nullptr;
+            for (const auto& e : kFrameInst) if (e.id == result) { fip = &e; break; }
+            if (!fip) return;   // gap id (254, ex-Sample) or unknown
+            const FrameInst& fi = *fip;
             std::string script = SoundShop::defaultFrameSynthScriptForType(fi.typeId);
             if (script.empty()) return;  // unknown type id (shouldn't happen)
 

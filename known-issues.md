@@ -5,38 +5,6 @@ top. When something is fixed, delete the entry (git history is the archive).
 
 ---
 
-## OPEN: Sample single-cycle capture/import not wired up
-
-**Noticed:** 2026-06-22, building the six standalone single-frame instruments
-(`__framesynth__:`). Five of the six (Layered, Frequency Domain, Wavelet Space,
-Inharmonic, Granular) have fully functional focused-mode editors. The sixth,
-**Sample (single cycle)** (`SampleFrame`, typeId `"sample"`), has **no live
-capture/import path**: the entire capture machinery
-(`CaptureFromPlaybackDialog` / `CaptureFromSongDialog` in
-`capture_from_playback.cpp`) only ever emits `GranularFrame`s — see the two
-`std::make_unique<GranularFrame>` sites (~lines 2063, 4178). Nothing in the live
-app constructs a `SampleFrame` from real audio (the comment in `sample_frame.h`
-claiming "the capture dialog produces many SampleFrames" is aspirational/stale).
-
-So the Sample instrument currently plays only its default single-cycle sine
-(`SampleFrame::defaultEmpty()`) and shows a focused-mode placeholder explaining
-that. It round-trips through save/load fine; it just can't yet load a real
-single cycle.
-
-**Proper fix (needs a small design decision + audio validation):** give
-`SampleFrame` a dedicated embedded editor (mirroring
-`GranularFrameEditorComponent`: waveform display + a "Capture / Import single
-cycle…" button) backed by a single-cycle extraction path: pitch-detect the
-source → grab exactly one period → resample to `tableSize` → `cleanLoopBoundaries()`
-(the FFT integer-bin conditioner already exists on `SampleFrame`). The source
-picker mirrors granular (project song / mic / file). This is real audio-DSP
-work that needs to be validated by ear, so it was deliberately NOT rushed in the
-framesynth pass. Until then, the Sample instrument is a single-cycle sine
-oscillator. Decision still open: whether single-cycle capture should be a new
-lean path or an emit-mode flag on the existing granular capture dialog.
-
----
-
 ## OPEN (latent): baked-chain "Pin" checkbox shows but does nothing
 
 **Noticed:** 2026-06-22, while investigating the morph-pin reports.

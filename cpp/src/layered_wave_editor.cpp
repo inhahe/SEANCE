@@ -376,6 +376,7 @@ public:
         freezeModeCombo.addItem("Async granular",      2);
         freezeModeCombo.addItem("Pitch-synced grains", 3);
         freezeModeCombo.addItem("Spectral freeze",     4);
+        freezeModeCombo.addItem("Single cycle",        5);
         freezeModeCombo.setTooltip(
             "Which 'sustain the spot' algorithm runs while a note is held:\n"
             " - Crossfade loop: faithful tape loop with a short seam blend\n"
@@ -384,7 +385,10 @@ public:
             "   detected pitch period, so the cloud has a clean, stable pitch\n"
             "   (only differs from Async when the freeze window is wider than\n"
             "   the grain - widen the amber band to give it roam room)\n"
-            " - Spectral freeze: FFT freeze - ethereal pad sustain");
+            " - Spectral freeze: FFT freeze - ethereal pad sustain\n"
+            " - Single cycle: detect one pitch period and loop just that single\n"
+            "   cycle - a static single-cycle-oscillator tone (the dead, fixed-\n"
+            "   timbre counterpart to Pitch-synced grains' living cloud)");
         freezeModeCombo.onChange = [this]() { onFreezeModeChanged(); };
 
         addAndMakeVisible(playBtn);
@@ -1265,6 +1269,16 @@ private:
                 "Disabled in Spectral-freeze mode - there are no grains. Use the "
                 "FFT size control instead. Switch to Async or Pitch-synced "
                 "grains to set the grain count.");
+        } else if (frame.freezeMode == GranularFreezeMode::SingleCycle) {
+            grainLengthSlider.setTooltip(
+                "Disabled in Single-cycle mode - this mode detects one pitch "
+                "period and loops just that single cycle, so there are no grains "
+                "and no loop-length slider (the loop is exactly one detected "
+                "period). Switch to Async or Pitch-synced grains to use it.");
+            grainCountSlider.setTooltip(
+                "Disabled in Single-cycle mode - this mode loops one detected "
+                "cycle, with no grains to count. Switch to Async or Pitch-synced "
+                "grains to set the grain count.");
         } else { // CrossfadeLoop
             grainLengthSlider.setTooltip(
                 "Disabled in Crossfade-loop mode - this mode loops the whole "
@@ -1293,7 +1307,7 @@ private:
     void onFreezeModeChanged() {
         if (suppressCallbacks) return;
         const int id = freezeModeCombo.getSelectedId();
-        if (id >= 1 && id <= 4) {
+        if (id >= 1 && id <= 5) {
             frame.freezeMode = (GranularFreezeMode)(id - 1);
             // The window floor changes with the mode (cloud modes floor at the
             // grain; crossfade/spectral floor smaller). Re-clamp an explicit band
@@ -12053,6 +12067,7 @@ static std::string captureEntryName(int sourceKind, const IWavetableFrame* frame
             case GranularFreezeMode::AsyncGranular:   name << " - Async granular";   break;
             case GranularFreezeMode::PitchSyncGrains: name << " - Pitch-sync grains";break;
             case GranularFreezeMode::SpectralFreeze:  name << " - Spectral freeze";  break;
+            case GranularFreezeMode::SingleCycle:     name << " - Single cycle";     break;
         }
     }
     return name.toStdString();

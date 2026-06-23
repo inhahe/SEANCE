@@ -6,6 +6,7 @@
 #include "spectral_editor.h"       // SpectralDoc - Bucket C per-bin warp
 #include "wavelet_frame.h"         // WaveletFrame - Bucket C per-coeff warp
 #include "granular_frame.h"        // GranularFrame - Bucket C per-grain warp
+#include "granular_freeze.h"       // GrainFreezeVoice - SingleCycle / freeze modes
 #include "inharmonic_frame.h"      // InharmonicFrame - Milestone 9 additive stack
 #include "waveform_bank.h"         // WaveformBank - factory single-cycle library
 #include "transport.h"
@@ -3651,6 +3652,88 @@ void testPitchDetect(Report& r) {
 }
 
 // ---------------------------------------------------------------------------
+// Granular freeze voice - focus on the SingleCycle mode (autocorrelation
+// period detection -> one repeating cycle). Verifies the frozen output is
+// finite, non-silent, level-bounded, and PERIODIC at the source's true period
+// (a stable single-cycle tone), and that it re-pitches with `ratio`.
+// ---------------------------------------------------------------------------
+void testGranularFreeze(Report& r) {
+    r.section("Granular freeze (SingleCycle mode)");
+
+    const double sr = 48000.0;
+    const float  hz = 220.0f;
+    const int    srcLen = (int)sr;                    // 1 s
+    const int    period = (int)std::lround(sr / hz);  // ~218 samples
+
+    // A mildly-complex periodic source (fundamental + a couple harmonics) so
+    // the test exercises real period detection, not a trivial pure sine.
+    std::vector<float> src((size_t)srcLen);
+    for (int i = 0; i < srcLen; ++i) {
+        const double t = 2.0 * juce::MathConstants<double>::pi * hz * i / sr;
+        src[(size_t)i] = (float)(0.7 * std::sin(t)
+                                 + 0.2 * std::sin(2.0 * t)
+                                 + 0.1 * std::sin(3.0 * t));
+    }
+
+    // Render the frozen single cycle at native pitch (ratio == 1).
+    GrainFreezeVoice voice;
+    const int outN = 4800;
+    std::vector<float> out((size_t)outN, 0.0f);
+    for (int i = 0; i < outN; ++i)
+        out[(size_t)i] = voice.process(src.data(), srcLen, /*grainLen*/ 480,
+                                       /*windowStart*/ -1, /*windowLen*/ -1,
+                                       /*grainCount*/ 0, /*fftSize*/ 0,
+                                       /*xfade*/ 64, /*embeddedPitchHz*/ hz,
+                                       /*srcRate*/ sr, /*deviceRate*/ sr,
+                                       /*ratio*/ 1.0f,
+                                       GranularFreezeMode::SingleCycle);
+
+    r.check(allFinite(out), "SingleCycle output is finite");
+    r.checkVal(rmsOf(out) > 0.1, "SingleCycle output is non-silent", rmsOf(out));
+    r.checkVal(peakAbs(out) < 1.5f, "SingleCycle output is level-bounded",
+               peakAbs(out));
+
+    // Periodicity: the back half of the buffer (past loop warm-up) should match
+    // itself shifted by one period - a stable single cycle. Correlate
+    // out[n] vs out[n+period] over a window.
+    {
+        const int base = outN / 2;
+        std::vector<double> a, b;
+        for (int i = base; i + period < outN; ++i) {
+            a.push_back((double)out[(size_t)i]);
+            b.push_back((double)out[(size_t)(i + period)]);
+        }
+        const double corr = pearson(a, b);
+        r.checkVal(corr > 0.95,
+                   "SingleCycle output repeats at the source period (stable cycle)",
+                   corr);
+    }
+
+    // Pitch tracking: at ratio 2 the loop advances twice as fast, so the output
+    // period halves. Render a fresh voice and check the half-period correlation.
+    {
+        GrainFreezeVoice up;
+        std::vector<float> outUp((size_t)outN, 0.0f);
+        for (int i = 0; i < outN; ++i)
+            outUp[(size_t)i] = up.process(src.data(), srcLen, 480, -1, -1, 0, 0,
+                                          64, hz, sr, sr, /*ratio*/ 2.0f,
+                                          GranularFreezeMode::SingleCycle);
+        const int halfP = std::max(1, period / 2);
+        const int base = outN / 2;
+        std::vector<double> a, b;
+        for (int i = base; i + halfP < outN; ++i) {
+            a.push_back((double)outUp[(size_t)i]);
+            b.push_back((double)outUp[(size_t)(i + halfP)]);
+        }
+        const double corr = pearson(a, b);
+        r.check(allFinite(outUp), "SingleCycle (ratio 2) output is finite");
+        r.checkVal(corr > 0.9,
+                   "SingleCycle re-pitches: ratio 2 halves the output period",
+                   corr);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Project-level asset library ("stores"). Covers the data-model invariants:
 // disjoint user id space, add+find, content-hash dedup, soft-delete, duplicate /
 // update live-edit, and a save/load round-trip through writeProject/readProject.
@@ -5359,6 +5442,7 @@ int runSelfTest(const juce::File& outDir) {
     testGlslCompute(r, outDir);
     testBuiltinMath(r);
     testPitchDetect(r);
+    testGranularFreeze(r);
     testAssetLibrary(r);
 
     r.section("Summary");

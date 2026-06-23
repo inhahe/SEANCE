@@ -199,7 +199,7 @@ bool GranularFrame::decodeBody(const std::string& body) {
     captureSourceKind = -1;  // unknown unless the (newer) header field is present
     int tmp;
     if (tryOptInt(tmp)) {
-        if (tmp >= 0 && tmp <= 3) freezeMode = (GranularFreezeMode)tmp;
+        if (tmp >= 0 && tmp <= 4) freezeMode = (GranularFreezeMode)tmp;
         // else: unknown value, keep default
     }
     if (tryOptInt(tmp)) {

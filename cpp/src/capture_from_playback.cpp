@@ -526,6 +526,8 @@ CaptureFromPlaybackDialog::CaptureFromPlaybackDialog(CaptureSource src, int ts, 
                             (int)GranularFreezeMode::PitchSyncGrains + 1);
     freezeModeCombo.addItem("Spectral freeze",
                             (int)GranularFreezeMode::SpectralFreeze + 1);
+    freezeModeCombo.addItem("Single cycle",
+                            (int)GranularFreezeMode::SingleCycle + 1);
     freezeModeCombo.setSelectedId(
         (int)GranularFreezeMode::CrossfadeLoop + 1, juce::dontSendNotification);
     freezeModeCombo.setTooltip(
@@ -539,6 +541,9 @@ CaptureFromPlaybackDialog::CaptureFromPlaybackDialog(CaptureSource src, int ts, 
         "clean sustained tone. Works best on a pitched source.\n"
         " - Spectral freeze: keeps the FFT magnitudes and regenerates phases "
         "each frame. Ethereal pad sustain.\n"
+        " - Single cycle: detects one pitch period and loops just that single "
+        "cycle - a static single-cycle-oscillator tone (fixed-timbre "
+        "counterpart to Pitch-sync grains' living cloud).\n"
         "Drives the Preview you're hearing, so you can A/B before capturing.");
     freezeModeCombo.onChange = [this]() {
         const int idx = freezeModeCombo.getSelectedId() - 1;
@@ -1955,7 +1960,7 @@ void CaptureFromPlaybackDialog::seedFromExistingFrame(double pitchHz,
     }
 
     // ----- Freeze mode -----
-    if (freezeModeIdx >= 0 && freezeModeIdx <= 3) {
+    if (freezeModeIdx >= 0 && freezeModeIdx <= 4) {
         freezeModeCombo.setSelectedId(freezeModeIdx + 1, juce::dontSendNotification);
         // Match the live audition to the seeded mode (the onChange handler that
         // would normally do this is suppressed by dontSendNotification).
@@ -3356,7 +3361,7 @@ void CaptureFromSongDialog::seedFromExistingFrame(double pitchHz,
     }
 
     // ----- Freeze mode -----
-    if (freezeModeIdx >= 0 && freezeModeIdx <= 3) {
+    if (freezeModeIdx >= 0 && freezeModeIdx <= 4) {
         freezeModeCombo.setSelectedId(freezeModeIdx + 1, juce::dontSendNotification);
         // Match the live audition to the seeded mode (the onChange handler that
         // would normally do this is suppressed by dontSendNotification).

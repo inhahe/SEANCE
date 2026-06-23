@@ -296,6 +296,43 @@ void GrainFreezeVoice::initialise(const float* src, int srcLen, int grainLen,
             readPos  = 0.0;
             break;
         }
+        case GranularFreezeMode::SingleCycle: {
+            // Detect ONE pitch period and loop exactly that single cycle, so the
+            // captured spot becomes a static single-cycle-oscillator timbre - one
+            // dead, perfectly-periodic cycle (the counterpart to PitchSyncGrains'
+            // living period-snapped cloud). Autocorrelation (NOT zero-crossing)
+            // finds the period, so it locks onto complex / inharmonic material;
+            // the embedded pitch label is the fallback only when no confident
+            // pitch is found. loopSample loops [anchor, anchor+period) and Hann-
+            // crossfades the seam against the NEXT period (one period further on,
+            // i.e. the same waveform phase), so any small period error blends out
+            // instead of clicking - directly the "a zero crossing isn't good
+            // enough" robustness the design calls for.
+            const double rate = (srcRate > 0.0) ? srcRate : deviceRate;
+            int period = detectPeriodSamples(src, srcLen, rate);
+            if (period < 16) {
+                period = (embeddedPitchHz > 0.0f)
+                             ? (int)std::lround(rate / (double)embeddedPitchHz)
+                             : grainLen;
+            }
+            period  = std::max(16, period);
+            loopLen = period;
+            if (banded) {
+                // Loop one period from the band start; clamp so a whole period
+                // (plus whatever crossfade lookahead exists past it) stays inside
+                // the source. A band at the far edge simply gets a hard loop (no
+                // tail to crossfade), handled by loopSample's lookahead clamp.
+                anchor = std::clamp(bandStart, 0, std::max(0, srcLen - loopLen));
+            } else {
+                // Centre the single cycle with one period of crossfade lookahead
+                // past it (matching the PitchSync short-source fallback framing).
+                const int needLen = loopLen + loopLen / 2;
+                if (srcLen < needLen) { loopLen = 0; }   // unviable -> silence
+                else { anchor = (srcLen - needLen) / 2; }
+            }
+            loopPhase = 0.0f;
+            break;
+        }
         case GranularFreezeMode::CrossfadeLoop:
         default: {
             // The loop IS the whole freeze window, so the loop length is the
@@ -546,6 +583,7 @@ float GrainFreezeVoice::process(const float* src, int srcLen, int grainLen,
             return (psGrain > 0) ? pitchSyncSample(src, srcLen, ratio)
                                  : loopSample(src, srcLen, xfade, ratio);
         case GranularFreezeMode::SpectralFreeze:  return spectralSample(ratio);
+        case GranularFreezeMode::SingleCycle:     return loopSample(src, srcLen, xfade, ratio);
         case GranularFreezeMode::CrossfadeLoop:
         default:                                  return loopSample(src, srcLen, xfade, ratio);
     }

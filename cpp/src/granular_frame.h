@@ -51,14 +51,25 @@ inline constexpr int kNumSpectralFftSizes  = 6;
 //                      regenerate phases per frame, IFFT. Ethereal pad
 //                      sustain - the most decoupled from the source's
 //                      time-domain identity.
+//   SingleCycle      - autocorrelation-detect ONE pitch period and loop just
+//                      that single cycle, turning the captured spot into a
+//                      static single-cycle-oscillator timbre (like extracting
+//                      one cycle into a wavetable). The dead, perfectly-
+//                      periodic counterpart to PitchSyncGrains' living cloud:
+//                      no grain scatter, just one repeating cycle, seam Hann-
+//                      crossfaded against the adjacent (same-phase) period so
+//                      any period-detection error doesn't click. Uses robust
+//                      autocorrelation, NOT zero-crossing, so it locks onto
+//                      complex / inharmonic material cleanly.
 // Stored as an int on disk for forward-compat with future variants. Wire
 // values are stable: 0=CrossfadeLoop, 1=AsyncGranular, 2=PitchSyncGrains,
-// 3=SpectralFreeze.
+// 3=SpectralFreeze, 4=SingleCycle.
 enum class GranularFreezeMode : int {
     CrossfadeLoop   = 0,
     AsyncGranular   = 1,
     PitchSyncGrains = 2,
     SpectralFreeze  = 3,
+    SingleCycle     = 4,
 };
 
 // Freeze-window WIDTH sentinels (windowLen / GranularFrame::windowLen). A

@@ -142,6 +142,15 @@ JUCE only recomputes this when the graph is **rebuilt**, so SEANCE must rebuild 
 
 Because PDC works, latency-bearing DSP designs are now viable in SEANCE. The shipping **Curve EQ** is still zero-latency by construction (a deliberate simplicity choice, not a PDC limitation); a latency-bearing high-quality EQ mode is a noted backlog item.
 
+**Seeing a node's latency.** Right-clicking any node shows a disabled readout near the bottom of its menu:
+
+- **Latency (this node)** — the node's own added delay, in samples and (when the audio device is running) milliseconds. Most built-in nodes report **0**; the figure is non-zero mainly for hosted plugins doing lookahead or linear-phase processing.
+- **Latency (to here)** — the cumulative delay the signal has accumulated by the time it leaves this node: the **largest** summed latency along any path of nodes feeding its inputs, **plus** this node's own. (Max, not sum, of the incoming paths — that's the value PDC aligns every branch to.) This line is shown **only when it differs** from the node's own latency, i.e. when something upstream contributes delay; for an all-zero chain only the first line appears (reading 0).
+
+**On the node face.** When a node's accumulated "to here" latency is non-zero, a small orange-bordered pill at its **bottom-left** shows that delay in ms (or samples if the audio device isn't running yet) — so latency is visible at a glance without opening the menu. The badge is drawn **only** for non-zero nodes (so a normal all-built-in graph shows none) and is hidden when zoomed out too far to read; right-click for the full own-vs-to-here breakdown.
+
+The numbers come from `GraphProcessor::snapshotNodeLatencies()` — a thread-safe copy of the `LatencyChangeListener`'s settled per-node latencies, keyed by stable node id. The listener tracks each node's **real** processor (the `nodeInputMap` side), not the trailing pan node on the `nodeMap` side, so a panned node still reports its true delay rather than the pan processor's zero. `NodeGraphComponent::cumulativeLatencyTo()` does the "to here" computation as a memoised, cycle-guarded walk up `graph.links` (pure UI-side graph traversal, no audio-thread access); `paint()` precomputes the badge totals once per frame and only when something actually reports latency, so zero-latency graphs do no extra work.
+
 ---
 
 ## Transport bar

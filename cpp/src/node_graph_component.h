@@ -1,6 +1,9 @@
 #pragma once
 #include "node_graph.h"
 #include <juce_gui_basics/juce_gui_basics.h>
+#include <functional>
+#include <unordered_map>
+#include <unordered_set>
 
 namespace SoundShop {
 
@@ -63,6 +66,14 @@ public:
     // or return sampleRate <= 0 before the audio device has started - callers
     // must fall back to a generic label in that case.
     std::function<std::pair<double, int>()> getAudioFormat;
+
+    // Returns each node's own audio latency in samples, keyed by stable node id
+    // (a missing id means 0). Wired by main_window to
+    // GraphProcessor::snapshotNodeLatencies(). Used by the node right-click menu
+    // to show this node's own latency and the cumulative latency accumulated
+    // along the longest path of nodes feeding it. May be null before wiring;
+    // returns an empty map before the audio graph has been built.
+    std::function<std::unordered_map<int, int>()> getNodeLatencies;
 
     // Convert between screen and canvas coordinates
     juce::Point<float> screenToCanvas(juce::Point<float> screen) const;
@@ -133,6 +144,25 @@ private:
     void showBackgroundMenu(juce::Point<float> canvasPos);
     void showNodeMenu(Node& node);
     void showLinkMenu(int linkId);
+
+    // Cumulative audio latency (in samples) accumulated at the OUTPUT of `nodeId`:
+    // the node's own latency plus the largest summed latency along any path of
+    // nodes feeding its inputs (the value JUCE's delay compensation aligns to).
+    // `ownLatency` is a snapshot from getNodeLatencies() (missing id => 0); `memo`
+    // and `visiting` are scratch maps the caller default-constructs (memo caches
+    // results, visiting guards against feedback cycles). Pure graph walk over
+    // graph.links/pins - no audio-thread access.
+    int cumulativeLatencyTo(int nodeId,
+                            const std::unordered_map<int, int>& ownLatency,
+                            std::unordered_map<int, int>& memo,
+                            std::unordered_set<int>& visiting) const;
+
+    // Transient per-paint cache feeding the on-node latency badge: stable node
+    // id -> total accumulated latency in samples (only nodes with >0 are stored).
+    // Recomputed at the top of paint(), and only when some node actually reports
+    // latency, so an all-zero graph does no work and draws no badges.
+    std::unordered_map<int, int> latencyBadgeTotals;
+    double latencyBadgeSampleRate = 0.0;
     // Right-click menu for a single pin (triggered anywhere across the pin's
     // row, including its label text). For a control-input pin (one bound to a
     // ModPin) this offers Switch Set/Mod and Remove; for any other pin it

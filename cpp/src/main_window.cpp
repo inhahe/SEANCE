@@ -126,6 +126,9 @@ MainContentComponent::MainContentComponent() {
         return std::make_pair(audioEngine.getSampleRate(),
                               audioEngine.getBlockSize());
     };
+    graphComponent->getNodeLatencies = [this]() {
+        return audioEngine.getGraphProcessor().snapshotNodeLatencies();
+    };
 
     // Hotkey system: register callbacks and load saved bindings
     setupHotkeyCallbacks();

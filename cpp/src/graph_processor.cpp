@@ -1358,7 +1358,15 @@ void GraphProcessor::rebuildGraph(NodeGraph& graph, Transport& transport) {
 
     // Diagnostic: dump bus layouts for every node so we can see if a Waveform
     // Synth is reporting an unexpected channel count.
-    for (auto& kv : nodeMap) {
+    //
+    // Iterate nodeInputMap, NOT nodeMap: for nodes that get a trailing pan
+    // processor inserted, nodeMap[id] is the PAN node (0 latency) while
+    // nodeInputMap[id] is the actual instrument/effect processor - the one that
+    // can actually report latency (a hosted plugin's lookahead, etc.). Tracking
+    // the real processor here makes both the runtime latency-change rebuild
+    // trigger AND the per-node latency snapshot (snapshotNodeLatencies) reflect
+    // the node's true delay instead of the pan node's zero.
+    for (auto& kv : nodeInputMap) {
         if (auto* gn = processorGraph->getNodeForId(kv.second)) {
             if (auto* p = gn->getProcessor()) {
                 // Watch for runtime latency changes so JUCE's built-in delay

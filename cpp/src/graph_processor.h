@@ -267,6 +267,13 @@ public:
     // Get the AudioProcessor for a given node ID (returns null if not in graph)
     juce::AudioProcessor* getProcessorForNode(int nodeId);
 
+    // Snapshot of every node's own audio latency in samples, keyed by stable
+    // node id (settled after the last graph prepare; a missing id means 0 - the
+    // node reported no latency, or the graph hasn't been built yet). Thread-safe
+    // (locks the latency listener). The UI uses this for the per-node and
+    // cumulative ("to here") latency readouts in the node right-click menu.
+    std::unordered_map<int, int> snapshotNodeLatencies() { return latencyListener.snapshot(); }
+
     // Automation
     AutomationManager& getAutomation() { return automation; }
     void applyAutomation(const std::vector<AutomationValue>& values);
@@ -322,6 +329,11 @@ private:
             std::lock_guard<std::mutex> lk(mtx);
             for (auto& kv : procNodeId)
                 lastLatencyByNode[kv.second] = kv.first->getLatencySamples();
+        }
+        // Thread-safe copy of the settled per-node latencies for the UI.
+        std::unordered_map<int, int> snapshot() {
+            std::lock_guard<std::mutex> lk(mtx);
+            return lastLatencyByNode;
         }
         void audioProcessorParameterChanged(juce::AudioProcessor*, int, float) override {}
         void audioProcessorChanged(juce::AudioProcessor* p,

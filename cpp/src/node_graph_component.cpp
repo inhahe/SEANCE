@@ -251,6 +251,26 @@ void NodeGraphComponent::paint(juce::Graphics& g) {
     if (dragMode == DragMode::DragLink)
         drawPendingLink(g);
 
+    // Pre-compute on-face latency badges. The common case (nothing in the graph
+    // reports latency) bails immediately, so a zero-latency graph pays nothing
+    // and shows no badges. Otherwise compute each node's accumulated "to here"
+    // latency once (shared memo across nodes), cached for drawNode to read.
+    latencyBadgeTotals.clear();
+    latencyBadgeSampleRate = (getAudioFormat ? getAudioFormat().first : 0.0);
+    if (getNodeLatencies) {
+        auto own = getNodeLatencies();
+        bool anyNonZero = false;
+        for (auto& kv : own) if (kv.second > 0) { anyNonZero = true; break; }
+        if (anyNonZero) {
+            std::unordered_map<int, int> memo;
+            for (auto& node : graph.nodes) {
+                std::unordered_set<int> visiting;
+                int tot = cumulativeLatencyTo(node.id, own, memo, visiting);
+                if (tot > 0) latencyBadgeTotals[node.id] = tot;
+            }
+        }
+    }
+
     // Draw nodes
     for (auto& node : graph.nodes)
         drawNode(g, node);
@@ -371,6 +391,35 @@ void NodeGraphComponent::drawNode(juce::Graphics& g, Node& node) {
         float indY = titleArea.getCentreY() - indR;
         g.setColour(juce::Colours::orange);
         g.fillEllipse(indX, indY, indR * 2, indR * 2);
+    }
+
+    // Latency badge: a small pill on the node face showing the delay the signal
+    // has accumulated by the time it leaves this node (own latency + the longest
+    // upstream path). Only present when non-zero - basically only when a hosted
+    // latency-bearing plugin is in the chain - so zero-latency graphs stay clean.
+    // Drawn at the node's bottom-left; hidden when zoomed too far out to read.
+    // Right-click the node for the full breakdown (own vs. to-here).
+    if (zoom > 0.45f) {
+        auto lit = latencyBadgeTotals.find(node.id);
+        if (lit != latencyBadgeTotals.end() && lit->second > 0) {
+            int samples = lit->second;
+            juce::String txt = (latencyBadgeSampleRate > 0.0)
+                ? juce::String(1000.0 * samples / latencyBadgeSampleRate, 1) + " ms"
+                : juce::String(samples) + " smp";
+            float fs = std::max(7.0f, 9.0f * zoom);
+            g.setFont(juce::Font(fs));
+            float padX = 4 * zoom, padY = 2 * zoom;
+            float tw = g.getCurrentFont().getStringWidthFloat(txt) + padX * 2;
+            float th = fs + padY * 2;
+            auto bl = canvasToScreen(bounds.getBottomLeft());
+            juce::Rectangle<float> pill(bl.x + 4 * zoom, bl.y - th - 4 * zoom, tw, th);
+            g.setColour(juce::Colours::black.withAlpha(0.55f));
+            g.fillRoundedRectangle(pill, 3 * zoom);
+            g.setColour(juce::Colours::orange);
+            g.drawRoundedRectangle(pill, 3 * zoom, 1.0f);
+            g.setColour(juce::Colours::white);
+            g.drawText(txt, pill, juce::Justification::centred);
+        }
     }
 
     // Pins
@@ -3238,6 +3287,45 @@ void NodeGraphComponent::showPinMenu(Node& node, const Pin& pin, bool isInput) {
     });
 }
 
+int NodeGraphComponent::cumulativeLatencyTo(
+        int nodeId,
+        const std::unordered_map<int, int>& ownLatency,
+        std::unordered_map<int, int>& memo,
+        std::unordered_set<int>& visiting) const {
+    if (auto m = memo.find(nodeId); m != memo.end()) return m->second;
+    if (visiting.count(nodeId)) return 0; // feedback cycle - break it
+    visiting.insert(nodeId);
+
+    int self = 0;
+    if (auto it = ownLatency.find(nodeId); it != ownLatency.end()) self = it->second;
+
+    int maxUpstream = 0;
+    if (Node* n = graph.findNode(nodeId)) {
+        // A node feeds `n` when one of its OUTPUT pins drives a link whose
+        // END pin is one of n's INPUT pins. Walk every link once.
+        for (auto& link : graph.links) {
+            bool feedsN = false;
+            for (auto& pin : n->pinsIn)
+                if (pin.id == link.endPin) { feedsN = true; break; }
+            if (!feedsN) continue;
+            int srcId = -1;
+            for (auto& other : graph.nodes) {
+                for (auto& op : other.pinsOut)
+                    if (op.id == link.startPin) { srcId = other.id; break; }
+                if (srcId >= 0) break;
+            }
+            if (srcId >= 0)
+                maxUpstream = std::max(maxUpstream,
+                    cumulativeLatencyTo(srcId, ownLatency, memo, visiting));
+        }
+    }
+
+    visiting.erase(nodeId);
+    int total = maxUpstream + self;
+    memo[nodeId] = total;
+    return total;
+}
+
 void NodeGraphComponent::showNodeMenu(Node& node) {
     juce::PopupMenu menu;
     menu.addItem(5, "Rename...");
@@ -3393,6 +3481,34 @@ void NodeGraphComponent::showNodeMenu(Node& node) {
         menu.addItem(-1, juce::String("Cache: valid (") +
             juce::String((int)(node.cache.numSamples / std::max(1.0, node.cache.sampleRate))) +
             "s)", false);
+
+    // Latency readout (disabled info items). Most built-in nodes report 0; a
+    // hosted plugin's lookahead/linear-phase processing reports its delay, which
+    // the audio graph compensates automatically. Two lines:
+    //   "Latency (this node)"  - the node's own added delay.
+    //   "Latency (to here)"    - the largest delay accumulated along any path of
+    //                            nodes feeding it, plus this node's own; i.e. how
+    //                            far behind real time the signal is by the time it
+    //                            leaves this node. Shown only when it differs from
+    //                            the node's own (i.e. something upstream adds delay).
+    if (getNodeLatencies) {
+        auto lat = getNodeLatencies();
+        int ownSamples = 0;
+        if (auto it = lat.find(node.id); it != lat.end()) ownSamples = it->second;
+        std::unordered_map<int, int> memo;
+        std::unordered_set<int> visiting;
+        int totalSamples = cumulativeLatencyTo(node.id, lat, memo, visiting);
+        double sr = (getAudioFormat ? getAudioFormat().first : 0.0);
+        auto fmt = [sr](int s) -> juce::String {
+            juce::String t = juce::String(s) + (s == 1 ? " sample" : " samples");
+            if (sr > 0.0) t += " (" + juce::String(1000.0 * s / sr, 1) + " ms)";
+            return t;
+        };
+        menu.addSeparator();
+        menu.addItem(-1, "Latency (this node): " + fmt(ownSamples), false);
+        if (totalSamples != ownSamples)
+            menu.addItem(-1, "Latency (to here): " + fmt(totalSamples), false);
+    }
 
     // Convolution auto-merge (#33): offer to merge with downstream convolution.
     if (node.script.rfind("__convolution__:", 0) == 0) {

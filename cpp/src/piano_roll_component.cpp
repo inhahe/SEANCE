@@ -2277,7 +2277,15 @@ void PianoRollComponent::mouseEnter(const juce::MouseEvent&) {
     // so Ctrl+C / Ctrl+V / Delete work while hovering, without first having to
     // click (which would place a stray note). Required for hover+Ctrl+V paste to
     // land where the ghost preview shows.
-    if (!hasKeyboardFocus(true))
+    //
+    // ...but ONLY when SEANCE is already the foreground application. On Windows,
+    // calling grabKeyboardFocus() inside a window that isn't the active window
+    // forces that window to the foreground (Win32 SetFocus activates the owning
+    // top-level window), which would yank SEANCE in front of whatever app the
+    // user is actually working in just because the mouse passed over our window.
+    // Guarding on isForegroundProcess() keeps focus-follows-mouse working when
+    // SEANCE is the active app while never stealing focus from another app.
+    if (juce::Process::isForegroundProcess() && !hasKeyboardFocus(true))
         grabKeyboardFocus();
 }
 

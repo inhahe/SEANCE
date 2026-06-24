@@ -4484,6 +4484,36 @@ void testAssetLibrary(Report& r) {
                    relDiff);
     }
 
+    // ---- Wavetable library: unique "(copy N)" names on duplicate ------------
+    {
+        // Duplicating a library waveform must give the copy an incremented
+        // "(copy N)" name instead of a bare "(copy)" that collides with prior
+        // copies. makeUniqueCopyName picks the lowest free N and strips an
+        // existing copy suffix so repeated duplication increments.
+        WavetableDoc doc;
+        doc.addLibraryEntry(std::make_unique<LayeredWaveform>(), "Saw");
+
+        const std::string c1 = doc.makeUniqueCopyName("Saw");
+        r.check(c1 == "Saw (copy 1)", "wt-copy: first copy is \"(copy 1)\"");
+        doc.addLibraryEntry(std::make_unique<LayeredWaveform>(), c1);
+
+        const std::string c2 = doc.makeUniqueCopyName("Saw");
+        r.check(c2 == "Saw (copy 2)", "wt-copy: second copy increments to \"(copy 2)\"");
+        doc.addLibraryEntry(std::make_unique<LayeredWaveform>(), c2);
+
+        // Duplicating an existing copy strips its suffix and continues the run
+        // off the base name rather than nesting ("Saw (copy 1) (copy 1)").
+        const std::string c3 = doc.makeUniqueCopyName("Saw (copy 1)");
+        r.check(c3 == "Saw (copy 3)",
+                "wt-copy: duplicating a copy increments off the base, no nesting");
+
+        // A name that merely contains "(copy...)" as real text (not our suffix)
+        // is left intact as the base.
+        const std::string keep = doc.makeUniqueCopyName("My (copyright) wave");
+        r.check(keep == "My (copyright) wave (copy 1)",
+                "wt-copy: non-suffix parentheses are preserved as the base name");
+    }
+
     // ---- Named morph params: legacy "Warp N" migration (inc 2) --------------
     {
         // A pre-warpSlot project stored warp params as "Warp 1"/"Warp 2" with

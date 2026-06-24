@@ -3484,13 +3484,19 @@ void NodeGraphComponent::showNodeMenu(Node& node) {
 
     // Latency readout (disabled info items). Most built-in nodes report 0; a
     // hosted plugin's lookahead/linear-phase processing reports its delay, which
-    // the audio graph compensates automatically. Two lines:
-    //   "Latency (this node)"  - the node's own added delay.
-    //   "Latency (to here)"    - the largest delay accumulated along any path of
-    //                            nodes feeding it, plus this node's own; i.e. how
-    //                            far behind real time the signal is by the time it
-    //                            leaves this node. Shown only when it differs from
-    //                            the node's own (i.e. something upstream adds delay).
+    // the audio graph compensates automatically. Two lines, ALWAYS both shown so
+    // the combined figure is never ambiguous by its absence:
+    //   "Latency (this node)"      - the node's own added delay.
+    //   "Latency (combined here)"  - the largest delay accumulated along any path
+    //                                of nodes feeding it, plus this node's own;
+    //                                i.e. how far behind real time the signal is
+    //                                by the time it leaves this node. This is the
+    //                                same max-over-input-paths figure the graph's
+    //                                delay compensation aligns every branch to.
+    //                                Equals the node's own value when nothing
+    //                                upstream adds delay (e.g. a source, or an
+    //                                all-zero-latency chain) - still shown, so the
+    //                                user can see it's been accounted for.
     if (getNodeLatencies) {
         auto lat = getNodeLatencies();
         int ownSamples = 0;
@@ -3506,8 +3512,7 @@ void NodeGraphComponent::showNodeMenu(Node& node) {
         };
         menu.addSeparator();
         menu.addItem(-1, "Latency (this node): " + fmt(ownSamples), false);
-        if (totalSamples != ownSamples)
-            menu.addItem(-1, "Latency (to here): " + fmt(totalSamples), false);
+        menu.addItem(-1, "Latency (combined here): " + fmt(totalSamples), false);
     }
 
     // Convolution auto-merge (#33): offer to merge with downstream convolution.

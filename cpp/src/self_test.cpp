@@ -3544,6 +3544,38 @@ static void testBuiltinMath(Report& r) {
         r.check(match, "Builtin program (named waves summed) == inline expression");
     }
 
+    // WaveExprParser::validate - structural checker that backs the Built-in
+    // language's error strip / node badge (Stage 2 of the script-error feature).
+    // It must accept every valid program but reject obvious structural mistakes,
+    // and crucially must NOT flag unknown identifiers (the evaluator reads those
+    // as 0 by design). The self-test doesn't otherwise exercise load(), so these
+    // assertions are the regression guard for the validator's allowlist.
+    {
+        std::string err;
+        auto ok  = [&](const char* p) { err.clear(); return WaveExprParser::validate(p, err); };
+        auto bad = [&](const char* p) { err.clear(); return !WaveExprParser::validate(p, err) && !err.empty(); };
+
+        // --- Valid programs must pass ---
+        r.check(ok("sin(x) + 0.5*sin(3*x)"),            "validate: plain expression passes");
+        r.check(ok("a = sin(x)\nb = 0.5*sin(3*x)\na+b"),"validate: multi-statement program passes");
+        r.check(ok("waveform(\"square\", x)"),          "validate: quoted name literal passes");
+        r.check(ok("init:\nphase = 0\nloop:\nnote(60,100,0.5)"), "validate: section headers + ':' pass");
+        r.check(ok("gate>0 ? freq : 0"),                "validate: ternary / comparison ops pass");
+        r.check(ok("foo + bar * baz"),                  "validate: unknown identifiers are NOT flagged");
+        r.check(ok("   \n\t ; \n "),                    "validate: whitespace/separator-only passes");
+
+        // --- Structural errors must be caught ---
+        r.check(bad("sin(x"),                           "validate: unclosed '(' rejected");
+        r.check(bad("sin(x))"),                         "validate: extra ')' rejected");
+        r.check(bad("waveform(\"square, x)"),           "validate: unterminated string rejected");
+        r.check(bad("x % 2"),                           "validate: out-of-grammar '%' rejected");
+        r.check(bad("a @ b"),                           "validate: out-of-grammar '@' rejected");
+        r.check(bad("x # comment"),                     "validate: out-of-grammar '#' rejected");
+
+        // --- Quote-awareness: an illegal char INSIDE a literal is fine ---
+        r.check(ok("waveform(\"50% duty\", x)"),        "validate: '%' inside a string literal is ignored");
+    }
+
     // Bucket A warp bindings: warpamp(method, x, amount) / warpphase(method,
     // phase, amount) must route to the SAME warpAmpValue/warpPhaseValue primitives
     // (the shared single source of truth), whether the method is given as a numeric

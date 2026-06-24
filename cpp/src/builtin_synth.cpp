@@ -903,8 +903,15 @@ struct ExprParser {
         float last = 0.0f;
         skipSeparators();
         while (*pos != '\0') {
+            const char* before = pos;
             last = parseStatement();
             skipSeparators();
+            // Safety: a token the grammar can't consume (e.g. a stray '#' or
+            // '@') leaves pos un-advanced; without this guard the loop would
+            // spin forever on the audio thread. Step over it so the program
+            // terminates. WaveExprParser::validate() reports such characters
+            // up front, but this keeps the evaluator hang-proof regardless.
+            if (pos == before) ++pos;
         }
         return last;
     }
@@ -992,6 +999,77 @@ float WaveExprParser::runProgram(const std::string& program,
     parser.shapeFn      = &shapeFn;
     parser.noteToFreqFn = &noteToFreqFn;
     return parser.runProgram();
+}
+
+bool WaveExprParser::validate(const std::string& program, std::string& error) {
+    error.clear();
+
+    // Characters that are legal *outside* of a quoted literal. Everything the
+    // grammar can consume: identifiers (letters/digits/_), numbers ('.'),
+    // operators and punctuation. Parens are handled separately (balance), and
+    // any char is allowed inside "..."/'...'. Anything not here is out of the
+    // language entirely.
+    auto isAllowedBare = [](unsigned char c) -> bool {
+        if (std::isalnum(c)) return true;
+        switch (c) {
+            case '_': case '.':                       // identifiers / numbers
+            case ',': case ';':                       // arg / statement separators
+            case '?': case ':':                       // ternary, section headers
+            case '<': case '>': case '=': case '!':   // comparisons
+            case '&': case '|':                       // boolean
+            case '+': case '-': case '*': case '/': case '^': // arithmetic
+            case ' ': case '\t': case '\r': case '\n':         // whitespace
+                return true;
+            default:
+                return false;
+        }
+    };
+
+    int  parenDepth = 0;
+    int  line       = 1;
+    bool inQuote    = false;
+    char quoteChar  = 0;
+
+    for (size_t i = 0; i < program.size(); ++i) {
+        char c = program[i];
+        if (inQuote) {
+            if (c == '\n') ++line;
+            else if (c == quoteChar) inQuote = false;
+            continue;
+        }
+        switch (c) {
+            case '\n': ++line; break;
+            case '"':
+            case '\'': inQuote = true; quoteChar = c; break;
+            case '(':  ++parenDepth; break;
+            case ')':
+                if (--parenDepth < 0) {
+                    error = "Unexpected ')' with no matching '(' (line "
+                          + std::to_string(line) + ")";
+                    return false;
+                }
+                break;
+            default:
+                if (!isAllowedBare((unsigned char) c)) {
+                    error = std::string("Unexpected character '") + c
+                          + "' (line " + std::to_string(line) + ")";
+                    return false;
+                }
+                break;
+        }
+    }
+
+    if (inQuote) {
+        error = std::string("Unterminated string literal (missing closing ")
+              + quoteChar + ")";
+        return false;
+    }
+    if (parenDepth > 0) {
+        error = "Unbalanced parentheses: " + std::to_string(parenDepth)
+              + (parenDepth == 1 ? " '(' is never closed" : " '(' are never closed");
+        return false;
+    }
+    return true;
 }
 
 // ==============================================================================

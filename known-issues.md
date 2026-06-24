@@ -712,12 +712,24 @@ error strip, and `SignalShapeProcessor` got the `scriptHasError` atomic +
 editors are fully covered for Lua/Wasm compile errors. This whole section is
 now closed except for the Built-in language gap (Stage 2 below).
 
+**Stage 2 RESOLVED (2026-06-24): Built-in language structural checking.**
+`BuiltinExprRuntime::load()` now runs `WaveExprParser::validate()` — a cheap,
+side-effect-free structural pass — and returns `false` + a message on a
+malformed program, so the existing Stage 1 strip/badge automatically light up
+for the Built-in language too. The evaluator stays intentionally tolerant
+(unknown identifier → 0, missing close paren ignored mid-render); rather than
+retrofit error-reporting into the ~50 tolerant parse sites (per-sample audio
+overhead, big risk), `validate()` does a separate structural scan reporting,
+with a 1-based line number: unbalanced parentheses, an unterminated string
+literal, and out-of-grammar characters (`%`, `@`, `#`, `\`, `~`, `[`, …). It
+deliberately does **not** flag unknown identifiers (those legitimately read as
+0). It is quote-aware (parens/illegal chars inside `"…"`/`'…'` are ignored).
+**Also fixed a latent hang:** `ExprParser::runProgram` could spin forever on a
+non-advancing token (e.g. a stray `#` that no parse rule consumes, leaving
+`pos` un-advanced on the audio thread); it now steps over any such character so
+the program always terminates even if `validate()` is bypassed.
+
 **Remaining staged plan (script-error feature):**
-- **Stage 2 — Built-in parse errors.** `WaveExprParser`/`BuiltinExprRuntime`
-  parses lazily per sample and silently returns `0.0f` on a malformed program,
-  so the Built-in language reports *no* error to the linter. Record the parse
-  error + character position at load and return it from `getError()` so the
-  same strip/badge lights up for Built-in too.
 - **Stage 3 — Python.** Add a `Py_CompileString(code,"<script>",Py_file_input)`
   syntax pre-check before `PyRun_String` (in `scripting.cpp` bakes), and format
   runtime tracebacks with `traceback.format_exception` for the offline bake

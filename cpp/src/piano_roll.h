@@ -7,11 +7,13 @@ namespace SoundShop {
 // Piano roll editor state (per-node)
 struct PianoRollState {
     int scrollPitch = 60;   // center pitch (C4)
-    // 18 semitones (1.5 octaves) is a comfortable starting view: at typical
-    // editor heights each row is ~25-30px, so note labels are readable and
-    // notes are easy to click without surgical precision. The user can zoom
-    // out for more range or use Fit All to auto-fit existing notes.
-    int visibleRange = 18;
+    // 15 semitones (~1.25 octaves) is the default view. It's deliberately
+    // zoomed in enough that, at the default editor-panel height (220px), each
+    // keyboard row is tall enough (~7.5px) to carry its own note-name label
+    // without the 6.5px font floor overlapping the neighbouring row - so the
+    // user can read which note EVERY row is, not just the C-of-octave anchors.
+    // The user can zoom out for more range or use Fit All to auto-fit notes.
+    int visibleRange = 15;
     float snap = 0.25f;     // 16th note
     float hZoom = 0.4f;     // horizontal zoom (<1.0 = zoomed out past timeline, showing room to expand)
     float hScroll = 0.0f;   // horizontal scroll (0.0 = start, in beats)

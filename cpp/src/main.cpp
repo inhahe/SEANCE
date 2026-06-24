@@ -63,6 +63,19 @@ public:
         if (args.contains("--ephemeral"))
             SoundShop::setEphemeralSession(true);
 
+        // A bare `.ssp` path opens that project on launch (e.g. "open with",
+        // or `SEANCE.exe foo.ssp`). First non-flag token ending in .ssp wins.
+        // fromTokens keeps the surrounding quotes on a quoted path (paths with
+        // spaces), so unquote before testing the extension / storing the path.
+        for (const auto& a : args) {
+            juce::String path = a.unquoted();
+            if (path.startsWithChar('-')) continue;
+            if (path.endsWithIgnoreCase(".ssp")) {
+                SoundShop::setStartupProjectFile(path);
+                break;
+            }
+        }
+
         initLogging();
 
         mainWindow = std::make_unique<SoundShop::MainWindow>(getApplicationName());

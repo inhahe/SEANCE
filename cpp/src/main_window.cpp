@@ -421,7 +421,21 @@ MainContentComponent::MainContentComponent() {
 
     // Load last project or set up default graph
     bool loaded = false;
-    if (autoLoadLastProject && !recentProjects.empty()) {
+    // A bare `.ssp` path on the command line overrides the auto-load-last
+    // behaviour: load exactly that file (used for `SEANCE.exe foo.ssp` and for
+    // opening a known project into an --ephemeral test session).
+    if (juce::String startup = startupProjectFile(); startup.isNotEmpty()) {
+        auto file = juce::File(startup);
+        if (file.existsAsFile()) {
+            {
+                std::lock_guard<std::recursive_mutex> graphLk(graph.mutationLock);
+                ProjectFile::load(startup.toStdString(), graph, nullptr);
+            }
+            if (graphComponent) graphComponent->notifyProjectLoaded();
+            loaded = true;
+        }
+    }
+    if (!loaded && autoLoadLastProject && !recentProjects.empty()) {
         auto file = juce::File(recentProjects[0]);
         if (file.existsAsFile()) {
             // Lock for the batch mutation (see node_graph.h mutationLock
@@ -3645,7 +3659,12 @@ void MainContentComponent::openEditor(Node& node) {
 
     auto panel = std::make_unique<EditorPanel>();
     panel->nodeId = node.id;
-    panel->heightPx = 200;
+    // 220px default: with the default vertical zoom (visibleRange 15) this
+    // gives ~7.5px keyboard rows, tall enough for a per-row note-name label
+    // (font floor 6.5px) so the user can read every row's note. A shorter
+    // panel falls back to cramped labels; the user can still drag the panel
+    // taller via the resize handle at its top edge.
+    panel->heightPx = 220;
     panel->component = std::make_unique<PianoRollComponent>(graph, node, &transport);
     panel->component->onClose = [this](int nodeId) { closeEditor(nodeId); };
     // Resize handle at the top of the piano roll panel. The handle's
@@ -3853,6 +3872,14 @@ void setEphemeralSession(bool on) {
             .deleteRecursively();
     }
 }
+
+// Optional startup project file (set from a bare `.ssp` path on the command
+// line). When non-empty it's loaded in place of the most-recent project, so a
+// launch like `SEANCE.exe foo.ssp` (optionally with --ephemeral) opens that
+// file directly. See setStartupProjectFile() / the constructor's load path.
+static juce::String g_startupProjectFile;
+juce::String startupProjectFile() { return g_startupProjectFile; }
+void setStartupProjectFile(const juce::String& path) { g_startupProjectFile = path; }
 
 static juce::File getAutosaveDir() {
     if (g_ephemeralSession)

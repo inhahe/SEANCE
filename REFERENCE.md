@@ -36,6 +36,7 @@ here.
 - [Asset library (project stores)](#asset-library-project-stores)
 - [Terrain-synth self-test (`--self-test`)](#terrain-synth-self-test---self-test)
 - [Ephemeral session (`--ephemeral`)](#ephemeral-session---ephemeral)
+- [Opening a project from the command line](#opening-a-project-from-the-command-line)
 
 ---
 
@@ -511,6 +512,14 @@ Every `MidiNote` stores, alongside the raw pitch:
 This enables the *Change Key* workflow: Analyze in the original key → change the Key/Scale dropdowns → click *Change Key* and pitches are recomputed from degrees in the new context, preserving melodic shape (C Major → D Minor keeps the contour, just transposed and re-coloured).
 
 Notes display their degree in the piano roll (e.g. `C4 (1)`, `E4 (3)`). Out-of-scale notes display sharps/flats relative to the nearest degree.
+
+### Keyboard column note names
+
+The keyboard column down the left edge labels **every** row with its note name (`C4`, `C#4`, `D4`, …), not just the C-of-octave rows. The label font shrinks to fit the row height (floored at 6.5px — the smallest size that still rasterises legibly), so at the default zoom and panel height every row is readable. The default vertical zoom (`visibleRange = 15` semitones ≈ 1¼ octaves) and default editor-panel height (220px) are tuned together so rows are ≈7.5px tall — enough for a per-row label. In-scale rows use brighter text (root = brightest), out-of-scale rows are dimmed. If you zoom out far enough that rows drop below ~4px, the column falls back to one large `C3`/`C4`/`C5`… anchor label per octave so the names stay legible.
+
+### Note hover popup
+
+Hovering the mouse over a note pops up a tooltip with that note's full detail: name and scale degree (`C#4 (3rd)`), velocity, start beat, length, and detune in cents (if non-zero), plus the clip name when the timeline holds more than one clip. If several notes overlap at the cursor (stacked pitches / chords), the popup lists **all** of them, prefixed with a count (`3 notes:`).
 
 ### Lanes (bottom strip)
 
@@ -2796,3 +2805,24 @@ implemented by `SoundShop::setEphemeralSession()` (`main_window.cpp`), which the
 `getAutosaveDir()` family consults. (`--self-test` and `--plugin-sandbox` never
 create a window or run the autosave machinery, so they were already safe;
 `--ephemeral` covers the GUI-launch case.)
+
+## Opening a project from the command line
+
+<a name="opening-a-project-from-the-command-line"></a>Passing a `.ssp` project
+path as a bare argument opens that project on launch instead of auto-loading the
+most-recent one:
+
+```
+SEANCE.exe "C:\path\to\song.ssp"
+```
+
+This is what the OS uses for "Open with…" / double-clicking a `.ssp` file (once
+the file type is associated with the exe), and it composes with `--ephemeral`
+for opening a known project into a throwaway test session
+(`SEANCE.exe --ephemeral "…\song.ssp"`). The first non-flag token ending in
+`.ssp` wins; any leading flags (`--ephemeral`, etc.) are ignored when picking the
+file. The named project takes priority over the normal *auto-load last project*
+behaviour. Editor panels saved in the project's `[Editors]` section are restored
+just as they are for an auto-loaded project. Parsed in `main.cpp::initialise`
+(stored via `SoundShop::setStartupProjectFile`); loaded in the
+`MainContentComponent` constructor before the auto-load fallback.

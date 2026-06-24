@@ -7,7 +7,8 @@
 namespace SoundShop {
 
 class PianoRollComponent : public juce::Component,
-                            public juce::ScrollBar::Listener {
+                            public juce::ScrollBar::Listener,
+                            public juce::TooltipClient {
 public:
     PianoRollComponent(NodeGraph& graph, Node& node, Transport* transport = nullptr);
     ~PianoRollComponent() override {
@@ -32,6 +33,14 @@ public:
     void mouseExit(const juce::MouseEvent& e) override;
     void mouseWheelMove(const juce::MouseEvent& e, const juce::MouseWheelDetails& w) override;
     bool keyPressed(const juce::KeyPress& key) override;
+
+    // Hover popup: when the mouse rests over a note in the grid, show every
+    // note under the cursor (name, scale degree, velocity, start beat,
+    // duration, detune). Multiple stacked/overlapping notes are all listed.
+    // Returns empty when not over a note so no tooltip appears. Implemented
+    // for juce::TooltipClient; the shared TooltipWindow lives on
+    // MainContentComponent.
+    juce::String getTooltip() override;
 
     // Refresh the node pointer from the graph. Call at the start of every
     // public entry point (paint, mouseDown, etc.) because graph.nodes can

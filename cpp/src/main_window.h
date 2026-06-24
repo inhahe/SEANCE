@@ -37,6 +37,14 @@ namespace SoundShop {
 void setEphemeralSession(bool on);
 bool isEphemeralSession();
 
+// Optional startup project file. When a non-empty path is set (from a bare
+// `.ssp` argument on the command line), MainContentComponent loads it at
+// construction instead of the most-recently-opened project. Combine with
+// --ephemeral to open a specific file in a throwaway session. Must be called
+// before MainContentComponent is constructed.
+void setStartupProjectFile(const juce::String& path);
+juce::String startupProjectFile();
+
 class MainContentComponent : public juce::Component,
                               public juce::MenuBarModel,
                               public juce::Timer {

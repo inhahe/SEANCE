@@ -32,6 +32,8 @@ VideoImportDialogComponent::VideoImportDialogComponent(NodeGraph& g, int id,
         playBtn.setButtonText(playing ? "Pause" : "Play");
         if (playing && currentTime >= tOut - 1.0e-4) currentTime = tIn;
     };
+    playBtn.setTooltip("Play / pause the preview. Playback loops within the time "
+                       "crop (the cyan in/out handles on the timeline below).");
     addAndMakeVisible(playBtn);
 
     statusLabel.setText("Choose a video file to begin.", juce::dontSendNotification);
@@ -405,8 +407,6 @@ void VideoImportDialogComponent::resized() {
 
     auto topRow = r.removeFromTop(28);
     chooseBtn.setBounds(topRow.removeFromLeft(140));
-    topRow.removeFromLeft(8);
-    playBtn.setBounds(topRow.removeFromLeft(80));
     r.removeFromTop(6);
 
     // Bottom controls reserved first so the canvas takes the middle.
@@ -433,7 +433,13 @@ void VideoImportDialogComponent::resized() {
     statusLabel.setBounds(r.removeFromBottom(22));
     r.removeFromBottom(6);
 
-    timelineRect = r.removeFromBottom(34);
+    // Transport lives with the timeline: Play/Pause sits to the left of the
+    // scrub bar (next to the playhead), where users expect transport controls -
+    // not tucked up by the file picker.
+    auto timelineRow = r.removeFromBottom(34);
+    playBtn.setBounds(timelineRow.removeFromLeft(76).reduced(0, 3));
+    timelineRow.removeFromLeft(8);
+    timelineRect = timelineRow;
     r.removeFromBottom(8);
 
     canvasRect = r;

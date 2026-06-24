@@ -165,6 +165,8 @@
 
 <h2 id="midi">Generating MIDI</h2>
 
+<p>This is the <em>programmatic, time-driven</em> way to make MIDI: a program that runs on the clock and emits arpeggios, sequences, or generative patterns. If instead you just want to <em>decorate notes you play</em> — harmonies, octaves, chords, flams, probabilistic ghost notes, or note generation from an audio threshold — reach for the rule-based <a href="trigger-node.html">Trigger</a> node, which does all of that by filling in form fields with no scripting.</p>
+
 <p>Set <strong>MIDI outputs</strong> to 1 (or more) and the node grows a MIDI Out pin and your program can emit MIDI live. Now the "Output" box is a little program that runs every sample; instead of just returning a number it can <em>do things</em>:</p>
 <ul>
   <li><code>note(pitch, vel, durSec)</code> — play a note now and release it after <code>durSec</code> seconds. <code>pitch</code> is a MIDI number or a name like <code>"C4"</code>; <code>vel</code> is 0–127.</li>

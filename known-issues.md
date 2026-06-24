@@ -704,11 +704,13 @@ a red border + "!" badge: `MidiScriptProcessor` now latches an
 `onSignalShapeManualTrigger` pattern). Failed loads are also logged to
 `seance.log`.
 
-**Still pending:** the **Signal Shape** editor (`signal_shape_node.cpp`,
-`SignalShapeEditorComponent`) has NOT yet had the same error strip / badge
-added — apply the identical `validateScript()` linter + a `scriptHasError`
-atomic on `SignalShapeProcessor` so its `getNodeScriptError` also lights up.
-This is a natural follow-on to Stage 1.
+**Signal Shape half RESOLVED too (2026-06-24, same Stage 1 work).**
+`SignalShapeEditorComponent` got the identical `validateScript()` linter +
+error strip, and `SignalShapeProcessor` got the `scriptHasError` atomic +
+`hasScriptError()`; `NodeGraphComponent::getNodeScriptError` now tries both
+`MidiScriptProcessor` and `SignalShapeProcessor`. Both real-time script
+editors are fully covered for Lua/Wasm compile errors. This whole section is
+now closed except for the Built-in language gap (Stage 2 below).
 
 **Remaining staged plan (script-error feature):**
 - **Stage 2 — Built-in parse errors.** `WaveExprParser`/`BuiltinExprRuntime`

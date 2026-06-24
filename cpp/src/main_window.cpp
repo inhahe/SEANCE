@@ -414,9 +414,11 @@ MainContentComponent::MainContentComponent() {
             proc->fireManualTrigger();
     };
     graphComponent->getNodeScriptError = [this](int nodeId) -> bool {
-        if (auto* proc = dynamic_cast<MidiScriptProcessor*>(
-                audioEngine.getGraphProcessor().getProcessorForNode(nodeId)))
-            return proc->hasScriptError();
+        auto* p = audioEngine.getGraphProcessor().getProcessorForNode(nodeId);
+        if (auto* ms = dynamic_cast<MidiScriptProcessor*>(p))
+            return ms->hasScriptError();
+        if (auto* ss = dynamic_cast<SignalShapeProcessor*>(p))
+            return ss->hasScriptError();
         return false;
     };
 

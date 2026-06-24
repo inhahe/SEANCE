@@ -452,6 +452,38 @@ void NodeGraphComponent::drawNode(juce::Graphics& g, Node& node) {
         auto pos = canvasToScreen({isInput ? bounds.getX() : bounds.getRight(), pinY + PIN_ROW_HEIGHT / 2});
         float r = PIN_RADIUS * zoom;
 
+        // Hover highlight: when this pin is the one under the cursor, light up
+        // its whole interactive region BEFORE the dot/label so they stay crisp
+        // on top. The region mirrors pinInRowBand (the same area a right-click
+        // resolves): for a labelled pin it's the readable row band (full node
+        // width, or the pin's half when the row also carries the opposite pin),
+        // extended past the node edge to include the dot's outer overhang. A
+        // folded param-row connector (withLabel == false) has only its dot.
+        if (dragMode == DragMode::None && pin.id == hoveredPinId) {
+            const float rc = PIN_RADIUS;          // dot overhang, canvas units
+            juce::Rectangle<float> regionCanvas;
+            if (!withLabel) {
+                juce::Point<float> c(isInput ? bounds.getX() : bounds.getRight(),
+                                     pinY + PIN_ROW_HEIGHT / 2.0f);
+                regionCanvas = { c.x - rc * 2, c.y - rc * 2, rc * 4, rc * 4 };
+            } else if (isInput) {
+                float left  = bounds.getX() - rc * 2;
+                float right = hasOpposite ? bounds.getCentreX() : bounds.getRight();
+                regionCanvas = { left, pinY, right - left, (float) PIN_ROW_HEIGHT };
+            } else {
+                float left  = hasOpposite ? bounds.getCentreX() : bounds.getX();
+                float right = bounds.getRight() + rc * 2;
+                regionCanvas = { left, pinY, right - left, (float) PIN_ROW_HEIGHT };
+            }
+            juce::Rectangle<float> regionScreen(
+                canvasToScreen(regionCanvas.getTopLeft()),
+                canvasToScreen(regionCanvas.getBottomRight()));
+            g.setColour(juce::Colours::white.withAlpha(0.13f));
+            g.fillRoundedRectangle(regionScreen, 4.0f * zoom);
+            g.setColour(colourForPinKind(pin.kind).withAlpha(0.55f));
+            g.drawRoundedRectangle(regionScreen, 4.0f * zoom, std::max(1.0f, zoom));
+        }
+
         // Pin circle. Normally colored by kind; while a wire-drag is in
         // flight and this pin is the current valid drop target, draw it in
         // bright yellow with an outer halo so the user knows the cursor is
@@ -1048,6 +1080,50 @@ int NodeGraphComponent::pinAtPoint(juce::Point<float> canvasPos, bool& isOutput,
     return bestPin;
 }
 
+const Pin* NodeGraphComponent::pinInRowBand(const Node& node,
+                                            juce::Point<float> canvasPos,
+                                            bool& isInput) {
+    auto bounds = getNodeBounds(node);
+    // Top region holds structural input pins (mod pins live on their param rows
+    // below), so index against the structural list - matching drawNode().
+    auto structIns = structuralInputPins(node);
+    int topRows = std::max((int)structIns.size(), (int)node.pinsOut.size());
+    float pinRowsTop   = bounds.getY() + HEADER_HEIGHT;
+    float paramRowsTop = pinRowsTop + topRows * PIN_ROW_HEIGHT;
+    if (canvasPos.x < bounds.getX() || canvasPos.x > bounds.getRight()
+        || canvasPos.y < pinRowsTop || canvasPos.y >= paramRowsTop)
+        return nullptr;
+    int row = (int)((canvasPos.y - pinRowsTop) / PIN_ROW_HEIGHT);
+    const Pin* inPin  = (row < (int)structIns.size())
+                            ? structIns[(size_t)row]  : nullptr;
+    const Pin* outPin = (row < (int)node.pinsOut.size())
+                            ? &node.pinsOut[(size_t)row] : nullptr;
+    if (inPin && outPin) {
+        bool leftHalf = canvasPos.x < bounds.getCentreX();
+        isInput = leftHalf;
+        return leftHalf ? inPin : outPin;
+    }
+    if (inPin)  { isInput = true;  return inPin; }   // input-only row
+    if (outPin) { isInput = false; return outPin; }  // output-only row
+    return nullptr;
+}
+
+int NodeGraphComponent::pinUnderCursor(juce::Point<float> canvasPos, bool& isOut) {
+    // The dot wins first (it can hang outside the node edge, so a pure bounds
+    // test would miss its outer half), then the readable label row band.
+    bool o = false;
+    int dot = pinAtPoint(canvasPos, o, -1);
+    if (dot >= 0) { isOut = o; return dot; }
+    if (auto* node = nodeAtPoint(canvasPos)) {
+        bool inp = true;
+        if (const Pin* pin = pinInRowBand(*node, canvasPos, inp)) {
+            isOut = !inp;
+            return pin->id;
+        }
+    }
+    return -1;
+}
+
 int NodeGraphComponent::linkAtPoint(juce::Point<float> canvasPos) {
     auto screenPos = canvasToScreen(canvasPos);
     // Return the CLOSEST link within tolerance, not merely the first one in
@@ -1172,42 +1248,14 @@ void NodeGraphComponent::mouseDown(const juce::MouseEvent& e) {
             // horizontal band of a pin (its circle AND its label text), not
             // just the small circle. This makes the Mod/Set switch (and other
             // pin actions) reachable by right-clicking the readable label,
-            // which is what users aim at, instead of the tiny edge dot.
-            //
-            // Each row may carry an input pin (drawn on the left) and/or an
-            // output pin (drawn on the right). When the row has BOTH, split at
-            // the node's horizontal centre. When it has only ONE, the WHOLE row
-            // hits that pin - never split. The split-by-centre rule alone was
-            // the bug: a long input label like "Mod: Position 1" extends past
-            // centreX, so clicking its right half looked for a (non-existent)
-            // output pin on that row and fell through to the node menu.
+            // which is what users aim at, instead of the tiny edge dot. The
+            // same band drives the hover highlight (see pinInRowBand), so the
+            // lit-up region always matches what a right-click will target.
             {
-                auto bounds = getNodeBounds(*node);
-                // Top region holds structural input pins (mod pins live on their
-                // param rows below), so index against the structural list.
-                auto structIns = structuralInputPins(*node);
-                int topRows = std::max((int)structIns.size(),
-                                       (int)node->pinsOut.size());
-                float pinRowsTop   = bounds.getY() + HEADER_HEIGHT;
-                float paramRowsTop = pinRowsTop + topRows * PIN_ROW_HEIGHT;
-                if (canvasPos.y >= pinRowsTop && canvasPos.y < paramRowsTop) {
-                    int row = (int)((canvasPos.y - pinRowsTop) / PIN_ROW_HEIGHT);
-                    const Pin* inPin  = (row < (int)structIns.size())
-                                            ? structIns[(size_t)row]  : nullptr;
-                    const Pin* outPin = (row < (int)node->pinsOut.size())
-                                            ? &node->pinsOut[(size_t)row] : nullptr;
-                    const Pin* pin = nullptr;
-                    bool isInput = true;
-                    if (inPin && outPin) {
-                        bool leftHalf = canvasPos.x < bounds.getCentreX();
-                        pin = leftHalf ? inPin : outPin;
-                        isInput = leftHalf;
-                    } else if (inPin) {
-                        pin = inPin;  isInput = true;   // input-only row
-                    } else if (outPin) {
-                        pin = outPin; isInput = false;  // output-only row
-                    }
-                    if (pin) { showPinMenu(*node, *pin, isInput); return; }
+                bool bandIsInput = true;
+                if (const Pin* pin = pinInRowBand(*node, canvasPos, bandIsInput)) {
+                    showPinMenu(*node, *pin, bandIsInput);
+                    return;
                 }
             }
             // Check if right-click is on a param row - show arm/disarm menu
@@ -1641,11 +1689,19 @@ void NodeGraphComponent::mouseMove(const juce::MouseEvent& e) {
     // user can see exactly which connection a click / right-click will target.
     // Uses the same hit-test as selection, so the highlighted cable is always
     // the one that would actually be picked.
-    int over = linkAtPoint(screenToCanvas(e.position));
-    if (over != hoveredLinkId) {
-        hoveredLinkId = over;
-        repaint();
-    }
+    auto canvasPos = screenToCanvas(e.position);
+    bool changed = false;
+
+    int over = linkAtPoint(canvasPos);
+    if (over != hoveredLinkId) { hoveredLinkId = over; changed = true; }
+
+    // Highlight the pin under the cursor (its dot + label row band = the whole
+    // right-clickable area) using the SAME resolution as the right-click menu.
+    bool isOut = false;
+    int hp = pinUnderCursor(canvasPos, isOut);
+    if (hp != hoveredPinId) { hoveredPinId = hp; changed = true; }
+
+    if (changed) repaint();
 }
 
 // Static per-param help text for the Terrain Synth node's slider rows. The
@@ -1776,8 +1832,9 @@ juce::String NodeGraphComponent::getTooltip() {
 }
 
 void NodeGraphComponent::mouseExit(const juce::MouseEvent&) {
-    if (hoveredLinkId != -1) {
+    if (hoveredLinkId != -1 || hoveredPinId != -1) {
         hoveredLinkId = -1;
+        hoveredPinId = -1;
         repaint();
     }
 }

@@ -135,6 +135,9 @@ private:
     int hoveredLinkId = -1;   // cable currently within right-click distance of
                               //   the cursor (highlighted so the user can see
                               //   what a right-click / click will target)
+    int hoveredPinId = -1;    // pin whose interactive region (dot + label row
+                              //   band, i.e. the whole right-clickable area) is
+                              //   under the cursor; highlighted on hover
 
     // Drawing helpers
     void drawGrid(juce::Graphics& g);
@@ -150,6 +153,18 @@ private:
     // pass the opposite of the source pin's direction so a target never
     // resolves to the wrong side / the source pin itself.
     int pinAtPoint(juce::Point<float> canvasPos, bool& isOutput, int wantInput = -1);
+    // The pin whose top-region ROW BAND (its dot AND readable label text)
+    // contains canvasPos, or nullptr. The row band is the full node width split
+    // at the node centre when a row carries both an input (left) and output
+    // (right) pin; a single-pin row owns its whole width. Assumes the caller has
+    // already confirmed the point is over `node`. `isInput` receives the side.
+    // Shared by right-click resolution and hover highlighting so the two agree.
+    const Pin* pinInRowBand(const Node& node, juce::Point<float> canvasPos,
+                            bool& isInput);
+    // Resolve the pin under the cursor for HOVER: the dot first (generous
+    // radius, may hang outside the node edge), then the row band. Returns the
+    // pin id (or -1) and sets isOut. Mirrors the right-click pin resolution.
+    int pinUnderCursor(juce::Point<float> canvasPos, bool& isOut);
     int linkAtPoint(juce::Point<float> canvasPos);
     juce::Rectangle<float> getNodeBounds(const Node& node) const;
     juce::Point<float> getPinPosition(const Node& node, const Pin& pin) const;

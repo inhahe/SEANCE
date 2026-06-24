@@ -4484,6 +4484,46 @@ void testAssetLibrary(Report& r) {
                    relDiff);
     }
 
+    // ---- Song length: mid-bar content end plays in full (no bar-rounding) ----
+    {
+        // Bug: a MIDI track whose last clip ends mid-bar (e.g. at beat 1.0 of a
+        // 4-beat bar) had the song-end MARKER drawn at the exact clip end, but
+        // PLAYBACK ran to the bar-rounded end (beat 4). The fix routes the
+        // auto-derived playback length through contentEndBeats() (un-rounded),
+        // so effectiveSongLengthBeats() matches the marker. getTimelineBeats()
+        // still rounds up for the grid/display width.
+        NodeGraph g;
+        int tlId = g.addNode("Track", NodeType::MidiTimeline, {},
+                             { Pin{0, "MIDI Out", PinKind::Midi, false} }).id;
+        Node* tl = g.findNode(tlId);
+        Clip c{}; c.name = "clip"; c.startBeat = 0.0f; c.lengthBeats = 1.0f;
+        tl->clips.push_back(c);
+
+        r.checkVal(std::abs(g.contentEndBeats() - 1.0) < 1e-6,
+                   "song-len: exact content end is un-rounded (1.0 beat)",
+                   (float) g.contentEndBeats());
+        r.checkVal(std::abs(g.effectiveSongLengthBeats() - 1.0) < 1e-6,
+                   "song-len: auto playback length matches the mid-bar marker",
+                   (float) g.effectiveSongLengthBeats());
+        // Display width still rounds up to a full 4-beat bar.
+        r.checkVal(std::abs(g.getTimelineBeats(*tl) - 4.0f) < 1e-6,
+                   "song-len: timeline display width still rounds up to a bar",
+                   g.getTimelineBeats(*tl));
+
+        // An explicit override still wins verbatim.
+        g.songLengthBeats = 2.5;
+        r.checkVal(std::abs(g.effectiveSongLengthBeats() - 2.5) < 1e-6,
+                   "song-len: explicit override wins over content end",
+                   (float) g.effectiveSongLengthBeats());
+        // growSongLengthToContent never shrinks an override that already
+        // exceeds content, and grows to the exact (un-rounded) content end.
+        g.songLengthBeats = 0.5;          // shorter than the 1.0-beat clip
+        g.growSongLengthToContent();
+        r.checkVal(std::abs(g.songLengthBeats - 1.0) < 1e-6,
+                   "song-len: grow-to-content uses exact (mid-bar) clip end",
+                   (float) g.songLengthBeats);
+    }
+
     // ---- Wavetable library: unique "(copy N)" names on duplicate ------------
     {
         // Duplicating a library waveform must give the copy an incremented

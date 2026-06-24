@@ -913,13 +913,22 @@ public:
     SongRepeat songRepeatMode  = SongRepeat::None;
     int       songRepeatCount  = 1;   // only used when mode == NTimes
 
+    // Exact, un-rounded end of the last clip across all AudioTimeline /
+    // MidiTimeline nodes (max of clip.startBeat + clip.lengthBeats). Unlike
+    // getTimelineBeats(), this does NOT round up to a 4-beat bar, so it can
+    // land mid-bar. Used as the auto-derived playback song length so the
+    // audible end matches where content actually stops (and where the
+    // song-end marker is drawn). Returns 0 if no timeline has clips.
+    double contentEndBeats() const;
+
     // Returns the effective song-end beat used by the transport.  If
     // songLengthBeats was set explicitly (> 0), that value wins. Otherwise
-    // walks all AudioTimeline / MidiTimeline nodes and returns the largest
-    // getTimelineBeats() across them - i.e. the end of the last clip,
-    // rounded up to the next 4-beat bar. Returns 0 if there are no
-    // timelines with clips (in which case the engine treats the song as
-    // having no end and just plays until the user presses Stop).
+    // walks all AudioTimeline / MidiTimeline nodes and returns the exact
+    // end of the last clip (contentEndBeats(), un-rounded - playback may end
+    // mid-bar). Returns 0 if there are no timelines with clips (in which case
+    // the engine treats the song as having no end and just plays until the
+    // user presses Stop). Note: the timeline grid/display width still rounds
+    // up to a full bar via getTimelineBeats(); only the audible end is exact.
     double effectiveSongLengthBeats() const;
 
     // When content is added past an explicit song-length override (e.g. the

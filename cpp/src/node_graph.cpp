@@ -57,35 +57,39 @@ float NodeGraph::getTimelineBeats(const Node& node) const {
     return std::max(4.0f, std::ceil(end / 4.0f) * 4.0f);
 }
 
-double NodeGraph::effectiveSongLengthBeats() const {
-    // Explicit override wins.
-    if (songLengthBeats > 0) return songLengthBeats;
-
-    // Auto-derive: max getTimelineBeats() across all timeline nodes that
-    // actually have clips. getTimelineBeats() returns 4.0 for empty
-    // timelines, which would falsely make an empty project "4 beats long";
-    // skip them so a project with no clips at all returns 0 (= no end).
+double NodeGraph::contentEndBeats() const {
+    // Exact end of the last clip across all timeline nodes with clips, NOT
+    // rounded up to a bar (so it can land mid-bar). Empty timelines are
+    // skipped so a project with no clips returns 0 (= no end).
     double maxEnd = 0.0;
     for (const auto& n : nodes) {
         if (n.type != NodeType::AudioTimeline &&
             n.type != NodeType::MidiTimeline) continue;
         if (n.clips.empty()) continue;
-        double e = (double) getTimelineBeats(n);
-        if (e > maxEnd) maxEnd = e;
+        for (const auto& c : n.clips)
+            maxEnd = std::max(maxEnd, (double) (c.startBeat + c.lengthBeats));
     }
     return maxEnd;
+}
+
+double NodeGraph::effectiveSongLengthBeats() const {
+    // Explicit override wins.
+    if (songLengthBeats > 0) return songLengthBeats;
+
+    // Auto-derive: exact (un-rounded) end of the last clip across all timeline
+    // nodes. We deliberately use contentEndBeats() rather than the bar-rounded
+    // getTimelineBeats() so the audible song end matches where the song-end
+    // marker is drawn and where content actually stops - the song may end
+    // mid-bar. The timeline grid still rounds up for a clean display width.
+    return contentEndBeats();
 }
 
 double NodeGraph::growSongLengthToContent() {
     double prior = songLengthBeats;
     if (songLengthBeats <= 0) return prior;  // auto mode follows clips already
-    double contentEnd = 0.0;
-    for (const auto& n : nodes) {
-        if (n.type != NodeType::AudioTimeline &&
-            n.type != NodeType::MidiTimeline) continue;
-        if (n.clips.empty()) continue;
-        contentEnd = std::max(contentEnd, (double) getTimelineBeats(n));
-    }
+    // Use the exact (un-rounded) content end so growing the override matches
+    // the mid-bar playback end, not a bar-rounded value.
+    double contentEnd = contentEndBeats();
     if (contentEnd > songLengthBeats) {
         songLengthBeats = contentEnd;
         dirty = true;

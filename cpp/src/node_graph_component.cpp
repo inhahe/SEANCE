@@ -1802,9 +1802,14 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
     // redundant. Collapsed into one entry; pick frame types after the
     // editor opens.
     instMenu.addItem(110, "Wavetable");
-    // Standalone single-frame instruments: a focused node per wavetable frame
-    // type (all the per-frame controls, none of the multi-frame wavetable
-    // machinery - no grid, no Position morph, no library).
+    // Focused single-oscillator instruments, one per wavetable frame type (all
+    // the per-frame controls, none of the multi-frame wavetable machinery - no
+    // grid, no Position morph, no library). These used to live under a
+    // "Single-Frame Instruments" submenu, but the name only made sense in
+    // contrast to wavetable frames (a concept the UI no longer surfaces), and
+    // since they're standalone instruments now they belong directly in the
+    // Instruments list - placed right after Wavetable so the wavetable-family
+    // synths stay adjacent.
     //
     // The old "Sample (single cycle)" instrument (id 254) was removed: a single
     // cycle extracted from captured audio is now available as the Granular
@@ -1812,13 +1817,11 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
     // crossfaded loop), which is strictly more robust than the SampleFrame's
     // zero-crossing collapse. Id 254 is intentionally left as a gap (the
     // SampleFrame *type* itself stays for project/back-compat decode).
-    juce::PopupMenu frameInstMenu;
-    frameInstMenu.addItem(250, "Layered Waveform");
-    frameInstMenu.addItem(251, "Frequency Domain");
-    frameInstMenu.addItem(252, "Wavelet Space");
-    frameInstMenu.addItem(253, "Inharmonic");
-    frameInstMenu.addItem(255, "Granular");
-    instMenu.addSubMenu("Single-Frame Instruments", frameInstMenu);
+    instMenu.addItem(250, "Layered Waveform");
+    instMenu.addItem(251, "Frequency Domain");
+    instMenu.addItem(252, "Wavelet Space");
+    instMenu.addItem(253, "Inharmonic");
+    instMenu.addItem(255, "Granular");
     juce::PopupMenu terrainMenu;
     terrainMenu.addItem(120, "2D Terrain (sin*cos)");
     terrainMenu.addItem(122, "2D Terrain (custom expression...)");

@@ -9178,6 +9178,18 @@ LayeredWaveEditorComponent::LayeredWaveEditorComponent(NodeGraph& g, int nid, st
     : graph(g), nodeId(nid), onApply(std::move(apply))
 {
     openWaveEditors().push_back(this);
+    // Want keyboard focus so a click on any non-focusable surface (the waveform
+    // display, empty editor background) lands focus HERE. Without this, clicking
+    // outside the inline waveform-name TextEditor never removed its focus - JUCE's
+    // mouse-click focus search bubbles up to this editor (the name field's
+    // parent) and, finding no component that wants focus, keeps focus on the
+    // still-editing name field (juce_Component.cpp: a parent of the focused
+    // component aborts the search). The result was that clicking the waveform to
+    // resume editing left the name field "stuck" in edit mode, unlike the slider
+    // fields (which take focus on click and so commit the name via onFocusLost).
+    // Taking focus here drops the name field's focus -> commits it; our own
+    // keyPressed (Ctrl+Z/Y) keeps working after a background click too.
+    setWantsKeyboardFocus(true);
     // Decode existing state. Try wavetable first, then fall back to single
     // layered waveform (wrapped as a 1-frame wavetable), then default sine.
     auto* nd = graph.findNode(nodeId);

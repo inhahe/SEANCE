@@ -110,13 +110,28 @@ Node& NodeGraph::addNode(const std::string& name, NodeType type,
     node.pos = pos;
     for (auto& p : ins) { p.id = newId(); node.pinsIn.push_back(p); }
     for (auto& p : outs) { p.id = newId(); node.pinsOut.push_back(p); }
-    nodes.push_back(std::move(node));
+    // Lock the structural mutation against the audio thread. push_back may
+    // reallocate `nodes`, move-constructing every existing Node and nulling
+    // the moved-from shared_ptr members; the audio callback holding a Node&
+    // into the old storage would then crash on a null mutex (see the
+    // mutationLock comment in node_graph.h). recursive_mutex so batch callers
+    // that already hold the lock (setupDefaultGraph, project/MOD load) nest
+    // safely.
+    {
+        std::lock_guard<std::recursive_mutex> lk(mutationLock);
+        nodes.push_back(std::move(node));
+    }
     dirty = true;
     return nodes.back();
 }
 
 void NodeGraph::addLink(int outPin, int inPin) {
-    links.push_back({newId(), outPin, inPin});
+    // Same reallocation race as addNode: a push_back that grows `links` can
+    // tear the audio thread's iteration in rebuildGraph. Lock it.
+    {
+        std::lock_guard<std::recursive_mutex> lk(mutationLock);
+        links.push_back({newId(), outPin, inPin});
+    }
     dirty = true;
 }
 
@@ -413,10 +428,13 @@ bool removeParamModPin(NodeGraph& graph, int nodeId, int paramIndex) {
             std::remove_if(nd->pinsIn.begin(), nd->pinsIn.end(),
                 [pinId](const Pin& p) { return p.id == pinId; }),
             nd->pinsIn.end());
-        graph.links.erase(
-            std::remove_if(graph.links.begin(), graph.links.end(),
-                [pinId](const auto& lk) { return lk.endPin == pinId; }),
-            graph.links.end());
+        {
+            std::lock_guard<std::recursive_mutex> lk(graph.mutationLock);
+            graph.links.erase(
+                std::remove_if(graph.links.begin(), graph.links.end(),
+                    [pinId](const auto& l) { return l.endPin == pinId; }),
+                graph.links.end());
+        }
         nd->modPins.erase(it);
         removed = true;
         break;
@@ -440,9 +458,12 @@ int pruneOrphanModPins(NodeGraph& graph, int nodeId) {
         return false;
     };
     auto dropPinAndLinks = [&](int pinId) {
-        graph.links.erase(std::remove_if(graph.links.begin(), graph.links.end(),
-            [&](const Link& l) { return l.startPin == pinId || l.endPin == pinId; }),
-            graph.links.end());
+        {
+            std::lock_guard<std::recursive_mutex> lk(graph.mutationLock);
+            graph.links.erase(std::remove_if(graph.links.begin(), graph.links.end(),
+                [&](const Link& l) { return l.startPin == pinId || l.endPin == pinId; }),
+                graph.links.end());
+        }
         nd->pinsIn.erase(std::remove_if(nd->pinsIn.begin(), nd->pinsIn.end(),
             [&](const Pin& p) { return p.id == pinId; }), nd->pinsIn.end());
     };

@@ -3938,7 +3938,7 @@ void NodeGraphComponent::showNodeMenu(Node& node) {
                             // callback iterating graph.nodes/links (see the
                             // mutationLock comment in deleteNodeAndDescendants).
                             {
-                                std::lock_guard<std::mutex> graphLk(graph.mutationLock);
+                                std::lock_guard<std::recursive_mutex> graphLk(graph.mutationLock);
                                 graph.links.erase(std::remove_if(graph.links.begin(), graph.links.end(),
                                     [&downPinIds](const Link& l) {
                                         for (int pid : downPinIds)
@@ -4000,8 +4000,11 @@ bool NodeGraphComponent::keyPressed(const juce::KeyPress& key) {
 
 void NodeGraphComponent::deleteSelectedLink() {
     if (selectedLinkId < 0) return;
-    graph.links.erase(std::remove_if(graph.links.begin(), graph.links.end(),
-        [this](auto& l) { return l.id == selectedLinkId; }), graph.links.end());
+    {
+        std::lock_guard<std::recursive_mutex> graphLk(graph.mutationLock);
+        graph.links.erase(std::remove_if(graph.links.begin(), graph.links.end(),
+            [this](auto& l) { return l.id == selectedLinkId; }), graph.links.end());
+    }
     graph.dirty = true;
     selectedLinkId = -1;
     // Topology change - keep undo tree and graph.links in sync (see
@@ -4083,7 +4086,7 @@ void NodeGraphComponent::deleteNodeAndDescendants(int rootId) {
     // function; commitSnapshot only serializes (reads) the graph and never
     // takes mutationLock, so holding it across the snapshot is deadlock-free
     // and additionally prevents an audio-thread rebuild mid-serialization.
-    std::lock_guard<std::mutex> graphLk(graph.mutationLock);
+    std::lock_guard<std::recursive_mutex> graphLk(graph.mutationLock);
 
     graph.links.erase(std::remove_if(graph.links.begin(), graph.links.end(),
         [&](auto& l) { return pinIds.count(l.startPin) || pinIds.count(l.endPin); }),
@@ -4230,8 +4233,11 @@ void NodeGraphComponent::showLinkMenu(int linkId) {
         if (!lk && result != 1) return;
 
         if (result == 1) {
-            graph.links.erase(std::remove_if(graph.links.begin(), graph.links.end(),
-                [linkId](auto& l) { return l.id == linkId; }), graph.links.end());
+            {
+                std::lock_guard<std::recursive_mutex> graphLk(graph.mutationLock);
+                graph.links.erase(std::remove_if(graph.links.begin(), graph.links.end(),
+                    [linkId](auto& l) { return l.id == linkId; }), graph.links.end());
+            }
             graph.dirty = true;
             selectedLinkId = -1;
             // See mouseUp's commitSnapshot - topology changes need to

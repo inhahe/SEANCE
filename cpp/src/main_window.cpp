@@ -429,7 +429,7 @@ MainContentComponent::MainContentComponent() {
             // makes the invariant "all batch graph mutations hold this
             // lock" hold even if the device starts unusually early.
             {
-                std::lock_guard<std::mutex> graphLk(graph.mutationLock);
+                std::lock_guard<std::recursive_mutex> graphLk(graph.mutationLock);
                 ProjectFile::load(recentProjects[0].toStdString(), graph, nullptr);
             }
             // Re-apply the saved pan/zoom from the loaded graph (or fit-all
@@ -512,7 +512,7 @@ MainContentComponent::MainContentComponent() {
         // is the same kind of batch mutation as MOD import. Same race risk
         // (see mutationLock comment in node_graph.h), same fix.
         {
-            std::lock_guard<std::mutex> graphLk(graph.mutationLock);
+            std::lock_guard<std::recursive_mutex> graphLk(graph.mutationLock);
             ProjectFile::loadFromString(snap, graph, nullptr);
         }
         // Drop editor panels whose underlying node no longer exists in the
@@ -2809,7 +2809,7 @@ void MainContentComponent::newProject() {
     // try-lock). Pair the lock here, matching the project-load path. See the
     // mutationLock comment in node_graph.h.
     {
-        std::lock_guard<std::mutex> graphLk(graph.mutationLock);
+        std::lock_guard<std::recursive_mutex> graphLk(graph.mutationLock);
         graph.nodes.clear();
         graph.links.clear();
         graph.openEditors.clear();
@@ -2824,7 +2824,7 @@ void MainContentComponent::newProject() {
     {
         // Same structural-mutation lock as the clear/rebuild above: addNode()
         // below can reallocate graph.nodes while the audio callback iterates.
-        std::lock_guard<std::mutex> graphLk(graph.mutationLock);
+        std::lock_guard<std::recursive_mutex> graphLk(graph.mutationLock);
 
         auto devices = juce::MidiInput::getAvailableDevices();
         // Resolve the default MIDI track's MIDI input PIN ID up front. Pin IDs
@@ -3053,7 +3053,7 @@ void MainContentComponent::openProjectFile(const juce::String& path) {
     // the original with no indication. We warn after the load completes.
     FactoryRefResolutionScope factoryRefScope;
     {
-        std::lock_guard<std::mutex> graphLk(graph.mutationLock);
+        std::lock_guard<std::recursive_mutex> graphLk(graph.mutationLock);
         ProjectFile::load(path.toStdString(), graph, &audioEngine.getPluginHost());
         upgradeLegacyNodes();
 
@@ -3319,7 +3319,7 @@ void MainContentComponent::importModFile() {
             // import work.
             ModImporter::ImportResult result;
             {
-                std::lock_guard<std::mutex> graphLk(graph.mutationLock);
+                std::lock_guard<std::recursive_mutex> graphLk(graph.mutationLock);
                 result = ModImporter::import(file.getFullPathName().toStdString(), graph);
             }
 
@@ -4608,7 +4608,7 @@ void MainContentComponent::tryRecoverAutosave() {
             // already running, so the audio callback is actively iterating
             // graph.nodes and would otherwise race with the load.
             {
-                std::lock_guard<std::mutex> graphLk(safe->graph.mutationLock);
+                std::lock_guard<std::recursive_mutex> graphLk(safe->graph.mutationLock);
                 ProjectFile::load(getAutosaveFile().getFullPathName().toStdString(),
                                   safe->graph, &safe->audioEngine.getPluginHost());
                 safe->upgradeLegacyNodes();

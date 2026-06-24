@@ -202,10 +202,13 @@ void ControlBankComponent::removeSlider(int idx) {
     // carry links to pins that no longer exist).
     if (idx < (int)nd->pinsOut.size()) {
         const int pinId = nd->pinsOut[(size_t)idx].id;
-        graph.links.erase(std::remove_if(graph.links.begin(), graph.links.end(),
-            [pinId](const Link& l) {
-                return l.startPin == pinId || l.endPin == pinId;
-            }), graph.links.end());
+        {
+            std::lock_guard<std::recursive_mutex> graphLk(graph.mutationLock);
+            graph.links.erase(std::remove_if(graph.links.begin(), graph.links.end(),
+                [pinId](const Link& l) {
+                    return l.startPin == pinId || l.endPin == pinId;
+                }), graph.links.end());
+        }
         nd->pinsOut.erase(nd->pinsOut.begin() + idx);
     }
     nd->params.erase(nd->params.begin() + idx);

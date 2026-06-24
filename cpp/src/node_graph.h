@@ -814,14 +814,31 @@ public:
     // audio callback and fall through to silence if the lock can't be
     // acquired immediately - blocking on the audio thread would risk
     // device underruns, and a single silent block during a multi-second
-    // import is barely audible compared to a crash. Usage pattern
-    // (mutators): hold a std::lock_guard for the duration of any batch
-    // that pushes more than a couple of nodes/links (tracker import,
-    // project file load, undo snapshot restore). Single-node menu
-    // additions don't strictly need it - those are one push_back and
-    // race-resolve quickly - but locking them too costs nothing and is
-    // future-safe.
-    mutable std::mutex mutationLock;
+    // import is barely audible compared to a crash.
+    //
+    // Usage pattern (mutators): hold a lock_guard for the duration of any
+    // batch that clears/rebuilds graph.nodes/links (tracker import, project
+    // file load, undo snapshot restore). Crucially, even a SINGLE addNode()
+    // /addLink() must be locked: a lone push_back that reallocates the vector
+    // move-constructs every existing Node into new storage, which nulls the
+    // moved-from Node's shared_ptr members (e.g. mpePassthroughMutex). If the
+    // audio thread is mid-processBlock holding a Node& into the old storage,
+    // it then dereferences a null mutex and crashes - exactly the new-MIDI-
+    // timeline crash (SEANCE.exe.118460.dmp: MidiInputProcessor::processBlock
+    // locking *node.mpePassthroughMutex, rbx=0). An earlier comment here
+    // wrongly claimed single-node additions "race-resolve quickly" and didn't
+    // need the lock; they do. addNode()/addLink() now take the lock
+    // themselves, so every structural mutation is covered whether or not the
+    // caller wrapped it.
+    //
+    // Recursive because batch mutators (which hold this lock) compose
+    // addNode()/addLink() (which also take it): setupDefaultGraph() runs under
+    // the lock at the new-project callsite, and ProjectFile / MOD import call
+    // addNode while already locked. A plain std::mutex would self-deadlock on
+    // that nesting; recursive_mutex lets the same thread re-enter. The audio
+    // thread never owns the lock, so its try_lock still fails (and goes silent)
+    // whenever any GUI thread is mid-mutation.
+    mutable std::recursive_mutex mutationLock;
 
     float editorPanelHeight = 250.0f;
     int activeEditorNodeId = -1; // node ID of the currently focused editor

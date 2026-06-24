@@ -3995,9 +3995,12 @@ void syncWarpParamsForNode(NodeGraph& graph, int nodeId, const WavetableDoc& doc
             } else ++it;
         }
         for (int pid : pinsToDrop) {
-            graph.links.erase(std::remove_if(graph.links.begin(), graph.links.end(),
-                [&](const Link& l) { return l.startPin == pid || l.endPin == pid; }),
-                graph.links.end());
+            {
+                std::lock_guard<std::recursive_mutex> graphLk(graph.mutationLock);
+                graph.links.erase(std::remove_if(graph.links.begin(), graph.links.end(),
+                    [&](const Link& l) { return l.startPin == pid || l.endPin == pid; }),
+                    graph.links.end());
+            }
             nd->pinsIn.erase(std::remove_if(nd->pinsIn.begin(), nd->pinsIn.end(),
                 [&](const Pin& p) { return p.id == pid; }), nd->pinsIn.end());
         }
@@ -4120,9 +4123,12 @@ void reconcilePerLayerWarpParams(NodeGraph& graph, int nodeId, int frameId,
             } else ++it;
         }
         for (int pid : pinsToDrop) {
-            graph.links.erase(std::remove_if(graph.links.begin(), graph.links.end(),
-                [&](const Link& l) { return l.startPin == pid || l.endPin == pid; }),
-                graph.links.end());
+            {
+                std::lock_guard<std::recursive_mutex> graphLk(graph.mutationLock);
+                graph.links.erase(std::remove_if(graph.links.begin(), graph.links.end(),
+                    [&](const Link& l) { return l.startPin == pid || l.endPin == pid; }),
+                    graph.links.end());
+            }
             nd->pinsIn.erase(std::remove_if(nd->pinsIn.begin(), nd->pinsIn.end(),
                 [&](const Pin& p) { return p.id == pid; }), nd->pinsIn.end());
         }
@@ -11198,8 +11204,11 @@ void LayeredWaveEditorComponent::syncPositionModPins(Node& nd,
             [pinId](const Pin& p) { return p.id == pinId; }), nd.pinsIn.end());
         nd.modPins.erase(std::remove_if(nd.modPins.begin(), nd.modPins.end(),
             [pinId](const Node::ModPin& mp) { return mp.pinId == pinId; }), nd.modPins.end());
-        graph.links.erase(std::remove_if(graph.links.begin(), graph.links.end(),
-            [pinId](const auto& lk) { return lk.endPin == pinId; }), graph.links.end());
+        {
+            std::lock_guard<std::recursive_mutex> graphLk(graph.mutationLock);
+            graph.links.erase(std::remove_if(graph.links.begin(), graph.links.end(),
+                [pinId](const auto& l) { return l.endPin == pinId; }), graph.links.end());
+        }
     }
 
     // Ensure each axis ends up with exactly one bound, correctly-labelled pin.

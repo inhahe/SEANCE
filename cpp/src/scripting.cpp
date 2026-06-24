@@ -824,7 +824,7 @@ static PyMethodDef soundshopMethods[] = {
         for (auto& p : nodes[nodeIdx].pinsOut) pinIds.push_back(p.id);
         // Guard the structural edit against the audio callback iterating
         // graph.nodes/links (see node_graph.h mutationLock comment).
-        std::lock_guard<std::mutex> graphLk(g_currentGraph->mutationLock);
+        std::lock_guard<std::recursive_mutex> graphLk(g_currentGraph->mutationLock);
         links.erase(std::remove_if(links.begin(), links.end(),
             [&pinIds](const Link& l) {
                 for (int pid : pinIds) if (l.startPin == pid || l.endPin == pid) return true;

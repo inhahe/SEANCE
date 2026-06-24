@@ -5,6 +5,35 @@ top. When something is fixed, delete the entry (git history is the archive).
 
 ---
 
+## OPEN (latent): node pin-vector mutations don't hold `mutationLock`
+
+**Noticed:** 2026-06-23, while fixing the new-MIDI-timeline crash
+(`SEANCE.exe.118460.dmp`). That crash — `MidiInputProcessor::processBlock`
+locking a null `*node.mpePassthroughMutex` — was a data race between the audio
+thread (holding a `Node&` into `graph.nodes`) and a GUI-thread
+`graph.nodes.push_back()` that **reallocated** the vector, move-constructing
+every Node and nulling the moved-from `shared_ptr` members. Fixed by (a) making
+`NodeGraph::mutationLock` a `std::recursive_mutex`, (b) locking inside
+`addNode()`/`addLink()` so even a single interactive add is covered, and (c)
+locking the remaining `graph.links.erase` sites in the editors.
+
+**Still open:** the audio thread holds `mutationLock` for the *entire* callback,
+including `GraphProcessor::rebuildGraph`, which reads each `node.pinsIn` /
+`node.pinsOut` (pin counts + `pin.kind` in `widenForControl`). Several editor
+operations mutate a node's pin vectors (`nd->pinsIn.erase` /
+`nd->pinsOut.erase`, and `nd->pinsIn = std::move(newPins)`) **without** taking
+the lock — e.g. `control_bank.cpp` (remove slider), `spectrum_tap.cpp`,
+`midi_mod_node.cpp` (resize signals), `layered_wave_editor.cpp` (drop mod
+pins). Lower crash-risk than the Node case (`Pin` shifts in place; the audio
+thread reads `pin.kind`, an enum, not `pin.name`), but still a torn-read race.
+**Proper fix:** wrap those pin-vector mutations in
+`std::lock_guard<std::recursive_mutex>(graph.mutationLock)` too — the lock is
+recursive so nesting under a batch caller is safe. Most of these functions
+already lock the adjacent `links.erase`; widen that scope to cover the pin
+erase. Not done yet to keep the crash fix scoped.
+
+---
+
 ## OPEN (latent): baked-chain "Pin" checkbox shows but does nothing
 
 **Noticed:** 2026-06-22, while investigating the morph-pin reports.

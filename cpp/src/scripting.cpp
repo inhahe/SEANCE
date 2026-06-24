@@ -39,6 +39,7 @@
 #include "waveform_bank.h"
 #include "warp.h"
 #include "buffer_warp.h"
+#include <juce_core/juce_core.h>   // juce::Logger for full-traceback logging
 #include <sstream>
 #include <cstdio>
 #include <cstring>
@@ -1023,29 +1024,121 @@ ScriptEngine& ScriptEngine::instance() {
     return engine;
 }
 
-// Pull a human-readable message out of the current Python exception state.
-static std::string fetchPythonError() {
+// Count the newlines in a string (== number of complete lines when each line is
+// '\n'-terminated). Used to locate where the user's source begins inside the
+// generated bake program so error line numbers can be mapped back.
+static int countNewlines(const std::string& s) {
+    int n = 0;
+    for (char c : s) if (c == '\n') ++n;
+    return n;
+}
+
+// Build a user-facing error message from the current Python exception, mapping
+// the generated-code line numbers back onto the user's OWN source lines.
+//
+// The bake wraps the user's program in generated scaffolding (imports, helper
+// defs, a `def __shape(x):` / `def __cell(...)` header, a driver loop), so a raw
+// Python line number points at machine-generated text the user never sees.
+// `userLineOffset` is the number of generated lines that precede the user's
+// first line; `userLineCount` is how many lines the user contributed. A
+// traceback / SyntaxError line `g` is one of the user's iff
+//   userLineOffset < g <= userLineOffset + userLineCount
+// in which case the user-facing line is `g - userLineOffset` (1-based).
+//
+// The concise headline ("Type: message (line N)") is returned for the editor's
+// error label; the FULL Python traceback (via traceback.format_exception) is
+// always written to seance.log so the complete stack is recoverable even though
+// the inline label only shows the headline.
+static std::string formatPythonError(int userLineOffset, int userLineCount) {
     if (!PyErr_Occurred()) return {};
     PyObject *type = nullptr, *value = nullptr, *tb = nullptr;
     PyErr_Fetch(&type, &value, &tb);
     PyErr_NormalizeException(&type, &value, &tb);
-    std::string msg;
+
+    auto mapLine = [&](long g) -> long {
+        if (g > userLineOffset && g <= (long)userLineOffset + userLineCount)
+            return g - userLineOffset;
+        return -1;
+    };
+
+    std::string typeName, msg;
+    if (type) {
+        if (PyObject* nm = PyObject_GetAttrString(type, "__name__")) {
+            if (const char* c = PyUnicode_AsUTF8(nm)) typeName = c;
+            Py_DECREF(nm);
+        }
+    }
     if (value) {
         if (PyObject* s = PyObject_Str(value)) {
             if (const char* c = PyUnicode_AsUTF8(s)) msg = c;
             Py_DECREF(s);
         }
     }
-    if (type) {
-        if (PyObject* nm = PyObject_GetAttrString(type, "__name__")) {
-            if (const char* c = PyUnicode_AsUTF8(nm))
-                msg = std::string(c) + (msg.empty() ? "" : ": " + msg);
-            Py_DECREF(nm);
+
+    long userLine = -1;
+
+    // SyntaxError carries the offending line as an attribute (a compile failure
+    // typically has no traceback frames to walk).
+    if (value && PyObject_HasAttrString(value, "lineno")) {
+        if (PyObject* lnO = PyObject_GetAttrString(value, "lineno")) {
+            if (PyLong_Check(lnO)) userLine = mapLine(PyLong_AsLong(lnO));
+            Py_DECREF(lnO);
         }
     }
+
+    // Runtime error: walk the traceback for the DEEPEST frame within the user's
+    // line range (their own offending call site). Attribute access (tb_lineno /
+    // tb_next) keeps this ABI-stable across CPython versions.
+    if (userLine < 0 && tb && tb != Py_None) {
+        PyObject* t = tb; Py_INCREF(t);
+        while (t && t != Py_None) {
+            if (PyObject* lnO = PyObject_GetAttrString(t, "tb_lineno")) {
+                if (PyLong_Check(lnO)) {
+                    long m = mapLine(PyLong_AsLong(lnO));
+                    if (m > 0) userLine = m;   // keep the deepest in-range frame
+                }
+                Py_DECREF(lnO);
+            }
+            PyObject* next = PyObject_GetAttrString(t, "tb_next"); // new ref; None at end
+            Py_DECREF(t);
+            t = next;
+        }
+        Py_XDECREF(t);
+    }
+
+    // Full traceback -> seance.log (line numbers are the generated ones, which is
+    // fine for a developer reading the log; the inline headline is what's remapped).
+    if (PyObject* tbmod = PyImport_ImportModule("traceback")) {
+        if (PyObject* list = PyObject_CallMethod(tbmod, "format_exception", "OOO",
+                                                 type  ? type  : Py_None,
+                                                 value ? value : Py_None,
+                                                 tb    ? tb    : Py_None)) {
+            if (PySequence_Check(list)) {
+                std::string full;
+                Py_ssize_t n = PySequence_Size(list);
+                for (Py_ssize_t i = 0; i < n; ++i) {
+                    if (PyObject* it = PySequence_GetItem(list, i)) {
+                        if (const char* c = PyUnicode_AsUTF8(it)) full += c;
+                        Py_DECREF(it);
+                    }
+                }
+                if (!full.empty())
+                    juce::Logger::writeToLog("Python bake error:\n" + juce::String(full));
+            }
+            Py_DECREF(list);
+        }
+        Py_DECREF(tbmod);
+        PyErr_Clear(); // format_exception shouldn't raise, but stay clean
+    }
+
     Py_XDECREF(type); Py_XDECREF(value); Py_XDECREF(tb);
     PyErr_Clear();
-    return msg.empty() ? std::string("Python error") : msg;
+
+    std::string out = typeName.empty() ? msg
+                    : (msg.empty() ? typeName : typeName + ": " + msg);
+    if (out.empty()) out = "Python error";
+    if (userLine > 0) out += " (line " + std::to_string(userLine) + ")";
+    return out;
 }
 
 // waveform(name, phase) — exposed to baked terrain/shape Python as a C builtin.
@@ -1318,7 +1411,15 @@ bool ScriptEngine::bakeShapeExpr(const std::string& src, bool domainRadians, int
             "def noise(v=0.0): return __ssr.random()\n"
          << kGlslParityPyPreamble
          << kWaveformsDictPreamble
-         << "def __shape(x):\n" << body
+         << "def __shape(x):\n";
+    // The user's source begins here, inside `body`. Capture how many generated
+    // lines precede it so a Python error line can be mapped back to the user's
+    // own 1-based line (see formatPythonError). `body` may lead with an injected
+    // `    f = x\n` line (non-radians) that is NOT user-authored.
+    const int injected = domainRadians ? 0 : 1;          // injected body lines
+    const int userLineOffset = countNewlines(code.str()) + injected;
+    const int userLineCount  = countNewlines(body) - injected;
+    code << body
          << "__N = " << N << "\n"
          << "if " << (clampResult ? "True" : "False") << ":\n"
             "    __result = [float(__shape(__i / __N * 2.0 * pi)) for __i in range(__N)]\n"
@@ -1332,7 +1433,7 @@ bool ScriptEngine::bakeShapeExpr(const std::string& src, bool domainRadians, int
 
     PyObject* res = PyRun_String(code.str().c_str(), Py_file_input, globals, globals);
     if (!res) {
-        error = fetchPythonError();
+        error = formatPythonError(userLineOffset, userLineCount);
         Py_DECREF(globals);
         out.assign(N, 0.0f);
         return false;
@@ -1409,6 +1510,11 @@ bool ScriptEngine::bakeTerrain(const std::string& src, bool wholeGrid,
          << "__dims = " << dimsLit.str() << "\n"
          << "__nd = len(__dims)\n"
          << "__total = " << total << "\n";
+
+    // Where the user's source lands inside the generated program, so a Python
+    // error line can be mapped back to the user's 1-based line (see
+    // formatPythonError). Set by whichever branch embeds the user source.
+    int userLineOffset = 0, userLineCount = 0;
 
     if (wholeGrid) {
         // Whole-grid: expose dims/nd/total + the cell buffer, run the user's
@@ -1527,6 +1633,8 @@ bool ScriptEngine::bakeTerrain(const std::string& src, bool wholeGrid,
         // User source verbatim (defines generate()), then invoke it.
         std::string user = trim(src);
         if (user.empty()) user = "def generate():\n    pass";
+        userLineOffset = countNewlines(code.str());     // generated lines before user
+        userLineCount  = countNewlines(user) + 1;       // user occupies this many lines
         code << user << "\n"
              << "generate()\n"
                 "if grid is None:\n"
@@ -1548,8 +1656,10 @@ bool ScriptEngine::bakeTerrain(const std::string& src, bool wholeGrid,
             if (user.empty()) user = "    return 0.0\n";
             body = user;
         }
-        code << "def __cell(c0, c1, c2, c3, c4, c5, c6, c7, x, y, z, w, nd):\n"
-             << body
+        code << "def __cell(c0, c1, c2, c3, c4, c5, c6, c7, x, y, z, w, nd):\n";
+        userLineOffset = countNewlines(code.str());     // generated lines before body
+        userLineCount  = countNewlines(body);           // body lines = user lines
+        code << body
              << "__data = [0.0] * __total\n"
                 "__TAU = 6.283185307179586\n"
                 "for __i in range(__total):\n"
@@ -1576,7 +1686,7 @@ bool ScriptEngine::bakeTerrain(const std::string& src, bool wholeGrid,
 
     PyObject* res = PyRun_String(code.str().c_str(), Py_file_input, globals, globals);
     if (!res) {
-        error = fetchPythonError();
+        error = formatPythonError(userLineOffset, userLineCount);
         Py_DECREF(globals);
         return false;
     }

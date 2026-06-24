@@ -729,11 +729,30 @@ non-advancing token (e.g. a stray `#` that no parse rule consumes, leaving
 `pos` un-advanced on the audio thread); it now steps over any such character so
 the program always terminates even if `validate()` is bypassed.
 
+**Stage 3 RESOLVED (2026-06-24): Python bake error reporting with line
+remapping.** A Python shape/terrain bake wraps the user's source in generated
+scaffolding (imports, helper defs, a `def __shape(x):` / `def __cell(...)`
+header, a driver loop), so a raw Python line number points at machine-generated
+text the user never sees. The old `fetchPythonError()` returned just
+`Type: message` with no line at all. Replaced it with
+`formatPythonError(userLineOffset, userLineCount)` (`scripting.cpp`), which:
+- Handles **SyntaxError** (read via the exception's `lineno` attribute) AND
+  **runtime tracebacks** (walked via `tb_lineno`/`tb_next` attribute access —
+  ABI-stable across CPython versions), mapping the generated line back to the
+  user's own 1-based line: `g` is the user's iff
+  `userLineOffset < g <= userLineOffset + userLineCount`, giving
+  `g - userLineOffset`. A no separate `Py_CompileString` pre-check was needed —
+  `PyRun_String` already raises SyntaxError through the same failed-run path, so
+  folding syntax handling into the formatter is the non-duplicative fix.
+- Writes the **full** `traceback.format_exception` stack to `seance.log` (the
+  inline label shows the concise remapped headline `Type: message (line N)`).
+Each bake site computes its offset/count by counting newlines in the generated
+program just before the user's source is appended (`countNewlines`), so the
+mapping is robust to future preamble changes. 8 self-test assertions cover it
+(bare-expr → line 1, multi-line → line 2, SyntaxError, clean program). Self-test
+678/678.
+
 **Remaining staged plan (script-error feature):**
-- **Stage 3 — Python.** Add a `Py_CompileString(code,"<script>",Py_file_input)`
-  syntax pre-check before `PyRun_String` (in `scripting.cpp` bakes), and format
-  runtime tracebacks with `traceback.format_exception` for the offline bake
-  report. Validate on Apply/bake, not per keystroke (Python is heavy).
 - **Stage 4 — GLSL.** On-demand compile-check via `glCompileShader` +
   `glGetShaderInfoLog`, gated to GL-available (degrade gracefully when no GL
   context can be created). Validate on bake, not per keystroke.

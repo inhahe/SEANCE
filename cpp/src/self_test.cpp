@@ -3576,6 +3576,57 @@ static void testBuiltinMath(Report& r) {
         r.check(ok("waveform(\"50% duty\", x)"),        "validate: '%' inside a string literal is ignored");
     }
 
+    // Python bake error reporting (script-error Stage 3). A Python shape bake
+    // wraps the user's source in generated scaffolding, so a raw Python line
+    // number points at machine code the user never sees. formatPythonError()
+    // must map both SyntaxError and runtime-traceback lines back onto the user's
+    // OWN 1-based line, and tag the message with the exception type. Guarded by
+    // pythonAvailable() so the suite still runs on Python-less builds.
+    if (ScriptEngine::pythonAvailable()) {
+        ScriptEngine::instance().init();
+        auto& eng = ScriptEngine::instance();
+        std::vector<float> out;
+
+        // Bare-expression runtime error -> user line 1.
+        {
+            std::string err;
+            bool ok = eng.bakeShapeExpr("1 / 0", /*domainRadians=*/true, 16, out, err);
+            r.check(!ok, "py-error: divide-by-zero bake fails");
+            r.check(err.find("ZeroDivisionError") != std::string::npos,
+                    "py-error: message names ZeroDivisionError");
+            r.check(err.find("(line 1)") != std::string::npos,
+                    "py-error: bare-expr runtime error maps to line 1");
+        }
+
+        // Multi-line runtime error -> user line 2 (the second of the user's lines).
+        {
+            std::string err;
+            bool ok = eng.bakeShapeExpr("a = sin(x)\nreturn a / 0",
+                                        /*domainRadians=*/true, 16, out, err);
+            r.check(!ok, "py-error: multi-line runtime error bake fails");
+            r.check(err.find("(line 2)") != std::string::npos,
+                    "py-error: multi-line runtime error maps to line 2");
+        }
+
+        // Syntax error on the second user line -> reported at line 2.
+        {
+            std::string err;
+            bool ok = eng.bakeShapeExpr("a = 1\nb = = 2\nreturn b",
+                                        /*domainRadians=*/true, 16, out, err);
+            r.check(!ok, "py-error: syntax-error bake fails");
+            r.check(err.find("SyntaxError") != std::string::npos
+                        || err.find("(line 2)") != std::string::npos,
+                    "py-error: syntax error reported (line 2 / SyntaxError)");
+        }
+
+        // A clean program still bakes fine (no false-positive error tagging).
+        {
+            std::string err;
+            bool ok = eng.bakeShapeExpr("sin(x)", /*domainRadians=*/true, 16, out, err);
+            r.check(ok && err.empty(), "py-error: valid program bakes with no error");
+        }
+    }
+
     // Bucket A warp bindings: warpamp(method, x, amount) / warpphase(method,
     // phase, amount) must route to the SAME warpAmpValue/warpPhaseValue primitives
     // (the shared single source of truth), whether the method is given as a numeric

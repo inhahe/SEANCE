@@ -21,16 +21,22 @@
 
 <h2>Layers</h2>
 
-<p>A layer is one shape with three knobs:</p>
+<p>A layer is one wave source with three knobs:</p>
 
 <ul>
-  <li><strong>Shape</strong> — Sine, Saw, Square, Triangle, Noise, Drawn (freehand), or Formula (a typed math expression). Pick from the row of buttons at the top of each layer row.</li>
+  <li><strong>Wave source</strong> — what generates this layer's cycle. Click the layer's <strong>wave-source button</strong> (it shows the current source's name) to open one menu. The top <strong>Custom shapes</strong> section is for shapes you make yourself: <em>Draw your own</em> (freehand), <em>Formula</em> (a typed math expression), <em>Use Library…</em> (pull a single cycle from your project's asset library for this one layer), <em>Save to Library…</em> (publish this layer's current cycle to the asset library), and <em>Unlink from Library</em> (break this layer's live link to a saved waveform while keeping its current cycle — greyed out unless the layer is currently linked). The <strong>Presets</strong> submenu has ready-made starting cycles in two groups: <em>Simple</em> — the param-free basics Sine, Saw, Square, Triangle, Noise (no extra knobs) — and <em>With parameters</em>, the <em>wave-defining generators</em> PWM, Hard Sync, FM, Phase Distortion, where a knob <em>is</em> the wave. A layer has exactly one wave source; picking a new one replaces the old. Choosing a generator reveals its own knob(s) right below (PWM's <em>Duty</em>, FM's <em>Index</em>/<em>Ratio</em>, …), and each of those knobs has its own <strong>Pin</strong> checkbox so you can modulate it live. <strong>Use Library…</strong> shows a <strong>Sync to library</strong> checkbox: leave it on to keep this layer live-linked to the stored waveform (edits to either side flow both ways), or turn it off to drop in a one-time independent copy. (Built-in factory shapes always copy.)</li>
   <li><strong>Harmonic</strong> — what multiple of the root pitch this layer cycles at. 1 means the same as the played note (the fundamental); 2 is one octave up; 3 is one octave + a fifth; higher numbers add brighter overtones. This is how you sculpt timbre — sine layers stacked at integer harmonics give organ-like additive sounds; non-integer harmonics give bell-like inharmonic textures.</li>
-  <li><strong>Phase</strong> — where in its cycle the layer starts (0 to 1). Doesn't matter for a single sine but affects how layers add up — two sines at the same pitch but opposite phase cancel completely; phase shifts between layers reshape the combined waveform.</li>
-  <li><strong>Amplitude</strong> — how loud this layer is in the sum (0 to 1). Use to balance layers against each other.</li>
+  <li><strong>Phase</strong> — where in its cycle the layer starts (0 to 1). Doesn't matter for a single sine but affects how layers add up — two sines at the same pitch but opposite phase cancel completely; phase shifts between layers reshape the combined waveform. Tick the small <strong>Mod</strong> box next to it to drive the phase live from a cable (LFO, envelope, …).</li>
+  <li><strong>Amplitude</strong> — how loud this layer is in the sum (0 to 1). Use to balance layers against each other. Also carries a <strong>Mod</strong> box so you can drive a layer's level live.</li>
 </ul>
 
+<p>Ticking a Phase or Amplitude <strong>Mod</strong> box exposes an input pin on the node so a cable can drive that value live. The slider stays editable — dragging it sets the <em>resting</em> value the modulation swings around — and only greys out (signal-locked) if you wire a <strong>Set</strong> (absolute) cable to the pin, which fully takes over the value; disconnect it or switch the pin to <strong>Mod</strong> to edit by hand again. This works on single- and multi-frame tables alike — the synth re-bakes just that frame as the modulation moves.</p>
+
+<p>A layer reshapes its own cycle only through its <strong>wave source</strong> (a Type-1 generator like Pulse / FM / Phase Distortion). To reshape the combined sound of all layers, use the <strong>Summation Morph</strong> strip below the preview (see <a href="#morphing-shape-bending-warp">Morphing &amp; shape-bending</a> below).</p>
+
 <p>Click <strong>+ Add Layer</strong> to stack more on top. Each new layer defaults to the next harmonic (1, 2, 3, …). Click the <strong>X</strong> on a layer to remove it. The waveform preview at the top updates live as you tweak.</p>
+
+<p>To actually <em>hear</em> the cycle you're building, press the green <strong>Preview</strong> button near the bottom of the editor (every frame editor and capture dialog puts a <strong>Preview</strong> button in the same spot). It sustains a note through the synth's own envelope and volume so you can audition the waveform on its own — even before you've placed it into a wavetable grid. Keep editing while it plays: every change you make is heard live. Click again (it turns red and reads <strong>Stop</strong>) to release the note.</p>
 
 <h3>The Drawn shape</h3>
 
@@ -38,17 +44,54 @@
 
 <h3>The Formula shape</h3>
 
-<p>Pick <em>Formula</em> to type a math expression instead of picking a fixed wave. The expression is evaluated over one cycle in the variable <code>x</code>, which sweeps from 0 to 2π (one full turn), and the result is clamped to the −1…1 range. So <code>sin(x)</code> is a plain sine, <code>tanh(3*sin(x))</code> is a softly-overdriven sine, and <code>sin(x) + 0.3*saw(3*x)</code> adds a third-harmonic sawtooth bite. You have the usual math vocabulary available: <code>sin cos tan sqrt abs exp log floor ceil min max pow clamp saw square triangle noise</code>, plus <code>pi</code> and <code>e</code>.</p>
+<p>Pick <em>Formula</em> to type a math expression instead of picking a fixed wave. The expression is evaluated over one cycle in the variable <code>x</code>, which sweeps from 0 to 2π (one full turn), and the result is clamped to the −1…1 range. So <code>sin(x)</code> is a plain sine, <code>tanh(3*sin(x))</code> is a softly-overdriven sine, and <code>sin(x) + 0.3*saw(3*x)</code> adds a third-harmonic sawtooth bite. You have the usual math vocabulary available: <code>sin cos tan asin acos sinh cosh atan asinh acosh atanh sqrt inversesqrt abs sign exp exp2 log log2 floor ceil round roundEven trunc fract mod min max pow clamp mix step smoothstep fma saw square triangle noise radians degrees</code>, plus <code>pi</code> and <code>e</code>. (These mirror the GLSL shaping functions — the Built-in language covers the complete scalar set of GLSL's trig/exponential/common builtins — so a shape ports cleanly between the Built-in and GLSL languages.) You can also apply the same <em>shape-bending</em> transfers as the Warp strip below right inside a formula: <code>warpamp(method, value, amount)</code> shapes a sample (clip / fold / saturate / …) and <code>warpphase(method, phase, amount)</code> bends a read position, where <code>method</code> is the warp's name or number, <code>amount</code> is 0…1 (0 does nothing), and the method comes first. So <code>warpamp("soft clip", sin(x), 0.8)</code> overdrives a sine with the exact Soft Clip curve the Warp strip uses.</p>
+<p>A formula can also be <strong>more than one line</strong>: build several waves as named pieces and combine them. Put each statement on its own line (or separate them with <code>;</code>), assign with <code>=</code>, and the last line is the result. For example:</p>
+<pre><code>a = sin(x)
+b = 0.5 * sin(3 * x)
+a + b</code></pre>
+<p>makes two oscillators and adds them together — the same idea as adding harmonics inline, but easier to read when you're stacking several. (Lua, Python and GLSL formulas can do this too, using their own local-variable syntax.)</p>
 
-<p>Next to the expression field is a small <strong>language</strong> dropdown with three choices:</p>
+<p>Next to the expression field is a small <strong>language</strong> dropdown with four choices:</p>
 
 <ul>
   <li><strong>Built-in</strong> (default) — SEANCE's own expression language. Fast, always available, and evaluated live.</li>
   <li><strong>Lua</strong> — write the shape as a little Lua program. Handy if you already know Lua or want loops/locals to build up a complex shape. A bare expression like <code>sin(x)</code> works as-is; for a longer program, end it with <code>return &lt;value&gt;</code>.</li>
   <li><strong>Python</strong> — same idea in Python. Generator-style one-liners like <code>sum(0.6**k * sin((k+1)*x) for k in range(6))</code> are a quick way to stack harmonics.</li>
+  <li><strong>GLSL</strong> — write the shape as a GPU compute shader (the body of <code>float shapeValue(float x, float f, int i, int n)</code>). This is the most capable waveshaping option: full GLSL math, the <code>TAU</code> constant, and <code>waveform(id, phase)</code> to sample any of the ~4000 factory waveforms right inside your expression. It runs once on an offscreen GPU context — never while audio plays. Needs a reasonably modern graphics driver (OpenGL 4.3); if yours is too old the option is greyed-out with a tooltip explaining why.</li>
 </ul>
 
-<p>Lua and Python shapes are computed once, in the background, the moment you finish typing — they never run while audio is playing, so they can't cause clicks or dropouts no matter how heavy the math is. If your script has a mistake, a red <em>Script error</em> message appears over the layer preview telling you what went wrong, and the layer stays silent until you fix it. A language that isn't available in your build shows up greyed-out with a tooltip explaining why.</p>
+<p>Lua, Python and GLSL shapes are computed once, in the background, the moment you finish typing — they never run while audio is playing, so they can't cause clicks or dropouts no matter how heavy the math is. If your script has a mistake, a red <em>Script error</em> message appears over the layer preview telling you what went wrong, and the layer stays silent until you fix it. A language that isn't available shows up greyed-out with a tooltip explaining why. The built-in language and Lua always work; <strong>Python is optional</strong> — SEANCE runs fine without it, but the Python option only lights up when a matching Python interpreter is installed (install Python and restart to enable it) — and <strong>GLSL</strong> needs an OpenGL 4.3-capable graphics driver.</p>
+
+<h2>Inharmonic stacks (bells, mallets, metallic tones)</h2>
+
+<p>Stacking sine layers at <em>whole-number</em> harmonics (1, 2, 3, …) gives you organ-like and vocal timbres — the overtones line up into a pitched, "musical" tone. But bells, gongs, chimes, marimbas, and most metallic or struck sounds have overtones that <em>don't</em> line up on whole numbers. That clangy, shimmering quality comes from <strong>inharmonic</strong> partials at ratios like 2.76 or 5.40 times the root.</p>
+
+<p>Press <strong>+ Waveform</strong> and pick <strong>Inharmonic stack (additive)</strong> to make one. You get a list of <strong>partials</strong>, each with three controls:</p>
+
+<ul>
+  <li><strong>Ratio</strong> — the partial's pitch as a multiple of the played note. <em>1</em> is the note itself; <em>2</em> is an octave up; <em>2.76</em> is a non-whole-number overtone that makes the tone bell-like. This is the control that makes the sound inharmonic.</li>
+  <li><strong>Amp</strong> — how loud that partial is (0 to 1).</li>
+  <li><strong>Phase</strong> — where in its cycle the partial starts. Mostly affects the attack character.</li>
+</ul>
+
+<p>Use <strong>+ Partial</strong> to add more (up to 64), the <strong>X</strong> on a row to remove one, and the <strong>Bell</strong> button to drop in a ready-made set of classic bell ratios as a starting point — tweak from there. Press <strong>Preview</strong> to audition it.</p>
+
+<p>Unlike the other waveform kinds, an inharmonic stack isn't a single repeating cycle — the synth plays <em>one sine oscillator per partial, live</em>, each at the note's pitch times its ratio. That's what lets the partials sit at any ratio at all. It plays at the same loudness as the thumbnail shows, blends on the Position axis alongside your other waveforms just like any frame, and never aliases when you play high notes (partials that would go above the audible limit simply drop out).</p>
+
+<h2>Factory waveforms (the built-in library)</h2>
+
+<p>You don't have to build every waveform from scratch. SEANCE ships with a <strong>library of thousands of ready-made single-cycle shapes</strong> — clean geometric waves, cycles sampled from real instruments (pianos, organs, guitars, strings, brass, woodwinds, voice), and a big pile of synthetic and character waves (FM, distorted, chiptune, video-game, and more). They come from the public-domain Adventure Kid Waveforms set.</p>
+
+<p>Press <strong>+ Waveform</strong> and pick <strong>Factory waveform…</strong> to open the browser:</p>
+
+<ul>
+  <li><strong>Categories</strong> run down the left (with an <em>All categories</em> row at the top). Click one to see just its waveforms.</li>
+  <li><strong>Search</strong> at the top filters by name or category — type "oboe", "saw", "bell", etc.</li>
+  <li><strong>Curated only</strong> is a toggle that narrows the list to a hand-picked "best of" subset. Those waveforms are also marked with a gold <strong>★</strong> and sorted to the top of every category, so even with the toggle off the good ones are easy to find. If thousands of choices feels like too much, flip <em>Curated only</em> on and browse a tight, vetted set instead.</li>
+  <li><strong>Click</strong> a waveform to see its shape in the preview at the bottom; <strong>double-click</strong> (or select it and press <strong>Insert</strong>) to add it.</li>
+</ul>
+
+<p>The waveform you pick lands in the <strong>Library</strong> as a normal, fully-editable waveform — it's imported as a hand-drawn (freehand) layer, so you can draw over it, stack more layers on top, bend it with shape-bending (warp), or use it as-is. Like any new library entry it isn't placed in the arrangement yet; drop it into a cell with <strong>Assign to selected cell</strong> or by dragging its row.</p>
 
 <h2>The waveform library</h2>
 
@@ -63,6 +106,8 @@
 </ul>
 
 <p>A newly-created waveform isn't placed in the arrangement yet, so it has no grid position. While it's highlighted but unplaced, the "Selected waveform position" controls are replaced by an <strong>Add to grid</strong> button — click it to drop the waveform into the arrangement (it fills the first empty cell, growing the grid if it's full), and the position controls reappear so you can move it around.</p>
+
+<p>To <strong>replace the highlighted waveform with one from the library</strong>, use the <strong>Use Library…</strong> button on the editor's name/colour row. Because this swaps the <em>whole</em> frame (all its layers), the picker leads with the <strong>frames you've saved</strong> — pick one to drop it in (tick <em>Sync to library</em> to keep it live-linked, so later edits flow both ways). Below a <em>"Start over with a single cycle"</em> divider you'll also find the full factory single-cycle catalog (the <code>AKWF_*</code> shapes); picking one of those starts the frame fresh as a single layer. (The per-layer <em>Use Library…</em> inside the wave-source menu is the other way around — single cycles first — because there a single cycle <em>is</em> the layer.)</p>
 
 <h3>Making one waveform louder or quieter</h3>
 
@@ -117,6 +162,52 @@
 <p>For 3D scatter spaces (or higher, with the projection combo controlling which axes are shown), there's an optional anaglyph 3D rendering mode. Toggle <strong>3D</strong> in the toolbar, put on red/cyan glasses, and the frame positions appear in stereoscopic depth. This is mostly useful as a visualization aid when you're trying to keep track of where many scatter frames sit relative to each other in a 3D-or-higher space.</p>
 
 <p>The IPD, viewing distance, and depth sliders let you tune the stereo for your eyes and screen — average IPD is around 63 mm, typical viewing distance ~60 cm. Adjust depth for more or less dramatic 3D protrusion.</p>
+
+<h2 id="morphing-shape-bending-warp">Morphing &amp; shape-bending (warp)</h2>
+
+<p>SEANCE has two kinds of "morph", and it keeps them separate on purpose:</p>
+
+<ul>
+  <li><strong>Wave-defining morphs</strong> generate the wave itself — <em>PWM, Hard Sync, FM, Phase Distortion</em>. You pick one from the layer's <strong>wave-source</strong> button, under <em>Presets → With parameters</em> (they're grouped there because, unlike a plain Sine or Saw, each carries its own defining knob). A layer has exactly one wave source, and choosing a generator reveals its own knob (PWM's <em>Duty</em>, FM's <em>Index</em>/<em>Ratio</em>, …), each with a <strong>Pin</strong> checkbox to modulate it live.</li>
+  <li><strong>Arbitrary-wave morphs</strong> reshape whatever wave you already have — fold it back on itself, clip it, saturate it for warmth, bend its read position, bitcrush it, and more. These are the <em>warp</em> stages you build with <strong>+ Add</strong>.</li>
+</ul>
+
+<p>A warp chain shows up as the <strong>Summation Morph</strong> strip below the preview, which reshapes the combined sound of all the layers. (A layer reshapes <em>its own</em> cycle only through its wave source — a Type-1 generator like Pulse / FM / Phase Distortion; there's no separate per-layer warp chain.) <strong>The Summation Morph belongs to the frame you're editing</strong> — each frame keeps its own chain, so in a multi-frame table you can give one frame a soft clip and another a fold, and they shape themselves independently before the Position knob blends between them. Press <strong>+ Add</strong> to put a stage on the chain. Each stage has:</p>
+
+<ul>
+  <li>A <strong>checkbox</strong> to switch it on or off without deleting it.</li>
+  <li>A <strong>method button</strong> — click it to pick the effect. The menu is grouped by kind, and the higher-quality picks have a <strong>★ star</strong>.</li>
+  <li>An <strong>amount</strong> slider from 0 (no effect) to 1 (full).</li>
+  <li>A <strong>Pin</strong> checkbox — see below.</li>
+  <li><strong>▲ / ▼ arrows</strong> to move the stage earlier or later in the chain.</li>
+  <li>An <strong>X</strong> to remove it.</li>
+</ul>
+
+<p><strong>The order of the stages is part of the sound.</strong> Folding and <em>then</em> clipping a wave gives a different result than clipping and then folding, so the chain runs top-to-bottom and the ▲ / ▼ arrows let you rearrange it until it sounds right. You can stack as many stages as you like — two or three is plenty for most sounds.</p>
+
+<p>The real magic is that each stage's <strong>amount is something you can modulate</strong>. Tick the stage's <strong>Pin</strong> checkbox (it used to be called "Mod") to give that amount a control input on the synth node, then wire an <strong>LFO, oscillator, or envelope</strong> into it — now the waveform's shape <em>moves</em> as a note plays, the way a sweeping filter does but on the waveform itself. Leave Pin unchecked and the stage costs nothing extra (it's baked into the wave). (If you reorder a stage you've wired up, the modulation follows that stage to its new spot, so you don't have to re-wire anything.) The same <strong>Pin</strong> checkbox also sits next to each layer's <em>Phase</em> and <em>Amplitude</em> sliders — and, for a generator layer, next to its extra knob (PWM <em>Duty</em>, FM <em>Index</em>/<em>Ratio</em>, …): tick one and a cable can sweep that value live. This works on single- and multi-frame tables alike — the synth re-bakes just the frame being modulated.</p>
+
+<p>Not sure where to start? The Summation Morph's library row has a <strong>status label</strong> (showing whether the chain is independent or linked to a saved morph) and three buttons: <strong>Unlink</strong>, <strong>Use Library…</strong>, and <strong>Save to Library</strong>. <strong>Use Library…</strong> opens a picker listing <strong>built-in starter chains</strong> — Warm Saturation, West Coast Fold, Lo-Fi Crush, and more — that drop a ready-made stack into the editor you can then tweak, plus any morphs you've saved yourself. Every entry in the picker loads a chain, so you always get something. Saved morphs offer a <strong>Sync to library</strong> checkbox: on, the chain stays live-linked (edits flow both ways); off, you get a one-time independent copy. (Built-in starter chains always copy.) <strong>Unlink</strong> breaks an existing live link while keeping the current chain as your own independent copy (greyed out unless the morph is currently linked). These live in your project's <em>Asset Library</em> too (under <em>Morph Algorithms</em>, marked with a ★), right alongside any chains you <strong>Save to Library</strong> yourself to reuse across frames.</p>
+
+<p>One note: <strong>captured (granular) waveforms and inharmonic stacks</strong> only offer the value-shaping warps (clip, fold, saturate, …), not the read-position ones — those play as a live, continuous stream, so there's no fixed cycle position to bend.</p>
+
+<h2>Shaping how each note fades in and out (the envelope)</h2>
+
+<p>A wavetable defines <em>what</em> a single cycle sounds like; the <strong>amplitude envelope</strong> defines how each note swells in and dies away when you play it. Click the <strong>Envelope…</strong> button in the wavetable editor's top toolbar (it opens in its own window) to set the Attack, Hold, Decay, Sustain and Release of the synth — short Attack for a plucky stab, long Attack and Release for a slow pad.</p>
+
+<p>Each of the three ramps (Attack, Decay, Release) has a <strong>curve knob</strong> right under the sliders: leave it centred for a straight line, turn it <em>right</em> for a slow start that speeds up (the classic "exponential" feel), or <em>left</em> for a fast start that eases out. Double-click a curve knob to snap it back to straight. It's one knob that bends the whole shape — you almost never need the deeper <em>…Curve…</em> editors beside it. The little preview at the top of the envelope window updates as you turn the knobs, so you can see the shape you're making. (The same Envelope… button lives in the Frequency-Domain editor, and every tonal synth node also has it on its right-click menu.)</p>
+
+<h2>One fixed timbre? Use a single-cycle oscillator instead</h2>
+
+<p>Everything above is about building a <em>wavetable</em> — several cycles the synth morphs between. But sometimes you just want <em>one</em> waveform, authored your favourite way, played as a plain oscillator with no morphing. For that, each of these ways to build a single cycle is also available as its own instrument node: <strong>Layered</strong>, <strong>Spectral</strong> (frequency-domain), <strong>Wavelet Space</strong>, <strong>Inharmonic</strong>, and <strong>Granular</strong>. Add one from the node menu just like any other instrument.</p>
+
+<p>These open a <strong>focused editor</strong> — the same authoring surface as the matching wavetable frame type, minus the wavetable-only parts (no Library/Cells panels, no Position morph, no "number of waveforms"). You still get a <strong>Gain</strong> control, a <strong>Preview</strong> button, the <strong>Envelope…</strong> button (the same Attack/Hold/Decay/Sustain/Release shape described above), and the <strong>Morph</strong> (shape-bending) panel. Reach for these when you want one solid timbre; reach for the full Waveform synth when you want that timbre to <em>move</em>.</p>
+
+<p>Want to turn a <em>recording</em> into one repeating cycle? Add a <strong>Granular</strong> node, capture some audio into it (capture from song, mic, or file), and set its <strong>Freeze mode</strong> to <strong>Single cycle</strong>. It detects one pitch period in the recording and loops just that cycle — a clean single-cycle oscillator built from your own sound. (This replaced an old "Sample" oscillator that never had working capture.)</p>
+
+<h2>Bending a sound on the wire — the Waveshaper effects</h2>
+
+<p>The same shape-bending curves you can apply inside a wavetable frame (Soft Clip, Wavefold, Tube Saturate, Bitcrush, and so on) are also available as standalone <strong>Waveshaper (amplitude morph)</strong> effect nodes — one per curve, found in the node menu. Drop one anywhere in your signal chain and turn its single knob to dial in the amount. It's the same math as the in-frame morph, so a sound you shape inside a wavetable and one you shape on the wire come out identical — handy when you want to add grit or fold to a whole mix rather than to one instrument's waveform.</p>
 
 <h2>Workflow tips</h2>
 

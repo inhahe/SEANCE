@@ -25,8 +25,15 @@ public:
     // view), false for undo snapshots (so undoing graph edits doesn't
     // also fling the user's viewport around). Defaults to true so all
     // existing call sites get the save-style behaviour.
+    //
+    // includeBlobs controls whether the content-addressed [Blob] store
+    // (baked terrain grids etc.) is written. True for file saves (the bytes
+    // must be on disk to reload), false for undo snapshots (the hash travels
+    // in node.script; the bytes stay in the live in-memory store across
+    // undo/redo, so duplicating them into every snapshot would bloat undo).
     static bool writeProject(std::ostream& out, NodeGraph& graph,
-                             GraphProcessor* gp, bool includeView = true);
+                             GraphProcessor* gp, bool includeView = true,
+                             bool includeBlobs = true);
     static bool readProject(std::istream& in, NodeGraph& graph, PluginHost* pluginHost);
 
     // Convenience: serialize the graph to a string with NO plugin state.
@@ -40,6 +47,14 @@ public:
     // restore.
     static bool loadFromString(const std::string& text, NodeGraph& graph,
                                PluginHost* pluginHost = nullptr);
+
+    // Export the project's asset library (or a selected subset, expanded to its
+    // dependency closure) to a standalone library-export file. The output is a
+    // minimal project file carrying only [AssetStore] sections, so importing it
+    // reuses the same readProject + merge path as importing a full session.
+    // selectedIds empty = export every asset. Does NOT touch currentPath.
+    static bool exportAssets(const std::string& path, const AssetLibrary& lib,
+                             const std::vector<int>& selectedIds = {});
 
     // Current project path (empty = untitled)
     static std::string currentPath;

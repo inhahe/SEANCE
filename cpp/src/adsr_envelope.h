@@ -46,7 +46,40 @@ struct AHDSREnvelope {
     SpectralCurve decayCurve;
     SpectralCurve releaseCurve;
 
+    // Per-segment "tension" (curve-bend) controls, each in [-1, 1], 0 =
+    // no bend. This is the single-linear-knob way to reshape a ramp,
+    // matching how hardware/virtual-analog ADSRs expose one "curve" knob
+    // per stage instead of a full curve editor. Tension warps the TIME
+    // axis of the segment's SpectralCurve when it is baked:
+    //   T = 0  -> curve sampled uniformly (exactly as authored)
+    //   T > 0  -> "slow start": the ramp lingers near its start value
+    //             then accelerates (ease-in / classic exponential attack)
+    //   T < 0  -> "fast start": the ramp jumps early then eases into its
+    //             end value (ease-out / logarithmic)
+    // Because it warps the *input* of evaluate() rather than replacing the
+    // curve, a custom freehand/equation shape and a tension setting compose:
+    // tension bends the timing of whatever shape the curve editor holds, and
+    // tension 0 leaves any authored curve untouched. The exact warp is
+    // tensionWarp() below.
+    float attackTension  = 0.0f;
+    float decayTension   = 0.0f;
+    float releaseTension = 0.0f;
+
     AHDSREnvelope();
+
+    // The curve-bend time warp shared by baking and preview. Maps a
+    // normalized position t in [0,1] to a warped position in [0,1] given
+    // a tension in [-1,1]. tension 0 is the identity. Monotonic and
+    // pins the endpoints (warp(0)=0, warp(1)=1) so segment start/end
+    // levels are preserved regardless of bend.
+    static float tensionWarp(float t, float tension);
+
+    // Evaluate one segment curve to N samples WITH its tension applied
+    // (the time-warp above). This is the single source of truth used by
+    // both AHDSRCurveTables baking and the editor preview, so they always
+    // agree. tension 0 is identical to curve.evaluate(N).
+    static std::vector<float> bakeSegment(const SpectralCurve& curve,
+                                          float tension, int N);
 
     // Default-construct curves so they hold the standard linear shapes
     // even before the user touches them. Without this every fresh

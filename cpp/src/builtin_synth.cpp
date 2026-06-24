@@ -1,6 +1,8 @@
 #include "builtin_synth.h"
 #include "fft_util.h"
 #include "music_theory.h"
+#include "waveform_bank.h"
+#include "warp.h"
 #include <cstring>
 #include <cstdio>
 #include <algorithm>
@@ -354,6 +356,23 @@ struct ExprParser {
         return true;
     }
 
+    // Parse the first argument of a warp*() call: either a quoted method NAME
+    // literal ("softclip", "bend+", ...) resolved via warpMethodFromName, or a
+    // numeric WarpMethod id. Leaves pos just after the argument (before the
+    // comma). Mirrors the waveform() id/name parsing.
+    WarpMethod parseWarpMethodArg() {
+        skipWS();
+        if (*pos == '"' || *pos == '\'') {
+            char quote = *pos++;
+            const char* start = pos;
+            while (*pos != '\0' && *pos != quote) pos++;
+            std::string nm(start, pos - start);
+            if (*pos == quote) pos++;            // consume closing quote
+            return warpMethodFromName(nm.c_str());
+        }
+        return (WarpMethod)(int)std::lround(parseTernary());
+    }
+
     // Match a bare keyword (no trailing '('): identifier that exactly equals
     // `name` and is followed by a non-identifier character. Advances pos on
     // success.
@@ -409,6 +428,34 @@ struct ExprParser {
         if (matchFunc("floor"))    { float v = parseTernary(); skipWS(); if (*pos == ')') pos++; return std::floor(v); }
         if (matchFunc("ceil"))     { float v = parseTernary(); skipWS(); if (*pos == ')') pos++; return std::ceil(v); }
 
+        // GLSL-parity single-arg scalar math (added so the Builtin language shares
+        // a vocabulary with the GLSL shape/terrain dialect). All pure and
+        // allocation-free, so they're real-time safe in the Script node too.
+        if (matchFunc("asin"))        { float v = parseTernary(); skipWS(); if (*pos == ')') pos++; return std::asin(std::clamp(v, -1.0f, 1.0f)); }
+        if (matchFunc("acos"))        { float v = parseTernary(); skipWS(); if (*pos == ')') pos++; return std::acos(std::clamp(v, -1.0f, 1.0f)); }
+        if (matchFunc("sinh"))        { float v = parseTernary(); skipWS(); if (*pos == ')') pos++; return std::sinh(v); }
+        if (matchFunc("cosh"))        { float v = parseTernary(); skipWS(); if (*pos == ')') pos++; return std::cosh(v); }
+        if (matchFunc("sign"))        { float v = parseTernary(); skipWS(); if (*pos == ')') pos++; return float((v > 0.0f) - (v < 0.0f)); }
+        if (matchFunc("fract"))       { float v = parseTernary(); skipWS(); if (*pos == ')') pos++; return v - std::floor(v); }
+        if (matchFunc("round"))       { float v = parseTernary(); skipWS(); if (*pos == ')') pos++; return std::round(v); }
+        if (matchFunc("trunc"))       { float v = parseTernary(); skipWS(); if (*pos == ')') pos++; return std::trunc(v); }
+        if (matchFunc("radians"))     { float v = parseTernary(); skipWS(); if (*pos == ')') pos++; return v * 0.01745329252f; }
+        if (matchFunc("degrees"))     { float v = parseTernary(); skipWS(); if (*pos == ')') pos++; return v * 57.2957795131f; }
+        if (matchFunc("inversesqrt")) { float v = parseTernary(); skipWS(); if (*pos == ')') pos++; return v > 0.0f ? 1.0f / std::sqrt(v) : 0.0f; }
+        if (matchFunc("exp2"))        { float v = parseTernary(); skipWS(); if (*pos == ')') pos++; return std::exp2(v); }
+        if (matchFunc("log2"))        { float v = parseTernary(); skipWS(); if (*pos == ')') pos++; return v > 0.0f ? std::log2(v) : 0.0f; }
+        if (matchFunc("asinh"))       { float v = parseTernary(); skipWS(); if (*pos == ')') pos++; return std::asinh(v); }
+        if (matchFunc("acosh"))       { float v = parseTernary(); skipWS(); if (*pos == ')') pos++; return std::acosh(std::max(1.0f, v)); }       // domain [1,inf)
+        if (matchFunc("atanh"))       { float v = parseTernary(); skipWS(); if (*pos == ')') pos++; return std::atanh(std::clamp(v, -0.999999f, 0.999999f)); } // domain (-1,1)
+        if (matchFunc("roundEven"))   { float v = parseTernary(); skipWS(); if (*pos == ')') pos++; return std::nearbyint(v); } // round half to even
+        // atan is overloaded: atan(y) or atan(y, x) (=atan2), matching GLSL.
+        if (matchFunc("atan")) {
+            float y = parseTernary(); skipWS();
+            if (*pos == ',') { pos++; float xx = parseTernary(); skipWS(); if (*pos == ')') pos++; return std::atan2(y, xx); }
+            if (*pos == ')') pos++;
+            return std::atan(y);
+        }
+
         // Range converters and unipolar trig aliases. Control signals on the
         // wire are unipolar 0..1, but sin/cos/tan (and saw/square/triangle/
         // noise) return bipolar -1..1, so a bare sin() clips its negative half
@@ -459,6 +506,63 @@ struct ExprParser {
         if (matchFunc("shape")) {
             float p = parseTernary(); skipWS(); if (*pos == ')') pos++;
             return (shapeFn && *shapeFn) ? (*shapeFn)(p) : 0.0f;
+        }
+
+        // waveform("name", phase) — read one of the ~4000 built-in factory
+        // single-cycle waveforms at a normalised phase in [0,1) (wraps), linearly
+        // interpolated, returning the raw sample in [-1,1]. The first argument is
+        // a quoted waveform NAME (resolved against the WaveformBank by name, NOT
+        // a note-name pitch like the bare string literal would be), or a numeric
+        // entry index for power users. An unknown name / out-of-range index reads
+        // as silence (0). The name lookup is case-insensitive. This is the same
+        // waveform() helper every generator language exposes, so a Builtin terrain
+        // and a Lua/Python/GLSL one read the bank identically.
+        if (matchFunc("waveform")) {
+            int id = -1;
+            skipWS();
+            if (*pos == '"' || *pos == '\'') {
+                char quote = *pos++;
+                const char* start = pos;
+                while (*pos != '\0' && *pos != quote) pos++;
+                std::string nm(start, pos - start);
+                if (*pos == quote) pos++;          // consume closing quote
+                auto& bank = WaveformBank::get();
+                bank.ensureLoaded();
+                id = bank.indexForName(nm);
+            } else {
+                id = (int)std::lround(parseTernary());  // numeric entry index
+            }
+            skipWS(); if (*pos == ',') pos++;
+            float ph = parseTernary();
+            skipWS(); if (*pos == ')') pos++;
+            return WaveformBank::get().sampleAtPhase(id, ph);
+        }
+
+        // warpamp(method, x, amount) / warpphase(method, phase, amount) — the
+        // wavetable shape-bending ("warp") algorithms exposed as pure scalar
+        // functions, routed to the SAME warpAmpValue/warpPhaseValue primitives the
+        // Layered Wave editor and synth voice use (so an in-formula clip/fold/bend
+        // matches the node bit-for-bit). The first arg is a method NAME literal
+        // ("softclip", "wavefold", "bend+", ...) or a numeric WarpMethod id;
+        // `amount` is the 0..1 morph knob (0 = identity). amp shapes a sample value
+        // in [-1,1]; phase remaps a read position in [0,1).
+        if (matchFunc("warpamp")) {
+            WarpMethod m = parseWarpMethodArg();
+            skipWS(); if (*pos == ',') pos++;
+            float xx = parseTernary();
+            skipWS(); if (*pos == ',') pos++;
+            float amt = parseTernary();
+            skipWS(); if (*pos == ')') pos++;
+            return warpAmpValue(m, xx, amt);
+        }
+        if (matchFunc("warpphase")) {
+            WarpMethod m = parseWarpMethodArg();
+            skipWS(); if (*pos == ',') pos++;
+            float ph = parseTernary();
+            skipWS(); if (*pos == ',') pos++;
+            float amt = parseTernary();
+            skipWS(); if (*pos == ')') pos++;
+            return warpPhaseValue(m, ph, amt);
         }
 
         // notefreq(note) — frequency in Hz of a MIDI note, using the PROJECT
@@ -526,6 +630,38 @@ struct ExprParser {
             float hi = parseTernary();
             skipWS(); if (*pos == ')') pos++;
             return std::clamp(v, lo, hi);
+        }
+
+        // GLSL-parity multi-arg scalar math (mod/step/mix/smoothstep), same
+        // semantics as the GLSL dialect. Pure and allocation-free.
+        if (matchFunc("mod")) {                // mod(a, b) = a - b*floor(a/b)
+            float a = parseTernary(); skipWS(); if (*pos == ',') pos++;
+            float b = parseTernary(); skipWS(); if (*pos == ')') pos++;
+            return b != 0.0f ? a - b * std::floor(a / b) : 0.0f;
+        }
+        if (matchFunc("step")) {               // step(edge, x) = x < edge ? 0 : 1
+            float edge = parseTernary(); skipWS(); if (*pos == ',') pos++;
+            float xx = parseTernary(); skipWS(); if (*pos == ')') pos++;
+            return xx < edge ? 0.0f : 1.0f;
+        }
+        if (matchFunc("mix")) {                // mix(a, b, t) = a + (b-a)*t (lerp)
+            float a = parseTernary(); skipWS(); if (*pos == ',') pos++;
+            float b = parseTernary(); skipWS(); if (*pos == ',') pos++;
+            float t = parseTernary(); skipWS(); if (*pos == ')') pos++;
+            return a + (b - a) * t;
+        }
+        if (matchFunc("smoothstep")) {         // smoothstep(e0, e1, x)
+            float e0 = parseTernary(); skipWS(); if (*pos == ',') pos++;
+            float e1 = parseTernary(); skipWS(); if (*pos == ',') pos++;
+            float xx = parseTernary(); skipWS(); if (*pos == ')') pos++;
+            float t = (e1 != e0) ? std::clamp((xx - e0) / (e1 - e0), 0.0f, 1.0f) : 0.0f;
+            return t * t * (3.0f - 2.0f * t);
+        }
+        if (matchFunc("fma")) {                // fma(a, b, c) = a*b + c
+            float a = parseTernary(); skipWS(); if (*pos == ',') pos++;
+            float b = parseTernary(); skipWS(); if (*pos == ',') pos++;
+            float c = parseTernary(); skipWS(); if (*pos == ')') pos++;
+            return std::fma(a, b, c);
         }
         if (matchFunc("if")) {
             float cond = parseTernary();
@@ -752,8 +888,18 @@ struct ExprParser {
     // the value of the last statement (0 for an empty program).
     float runProgram() {
         pos = str;
-        x = 0.0f;
-        f = 0.0f;
+        // Seed the reserved `x`/`f` free variables from the bound vars if the
+        // caller supplied them (shape/curve bakes pass the sweep position as
+        // `x`, so `sin(x)` works in a multi-statement program exactly as it
+        // does in a single expression). MIDI programs that don't bind `x`/`f`
+        // get the historical default of 0.
+        auto seed = [this](const char* name, float def) -> float {
+            if (extraVars) { auto it = extraVars->find(name); if (it != extraVars->end()) return it->second; }
+            if (stateVars) { auto it = stateVars->find(name); if (it != stateVars->end()) return it->second; }
+            return def;
+        };
+        x = seed("x", 0.0f);
+        f = seed("f", 0.0f);
         float last = 0.0f;
         skipSeparators();
         while (*pos != '\0') {

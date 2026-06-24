@@ -181,6 +181,23 @@ MidiScriptEditorComponent::MidiScriptEditorComponent(NodeGraph& g, int nid,
     outCountEditor.setTooltip("Number of independent MIDI output pins (1..16). Route emits\n"
                               "to a pin by setting `out = k` (0-based) in the program.");
 
+    addAndMakeVisible(midiInLabel);
+    addAndMakeVisible(midiInEditor);
+    midiInEditor.setInputRestrictions(2, "0123456789");
+    midiInEditor.setText(juce::String(doc.midiInputCount), juce::dontSendNotification);
+    midiInEditor.onTextChange = [this]() {
+        int n = juce::jlimit(0, 16, midiInEditor.getText().getIntValue());
+        if (n != doc.midiInputCount) {
+            doc.midiInputCount = n;
+            syncPins();
+            commitToNode();
+        }
+    };
+    midiInEditor.setTooltip("Number of MIDI input pins. 0 = none (note/vel/gate stay\n"
+                            "idle); 1 = a single MIDI In. With >1 you get MIDI In 1..N,\n"
+                            "and pollmidi()/midievent() tell you which input each event\n"
+                            "arrived on (1-based). 0..16.");
+
     addAndMakeVisible(shapeLabel);
     {
         LayerStackComponent::Options lsOpts;
@@ -296,18 +313,33 @@ bool MidiScriptEditorComponent::syncPins() {
     if (!nd) return false;
     bool changed = false;
 
-    // ---- Inputs: "MIDI In" + N Signal pins (preserve ids by name) ----
+    // ---- Inputs: MIDI In pin(s) + N Signal pins (preserve ids by name) ----
+    // 0 = none, 1 = a single "MIDI In", >1 = "MIDI In 1..N".
     {
+        const int midiInCount = juce::jlimit(0, 16, doc.midiInputCount);
         std::vector<Pin> rebuilt;
-        rebuilt.reserve(1 + doc.signalInputCount);
+        rebuilt.reserve(midiInCount + doc.signalInputCount);
 
-        int midiPinId = -1;
-        for (auto& p : nd->pinsIn)
-            if (p.kind == PinKind::Midi) { midiPinId = p.id; break; }
-        if (midiPinId < 0) midiPinId = graph.allocId();
-        Pin midiIn; midiIn.id = midiPinId; midiIn.name = "MIDI In";
-        midiIn.kind = PinKind::Midi; midiIn.isInput = true;
-        rebuilt.push_back(midiIn);
+        // Preserve existing MIDI-input pin ids by name so cables survive a
+        // count change. Look up by the name we're about to assign.
+        auto findMidiId = [&](const std::string& name) -> int {
+            for (auto& p : nd->pinsIn)
+                if (p.kind == PinKind::Midi && p.name == name) return p.id;
+            return -1;
+        };
+        auto pushMidiIn = [&](const std::string& name) {
+            int id = findMidiId(name);
+            if (id < 0) id = graph.allocId();
+            Pin mi; mi.id = id; mi.name = name;
+            mi.kind = PinKind::Midi; mi.isInput = true;
+            rebuilt.push_back(mi);
+        };
+        if (midiInCount == 1) {
+            pushMidiIn("MIDI In");
+        } else {
+            for (int i = 0; i < midiInCount; ++i)
+                pushMidiIn("MIDI In " + std::to_string(i + 1));
+        }
 
         for (int i = 0; i < doc.signalInputCount; ++i) {
             std::string name = "s" + std::to_string(i + 1);
@@ -365,8 +397,11 @@ void MidiScriptEditorComponent::resized() {
         sigCountLabel.setBounds(row.removeFromLeft(150));
         sigCountEditor.setBounds(row.removeFromLeft(50));
         row.removeFromLeft(20);
-        outCountLabel.setBounds(row.removeFromLeft(100));
+        outCountLabel.setBounds(row.removeFromLeft(90));
         outCountEditor.setBounds(row.removeFromLeft(50));
+        row.removeFromLeft(20);
+        midiInLabel.setBounds(row.removeFromLeft(80));
+        midiInEditor.setBounds(row.removeFromLeft(50));
         r.removeFromBottom(8);
     }
 

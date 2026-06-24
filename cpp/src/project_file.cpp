@@ -1,5 +1,10 @@
 #include "project_file.h"
+#include "asset_import.h"
+#include "warp.h"           // seedBuiltinMorphLibrary, isBuiltinMorphAssetId
+#include "spectrum_tap.h"   // resolveSpectrumTapReferences (FrequencyGraph refs)
+#include "spectral_editor.h"  // resolveSpectralReferences (FrequencyGraph refs)
 #include <juce_core/juce_core.h>
+#include <functional>
 #include <fstream>
 #include <sstream>
 #include <cstdio>
@@ -28,6 +33,40 @@ static void writeFloat(std::ostream& f, const std::string& key, float val) {
     f << key << "=" << val << "\n";
 }
 
+// Emit one [AssetStore] section. Shared by writeProject (full save) and
+// exportAssets (library export) so the on-disk asset format has a single
+// source of truth. The opaque payload is base64-encoded so arbitrary bytes
+// (including newlines) survive the line-based format; the content hash is
+// written verbatim and trusted on load (mirroring [Blob]).
+static void writeAssetEntry(std::ostream& f, const AssetEntry& a) {
+    f << "\n[AssetStore]\n";
+    writeInt(f, "id", a.id);
+    writeStr(f, "kind", assetKindTag(a.kind));
+    writeStr(f, "name", a.name);
+    if (!a.subType.empty()) writeStr(f, "subType", a.subType);
+    writeStr(f, "hash", a.contentHash);
+    if (a.archived) writeInt(f, "archived", 1);
+    if (a.starred)  writeInt(f, "starred", 1);
+    juce::String b64 = juce::Base64::toBase64(a.payload.data(),
+                                              (int) a.payload.size());
+    writeStr(f, "payload", b64.toStdString());
+}
+
+// Collect content-store blob hashes referenced by a node script. A reference is
+// the trailing '#<hash>' field of a __generate__ script (and, in future, any
+// other blob-backed node tag). Used at save time so writeProject emits only the
+// blobs the current graph still references - orphans created by this session's
+// edits (each Edit Source bakes a new hash) are pruned from the file. The live
+// in-memory store keeps every blob so undo/redo can still resolve old hashes.
+static void collectBlobHashes(const std::string& script, std::set<std::string>& out) {
+    if (script.rfind("__generate__:", 0) != 0) return;
+    size_t bar = script.rfind('|');
+    if (bar == std::string::npos || bar + 2 > script.size()) return;
+    if (script[bar + 1] != '#') return;
+    std::string hash = script.substr(bar + 2);
+    if (!hash.empty()) out.insert(hash);
+}
+
 bool ProjectFile::save(const std::string& path, NodeGraph& graph, GraphProcessor* gp) {
     std::ofstream f(path);
     if (!f) {
@@ -42,8 +81,52 @@ bool ProjectFile::save(const std::string& path, NodeGraph& graph, GraphProcessor
     return ok;
 }
 
+bool ProjectFile::exportAssets(const std::string& path, const AssetLibrary& lib,
+                               const std::vector<int>& selectedIds) {
+    std::ofstream f(path);
+    if (!f) {
+        fprintf(stderr, "Failed to export asset library: %s\n", path.c_str());
+        return false;
+    }
+    // A library export is just a minimal project file carrying an [AssetStore]
+    // closure - the importer reuses the exact same readProject + merge path it
+    // uses for a full session, so there is one import code path, not two. The
+    // marker key lets a reader tell an export apart from a full project if needed.
+    f << "[Project]\n";
+    writeStr(f, "assetLibraryExport", "1");
+
+    // Expand the selection to its dependency closure (identity for leaves today;
+    // see assetChildIds). Empty selection = export every entry.
+    std::set<int> want;
+    if (!selectedIds.empty()) {
+        std::function<void(int)> expand = [&](int id) {
+            if (want.count(id)) return;
+            const AssetEntry* e = lib.find(id);
+            if (!e) return;
+            want.insert(id);
+            for (int child : assetChildIds(*e)) expand(child);
+        };
+        for (int id : selectedIds) expand(id);
+    }
+
+    int count = 0;
+    for (const auto& a : lib.all()) {
+        if (!selectedIds.empty() && !want.count(a.id)) continue;
+        // Built-in morph chains are code-owned and seeded into every project, so
+        // exporting them is meaningless boilerplate (the destination already has
+        // them). Skip, matching writeProject.
+        if (a.kind == AssetKind::MorphAlgorithm && isBuiltinMorphAssetId(a.id))
+            continue;
+        writeAssetEntry(f, a);
+        ++count;
+    }
+    fprintf(stderr, "Exported %d asset(s) to: %s\n", count, path.c_str());
+    return true;
+}
+
 bool ProjectFile::writeProject(std::ostream& f, NodeGraph& graph,
-                               GraphProcessor* gp, bool includeView) {
+                               GraphProcessor* gp, bool includeView,
+                               bool includeBlobs) {
 
     f << "[Project]\n";
     writeFloat(f, "bpm", graph.bpm);
@@ -97,6 +180,27 @@ bool ProjectFile::writeProject(std::ostream& f, NodeGraph& graph,
             ids += std::to_string(lid);
         }
         if (!ids.empty()) writeStr(f, "linkIds", ids);
+    }
+
+    // Project-level asset library ("stores"). Each entry is one reusable asset
+    // (waveform/generator, instrument, ADHSR curve, or morph algorithm) keyed by
+    // a stable user id. Written into undo snapshots too (store edits are project
+    // state and must be undoable) - the payloads are encoded bodies, generally
+    // small. The opaque payload is base64-encoded so arbitrary content (including
+    // newlines) survives the line-based format. The content hash is saved and
+    // trusted on load (not recomputed), mirroring [Blob]. Archived (soft-deleted)
+    // entries are persisted too so existing references stay resolvable.
+    //
+    // EXCEPTION: the curated built-in morph chains are code-owned (seeded into
+    // every project by seedBuiltinMorphLibrary) and must NOT be written - that
+    // keeps project files free of boilerplate and lets the built-ins improve
+    // across app versions. They are re-seeded on load, so skipping them here is
+    // safe. (Frames never live-reference a built-in - the picker copies a
+    // built-in to an Independent chain - so this never orphans a reference.)
+    for (const auto& a : graph.assets.all()) {
+        if (a.kind == AssetKind::MorphAlgorithm && isBuiltinMorphAssetId(a.id))
+            continue;
+        writeAssetEntry(f, a);
     }
 
     writeInt(f, "nextId", 0);
@@ -159,6 +263,17 @@ bool ProjectFile::writeProject(std::ostream& f, NodeGraph& graph,
         // 300ms / velSens=1) — we want those defaults to persist exactly across
         // save/load rather than relying on the constructor at load time.
         writeStr(f, "ahdsrEnvelope", node.ahdsrEnvelope.encode());
+        // Live reference to a project asset-library AHDSR curve (-1 = none).
+        if (node.ahdsrAssetId >= 0) writeInt(f, "ahdsrAssetId", node.ahdsrAssetId);
+        // Additional per-component AHDSR envelopes (FM operators etc.). Saved
+        // only when present so non-FM nodes stay clean. Count first, then one
+        // encoded line per envelope keyed opEnvelope0..N.
+        if (!node.opEnvelopes.empty()) {
+            writeInt(f, "opEnvelopeCount", (int)node.opEnvelopes.size());
+            for (size_t i = 0; i < node.opEnvelopes.size(); ++i)
+                writeStr(f, "opEnvelope" + std::to_string(i),
+                         node.opEnvelopes[i].encode());
+        }
         if (node.aftertouchSensitivity != 0.5f)
             writeFloat(f, "aftertouchSensitivity", node.aftertouchSensitivity);
         writeInt(f, "pluginIndex", node.pluginIndex);
@@ -246,6 +361,21 @@ bool ProjectFile::writeProject(std::ostream& f, NodeGraph& graph,
             writeFloat(f, "min", param.minVal);
             writeFloat(f, "max", param.maxVal);
             writeStr(f, "format", param.format);
+            // Warp-slot key (unified warp/morph). Only emitted for warp params so
+            // ordinary params stay unchanged; absent => -1 (not a warp param).
+            if (param.warpSlot >= 0) writeInt(f, "warpSlot", param.warpSlot);
+            // Warp scope: which chain the slot indexes. Only emitted for per-
+            // layer warp params (>=0); absent => -1 (frame-scope / not a warp).
+            // Also used as the layer index for layer-field (phase/amp) params.
+            if (param.warpLayer >= 0) writeInt(f, "warpLayer", param.warpLayer);
+            // Per-layer field key (0=phase, 1=amplitude). Only emitted for
+            // layer-field modulation params; absent => -1 (not a layer field).
+            if (param.layerField >= 0) writeInt(f, "layerField", param.layerField);
+            // Owning wavetable frame (library id) for warp / layer-field params.
+            // Only emitted when set (>=0); absent => -1 (legacy whole-node, the
+            // pre-per-frame layout). Lets two frames carry the same warp op
+            // without their modulation params colliding on (warpLayer,warpSlot).
+            if (param.warpFrameId >= 0) writeInt(f, "warpFrameId", param.warpFrameId);
             for (auto& ap : param.automation.points)
                 f << "auto=" << ap.beat << "," << ap.value << "\n";
         }
@@ -390,6 +520,29 @@ bool ProjectFile::writeProject(std::ostream& f, NodeGraph& graph,
         writeInt(f, "activeEditor", graph.activeEditorNodeId);
     }
 
+    // Content-addressed blob store (baked terrain grids; later decoded video /
+    // wavetable PCM). Written on real saves but NOT into undo snapshots
+    // (serializeForUndo passes includeBlobs=false): the snapshot carries the
+    // hash inside node.script, and on undo/redo the bytes come from the live
+    // in-memory store. Only emit blobs the current graph references, pruning
+    // session orphans (each Edit Source bakes a new hash; the old one is dropped
+    // from the file but kept in memory for undo).
+    if (includeBlobs) {
+        std::set<std::string> referenced;
+        for (auto& node : graph.nodes)
+            collectBlobHashes(node.script, referenced);
+        const auto& entries = graph.contentStore.entries();
+        for (const auto& h : referenced) {
+            auto it = entries.find(h);
+            if (it == entries.end()) continue;   // dangling ref - nothing to write
+            f << "\n[Blob]\n";
+            writeStr(f, "hash", h);
+            juce::String b64 = juce::Base64::toBase64(it->second.compressed.data(),
+                                                      (int) it->second.compressed.size());
+            writeStr(f, "bytes", b64.toStdString());
+        }
+    }
+
     f << "\n[End]\n";
     return true;
 }
@@ -400,6 +553,11 @@ bool ProjectFile::load(const std::string& path, NodeGraph& graph, PluginHost* pl
         fprintf(stderr, "Failed to load project: %s\n", path.c_str());
         return false;
     }
+    // Real file open replaces the whole project, so drop the previous project's
+    // baked blobs before readProject repopulates from the file's [Blob] sections.
+    // (Undo restore goes through loadFromString, which must NOT clear the store -
+    // its snapshots carry no blobs, the bytes live in memory across undo/redo.)
+    graph.contentStore.clear();
     bool ok = readProject(f, graph, pluginHost);
     if (ok) {
         currentPath = path;
@@ -429,6 +587,8 @@ bool ProjectFile::readProject(std::istream& f, NodeGraph& graph, PluginHost* plu
     std::string line, section;
     Node* curNode = nullptr;
     Clip* curClip = nullptr;
+    std::string curBlobHash;   // [Blob] section: hash read before its bytes line
+    AssetEntry curAsset;       // [AssetStore] section: built up, committed on payload
     int maxId = 0;
 
     auto getValue = [](const std::string& line) -> std::string {
@@ -484,12 +644,48 @@ bool ProjectFile::readProject(std::istream& f, NodeGraph& graph, PluginHost* plu
                 graph.waveformLibrary.push_back({});
             } else if (section == "[EffectGroup]") {
                 graph.effectGroups.push_back({});
+            } else if (section == "[AssetStore]") {
+                curAsset = AssetEntry{};   // staged, committed when payload arrives
             }
             continue;
         }
 
         auto key = getKey(line);
         auto val = getValue(line);
+
+        // Signal modulation pin bindings (#88): "modPin=paramIdx,pinId,depth[,mode]"
+        // (mode 0=Modulate, 1=Absolute; optional for back-compat -> Modulate).
+        //
+        // These are written right after the node's [Param] blocks with NO section
+        // header of their own, so by the time the parser reaches them `section` is
+        // still "[Param]" - NOT "[Node]". A historical bug handled `modPin` only
+        // inside the "[Node]" branch, so the key never matched and EVERY saved
+        // modulation-pin binding (a pinned morph/layer param, a wired LFO, ...) was
+        // silently dropped on load: the [Param] survived but its pin + binding
+        // vanished, so reopening a project lost all its pins. Handle it here, ahead
+        // of the section dispatch, so it's recognised regardless of section - which
+        // fixes both newly-saved and already-saved (old) projects.
+        if (key == "modPin" && curNode) {
+            Node::ModPin mp;
+            auto c1 = val.find(',');
+            auto c2 = (c1 == std::string::npos) ? std::string::npos
+                                                : val.find(',', c1 + 1);
+            if (c1 != std::string::npos && c2 != std::string::npos) {
+                mp.paramIndex = std::stoi(val.substr(0, c1));
+                mp.pinId      = std::stoi(val.substr(c1 + 1, c2 - c1 - 1));
+                auto c3 = val.find(',', c2 + 1);
+                if (c3 != std::string::npos) {
+                    mp.depth = std::stof(val.substr(c2 + 1, c3 - c2 - 1));
+                    mp.mode  = (std::stoi(val.substr(c3 + 1)) == 1)
+                                   ? Node::ModPin::Mode::Absolute
+                                   : Node::ModPin::Mode::Modulate;
+                } else {
+                    mp.depth = std::stof(val.substr(c2 + 1));
+                }
+                curNode->modPins.push_back(mp);
+            }
+            continue;
+        }
 
         if (section == "[Project]") {
             if (key == "bpm") graph.bpm = std::stof(val);
@@ -618,6 +814,33 @@ bool ProjectFile::readProject(std::istream& f, NodeGraph& graph, PluginHost* plu
                 if (AHDSREnvelope::decode(val, tmp))
                     curNode->ahdsrEnvelope = std::move(tmp);
             }
+            else if (key == "ahdsrAssetId") {
+                try { curNode->ahdsrAssetId = std::stoi(val); } catch (...) {}
+            }
+            // Additional per-component AHDSR envelopes (FM operators etc.).
+            // opEnvelopeCount is written first and pre-sizes the vector; the
+            // opEnvelopeN lines that follow fill each slot. We tolerate either
+            // order (decode resizes on demand) so a hand-edited file can't lose
+            // an envelope to ordering.
+            else if (key == "opEnvelopeCount") {
+                try {
+                    int n = std::stoi(val);
+                    if (n > 0 && n <= 64 && (int)curNode->opEnvelopes.size() < n)
+                        curNode->opEnvelopes.resize(n);
+                } catch (...) {}
+            }
+            else if (key.rfind("opEnvelope", 0) == 0 && key != "opEnvelopeCount") {
+                try {
+                    int idx = std::stoi(key.substr(std::string("opEnvelope").size()));
+                    if (idx >= 0 && idx < 64) {
+                        if ((int)curNode->opEnvelopes.size() <= idx)
+                            curNode->opEnvelopes.resize(idx + 1);
+                        AHDSREnvelope tmp;
+                        if (AHDSREnvelope::decode(val, tmp))
+                            curNode->opEnvelopes[idx] = std::move(tmp);
+                    }
+                } catch (...) {}
+            }
             else if (key == "aftertouchSensitivity") {
                 try { curNode->aftertouchSensitivity = std::stof(val); }
                 catch (...) {}
@@ -652,29 +875,10 @@ bool ProjectFile::readProject(std::istream& f, NodeGraph& graph, PluginHost* plu
                 while (std::getline(ss, token, ','))
                     if (!token.empty()) curNode->childNodeIds.push_back(std::stoi(token));
             }
-            // Signal modulation pin bindings (#88):
-            // "modPin=paramIdx,pinId,depth[,mode]" where mode 0=Modulate,
-            // 1=Absolute. The mode field is optional for back-compat with
-            // older projects (missing -> Modulate).
-            else if (key == "modPin") {
-                Node::ModPin mp;
-                auto c1 = val.find(',');
-                auto c2 = val.find(',', c1 + 1);
-                if (c1 != std::string::npos && c2 != std::string::npos) {
-                    mp.paramIndex = std::stoi(val.substr(0, c1));
-                    mp.pinId      = std::stoi(val.substr(c1 + 1, c2 - c1 - 1));
-                    auto c3 = val.find(',', c2 + 1);
-                    if (c3 != std::string::npos) {
-                        mp.depth = std::stof(val.substr(c2 + 1, c3 - c2 - 1));
-                        mp.mode  = (std::stoi(val.substr(c3 + 1)) == 1)
-                                       ? Node::ModPin::Mode::Absolute
-                                       : Node::ModPin::Mode::Modulate;
-                    } else {
-                        mp.depth = std::stof(val.substr(c2 + 1));
-                    }
-                    curNode->modPins.push_back(mp);
-                }
-            }
+            // NOTE: "modPin=" lines are parsed earlier (before the section
+            // dispatch) because they are written after the [Param] blocks, so
+            // the active section is "[Param]" — not "[Node]" — when they're
+            // read. See the hoisted handler near the top of this loop.
         }
         else if ((section == "[PinIn]" || section == "[PinOut]") && curNode) {
             auto& pins = (section == "[PinIn]") ? curNode->pinsIn : curNode->pinsOut;
@@ -693,6 +897,10 @@ bool ProjectFile::readProject(std::istream& f, NodeGraph& graph, PluginHost* plu
             else if (key == "min") p.minVal = std::stof(val);
             else if (key == "max") p.maxVal = std::stof(val);
             else if (key == "format") p.format = val;
+            else if (key == "warpSlot") p.warpSlot = std::stoi(val);
+            else if (key == "warpLayer") p.warpLayer = std::stoi(val);
+            else if (key == "layerField") p.layerField = std::stoi(val);
+            else if (key == "warpFrameId") p.warpFrameId = std::stoi(val);
             else if (key == "auto") {
                 auto comma = val.find(',');
                 if (comma != std::string::npos)
@@ -816,6 +1024,46 @@ bool ProjectFile::readProject(std::istream& f, NodeGraph& graph, PluginHost* plu
                     wf.points.push_back({std::stof(val.substr(0, comma)), std::stof(val.substr(comma + 1))});
             }
         }
+        else if (section == "[AssetStore]") {
+            // Project-level asset library entry (see writeProject [AssetStore]).
+            // Fields arrive in write order with payload LAST, so we stage into
+            // curAsset and commit when the payload line is seen. id/hash are
+            // trusted from the file (not recomputed), mirroring [Blob].
+            if (key == "id") curAsset.id = std::stoi(val);
+            else if (key == "kind") assetKindFromTag(val, curAsset.kind);
+            else if (key == "name") curAsset.name = val;
+            else if (key == "subType") curAsset.subType = val;
+            else if (key == "hash") curAsset.contentHash = val;
+            else if (key == "archived") curAsset.archived = (val == "1");
+            else if (key == "starred") curAsset.starred = (val == "1");
+            else if (key == "payload") {
+                juce::MemoryOutputStream mos;
+                if (juce::Base64::convertFromBase64(mos, val)) {
+                    const char* d = (const char*) mos.getData();
+                    curAsset.payload.assign(d, d + mos.getDataSize());
+                }
+                graph.assets.insertRaw(curAsset);   // bumps nextId past this id
+                curAsset = AssetEntry{};
+            }
+        }
+        else if (section == "[Blob]") {
+            // Content-addressed baked blob (see writeProject [Blob]). The hash is
+            // trusted from the file - not recomputed - so loading never has to
+            // decompress; integrity is checked lazily when a node resolves it.
+            if (key == "hash") curBlobHash = val;
+            else if (key == "bytes") {
+                if (!curBlobHash.empty()) {
+                    juce::MemoryOutputStream mos;
+                    if (juce::Base64::convertFromBase64(mos, val)) {
+                        const uint8_t* d = (const uint8_t*) mos.getData();
+                        graph.contentStore.insertRaw(
+                            curBlobHash,
+                            std::vector<uint8_t>(d, d + mos.getDataSize()));
+                    }
+                    curBlobHash.clear();
+                }
+            }
+        }
         else if (section == "[Editors]") {
             if (key == "openEditors") {
                 std::istringstream ss(val);
@@ -833,6 +1081,64 @@ bool ProjectFile::readProject(std::istream& f, NodeGraph& graph, PluginHost* plu
 
     // Restore nextId so new IDs don't conflict
     graph.setNextId(maxId + 1);
+
+    // Re-seed the code-owned built-in morph chains. They are deliberately NOT
+    // serialized (writeProject skips them), so a loaded file - and every undo
+    // snapshot restored through this same path - arrives without them; re-seeding
+    // here makes them present and keeps any frame that references a built-in id
+    // resolvable below. Idempotent, so a file that somehow already carries them
+    // (or a back-to-back load) never duplicates. See seedBuiltinMorphLibrary.
+    seedBuiltinMorphLibrary(graph.assets);
+
+    // Mirror every live-referenced asset-library AHDSR curve into its
+    // referencing nodes' local ahdsrEnvelope (the audio thread reads that
+    // directly). Assets are parsed before nodes, so the library is complete here.
+    graph.resolveAhdsrReferences();
+
+    // FM synth: migrate any project that predates node.opEnvelopes. Old files
+    // carry "Op{i} A/D/S/R" linear-ramp params and no opEnvelopes; this rebuilds
+    // the 4 per-operator AHDSR envelopes from them (and strips the old params).
+    // No-op for files already carrying the 4 envelopes and for non-FM nodes.
+    for (auto& n : graph.nodes)
+        ensureFmOpEnvelopes(n);
+
+    // Same for live-referenced Waveform assets: push each referenced asset's
+    // frame into the wavetable library entries that point at it, re-encoding
+    // the affected node scripts so the audio thread (which decodes node.script)
+    // sees the asset content. Free function in layered_wave_editor.cpp.
+    resolveWaveformReferences(graph);
+
+    // Per-layer analogue: any individual WaveLayer that live-references a Waveform
+    // asset (WaveLayer::assetId >= 0) has its cycle pulled from the asset, after
+    // the frame-scope pass so a frame entry that itself came from an asset already
+    // has its layers in place. Free function in layered_wave_editor.cpp.
+    resolvePerLayerWaveformReferences(graph);
+
+    // Same for live-referenced MorphAlgorithm (warp-chain) assets: replace each
+    // referencing frame's cached warp chain with the asset's stored chain and
+    // reconcile the node's warp modulation params. Free function in
+    // layered_wave_editor.cpp.
+    resolveWarpReferences(graph);
+
+    // resolveWarpReferences only touches asset-referenced frames; independent
+    // frames (the common case) need their warp params reconciled too so legacy
+    // "Warp N" params migrate to the warpSlot key + named-morph labels and the
+    // synth (reads warp amounts by warpSlot) finds them. Idempotent.
+    reconcileAllWarpParams(graph);
+
+    // Same for live-referenced FrequencyGraph assets: mirror each referenced
+    // curve into the spectrum-tap bins that point at it, re-encoding the
+    // affected node scripts. Free function in spectrum_tap.cpp.
+    resolveSpectrumTapReferences(graph);
+
+    // Same FrequencyGraph assets feed the spectral (FFT) mag/phase curves -
+    // both standalone Frequency Domain nodes and SpectralFrames nested inside
+    // wavetable nodes. Free function in spectral_editor.cpp.
+    resolveSpectralReferences(graph);
+
+    // ...and the Curve EQ nodes, the third FrequencyGraph consumer. Free
+    // function in curve_editor.cpp.
+    resolveCurveEqReferences(graph);
 
     // Restore open editors (store IDs only - never store Node*)
     graph.openEditors.clear();
@@ -884,7 +1190,7 @@ std::string ProjectFile::serializeForUndo(NodeGraph& graph) {
     // pan/zoom so undoing a graph edit doesn't also jerk the user's
     // viewport around. The view state lives on NodeGraph but is treated
     // as out-of-band session state for undo purposes.
-    writeProject(oss, graph, nullptr, /*includeView*/ false);
+    writeProject(oss, graph, nullptr, /*includeView*/ false, /*includeBlobs*/ false);
     return oss.str();
 }
 

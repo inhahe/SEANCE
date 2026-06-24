@@ -1,15 +1,25 @@
 #pragma once
 #include "node_graph.h"
 #include <juce_gui_basics/juce_gui_basics.h>
+#include <functional>
+#include <unordered_map>
+#include <unordered_set>
 
 namespace SoundShop {
 
-class NodeGraphComponent : public juce::Component {
+class NodeGraphComponent : public juce::Component,
+                           public juce::TooltipClient {
 public:
     NodeGraphComponent(NodeGraph& graph);
 
     void paint(juce::Graphics& g) override;
     void resized() override;
+
+    // TooltipClient: when the mouse rests over a pin that carries a
+    // Pin::tooltip (e.g. a synth "Pressure" input or a MIDI Breakout output),
+    // return that text so the app's TooltipWindow shows it. Returns "" over
+    // empty space, nodes, or pins with no tooltip.
+    juce::String getTooltip() override;
 
     void mouseDown(const juce::MouseEvent& e) override;
     void mouseDrag(const juce::MouseEvent& e) override;
@@ -56,6 +66,14 @@ public:
     // or return sampleRate <= 0 before the audio device has started - callers
     // must fall back to a generic label in that case.
     std::function<std::pair<double, int>()> getAudioFormat;
+
+    // Returns each node's own audio latency in samples, keyed by stable node id
+    // (a missing id means 0). Wired by main_window to
+    // GraphProcessor::snapshotNodeLatencies(). Used by the node right-click menu
+    // to show this node's own latency and the cumulative latency accumulated
+    // along the longest path of nodes feeding it. May be null before wiring;
+    // returns an empty map before the audio graph has been built.
+    std::function<std::unordered_map<int, int>()> getNodeLatencies;
 
     // Convert between screen and canvas coordinates
     juce::Point<float> screenToCanvas(juce::Point<float> screen) const;
@@ -126,6 +144,25 @@ private:
     void showBackgroundMenu(juce::Point<float> canvasPos);
     void showNodeMenu(Node& node);
     void showLinkMenu(int linkId);
+
+    // Cumulative audio latency (in samples) accumulated at the OUTPUT of `nodeId`:
+    // the node's own latency plus the largest summed latency along any path of
+    // nodes feeding its inputs (the value JUCE's delay compensation aligns to).
+    // `ownLatency` is a snapshot from getNodeLatencies() (missing id => 0); `memo`
+    // and `visiting` are scratch maps the caller default-constructs (memo caches
+    // results, visiting guards against feedback cycles). Pure graph walk over
+    // graph.links/pins - no audio-thread access.
+    int cumulativeLatencyTo(int nodeId,
+                            const std::unordered_map<int, int>& ownLatency,
+                            std::unordered_map<int, int>& memo,
+                            std::unordered_set<int>& visiting) const;
+
+    // Transient per-paint cache feeding the on-node latency badge: stable node
+    // id -> total accumulated latency in samples (only nodes with >0 are stored).
+    // Recomputed at the top of paint(), and only when some node actually reports
+    // latency, so an all-zero graph does no work and draws no badges.
+    std::unordered_map<int, int> latencyBadgeTotals;
+    double latencyBadgeSampleRate = 0.0;
     // Right-click menu for a single pin (triggered anywhere across the pin's
     // row, including its label text). For a control-input pin (one bound to a
     // ModPin) this offers Switch Set/Mod and Remove; for any other pin it
@@ -167,5 +204,28 @@ private:
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(NodeGraphComponent)
 };
+
+// Launch the shared AHDSR envelope editor (AHDSREnvelopeComponent) as a
+// tool dialog editing `graph.findNode(nodeId)->ahdsrEnvelope`. Shared by the
+// node right-click "Envelope (AHDSR)..." menu and the "Envelope..." buttons
+// inside the instrument editor dialogs (wavetable / layered / spectral, etc.)
+// so there's a single launch path. Marks the graph dirty on each edit and
+// commits one "Edit envelope" undo snapshot. `parent` is the component the
+// dialog centres around / is owned by (for taskbar parentage). No-op if the
+// node no longer exists.
+void launchAhdsrEnvelopeDialog(juce::Component* parent, NodeGraph& graph,
+                               int nodeId);
+
+// Open a multi-tab AHDSR editor over node.opEnvelopes - one tab per envelope,
+// each hosting an AHDSREnvelopeComponent bound to opEnvelopes[i] by reference.
+// `tabNames` gives the tab labels and also fixes the expected count: the node's
+// opEnvelopes vector is resized to tabNames.size() if needed so the dialog
+// always has something to edit. Used by the FM synth (4 operator envelopes) and
+// available to any future multi-envelope instrument. Marks the graph dirty on
+// each edit and commits one undo snapshot when the (modal) dialog closes. No-op
+// if the node no longer exists. `parent` provides taskbar parentage.
+void launchOpEnvelopesDialog(juce::Component* parent, NodeGraph& graph,
+                             int nodeId,
+                             const std::vector<juce::String>& tabNames);
 
 } // namespace SoundShop

@@ -1,6 +1,7 @@
 #pragma once
 #include "wavetable_frame.h"
 #include "wavelet_paint.h"   // encodeWaveletPaint / decodeWaveletPaint / waveletPaintToWaveform
+#include "warp.h"            // WarpOp (per-coefficient element warp)
 #include <vector>
 #include <string>
 #include <memory>
@@ -21,6 +22,13 @@ struct WaveletFrame : public IWavetableFrame {
     int         numLevels = kWaveletPaintDefaultLevels;
     int         totalSize = kWaveletPaintDefaultSize;
     std::string filterName = kWaveletPaintDefaultFilter;
+
+    // Bucket C element warp: a chain of shape-bending ops applied to the DWT
+    // coefficient array before the IDWT. Amplitude-domain ops reshape the
+    // coefficient magnitudes (clip / fold / saturate detail); phase-domain ops
+    // stretch / shift along the coefficient index. Baked at render (not
+    // modulatable), like the per-layer warp.
+    std::vector<WarpOp> warpChain;
 
     WaveletFrame() = default;
 

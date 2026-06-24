@@ -13,6 +13,9 @@
 #include "undo.h"
 #include "plugin_host.h"
 #include "adsr_envelope.h"
+#include "warp.h"            // WarpOp (granular element warp on audition frames)
+#include "content_store.h"   // content-addressed side-store for baked blobs
+#include "asset_library.h"   // project-level asset stores (waveforms, instruments, ...)
 
 namespace SoundShop {
 
@@ -64,7 +67,14 @@ enum class NodeType {
     // N Signal inputs, and 1..16 independent MIDI outputs. See midi_script_node.h.
     // NOTE: new enum values MUST be appended at the END - project files store
     // node.type as a raw int, so reordering would corrupt existing saves.
-    MidiScript
+    MidiScript,
+    // MidiBreakout: taps a live MIDI stream and exposes its expression
+    // controllers as block-rate control (Signal) outputs - Velocity, Pressure
+    // (channel aftertouch), Mod Wheel (CC1) and Pitch Bend - so they can be
+    // wired anywhere a control cable is accepted (filter cutoff, wavetable
+    // position, a different synth's Pressure input, etc.). One MIDI input, four
+    // Signal outputs. See midi_breakout_node.h.
+    MidiBreakout
 };
 
 struct Pin {
@@ -78,6 +88,14 @@ struct Pin {
     PinKind kind;
     bool isInput;
     int channels = 2; // 1=mono, 2=stereo, 6=5.1, etc.
+
+    // Optional hover-tooltip text shown when the mouse rests over this pin in
+    // the node graph (NodeGraphComponent::getTooltip). Empty = no tooltip.
+    // Not serialized: pins that need a tooltip (e.g. the synth "Pressure"
+    // input, the MIDI Breakout outputs) re-set it every graph build / node
+    // creation, so the text always reflects the current code, never a stale
+    // copy baked into an old project file.
+    std::string tooltip;
 };
 
 // Automation point on a parameter timeline
@@ -144,6 +162,50 @@ struct Param {
     // baseValue/value are split or identical this block.
     float baseValue = 0.0f;
     bool  modulated = false;
+
+    // Warp slot key (unified warp/morph model). >= 0 marks this as the
+    // modulation param for warp-chain op `warpSlot` (0-based); -1 = not a warp
+    // param. This is the STABLE key the synth + reconcile logic address the op
+    // by, DECOUPLED from `name` - which is now a human label that follows the
+    // op's method (e.g. "Soft Clip Drive 1"), so renaming on a method change
+    // never disturbs which op a wired modulation pin drives. See
+    // syncWarpParamsForNode / warpParamIndexForOp.
+    int warpSlot = -1;
+    // Warp scope: which warp chain `warpSlot` indexes into.
+    //   -1 = the frame-scope (summation-morph) chain  (IWavetableFrame::warpChain)
+    //   >=0 = the per-layer chain of layer `warpLayer`  (WaveLayer::warpChain)
+    // Per-layer warp params exist ON DEMAND - one is created only when the user
+    // opts a per-layer op into modulation (the "Mod" checkbox), and removed when
+    // they opt out or the op/layer goes away. Frame-scope params (warpLayer==-1)
+    // exist for every op so the amount is always modulatable. Only meaningful
+    // when warpSlot >= 0.
+    int warpLayer = -1;
+
+    // Which wavetable FRAME (library entry id) this warp/layer-field param
+    // belongs to. The summation-morph warp chain, the per-layer warp chains,
+    // and the per-layer Phase/Amp fields all live PER FRAME now (a wavetable
+    // node can hold several frames, each shaping its own cycle before the
+    // cross-frame morph blend), so a warp param must record which frame it
+    // drives or two frames carrying the same op (e.g. both a "Drive" at slot 0)
+    // would collide on the (warpLayer, warpSlot) key. >= 0 = the owning frame's
+    // library id. -1 = legacy/whole-node: pre-per-frame projects stored a single
+    // shared chain with no frame id; on load those params keep -1 until the
+    // migration in syncWarpParamsForNode reassigns them. Only meaningful when
+    // warpSlot >= 0 or layerField >= 0. Serialized as the optional "warpFrameId"
+    // field (omitted when -1, so old projects round-trip unchanged).
+    int warpFrameId = -1;
+
+    // Per-layer field modulation key (layered wavetable). Marks this as the
+    // on-demand modulation param for a layer's Phase or Amplitude slider:
+    //   -1 = not a layer-field param (default)
+    //    0 = layer Phase
+    //    1 = layer Amplitude
+    // When layerField >= 0, `warpLayer` holds the 0-based layer index and
+    // `warpSlot` stays -1 - so a layer-field param never collides with warp
+    // param lookups (which require warpSlot >= 0). Created on demand when the
+    // user ticks the per-layer Phase/Amp "Mod" checkbox, removed when unticked
+    // or the layer goes away. See setLayerFieldModulated / renderWithLiveOverrides.
+    int layerField = -1;
 };
 
 // Rational fraction for exact beat subdivisions (e.g., triplets)
@@ -352,15 +414,39 @@ struct Node {
     // the node). Save/load and undo serialize this through encode/decode.
     AHDSREnvelope ahdsrEnvelope;
 
-    // Per-channel aftertouch input. When something is wired to the
-    // "Aftertouch" Param input pin on a synth node, the wired control's
+    // Optional LIVE reference to a project asset-library AHDSR curve. -1 means
+    // "independent" - ahdsrEnvelope is this node's own local copy (the original
+    // behavior). When >= 0, this node references the AhdsrCurve asset with that
+    // id: ahdsrEnvelope is kept as a mirror of the stored curve, and editing the
+    // curve (from any referencing node's envelope dialog) propagates to every
+    // node that shares the id. See NodeGraph::resolveAhdsrReferences(). The
+    // audio thread still reads ahdsrEnvelope directly, so referencing costs it
+    // nothing - resolution happens at edit/load time, never per block.
+    int ahdsrAssetId = -1;
+
+    // Additional per-component AHDSR envelopes for instruments that need more
+    // than one envelope per voice. Empty for almost every node type. The FM
+    // synth populates exactly 4 (one full AHDSR per operator), replacing the
+    // old per-operator "Op{i} A/D/S/R" linear-ramp params with the shared
+    // AHDSR model (hold stage, per-segment curves, tension, velocity
+    // sensitivity). Edited via the multi-tab operator-envelope dialog
+    // (launchOpEnvelopesDialog). Serialized as opEnvelope0..N in project
+    // files; on load, projects predating this field rebuild the 4 entries
+    // from the legacy "Op{i} A/D/S/R" params. Each entry is "independent"
+    // (no asset-library reference - that single-id model only fits the main
+    // ahdsrEnvelope). The audio thread reads these directly per block.
+    std::vector<AHDSREnvelope> opEnvelopes;
+
+    // Per-voice pressure (aftertouch) input. When something is wired to the
+    // "Pressure" Param input pin on a synth node, the wired control's
     // value (0..1, read as the block mean) drives the per-voice
-    // aftertouch. It's a Param (block-rate) pin because the consumer
+    // pressure swell. It's a Param (block-rate) pin because the consumer
     // averages it over the whole block to stay smooth. When the
-    // pin is unwired, the synth uses channel-pressure events from the
-    // incoming MIDI stream instead. Either way the value is exposed to
-    // every voice as a per-sample modulation source that defaults to
-    // scaling output amplitude by 1 + 0.5*aftertouch.
+    // pin is unwired, the synth uses channel-pressure (aftertouch) events
+    // from the incoming MIDI stream instead. Either way the value is exposed
+    // to every voice as a modulation source that defaults to scaling output
+    // amplitude by 1 + 0.5*pressure. (The pin was historically named
+    // "Aftertouch"; the graph builder migrates that name to "Pressure".)
     float aftertouchSensitivity = 0.5f;  // 0 = ignore, 1 = full volume swell
 
     // Panning and spatial positioning
@@ -437,6 +523,44 @@ struct Node {
         int    fftSize          = 0;    // SpectralFreeze FFT size; 0 = auto
         int    crossfadeSamples = 2400;
         float  gain             = 1.0f; // mirrors IWavetableFrame::gain
+        // Bucket C element warp (amplitude-domain). Mirrors GranularFrame::
+        // warpAmpOps() so the editor's Play audition carries the same
+        // waveshaping the placed-frame synth path and renderRaw apply -
+        // "what you audition = what you get". Empty = no warp.
+        std::vector<WarpOp> warpAmpOps;
+    };
+
+    // Direct inharmonic-frame payload carried by an audition note-on so the
+    // synth can render a SPECIFIC inharmonic stack that isn't placed into the
+    // wavetable's grid/scatter (and therefore isn't in the synth's
+    // wtInharmonicFrames table). The inharmonic frame editor's Play button uses
+    // this so an unplaced stack is audible immediately and faithfully, the same
+    // way AuditionGranularFrame does for granular library frames. Mirrors
+    // InharmonicFrame's partial fields without pulling inharmonic_frame.h into
+    // this header. The live voice plays one sine oscillator per partial at
+    // noteHz * ratio, sums amp*sin, scales by normGain (so it's as loud as the
+    // editor thumbnail), applies the amplitude-domain warp, then the gain.
+    struct AuditionInharmonicFrame {
+        struct Partial { float ratio = 1.0f; float amp = 1.0f; float phase = 0.0f; };
+        std::vector<Partial> partials;
+        float               gain     = 1.0f;  // mirrors IWavetableFrame::gain
+        float               normGain = 1.0f;  // InharmonicFrame::normGainFor(partials)
+        std::vector<WarpOp> warpAmpOps;        // amplitude-domain element warp
+    };
+
+    // Direct single-cycle payload carried by an audition note-on so the synth
+    // can render a SPECIFIC wavetable cycle that isn't placed into the grid/
+    // scatter. This is the generic, frame-type-agnostic audition path used by
+    // the layered-waveform editor's Play button (and, eventually, every frame
+    // editor): any IWavetableFrame::render(tableSize, out) produces one final
+    // single cycle with the frame's gain and internal warps already baked in,
+    // so the voice just reads it as a wavetable oscillator (linear-interpolated
+    // at the played pitch), bypassing the cycle terrain / granular / inharmonic
+    // layers entirely. That makes the edited frame audible immediately and
+    // faithfully - "what the editor previews = what you hear" - even before
+    // it's dropped into a cell. Empty cycle = nothing to audition.
+    struct AuditionCycleFrame {
+        std::vector<float> cycle;  // final single cycle, gain + warps baked in
     };
 
     // Audition MIDI events injected from the UI (thread-safe via simple flag)
@@ -457,6 +581,15 @@ struct Node {
         // editor auditions an unplaced library frame. Null for ordinary
         // MIDI / timeline notes and for non-granular frame auditions.
         std::shared_ptr<AuditionGranularFrame> granularFrame;
+        // Optional direct inharmonic frame to render for this note-on. Same
+        // role as granularFrame but for an unplaced inharmonic stack; the voice
+        // plays its oscillator bank exclusively. Null otherwise.
+        std::shared_ptr<AuditionInharmonicFrame> inharmonicFrame;
+        // Optional direct single cycle to render for this note-on. Same role as
+        // granularFrame / inharmonicFrame but for an unplaced wavetable cycle
+        // (layered / spectral / wavelet / sample frames); the voice reads this
+        // cycle exclusively as a wavetable oscillator. Null otherwise.
+        std::shared_ptr<AuditionCycleFrame> cycleFrame;
     };
     std::vector<AuditionEvent> pendingAudition; // written by UI, read by audio thread
 
@@ -544,6 +677,38 @@ struct Node {
 inline void setNodeScriptSynced(Node& node, std::string s) {
     std::lock_guard<std::mutex> lock(*node.auditionMutex);
     node.script = std::move(s);
+}
+
+// Ship one final single cycle to a node's level-triggered held audition - the
+// generic "Preview" path used by the waveform/frame editors (see
+// Node::heldAudition / AuditionCycleFrame). The voice reads `cycle` as a
+// wavetable oscillator at a fixed A4 (note 69) while held, so the edited
+// waveform is audible immediately and survives the debounced graph rebuild an
+// edit fires. Re-call on every audible edit to keep the audition in sync; an
+// empty cycle clears it. Thread-safe via the node's auditionMutex. The node
+// must reach an Output node for the audition to actually be heard.
+inline void setNodeHeldAuditionCycle(Node& node, std::vector<float> cycle) {
+    if (cycle.empty()) {
+        std::lock_guard<std::mutex> lock(*node.auditionMutex);
+        node.heldAudition.reset();
+        return;
+    }
+    auto cyc = std::make_shared<Node::AuditionCycleFrame>();
+    cyc->cycle = std::move(cycle);
+    auto ev = std::make_shared<Node::AuditionEvent>();
+    ev->isNoteOn   = true;
+    ev->pitch      = 69;   // A4, the same fixed audition pitch the shell uses
+    ev->velocity   = 127;
+    ev->cycleFrame = std::move(cyc);
+    std::lock_guard<std::mutex> lock(*node.auditionMutex);
+    node.heldAudition = std::move(ev);
+}
+
+// Stop a node's held audition (editor Preview -> Stop / editor close). The
+// synth releases the voice on its next block. Thread-safe via auditionMutex.
+inline void clearNodeHeldAudition(Node& node) {
+    std::lock_guard<std::mutex> lock(*node.auditionMutex);
+    node.heldAudition.reset();
 }
 
 // Named marker on the project timeline
@@ -649,18 +814,50 @@ public:
     // audio callback and fall through to silence if the lock can't be
     // acquired immediately - blocking on the audio thread would risk
     // device underruns, and a single silent block during a multi-second
-    // import is barely audible compared to a crash. Usage pattern
-    // (mutators): hold a std::lock_guard for the duration of any batch
-    // that pushes more than a couple of nodes/links (tracker import,
-    // project file load, undo snapshot restore). Single-node menu
-    // additions don't strictly need it - those are one push_back and
-    // race-resolve quickly - but locking them too costs nothing and is
-    // future-safe.
-    mutable std::mutex mutationLock;
+    // import is barely audible compared to a crash.
+    //
+    // Usage pattern (mutators): hold a lock_guard for the duration of any
+    // batch that clears/rebuilds graph.nodes/links (tracker import, project
+    // file load, undo snapshot restore). Crucially, even a SINGLE addNode()
+    // /addLink() must be locked: a lone push_back that reallocates the vector
+    // move-constructs every existing Node into new storage, which nulls the
+    // moved-from Node's shared_ptr members (e.g. mpePassthroughMutex). If the
+    // audio thread is mid-processBlock holding a Node& into the old storage,
+    // it then dereferences a null mutex and crashes - exactly the new-MIDI-
+    // timeline crash (SEANCE.exe.118460.dmp: MidiInputProcessor::processBlock
+    // locking *node.mpePassthroughMutex, rbx=0). An earlier comment here
+    // wrongly claimed single-node additions "race-resolve quickly" and didn't
+    // need the lock; they do. addNode()/addLink() now take the lock
+    // themselves, so every structural mutation is covered whether or not the
+    // caller wrapped it.
+    //
+    // Recursive because batch mutators (which hold this lock) compose
+    // addNode()/addLink() (which also take it): setupDefaultGraph() runs under
+    // the lock at the new-project callsite, and ProjectFile / MOD import call
+    // addNode while already locked. A plain std::mutex would self-deadlock on
+    // that nesting; recursive_mutex lets the same thread re-enter. The audio
+    // thread never owns the lock, so its try_lock still fails (and goes silent)
+    // whenever any GUI thread is mid-mutation.
+    mutable std::recursive_mutex mutationLock;
 
     float editorPanelHeight = 250.0f;
     int activeEditorNodeId = -1; // node ID of the currently focused editor
     PluginHost* pluginHost = nullptr; // set by App
+
+    // Content-addressed store for large immutable baked blobs (generated /
+    // imported terrain grids; later decoded video, wavetable PCM). Nodes refer
+    // to blobs by short hash in node.script; the bytes live here once, keyed by
+    // a hash of their canonical .npy payload. Excluded from undo snapshots (the
+    // hash travels in the snapshot, the bytes do not) - see content_store.h.
+    ContentStore contentStore;
+
+    // Project-level asset library ("stores") - reusable waveforms / generators,
+    // independent instruments, ADHSR curves, and morph algorithms, each published
+    // once and referenced by a stable integer id from many places. See
+    // asset_library.h for the model (explicit add, live-reference-by-id, soft-
+    // delete, disjoint user/built-in id spaces).
+    AssetLibrary assets;
+
     // Dirty tracking - set on any mutation
     bool dirty = false;
 
@@ -897,6 +1094,14 @@ public:
     // which itself includes node_graph.h.
     void commitSnapshot(const std::string& description);
 
+    // Re-resolve every node that LIVE-references an asset-library AHDSR curve
+    // (ahdsrAssetId >= 0): decode the stored curve into the node's local
+    // ahdsrEnvelope mirror so the audio thread (which reads ahdsrEnvelope
+    // directly) sees the current library curve. Call after project load and
+    // after any edit to a referenced AhdsrCurve asset. Defined in
+    // node_graph.cpp (needs adsr_envelope.h / asset_library.h, both included).
+    void resolveAhdsrReferences();
+
     std::map<int, PianoRollState> pianoRollStates;
 
 private:
@@ -908,5 +1113,99 @@ private:
     // Node editor context
     void* editorContext = nullptr;
 };
+
+// Resolve every live Waveform asset reference in the graph. For each node whose
+// script is a wavetable, any library entry referencing a published Waveform
+// asset (assetId >= 0) has its frame replaced by a fresh copy of the asset's
+// frame, so the audio thread (which re-decodes node.script) sees the asset
+// content. A missing/erased asset detaches the entry to independent. Re-encodes
+// the affected node scripts in place. Free function (not a NodeGraph method)
+// because the implementation lives in layered_wave_editor.cpp where the
+// wavetable codec + frame factory are; declared here so the non-GUI
+// serialization layer (project_file.cpp) can call it without the editor header.
+// Returns the number of references resolved. Mirrors resolveAhdsrReferences().
+int resolveWaveformReferences(NodeGraph& graph);
+
+// Resolve every live PER-LAYER Waveform asset reference in the graph: the
+// per-layer analogue of resolveWaveformReferences. For each wavetable node, any
+// WaveLayer with assetId >= 0 (inside a LayeredWaveform library entry) has its
+// shape content replaced by a fresh decode of the referenced asset, preserving
+// the layer's own amp (slot volume). A missing/erased asset detaches that layer
+// to independent. Re-encodes affected node scripts in place. Free function for
+// the same reason as resolveWaveformReferences (codec lives in
+// layered_wave_editor.cpp). Returns the number of layer references resolved.
+int resolvePerLayerWaveformReferences(NodeGraph& graph);
+
+// Resolve every live MorphAlgorithm (warp-chain) asset reference in the graph.
+// For each wavetable node whose WavetableDoc has warpAssetId >= 0, the frame-
+// scope warp chain is replaced by a fresh decode of the asset's stored chain,
+// and the node's "Warp N" modulation params are reconciled to the new op count
+// (resolving a chain can change its length). A missing/erased asset detaches to
+// independent (keeps the cached chain). Re-encodes affected node scripts in
+// place. Free function for the same reason as resolveWaveformReferences (codec
+// lives in layered_wave_editor.cpp). Returns the number of references resolved.
+int resolveWarpReferences(NodeGraph& graph);
+
+// Load-time reconcile of frame-scope warp modulation params across EVERY
+// wavetable node (not just asset-referenced ones). Migrates legacy "Warp N"
+// params to the warpSlot key + named-morph display labels and ensures the synth
+// (which reads warp amounts by warpSlot) always finds them. Idempotent. Defined
+// in layered_wave_editor.cpp (needs the WavetableDoc codec). Call after load.
+void reconcileAllWarpParams(NodeGraph& graph);
+
+// Reconcile the per-layer (warpLayer >= 0) Type-2 warp params of ONE frame
+// (identified by `frameId`, the owning library entry id stored in
+// Param::warpFrameId) for a single wavetable node against that frame's live
+// per-layer warp chains. Removes params of this frame whose (warpLayer,
+// warpSlot) no longer addresses a live op (dropping their modPins, pins and
+// links), remaps survivors to their new positional slot, and relabels them from
+// the method name. Params of OTHER frames are left untouched. `layerChains[L]`
+// is the ordered warp chain of layer L. Defined in layered_wave_editor.cpp.
+// Idempotent.
+void reconcilePerLayerWarpParams(NodeGraph& graph, int nodeId, int frameId,
+                                 const std::vector<std::vector<WarpOp>>& layerChains);
+
+// ---------------------------------------------------------------------------
+// On-demand modulation pins (#88) - graph-level helpers.
+//
+// These are the pure data-model operations behind the node-graph right-click
+// "Add/Remove modulation input" menu AND the warp/morph editor's per-param
+// "modulate" checkbox (the unified warp/morph model: any shaping param can opt
+// into a modulation pin). They mutate the graph ONLY - no snapshot, no repaint,
+// no rebuild callback - so every caller drives its own commit/undo/rebuild flow
+// (NodeGraphComponent does its commitSnapshot()+onNodeEdited(); the layered-wave
+// editor folds the change into its settled-edit commit). Addressing is by stable
+// (nodeId, paramIndex) so nothing dangles across the call.
+// ---------------------------------------------------------------------------
+
+// True iff node `nodeId` has a ModPin bound to param `paramIndex`.
+bool hasParamModPin(const NodeGraph& graph, int nodeId, int paramIndex);
+
+// Add a modulation pin for (nodeId, paramIndex) if one doesn't already exist.
+// `absolute` chooses Set (true) vs Modulate (false) mode. Returns the new (or
+// existing) pin id, or -1 if the node/param is invalid. Does NOT commit/rebuild.
+int addParamModPin(NodeGraph& graph, int nodeId, int paramIndex, bool absolute);
+
+// Remove the modulation pin bound to (nodeId, paramIndex) - dropping its input
+// pin and any cables into it, and clearing the param's modulated state so it
+// returns to its resting value. Returns true if a pin was removed. No commit.
+bool removeParamModPin(NodeGraph& graph, int nodeId, int paramIndex);
+
+// Restore the pin<->modPin invariant on `nodeId`: drop any "Mod:"/"Set:" Param
+// input pin with no backing modPin (a dangling ghost modulation input), and any
+// modPin whose param is out of range or whose pin is gone. Returns the count
+// removed (0 = already consistent, the common case). Idempotent. No commit.
+// Run wherever a node's params/pins are reconciled (e.g. syncWarpParamsForNode,
+// which fires on load + every warp edit) so historical corruption self-heals.
+int pruneOrphanModPins(NodeGraph& graph, int nodeId);
+
+// FM operator envelopes. Ensures an FM synth node (`script == "__fmsynth__"`)
+// carries exactly 4 per-operator AHDSREnvelopes in `node.opEnvelopes`,
+// migrating any legacy "Op{i} A/D/S/R" linear-ramp params into them (and
+// stripping those params) the first time. A no-op for non-FM nodes and for FM
+// nodes already holding 4 envelopes. Called both at node creation (seeds
+// defaults) and after project load (migrates old files). Safe to call
+// repeatedly.
+void ensureFmOpEnvelopes(Node& node);
 
 } // namespace SoundShop

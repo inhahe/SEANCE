@@ -16,6 +16,36 @@ bool wasmRuntimeAvailable();
 //   Lua     -> PerSample and PerBlock
 //   Wasm    -> PerBlock only
 // -----------------------------------------------------------------------------
+void buildScriptMidiIn(const juce::MidiBuffer& midi, int numSamples,
+                       std::vector<ScriptMidiEvent>& out, int midiInputCount) {
+    out.clear();
+    const int maxOff = numSamples > 0 ? numSamples - 1 : 0;
+    const bool multiIn = midiInputCount > 1;
+    for (const auto meta : midi) {
+        const auto msg = meta.getMessage();
+        ScriptMidiEvent e;
+        e.offset = juce::jlimit(0, maxOff, meta.samplePosition);
+        // For a multi-input node the graph stamped channel = inIndex + 1.
+        e.inIndex = multiIn ? juce::jlimit(0, midiInputCount - 1, msg.getChannel() - 1) : 0;
+        if (msg.isNoteOn()) {
+            e.kind = 1; e.a = msg.getNoteNumber();
+            e.b = (float) msg.getVelocity() / 127.0f;
+        } else if (msg.isNoteOff()) {
+            e.kind = 0; e.a = msg.getNoteNumber(); e.b = 0.0f;
+        } else if (msg.isController()) {
+            e.kind = 2; e.a = msg.getControllerNumber();
+            e.b = (float) msg.getControllerValue() / 127.0f;
+        } else if (msg.isPitchWheel()) {
+            e.kind = 3; e.a = 0;
+            // 14-bit 0..16383, centre 8192 -> -1..1.
+            e.b = ((float) msg.getPitchWheelValue() - 8192.0f) / 8192.0f;
+        } else {
+            continue;
+        }
+        out.push_back(e);
+    }
+}
+
 bool scriptLangSupportsRate(ScriptLang lang, ScriptRate rate) {
     switch (lang) {
         case ScriptLang::Builtin: return rate == ScriptRate::PerSample;

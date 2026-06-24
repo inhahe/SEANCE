@@ -452,7 +452,7 @@ void AudioEngine::audioDeviceIOCallbackWithContext(
     // restore - to be added at those sites). If we can't acquire
     // immediately the block is silent, which is barely audible against
     // a multi-second import and dramatically better than a crash.
-    std::unique_lock<std::mutex> graphLk(graph->mutationLock, std::try_to_lock);
+    std::unique_lock<std::recursive_mutex> graphLk(graph->mutationLock, std::try_to_lock);
     if (!graphLk.owns_lock()) return;
 
     double graphRate = getProjectSampleRate();

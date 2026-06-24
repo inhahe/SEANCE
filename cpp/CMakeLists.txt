@@ -63,6 +63,16 @@ target_sources(SEANCE PRIVATE
     src/main_window.h
     src/node_graph.cpp
     src/node_graph.h
+    src/content_store.cpp
+    src/content_store.h
+    src/hash_util.cpp
+    src/hash_util.h
+    src/asset_library.cpp
+    src/asset_library.h
+    src/asset_import.cpp
+    src/asset_import.h
+    src/asset_library_component.cpp
+    src/asset_library_component.h
     src/node_graph_component.cpp
     src/node_graph_component.h
     src/piano_roll_component.cpp
@@ -104,6 +114,10 @@ target_sources(SEANCE PRIVATE
     src/builtin_synth.h
     src/terrain_synth.cpp
     src/terrain_synth.h
+    src/glsl_compute.cpp
+    src/glsl_compute.h
+    src/glsl_waveform.cpp
+    src/glsl_waveform.h
     src/granular_freeze.cpp
     src/granular_freeze.h
     src/multi_sampler.cpp
@@ -122,6 +136,12 @@ target_sources(SEANCE PRIVATE
     src/script_lang_bar.h
     src/shape_expr.cpp
     src/shape_expr.h
+    src/warp.cpp
+    src/warp.h
+    src/buffer_warp.cpp
+    src/buffer_warp.h
+    src/warp_editor.cpp
+    src/warp_editor.h
     src/lua_prelude.h
     src/signal_modulation.h
     src/wavelet.h
@@ -163,6 +183,10 @@ target_sources(SEANCE PRIVATE
     src/sample_frame.cpp
     src/granular_frame.h
     src/granular_frame.cpp
+    src/inharmonic_frame.h
+    src/inharmonic_frame.cpp
+    src/waveform_bank.h
+    src/waveform_bank.cpp
     src/capture_from_playback.h
     src/capture_from_playback.cpp
     src/layered_wave_editor.cpp
@@ -217,6 +241,8 @@ target_sources(SEANCE PRIVATE
     src/video_decoder.h
     src/video_import_dialog.cpp
     src/video_import_dialog.h
+    src/generate_dialog.cpp
+    src/generate_dialog.h
 )
 
 target_link_libraries(SEANCE PRIVATE
@@ -231,6 +257,7 @@ target_link_libraries(SEANCE PRIVATE
     juce::juce_graphics
     juce::juce_gui_basics
     juce::juce_gui_extra
+    juce::juce_opengl
 )
 
 target_compile_definitions(SEANCE PRIVATE
@@ -369,32 +396,102 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/lua/lua.h")
     target_compile_definitions(SEANCE PRIVATE HAS_LUA=1)
 endif()
 
-# Python embedding
+# ---------------------------------------------------------------------------
+# Python embedding (OPTIONAL — Python is NOT a hard requirement to run SEANCE)
+#
+# The Script Console, Signal evaluation, and the Python shape-baker use an
+# embedded CPython interpreter. We link Python's import library so the C API is
+# available at build time, but on MSVC we DELAY-LOAD the DLL (see the /DELAYLOAD
+# option in the MSVC block below) so SEANCE.exe still launches on a machine with
+# no Python installed. Every entry into the interpreter is guarded by a
+# LoadLibrary probe (ScriptEngine::pythonAvailable); if the DLL can't be loaded
+# we disable Python scripting gracefully instead of crashing or failing to
+# start. When Python IS present at build time we copy its runtime DLL next to
+# the exe (post-build, below) so the produced build ships with working Python.
+#
+# HAS_PYTHON gates all the CPython API code in scripting.cpp: without it the
+# file compiles to stubs and the build still succeeds with Python disabled.
+# SEANCE_PYTHON_DLL_NAME is the bare DLL filename used for /DELAYLOAD and the
+# runtime probe; SEANCE_PYTHON_DLL is its full path (for the copy step).
+# ---------------------------------------------------------------------------
+set(SEANCE_PYTHON_DLL "")
+set(SEANCE_PYTHON_DLL_NAME "")
+
 find_package(Python3 COMPONENTS Development)
 if(Python3_FOUND)
     target_include_directories(SEANCE PRIVATE src ${Python3_INCLUDE_DIRS})
     target_link_libraries(SEANCE PRIVATE ${Python3_LIBRARIES})
-    message(STATUS "Python: ${Python3_VERSION} at ${Python3_INCLUDE_DIRS}")
+    target_compile_definitions(SEANCE PRIVATE HAS_PYTHON=1)
+    set(SEANCE_PYTHON_DLL_NAME "python${Python3_VERSION_MAJOR}${Python3_VERSION_MINOR}.dll")
+    # Locate the runtime DLL (Windows) for the copy step. With COMPONENTS
+    # Development the Interpreter isn't requested, so Python3_EXECUTABLE may be
+    # empty — search several candidate roots: the interpreter dir, the runtime
+    # library dirs, and the install root (parent of include/ and of libs/).
+    set(_py_dll_candidates "")
+    if(Python3_EXECUTABLE)
+        get_filename_component(_py_exe_dir "${Python3_EXECUTABLE}" DIRECTORY)
+        list(APPEND _py_dll_candidates "${_py_exe_dir}")
+    endif()
+    if(Python3_RUNTIME_LIBRARY_DIRS)
+        list(APPEND _py_dll_candidates ${Python3_RUNTIME_LIBRARY_DIRS})
+    endif()
+    foreach(_inc ${Python3_INCLUDE_DIRS})
+        get_filename_component(_inc_parent "${_inc}" DIRECTORY)
+        list(APPEND _py_dll_candidates "${_inc_parent}")
+    endforeach()
+    foreach(_libdir ${Python3_LIBRARY_DIRS})
+        get_filename_component(_lib_parent "${_libdir}" DIRECTORY)
+        list(APPEND _py_dll_candidates "${_libdir}" "${_lib_parent}")
+    endforeach()
+    foreach(_cand ${_py_dll_candidates})
+        if(NOT SEANCE_PYTHON_DLL AND EXISTS "${_cand}/${SEANCE_PYTHON_DLL_NAME}")
+            set(SEANCE_PYTHON_DLL "${_cand}/${SEANCE_PYTHON_DLL_NAME}")
+        endif()
+    endforeach()
+    message(STATUS "Python: ${Python3_VERSION} at ${Python3_INCLUDE_DIRS} (DLL: ${SEANCE_PYTHON_DLL})")
 else()
-    # Fallback to hardcoded path (Windows dev machine)
+    # Fallback to hardcoded path (Windows dev machine).
     if(EXISTS "D:/python314/Include")
         target_include_directories(SEANCE PRIVATE src D:/python314/Include)
         target_link_directories(SEANCE PRIVATE D:/python314/libs)
         target_link_libraries(SEANCE PRIVATE python314)
+        target_compile_definitions(SEANCE PRIVATE HAS_PYTHON=1)
+        set(SEANCE_PYTHON_DLL_NAME "python314.dll")
+        if(EXISTS "D:/python314/python314.dll")
+            set(SEANCE_PYTHON_DLL "D:/python314/python314.dll")
+        endif()
         message(STATUS "Python: using hardcoded D:/python314")
     else()
-        message(WARNING "Python not found. Scripting will be disabled.")
+        message(WARNING "Python not found. Python scripting will be disabled (build still succeeds).")
     endif()
 endif()
 
-# On Windows, Python's pyconfig.h auto-links python314_d.lib in Debug builds
+# Pass the DLL name to the runtime probe (ScriptEngine::pythonAvailable).
+if(SEANCE_PYTHON_DLL_NAME)
+    target_compile_definitions(SEANCE PRIVATE PYTHON_DLL_NAME="${SEANCE_PYTHON_DLL_NAME}")
+endif()
+
+# On Windows, Python's pyconfig.h auto-links python3XY_d.lib in Debug builds
 # via #pragma comment(lib,...). Standard Python installs don't ship the debug
 # lib, so tell the linker to ignore it and use the release lib in Debug too.
-# Python is dynamically loaded at runtime, so this is safe.
+#
+# NOTE on optionality: we link Python at LOAD time (not /DELAYLOAD). Delay-load
+# is incompatible with CPython because the C API imports DATA symbols
+# (`_Py_NoneStruct` behind Py_None/Py_RETURN_NONE, `PyFloat_Type`, the `PyExc_*`
+# exception objects); MSVC's /DELAYLOAD only wraps function imports and errors
+# with LNK1194 on data imports. So instead of making the DLL absence survivable
+# at launch, we SHIP the DLL next to the exe (post-build copy below) so a build
+# made with Python always has it. A build made WITHOUT Python (HAS_PYTHON
+# undefined) links no Python at all and disables scripting via stubs. Truly
+# launching without the DLL when the build linked it would require fully dynamic
+# GetProcAddress loading of every symbol — tracked as a future option.
 if(MSVC)
-    target_link_options(SEANCE PRIVATE
-        "$<$<CONFIG:Debug>:/NODEFAULTLIB:python314_d.lib>"
-        "/SUBSYSTEM:WINDOWS")
+    target_link_options(SEANCE PRIVATE "/SUBSYSTEM:WINDOWS")
+    if(SEANCE_PYTHON_DLL_NAME)
+        string(REPLACE ".dll" "_d.lib" SEANCE_PYTHON_DEBUG_LIB "${SEANCE_PYTHON_DLL_NAME}")
+        target_link_options(SEANCE PRIVATE
+            "$<$<CONFIG:Debug>:/NODEFAULTLIB:${SEANCE_PYTHON_DEBUG_LIB}>")
+    endif()
 
     # Emit debug symbols (PDB) for Release too. /Zi keeps full /O2 codegen but
     # produces a side PDB, and /DEBUG tells the linker to write it; /OPT:REF and
@@ -422,5 +519,31 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../docs")
         COMMAND ${CMAKE_COMMAND} -E copy_directory
             "${CMAKE_CURRENT_SOURCE_DIR}/../docs"
             "$<TARGET_FILE_DIR:SEANCE>/docs"
+    )
+endif()
+
+# Copy resources/ (the packed factory waveform library waveforms.bin, etc.)
+# alongside the built exe so WaveformBank can load it at runtime. Like docs/,
+# these ship as files rather than embedded data: a single ~4 MB read beats
+# embedding 4000 cycles in the binary and bloating the build.
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/resources")
+    add_custom_command(TARGET SEANCE POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+            "${CMAKE_CURRENT_SOURCE_DIR}/resources"
+            "$<TARGET_FILE_DIR:SEANCE>/resources"
+    )
+endif()
+
+# Copy the Python runtime DLL next to the exe (when Python was found at build
+# time) so the produced build has working Python scripting without relying on
+# Python being on the system PATH. Because Python is delay-loaded, the DLL's
+# absence only disables scripting — it never blocks launch — so this copy is a
+# convenience, not a requirement. (The interpreter still needs its standard
+# library, which it locates via the install/registry; we copy only the DLL.)
+if(SEANCE_PYTHON_DLL)
+    add_custom_command(TARGET SEANCE POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${SEANCE_PYTHON_DLL}"
+            "$<TARGET_FILE_DIR:SEANCE>"
     )
 endif()

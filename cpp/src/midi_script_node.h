@@ -45,9 +45,11 @@ namespace SoundShop {
 //   playing 1 while the transport is rolling, 0 when stopped
 //   sr      sample rate
 //   dt      seconds per sample (1 / sr)
-//   note    MIDI note number of the most-recent note-on at the MIDI input (-1 if none)
+//   note    MIDI note number of the most-recent note-on across ALL MIDI inputs (-1 if none)
 //   vel     velocity 0..1 of that note-on
 //   gate    1 while any MIDI-input note is held, 0 otherwise
+//           (per-input identity is available via pollmidi()/midievent(), which
+//            report a 1-based input index for each event)
 //   s1..sN  the Signal input pin values at this sample
 //   out     reserved output selector (read/write; default 0)
 //   shape(pos)  samples the optional drawn shape table at pos (0..1, wraps)
@@ -78,9 +80,16 @@ struct MidiScriptDoc {
     // editor's native file dialog. Empty until the user picks a file.
     std::string wasmPath;
 
-    // Number of Signal input pins (0..16), exposed as s1..sN. The node always
-    // has exactly one MIDI input pin (merged) in addition to these.
+    // Number of Signal input pins (0..16), exposed as s1..sN.
     int signalInputCount = 0;
+
+    // Number of MIDI input pins (0..16). 0 = no MIDI input (note/vel/gate stay
+    // idle); 1 = a single "MIDI In" pin; >1 exposes "MIDI In 1..N". With more
+    // than one, pollmidi() / midievent() report which input each event arrived
+    // on (1-based) so the program can react to several MIDI sources separately.
+    // The note/vel/gate convenience variables track the most recent note-on
+    // across ALL inputs.
+    int midiInputCount = 1;
 
     // Number of MIDI output pins (1..16). Each is an independent MIDI cable;
     // the program routes to one via the `out` variable. Implemented by tagging
@@ -166,6 +175,10 @@ private:
     int   lastNoteOn = -1;
     float lastVelocity = 0.0f;
 
+    // Event-driven MIDI-input scratch for block mode (ScriptBlockCtx::midiIn).
+    // A member so it isn't reallocated on the audio thread every block.
+    std::vector<ScriptMidiEvent> midiInEvents;
+
     // A note scheduled by note(p,v,d): its note-off is due `samplesRemaining`
     // samples from the start of the CURRENT block. Each block we subtract the
     // block length; when it reaches <= 0 the note-off is emitted at that offset.
@@ -230,6 +243,48 @@ public:
 
 private:
     int targetChannel = 1;
+};
+
+// -----------------------------------------------------------------------------
+// MidiChannelStampProcessor
+// -----------------------------------------------------------------------------
+//
+// The input-side mirror of MidiChannelFilterProcessor. A SignalShape / MidiScript
+// / Script node with >1 MIDI input pin needs to know which input pin each event
+// arrived on, but JUCE merges all incoming MIDI cables into a node's single MIDI
+// bus. So graph_processor splices one of these onto every cable feeding a given
+// input pin: it rewrites EVERY event's channel to the pin's index + 1 (regardless
+// of the event's original channel), so after the merge the receiving processor
+// can recover the source pin from the channel nibble. The channel tag is purely
+// an internal routing detail (the script API never exposes raw MIDI channels).
+//
+// Audio passes through untouched. One stamper is shared by all cables into the
+// same input pin (they all stamp to the same channel and merge cleanly).
+class MidiChannelStampProcessor : public juce::AudioProcessor {
+public:
+    explicit MidiChannelStampProcessor(int channel1to16)
+        : channel(channel1to16) {}
+
+    const juce::String getName() const override { return "MIDI In Stamp"; }
+    void prepareToPlay(double, int) override {}
+    void releaseResources() override {}
+    void processBlock(juce::AudioBuffer<float>& buf, juce::MidiBuffer& midi) override;
+    double getTailLengthSeconds() const override { return 0; }
+    bool acceptsMidi() const override { return true; }
+    bool producesMidi() const override { return true; }
+    bool isBusesLayoutSupported(const BusesLayout&) const override { return true; }
+    juce::AudioProcessorEditor* createEditor() override { return nullptr; }
+    bool hasEditor() const override { return false; }
+    int getNumPrograms() override { return 1; }
+    int getCurrentProgram() override { return 0; }
+    void setCurrentProgram(int) override {}
+    const juce::String getProgramName(int) override { return {}; }
+    void changeProgramName(int, const juce::String&) override {}
+    void getStateInformation(juce::MemoryBlock&) override {}
+    void setStateInformation(const void*, int) override {}
+
+private:
+    int channel = 1;
 };
 
 } // namespace SoundShop

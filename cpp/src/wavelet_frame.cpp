@@ -9,7 +9,11 @@ void WaveletFrame::renderRaw(int tableSize, std::vector<float>& out) const {
     // so a wavelet frame fits into a wavetable whose other frames may use
     // a different tableSize. In practice the editor pins the doc's
     // tableSize to match all frames, so this resample is usually identity.
-    auto wave = waveletPaintToWaveform(coefficients, numLevels, filterName);
+    // Per-coefficient warp (Bucket C) is baked here: warp the coefficient grid
+    // before the IDWT so the shaping happens in the wavelet domain.
+    std::vector<float> coeffs = coefficients;
+    if (!warpChain.empty()) applyWarpChain(warpChain, coeffs);
+    auto wave = waveletPaintToWaveform(coeffs, numLevels, filterName);
     if (tableSize <= 0) { out.clear(); return; }
     if ((int)wave.size() == tableSize) { out = std::move(wave); return; }
 
@@ -28,13 +32,30 @@ std::string WaveletFrame::encodeBody() const {
     // the prefix so the wavetable container can length-prefix the body.
     auto full = encodeWaveletPaint(coefficients, numLevels, filterName);
     const std::string prefix = "__waveletpaint__:";
-    if (full.rfind(prefix, 0) == 0) return full.substr(prefix.size());
-    return full;
+    std::string b = (full.rfind(prefix, 0) == 0) ? full.substr(prefix.size())
+                                                 : full;
+    // Optional per-coefficient warp chain, appended as a ":warp:<chain>"
+    // section. The coefficient list is comma-separated and never contains the
+    // literal "warp", so decodeBody can split this back off unambiguously.
+    // Omitted when empty so pre-warp frames round-trip byte-identical.
+    if (!warpChain.empty()) b += ":warp:" + encodeWarpChain(warpChain);
+    return b;
 }
 
 bool WaveletFrame::decodeBody(const std::string& body) {
-    return decodeWaveletPaint("__waveletpaint__:" + body,
-                              coefficients, numLevels, totalSize, filterName);
+    // Split off the optional ":warp:<chain>" section before handing the rest
+    // to the (warp-unaware) wavelet-paint decoder.
+    std::string wpBody = body;
+    std::vector<WarpOp> wc;
+    auto wpos = body.find(":warp:");
+    if (wpos != std::string::npos) {
+        wc = decodeWarpChain(body.substr(wpos + 6));
+        wpBody = body.substr(0, wpos);
+    }
+    bool ok = decodeWaveletPaint("__waveletpaint__:" + wpBody,
+                                 coefficients, numLevels, totalSize, filterName);
+    if (ok) warpChain = std::move(wc);
+    return ok;
 }
 
 std::unique_ptr<IWavetableFrame> WaveletFrame::clone() const {

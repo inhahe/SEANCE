@@ -384,11 +384,55 @@ wasm-ld --no-entry --export-all *.o -o lua_effect.wasm
 | `ss_midi_out` | `(sample_offset: i32, status: u8, d1: u8, d2: u8) -> void` | Emit a MIDI event to MIDI output 0. |
 | `ss_midi_out_n` | `(out_index: i32, sample_offset: i32, status: u8, d1: u8, d2: u8) -> void` | Emit a MIDI event to a specific MIDI output pin (needs `ss_num_midi_outputs() > 1`). With multiple outputs the host re-stamps the channel for routing, so don't rely on the channel nibble of `status` surviving. |
 | `ss_note_to_freq` | `(midinote: i32) -> f32` | Frequency in Hz of a MIDI note using the **project tuning system** (Equal Temperament / Pythagorean / Just Intonation / Meantone) and concert pitch — not a hardcoded 12-TET A440. Returns 0 for a note outside 0..127. |
+| `ss_waveform` | `(id: i32, phase: f32) -> f32` | Sample the factory waveform `id` (one of the ~4000 bundled single-cycle AKWF shapes) at `phase` in `[0,1)` (wraps), returning the raw `[-1,1]` value with linear interpolation — the same wrap+interpolate every other SEANCE language uses. An out-of-range id returns 0 for every phase (a typo degrades to silence, never an error). |
+| `ss_waveform_id` | `(name: *u8) -> i32` | Resolve a factory-waveform **name** (case-insensitive, surrounding whitespace ignored) to its **stable integer id**, or -1 if unknown. Resolve once and reuse the integer in the hot loop — the WASM analogue of Lua's `waveforms["name"]`. |
 | `ss_log` | `(msg: *u8) -> void` | Debug print (no-op in release). |
 
 All host functions are imported from module `"env"`.
 
 **Note names.** `ss_note_to_freq` is the only note helper that needs the host, because only the host knows the project's tuning. Name ↔ number conversion is pure, so `soundshop_wasm.h` provides it inline (no host round-trip): `ss_notenum("C4") -> 60`, `ss_notename(60, buf) -> "C4"`, and `ss_notefreq("C4")` (which combines `ss_notenum` with `ss_note_to_freq`). C4 = MIDI 60, A4 = 69.
+
+**Factory waveforms.** `ss_waveform` / `ss_waveform_id` give a WASM module the same ~4000-waveform bank the other languages reach via `waveform(id_or_name, phase)` (see the factory-waveform browser's dim `#N` ids). The bank is warmed off the audio thread at module-link time, so the first call is allocation-free; resolve a name once with `ss_waveform_id` (e.g. in `ss_init`) and pass the integer to `ss_waveform` each sample.
+
+**Shaping helpers (no libm).** Modules compile `-nostdlib`, so libm's transcendentals (`sinf`/`cosf`/`expf`/`tanhf`) need an explicitly linked libm or `<math.h>`. For the common GLSL-parity shaping math that *doesn't*, `soundshop_wasm.h` provides header-only inlines built on `__builtin_floorf` (so they work under `-nostdlib`): `ss_fract`, `ss_sign`, `ss_mod` (GLSL floored modulo), `ss_clamp`, `ss_min`, `ss_max`, `ss_mix`, `ss_step`, `ss_smoothstep`, `ss_radians`, `ss_degrees`, `ss_saw`, `ss_square`, `ss_triangle`, `ss_unipolar`, `ss_bipolar`. Define `SS_NO_SHAPING_HELPERS` before including the header to suppress them if you supply your own.
+
+### Terrain generation (whole-grid, no audio)
+
+A WASM module can also be a **Terrain Synth generator** instead of an audio node.
+This is a completely separate role — there is **no audio path**. The host calls
+the module **once, offline** (on the message thread, never the audio thread) to
+fill an N-dimensional grid, then **bakes** the result into the project. Pick it in
+**Add Node → Terrain → Terrain from Program (Generate)…** with Language =
+**"WASM (.wasm module)"** and the **Browse .wasm…** button. WASM terrain is
+**whole-grid only** (a module owns its own loop, so it can't be re-invoked
+per-cell). See [`terrain_ripple.c`](terrain_ripple.c) for a complete, rank-agnostic example.
+
+**Exports:** `ss_init() -> i32` (re-seed hook, as usual) and `ss_generate() -> void`
+(fills the grid). A terrain module needs `ss_init` plus `ss_generate`; it does
+**not** provide `ss_process` (the same `WasmRuntime` load path serves both — a
+module supplies `ss_process` *or* `ss_generate`, or both).
+
+**Grid host functions** (imported from `"env"`, declared in `soundshop_wasm.h`).
+The grid is host-owned and addressed by **flat, row-major index** (last axis
+varies fastest), mirroring the Lua whole-grid API one-for-one:
+
+| Function | Signature | Description |
+|----------|-----------|-------------|
+| `ss_grid_total` | `() -> i32` | Total cell count = product(dims). |
+| `ss_grid_nd` | `() -> i32` | Number of axes (rank). |
+| `ss_grid_dim` | `(axis: i32) -> i32` | Size of one axis (0 if out of range). |
+| `ss_grid_set` | `(flat: i32, v: f32) -> void` | Write a cell. `v` is clamped to `[0,1]` (NaN→0); an out-of-range index is ignored. |
+| `ss_grid_get` | `(flat: i32) -> f32` | Read a cell back (0 before written / out of range). |
+| `ss_grid_coord` | `(flat: i32, axis: i32) -> f32` | Normalised `[0,1]` position of a cell along an axis. |
+| `ss_grid_coord_axis` | `(flat: i32, axis: i32) -> i32` | Integer index of a cell along an axis. |
+| `ss_grid_neighbor` | `(flat: i32, axis: i32, delta: i32) -> i32` | Flat index `delta` steps along an axis, **edge-clamped** to `[0, dim-1]`. |
+
+Each cell is one value in **`[0,1]`** (a grayscale height); the host maps it to the
+terrain's bipolar `[-1,1]` as `v*2-1`. Because the bake is offline, per-cell
+host-call overhead is irrelevant, so the grid stays host-owned (poked via these
+imports) rather than shared through linear memory. The header also ships inline
+N-D-coordinate helpers `ss_grid_flatten` / `ss_grid_getat` / `ss_grid_setat`
+(suppress with `SS_NO_GRID_HELPERS`).
 
 ### Shared Memory Layout
 

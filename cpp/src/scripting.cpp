@@ -1,5 +1,20 @@
+// =============================================================================
+// Python embedding — OPTIONAL.
+//
+// Everything that touches the CPython C API lives under HAS_PYTHON. When SEANCE
+// is built without Python (the find_package / hardcoded-path lookup in
+// CMakeLists.txt failed), this file compiles to stubs and Python scripting is
+// simply disabled — the build and the app still work.
+//
+// Even WITH HAS_PYTHON, the Python DLL is delay-loaded on Windows, so it may be
+// absent at runtime. ScriptEngine::pythonAvailable() probes for it (and is the
+// gate every entry point checks) so we never trigger the delay-load helper for
+// a missing DLL. See CMakeLists.txt for the /DELAYLOAD wiring.
+// =============================================================================
+#ifdef HAS_PYTHON
+
 #define PY_SSIZE_T_CLEAN
-// Python's pyconfig.h auto-selects python314_d.lib and enables Py_REF_DEBUG
+// Python's pyconfig.h auto-selects python3XY_d.lib and enables Py_REF_DEBUG
 // refcount tracing (which references debug-only symbols) whenever _DEBUG is
 // defined. Standard Python installs don't ship the debug lib or those
 // symbols, so undefine _DEBUG around the Python.h include and restore it.
@@ -12,13 +27,58 @@
 #  define _DEBUG
 #  undef SOUNDSHOP_RESTORE_DEBUG
 #endif
+
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
+#endif // HAS_PYTHON
+
 #include "scripting.h"
 #include "music_theory.h"
+#include "waveform_bank.h"
+#include "warp.h"
+#include "buffer_warp.h"
 #include <sstream>
 #include <cstdio>
+#include <cstring>
 #include <cctype>
 
+// Bare DLL filename used for the runtime load probe (passed by CMake). Falls
+// back to the 3.14 name if the build didn't define it.
+#ifndef PYTHON_DLL_NAME
+#define PYTHON_DLL_NAME "python314.dll"
+#endif
+
 namespace SoundShop {
+
+// -----------------------------------------------------------------------------
+// pythonAvailable() — defined in ALL builds so callers (shape_expr.cpp, the UI
+// combos) can gate Python-only features uniformly.
+// -----------------------------------------------------------------------------
+bool ScriptEngine::pythonAvailable() {
+#ifdef HAS_PYTHON
+  #ifdef _WIN32
+    // Delay-loaded: probe whether the DLL can be found before any C-API call.
+    // Cache the result (the answer can't change within a process run). We keep
+    // the handle loaded so the subsequent delay-load resolves the same module.
+    static int cached = -1;
+    if (cached < 0) {
+        HMODULE h = LoadLibraryA(PYTHON_DLL_NAME);
+        cached = h ? 1 : 0;
+    }
+    return cached == 1;
+  #else
+    // Non-Windows: Python is linked normally (no delay-load), so if HAS_PYTHON
+    // is defined the interpreter is present.
+    return true;
+  #endif
+#else
+    return false;
+#endif
+}
+
+#ifdef HAS_PYTHON
 
 // Global pointer so Python callbacks can access the graph
 static NodeGraph* g_currentGraph = nullptr;
@@ -764,7 +824,7 @@ static PyMethodDef soundshopMethods[] = {
         for (auto& p : nodes[nodeIdx].pinsOut) pinIds.push_back(p.id);
         // Guard the structural edit against the audio callback iterating
         // graph.nodes/links (see node_graph.h mutationLock comment).
-        std::lock_guard<std::mutex> graphLk(g_currentGraph->mutationLock);
+        std::lock_guard<std::recursive_mutex> graphLk(g_currentGraph->mutationLock);
         links.erase(std::remove_if(links.begin(), links.end(),
             [&pinIds](const Link& l) {
                 for (int pid : pinIds) if (l.startPin == pid || l.endPin == pid) return true;
@@ -813,6 +873,12 @@ ScriptEngine::~ScriptEngine() {
 bool ScriptEngine::init() {
     if (initialized) return true;
 
+    // Gate the very first C-API call behind the DLL probe. With delay-loading,
+    // calling PyImport_AppendInittab when the DLL is missing would trigger the
+    // delay-load helper and crash; this returns false instead so callers
+    // gracefully disable Python scripting.
+    if (!pythonAvailable()) return false;
+
     // Register our module before initializing Python
     PyImport_AppendInittab("soundshop", &PyInit_soundshop);
 
@@ -847,7 +913,10 @@ void ScriptEngine::shutdown() {
 }
 
 std::string ScriptEngine::run(const std::string& code, NodeGraph& graph, int activeNodeIdx) {
-    if (!initialized && !init()) return "Error: Python not initialized";
+    if (!initialized && !init())
+        return "Python is not available — install Python (matching the build's "
+               "version) so its DLL can be found, then restart SEANCE. Python "
+               "scripting is disabled until then.";
 
     g_currentGraph = &graph;
     g_activeNodeIndex = activeNodeIdx;
@@ -979,6 +1048,225 @@ static std::string fetchPythonError() {
     return msg.empty() ? std::string("Python error") : msg;
 }
 
+// waveform(name, phase) — exposed to baked terrain/shape Python as a C builtin.
+// Reads one of the ~4000 factory single-cycle waveforms at a normalised phase in
+// [0,1) (wraps), linearly interpolated, returning the raw sample in [-1,1]. The
+// first argument is the waveform NAME (case-insensitive) or a numeric entry
+// index; an unknown name / out-of-range index reads as 0. Identical semantics to
+// the Builtin/Lua/GLSL waveform() so every generator language reads the bank the
+// same way. Registered into the run's globals by registerWaveformBuiltin().
+static PyObject* py_waveform(PyObject* /*self*/, PyObject* args) {
+    PyObject* nameObj = nullptr;
+    double phase = 0.0;
+    if (!PyArg_ParseTuple(args, "O|d", &nameObj, &phase)) return nullptr;
+    auto& bank = WaveformBank::get();
+    bank.ensureLoaded();
+    int id = -1;
+    if (PyUnicode_Check(nameObj)) {
+        const char* nm = PyUnicode_AsUTF8(nameObj);
+        id = bank.indexForName(nm ? nm : "");
+    } else {
+        id = (int)PyLong_AsLong(nameObj);
+        if (PyErr_Occurred()) { PyErr_Clear(); id = (int)PyFloat_AsDouble(nameObj); }
+        if (PyErr_Occurred()) { PyErr_Clear(); id = -1; }
+    }
+    return PyFloat_FromDouble((double)bank.sampleAtPhase(id, (float)phase));
+}
+
+static PyMethodDef kWaveformMethodDef = {
+    "waveform", py_waveform, METH_VARARGS,
+    "waveform(name, phase) -> factory single-cycle sample in [-1,1]"
+};
+
+// _ss_wfindex(name) -> stable entry index (int), or -1 for an unknown name. Backs
+// the `waveforms` dict so a NAME resolves to the same integer id every language
+// uses (and the id shown in the factory browser). The dict caches the result so
+// each distinct name hits indexForName() only once.
+//
+// NOTE on the name: it must NOT use the `__name` (two leading underscores, no
+// trailing) form, because the `waveforms` dict's __missing__ references it from
+// INSIDE a class body, where Python private-name mangling would rewrite a
+// `__wfindex` reference to `_WaveformDict__wfindex` and the global lookup would
+// fail. A single leading underscore is immune to mangling.
+static PyObject* py_waveform_index(PyObject* /*self*/, PyObject* args) {
+    const char* nm = nullptr;
+    if (!PyArg_ParseTuple(args, "s", &nm)) return nullptr;
+    auto& bank = WaveformBank::get();
+    bank.ensureLoaded();
+    return PyLong_FromLong((long)bank.indexForName(nm ? nm : ""));
+}
+
+static PyMethodDef kWaveformIndexMethodDef = {
+    "_ss_wfindex", py_waveform_index, METH_VARARGS,
+    "_ss_wfindex(name) -> factory waveform entry index, or -1"
+};
+
+// Resolve a Python warp-method argument: a method NAME string ("softclip",
+// "bend+", ...) via warpMethodFromName, or a numeric WarpMethod id. Shared by
+// py_warpamp / py_warpphase.
+static WarpMethod pyWarpMethodArg(PyObject* methodObj) {
+    if (PyUnicode_Check(methodObj)) {
+        const char* nm = PyUnicode_AsUTF8(methodObj);
+        return warpMethodFromName(nm ? nm : "");
+    }
+    long v = PyLong_AsLong(methodObj);
+    if (PyErr_Occurred()) { PyErr_Clear(); v = (long)PyFloat_AsDouble(methodObj); }
+    if (PyErr_Occurred()) { PyErr_Clear(); v = 0; }
+    return (WarpMethod)(int)v;
+}
+
+// warpamp(method, x, amount) / warpphase(method, phase, amount) — the wavetable
+// shape-bending warps as pure scalar functions, routed to the SAME
+// warpAmpValue/warpPhaseValue primitives the editor and synth voice use. `amount`
+// is the 0..1 morph knob (0 = identity); unknown method = identity.
+static PyObject* py_warpamp(PyObject* /*self*/, PyObject* args) {
+    PyObject* methodObj = nullptr;
+    double x = 0.0, amount = 0.0;
+    if (!PyArg_ParseTuple(args, "Od|d", &methodObj, &x, &amount)) return nullptr;
+    WarpMethod m = pyWarpMethodArg(methodObj);
+    return PyFloat_FromDouble((double)warpAmpValue(m, (float)x, (float)amount));
+}
+static PyMethodDef kWarpAmpMethodDef = {
+    "warpamp", py_warpamp, METH_VARARGS,
+    "warpamp(method, x, amount) -> amplitude-domain warp of x in [-1,1]"
+};
+
+static PyObject* py_warpphase(PyObject* /*self*/, PyObject* args) {
+    PyObject* methodObj = nullptr;
+    double phase = 0.0, amount = 0.0;
+    if (!PyArg_ParseTuple(args, "Od|d", &methodObj, &phase, &amount)) return nullptr;
+    WarpMethod m = pyWarpMethodArg(methodObj);
+    return PyFloat_FromDouble((double)warpPhaseValue(m, (float)phase, (float)amount));
+}
+static PyMethodDef kWarpPhaseMethodDef = {
+    "warpphase", py_warpphase, METH_VARARGS,
+    "warpphase(method, phase, amount) -> phase-domain read-position warp"
+};
+
+// --- Bucket C: representation-bound whole-buffer warps ----------------------
+// spectralwarp(buf, method, amount) and waveletwarp(buf, method, amount,
+// [filter], [levels]) take a sequence of samples, warp it in the FFT-magnitude /
+// DWT-coefficient domain (see buffer_warp.h), and return a NEW list of the same
+// length. Whole-buffer only, so they exist in the buffer-capable languages
+// (Python / Lua / WASM), not the per-sample expression parser.
+static bool pySeqToBuffer(PyObject* seq, std::vector<float>& out) {
+    PyObject* fast = PySequence_Fast(seq, "expected a list/sequence of samples");
+    if (!fast) return false;
+    Py_ssize_t n = PySequence_Fast_GET_SIZE(fast);
+    out.resize((size_t)n);
+    for (Py_ssize_t i = 0; i < n; ++i)
+        out[(size_t)i] = (float)PyFloat_AsDouble(PySequence_Fast_GET_ITEM(fast, i));
+    Py_DECREF(fast);
+    if (PyErr_Occurred()) return false;
+    return true;
+}
+static PyObject* pyBufferToList(const std::vector<float>& buf) {
+    PyObject* out = PyList_New((Py_ssize_t)buf.size());
+    if (!out) return nullptr;
+    for (size_t i = 0; i < buf.size(); ++i)
+        PyList_SET_ITEM(out, (Py_ssize_t)i, PyFloat_FromDouble((double)buf[i]));
+    return out;
+}
+static PyObject* py_spectralwarp(PyObject* /*self*/, PyObject* args) {
+    PyObject* seq = nullptr; PyObject* methodObj = nullptr;
+    double amount = 0.0;
+    if (!PyArg_ParseTuple(args, "OO|d", &seq, &methodObj, &amount)) return nullptr;
+    std::vector<float> buf;
+    if (!pySeqToBuffer(seq, buf)) return nullptr;
+    spectralWarpBuffer(buf, pyWarpMethodArg(methodObj), (float)amount);
+    return pyBufferToList(buf);
+}
+static PyMethodDef kSpectralWarpMethodDef = {
+    "spectralwarp", py_spectralwarp, METH_VARARGS,
+    "spectralwarp(buf, method, amount) -> buffer warped in the FFT-magnitude domain"
+};
+static PyObject* py_waveletwarp(PyObject* /*self*/, PyObject* args) {
+    PyObject* seq = nullptr; PyObject* methodObj = nullptr;
+    double amount = 0.0;
+    const char* filter = "db4";
+    int levels = 5;
+    if (!PyArg_ParseTuple(args, "OO|dsi", &seq, &methodObj, &amount, &filter, &levels))
+        return nullptr;
+    std::vector<float> buf;
+    if (!pySeqToBuffer(seq, buf)) return nullptr;
+    waveletWarpBuffer(buf, pyWarpMethodArg(methodObj), (float)amount,
+                      filter ? filter : "db4", levels);
+    return pyBufferToList(buf);
+}
+static PyMethodDef kWaveletWarpMethodDef = {
+    "waveletwarp", py_waveletwarp, METH_VARARGS,
+    "waveletwarp(buf, method, amount, filter='db4', levels=5) -> buffer warped in the DWT-coefficient domain"
+};
+
+// Bind waveform() and the _ss_wfindex helper into a run's globals dict. The
+// `waveforms` dict itself is defined in pure Python by each baker's preamble
+// (kWaveformsDictPreamble), which uses _ss_wfindex. Safe to call once per run
+// right after the globals are created.
+static void registerWaveformBuiltin(PyObject* globals) {
+    PyObject* fn = PyCFunction_New(&kWaveformMethodDef, nullptr);
+    if (fn) { PyDict_SetItemString(globals, "waveform", fn); Py_DECREF(fn); }
+    PyObject* idx = PyCFunction_New(&kWaveformIndexMethodDef, nullptr);
+    if (idx) { PyDict_SetItemString(globals, "_ss_wfindex", idx); Py_DECREF(idx); }
+    PyObject* wa = PyCFunction_New(&kWarpAmpMethodDef, nullptr);
+    if (wa) { PyDict_SetItemString(globals, "warpamp", wa); Py_DECREF(wa); }
+    PyObject* wp = PyCFunction_New(&kWarpPhaseMethodDef, nullptr);
+    if (wp) { PyDict_SetItemString(globals, "warpphase", wp); Py_DECREF(wp); }
+    PyObject* sw = PyCFunction_New(&kSpectralWarpMethodDef, nullptr);
+    if (sw) { PyDict_SetItemString(globals, "spectralwarp", sw); Py_DECREF(sw); }
+    PyObject* ww = PyCFunction_New(&kWaveletWarpMethodDef, nullptr);
+    if (ww) { PyDict_SetItemString(globals, "waveletwarp", ww); Py_DECREF(ww); }
+}
+
+// Pure-Python preamble defining the `waveforms` mapping: waveforms["name"] ->
+// stable integer id, with the lookup cached so each name hashes through
+// _ss_wfindex() (and thus indexForName) only once — every later access, even
+// from a hot per-cell loop, is a plain dict hit. Resolve once and reuse the
+// integer with waveform(id, phase) for the fastest path:
+//   W = waveforms["AKWF sin"]      # one C lookup
+//   ... waveform(W, phase) ...     # no per-call name hashing
+// Appended verbatim into each terrain/shape program's source.
+static const char* kWaveformsDictPreamble =
+    "class __WaveformDict(dict):\n"
+    "    def __missing__(self, k):\n"
+    "        v = _ss_wfindex(k); self[k] = v; return v\n"
+    "waveforms = __WaveformDict()\n";
+
+// GLSL-parity scalar math, so the Python dialect exposes the same vocabulary as
+// the Built-in, Lua, and GLSL shape languages. Must be emitted AFTER the base
+// preamble (it relies on clamp/floor/sqrt being defined). atan(y) and atan(y,x)
+// mirror GLSL's overload; mod uses GLSL's floored semantics, not Python's % on
+// floats (which already floors, but we guard b==0). round = floor(x+0.5).
+static const char* kGlslParityPyPreamble =
+    "from math import atan as __atan1, atan2 as __atan2, sinh, cosh, "
+    "radians, degrees, trunc\n"
+    "def atan(y, x=None): return __atan2(y, x) if x is not None else __atan1(y)\n"
+    "def sign(v): return 1.0 if v > 0 else (-1.0 if v < 0 else 0.0)\n"
+    "def mod(a, b): return 0.0 if b == 0 else a - b * floor(a / b)\n"
+    "def mix(a, b, t): return a + (b - a) * t\n"
+    "def step(edge, x): return 0.0 if x < edge else 1.0\n"
+    "def smoothstep(e0, e1, x):\n"
+    "    t = clamp((x - e0) / (e1 - e0), 0.0, 1.0)\n"
+    "    return t * t * (3 - 2 * t)\n"
+    "def round(v): return floor(v + 0.5)\n"
+    "def inversesqrt(v): return 1.0 / sqrt(v) if v > 0 else 0.0\n"
+    // Remaining GLSL exponential + inverse-hyperbolic + common builtins. log2 is
+    // safe (math.log2, Py3.3+); we wrap asinh/acosh/atanh with the same domain
+    // guards as the Built-in parser; exp2/fma/roundEven are defined directly so
+    // we don't depend on math.exp2 (3.11+) or math.fma (3.13+).
+    "from math import log2 as __log2, asinh as __asinh, acosh as __acosh, "
+    "atanh as __atanh\n"
+    "def exp2(v): return 2.0 ** v\n"
+    "def log2(v): return __log2(v) if v > 0 else 0.0\n"
+    "def fma(a, b, c): return a * b + c\n"
+    "def asinh(v): return __asinh(v)\n"
+    "def acosh(v): return __acosh(v if v > 1.0 else 1.0)\n"
+    "def atanh(v): return __atanh(clamp(v, -0.999999, 0.999999))\n"
+    "def roundEven(v):\n"
+    "    f = floor(v); d = v - f\n"
+    "    if d < 0.5: return float(f)\n"
+    "    if d > 0.5: return float(f + 1)\n"
+    "    return float(f if f % 2 == 0 else f + 1)\n";
+
 bool ScriptEngine::bakeShapeExpr(const std::string& src, bool domainRadians, int N,
                                  std::vector<float>& out, std::string& error) {
     const bool clampResult = domainRadians; // periodic shapes clamp to [-1,1]
@@ -1028,6 +1316,8 @@ bool ScriptEngine::bakeShapeExpr(const std::string& src, bool domainRadians, int
             "def square(p):\n    p = p - floor(p)\n    return 1.0 if p < 0.5 else -1.0\n"
             "def triangle(p):\n    p = p - floor(p)\n    return 4 * p - 1 if p < 0.5 else 3 - 4 * p\n"
             "def noise(v=0.0): return __ssr.random()\n"
+         << kGlslParityPyPreamble
+         << kWaveformsDictPreamble
          << "def __shape(x):\n" << body
          << "__N = " << N << "\n"
          << "if " << (clampResult ? "True" : "False") << ":\n"
@@ -1038,6 +1328,7 @@ bool ScriptEngine::bakeShapeExpr(const std::string& src, bool domainRadians, int
     PyObject* globals = PyDict_New();
     if (!globals) { error = "out of memory"; out.assign(N, 0.0f); return false; }
     PyDict_SetItemString(globals, "__builtins__", PyEval_GetBuiltins());
+    registerWaveformBuiltin(globals);
 
     PyObject* res = PyRun_String(code.str().c_str(), Py_file_input, globals, globals);
     if (!res) {
@@ -1067,5 +1358,315 @@ bool ScriptEngine::bakeShapeExpr(const std::string& src, bool domainRadians, int
     if (!ok) { out.assign(N, 0.0f); return false; }
     return true;
 }
+
+bool ScriptEngine::bakeTerrain(const std::string& src, bool wholeGrid,
+                               const std::vector<int>& dims,
+                               std::vector<float>& out, std::string& error) {
+    out.clear();
+    error.clear();
+    if (dims.empty()) { error = "no dimensions given"; return false; }
+    long long total = 1;
+    for (int d : dims) {
+        if (d < 1) { error = "every dimension must be >= 1"; return false; }
+        total *= d;
+        if (total > (1LL << 30)) { error = "terrain too large (> 1G cells)"; return false; }
+    }
+    if (!initialized && !init()) {
+        error = "Python interpreter unavailable";
+        return false;
+    }
+
+    auto trim = [](const std::string& s) {
+        size_t a = 0, b = s.size();
+        while (a < b && std::isspace((unsigned char)s[a])) ++a;
+        while (b > a && std::isspace((unsigned char)s[b - 1])) --b;
+        return s.substr(a, b - a);
+    };
+
+    // Python literal for the dims list, e.g. "[7, 9, 3]".
+    std::ostringstream dimsLit;
+    dimsLit << "[";
+    for (size_t i = 0; i < dims.size(); ++i) { if (i) dimsLit << ", "; dimsLit << dims[i]; }
+    dimsLit << "]";
+
+    // Shared preamble: the same math vocabulary the shape baker exposes.
+    const char* kPreamble =
+        "from math import sin, cos, tan, sqrt, exp, log, floor, ceil, "
+        "pi, e, tanh, atan, asin, acos\n"
+        "import random as __ssr\n"
+        "def pow(a, b): return a ** b\n"
+        "def clamp(v, lo, hi): return lo if v < lo else (hi if v > hi else v)\n"
+        "def fract(v): return v - floor(v)\n"
+        "def saw(p):\n    p = p - floor(p)\n    return 2 * p - 1\n"
+        "def square(p):\n    p = p - floor(p)\n    return 1.0 if p < 0.5 else -1.0\n"
+        "def triangle(p):\n    p = p - floor(p)\n    return 4 * p - 1 if p < 0.5 else 3 - 4 * p\n"
+        "def noise(v=0.0): return __ssr.random()\n";
+
+    std::ostringstream code;
+    code << kPreamble
+         << kGlslParityPyPreamble
+         << kWaveformsDictPreamble
+         << "__dims = " << dimsLit.str() << "\n"
+         << "__nd = len(__dims)\n"
+         << "__total = " << total << "\n";
+
+    if (wholeGrid) {
+        // Whole-grid: expose dims/nd/total + the cell buffer, run the user's
+        // generate(), then map the unipolar buffer to bipolar.
+        //
+        // Storage: when numpy is importable, the grid is a float64 ndarray
+        // `grid` shaped exactly like the terrain (dims), so a program can write
+        // `grid[r, c] = ...` or use vectorized numpy ops directly. Otherwise
+        // `grid is None` and the cells live in a private flat list. EITHER way
+        // the set/get/getAt/setAt helpers operate on the live grid, so a program
+        // can mix numpy slicing with the helpers, and reassigning `grid` to a new
+        // array (e.g. `grid = grid + 1`) is honoured at readback. Helpers keep the
+        // [0,1] clamp; raw numpy writes are clamped once at readback via np.clip.
+        code << "nd = __nd\n"
+                "total = __total\n"
+                "dims = list(__dims)\n"
+                "try:\n"
+                "    import numpy as __np\n"
+                "except Exception:\n"
+                "    __np = None\n"
+                "if __np is not None:\n"
+                "    grid = __np.zeros(tuple(__dims), dtype=__np.float64)\n"
+                "    __store = None\n"
+                "else:\n"
+                "    grid = None\n"
+                "    __store = [0.0] * __total\n"
+                "def set(i, v):\n"
+                "    v = float(v)\n"
+                "    if v < 0.0: v = 0.0\n"
+                "    elif v > 1.0: v = 1.0\n"
+                "    if grid is None: __store[int(i)] = v\n"
+                "    else: grid.flat[int(i)] = v\n"
+                "def get(i):\n"
+                "    return float(__store[int(i)] if grid is None else grid.flat[int(i)])\n"
+                "def coord(i, axis):\n"
+                "    __t = int(i)\n"
+                "    for __a in range(__nd - 1, -1, -1):\n"
+                "        __sz = __dims[__a]\n"
+                "        __idx = __t % __sz\n"
+                "        __t //= __sz\n"
+                "        if __a == axis:\n"
+                "            return (__idx / (__sz - 1)) if __sz > 1 else 0.0\n"
+                "    return 0.0\n"
+                // coordAxis(i, axis): INTEGER coordinate of cell i along axis -
+                // the inverse companion to flatten(). Mirrors GLSL coordAxis().
+                "def coordAxis(i, axis):\n"
+                "    __t = int(i)\n"
+                "    for __a in range(__nd - 1, -1, -1):\n"
+                "        __sz = __dims[__a]\n"
+                "        __idx = __t % __sz\n"
+                "        __t //= __sz\n"
+                "        if __a == axis:\n"
+                "            return __idx\n"
+                "    return 0\n"
+                // flatten(*coords): row-major flat index from per-axis INTEGER
+                // coordinates, each clamped to [0, dim-1]. Missing trailing args
+                // count as 0; extras ignored. Inverse of coordAxis(); CPU twin of
+                // the GLSL whole-grid flatten().
+                "def flatten(*coords):\n"
+                "    __idx = 0\n"
+                "    for __a in range(__nd):\n"
+                "        __sz = __dims[__a]\n"
+                "        __c = int(coords[__a]) if __a < len(coords) else 0\n"
+                "        if __c < 0: __c = 0\n"
+                "        elif __c > __sz - 1: __c = __sz - 1\n"
+                "        __idx = __idx * __sz + __c\n"
+                "    return __idx\n"
+                // neighbor(i, axis, delta): flat index delta steps from i along
+                // axis, clamped to the edge. Read back with get(neighbor(...)).
+                "def neighbor(i, axis, delta):\n"
+                "    __t = int(i)\n"
+                "    __co = [0] * __nd\n"
+                "    for __a in range(__nd - 1, -1, -1):\n"
+                "        __sz = __dims[__a]\n"
+                "        __co[__a] = __t % __sz\n"
+                "        __t //= __sz\n"
+                "    __sz = __dims[axis]\n"
+                "    __c = __co[axis] + int(delta)\n"
+                "    if __c < 0: __c = 0\n"
+                "    elif __c > __sz - 1: __c = __sz - 1\n"
+                "    __co[axis] = __c\n"
+                "    __idx = 0\n"
+                "    for __a in range(__nd):\n"
+                "        __idx = __idx * __dims[__a] + __co[__a]\n"
+                "    return __idx\n"
+                // getAt(*coords): DIRECT N-D read - the cell at per-axis INTEGER
+                // coordinates, no manual flatten(). Each coord is EDGE-CLAMPED to
+                // [0, dim-1] (reads past a border replicate the edge - the useful
+                // default for stencils). Missing coords count as 0; extras ignored.
+                "def getAt(*coords):\n"
+                "    __idx = 0\n"
+                "    for __a in range(__nd):\n"
+                "        __sz = __dims[__a]\n"
+                "        __c = int(coords[__a]) if __a < len(coords) else 0\n"
+                "        if __c < 0: __c = 0\n"
+                "        elif __c > __sz - 1: __c = __sz - 1\n"
+                "        __idx = __idx * __sz + __c\n"
+                "    return float(__store[__idx] if grid is None else grid.flat[__idx])\n"
+                // setAt(c0, ..., v): DIRECT N-D write - store v (clamped [0,1]) at
+                // the cell at the nd INTEGER coords; the value is the arg AFTER the
+                // coords (args[__nd]). An OUT-OF-RANGE coord makes the write a
+                // no-op (mirrors set), so an off-by-one never clobbers an edge cell.
+                "def setAt(*args):\n"
+                "    if len(args) < __nd + 1: return\n"
+                "    __v = float(args[__nd])\n"
+                "    __idx = 0\n"
+                "    for __a in range(__nd):\n"
+                "        __sz = __dims[__a]\n"
+                "        __c = int(args[__a])\n"
+                "        if __c < 0 or __c > __sz - 1: return\n"
+                "        __idx = __idx * __sz + __c\n"
+                "    if __v < 0.0: __v = 0.0\n"
+                "    elif __v > 1.0: __v = 1.0\n"
+                "    if grid is None: __store[__idx] = __v\n"
+                "    else: grid.flat[__idx] = __v\n";
+        // User source verbatim (defines generate()), then invoke it.
+        std::string user = trim(src);
+        if (user.empty()) user = "def generate():\n    pass";
+        code << user << "\n"
+             << "generate()\n"
+                "if grid is None:\n"
+                "    __result = [v * 2.0 - 1.0 for v in __store]\n"
+                "else:\n"
+                "    __result = __np.ascontiguousarray("
+                "__np.clip(grid, 0.0, 1.0) * 2.0 - 1.0, dtype=__np.float64).reshape(-1)\n";
+    } else {
+        // Per-cell: wrap the user expression/body into __cell(...) and loop.
+        std::string trimmed = trim(src);
+        std::string body;
+        if (trimmed.find('\n') == std::string::npos &&
+            trimmed.find("return") == std::string::npos) {
+            body = "    return (" + trimmed + ")\n";
+        } else {
+            std::istringstream lines(trimmed);
+            std::string ln, user;
+            while (std::getline(lines, ln)) user += "    " + ln + "\n";
+            if (user.empty()) user = "    return 0.0\n";
+            body = user;
+        }
+        code << "def __cell(c0, c1, c2, c3, c4, c5, c6, c7, x, y, z, w, nd):\n"
+             << body
+             << "__data = [0.0] * __total\n"
+                "__TAU = 6.283185307179586\n"
+                "for __i in range(__total):\n"
+                "    __t = __i\n"
+                "    __cc = [0.0] * 8\n"
+                "    for __a in range(__nd - 1, -1, -1):\n"
+                "        __sz = __dims[__a]\n"
+                "        __idx = __t % __sz\n"
+                "        __t //= __sz\n"
+                "        __cc[__a] = (__idx / (__sz - 1)) if __sz > 1 else 0.0\n"
+                "    c0, c1, c2, c3, c4, c5, c6, c7 = __cc\n"
+                "    __v = float(__cell(c0, c1, c2, c3, c4, c5, c6, c7, "
+                "c0 * __TAU, c1 * __TAU, c2 * __TAU, c3 * __TAU, __nd))\n"
+                "    if __v < 0.0: __v = 0.0\n"
+                "    elif __v > 1.0: __v = 1.0\n"
+                "    __data[__i] = __v * 2.0 - 1.0\n"
+                "__result = __data\n";
+    }
+
+    PyObject* globals = PyDict_New();
+    if (!globals) { error = "out of memory"; return false; }
+    PyDict_SetItemString(globals, "__builtins__", PyEval_GetBuiltins());
+    registerWaveformBuiltin(globals);
+
+    PyObject* res = PyRun_String(code.str().c_str(), Py_file_input, globals, globals);
+    if (!res) {
+        error = fetchPythonError();
+        Py_DECREF(globals);
+        return false;
+    }
+    Py_DECREF(res);
+
+    PyObject* result = PyDict_GetItemString(globals, "__result"); // borrowed
+    bool ok = false;
+    if (result && PyList_Check(result) && PyList_Size(result) == (Py_ssize_t)total) {
+        // Flat-list path (no numpy, or per-cell mode).
+        ok = true;
+        out.resize((size_t)total);
+        for (long long i = 0; i < total; ++i) {
+            PyObject* item = PyList_GetItem(result, (Py_ssize_t)i); // borrowed
+            double v = item ? PyFloat_AsDouble(item) : 0.0;
+            if (PyErr_Occurred()) { PyErr_Clear(); v = 0.0; }
+            out[(size_t)i] = (float)v;
+        }
+    } else if (result && PyObject_CheckBuffer(result)) {
+        // numpy path: __result is a C-contiguous float64 1-D ndarray. Read it
+        // straight out of its buffer (no per-element Python calls).
+        Py_buffer view;
+        if (PyObject_GetBuffer(result, &view,
+                               PyBUF_C_CONTIGUOUS | PyBUF_FORMAT) == 0) {
+            if (view.itemsize == (Py_ssize_t)sizeof(double) &&
+                view.format && std::strchr(view.format, 'd') &&
+                view.len == (Py_ssize_t)(total * (long long)sizeof(double)) &&
+                view.buf) {
+                ok = true;
+                out.resize((size_t)total);
+                const double* d = (const double*)view.buf;
+                for (long long i = 0; i < total; ++i) out[(size_t)i] = (float)d[i];
+            }
+            PyBuffer_Release(&view);
+        } else {
+            PyErr_Clear();
+        }
+    }
+    if (!ok) {
+        error = "program did not produce " + std::to_string(total) + " cells "
+                "(whole-grid programs must define generate())";
+    }
+    Py_DECREF(globals);
+
+    if (!ok) { out.clear(); return false; }
+    return true;
+}
+
+#else // !HAS_PYTHON ----------------------------------------------------------
+// Stub implementation for builds without Python. Every method is a no-op that
+// reports unavailability so callers degrade gracefully. pythonAvailable() is
+// defined above (it returns false in this branch).
+
+static const char* kNoPython =
+    "Python is not available in this build of SEANCE. Built-in expressions "
+    "and Lua are still available.";
+
+ScriptEngine::ScriptEngine() {}
+ScriptEngine::~ScriptEngine() {}
+
+bool ScriptEngine::init() { return false; }
+void ScriptEngine::shutdown() {}
+
+std::string ScriptEngine::run(const std::string&, NodeGraph&, int) {
+    return kNoPython;
+}
+
+std::vector<ScriptEngine::SignalValue> ScriptEngine::evaluateSignals(int, int, int) {
+    return {};
+}
+
+bool ScriptEngine::bakeShapeExpr(const std::string&, bool, int N,
+                                 std::vector<float>& out, std::string& error) {
+    out.assign(N > 0 ? N : 0, 0.0f);
+    error = kNoPython;
+    return false;
+}
+
+bool ScriptEngine::bakeTerrain(const std::string&, bool,
+                               const std::vector<int>&,
+                               std::vector<float>& out, std::string& error) {
+    out.clear();
+    error = kNoPython;
+    return false;
+}
+
+ScriptEngine& ScriptEngine::instance() {
+    static ScriptEngine engine;
+    return engine;
+}
+
+#endif // HAS_PYTHON
 
 } // namespace SoundShop

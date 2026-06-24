@@ -1,5 +1,6 @@
 #include "main_window.h"
 #include "dialog_helpers.h"
+#include "asset_library_component.h"
 #include "terrain_synth.h"
 #include "builtin_synth.h"
 #include "layered_wave_editor.h"
@@ -124,6 +125,9 @@ MainContentComponent::MainContentComponent() {
     graphComponent->getAudioFormat = [this]() {
         return std::make_pair(audioEngine.getSampleRate(),
                               audioEngine.getBlockSize());
+    };
+    graphComponent->getNodeLatencies = [this]() {
+        return audioEngine.getGraphProcessor().snapshotNodeLatencies();
     };
 
     // Hotkey system: register callbacks and load saved bindings
@@ -425,7 +429,7 @@ MainContentComponent::MainContentComponent() {
             // makes the invariant "all batch graph mutations hold this
             // lock" hold even if the device starts unusually early.
             {
-                std::lock_guard<std::mutex> graphLk(graph.mutationLock);
+                std::lock_guard<std::recursive_mutex> graphLk(graph.mutationLock);
                 ProjectFile::load(recentProjects[0].toStdString(), graph, nullptr);
             }
             // Re-apply the saved pan/zoom from the loaded graph (or fit-all
@@ -483,6 +487,11 @@ MainContentComponent::MainContentComponent() {
                 n->pluginStateDirty = true;
         };
 
+    // Crash detection (must run before tryRecoverAutosave is scheduled and
+    // before the autosave worker can touch the dir): note whether a session
+    // lock survived from a previous run, then drop a fresh lock for this run.
+    setupSessionLock();
+
     // Background worker for slow autosave (#86). Runs the disk write
     // off the UI thread so larger projects don't hiccup during the save.
     startAutosaveWorker();
@@ -503,7 +512,7 @@ MainContentComponent::MainContentComponent() {
         // is the same kind of batch mutation as MOD import. Same race risk
         // (see mutationLock comment in node_graph.h), same fix.
         {
-            std::lock_guard<std::mutex> graphLk(graph.mutationLock);
+            std::lock_guard<std::recursive_mutex> graphLk(graph.mutationLock);
             ProjectFile::loadFromString(snap, graph, nullptr);
         }
         // Drop editor panels whose underlying node no longer exists in the
@@ -1088,6 +1097,11 @@ void MainContentComponent::timerCallback() {
         } else if (projectDirty || graph.dirty) {
             title += " *";
         }
+        // Make ephemeral (test) sessions obvious so they're never mistaken for
+        // a real working session - and so the absence of a recovery prompt is
+        // clearly explained.
+        if (isEphemeralSession())
+            title += "  [ephemeral session]";
         win->setName(title);
     }
 }
@@ -1130,6 +1144,8 @@ juce::PopupMenu MainContentComponent::getMenuForIndex(int idx, const juce::Strin
                      hasLoop); // only enabled when loop region is set
         menu.addItem(23, "Arm All Params for Write");
         menu.addItem(24, "Disarm All Params");
+        menu.addSeparator();
+        menu.addItem(26, "Asset Library...");
     } else if (name == "Scripts") {
         menu.addItem(90, "Script Console...");
         menu.addItem(91, "Run Script File...");
@@ -1293,6 +1309,7 @@ void MainContentComponent::menuItemSelected(int menuItemID, int) {
         }
         case 23: graph.armAllParams(true); graphComponent->repaint(); break;
         case 24: graph.armAllParams(false); graphComponent->repaint(); break;
+        case 26: showAssetLibraryDialog(); break;
         case 70: case 71: case 72: case 73:
             graph.tuningSystem = (TuningSystem)(menuItemID - 70);
             break;
@@ -2206,6 +2223,25 @@ void MainContentComponent::showPluginUI(int nodeId) {
         return;
     }
 
+    // Curve EQ editor: an Effect node whose script is a `__curveeq__:` curve.
+    // Draws an arbitrary magnitude-response curve applied via block-local STFT.
+    if (node && node->type == NodeType::Effect
+        && node->script.rfind("__curveeq__:", 0) == 0) {
+        auto* editor = new CurveEQEditorComponent(graph, node->id, [this]() {
+            audioEngine.getGraphProcessor().requestRebuild();
+        });
+        juce::DialogWindow::LaunchOptions opts;
+        opts.content.setOwned(editor);
+        opts.dialogTitle = "Curve EQ: " + juce::String(node->name);
+        opts.dialogBackgroundColour = juce::Colour(22, 22, 28);
+        opts.escapeKeyTriggersCloseButton = true;
+        opts.useNativeTitleBar = false;
+        opts.resizable = true;
+        opts.componentToCentreAround = this;
+        SoundShop::launchToolDialog(opts);
+        return;
+    }
+
     // Spectral (frequency-domain) editor for nodes authored with a
     // mag/phase spectrum. Both the new `__spectral2__:` format and the
     // legacy `__spectral__:` format open the same editor; the editor
@@ -2228,6 +2264,34 @@ void MainContentComponent::showPluginUI(int nodeId) {
         opts.resizable = true;
         opts.componentToCentreAround = this;
         SoundShop::launchToolDialog(opts);
+        return;
+    }
+
+    // Standalone single-frame "frame synth" instrument nodes (#- the six
+    // capture/synthesis frame types as their own node type). The script is a
+    // __framesynth__ wrapper around a one-frame WavetableDoc; it opens the SAME
+    // LayeredWaveEditorComponent, which detects the prefix and runs in FOCUSED
+    // mode (no grid / library / Position morph - just the one frame's editor
+    // plus Gain / Preview / Envelope / Morph). This must be checked before the
+    // wavetable gate below: the wrapped body is itself a __wavetable5__ encode,
+    // so without this earlier gate a frame synth would open as a full wavetable.
+    if (node && (node->type == NodeType::Instrument || node->type == NodeType::TerrainSynth)
+        && !node->plugin && node->pluginIndex < 0
+        && node->script.rfind("__framesynth__:", 0) == 0) {
+        auto* editor = new LayeredWaveEditorComponent(graph, node->id, [this]() {
+            audioEngine.getGraphProcessor().requestRebuild();
+        });
+        juce::DialogWindow::LaunchOptions opts;
+        opts.content.setOwned(editor);
+        opts.dialogTitle = "Instrument: " + juce::String(node->name);
+        opts.dialogBackgroundColour = juce::Colour(22, 22, 28);
+        opts.escapeKeyTriggersCloseButton = true;
+        opts.useNativeTitleBar = false;
+        opts.resizable = true;
+        opts.componentToCentreAround = this;
+        // Non-modal for the same drag-and-drop reason as the wavetable editor
+        // (the focused editor still hosts library-capable sub-editors).
+        SoundShop::launchNonModalToolDialog(opts);
         return;
     }
 
@@ -2745,7 +2809,7 @@ void MainContentComponent::newProject() {
     // try-lock). Pair the lock here, matching the project-load path. See the
     // mutationLock comment in node_graph.h.
     {
-        std::lock_guard<std::mutex> graphLk(graph.mutationLock);
+        std::lock_guard<std::recursive_mutex> graphLk(graph.mutationLock);
         graph.nodes.clear();
         graph.links.clear();
         graph.openEditors.clear();
@@ -2760,7 +2824,7 @@ void MainContentComponent::newProject() {
     {
         // Same structural-mutation lock as the clear/rebuild above: addNode()
         // below can reallocate graph.nodes while the audio callback iterates.
-        std::lock_guard<std::mutex> graphLk(graph.mutationLock);
+        std::lock_guard<std::recursive_mutex> graphLk(graph.mutationLock);
 
         auto devices = juce::MidiInput::getAvailableDevices();
         // Resolve the default MIDI track's MIDI input PIN ID up front. Pin IDs
@@ -2982,10 +3046,40 @@ void MainContentComponent::openProjectFile(const juce::String& path) {
     // ProjectFile::load clears graph.nodes/links and rebuilds them from the
     // file - same batch-mutation race surface as MOD import. See the
     // mutationLock comment in node_graph.h.
+    // Collect any factory-waveform references that fail to resolve against this
+    // build's WaveformBank (e.g. the project was saved by a newer SEANCE whose
+    // waveforms.bin added cycles this build doesn't have). resolveFactoryRef()
+    // silences such layers; without this warning the song would be untrue to
+    // the original with no indication. We warn after the load completes.
+    FactoryRefResolutionScope factoryRefScope;
     {
-        std::lock_guard<std::mutex> graphLk(graph.mutationLock);
+        std::lock_guard<std::recursive_mutex> graphLk(graph.mutationLock);
         ProjectFile::load(path.toStdString(), graph, &audioEngine.getPluginHost());
         upgradeLegacyNodes();
+
+        // Embed baked formula cycles for old projects (#crash-python314). A
+        // Lua/Python/GLSL Formula layer in a Terrain Synth (__layered__) or
+        // Signal Shape script used to be re-baked by re-running the interpreter
+        // whenever the audio thread rebuilt the processor - which crashes deep
+        // in python3xx.dll because the CPython interpreter is message-thread
+        // only. encodeLayer now embeds the baked cycle ("bake=" field) so the
+        // audio thread never needs an interpreter, but projects saved before
+        // that change have no embedded cycle. Re-bake here (we're on the message
+        // thread, holding mutationLock so the audio thread is parked) and
+        // re-encode so the embed is present before the graph goes live. New
+        // edits already save with the embed, so this only ever rewrites old
+        // files. See rebakeFormula / migrateLayeredScriptEmbedBake.
+        for (auto& node : graph.nodes) {
+            std::string script = node.script;
+            if (script.rfind("__layered__:", 0) == 0) {
+                if (migrateLayeredScriptEmbedBake(script))
+                    setNodeScriptSynced(node, script);
+            } else if (SignalShapeDoc::isSignalShapeScript(script)) {
+                SignalShapeDoc d;
+                if (d.decode(script) && d.layers.decodedNeedsBakeEmbed)
+                    setNodeScriptSynced(node, d.encode());
+            }
+        }
     }
 
     auto editorIds = graph.openEditors;
@@ -3012,6 +3106,42 @@ void MainContentComponent::openProjectFile(const juce::String& path) {
     // Shared-history handling (#90): check for a sidecar and, if it
     // hasn't been seen by this user before, show the 3-option prompt.
     handleSharedHistoryOnOpen(path);
+
+    // Warn if the project referenced built-in factory waveforms this build's
+    // WaveformBank doesn't have (typically a project saved by a newer SEANCE).
+    // Those layers were silenced on load; surfacing the names lets the user
+    // know the song won't sound exactly as authored.
+    if (!factoryRefScope.unresolved.empty()) {
+        juce::StringArray names;
+        for (const auto& n : factoryRefScope.unresolved)
+            names.add(juce::String(n));
+        int extra = 0;
+        const int kMaxListed = 12;
+        if (names.size() > kMaxListed) {
+            extra = names.size() - kMaxListed;
+            names.removeRange(kMaxListed, extra);
+        }
+        juce::String msg =
+            "This project references " + juce::String(factoryRefScope.unresolved.size()) +
+            (factoryRefScope.unresolved.size() == 1
+                 ? " built-in waveform that isn't in this version of SEANCE:\n\n"
+                 : " built-in waveforms that aren't in this version of SEANCE:\n\n") +
+            names.joinIntoString("\n");
+        if (extra > 0)
+            msg += "\n+ " + juce::String(extra) + " more";
+        msg += "\n\nThis usually means the project was saved with a newer version of "
+               "SEANCE that added these waveforms. The affected layers were silenced, "
+               "so the song may not sound exactly as it was authored. Updating SEANCE "
+               "should restore them.";
+        juce::NativeMessageBox::showAsync(
+            juce::MessageBoxOptions()
+                .withIconType(juce::MessageBoxIconType::WarningIcon)
+                .withTitle("Missing built-in waveforms")
+                .withMessage(msg)
+                .withButton("OK")
+                .withAssociatedComponent(this),
+            nullptr);
+    }
 }
 
 void MainContentComponent::freezeNode(int nodeId) {
@@ -3189,7 +3319,7 @@ void MainContentComponent::importModFile() {
             // import work.
             ModImporter::ImportResult result;
             {
-                std::lock_guard<std::mutex> graphLk(graph.mutationLock);
+                std::lock_guard<std::recursive_mutex> graphLk(graph.mutationLock);
                 result = ModImporter::import(file.getFullPathName().toStdString(), graph);
             }
 
@@ -3683,7 +3813,29 @@ void MainContentComponent::savePreferences() {
 // Autosave
 // ==============================================================================
 
+// Ephemeral-session state (see setEphemeralSession in main_window.h). File-
+// local so the getAutosaveDir() family below can consult it; toggled through
+// the namespace-scoped setter that main.cpp calls when --ephemeral is parsed.
+static bool g_ephemeralSession = false;
+
+bool isEphemeralSession() { return g_ephemeralSession; }
+void setEphemeralSession(bool on) {
+    g_ephemeralSession = on;
+    if (on) {
+        // Start every ephemeral launch from a clean slate so a previously
+        // killed ephemeral run can't leave an autosave that makes the NEXT
+        // ephemeral run prompt for recovery. (The user's real session dir is
+        // never touched in this mode.)
+        juce::File::getSpecialLocation(juce::File::tempDirectory)
+            .getChildFile("SEANCE-ephemeral")
+            .deleteRecursively();
+    }
+}
+
 static juce::File getAutosaveDir() {
+    if (g_ephemeralSession)
+        return juce::File::getSpecialLocation(juce::File::tempDirectory)
+                   .getChildFile("SEANCE-ephemeral");
     return juce::File::getSpecialLocation(juce::File::userApplicationDataDirectory)
                .getChildFile("SoundShop");
 }
@@ -3695,6 +3847,15 @@ static juce::File getAutosaveMetaFile() {
 }
 static juce::File getUndoTreeFile() {
     return getAutosaveDir().getChildFile("undo-tree.dat");
+}
+// Session-lock sentinel. Created on startup, deleted on clean shutdown. Its
+// presence at the next startup means the previous run never reached a clean
+// shutdown (crash, force-kill, power loss, or a quit sequence that didn't
+// finish). This is the crash signal - decoupled from autosave.ssp, which a
+// normal idle session also writes and which a clean exit only *usually*
+// manages to sweep before the process dies.
+static juce::File getSessionLockFile() {
+    return getAutosaveDir().getChildFile("session.lock");
 }
 static juce::File getPluginStateFile(int nodeId) {
     return getAutosaveDir().getChildFile("autosave-plugin-" + juce::String(nodeId) + ".dat");
@@ -3924,6 +4085,23 @@ void MainContentComponent::quiesceAutosaveWorker() {
     autosaveWorkerIdleCv.wait(lk, [this]() {       // wait out any in-flight write
         return !autosaveWorkerBusy;
     });
+}
+
+void MainContentComponent::setupSessionLock() {
+    auto dir = getAutosaveDir();
+    if (!dir.exists()) dir.createDirectory();
+    auto lock = getSessionLockFile();
+    // If the lock is already here, the previous run never reached a clean
+    // shutdown - that's our crash signal, independent of whether autosave.ssp
+    // happens to exist. (For an --ephemeral run the whole dir was just wiped,
+    // so the lock is absent and this run is correctly treated as clean.)
+    startupWasUncleanShutdown = lock.existsAsFile();
+    lock.replaceWithText(juce::Time::getCurrentTime().toISO8601(true));
+}
+
+void MainContentComponent::markCleanShutdown() {
+    auto lock = getSessionLockFile();
+    if (lock.existsAsFile()) lock.deleteFile();
 }
 
 void MainContentComponent::discardAutosave() {
@@ -4363,9 +4541,22 @@ void MainContentComponent::tryRecoverAutosave() {
     autosaveRecoveryOffered = true;
 
     auto autoFile = getAutosaveFile();
+
+    // The previous run exited cleanly (its session lock was removed). Any
+    // autosave still on disk is therefore stale - a clean exit normally sweeps
+    // it, but a leftover (e.g. the autosave worker re-wrote autosave.ssp in the
+    // last few milliseconds before the process exited, after discardAutosave
+    // already ran) must NOT trigger a false "didn't shut down cleanly" prompt.
+    // Sweep any straggler silently and just restore the persisted undo tree.
+    if (!startupWasUncleanShutdown) {
+        if (autoFile.existsAsFile()) discardAutosave();
+        tryRestoreUndoTree();
+        return;
+    }
+
     if (!autoFile.existsAsFile()) {
-        // No autosave to consider - but we still want to restore the
-        // persisted undo tree if one exists from a clean prior session.
+        // Unclean shutdown, but nothing was autosaved (e.g. crashed before the
+        // first autosave tick). Still restore the persisted undo tree if any.
         tryRestoreUndoTree();
         return;
     }
@@ -4417,7 +4608,7 @@ void MainContentComponent::tryRecoverAutosave() {
             // already running, so the audio callback is actively iterating
             // graph.nodes and would otherwise race with the load.
             {
-                std::lock_guard<std::mutex> graphLk(safe->graph.mutationLock);
+                std::lock_guard<std::recursive_mutex> graphLk(safe->graph.mutationLock);
                 ProjectFile::load(getAutosaveFile().getFullPathName().toStdString(),
                                   safe->graph, &safe->audioEngine.getPluginHost());
                 safe->upgradeLegacyNodes();
@@ -4531,6 +4722,21 @@ public:
         recentBtn.onClick = [this]() { showRecentMenu(); };
 
         loadRecentList();
+
+        // If no Python interpreter is available, the console can't run anything.
+        // Say so up front (rather than silently doing nothing on Run) and
+        // explain how to enable it — see CLAUDE.md's grayed-control rule.
+        if (!ScriptEngine::pythonAvailable()) {
+            outputEditor.setText(
+                "Python scripting is disabled: no Python interpreter was found.\n"
+                "SEANCE delay-loads Python, so it runs fine without it — but the\n"
+                "Script Console, Python signal evaluation, and the Python shape\n"
+                "baker need a Python install. Install Python (matching this build's\n"
+                "version) so its DLL is on the system PATH, then restart SEANCE.");
+            runBtn.setEnabled(false);
+            runBtn.setTooltip("Disabled — no Python interpreter was found. Install "
+                              "Python and restart SEANCE to enable scripting.");
+        }
 
         setSize(700, 550);
     }
@@ -5123,6 +5329,26 @@ void MainContentComponent::showAudioDeviceSettings() {
 #endif
 }
 
+void MainContentComponent::showAssetLibraryDialog() {
+    auto* dlg = new AssetLibraryComponent(graph,
+        [this](const std::string& desc) {
+            projectDirty = true;
+            graph.dirty = true;
+            graph.commitSnapshot(desc);
+            if (graphComponent) graphComponent->repaint();
+        });
+
+    juce::DialogWindow::LaunchOptions opts;
+    opts.content.setOwned(dlg);
+    opts.dialogTitle = "Asset Library";
+    opts.dialogBackgroundColour = juce::Colour(40, 40, 45);
+    opts.escapeKeyTriggersCloseButton = true;
+    opts.useNativeTitleBar = false;
+    opts.resizable = true;
+    opts.componentToCentreAround = this;
+    SoundShop::launchToolDialog(opts);
+}
+
 void MainContentComponent::showPluginSettingsDialog() {
     auto* dlg = new PluginSettingsComponent(pluginSettings, audioEngine.getPluginHost(), graph);
 
@@ -5437,8 +5663,16 @@ bool MainContentComponent::handleKeyboardMidi(const juce::KeyPress& key, bool is
 
 void MainWindow::tryQuit() {
     auto* content = dynamic_cast<MainContentComponent*>(getContentComponent());
-    if (content && content->tryQuit())
+    if (content && content->tryQuit()) {
+        // We're definitely quitting cleanly now: drop the session lock so the
+        // next launch knows this shutdown was clean and won't offer to recover
+        // a stale autosave. This is the single chokepoint every clean quit
+        // funnels through (window close button, File -> Quit, OS quit request,
+        // and the deferred re-quit after an async Save). A crash or force-kill
+        // never reaches here, so the lock survives and recovery is offered.
+        content->markCleanShutdown();
         juce::JUCEApplication::getInstance()->quit();
+    }
 }
 
 // ==============================================================================

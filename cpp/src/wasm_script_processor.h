@@ -84,6 +84,14 @@ private:
     // MIDI Script node's multi-output model. Clamped 1..16.
     int numMidiOutPins = 1;
 
+    // Number of independent MIDI INPUT pins. 1 = single "MIDI In" pin (the
+    // common case). >1 = the script declared ss_num_midi_inputs() > 1, exposing
+    // "MIDI In 1..N"; the graph stamps each incoming cable's channel nibble with
+    // (input-pin index + 1), and copyMidiIn() writes that index into byte 7 of
+    // each event so the module can read input_index. Mirrors the multi-output
+    // model on the input side. Clamped 1..16.
+    int numMidiInPins = 1;
+
     // Direct pointer into WASM linear memory
     uint8_t* wasmMem = nullptr;
     uint32_t wasmMemSize = 0;

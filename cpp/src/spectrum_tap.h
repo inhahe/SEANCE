@@ -34,6 +34,15 @@ struct FrequencyBin {
     bool useCustomResponse = false;
     SpectralCurve responseCurve;
 
+    // Live reference to a FrequencyGraph asset-library entry, or -1 if the
+    // curve is independent (authored in place). When set, the bin's
+    // responseCurve is a mirror re-decoded from the asset by
+    // resolveSpectrumTapReferences() so editing the shared asset propagates to
+    // every bin / node that references it. The cached responseCurve is still
+    // persisted so a hard-deleted asset degrades to an independent curve rather
+    // than dangling.
+    int responseCurveAssetId = -1;
+
     // Biquad bandpass state (2nd-order IIR), used when !useCustomResponse
     float b0 = 0, b1 = 0, b2 = 0, a1 = 0, a2 = 0; // coefficients
     float x1 = 0, x2 = 0, y1 = 0, y2 = 0;           // state
@@ -121,6 +130,12 @@ public:
     // SpectralCurve::encode() payload. When `fftSize` is the default
     // AND there are no custom curves, the result collapses to plain
     // `__spectrumtap__` so legacy / biquad-only taps round-trip cleanly.
+    //
+    // Bins that live-reference a FrequencyGraph asset append a trailing
+    // `|#refs|<slot>:<assetId>|...` section after the curve list, so the
+    // reference ids persist alongside the cached curve. Old decoders that
+    // predate this section see the `#refs` token as an extra (un-decodable,
+    // hence biquad) curve slot and ignore it harmlessly.
     static std::string encodeScript(const std::vector<FrequencyBin>& bins,
                                     int fftSize);
 
@@ -132,10 +147,14 @@ public:
     // int FFT size when it is purely numeric; otherwise it is treated
     // as a curve slot for backwards compatibility with the very first
     // iteration of this format (which had no fftSize header).
+    // outAssetIds is filled parallel to outCurves: the FrequencyGraph asset id
+    // each slot references, or -1 for an independent curve. Slots with no `#refs`
+    // entry default to -1.
     static void decodeScript(const std::string& script,
                              int& outFftSize,
                              std::vector<SpectralCurve>& outCurves,
-                             std::vector<bool>& outUseCustom);
+                             std::vector<bool>& outUseCustom,
+                             std::vector<int>& outAssetIds);
 
 private:
     Node& node;
@@ -160,6 +179,15 @@ private:
     void rebuildBinFftWeights();
     void ensureFFTReady();
 };
+
+// Mirror every live-referenced FrequencyGraph asset into the spectrum-tap
+// bins that point at it: re-decode the asset payload into the bin's cached
+// responseCurve and re-encode the node script. Dangling references (asset
+// hard-deleted) detach to independent, keeping the last cached curve. Returns
+// the number of references resolved. Mirrors resolveAhdsrReferences(). Declared
+// here (not node_graph.h) because it needs the spectrum-tap script codec; the
+// project loader calls it via this header.
+int resolveSpectrumTapReferences(NodeGraph& graph);
 
 // UI for the spectrum tap: shows bins on a frequency axis, lets user
 // add/remove/resize them, displays live amplitude levels.
@@ -193,17 +221,28 @@ private:
     int              fftSize = SpectrumTapProcessor::kDefaultFftSize;
 
     // Per-bin custom response curve state, kept in lock-step with the
-    // node's "Bin " params. binCurveStates[i].first is whether the i-th
-    // bin uses a custom response curve, .second is the curve itself
-    // (only meaningful when .first is true). Mirrored to node.script
+    // node's "Bin " params. `useCustom` is whether the i-th bin uses a
+    // custom response curve, `curve` is the curve itself (only meaningful
+    // when useCustom is true), and `assetId` is the FrequencyGraph library
+    // entry it live-references (-1 = independent). Mirrored to node.script
     // via syncCurvesToScript() so the audio processor and persistence
     // layers see the same view.
-    std::vector<std::pair<bool, SpectralCurve>> binCurveStates;
+    struct BinCurveState {
+        bool          useCustom = false;
+        SpectralCurve curve;
+        int           assetId = -1;
+    };
+    std::vector<BinCurveState> binCurveStates;
     int countBinParams() const;
     void syncCurveStateCount();        // pad/truncate to match bin count
     void loadCurveStatesFromScript();  // read node.script
     void syncCurvesToScript();         // write node.script + dirty + rebuild
     void openResponseEditor(int binSlotIdx);
+    // Called when the curve in slot `binSlotIdx` was edited in the response
+    // editor. Mirrors the edit to node.script; if the slot live-references a
+    // FrequencyGraph asset, also writes the edit back into that asset and
+    // re-resolves so every other bin/node sharing it updates.
+    void commitCurveEdit(int binSlotIdx);
 
     // Convert between Hz and screen x (log scale)
     float hzToX(float hz) const;

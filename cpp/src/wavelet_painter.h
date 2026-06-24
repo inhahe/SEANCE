@@ -2,6 +2,7 @@
 #include "node_graph.h"
 #include "wavelet_paint.h"
 #include "wavelet_frame.h"
+#include "warp_editor.h"     // WarpChainEditor (per-coefficient element warp)
 #include <juce_gui_basics/juce_gui_basics.h>
 #include <vector>
 #include <string>
@@ -86,6 +87,23 @@ private:
     juce::Label      levelsLabel;
     juce::TextButton clearBtn { "Clear" };
     juce::TextButton helpBtn  { "?" };
+    // Opens the shared AHDSR amplitude-envelope editor for this node in a
+    // separate dialog. Node-backed mode only (graph != nullptr); in frame-backed
+    // sub-editor mode the wavetable shell owns the envelope button instead.
+    juce::TextButton envelopeBtn { "Envelope..." };
+    // Sustained held audition (the generic editor "Preview" button - same role
+    // as the wavetable shell's playBtn). Node-backed mode only.
+    juce::TextButton playBtn { "Preview" };
+    bool framePlaying = false;
+
+    // Bucket C element warp (frame-backed mode only). Edits the owning
+    // WaveletFrame's warpChain, baked into the coefficient grid before the IDWT
+    // (matching WaveletFrame::renderRaw) so the preview reflects the audio. Null
+    // in node-backed mode, where the standalone wavelet node stores only a
+    // __waveletpaint__ script with no warp section. Both warp domains apply:
+    // phase-domain ops stretch/shift along the coefficient index, amplitude-
+    // domain ops reshape the coefficient magnitudes.
+    std::unique_ptr<WarpChainEditor> warpEditor;
 
     // Layout caches updated in resized()
     juce::Rectangle<int> toolbarBounds;
@@ -96,6 +114,12 @@ private:
     void commitToNode();
     void paintCoeff(const juce::MouseEvent& e);
     void seedDefaultCoefficients();
+
+    // Held-audition (Preview) control. togglePreview starts/stops; ship re-sends
+    // the freshly-rendered cycle whenever an edit changes it (no-op unless a
+    // Preview is active). Both no-op in frame-backed mode (graph == nullptr).
+    void togglePreview();
+    void refreshPreviewAudition();
 };
 
 } // namespace SoundShop

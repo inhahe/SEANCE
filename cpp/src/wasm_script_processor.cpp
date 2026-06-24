@@ -10,6 +10,9 @@
 #define HAS_WASM3 0
 #endif
 
+#include "waveform_bank.h"      // shared cross-language waveform() factory bank
+#include "warp.h"               // shared cross-language warpamp/warpphase shapers
+#include "buffer_warp.h"        // Bucket C whole-buffer spectral/wavelet warps
 #include <cstring>
 #include <cstdio>
 #include <cmath>
@@ -97,6 +100,10 @@ bool WasmScriptProcessor::loadWasm(const std::vector<uint8_t>& wasmBytes) {
     result = m3_LoadModule(wasmRuntime, wasmModule);
     if (result) { fprintf(stderr, "[WASM] Load error: %s\n", result); return false; }
 
+    // Warm the factory-waveform bank off the audio thread so ss_waveform() and
+    // ss_waveform_id() are allocation-free when called from ss_process().
+    { auto& bank = WaveformBank::get(); bank.ensureLoaded(); bank.indexForName(""); }
+
     // Link host imports
     m3_LinkRawFunction(wasmModule, "env", "ss_declare_param", "i(*fff)", [](IM3Runtime rt, IM3ImportContext ctx, uint64_t* sp, void* mem) -> const void* {
         auto* self = (WasmScriptProcessor*)m3_GetUserData(rt);
@@ -181,6 +188,91 @@ bool WasmScriptProcessor::loadWasm(const std::vector<uint8_t>& wasmBytes) {
         return m3Err_none;
     });
 
+    // ss_waveform(id, phase) -> sample from the shared factory-waveform bank
+    // (the same waveform() the Built-in/Lua/Python/GLSL formula languages use).
+    m3_LinkRawFunction(wasmModule, "env", "ss_waveform", "f(if)", [](IM3Runtime rt, IM3ImportContext ctx, uint64_t* sp, void* mem) -> const void* {
+        int id = (int)(int32_t)sp[0];
+        float phase = *(float*)&sp[1];
+        *(float*)&sp[0] = WaveformBank::get().sampleAtPhase(id, phase);
+        return m3Err_none;
+    });
+
+    // ss_waveform_id(name) -> stable entry index (-1 if unknown).
+    m3_LinkRawFunction(wasmModule, "env", "ss_waveform_id", "i(*)", [](IM3Runtime rt, IM3ImportContext ctx, uint64_t* sp, void* mem) -> const void* {
+        auto* self = (WasmScriptProcessor*)m3_GetUserData(rt);
+        uint32_t namePtr = (uint32_t)sp[0];
+        const char* name = namePtr < self->wasmMemSize ? (const char*)(self->wasmMem + namePtr) : "";
+        int id = WaveformBank::get().indexForName(name);
+        sp[0] = (uint64_t)(uint32_t)(int32_t)id;
+        return m3Err_none;
+    });
+
+    // ss_warpamp(method, x, amount) / ss_warpphase(method, phase, amount) -> the
+    // wavetable shape-bending warps as pure scalar functions, routed to the SAME
+    // warpAmpValue/warpPhaseValue primitives the editor and synth voice use.
+    // `method` is the integer WarpMethod id (resolve a name once via ss_warp_method).
+    m3_LinkRawFunction(wasmModule, "env", "ss_warpamp", "f(iff)", [](IM3Runtime rt, IM3ImportContext ctx, uint64_t* sp, void* mem) -> const void* {
+        WarpMethod m = (WarpMethod)(int)(int32_t)sp[0];
+        float x   = *(float*)&sp[1];
+        float amt = *(float*)&sp[2];
+        *(float*)&sp[0] = warpAmpValue(m, x, amt);
+        return m3Err_none;
+    });
+    m3_LinkRawFunction(wasmModule, "env", "ss_warpphase", "f(iff)", [](IM3Runtime rt, IM3ImportContext ctx, uint64_t* sp, void* mem) -> const void* {
+        WarpMethod m = (WarpMethod)(int)(int32_t)sp[0];
+        float ph  = *(float*)&sp[1];
+        float amt = *(float*)&sp[2];
+        *(float*)&sp[0] = warpPhaseValue(m, ph, amt);
+        return m3Err_none;
+    });
+    // ss_warp_method(name) -> integer WarpMethod id (0/None if unknown).
+    m3_LinkRawFunction(wasmModule, "env", "ss_warp_method", "i(*)", [](IM3Runtime rt, IM3ImportContext ctx, uint64_t* sp, void* mem) -> const void* {
+        auto* self = (WasmScriptProcessor*)m3_GetUserData(rt);
+        uint32_t namePtr = (uint32_t)sp[0];
+        const char* name = namePtr < self->wasmMemSize ? (const char*)(self->wasmMem + namePtr) : "";
+        sp[0] = (uint64_t)(uint32_t)(int32_t)warpMethodFromName(name);
+        return m3Err_none;
+    });
+
+    // ss_spectralwarp(ptr, len, method, amount) / ss_waveletwarp(ptr, len, method,
+    // amount, filterPtr, levels) -> Bucket C representation-bound warps applied IN
+    // PLACE to a float buffer in WASM linear memory (ptr = byte offset of the first
+    // float, len = sample count). Whole-buffer FFT-magnitude / DWT-coefficient
+    // shaping (see buffer_warp.h). Allocates a scratch vector - note-on/block-rate,
+    // not per-sample hot path.
+    m3_LinkRawFunction(wasmModule, "env", "ss_spectralwarp", "v(iiif)", [](IM3Runtime rt, IM3ImportContext ctx, uint64_t* sp, void* mem) -> const void* {
+        auto* self = (WasmScriptProcessor*)m3_GetUserData(rt);
+        uint32_t ptr = (uint32_t)sp[0];
+        int      len = (int)(int32_t)sp[1];
+        WarpMethod m = (WarpMethod)(int)(int32_t)sp[2];
+        float    amt = *(float*)&sp[3];
+        if (!self->wasmMem || len <= 0) return m3Err_none;
+        if ((uint64_t)ptr + (uint64_t)len * 4u > self->wasmMemSize) return m3Err_none;
+        float* base = (float*)(self->wasmMem + ptr);
+        std::vector<float> buf(base, base + len);
+        spectralWarpBuffer(buf, m, amt);
+        for (int i = 0; i < len; ++i) base[i] = buf[(size_t)i];
+        return m3Err_none;
+    });
+    m3_LinkRawFunction(wasmModule, "env", "ss_waveletwarp", "v(iiifii)", [](IM3Runtime rt, IM3ImportContext ctx, uint64_t* sp, void* mem) -> const void* {
+        auto* self = (WasmScriptProcessor*)m3_GetUserData(rt);
+        uint32_t ptr       = (uint32_t)sp[0];
+        int      len       = (int)(int32_t)sp[1];
+        WarpMethod m       = (WarpMethod)(int)(int32_t)sp[2];
+        float    amt       = *(float*)&sp[3];
+        uint32_t filterPtr = (uint32_t)sp[4];
+        int      levels    = (int)(int32_t)sp[5];
+        if (!self->wasmMem || len <= 0) return m3Err_none;
+        if ((uint64_t)ptr + (uint64_t)len * 4u > self->wasmMemSize) return m3Err_none;
+        const char* filter = (filterPtr && filterPtr < self->wasmMemSize)
+                             ? (const char*)(self->wasmMem + filterPtr) : "db4";
+        float* base = (float*)(self->wasmMem + ptr);
+        std::vector<float> buf(base, base + len);
+        waveletWarpBuffer(buf, m, amt, filter, levels);
+        for (int i = 0; i < len; ++i) base[i] = buf[(size_t)i];
+        return m3Err_none;
+    });
+
     // Get WASM memory pointer
     wasmMem = m3_GetMemory(wasmRuntime, &wasmMemSize, 0);
     if (!wasmMem) { fprintf(stderr, "[WASM] No memory\n"); return false; }
@@ -211,6 +303,14 @@ bool WasmScriptProcessor::loadWasm(const std::vector<uint8_t>& wasmBytes) {
     m3_FindFunction(&fnNumMidiOut, wasmRuntime, "ss_num_midi_outputs");
     if (fnNumMidiOut) { m3_CallV(fnNumMidiOut); m3_GetResultsV(fnNumMidiOut, &numMidiOutPins); }
     numMidiOutPins = juce::jlimit(1, 16, numMidiOutPins);
+
+    // Optional: number of independent MIDI input pins (default 1). Scripts that
+    // want to distinguish several MIDI sources export ss_num_midi_inputs() and
+    // read each event's input_index (byte 7).
+    IM3Function fnNumMidiIn = nullptr;
+    m3_FindFunction(&fnNumMidiIn, wasmRuntime, "ss_num_midi_inputs");
+    if (fnNumMidiIn) { m3_CallV(fnNumMidiIn); m3_GetResultsV(fnNumMidiIn, &numMidiInPins); }
+    numMidiInPins = juce::jlimit(1, 16, numMidiInPins);
 
     // Initialize header before calling ss_init
     computeOffsets();
@@ -252,8 +352,16 @@ void WasmScriptProcessor::populateNodePins(Node& n) {
         n.pinsIn.push_back({nextPinId++, name, PinKind::Audio, true, 2});
     }
 
-    // MIDI input
-    n.pinsIn.push_back({nextPinId++, "MIDI In", PinKind::Midi, true});
+    // MIDI input(s). One "MIDI In" pin by default; if the script declared
+    // ss_num_midi_inputs() > 1 we expose "MIDI In 1..N" and the graph stamps each
+    // incoming cable's channel so copyMidiIn() can tag events with input_index.
+    if (numMidiInPins <= 1) {
+        n.pinsIn.push_back({nextPinId++, "MIDI In", PinKind::Midi, true});
+    } else {
+        for (int i = 0; i < numMidiInPins; ++i)
+            n.pinsIn.push_back({nextPinId++, "MIDI In " + std::to_string(i + 1),
+                                PinKind::Midi, true});
+    }
 
     // Param inputs
     for (int i = 0; i < (int)paramDecls.size(); ++i) {
@@ -447,7 +555,11 @@ void WasmScriptProcessor::copyMidiIn(const juce::MidiBuffer& midi) {
         wasmMem[off + 4] = raw[0];
         wasmMem[off + 5] = msg.getRawDataSize() > 1 ? raw[1] : 0;
         wasmMem[off + 6] = msg.getRawDataSize() > 2 ? raw[2] : 0;
-        wasmMem[off + 7] = 0;
+        // input_index: for a multi-input node the graph stamped the channel
+        // nibble with (input-pin index + 1); recover the 0-based pin here.
+        wasmMem[off + 7] = (numMidiInPins > 1)
+            ? (uint8_t)juce::jlimit(0, numMidiInPins - 1, msg.getChannel() - 1)
+            : 0;
         count++;
     }
     wmem<uint32_t>(wasmMem, H_MIDI_IN_COUNT, count);

@@ -123,8 +123,15 @@ struct SignalShapeDoc {
     //                        (no MIDI emit, classic Signal Shape). >=1 enables
     //                        the emit functions note()/cc()/bend()/... with the
     //                        reserved `out` variable selecting the pin.
-    //   midiInput          - whether the node has a MIDI INPUT pin (drives the
-    //                        note/vel/gate/freq variables). True by default.
+    //   midiInputCount     - MIDI INPUT pins (0..16). 0 = no MIDI input (the
+    //                        note/vel/gate/freq variables stay at their idle
+    //                        values). 1 = the classic single "MIDI In" pin. >1
+    //                        exposes "MIDI In 1..N"; events carry which pin they
+    //                        arrived on (pollmidi()/the structured pull report a
+    //                        1-based input index), so one program can react to
+    //                        several MIDI sources independently. The note/vel/gate
+    //                        convenience variables track the most recent note-on
+    //                        across ALL inputs.
     //
     // A node with midiOutputCount==0 behaves exactly like the old Signal Shape;
     // continuousOutputCount==1 + a MIDI-emitting program behaves like the old
@@ -132,7 +139,7 @@ struct SignalShapeDoc {
     // hybrid (e.g. an arpeggiator that also outputs an envelope).
     int continuousOutputCount = 1;
     int midiOutputCount = 0;
-    bool midiInput = true;
+    int midiInputCount = 1;
 
     // Pin kind for the continuous input/output pins: false = Signal (blue),
     // true = Param (orange). Purely semantic - both route identically on the
@@ -235,6 +242,16 @@ private:
     // to every Signal/Param output channel). Kept as a member so it isn't
     // reallocated on the audio thread every block.
     std::vector<float> blockOut;
+    // Multi-output scratch for STREAMING block mode: one buffer per continuous
+    // output pin o1..oP, plus a pointer array handed to ScriptBlockCtx::outs.
+    // A streaming script writes each pin independently via out(pin,v); we route
+    // outBufs[p] to output channel outChStart+p. Members so nothing reallocates
+    // on the audio thread per block (only when the output count changes).
+    std::vector<std::vector<float>> outBufs;
+    std::vector<float*>             outPtrs;
+    // Event-driven MIDI-input scratch for block mode (ScriptBlockCtx::midiIn).
+    // A member so it isn't reallocated on the audio thread every block.
+    std::vector<ScriptMidiEvent> midiInEvents;
     // Bind the shape(pos) sampler on the runtime after a shape rebuild.
     void bindShape();
 
@@ -389,14 +406,16 @@ private:
     juce::TextEditor sigCountEditor;
 
     // Unified-node I/O controls. continuousOutputCount (o1..oP) is always >=1;
-    // midiOutputCount 0 = pure signal source; midiInToggle adds/removes the MIDI
-    // In pin; kindCombo flips ALL continuous pins between Signal (blue) and Param
-    // (orange). All four call syncPins() then commitToNode() on change.
+    // midiOutputCount 0 = pure signal source; midiInEditor sets how many MIDI In
+    // pins (0 = none, 1 = single "MIDI In", >1 = "MIDI In 1..N"); kindCombo flips
+    // ALL continuous pins between Signal (blue) and Param (orange). All call
+    // syncPins() then commitToNode() on change.
     juce::Label   outCountLabel   { {}, "Signal outputs (o1..oP):" };
     juce::TextEditor outCountEditor;
     juce::Label   midiOutLabel    { {}, "MIDI outputs:" };
     juce::TextEditor midiOutEditor;
-    juce::ToggleButton midiInToggle { "MIDI input" };
+    juce::Label   midiInLabel     { {}, "MIDI inputs:" };
+    juce::TextEditor midiInEditor;
     juce::Label   kindLabel       { {}, "Pin type:" };
     juce::ComboBox kindCombo;
 
@@ -453,7 +472,8 @@ private:
     // Pointer to a node param by name, or nullptr if the node/param is gone.
     Param* paramByName(const std::string& name);
     // Reconcile BOTH pin lists to the current doc:
-    //   pinsIn  = [MIDI In if doc.midiInput] + s1..sN  (ctrl kind = paramKind)
+    //   pinsIn  = [MIDI In pin(s), doc.midiInputCount of them] + s1..sN
+    //             (ctrl kind = paramKind)
     //   pinsOut = o1..oP (ctrl kind) + MIDI Out 1..Q  (PinKind::Midi)
     // where N = signalInputCount, P = continuousOutputCount (>=1),
     // Q = midiOutputCount. Pin ids are preserved by name so existing cables

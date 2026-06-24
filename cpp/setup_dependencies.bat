@@ -50,16 +50,12 @@ if exist "%BASE%third_party\wasm3\source\wasm3.h" (
     echo [OK] wasm3: Already downloaded
 ) else (
     echo [..] Downloading wasm3...
-    git clone --depth 1 https://github.com/nicholasgasior/wasm3 "%BASE%third_party\wasm3" 2>nul
-    if errorlevel 1 (
-        echo [..] Trying alternative URL...
-        git clone --depth 1 https://github.com/nicholasgasior/nicholasgasior-wasm3 "%BASE%third_party\wasm3" 2>nul
-    )
+    git clone --depth 1 https://github.com/wasm3/wasm3.git "%BASE%third_party\wasm3" 2>nul
     if exist "%BASE%third_party\wasm3\source\wasm3.h" (
         echo [OK] wasm3: Downloaded
     ) else (
         echo [SKIP] wasm3: Download failed. WASM scripts will be disabled.
-        echo        Clone manually: git clone https://github.com/nicholasgasior/nicholasgasior-wasm3 third_party/wasm3
+        echo        Clone manually: git clone https://github.com/wasm3/wasm3 third_party/wasm3
     )
 )
 echo.

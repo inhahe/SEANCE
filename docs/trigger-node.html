@@ -20,6 +20,9 @@
 
 <p>Add one from <em>Effects → Trigger</em> in the right-click menu. Wire your MIDI input into its MIDI In, wire the MIDI Out to your synth, and wire the Signal Out to whatever parameter you want envelope-shaped. The node also has an <strong>Audio In</strong> pin used by the Audio Threshold firing mode (see below) — leave it unwired if you're not using that mode. Double-click the node to open the rule editor.</p>
 
+<div class="tip">
+<strong>Trigger vs. <a href="signal-shape.html">Script</a>:</strong> both nodes can put new MIDI notes into the graph, so it's worth knowing which to reach for. The Trigger is <em>reactive and rule-based</em> — it watches the notes you play and decorates each one (harmonies, octaves, chords, flams, ghost notes), all by filling in form fields, no programming. The Script is <em>continuous and programmatic</em> — it runs on the clock (free-running LFOs, transport-locked sweeps) and writes generative sequences/arpeggios as a little program. Rule of thumb: "when I play a note, also do X" → Trigger; "emit this signal or pattern over time" → Script. Two things only the Trigger can do: fire from an <strong>audio</strong> threshold (side-chain a kick into note generation — the Script can't read the audio buffer), and build chords/flams/probabilistic notes with zero scripting.</div>
+
 <h2>Rules</h2>
 
 <p>The editor shows a list of <strong>rules</strong>. Each rule has three sections that together describe one thing the trigger does:</p>

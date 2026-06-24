@@ -7,7 +7,12 @@
 #include "spectral_editor.h"     // for SpectralDoc decode/render
 #include "wavelet_paint.h"       // for __waveletpaint__: decode
 #include "granular_frame.h"      // for GranularFrame side-table entries
+#include "inharmonic_frame.h"    // for InharmonicFrame side-table entries
 #include "audio_engine.h"        // for AudioEngine audition-monitor bus
+#include "script_runtime.h"      // for fillFromScript (Builtin / Lua per-cell)
+#include "glsl_compute.h"        // for fillFromGlsl (offscreen GL 4.3 compute)
+#include "glsl_waveform.h"       // shared GLSL waveform() bank wiring
+#include "waveform_bank.h"       // for the waveform() factory-bank generator API
 #include <cstring>
 #include <cstdio>
 #include <algorithm>
@@ -16,6 +21,7 @@
 #include <fstream>
 #include <complex>
 #include <cmath>
+#include <limits>
 
 namespace SoundShop {
 
@@ -268,6 +274,329 @@ void Terrain::fillFromExpression(const std::string& expr) {
     }
 }
 
+bool Terrain::fillFromScript(ScriptLang lang, const std::string& src,
+                             const std::vector<int>& dimensions,
+                             std::string& error) {
+    error.clear();
+    if (dimensions.empty()) { error = "no dimensions given"; return false; }
+    long long total = 1;
+    for (int d : dimensions) {
+        if (d < 1) { error = "every dimension must be >= 1"; return false; }
+        total *= d;
+        if (total > (1LL << 30)) { error = "terrain too large (> 1G cells)"; return false; }
+    }
+
+    // Per-cell generation needs a PerSample-capable runtime. Block-only
+    // languages (Wasm) generate via the buffer-fill path instead (not here).
+    if (!scriptLangSupportsRate(lang, ScriptRate::PerSample)) {
+        error = "this language is block-only and can't generate per-cell";
+        return false;
+    }
+    auto rt = makeScriptRuntime(lang, ScriptRole::Signal, ScriptRate::PerSample);
+    if (!rt) { error = "script language backend is not available in this build"; return false; }
+    if (!rt->load(src, error)) {
+        if (error.empty()) error = "failed to load script";
+        return false;
+    }
+    rt->reset();
+
+    init(dimensions);
+    const int nd = (int)dims.size();
+
+    // Pre-build the c0..c{nd-1} key strings once - the per-cell loop runs up to
+    // ~1e9 times, so we never want to allocate a std::string inside it.
+    std::vector<std::string> cKeys((size_t)nd);
+    for (int d = 0; d < nd; ++d) cKeys[(size_t)d] = "c" + std::to_string(d);
+    static const char* kAxis[4] = { "x", "y", "z", "w" };
+    const float kTwoPi = 6.28318530717958648f;
+
+    ScriptVars sv;
+    sv.reserve((size_t)nd + 8);
+    sv["nd"] = (float)nd;
+
+    std::vector<int> indices((size_t)nd, 0);
+    const int n = (int)data.size();
+    for (int flat = 0; flat < n; ++flat) {
+        int tmp = flat;
+        for (int d = nd - 1; d >= 0; --d) { indices[(size_t)d] = tmp % dims[(size_t)d]; tmp /= dims[(size_t)d]; }
+        for (int d = 0; d < nd; ++d) {
+            float norm = (dims[(size_t)d] > 1)
+                             ? (float)indices[(size_t)d] / (float)(dims[(size_t)d] - 1)
+                             : 0.0f;
+            sv[cKeys[(size_t)d]] = norm;
+            if (d < 4) sv[kAxis[d]] = norm * kTwoPi;
+        }
+        // Script returns 0..1 (heightmap/brightness); map to the terrain's
+        // bipolar [-1,1] like fillFromImage/fillFromVideoData. The clamp also
+        // unifies the two languages: Lua's Signal role already clamps to [0,1],
+        // Builtin's evalSignal is unclamped, so clamping here makes both match.
+        float v01 = juce::jlimit(0.0f, 1.0f, rt->evalSignal(sv));
+        data[(size_t)flat] = v01 * 2.0f - 1.0f;
+    }
+    return true;
+}
+
+bool Terrain::fillFromScriptWholeGrid(ScriptLang lang, const std::string& src,
+                                      const std::vector<int>& dimensions,
+                                      std::string& error) {
+    error.clear();
+    if (dimensions.empty()) { error = "no dimensions given"; return false; }
+    long long total = 1;
+    for (int d : dimensions) {
+        if (d < 1) { error = "every dimension must be >= 1"; return false; }
+        total *= d;
+        if (total > (1LL << 30)) { error = "terrain too large (> 1G cells)"; return false; }
+    }
+
+    // Whole-grid generation needs a PerBlock-capable runtime (the program runs
+    // once and owns the array). Per-cell-only languages (Builtin) can't do this.
+    if (!scriptLangSupportsRate(lang, ScriptRate::PerBlock)) {
+        error = "this language can't generate a whole grid at once "
+                "(use per-cell mode instead)";
+        return false;
+    }
+    auto rt = makeScriptRuntime(lang, ScriptRole::Signal, ScriptRate::PerBlock);
+    if (!rt) { error = "script language backend is not available in this build"; return false; }
+    if (!rt->load(src, error)) {
+        if (error.empty()) error = "failed to load script";
+        return false;
+    }
+    rt->reset();
+
+    init(dimensions);
+    // The runtime writes each cell in [0,1] (it clamps via set()); we then map
+    // 0..1 -> bipolar [-1,1] just like the per-cell path, so both modes share
+    // one output contract.
+    if (!rt->runGenerate(dims, data.data(), error)) {
+        if (error.empty()) error = "whole-grid generation failed";
+        return false;
+    }
+    for (size_t i = 0; i < data.size(); ++i) {
+        float v01 = juce::jlimit(0.0f, 1.0f, data[i]);
+        data[i] = v01 * 2.0f - 1.0f;
+    }
+    return true;
+}
+
+// GLSL fixed-array dimension cap (per-cell coord/dims arrays and the uDims
+// uniform are declared [GLSL_MAX_DIMS] in the generated shader).
+static constexpr int kGlslMaxDims = 16;
+
+// Upper bound on whole-grid ping-pong passes. Each pass is a full GPU dispatch;
+// this caps pathological iteration counts (a runaway bake) while leaving ample
+// headroom for diffusion/erosion/cellular-automata that want hundreds of steps.
+static constexpr int kGlslMaxPasses = 4096;
+
+bool Terrain::fillFromGlsl(const std::string& userBody, bool wholeGrid,
+                           const std::vector<int>& dimensions, std::string& error,
+                           int passes) {
+    error.clear();
+    const int nd = (int) dimensions.size();
+    if (nd < 1) { error = "no dimensions given"; return false; }
+    if (nd > kGlslMaxDims) {
+        error = "GLSL terrains are limited to " + std::to_string(kGlslMaxDims)
+              + " dimensions (requested " + std::to_string(nd)
+              + "); use Lua or Python for higher rank.";
+        return false;
+    }
+    // Multi-pass is a whole-grid-only facility. Clamp to a sane range; a single
+    // pass for per-cell or passes<=1 is the original single-buffer behaviour.
+    if (!wholeGrid) passes = 1;
+    if (passes < 1) { error = "passes must be >= 1"; return false; }
+    if (passes > kGlslMaxPasses) {
+        error = "too many passes (max " + std::to_string(kGlslMaxPasses) + ")";
+        return false;
+    }
+    long long total = 1;
+    for (int d : dimensions) {
+        if (d < 1) { error = "every dimension must be >= 1"; return false; }
+        total *= d;
+        // 4 bytes/cell SSBO; cap well under typical GPU memory.
+        if (total > (1LL << 27)) { error = "terrain too large for GPU (> 128M cells)"; return false; }
+    }
+
+    std::string why;
+    if (!glslComputeAvailable(&why)) {
+        error = "GLSL compute is unavailable on this machine: " + why;
+        return false;
+    }
+
+    // ---- Wire up integer-indexed waveform() access (no source rewriting). ----
+    // Shared with the curve/wavetable GLSL bake path: if the body mentions
+    // "waveform", this uploads the factory bank to the cached binding-2 SSBO and
+    // returns the GLSL waveform() function indexing it (empty if unused). See
+    // glsl_waveform.h.
+    std::string wfFn;
+    {
+        std::string upErr;
+        if (!glslWaveformFn(userBody, wfFn, &upErr)) { error = upErr; return false; }
+    }
+    const std::string& procBody = userBody;   // body is used verbatim now
+
+    // ---- Build the full compute shader, templating in the user body. --------
+    const std::string maxN = std::to_string(kGlslMaxDims);
+    std::string src;
+    if (!wholeGrid) {
+        // Per-cell: userBody is the body of cellValue(), which must `return` a
+        // float in [0,1]. Coordinate vocabulary mirrors fillFromScript.
+        src =
+            "#version 430\n"
+            "layout(local_size_x = 64) in;\n"
+            "layout(std430, binding = 0) buffer Out { float data[]; };\n"
+            "uniform int nd;\n"
+            "uniform int uDims[" + maxN + "];\n"
+            "uniform int uTotal;\n"
+            "const float TAU = 6.28318530717958648;\n"
+            + wfFn +
+            "float cellValue(float c[" + maxN + "], int coord[" + maxN + "], int dims[" + maxN + "], int nd, "
+            "float x, float y, float z, float w) {\n"
+            + procBody + "\n"
+            "}\n"
+            "void main() {\n"
+            "  uint gid = gl_GlobalInvocationID.x;\n"
+            "  if (gid >= uint(uTotal)) return;\n"
+            "  int coord[" + maxN + "];\n"
+            "  int rem = int(gid);\n"
+            "  for (int d = nd - 1; d >= 0; --d) { coord[d] = rem % uDims[d]; rem /= uDims[d]; }\n"
+            "  float c[" + maxN + "]; int dims[" + maxN + "];\n"
+            "  for (int d = 0; d < " + maxN + "; ++d) {\n"
+            "    dims[d] = (d < nd) ? uDims[d] : 1;\n"
+            "    if (d >= nd) coord[d] = 0;\n"
+            "    c[d] = (d < nd && uDims[d] > 1) ? float(coord[d]) / float(uDims[d] - 1) : 0.0;\n"
+            "  }\n"
+            "  float x = (nd > 0) ? c[0] * TAU : 0.0;\n"
+            "  float y = (nd > 1) ? c[1] * TAU : 0.0;\n"
+            "  float z = (nd > 2) ? c[2] * TAU : 0.0;\n"
+            "  float w = (nd > 3) ? c[3] * TAU : 0.0;\n"
+            "  data[gid] = clamp(cellValue(c, coord, dims, nd, x, y, z, w), 0.0, 1.0);\n"
+            "}\n";
+    } else {
+        // Whole-grid: userBody is the body of main(). The program owns the write
+        // to data[gid] and has coordOf(idx,axis) + uDims/nd/uTotal available.
+        //
+        // Two SSBOs are always declared so the SAME template serves single-pass
+        // (passes==1, prev[] = zeros, typically unused) and multi-pass ping-pong
+        // (passes>1). prev[] (binding 1) is the previous pass's full output; the
+        // dispatch layer swaps the two buffers between passes. uPass/uNumPasses
+        // let the program seed on pass 0 and iterate afterwards. Helpers:
+        //   coordOf(idx,axis)  -> [0,1] position of cell idx along axis
+        //   coordAxis(idx,axis)-> integer coordinate of cell idx along axis
+        //   neighbor(idx,axis,d) -> flat index of the cell d steps along axis,
+        //                           clamped to the edge (compose for diagonals)
+        //   prevAt(idx)        -> prev[idx], 0 if idx is out of range
+        //   flatten(c0,c1,...) -> flat index from integer per-axis coordinates,
+        //                         specialised to THIS terrain (see below)
+        //
+        // flatten() is emitted tailored to the current rank and per-axis sizes:
+        // its parameter count == nd and the dimension extents are baked in as
+        // literal constants (with edge-clamping), so the user converts an N-D
+        // coordinate to a flat data[]/prev[] index with no uDims[] loop. e.g. a
+        // {4,128,128} terrain yields `int flatten(int c0,int c1,int c2)` whose
+        // body is `return (clamp(c0,0,3)*128 + clamp(c1,0,127))*128 + clamp(c2,0,127);`.
+        // The per-axis sizes are also exposed as `const int DIM0..DIM{nd-1}`.
+        std::string dimConsts, flattenParams, flattenClamps, flattenExpr;
+        for (int d = 0; d < nd; ++d) {
+            const std::string ci = "c" + std::to_string(d);
+            const std::string hi = std::to_string(dimensions[d] - 1);
+            dimConsts     += "const int DIM" + std::to_string(d) + " = "
+                           + std::to_string(dimensions[d]) + ";\n";
+            flattenParams += (d ? ", " : "") + std::string("int ") + ci;
+            flattenClamps += "  " + ci + " = clamp(" + ci + ", 0, " + hi + ");\n";
+            // Horner form: flat = (((c0)*dim1 + c1)*dim2 + c2)...; the last axis
+            // varies fastest (row-major), matching the rest of the engine.
+            if (d == 0) flattenExpr = ci;
+            else        flattenExpr = "(" + flattenExpr + ") * "
+                                    + std::to_string(dimensions[d]) + " + " + ci;
+        }
+        const std::string flattenFn =
+            dimConsts
+          + "int flatten(" + flattenParams + ") {\n"
+          + flattenClamps
+          + "  return " + flattenExpr + ";\n"
+            "}\n";
+        src =
+            "#version 430\n"
+            "layout(local_size_x = 64) in;\n"
+            "layout(std430, binding = 0) buffer Out  { float data[]; };\n"
+            "layout(std430, binding = 1) buffer Prev { float prev[]; };\n"
+            "uniform int nd;\n"
+            "uniform int uDims[" + maxN + "];\n"
+            "uniform int uTotal;\n"
+            "uniform int uPass;\n"
+            "uniform int uNumPasses;\n"
+            "const float TAU = 6.28318530717958648;\n"
+            "float coordOf(int idx, int axis) {\n"
+            "  if (axis < 0 || axis >= nd) return 0.0;\n"
+            "  int rem = idx;\n"
+            "  for (int d = nd - 1; d > axis; --d) rem /= uDims[d];\n"
+            "  int ci = rem % uDims[axis];\n"
+            "  return (uDims[axis] > 1) ? float(ci) / float(uDims[axis] - 1) : 0.0;\n"
+            "}\n"
+            "int coordAxis(int idx, int axis) {\n"
+            "  if (axis < 0 || axis >= nd) return 0;\n"
+            "  int rem = idx;\n"
+            "  for (int d = nd - 1; d > axis; --d) rem /= uDims[d];\n"
+            "  return rem % uDims[axis];\n"
+            "}\n"
+            "int neighbor(int idx, int axis, int delta) {\n"
+            "  if (axis < 0 || axis >= nd) return idx;\n"
+            "  int coord[" + maxN + "];\n"
+            "  int rem = idx;\n"
+            "  for (int d = nd - 1; d >= 0; --d) { coord[d] = rem % uDims[d]; rem /= uDims[d]; }\n"
+            "  coord[axis] = clamp(coord[axis] + delta, 0, uDims[axis] - 1);\n"
+            "  int flatIdx = 0;\n"
+            "  for (int d = 0; d < nd; ++d) flatIdx = flatIdx * uDims[d] + coord[d];\n"
+            "  return flatIdx;\n"
+            "}\n"
+            "float prevAt(int idx) {\n"
+            "  if (idx < 0 || idx >= uTotal) return 0.0;\n"
+            "  return prev[idx];\n"
+            "}\n"
+            + flattenFn
+            + wfFn +
+            "void main() {\n"
+            + procBody + "\n"
+            "}\n";
+    }
+
+    std::vector<int> dimsU(kGlslMaxDims, 1);
+    for (int d = 0; d < nd; ++d) dimsU[d] = dimensions[d];
+
+    std::vector<GlslUniformInt> uniforms = {
+        { "nd",         { nd } },
+        { "uDims",      dimsU },
+        { "uTotal",     { (int) total } },
+        { "uNumPasses", { passes } },
+    };
+
+    // The factory waveform bank (if the shader uses waveform()) is already
+    // resident in the cached binding-2 SSBO (uploaded above, once per session);
+    // the dispatch layer re-binds it automatically. Nothing buffer-related to
+    // pass here anymore.
+
+    // Per-cell stays single-buffer; whole-grid always goes through the ping-pong
+    // path (passes==1 just means one pass with an all-zero prev[]).
+    auto res = wholeGrid
+        ? glslDispatchComputePingPong(src, (int) total, passes, uniforms)
+        : glslDispatchCompute(src, (int) total, uniforms);
+    if (!res.ok) { error = res.error; return false; }
+    if ((long long) res.data.size() != total) {
+        error = "GLSL readback size mismatch";
+        return false;
+    }
+
+    // Map [0,1] -> bipolar [-1,1], clamping defensively (NaN -> 0), matching the
+    // fillFromScript output contract so every generation language behaves alike.
+    init(dimensions);
+    for (long long i = 0; i < total; ++i) {
+        float v = res.data[(size_t) i];
+        if (!(v == v)) v = 0.0f;                  // NaN guard
+        v = juce::jlimit(0.0f, 1.0f, v);
+        data[(size_t) i] = v * 2.0f - 1.0f;
+    }
+    return true;
+}
+
 void Terrain::fillFromImage(const std::string& path) {
     // Load image using JUCE
     auto file = juce::File(path);
@@ -350,6 +679,153 @@ bool parseVideoTerrainScript(const std::string& script, VideoTerrainParams& out,
         }
     }
     return true;
+}
+
+// ---- Programmatic terrain source encode / decode (see terrain_synth.h) -----
+//
+// Float-blob codec: the baked terrain grid is gzip-compressed (procedural data
+// compresses very well) then base64-encoded so it can live on one '|'-delimited
+// line. The float count is recoverable from dims, so the blob stores only raw
+// little-endian float32 bytes (SEANCE targets x86, so endianness is fixed).
+static juce::String encodeFloatBlob(const std::vector<float>& data) {
+    if (data.empty()) return {};
+    juce::MemoryOutputStream compressed;
+    {
+        juce::GZIPCompressorOutputStream gz(compressed, 9);
+        gz.write(data.data(), data.size() * sizeof(float));
+    } // gz destructor flushes the deflate stream into `compressed`
+    return juce::Base64::toBase64(compressed.getData(), compressed.getDataSize());
+}
+static bool decodeFloatBlob(const juce::String& b64, std::vector<float>& out) {
+    out.clear();
+    if (b64.isEmpty()) return false;
+    juce::MemoryOutputStream b64out;
+    if (!juce::Base64::convertFromBase64(b64out, b64)) return false;
+    juce::MemoryInputStream mis(b64out.getData(), b64out.getDataSize(), false);
+    juce::GZIPDecompressorInputStream gz(mis);
+    juce::MemoryBlock raw;
+    gz.readIntoMemoryBlock(raw);
+    if (raw.getSize() == 0 || (raw.getSize() % sizeof(float)) != 0) return false;
+    const size_t n = raw.getSize() / sizeof(float);
+    out.resize(n);
+    std::memcpy(out.data(), raw.getData(), raw.getSize());
+    return true;
+}
+
+std::string makeGenerateTerrainScript(const GenerateTerrainParams& p,
+                                      ContentStore* store) {
+    juce::String dimsS;
+    for (size_t i = 0; i < p.dims.size(); ++i) {
+        if (i) dimsS << ",";
+        dimsS << p.dims[i];
+    }
+    juce::String srcB64 = p.source.empty()
+        ? juce::String()
+        : juce::Base64::toBase64(p.source.data(), p.source.size());
+    // 4th field: '#'-prefixed content hash when a store is available (bytes live
+    // in the store, the snapshot carries only the hash); otherwise a legacy
+    // inline gzip+base64 blob so standalone make/parse still round-trips.
+    juce::String dataField;
+    if (store != nullptr && !p.data.empty()) {
+        std::string hash = store->putFloatGrid(p.data, p.dims);
+        dataField = "#" + juce::String(hash);
+    } else {
+        dataField = encodeFloatBlob(p.data);
+    }
+    // Field 0 is "<langInt>", "<langInt>:<modeInt>", or
+    // "<langInt>:<modeInt>:<passes>". The bare-int form keeps old projects (which
+    // had no mode field) parsing as mode 0 / passes 1, and stays human-readable.
+    // The passes suffix is only emitted when it's non-default (>1), so existing
+    // tags are byte-identical.
+    juce::String langField = juce::String(p.lang);
+    if (p.mode != 0 || p.passes > 1) langField << ":" << p.mode;
+    if (p.passes > 1) langField << ":" << p.passes;
+    juce::String s;
+    s << "__generate__:" << langField << "|" << dimsS << "|" << srcB64
+      << "|" << dataField;
+    return s.toStdString();
+}
+
+bool parseGenerateTerrainScript(const std::string& script, GenerateTerrainParams& out,
+                                ContentStore* store) {
+    const std::string pre = "__generate__:";
+    if (script.rfind(pre, 0) != 0) return false;
+    // Fields: <lang>|<dims>|<b64 src>|<b64 data>. The first two '|' delimit lang
+    // and dims; the base64 source can't contain '|' so the third '|' (if any)
+    // delimits source from the baked-data blob. Old 3-field tags (no data) parse
+    // with an empty data field.
+    juce::String body(script.substr(pre.size()));
+    int p1 = body.indexOfChar('|');
+    if (p1 < 0) return false;
+    int p2 = body.indexOfChar(p1 + 1, '|');
+    if (p2 < 0) return false;
+    int p3 = body.indexOfChar(p2 + 1, '|');   // optional 4th field (baked data)
+    juce::String langS  = body.substring(0, p1);
+    juce::String dimsS  = body.substring(p1 + 1, p2);
+    juce::String srcB64 = (p3 >= 0) ? body.substring(p2 + 1, p3) : body.substring(p2 + 1);
+    juce::String dataB64 = (p3 >= 0) ? body.substring(p3 + 1) : juce::String();
+
+    // Field 0 is "<langInt>", "<langInt>:<modeInt>", or
+    // "<langInt>:<modeInt>:<passes>". Old projects have no ':' so default to
+    // mode 0 / passes 1.
+    out.passes = 1;
+    {
+        juce::StringArray lf;
+        lf.addTokens(langS, ":", "");
+        out.lang = lf.size() > 0 ? lf[0].getIntValue() : 0;
+        out.mode = lf.size() > 1 ? lf[1].getIntValue() : 0;
+        if (lf.size() > 2) out.passes = juce::jmax(1, lf[2].getIntValue());
+    }
+    out.dims.clear();
+    juce::StringArray a;
+    a.addTokens(dimsS, ",", "");
+    for (const auto& t : a) {
+        if (t.trim().isEmpty()) continue;
+        out.dims.push_back(t.getIntValue());
+    }
+    if (out.dims.empty()) return false;
+
+    out.source.clear();
+    if (srcB64.isNotEmpty()) {
+        juce::MemoryOutputStream mos;
+        if (juce::Base64::convertFromBase64(mos, srcB64)) {
+            const char* d = (const char*)mos.getData();
+            out.source.assign(d, d + mos.getDataSize());
+        }
+    }
+
+    // Baked terrain data (optional). Two encodings in the 4th field:
+    //   "#<hash>" - content-store reference: the bytes live in `store` keyed by
+    //               the 32-hex hash. Resolve via getFloatGrid (null store / miss
+    //               -> data left empty, loader regenerates or falls back).
+    //   "<b64>"   - legacy inline gzip+base64 blob (pre-content-store projects).
+    // Either way, if the float count doesn't match the grid shape, drop it so the
+    // loader falls back to recomputing.
+    out.data.clear();
+    long long total = 1;
+    for (int d : out.dims) total *= (d > 0 ? d : 1);
+    if (dataB64.startsWithChar('#')) {
+        if (store != nullptr) {
+            std::string hash = dataB64.substring(1).toStdString();
+            std::vector<float> blob;
+            std::vector<int> blobShape;
+            if (store->getFloatGrid(hash, blob, blobShape)
+                && (long long)blob.size() == total)
+                out.data = std::move(blob);
+        }
+    } else if (dataB64.isNotEmpty()) {
+        std::vector<float> blob;
+        if (decodeFloatBlob(dataB64, blob)
+            && (long long)blob.size() == total)
+            out.data = std::move(blob);
+    }
+    return true;
+}
+
+int generateScriptRank(const std::string& script) {
+    GenerateTerrainParams gp;
+    if (!parseGenerateTerrainScript(script, gp, nullptr)) return 0;
+    return (int)gp.dims.size();
 }
 
 void Terrain::smooth(int passes) {
@@ -748,7 +1224,10 @@ void TerrainSynthProcessor::reloadIfScriptChanged() {
 // detection chain in the TerrainSynthProcessor constructor / reload path
 // so the node-graph UI can filter the Synth Mode picker without holding
 // a pointer to the live audio processor.
-SynthSourceClass classifySynthSource(const std::string& script) {
+SynthSourceClass classifySynthSource(const std::string& rawScript) {
+    // A "__framesynth__:" standalone node is classified by its wrapped body.
+    const std::string script = effectiveSynthScript(rawScript);
+
     // Explicit source-type prefixes first.
     if (script.rfind("__audio__:", 0)         == 0) return SynthSourceClass::Sample;
     if (script.rfind("__image__:", 0)         == 0) return SynthSourceClass::Surface;
@@ -762,6 +1241,18 @@ SynthSourceClass classifySynthSource(const std::string& script) {
     if (script.rfind("__waveletpaint__:", 0)  == 0) return SynthSourceClass::Wavetable;
     if (script.rfind("__spectral__:", 0)      == 0) return SynthSourceClass::Wavetable;
     if (script.rfind("__spectral2__:", 0)     == 0) return SynthSourceClass::Wavetable;
+
+    // Programmatic generator: classified by terrain dimensionality, parsed
+    // from the dims field of the __generate__:<lang>|<dims>|<src> script.
+    if (script.rfind("__generate__:", 0) == 0) {
+        GenerateTerrainParams gp;
+        if (parseGenerateTerrainScript(script, gp)) {
+            int nd = (int)gp.dims.size();
+            return (nd <= 1) ? SynthSourceClass::Sample
+                             : SynthSourceClass::Surface;
+        }
+        return SynthSourceClass::Surface;
+    }
 
     // Fractal value noise: classified by terrain dimensionality. The
     // script format is "__valuenoise__:D0,D1,...:OCTAVES:..." so we look
@@ -809,9 +1300,14 @@ SynthModeAvailability synthModeAvailabilityFor(SynthSourceClass cls) {
     return a;
 }
 
-TerrainSynthProcessor::TerrainSynthProcessor(Node& n, Transport& t) : node(n), transport(t) {
-    auto& script = node.script;
-    cachedScript = script;
+TerrainSynthProcessor::TerrainSynthProcessor(Node& n, Transport& t, ContentStore* store) : node(n), transport(t) {
+    // cachedScript tracks the RAW node.script (used for change-detection in
+    // reloadIfScriptChanged). The dispatch below works off the EFFECTIVE script
+    // - for a "__framesynth__:" standalone single-frame node that is the wrapped
+    // "__wavetable5__:..." body, so the entire wavetable render path is reused
+    // verbatim (granular / inharmonic / cycle voices) with no duplication.
+    cachedScript = node.script;
+    const std::string script = effectiveSynthScript(node.script);
 
     if (script.rfind("__video__:", 0) == 0) {
         // Video terrain: the downscaled grayscale grid is baked into the script
@@ -822,6 +1318,41 @@ TerrainSynthProcessor::TerrainSynthProcessor(Node& n, Transport& t) : node(n), t
             terrain.fillFromVideoData(vp.gray, vp.outFrames, vp.outH, vp.outW);
         else
             terrain.init({1, 1, 1});   // empty/placeholder
+    } else if (script.rfind("__generate__:", 0) == 0) {
+        // Programmatic terrain: re-run the baked generator program to rebuild
+        // the grid. Deterministic (pure function of coordinate), so this
+        // reproduces the original terrain without storing the (potentially
+        // huge) data. See makeGenerateTerrainScript.
+        GenerateTerrainParams gp;
+        if (parseGenerateTerrainScript(script, gp, store) && !gp.dims.empty()) {
+            long long total = 1;
+            for (int d : gp.dims) total *= (d > 0 ? d : 1);
+            if (!gp.data.empty() && (long long)gp.data.size() == total) {
+                // Baked path (the normal case): the grid was computed once on the
+                // message thread and stored in the tag, so just load it - no
+                // interpreter runs here on the audio thread. Works for every
+                // language including Python.
+                terrain.init(gp.dims);
+                terrain.getData() = gp.data;
+            } else if (gp.lang == (int)GenLang::Builtin || gp.lang == (int)GenLang::Lua) {
+                // Fallback: a legacy/hand-edited tag with no baked data. Builtin
+                // and Lua are pure C++ runtimes, so it's safe to recompute here.
+                std::string err;
+                bool ok = (gp.mode == 1)
+                    ? terrain.fillFromScriptWholeGrid((ScriptLang)gp.lang, gp.source, gp.dims, err)
+                    : terrain.fillFromScript((ScriptLang)gp.lang, gp.source, gp.dims, err);
+                if (!ok)
+                    terrain.init(gp.dims);   // keep the requested shape even on failure
+            } else {
+                // Python and GLSL with no baked data can't regenerate here: the
+                // CPython interpreter and the GL context are both message-thread
+                // only, and this runs on the audio thread. Use a flat grid until
+                // the dialog re-bakes on the message thread.
+                terrain.init(gp.dims);
+            }
+        } else {
+            terrain.init({1});
+        }
     } else if (script.find("__image__:") == 0) {
         terrain.fillFromImage(script.substr(10));
     } else if (script.find("__audio__:") == 0) {
@@ -861,28 +1392,61 @@ TerrainSynthProcessor::TerrainSynthProcessor(Node& n, Transport& t) : node(n), t
         // colorIdx), __wavetable2__, and legacy __wavetable__ payloads.
         WavetableDoc doc;
         bool decoded = doc.decode(script);
+        // Per-frame morph is baked into each frame's cycle below (renderMorphed),
+        // not applied post-blend. Reset the live re-bake table; the bake loops
+        // populate it for frames carrying a morph chain or per-layer warp ops.
+        wtRebakeFrames.clear();
         if (decoded && doc.mode == WavetableMode::Scatter && !doc.scatterFrames.empty()) {
             int ts = doc.tableSize;
             wtScatterFrameSamples.clear();
             wtScatterFramePositions.clear();
             wtGranularFrames.clear();
+            wtInharmonicFrames.clear();
             for (auto& sf : doc.scatterFrames) {
-                // Granular frames feed the granular layer, not the cycle
-                // terrain: bake a zero-cycle for the cycle blend so the
-                // cell contributes nothing through terrain.sample(), then
-                // stash the source PCM + grain length in the side table.
-                // We still keep an entry in wtScatterFrameSamples (zeroed)
-                // so the per-block weight indexing aligns 1:1 across both
-                // layers - simplifies the morph math.
+                // Granular and inharmonic frames feed their own LIVE side layers,
+                // not the cycle terrain: bake a zero-cycle for the cycle blend so
+                // the cell contributes nothing through terrain.sample(), then
+                // stash the per-layer data in the side table. We still keep an
+                // entry in wtScatterFrameSamples (zeroed) so the per-block weight
+                // indexing aligns 1:1 across all layers - simplifies the morph
+                // math.
                 IWavetableFrame* w = doc.libraryFrameById(sf.waveformId);
                 bool isGran = (w && std::string(w->typeId()) == "granular");
+                bool isInh  = (w && std::string(w->typeId()) == "inharmonic");
                 std::vector<float> samples;
-                if (w && !isGran) w->render(ts, samples);
+                // Bake the frame's RESTING per-frame morph into its cycle (each
+                // frame shapes independently before the cross-frame RBF blend).
+                if (w && !isGran && !isInh) w->renderMorphed(ts, samples);
                 if ((int)samples.size() != ts) samples.resize(ts, 0.0f);
+                int scatterIdx = (int)wtScatterFrameSamples.size();
                 wtScatterFrameSamples.push_back(std::move(samples));
                 wtScatterFramePositions.push_back(sf.position);
 
-                if (isGran) {
+                // Layered frames support live per-block re-bake (morph amounts /
+                // per-layer warp wired to node params). Register a RebakeFrame.
+                if (w && std::string(w->typeId()) == "layered") {
+                    RebakeFrame rb;
+                    rb.frame = w->clone();
+                    static_cast<LayeredWaveform*>(rb.frame.get())->tableSize = ts;
+                    rb.frameId      = sf.waveformId;
+                    rb.tableSize    = ts;
+                    rb.scatterIndex = scatterIdx;
+                    rb.morphChain   = w->morphChain;
+                    wtRebakeFrames.push_back(std::move(rb));
+                }
+
+                if (isInh) {
+                    auto* inf = static_cast<InharmonicFrame*>(w);
+                    InharmonicLayerEntry e;
+                    e.partials.reserve(inf->partials.size());
+                    for (const auto& p : inf->partials)
+                        e.partials.push_back({ p.ratio, p.amp, p.phase });
+                    e.gain       = inf->gain;
+                    e.normGain   = InharmonicFrame::normGainFor(inf->partials);
+                    e.warpAmpOps = inf->warpAmpOps();
+                    e.position   = sf.position;
+                    wtInharmonicFrames.push_back(std::move(e));
+                } else if (isGran) {
                     auto* gf = static_cast<GranularFrame*>(w);
                     GranularLayerEntry e;
                     e.source           = gf->source;
@@ -897,6 +1461,7 @@ TerrainSynthProcessor::TerrainSynthProcessor(Node& n, Transport& t) : node(n), t
                     e.fftSize          = gf->fftSize;
                     e.crossfadeSamples = std::max(0, gf->crossfadeSamples);
                     e.gain             = gf->gain;
+                    e.warpAmpOps       = gf->warpAmpOps();
                     e.position         = sf.position;
                     wtGranularFrames.push_back(std::move(e));
                 }
@@ -923,6 +1488,7 @@ TerrainSynthProcessor::TerrainSynthProcessor(Node& n, Transport& t) : node(n), t
             terrain.init(terrainDims);
             auto& data = terrain.getData();
             wtGranularFrames.clear();
+            wtInharmonicFrames.clear();
 
             // Occupancy mask over the morph axes only (gridDims, no phase
             // axis): 1.0 where a cell holds a frame, 0.0 where it's empty.
@@ -945,9 +1511,12 @@ TerrainSynthProcessor::TerrainSynthProcessor(Node& n, Transport& t) : node(n), t
                 // samples as usual.
                 IWavetableFrame* w = doc.frameAt(f);
                 bool isGran = (w && std::string(w->typeId()) == "granular");
+                bool isInh  = (w && std::string(w->typeId()) == "inharmonic");
                 std::vector<float> samples;
-                if (w && !isGran)
-                    w->render(ts, samples);
+                // Bake the frame's RESTING per-frame morph into its cycle (each
+                // frame shapes independently before the cross-frame grid blend).
+                if (w && !isGran && !isInh)
+                    w->renderMorphed(ts, samples);
                 if ((int)samples.size() != ts) samples.resize(ts, 0.0f);
 
                 // Compute the flat terrain offset for this frame.
@@ -988,7 +1557,50 @@ TerrainSynthProcessor::TerrainSynthProcessor(Node& n, Transport& t) : node(n), t
                         data[flatIdx] = samples[i];
                 }
 
-                if (isGran) {
+                // Layered cells support live per-block re-bake. The terrain layout
+                // is {ts, dim0, ...} with phase outermost, so this cell occupies
+                // data[i * gridStride + gridOffset] for i in [0,ts): gridStride =
+                // totalSize/ts (= product of gridDims), gridOffset = the flat index
+                // of (phase 0, gridCoord).
+                if (w && std::string(w->typeId()) == "layered") {
+                    std::vector<int> baseIdx = {0};
+                    baseIdx.insert(baseIdx.end(), gridCoord.begin(), gridCoord.end());
+                    RebakeFrame rb;
+                    rb.frame = w->clone();
+                    static_cast<LayeredWaveform*>(rb.frame.get())->tableSize = ts;
+                    rb.frameId    = doc.cellWaveformIds[f];
+                    rb.tableSize  = ts;
+                    rb.gridStride = (ts > 0) ? terrain.totalSize() / ts : 0;
+                    rb.gridOffset = terrain.coordToFlatIndex(baseIdx);
+                    rb.morphChain = w->morphChain;
+                    wtRebakeFrames.push_back(std::move(rb));
+                }
+
+                // Normalize gridCoord into [0,1] per dim so the per-block
+                // Position weight math doesn't need to know about the underlying
+                // grid resolution. Shared by both live side layers below.
+                auto normGridPos = [&]() {
+                    std::vector<float> pos(gridCoord.size(), 0.0f);
+                    for (size_t d = 0; d < gridCoord.size(); ++d) {
+                        int dim = std::max(1, doc.gridDims[d]);
+                        pos[d] = (dim <= 1) ? 0.0f
+                            : (float)gridCoord[d] / (float)(dim - 1);
+                    }
+                    return pos;
+                };
+
+                if (isInh) {
+                    auto* inf = static_cast<InharmonicFrame*>(w);
+                    InharmonicLayerEntry e;
+                    e.partials.reserve(inf->partials.size());
+                    for (const auto& p : inf->partials)
+                        e.partials.push_back({ p.ratio, p.amp, p.phase });
+                    e.gain       = inf->gain;
+                    e.normGain   = InharmonicFrame::normGainFor(inf->partials);
+                    e.warpAmpOps = inf->warpAmpOps();
+                    e.position   = normGridPos();
+                    wtInharmonicFrames.push_back(std::move(e));
+                } else if (isGran) {
                     auto* gf = static_cast<GranularFrame*>(w);
                     GranularLayerEntry e;
                     e.source           = gf->source;
@@ -1003,15 +1615,8 @@ TerrainSynthProcessor::TerrainSynthProcessor(Node& n, Transport& t) : node(n), t
                     e.fftSize          = gf->fftSize;
                     e.crossfadeSamples = std::max(0, gf->crossfadeSamples);
                     e.gain             = gf->gain;
-                    // Normalize gridCoord into [0,1] per dim so the per-
-                    // block Position weight math doesn't need to know about
-                    // the underlying grid resolution.
-                    e.position.assign(gridCoord.size(), 0.0f);
-                    for (size_t d = 0; d < gridCoord.size(); ++d) {
-                        int dim = std::max(1, doc.gridDims[d]);
-                        e.position[d] = (dim <= 1) ? 0.0f
-                            : (float)gridCoord[d] / (float)(dim - 1);
-                    }
+                    e.warpAmpOps       = gf->warpAmpOps();
+                    e.position         = normGridPos();
                     wtGranularFrames.push_back(std::move(e));
                 }
             }
@@ -1019,6 +1624,10 @@ TerrainSynthProcessor::TerrainSynthProcessor(Node& n, Transport& t) : node(n), t
             wtFrameCount = nf;
             wtNumDims = doc.numDimensions();
             wtEffectiveAxes = doc.effectiveAxes();
+            // Per-frame live re-bake entries were registered per cell in the bake
+            // loop above (each layered cell knows its own grid destination), so
+            // multi-cell grids now re-bake every modulated frame independently -
+            // the old single-cell-only restriction is gone.
         } else {
             terrain.init({2048});
             terrain.fillFromExpression("sin(x)");
@@ -1153,6 +1762,175 @@ static float getParamByName(const Node& node, const std::string& name, float def
     for (const auto& p : node.params)
         if (p.name == name) return p.value;
     return def;
+}
+
+// Read a frame-scope warp op's live amount by its stable warpSlot key (the
+// unified warp/morph model). The param's display name follows its method
+// ("Soft Clip Drive 1", ...) so it can't be addressed by a fixed string; the
+// warpSlot is the stable identity. Falls back to `def` when no such param
+// exists yet (the common case until a warp is opted into modulation).
+static float getParamByWarpSlot(const Node& node, int frameId, int slot, float def) {
+    for (const auto& p : node.params)
+        if (p.warpSlot == slot && p.warpLayer == -1 && p.warpFrameId == frameId)
+            return p.value;  // frame-scope morph of frame `frameId`
+    return def;
+}
+
+// Read a per-layer warp op's live amount by its (warpLayer, warpSlot) key.
+// Per-layer warp params (Param::warpLayer >= 0) only exist when the user opts a
+// layer's warp op into modulation, so this returns `def` whenever no such param
+// is present. Callers pass def = -1 so "no param" reads as "keep the baked
+// amount" in the renderWithLiveWarp override convention.
+static float getParamByWarpLayerSlot(const Node& node, int frameId, int layer, int slot, float def) {
+    for (const auto& p : node.params)
+        if (p.warpLayer == layer && p.warpSlot == slot && p.warpFrameId == frameId)
+            return p.value;
+    return def;
+}
+
+// Read a per-layer Phase/Amplitude modulation param by its (layer, field) key.
+// Layer-field params (Param::layerField >= 0, with warpLayer holding the layer
+// index and warpSlot == -1) only exist when the user opts a layer's Phase (0) or
+// Amplitude (1) slider into modulation, so this returns `def` whenever no such
+// param is present. Callers pass the NaN sentinel for def so "no param" reads as
+// "keep the layer's stored value" in the renderWithLiveOverrides convention.
+static float getParamByLayerField(const Node& node, int frameId, int layer, int field, float def) {
+    for (const auto& p : node.params)
+        if (p.layerField == field && p.warpLayer == layer && p.warpSlot == -1
+            && p.warpFrameId == frameId)
+            return p.value;
+    return def;
+}
+
+// Per-frame live morph re-bake (per-frame morph chains + #88). For each layered
+// frame registered at rebuild, gather this block's live per-layer warp overrides
+// and live frame-scope morph-chain amounts from the node params (keyed by the
+// frame's library id via Param::warpFrameId), re-render the cycle, and write it
+// back into the frame's terrain/scatter slot. A NaN-aware change check skips the
+// re-render whenever a frame's modulation inputs are steady, so an unmodulated
+// table costs only the per-block param scan after one priming block. When a
+// frame's inputs return to resting (e.g. a Mod cable is unplugged), the override
+// grid reverts to the all-(-1)/NaN sentinels and this re-renders the static
+// renderMorphed cycle, restoring the rebuild bake without needing a script reload.
+void TerrainSynthProcessor::rebakeFramesIfNeeded(const Node& node) {
+    if (wtRebakeFrames.empty()) return;
+    // Fast path: with no morph / per-layer / layer-field modulation params on the
+    // node at all, every frame is at its resting bake (already in the terrain from
+    // rebuild's renderMorphed). A warp op only vanishes from node.params alongside
+    // a script edit -> rebuild, so there's no stale modulated cycle to restore;
+    // skip the whole per-frame scan. This keeps the common "nothing wired" case
+    // O(params) once, not O(frames x params) every block.
+    {
+        bool anyMod = false;
+        for (const auto& p : node.params)
+            if (p.warpSlot >= 0 || p.layerField >= 0) { anyMod = true; break; }
+        if (!anyMod) return;
+    }
+    const float kNaN = std::numeric_limits<float>::quiet_NaN();
+    // NaN != NaN, so a plain `==` of override grids would never match an
+    // unmodulated (NaN-sentinel) layer and force a needless re-render every
+    // block. Compare NaN-aware so a steady grid skips the re-render.
+    auto sameF = [](const std::vector<float>& a, const std::vector<float>& b) {
+        if (a.size() != b.size()) return false;
+        for (size_t i = 0; i < a.size(); ++i) {
+            bool an = std::isnan(a[i]), bn = std::isnan(b[i]);
+            if (an != bn) return false;
+            if (!an && a[i] != b[i]) return false;
+        }
+        return true;
+    };
+    for (auto& rb : wtRebakeFrames) {
+        auto* lw = static_cast<LayeredWaveform*>(rb.frame.get());
+        if (!lw || rb.tableSize <= 0) continue;
+
+        // ---- gather live per-layer warp / field overrides ----
+        // -1 sentinel = "no param -> keep the op's baked amount"; NaN sentinel
+        // for Phase/Amplitude/shape fields = "no param -> keep stored value".
+        std::vector<std::vector<float>> overrides(lw->layers.size());
+        std::vector<float> phaseOv(lw->layers.size(), kNaN);
+        std::vector<float> ampOv(lw->layers.size(), kNaN);
+        std::vector<float> shapeOv(lw->layers.size(), kNaN);
+        std::vector<float> shape2Ov(lw->layers.size(), kNaN);
+        bool anyPerLayer = false;
+        for (size_t li = 0; li < lw->layers.size(); ++li) {
+            const auto& chain = lw->layers[li].warpChain;
+            overrides[li].assign(chain.size(), -1.0f);
+            for (size_t slot = 0; slot < chain.size(); ++slot) {
+                float v = getParamByWarpLayerSlot(node, rb.frameId, (int)li, (int)slot, -1.0f);
+                overrides[li][slot] = v;
+                if (v >= 0.0f) anyPerLayer = true;
+            }
+            float ph  = getParamByLayerField(node, rb.frameId, (int)li, 0, kNaN);
+            float am  = getParamByLayerField(node, rb.frameId, (int)li, 1, kNaN);
+            float sp  = getParamByLayerField(node, rb.frameId, (int)li, 2, kNaN);
+            float sp2 = getParamByLayerField(node, rb.frameId, (int)li, 3, kNaN);
+            phaseOv[li] = ph; ampOv[li] = am; shapeOv[li] = sp; shape2Ov[li] = sp2;
+            if (!std::isnan(ph) || !std::isnan(am) || !std::isnan(sp) || !std::isnan(sp2))
+                anyPerLayer = true;
+        }
+
+        // ---- gather live frame-scope morph amounts ----
+        // NaN = "no param -> keep the op's resting amount baked at rebuild".
+        std::vector<float> morphAmounts(rb.morphChain.size(), kNaN);
+        for (size_t k = 0; k < rb.morphChain.size(); ++k) {
+            const WarpOp& def = rb.morphChain[k];
+            if (!def.enabled || def.method == WarpMethod::None) continue;
+            morphAmounts[k] = getParamByWarpSlot(node, rb.frameId, (int)k, kNaN);
+        }
+
+        // Skip the re-render when nothing moved since the last bake. Caches start
+        // empty, so the first block always renders (priming the slot to exactly
+        // the static renderMorphed bake when nothing is modulated).
+        bool changed = (overrides != rb.lastLayerOverrides)
+                    || !sameF(phaseOv,  rb.lastPhaseOv)
+                    || !sameF(ampOv,    rb.lastAmpOv)
+                    || !sameF(shapeOv,  rb.lastShapeOv)
+                    || !sameF(shape2Ov, rb.lastShape2Ov)
+                    || !sameF(morphAmounts, rb.lastMorphAmounts);
+        if (!changed) continue;
+
+        // ---- re-render the cycle ----
+        std::vector<float> cycle;
+        if (anyPerLayer)
+            lw->renderWithLiveOverrides(overrides, phaseOv, ampOv, shapeOv, shape2Ov, cycle);
+        else
+            lw->renderRaw(rb.tableSize, cycle); // gain-free; applied below
+        const float g = lw->gain;
+        if (g != 1.0f) for (auto& sv : cycle) sv *= g;
+
+        // Per-frame morph chain on top, at live amounts where wired, resting
+        // otherwise - matches the renderMorphed() static bake when unmodulated.
+        if (!rb.morphChain.empty()) {
+            std::vector<WarpOp> live = rb.morphChain;
+            for (size_t k = 0; k < live.size() && k < morphAmounts.size(); ++k)
+                if (!std::isnan(morphAmounts[k]))
+                    live[k].amount = juce::jlimit(0.0f, 1.0f, morphAmounts[k]);
+            applyWarpChain(live, cycle);
+        }
+
+        // ---- write back into the frame's slot ----
+        if (rb.scatterIndex >= 0) {
+            if (rb.scatterIndex < (int)wtScatterFrameSamples.size()) {
+                auto& dst = wtScatterFrameSamples[rb.scatterIndex];
+                int n = std::min((int)cycle.size(), (int)dst.size());
+                for (int i = 0; i < n; ++i) dst[i] = cycle[i];
+            }
+        } else {
+            auto& data = terrain.getData();
+            int n = std::min((int)cycle.size(), rb.tableSize);
+            for (int i = 0; i < n; ++i) {
+                int flat = i * rb.gridStride + rb.gridOffset;
+                if (flat >= 0 && flat < (int)data.size()) data[flat] = cycle[i];
+            }
+        }
+
+        rb.lastLayerOverrides = std::move(overrides);
+        rb.lastPhaseOv        = std::move(phaseOv);
+        rb.lastAmpOv          = std::move(ampOv);
+        rb.lastShapeOv        = std::move(shapeOv);
+        rb.lastShape2Ov       = std::move(shape2Ov);
+        rb.lastMorphAmounts   = std::move(morphAmounts);
+    }
 }
 
 // Extract harmonic magnitudes and phases from the current 1D wavetable
@@ -1353,114 +2131,113 @@ void TerrainSynthProcessor::updateGranularWeights() {
 
 void TerrainSynthProcessor::computeGranularWeights(const std::vector<float>& pos,
                                                    std::vector<float>& out) {
-    out.assign(wtGranularFrames.size(), 0.0f);
-    if (wtGranularFrames.empty()) return;
+    // Gather the granular entries' positions and delegate to the shared kernel.
+    std::vector<std::vector<float>> positions;
+    positions.reserve(wtGranularFrames.size());
+    for (const auto& e : wtGranularFrames) positions.push_back(e.position);
+    computeSideTableWeights(positions, pos, out);
+}
+
+void TerrainSynthProcessor::updateInharmonicWeights() {
+    // Same Position resolution as updateGranularWeights (which see) - geometric-
+    // axis-indexed query so it lines up with the entries' stored positions.
+    std::vector<float> pos;
+    if (wtScatter) {
+        pos = scatterQueryPosition();
+    } else {
+        pos.assign(std::max(1, wtNumDims), 0.0f);
+        const int K = (int)wtEffectiveAxes.size();
+        for (int k = 0; k < K; ++k) {
+            const int axis = wtEffectiveAxes[k];
+            std::string pname = (K == 1) ? std::string("Position")
+                              : std::string("Position ") + std::to_string(k + 1);
+            if (axis >= 0 && axis < (int)pos.size())
+                pos[axis] = juce::jlimit(0.0f, 1.0f, getParamByName(node, pname.c_str(), 0.0f));
+        }
+    }
+    computeInharmonicWeights(pos, inhWeights);
+}
+
+void TerrainSynthProcessor::computeInharmonicWeights(const std::vector<float>& pos,
+                                                     std::vector<float>& out) {
+    std::vector<std::vector<float>> positions;
+    positions.reserve(wtInharmonicFrames.size());
+    for (const auto& e : wtInharmonicFrames) positions.push_back(e.position);
+    computeSideTableWeights(positions, pos, out);
+}
+
+void TerrainSynthProcessor::computeSideTableWeights(
+        const std::vector<std::vector<float>>& entryPositions,
+        const std::vector<float>& pos, std::vector<float>& out) {
+    out.assign(entryPositions.size(), 0.0f);
+    if (entryPositions.empty()) return;
 
     if (wtScatter) {
-        // Wendland weights - normalized to sum-1 by default, matching the
-        // cycle blend; in "distance fades volume" mode (wtAbsoluteBlend)
-        // the raw weight is used as gain instead (invT = 1, no fallback).
+        // Scatter blend. The normalisation denominator (totalW) sums over ALL
+        // scatter frames - cycle + every live side layer - exactly like the
+        // cycle blend, so each entry's weight is computed directly from its own
+        // Position against that shared denominator. Each side-table entry's
+        // Position equals one scatter frame's Position, so this yields the same
+        // numbers the old per-frame-then-join code did, without the join.
         const float r = std::max(1e-3f, wtScatterRadius);
-        float totalW = 0.0f;
-        std::vector<float> wAll(wtScatterFrameSamples.size(), 0.0f);
-        // Distances first (shared by both kernels); track the nearest so the
-        // Shepard weights below can normalize against it overflow-safely.
-        std::vector<float> dists(wtScatterFrameSamples.size(), 0.0f);
-        float dmin = 1e30f;
-        for (size_t fi = 0; fi < wtScatterFrameSamples.size(); ++fi) {
-            const auto& fp = wtScatterFramePositions[fi];
+        const float p = 2.0f / std::max(0.05f, wtScatterRadius);
+        auto distTo = [&](const std::vector<float>& fp) {
             float d2 = 0.0f;
             for (int d = 0; d < wtScatterDims; ++d) {
-                float a = (d < (int)fp.size()) ? fp[d] : 0.5f;
+                float a  = (d < (int)fp.size()) ? fp[d] : 0.5f;
                 float dd = a - (d < (int)pos.size() ? pos[d] : 0.5f);
                 d2 += dd * dd;
             }
-            dists[fi] = std::sqrt(d2);
-            dmin = std::min(dmin, dists[fi]);
-        }
-        if (wtAbsoluteBlend) {
-            // Compact-support Wendland: raw weight used as gain, silent outside
-            // every frame's radius. Mirrors the cycle blend's absolute path.
-            for (size_t fi = 0; fi < wtScatterFrameSamples.size(); ++fi) {
-                float dist = dists[fi];
-                if (dist < r) {
-                    float u = dist / r;
-                    float v = 1.0f - u;
-                    wAll[fi] = v * v * v * v * (4.0f * u + 1.0f);
-                }
-            }
-        } else {
-            // Normalized blend: scale-free inverse-distance (Shepard), matching
-            // the cycle blend so granular and cycle frames morph identically.
-            // Always tracks Position - no hard switch / static-average dead
-            // zones, no nearest-frame fallback needed.
-            float p = 2.0f / std::max(0.05f, wtScatterRadius);
-            for (size_t fi = 0; fi < wtScatterFrameSamples.size(); ++fi) {
-                float ratio = (dmin + 1e-6f) / (dists[fi] + 1e-6f);
-                wAll[fi] = std::pow(ratio, p);
-                totalW += wAll[fi];
-            }
-        }
-        // Map granular-frame entries to their per-frame weight in wAll.
-        // The granular entries are pushed in the same order as the
-        // scatter-frame iteration but we store position copies, so we
-        // match by position equality - cheaper to just iterate both
-        // arrays together since they were populated in lockstep skipping
-        // cycle frames. Use position equality as the join key.
+            return std::sqrt(d2);
+        };
+        // Nearest scatter frame (overflow-safe Shepard reference) and the
+        // normalised-blend denominator over all scatter frames.
+        float dmin = 1e30f;
+        for (const auto& fp : wtScatterFramePositions)
+            dmin = std::min(dmin, distTo(fp));
+        float totalW = 0.0f;
+        if (!wtAbsoluteBlend)
+            for (const auto& fp : wtScatterFramePositions)
+                totalW += std::pow((dmin + 1e-6f) / (distTo(fp) + 1e-6f), p);
         const float invT = wtAbsoluteBlend ? 1.0f
                                            : (totalW > 1e-9f ? 1.0f / totalW : 0.0f);
-        size_t gi = 0;
-        for (size_t fi = 0; fi < wtScatterFrameSamples.size() && gi < wtGranularFrames.size(); ++fi) {
-            const auto& fp = wtScatterFramePositions[fi];
-            const auto& gp = wtGranularFrames[gi].position;
-            if (fp.size() != gp.size()) continue;
-            bool match = true;
-            for (size_t d = 0; d < fp.size(); ++d) {
-                if (std::abs(fp[d] - gp[d]) > 1e-6f) { match = false; break; }
-            }
-            if (match) {
-                out[gi] = wAll[fi] * invT;
-                ++gi;
+        for (size_t ei = 0; ei < entryPositions.size(); ++ei) {
+            float dist = distTo(entryPositions[ei]);
+            if (wtAbsoluteBlend) {
+                // Compact-support Wendland: raw weight as gain, silent past r.
+                if (dist < r) {
+                    float u = dist / r, v = 1.0f - u;
+                    out[ei] = v * v * v * v * (4.0f * u + 1.0f);
+                }
+            } else {
+                // Normalised scale-free inverse-distance (Shepard).
+                out[ei] = std::pow((dmin + 1e-6f) / (dist + 1e-6f), p) * invT;
             }
         }
         return;
     }
 
-    // Grid mode: N-linear interp weight. For each granular frame, its
-    // grid-coord position (already in [0,1]) yields a weight as the
-    // product of per-dimension hat functions: max(0, 1 - |pos - gp| * (dim-1)).
-    // This is exactly the weight the terrain's bilinear/N-linear interp
-    // would apply to that grid cell.
-    //
-    // We need the original grid dims to know the cell spacing; we stored
-    // wtNumDims but not the per-dim grid size. Derive it from the terrain
-    // shape: terrainDims = {tableSize, d0, d1, ...} so dims[d+1] is the
-    // grid size in dimension d.
+    // Grid mode: N-linear interp weight. Each entry's grid-coord position
+    // (already in [0,1]) yields a weight as the product of per-dimension hat
+    // functions: max(0, 1 - |pos - gp| * (dim-1)) - exactly the weight the
+    // terrain's N-linear interp applies to that grid cell. Terrain dims are
+    // {tableSize, d0, d1, ...} so tdims[d+1] is the grid size in dimension d.
     const auto& tdims = terrain.getDimensions();
-    for (size_t gi = 0; gi < wtGranularFrames.size(); ++gi) {
-        const auto& gp = wtGranularFrames[gi].position;
+    for (size_t ei = 0; ei < entryPositions.size(); ++ei) {
+        const auto& gp = entryPositions[ei];
         float w = 1.0f;
         for (int d = 0; d < (int)gp.size() && (d + 1) < (int)tdims.size(); ++d) {
-            const int   dimSize = std::max(1, tdims[d + 1]);
-            // Single-cell axis: the lone cell covers the whole [0,1]
-            // range of the Position param. With no neighbour to
-            // interpolate to, weight is 1.0 regardless of pos[d] -
-            // matching Terrain::sample, which special-cases dim=1 by
-            // collapsing both interpolation corners onto index 0.
-            // Without this, a 1x1x...x1 wavetable comes out at half
-            // amplitude at the default Position=0.5, and goes completely
-            // silent the moment the user moves Position to 1.0 (because
-            // the cell's stored gp[d] is 0.0 and the hat function reads
-            // h = 1 - |1 - 0| = 0).
+            const int dimSize = std::max(1, tdims[d + 1]);
+            // Single-cell axis: the lone cell covers the whole [0,1] Position
+            // range, weight 1.0 regardless of pos[d] - matching Terrain::sample,
+            // which collapses both interp corners onto index 0 when dim==1.
             if (dimSize <= 1) continue;
-            const float scale   = (float)(dimSize - 1);
-            // |pos - gp| measured in cell units. Hat width = 1 cell.
-            const float diff    = std::abs((d < (int)pos.size() ? pos[d] : 0.5f)
-                                           - gp[d]) * scale;
-            const float h       = std::max(0.0f, 1.0f - diff);
-            w *= h;
+            const float scale = (float)(dimSize - 1);
+            const float diff  = std::abs((d < (int)pos.size() ? pos[d] : 0.5f)
+                                         - gp[d]) * scale;
+            w *= std::max(0.0f, 1.0f - diff);
         }
-        out[gi] = w;
+        out[ei] = w;
     }
 }
 
@@ -1500,6 +2277,17 @@ int TerrainSynthProcessor::startVoice(int noteNumber, int channel, int velocity)
     // it for granular library-frame previews.
     v.auditionFrame.reset();
     v.auditionFrameStream = Voice::GranStream{};
+    // Inharmonic oscillator-bank state: clear the per-partial phase accumulators
+    // so a reused voice restarts each partial from its authored initial phase
+    // (tonal partials would click on a phase discontinuity otherwise), and clear
+    // any unplaced-frame audition override.
+    v.inhStreams.clear();
+    v.auditionInhFrame.reset();
+    v.auditionInhFrameStream = Voice::InhStream{};
+    // Clear any unplaced single-cycle audition override (layered-frame Play).
+    v.auditionCycleFrame.reset();
+    v.auditionCyclePrev.reset();
+    v.auditionCycleFade = 1.0f;
     return vi;
 }
 
@@ -1552,6 +2340,19 @@ void TerrainSynthProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mi
                 voices[vi].auditionFrame       = ev.granularFrame;
                 voices[vi].auditionFrameStream = Voice::GranStream{};
             }
+            // Direct unplaced inharmonic-stack audition (parallel to granular).
+            if (vi >= 0 && ev.inharmonicFrame
+                && !ev.inharmonicFrame->partials.empty()) {
+                voices[vi].auditionInhFrame       = ev.inharmonicFrame;
+                voices[vi].auditionInhFrameStream = Voice::InhStream{};
+            }
+            // Direct unplaced single-cycle audition (layered-frame Play, and
+            // eventually every frame editor). The voice reads this cycle as a
+            // wavetable oscillator via the existing v.phase accumulator, so no
+            // extra per-voice stream state is needed.
+            if (vi >= 0 && ev.cycleFrame && !ev.cycleFrame->cycle.empty()) {
+                voices[vi].auditionCycleFrame = ev.cycleFrame;
+            }
         };
 
         for (auto& ev : node.pendingAudition) {
@@ -1571,6 +2372,33 @@ void TerrainSynthProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mi
             startAuditionVoice(*node.heldAudition);
             heldAuditionActive = true;
             heldAuditionPitch  = node.heldAudition->pitch;
+        } else if (wantHeld && heldAuditionActive) {
+            // The editor re-ships node.heldAudition with a freshly rendered
+            // single cycle on every morph/gain edit (refreshHeldFrameAudition,
+            // from onLayerChanged) so the sustained Preview tracks the slider.
+            // But the voice captured its cycle ONLY at note-on, so without this
+            // the audition stepped to the new cycle only when the debounced
+            // graph rebuild recreated this processor (~150 ms) - which read as
+            // the preview updating "periodically, not continuously" while
+            // dragging. Update the live voice's cycle in place so the Preview
+            // tracks a slider drag as smoothly as a modulation signal does
+            // (the synth rebakes the terrain every block in the signal case).
+            // Reading a new table mid-phase steps the output (a click), even for
+            // a small slider delta if the morph reshapes the wave near the read
+            // point. So we don't swap hard: stash the old cycle as the crossfade
+            // source and ramp auditionCycleFade 0->1 over a few ms (the read path
+            // blends prev->current), matching the smooth per-sample signal path.
+            // A swap arriving mid-fade re-bases the fade on the cycle we were
+            // heading to, so prev is always a real table and the deltas stay tiny.
+            if (node.heldAudition->cycleFrame)
+                for (auto& v : voices)
+                    if (v.env.isActive() && v.noteNumber == heldAuditionPitch
+                        && v.auditionCycleFrame
+                        && v.auditionCycleFrame != node.heldAudition->cycleFrame) {
+                        v.auditionCyclePrev  = v.auditionCycleFrame;
+                        v.auditionCycleFrame = node.heldAudition->cycleFrame;
+                        v.auditionCycleFade  = 0.0f;
+                    }
         } else if (!wantHeld && heldAuditionActive) {
             releaseNote(heldAuditionPitch, 1);
             heldAuditionActive = false;
@@ -1581,10 +2409,10 @@ void TerrainSynthProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mi
     // Snapshot the incoming control-signal channels (2+) BEFORE clearing the
     // buffer. `buf` is also this synth's render target, so the buf.clear()
     // below wipes the live signal that upstream nodes wrote into channels 2+
-    // (the "Sig X/Y/.." coordinate drivers and the "Aftertouch" pin). The
+    // (the "Sig X/Y/.." coordinate drivers and the "Pressure" pin). The
     // per-sample readers further down must read this snapshot, not `buf`,
     // otherwise they'd see only the post-clear zeros - which silently pinned
-    // every Sig-driven coordinate to 0 and stopped the aftertouch-signal
+    // every Sig-driven coordinate to 0 and stopped the pressure-signal
     // override from ever engaging. (applySignalModulations ran above and reads
     // sample 0 pre-clear, so Mod/Set param pins were unaffected; only these
     // per-sample channel readers needed the snapshot.) controlInBuf channel c
@@ -1724,7 +2552,7 @@ void TerrainSynthProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mi
             // Channel aftertouch: hardware keyboards send this when the
             // player presses harder on a key already held down. We store
             // per-channel and let the render loop multiply final volume
-            // by (1 + sensitivity * aftertouch). The "Aftertouch" signal
+            // by (1 + sensitivity * aftertouch). The "Pressure" signal
             // input pin, when wired, overrides this with the signal's
             // sample value instead.
             int ch = juce::jlimit(1, 16, msg.getChannel());
@@ -1776,15 +2604,15 @@ void TerrainSynthProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mi
     int numSignalInputs = std::max(0, numChannels - 2);
     bool hasSignalInputs = numSignalInputs > 0;
 
-    // Find the "Aftertouch" input pin among the node's control inputs
+    // Find the "Pressure" input pin among the node's control inputs
     // and read its current block-mean value. Control inputs map to audio
     // buffer channels starting at channel 2, in the order they appear in
     // node.pinsIn. The slot index must count BOTH Signal and Param pins,
     // exactly the way graph_processor assigns control channels (it routes
     // Signal *and* Param input pins onto channels 2+). Counting only Signal
     // pins here mis-mapped the channel once the Position modulation pins -
-    // and the Aftertouch pin itself - became block-rate Param, reading a
-    // neighbouring pin's data as aftertouch. When unwired (no node provides
+    // and the Pressure pin itself - became block-rate Param, reading a
+    // neighbouring pin's data as pressure. When unwired (no node provides
     // this channel) the channel stays at silence and we fall back to MIDI
     // channel-pressure. We use the block mean rather than per-sample so a
     // slow LFO drives a smooth aftertouch rather than carrying its audio
@@ -1796,7 +2624,9 @@ void TerrainSynthProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mi
         int targetSigIdx = -1;
         for (auto& p : node.pinsIn) {
             if (p.kind != PinKind::Signal && p.kind != PinKind::Param) continue;
-            if (p.name == "Aftertouch") { targetSigIdx = sigIdx; break; }
+            // Match the migrated "Pressure" name, plus the legacy "Aftertouch"
+            // name in case a node is read before the graph builder migrates it.
+            if (p.name == "Pressure" || p.name == "Aftertouch") { targetSigIdx = sigIdx; break; }
             ++sigIdx;
         }
         if (targetSigIdx >= 0) {
@@ -1820,6 +2650,9 @@ void TerrainSynthProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mi
     // Position so the per-sample voice loop can mix in Σ wGran[i] *
     // olaStream[i] on top of the cycle terrain.
     updateGranularWeights();
+    // Inharmonic layer: same per-frame morph weights from the current Position,
+    // read by the per-sample oscillator-bank mix.
+    updateInharmonicWeights();
 
     // Wavetable-editor audition voices select their frame from a per-voice
     // Position override rather than the live Position. Compute each such
@@ -1833,6 +2666,20 @@ void TerrainSynthProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mi
                 computeGranularWeights(v.auditionPos, v.auditionWeights);
         }
     }
+    if (!wtInharmonicFrames.empty()) {
+        for (int vi = 0; vi < MAX_VOICES; ++vi) {
+            auto& v = voices[vi];
+            if (v.env.isActive() && v.hasAuditionPos && !v.auditionPos.empty())
+                computeInharmonicWeights(v.auditionPos, v.auditionInhWeights);
+        }
+    }
+
+    // Per-frame live morph re-bake: re-render any frame whose morph amounts or
+    // per-layer warp ops are wired to node params, writing the shaped cycle back
+    // into its scatter/terrain slot. MUST run before the scatter blend below and
+    // before the per-sample grid lookup, so the shaped cycles feed the blend.
+    // Frames with nothing modulated keep the static renderMorphed bake from rebuild.
+    rebakeFramesIfNeeded(node);
 
     // Scatter wavetable: blend frames into the 1D terrain at block start
     // using a Wendland C^2 RBF over the current Position. The per-sample
@@ -1950,7 +2797,10 @@ void TerrainSynthProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mi
     bool anyAuditionVoice = false;
     if (divertAudition) {
         for (auto& v : voices)
-            if (v.env.isActive() && v.auditionFrame) { anyAuditionVoice = true; break; }
+            if (v.env.isActive()
+                && (v.auditionFrame || v.auditionInhFrame || v.auditionCycleFrame)) {
+                anyAuditionVoice = true; break;
+            }
         if (anyAuditionVoice) {
             auditionScratch.assign((size_t)numSamples, 0.0f);
         }
@@ -2013,10 +2863,10 @@ void TerrainSynthProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mi
         // - "Sig X", "Sig Y", ...). The Nth such pin maps onto coord[N].
         //
         // This must be PIN-AWARE, not a blind "channel 2+si -> coord[si]" map:
-        // tonal synths now also carry an "Aftertouch" Signal pin (#78) and the
+        // tonal synths now also carry a "Pressure" Signal pin (#78) and the
         // on-demand "Mod: ..." modulation pins (#88), all of which occupy
         // control channels (2,3,4,...) interleaved with any Sig pins. Those
-        // pins are NOT coordinate drivers - Aftertouch feeds the amplitude
+        // pins are NOT coordinate drivers - Pressure feeds the amplitude
         // swell and Mod pins modulate named params via applySignalModulations
         // at the top of the block (which is how a wired LFO already reaches the
         // wavetable Position). Treating their channels as coordinates was the
@@ -2116,6 +2966,11 @@ void TerrainSynthProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mi
                 if (!pitchCoord.empty())
                     pitchCoord[0] = std::fmod(pitchCoord[0] + v.phase, 1.0f);
 
+                // Per-frame morph (phase- and amplitude-domain warps) is baked
+                // into each frame's cycle at rebuild / per-block re-bake, NOT
+                // applied here - so a phase warp shapes its own frame before the
+                // cross-frame blend rather than smearing the blended result.
+
                 if (grainSizeSamples > 0) {
                     // Graintable mode: crossfade between overlapping grains
                     // Two grains offset by half a grain size, triangular crossfade
@@ -2146,6 +3001,8 @@ void TerrainSynthProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mi
                 // Renormalize the cycle sample over filled grid cells so
                 // empty cells don't drain volume (no-op when gain == 1).
                 sample *= gridRenormGain;
+
+                // (Amplitude-domain morph is baked into the frame cycle, see above.)
 
                 // ---- Granular layer mix ----
                 //
@@ -2193,7 +3050,83 @@ void TerrainSynthProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mi
                                             (GranularFreezeMode)freezeMode);
                 };
 
-                if (v.auditionFrame && v.auditionFrame->source
+                // Inharmonic oscillator bank: one sine per partial at
+                // effFreq * ratio, summed, then peak-normalised by `normGain` so
+                // the live voice is as loud as the editor's normalised thumbnail,
+                // then shaped by the amplitude-domain element warp (same transfer
+                // renderRaw bakes into the thumbnail). Partials at or above
+                // Nyquist are skipped (anti-aliasing). `st` carries per-partial
+                // running phase, seeded from each partial's authored initial
+                // phase on first use. Generic over the partial struct so the
+                // placed (InharmonicLayerEntry) and audition (AuditionInharmonic-
+                // Frame) paths share one implementation. Captures effFreq +
+                // sampleRate from the enclosing per-sample scope.
+                auto renderInhSample =
+                    [&](const auto& partials, float normGain,
+                        const std::vector<WarpOp>& warpAmpOps,
+                        Voice::InhStream& st) -> float {
+                    const size_t N = partials.size();
+                    if (st.phase.size() != N) {
+                        st.phase.resize(N);
+                        for (size_t k = 0; k < N; ++k) st.phase[k] = partials[k].phase;
+                    }
+                    const float TWO_PI  = 6.28318530718f;
+                    const float nyquist = 0.5f * (float)sampleRate;
+                    float outv = 0.0f;
+                    for (size_t k = 0; k < N; ++k) {
+                        float pf = effFreq * partials[k].ratio;
+                        if (pf <= 0.0f) continue;
+                        if (pf < nyquist)
+                            outv += partials[k].amp * std::sin(TWO_PI * st.phase[k]);
+                        st.phase[k] += pf / (float)sampleRate;
+                        if (st.phase[k] >= 1.0f) st.phase[k] -= std::floor(st.phase[k]);
+                    }
+                    outv *= normGain;
+                    for (const auto& op : warpAmpOps)
+                        outv = warpAmpValue(op.method, outv, op.amount);
+                    return outv;
+                };
+
+                if (v.auditionCycleFrame && !v.auditionCycleFrame->cycle.empty()) {
+                    // Unplaced single-cycle audition (layered-frame editor Play,
+                    // and eventually every frame editor). Read ONLY this cycle as
+                    // a wavetable oscillator, replacing the cycle terrain so the
+                    // user hears exactly the edited frame regardless of what's
+                    // placed in the table or where the Position knob sits. The
+                    // cycle already has the frame's gain + internal warps baked in
+                    // (IWavetableFrame::render), so it's read straight - matching
+                    // the editor's on-screen single-cycle preview byte-for-byte.
+                    const float ph = v.phase - std::floor(v.phase);  // [0,1)
+                    // Read one single-cycle table at the current phase (linear
+                    // interp). Shared by the current cycle and, during a de-click
+                    // crossfade, the previous cycle.
+                    auto readCycle = [ph](const std::vector<float>& cyc) -> float {
+                        const int N = (int)cyc.size();
+                        float fpos = ph * (float)N;
+                        int i0 = (int)fpos;
+                        if (i0 >= N) i0 = N - 1;
+                        const int i1 = (i0 + 1) % N;
+                        const float frac = fpos - (float)i0;
+                        return cyc[(size_t)i0] + (cyc[(size_t)i1] - cyc[(size_t)i0]) * frac;
+                    };
+                    float curS = readCycle(v.auditionCycleFrame->cycle);
+                    // De-click a live cycle swap: crossfade prev->current over a
+                    // few ms so a morph-slider drag tracks smoothly instead of
+                    // stepping. ~6 ms; advances one step per output sample.
+                    if (v.auditionCycleFade < 1.0f && v.auditionCyclePrev
+                        && !v.auditionCyclePrev->cycle.empty()) {
+                        float prevS = readCycle(v.auditionCyclePrev->cycle);
+                        sample = prevS + (curS - prevS) * v.auditionCycleFade;
+                        const float fadeInc = (float)(1.0 / std::max(1.0, sampleRate * 0.006));
+                        v.auditionCycleFade += fadeInc;
+                        if (v.auditionCycleFade >= 1.0f) {
+                            v.auditionCycleFade = 1.0f;
+                            v.auditionCyclePrev.reset();
+                        }
+                    } else {
+                        sample = curS;
+                    }
+                } else if (v.auditionFrame && v.auditionFrame->source
                     && !v.auditionFrame->source->empty()) {
                     // Unplaced-frame audition (wavetable editor Play on a
                     // library-only granular frame). Render ONLY this frame,
@@ -2205,12 +3138,29 @@ void TerrainSynthProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mi
                     // af.gain mirrors the frame's IWavetableFrame::gain so the
                     // editor's Gain knob is audible when auditioning a granular
                     // library frame directly (the grain reader bypasses render()).
-                    sample += af.gain * renderGrainSample(
+                    float gsamp = renderGrainSample(
                         af.source->data(), (int)af.source->size(),
                         af.grainLength, af.windowStart, af.windowLen,
                         af.grainCount, af.fftSize, af.crossfadeSamples,
                         af.embeddedPitchHz, af.sourceSampleRate,
                         af.freezeMode, v.auditionFrameStream);
+                    // Bucket C element warp, mirroring the placed-frame path so
+                    // the audition matches the synth and the editor preview.
+                    for (const auto& op : af.warpAmpOps)
+                        gsamp = warpAmpValue(op.method, gsamp, op.amount);
+                    sample += af.gain * gsamp;
+                } else if (v.auditionInhFrame
+                           && !v.auditionInhFrame->partials.empty()) {
+                    // Unplaced inharmonic-stack audition (inharmonic editor Play
+                    // on a library-only stack). Render ONLY this stack's
+                    // oscillator bank, replacing the cycle terrain so the user
+                    // hears exactly the edited stack regardless of the table /
+                    // Position knob. Mirrors the granular audition branch above.
+                    sample = 0.0f;
+                    const auto& af = *v.auditionInhFrame;
+                    sample += af.gain * renderInhSample(af.partials, af.normGain,
+                                                        af.warpAmpOps,
+                                                        v.auditionInhFrameStream);
                 } else if (!wtGranularFrames.empty() && isWavetable) {
                     // Lazy-allocate the per-voice granular stream array on
                     // first use - voices that never hit a granular cell
@@ -2239,12 +3189,57 @@ void TerrainSynthProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mi
                         // dialog's Gain control); the cycle layer applies it in
                         // render(), but the grain reader bypasses render() so we
                         // apply it here.
-                        sample += w * gridRenormGain * gf.gain * renderGrainSample(
+                        float gsamp = renderGrainSample(
                             gf.source.data(), (int)gf.source.size(),
                             gf.grainLength, gf.windowStart, gf.windowLen,
                             gf.grainCount, gf.fftSize, gf.crossfadeSamples,
                             gf.embeddedPitchHz, gf.sourceSampleRate,
                             gf.freezeMode, v.granStreams[gi]);
+                        // Bucket C element warp: shape the grain-stream output
+                        // through the frame's amplitude-domain warp chain before
+                        // applying mix weight / gain, mirroring what renderRaw
+                        // bakes into the representative cycle so audio == preview.
+                        for (const auto& op : gf.warpAmpOps)
+                            gsamp = warpAmpValue(op.method, gsamp, op.amount);
+                        sample += w * gridRenormGain * gf.gain * gsamp;
+                    }
+                }
+
+                // ---- Inharmonic stack layer mix ----
+                //
+                // Live oscillator bank for each placed inharmonic frame, added
+                // on top of the cycle + granular layers by the same Position
+                // morph weight (the inharmonic frames baked a zero cycle, so the
+                // terrain contributes nothing for them). Skipped while a direct-
+                // audition frame (granular or inharmonic) owns the voice - those
+                // branches above already set `sample` to play only themselves.
+                if (!wtInharmonicFrames.empty() && isWavetable
+                    && !v.auditionFrame && !v.auditionInhFrame
+                    && !v.auditionCycleFrame) {
+                    // Lazy-allocate the per-voice oscillator-bank state on first
+                    // use (cleared at note-on so phases restart cleanly).
+                    if ((int)v.inhStreams.size() != (int)wtInharmonicFrames.size())
+                        v.inhStreams.resize(wtInharmonicFrames.size());
+
+                    // Audition voices use their own per-voice weights; all other
+                    // voices share the live-Position inhWeights.
+                    const float* iw =
+                        (v.hasAuditionPos
+                         && v.auditionInhWeights.size() == wtInharmonicFrames.size())
+                            ? v.auditionInhWeights.data()
+                            : inhWeights.data();
+
+                    for (size_t ii = 0; ii < wtInharmonicFrames.size(); ++ii) {
+                        const float w = iw[ii];
+                        if (w <= 1e-5f) continue;
+                        const auto& inf = wtInharmonicFrames[ii];
+                        // Same empty-cell renormalization the cycle/granular
+                        // layers get; inf.gain is the editor's per-frame Gain
+                        // (the bank bypasses render(), so apply it here).
+                        float ssamp = renderInhSample(inf.partials, inf.normGain,
+                                                      inf.warpAmpOps,
+                                                      v.inhStreams[ii]);
+                        sample += w * gridRenormGain * inf.gain * ssamp;
                     }
                 }
 
@@ -2305,10 +3300,10 @@ void TerrainSynthProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mi
                 }
             }
 
-            // Aftertouch volume swell. Channel aftertouch + poly
+            // Pressure volume swell. Channel aftertouch + poly
             // aftertouch combine (capped at 1) so per-note pressure
             // adds on top of the channel-wide value. When the synth's
-            // "Aftertouch" input pin is wired, aftertouchOverride
+            // "Pressure" input pin is wired, aftertouchOverride
             // replaces channel aftertouch with the wired signal.
             float chanAT = (aftertouchOverride >= 0.0f) ? aftertouchOverride
                                                        : channelAftertouch[v.midiChannel - 1];
@@ -2321,7 +3316,8 @@ void TerrainSynthProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mi
             // Divert this voice's contribution to the audition-monitor bus
             // when it's an unrouted-node audition voice (see collectAudition).
             // Otherwise it joins the normal mix bound for the graph output.
-            if (collectAudition && v.auditionFrame) {
+            if (collectAudition
+                && (v.auditionFrame || v.auditionInhFrame || v.auditionCycleFrame)) {
                 auditionSample += contrib;
                 auditionVoiceCount++;
             } else {

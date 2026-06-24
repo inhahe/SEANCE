@@ -13,6 +13,12 @@
 //                                           pins, each an independent cable.
 //                                           Emit to a specific one with
 //                                           ss_midi_out_n(out_index, ...).
+//   int32_t ss_num_midi_inputs(void)      — default 1; >1 exposes "MIDI In 1..N"
+//                                           pins, each an independent cable. The
+//                                           host merges them into the single
+//                                           MIDI-input event buffer, tagging each
+//                                           event with the 0-based pin it arrived
+//                                           on in ss_midi_event_t.input_index.
 
 #ifndef SOUNDSHOP_WASM_H
 #define SOUNDSHOP_WASM_H
@@ -62,6 +68,200 @@ void ss_midi_out(int32_t sample_offset, uint8_t status, uint8_t d1, uint8_t d2);
 __attribute__((import_module("env"), import_name("ss_midi_out_n")))
 void ss_midi_out_n(int32_t out_index, int32_t sample_offset,
                    uint8_t status, uint8_t d1, uint8_t d2);
+
+// Read one of the shared FACTORY-WAVEFORM cycles — the exact same bank the
+// Built-in / Lua / Python / GLSL formula languages expose as waveform(id, phase).
+// `id` is the stable entry index (the integer shown in the factory-waveform
+// browser; identical across every language). `phase` is normalised [0,1) and
+// wraps; the cycle is read with linear interpolation. Returns the sample in
+// [-1,1], or 0 for an out-of-range id. RT-safe (a plain table read host-side).
+__attribute__((import_module("env"), import_name("ss_waveform")))
+float ss_waveform(int32_t id, float phase);
+
+// Resolve a factory-waveform NAME (case-insensitive, e.g. "AKWF oboe 0001") to
+// its stable entry index for ss_waveform(), or -1 if there is no such waveform.
+// Call this once in ss_init() and cache the result: the first lookup builds an
+// internal name->index map host-side, so it is not guaranteed allocation-free.
+__attribute__((import_module("env"), import_name("ss_waveform_id")))
+int32_t ss_waveform_id(const char* name);
+
+// ----------------------------------------------------------------------------
+// Wavetable shape-bending ("warp") algorithms
+// ----------------------------------------------------------------------------
+// The same warps the Layered Wave editor and synth voice apply, exposed as pure
+// scalar functions so an in-script clip/fold/bend matches the node bit-for-bit.
+//   ss_warpamp(method, x, amount)     - amplitude-domain transfer on a sample
+//                                       value x in [-1,1] (clip/fold/saturate/...)
+//   ss_warpphase(method, phase, amount) - phase-domain remap of a read position
+//                                       in [0,1) (bend/asym/PWM-skew/PD/...)
+// `method` is an integer WarpMethod id - use the SS_WARP_* constants below, or
+// ss_warp_method("name") to resolve a readable name once. `amount` is the 0..1
+// morph knob (0 = identity). An unknown method id is treated as identity.
+__attribute__((import_module("env"), import_name("ss_warpamp")))
+float ss_warpamp(int32_t method, float x, float amount);
+__attribute__((import_module("env"), import_name("ss_warpphase")))
+float ss_warpphase(int32_t method, float phase, float amount);
+__attribute__((import_module("env"), import_name("ss_warp_method")))
+int32_t ss_warp_method(const char* name);
+
+// Stable WarpMethod ids (mirror enum WarpMethod in cpp/src/warp.h; serialized, so
+// these values never change). Amplitude-domain shapers feed ss_warpamp; phase-
+// domain remaps feed ss_warpphase.
+#define SS_WARP_NONE              0
+#define SS_WARP_SOFTCLIP         1   // amplitude
+#define SS_WARP_HARDCLIP         2
+#define SS_WARP_WAVEFOLD         3
+#define SS_WARP_WAVEWRAP         4
+#define SS_WARP_RECTIFY          5
+#define SS_WARP_QUANTIZE         6
+#define SS_WARP_TUBESAT          7
+#define SS_WARP_TAPESAT          8
+#define SS_WARP_FLIP            10
+#define SS_WARP_CHEBYSHEV       11
+#define SS_WARP_BENDPLUS        20   // phase
+#define SS_WARP_BENDMINUS       21
+#define SS_WARP_ASYMPLUS        22
+#define SS_WARP_ASYMMINUS       23
+#define SS_WARP_PWMSKEW         24
+#define SS_WARP_PHASEQUANTIZE   25
+#define SS_WARP_PHASEDISTORTION 26
+#define SS_WARP_VPS             27
+#define SS_WARP_REMAP           28
+#define SS_WARP_SELFSYNC        29
+
+// ----------------------------------------------------------------------------
+// Bucket C: representation-bound whole-buffer warps.
+//   ss_spectralwarp(buf, len, method, amount)
+//       - FFT the buffer, warp its per-bin MAGNITUDE envelope through the same
+//         amplitude transfer as ss_warpamp (phase preserved), inverse FFT.
+//   ss_waveletwarp(buf, len, method, amount, filter, levels)
+//       - forward DWT, warp every coefficient, inverse DWT. `filter` is a
+//         wavelet name ("db4", "db2", "sym4", "db1"/"haar"); pass 0/NULL for the
+//         "db4" default. `levels` is the decomposition depth (e.g. 5).
+// Both operate IN PLACE on `len` floats starting at `buf` and preserve length.
+// These only make sense over a whole buffer (offline bake / block streaming), so
+// there is no per-sample equivalent. `amount` is the 0..1 morph knob (0 =
+// identity); an unknown method is identity. Not for the per-sample hot path -
+// each call allocates a scratch buffer host-side.
+__attribute__((import_module("env"), import_name("ss_spectralwarp")))
+void ss_spectralwarp(float* buf, int32_t len, int32_t method, float amount);
+__attribute__((import_module("env"), import_name("ss_waveletwarp")))
+void ss_waveletwarp(float* buf, int32_t len, int32_t method, float amount,
+                    const char* filter, int32_t levels);
+
+// ============================================================================
+// Whole-grid TERRAIN generation (the Terrain Synth "generate" feature)
+// ============================================================================
+// A module used to GENERATE a terrain is a different shape from an audio module:
+// instead of ss_process(), it exports
+//
+//     void ss_generate(void);
+//
+// which the host calls ONCE (offline, on the message thread - never the audio
+// thread) to fill an N-D grid. The grid is HOST-owned, not in your linear memory:
+// you read/write cells by FLAT row-major index through the ss_grid_* imports
+// below. A generator module still needs an ss_init() (it may be empty) but does
+// NOT need ss_process(); an audio module is unchanged (ss_process, no
+// ss_generate). The result is one value per cell in [0,1] (a grayscale height),
+// baked and mapped to the terrain's bipolar [-1,1] as v*2-1, exactly like every
+// other generation language.
+//
+// WASM is block-only, so terrain WASM is WHOLE-GRID ONLY (no per-cell mode): the
+// whole program owns the array, which is what makes cross-cell work - blur,
+// cellular automata, FFT, global normalisation - possible. These imports mirror
+// the Lua whole-grid API (set/get/coord/coordAxis/neighbor) one-for-one.
+//
+// Minimal generator:
+//     int32_t ss_init(void) { return 0; }
+//     void ss_generate(void) {
+//         int32_t total = ss_grid_total();
+//         for (int32_t i = 0; i < total; ++i) {
+//             float x = ss_grid_coord(i, 0) * 6.2831853f;
+//             float y = ss_grid_coord(i, 1) * 6.2831853f;
+//             ss_grid_set(i, 0.5f + 0.5f * sinf(x) * cosf(y));
+//         }
+//     }
+__attribute__((import_module("env"), import_name("ss_grid_total")))
+int32_t ss_grid_total(void);                       // total cell count = product(dims)
+__attribute__((import_module("env"), import_name("ss_grid_nd")))
+int32_t ss_grid_nd(void);                          // number of dimensions (rank)
+__attribute__((import_module("env"), import_name("ss_grid_dim")))
+int32_t ss_grid_dim(int32_t axis);                 // size of `axis` (0 if out of range)
+__attribute__((import_module("env"), import_name("ss_grid_set")))
+void ss_grid_set(int32_t i, float v);              // write flat cell i (v clamped [0,1])
+__attribute__((import_module("env"), import_name("ss_grid_get")))
+float ss_grid_get(int32_t i);                      // read flat cell i (0 outside range)
+__attribute__((import_module("env"), import_name("ss_grid_coord")))
+float ss_grid_coord(int32_t i, int32_t axis);      // normalised [0,1] position along axis
+__attribute__((import_module("env"), import_name("ss_grid_coord_axis")))
+int32_t ss_grid_coord_axis(int32_t i, int32_t axis); // INTEGER coord of cell i along axis
+__attribute__((import_module("env"), import_name("ss_grid_neighbor")))
+int32_t ss_grid_neighbor(int32_t i, int32_t axis, int32_t delta); // flat idx delta steps, edge-clamped
+
+// Convenience N-D helpers (header-only; compose the imports above). `coords` is
+// an array of `nd` integer per-axis coordinates. flatten/getat clamp each coord
+// to [0,dim-1] (edge replicate); setat ignores an out-of-range write, matching
+// the Lua flatten/getAt/setAt twins. Define SS_NO_GRID_HELPERS to omit.
+#ifndef SS_NO_GRID_HELPERS
+static inline int32_t ss_grid_flatten(const int32_t* coords, int32_t nd) {
+    int32_t idx = 0;
+    for (int32_t a = 0; a < nd; ++a) {
+        int32_t sz = ss_grid_dim(a); if (sz < 1) sz = 1;
+        int32_t c = coords[a]; if (c < 0) c = 0; else if (c > sz - 1) c = sz - 1;
+        idx = idx * sz + c;                 // Horner form, last axis fastest
+    }
+    return idx;
+}
+static inline float ss_grid_getat(const int32_t* coords, int32_t nd) {
+    return ss_grid_get(ss_grid_flatten(coords, nd));
+}
+static inline void ss_grid_setat(const int32_t* coords, int32_t nd, float v) {
+    for (int32_t a = 0; a < nd; ++a) {
+        int32_t sz = ss_grid_dim(a); if (sz < 1) sz = 1;
+        if (coords[a] < 0 || coords[a] > sz - 1) return;   // OOB coord => no-op
+    }
+    ss_grid_set(ss_grid_flatten(coords, nd), v);
+}
+#endif // SS_NO_GRID_HELPERS
+
+// ============================================================================
+// GLSL-style shaping helpers (header-only, no libm)
+// ============================================================================
+// C's <math.h> has the transcendentals (sinf, cosf, expf, logf, tanhf, ...) but
+// NOT GLSL's shaping builtins (mix, clamp, step, smoothstep, fract, mod, sign,
+// the wave shapers). These inline versions give a WASM script the same shaping
+// vocabulary the Built-in/Lua/Python/GLSL formula languages share, spelled with
+// the `ss_` prefix to match the rest of this ABI. They use compiler builtins
+// that lower to native WASM float ops, so they work even under -nostdlib.
+//
+// For the transcendentals, include <math.h> and link a wasm libm (or drop
+// -nostdlib). `ss_mod` uses GLSL's *floored* semantics (a - b*floor(a/b)), which
+// differ from C's fmodf for negative operands. Define SS_NO_SHAPING_HELPERS
+// before including this header to omit this section.
+#ifndef SS_NO_SHAPING_HELPERS
+static inline float ss_fract(float x)            { return x - __builtin_floorf(x); }
+static inline float ss_sign(float x)             { return (float)((x > 0.0f) - (x < 0.0f)); }
+static inline float ss_mod(float a, float b)     { return b == 0.0f ? 0.0f : a - b * __builtin_floorf(a / b); }
+static inline float ss_clamp(float x, float lo, float hi) { return x < lo ? lo : (x > hi ? hi : x); }
+static inline float ss_min(float a, float b)     { return a < b ? a : b; }
+static inline float ss_max(float a, float b)     { return a > b ? a : b; }
+static inline float ss_mix(float a, float b, float t)     { return a + (b - a) * t; }
+static inline float ss_step(float edge, float x)          { return x < edge ? 0.0f : 1.0f; }
+static inline float ss_smoothstep(float e0, float e1, float x) {
+    float t = e1 == e0 ? 0.0f : ss_clamp((x - e0) / (e1 - e0), 0.0f, 1.0f);
+    return t * t * (3.0f - 2.0f * t);
+}
+static inline float ss_radians(float deg)        { return deg * 0.01745329252f; }
+static inline float ss_degrees(float rad)        { return rad * 57.2957795131f; }
+// Bipolar wave shapers over a phase p in turns (1.0 = one cycle), matching the
+// formula languages' saw/square/triangle. Range [-1,1].
+static inline float ss_saw(float p)      { p -= __builtin_floorf(p); return 2.0f * p - 1.0f; }
+static inline float ss_square(float p)   { p -= __builtin_floorf(p); return p < 0.5f ? 1.0f : -1.0f; }
+static inline float ss_triangle(float p) { p -= __builtin_floorf(p); return p < 0.5f ? 4.0f * p - 1.0f : 3.0f - 4.0f * p; }
+// Polarity converters: -1..1 <-> 0..1 (audio cables carry bipolar, control 0..1).
+static inline float ss_unipolar(float x) { return x * 0.5f + 0.5f; }
+static inline float ss_bipolar(float x)  { return x * 2.0f - 1.0f; }
+#endif // SS_NO_SHAPING_HELPERS
 
 // ============================================================================
 // Shared memory layout
@@ -134,12 +334,18 @@ typedef struct {
     uint8_t  status;
     uint8_t  data1;
     uint8_t  data2;
-    uint8_t  _reserved;
+    // For MIDI-INPUT events this is the 0-based MIDI-input pin the event arrived
+    // on (the same index the Lua stream pollmidi() exposes as its 1-based `idx`).
+    // Today every node has a single MIDI input, so it is 0. For events the module
+    // EMITS, the output pin is chosen by ss_midi_out_n(out_idx, ...) instead.
+    uint8_t  input_index;
 } ss_midi_event_t;
 
 static inline ss_midi_event_t* ss_midi_in_events(void) {
     return (ss_midi_event_t*)(uintptr_t)SS_MIDI_IN_OFF;
 }
+// Number of MIDI-input events delivered to this block (read SS_MIDI_IN_COUNT).
+static inline uint32_t ss_midi_in_count(void) { return SS_MIDI_IN_COUNT; }
 
 // ============================================================================
 // Note names <-> MIDI numbers (pure, host-independent)

@@ -22,12 +22,33 @@
 
 namespace SoundShop {
 
+// Ephemeral-session mode (--ephemeral). When enabled, all crash-recovery /
+// session-state files (autosave.ssp, autosave.meta.xml, undo-tree.dat, the
+// per-plugin autosave-plugin-*.dat blobs) are redirected from the user's real
+// app-data folder to an isolated throwaway directory that is wiped on every
+// launch, and the "didn't shut down cleanly - recover?" prompt therefore never
+// fires for these runs. Purpose: automated / test launches (e.g. opening the
+// app to verify a feature, then killing the process) must not leave a stale
+// autosave that makes the user's NEXT normal launch falsely report a crash. A
+// genuine crash in a normal (non-ephemeral) launch still leaves the real
+// autosave, so the recovery prompt continues to mean "something went wrong".
+// Must be called before MainContentComponent is constructed. isEphemeralSession
+// reflects the current state (false by default).
+void setEphemeralSession(bool on);
+bool isEphemeralSession();
+
 class MainContentComponent : public juce::Component,
                               public juce::MenuBarModel,
                               public juce::Timer {
 public:
     MainContentComponent();
     ~MainContentComponent() override;
+
+    // Delete the session-lock sentinel to record that this run exited cleanly,
+    // so the next launch won't offer to recover a now-stale autosave. Called
+    // from MainWindow::tryQuit at the single clean-quit chokepoint (public so
+    // the owning MainWindow can invoke it).
+    void markCleanShutdown();
 
     void paint(juce::Graphics& g) override;
     void resized() override;
@@ -186,6 +207,7 @@ private:
     bool midiDeviceScanInitialized = false;
     void showPluginSettingsDialog();
     void showSongSettingsDialog();
+    void showAssetLibraryDialog();
     void showAudioDeviceSettings();
 
     // Recent projects
@@ -211,9 +233,19 @@ private:
     double lastAutosaveAttemptMs = 0.0;
     bool autosaveRecoveryOffered = false; // gate so we only prompt once
     bool autosaveLaptopNoticeShown = false; // first-launch laptop notice gate
+    // Crash detection: true if a session-lock sentinel was already present at
+    // startup, meaning the previous run never reached a clean shutdown. This is
+    // what decides whether to offer autosave recovery - NOT the mere presence of
+    // autosave.ssp (a normal idle session writes that file too). Captured in the
+    // constructor before we (re)create our own lock.
+    bool startupWasUncleanShutdown = false;
     void performAutosave();
     void discardAutosave();
     void tryRecoverAutosave(); // called after window is visible on startup
+    // Capture whether a session lock was left over from a previous run (-> set
+    // startupWasUncleanShutdown), then (re)create our own lock for this run.
+    // Called once from the constructor.
+    void setupSessionLock();
 
     // Slow autosave background worker (#86). Owns a single-slot mailbox
     // that the UI thread fills with the next save's content; the worker

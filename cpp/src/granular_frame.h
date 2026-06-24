@@ -1,5 +1,6 @@
 #pragma once
 #include "wavetable_frame.h"
+#include "warp.h"            // WarpOp (per-grain element warp, amplitude-domain)
 #include <vector>
 #include <string>
 #include <memory>
@@ -50,14 +51,25 @@ inline constexpr int kNumSpectralFftSizes  = 6;
 //                      regenerate phases per frame, IFFT. Ethereal pad
 //                      sustain - the most decoupled from the source's
 //                      time-domain identity.
+//   SingleCycle      - autocorrelation-detect ONE pitch period and loop just
+//                      that single cycle, turning the captured spot into a
+//                      static single-cycle-oscillator timbre (like extracting
+//                      one cycle into a wavetable). The dead, perfectly-
+//                      periodic counterpart to PitchSyncGrains' living cloud:
+//                      no grain scatter, just one repeating cycle, seam Hann-
+//                      crossfaded against the adjacent (same-phase) period so
+//                      any period-detection error doesn't click. Uses robust
+//                      autocorrelation, NOT zero-crossing, so it locks onto
+//                      complex / inharmonic material cleanly.
 // Stored as an int on disk for forward-compat with future variants. Wire
 // values are stable: 0=CrossfadeLoop, 1=AsyncGranular, 2=PitchSyncGrains,
-// 3=SpectralFreeze.
+// 3=SpectralFreeze, 4=SingleCycle.
 enum class GranularFreezeMode : int {
     CrossfadeLoop   = 0,
     AsyncGranular   = 1,
     PitchSyncGrains = 2,
     SpectralFreeze  = 3,
+    SingleCycle     = 4,
 };
 
 // Freeze-window WIDTH sentinels (windowLen / GranularFrame::windowLen). A
@@ -327,6 +339,34 @@ struct GranularFrame : public IWavetableFrame {
     // mic-captured frame must not offer "Re-capture from song" (and vice
     // versa) - that re-captures from the wrong place entirely.
     int captureSourceKind = -1;
+
+    // Bucket C element warp: a chain of AMPLITUDE-domain shape-bending ops
+    // (clip / fold / saturate / quantize / ...) applied to the granular voice's
+    // output, in chain order. Unlike spectral (per-bin) and wavelet (per-coeff)
+    // element warp - whose representations have a meaningful index axis a phase
+    // warp can stretch/shift along - a granular frame's sound is a continuous
+    // overlap-add grain stream with no periodic phase axis, so only amplitude-
+    // domain waveshaping is meaningful here (the editor's picker is restricted to
+    // it). The same ops are baked into the representative cycle in renderRaw AND
+    // applied to the live grain-stream sample in the synth, so the on-screen
+    // preview matches the audio. Baked at render (not modulatable), like the
+    // other Bucket C / per-layer warps. Phase-domain ops, if ever present from a
+    // hand-edited file, are ignored (warpAmpOpsOnly filters them out).
+    std::vector<WarpOp> warpChain;
+
+    // Return only the enabled amplitude-domain ops from warpChain - the subset
+    // that is meaningful for a granular grain stream. Shared by renderRaw and
+    // the synth so both apply an identical transfer. (A hand-edited file could
+    // contain phase-domain ops; they are silently dropped here rather than
+    // applied somewhere they'd have no defined meaning.)
+    std::vector<WarpOp> warpAmpOps() const {
+        std::vector<WarpOp> out;
+        for (const auto& op : warpChain)
+            if (op.enabled && op.method != WarpMethod::None
+                && warpDomainOf(op.method) == WarpDomain::Amplitude)
+                out.push_back(op);
+        return out;
+    }
 
     GranularFrame() = default;
     GranularFrame(std::vector<float> src,

@@ -51,6 +51,8 @@ private:
     juce::TextEditor sigCountEditor;
     juce::Label    outCountLabel { {}, "MIDI outputs:" };
     juce::TextEditor outCountEditor;
+    juce::Label    midiInLabel   { {}, "MIDI inputs:" };
+    juce::TextEditor midiInEditor;
 
     juce::Label    shapeLabel { {}, "Shape (sampled by shape(pos)):" };
     std::unique_ptr<LayerStackComponent> shapeStack;

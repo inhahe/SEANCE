@@ -1,4 +1,5 @@
 #include "adsr_envelope_component.h"
+#include "asset_library.h"
 #include <algorithm>
 #include <cmath>
 
@@ -70,6 +71,45 @@ AHDSREnvelopeComponent::AHDSREnvelopeComponent(AHDSREnvelope& e,
     velLbl    .setTooltip("How much the key strike strength affects volume. 0 = ignore velocity (every note plays at full volume, organ-like). 1 = full velocity scaling (soft key press = soft note, piano-like).");
     sustainS  .setTooltip("Volume the note holds at while the key stays pressed (0..1).");
 
+    // Per-segment tension (curve-bend) knobs. Rotary, -1..1, detented at 0
+    // (the linear midpoint). These are the simple one-knob shapers; the
+    // "... Curve..." buttons below remain for full freehand/equation editing.
+    auto setupTension = [this](juce::Slider& s, juce::Label& l, float initial,
+                               const juce::String& seg) {
+        s.setSliderStyle(juce::Slider::RotaryHorizontalVerticalDrag);
+        s.setTextBoxStyle(juce::Slider::TextBoxBelow, false, 56, 16);
+        s.setRange(-1.0, 1.0, 0.01);
+        s.setValue(initial, juce::dontSendNotification);
+        s.setDoubleClickReturnValue(true, 0.0);  // dbl-click -> linear
+        addAndMakeVisible(s);
+        l.setJustificationType(juce::Justification::centred);
+        l.setFont(juce::Font(11.0f, juce::Font::bold));
+        addAndMakeVisible(l);
+        juce::String tip =
+            "Bends the shape of the " + seg + " ramp with one knob. "
+            "0 (centre, double-click to reset) = straight line. "
+            "Turn right for a slow start that speeds up (ease-in); "
+            "turn left for a fast start that eases out. Composes with any "
+            "custom shape set via the \"" + seg.substring(0,1).toUpperCase()
+            + seg.substring(1) + " Curve...\" button below.";
+        s.setTooltip(tip);
+        l.setTooltip(tip);
+    };
+    setupTension(attackTenS,  attackTenLbl,  env.attackTension,  "attack");
+    setupTension(decayTenS,   decayTenLbl,   env.decayTension,   "decay");
+    setupTension(releaseTenS, releaseTenLbl, env.releaseTension, "release");
+
+    auto bindTension = [this](juce::Slider& s, float& field) {
+        s.onValueChange = [this, &s, &field]() {
+            field = (float)s.getValue();
+            commitChange();
+        };
+        s.onDragEnd = [this]() { commitChange(); };
+    };
+    bindTension(attackTenS,  env.attackTension);
+    bindTension(decayTenS,   env.decayTension);
+    bindTension(releaseTenS, env.releaseTension);
+
     // Top row controls.
     presetLabel.setJustificationType(juce::Justification::centredRight);
     addAndMakeVisible(presetLabel);
@@ -86,6 +126,21 @@ AHDSREnvelopeComponent::AHDSREnvelopeComponent(AHDSREnvelope& e,
     };
     saveAsBtn.onClick  = [this]() { openSaveAsDialog(); };
     manageBtn.onClick  = [this]() { openManageDialog(); };
+
+    // Library row (hidden until setLibraryContext provides a library).
+    libraryLbl.setJustificationType(juce::Justification::centredRight);
+    addChildComponent(libraryLbl);
+    addChildComponent(libraryCombo);
+    addChildComponent(addToLibBtn);
+    libraryCombo.setTooltip("Reference a shared AHDSR curve from this project's "
+        "library. Editing it here changes it for EVERY node that references the "
+        "same curve. Choose \"(Independent)\" to keep this node's envelope "
+        "private. Unlike a preset (above), a library reference is live and "
+        "project-scoped.");
+    addToLibBtn.setTooltip("Publish the current envelope shape to the project "
+        "library as a new shared AHDSR curve, and make this node reference it.");
+    libraryCombo.onChange = [this]() { onLibrarySelected(libraryCombo.getSelectedId()); };
+    addToLibBtn.onClick = [this]() { openAddToLibraryDialog(); };
 
     rebuildPresetCombo();
     // Subscribe to preset list changes so a Save-as in this component
@@ -126,12 +181,99 @@ void AHDSREnvelopeComponent::syncFromModel() {
     sustainS.setValue(env.sustain,   juce::dontSendNotification);
     releaseS.setValue(env.releaseMs, juce::dontSendNotification);
     velS    .setValue(env.velocitySensitivity, juce::dontSendNotification);
+    attackTenS .setValue(env.attackTension,  juce::dontSendNotification);
+    decayTenS  .setValue(env.decayTension,   juce::dontSendNotification);
+    releaseTenS.setValue(env.releaseTension, juce::dontSendNotification);
     repaint();
 }
 
 void AHDSREnvelopeComponent::commitChange() {
+    // If this node currently references a library AHDSR curve, the edit IS an
+    // edit to that shared curve: write the new shape back to the asset and
+    // re-resolve so every other node sharing the id updates live.
+    if (libCtx.lib && libCtx.getAssetId) {
+        int id = libCtx.getAssetId();
+        if (id >= 0) {
+            libCtx.lib->update(id, "", env.encode());
+            if (libCtx.propagate) libCtx.propagate();
+        }
+    }
     if (onChanged) onChanged();
     repaint();
+}
+
+void AHDSREnvelopeComponent::setLibraryContext(LibraryContext ctx) {
+    libCtx = std::move(ctx);
+    libraryRowVisible = (libCtx.lib != nullptr);
+    libraryLbl.setVisible(libraryRowVisible);
+    libraryCombo.setVisible(libraryRowVisible);
+    addToLibBtn.setVisible(libraryRowVisible);
+    if (libraryRowVisible) rebuildLibraryCombo();
+    resized();
+}
+
+void AHDSREnvelopeComponent::rebuildLibraryCombo() {
+    if (!libCtx.lib) return;
+    libraryCombo.clear(juce::dontSendNotification);
+    libraryCombo.addItem("(Independent)", 1);   // reserved id 1 (user ids >= 1e6)
+    int cur = libCtx.getAssetId ? libCtx.getAssetId() : -1;
+    bool curListed = false;
+    for (const AssetEntry* e : libCtx.lib->list(AssetKind::AhdsrCurve)) {
+        juce::String nm = e->name.empty() ? ("#" + juce::String(e->id))
+                                          : juce::String(e->name);
+        libraryCombo.addItem(nm, e->id);
+        if (e->id == cur) curListed = true;
+    }
+    // If the referenced curve is archived (hidden from the normal list), still
+    // show it so the user sees what they're referencing.
+    if (cur >= 0 && !curListed) {
+        const AssetEntry* e = libCtx.lib->find(cur);
+        if (e) libraryCombo.addItem(juce::String(e->name) + "  [archived]", e->id);
+    }
+    libraryCombo.setSelectedId(cur >= 0 ? cur : 1, juce::dontSendNotification);
+}
+
+void AHDSREnvelopeComponent::onLibrarySelected(int comboId) {
+    if (!libCtx.lib || !libCtx.setAssetId) return;
+    if (comboId == 1) {
+        // Detach to independent: keep the current envelope as this node's own
+        // local copy (no payload change), just stop referencing.
+        libCtx.setAssetId(-1);
+        if (onChanged) onChanged();
+        return;
+    }
+    // Adopt the chosen library curve: mirror its shape into env and reference it.
+    libCtx.setAssetId(comboId);
+    const AssetEntry* e = libCtx.lib->find(comboId);
+    if (e) {
+        AHDSREnvelope::decode(e->payload, env);
+        syncFromModel();
+    }
+    if (libCtx.propagate) libCtx.propagate();
+    if (onChanged) onChanged();
+}
+
+void AHDSREnvelopeComponent::openAddToLibraryDialog() {
+    if (!libCtx.lib || !libCtx.setAssetId) return;
+    auto* aw = new juce::AlertWindow("Add envelope to Library",
+        "Name for the shared AHDSR curve:", juce::MessageBoxIconType::NoIcon, this);
+    aw->addTextEditor("name", "Envelope");
+    aw->addButton("OK", 1, juce::KeyPress(juce::KeyPress::returnKey));
+    aw->addButton("Cancel", 0, juce::KeyPress(juce::KeyPress::escapeKey));
+    aw->enterModalState(true, juce::ModalCallbackFunction::create(
+        [this, aw](int res) {
+            if (res == 1) {
+                auto name = aw->getTextEditorContents("name").trim().toStdString();
+                if (name.empty()) name = "Envelope";
+                int id = libCtx.lib->add(AssetKind::AhdsrCurve, name, "",
+                                         env.encode());
+                libCtx.setAssetId(id);
+                rebuildLibraryCombo();
+                libraryCombo.setSelectedId(id, juce::dontSendNotification);
+                if (onChanged) onChanged();
+            }
+            delete aw;
+        }), true);
 }
 
 // ==============================================================================
@@ -609,6 +751,16 @@ void AHDSREnvelopeComponent::resized() {
     manageBtn .setBounds(top.removeFromLeft(90));
     r.removeFromTop(6);
 
+    // Library row (only when the asset-library context is set).
+    if (libraryRowVisible) {
+        auto lib = r.removeFromTop(26);
+        libraryLbl.setBounds(lib.removeFromLeft(60));
+        libraryCombo.setBounds(lib.removeFromLeft(220));
+        lib.removeFromLeft(8);
+        addToLibBtn.setBounds(lib.removeFromLeft(120));
+        r.removeFromTop(6);
+    }
+
     // Slider row (~120-160px tall depending on container).
     int sliderH = juce::jmax(90, r.getHeight() / 2);
     auto sliders = r.removeFromTop(sliderH);
@@ -629,13 +781,28 @@ void AHDSREnvelopeComponent::resized() {
 
     r.removeFromTop(4);
 
-    // Preview + edit buttons.
+    // Preview + (tension knobs) + edit buttons, stacked along the bottom.
     auto btnRow = r.removeFromBottom(26);
     int bw = btnRow.getWidth() / 3;
     editAttackBtn .setBounds(btnRow.withX(btnRow.getX() + 0 * bw).withWidth(bw - 4));
     editDecayBtn  .setBounds(btnRow.withX(btnRow.getX() + 1 * bw).withWidth(bw - 4));
     editReleaseBtn.setBounds(btnRow.withX(btnRow.getX() + 2 * bw).withWidth(bw - 4));
     r.removeFromBottom(4);
+
+    // Tension-knob row: three rotary knobs (label on top) aligned under the
+    // matching A/D/R curve buttons.
+    auto tenRow = r.removeFromBottom(62);
+    int tw = tenRow.getWidth() / 3;
+    auto layTension = [&](juce::Slider& s, juce::Label& l, int i) {
+        auto col = tenRow.withX(tenRow.getX() + i * tw).withWidth(tw);
+        l.setBounds(col.removeFromTop(14));
+        s.setBounds(col.reduced(4, 0));
+    };
+    layTension(attackTenS,  attackTenLbl,  0);
+    layTension(decayTenS,   decayTenLbl,   1);
+    layTension(releaseTenS, releaseTenLbl, 2);
+    r.removeFromBottom(4);
+
     previewBounds = r;
 }
 
@@ -658,9 +825,11 @@ void AHDSREnvelopeComponent::paintPreview(juce::Graphics& g,
     // Bake the envelope to a polyline. We allocate samples to stages
     // proportionally to their durations, capped so a tiny / huge value
     // doesn't drown the preview.
-    auto A = env.attackCurve.evaluate(64);
-    auto D = env.decayCurve.evaluate(64);
-    auto R = env.releaseCurve.evaluate(64);
+    // Use the shared tension-aware bake so the preview matches what the
+    // audio engine actually plays (AHDSRCurveTables::prepare uses the same).
+    auto A = AHDSREnvelope::bakeSegment(env.attackCurve,  env.attackTension,  64);
+    auto D = AHDSREnvelope::bakeSegment(env.decayCurve,   env.decayTension,   64);
+    auto R = AHDSREnvelope::bakeSegment(env.releaseCurve, env.releaseTension, 64);
 
     float total = env.attackMs + env.holdMs + env.decayMs
                 + std::max(50.0f, env.releaseMs); // pretend a tail

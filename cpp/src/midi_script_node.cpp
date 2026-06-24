@@ -34,6 +34,7 @@ MidiScriptDoc MidiScriptDoc::defaultDoc() {
     d.program.clear();          // silent until the user writes a program
     d.signalInputCount = 0;
     d.outputCount = 1;
+    d.midiInputCount = 1;
     d.shapeLayers.layers.clear();
     d.shapeLayers.tableSize = 1024;
     return d;
@@ -45,6 +46,7 @@ std::string MidiScriptDoc::encode() const {
     o << "program=" << b64(program) << "\n";
     o << "sigCount=" << signalInputCount << "\n";
     o << "outCount=" << outputCount << "\n";
+    o << "midiInCount=" << midiInputCount << "\n";
     o << "lang=" << (int)language << "\n";
     o << "rate=" << (int)rate << "\n";
     o << "wasm=" << b64(wasmPath) << "\n";
@@ -72,6 +74,8 @@ bool MidiScriptDoc::decode(const std::string& s) {
             try { signalInputCount = juce::jlimit(0, 16, std::stoi(val)); } catch (...) {}
         } else if (key == "outCount") {
             try { outputCount = juce::jlimit(1, 16, std::stoi(val)); } catch (...) {}
+        } else if (key == "midiInCount") {
+            try { midiInputCount = juce::jlimit(0, 16, std::stoi(val)); } catch (...) {}
         } else if (key == "lang") {
             try { language = (ScriptLang)juce::jlimit(0, 2, std::stoi(val)); } catch (...) {}
         } else if (key == "rate") {
@@ -240,8 +244,12 @@ void MidiScriptProcessor::reloadIfScriptChanged() {
     runtime->load(src, err); // errors surface via getError(); audio stays silent
     runtime->reset();        // runs the language's init hook (Builtin init:, ...)
 
+    // A streaming program (defines stream()) owns its own sample loop and is
+    // inherently sample-accurate regardless of the Run dropdown, so always drive
+    // it via the block path — streaming works at audio rate as well as block rate.
     runBlockMode = runtime->supportsPerBlock()
-                   && (effRate == ScriptRate::PerBlock || !runtime->supportsPerSample());
+                   && (effRate == ScriptRate::PerBlock || !runtime->supportsPerSample()
+                       || runtime->isStreaming());
 
     // Force the next block to treat the transport as a fresh start so the start
     // hook fires if we're already playing when the script changes.
@@ -288,6 +296,10 @@ void MidiScriptProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Midi
             if (notesHeld > 0) notesHeld--;
         }
     }
+    // Capture the block's input events for event-driven block-mode scripts
+    // (midiin()/midievent()), before we clear the buffer to write our own output.
+    if (runBlockMode)
+        buildScriptMidiIn(midiIn, numSamples, midiInEvents, doc.midiInputCount);
     midiIn.clear();
 
     // Audio buffer is unused by a pure MIDI node, but Signal inputs ride on
@@ -362,6 +374,8 @@ void MidiScriptProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Midi
         ctx.freq       = freqHz;
         ctx.sig        = &sigChans;
         ctx.sigCount   = sigCount;
+        ctx.midiIn     = &midiInEvents;
+        ctx.midiInCount = (int)midiInEvents.size();
         ctx.sink       = &sink;
         runtime->runBlock(ctx);
     } else {
@@ -412,6 +426,25 @@ void MidiChannelFilterProcessor::processBlock(juce::AudioBuffer<float>&,
         }
     }
     midi.swapWith(kept);
+}
+
+// -----------------------------------------------------------------------------
+// MidiChannelStampProcessor
+// -----------------------------------------------------------------------------
+
+void MidiChannelStampProcessor::processBlock(juce::AudioBuffer<float>&,
+                                             juce::MidiBuffer& midi) {
+    // Re-stamp every channel-carrying event to `channel` so the merged stream at
+    // the destination encodes which input pin it came from. Channel-less
+    // messages (clock, etc.) pass through untouched.
+    juce::MidiBuffer stamped;
+    for (auto meta : midi) {
+        auto msg = meta.getMessage();
+        if (msg.getChannel() > 0)
+            msg.setChannel(channel);
+        stamped.addEvent(msg, meta.samplePosition);
+    }
+    midi.swapWith(stamped);
 }
 
 } // namespace SoundShop

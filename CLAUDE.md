@@ -26,14 +26,15 @@ Traditional DAWs are designed by musicians for musicians and are full of cryptic
 
 ### Two-phase development
 - **Phase 1 (complete): Python prototype** — `main.py`, imgui_bundle. Used to prove the UX concept.
-- **Phase 2 (current): C++ production** — Dear ImGui + imgui-node-editor + SDL2 for UI, JUCE 8.0.12 for audio engine, plugin hosting (VST3/AU), MIDI.
+- **Phase 2 (current): C++ production** — **JUCE 8.0.12 for everything**: GUI (`juce_gui_basics`/`juce_gui_extra`, software-rendered), node graph, audio engine, plugin hosting (VST3/LV2), MIDI, audio formats.
+
+> **NOTE (corrected 2026-06):** An earlier plan called for Dear ImGui + imgui-node-editor + SDL2 + OpenGL for the UI. **That plan was never built.** The production app is a pure `juce::JUCEApplication` (`main.cpp`) using JUCE's software-rendered GUI. There is **no SDL2, no OpenGL context, and no live ImGui** in the build — `cpp/CMakeLists.txt` links none of them, and the only ImGui-using file (`cpp/src/piano_roll.cpp`) is dead/backup code excluded from the build (the live piano roll is `piano_roll_component.cpp`). Anything needing a GPU/GL context must stand one up from scratch.
 
 ## Tech Stack
 
 - **C++20**, Visual Studio 2022, CMake
-- **Dear ImGui** + **imgui-node-editor** (develop branch) — UI and node graph
-- **SDL2** + OpenGL 3.3 — window and rendering backend
-- **JUCE 8.0.12** (`D:/JUCE-8.0.12`) — audio devices, plugin hosting, MIDI, audio formats
+- **JUCE 8.0.12** (`D:/JUCE-8.0.12`) — UI (software-rendered `juce_gui_basics`/`juce_gui_extra`), node-graph rendering, audio devices, plugin hosting, MIDI, audio formats
+- **No GPU/GL/SDL/ImGui** in the production build (see note above)
 - **Python prototype** still in `main.py` for reference
 
 ## Project Structure
@@ -41,7 +42,10 @@ Traditional DAWs are designed by musicians for musicians and are full of cryptic
 - `main.py` — Python prototype (reference)
 - `cpp/` — C++ production code
   - `cpp/CMakeLists.txt` — build system
-  - `cpp/src/main.cpp` — SDL2 window, ImGui setup, main loop
+  - `cpp/src/main.cpp` — `juce::JUCEApplication` entry point, logging, `--self-test`/`--plugin-sandbox` dispatch
+  - `cpp/src/main_window.h/cpp` — main JUCE window, menu bar, top-level component
+  - `cpp/src/node_graph_component.h/cpp` — live JUCE node-graph editor (drawing + interaction)
+  - `cpp/src/piano_roll_component.h/cpp` — live JUCE piano roll (the ImGui `piano_roll.cpp` is dead/backup code, not built)
   - `cpp/src/app.h/cpp` — top-level app, menu bar, file dialogs, preferences
   - `cpp/src/node_graph.h/cpp` — node/link data model, graph drawing, transport bar, context menus
   - `cpp/src/piano_roll.h/cpp` — piano roll state and drawing/interaction
@@ -62,6 +66,17 @@ cmake -B build -G "Visual Studio 17 2022" -A x64
 cmake --build build --config Release
 build\Release\SoundShop2.exe
 ```
+
+**Testing the GUI: always launch with `--ephemeral`.** When you open the full
+app to verify a feature (not `--self-test`/`--plugin-sandbox`, which never make a
+window), pass `--ephemeral`. It redirects all crash-recovery state to a wiped
+throwaway temp dir, so killing the process to rebuild can't leave a stale
+`autosave.ssp` in the user's real `%APPDATA%/SoundShop` — which would otherwise
+make their next normal launch falsely prompt "didn't shut down cleanly". The
+window title shows `[ephemeral session]`. See `REFERENCE.md` →
+[Ephemeral session](#ephemeral-session---ephemeral). Also: kill any leftover
+`SEANCE.exe` before rebuilding (the linker can't overwrite a running exe →
+`LNK1104`).
 
 **Required JUCE patches:** SEANCE depends on fixes to the shared JUCE install
 (`D:/JUCE-8.0.12`) that live in `patches/` and are **lost on any JUCE
@@ -149,6 +164,10 @@ Everything else — adding/removing nodes, adding/removing links, dialog-driven 
   - For simple OK/Yes-No popups: use `juce::NativeMessageBox::showAsync(MessageBoxOptions().withAssociatedComponent(this)...)`. NOT `juce::AlertWindow::showAsync` and NOT `juce::AlertWindow::showMessageBoxAsync` — both of those create a JUCE top-level desktop component without an owner HWND, which Windows treats as a separate app and gives its own taskbar entry. `withAssociatedComponent` on the *AlertWindow* path only affects positioning, not taskbar parentage; on the *NativeMessageBox* path it controls the HWND owner that's passed to the OS `MessageBox()` call, which IS what suppresses the taskbar entry.
   - For custom JUCE dialogs (`DialogWindow::LaunchOptions`): set `componentToCentreAround` to a component inside the main window. If the dialog still gets its own taskbar entry, the underlying issue is that the JUCE peer window has no Windows owner — fix it by making the dialog a child component of the main window instead of a desktop window, or by setting `escapeKeyTriggersCloseButton` + `useNativeTitleBar(false)` and parenting via `addAndMakeVisible` on a wrapper.
   - **Always physically test** that a new dialog doesn't add a second SEANCE icon to the Windows taskbar. The default JUCE patterns get this wrong, and there is no compile-time check.
+
+## Version Control
+
+- **Commit to git freely whenever it makes sense; never `git push`.** You don't need to ask before committing — create commits at natural checkpoints (a feature done, a known-good buildable/tested state, before a risky change). Scope commits sensibly and keep build/render artifacts (release archives, `*.wav` renders, `captures/`, self-test scratch) and secrets out of history. Pushing to a remote (GitHub, etc.) is always the user's action — never run `git push` unless explicitly told to in that moment.
 
 ## UX Principles
 

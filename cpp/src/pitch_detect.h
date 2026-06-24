@@ -31,20 +31,27 @@ struct PitchResult {
 // Autocorrelation pitch detection. Simple, fast, works well for clean
 // periodic signals. Can be confused by octave errors (detecting 2x or
 // 0.5x the true frequency).
+//
+// minHz/maxHz bound the search: a higher minHz (or smaller window) means a
+// shorter maxLag and so a higher lowest-detectable pitch; maxHz bounds the
+// shortest lag. Defaults reproduce the original 20..5000 Hz behaviour.
 inline PitchResult detectPitchAutocorrelation(const float* samples, int numSamples,
-                                                double sampleRate)
+                                                double sampleRate,
+                                                float minHz = 20.0f,
+                                                float maxHz = 5000.0f)
 {
     PitchResult result;
     if (numSamples < 64) return result;
+    if (maxHz <= minHz) return result;
 
     // Use the middle portion of the sample for stability
     int analyzeLen = std::min(numSamples, (int)(sampleRate * 0.1)); // up to 100ms
     int offset = std::max(0, (numSamples - analyzeLen) / 2);
     const float* data = samples + offset;
 
-    // Min/max lag: 20 Hz to 5000 Hz
-    int minLag = std::max(1, (int)(sampleRate / 5000.0));
-    int maxLag = std::min(analyzeLen / 2, (int)(sampleRate / 20.0));
+    // Min/max lag derived from the requested frequency band.
+    int minLag = std::max(1, (int)(sampleRate / maxHz));
+    int maxLag = std::min(analyzeLen / 2, (int)(sampleRate / minHz));
     if (maxLag <= minLag) return result;
 
     // Compute autocorrelation
@@ -61,19 +68,38 @@ inline PitchResult detectPitchAutocorrelation(const float* samples, int numSampl
         corr[lag] = sum / energy;
     }
 
-    // Find the first peak above a threshold after the initial dip
+    // Find the fundamental period. A periodic signal's autocorrelation has
+    // near-equal-height peaks at EVERY integer multiple of the true period,
+    // so simply taking the global maximum can land on a subharmonic (a
+    // longer lag), reporting e.g. 80 Hz for an 880 Hz sine. Instead: find
+    // the strongest peak as a reference, then take the FIRST local maximum
+    // (after the initial dip) that reaches a strong fraction of it - that
+    // earliest strong peak is the fundamental period, not a multiple of it.
     bool pastDip = false;
-    int bestLag = minLag;
-    float bestCorr = 0;
+    float maxCorr = 0.0f;
     for (int lag = minLag; lag <= maxLag; ++lag) {
         if (!pastDip && corr[lag] < 0.0f) pastDip = true;
-        if (pastDip && corr[lag] > bestCorr) {
-            bestCorr = corr[lag];
+        if (pastDip) maxCorr = std::max(maxCorr, corr[lag]);
+    }
+    if (maxCorr < 0.2f) return result; // too low confidence
+
+    int bestLag = -1;
+    float bestCorr = 0.0f;
+    const float peakThresh = 0.85f * maxCorr;
+    pastDip = false;
+    for (int lag = minLag; lag <= maxLag; ++lag) {
+        if (!pastDip && corr[lag] < 0.0f) pastDip = true;
+        if (!pastDip) continue;
+        bool isPeak = (lag > minLag && lag < maxLag)
+                          ? (corr[lag] >= corr[lag - 1] && corr[lag] > corr[lag + 1])
+                          : false;
+        if (isPeak && corr[lag] >= peakThresh) {
             bestLag = lag;
+            bestCorr = corr[lag];
+            break;
         }
     }
-
-    if (bestCorr < 0.2f) return result; // too low confidence
+    if (bestLag < 0) return result; // no clear periodic peak
 
     // Parabolic interpolation around the peak for sub-sample accuracy
     float refinedLag = (float)bestLag;
@@ -93,18 +119,20 @@ inline PitchResult detectPitchAutocorrelation(const float* samples, int numSampl
 // cumulative mean normalized difference function that reduces octave
 // errors. Standard algorithm from de Cheveigné & Kawahara (2002).
 inline PitchResult detectPitchYIN(const float* samples, int numSamples,
-                                   double sampleRate, float threshold = 0.15f)
+                                   double sampleRate, float threshold = 0.15f,
+                                   float minHz = 20.0f, float maxHz = 5000.0f)
 {
     PitchResult result;
     if (numSamples < 64) return result;
+    if (maxHz <= minHz) return result;
 
     int analyzeLen = std::min(numSamples, (int)(sampleRate * 0.1));
     int offset = std::max(0, (numSamples - analyzeLen) / 2);
     const float* data = samples + offset;
 
     int halfLen = analyzeLen / 2;
-    int minLag = std::max(1, (int)(sampleRate / 5000.0));
-    int maxLag = std::min(halfLen - 1, (int)(sampleRate / 20.0));
+    int minLag = std::max(1, (int)(sampleRate / maxHz));
+    int maxLag = std::min(halfLen - 1, (int)(sampleRate / minHz));
     if (maxLag <= minLag) return result;
 
     // Step 1: Difference function d(tau) = sum((x[i] - x[i+tau])^2)

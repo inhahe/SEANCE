@@ -2,6 +2,8 @@
 #include "node_graph.h"
 #include "wavetable_frame.h"
 #include "shape_expr.h"
+#include "warp.h"
+#include "warp_editor.h"
 #include <juce_gui_basics/juce_gui_basics.h>
 #include <vector>
 #include <map>
@@ -12,15 +14,75 @@
 
 namespace SoundShop {
 
+// Load-scoped collector for factory-waveform references that fail to resolve
+// against the current build's WaveformBank. A reference is a stable bank NAME
+// (see WaveLayer::factoryRef); resolveFactoryRef() looks it up via
+// WaveformBank::indexForName and, when the name is absent (e.g. the project was
+// saved by a NEWER SEANCE whose waveforms.bin added that cycle), it silences the
+// layer rather than embedding samples. That silent-zeroing would make a loaded
+// song untrue to the original with no indication, so we surface a warning.
+//
+// Usage: construct a FactoryRefResolutionScope on the stack around a project
+// load (or import). While one or more scopes are active, resolveFactoryRef()
+// reports every unresolved name into the innermost scope (deduplicated, in
+// encounter order). After the load completes, inspect `unresolved` and, if
+// non-empty, warn the user. Scopes nest (the active one is a thread-unaware
+// stack - loads happen on the message thread). When no scope is active,
+// resolution failures are simply silent as before (e.g. undo restore, library
+// preview decodes), so only user-facing project opens raise the popup.
+class FactoryRefResolutionScope {
+public:
+    FactoryRefResolutionScope();
+    ~FactoryRefResolutionScope();
+    FactoryRefResolutionScope(const FactoryRefResolutionScope&) = delete;
+    FactoryRefResolutionScope& operator=(const FactoryRefResolutionScope&) = delete;
+
+    // Names of factory waveforms that could not be resolved during this scope,
+    // unique and in the order first encountered.
+    std::vector<std::string> unresolved;
+
+    // Called by WaveLayer::resolveFactoryRef() when a name fails to resolve.
+    // No-op when no scope is active.
+    static void reportUnresolved(const std::string& name);
+
+private:
+    FactoryRefResolutionScope* prev_ = nullptr;
+    static FactoryRefResolutionScope* active_;
+};
+
 // A single layer in a layered waveform: a basic shape at a harmonic ratio,
 // with phase offset and amplitude. Layers are summed into one single-cycle
 // wavetable at edit time (bake-once, not per-note).
 struct WaveLayer {
-    enum Shape { Sine, Saw, Square, Triangle, Noise, Drawn, Formula };
+    // Shape ids are serialized by NAME (see shapeName/parseShape), never by
+    // ordinal, so new values can be appended freely without breaking old files.
+    // The last four (Pulse..PhaseDist) are the Bucket B "generator morphs": a
+    // built-in oscillator whose timbre is swept by a morph parameter that is
+    // part of the wave's DEFINITION (duty, sync ratio, FM index, PD amount),
+    // distinct from the Bucket A warp chain that transforms an arbitrary cycle.
+    enum Shape { Sine, Saw, Square, Triangle, Noise, Drawn, Formula,
+                 Pulse, Sync, FM, PhaseDist };
     Shape shape = Sine;
     int   ratio = 1;      // harmonic number: 1 = fundamental, 2 = octave, ...
     float phase = 0.0f;   // 0..1 (one full cycle)
     float amp   = 1.0f;   // 0..1
+
+    // Bucket B generator-morph parameters. Meaning is per-shape; ignored by the
+    // classic shapes (Sine..Formula). Stored as two generic normalised [0,1]
+    // knobs so the serializer and UI stay uniform:
+    //   Pulse     - shapeParam = duty cycle (0=thin, 1=wide; 0.5 = square).
+    //               shapeParam2 unused.
+    //   Sync      - shapeParam = hard-sync amount; the slave oscillator runs
+    //               (1 + 7*shapeParam)x the master and resets every master cycle
+    //               (the classic sync sweep). shapeParam2 unused.
+    //   FM        - shapeParam  = modulation index (0..~8 radians of phase mod).
+    //               shapeParam2 = modulator : carrier ratio (mapped to 1..8),
+    //               quantised to integers so one cycle stays periodic.
+    //   PhaseDist - shapeParam = Casio-CZ phase-distortion amount (0 = sine,
+    //               1 = hard resonant skew). shapeParam2 unused.
+    // Defaults give an immediately-audible morph at the midpoint.
+    float shapeParam  = 0.5f;
+    float shapeParam2 = 0.5f;
 
     // For Drawn shape: two sub-modes.
     //
@@ -55,10 +117,66 @@ struct WaveLayer {
     std::vector<float> formulaSamples;
     std::string        formulaError;
 
+    // Per-layer warp chain (Bucket A, element-scope): shape-bending ops baked
+    // into THIS layer's single cycle at render time, before it's summed into
+    // the stack. Unlike the frame-scope warp chain (WavetableDoc::warpChain,
+    // applied live per voice and modulatable), these are part of the layer's
+    // baked definition - they let one layer be folded/clipped/bent while its
+    // neighbours stay clean. Empty by default. Serialized as a trailing
+    // "warp=" field on the layer (see encodeLayer/parseLayer).
+    std::vector<WarpOp> warpChain;
+
+    // When non-empty, this Drawn/Freehand layer's cycle is a REFERENCE to a
+    // built-in factory waveform, identified by its stable WaveformBank NAME
+    // (resolved via WaveformBank::indexForName). Set by the factory-waveform
+    // browser when the user inserts a stock cycle. While the reference holds,
+    // the project serializes only the NAME (a "factory=" field), NOT the 512
+    // samples - so a session that uses stock waveforms stays small. On load the
+    // samples are re-resolved from the bank into drawnSamples (resolveFactoryRef)
+    // so the render path is unchanged.
+    //
+    // The reference survives level/tuning edits (amp, phase, ratio, warp) but is
+    // dropped - "forked to a full copy" - the moment the cycle CONTENT itself is
+    // edited (drawing over it, switching to Points, changing shape). Forking is
+    // belt-and-suspenders: the UI clears factoryRef on those edits, AND the
+    // serializer is content-addressed (it only writes the name when drawnSamples
+    // still match the bank byte-for-byte), so a missed UI trigger can never
+    // silently store the wrong reference. Empty for user-drawn / captured /
+    // imported / generator cycles; only meaningful for Drawn shape.
+    std::string factoryRef;
+
+    // When >= 0, this layer LIVE-REFERENCES a user Waveform asset in the project
+    // library (AssetLibrary id), the per-layer analogue of the frame-scope
+    // WaveformLibraryEntry::assetId. While the reference holds, the layer's cycle
+    // content is kept in sync with the asset: on load (and after any settled edit
+    // elsewhere) resolvePerLayerWaveformReferences() pulls the asset's body into
+    // this layer, and a settled edit to THIS layer is pushed back to the asset by
+    // writeBackPerLayerWaveforms(), propagating to every layer/frame that shares
+    // the id (the "live reference" model). -1 = independent (the layer owns its
+    // cycle outright), exactly as before.
+    //
+    // The shared unit is the layer's SHAPE content, not its mix placement: amp is
+    // a per-slot property preserved across resolves (like a frame entry's gain).
+    // A per-layer asset is stored as a single-layer LayeredWaveform; if a layer is
+    // pointed at a MULTI-layer asset (one saved from frame scope) it is flattened
+    // to that frame's summed cycle on resolve, and a write-back would shrink the
+    // asset to that single flattened cycle - so multi-layer assets are best used
+    // by COPY (sync off) at the layer scope. See layerToWaveformAsset /
+    // applyWaveformAssetToLayer. Serialized as a trailing "asset=" field.
+    int assetId = -1;
+
     // Re-bake formulaSamples from formulaExpr for the current formulaLang.
     // No-op (clears the buffer) for Built-in. Call after any change to
     // formulaExpr / formulaLang and after loading from a project.
     void rebakeFormula();
+
+    // Resolve factoryRef -> drawnSamples from the built-in WaveformBank (also
+    // forces shape=Drawn, freehandMode=true). No-op when factoryRef is empty.
+    // If the name can't be found (e.g. waveforms.bin missing), drawnSamples is
+    // left empty - the layer renders silent - and factoryRef is kept so a
+    // re-save still references it. Defined in layered_wave_editor.cpp (needs the
+    // bank). Call after decoding a layer that carries a factory= reference.
+    void resolveFactoryRef();
 };
 
 // Editor component for a single WaveLayer. Used by the wavetable editor (one
@@ -91,9 +209,71 @@ public:
         // 1-based index. Called every syncFromModel(). If null, the label
         // reads "Layer" with no index suffix.
         std::function<int()> indexForLabel;
+        // Optional. Fired when the row's preferred height changes (the only
+        // cause is an op being added to / removed from the per-layer warp
+        // chain, which grows/shrinks the embedded warp editor). The owner
+        // re-lays-out its row stack so the rows below shift to follow. Null
+        // when per-layer warp is disabled.
+        std::function<void()> onHeightChanged;
+        // Optional. Fired when the user picks "From Library..." in the wave-
+        // source picker. The owner opens the waveform library browser and, on
+        // a pick, loads the chosen single cycle into THIS layer (the owner
+        // re-fetches the layer by its stable index and calls refreshFromModel).
+        // If null, the "Use Library..." menu entry is omitted.
+        std::function<void()> onPickFromLibrary;
+        // Optional. Fired when the user picks "Save to Library..." in the wave-
+        // source picker. The owner publishes THIS layer as a reusable Waveform
+        // asset (a single-layer LayeredWaveform) and live-links the layer to it.
+        // If null, the "Save to Library..." menu entry is omitted.
+        std::function<void()> onSaveToLibrary;
+        // Optional. Fired when the user picks "Unlink from Library" in the wave-
+        // source picker. The owner detaches THIS layer's live link (sets
+        // WaveLayer::assetId = -1) while KEEPING the current cycle content, so the
+        // layer becomes an independent editable copy that no longer propagates to
+        // or from the asset. Only meaningful (and only shown enabled) when the
+        // layer currently references an asset. If null, the entry is omitted.
+        std::function<void()> onDesyncFromLibrary;
+
+        // Optional. Per-layer warp modulation (#88, item-M). The embedded
+        // per-layer warp editor's "Mod" checkbox routes through these so the
+        // owner can create/destroy a per-layer warp Param + modulation pin for
+        // warp op `opIndex` on THIS layer. The layer identity is resolved by the
+        // owner (the LayerStackComponent closure that captures the row index);
+        // only the warp slot `opIndex` is passed here. Left unset when per-layer
+        // warp is disabled - the "Mod" checkbox then stays hidden.
+        std::function<bool(int opIndex)>      isWarpOpModulated;
+        std::function<void(int opIndex,bool)> setWarpOpModulated;
+        // Optional. Absolute-only amount lock for this layer's warp op (forwarded
+        // to WarpChainEditor::Callbacks::isAmountLocked). Unset = lock when pinned.
+        std::function<bool(int opIndex)>      isWarpOpAmountLocked;
+        // Optional. Mirrors WarpChainEditor::Callbacks::modDisabledReason for the
+        // per-layer chain: a non-empty return disables the op's "Mod" checkbox and
+        // shows the string as its tooltip. Used to gate per-layer warp modulation
+        // to single-frame wavetables (the only shape the synth re-bakes live).
+        std::function<juce::String(int opIndex)> warpModDisabledReason;
+
+        // Optional. Per-layer field modulation (#88, item-M). A "Mod" checkbox
+        // next to this layer's Phase and Amplitude slider routes through these so
+        // the owner can create/destroy a layer-field Param + modulation pin so a
+        // cable can drive that value live. field: 0 = Phase, 1 = Amplitude. The
+        // layer identity is resolved by the owner (the LayerStackComponent closure
+        // capturing the row index); only the field is passed here. Left unset when
+        // per-layer field modulation is disabled - the checkboxes stay hidden.
+        std::function<bool(int field)>      isFieldModulated;
+        std::function<void(int field,bool)> setFieldModulated;
+        // Optional. Absolute-only lock for the Phase/Amp/generator slider. Unset =
+        // lock whenever the field is pinned (legacy).
+        std::function<bool(int field)>      isFieldAmountLocked;
+        // Optional. A non-empty return disables the field's "Mod" checkbox and
+        // shows the string as its tooltip (gates to single-frame wavetables).
+        std::function<juce::String(int field)> fieldModDisabledReason;
     };
 
-    WaveLayerEditor(WaveLayer* layerPtr, Callbacks cb);
+    // enableWarp embeds a per-layer warp chain editor (baked shape-bending on
+    // THIS layer's cycle, not modulatable - distinct from the doc-level
+    // frame-scope warp). Off for the LFO / Signal-Shape editor, on for the
+    // wavetable layer stack.
+    WaveLayerEditor(WaveLayer* layerPtr, Callbacks cb, bool enableWarp = false);
 
     // Rebind to a different layer (e.g. after the owner's storage moved).
     // Triggers a full UI sync from the new layer's state.
@@ -118,34 +298,70 @@ public:
     void mouseUp(const juce::MouseEvent&) override;
 
     static constexpr int previewHeight = 92;
-    // Total minimum row height: label + shape btn row + sub-row +
-    // 3 slider rows + padding + preview. Owners use this to lay out
-    // a vertical stack of editors at a uniform pitch.
-    static int rowHeight() { return 22 + 24 + 24 + 20 * 3 + 12 + previewHeight + 4; }
+    // Fixed part of a layer row, the same for every wave-source shape: outer
+    // margin (reduced(4) top+bottom) + label + wave-source picker + sub-row +
+    // the 3 base slider rows (Harmonic / Phase / Amplitude) + the mini preview.
+    // The generator-morph slider rows are NOT included here - they exist only
+    // for the generator shapes (Pulse / Sync / FM / PhaseDist), so
+    // preferredHeight() adds them on demand. Reserving them unconditionally
+    // (the old behaviour) left a large empty gap above the Layer Morph strip
+    // for the classic shapes, which is exactly the wasted space we're removing.
+    static constexpr int baseRowHeight = 8 + 22 + 24 + 24 + 20 * 3 + previewHeight;
+
+    // Actual height this row wants: baseRowHeight, plus one row per VISIBLE
+    // generator-morph slider, plus the embedded per-layer warp editor's current
+    // height (which tracks its op count) when warp is enabled. Owners lay out
+    // the row stack at this per-row pitch; updateSourceControls() fires
+    // onHeightChanged when the visible-morph-row count changes so the stack
+    // reflows on a shape switch.
+    int preferredHeight() const;
 
 private:
-    void updateShapeButtons();
+    void updateSourceControls();
+    // Refresh the Phase/Amp "Mod" checkbox visibility, toggle state, enabled
+    // state (+ disabled-reason tooltip), and whether the corresponding slider is
+    // signal-locked (greyed) because a modulation cable is driving it.
+    void syncFieldModState();
     juce::Rectangle<float> getPreviewAreaBounds() const;
     bool mouseToPointXY(juce::Point<float> p, float& outX, float& outY) const;
     int findPointNear(float x, float y, float radius = 0.05f) const;
     void sortPointsByX();
     void writeFreehandSample(float x, float y);
-    void showPresetMenu();
+    void showWaveSourceMenu();
 
     WaveLayer* layer = nullptr;
     Callbacks callbacks;
 
     juce::Label label;
-    juce::TextButton sineBtn, sawBtn, squareBtn, triangleBtn, noiseBtn, drawnBtn, formulaBtn;
+    // One unified wave-source picker replaces the old 11 shape buttons + the
+    // separate Preset button. Opens a single menu: static shapes -> Draw ->
+    // Formula -> wave-defining (Type-1) morphs -> Presets -> From Library.
+    juce::TextButton waveSourceBtn;
     juce::TextButton freehandToggle;
     juce::TextEditor formulaEditor;
     juce::ComboBox   formulaLangCombo;   // Built-in / Lua / Python (Formula only)
     juce::Slider ratioSlider, phaseSlider, ampSlider;
     juce::Label  ratioLabel, phaseLabel, ampLabel;
-    juce::TextButton presetBtn;
+    // Per-parameter modulation "Pin" toggles (#88, item-M). Visible only when
+    // callbacks.setFieldModulated is wired (the wavetable layer stack); hidden for
+    // the LFO / Signal-Shape editor. field 0 = phase, 1 = amplitude, 2 = generator
+    // param (Duty/Amount/Index), 3 = FM ratio. morph/morph2 buttons additionally
+    // follow their slider's visibility (only the parameter-bearing generators).
+    juce::ToggleButton phaseModBtn, ampModBtn, morphModBtn, morph2ModBtn;
+    // Generator-morph parameter sliders (visible only for Pulse/Sync/FM/PD).
+    // morphSlider drives shapeParam (duty / sync amount / FM index / PD amount);
+    // morph2Slider drives shapeParam2 (FM modulator:carrier ratio only).
+    juce::Slider morphSlider, morph2Slider;
+    juce::Label  morphLabel, morph2Label;
     juce::TextButton deleteBtn;
     std::vector<float> previewSamples;
     int draggingIdx = -1;
+
+    // Per-layer warp chain editor (baked shape-bending on this layer's cycle).
+    // Null unless the owner passed enableWarp=true. Bound to layer->warpChain
+    // and rebound in setLayerPtr; its onChanged re-renders this row's preview
+    // (warp is shown applied) and forwards to callbacks.onChanged.
+    std::unique_ptr<WarpChainEditor> warpEditor;
 
     bool freehandDrawing = false;
     int  lastFreehandIdx = -1;
@@ -169,11 +385,64 @@ struct LayeredWaveform : public IWavetableFrame {
     // should go through the IWavetableFrame render() path.
     void render(std::vector<float>& out) const;
 
+    // Render like render(), but with each layer's per-layer warp-op amounts
+    // overridden by live values (the unified warp/morph model: a per-layer warp
+    // op can opt into a modulation pin, so its amount is driven by a cable). The
+    // synth calls this at block rate to re-bake the cycle when any per-layer warp
+    // op is modulated; the editor's baked path stays on plain render().
+    //   overrides[layerIdx][opSlot] = live amount in [0,1], or < 0 to keep the
+    //   op's baked amount. overrides[layerIdx] may be shorter than the layer's
+    //   warp chain (trailing ops keep their baked amount) or empty (no override
+    //   for that layer). `overrides` itself may be shorter than `layers`.
+    // With an empty `overrides` this is byte-for-byte identical to render() -
+    // render() delegates here - so there is a single summation/normalization
+    // code path.
+    void renderWithLiveWarp(const std::vector<std::vector<float>>& overrides,
+                            std::vector<float>& out) const;
+
+    // Render like renderWithLiveWarp(), but ALSO override each layer's Phase
+    // and/or Amplitude with live (modulated) values. These are the per-layer
+    // field modulation pins (#88): a layer's Phase or Amp slider can opt into a
+    // modulation cable, so its value is driven at block rate.
+    //   warpOverrides  - same convention as renderWithLiveWarp's `overrides`.
+    //   phaseOverrides[layerIdx] = live phase offset (any value, including
+    //                  negative - phase wraps into the layer's sample lookup), or
+    //                  NaN to keep the layer's stored phase. (A < 0 sentinel can't
+    //                  be used here: a modulated phase can legitimately be
+    //                  negative.) May be shorter than `layers` (trailing layers
+    //                  keep stored phase).
+    //   ampOverrides[layerIdx]   = live amplitude in [0,1], or NaN to keep the
+    //                  layer's stored amp. Same length rules.
+    //   shapeOverrides[layerIdx] = live generator parameter (shapeParam: duty /
+    //                  sync amount / FM index / phase-dist amount) in [0,1], or NaN
+    //                  to keep the layer's stored value. Only affects the
+    //                  parameter-bearing generator shapes; ignored otherwise.
+    //   shape2Overrides[layerIdx]= live second generator parameter (shapeParam2:
+    //                  FM modulator:carrier ratio) in [0,1], or NaN. FM only.
+    // renderWithLiveWarp delegates here with empty overrides, so the
+    // summation/normalization code path stays unified.
+    void renderWithLiveOverrides(const std::vector<std::vector<float>>& warpOverrides,
+                                 const std::vector<float>& phaseOverrides,
+                                 const std::vector<float>& ampOverrides,
+                                 const std::vector<float>& shapeOverrides,
+                                 const std::vector<float>& shape2Overrides,
+                                 std::vector<float>& out) const;
+
     // Encode as a string stored in node.script, prefixed with "__layered__:".
     std::string encode() const;
 
     // Decode from a string (with or without the prefix). Returns true on success.
     bool decode(const std::string& s);
+
+    // Transient (not serialized). Set by decode(): true when at least one
+    // non-Built-in (Lua/Python/GLSL) Formula layer arrived WITHOUT an embedded
+    // pre-baked cycle (the "bake=" field encodeLayer now writes). Such layers
+    // can only be baked on the message thread (the interpreters are not
+    // audio-thread safe), so when this is true after a project load the owner
+    // should re-encode the script on the message thread - see
+    // migrateLayeredScriptEmbedBake - so the audio thread never has to run an
+    // interpreter to reconstruct the cycle.
+    bool decodedNeedsBakeEmbed = false;
 
     // Create a default 1-layer sine.
     static LayeredWaveform defaultSine();
@@ -189,6 +458,15 @@ struct LayeredWaveform : public IWavetableFrame {
     bool decodeBody(const std::string& body) override;
     std::unique_ptr<IWavetableFrame> clone() const override;
 };
+
+// Message-thread migration for old projects. If `script` is a "__layered__:"
+// tag whose Lua/Python/GLSL Formula layers carry no embedded baked cycle (saved
+// before encodeLayer started embedding "bake=" data), this re-bakes the
+// formulas on the CURRENT thread and re-encodes so the audio thread can render
+// them without ever invoking an interpreter. Rewrites `script` and returns true
+// ONLY when a change was needed; otherwise it's a cheap no-op returning false.
+// MUST be called on the message thread (it may run Python/Lua to bake).
+bool migrateLayeredScriptEmbedBake(std::string& script);
 
 // -----------------------------------------------------------------------------
 // LayerStackComponent
@@ -229,6 +507,59 @@ public:
         // Seed for a freshly added layer. Arg = current layer count. If null,
         // a default-constructed WaveLayer (sine, ratio 1, amp 1) is used.
         std::function<WaveLayer(int existingCount)> makeNewLayer;
+        // When true, each layer row embeds a per-layer warp chain editor
+        // (baked shape-bending on that layer's cycle). The wavetable layer
+        // stack turns this ON; the LFO / Signal-Shape editor leaves it OFF.
+        bool enablePerLayerWarp = false;
+        // Optional. When set, each layer row's wave-source picker offers a
+        // "From Library..." entry. The arg is the row's (stable) layer index;
+        // the owner opens the waveform browser and, on a pick, loads the
+        // chosen single cycle into target->layers[index] then calls
+        // refreshFromModel(). Null = no library entry on the picker.
+        std::function<void(int layerIndex)> onPickFromLibrary;
+        // Optional. When set, each layer row's wave-source picker also offers a
+        // "Save to Library..." entry. The arg is the row's (stable) layer index;
+        // the owner publishes target->layers[index] as a Waveform asset and
+        // live-links the layer to it. Null = no save entry on the picker.
+        std::function<void(int layerIndex)> onSaveToLibrary;
+        // Optional. When set, each layer row's wave-source picker offers an
+        // "Unlink from Library" entry (enabled only while that layer references
+        // an asset). The arg is the row's (stable) layer index; the owner clears
+        // target->layers[index].assetId, keeping the current cycle as an
+        // independent copy. Null = no unlink entry on the picker.
+        std::function<void(int layerIndex)> onDesyncFromLibrary;
+
+        // Optional. Per-layer warp modulation (#88, item-M). The per-layer warp
+        // editor's "Mod" checkbox routes (layerIndex, opIndex) to the owner, which
+        // creates/destroys a per-layer warp Param + modulation pin so an LFO /
+        // oscillator cable can drive that op's amount live. isLayerWarpOpModulated
+        // queries the current pin state; setLayerWarpOpModulated toggles it;
+        // layerWarpModDisabledReason returns a non-empty string to disable the
+        // checkbox with an explanation (used to gate modulation to single-frame
+        // wavetables). All null = the "Mod" checkbox stays hidden (baked-only).
+        std::function<bool(int layerIndex,int opIndex)>      isLayerWarpOpModulated;
+        std::function<void(int layerIndex,int opIndex,bool)> setLayerWarpOpModulated;
+        std::function<juce::String(int layerIndex,int opIndex)> layerWarpModDisabledReason;
+        // Optional. Returns whether (layerIndex, opIndex)'s amount slider should be
+        // LOCKED - true only under an active Absolute ("Set") cable. Unset = lock
+        // whenever pinned (legacy).
+        std::function<bool(int layerIndex,int opIndex)>      isLayerWarpOpAmountLocked;
+
+        // Optional. Per-layer field modulation (#88, item-M). A "Mod" checkbox
+        // next to each layer's Phase and Amplitude slider routes (layerIndex,
+        // field) to the owner, which creates/destroys a layer-field Param +
+        // modulation pin so an LFO / oscillator cable can drive that value live.
+        // field: 0 = Phase, 1 = Amplitude. isLayerFieldModulated queries the
+        // current pin state; setLayerFieldModulated toggles it;
+        // layerFieldModDisabledReason returns a non-empty string to disable the
+        // checkbox with an explanation (gates modulation to single-frame tables,
+        // same as warp). All null = the "Mod" checkboxes stay hidden (baked-only).
+        std::function<bool(int layerIndex,int field)>      isLayerFieldModulated;
+        std::function<void(int layerIndex,int field,bool)> setLayerFieldModulated;
+        std::function<juce::String(int layerIndex,int field)> layerFieldModDisabledReason;
+        // Optional. Absolute-only lock for the Phase/Amp/generator slider (twin of
+        // isLayerWarpOpAmountLocked). Unset = lock whenever pinned (legacy).
+        std::function<bool(int layerIndex,int field)>      isLayerFieldAmountLocked;
     };
 
     LayerStackComponent(Options opts, std::function<void()> onChanged);
@@ -305,17 +636,27 @@ struct WaveformLibraryEntry {
     int colorIdx = -1;
     std::unique_ptr<IWavetableFrame> wave;
 
+    // Project asset-library reference. -1 = independent (this entry owns its
+    // own `wave` data). >=0 = live reference to a published Waveform asset:
+    // `wave` is a resolved copy of that asset's frame, kept in sync by
+    // resolveWaveformReferences() at edit/load time. Editing the asset
+    // propagates to every library entry (in any node) that references it.
+    // Distinct from `id`, which is the document-local entry id that cells
+    // reference; assetId points OUT to the project-global store.
+    int assetId = -1;
+
     WaveformLibraryEntry() = default;
     WaveformLibraryEntry(WaveformLibraryEntry&&) noexcept = default;
     WaveformLibraryEntry& operator=(WaveformLibraryEntry&&) noexcept = default;
     // unique_ptr is non-copyable, so we provide deep-copy via clone().
     WaveformLibraryEntry(const WaveformLibraryEntry& o)
         : id(o.id), name(o.name), colorIdx(o.colorIdx),
-          wave(o.wave ? o.wave->clone() : nullptr) {}
+          wave(o.wave ? o.wave->clone() : nullptr), assetId(o.assetId) {}
     WaveformLibraryEntry& operator=(const WaveformLibraryEntry& o) {
         if (&o == this) return *this;
         id = o.id; name = o.name; colorIdx = o.colorIdx;
         wave = o.wave ? o.wave->clone() : nullptr;
+        assetId = o.assetId;
         return *this;
     }
 };
@@ -459,6 +800,14 @@ struct WavetableDoc {
     // Cleared whenever a scatter frame moves off its snapshot cell center,
     // or on any mode switch other than the matching reverse.
     std::optional<ScatterFromGridSnapshot> scatterFromGridSnapshot;
+
+    // NOTE: the frame-scope ("Summation Morph") warp chain and its asset
+    // reference USED to live here as doc-level fields (warpChain / warpAssetId)
+    // shared by every frame. As of 2026-06 they are PER FRAME: see
+    // IWavetableFrame::morphChain / morphAssetId. Each library entry's frame
+    // carries its own chain, baked into its cycle before the cross-frame morph
+    // blend. Old projects that stored the single doc-level chain are migrated
+    // into every frame on decode (see WavetableDoc::decode).
 
     WavetableDoc() = default;
     WavetableDoc(WavetableDoc&&) noexcept = default;
@@ -643,6 +992,71 @@ struct WavetableDoc {
     static WavetableDoc defaultEmpty();
 };
 
+// ---- Waveform asset-library bridge -----------------------------------------
+//
+// A published Waveform asset stores a single IWavetableFrame: AssetEntry.subType
+// is the frame typeId() ("layered"/"spectral"/...) and AssetEntry.payload is the
+// frame's encodeBody(). These two helpers convert between a frame and that
+// asset representation; the resolver below pushes a stored frame into every
+// library entry that references it.
+
+// Encode a frame as (subType, payload) for AssetLibrary::add/update. A null
+// frame encodes as an empty "layered" body (matching WavetableDoc::encode()).
+void waveformAssetFromFrame(const IWavetableFrame* frame,
+                            std::string& outSubType, std::string& outPayload);
+
+// Build a fresh frame from a Waveform asset's (subType, payload). Returns
+// nullptr on an unknown subType or a body that fails to decode.
+std::unique_ptr<IWavetableFrame> frameFromWaveformAsset(const std::string& subType,
+                                                        const std::string& payload);
+
+// Per-layer Waveform asset bridge (the per-layer analogue of the above). A layer
+// is shared as a single-layer LayeredWaveform; amp is excluded (a per-slot
+// property). layerToWaveformAsset encodes one layer into (subType, payload);
+// applyWaveformAssetToLayer pulls an asset body back into a layer, preserving the
+// layer's amp + assetId and flattening multi-layer/non-layered assets to a
+// freehand cycle. See WaveLayer::assetId and resolvePerLayerWaveformReferences().
+void layerToWaveformAsset(const WaveLayer& layer,
+                          std::string& outSubType, std::string& outPayload);
+bool applyWaveformAssetToLayer(const std::string& subType,
+                               const std::string& payload, WaveLayer& layer);
+
+// ---- Standalone single-frame instrument ("__framesynth__:") ----------------
+//
+// A standalone single-frame instrument node (Layered / Frequency Domain /
+// Wavelet Space / Inharmonic / Sample / Granular) wraps ONE IWavetableFrame in
+// a 1x1-grid WavetableDoc and stores it as "__framesynth__:" + doc.encode().
+// The synth strips the prefix and renders it through the normal wavetable path
+// (see terrain_synth.h kFrameSynthPrefix / effectiveSynthScript); the editor
+// dispatch routes the prefix to LayeredWaveEditorComponent, which detects the
+// wrapper and runs in FOCUSED mode (the wavetable-only surfaces hidden). These
+// helpers are the single source of truth for building / reading that wrapper so
+// the menu-creation code, the editor, and the self-tests all agree.
+
+// Wrap one frame as a 1x1-grid WavetableDoc (the canonical single-frame doc).
+WavetableDoc makeSingleFrameWavetable(std::unique_ptr<IWavetableFrame> frame);
+
+// Encode a single frame as a "__framesynth__:" standalone node script.
+std::string encodeFrameSynthScript(std::unique_ptr<IWavetableFrame> frame);
+
+// Build a default (factory) "__framesynth__:" script for one of the six frame
+// types (typeId is "layered" / "spectral" / "wavelet" / "sample" / "granular" /
+// "inharmonic"). Returns an empty string for an unknown id. Used by the
+// node-graph Add-node menu so frame-instrument creation lives behind one helper
+// that knows how to construct each frame type's default.
+std::string defaultFrameSynthScriptForType(const std::string& typeId);
+
+// Decode a "__framesynth__:" script back to its single frame (a clone), or
+// nullptr if `script` is not a framesynth script / fails to decode. `outDoc`,
+// when non-null, receives the full decoded doc (for the editor, which keeps the
+// doc as its edit buffer).
+std::unique_ptr<IWavetableFrame> decodeFrameSynthScript(const std::string& script,
+                                                        WavetableDoc* outDoc = nullptr);
+
+// resolveWaveformReferences(NodeGraph&) is declared in node_graph.h (so the
+// non-GUI serialization layer can call it without pulling in the editor),
+// and implemented in layered_wave_editor.cpp alongside WavetableDoc decode.
+
 // Editor window contents (paired with a juce::DialogWindow launched by the caller).
 // Edits `node.script` directly. onApply() should request a graph rebuild so
 // the new waveform takes effect; it is called on a debounce timer (not on
@@ -728,6 +1142,26 @@ private:
     int nodeId;
     std::function<void()> onApply;
 
+    // ---- Standalone single-frame "frame synth" focus mode ----
+    // When the node's script is a __framesynth__ wrapper (a single-frame
+    // WavetableDoc representing one of the six standalone instrument node
+    // types - Layered / Spectral / Wavelet / Inharmonic / Sample / Granular),
+    // this editor runs in a FOCUSED mode: the wavetable-only surfaces (grid /
+    // scatter arrangement view, library list, + Waveform, multi-frame Position
+    // morph, mode conversion, the asset-library row) are hidden, leaving just
+    // the single frame's editor plus the generic Gain / Preview / Envelope /
+    // Morph toolbar. The underlying WavetableDoc still holds exactly one frame
+    // and the entire wavetable render path is reused unchanged - the frame
+    // synth is a distinct node type to the user, never a "1-frame wavetable in
+    // disguise", but shares 100% of the DSP and sub-editor code.
+    //   frameSynthMode : true when opened on a __framesynth__ node.
+    //   scriptPrefix   : "" for a real wavetable, kFrameSynthPrefix for a frame
+    //                    synth. Re-prepended on every commitToNode() so the
+    //                    wrapper survives round-trips; decode paths always strip
+    //                    it via effectiveSynthScript().
+    bool frameSynthMode = false;
+    std::string scriptPrefix;
+
     WavetableDoc wave;
     // ---- Editor target vs. arrangement-view selection (two separate things) ----
     //
@@ -810,9 +1244,90 @@ private:
     // the menu is dismissed.
     void showAddWaveformMenu(juce::Component* anchor);
 
+    // Open the unified waveform-library browser: the built-in single-cycle
+    // library (category tree + search + curated ★) AND the project's user
+    // Waveform assets in one picker, with "starred only" and "show user items"
+    // filters. Selecting a built-in inserts an editable Drawn/Freehand
+    // LayeredWaveform copy (see makeFactoryFrame); selecting a user asset
+    // live-references it (edits propagate to every reference).
+    //   replaceCurrentFrame == false: the + Waveform flow - ADD a new frame.
+    //   replaceCurrentFrame == true:  the identity-row "Use Library..." flow -
+    //     REPLACE the current frame's content/reference in place.
+    // Anchor centres the dialog.
+    void showWaveformLibraryBrowser(juce::Component* anchor,
+                                    bool replaceCurrentFrame);
+
+    // Per-layer "From Library..." loader: opens the waveform browser and, on a
+    // pick, loads the chosen single cycle into layer `layerIndex` of the frame
+    // currently bound to the layer stack (preserving that layer's ratio/phase/
+    // amp). Wired into LayerStackComponent::Options::onPickFromLibrary.
+    void showWaveformLibraryBrowserForLayer(int layerIndex);
+
+    // Per-layer "Save to Library..." publisher: prompts for a name, publishes
+    // layer `layerIndex` of the frame currently bound to the layer stack as a
+    // single-layer Waveform asset, and live-links that layer to the new asset
+    // (so subsequent edits propagate). Wired into LayerStackComponent::Options::
+    // onSaveToLibrary.
+    void publishLayerToLibrary(int layerIndex);
+
+    // Per-layer "Unlink from Library" handler: clears layer `layerIndex`'s
+    // assetId (detaching the live link) while keeping the current cycle as an
+    // independent editable copy. Wired into LayerStackComponent::Options::
+    // onDesyncFromLibrary.
+    void desyncLayerFromLibrary(int layerIndex);
+
+    // Build a one-layer LayeredWaveform whose single Drawn/Freehand layer holds
+    // `cycle` (expected 512 samples in [-1,1], one cycle). This is the import
+    // path for both a factory-bank entry and a user-loaded single-cycle wav: the
+    // result is a fully editable, serialisable frame (the user can draw over it,
+    // stack layers on it, warp it). Shared so both callers stay in sync. Public
+    // (and static) so the self-test can exercise it without a live component.
+public:
+    // `factoryName` (when non-empty) marks the resulting single layer as a live
+    // reference to the named built-in factory waveform (sets WaveLayer::factoryRef
+    // so the project stores just the name, not the samples - see that field). Pass
+    // the bank entry's stable name for a factory pick; leave empty for a user-
+    // loaded single-cycle .wav (which must embed its samples).
+    static std::unique_ptr<IWavetableFrame> makeFactoryFrame(
+        const std::vector<float>& cycle, const std::string& factoryName = "");
+private:
+
     juce::TextButton applyBtn    { "Apply" };
     juce::TextButton closeBtn    { "Close" };
     juce::TextButton helpBtn     { "?" };
+    // Preview/Stop: audition the currently-edited frame through the owning
+    // synth's voice path (envelope + Volume + downstream chain), exactly like
+    // the granular ("from audio file") and inharmonic frame editors and the
+    // capture dialogs. Ships the frame's rendered single cycle as a direct
+    // audition payload so it's audible even when it isn't placed into the
+    // wavetable grid, and refreshes live as the frame is edited (so you hear
+    // changes while a note sustains). Labelled "Preview" (toggling to "Stop")
+    // and sits in a button row near the bottom of the editor, matching every
+    // other audition control in the app.
+    juce::TextButton playBtn     { "Preview" };
+    bool framePlaying = false;
+
+    // Continuous low-rate poll that watches the LIVE node-param amounts for the
+    // current frame's summation-morph (warp) slots and re-ships the preview +
+    // held audition whenever they change underneath the editor - e.g. the user
+    // drags the node-graph param slider of a PINNED morph op while this editor
+    // is open. The preview/audition render at the live node-param amount
+    // (renderEditingFrameLiveCycle), but only refresh on editor-originated
+    // events; without this poll a node-side drag would appear to "do nothing"
+    // (the held audition keeps overriding the synth terrain with the stale
+    // cycle). A decoupled poll - rather than storing this editor's pointer in
+    // the node graph for push notification - avoids any dangling-pointer risk
+    // across graph.nodes reallocations.
+    struct CallbackTimer : juce::Timer {
+        std::function<void()> fn;
+        void timerCallback() override { if (fn) fn(); }
+    };
+    CallbackTimer paramWatchTimer;
+    std::vector<float> lastPolledWarpAmounts;
+    void pollNodeParamChanges();
+    // Opens the shared AHDSR amplitude-envelope editor for this synth's
+    // node in a separate dialog (kept out of this already-dense editor).
+    juce::TextButton envelopeBtn { "Envelope..." };
     // Compare (#9): switch the synth between two render modes that apply
     // to a wavetable cycle, so the user can A/B audition the same waveform
     // played two different ways. Direct = the cycle is read by one
@@ -842,6 +1357,7 @@ private:
     // arrangement-view sidebar.
     juce::Label      identityLabel { {}, "Waveform:" };
     std::unique_ptr<LibraryColorSwatch> nameColorSwatch;
+    juce::Label      nameFieldLabel { {}, "Name:" };
     juce::TextEditor nameEditor;
 
     // Per-waveform output gain (IWavetableFrame::gain). A horizontal slider on
@@ -860,6 +1376,48 @@ private:
     // changes, the editor is constructed, or the user finishes editing.
     void refreshIdentityRow();
 
+    // ---- Project asset-library reference row (below the gain row) ----------
+    // Shows whether the currently-edited library entry live-references a
+    // published Waveform asset, and lets the user (a) publish the current frame
+    // as a new asset ("Save to Library"), or (b) repoint THIS frame to a library
+    // waveform via the unified browser ("Use Library...", replaceCurrentFrame).
+    // While referenced, edits to this waveform write back to the asset and
+    // propagate to every other node referencing it (the live-reference model,
+    // mirroring the AHDSR row). Selection uses the same category/starred/show-
+    // user browser as the + Waveform flow, never a flat dropdown - the wave-shape
+    // library is far too large for a combo (see agent-todo design refinement #2).
+    juce::Label      assetLibStatus;
+    juce::TextButton useLibraryBtn  { juce::String::fromUTF8("Use Library\xe2\x80\xa6") };
+    juce::TextButton saveToLibBtn   { "Save to Library" };
+    juce::TextButton desyncFromLibBtn { "Unlink" };
+    // Refresh the status label + button enablement from the current entry's
+    // assetId (shows the referenced asset name, or "Independent waveform").
+    void refreshAssetLibRow();
+    // Repoint the current entry to live-reference a user Waveform asset (mirror
+    // the asset's frame in, preserving this slot's gain). Used by the identity-
+    // row "Use Library..." browser flow when a user asset is chosen.
+    void adoptWaveformAsset(int assetId);
+    // Publish the current entry's frame as a new Waveform asset and link it.
+    void publishCurrentWaveformToLibrary();
+    // Detach the current entry's live link to a Waveform asset (set assetId = -1)
+    // while keeping the current frame as an independent editable copy. Used by
+    // the identity-row "Unlink" button; no-op when already independent.
+    void desyncCurrentWaveformFromLibrary();
+    // After committing this node, push every asset-referencing entry's frame
+    // up to its asset and propagate to other nodes (live write-back). Called
+    // from commitToNode(). No-op when no entry references an asset.
+    void writeBackReferencedWaveforms();
+    // Per-layer analogue: push every layer that live-references a Waveform asset
+    // (WaveLayer::assetId >= 0) back up to its asset and propagate to every other
+    // layer/frame sharing the id. Called from commitToNode(). No-op when no layer
+    // references an asset. A layer linked to a multi-layer asset writes back a
+    // single flattened cycle (see WaveLayer::assetId / layerToWaveformAsset).
+    void writeBackPerLayerWaveforms();
+    // Same for the frame-scope warp chain: if it references a shared
+    // MorphAlgorithm asset, push the edited chain back and propagate. Called
+    // from commitUndoStep(). No-op when warpAssetId < 0 (independent).
+    void writeBackReferencedWarp();
+
     // Shared layer-stack widget (the "+ Layer" header, the scrolling list of
     // WaveLayerEditor rows, and per-layer add/delete). Identical code is used
     // by the Signal Shape (LFO / envelope) editor. Summation preview is OFF
@@ -868,6 +1426,11 @@ private:
     // granular frames too, which the shared component knows nothing about.
     // Bound to the current layered frame via setTarget(currentEditingLayeredFrame()).
     std::unique_ptr<LayerStackComponent> layerStack;
+
+    // Frame-scope warp chain editor (Bucket A shape-bending), bound to
+    // wave.warpChain. Lives in the right pane under the layer stack. Its amounts
+    // become "Warp N" node params (syncWarpParams) so they can be modulated.
+    std::unique_ptr<WarpChainEditor> frameWarpEditor;
 
     // When the current frame is non-layered (spectral / wavelet), the
     // matching editor is embedded into the same screen area normally
@@ -1039,6 +1602,28 @@ private:
     void updateFrameEditorEmbed();
     void rebuildScatterUI();        // re-evaluates rotation slider count when dim count changes
     void refreshPreview();
+    // ---- Frame audition (Play button) --------------------------------------
+    // toggleFramePlay flips between start/stop. startFramePlay holds a
+    // level-triggered audition on the owning synth node (Node::heldAudition)
+    // carrying the current frame's rendered single cycle, so the synth voice
+    // sustains it across the debounced graph rebuild an edit fires. stop clears
+    // the held note. refreshHeldFrameAudition re-ships the cycle when the frame
+    // is edited mid-play (or the editor target changes) so the sustained note
+    // tracks the edit - "what you see = what you hear". All three look the node
+    // up fresh via graph.findNode(nodeId) so a graph.nodes reallocation can
+    // never leave a stale Node*.
+    void toggleFramePlay();
+    void startFramePlay();
+    void stopFramePlay();
+    void refreshHeldFrameAudition();
+    // Render the currently-edited frame to a single cycle the way the SYNTH
+    // sees it: the frame's summation-morph chain applied at the LIVE node-param
+    // amounts (so a PINNED op reflects the value dialled in on the node-graph
+    // param slider, not the frozen editor amount). For unpinned ops the param
+    // mirrors the editor amount, so the result matches renderMorphed. Used by
+    // the preview and the held audition so "what you see / hear" tracks the node
+    // param slider for pinned morph stages. Returns false if there's no frame.
+    bool renderEditingFrameLiveCycle(std::vector<float>& out);
     void commitToNode(); // encode `wave` into node.script
     // Push a graph undo snapshot so a settled wavetable edit enters the undo
     // system. Without this the edit lives only in the node's script (updated
@@ -1047,8 +1632,89 @@ private:
     // making the waveform/cell "vanish" on reload.
     void commitUndoStep();
     void onLayerChanged();
+    // Lighter sibling of onLayerChanged() for a continuous frame-scope morph
+    // amount-slider drag: refreshes the on-screen preview and restarts the
+    // debounce, but does NOT rewrite the node script or synchronously re-ship the
+    // held audition every tick (the amount already flows to the synth via its
+    // live-read "Warp N" param, and the 20 Hz poll re-ships the audition at a
+    // de-clickable rate). The settled script commit happens in timerCallback.
+    void onFrameWarpAmountDragged();
     void switchToFrame(int idx);
     void syncPositionParams();      // ensure node has the right number of Position params
+    // Ensure the node carries exactly one frame-scope morph param per op across
+    // EVERY frame's per-frame morph chain (IWavetableFrame::morphChain), keyed by
+    // (warpFrameId, warpSlot), so the on-demand modulation-pin mechanism (#88)
+    // can drive each morph amount with an LFO / oscillator. Adds missing params
+    // (seeded from the op amount), removes params for deleted ops / frames (with
+    // their mod pins / cables), and remaps surviving modPin param indices. Called
+    // on a structural morph-chain edit. Delegates to syncWarpParamsForNode(doc).
+    void syncWarpParams();
+    // Re-point the per-frame summation-morph editor (frameWarpEditor) at the
+    // current frame's morphChain + morphAssetId. Called from every flow that
+    // changes the editor target (rebuildRows) or moves the storage (undo
+    // restore). The chain is per-frame, so the editor must rebind on each switch.
+    void rebindFrameWarpEditor();
+    // Lightweight: mirror each op's current amount into its matching (un-
+    // modulated) "Warp N" param so the synth's live read tracks the editor
+    // slider without a full param rebuild. Called on every warp amount edit.
+    void pushWarpAmountsToParams();
+    // Reorder support: when two warp ops swap slots a<->b, swap the names of
+    // their positional "Warp a+1" / "Warp b+1" node params so a wired
+    // modulation cable keeps driving its op rather than the slot it vacated.
+    // The param objects (and the modPins that reference them by index) stay
+    // put in nd->params; only their names swap, so the synth's per-slot
+    // getParamByName("Warp k+1") read now resolves each op to its original
+    // (possibly modulated) param. No-op if either name is absent.
+    void swapWarpParamNames(int a, int b);
+    // Map frame-scope warp op `opIndex` to the index of its "Warp opIndex+1" node
+    // param (the unified warp/morph model: the op's amount is a node param that
+    // can opt into a modulation pin). Returns -1 if the param isn't present yet.
+    // Used by the warp editor's per-row "Mod" checkbox callbacks.
+    int warpParamIndexForOp(int opIndex) const;
+
+    // ---- Per-layer warp modulation (#88, item-M) --------------------------
+    // The layer stack's per-layer "Mod" checkbox routes (layer, opIndex) here.
+    // A per-layer warp param is keyed by (Param::warpLayer == layer,
+    // Param::warpSlot == opIndex) and exists ONLY while modulated (created on
+    // check, destroyed on uncheck) - distinct from the always-present frame-
+    // scope "Warp N" params. The synth re-bakes the modulated op's amount live
+    // for a SINGLE-frame wavetable only, so the checkbox is gated to that case.
+    //
+    // perLayerWarpParamIndex: find the (layer, op) param's index, or -1.
+    int  perLayerWarpParamIndex(int layer, int op) const;
+    // True when per-layer warp modulation is offered (the wavetable holds exactly
+    // one frame, the only shape the synth re-bakes live).
+    bool perLayerWarpModSupported() const;
+    // Query/toggle the (layer, op) per-layer warp modulation pin. Toggling on
+    // creates the param (seeded from the op amount) + a mod pin; toggling off
+    // drops the pin and the now-orphan param. No-op when unsupported.
+    bool isLayerWarpOpModulated(int layer, int op) const;
+    void setLayerWarpOpModulated(int layer, int op, bool on);
+    // True only when an active Absolute ("Set") cable drives this (layer, op)'s
+    // amount - the single condition that locks its slider. A bare pin or a "Mod"
+    // cable leaves it editable (drag sets the base).
+    bool isLayerWarpOpAmountLocked(int layer, int op) const;
+    // Reconcile every per-layer warp param against the current editing frame's
+    // chains (remove params for deleted ops + their pins, relabel survivors).
+    // Called from onLayerChanged on every edit; early-outs when no per-layer warp
+    // param exists. Drops all per-layer params when the table isn't single-frame.
+    void reconcilePerLayerWarpParamsNow();
+    // Empty when the (layer, op) op can be modulated; otherwise the reason its
+    // "Mod" checkbox is disabled (the grayed-control-explains-itself rule).
+    juce::String layerWarpModDisabledReason(int layer, int op) const;
+
+    // ---- Per-layer Phase / Amplitude modulation (#88, item-M) -------------
+    // Each layer's Phase/Amp "Mod" checkbox routes (layer, field) here, where
+    // field 0 = Phase, 1 = Amplitude. A layer-field param is keyed by
+    // (Param::warpLayer == layer, Param::layerField == field, Param::warpSlot ==
+    // -1) and exists ONLY while modulated. The synth re-bakes the modulated
+    // phase/amp live for a SINGLE-frame wavetable only (same gate as warp).
+    int  layerFieldParamIndex(int layer, int field) const;
+    bool isLayerFieldModulated(int layer, int field) const;
+    void setLayerFieldModulated(int layer, int field, bool on);
+    // Absolute-only lock for the Phase/Amp/generator slider (see warp-op twin).
+    bool isLayerFieldAmountLocked(int layer, int field) const;
+    juce::String layerFieldModDisabledReason(int layer, int field) const;
     // Re-sync Position params/pins only when the effective dimension count has
     // actually changed since the params were last built. Cheap to call on every
     // structural mutation (grid axis resize, scatter frame add/remove, cell

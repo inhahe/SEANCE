@@ -117,11 +117,11 @@ hit ? note(48 + step*3, 100, 0.2) : 0</pre>
 <ul>
   <li><code>t</code> — seconds since the song started; <code>beat</code>, <code>bar</code> — musical position; <code>bpm</code> — tempo; <code>playing</code> — 1 while playing.</li>
   <li><code>dt</code> — the length of one sample in seconds; <code>sr</code> — the sample rate.</li>
-  <li><code>note</code>, <code>vel</code>, <code>gate</code>, <code>freq</code> — the most recent note arriving at the node's <strong>MIDI In</strong> pin (its number, velocity 0–1, whether a key is held, and its pitch in Hz). Use these to react to what you play.</li>
+  <li><code>note</code>, <code>vel</code>, <code>gate</code>, <code>freq</code> — the most recent note arriving at the node's <strong>MIDI In</strong> pin (its number, velocity 0–1, whether a key is held, and its pitch in Hz). Use these to react to what you play. If the node has several MIDI inputs (see below), these track the most recent note across <em>all</em> of them.</li>
   <li><code>s1</code>, <code>s2</code>, … — Signal input pins (see below).</li>
 </ul>
 
-<p>The full maths toolbox is available too: <code>sin cos tan sqrt abs exp log pow tanh saw square triangle noise floor ceil min max clamp if</code>, comparisons (<code>&lt; &gt; == …</code>), and <code>&amp;&amp; || !</code>.</p>
+<p>The full maths toolbox is available too: <code>sin cos tan asin acos sinh cosh atan asinh acosh atanh sqrt inversesqrt abs sign exp exp2 log log2 pow tanh saw square triangle noise floor ceil round roundEven trunc fract mod min max clamp mix step smoothstep fma radians degrees if</code>, comparisons (<code>&lt; &gt; == …</code>), and <code>&amp;&amp; || !</code>. (These match the GLSL shaping functions — the complete scalar set of GLSL's trig/exponential/common builtins — so the same idioms carry over.)</p>
 
 <h2>Signal inputs and a drawn shape</h2>
 
@@ -141,6 +141,21 @@ out = 1;  note(38, 90, 0.1)
 out = 2;  note(42, 60, 0.05)</pre>
 
 <p>Each output is its own independent MIDI cable (numbered from 0 in the script, shown as "MIDI Out 1" upward on the node) — <em>not</em> a MIDI channel you have to manage. Wire each one to a different drum instrument.</p>
+
+<h2>Multiple inputs — merge or split incoming MIDI</h2>
+
+<p>The mirror image: turn up <strong>MIDI inputs</strong> in the editor to give the node several input pins ("MIDI In 1", "MIDI In 2", …), each its own cable. When you read events with <code>midievent()</code> (or <code>pollmidi()</code> in a streaming program) the last value it returns is <code>idx</code> — which input the event came in on (1 = MIDI In 1, 2 = MIDI In 2, …):</p>
+
+<pre>for k = 1, midiin() do
+  local kind, offset, a, b, idx = midievent(k)
+  if kind == "on" then
+    if idx == 1 then -- handle keyboard
+    elseif idx == 2 then -- handle a drum pad
+    end
+  end
+end</pre>
+
+<p>Like the outputs, each input is an independent cable, not a MIDI channel you manage. Leave <strong>MIDI inputs</strong> at <strong>1</strong> (the default) for the usual single MIDI In pin, set it to <strong>0</strong> if the node takes no MIDI at all, or higher to split sources apart. The <code>note</code>/<code>vel</code>/<code>gate</code>/<code>freq</code> convenience variables always reflect the most recent note across every input.</p>
 
 <h2>Choosing a language: Built-in, Lua, or WebAssembly</h2>
 

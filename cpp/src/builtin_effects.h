@@ -2,8 +2,11 @@
 #include "node_graph.h"
 #include "signal_modulation.h"
 #include "wavelet.h"
+#include "pitch_detect.h"
 #include "fft_util.h"
 #include "builtin_synth.h"
+#include "curve_editor.h"   // SpectralCurve + CurveEq script helpers (Curve EQ)
+#include "warp.h"           // warpAmpValue + Waveshaper script helpers (Waveshaper FX)
 #include <juce_audio_processors/juce_audio_processors.h>
 #include <cmath>
 #include <vector>
@@ -75,6 +78,66 @@ public:
 private:
     Node& node;
     double sampleRate = 44100, phase = 0;
+};
+
+// ==============================================================================
+// WAVESHAPER - amplitude-domain transfer (Bucket A warp) on the input signal.
+//
+// One method per node, chosen at creation and stored in node.script
+// ("__waveshaper:<token>__"; see warp.h). A single modulatable "Amount" param
+// (0..1, 0 = passthrough). The DSP is the shared per-sample primitive
+// warpAmpValue() - the exact transfer the synth's amplitude morphs use - so the
+// node and the in-synth morph sound identical for the same method/amount.
+//
+// Phase-domain warps are intentionally NOT exposed as effect nodes: they remap
+// the read position before a table lookup, which only exists inside an
+// oscillator, not on an arbitrary audio stream.
+// ==============================================================================
+class WaveshaperProcessor : public juce::AudioProcessor {
+public:
+    WaveshaperProcessor(Node& n)
+        : node(n), method(waveshaperMethodFromScript(n.script)) {
+        // The single amount param is labelled with the method's named morph
+        // parameter ("Drive"/"Fold"/"Crush"/...) at creation time. Derive the
+        // SAME label here from the method so paramByName() finds it regardless
+        // of which variant this is.
+        const char* pl = warpParamLabel(method);
+        amountParamName = (pl && *pl) ? pl : "Amount";
+    }
+    const juce::String getName() const override { return "Waveshaper"; }
+    void prepareToPlay(double, int) override {}
+    void releaseResources() override {}
+    void processBlock(juce::AudioBuffer<float>& buf, juce::MidiBuffer&) override {
+        applySignalModulations(node, buf);
+        const float amount = juce::jlimit(
+            0.0f, 1.0f,
+            paramByName(node, amountParamName.toRawUTF8(), 0.5f));
+        // None (unknown token) or zero amount = identity: leave audio untouched.
+        if (method == WarpMethod::None || amount <= 0.0f) return;
+        const int ns = buf.getNumSamples();
+        for (int c = 0; c < buf.getNumChannels(); ++c) {
+            float* d = buf.getWritePointer(c);
+            for (int s = 0; s < ns; ++s)
+                d[s] = warpAmpValue(method, d[s], amount);
+        }
+    }
+    double getTailLengthSeconds() const override { return 0; }
+    bool acceptsMidi() const override { return true; }
+    bool producesMidi() const override { return true; }
+    bool isBusesLayoutSupported(const BusesLayout&) const override { return true; }
+    juce::AudioProcessorEditor* createEditor() override { return nullptr; }
+    bool hasEditor() const override { return false; }
+    int getNumPrograms() override { return 1; }
+    int getCurrentProgram() override { return 0; }
+    void setCurrentProgram(int) override {}
+    const juce::String getProgramName(int) override { return {}; }
+    void changeProgramName(int, const juce::String&) override {}
+    void getStateInformation(juce::MemoryBlock&) override {}
+    void setStateInformation(const void*, int) override {}
+private:
+    Node& node;
+    WarpMethod method = WarpMethod::None;
+    juce::String amountParamName { "Amount" };
 };
 
 // ==============================================================================
@@ -935,7 +998,7 @@ public:
 
         const int n = buf.getNumSamples();
         const int ch = buf.getNumChannels();
-        for (int b = 0; b < kNumBands; ++b) {
+        for (int b = 0; b < (int)bands.size(); ++b) {
             for (int c = 0; c < std::min(ch, 2); ++c) {
                 float* data = buf.getWritePointer(c);
                 auto& s = bands[b].state[c];
@@ -966,10 +1029,30 @@ public:
     void getStateInformation(juce::MemoryBlock&) override {}
     void setStateInformation(const void*, int) override {}
 
+    // Maximum number of EQ bands the node can carry. The active count is
+    // variable: it equals the number of contiguous "B<n> Type" params present
+    // on the node (bands are added/removed via the node context menu, which
+    // pushes/pops the four B<n> Type/Freq/Gain/Q params as a group). Each band
+    // is one RBJ-cookbook biquad cascaded in series, so any count works.
+    static constexpr int kMaxBands = 12;
+
+    // Count the contiguous B1.. bands present on the node (B<n> Type present).
+    static int countBands(const Node& node) {
+        int n = 0;
+        while (n < kMaxBands) {
+            std::string key = "B" + std::to_string(n + 1) + " Type";
+            bool found = false;
+            for (const auto& p : node.params)
+                if (p.name == key) { found = true; break; }
+            if (!found) break;
+            ++n;
+        }
+        return n;
+    }
+
 private:
     Node& node;
     double sampleRate = 44100;
-    static constexpr int kNumBands = 4;
 
     struct Coeffs { float b0=1,b1=0,b2=0,a1=0,a2=0; };
     struct BiquadState { float x1=0,x2=0,y1=0,y2=0; };
@@ -978,18 +1061,18 @@ private:
         BiquadState state[2]; // stereo
         void reset() { state[0] = state[1] = {}; }
     };
-    Band bands[kNumBands];
+    std::vector<Band> bands;
 
     // RBJ cookbook biquad coefficient computation.
     void updateCoefficients() {
-        const char* bandNames[] = {"B1", "B2", "B3", "B4"};
-        for (int b = 0; b < kNumBands; ++b) {
-            std::string prefix = std::string(bandNames[b]) + " ";
-            int type  = (int)paramByName(node, (prefix + "Type").c_str(),
-                                          b == 0 ? 3.0f : b == 3 ? 4.0f : 0.0f);
-            float freq = paramByName(node, (prefix + "Freq").c_str(),
-                                      b == 0 ? 80.0f : b == 1 ? 400.0f :
-                                      b == 2 ? 2500.0f : 8000.0f);
+        int nb = countBands(node);
+        // Resize preserves existing bands' filter state (no clicks when only
+        // the param values change); newly-grown bands start from a clean state.
+        if ((int)bands.size() != nb) bands.resize((size_t)nb);
+        for (int b = 0; b < nb; ++b) {
+            std::string prefix = "B" + std::to_string(b + 1) + " ";
+            int type  = (int)paramByName(node, (prefix + "Type").c_str(), 0.0f);
+            float freq = paramByName(node, (prefix + "Freq").c_str(), 1000.0f);
             float gain = paramByName(node, (prefix + "Gain").c_str(), 0.0f);
             float Q    = paramByName(node, (prefix + "Q").c_str(), 0.707f);
 
@@ -1216,18 +1299,27 @@ public:
         int algo    = (int)paramByName(node, "Algorithm", 0.0f);
         float fbAmt = paramByName(node, "Feedback", 0.3f);
 
-        // Per-operator params.
-        struct OpParams { float ratio, level, a, d, s, r; };
+        // Per-operator ratio + output level (the envelope is now a full AHDSR
+        // per operator, held in node.opEnvelopes - see below).
+        struct OpParams { float ratio, level; };
         OpParams ops[4];
         const char* opNames[] = {"Op1","Op2","Op3","Op4"};
         for (int i = 0; i < 4; ++i) {
             std::string p(opNames[i]);
             ops[i].ratio = paramByName(node, (p+" Ratio").c_str(), (float)(i+1));
             ops[i].level = paramByName(node, (p+" Level").c_str(), i==0?1.0f:0.5f);
-            ops[i].a     = std::max(0.001f, paramByName(node, (p+" A").c_str(), 0.01f));
-            ops[i].d     = std::max(0.001f, paramByName(node, (p+" D").c_str(), 0.1f));
-            ops[i].s     = paramByName(node, (p+" S").c_str(), 0.7f);
-            ops[i].r     = std::max(0.001f, paramByName(node, (p+" R").c_str(), 0.3f));
+        }
+
+        // Per-operator AHDSR envelopes. node.opEnvelopes holds exactly 4 once
+        // the node has been created / migrated (ensureFmOpEnvelopes). If a
+        // graph somehow arrives without them (defensive), fall back to a
+        // default envelope so the synth still sounds. Bake each operator's
+        // shape curves once per block; every voice samples these tables.
+        for (int i = 0; i < 4; ++i) {
+            opEnv[i] = (i < (int)node.opEnvelopes.size())
+                         ? node.opEnvelopes[(size_t)i]
+                         : AHDSREnvelope{};
+            opTables[i].prepare(opEnv[i]);
         }
 
         // Handle MIDI.
@@ -1243,12 +1335,13 @@ public:
                 v.relTime = 0;
                 v.mpeChannel = msg.getChannel();
                 v.mpe = MpeVoiceState{};
-                for (int i = 0; i < 4; ++i) v.phase[i] = 0;
+                for (int i = 0; i < 4; ++i) { v.phase[i] = 0; v.opEnvRt[i].noteOn(v.vel); }
                 v.fb1 = v.fb2 = 0;
             } else if (msg.isNoteOff()) {
                 for (auto& v : voices)
                     if (v.active && v.held && v.note == msg.getNoteNumber())
-                        { v.held = false; v.relTime = v.time; }
+                        { v.held = false; v.relTime = v.time;
+                          for (int i = 0; i < 4; ++i) v.opEnvRt[i].noteOff(); }
             }
         }
         // Distribute MPE / per-note expression (pitch bend, channel + poly
@@ -1265,30 +1358,22 @@ public:
                 if (!v.active) continue;
                 // MPE per-note pitch bend (#78)
                 float baseFreq = 440.0f * std::pow(2.0f, (v.note - 69 + v.mpe.pitchBend) / 12.0f);
-                // Compute per-operator envelopes.
+                // Per-operator AHDSR envelopes (shared runtime: hold stage,
+                // per-segment curves, tension, optional velocity sensitivity).
+                // Velocity is folded into each runtime's peak only when that
+                // operator's velocitySensitivity > 0; the default 0 keeps the
+                // master out *= v.vel below as the single velocity scaling.
                 float env[4];
+                bool anyActive = false;
                 for (int i = 0; i < 4; ++i) {
-                    float t = v.time;
-                    if (v.held) {
-                        if (t < ops[i].a) env[i] = t / ops[i].a;
-                        else if (t < ops[i].a + ops[i].d)
-                            env[i] = 1.0f + (ops[i].s - 1.0f) * ((t - ops[i].a) / ops[i].d);
-                        else env[i] = ops[i].s;
-                    } else {
-                        float envAtRel = ops[i].s;
-                        float rt = v.time - v.relTime;
-                        env[i] = envAtRel * std::max(0.0f, 1.0f - rt / ops[i].r);
-                        if (rt >= ops[i].r) env[i] = 0;
-                    }
-                    env[i] *= ops[i].level;
+                    env[i] = v.opEnvRt[i].tick((float)sampleRate, opEnv[i], opTables[i])
+                             * ops[i].level;
+                    if (v.opEnvRt[i].isActive()) anyActive = true;
                 }
-                // Check if all envelopes are done.
-                if (!v.held) {
-                    bool allDone = true;
-                    for (int i = 0; i < 4; ++i)
-                        if (env[i] > 0.0001f) { allDone = false; break; }
-                    if (allDone) { v.active = false; continue; }
-                }
+                // Voice ends once every operator envelope has reached Off
+                // (only possible after note-off; during hold the sustain stage
+                // keeps each runtime active).
+                if (!anyActive) { v.active = false; continue; }
                 // Compute operators with algorithm routing.
                 // Op4 with feedback.
                 float fb = (v.fb1 + v.fb2) * 0.5f * fbAmt;
@@ -1361,17 +1446,12 @@ public:
         }
     }
 
-    // Tail = max release time across the 4 operators (FM voice ends when
-    // every op envelope reaches 0).  Names match the per-op R param the
-    // processBlock reads.
+    // Tail = max release time across the 4 operator envelopes (FM voice ends
+    // when every op envelope reaches Off after note-off).
     double getTailLengthSeconds() const override {
         double maxR = 0.001;
-        const char* opNames[] = {"Op1","Op2","Op3","Op4"};
-        for (int i = 0; i < 4; ++i) {
-            std::string p(opNames[i]);
-            double r = (double) paramByName(node, (p+" R").c_str(), 0.3f);
-            if (r > maxR) maxR = r;
-        }
+        for (const auto& e : node.opEnvelopes)
+            maxR = std::max(maxR, (double) e.releaseMs * 0.001);
         return maxR;
     }
     bool acceptsMidi() const override { return true; }
@@ -1390,6 +1470,10 @@ public:
 private:
     Node& node;
     double sampleRate = 44100;
+    // Per-operator baked shape-curve tables + the effective envelope snapshots
+    // the voices sample against (refreshed once per block from node.opEnvelopes).
+    AHDSRCurveTables opTables[4];
+    AHDSREnvelope    opEnv[4];
     struct Voice {
         bool active = false, held = false;
         int note = 0;
@@ -1398,6 +1482,7 @@ private:
         float fb1 = 0, fb2 = 0;
         int mpeChannel = 1;     // MPE per-note channel (#78)
         MpeVoiceState mpe;
+        AHDSREnvelopeRuntime opEnvRt[4]; // one AHDSR runtime per operator
     };
     std::vector<Voice> voices;
     Voice& allocVoice() {
@@ -1637,6 +1722,12 @@ public:
         int   shape      = (int)paramByName(node, "Shape", 0.0f);
         float volume     = paramByName(node, "Volume", 0.5f);
 
+        // Note-level amplitude envelope: the shared node AHDSR is a VCA over
+        // the whole grain cloud (orthogonal to each grain's own attack/release
+        // shaping below). Bake the shape curves once per block.
+        effectiveEnv = node.ahdsrEnvelope;
+        ampTables.prepare(effectiveEnv);
+
         // Handle MIDI
         for (auto meta : midi) {
             auto msg = meta.getMessage();
@@ -1644,8 +1735,10 @@ public:
                 heldNote = msg.getNoteNumber();
                 heldVel = msg.getVelocity() / 127.0f;
                 noteActive = true;
+                noteAmpEnv.noteOn(heldVel);
             } else if (msg.isNoteOff() && msg.getNoteNumber() == heldNote) {
                 noteActive = false;
+                noteAmpEnv.noteOff();
             }
         }
 
@@ -1655,8 +1748,10 @@ public:
         const float kPi2 = 6.28318530718f;
 
         for (int s = 0; s < numSamples; ++s) {
-            // Spawn new grains when a note is held
-            if (noteActive) {
+            // Keep spawning grains while the note envelope is sounding - this
+            // includes the release stage, so the cloud sustains through the
+            // AHDSR release rather than cutting off one grain after note-off.
+            if (noteAmpEnv.isActive()) {
                 spawnTimer += dt;
                 while (spawnTimer >= spawnInterval) {
                     spawnTimer -= spawnInterval;
@@ -1694,7 +1789,7 @@ public:
                     case 2: sample = ph < 0.5f ? 1.0f : -1.0f; break;
                     default: sample = ((float)rng() / (float)rng.max()) * 2.0f - 1.0f; break;
                 }
-                sample *= env * g.vel;
+                sample *= env;  // velocity now lives in the note-level AHDSR VCA
                 float panL = std::cos((g.pan + 1.0f) * 0.25f * 3.14159f);
                 float panR = std::sin((g.pan + 1.0f) * 0.25f * 3.14159f);
                 outL += sample * panL;
@@ -1710,6 +1805,11 @@ public:
             if (gc > 1) { outL /= std::sqrt(gc); outR /= std::sqrt(gc); }
             outL *= volume; outR *= volume;
 
+            // Note-level AHDSR VCA (velocity already folded into its peak via
+            // velocitySensitivity, so the grains no longer scale by velocity).
+            float ne = noteAmpEnv.tick((float)sampleRate, effectiveEnv, ampTables);
+            outL *= ne; outR *= ne;
+
             if (buf.getNumChannels() >= 1) buf.addSample(0, s, outL);
             if (buf.getNumChannels() >= 2) buf.addSample(1, s, outR);
         }
@@ -1718,12 +1818,12 @@ public:
         if (grains.size() > 1024) grains.erase(grains.begin(), grains.begin() + 512);
     }
 
-    // Tail = the grain duration.  Each particle has its own envelope that
-    // completes within the grain, so once new particles stop firing
-    // (no more held notes), the longest possible remaining audio is one
-    // full grain.
+    // Tail = the note-level AHDSR release (grains keep spawning through it)
+    // plus one grain duration for the final grains to finish their own
+    // envelopes after the cloud stops spawning.
     double getTailLengthSeconds() const override {
-        return (double) paramByName(node, "Grain Size", 50.0f) * 0.001;
+        return (double) paramByName(node, "Grain Size", 50.0f) * 0.001
+             + (double) node.ahdsrEnvelope.releaseMs * 0.001;
     }
     bool acceptsMidi() const override { return true; }
     bool producesMidi() const override { return false; }
@@ -1752,6 +1852,11 @@ private:
     float heldVel = 0.8f;
     float spawnTimer = 0;
     std::mt19937 rng{42};
+    // Note-level amplitude envelope (shared node AHDSR), separate from the
+    // per-grain attack/release that shapes each individual grain.
+    AHDSREnvelopeRuntime noteAmpEnv;
+    AHDSREnvelope effectiveEnv;
+    AHDSRCurveTables ampTables;
 };
 
 // ==============================================================================
@@ -2430,6 +2535,128 @@ private:
 };
 
 // ==============================================================================
+// CURVE EQ - draw-the-response equaliser
+//
+// Applies a single magnitude-response curve (a SpectralCurve: gain multiplier
+// vs. frequency, evaluated per FFT bin) to the audio. Unlike the biquad
+// Parametric EQ (a handful of resonant bands), this lets the user draw or write
+// an arbitrary frequency response and is the third consumer of FrequencyGraph
+// library assets (alongside the Spectrum Tap and the Frequency Domain wavetable
+// node), so the same shared curve can drive all three.
+//
+// Implementation: block-local Hann overlap-add STFT (75% overlap), magnitude-
+// only multiply (phase preserved -> zero-phase / linear-phase response),
+// normalised per output sample by the summed synthesis window. Zero latency,
+// matching every other built-in effect (SEANCE has no plugin-delay
+// compensation, so a latency-bearing design would misalign parallel chains).
+//
+// Script: __curveeq__:<curve.encode()>[|refs:<assetId>]  (see CurveEq, curve_editor.h)
+// Params: FFT Size (2^exp resolution), Mix (dry/wet).
+// ==============================================================================
+class CurveEQProcessor : public juce::AudioProcessor {
+public:
+    CurveEQProcessor(Node& n) : node(n) { decodeCurve(); }
+    const juce::String getName() const override { return "Curve EQ"; }
+    void prepareToPlay(double sr, int) override { sampleRate = sr; decodeCurve(); }
+    void releaseResources() override {}
+
+    void processBlock(juce::AudioBuffer<float>& buf, juce::MidiBuffer&) override {
+        applySignalModulations(node, buf);
+        const int n = buf.getNumSamples();
+        const int ch = std::min(2, buf.getNumChannels());
+        if (n == 0 || ch == 0) return;
+
+        int fftExp = juce::jlimit(8, 12, (int)paramByName(node, "FFT Size", 11.0f));
+        float mix  = juce::jlimit(0.0f, 1.0f, paramByName(node, "Mix", 1.0f));
+
+        int fftSize = 1 << fftExp;
+        while (fftSize > n) fftSize /= 2;   // can't exceed the block
+        if (fftSize < 16) return;           // too small to filter meaningfully
+        int halfBins = fftSize / 2 + 1;
+
+        ensureGains(halfBins);
+
+        FFT fft(fftSize);
+        std::vector<float> window(fftSize);
+        for (int i = 0; i < fftSize; ++i)
+            window[i] = 0.5f * (1.0f - std::cos(6.28318530718f * i / fftSize)); // Hann
+
+        const int hop = std::max(1, fftSize / 4); // 75% overlap
+
+        for (int c = 0; c < ch; ++c) {
+            float* data = buf.getWritePointer(c);
+            std::vector<float> dry(data, data + n);
+            std::vector<float> out(n, 0.0f);
+            std::vector<float> norm(n, 0.0f);
+
+            auto processFrame = [&](int start) {
+                std::vector<float> windowed(fftSize);
+                for (int i = 0; i < fftSize; ++i)
+                    windowed[i] = data[start + i] * window[i];
+                std::vector<std::complex<float>> spec;
+                fft.forwardReal(windowed, spec);
+                for (int k = 0; k < halfBins && k < (int)spec.size(); ++k)
+                    spec[k] *= gains[(size_t)k];       // magnitude scale, phase kept
+                std::vector<float> time;
+                fft.inverseReal(spec, time);
+                for (int i = 0; i < fftSize; ++i) {
+                    out[start + i]  += time[i] * window[i];   // synthesis window
+                    norm[start + i] += window[i] * window[i];
+                }
+            };
+
+            int start = 0;
+            for (; start + fftSize <= n; start += hop) processFrame(start);
+            // Cover the block tail so the end isn't under-filtered (skip if the
+            // last hop already lands exactly on n-fftSize).
+            if (n >= fftSize && ((n - fftSize) % hop) != 0) processFrame(n - fftSize);
+
+            for (int i = 0; i < n; ++i) {
+                float wet = norm[i] > 1e-6f ? out[i] / norm[i] : dry[i];
+                data[i] = dry[i] * (1.0f - mix) + wet * mix;
+            }
+        }
+    }
+
+    double getTailLengthSeconds() const override { return 0; }
+    bool acceptsMidi() const override { return true; }
+    bool producesMidi() const override { return true; }
+    bool isBusesLayoutSupported(const BusesLayout&) const override { return true; }
+    juce::AudioProcessorEditor* createEditor() override { return nullptr; }
+    bool hasEditor() const override { return false; }
+    int getNumPrograms() override { return 1; }
+    int getCurrentProgram() override { return 0; }
+    void setCurrentProgram(int) override {}
+    const juce::String getProgramName(int) override { return {}; }
+    void changeProgramName(int, const juce::String&) override {}
+    void getStateInformation(juce::MemoryBlock&) override {}
+    void setStateInformation(const void*, int) override {}
+
+private:
+    Node& node;
+    double sampleRate = 44100;
+    SpectralCurve curve;
+    std::vector<float> gains;     // per-bin magnitude multiplier, sized halfBins
+    int gainsBins = -1;
+
+    void decodeCurve() {
+        int assetId = -1;
+        if (!CurveEq::decode(node.script, curve, assetId)) {
+            curve = SpectralCurve();
+            curve.expression = "1";   // flat (unity) fallback
+        }
+        gainsBins = -1;               // force gain recompute
+    }
+
+    void ensureGains(int halfBins) {
+        if (gainsBins == halfBins && (int)gains.size() == halfBins) return;
+        gains = curve.evaluate(halfBins);
+        for (auto& g : gains) g = juce::jlimit(0.0f, 8.0f, g); // sane magnitude range
+        gainsBins = halfBins;
+    }
+};
+
+// ==============================================================================
 // INDEPENDENT TRANSIENT + TONAL PITCH SHIFTING
 //
 // Separates audio into transient and tonal components via wavelet
@@ -2972,6 +3199,140 @@ public:
 private:
     Node& node;
     double sampleRate = 44100;
+};
+
+// ==============================================================================
+// PITCH DETECTOR
+//
+// Determines the fundamental pitch of an incoming audio-rate signal and
+// emits it as a unipolar Signal value (0..1) over a configurable
+// frequency range. Unlike the legacy Wavelet Pitch Tracker (octave-band
+// resolution only), this uses precise sample-accurate pitch trackers
+// (YIN or autocorrelation, selectable) with parabolic interpolation.
+//
+// The analysis window can be larger than one audio block: incoming audio
+// is accumulated into a ring buffer and analysed over the last `Window`
+// samples. A larger window lowers the lowest detectable frequency but
+// adds latency. The `Hop` option controls how often (in samples) the
+// detector re-runs; 0 means once per block.
+//
+// Because the graph's internal sample rate can far exceed the audio
+// output rate, the usable frequency band can run well above 20 kHz, so
+// Max Hz is user-selectable (clamped below Nyquist). Min Hz is clamped up
+// to the floor implied by the window size. The detected frequency is
+// mapped to 0..1 either logarithmically (default, musically even) or
+// linearly across [Min Hz, Max Hz].
+//
+// Params: Algorithm (0=YIN, 1=Autocorrelation), Window (samples),
+//         Hop (samples, 0=per block), Min Hz, Max Hz,
+//         Mapping (0=Logarithmic, 1=Linear), Detected Hz (display).
+// Audio in/out passes through on channels 0/1; Signal out on channel 2.
+// ==============================================================================
+class PitchDetectorProcessor : public juce::AudioProcessor {
+public:
+    static constexpr int kMaxWindow = 65536;
+
+    PitchDetectorProcessor(Node& n) : node(n) {}
+    const juce::String getName() const override { return "Pitch Detector"; }
+    void prepareToPlay(double sr, int) override {
+        sampleRate = sr;
+        ring.assign(kMaxWindow, 0.0f);
+        writePos = 0;
+        filled = 0;
+        sinceHop = 0;
+        lastNormalized = 0.0f;
+    }
+    void releaseResources() override {}
+
+    void processBlock(juce::AudioBuffer<float>& buf, juce::MidiBuffer&) override {
+        applySignalModulations(node, buf);
+        const int n = buf.getNumSamples();
+        if (n == 0 || buf.getNumChannels() == 0) return;
+
+        int algo = (int)std::round(paramByName(node, "Algorithm", 0.0f)); // 0=YIN,1=Autocorr
+        int hop = (int)std::round(paramByName(node, "Hop", 0.0f));
+        if (hop <= 0) hop = n; // re-run every block
+
+        bool logMap = (int)std::round(paramByName(node, "Mapping", 0.0f)) == 0; // 0=log,1=linear
+
+        float maxHz = std::min((float)(sampleRate * 0.45), paramByName(node, "Max Hz", 2000.0f));
+
+        // The analysis window is DERIVED from the lowest frequency we must
+        // detect rather than set by hand: pitch detection needs ~kAnalysisPeriods
+        // full periods of the lowest note to lock on, so window = periods*sr/minHz.
+        // This makes "Min Hz" the single honest control - lower detects deeper
+        // notes but costs proportionally more latency (a longer window) - and
+        // removes the redundant manual window knob. Min Hz is floored so the
+        // derived window still fits kMaxWindow.
+        const float kAnalysisPeriods = 3.0f;
+        float minHzFloor = kAnalysisPeriods * (float)sampleRate / (float)kMaxWindow;
+        float minHz = std::max(minHzFloor, paramByName(node, "Min Hz", 50.0f));
+        if (maxHz <= minHz) maxHz = minHz + 1.0f;
+        int window = (int)std::ceil(kAnalysisPeriods * (float)sampleRate / minHz);
+        window = juce::jlimit(64, kMaxWindow, window);
+
+        // Accumulate the mono input into the ring buffer.
+        const float* input = buf.getReadPointer(0);
+        for (int i = 0; i < n; ++i) {
+            ring[writePos] = input[i];
+            writePos = (writePos + 1) % kMaxWindow;
+            if (filled < kMaxWindow) ++filled;
+        }
+        sinceHop += n;
+
+        // Re-run detection once a hop has elapsed and the window is full.
+        if (sinceHop >= hop && filled >= window) {
+            sinceHop = 0;
+            std::vector<float> w(window);
+            int start = ((writePos - window) % kMaxWindow + kMaxWindow) % kMaxWindow;
+            for (int i = 0; i < window; ++i)
+                w[i] = ring[(start + i) % kMaxWindow];
+
+            PitchResult pr = (algo == 1)
+                ? detectPitchAutocorrelation(w.data(), window, sampleRate, minHz, maxHz)
+                : detectPitchYIN(w.data(), window, sampleRate, 0.15f, minHz, maxHz);
+
+            if (pr.frequencyHz > 0.0f) {
+                float f = juce::jlimit(minHz, maxHz, pr.frequencyHz);
+                float norm = logMap
+                    ? std::log(f / minHz) / std::log(maxHz / minHz)
+                    : (f - minHz) / (maxHz - minHz);
+                lastNormalized = juce::jlimit(0.0f, 1.0f, norm);
+                for (auto& p : node.params)
+                    if (p.name == "Detected Hz") { p.value = pr.frequencyHz; break; }
+            }
+            // If no confident pitch this hop, hold the previous value.
+        }
+
+        // Emit the normalized pitch on the Signal output (channel 2). Audio
+        // on channels 0/1 passes through untouched so the node can sit inline.
+        if (buf.getNumChannels() > 2) {
+            float* out = buf.getWritePointer(2);
+            for (int i = 0; i < n; ++i) out[i] = lastNormalized;
+        }
+    }
+
+    double getTailLengthSeconds() const override { return 0; }
+    bool acceptsMidi() const override { return false; }
+    bool producesMidi() const override { return false; }
+    bool isBusesLayoutSupported(const BusesLayout&) const override { return true; }
+    juce::AudioProcessorEditor* createEditor() override { return nullptr; }
+    bool hasEditor() const override { return false; }
+    int getNumPrograms() override { return 1; }
+    int getCurrentProgram() override { return 0; }
+    void setCurrentProgram(int) override {}
+    const juce::String getProgramName(int) override { return {}; }
+    void changeProgramName(int, const juce::String&) override {}
+    void getStateInformation(juce::MemoryBlock&) override {}
+    void setStateInformation(const void*, int) override {}
+private:
+    Node& node;
+    double sampleRate = 44100;
+    std::vector<float> ring;
+    int writePos = 0;
+    int filled = 0;
+    int sinceHop = 0;
+    float lastNormalized = 0.0f;
 };
 
 // ==============================================================================

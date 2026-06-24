@@ -7,6 +7,8 @@
 
 namespace SoundShop {
 
+class AssetLibrary;
+
 // ==============================================================================
 // AHDSREnvelopeComponent - the shared editor for an AHDSREnvelope, designed
 // to be embedded as a section inside any synth dialog and also opened as a
@@ -45,15 +47,41 @@ public:
     // some other path, or undo/redo restored a different state).
     void syncFromModel();
 
+    // Optional integration with the project asset library's AHDSR-curve store.
+    // When set, the editor shows a "Library" row: a picker to reference a stored
+    // curve (live) and an "Add to Library" button to publish the current shape.
+    // While a stored curve is referenced, edits write back to it and propagate
+    // to every node sharing the id (the "live reference" model). When the picker
+    // is "(Independent)", the editor behaves exactly as before (edits the node's
+    // own local envelope). Distinct from the app-global *preset* row above, which
+    // is copy-on-apply and not project-scoped.
+    struct LibraryContext {
+        AssetLibrary* lib = nullptr;
+        std::function<int()>     getAssetId;   // node's current ahdsrAssetId
+        std::function<void(int)> setAssetId;   // set node's ahdsrAssetId
+        std::function<void()>    propagate;    // re-resolve all live references
+    };
+    void setLibraryContext(LibraryContext ctx);
+
 private:
     AHDSREnvelope& env;
     std::function<void()> onChanged;
+    LibraryContext libCtx;
+    bool libraryRowVisible = false;
 
     // Top row: preset picker + save/manage.
     juce::Label      presetLabel { {}, "Preset:" };
     juce::ComboBox   presetCombo;
     juce::TextButton saveAsBtn   { "Save as..." };
     juce::TextButton manageBtn   { "Manage..." };
+
+    // Library row (asset-library AHDSR-curve store). Hidden until setLibraryContext.
+    juce::Label      libraryLbl  { {}, "Library:" };
+    juce::ComboBox   libraryCombo;
+    juce::TextButton addToLibBtn { "Add to Library" };
+    void rebuildLibraryCombo();
+    void onLibrarySelected(int comboId);
+    void openAddToLibraryDialog();
 
     // Time / level sliders. We use vertical sliders with text boxes
     // below; this is the layout musicians expect and it packs cleanly
@@ -65,6 +93,14 @@ private:
     juce::Label releaseLbl { {}, "Release"  };
     juce::Label velLbl     { {}, "Vel Sens" };
     juce::Slider attackS, holdS, decayS, sustainS, releaseS, velS;
+
+    // Per-segment tension (curve-bend) knobs - the single-linear-control
+    // way to reshape a ramp without opening the full curve editor. Each
+    // drives env.{attack,decay,release}Tension in [-1, 1] (0 = linear).
+    juce::Label  attackTenLbl  { {}, "A Curve" };
+    juce::Label  decayTenLbl   { {}, "D Curve" };
+    juce::Label  releaseTenLbl { {}, "R Curve" };
+    juce::Slider attackTenS, decayTenS, releaseTenS;
 
     // Bottom: curve preview + per-segment edit buttons.
     juce::TextButton editAttackBtn  { "Attack Curve..."  };

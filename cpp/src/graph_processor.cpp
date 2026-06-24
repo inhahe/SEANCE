@@ -19,6 +19,7 @@
 #include "trigger_node.h"
 #include "midi_mod_node.h"
 #include "midi_input_node.h"
+#include "midi_breakout_node.h"
 #include "drum_synth.h"
 #include "spatializer_3d.h"
 #include <algorithm>
@@ -558,6 +559,9 @@ void PassthroughProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mid
 
 GraphProcessor::GraphProcessor() {
     processorGraph = std::make_unique<juce::AudioProcessorGraph>();
+    // The listener flips the same atomic that requestRebuild() uses, so a
+    // runtime latency change schedules a rebuild on the next audio callback.
+    latencyListener.rebuildFlag = &rebuildRequested;
 }
 
 void GraphProcessor::prepare(NodeGraph& graph, double sr, int bs) {
@@ -569,6 +573,7 @@ void GraphProcessor::prepare(NodeGraph& graph, double sr, int bs) {
 
 void GraphProcessor::rebuildGraph(NodeGraph& graph, Transport& transport) {
     processorGraph->clear();
+    latencyListener.beginRebuild(); // forget old processor->nodeId mappings (pointers are stale)
     nodeMap.clear();
     nodeInputMap.clear();
 
@@ -638,13 +643,14 @@ void GraphProcessor::rebuildGraph(NodeGraph& graph, Transport& transport) {
             continue;
         }
 
-        // Ensure tonal / note-triggered synths carry a Signal input pin
-        // named "Aftertouch" so users can wire any signal source (an
-        // LFO, an XY pad axis, channel pressure from a separate MIDI
-        // source, etc.) to drive the synth's per-voice volume swell.
-        // The pin is added once and persists in the project file via
-        // the normal pin save/load. When unwired, the synth falls back
-        // to channel-pressure events on its own MIDI input.
+        // Ensure tonal / note-triggered synths carry a control input pin
+        // named "Pressure" so users can wire any signal source (an
+        // LFO, an XY pad axis, an envelope, etc.) to drive the synth's
+        // per-voice volume swell. The pin is added once and persists in the
+        // project file via the normal pin save/load. When unwired, the synth
+        // falls back to channel-pressure (aftertouch) events on its own MIDI
+        // input. (Historically this pin was named "Aftertouch"; it is migrated
+        // to "Pressure" in place below - same pin id, so old cables survive.)
         auto isTonalSynthNodeForPin = [](const Node& n) {
             if (n.type == NodeType::TerrainSynth) return true;
             if (n.type == NodeType::Instrument && !n.plugin) {
@@ -663,41 +669,61 @@ void GraphProcessor::rebuildGraph(NodeGraph& graph, Transport& transport) {
             return false;
         };
         if (isTonalSynthNodeForPin(node)) {
-            // Aftertouch is system-managed (auto-created here, never chosen by
+            // Pressure is system-managed (auto-created here, never chosen by
             // the user), and it's consumed as the block MEAN in terrain_synth
             // (averaged across the whole block to stay smooth). That makes it a
             // block-rate value, so its pin is Param (orange), not Signal
-            // (amber). Match by name regardless of kind, and normalize any
-            // existing Signal Aftertouch pin from older projects to Param -
-            // safe precisely because this pin is system-managed, not a
-            // user-set type we'd be overriding.
+            // (amber). Match by name regardless of kind, migrate the legacy
+            // "Aftertouch" name to "Pressure" in place (same pin id keeps old
+            // cables intact), and normalize any existing Signal pin from older
+            // projects to Param - safe precisely because this pin is
+            // system-managed, not a user-set type we'd be overriding.
+            //
+            // The tooltip warns against the one wiring that double-applies:
+            // feeding a MIDI Breakout's Pressure out into THIS synth, which
+            // already reads pressure from the same MIDI stream internally.
+            static const char* kPressureTip =
+                "Volume swell from key pressure (aftertouch). 0 = normal level, "
+                "higher = louder; amount scaled by this node's Aftertouch "
+                "sensitivity. When wired, this signal REPLACES the keyboard's "
+                "own pressure - so wire a slow signal (LFO, envelope, XY pad "
+                "axis) to drive the swell yourself. Leave unwired to let the "
+                "keyboard drive it. No need to route a MIDI Breakout's Pressure "
+                "output back in here: the synth already reads pressure from its "
+                "MIDI input, and the pin would just overwrite that same value "
+                "(read once per block instead of sample-accurate) - redundant, "
+                "and it wastes the pin.";
             Pin* existingAT = nullptr;
             for (auto& p : node.pinsIn)
-                if (p.name == "Aftertouch") { existingAT = &p; break; }
+                if (p.name == "Pressure" || p.name == "Aftertouch") { existingAT = &p; break; }
             if (existingAT) {
+                existingAT->name = "Pressure";
                 existingAT->kind = PinKind::Param;
+                existingAT->tooltip = kPressureTip;
             } else {
                 Pin atPin;
                 atPin.id = graph.allocId();
-                atPin.name = "Aftertouch";
+                atPin.name = "Pressure";
                 atPin.kind = PinKind::Param;
                 atPin.isInput = true;
                 atPin.channels = 1;
+                atPin.tooltip = kPressureTip;
                 node.pinsIn.push_back(atPin);
             }
-            // Normalize pin order: keep the Aftertouch input AFTER every other
+            // Normalize pin order: keep the Pressure input AFTER every other
             // input pin (MIDI, Position / Sig axes). It's appended here at
             // graph-build time, but adding a Position axis in the wavetable
             // editor later push_backs a new Position pin behind the existing
-            // Aftertouch, leaving Aftertouch wedged between two Position
-            // inputs. Stable-partition moves the single Aftertouch pin to the
-            // end while preserving every other pin's relative order. Runs every
-            // build, so it also normalizes the order of projects saved with the
-            // old wedged layout. Links reference pins by id, so reordering
-            // never breaks a cable.
+            // Pressure pin, leaving it wedged between two Position inputs.
+            // Stable-partition moves the single Pressure pin to the end while
+            // preserving every other pin's relative order. Runs every build, so
+            // it also normalizes the order of projects saved with the old
+            // wedged layout. Links reference pins by id, so reordering never
+            // breaks a cable. Accept the legacy name too for nodes not yet
+            // migrated by the block above this build.
             std::stable_partition(node.pinsIn.begin(), node.pinsIn.end(),
                 [](const Pin& p) {
-                    return p.name != "Aftertouch";
+                    return p.name != "Pressure" && p.name != "Aftertouch";
                 });
         }
 
@@ -757,13 +783,15 @@ void GraphProcessor::rebuildGraph(NodeGraph& graph, Transport& transport) {
         } else if (node.type == NodeType::TerrainSynth || node.type == NodeType::Instrument) {
             // Unified synth: TerrainSynthProcessor handles everything
             // 1D waveforms (simple synths) and N-D terrains
-            proc = std::make_unique<TerrainSynthProcessor>(node, transport);
+            proc = std::make_unique<TerrainSynthProcessor>(node, transport, &graph.contentStore);
         } else if (node.type == NodeType::SignalShape) {
             proc = std::make_unique<SignalShapeProcessor>(node, transport);
         } else if (node.type == NodeType::MidiScript) {
             proc = std::make_unique<MidiScriptProcessor>(node, transport);
         } else if (node.type == NodeType::MidiInput) {
             proc = std::make_unique<MidiInputProcessor>(node);
+        } else if (node.type == NodeType::MidiBreakout) {
+            proc = std::make_unique<MidiBreakoutProcessor>(node);
         } else if (node.type == NodeType::Effect && node.script.rfind("__spectrumtap__", 0) == 0) {
             // Spectrum Tap may carry per-bin custom response curves appended
             // to its tag as "__spectrumtap__|<curve1>|<curve2>|...", so we
@@ -780,6 +808,10 @@ void GraphProcessor::rebuildGraph(NodeGraph& graph, Transport& transport) {
         } else if (node.type == NodeType::Effect &&
                    node.script.rfind("__convolution__:", 0) == 0) {
             proc = std::make_unique<ConvolutionProcessor>(node);
+        } else if (node.type == NodeType::Effect && isWaveshaperScript(node.script)) {
+            // One generic processor for all ten amplitude-domain Waveshaper
+            // variants; it reads its WarpMethod from the script prefix.
+            proc = std::make_unique<WaveshaperProcessor>(node);
         } else if (node.type == NodeType::Effect && node.script == "__tremolo__") {
             proc = std::make_unique<TremoloProcessor>(node);
         } else if (node.type == NodeType::Effect && node.script == "__vibrato__") {
@@ -794,6 +826,9 @@ void GraphProcessor::rebuildGraph(NodeGraph& graph, Transport& transport) {
             proc = std::make_unique<ReverbProcessor>(node);
         } else if (node.type == NodeType::Effect && node.script == "__eq__") {
             proc = std::make_unique<ParametricEQProcessor>(node);
+        } else if (node.type == NodeType::Effect &&
+                   node.script.rfind("__curveeq__:", 0) == 0) {
+            proc = std::make_unique<CurveEQProcessor>(node);
         } else if (node.type == NodeType::Effect && node.script == "__ringmod__") {
             proc = std::make_unique<RingModProcessor>(node);
         } else if (node.type == NodeType::Effect &&
@@ -828,6 +863,8 @@ void GraphProcessor::rebuildGraph(NodeGraph& graph, Transport& transport) {
             proc = std::make_unique<WaveletVocoderProcessor>(node);
         } else if (node.type == NodeType::Effect && node.script == "__pitchtracker__") {
             proc = std::make_unique<WaveletPitchTrackerProcessor>(node);
+        } else if (node.type == NodeType::Effect && node.script == "__pitchdetector__") {
+            proc = std::make_unique<PitchDetectorProcessor>(node);
         } else if (node.type == NodeType::Effect && node.script == "__asymfilter__") {
             proc = std::make_unique<AsymmetricFilterProcessor>(node);
         } else if (node.type == NodeType::Effect && node.script == "__waveletcomplexity__") {
@@ -935,6 +972,17 @@ void GraphProcessor::rebuildGraph(NodeGraph& graph, Transport& transport) {
     // by (sourceNodeId, midiOutputIndex) so all cables leaving the same output
     // pin share one filter node. Populated lazily in the link loop below.
     std::map<std::pair<int,int>, juce::AudioProcessorGraph::NodeID> midiOutFilters;
+
+    // Per-INPUT MIDI channel stampers for multi-INPUT script nodes (the mirror
+    // image of midiOutFilters). A SignalShape / MidiScript / Script node with
+    // >1 MIDI input pin needs to know which pin each incoming event arrived on,
+    // but JUCE merges every incoming MIDI cable into the node's single MIDI bus.
+    // So for each MIDI cable feeding input pin i (0-based) we splice a stamper
+    // that rewrites every event's channel to (i + 1); the receiving processor
+    // recovers the pin index from the channel nibble (see buildScriptMidiIn).
+    // Keyed by (destNodeId, midiInputIndex) so all cables into the same input
+    // pin share one stamper. Channel is purely an internal routing detail.
+    std::map<std::pair<int,int>, juce::AudioProcessorGraph::NodeID> midiInStamps;
 
     // Create connections based on our links
     for (auto& link : graph.links) {
@@ -1164,6 +1212,33 @@ void GraphProcessor::rebuildGraph(NodeGraph& graph, Transport& transport) {
                     if (dn.id == dstNodeId) { dstIsHostedPlugin = (dn.plugin != nullptr); break; }
             }
 
+            // Multi-MIDI-input destination: a SignalShape / MidiScript / Script
+            // node with >1 MIDI input pin needs each event tagged with the input
+            // pin it arrived on. Find which MIDI input pin (0-based) this cable
+            // feeds and, when the node has more than one, splice a per-input
+            // channel stamper (channel = inIdx + 1). The receiving processor maps
+            // the channel nibble back to the input-pin index. Hosted plugins are
+            // never multi-MIDI-input script nodes, so this only affects the
+            // native-destination path below.
+            int destMidiInCount = 0, thisMidiInIdx = -1;
+            if (srcKind == PinKind::Midi) {
+                for (auto& dn : graph.nodes) {
+                    if (dn.id != dstNodeId) continue;
+                    if (dn.type == NodeType::SignalShape ||
+                        dn.type == NodeType::MidiScript ||
+                        dn.type == NodeType::Script) {
+                        int idx = 0;
+                        for (auto& pin : dn.pinsIn) {
+                            if (pin.kind != PinKind::Midi) continue;
+                            if (pin.id == link.endPin) thisMidiInIdx = idx;
+                            ++idx;
+                        }
+                        destMidiInCount = idx;
+                    }
+                    break;
+                }
+            }
+
             if (dstIsHostedPlugin) {
                 Node* dstNodePtr = nullptr;
                 for (auto& dn : graph.nodes)
@@ -1178,9 +1253,28 @@ void GraphProcessor::rebuildGraph(NodeGraph& graph, Transport& transport) {
                     {adapterNode->nodeID, juce::AudioProcessorGraph::midiChannelIndex},
                     {dstGraphId, juce::AudioProcessorGraph::midiChannelIndex}});
             } else {
+                auto midiFinalSrc = midiSrcId;
+                if (destMidiInCount > 1 && thisMidiInIdx >= 0) {
+                    auto key = std::make_pair(dstNodeId, thisMidiInIdx);
+                    auto found = midiInStamps.find(key);
+                    juce::AudioProcessorGraph::NodeID stampId;
+                    if (found != midiInStamps.end()) {
+                        stampId = found->second;
+                    } else {
+                        auto stamp = std::make_unique<MidiChannelStampProcessor>(thisMidiInIdx + 1);
+                        stamp->enableAllBuses();
+                        auto stampNode = processorGraph->addNode(std::move(stamp));
+                        stampId = stampNode->nodeID;
+                        midiInStamps[key] = stampId;
+                    }
+                    processorGraph->addConnection({
+                        {midiSrcId, juce::AudioProcessorGraph::midiChannelIndex},
+                        {stampId,   juce::AudioProcessorGraph::midiChannelIndex}});
+                    midiFinalSrc = stampId;
+                }
                 processorGraph->addConnection({
-                    {midiSrcId, juce::AudioProcessorGraph::midiChannelIndex},
-                    {dstGraphId, juce::AudioProcessorGraph::midiChannelIndex}});
+                    {midiFinalSrc, juce::AudioProcessorGraph::midiChannelIndex},
+                    {dstGraphId,   juce::AudioProcessorGraph::midiChannelIndex}});
             }
         }
     }
@@ -1264,9 +1358,22 @@ void GraphProcessor::rebuildGraph(NodeGraph& graph, Transport& transport) {
 
     // Diagnostic: dump bus layouts for every node so we can see if a Waveform
     // Synth is reporting an unexpected channel count.
-    for (auto& kv : nodeMap) {
+    //
+    // Iterate nodeInputMap, NOT nodeMap: for nodes that get a trailing pan
+    // processor inserted, nodeMap[id] is the PAN node (0 latency) while
+    // nodeInputMap[id] is the actual instrument/effect processor - the one that
+    // can actually report latency (a hosted plugin's lookahead, etc.). Tracking
+    // the real processor here makes both the runtime latency-change rebuild
+    // trigger AND the per-node latency snapshot (snapshotNodeLatencies) reflect
+    // the node's true delay instead of the pan node's zero.
+    for (auto& kv : nodeInputMap) {
         if (auto* gn = processorGraph->getNodeForId(kv.second)) {
             if (auto* p = gn->getProcessor()) {
+                // Watch for runtime latency changes so JUCE's built-in delay
+                // compensation gets recomputed (addListener dedups, so a
+                // processor that survives a rebuild isn't double-registered).
+                p->addListener(&latencyListener);
+                latencyListener.track(p, kv.first); // map this processor to its stable node id
                 dbg("  node " + juce::String(kv.first)
                     + " (" + p->getName() + "): inCh="
                     + juce::String(p->getTotalNumInputChannels())
@@ -1287,6 +1394,10 @@ void GraphProcessor::processBlock(NodeGraph& graph, Transport& transport,
         rebuildGraph(graph, transport);
         if (sampleRate > 0)
             processorGraph->prepareToPlay(sampleRate, numSamples);
+        // Record settled latencies AFTER prepare so the latencyChanged
+        // notification that prepareToPlay emits converges to a no-op instead
+        // of re-flagging a rebuild (which would loop forever).
+        latencyListener.commitLatencies();
     }
 
     // Process the graph

@@ -406,6 +406,7 @@ void MidiModEditorComponent::syncNodePins() {
     if (wantedSigs < (int)existingSignalIds.size()) {
         std::vector<int> droppedIds(existingSignalIds.begin() + wantedSigs,
                                     existingSignalIds.end());
+        std::lock_guard<std::recursive_mutex> graphLk(graph.mutationLock);
         graph.links.erase(std::remove_if(graph.links.begin(), graph.links.end(),
             [&](const Link& l) {
                 for (int did : droppedIds)

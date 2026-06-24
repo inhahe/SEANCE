@@ -35,9 +35,12 @@ std::string SpectrumTapProcessor::encodeScript(const std::vector<FrequencyBin>& 
                                                int fftSize)
 {
     // Drop trailing biquad bins so the encoded form is as compact as possible.
+    // A bin that references an asset is always custom, so referenced slots are
+    // covered by lastCustom too.
     int lastCustom = -1;
     for (int i = 0; i < (int)bins.size(); ++i)
-        if (bins[i].useCustomResponse) lastCustom = i;
+        if (bins[i].useCustomResponse || bins[i].responseCurveAssetId >= 0)
+            lastCustom = i;
 
     // Nothing custom AND default FFT size -> bare tag (round-trips legacy).
     if (lastCustom < 0 && fftSize == kDefaultFftSize) return kSpectrumTapPrefix;
@@ -49,17 +52,31 @@ std::string SpectrumTapProcessor::encodeScript(const std::vector<FrequencyBin>& 
         if (bins[i].useCustomResponse)
             o << bins[i].responseCurve.encode();
     }
+
+    // Trailing reference section: `#refs|<slot>:<assetId>|...`. Only emitted
+    // when at least one bin live-references a FrequencyGraph asset.
+    bool anyRef = false;
+    for (int i = 0; i <= lastCustom; ++i)
+        if (bins[i].responseCurveAssetId >= 0) { anyRef = true; break; }
+    if (anyRef) {
+        o << '|' << "#refs";
+        for (int i = 0; i <= lastCustom; ++i)
+            if (bins[i].responseCurveAssetId >= 0)
+                o << '|' << i << ':' << bins[i].responseCurveAssetId;
+    }
     return o.str();
 }
 
 void SpectrumTapProcessor::decodeScript(const std::string& script,
                                         int& outFftSize,
                                         std::vector<SpectralCurve>& outCurves,
-                                        std::vector<bool>& outUseCustom)
+                                        std::vector<bool>& outUseCustom,
+                                        std::vector<int>& outAssetIds)
 {
     outFftSize = kDefaultFftSize;
     outCurves.clear();
     outUseCustom.clear();
+    outAssetIds.clear();
     if (script.rfind(kSpectrumTapPrefix, 0) != 0) return;
     if (script.size() == std::strlen(kSpectrumTapPrefix)) return;
     if (script[std::strlen(kSpectrumTapPrefix)] != '|') return;
@@ -80,9 +97,15 @@ void SpectrumTapProcessor::decodeScript(const std::string& script,
         curveStart = 1;
     }
 
-    size_t nCurves = fields.size() - curveStart;
+    // The curve list runs until the optional `#refs` marker (or end of fields).
+    size_t refsMarker = fields.size();
+    for (size_t i = curveStart; i < fields.size(); ++i)
+        if (fields[i] == "#refs") { refsMarker = i; break; }
+
+    size_t nCurves = refsMarker - curveStart;
     outCurves.resize(nCurves);
     outUseCustom.assign(nCurves, false);
+    outAssetIds.assign(nCurves, -1);
     for (size_t i = 0; i < nCurves; ++i) {
         const std::string& f = fields[curveStart + i];
         if (f.empty()) continue;
@@ -92,6 +115,65 @@ void SpectrumTapProcessor::decodeScript(const std::string& script,
             outUseCustom[i] = true;
         }
     }
+
+    // Parse the trailing `<slot>:<assetId>` reference entries.
+    for (size_t i = refsMarker + 1; i < fields.size(); ++i) {
+        const std::string& f = fields[i];
+        size_t colon = f.find(':');
+        if (colon == std::string::npos) continue;
+        std::string slotStr = f.substr(0, colon);
+        std::string idStr   = f.substr(colon + 1);
+        if (!isPureInteger(slotStr) || !isPureInteger(idStr)) continue;
+        size_t slot = 0; int id = -1;
+        try { slot = (size_t) std::stoul(slotStr); id = std::stoi(idStr); }
+        catch (...) { continue; }
+        if (slot < outAssetIds.size()) outAssetIds[slot] = id;
+    }
+}
+
+int resolveSpectrumTapReferences(NodeGraph& graph) {
+    int resolved = 0;
+    for (auto& node : graph.nodes) {
+        if (node.type != NodeType::Effect) continue;
+        if (node.script.rfind("__spectrumtap__", 0) != 0) continue;
+
+        int fft = SpectrumTapProcessor::kDefaultFftSize;
+        std::vector<SpectralCurve> curves;
+        std::vector<bool> useCustom;
+        std::vector<int> assetIds;
+        SpectrumTapProcessor::decodeScript(node.script, fft, curves, useCustom, assetIds);
+
+        bool changed = false;
+        for (size_t i = 0; i < assetIds.size(); ++i) {
+            if (assetIds[i] < 0) continue;
+            const AssetEntry* e = graph.assets.find(assetIds[i]);
+            if (e && e->kind == AssetKind::FrequencyGraph) {
+                SpectralCurve c;
+                if (SpectralCurve::decode(e->payload, c)) {
+                    curves[i] = std::move(c);
+                    useCustom[i] = true;
+                    ++resolved;
+                    changed = true;
+                }
+            } else {
+                // Referenced asset is gone -> detach to independent, keeping the
+                // last cached curve so the bin doesn't dangle.
+                assetIds[i] = -1;
+                changed = true;
+            }
+        }
+
+        if (changed) {
+            std::vector<FrequencyBin> tmp(curves.size());
+            for (size_t i = 0; i < curves.size(); ++i) {
+                tmp[i].useCustomResponse  = useCustom[i];
+                tmp[i].responseCurve      = curves[i];
+                tmp[i].responseCurveAssetId = (i < assetIds.size()) ? assetIds[i] : -1;
+            }
+            node.script = SpectrumTapProcessor::encodeScript(tmp, fft);
+        }
+    }
+    return resolved;
 }
 
 // ==============================================================================
@@ -119,7 +201,8 @@ void SpectrumTapProcessor::rebuildBins() {
     int decodedFftSize = kDefaultFftSize;
     std::vector<SpectralCurve> curves;
     std::vector<bool> useCustom;
-    decodeScript(node.script, decodedFftSize, curves, useCustom);
+    std::vector<int> assetIds;
+    decodeScript(node.script, decodedFftSize, curves, useCustom, assetIds);
     if (decodedFftSize != fftSize) {
         fftSize = decodedFftSize;
         // Force re-allocation of the FFT machinery on the next ensureFFTReady()
@@ -142,6 +225,8 @@ void SpectrumTapProcessor::rebuildBins() {
             bin.useCustomResponse = true;
             bin.responseCurve = curves[binIdx];
         }
+        if (binIdx < (int)assetIds.size())
+            bin.responseCurveAssetId = assetIds[binIdx];
         bins.push_back(std::move(bin));
         binIdx++;
     }
@@ -405,7 +490,7 @@ void SpectrumTapComponent::syncCurveStateCount() {
     int target = countBinParams();
     if ((int)binCurveStates.size() == target) return;
     if ((int)binCurveStates.size() < target)
-        binCurveStates.resize(target, { false, SpectralCurve{} });
+        binCurveStates.resize(target, BinCurveState{});
     else
         binCurveStates.resize(target);
 }
@@ -416,13 +501,17 @@ void SpectrumTapComponent::loadCurveStatesFromScript() {
     int decodedFft = SpectrumTapProcessor::kDefaultFftSize;
     std::vector<SpectralCurve> curves;
     std::vector<bool> useCustom;
-    SpectrumTapProcessor::decodeScript(nd->script, decodedFft, curves, useCustom);
+    std::vector<int> assetIds;
+    SpectrumTapProcessor::decodeScript(nd->script, decodedFft, curves, useCustom, assetIds);
     fftSize = decodedFft;
     binCurveStates.clear();
     binCurveStates.reserve(std::max(curves.size(), useCustom.size()));
     for (size_t i = 0; i < curves.size(); ++i) {
-        bool flag = (i < useCustom.size()) ? useCustom[i] : false;
-        binCurveStates.emplace_back(flag, std::move(curves[i]));
+        BinCurveState st;
+        st.useCustom = (i < useCustom.size()) ? useCustom[i] : false;
+        st.curve     = std::move(curves[i]);
+        st.assetId   = (i < assetIds.size()) ? assetIds[i] : -1;
+        binCurveStates.push_back(std::move(st));
     }
 }
 
@@ -433,8 +522,9 @@ void SpectrumTapComponent::syncCurvesToScript() {
     // encoder. We only need the useCustomResponse/responseCurve fields.
     std::vector<FrequencyBin> tmp(binCurveStates.size());
     for (size_t i = 0; i < binCurveStates.size(); ++i) {
-        tmp[i].useCustomResponse = binCurveStates[i].first;
-        tmp[i].responseCurve = binCurveStates[i].second;
+        tmp[i].useCustomResponse    = binCurveStates[i].useCustom;
+        tmp[i].responseCurve        = binCurveStates[i].curve;
+        tmp[i].responseCurveAssetId = binCurveStates[i].assetId;
     }
     std::string newScript = SpectrumTapProcessor::encodeScript(tmp, fftSize);
     if (nd->script == newScript) return;
@@ -444,6 +534,14 @@ void SpectrumTapComponent::syncCurvesToScript() {
     // rebuild so it picks up the changes. This is what onTopologyChanged
     // already does.
     if (onTopologyChanged) onTopologyChanged();
+}
+
+void SpectrumTapComponent::commitCurveEdit(int binSlotIdx) {
+    // No write-back: a linked curve is read-only, so edits only happen on an
+    // independent curve with no asset to propagate to. A shared library item is
+    // changed only by editing it in the library.
+    juce::ignoreUnused(binSlotIdx);
+    syncCurvesToScript();
 }
 
 void SpectrumTapComponent::openResponseEditor(int binSlotIdx) {
@@ -470,17 +568,20 @@ void SpectrumTapComponent::openResponseEditor(int binSlotIdx) {
     // Flip the slot into custom mode (so the curve takes effect immediately
     // even before any edits) and ensure the curve has sensible defaults.
     auto& state = binCurveStates[binSlotIdx];
-    if (!state.first) {
-        state.first = true;
-        if (state.second.expression.empty())
-            state.second.expression = "1 - abs(2*f - 1)"; // triangle peak
+    if (!state.useCustom) {
+        state.useCustom = true;
+        if (state.curve.expression.empty())
+            state.curve.expression = "1 - abs(2*f - 1)"; // triangle peak
     }
     syncCurvesToScript();
 
-    // Build a small container: the panel + Close / "Reset to bandpass" buttons.
+    // Build a small container: the panel + Library / Close / "Reset" buttons
+    // plus a status label showing the current library link.
     class ResponseEditorContainer : public juce::Component {
     public:
         SpectralCurvePanel panel;
+        juce::Label      linkLabel;
+        juce::TextButton libraryBtn { "Library..." };
         juce::TextButton closeBtn { "Close" };
         juce::TextButton resetBtn { "Use Default (bandpass)" };
         ResponseEditorContainer(SpectralCurve& curve,
@@ -490,9 +591,19 @@ void SpectrumTapComponent::openResponseEditor(int binSlotIdx) {
             : panel(curve, title, 0.0f, 1.0f, colour, std::move(onChange))
         {
             addAndMakeVisible(panel);
+            addAndMakeVisible(linkLabel);
+            addAndMakeVisible(libraryBtn);
             addAndMakeVisible(closeBtn);
             addAndMakeVisible(resetBtn);
-            setSize(560, 360);
+            linkLabel.setFont(11.0f);
+            linkLabel.setColour(juce::Label::textColourId, juce::Colour(0xFFAAAAAA));
+            libraryBtn.setTooltip(
+                "Publish this response curve to the project's Frequency Graphs "
+                "library, load a copy of a library curve (independent), or sync "
+                "this bin to one as a live, read-only mirror. A synced curve is "
+                "edited only in the library; click the panel's read-only badge to "
+                "fork an editable copy.");
+            setSize(560, 388);
         }
         void resized() override {
             auto a = getLocalBounds().reduced(6);
@@ -500,17 +611,19 @@ void SpectrumTapComponent::openResponseEditor(int binSlotIdx) {
             closeBtn.setBounds(bottom.removeFromRight(80));
             bottom.removeFromRight(6);
             resetBtn.setBounds(bottom.removeFromRight(180));
+            bottom.removeFromRight(6);
+            libraryBtn.setBounds(bottom.removeFromRight(90));
+            auto linkRow = a.removeFromBottom(20);
+            linkLabel.setBounds(linkRow);
             panel.setBounds(a);
         }
     };
 
     auto* container = new ResponseEditorContainer(
-        state.second,
+        state.curve,
         "Response - " + binLabel,
-        juce::Colour(state.first
-                     ? 0xFF55C8FF
-                     : 0xFFAAAAAA),
-        [this]() { syncCurvesToScript(); });
+        juce::Colour(state.useCustom ? 0xFF55C8FF : 0xFFAAAAAA),
+        [this, binSlotIdx]() { commitCurveEdit(binSlotIdx); });
 
     juce::DialogWindow::LaunchOptions opts;
     opts.content.setOwned(container);
@@ -523,16 +636,71 @@ void SpectrumTapComponent::openResponseEditor(int binSlotIdx) {
     opts.componentToCentreAround = this;
     auto* dlg = opts.launchAsync();
 
+    int slotCapture = binSlotIdx;
+
+    // Refresh the "Independent / Linked to ..." status line from current state.
+    auto updateLinkLabel = [this, slotCapture, container]() {
+        if (slotCapture < 0 || slotCapture >= (int)binCurveStates.size()) return;
+        int aid = binCurveStates[slotCapture].assetId;
+        if (aid < 0) {
+            container->linkLabel.setText("Independent curve (not in library)",
+                                         juce::dontSendNotification);
+        } else {
+            const AssetEntry* e = graph.assets.find(aid);
+            juce::String nm = e ? juce::String(e->name) : juce::String("(missing)");
+            container->linkLabel.setText("Linked to library curve: " + nm +
+                                         " (#" + juce::String(aid) +
+                                         ")  - read only (click the badge to edit a copy)",
+                                         juce::dontSendNotification);
+        }
+        container->panel.setReadOnly(aid >= 0);
+    };
+    updateLinkLabel();
+
+    // Read-only badge → break the library link and keep an independent copy
+    // (the only unlink path; see SpectralCurvePanel::onUnlink).
+    container->panel.onUnlink = [this, slotCapture, container, updateLinkLabel]() {
+        if (slotCapture < 0 || slotCapture >= (int)binCurveStates.size()) return;
+        auto& s = binCurveStates[slotCapture];
+        s.assetId = -1;      // detach from library
+        s.useCustom = true;  // keep the (now independent) curve active
+        container->panel.syncFromModel();
+        syncCurvesToScript();
+        updateLinkLabel();
+        container->panel.repaint();
+    };
+
     container->closeBtn.onClick = [dlg]() {
         if (dlg) dlg->exitModalState(0);
     };
-    int slotCapture = binSlotIdx;
     container->resetBtn.onClick = [this, slotCapture, dlg]() {
-        if (slotCapture >= 0 && slotCapture < (int)binCurveStates.size())
-            binCurveStates[slotCapture].first = false;
+        if (slotCapture >= 0 && slotCapture < (int)binCurveStates.size()) {
+            binCurveStates[slotCapture].useCustom = false;
+            binCurveStates[slotCapture].assetId = -1;  // detach from library too
+        }
         syncCurvesToScript();
         if (dlg) dlg->exitModalState(0);
         repaint();
+    };
+    container->libraryBtn.onClick = [this, slotCapture, container, updateLinkLabel,
+                                     binLabel]() {
+        if (slotCapture < 0 || slotCapture >= (int)binCurveStates.size()) return;
+        auto& st = binCurveStates[slotCapture];
+        // Shared publish / link / detach menu (curve_editor.cpp). It mirrors a
+        // picked asset's curve into st.curve directly; our callback persists the
+        // new link id and refreshes the UI.
+        showFrequencyGraphLibraryMenu(&container->libraryBtn, graph, st.curve,
+            st.assetId, "Response " + binLabel,
+            [this, slotCapture, container, updateLinkLabel](int newId) {
+                if (slotCapture < 0 || slotCapture >= (int)binCurveStates.size()) return;
+                auto& s = binCurveStates[slotCapture];
+                s.assetId = newId;
+                s.useCustom = true;   // any publish/link/detach keeps the curve active
+                container->panel.syncFromModel();
+                syncCurvesToScript();
+                updateLinkLabel();
+                container->panel.repaint();
+            });
     };
 }
 
@@ -576,10 +744,13 @@ bool SpectrumTapComponent::syncBinPins() {
         int posInPinsOut = sigPinPositions.back();
         int pinId = nd->pinsOut[posInPinsOut].id;
         nd->pinsOut.erase(nd->pinsOut.begin() + posInPinsOut);
-        graph.links.erase(
-            std::remove_if(graph.links.begin(), graph.links.end(),
-                [pinId](const auto& lk) { return lk.startPin == pinId; }),
-            graph.links.end());
+        {
+            std::lock_guard<std::recursive_mutex> graphLk(graph.mutationLock);
+            graph.links.erase(
+                std::remove_if(graph.links.begin(), graph.links.end(),
+                    [pinId](const auto& l) { return l.startPin == pinId; }),
+                graph.links.end());
+        }
         sigPinPositions.pop_back();
         changed = true;
     }
@@ -658,7 +829,7 @@ void SpectrumTapComponent::mouseDown(const juce::MouseEvent& e) {
 
         syncCurveStateCount();
         const bool isCustom = (hitBinSlot < (int)binCurveStates.size())
-                           && binCurveStates[hitBinSlot].first;
+                           && binCurveStates[hitBinSlot].useCustom;
 
         juce::PopupMenu menu;
         menu.addItem(1, "Edit response curve...");
@@ -676,8 +847,10 @@ void SpectrumTapComponent::mouseDown(const juce::MouseEvent& e) {
                 if (result == 1) {
                     openResponseEditor(binSlotCap);
                 } else if (result == 2) {
-                    if (binSlotCap >= 0 && binSlotCap < (int)binCurveStates.size())
-                        binCurveStates[binSlotCap].first = false;
+                    if (binSlotCap >= 0 && binSlotCap < (int)binCurveStates.size()) {
+                        binCurveStates[binSlotCap].useCustom = false;
+                        binCurveStates[binSlotCap].assetId = -1;
+                    }
                     syncCurvesToScript();
                     repaint();
                 } else if (result == 3) {
@@ -820,10 +993,10 @@ void SpectrumTapComponent::paint(juce::Graphics& g) {
         // Custom-response overlay: trace the user-drawn curve across the
         // bin's range so the chosen response shape is visible at a glance.
         bool isCustom = (binCount < (int)binCurveStates.size())
-                     && binCurveStates[binCount].first;
+                     && binCurveStates[binCount].useCustom;
         if (isCustom && binW > 4.0f) {
             const int N = std::max(8, (int)binW);
-            auto samples = binCurveStates[binCount].second.evaluate(N);
+            auto samples = binCurveStates[binCount].curve.evaluate(N);
             juce::Path curvePath;
             for (int i = 0; i < (int)samples.size(); ++i) {
                 float t = (samples.size() > 1) ? (float)i / (float)(samples.size() - 1) : 0.0f;

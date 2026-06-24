@@ -57,6 +57,18 @@ void GranularFrame::renderRaw(int tableSize, std::vector<float>& out) const {
         float inv = 1.0f / peak;
         for (float& v : ifftOut) v *= inv;
     }
+
+    // Bucket C element warp (amplitude-domain waveshaping). Applied to the
+    // normalised representative cycle so the editor thumbnail / terrain
+    // fallback reflect the same transfer the synth applies to the live grain
+    // stream (see TerrainSynthProcessor's granular mix). warpAmpOps() drops any
+    // non-amplitude ops, so this is a pure post-lookup transfer on [-1,1].
+    auto ampOps = warpAmpOps();
+    if (!ampOps.empty())
+        for (auto& v : ifftOut)
+            for (const auto& op : ampOps)
+                v = warpAmpValue(op.method, v, op.amount);
+
     out = std::move(ifftOut);
 }
 
@@ -111,6 +123,15 @@ std::string GranularFrame::encodeBody() const {
         std::snprintf(buf, sizeof(buf), "%.4f", source[i]);
         ss << buf;
     }
+    // Optional Bucket C element warp chain, appended as a ";warp:<chain>"
+    // section after the comma-separated sample list. The sample list never
+    // contains ';' or the literal "warp", so decodeBody can split this off
+    // unambiguously. Omitted when empty so pre-warp frames round-trip
+    // byte-identical (and older readers, which stop at the sample list, ignore
+    // it). encodeWarpChain uses ':'/';' internally but never the substring
+    // ";warp:", so the delimiter stays unique.
+    if (!warpChain.empty())
+        ss << ";warp:" << encodeWarpChain(warpChain);
     return ss.str();
 }
 
@@ -178,7 +199,7 @@ bool GranularFrame::decodeBody(const std::string& body) {
     captureSourceKind = -1;  // unknown unless the (newer) header field is present
     int tmp;
     if (tryOptInt(tmp)) {
-        if (tmp >= 0 && tmp <= 3) freezeMode = (GranularFreezeMode)tmp;
+        if (tmp >= 0 && tmp <= 4) freezeMode = (GranularFreezeMode)tmp;
         // else: unknown value, keep default
     }
     if (tryOptInt(tmp)) {
@@ -230,13 +251,24 @@ bool GranularFrame::decodeBody(const std::string& body) {
     }
     size_t sampleStart = pos;
 
+    // Optional ";warp:<chain>" section appended after the sample list (Bucket C
+    // element warp). Split it off first so the float loop never sees it; absent
+    // in pre-warp frames (sampleEnd == body.size(), warpChain stays empty).
+    warpChain.clear();
+    size_t sampleEnd = body.size();
+    size_t wpos = body.find(";warp:", sampleStart);
+    if (wpos != std::string::npos) {
+        warpChain = decodeWarpChain(body.substr(wpos + 6));
+        sampleEnd = wpos;
+    }
+
     // Body: comma-separated floats.
     source.clear();
     source.reserve((size_t)srcLen);
     size_t p = sampleStart;
-    while (p <= body.size()) {
+    while (p <= sampleEnd) {
         size_t n = body.find(',', p);
-        if (n == std::string::npos) n = body.size();
+        if (n == std::string::npos || n > sampleEnd) n = sampleEnd;
         if (n > p) {
             try { source.push_back(std::stof(body.substr(p, n - p))); }
             catch (...) { source.push_back(0.0f); }

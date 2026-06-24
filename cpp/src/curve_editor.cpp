@@ -1,6 +1,7 @@
 #define _USE_MATH_DEFINES
 #include "curve_editor.h"
 #include "builtin_synth.h"   // WaveExprParser
+#include "node_graph.h"      // NodeGraph + AssetLibrary for the library menu
 #include <algorithm>
 #include <cmath>
 #include <sstream>
@@ -115,7 +116,7 @@ static std::vector<std::string> splitChar(const std::string& s, char sep) {
 // ==============================================================================
 // SpectralCurve - evaluation and serialization
 // ==============================================================================
-// Resolution of the normalized buffer baked from a Lua/Python equation.
+// Resolution of the normalized buffer baked from a Lua/Python/GLSL equation.
 static constexpr int kScriptBakeRes = 1024;
 
 void SpectralCurve::rebake() {
@@ -141,8 +142,8 @@ std::vector<float> SpectralCurve::evaluate(int N) const {
             out = WaveExprParser::evaluateOverBins(expression, N);
             return out;
         }
-        // Lua/Python: resample the pre-baked normalized [0,1] buffer. Never
-        // calls the interpreter (which isn't audio-thread safe).
+        // Lua/Python/GLSL: resample the pre-baked normalized [0,1] buffer. Never
+        // calls the interpreter / GPU (which isn't audio-thread safe).
         for (int k = 0; k < N; ++k) {
             float x = (N > 1) ? (float)k / (float)(N - 1) : 0.0f;
             out[k] = scriptSamples.empty() ? 0.0f
@@ -293,19 +294,30 @@ SpectralCurvePanel::SpectralCurvePanel(SpectralCurve& curve_,
         repaint();
     };
 
-    // Language selector (Built-in / Lua / Python) for the Equation expression.
+    // Language selector (Built-in / Lua / Python / GLSL) for the Equation expression.
     addAndMakeVisible(langCombo);
     langCombo.addItem("Built-in", 1);
     langCombo.addItem("Lua",      2);
     langCombo.addItem("Python",   3);
+    langCombo.addItem("GLSL",     4);
     langCombo.setItemEnabled(2, shapeLangAvailable(ShapeLang::Lua));
     langCombo.setItemEnabled(3, shapeLangAvailable(ShapeLang::Python));
+    langCombo.setItemEnabled(4, shapeLangAvailable(ShapeLang::Glsl));
     langCombo.setSelectedId((int)curve.lang + 1, juce::dontSendNotification);
-    langCombo.setTooltip("Language for the Equation. Built-in: `f` is the bin index "
+    langCombo.setTooltip(juce::String(
+                         "Language for the Equation. Built-in: `f` is the bin index "
                          "(0..N-1) over the curve. Lua / Python: `f` is the normalized "
                          "position 0..1, with full loops/variables (e.g. sum many "
-                         "harmonics). Lua/Python are baked into the curve when you edit, "
-                         "not run live; multi-line bodies must end with `return`.");
+                         "harmonics). GLSL: a GPU compute shader — `f` is the normalized "
+                         "position 0..1, with native GLSL math and waveform(id,phase) for "
+                         "the factory bank. Lua/Python/GLSL are baked into the curve when "
+                         "you edit, not run live; multi-line bodies must end with `return`.")
+                         + (shapeLangAvailable(ShapeLang::Python) ? ""
+                            : "  (Python is greyed out because no Python interpreter "
+                              "was found — install Python and restart to enable it.)")
+                         + (shapeLangAvailable(ShapeLang::Glsl) ? ""
+                            : "  (GLSL is greyed out because no OpenGL 4.3 compute "
+                              "driver is available on this machine.)"));
     langCombo.onChange = [this]() {
         curve.lang = (ShapeLang)(langCombo.getSelectedId() - 1);
         exprEditor.setMultiLine(curve.lang != ShapeLang::Builtin);
@@ -317,6 +329,18 @@ SpectralCurvePanel::SpectralCurvePanel(SpectralCurve& curve_,
     };
 
     updateModeUI();
+}
+
+void SpectralCurvePanel::setReadOnly(bool ro) {
+    if (readOnly == ro) return;
+    readOnly = ro;
+    exprEditor.setReadOnly(ro);
+    exprEditor.setCaretVisible(!ro);
+    equationBtn.setEnabled(!ro);
+    drawBtn.setEnabled(!ro);
+    freehandToggle.setEnabled(!ro);
+    langCombo.setEnabled(!ro);
+    repaint();
 }
 
 void SpectralCurvePanel::syncFromModel() {
@@ -475,6 +499,26 @@ void SpectralCurvePanel::paint(juce::Graphics& g) {
                          cb.toNearestInt().reduced(4),
                          juce::Justification::topLeft, 3);
     }
+
+    // Read-only badge (curve is a live library link). When an unlink handler is
+    // wired the badge is clickable and invites forking a copy; otherwise it's a
+    // plain status label. (Unlinking lives here, not in the library popup menu.)
+    if (readOnly) {
+        bool canUnlink = (bool) onUnlink;
+        juce::String badge = canUnlink ? "linked - click to edit a copy"
+                                       : "linked - read only";
+        g.setFont(11.0f);
+        int tw = g.getCurrentFont().getStringWidth(badge) + 12;
+        juce::Rectangle<float> r((float)(cb.getRight() - tw - 4), cb.getY() + 4.0f,
+                                 (float)tw, 16.0f);
+        badgeBounds = canUnlink ? r : juce::Rectangle<float>();
+        g.setColour(juce::Colour(canUnlink ? 0xD9396090 : 0xD9285A5A));
+        g.fillRoundedRectangle(r, 3.0f);
+        g.setColour(juce::Colour(0xFFAEC8E8));
+        g.drawText(badge, r, juce::Justification::centred);
+    } else {
+        badgeBounds = {};
+    }
 }
 
 float SpectralCurvePanel::yToPixel(float v, const juce::Rectangle<float>& cb) const {
@@ -536,6 +580,14 @@ void SpectralCurvePanel::writeFreehandSample(float x, float y) {
 }
 
 void SpectralCurvePanel::mouseDown(const juce::MouseEvent& e) {
+    if (readOnly) {
+        // The only interactive element in read-only mode is the "click to edit
+        // a copy" badge, which breaks the library link and forks an independent
+        // copy via the consumer-supplied handler.
+        if (onUnlink && badgeBounds.contains(e.position))
+            onUnlink();
+        return;
+    }
     if (curve.mode != SpectralCurve::Drawn) return;
     float x, y;
     if (!mouseToCurveXY(e.position, x, y)) return;
@@ -576,6 +628,7 @@ void SpectralCurvePanel::mouseDown(const juce::MouseEvent& e) {
 }
 
 void SpectralCurvePanel::mouseDrag(const juce::MouseEvent& e) {
+    if (readOnly) return;
     if (curve.mode != SpectralCurve::Drawn) return;
     auto cb = getCanvasBoundsF();
     auto cp = e.position;
@@ -606,9 +659,108 @@ void SpectralCurvePanel::mouseDrag(const juce::MouseEvent& e) {
 }
 
 void SpectralCurvePanel::mouseUp(const juce::MouseEvent&) {
+    if (readOnly) return;
     draggingIdx = -1;
     freehandDrawing = false;
     lastFreehandIdx = -1;
+}
+
+// ==============================================================================
+// Shared FrequencyGraph library menu (publish / link / detach)
+// ==============================================================================
+void showFrequencyGraphLibraryMenu(juce::Component* anchor,
+                                   NodeGraph& graph,
+                                   SpectralCurve& curve,
+                                   int currentId,
+                                   const juce::String& defaultName,
+                                   std::function<void(int)> onChanged)
+{
+    juce::PopupMenu m;
+    m.addItem(1, "Add this curve to library");
+
+    // Snapshot the current FrequencyGraph assets. Captured by value into the
+    // async callback - the user can't mutate the asset store while the popup is
+    // open, so the raw pointers stay valid for the lifetime of the menu (the
+    // same pattern the Spectrum Tap response editor uses).
+    auto graphs = graph.assets.list(AssetKind::FrequencyGraph, false);
+    const int copyBase = 2000;   // "Load a copy" item ids
+    const int linkBase = 1000;   // "Link" item ids
+    juce::PopupMenu copyMenu, linkMenu;
+    for (size_t i = 0; i < graphs.size(); ++i) {
+        juce::String label = juce::String(graphs[i]->name) +
+                             " (#" + juce::String(graphs[i]->id) + ")";
+        copyMenu.addItem(copyBase + (int) i, label);
+        linkMenu.addItem(linkBase + (int) i, label);
+    }
+    // Loading a library curve forks by default (independent copy). Linking is
+    // the opt-in, and a linked curve is read-only until unlinked - the only way
+    // to edit a shared library item is in the library itself. See the
+    // FrequencyGraph library model in REFERENCE.md.
+    m.addSubMenu("Load a copy from library", copyMenu, !graphs.empty());
+    m.addSubMenu("Sync with library curve (read-only)", linkMenu, !graphs.empty());
+    // Unlinking is deliberately NOT here - it's a node-state action, surfaced
+    // instead via the read-only badge on the curve panel ("click to edit a
+    // copy"). The library popup only does library operations (publish / load /
+    // sync). currentId is retained in the signature for callers that still pass
+    // it but is no longer consulted here.
+    juce::ignoreUnused(currentId);
+
+    m.showMenuAsync(juce::PopupMenu::Options().withTargetComponent(anchor),
+        [&graph, &curve, defaultName, onChanged = std::move(onChanged),
+         graphs, copyBase, linkBase]
+        (int r) {
+            if (r == 0) return;  // dismissed
+            if (r == 1) {
+                // Publish a copy into the library. The node stays independent
+                // (fork model): you've deposited a copy, not handed the node's
+                // future edits to the library.
+                graph.assets.add(AssetKind::FrequencyGraph,
+                                 defaultName.toStdString(), "", curve.encode());
+                if (onChanged) onChanged(-1);
+            } else if (r >= copyBase && r - copyBase < (int) graphs.size()) {
+                const AssetEntry* e = graphs[(size_t)(r - copyBase)];
+                SpectralCurve c;
+                if (e && SpectralCurve::decode(e->payload, c)) {
+                    curve = c;                 // fork: independent copy
+                    if (onChanged) onChanged(-1);
+                }
+            } else if (r >= linkBase && r - linkBase < (int) graphs.size()) {
+                const AssetEntry* e = graphs[(size_t)(r - linkBase)];
+                SpectralCurve c;
+                if (e && SpectralCurve::decode(e->payload, c)) {
+                    curve = c;                 // mirror the shared curve (live link)
+                    if (onChanged) onChanged(e->id);
+                }
+            }
+        });
+}
+
+// ==============================================================================
+// Curve EQ FrequencyGraph live-reference resolution
+// ==============================================================================
+int resolveCurveEqReferences(NodeGraph& graph) {
+    int refreshed = 0;
+    for (auto& n : graph.nodes) {
+        if (n.script.rfind(CurveEq::kPrefix(), 0) != 0) continue;
+        SpectralCurve curve;
+        int assetId = -1;
+        if (!CurveEq::decode(n.script, curve, assetId)) continue;
+        if (assetId < 0) continue;                  // independent - nothing to do
+
+        const AssetEntry* e = graph.assets.find(assetId);
+        if (e && e->kind == AssetKind::FrequencyGraph) {
+            SpectralCurve c;
+            if (SpectralCurve::decode(e->payload, c)) {  // decode() rebakes Lua/Python
+                setNodeScriptSynced(n, CurveEq::encode(c, assetId));
+                ++refreshed;
+            }
+            // malformed payload -> leave the cached curve + link untouched
+        } else {
+            // referenced asset gone -> detach, keep the last cached curve
+            setNodeScriptSynced(n, CurveEq::encode(curve, -1));
+        }
+    }
+    return refreshed;
 }
 
 } // namespace SoundShop

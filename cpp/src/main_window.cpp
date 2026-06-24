@@ -12,6 +12,7 @@
 #include "midi_device_wizard.h"
 #include "xy_pad.h"
 #include "signal_shape_node.h"
+#include "midi_script_node.h"
 #include "spectrum_tap.h"
 #include "analyzer_nodes.h"
 #include "convolution_processor.h"
@@ -411,6 +412,12 @@ MainContentComponent::MainContentComponent() {
         if (auto* proc = dynamic_cast<SignalShapeProcessor*>(
                 audioEngine.getGraphProcessor().getProcessorForNode(nodeId)))
             proc->fireManualTrigger();
+    };
+    graphComponent->getNodeScriptError = [this](int nodeId) -> bool {
+        if (auto* proc = dynamic_cast<MidiScriptProcessor*>(
+                audioEngine.getGraphProcessor().getProcessorForNode(nodeId)))
+            return proc->hasScriptError();
+        return false;
     };
 
     // Load prefs, plugin cache, recent projects (audio engine deferred to timer)

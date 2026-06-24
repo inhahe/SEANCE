@@ -59,6 +59,15 @@ public:
     // graph may have rebuilt since the dialog opened).
     std::function<void(int)> onSignalShapeManualTrigger;
 
+    // Returns true when node `id` is a script-bearing node (MIDI Script, ...)
+    // whose live processor reports a compile/link error in its current script.
+    // main_window wires this to GraphProcessor::getProcessorForNode +
+    // dynamic_cast<MidiScriptProcessor*>::hasScriptError(). Used by drawNode to
+    // paint a red "!" error badge and getTooltip to explain it. May be null
+    // before wiring, or return false when the node isn't a script node / has no
+    // live processor yet.
+    std::function<bool(int)> getNodeScriptError;
+
     // Returns the audio graph's live {sampleRate, blockSize}. Wired by
     // main_window to the audio engine. Used by the cable right-click menu to
     // show the exact Param update rate (sampleRate / blockSize) and the block

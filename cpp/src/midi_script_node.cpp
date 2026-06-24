@@ -241,7 +241,14 @@ void MidiScriptProcessor::reloadIfScriptChanged() {
     const std::string& src = (doc.language == ScriptLang::Wasm) ? doc.wasmPath
                                                                 : doc.program;
     std::string err;
-    runtime->load(src, err); // errors surface via getError(); audio stays silent
+    bool ok = runtime->load(src, err); // errors surface via getError(); audio stays silent
+    // Latch the error state for the node-graph badge (read on the message
+    // thread). Also log the failure to seance.log so there's a persistent
+    // record even if no editor is open to show the strip.
+    scriptHasError.store(!ok, std::memory_order_relaxed);
+    if (!ok)
+        juce::Logger::writeToLog("MIDI Script \"" + juce::String(node.name)
+                                 + "\": " + juce::String(err));
     runtime->reset();        // runs the language's init hook (Builtin init:, ...)
 
     // A streaming program (defines stream()) owns its own sample loop and is

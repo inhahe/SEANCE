@@ -245,8 +245,19 @@ MidiScriptEditorComponent::MidiScriptEditorComponent(NodeGraph& g, int nid,
             dw->setVisible(false);
     };
 
+    // Error strip (hidden until a compile fails).
+    addChildComponent(errorLabel);
+    errorLabel.setColour(juce::Label::textColourId, juce::Colours::orangered);
+    errorLabel.setColour(juce::Label::backgroundColourId, juce::Colour(0xff2a1414));
+    errorLabel.setFont(juce::Font(juce::Font::getDefaultMonospacedFontName(), 12.0f,
+                                  juce::Font::plain));
+    errorLabel.setMinimumHorizontalScale(1.0f);
+    errorLabel.setTooltip("The program failed to compile. The audio output stays "
+                          "silent until you fix the error.");
+
     updateLanguageUI();
     setSize(700, 800);
+    validateScript();   // surface any pre-existing error in the loaded script
 }
 
 MidiScriptEditorComponent::~MidiScriptEditorComponent() {
@@ -275,6 +286,39 @@ void MidiScriptEditorComponent::commitToNode() {
     if (!nd) return;
     nd->script = doc.encode();
     if (onChanged) onChanged();
+    // Re-lint after edits settle (300ms debounce) so a heavy Lua top-level
+    // isn't recompiled on every keystroke. Counts-only edits also re-validate,
+    // which is harmless.
+    startTimer(300);
+}
+
+void MidiScriptEditorComponent::timerCallback() {
+    stopTimer();
+    validateScript();
+}
+
+void MidiScriptEditorComponent::validateScript() {
+    std::string err;
+    // Pick the effective rate from the capability matrix (mirrors
+    // MidiScriptProcessor::reloadIfScriptChanged).
+    ScriptRate effRate = doc.rate;
+    if (!scriptLangSupportsRate(doc.language, effRate))
+        effRate = (doc.language == ScriptLang::Wasm) ? ScriptRate::PerBlock
+                                                     : ScriptRate::PerSample;
+    if (auto rt = makeScriptRuntime(doc.language, ScriptRole::Midi, effRate)) {
+        // Wasm validates its binary path; Builtin/Lua compile the text.
+        const std::string& src = (doc.language == ScriptLang::Wasm) ? doc.wasmPath
+                                                                    : doc.program;
+        rt->load(src, err);
+    }
+    const bool hasErr = !err.empty();
+    if (hasErr)
+        errorLabel.setText("Script error: " + juce::String(err),
+                           juce::dontSendNotification);
+    if (errorLabel.isVisible() != hasErr) {
+        errorLabel.setVisible(hasErr);
+        resized();   // claim / release the bottom strip
+    }
 }
 
 void MidiScriptEditorComponent::updateLanguageUI() {
@@ -385,7 +429,13 @@ bool MidiScriptEditorComponent::syncPins() {
 void MidiScriptEditorComponent::resized() {
     auto r = getLocalBounds().reduced(10);
 
-    // Bottom button row first.
+    // Error strip at the very bottom (only when a compile failed).
+    if (errorLabel.isVisible()) {
+        errorLabel.setBounds(r.removeFromBottom(22));
+        r.removeFromBottom(6);
+    }
+
+    // Bottom button row.
     auto btnRow = r.removeFromBottom(28);
     helpBtn.setBounds(btnRow.removeFromLeft(180));
     closeBtn.setBounds(btnRow.removeFromRight(80));

@@ -422,6 +422,30 @@ void NodeGraphComponent::drawNode(juce::Graphics& g, Node& node) {
         }
     }
 
+    // Script error badge: a red "!" disc at the node's top-right corner plus a
+    // red border, shown when this node's live script failed to compile/link
+    // (Lua syntax error, Wasm load error, ...). Mirrors the editor's error
+    // strip so the problem is visible even with the editor closed. The tooltip
+    // (getTooltip) explains it and points the user at the editor.
+    if (getNodeScriptError && getNodeScriptError(node.id)) {
+        // Re-draw the border in red so the whole node reads as "errored".
+        g.setColour(juce::Colours::red);
+        g.drawRoundedRectangle(
+            juce::Rectangle<float>(canvasToScreen(bounds.getTopLeft()),
+                                   canvasToScreen(bounds.getBottomRight())),
+            6.0f * zoom, 2.0f);
+        // "!" disc at the top-right corner.
+        float r = std::max(6.0f, 8.0f * zoom);
+        auto tr = canvasToScreen(bounds.getTopRight());
+        juce::Rectangle<float> disc(tr.x - r, tr.y - r, r * 2, r * 2);
+        g.setColour(juce::Colours::red);
+        g.fillEllipse(disc);
+        g.setColour(juce::Colours::white);
+        g.drawEllipse(disc, std::max(1.0f, zoom));
+        g.setFont(juce::Font(r * 1.4f, juce::Font::bold));
+        g.drawText("!", disc, juce::Justification::centred);
+    }
+
     // Pins
     float pinY = bounds.getY() + HEADER_HEIGHT;
     auto drawPin = [&](const Pin& pin, bool isInput, bool hasOpposite, bool withLabel = true) {
@@ -1740,8 +1764,14 @@ juce::String NodeGraphComponent::getTooltip() {
         return {};
     }
     // No pin under the cursor - fall back to a param-row tooltip (slider help).
-    if (auto* node = nodeAtPoint(canvasPos))
+    if (auto* node = nodeAtPoint(canvasPos)) {
+        // A node showing the red script-error badge explains it here so the
+        // user knows the script didn't compile and where to fix it.
+        if (getNodeScriptError && getNodeScriptError(node->id))
+            return "Script error - this node's program failed to compile.\n"
+                   "Open the editor (double-click) to see the error message.";
         return paramRowTooltip(*node, canvasPos);
+    }
     return {};
 }
 

@@ -687,19 +687,42 @@ fails to load/link, the runtime captures the message via
 just goes silent. The user gets no feedback about *why*.
 
 **Where:** `MidiScriptEditorComponent` (`midi_script_editor.cpp`) and
-`SignalShapeEditorComponent` (`signal_shape_node.cpp`). The live error lives
-on the runtime owned by the processor (`MidiScriptProcessor` /
-`SignalShapeProcessor`), not on the doc, so the editor can't read it directly.
+`SignalShapeEditorComponent` (`signal_shape_node.cpp`).
 
-**Proper fix:** plumb a way for the editor to poll the live processor's
-`runtime->getError()` (similar to how SignalShape's `onManualTrigger` reaches
-the live processor via the GraphProcessor lookup), then show the message in a
-red status line under the program editor, clearing it when the script
-compiles clean. A `juce::Timer` on the editor that queries once or twice a
-second is sufficient (load happens on the audio thread on the next rebuild).
+**Status (2026-06-24): MIDI Script half RESOLVED (Stage 1 of the script-error
+feature).** `MidiScriptEditorComponent` now shows a red **error strip** at the
+bottom, fed by a message-thread *linter* (`validateScript()`): every edit,
+debounced ~300 ms, compiles the program with a throwaway runtime via
+`makeScriptRuntime(...)->load()` and shows/hides the strip. This is cleaner
+than the originally-proposed "poll the live processor" approach — the lint is
+immediate, side-effect-free (throwaway state), and reuses the exact load path.
+In the node graph, a node whose **live** script failed to compile is drawn with
+a red border + "!" badge: `MidiScriptProcessor` now latches an
+`std::atomic<bool> scriptHasError` after each audio-thread `load()`, exposed via
+`hasScriptError()` and wired to `NodeGraphComponent::getNodeScriptError`
+(`getProcessorForNode` + `dynamic_cast<MidiScriptProcessor*>`, mirroring the
+`onSignalShapeManualTrigger` pattern). Failed loads are also logged to
+`seance.log`.
 
-**Workaround for now:** the in-editor Lua reference documents that a `loop()`
-function is required, and the inline warning covers the per-sample perf risk.
+**Still pending:** the **Signal Shape** editor (`signal_shape_node.cpp`,
+`SignalShapeEditorComponent`) has NOT yet had the same error strip / badge
+added — apply the identical `validateScript()` linter + a `scriptHasError`
+atomic on `SignalShapeProcessor` so its `getNodeScriptError` also lights up.
+This is a natural follow-on to Stage 1.
+
+**Remaining staged plan (script-error feature):**
+- **Stage 2 — Built-in parse errors.** `WaveExprParser`/`BuiltinExprRuntime`
+  parses lazily per sample and silently returns `0.0f` on a malformed program,
+  so the Built-in language reports *no* error to the linter. Record the parse
+  error + character position at load and return it from `getError()` so the
+  same strip/badge lights up for Built-in too.
+- **Stage 3 — Python.** Add a `Py_CompileString(code,"<script>",Py_file_input)`
+  syntax pre-check before `PyRun_String` (in `scripting.cpp` bakes), and format
+  runtime tracebacks with `traceback.format_exception` for the offline bake
+  report. Validate on Apply/bake, not per keystroke (Python is heavy).
+- **Stage 4 — GLSL.** On-demand compile-check via `glCompileShader` +
+  `glGetShaderInfoLog`, gated to GL-available (degrade gracefully when no GL
+  context can be created). Validate on bake, not per keystroke.
 
 ## Control Bank editor may not push undo steps / mark dirty (audit)
 

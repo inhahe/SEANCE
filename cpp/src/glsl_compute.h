@@ -83,4 +83,18 @@ GlslDispatchResult glslDispatchComputePingPong(const std::string& computeSource,
                                                int numPasses,
                                                const std::vector<GlslUniformInt>& intUniforms = {});
 
+// Rewrite driver-reported line numbers in a GLSL compile/link info log so they
+// refer to the user's own source lines instead of the generated scaffolding. A
+// shape/terrain bake wraps the user body in a templated shader; `userLineOffset`
+// is the number of generated lines that precede the user body and `userLineCount`
+// is how many lines the user body spans. A reported (generated) line g is a user
+// line iff userLineOffset < g <= userLineOffset + userLineCount, mapping to
+// g - userLineOffset (1-based). Two driver formats are handled in place:
+//   * "<src>(<line>) ..."  (NVIDIA),          e.g. 0(12) : error C0000
+//   * "<src>:<line>: ..."  (AMD/Intel/Mesa),  e.g. ERROR: 0:12: '...'
+// Line numbers outside the user range (errors inside the wrapper) are left
+// untouched. Pure string processing — safe on any platform, no GL needed.
+std::string remapGlslErrorLog(const std::string& log,
+                              int userLineOffset, int userLineCount);
+
 } // namespace SoundShop

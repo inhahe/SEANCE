@@ -3254,6 +3254,25 @@ void testWarp(Report& r) {
 void testGlslCompute(Report& r, const juce::File&) {
     r.section("GLSL compute backend (headless GL 4.3)");
 
+    // remapGlslErrorLog is pure string processing (no GL needed) so it runs even
+    // on machines with no GL 4.3 driver. It rewrites driver info-log line numbers
+    // from the generated-shader space back to the user's own source. With 6
+    // generated lines above the body and a 3-line body, generated lines 7..9 map
+    // to user lines 1..3; lines inside the wrapper (<=6) or past the body (>9)
+    // are left untouched. Both NVIDIA "0(L)" and AMD/Mesa "0:L:" forms remap.
+    {
+        r.check(remapGlslErrorLog("0(7) : error C0000: syntax error", 6, 3)
+                    == "0(1) : error C0000: syntax error",
+                "remapGlslErrorLog: NVIDIA line 7 -> user line 1");
+        r.check(remapGlslErrorLog("ERROR: 0:8: 'x' : undeclared identifier", 6, 3)
+                    == "ERROR: 0:2: 'x' : undeclared identifier",
+                "remapGlslErrorLog: AMD line 8 -> user line 2");
+        r.check(remapGlslErrorLog("0(3) : error", 6, 3) == "0(3) : error",
+                "remapGlslErrorLog: wrapper line (<=offset) left unchanged");
+        r.check(remapGlslErrorLog("0(10) : error", 6, 3) == "0(10) : error",
+                "remapGlslErrorLog: line past user body left unchanged");
+    }
+
     std::string why;
     bool avail = glslComputeAvailable(&why);
     if (!avail) {
@@ -3481,6 +3500,15 @@ void testGlslCompute(Report& r, const juce::File&) {
                            /*domainRadians=*/true, 256, out, err);
         if (!r.check(ok && (int) out.size() == 256, "GLSL shape: multi-statement body bakes"))
             r.note("error: " + juce::String(err));
+
+        // A syntactically broken body must surface a compile error (ok=false,
+        // non-empty message) instead of silently baking garbage. The error text
+        // is the driver info log with line numbers remapped to the user's source.
+        err.clear();
+        ok = bakeShapeExpr(ShapeLang::Glsl, "return sin(x", /*domainRadians=*/true,
+                           128, out, err);
+        r.check(!ok && !err.empty(),
+                "GLSL shape: broken body reports compile error (not silent)");
     }
 }
 

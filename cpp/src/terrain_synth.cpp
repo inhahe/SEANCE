@@ -25,6 +25,12 @@
 
 namespace SoundShop {
 
+static int countNewlines(const std::string& s) {
+    int n = 0;
+    for (char c : s) if (c == '\n') ++n;
+    return n;
+}
+
 // ==============================================================================
 // Terrain - N-dimensional sample data
 // ==============================================================================
@@ -434,12 +440,17 @@ bool Terrain::fillFromGlsl(const std::string& userBody, bool wholeGrid,
     const std::string& procBody = userBody;   // body is used verbatim now
 
     // ---- Build the full compute shader, templating in the user body. --------
+    // The user body is wrapped in generated scaffolding; track how many lines
+    // precede it so GLSL info-log line numbers can be remapped back to the
+    // user's own source (mirrors the Python bake's userLineOffset trick).
     const std::string maxN = std::to_string(kGlslMaxDims);
     std::string src;
+    int userLineOffset = 0;
+    const int userLineCount = countNewlines(procBody) + 1;
     if (!wholeGrid) {
         // Per-cell: userBody is the body of cellValue(), which must `return` a
         // float in [0,1]. Coordinate vocabulary mirrors fillFromScript.
-        src =
+        const std::string prefix =
             "#version 430\n"
             "layout(local_size_x = 64) in;\n"
             "layout(std430, binding = 0) buffer Out { float data[]; };\n"
@@ -449,7 +460,10 @@ bool Terrain::fillFromGlsl(const std::string& userBody, bool wholeGrid,
             "const float TAU = 6.28318530717958648;\n"
             + wfFn +
             "float cellValue(float c[" + maxN + "], int coord[" + maxN + "], int dims[" + maxN + "], int nd, "
-            "float x, float y, float z, float w) {\n"
+            "float x, float y, float z, float w) {\n";
+        userLineOffset = countNewlines(prefix);
+        src =
+            prefix
             + procBody + "\n"
             "}\n"
             "void main() {\n"
@@ -514,7 +528,7 @@ bool Terrain::fillFromGlsl(const std::string& userBody, bool wholeGrid,
           + flattenClamps
           + "  return " + flattenExpr + ";\n"
             "}\n";
-        src =
+        const std::string prefix =
             "#version 430\n"
             "layout(local_size_x = 64) in;\n"
             "layout(std430, binding = 0) buffer Out  { float data[]; };\n"
@@ -554,7 +568,10 @@ bool Terrain::fillFromGlsl(const std::string& userBody, bool wholeGrid,
             "}\n"
             + flattenFn
             + wfFn +
-            "void main() {\n"
+            "void main() {\n";
+        userLineOffset = countNewlines(prefix);
+        src =
+            prefix
             + procBody + "\n"
             "}\n";
     }
@@ -579,7 +596,11 @@ bool Terrain::fillFromGlsl(const std::string& userBody, bool wholeGrid,
     auto res = wholeGrid
         ? glslDispatchComputePingPong(src, (int) total, passes, uniforms)
         : glslDispatchCompute(src, (int) total, uniforms);
-    if (!res.ok) { error = res.error; return false; }
+    if (!res.ok) {
+        juce::Logger::writeToLog("GLSL terrain bake error:\n" + juce::String(res.error));
+        error = remapGlslErrorLog(res.error, userLineOffset, userLineCount);
+        return false;
+    }
     if ((long long) res.data.size() != total) {
         error = "GLSL readback size mismatch";
         return false;

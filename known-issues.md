@@ -752,10 +752,32 @@ mapping is robust to future preamble changes. 8 self-test assertions cover it
 (bare-expr → line 1, multi-line → line 2, SyntaxError, clean program). Self-test
 678/678.
 
-**Remaining staged plan (script-error feature):**
-- **Stage 4 — GLSL.** On-demand compile-check via `glCompileShader` +
-  `glGetShaderInfoLog`, gated to GL-available (degrade gracefully when no GL
-  context can be created). Validate on bake, not per keystroke.
+**Stage 4 RESOLVED (2026-06-24): GLSL bake error reporting with line
+remapping.** GLSL shape/terrain bakes already compiled on demand through the
+headless GL 4.3 compute context and surfaced `glGetShaderInfoLog` /
+`glGetProgramInfoLog` text via `GlslDispatchResult::error` (gated to
+GL-available — when no 4.3 context can be created the bake fails with a
+human-readable reason and the language is greyed out in the dropdown). The
+remaining gap was the same one Stage 3 closed for Python: the driver info-log
+line numbers point at the *generated* compute shader (the `shapeValue` /
+`cellValue` / `main` wrapper + `waveform()` helper), not the user's body. Added
+`remapGlslErrorLog(log, userLineOffset, userLineCount)` in `glsl_compute.cpp`
+(pure string processing, platform-independent) which rewrites the line numbers
+in both the NVIDIA `0(L)` and AMD/Intel/Mesa `0:L:` log formats back to the
+user's 1-based source line, leaving wrapper/out-of-range numbers untouched.
+`bakeGlsl` (`shape_expr.cpp`) and `Terrain::fillFromGlsl` (`terrain_synth.cpp`,
+both per-cell and whole-grid branches) now build the scaffolding prefix as a
+separate string, count its newlines for `userLineOffset`, remap `res.error`
+before returning it, and log the raw un-remapped driver log to `seance.log` via
+`juce::Logger`. Self-test adds 4 deterministic `remapGlslErrorLog` unit checks
+(run even with no GL) plus an end-to-end "broken GLSL body → compile error, not
+silent" bake check. Self-test 683/683.
+
+**The staged script-error feature is now complete (Stages 1–4 all resolved):**
+Lua/Wasm (Stage 1) and Built-in (Stage 2) errors light up the editor strip +
+node badge; Python (Stage 3) and GLSL (Stage 4) bake errors show a remapped
+`Script error: …` overlay with the user's own source line, full detail logged to
+`seance.log`.
 
 ## Control Bank editor may not push undo steps / mark dirty (audit)
 

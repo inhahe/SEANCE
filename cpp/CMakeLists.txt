@@ -193,6 +193,8 @@ target_sources(SEANCE PRIVATE
     src/layered_wave_editor.h
     src/spectral_editor.cpp
     src/spectral_editor.h
+    src/signal_eq_editor.cpp
+    src/signal_eq_editor.h
     src/curve_editor.cpp
     src/curve_editor.h
     src/adsr_envelope.cpp

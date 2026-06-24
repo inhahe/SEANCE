@@ -5,6 +5,7 @@
 #include "builtin_synth.h"
 #include "layered_wave_editor.h"
 #include "spectral_editor.h"
+#include "signal_eq_editor.h"
 #include "wavelet_painter.h"
 #include "trigger_node.h"
 #include "midi_mod_node.h"
@@ -2233,6 +2234,25 @@ void MainContentComponent::showPluginUI(int nodeId) {
         juce::DialogWindow::LaunchOptions opts;
         opts.content.setOwned(editor);
         opts.dialogTitle = "Curve EQ: " + juce::String(node->name);
+        opts.dialogBackgroundColour = juce::Colour(22, 22, 28);
+        opts.escapeKeyTriggersCloseButton = true;
+        opts.useNativeTitleBar = false;
+        opts.resizable = true;
+        opts.componentToCentreAround = this;
+        SoundShop::launchToolDialog(opts);
+        return;
+    }
+
+    // Signal EQ editor: an Effect node whose script is "__signaleq__". Curve
+    // points (each a peaking bell with a signal-modulatable Freq + Gain) are
+    // dragged on a log-frequency / dB canvas.
+    if (node && node->type == NodeType::Effect && node->script == "__signaleq__") {
+        auto* editor = new SignalEQEditorComponent(graph, node->id, [this]() {
+            audioEngine.getGraphProcessor().requestRebuild();
+        });
+        juce::DialogWindow::LaunchOptions opts;
+        opts.content.setOwned(editor);
+        opts.dialogTitle = "Signal EQ: " + juce::String(node->name);
         opts.dialogBackgroundColour = juce::Colour(22, 22, 28);
         opts.escapeKeyTriggersCloseButton = true;
         opts.useNativeTitleBar = false;

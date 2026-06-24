@@ -1904,6 +1904,7 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
     fxMenu.addItem(221, "Reverb");
     fxMenu.addItem(222, "Parametric EQ");
     fxMenu.addItem(241, "Curve EQ (draw response)");
+    fxMenu.addItem(242, "Signal EQ (modulatable points)");
     // Waveshaper submenu: one entry per amplitude-domain morph method. Built
     // from the shared registry (warp.h) so labels/tooltips stay in sync with
     // the synth's morph picker. IDs 260 + index (260..269); see the matching
@@ -2791,8 +2792,11 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
                 {Pin{0, "Audio In", PinKind::Audio, true}},
                 {Pin{0, "Audio Out", PinKind::Audio, false}}, {p.x, p.y});
             n.script = ConvolutionProcessor::encodeIR({1.0f}); // identity (passthrough)
-        } else if (result >= 208 && result <= 216) {
-            // Built-in effects with real DSP
+        } else if (result >= 208 && result <= 245 && result != 217) {
+            // Built-in effects with real DSP. The switch below handles ids
+            // 208-241 (id 217, the 3D Spatializer, has its own branch further
+            // down with a different pin/param layout, so it is excluded here).
+            // Keep this upper bound ahead of the highest effect id in the switch.
             auto makeEffect = [&](const char* name, const char* script,
                                    std::vector<Param> params, bool midiIO = false) -> Node& {
                 auto& n = graph.addNode(name, NodeType::Effect,
@@ -2878,6 +2882,27 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
                         {"Mix",       1.0f, 0.0f,  1.0f},
                     });
                     n.script = CurveEq::encode(c, -1);
+                    break;
+                }
+                case 242: {
+                    // Signal EQ: curve-point equaliser whose every point (Freq +
+                    // Gain) is a node param and therefore individually signal-
+                    // modulatable. Default = 3 flat points spread across the
+                    // spectrum (0 dB, so the node passes audio unchanged until the
+                    // user drags a point or wires a control input). Global Mode /
+                    // Width / Mix / FFT Size precede the per-point params.
+                    makeEffect("Signal EQ", "__signaleq__", {
+                        {"Mode",     0.0f,  0.0f,     1.0f},      // 0=Zero-latency, 1=FFT exact
+                        {"Width",    1.0f,  0.1f,    24.0f},      // shared Q (bell width)
+                        {"Mix",      1.0f,  0.0f,     1.0f},
+                        {"FFT Size", 11.0f, 8.0f,    12.0f},      // only used in FFT mode
+                        {"P1 Freq",  200.0f,  20.0f, 20000.0f},
+                        {"P1 Gain",    0.0f, -24.0f,    24.0f},
+                        {"P2 Freq", 1000.0f,  20.0f, 20000.0f},
+                        {"P2 Gain",    0.0f, -24.0f,    24.0f},
+                        {"P3 Freq", 5000.0f,  20.0f, 20000.0f},
+                        {"P3 Gain",    0.0f, -24.0f,    24.0f},
+                    });
                     break;
                 }
                 case 239: makeEffect("SMS", "__sms__", {
@@ -3443,6 +3468,16 @@ void NodeGraphComponent::showNodeMenu(Node& node) {
         menu.addItem(201, "Remove Last EQ Band", nb > 1);
     }
 
+    // Signal EQ: add/remove curve points. Each point is a peaking bell whose
+    // Freq + Gain are individual node params (so each is signal-modulatable).
+    // "Add" pushes the two P<n> Freq/Gain params; "Remove" pops the highest
+    // point's two params (and any modulation pins bound to them).
+    if (node.type == NodeType::Effect && node.script == "__signaleq__") {
+        int np = SignalEQProcessor::countPoints(node);
+        menu.addItem(202, "Add EQ Point", np < SignalEQProcessor::kMaxPoints);
+        menu.addItem(203, "Remove Last EQ Point", np > SignalEQProcessor::kMinPoints);
+    }
+
     // The unified Script node gets an "Edit Script" entry (hidden for the
     // sibling XY Pad / Control Bank nodes, which share NodeType::SignalShape
     // but have their own dedicated editors opened via double-click).
@@ -3604,6 +3639,51 @@ void NodeGraphComponent::showNodeMenu(Node& node) {
                         }),
                     node->params.end());
                 graph.commitSnapshot("Remove EQ band");
+                if (onNodeEdited) onNodeEdited();
+            }
+        } else if (result == 202) {
+            // Add a Signal EQ point: a flat (0 dB) peaking bell at a frequency
+            // that fills the gap above the current highest point (so successive
+            // adds spread out rather than stacking at one spot).
+            int np = SignalEQProcessor::countPoints(*node);
+            if (np < SignalEQProcessor::kMaxPoints) {
+                float lastFreq = 1000.0f;
+                {
+                    std::string key = "P" + std::to_string(np) + " Freq";
+                    for (auto& pr : node->params)
+                        if (pr.name == key) { lastFreq = pr.value; break; }
+                }
+                float newFreq = juce::jlimit(20.0f, 20000.0f, lastFreq * 2.0f);
+                std::string pfx = "P" + std::to_string(np + 1) + " ";
+                node->params.push_back({pfx + "Freq", newFreq, 20.0f, 20000.0f});
+                node->params.push_back({pfx + "Gain", 0.0f, -24.0f, 24.0f});
+                graph.commitSnapshot("Add EQ point");
+                if (onNodeEdited) onNodeEdited();
+            }
+        } else if (result == 203) {
+            // Remove the highest-numbered Signal EQ point (its two params). First
+            // drop any modulation pins bound to those two param indices so no
+            // orphan "Mod:"/"Set:" pin is left dangling, then erase the params.
+            int np = SignalEQProcessor::countPoints(*node);
+            if (np > SignalEQProcessor::kMinPoints) {
+                std::string pfx = "P" + std::to_string(np) + " ";
+                // Collect indices of this point's params (descending) and remove
+                // their modPins by paramIndex before the erase shifts indices.
+                std::vector<int> idxs;
+                for (int i = 0; i < (int)node->params.size(); ++i)
+                    if (juce::String(node->params[i].name).startsWith(pfx))
+                        idxs.push_back(i);
+                std::sort(idxs.rbegin(), idxs.rend());
+                for (int pi : idxs)
+                    removeParamModPin(graph, nodeId, pi);
+                node->params.erase(
+                    std::remove_if(node->params.begin(), node->params.end(),
+                        [&](const Param& p) {
+                            return juce::String(p.name).startsWith(pfx);
+                        }),
+                    node->params.end());
+                pruneOrphanModPins(graph, nodeId);
+                graph.commitSnapshot("Remove EQ point");
                 if (onNodeEdited) onNodeEdited();
             }
         } else if (result == 10) {

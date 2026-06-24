@@ -5311,6 +5311,75 @@ void testAssetLibrary(Report& r) {
                 r.check(centralRMS(buf) < 1e-3,
                         "curveeq: zero curve silences the central region");
             }
+
+            // ---- Signal EQ -------------------------------------------------
+            // Same sine/RMS rig. The Signal EQ's response is a product of
+            // peaking bells (one per point), shared across the Zero-latency
+            // (biquad cascade) and FFT-exact engines. We pin: (a) a flat node
+            // passes a 440 Hz sine through unchanged in BOTH modes, and (b) a
+            // deep narrow dip ON 440 Hz strongly attenuates it in BOTH modes -
+            // proving the points map to filter bands and that Mode selects an
+            // engine without changing the magnitude target.
+            auto makeSignalEqNode = [&](NodeGraph& g, int mode,
+                                        std::vector<std::array<float,2>> pts) -> int {
+                int nId = g.addNode("seq", NodeType::Effect, {}, {}).id;
+                Node& nd = *g.findNode(nId);
+                nd.script = "__signaleq__";
+                nd.params.push_back({"Mode",     (float)mode, 0.0f,  1.0f});
+                nd.params.push_back({"Width",    8.0f,        0.1f, 24.0f});
+                nd.params.push_back({"Mix",      1.0f,        0.0f,  1.0f});
+                nd.params.push_back({"FFT Size", 11.0f,       8.0f, 12.0f});
+                for (size_t i = 0; i < pts.size(); ++i) {
+                    std::string pfx = "P" + std::to_string((int)i + 1) + " ";
+                    nd.params.push_back({pfx + "Freq", pts[i][0],  20.0f, 20000.0f});
+                    nd.params.push_back({pfx + "Gain", pts[i][1], -24.0f,    24.0f});
+                }
+                return nId;
+            };
+
+            for (int mode = 0; mode <= 1; ++mode) {
+                const char* mn = (mode == 0 ? "zero-latency" : "FFT");
+                // (a) Flat (3 points at 0 dB) preserves the sine.
+                {
+                    NodeGraph g;
+                    int nId = makeSignalEqNode(g, mode,
+                        {{200.0f, 0.0f}, {440.0f, 0.0f}, {5000.0f, 0.0f}});
+                    SignalEQProcessor proc(*g.findNode(nId));
+                    proc.prepareToPlay(sr, N);
+                    juce::AudioBuffer<float> buf; makeSine(buf);
+                    juce::AudioBuffer<float> dry; makeSine(dry);
+                    juce::MidiBuffer mb;
+                    proc.processBlock(buf, mb);
+                    double rWet = centralRMS(buf), rDry = centralRMS(dry);
+                    r.check(rDry > 1e-3 && std::abs(rWet - rDry) / rDry < 0.1,
+                            juce::String("signaleq: flat curve preserves RMS (")
+                                + mn + ")");
+                }
+                // (b) Deep narrow dip on 440 Hz attenuates the 440 Hz sine.
+                {
+                    NodeGraph g;
+                    int nId = makeSignalEqNode(g, mode, {{440.0f, -24.0f}});
+                    SignalEQProcessor proc(*g.findNode(nId));
+                    proc.prepareToPlay(sr, N);
+                    juce::AudioBuffer<float> buf; makeSine(buf);
+                    juce::AudioBuffer<float> dry; makeSine(dry);
+                    juce::MidiBuffer mb;
+                    proc.processBlock(buf, mb);
+                    double rWet = centralRMS(buf), rDry = centralRMS(dry);
+                    r.check(rDry > 1e-3 && rWet < 0.5 * rDry,
+                            juce::String("signaleq: -24 dB notch on tone cuts RMS (")
+                                + mn + ")");
+                }
+            }
+            // countPoints reflects the contiguous P<n> params.
+            {
+                NodeGraph g;
+                int nId = makeSignalEqNode(g, 0,
+                    {{100.0f, 3.0f}, {1000.0f, -6.0f}, {8000.0f, 2.0f}});
+                r.checkVal(SignalEQProcessor::countPoints(*g.findNode(nId)) == 3,
+                           "signaleq: countPoints counts contiguous points",
+                           SignalEQProcessor::countPoints(*g.findNode(nId)));
+            }
         }
     }
 

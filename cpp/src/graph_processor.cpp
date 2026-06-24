@@ -829,6 +829,8 @@ void GraphProcessor::rebuildGraph(NodeGraph& graph, Transport& transport) {
         } else if (node.type == NodeType::Effect &&
                    node.script.rfind("__curveeq__:", 0) == 0) {
             proc = std::make_unique<CurveEQProcessor>(node);
+        } else if (node.type == NodeType::Effect && node.script == "__signaleq__") {
+            proc = std::make_unique<SignalEQProcessor>(node);
         } else if (node.type == NodeType::Effect && node.script == "__ringmod__") {
             proc = std::make_unique<RingModProcessor>(node);
         } else if (node.type == NodeType::Effect &&

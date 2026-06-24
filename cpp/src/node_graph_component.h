@@ -82,6 +82,11 @@ public:
 private:
     NodeGraph& graph;
 
+    // Fallback tooltip for a param-row slider when the mouse isn't over a pin.
+    // Returns help text for the slider under canvasPos (currently Terrain
+    // Synth params), or "" if no row matches. Called by getTooltip().
+    juce::String paramRowTooltip(const Node& node, juce::Point<float> canvasPos);
+
     // View transform
     float zoom = 1.0f;
     juce::Point<float> panOffset{0, 0};

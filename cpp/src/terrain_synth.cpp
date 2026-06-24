@@ -1164,6 +1164,18 @@ std::vector<float> Traversal::evaluate(const TraversalParams& params, int numDim
         break;
     }
 
+    case TraversalMode::Static: {
+        // No automatic motion: hold the point at Center on each axis. The
+        // circling oscillators (Radius / Speed / Rad Mod) are bypassed, so the
+        // user controls the playback position directly via the Center sliders
+        // or by driving Center X/Y with a signal cable (LFO, XY pad, envelope,
+        // automation). centerX/centerY reuse the Orbit centre params.
+        if (numDims >= 1) coord[0] = juce::jlimit(0.0f, 1.0f, params.centerX);
+        if (numDims >= 2) coord[1] = juce::jlimit(0.0f, 1.0f, params.centerY);
+        for (int d = 2; d < numDims; ++d) coord[d] = 0.5f;
+        break;
+    }
+
     case TraversalMode::Custom:
         // TODO: expression-based traversal
         break;
@@ -2472,6 +2484,7 @@ void TerrainSynthProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mi
         traversalParams.mode = (modeInt == 1) ? TraversalMode::Linear
                              : (modeInt == 2) ? TraversalMode::Lissajous
                              : (modeInt == 3) ? TraversalMode::Physics
+                             : (modeInt == 4) ? TraversalMode::Static
                              : TraversalMode::Orbit;
     }
 

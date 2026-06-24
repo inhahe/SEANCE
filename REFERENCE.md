@@ -1321,16 +1321,17 @@ All three appear only on generated (`__generate__`) terrains, and the menu shows
 
 ### Traversal modes
 
-Six built-in modes:
+Seven built-in modes:
 
 - **Linear** — sweeps a single axis at constant speed. The default for 1D waveform (= standard wavetable playback) and 1D audio file (= sample player).
 - **Orbit** — circles a center point in 2D-or-higher; radius and speed are knobs. Periodically revisits each region.
 - **Lissajous** — two-axis independent oscillators with different rates; classic figure-8/lemniscate patterns drawn through the terrain. Complex periodic timbres.
 - **Path** — user-defined polyline through 2D-or-higher space. Click points in the visualizer (Click Points draw mode) or drag (Freehand). Playback modes: **Loop** (jump back at end) or **Bounce** (ping-pong).
 - **Physics** — particle-with-forces traversal.
+- **Static** — no automatic motion. The playback point is held at **Center X/Y**, so the circling oscillators (Radius, Speed, Rad Mod) are bypassed entirely. This is the "turn the circling oscillators off" option: pick Static when you'd rather place the point yourself — set it with the Center sliders, or drive **Center X**/**Center Y** with a signal cable (LFO, XY pad, envelope, automation, or another node) by right-clicking those rows to add a modulation input (see [Control inputs on parameters](#control-inputs-on-parameters-set-vs-mod)). With no modulation the timbre is frozen at one spot, like a single-cycle wavetable position.
 - **Custom** — user-defined math expression.
 
-The terrain visualizer (the colored grid in the synth editor) shows the current 2D slice with the traversal path overlaid.
+The **Traversal** parameter row is a discrete picker: click it to choose a mode from a popup (it does not drag-scrub between values). The terrain visualizer (the colored grid in the synth editor) shows the current 2D slice with the traversal path overlaid.
 
 ### Math expression grammar (Formula traversals and terrain)
 

@@ -97,6 +97,7 @@ Traversal modes:
 - **Orbit** — circle around a center point in 2D-or-higher. Produces evolving pad sounds where the traversal periodically revisits each region.
 - **Lissajous** — figure-8 / lemniscate / other patterns formed by independent X and Y oscillators at different rates. Complex periodic timbres.
 - **Path** — a user-drawn polyline through the terrain. Click points to define vertices, or freehand-draw a curve. Loop or bounce playback at the ends.
+- **Static** — no automatic motion: the playback point is held at the Center, with the circling oscillators turned off. Place it yourself with the Center sliders, or drive Center X/Y with an LFO, envelope, XY pad, or automation to control the timbre directly.
 
 The same terrain with different traversals produces wildly different sounds. The same traversal with different terrains does too. Per-axis parameters of each can be modulated by signals, automation, or live MIDI controllers — turning a static N-D terrain into a fully alive, controllable instrument.
 

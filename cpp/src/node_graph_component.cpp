@@ -660,11 +660,12 @@ void NodeGraphComponent::drawNode(juce::Graphics& g, Node& node) {
                          : (effective == TerrainSynthMode::WaveformPerPoint) ? "AM-sine"
                                                                              : juce::String("Additive bank");
             } else if (p.name == "Traversal") {
-                int m = juce::jlimit(0, 3, (int)std::round(p.value));
+                int m = juce::jlimit(0, 4, (int)std::round(p.value));
                 valueStr = (m == 0) ? "Orbit"
                          : (m == 1) ? "Linear"
                          : (m == 2) ? "Lissajous"
-                         : juce::String("Physics");
+                         : (m == 3) ? "Physics"
+                         : juce::String("Static");
             } else if (p.name == "Algorithm" && node.script == "__pitchdetector__") {
                 valueStr = ((int)std::round(p.value) == 1) ? "Autocorr"
                                                            : juce::String("YIN");
@@ -1375,6 +1376,39 @@ void NodeGraphComponent::mouseDown(const juce::MouseEvent& e) {
                         });
                         return;
                     }
+                    // Traversal is a discrete enum (Orbit / Linear / Lissajous
+                    // / Physics / Static) - same rationale as Synth Mode, so
+                    // give it a popup picker rather than letting it fall through
+                    // to the continuous DragParam scrub (which let users park
+                    // between modes at e.g. 2.4). Static turns off the circling
+                    // oscillators entirely.
+                    if (p.name == "Traversal") {
+                        selectedNodeId = node->id;
+                        int cur = juce::jlimit(0, 4, (int)std::round(p.value));
+                        juce::PopupMenu pm;
+                        auto addTrav = [&](int id, const juce::String& label,
+                                           const juce::String& hint) {
+                            // Menu IDs are value+1 (0 reserved for cancel).
+                            pm.addItem(id + 1, label + "  -  " + hint, true, id == cur);
+                        };
+                        addTrav(0, "Orbit",     "circles around Center using Radius");
+                        addTrav(1, "Linear",    "sweeps back and forth along one axis");
+                        addTrav(2, "Lissajous", "independent sine wobble per axis");
+                        addTrav(3, "Physics",   "bouncing point pulled by gravity wells");
+                        addTrav(4, "Static",    "no motion - held at Center (off)");
+                        int nodeId = node->id;
+                        int paramIdx = idx;
+                        pm.showMenuAsync({}, [this, nodeId, paramIdx](int r) {
+                            if (r == 0) return;
+                            auto* nd = graph.findNode(nodeId);
+                            if (!nd || paramIdx >= (int)nd->params.size()) return;
+                            nd->params[paramIdx].value = (float)(r - 1);
+                            graph.dirty = true;
+                            graph.commitSnapshot("Change Traversal");
+                            repaint();
+                        });
+                        return;
+                    }
                     // Other discrete enum params (Pitch Detector's Algorithm
                     // and Mapping) also get a popup picker rather than a
                     // slider, for the same reason: discrete labelled states
@@ -1590,6 +1624,104 @@ void NodeGraphComponent::mouseMove(const juce::MouseEvent& e) {
     }
 }
 
+// Static per-param help text for the Terrain Synth node's slider rows. The
+// text is a pure function of the param name (the meaning never varies per
+// instance), so there's nothing to serialize and the tooltips survive
+// save/load automatically - unlike a stored Param field. Every slider on a
+// terrain synth can be driven by a Signal/Param cable on demand (#88), so the
+// modulatable ones say so. Returns "" for names with no entry.
+static juce::String terrainSynthParamTooltip(const std::string& name) {
+    // Shared closing hint for any continuously-modulatable knob.
+    static const char* kMod =
+        " Right-click this row to add a signal input so a cable (LFO, envelope, "
+        "XY pad, automation, another node) can drive it.";
+    if (name == "Volume")
+        return juce::String("Output loudness, 0 = silent to 1 = full.") + kMod;
+    if (name == "Pan")
+        return juce::String("Stereo placement: -1 = hard left, 0 = centre, "
+                            "+1 = hard right.") + kMod;
+    if (name == "Speed")
+        return juce::String("How fast the playback point travels through the "
+                            "terrain, in cycles per beat (tempo-synced). Higher "
+                            "= faster motion.") + kMod;
+    if (name.rfind("Radius ", 0) == 0)
+        return juce::String("Size of the looping path the playback point sweeps "
+                            "along this axis (0 = no motion on this axis, 0.5 = "
+                            "sweeps the full extent). Used by Orbit / Lissajous "
+                            "traversal; ignored in Static mode.") + kMod;
+    if (name.rfind("Center ", 0) == 0)
+        return juce::String("Where the playback path is centred on this axis "
+                            "(0 = one edge to 1 = the other). In Static traversal "
+                            "mode this IS the playback position.") + kMod;
+    if (name == "Rad Mod Spd")
+        return juce::String("Speed of a slow wobble applied to the path radius, "
+                            "in cycles per beat (0 = steady radius) - makes the "
+                            "orbit breathe in and out. Pairs with Rad Mod Amt.") + kMod;
+    if (name == "Rad Mod Amt")
+        return juce::String("How far the path radius wobbles (0 = none). Pairs "
+                            "with Rad Mod Spd.") + kMod;
+    if (name == "Traversal")
+        return juce::String("How the playback point moves through the terrain "
+                            "over time. Orbit = circles around Center using "
+                            "Radius; Linear = sweeps one axis; Lissajous = "
+                            "independent wobble per axis; Physics = bouncing "
+                            "point; Static = held at Center (no automatic motion - "
+                            "move it yourself or drive Center with a signal cable). "
+                            "Click to pick.");
+    if (name == "Synth Mode")
+        return juce::String("How terrain values become sound. Direct = play them "
+                            "as a waveform (1D wavetables/samples); AM-sine = use "
+                            "them to shape the volume of a pitched sine (the only "
+                            "musical mode for 2D+ images/maths/noise); Additive "
+                            "bank = rebuild the cycle from a bank of sine partials. "
+                            "Click to pick; modes that don't fit the current "
+                            "source are disabled and explain why.");
+    if (name == "LFO1 Rate" || name == "LFO2 Rate")
+        return juce::String("Speed of this internal modulation oscillator, in Hz "
+                            "(cycles per second).") + kMod;
+    if (name == "LFO1 Amount" || name == "LFO2 Amount")
+        return juce::String("How strongly this LFO wobbles the playback position "
+                            "(0 = off).") + kMod;
+    if (name == "Grain Size")
+        return juce::String("Granular grain length in seconds. 0 = off (smooth "
+                            "playback); larger values chop the sound into "
+                            "overlapping grains for a time-stretched, textured "
+                            "character.") + kMod;
+    if (name == "Freeze")
+        return juce::String("Hold playback at the current spot (1) so the sound "
+                            "sustains like a pad; 0 = keep moving.") + kMod;
+    if (name == "Grain Jitter")
+        return juce::String("Random scatter added to each grain's start position "
+                            "(0 = regular, 1 = fully scrambled). Only matters when "
+                            "Grain Size is above 0.") + kMod;
+    if (name.rfind("Position", 0) == 0)
+        return juce::String("Position along this axis of the wavetable/terrain "
+                            "(0 to 1) - picks which frame or slice you hear and "
+                            "morphs smoothly between them.") + kMod;
+    return {};
+}
+
+// Resolve the tooltip for a param row of `node` under the canvas point, or ""
+// if the point isn't over a param row. Mirrors the param-row geometry used by
+// the click / double-click handlers so hover and click agree on row bounds.
+juce::String NodeGraphComponent::paramRowTooltip(const Node& node,
+                                                 juce::Point<float> canvasPos) {
+    if (node.params.empty()) return {};
+    auto bounds = getNodeBounds(node);
+    int topRows = numTopPinRows(node);
+    float paramRowsTop = bounds.getY() + HEADER_HEIGHT + topRows * PIN_ROW_HEIGHT;
+    float paramRowsLeft  = bounds.getX() + 6;
+    float paramRowsRight = bounds.getRight() - 6;
+    if (canvasPos.x < paramRowsLeft || canvasPos.x > paramRowsRight
+        || canvasPos.y < paramRowsTop)
+        return {};
+    int idx = (int)((canvasPos.y - paramRowsTop) / PIN_ROW_HEIGHT);
+    if (idx < 0 || idx >= (int)node.params.size()) return {};
+    if (node.type == NodeType::TerrainSynth)
+        return terrainSynthParamTooltip(node.params[idx].name);
+    return {};
+}
+
 juce::String NodeGraphComponent::getTooltip() {
     // Resolve the pin under the current mouse position directly (rather than
     // caching hover state) so the text is always accurate. pinAtPoint with
@@ -1598,13 +1730,18 @@ juce::String NodeGraphComponent::getTooltip() {
     auto canvasPos = screenToCanvas(getMouseXYRelative().toFloat());
     bool isOut = false;
     int pinId = pinAtPoint(canvasPos, isOut, -1);
-    if (pinId < 0) return {};
-    for (auto& node : graph.nodes) {
-        for (auto& p : node.pinsIn)
-            if (p.id == pinId) return juce::String(p.tooltip);
-        for (auto& p : node.pinsOut)
-            if (p.id == pinId) return juce::String(p.tooltip);
+    if (pinId >= 0) {
+        for (auto& node : graph.nodes) {
+            for (auto& p : node.pinsIn)
+                if (p.id == pinId) return juce::String(p.tooltip);
+            for (auto& p : node.pinsOut)
+                if (p.id == pinId) return juce::String(p.tooltip);
+        }
+        return {};
     }
+    // No pin under the cursor - fall back to a param-row tooltip (slider help).
+    if (auto* node = nodeAtPoint(canvasPos))
+        return paramRowTooltip(*node, canvasPos);
     return {};
 }
 
@@ -4442,7 +4579,7 @@ Node& NodeGraphComponent::makeTerrainNode(const std::string& name,
                             0.5f, 0.0f, 1.0f});
     n.params.push_back({"Rad Mod Spd",  0.0f,  0.0f,  10.0f});
     n.params.push_back({"Rad Mod Amt",  0.0f,  0.0f,   0.3f});
-    n.params.push_back({"Traversal",    0.0f,  0.0f,   3.0f}); // 0=Orbit,1=Linear,2=Lissajous,3=Physics
+    n.params.push_back({"Traversal",    0.0f,  0.0f,   4.0f}); // 0=Orbit,1=Linear,2=Lissajous,3=Physics,4=Static
     // Synth Mode: 0=Direct (SamplePerPoint), 1=AM-sine (WaveformPerPoint),
     // 2=Additive bank (per-partial sines). Direct is natural for 1D
     // wavetable/audio terrains; AM-sine is the only meaningful mode for

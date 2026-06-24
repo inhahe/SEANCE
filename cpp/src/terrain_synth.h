@@ -325,7 +325,10 @@ enum class TraversalMode {
     Lissajous,    // sine-driven per axis with different frequencies
     Path,         // user-defined sequence of control points
     Physics,      // gravity wells, bouncing point
-    Custom        // expression or code-defined
+    Custom,       // expression or code-defined
+    Static        // no automatic motion - held at Center per axis (drive Center
+                  // manually or with a signal cable). Lets the user turn the
+                  // circling oscillators off entirely.
 };
 
 struct TraversalParams {

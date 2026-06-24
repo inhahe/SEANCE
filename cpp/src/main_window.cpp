@@ -3292,7 +3292,8 @@ void MainContentComponent::saveProject(std::function<void()> onSaved) {
 void MainContentComponent::saveProjectAs(std::function<void()> onSaved) {
     syncCCMappingsToGraph();
     auto chooser = std::make_shared<juce::FileChooser>("Save Project", juce::File(), "*.ssp");
-    chooser->launchAsync(juce::FileBrowserComponent::saveMode,
+    chooser->launchAsync(juce::FileBrowserComponent::saveMode
+                             | juce::FileBrowserComponent::warnAboutOverwriting,
         [this, chooser, onSaved = std::move(onSaved)](const juce::FileChooser& fc) {
             auto file = fc.getResult();
             if (file == juce::File()) return; // user cancelled - don't fire onSaved
@@ -3532,7 +3533,8 @@ void MainContentComponent::exportAudioWithBeat(float maxBeat) {
             auto filter = "*" + ext;
             auto chooser = std::make_shared<juce::FileChooser>(
                 "Export Audio", juce::File(), filter);
-            chooser->launchAsync(juce::FileBrowserComponent::saveMode,
+            chooser->launchAsync(juce::FileBrowserComponent::saveMode
+                                     | juce::FileBrowserComponent::warnAboutOverwriting,
                 [this, chooser, opts, maxBeat](const juce::FileChooser& fc) {
                     auto file = fc.getResult();
                     if (file == juce::File()) return;
@@ -4816,7 +4818,8 @@ public:
     void saveScript() {
         fileChooser = std::make_shared<juce::FileChooser>(
             "Save Script", getLastDirectory(), "*.py");
-        fileChooser->launchAsync(juce::FileBrowserComponent::saveMode,
+        fileChooser->launchAsync(juce::FileBrowserComponent::saveMode
+                                     | juce::FileBrowserComponent::warnAboutOverwriting,
             [this](const juce::FileChooser& fc) {
                 auto file = fc.getResult();
                 if (file != juce::File()) {

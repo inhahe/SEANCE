@@ -887,6 +887,36 @@ void NodeGraphComponent::drawLink(juce::Graphics& g, Link& link) {
             g.setColour(glowCol.withAlpha(0.13f)),
             g.strokePath(path, juce::PathStrokeType(thickness + (float)i * 4.0f * zoom,
                          juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
+
+        // Halo the circles too: the two end pin dots and the middle identity
+        // tag get the same soft glow as the wire, so the whole connection reads
+        // as a single lit-up object. The middle tag's position is computed with
+        // the same bezier + tag-centring math used where the circle is actually
+        // drawn further below (keep the two in sync).
+        auto bezierAtGlow = [&](float t) -> juce::Point<float> {
+            float u = 1.0f - t;
+            float x = u*u*u*start.x + 3*u*u*t*(start.x+dx) + 3*u*t*t*(end.x-dx) + t*t*t*end.x;
+            float y = u*u*u*start.y + 3*u*u*t*start.y      + 3*u*t*t*end.y       + t*t*t*end.y;
+            return {x, y};
+        };
+        int tagCountGlow = 1;
+        for (const auto& grp : graph.effectGroups)
+            for (int lid : grp.linkIds)
+                if (lid == link.id) { ++tagCountGlow; break; }
+        float tMidGlow = 0.5f - (tagCountGlow - 1) * 0.12f * 0.5f;
+        float endR = PIN_RADIUS * zoom;
+        float tagR = std::max(4.0f, 5.0f * zoom);
+        struct { juce::Point<float> pos; float r; } glowCircles[3] = {
+            { start,                  endR },
+            { end,                    endR },
+            { bezierAtGlow(tMidGlow), tagR },
+        };
+        for (const auto& c : glowCircles)
+            for (int i = 3; i >= 1; --i) {
+                float gr = c.r + (float)i * 3.0f * zoom;
+                g.setColour(glowCol.withAlpha(0.13f));
+                g.fillEllipse(c.pos.x - gr, c.pos.y - gr, gr * 2.0f, gr * 2.0f);
+            }
     }
 
     // Cable colour: brighten when emphasised so it stands out above its neighbours.

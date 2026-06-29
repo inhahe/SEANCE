@@ -485,16 +485,18 @@ void NodeGraphComponent::drawNode(juce::Graphics& g, Node& node) {
         }
 
         // Pin circle. Normally colored by kind; while a wire-drag is in
-        // flight and this pin is the current valid drop target, draw it in
-        // bright yellow with an outer halo so the user knows the cursor is
-        // close enough to drop.
+        // flight and this pin is the current valid drop target, draw it bigger
+        // with an outer halo in the pin's OWN kind colour (so the glow reads as
+        // "this pin, lit up" rather than a generic yellow) plus a white rim so
+        // it still pops against the cursor.
         bool isHoverDropTarget = (dragMode == DragMode::DragLink)
                               && (pin.id == dragHoverPinId);
         if (isHoverDropTarget) {
+            juce::Colour kindColour = colourForPinKind(pin.kind);
             // Outer halo
-            g.setColour(juce::Colours::yellow.withAlpha(0.35f));
+            g.setColour(kindColour.withAlpha(0.35f));
             g.fillEllipse(pos.x - r * 2, pos.y - r * 2, r * 4, r * 4);
-            g.setColour(juce::Colours::yellow);
+            g.setColour(kindColour);
             g.fillEllipse(pos.x - r * 1.4f, pos.y - r * 1.4f, r * 2.8f, r * 2.8f);
             g.setColour(juce::Colours::white);
             g.drawEllipse(pos.x - r * 1.4f, pos.y - r * 1.4f, r * 2.8f, r * 2.8f, 1.5f);

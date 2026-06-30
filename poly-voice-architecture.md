@@ -159,6 +159,46 @@ Internally:
   *supported* by the architecture (each voice has its own state, RNG, and
   context) but are M2/M3 polish, not v1.
 
+## Open engine decisions (resolve before writing `PolyVoiceProcessor`)
+
+These two forks surfaced while scoping the M1 engine. Both want a human in the
+loop (architectural call + an *auditory* "do N voices sum correctly" check that
+`--self-test` can't make), so they're recorded here rather than guessed at.
+
+1. **Inner-graph wiring reuse.** `GraphProcessor::rebuildGraph`'s
+   connection-builder (~550 lines) is what wires control-channel widening, pan
+   insertion, gain/gate cable nodes, and Signal/MIDI routing. The N inner voice
+   clones need that *same* wiring. Phase 0 already extracted the node→processor
+   *factory* (`createNodeProcessor`); the **connection-building still needs an
+   analogous extraction** into a reusable `wireSubgraph(targetGraph, nodes,
+   links, transport, sr, bs, …)` so both the main graph and each inner clone
+   call one routine. It's intertwined with main-graph-only concerns
+   (Output-sink mapping, hosted-plugin ownership transfer, MPE plugin config,
+   cache) that must be parameterized out. Behaviour-preserving and
+   self-test-verifiable, but its only second consumer (`PolyVoiceProcessor`)
+   doesn't exist yet, so do the extraction *together with* the first engine
+   draft, not speculatively before it.
+
+2. **How inner nodes get their per-note pitch/gate — Signal-context vs
+   forwarded MIDI.** The elegant design (point 2 above) drives the patch purely
+   from Pitch/Gate/Velocity **Signal** sources. But every existing
+   oscillator/synth node is **MIDI-driven** (reads its own MIDI input for
+   note/gate) — none accept a Signal pitch input today. So M1 has two routes:
+   - **(a) Forward MIDI per voice:** the container injects voice *v*'s note as
+     MIDI into clone *v*'s "Voice In" puck; existing synths work unmodified.
+     Fast path to "hear a chord," but the Pitch/Gate/Velocity Signal modules
+     stay decorative until osc/env nodes learn to read them.
+     - **(b) Signal-context driving:** add a Signal **pitch input** (and gate)
+     to at least one oscillator + the envelope, and drive them from the context
+     modules. This is the real modular payoff but needs new pins on existing
+     synths.
+   Likely answer: do **both** — ship (a) so M1 is audible immediately, and add
+   the Signal pitch/gate inputs from (b) to make the context modules real. This
+   choice fixes the exact output contract of `VoicePitch`/`VoiceGate`/
+   `VoiceVelocity` (Hz vs note-number, etc.), so **don't build those processors
+   until it's settled** — a guessed contract would be the "smaller version of
+   the wrong thing" CLAUDE.md prohibits.
+
 ## Build order
 
 - **Phase 0 (enabling refactor):** extract the node→processor factory from

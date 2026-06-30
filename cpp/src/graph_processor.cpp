@@ -28,6 +28,7 @@
 #include "signal_lfo.h"
 #include "signal_sample_hold.h"
 #include "signal_logic.h"
+#include "signal_filter.h"
 #include "poly_voice_processor.h"
 #include <algorithm>
 #include <cmath>
@@ -690,6 +691,8 @@ std::unique_ptr<juce::AudioProcessor> GraphProcessor::createNodeProcessor(
         return std::make_unique<CurveEQProcessor>(node);
     } else if (node.type == NodeType::Effect && node.script == "__signaleq__") {
         return std::make_unique<SignalEQProcessor>(node);
+    } else if (node.type == NodeType::Effect && node.script == "__signalfilter__") {
+        return std::make_unique<SignalFilterProcessor>(node);
     } else if (node.type == NodeType::Effect && node.script == "__ringmod__") {
         return std::make_unique<RingModProcessor>(node);
     } else if (node.type == NodeType::Effect &&

@@ -221,8 +221,11 @@ loop (architectural call + an *auditory* "do N voices sum correctly" check that
 - **M2 (done):** steal modes, glide, sample-accurate gates, edit-while-playing
   safety, full save/load + dirty/undo, scoped inner editor + breadcrumb +
   boundary pucks.
-- **M3:** real module kit (math, LFO, sample & hold, logic, more osc/filter
-  types), MPE per-note expression into the context, unison.
+- **M3 (in progress):** real module kit — **Signal Math, Signal LFO, Sample &
+  Hold, Signal Logic, and a resonant Signal Filter (LP/HP/BP, cutoff/resonance
+  modulatable via #88) are landed** (each with its own `--self-test` coverage and
+  docs across REFERENCE.md + the Voices tutorial). Still open: more oscillator
+  flavours / a noise source, MPE per-note expression into the context, unison.
 - **M4:** presets, modular-familiarity niceties, docs across the three surfaces.
 
 ## Edit-while-playing safety

@@ -2690,6 +2690,37 @@ Stateless; the audio bus stays silent. Covered by `testSignalLogic` in
 `--self-test` (every operation true/false, the silent audio bus, and the
 Operation param round-trip).
 
+#### Signal Filter (`__signalfilter__`)
+
+**Add Node → Effects → Signal Filter (resonant LP/HP/BP)** creates a
+`SignalFilterProcessor` (`signal_filter.h`). Unlike the four utilities above it is
+a true **audio Effect** (blue node, **Audio In → Audio Out**), not a control-Signal
+node — it's the modular kit's actual filter. It's a hand-rolled **TPT
+state-variable filter** (Andrew Simper / Cytomic topology), the same numerically
+stable form used for clean cutoff sweeps:
+
+- **Param — Type** (popup enum): **0 Low-pass** (keep lows), **1 High-pass** (keep
+  highs), **2 Band-pass** (keep a band centred on the cutoff).
+- **Param — Cutoff** (20–20 000 Hz, shown as `… Hz`): the corner frequency. Clamped
+  internally to 0.45 × sample-rate so it never reaches Nyquist (where `tan()` blows
+  up).
+- **Param — Resonance** (0–1): emphasis right at the cutoff. Maps to filter **Q
+  0.5–10**; at 1.0 it's a sharp resonant peak that can ring/whistle. The filter
+  stays finite even at max resonance + an impulse (state is NaN-flushed each block).
+
+**Modulating the cutoff is done the proper SEANCE way — via the on-demand
+modulation-pin mechanism (#88), not a hardcoded signal pin.** Right-click the
+**Cutoff** (or **Resonance**) param row → **Add Modulation Input (Mod)** grows a
+`Mod: Cutoff` control pin; wire an LFO / envelope / Sample & Hold / any Signal to it
+and it swings the cutoff around the knob's setting (block-rate). This mirrors Signal
+EQ and deliberately avoids a bespoke "Cutoff" input pin (CLAUDE.md #88 rule). Filter
+state (`ic1eq`/`ic2eq`) is per audio channel and persists across blocks, so a
+per-voice clone inside a Voice container gets its own independent filter — each note
+can have its cutoff swept independently. Covered by `testSignalFilter` in
+`--self-test` (LP passes lows / rejects highs, HP rejects DC / passes highs, BP
+rejects DC and peaks at cutoff, high-resonance stability, and the Type/Cutoff/
+Resonance save-load round-trip).
+
 ### Save / load, dirty tracking, undo
 
 Inner nodes and links serialize through the **same** generic path as any node —
@@ -2735,7 +2766,10 @@ values, sine bounds, bipolar/unipolar range, mid-block sync reset, and its param
 round-trip; `testSampleHold` checks input sampling and hold across triggers, the
 random modes' range and In-independence, and its Source param round-trip;
 `testSignalLogic` checks every comparison/boolean operation and its param
-round-trip.
+round-trip; and `testSignalFilter` runs the resonant filter in all three modes
+(low-pass passes a 50 Hz tone and rejects 8 kHz, high-pass rejects DC and passes
+8 kHz, band-pass rejects DC and peaks at the cutoff), confirms a high-resonance
+impulse stays finite, and round-trips the Type/Cutoff/Resonance params.
 
 ## Asset library (project stores)
 

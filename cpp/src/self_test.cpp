@@ -30,6 +30,7 @@
 #include "signal_lfo.h"             // SignalLFOProcessor - modular-kit LFO module
 #include "signal_sample_hold.h"     // SampleHoldProcessor - modular-kit S&H module
 #include "signal_logic.h"           // SignalLogicProcessor - modular-kit logic module
+#include "signal_filter.h"          // SignalFilterProcessor - modular-kit resonant filter
 
 #include <juce_audio_formats/juce_audio_formats.h>
 #include <juce_graphics/juce_graphics.h>
@@ -6483,6 +6484,121 @@ void testSignalLogic(Report& r) {
     r.check(found, "logic-saveload: Operation value round-trips");
 }
 
+void testSignalFilter(Report& r) {
+    r.section("Signal Filter module (resonant LP/HP/BP)");
+
+    NodeGraph graph;
+    auto& node = graph.addNode("Signal Filter", NodeType::Effect,
+        {Pin{0, "Audio In", PinKind::Audio, true}},
+        {Pin{0, "Audio Out", PinKind::Audio, false}}, {0.0f, 0.0f});
+    node.script = "__signalfilter__";
+    node.params.push_back({"Type", 0.0f, 0.0f, 2.0f});
+    node.params.push_back({"Cutoff", 1000.0f, 20.0f, 20000.0f});
+    node.params.push_back({"Resonance", 0.2f, 0.0f, 1.0f});
+
+    const double SR = 48000.0;
+    const int N = 512;
+
+    // Run a sine of frequency `freq` (or DC if freq==0) through the filter for a
+    // few blocks to reach steady state, then return the RMS of the final block.
+    auto rmsThrough = [&](int type, float cutoff, float freq) -> float {
+        node.params[0].value = (float) type;
+        node.params[1].value = cutoff;
+        SignalFilterProcessor proc(node);
+        proc.prepareToPlay(SR, N);
+        double phase = 0.0;
+        const double inc = 2.0 * juce::MathConstants<double>::pi * freq / SR;
+        juce::AudioBuffer<float> buf(2, N);
+        float rms = 0.0f;
+        for (int blk = 0; blk < 12; ++blk) {
+            for (int i = 0; i < N; ++i) {
+                float s = (freq <= 0.0f) ? 1.0f : (float) std::sin(phase);
+                phase += inc;
+                buf.setSample(0, i, s);
+                buf.setSample(1, i, s);
+            }
+            juce::MidiBuffer m;
+            proc.processBlock(buf, m);
+            // Measure on the last block only (steady state).
+            if (blk == 11) {
+                double acc = 0.0;
+                for (int i = 0; i < N; ++i) {
+                    float v = buf.getSample(0, i);
+                    acc += (double) v * v;
+                }
+                rms = (float) std::sqrt(acc / N);
+            }
+        }
+        return rms;
+    };
+
+    const float kSineRms = 0.707f; // RMS of a unit sine
+
+    // Low-pass: passes a low tone, rejects a high tone.
+    float lpLow  = rmsThrough(0, 500.0f, 50.0f);
+    float lpHigh = rmsThrough(0, 500.0f, 8000.0f);
+    r.check(lpLow > 0.5f, "filter LP: 50 Hz passes (rms " + juce::String(lpLow, 3) + ")");
+    r.check(lpHigh < 0.15f, "filter LP: 8 kHz rejected (rms " + juce::String(lpHigh, 3) + ")");
+    r.check(lpLow > lpHigh * 4.0f, "filter LP: low tone louder than high tone");
+
+    // High-pass: rejects DC, passes a high tone.
+    float hpDc   = rmsThrough(1, 500.0f, 0.0f);
+    float hpHigh = rmsThrough(1, 500.0f, 8000.0f);
+    r.check(hpDc < 0.1f, "filter HP: DC rejected (rms " + juce::String(hpDc, 3) + ")");
+    r.check(hpHigh > 0.5f, "filter HP: 8 kHz passes (rms " + juce::String(hpHigh, 3) + ")");
+
+    // Band-pass: rejects DC and a far-off tone, passes a tone at the cutoff.
+    float bpDc   = rmsThrough(2, 1000.0f, 0.0f);
+    float bpAt   = rmsThrough(2, 1000.0f, 1000.0f);
+    float bpFar  = rmsThrough(2, 1000.0f, 12000.0f);
+    r.check(bpDc < 0.1f, "filter BP: DC rejected (rms " + juce::String(bpDc, 3) + ")");
+    r.check(bpAt > bpDc + 0.2f && bpAt > bpFar, "filter BP: tone at cutoff passes strongest");
+
+    // Stability: output is always finite, even with high resonance + a step.
+    {
+        node.params[0].value = 0.0f;       // LP
+        node.params[1].value = 2000.0f;
+        node.params[2].value = 1.0f;       // max resonance
+        SignalFilterProcessor proc(node);
+        proc.prepareToPlay(SR, N);
+        juce::AudioBuffer<float> buf(2, N);
+        bool finite = true;
+        for (int blk = 0; blk < 8; ++blk) {
+            for (int i = 0; i < N; ++i) {
+                float s = (blk == 0 && i == 0) ? 1.0f : 0.0f; // impulse
+                buf.setSample(0, i, s);
+                buf.setSample(1, i, s);
+            }
+            juce::MidiBuffer m;
+            proc.processBlock(buf, m);
+            for (int i = 0; i < N; ++i)
+                if (!std::isfinite(buf.getSample(0, i))) finite = false;
+        }
+        r.check(finite, "filter: high-resonance impulse stays finite (no blow-up)");
+    }
+
+    // Save/load round-trip.
+    node.params[0].value = 2.0f;     // BP
+    node.params[1].value = 3500.0f;
+    node.params[2].value = 0.7f;
+    const std::string text = ProjectFile::serializeForUndo(graph);
+    NodeGraph dst;
+    const bool ok = ProjectFile::loadFromString(text, dst);
+    r.check(ok, "filter-saveload: project text parses back");
+    Node* d = dst.findNode(node.id);
+    r.check(d != nullptr && d->script == "__signalfilter__",
+            "filter-saveload: script tag survives");
+    if (d) {
+        auto val = [&](const char* nm) -> float {
+            for (auto& p : d->params) if (p.name == nm) return p.value;
+            return -999.0f;
+        };
+        r.check(std::abs(val("Type") - 2.0f) < 0.01f, "filter-saveload: Type round-trips");
+        r.check(std::abs(val("Cutoff") - 3500.0f) < 0.5f, "filter-saveload: Cutoff round-trips");
+        r.check(std::abs(val("Resonance") - 0.7f) < 0.01f, "filter-saveload: Resonance round-trips");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Voice container end-to-end audio: build a real NodeGraph with a VoiceContainer
 // whose inner patch is VoiceIn -> Signal Oscillator -> VoiceOut, drive it with a
@@ -6720,6 +6836,7 @@ int runSelfTest(const juce::File& outDir) {
     testSignalLFO(r);
     testSampleHold(r);
     testSignalLogic(r);
+    testSignalFilter(r);
     testVoiceContainerAudio(r);
     testVoiceContainerSaveLoad(r);
 

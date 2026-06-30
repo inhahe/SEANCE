@@ -138,6 +138,18 @@
 
 <p>The most useful question is <strong>A &gt; B</strong> — "is A above B?" Feed a signal into A and a threshold into B, and the output turns on whenever the signal climbs past that line. That's how you turn a smooth control into a trigger: for instance, fire a Sample &amp; Hold only when an LFO peaks. The other operations combine on/off signals: <strong>AND</strong> (both on), <strong>OR</strong> (either on), <strong>XOR</strong> (exactly one on), and <strong>NOT</strong> (flips A on↔off). Because the output is a tidy gate, you can wire it straight into anything that expects one — a Trigger, a Gate, or another Logic node's input to build up bigger conditions.</p>
 
+<h2>Shaping the tone — the Signal Filter</h2>
+
+<p>A <strong>Signal Filter</strong> brightens or darkens a sound by letting some frequencies through and holding others back — the single most useful tool for turning a raw, buzzy oscillator into something musical. Add one from <strong>Add Node → Effects → Signal Filter (resonant LP/HP/BP)</strong> and wire your audio through it (Audio In → Audio Out), just like any other effect. It has three controls:</p>
+
+<ul>
+  <li><strong>Type</strong> — click to pick. <em>Low-pass</em> keeps the lows and rolls off the highs (warmer, rounder); <em>High-pass</em> keeps the highs and removes the lows (thinner, airier); <em>Band-pass</em> keeps a band around the cutoff and drops everything else (nasal, focused).</li>
+  <li><strong>Cutoff</strong> — the frequency, in Hz, where the filter starts working. Drag it down to make a low-pass sound muffled, up to open it back up.</li>
+  <li><strong>Resonance</strong> — how much the filter emphasises the exact cutoff frequency. Low is gentle; turn it up and you get a sharp resonant peak that whistles and rings — the classic "wah" or "acid" sound.</li>
+</ul>
+
+<p>The real magic is <strong>sweeping the cutoff over time</strong>. Right-click the <strong>Cutoff</strong> row and choose <strong>Add Modulation Input</strong> — a small <em>Mod: Cutoff</em> socket appears on the node. Wire a <strong>Signal LFO</strong> into it for a slow wah that breathes, or an envelope so each note opens up bright and then closes down. Because everything inside a Voice container is its own copy, every note gets its <em>own</em> filter with its own moving cutoff — so a chord doesn't all sweep in lockstep; each note moves on its own.</p>
+
 <h2>Current limitations</h2>
 
 <p>This is the first version of the feature. A few things are intentionally simple for now:</p>

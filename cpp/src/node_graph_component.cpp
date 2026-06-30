@@ -1606,6 +1606,29 @@ void NodeGraphComponent::mouseDown(const juce::MouseEvent& e) {
                         });
                         return;
                     }
+                    // Signal Filter's Type is a discrete enum (Low-pass /
+                    // High-pass / Band-pass) - popup picker.
+                    if (p.name == "Type" && node->script == "__signalfilter__") {
+                        selectedNodeId = node->id;
+                        const char* labels[] = { "Low-pass  (keep lows)",
+                            "High-pass  (keep highs)", "Band-pass  (keep a band)" };
+                        int cur = juce::jlimit(0, 2, (int)std::round(p.value));
+                        juce::PopupMenu pm;
+                        for (int i = 0; i < 3; ++i)
+                            pm.addItem(i + 1, labels[i], true, i == cur);
+                        int nodeId = node->id;
+                        int paramIdx = idx;
+                        pm.showMenuAsync({}, [this, nodeId, paramIdx](int r) {
+                            if (r == 0) return;
+                            auto* nd = graph.findNode(nodeId);
+                            if (!nd || paramIdx >= (int)nd->params.size()) return;
+                            nd->params[paramIdx].value = (float)(r - 1);
+                            graph.dirty = true;
+                            graph.commitSnapshot("Change Signal Filter type");
+                            repaint();
+                        });
+                        return;
+                    }
                     // Signal Logic's Operation is a discrete enum (popup picker).
                     if (p.name == "Operation" && node->script == "__signallogic__") {
                         selectedNodeId = node->id;
@@ -1998,6 +2021,26 @@ juce::String NodeGraphComponent::paramRowTooltip(const Node& node,
     if (idx < 0 || idx >= (int)node.params.size()) return {};
     if (node.type == NodeType::TerrainSynth)
         return terrainSynthParamTooltip(node.params[idx].name);
+    // Signal Filter: music-terminology params (Cutoff in Hz, Resonance) get
+    // unit-bearing help, and the modulatable ones say how to wire a cable (#88).
+    if (node.type == NodeType::Effect && node.script == "__signalfilter__") {
+        const std::string& nm = node.params[idx].name;
+        static const char* kMod =
+            " Right-click this row to add a signal input so a cable (LFO, "
+            "envelope, another node) can drive it.";
+        if (nm == "Type")
+            return "Filter shape: Low-pass keeps frequencies below the cutoff, "
+                   "High-pass keeps those above, Band-pass keeps a band centred "
+                   "on the cutoff. Click to pick.";
+        if (nm == "Cutoff")
+            return juce::String("Corner frequency in Hz (cycles per second) - "
+                                "where the filter starts taking effect. Lower = "
+                                "darker/duller, higher = brighter.") + kMod;
+        if (nm == "Resonance")
+            return juce::String("Emphasis right at the cutoff (0 = none, 1 = a "
+                                "sharp resonant peak that can ring or whistle). "
+                                "Maps to filter Q 0.5-10.") + kMod;
+    }
     return {};
 }
 
@@ -2507,6 +2550,7 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
     fxMenu.addItem(222, "Parametric EQ");
     fxMenu.addItem(241, "Curve EQ (draw response)");
     fxMenu.addItem(242, "Signal EQ (modulatable points)");
+    fxMenu.addItem(243, "Signal Filter (resonant LP/HP/BP)");
     // Waveshaper submenu: one entry per amplitude-domain morph method. Built
     // from the shared registry (warp.h) so labels/tooltips stay in sync with
     // the synth's morph picker. IDs 260 + index (260..269); see the matching
@@ -3691,6 +3735,11 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
                     });
                     break;
                 }
+                case 243: makeEffect("Signal Filter", "__signalfilter__", {
+                    {"Type",      0.0f,    0.0f,     2.0f},              // 0=LP, 1=HP, 2=BP (enum picker)
+                    {"Cutoff", 1000.0f,   20.0f, 20000.0f, "%.0f Hz"},  // modulatable via #88
+                    {"Resonance", 0.2f,    0.0f,     1.0f},             // -> Q 0.5..10 - modulatable via #88
+                }); break;
                 case 239: makeEffect("SMS", "__sms__", {
                     {"Threshold",     0.1f, 0.0f,  1.0f},
                     {"Harmonic Gain", 1.0f, 0.0f,  3.0f},

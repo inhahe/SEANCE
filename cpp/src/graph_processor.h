@@ -277,6 +277,18 @@ public:
     // Force a rebuild on the next audio callback (thread-safe)
     void requestRebuild() { rebuildRequested = true; }
 
+    // Scope filter for rebuildGraph (per-voice polyphony, see
+    // poly-voice-architecture.md). -1 (default) = the main/top-level graph:
+    // build only nodes whose voiceContainerId == -1 (top level). >= 0 = build
+    // only the inner subgraph of that VoiceContainer (nodes whose
+    // voiceContainerId == scope). PolyVoiceProcessor sets this to the container
+    // id on each per-voice GraphProcessor so the same connection-builder wires
+    // the inner clone. The cross-scope link filtering is automatic: a link is
+    // only wired if BOTH endpoints were built in this scope (they land in
+    // nodeMap/nodeInputMap), so out-of-scope links are skipped by the existing
+    // membership guard in the link loop.
+    void setBuildScope(int s) { buildScope = s; }
+
     // Get the AudioProcessor for a given node ID (returns null if not in graph)
     juce::AudioProcessor* getProcessorForNode(int nodeId);
 
@@ -384,6 +396,9 @@ private:
     int lastNodeCount = 0;
     int lastLinkCount = 0;
     std::atomic<bool> rebuildRequested{false};
+
+    // Which scope rebuildGraph builds (see setBuildScope). -1 = top level.
+    int buildScope = -1;
 };
 
 } // namespace SoundShop

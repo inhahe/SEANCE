@@ -22,6 +22,8 @@
 #include "midi_breakout_node.h"
 #include "drum_synth.h"
 #include "spatializer_3d.h"
+#include "voice_nodes.h"
+#include "poly_voice_processor.h"
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -580,7 +582,11 @@ std::unique_ptr<juce::AudioProcessor> GraphProcessor::createNodeProcessor(
     // them before delegating. Everything else (timelines, SignalShape/Script,
     // every built-in synth and effect, passthrough fallback) is produced here so
     // an inner per-voice subgraph can be built with the same factory.
-    if (node.type == NodeType::MidiTimeline) {
+    if (node.type == NodeType::VoiceIn) {
+        // Per-note context source ("Voice In" puck) inside a VoiceContainer's
+        // inner graph. Driven per-voice by PolyVoiceProcessor.
+        return std::make_unique<VoiceInProcessor>(node);
+    } else if (node.type == NodeType::MidiTimeline) {
         return std::make_unique<MidiTimelineProcessor>(node, transport);
     } else if (node.type == NodeType::AudioTimeline) {
         return std::make_unique<AudioTimelineProcessor>(node, transport, graph);
@@ -755,6 +761,12 @@ void GraphProcessor::rebuildGraph(NodeGraph& graph, Transport& transport) {
 
     // Create a processor for each of our nodes
     for (auto& node : graph.nodes) {
+        // Per-voice polyphony scope filter (see setBuildScope). The main graph
+        // (buildScope == -1) builds only top-level nodes; a VoiceContainer's
+        // inner nodes (voiceContainerId == containerId) are built by that
+        // container's per-voice GraphProcessors with buildScope == containerId.
+        if (node.voiceContainerId != buildScope) continue;
+
         std::unique_ptr<juce::AudioProcessor> proc;
 
         // Check cache: manual freeze or auto-cache.
@@ -884,11 +896,17 @@ void GraphProcessor::rebuildGraph(NodeGraph& graph, Transport& transport) {
         // Everything else delegates to createNodeProcessor() so the SAME factory
         // builds main-graph and inner per-voice subgraph nodes (see
         // poly-voice-architecture.md).
-        if (node.type == NodeType::Output) {
-            // Our output node maps to the graph's audio output - skip creating a processor
+        if (node.type == NodeType::Output || node.type == NodeType::VoiceOut) {
+            // Output (main graph) and VoiceOut (a VoiceContainer's inner audio
+            // sink) both map to this graph's audio output node - no processor.
             nodeMap[node.id] = outputNodeId;
             nodeInputMap[node.id] = outputNodeId;
             continue;
+        } else if (node.type == NodeType::VoiceContainer) {
+            // A polyphonic instrument: one node on the main canvas, N inner
+            // patch clones summed inside. Built like any audio-producing node
+            // (gets MIDI in, stereo out, and a trailing pan below).
+            proc = std::make_unique<PolyVoiceProcessor>(node, graph, transport);
         } else if (node.plugin && node.plugin->instance) {
             // Real plugin - transfer ownership to the graph
             auto graphNode = processorGraph->addNode(std::move(node.plugin->instance));

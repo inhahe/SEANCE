@@ -93,9 +93,22 @@ enum class NodeType {
     // graph and expose the per-note state of the voice they're being rendered
     // for as a Signal output. The container writes each voice's value into the
     // module's output before rendering that voice. No inputs.
+    // RESERVED: standalone context-signal source nodes. Superseded for M1 by the
+    // consolidated VoiceIn puck (which carries Pitch/Gate/Velocity as output pins
+    // alongside raw MIDI), so these are not built or offered in the UI yet. Kept
+    // in the enum (append-only - node.type is a raw int) for a possible future
+    // "separate context modules" mode. createNodeProcessor returns Passthrough.
     VoicePitch,     // note pitch: Signal out (note number and/or Hz)
     VoiceGate,      // 1.0 while the note is held, 0.0 after note-off
-    VoiceVelocity   // note-on velocity, 0..1
+    VoiceVelocity,  // note-on velocity, 0..1
+    // Voice boundary pucks. These live INSIDE a VoiceContainer's inner graph.
+    // VoiceIn is the single per-note context source: the container drives it with
+    // the current voice's MIDI (raw per-voice note stream, for MIDI-driven synths)
+    // AND its Pitch (Hz), Gate (0/1) and Velocity (0..1) as Signal outputs. VoiceOut
+    // is the inner audio sink - the per-voice patch's audio leaves through it and is
+    // summed across voices (mapped to the inner graph's output node, like Output).
+    VoiceIn,
+    VoiceOut
 };
 
 struct Pin {

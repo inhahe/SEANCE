@@ -80,7 +80,22 @@ enum class NodeType {
     // wired anywhere a control cable is accepted (filter cutoff, wavetable
     // position, a different synth's Pressure input, etc.). One MIDI input, four
     // Signal outputs. See midi_breakout_node.h.
-    MidiBreakout
+    MidiBreakout,
+    // --- Per-voice polyphony (see poly-voice-architecture.md). NOTE: still
+    // append-only; node.type is stored as a raw int. ---
+    // VoiceContainer: a polyphonic instrument built from graph primitives. On
+    // the main canvas it is one node (MIDI in, audio out). Internally it owns an
+    // inner subgraph (nodes whose voiceContainerId == this node's id) that is
+    // instantiated N times - once per sounding MIDI note - and summed. Driven by
+    // PolyVoiceProcessor.
+    VoiceContainer,
+    // Voice-context source modules. These live INSIDE a VoiceContainer's inner
+    // graph and expose the per-note state of the voice they're being rendered
+    // for as a Signal output. The container writes each voice's value into the
+    // module's output before rendering that voice. No inputs.
+    VoicePitch,     // note pitch: Signal out (note number and/or Hz)
+    VoiceGate,      // 1.0 while the note is held, 0.0 after note-off
+    VoiceVelocity   // note-on velocity, 0..1
 };
 
 struct Pin {
@@ -511,6 +526,14 @@ struct Node {
     std::string anchorMarker;       // if non-empty, groupBeatOffset is overridden by this marker's beat
     float absoluteBeatOffset = 0.0f; // cached: cascading offset through all parents (updated by resolveAnchors)
     bool groupExpanded = true;      // show children in graph view
+
+    // Voice container (per-voice polyphony) - see poly-voice-architecture.md.
+    // Kept SEPARATE from the timeline-group fields above so the two membership
+    // meanings never collide. A node with voiceContainerId >= 0 lives inside the
+    // inner per-note patch of that VoiceContainer node.
+    int voiceContainerId = -1;   // -1 = not inside any Voice container (top level)
+    int voicePolyphony = 8;      // VoiceContainer: number of simultaneous voices
+    int voiceStealMode = 0;      // VoiceContainer: 0=oldest (v1)
 
     // MOD-import song-setting restore: when a module import overrides the
     // global song settings (repeat mode, song length, loop region), the

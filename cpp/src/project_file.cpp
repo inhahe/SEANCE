@@ -331,6 +331,13 @@ bool ProjectFile::writeProject(std::ostream& f, NodeGraph& graph,
         if (!node.anchorMarker.empty())
             writeStr(f, "anchorMarker", node.anchorMarker);
         writeInt(f, "groupExpanded", node.groupExpanded ? 1 : 0);
+        // Voice container (per-voice polyphony) - see poly-voice-architecture.md
+        if (node.voiceContainerId != -1)
+            writeInt(f, "voiceContainerId", node.voiceContainerId);
+        if (node.type == NodeType::VoiceContainer) {
+            writeInt(f, "voicePolyphony", node.voicePolyphony);
+            writeInt(f, "voiceStealMode", node.voiceStealMode);
+        }
         // Save child IDs as comma-separated
         if (!node.childNodeIds.empty()) {
             std::string ids;
@@ -776,6 +783,7 @@ bool ProjectFile::readProject(std::istream& f, NodeGraph& graph, PluginHost* plu
                         "mpeEnabled", "mpePitchBendRange", "parentGroupId",
                         "groupBeatOffset", "anchorMarker", "groupExpanded",
                         "childNodeIds", "modPin",
+                        "voiceContainerId", "voicePolyphony", "voiceStealMode",
                         "modImportSavedSong", "modImportPrevRepeatMode",
                         "modImportPrevRepeatCount", "modImportPrevSongLength",
                         "modImportPrevLoopEnabled", "modImportPrevLoopStart",
@@ -876,6 +884,9 @@ bool ProjectFile::readProject(std::istream& f, NodeGraph& graph, PluginHost* plu
             else if (key == "groupBeatOffset") curNode->groupBeatOffset = std::stof(val);
             else if (key == "anchorMarker") curNode->anchorMarker = val;
             else if (key == "groupExpanded") curNode->groupExpanded = (val == "1");
+            else if (key == "voiceContainerId") curNode->voiceContainerId = std::stoi(val);
+            else if (key == "voicePolyphony") curNode->voicePolyphony = std::stoi(val);
+            else if (key == "voiceStealMode") curNode->voiceStealMode = std::stoi(val);
             else if (key == "modImportSavedSong") curNode->modImportSavedSong = (val == "1");
             else if (key == "modImportPrevRepeatMode") curNode->modImportPrevRepeatMode = std::stoi(val);
             else if (key == "modImportPrevRepeatCount") curNode->modImportPrevRepeatCount = std::stoi(val);

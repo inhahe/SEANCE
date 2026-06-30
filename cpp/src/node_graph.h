@@ -546,7 +546,9 @@ struct Node {
     // inner per-note patch of that VoiceContainer node.
     int voiceContainerId = -1;   // -1 = not inside any Voice container (top level)
     int voicePolyphony = 8;      // VoiceContainer: number of simultaneous voices
-    int voiceStealMode = 0;      // VoiceContainer: 0=oldest (v1)
+    int voiceStealMode = 0;      // VoiceContainer: 0=oldest, 1=quietest, 2=round-robin
+    float voiceGlideMs = 0.0f;   // VoiceContainer: portamento time when a voice is
+                                 // stolen for a new note (0 = off / instant pitch)
 
     // MOD-import song-setting restore: when a module import overrides the
     // global song settings (repeat mode, song length, loop region), the

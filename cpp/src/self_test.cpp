@@ -6111,6 +6111,53 @@ void testVoiceInSignals(Report& r) {
         r.check(std::abs(buf.getSample(2, 60)  - c4) < 0.5f, "multi: pitch C4 during first note");
         r.check(std::abs(buf.getSample(2, 320) - e4) < 0.5f, "multi: pitch E4 during second note");
     }
+
+    const float c4 = VoiceInProcessor::midiToHz(60); // 261.63 Hz
+    const float c5 = VoiceInProcessor::midiToHz(72); // 523.25 Hz
+
+    // --- Block 5: glide (portamento) C4 -> C5 over 10 ms (480 < 512 samples). ---
+    {
+        // Establish a current pitch with a plain (no-glide) note-on first.
+        buf.clear();
+        juce::MidiBuffer m;
+        vip.noteOn(0, 60, 1.0f);
+        vip.processBlock(buf, m);
+        r.check(std::abs(buf.getSample(2, 0) - c4) < 0.5f, "glide: plain note-on sets C4 instantly");
+
+        buf.clear();
+        juce::MidiBuffer m2;
+        vip.noteOn(0, 72, 1.0f, 10.0f); // 10 ms @ 48 kHz = 480 samples
+        vip.processBlock(buf, m2);
+        r.check(buf.getSample(2, 0) > c4 && buf.getSample(2, 0) < c5 - 1.0f,
+                "glide: pitch starts sliding up from C4 (not an instant jump)");
+        r.check(buf.getSample(2, 100) < buf.getSample(2, 400),
+                "glide: pitch rises monotonically through the slide");
+        r.check(std::abs(buf.getSample(2, 479) - c5) < 1.0f,
+                "glide: reaches the target C5 at the end of the ramp");
+        r.check(std::abs(buf.getSample(2, 511) - c5) < 1.0f,
+                "glide: holds the target after the ramp completes");
+        // Gate still steps instantly even while pitch glides.
+        r.check(buf.getSample(3, 0) == 1.0f, "glide: gate retriggers instantly (not ramped)");
+    }
+
+    // --- Block 6: glide spanning more than one block (20 ms = 960 > 512). ---
+    {
+        buf.clear();
+        juce::MidiBuffer m;
+        vip.noteOn(0, 60, 1.0f, 20.0f); // C5 -> C4 over 960 samples
+        vip.processBlock(buf, m);
+        const float endB1 = buf.getSample(2, 511);
+        r.check(endB1 < c5 - 1.0f && endB1 > c4,
+                "glide(cross-block): still mid-slide at the end of the first block");
+
+        buf.clear();
+        juce::MidiBuffer m2;
+        vip.processBlock(buf, m2); // no new events; ramp must continue on its own
+        r.check(buf.getSample(2, 0) < endB1,
+                "glide(cross-block): keeps sliding into the second block");
+        r.check(std::abs(buf.getSample(2, 511) - c4) < 1.0f,
+                "glide(cross-block): reaches the target by the end of the second block");
+    }
 }
 
 // ---------------------------------------------------------------------------

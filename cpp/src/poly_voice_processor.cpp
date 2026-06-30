@@ -75,8 +75,15 @@ void PolyVoiceProcessor::processBlock(juce::AudioBuffer<float>& buf,
             if (res.slot < 0) continue;
             auto& v = voices[(size_t) res.slot];
             if (res.stole && v.voiceIn) v.voiceIn->reset();
-            if (v.voiceIn)
-                v.voiceIn->noteOn(off, m.getNoteNumber(), m.getFloatVelocity());
+            if (v.voiceIn) {
+                // Portamento applies only when this voice was STOLEN mid-note
+                // (the pitch slides from the old note to the new one). A fresh /
+                // freed voice has no meaningful "previous pitch", so it starts on
+                // pitch with no glide. glide time is a live container field.
+                const float glideMs = res.stole
+                    ? juce::jmax(0.0f, containerNode.voiceGlideMs) : 0.0f;
+                v.voiceIn->noteOn(off, m.getNoteNumber(), m.getFloatVelocity(), glideMs);
+            }
         } else if (m.isNoteOff() || (m.isNoteOn() && m.getVelocity() == 0)) {
             const int slot = alloc.noteOff(m.getNoteNumber());
             if (slot >= 0 && voices[(size_t) slot].voiceIn)

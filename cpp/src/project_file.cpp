@@ -337,6 +337,7 @@ bool ProjectFile::writeProject(std::ostream& f, NodeGraph& graph,
         if (node.type == NodeType::VoiceContainer) {
             writeInt(f, "voicePolyphony", node.voicePolyphony);
             writeInt(f, "voiceStealMode", node.voiceStealMode);
+            writeFloat(f, "voiceGlideMs", node.voiceGlideMs);
         }
         // Save child IDs as comma-separated
         if (!node.childNodeIds.empty()) {
@@ -784,6 +785,7 @@ bool ProjectFile::readProject(std::istream& f, NodeGraph& graph, PluginHost* plu
                         "groupBeatOffset", "anchorMarker", "groupExpanded",
                         "childNodeIds", "modPin",
                         "voiceContainerId", "voicePolyphony", "voiceStealMode",
+                        "voiceGlideMs",
                         "modImportSavedSong", "modImportPrevRepeatMode",
                         "modImportPrevRepeatCount", "modImportPrevSongLength",
                         "modImportPrevLoopEnabled", "modImportPrevLoopStart",
@@ -887,6 +889,7 @@ bool ProjectFile::readProject(std::istream& f, NodeGraph& graph, PluginHost* plu
             else if (key == "voiceContainerId") curNode->voiceContainerId = std::stoi(val);
             else if (key == "voicePolyphony") curNode->voicePolyphony = std::stoi(val);
             else if (key == "voiceStealMode") curNode->voiceStealMode = std::stoi(val);
+            else if (key == "voiceGlideMs") curNode->voiceGlideMs = std::stof(val);
             else if (key == "modImportSavedSong") curNode->modImportSavedSong = (val == "1");
             else if (key == "modImportPrevRepeatMode") curNode->modImportPrevRepeatMode = std::stoi(val);
             else if (key == "modImportPrevRepeatCount") curNode->modImportPrevRepeatCount = std::stoi(val);

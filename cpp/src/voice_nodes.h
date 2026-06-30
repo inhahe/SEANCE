@@ -60,10 +60,17 @@ public:
 
     // Queue a note-on for this voice at the given within-block sample offset.
     // Schedules the Pitch/Gate/Velocity step at that offset AND the MIDI note.
-    void noteOn(int sampleOffset, int midiNote, float vel) {
+    // glideMs > 0 makes the Pitch signal SLIDE (portamento) from its current
+    // value to the new note over glideMs instead of stepping - used when this
+    // voice was stolen mid-note (see PolyVoiceProcessor). The Gate still steps
+    // instantly at the offset so the envelope retriggers on time.
+    void noteOn(int sampleOffset, int midiNote, float vel, float glideMs = 0.0f) {
         const float v  = juce::jlimit(0.0f, 1.0f, vel);
         const float hz = midiToHz(midiNote);
-        pushSeg({ sampleOffset, 1.0f, hz, v });
+        int glideSamples = 0;
+        if (glideMs > 0.0f && sampleRate > 0.0)
+            glideSamples = (int) std::lround(glideMs * 0.001 * sampleRate);
+        pushSeg({ sampleOffset, 1.0f, hz, v, glideSamples });
         if (pending.size() < kMaxPending)
             pending.push_back({ juce::MidiMessage::noteOn(1, midiNote,
                                  (juce::uint8)juce::jlimit(1, 127, (int)std::lround(vel * 127.0f))),
@@ -74,7 +81,7 @@ public:
     // through its tail, so Pitch/Velocity are held at their current values and
     // only the Gate falls to 0.
     void noteOff(int sampleOffset, int midiNote) {
-        pushSeg({ sampleOffset, 0.0f, lastPitch(), lastVel() });
+        pushSeg({ sampleOffset, 0.0f, lastPitch(), lastVel(), 0 });
         if (pending.size() < kMaxPending)
             pending.push_back({ juce::MidiMessage::noteOff(1, midiNote), sampleOffset });
     }
@@ -86,7 +93,7 @@ public:
         const float p = lastPitch();
         const float v = lastVel();
         segs.clear();
-        pushSeg({ 0, 0.0f, p, v });
+        pushSeg({ 0, 0.0f, p, v, 0 });
         pending.clear();
         if (pending.size() < kMaxPending)
             pending.push_back({ juce::MidiMessage::allNotesOff(1), 0 });
@@ -112,8 +119,10 @@ public:
 
 private:
     // One scheduled value-change of the Pitch/Gate/Velocity signals, to take
-    // effect from `offset` samples into the current block.
-    struct Seg { int offset; float gate, pitch, vel; };
+    // effect from `offset` samples into the current block. glideSamples > 0
+    // turns the pitch change into a portamento ramp of that many samples
+    // (linear in log-frequency, i.e. constant semitones/sec); 0 = instant step.
+    struct Seg { int offset; float gate, pitch, vel; int glideSamples; };
 
     // The latest scheduled Pitch/Velocity this block (or the carried value if
     // nothing is queued yet) - what a note-off should hold the tone at.
@@ -141,7 +150,26 @@ private:
         float g = curGate, p = curPitch, v = curVel;
         for (int i = 0; i < n; ++i) {
             while (idx < segs.size() && segs[idx].offset <= i) {
-                g = segs[idx].gate; p = segs[idx].pitch; v = segs[idx].vel; ++idx;
+                const Seg& s = segs[idx];
+                g = s.gate; v = s.vel;
+                if (s.glideSamples > 0 && p > 0.0f && s.pitch > 0.0f) {
+                    // Begin a portamento ramp from the current pitch toward the
+                    // target, advancing one step per sample in log-frequency.
+                    glideTargetLog = std::log((double) s.pitch);
+                    glideRemaining = s.glideSamples;
+                    glideStepLog   = (glideTargetLog - std::log((double) p))
+                                     / (double) s.glideSamples;
+                } else {
+                    p = s.pitch;          // instant step
+                    glideRemaining = 0;
+                }
+                ++idx;
+            }
+            // Advance an in-flight glide toward its target (may span blocks).
+            if (glideRemaining > 0) {
+                double lp = std::log((double) p) + glideStepLog;
+                if (--glideRemaining == 0) lp = glideTargetLog; // snap to exact
+                p = (float) std::exp(lp);
             }
             if (pp) pp[i] = p;
             if (gp) gp[i] = g;
@@ -150,7 +178,17 @@ private:
         // Any segments past the block end still update the carried value so they
         // take effect at the very start of the next block.
         while (idx < segs.size()) {
-            g = segs[idx].gate; p = segs[idx].pitch; v = segs[idx].vel; ++idx;
+            const Seg& s = segs[idx];
+            g = s.gate; v = s.vel;
+            if (s.glideSamples > 0 && p > 0.0f && s.pitch > 0.0f) {
+                glideTargetLog = std::log((double) s.pitch);
+                glideRemaining = s.glideSamples;
+                glideStepLog   = (glideTargetLog - std::log((double) p)) / (double) s.glideSamples;
+            } else {
+                p = s.pitch;
+                glideRemaining = 0;
+            }
+            ++idx;
         }
         curGate = g; curPitch = p; curVel = v;
         segs.clear();
@@ -170,6 +208,12 @@ private:
     float curPitch = 440.0f;
     float curGate  = 0.0f;
     float curVel   = 0.0f;
+
+    // In-flight portamento ramp state, persisted across blocks so a glide longer
+    // than one block keeps sliding. glideRemaining == 0 means no active glide.
+    int    glideRemaining = 0;
+    double glideStepLog   = 0.0;
+    double glideTargetLog = 0.0;
 };
 
 } // namespace SoundShop

@@ -6060,6 +6060,79 @@ void testVoiceContainerAudio(Report& r) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Voice container save/load: the new membership fields (voiceContainerId,
+// voicePolyphony, voiceStealMode) and the container<->inner relationship must
+// survive a serialize/deserialize cycle. Uses the exact in-memory path that
+// commitSnapshot()/undo uses (serializeForUndo -> loadFromString), so this also
+// guards the undo round-trip. CLAUDE.md "Save/Load" checklist item.
+// ---------------------------------------------------------------------------
+void testVoiceContainerSaveLoad(Report& r) {
+    r.section("Voice container (save/load round-trip)");
+
+    NodeGraph src;
+    int containerId, innerId;
+    {
+        auto& c = src.addNode("Voice", NodeType::VoiceContainer,
+            {Pin{0, "MIDI", PinKind::Midi, true}},
+            {Pin{0, "Audio", PinKind::Audio, false}}, {0.0f, 0.0f});
+        c.voicePolyphony = 6;
+        c.voiceStealMode = 0;
+        containerId = c.id;
+    }
+    int viMidi, synMidi, synAudio, voAudio;
+    {
+        auto& vi = src.addNode("Voice In", NodeType::VoiceIn, {},
+            {Pin{0, "MIDI", PinKind::Midi, false}}, {-200.0f, 0.0f});
+        vi.voiceContainerId = containerId;
+        viMidi = vi.pinsOut[0].id;
+    }
+    {
+        auto& s = src.addNode("FM Synth", NodeType::Instrument,
+            {Pin{0, "MIDI", PinKind::Midi, true}},
+            {Pin{0, "Audio", PinKind::Audio, false}}, {0.0f, 0.0f});
+        s.voiceContainerId = containerId;
+        s.script = "__fmsynth__";
+        innerId = s.id;
+        synMidi  = s.pinsIn[0].id;
+        synAudio = s.pinsOut[0].id;
+    }
+    {
+        auto& vo = src.addNode("Voice Out", NodeType::VoiceOut,
+            {Pin{0, "Audio", PinKind::Audio, true}}, {}, {200.0f, 0.0f});
+        vo.voiceContainerId = containerId;
+        voAudio = vo.pinsIn[0].id;
+    }
+    src.addLink(viMidi, synMidi);
+    src.addLink(synAudio, voAudio);
+
+    const std::string text = ProjectFile::serializeForUndo(src);
+    NodeGraph dst;
+    const bool ok = ProjectFile::loadFromString(text, dst);
+    r.check(ok, "vc-saveload: project text parses back");
+    r.check(dst.nodes.size() == src.nodes.size(),
+            "vc-saveload: node count preserved");
+    r.check(dst.links.size() == src.links.size(),
+            "vc-saveload: link count preserved");
+
+    Node* c = dst.findNode(containerId);
+    r.check(c != nullptr && c->type == NodeType::VoiceContainer,
+            "vc-saveload: container survives with its type");
+    r.check(c != nullptr && c->voicePolyphony == 6,
+            "vc-saveload: voicePolyphony round-trips");
+
+    Node* inner = dst.findNode(innerId);
+    r.check(inner != nullptr && inner->voiceContainerId == containerId,
+            "vc-saveload: inner node keeps its container membership");
+    r.check(inner != nullptr && inner->script == "__fmsynth__",
+            "vc-saveload: inner synth keeps its identity");
+
+    // Top-level membership (-1) must not leak onto inner nodes, and vice-versa.
+    int innerCount = 0;
+    for (auto& n : dst.nodes) if (n.voiceContainerId == containerId) ++innerCount;
+    r.check(innerCount == 3, "vc-saveload: all three inner nodes stay scoped");
+}
+
 int runSelfTest(const juce::File& outDir) {
     outDir.createDirectory();
     Report r;
@@ -6081,6 +6154,7 @@ int runSelfTest(const juce::File& outDir) {
     testAssetLibrary(r);
     testVoiceAllocator(r);
     testVoiceContainerAudio(r);
+    testVoiceContainerSaveLoad(r);
 
     r.section("Summary");
     r.line("  PASSED: " + juce::String(r.passed));

@@ -4026,6 +4026,24 @@ void NodeGraphComponent::showNodeMenu(Node& node) {
         const char* modeName = node.voiceStealMode == 1 ? "quietest"
                              : node.voiceStealMode == 2 ? "round-robin" : "oldest";
         menu.addSubMenu("Voice stealing (" + juce::String(modeName) + ")", stealMenu);
+
+        // Glide (portamento): how long the pitch takes to slide to a new note
+        // when a sounding voice is reused. Preset times keep the popup simple
+        // (no in-menu slider); ticked to the closest current value.
+        juce::PopupMenu glideMenu;
+        struct { int id; const char* label; float ms; } gl[] = {
+            { 220, "Off (instant)", 0.0f },
+            { 221, "Short (20 ms)", 20.0f },
+            { 222, "Medium (60 ms)", 60.0f },
+            { 223, "Long (150 ms)", 150.0f },
+            { 224, "Very long (400 ms)", 400.0f },
+        };
+        for (auto& g : gl)
+            glideMenu.addItem(g.id, g.label, true,
+                              std::abs(node.voiceGlideMs - g.ms) < 0.5f);
+        juce::String glLabel = node.voiceGlideMs <= 0.5f
+            ? "off" : juce::String((int) std::lround(node.voiceGlideMs)) + " ms";
+        menu.addSubMenu("Glide (" + glLabel + ")", glideMenu);
     }
 
     // Envelope editor on synths whose amplitude envelope IS the shared node
@@ -4246,6 +4264,16 @@ void NodeGraphComponent::showNodeMenu(Node& node) {
             if (node->voiceStealMode != mode) {
                 node->voiceStealMode = mode;
                 graph.commitSnapshot("Set voice stealing mode");
+                if (onNodeEdited) onNodeEdited();
+            }
+        } else if (result >= 220 && result <= 224) {
+            // Voice glide (portamento) time. Like the steal mode, PolyVoiceProcessor
+            // reads voiceGlideMs live, so the change applies without a rebuild.
+            const float ms[] = { 0.0f, 20.0f, 60.0f, 150.0f, 400.0f };
+            float v = ms[result - 220];
+            if (std::abs(node->voiceGlideMs - v) > 0.5f) {
+                node->voiceGlideMs = v;
+                graph.commitSnapshot("Set voice glide");
                 if (onNodeEdited) onNodeEdited();
             }
         } else if (result == 181) {

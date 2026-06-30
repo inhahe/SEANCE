@@ -2701,7 +2701,7 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
     fxMenu.addItem(224, "M/S Encode (stereo -> mid+side)");
     fxMenu.addItem(225, "M/S Decode (mid+side -> stereo)");
     fxMenu.addSeparator();
-    fxMenu.addItem(217, "3D Spatializer (binaural)");
+    fxMenu.addItem(217, "3D Spatializer (binaural / holophonic)");
     menu.addSubMenu("Effects", fxMenu);
 
     menu.addSeparator();

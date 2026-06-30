@@ -132,6 +132,12 @@
 
 <p>With Source set to <strong>Input</strong> instead, it samples whatever you feed In at each trigger — for example, sampling a slow LFO on every note gives stepped, staircase movement instead of a smooth glide.</p>
 
+<h2>Yes/no decisions — Signal Logic</h2>
+
+<p><strong>Signal Logic</strong> answers a yes/no question every moment and puts out a clean on/off signal (a "gate") — 1 for yes, 0 for no. Add one from <strong>Add Node → Signal Shape → Signal Logic (compare / gate)</strong>. It has two inputs, <strong>A</strong> and <strong>B</strong>, and the <strong>Operation</strong> control on the node picks the question.</p>
+
+<p>The most useful question is <strong>A &gt; B</strong> — "is A above B?" Feed a signal into A and a threshold into B, and the output turns on whenever the signal climbs past that line. That's how you turn a smooth control into a trigger: for instance, fire a Sample &amp; Hold only when an LFO peaks. The other operations combine on/off signals: <strong>AND</strong> (both on), <strong>OR</strong> (either on), <strong>XOR</strong> (exactly one on), and <strong>NOT</strong> (flips A on↔off). Because the output is a tidy gate, you can wire it straight into anything that expects one — a Trigger, a Gate, or another Logic node's input to build up bigger conditions.</p>
+
 <h2>Current limitations</h2>
 
 <p>This is the first version of the feature. A few things are intentionally simple for now:</p>

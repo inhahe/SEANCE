@@ -1606,6 +1606,29 @@ void NodeGraphComponent::mouseDown(const juce::MouseEvent& e) {
                         });
                         return;
                     }
+                    // Signal Logic's Operation is a discrete enum (popup picker).
+                    if (p.name == "Operation" && node->script == "__signallogic__") {
+                        selectedNodeId = node->id;
+                        const char* labels[] = { "A > B  (above threshold)",
+                            "A < B  (below threshold)", "A AND B", "A OR B",
+                            "A XOR B  (exactly one)", "NOT A  (invert A)" };
+                        int cur = juce::jlimit(0, 5, (int)std::round(p.value));
+                        juce::PopupMenu pm;
+                        for (int i = 0; i < 6; ++i)
+                            pm.addItem(i + 1, labels[i], true, i == cur);
+                        int nodeId = node->id;
+                        int paramIdx = idx;
+                        pm.showMenuAsync({}, [this, nodeId, paramIdx](int r) {
+                            if (r == 0) return;
+                            auto* nd = graph.findNode(nodeId);
+                            if (!nd || paramIdx >= (int)nd->params.size()) return;
+                            nd->params[paramIdx].value = (float)(r - 1);
+                            graph.dirty = true;
+                            graph.commitSnapshot("Change Signal Logic operation");
+                            repaint();
+                        });
+                        return;
+                    }
                     // Sample & Hold's Source is a discrete enum (popup picker).
                     if (node->script == "__signalsh__" && p.name == "Source") {
                         selectedNodeId = node->id;
@@ -2121,7 +2144,7 @@ void NodeGraphComponent::mouseDoubleClick(const juce::MouseEvent& e) {
         // the SignalShape family for coloring but have no program editor - their
         // params are edited directly on the node face. Double-click is a no-op.
         if (node->script == "__signalmath__" || node->script == "__signallfo__"
-            || node->script == "__signalsh__")
+            || node->script == "__signalsh__" || node->script == "__signallogic__")
             return;
         if (node->script == "__xypad__") {
             auto* pad = new XYPadComponent(graph, captured);
@@ -2560,6 +2583,8 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
     sigMenu.addItem(153, "Signal LFO (modulation source)");
     // Modular-kit sample & hold (stepped / random-per-note modulation).
     sigMenu.addItem(154, "Sample & Hold (stepped/random)");
+    // Modular-kit comparison + boolean logic (signals -> gate).
+    sigMenu.addItem(155, "Signal Logic (compare / gate)");
     sigMenu.addSeparator();
     sigMenu.addItem(133, "XY Pad");
     sigMenu.addItem(135, "Control Bank");
@@ -2790,6 +2815,23 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
                 n.pinsOut[0].tooltip = "The most recently held value.";
             // 0=Input 1=Random(-1..1) 2=Random(0..1)
             n.params.push_back({"Source", 0.0f, 0.0f, 2.0f});
+        } else if (result == 155) {
+            // Signal Logic: comparison + boolean logic -> 0/1 gate. Two Signal
+            // inputs (A=ch2, B=ch3) -> one Signal output (Out=ch2).
+            // NodeType::SignalShape tagged "__signallogic__"; SignalLogicProcessor.
+            auto& n = graph.addNode("Signal Logic", NodeType::SignalShape,
+                {Pin{0, "A", PinKind::Signal, true, 1},
+                 Pin{0, "B", PinKind::Signal, true, 1}},
+                {Pin{0, "Out", PinKind::Signal, false, 1}}, {p.x, p.y});
+            n.script = "__signallogic__";
+            if (n.pinsIn.size() >= 2) {
+                n.pinsIn[0].tooltip = "A: first operand (signal, or boolean when >= 0.5).";
+                n.pinsIn[1].tooltip = "B: threshold / second operand. Unwired = 0.";
+            }
+            if (!n.pinsOut.empty())
+                n.pinsOut[0].tooltip = "Result as a 0/1 gate, computed every sample.";
+            // 0=A>B 1=A<B 2=AND 3=OR 4=XOR 5=NOT A
+            n.params.push_back({"Operation", 0.0f, 0.0f, 5.0f});
         } else if (result == 6) {
             // WASM Script - open file chooser
             auto chooser = std::make_shared<juce::FileChooser>(

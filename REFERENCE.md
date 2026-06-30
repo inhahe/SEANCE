@@ -2670,6 +2670,26 @@ random values vary between voices. Covered by `testSampleHold` in `--self-test`
 (input sampling + hold across two triggers, random modes ignoring In and staying
 in range, hold steadiness, the silent audio bus, and the Source param round-trip).
 
+#### Signal Logic (`__signallogic__`)
+
+**Add Node → Signal Shape → Signal Logic (compare / gate)** creates a
+`SignalLogicProcessor` (`signal_logic.h`). It turns two control Signals into a
+clean **0/1 gate** every sample — for thresholding a signal or combining gates. A
+boolean input is read as "true when ≥ 0.5":
+
+- **Inputs (Signal):** **A** (channel 2) and **B** (channel 3 — threshold / second
+  operand; B unwired = 0).
+- **Output (Signal):** **Out** (channel 2) — a hard 1.0 or 0.0.
+- **Param — Operation** (popup enum): **0 A > B** (gate while A is above the
+  threshold B), **1 A < B**, **2 A AND B**, **3 A OR B**, **4 A XOR B** (exactly
+  one true), **5 NOT A** (invert A; ignores B).
+
+Because the output is a hard gate it composes cleanly with anything that wants
+one — a Sample & Hold's Trigger, a Signal Oscillator's Gate, another Logic input.
+Stateless; the audio bus stays silent. Covered by `testSignalLogic` in
+`--self-test` (every operation true/false, the silent audio bus, and the
+Operation param round-trip).
+
 ### Save / load, dirty tracking, undo
 
 Inner nodes and links serialize through the **same** generic path as any node —
@@ -2713,7 +2733,9 @@ checks divide-by-zero safety, unwired-input (=0) behavior, the silent audio bus,
 and the Operation-param save/load round-trip; `testSignalLFO` checks LFO waveform
 values, sine bounds, bipolar/unipolar range, mid-block sync reset, and its param
 round-trip; `testSampleHold` checks input sampling and hold across triggers, the
-random modes' range and In-independence, and its Source param round-trip.
+random modes' range and In-independence, and its Source param round-trip;
+`testSignalLogic` checks every comparison/boolean operation and its param
+round-trip.
 
 ## Asset library (project stores)
 

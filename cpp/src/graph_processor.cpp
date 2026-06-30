@@ -27,6 +27,7 @@
 #include "signal_math.h"
 #include "signal_lfo.h"
 #include "signal_sample_hold.h"
+#include "signal_logic.h"
 #include "poly_voice_processor.h"
 #include <algorithm>
 #include <cmath>
@@ -647,6 +648,9 @@ std::unique_ptr<juce::AudioProcessor> GraphProcessor::createNodeProcessor(
     } else if (node.type == NodeType::SignalShape && node.script == "__signalsh__") {
         // Modular-kit sample & hold. Same SignalShape-family dispatch.
         return std::make_unique<SampleHoldProcessor>(node);
+    } else if (node.type == NodeType::SignalShape && node.script == "__signallogic__") {
+        // Modular-kit comparison + boolean logic. Same SignalShape dispatch.
+        return std::make_unique<SignalLogicProcessor>(node);
     } else if (node.type == NodeType::SignalShape) {
         return std::make_unique<SignalShapeProcessor>(node, transport);
     } else if (node.type == NodeType::MidiScript) {

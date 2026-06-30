@@ -29,6 +29,7 @@
 #include "signal_math.h"            // SignalMathProcessor - modular-kit math module
 #include "signal_lfo.h"             // SignalLFOProcessor - modular-kit LFO module
 #include "signal_sample_hold.h"     // SampleHoldProcessor - modular-kit S&H module
+#include "signal_logic.h"           // SignalLogicProcessor - modular-kit logic module
 
 #include <juce_audio_formats/juce_audio_formats.h>
 #include <juce_graphics/juce_graphics.h>
@@ -6426,6 +6427,63 @@ void testSampleHold(Report& r) {
 }
 
 // ---------------------------------------------------------------------------
+// Signal Logic module: comparison + boolean logic -> 0/1 gate.
+// ---------------------------------------------------------------------------
+void testSignalLogic(Report& r) {
+    r.section("Signal Logic module (modular kit)");
+
+    NodeGraph graph;
+    auto& node = graph.addNode("Signal Logic", NodeType::SignalShape,
+        {Pin{0, "A", PinKind::Signal, true, 1},
+         Pin{0, "B", PinKind::Signal, true, 1}},
+        {Pin{0, "Out", PinKind::Signal, false, 1}}, {0.0f, 0.0f});
+    node.script = "__signallogic__";
+    node.params.push_back({"Operation", 0.0f, 0.0f, 5.0f});
+
+    SignalLogicProcessor proc(node);
+    const int N = 16;
+    juce::AudioBuffer<float> buf(4, N); // ch2=A/Out, ch3=B
+    proc.prepareToPlay(48000.0, N);
+
+    auto run = [&](int op, float a, float b) -> float {
+        node.params[0].value = (float) op;
+        buf.clear();
+        for (int i = 0; i < N; ++i) { buf.setSample(2, i, a); buf.setSample(3, i, b); }
+        juce::MidiBuffer m;
+        proc.processBlock(buf, m);
+        return buf.getSample(2, N / 2);
+    };
+
+    r.check(run(0, 0.8f, 0.5f) == 1.0f, "logic: A>B true (0.8 > 0.5)");
+    r.check(run(0, 0.3f, 0.5f) == 0.0f, "logic: A>B false (0.3 > 0.5)");
+    r.check(run(1, 0.3f, 0.5f) == 1.0f, "logic: A<B true (0.3 < 0.5)");
+    r.check(run(1, 0.8f, 0.5f) == 0.0f, "logic: A<B false");
+    r.check(run(2, 1.0f, 1.0f) == 1.0f, "logic: AND true (both high)");
+    r.check(run(2, 1.0f, 0.0f) == 0.0f, "logic: AND false (one low)");
+    r.check(run(3, 1.0f, 0.0f) == 1.0f, "logic: OR true (one high)");
+    r.check(run(3, 0.0f, 0.0f) == 0.0f, "logic: OR false (both low)");
+    r.check(run(4, 1.0f, 0.0f) == 1.0f, "logic: XOR true (exactly one)");
+    r.check(run(4, 1.0f, 1.0f) == 0.0f, "logic: XOR false (both high)");
+    r.check(run(5, 0.0f, 0.0f) == 1.0f, "logic: NOT A true (A low)");
+    r.check(run(5, 1.0f, 0.0f) == 0.0f, "logic: NOT A false (A high)");
+    r.check(buf.getSample(0, 0) == 0.0f && buf.getSample(1, 0) == 0.0f,
+            "logic: audio channels stay silent");
+
+    // Save/load round-trip.
+    node.params[0].value = 4.0f; // XOR
+    const std::string text = ProjectFile::serializeForUndo(graph);
+    NodeGraph dst;
+    const bool ok = ProjectFile::loadFromString(text, dst);
+    r.check(ok, "logic-saveload: project text parses back");
+    Node* d = dst.findNode(node.id);
+    r.check(d != nullptr && d->script == "__signallogic__", "logic-saveload: script tag survives");
+    bool found = false;
+    if (d) for (auto& p : d->params)
+        if (p.name == "Operation") found = std::abs(p.value - 4.0f) < 0.01f;
+    r.check(found, "logic-saveload: Operation value round-trips");
+}
+
+// ---------------------------------------------------------------------------
 // Voice container end-to-end audio: build a real NodeGraph with a VoiceContainer
 // whose inner patch is VoiceIn -> Signal Oscillator -> VoiceOut, drive it with a
 // synthetic MIDI buffer through PolyVoiceProcessor, and confirm the clone/build/
@@ -6661,6 +6719,7 @@ int runSelfTest(const juce::File& outDir) {
     testSignalMath(r);
     testSignalLFO(r);
     testSampleHold(r);
+    testSignalLogic(r);
     testVoiceContainerAudio(r);
     testVoiceContainerSaveLoad(r);
 

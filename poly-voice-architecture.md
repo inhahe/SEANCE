@@ -1,13 +1,17 @@
 # Per-Voice Polyphony — the Voice container ("Poly Grid") architecture
 
-Status: **M1 landed (forks (a) + (b) shipped).** The Voice container, its
-`PolyVoiceProcessor` engine, the VoiceIn/VoiceOut boundary pucks, the scoped
-drill-in editor with breadcrumb, and the Signal-driven oscillator are all built
-and in the Release build. Open fork #2 (below) was resolved **"do both"**: the
-container forwards each voice's note as MIDI into its clone (a) *and* exposes
-Pitch/Gate/Velocity Signal context that the new **Signal Oscillator** reads (b).
-This document remains the canonical spec; M2/M3/M4 polish items below are still
-open. Keep it in sync as further work lands.
+Status: **M1 + M2 landed.** The Voice container, its `PolyVoiceProcessor`
+engine, the VoiceIn/VoiceOut boundary pucks, the scoped drill-in editor with
+breadcrumb, and the Signal-driven oscillator are all built and in the Release
+build. Open fork #2 (below) was resolved **"do both"**: the container forwards
+each voice's note as MIDI into its clone (a) *and* exposes Pitch/Gate/Velocity
+Signal context that the new **Signal Oscillator** reads (b). **M2 is now
+complete**: three steal modes (oldest / quietest / round-robin), glide
+(portamento) on legato voice-stealing, sample-accurate piecewise-constant gate
+signals, full save/load + dirty/undo round-trip, and edit-while-playing safety
+(see the "Edit-while-playing safety" section below). This document remains the
+canonical spec; M3/M4 items below are still open. Keep it in sync as further
+work lands.
 
 ## Problem
 
@@ -214,9 +218,35 @@ loop (architectural call + an *auditory* "do N voices sum correctly" check that
   one existing oscillator + one envelope wired inside; RMS voice-free; fixed N.
   Goal: play a chord into it and hear N summed voices. Self-test for voice
   allocation/stealing.
-- **M2:** steal modes, glide, sample-accurate gates, edit-while-playing safety,
-  full save/load + dirty/undo, scoped inner editor + breadcrumb + boundary
-  pucks.
+- **M2 (done):** steal modes, glide, sample-accurate gates, edit-while-playing
+  safety, full save/load + dirty/undo, scoped inner editor + breadcrumb +
+  boundary pucks.
 - **M3:** real module kit (math, LFO, sample & hold, logic, more osc/filter
   types), MPE per-note expression into the context, unison.
 - **M4:** presets, modular-familiarity niceties, docs across the three surfaces.
+
+## Edit-while-playing safety
+
+Two distinct kinds of live edit can happen to a sounding container, and each is
+safe by construction — no container-specific machinery was needed:
+
+1. **Inner-graph topology edits** (add/remove a node inside the container, draw
+   or cut a cable). These flow through the same path as any graph edit:
+   `onNodeEdited` → `GraphProcessor::requestRebuild()`. The rebuild runs at the
+   top of `GraphProcessor::processBlock` (graph_processor.cpp ~1428) *before*
+   any processing, and the whole audio callback holds `NodeGraph::mutationLock`
+   (audio_engine.cpp), which `addNode`/`addLink` also take. So the stale
+   `PolyVoiceProcessor` (which holds a `Node&` into `graph.nodes`) is destroyed
+   and rebuilt *before* it can dereference anything that a concurrent edit moved.
+   The rebuild does reset voice DSP state (a fresh `buildVoices()`), which is
+   the correct behavior for a structural change — the patch itself changed.
+
+2. **Container field tweaks** (steal mode, glide time) from the right-click
+   menu. These deliberately **do not** rebuild. `PolyVoiceProcessor` re-reads
+   `containerNode.voiceStealMode` and `voiceGlideMs` from the node every block,
+   so the change is audible on the next stolen/legato note with zero DSP reset —
+   matching the docs' "switch modes while the music is playing" promise. The
+   handlers call only `commitSnapshot()` (undo/save/dirty), never
+   `onNodeEdited()`. Calling `onNodeEdited()` here was an early bug: it forced a
+   rebuild that reset every voice's oscillator phase + envelope, glitching held
+   notes on each menu change. Fixed by dropping the `onNodeEdited()` call.

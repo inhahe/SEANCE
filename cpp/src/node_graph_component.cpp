@@ -2494,6 +2494,23 @@ void NodeGraphComponent::resized() {
 }
 
 // ==============================================================================
+// Voice (polyphonic) factory presets
+// ==============================================================================
+//
+// The actual node/link construction lives in the free function buildVoicePreset
+// (node_graph.cpp) so the same code path is exercised headlessly by the
+// self-test. This GUI wrapper just owns the post-build side effects the data
+// model can't: committing one undo snapshot and triggering an audio-graph
+// rebuild. See poly-voice-architecture.md.
+void NodeGraphComponent::createVoicePreset(juce::Point<float> p, int preset) {
+    const int containerId = buildVoicePreset(graph, Vec2{p.x, p.y}, preset);
+    const Node* c = graph.findNode(containerId);
+    const std::string label = (c ? c->name : std::string("Voice"));
+    graph.commitSnapshot(std::string("Add Voice container (") + label + ")");
+    if (onNodeEdited) onNodeEdited();
+}
+
+// ==============================================================================
 // Context menus
 // ==============================================================================
 
@@ -2562,7 +2579,19 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
     // inside another's patch. See poly-voice-architecture.md.
     if (viewScope == -1) {
         instMenu.addSeparator();
-        instMenu.addItem(150, "Voice (polyphonic)...");
+        // Factory presets: each builds a ready-made inner patch + container
+        // settings (polyphony / glide / unison) so common voices are one click.
+        // "Basic (FM Synth)..." is the original blank-ish starting point; the
+        // others come pre-wired (Signal Osc / Signal Noise) and pre-tuned. IDs
+        // 150 (basic) + 160..163 (named presets) -> createVoicePreset().
+        juce::PopupMenu voiceMenu;
+        voiceMenu.addItem(150, "Basic (FM Synth)...");
+        voiceMenu.addSeparator();
+        voiceMenu.addItem(160, "Warm Pad");
+        voiceMenu.addItem(161, "Pluck");
+        voiceMenu.addItem(162, "Supersaw Lead");
+        voiceMenu.addItem(163, "Noise Perc");
+        instMenu.addSubMenu("Voice (polyphonic)", voiceMenu);
     }
     menu.addSubMenu("Instruments", instMenu);
 
@@ -2736,89 +2765,17 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
         } else if (result == 5) {
             graph.createGroup("Group", {p.x, p.y});
         } else if (result == 150) {
-            // Voice (polyphonic) container: a wrapper whose inner patch is
-            // instantiated once per simultaneous note and summed. Creating it
-            // also seeds a default inner patch (VoiceIn -> FM synth -> VoiceOut),
-            // all tagged with voiceContainerId = container.id so the top-level
-            // build skips them and each voice clone builds them in isolation.
+            // Voice (polyphonic) container, Basic preset: VoiceIn -> FM Synth ->
+            // VoiceOut. The inner patch is instantiated once per simultaneous
+            // note and summed; all inner nodes are tagged with voiceContainerId
+            // so the top-level build skips them and each voice clone builds them
+            // in isolation. createVoicePreset() owns the build + commit + rebuild.
             // See poly-voice-architecture.md.
-            //
-            // addNode reallocates graph.nodes, so we capture stable node/pin IDs
-            // immediately after each creation and NEVER hold a Node& across the
-            // next addNode (CLAUDE.md no-dangling-references rule).
-
-            // 1. The container itself (MIDI in -> Audio out), at the top level.
-            int containerId;
-            {
-                auto& c = graph.addNode("Voice", NodeType::VoiceContainer,
-                    {Pin{0, "MIDI", PinKind::Midi, true}},
-                    {Pin{0, "Audio", PinKind::Audio, false}}, {p.x, p.y});
-                c.voicePolyphony = 8;
-                containerId = c.id;
-            }
-
-            // 2. Inner VoiceIn puck: per-note context source. Emits raw per-voice
-            //    MIDI plus Pitch(Hz)/Gate(0/1)/Velocity(0..1) and the MPE
-            //    expression signals Pressure(0..1)/Timbre(0..1) Signal channels.
-            int voiceInMidiPin;
-            {
-                auto& vi = graph.addNode("Voice In", NodeType::VoiceIn, {},
-                    {Pin{0, "MIDI",     PinKind::Midi,   false},
-                     Pin{0, "Pitch",    PinKind::Signal, false, 1},
-                     Pin{0, "Gate",     PinKind::Signal, false, 1},
-                     Pin{0, "Velocity", PinKind::Signal, false, 1},
-                     Pin{0, "Pressure", PinKind::Signal, false, 1},
-                     Pin{0, "Timbre",   PinKind::Signal, false, 1}},
-                    {p.x - 240.0f, p.y + 170.0f});
-                vi.voiceContainerId = containerId;
-                if (vi.pinsOut.size() >= 6) {
-                    vi.pinsOut[1].tooltip = "Pitch (Hz): this voice's note frequency, including pitch bend.";
-                    vi.pinsOut[2].tooltip = "Gate (0/1): 1 while the key is held, 0 after release.";
-                    vi.pinsOut[3].tooltip = "Velocity (0..1): how hard this note was struck.";
-                    vi.pinsOut[4].tooltip = "Pressure (0..1): per-note pressure (MPE / aftertouch); 0 at rest.";
-                    vi.pinsOut[5].tooltip = "Timbre (0..1): per-note timbre slide (MPE CC74); 0.5 = centre.";
-                }
-                voiceInMidiPin = vi.pinsOut[0].id;
-            }
-
-            // 3. Inner synth (FM Synth by default) - MIDI in, Audio out. Same
-            //    defaults as the standalone FM Synth menu entry (result 107).
-            int synthMidiInPin, synthAudioOutPin;
-            {
-                auto& s = graph.addNode("FM Synth", NodeType::Instrument,
-                    {Pin{0, "MIDI", PinKind::Midi, true}},
-                    {Pin{0, "Audio", PinKind::Audio, false}}, {p.x, p.y + 170.0f});
-                s.voiceContainerId = containerId;
-                s.script = "__fmsynth__";
-                s.params.push_back({"Algorithm", 0.0f, 0.0f, 7.0f});
-                s.params.push_back({"Feedback",  0.3f, 0.0f, 1.0f});
-                s.params.push_back({"Volume",    0.5f, 0.0f, 1.0f});
-                for (int i = 1; i <= 4; ++i) {
-                    auto pp = "Op" + std::to_string(i) + " ";
-                    s.params.push_back({pp + "Ratio", (float)i, 0.1f, 16.0f});
-                    s.params.push_back({pp + "Level", i == 1 ? 1.0f : 0.5f, 0.0f, 1.0f});
-                }
-                ensureFmOpEnvelopes(s);
-                synthMidiInPin   = s.pinsIn[0].id;
-                synthAudioOutPin = s.pinsOut[0].id;
-            }
-
-            // 4. Inner VoiceOut sink: mapped to the inner graph's audio output.
-            int voiceOutAudioInPin;
-            {
-                auto& vo = graph.addNode("Voice Out", NodeType::VoiceOut,
-                    {Pin{0, "Audio", PinKind::Audio, true}}, {},
-                    {p.x + 240.0f, p.y + 170.0f});
-                vo.voiceContainerId = containerId;
-                voiceOutAudioInPin = vo.pinsIn[0].id;
-            }
-
-            // 5. Wire the default inner patch.
-            graph.addLink(voiceInMidiPin,   synthMidiInPin);
-            graph.addLink(synthAudioOutPin, voiceOutAudioInPin);
-
-            graph.commitSnapshot("Add Voice container");
-            if (onNodeEdited) onNodeEdited();
+            createVoicePreset(p, 0);
+        } else if (result >= 160 && result <= 163) {
+            // Named factory presets: Warm Pad / Pluck / Supersaw Lead / Noise
+            // Perc (preset ids 1..4). Each comes pre-wired and pre-tuned.
+            createVoicePreset(p, result - 159);
         } else if (result == 151) {
             // Signal Oscillator: Pitch/Gate/Velocity Signal inputs -> tone.
             // Pin order fixes the control-channel mapping (Pitch=ch2, Gate=ch3,

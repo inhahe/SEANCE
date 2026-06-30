@@ -2445,17 +2445,41 @@ full milestone plan live in `poly-voice-architecture.md` at the repo root.
 
 ### What it looks like on the canvas
 
-- **Add Node → Instruments → Voice (polyphonic)…** creates the container. (The
-  menu item only appears at the **top level** — you cannot nest a Voice
-  container inside another one in M1.)
+- **Add Node → Instruments → Voice (polyphonic)** opens a submenu of **factory
+  presets** (see below). The submenu only appears at the **top level** — you
+  cannot nest a Voice container inside another one in M1.
 - On the main canvas the container is a **single node** with one **MIDI input**
   (left) and one **stereo audio output** (right). Because node colour is inferred
   from pins (`getVisualCategory`), a MIDI-in / audio-out node reads as an
   **instrument** automatically — no special-case colour. Wire a MIDI source
   (Timeline, Computer Keyboard, MIDI Input, …) into it and its audio out to a
   Mixer / Output exactly like any built-in synth.
-- It ships with a default inner patch so it makes sound immediately: a **VoiceIn
-  puck → FM synth → VoiceOut puck**, at **8 voices**.
+- Every preset ships with a complete inner patch so the container makes sound
+  immediately — there is no "empty" Voice container.
+
+### Factory presets
+
+The **Voice (polyphonic)** submenu offers ready-made voices so you don't have to
+wire an inner patch by hand. Each entry builds the full container shell (VoiceIn
+puck + inner instrument + VoiceOut puck) **and** pre-tunes the container's
+polyphony / glide / unison settings, then drops it on the canvas as one undo
+step ("Add Voice container (*name*)"). Pick one and play — drill in afterwards to
+customise.
+
+| Preset | Inner instrument | Voices | Unison | Glide | Character |
+|---|---|---|---|---|---|
+| **Basic (FM Synth)** | FM Synth (`__fmsynth__`) | 8 | 1 | — | The original neutral starting point; a 4-op FM synth driven by VoiceIn's **MIDI** fork. Best base for "I'll build my own patch." |
+| **Warm Pad** | Signal Osc (triangle) | 8 | 3 @ 8¢ | — | Mellow triangle with a slow 400 ms swell and 900 ms release; 3-voice unison for width. |
+| **Pluck** | Signal Osc (saw) | 8 | 1 | — | Fast saw attack, no sustain, short release — a percussive pluck. |
+| **Supersaw Lead** | Signal Osc (saw) | **1 (mono)** | **7 @ 25¢, full spread** | **50 ms** | Monophonic gliding lead with a fat 7-voice supersaw stack spread hard across the stereo field. |
+| **Noise Perc** | Signal Noise (white) | 8 | 1 | — | Gated white-noise burst with a short percussive envelope — snare/hat-style hits. |
+
+The construction itself lives in the free function **`buildVoicePreset(graph,
+pos, presetId)`** (`node_graph.cpp`), not in the GUI, so the *same* code path is
+exercised headlessly by the self-test (`testVoicePresets`). The GUI menu wrapper
+(`NodeGraphComponent::createVoicePreset`) only adds the post-build side effects
+the data model can't own: the undo snapshot and the audio-graph rebuild. "Basic"
+is preset id 0; the named presets are 1–4. Unknown ids fall back to Basic.
 
 ### Drilling in — the scoped inner editor
 

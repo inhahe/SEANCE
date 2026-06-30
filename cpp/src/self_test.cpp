@@ -7334,6 +7334,129 @@ void testVoiceContainerSaveLoad(Report& r) {
     r.check(innerCount == 3, "vc-saveload: all three inner nodes stay scoped");
 }
 
+// ---------------------------------------------------------------------------
+// Voice factory presets: buildVoicePreset() must produce a well-formed
+// container + inner patch for each preset id, with the right container settings
+// (polyphony / glide / unison), the right inner instrument, and a fully-wired
+// VoiceIn -> instrument -> VoiceOut chain. Then one preset is rendered
+// end-to-end to prove the built patch actually sounds, and one is round-tripped
+// through save/load. This exercises the SAME construction code the GUI menu
+// calls (the menu wrapper only adds commitSnapshot + rebuild on top).
+// ---------------------------------------------------------------------------
+void testVoicePresets(Report& r) {
+    r.section("Voice factory presets (buildVoicePreset)");
+
+    // Helper: count nodes scoped to a container, find the inner instrument
+    // (the one node that's neither VoiceIn nor VoiceOut), and confirm every
+    // inner node was tagged with the container id.
+    auto innerInstrument = [](NodeGraph& g, int cid) -> Node* {
+        for (auto& n : g.nodes)
+            if (n.voiceContainerId == cid
+                && n.type != NodeType::VoiceIn && n.type != NodeType::VoiceOut)
+                return &n;
+        return nullptr;
+    };
+
+    struct Expect { int preset; const char* name; int poly; int unison;
+                    float glide; const char* script; };
+    const Expect cases[] = {
+        {0, "Voice",         8, 1,  0.0f, "__fmsynth__"},
+        {1, "Warm Pad",      8, 3,  0.0f, "__signalosc__"},
+        {2, "Pluck",         8, 1,  0.0f, "__signalosc__"},
+        {3, "Supersaw Lead", 1, 7, 50.0f, "__signalosc__"},
+        {4, "Noise Perc",    8, 1,  0.0f, "__signalnoise__"},
+    };
+
+    for (const auto& e : cases) {
+        NodeGraph g;
+        const int cid = buildVoicePreset(g, Vec2{0.0f, 0.0f}, e.preset);
+        const std::string tag = std::string("preset[") + e.name + "]: ";
+
+        Node* c = g.findNode(cid);
+        r.check(c != nullptr && c->type == NodeType::VoiceContainer,
+                tag + "container created");
+        if (!c) continue;
+        r.check(c->name == e.name, tag + "container named");
+        r.check(c->voicePolyphony == e.poly, tag + "polyphony set");
+        r.check(c->voiceUnison == e.unison, tag + "unison set");
+        r.check(std::abs(c->voiceGlideMs - e.glide) < 0.01f, tag + "glide set");
+
+        // Exactly 3 inner nodes (VoiceIn + instrument + VoiceOut), all scoped.
+        int inner = 0, vin = 0, vout = 0;
+        for (auto& n : g.nodes) {
+            if (n.voiceContainerId != cid) continue;
+            ++inner;
+            if (n.type == NodeType::VoiceIn)  ++vin;
+            if (n.type == NodeType::VoiceOut) ++vout;
+        }
+        r.check(inner == 3, tag + "three inner nodes, all scoped");
+        r.check(vin == 1 && vout == 1, tag + "one VoiceIn and one VoiceOut");
+
+        Node* instr = innerInstrument(g, cid);
+        r.check(instr != nullptr && instr->script == e.script,
+                tag + "inner instrument is the expected kind");
+
+        // The instrument must be wired on both sides: at least one link into it
+        // (from VoiceIn) and exactly one out of it (to VoiceOut). 4 nodes total
+        // means 2-4 links depending on how many control pins the instr uses.
+        if (instr) {
+            int into = 0, outOf = 0;
+            for (auto& l : g.links) {
+                for (auto& pin : instr->pinsIn)  if (pin.id == l.endPin)   ++into;
+                for (auto& pin : instr->pinsOut) if (pin.id == l.startPin) ++outOf;
+            }
+            r.check(into >= 1,  tag + "instrument driven by VoiceIn");
+            r.check(outOf == 1, tag + "instrument feeds VoiceOut");
+        }
+    }
+
+    // End-to-end: the Pluck preset should actually sound when a note is played.
+    {
+        NodeGraph g;
+        Transport transport;
+        const int cid = buildVoicePreset(g, Vec2{0.0f, 0.0f}, 2); // Pluck
+        Node* c = g.findNode(cid);
+        r.check(c != nullptr, "preset-audio: container exists");
+        if (c) {
+            const double sr = 44100.0; const int bs = 512;
+            PolyVoiceProcessor poly(*c, g, transport);
+            poly.setPlayConfigDetails(0, 2, sr, bs);
+            poly.prepareToPlay(sr, bs);
+            juce::AudioBuffer<float> out(2, bs);
+            juce::MidiBuffer on;
+            on.addEvent(juce::MidiMessage::noteOn(1, 60, (juce::uint8)110), 0);
+            poly.processBlock(out, on);
+            juce::MidiBuffer empty;
+            float peak = 0.0f;
+            for (int i = 0; i < 3; ++i) {
+                poly.processBlock(out, empty);
+                peak = std::max(peak, out.getMagnitude(0, 0, bs));
+            }
+            r.check(peak > 1.0e-2f, "preset-audio: Pluck preset produces a tone");
+        }
+    }
+
+    // Save/load round-trip of a built preset (the Supersaw Lead, since it has
+    // the most non-default container settings to preserve).
+    {
+        NodeGraph src;
+        const int cid = buildVoicePreset(src, Vec2{0.0f, 0.0f}, 3);
+        const std::string text = ProjectFile::serializeForUndo(src);
+        NodeGraph dst;
+        const bool ok = ProjectFile::loadFromString(text, dst);
+        r.check(ok, "preset-saveload: project text parses back");
+        r.check(dst.nodes.size() == src.nodes.size(),
+                "preset-saveload: node count preserved");
+        Node* c = dst.findNode(cid);
+        r.check(c != nullptr && c->voicePolyphony == 1,
+                "preset-saveload: Supersaw polyphony (mono) round-trips");
+        r.check(c != nullptr && c->voiceUnison == 7,
+                "preset-saveload: Supersaw unison round-trips");
+        r.check(c != nullptr && std::abs(c->voiceGlideMs - 50.0f) < 0.01f,
+                "preset-saveload: Supersaw glide round-trips");
+    }
+}
+
 int runSelfTest(const juce::File& outDir) {
     outDir.createDirectory();
     Report r;
@@ -7365,6 +7488,7 @@ int runSelfTest(const juce::File& outDir) {
     testVoiceUnison(r);
     testVoiceContainerAudio(r);
     testVoiceContainerSaveLoad(r);
+    testVoicePresets(r);
 
     r.section("Summary");
     r.line("  PASSED: " + juce::String(r.passed));

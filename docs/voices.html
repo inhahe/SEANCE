@@ -23,9 +23,18 @@
 
 <h2>Add one and hear it</h2>
 
-<p>Right-click an empty spot on the graph and choose <strong>Add Node → Instruments → Voice (polyphonic)…</strong>. You get a single node on the canvas with a <strong>MIDI input</strong> on the left and a <strong>stereo audio output</strong> on the right — it looks and wires up like any other instrument. Wire a note source into its MIDI input (a <a href="midi-input.html">Computer Keyboard</a> node, a Timeline, or a hardware MIDI input) and wire its audio output to your Mixer or the Output node.</p>
+<p>Right-click an empty spot on the graph and open <strong>Add Node → Instruments → Voice (polyphonic)</strong>. Instead of one entry, you get a short menu of ready-made <strong>presets</strong> — pick one and a complete voice drops onto the canvas. Each is a single node with a <strong>MIDI input</strong> on the left and a <strong>stereo audio output</strong> on the right — it looks and wires up like any other instrument. Wire a note source into its MIDI input (a <a href="midi-input.html">Computer Keyboard</a> node, a Timeline, or a hardware MIDI input) and wire its audio output to your Mixer or the Output node.</p>
 
-<p>It comes pre-loaded with a working patch — a small FM synth inside — and <strong>8 voices</strong>, so it makes sound the moment you wire it up. Play a chord: each note spins up its own copy of the inner patch, and you hear them stack. That's polyphony built from a container instead of baked into a fixed instrument.</p>
+<p>The presets are:</p>
+<ul>
+<li><strong>Basic (FM Synth)</strong> — a small FM synth inside, 8 voices. The neutral starting point if you want to build your own patch from scratch.</li>
+<li><strong>Warm Pad</strong> — a mellow triangle tone that swells in slowly and fades out gently, with three slightly-detuned copies stacked for width. Good for sustained background chords.</li>
+<li><strong>Pluck</strong> — a short, snappy attack with no sustain, like plucking a string. Each note rings briefly and decays.</li>
+<li><strong>Supersaw Lead</strong> — a big, fat lead with seven detuned sawtooth copies spread across the stereo field. It's <em>monophonic</em> (one note at a time) and <em>glides</em> between notes, the classic trance-lead sound.</li>
+<li><strong>Noise Perc</strong> — a burst of noise shaped into a short percussive hit, for snare/hat-style sounds.</li>
+</ul>
+
+<p>Every preset makes sound the moment you wire it up. Play a chord: each note spins up its own copy of the inner patch, and you hear them stack. That's polyphony built from a container instead of baked into a fixed instrument. (The <em>Basic</em> preset uses <strong>8 voices</strong>; the others come pre-tuned with their own voice counts, glide, and unison — all of which you can change afterwards, as described below.) Whichever preset you start from, you can drill inside and rebuild it however you like — the presets are just convenient starting points, not fixed instruments.</p>
 
 <div class="note">
 <strong>Why "8 voices"?</strong> That's how many notes can sound <em>at once</em>. The container builds 8 independent copies of the inner patch up front and hands a free one to each note you play. If you play a 9th note while 8 are still ringing, one of them is cut short to make room (this is called "voice stealing" — you choose which one below). Idle copies cost almost nothing, so a high voice count is cheap until you actually play that many notes.</div>

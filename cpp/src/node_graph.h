@@ -1287,4 +1287,15 @@ int pruneOrphanModPins(NodeGraph& graph, int nodeId);
 // repeatedly.
 void ensureFmOpEnvelopes(Node& node);
 
+// Build a Voice (polyphonic) container plus a ready-made inner patch + container
+// settings for the given factory preset, centred around `pos`. Adds the nodes
+// and links to `graph` and returns the new container node's id (or -1 on a bad
+// preset id, though unknown ids fall back to the Basic preset). Does NOT commit
+// an undo snapshot or fire any rebuild callback - the caller owns those (the GUI
+// path commits + rebuilds; the self-test inspects the raw graph). Preset ids:
+//   0 = Basic (FM Synth)   1 = Warm Pad   2 = Pluck
+//   3 = Supersaw Lead      4 = Noise Perc
+// See poly-voice-architecture.md.
+int buildVoicePreset(NodeGraph& graph, Vec2 pos, int preset);
+
 } // namespace SoundShop

@@ -239,6 +239,13 @@ private:
 
     // Context menu
     void showBackgroundMenu(juce::Point<float> canvasPos);
+    // Build a Voice (polyphonic) container plus a ready-made inner patch and
+    // container settings for the given factory preset. preset ids:
+    //   0 = Basic (FM Synth)   1 = Warm Pad   2 = Pluck
+    //   3 = Supersaw Lead      4 = Noise Perc
+    // Centres the new nodes around `p`. Commits one undo snapshot and fires
+    // onNodeEdited so the audio graph rebuilds. See poly-voice-architecture.md.
+    void createVoicePreset(juce::Point<float> p, int preset);
     void showNodeMenu(Node& node);
     void showLinkMenu(int linkId);
 

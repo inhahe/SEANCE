@@ -240,7 +240,16 @@ loop (architectural call + an *auditory* "do N voices sum correctly" check that
   decorrelation, and the field save/load). Each with its own `--self-test`
   coverage and docs across REFERENCE.md + the Voices tutorial. Still open: more
   oscillator flavours.
-- **M4:** presets, modular-familiarity niceties, docs across the three surfaces.
+- **M4:** **factory presets are landed** — the **Add Node → Instruments → Voice
+  (polyphonic)** entry is now a submenu of ready-made voices (Basic FM / Warm Pad
+  / Pluck / Supersaw Lead / Noise Perc). Construction lives in the free function
+  `buildVoicePreset(graph, pos, presetId)` (`node_graph.cpp`) so the *same* path
+  the GUI menu calls is exercised headlessly by `testVoicePresets`; the GUI
+  wrapper `NodeGraphComponent::createVoicePreset` only adds the undo snapshot +
+  rebuild. Each preset builds the full container shell plus a pre-tuned inner
+  patch and container settings (polyphony / glide / unison). Docs across all
+  three surfaces (README, REFERENCE → *Factory presets*, Voices tutorial). Still
+  open: more oscillator flavours, further modular-familiarity niceties.
 
 ## Edit-while-playing safety
 

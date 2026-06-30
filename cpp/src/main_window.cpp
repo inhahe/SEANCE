@@ -3387,7 +3387,14 @@ void MainContentComponent::importModFile() {
                 // which then gets saved, so the mod "doesn't save/reload".
                 graph.commitSnapshot("Import tracker module");
                 audioEngine.getGraphProcessor().requestRebuild();
-                graphComponent->fitAll();
+                // Frame the view on just the imported nodes, not the whole
+                // graph: a pre-existing Master Out / synth parked in another
+                // corner would otherwise inflate fitAll's bounding box and
+                // zoom the import down to a tiny cluster with empty margins.
+                if (!result.nodeIds.empty())
+                    graphComponent->fitNodes(result.nodeIds);
+                else
+                    graphComponent->fitAll();
             } else {
                 msg = "Import failed: " + juce::String(result.error);
             }

@@ -2007,6 +2007,11 @@ ModImporter::ImportResult ModImporter::import(const std::string& path, NodeGraph
     result.numSamplesExtracted = numSamplers;
     result.numTracks = numTracks;
     result.sampleDir = sampleDir;
+    result.groupId = groupId;
+    result.nodeIds.push_back(groupId);
+    if (auto* grpNode = graph.findNode(groupId))
+        for (int cid : grpNode->childNodeIds)
+            result.nodeIds.push_back(cid);
 
     fprintf(stderr,
         "Tracker imported (%s): %d channels, %d patterns, %d notes, "

@@ -2039,7 +2039,27 @@ void NodeGraphComponent::fitAll() {
         maxX = std::max(maxX, b.getRight());
         maxY = std::max(maxY, b.getBottom());
     }
+    applyFitBounds(minX, minY, maxX, maxY);
+}
 
+void NodeGraphComponent::fitNodes(const std::vector<int>& nodeIds) {
+    float minX = 1e9f, minY = 1e9f, maxX = -1e9f, maxY = -1e9f;
+    bool any = false;
+    for (int id : nodeIds) {
+        if (auto* node = graph.findNode(id)) {
+            auto b = getNodeBounds(*node);
+            minX = std::min(minX, b.getX());
+            minY = std::min(minY, b.getY());
+            maxX = std::max(maxX, b.getRight());
+            maxY = std::max(maxY, b.getBottom());
+            any = true;
+        }
+    }
+    if (!any) { fitAll(); return; } // nothing resolved - fall back
+    applyFitBounds(minX, minY, maxX, maxY);
+}
+
+void NodeGraphComponent::applyFitBounds(float minX, float minY, float maxX, float maxY) {
     float contentW = maxX - minX + 100;
     float contentH = maxY - minY + 100;
     float zoomX = getWidth() / contentW;

@@ -32,6 +32,13 @@ public:
 
     void fitAll();
 
+    // Frame the view on a specific set of nodes (by id), e.g. the nodes a
+    // tracker import just created, so the view focuses on what was added
+    // instead of zooming out to also include distant pre-existing nodes (a
+    // parked Master Out, an unrelated synth in another corner of the canvas).
+    // Unknown ids are skipped; if none resolve, falls back to fitAll().
+    void fitNodes(const std::vector<int>& nodeIds);
+
     // After a project load (or any external mutation of graph.viewZoom),
     // re-evaluate which view to show: restore the saved pan/zoom if one was
     // persisted (graph.viewZoom > 0), otherwise fit-all. Called by
@@ -115,6 +122,10 @@ private:
     // fitAll). NodeGraph itself owns the saved view; the component just
     // mirrors its own working values into the graph as they change.
     void publishViewState();
+
+    // Shared framing math for fitAll()/fitNodes(): zoom+pan so the given
+    // canvas-space bounding box (plus margin) fits the viewport, centred.
+    void applyFitBounds(float minX, float minY, float maxX, float maxY);
 
     // Interaction state
     enum class DragMode { None, Pan, MoveNode, DragLink, SelectBox, DragParam };

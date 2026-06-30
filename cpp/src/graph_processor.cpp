@@ -24,6 +24,7 @@
 #include "spatializer_3d.h"
 #include "voice_nodes.h"
 #include "signal_oscillator.h"
+#include "signal_math.h"
 #include "poly_voice_processor.h"
 #include <algorithm>
 #include <cmath>
@@ -631,6 +632,12 @@ std::unique_ptr<juce::AudioProcessor> GraphProcessor::createNodeProcessor(
         // Unified synth: TerrainSynthProcessor handles everything
         // 1D waveforms (simple synths) and N-D terrains
         return std::make_unique<TerrainSynthProcessor>(node, transport, &graph.contentStore);
+    } else if (node.type == NodeType::SignalShape && node.script == "__signalmath__") {
+        // Modular-kit signal utility: per-sample binary arithmetic on two
+        // control signals. Tagged inside the SignalShape family but dispatched
+        // here before the generic SignalShapeProcessor (which would try to run
+        // it as a signal-shape program).
+        return std::make_unique<SignalMathProcessor>(node);
     } else if (node.type == NodeType::SignalShape) {
         return std::make_unique<SignalShapeProcessor>(node, transport);
     } else if (node.type == NodeType::MidiScript) {

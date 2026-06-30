@@ -2592,6 +2592,41 @@ FM synth, drop in a Signal Oscillator, and wire **VoiceIn Pitch → Pitch**,
 **VoiceIn Gate → Gate**, **VoiceIn Velocity → Velocity**, then **Signal Oscillator
 audio → VoiceOut**.
 
+### Modular kit — signal utilities (M3)
+
+Beyond the Signal Oscillator, a growing **kit of small signal-processing
+modules** lets you build modulation and shaping inside a voice (or anywhere
+control Signals flow) out of native nodes instead of a script. Each is a tiny,
+stateless-or-near-stateless `NodeType::SignalShape` node (so it gets the
+signal-family orange color), tagged by a `script` string and dispatched in
+`GraphProcessor::createNodeProcessor`. They have **no editor** — their params are
+edited directly on the node face — so double-clicking one is a no-op.
+
+#### Signal Math (`__signalmath__`)
+
+**Add Node → Signal Shape → Signal Math (A op B)** creates a
+`SignalMathProcessor` (`signal_math.h`). It combines two control Signals
+sample-by-sample with a selectable operation:
+
+- **Inputs (Signal):** **A** (channel 2) and **B** (channel 3). An **unwired
+  input reads as 0** — the honest modular convention. So Subtract with **A**
+  unwired negates **B** (`Out = -B`, a one-input inverter); Multiply with either
+  input unwired is silent.
+- **Output (Signal):** **Out** (channel 2) = `A op B`, computed every sample.
+- **Param — Operation** (discrete enum, popup picker on the node face, not a drag
+  slider): **0 Add** (`A+B`), **1 Subtract** (`A-B`), **2 Multiply** (`A*B` — a
+  per-sample VCA / ring-mod / scaler), **3 Divide** (`A/B`, with **B = 0 → 0** so
+  no NaN/inf escapes), **4 Min**, **5 Max**. Any non-finite result is clamped to 0.
+- A constant operand is **not** baked in; wire a dedicated constant/control source
+  to one input. This keeps each operation's semantics clean (no per-op "what does
+  the default constant mean" ambiguity).
+
+The node's audio bus (channels 0/1) is always cleared on output so it never leaks
+the raw input Signals downstream as audio. Save/load is the generic node path
+(type + `script` + params + pins all round-trip); covered by `testSignalMath` in
+`--self-test` (each operation, divide-by-zero safety, unwired-input behavior, the
+silent audio bus, and the Operation-param round-trip).
+
 ### Save / load, dirty tracking, undo
 
 Inner nodes and links serialize through the **same** generic path as any node —
@@ -2629,7 +2664,10 @@ glide ramp — start, monotonic slide, snap-to-target, hold, and a glide spannin
 multiple blocks); and `testVoiceContainerAudio` builds a real container
 (VoiceIn → Signal Oscillator → VoiceOut), drives it with a synthetic MIDI buffer
 through `PolyVoiceProcessor`, and asserts a held note makes a tone, three notes sum
-louder than one, and the voices decay back to silence after release.
+louder than one, and the voices decay back to silence after release. The modular
+kit has its own coverage: `testSignalMath` runs every Signal Math operation,
+checks divide-by-zero safety, unwired-input (=0) behavior, the silent audio bus,
+and the Operation-param save/load round-trip.
 
 ## Asset library (project stores)
 

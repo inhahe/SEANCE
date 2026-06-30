@@ -1581,6 +1581,31 @@ void NodeGraphComponent::mouseDown(const juce::MouseEvent& e) {
                         });
                         return;
                     }
+                    // Signal Math's Operation is a discrete enum (Add /
+                    // Subtract / Multiply / Divide / Min / Max) - popup picker,
+                    // same rationale as Synth Mode / Traversal above.
+                    if (p.name == "Operation" && node->script == "__signalmath__") {
+                        selectedNodeId = node->id;
+                        const char* labels[] = { "Add  (A + B)", "Subtract  (A - B)",
+                            "Multiply  (A * B)", "Divide  (A / B)",
+                            "Min  (lower of A, B)", "Max  (higher of A, B)" };
+                        int cur = juce::jlimit(0, 5, (int)std::round(p.value));
+                        juce::PopupMenu pm;
+                        for (int i = 0; i < 6; ++i)
+                            pm.addItem(i + 1, labels[i], true, i == cur);
+                        int nodeId = node->id;
+                        int paramIdx = idx;
+                        pm.showMenuAsync({}, [this, nodeId, paramIdx](int r) {
+                            if (r == 0) return;
+                            auto* nd = graph.findNode(nodeId);
+                            if (!nd || paramIdx >= (int)nd->params.size()) return;
+                            nd->params[paramIdx].value = (float)(r - 1);
+                            graph.dirty = true;
+                            graph.commitSnapshot("Change Signal Math operation");
+                            repaint();
+                        });
+                        return;
+                    }
                     // Other discrete enum params (Pitch Detector's Algorithm
                     // and Mapping) also get a popup picker rather than a
                     // slider, for the same reason: discrete labelled states
@@ -2045,6 +2070,11 @@ void NodeGraphComponent::mouseDoubleClick(const juce::MouseEvent& e) {
     // distinguishing tag is the "__xypad__" script.
     if (node->type == NodeType::SignalShape) {
         int captured = node->id;
+        // Modular-kit signal utilities (Signal Math, etc.) live in the
+        // SignalShape family for coloring but have no program editor - their
+        // params are edited directly on the node face. Double-click is a no-op.
+        if (node->script == "__signalmath__")
+            return;
         if (node->script == "__xypad__") {
             auto* pad = new XYPadComponent(graph, captured);
             juce::DialogWindow::LaunchOptions opts;
@@ -2476,6 +2506,8 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
     // a tone. The natural inner voice for a Voice container (wire VoiceIn's
     // Pitch/Gate/Velocity into it), but usable standalone too.
     sigMenu.addItem(151, "Signal Oscillator (pitch/gate -> tone)");
+    // Modular-kit signal utility: per-sample arithmetic on two control signals.
+    sigMenu.addItem(152, "Signal Math (A op B)");
     sigMenu.addSeparator();
     sigMenu.addItem(133, "XY Pad");
     sigMenu.addItem(135, "Control Bank");
@@ -2651,6 +2683,25 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
             n.ahdsrEnvelope.decayMs   = 100.0f;
             n.ahdsrEnvelope.sustain   = 0.7f;
             n.ahdsrEnvelope.releaseMs = 300.0f;
+        } else if (result == 152) {
+            // Signal Math: per-sample binary arithmetic on two control signals.
+            // Two Signal inputs (A=ch2, B=ch3) -> one Signal output (Out=ch2).
+            // A NodeType::SignalShape so it gets the signal-family color; the
+            // "__signalmath__" script routes it to SignalMathProcessor and is
+            // excluded from the SignalShape double-click editor below.
+            auto& n = graph.addNode("Signal Math", NodeType::SignalShape,
+                {Pin{0, "A", PinKind::Signal, true, 1},
+                 Pin{0, "B", PinKind::Signal, true, 1}},
+                {Pin{0, "Out", PinKind::Signal, false, 1}}, {p.x, p.y});
+            n.script = "__signalmath__";
+            if (n.pinsIn.size() >= 2) {
+                n.pinsIn[0].tooltip = "A: first operand (control signal). Unwired = 0.";
+                n.pinsIn[1].tooltip = "B: second operand (control signal). Unwired = 0.";
+            }
+            if (!n.pinsOut.empty())
+                n.pinsOut[0].tooltip = "A (op) B, computed every sample.";
+            // 0=Add 1=Subtract 2=Multiply 3=Divide 4=Min 5=Max
+            n.params.push_back({"Operation", 0.0f, 0.0f, 5.0f});
         } else if (result == 6) {
             // WASM Script - open file chooser
             auto chooser = std::make_shared<juce::FileChooser>(

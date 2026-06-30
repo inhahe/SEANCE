@@ -26,6 +26,7 @@
 #include "builtin_effects.h"       // ParametricEQProcessor - variable EQ band count
 #include "voice_allocator.h"       // VoiceAllocator - per-voice polyphony policy
 #include "poly_voice_processor.h"   // PolyVoiceProcessor - end-to-end voice audio
+#include "signal_math.h"            // SignalMathProcessor - modular-kit math module
 
 #include <juce_audio_formats/juce_audio_formats.h>
 #include <juce_graphics/juce_graphics.h>
@@ -6161,6 +6162,85 @@ void testVoiceInSignals(Report& r) {
 }
 
 // ---------------------------------------------------------------------------
+// Signal Math module: per-sample arithmetic on two control signals. Verify each
+// operation and that the node + its Operation param survive a save/load round-trip.
+// ---------------------------------------------------------------------------
+void testSignalMath(Report& r) {
+    r.section("Signal Math module (modular kit)");
+
+    NodeGraph graph;
+    auto& node = graph.addNode("Signal Math", NodeType::SignalShape,
+        {Pin{0, "A", PinKind::Signal, true, 1},
+         Pin{0, "B", PinKind::Signal, true, 1}},
+        {Pin{0, "Out", PinKind::Signal, false, 1}}, {0.0f, 0.0f});
+    node.script = "__signalmath__";
+    node.params.push_back({"Operation", 0.0f, 0.0f, 5.0f});
+
+    SignalMathProcessor proc(node);
+    const int N = 64;
+    proc.prepareToPlay(48000.0, N);
+
+    // Layout: ch0/1 audio (unused), ch2 = A, ch3 = B, output Out on ch2.
+    juce::AudioBuffer<float> buf(4, N);
+    auto setInputs = [&](float aVal, float bVal) {
+        buf.clear();
+        for (int i = 0; i < N; ++i) {
+            buf.setSample(2, i, aVal);
+            buf.setSample(3, i, bVal);
+        }
+    };
+    auto run = [&](int op, float aVal, float bVal) -> float {
+        node.params[0].value = (float) op;
+        setInputs(aVal, bVal);
+        juce::MidiBuffer m;
+        proc.processBlock(buf, m);
+        return buf.getSample(2, N / 2);
+    };
+
+    r.check(std::abs(run(0, 3.0f, 4.0f) - 7.0f) < 1e-5f, "math: Add  3+4=7");
+    r.check(std::abs(run(1, 3.0f, 4.0f) - (-1.0f)) < 1e-5f, "math: Subtract  3-4=-1");
+    r.check(std::abs(run(2, 3.0f, 4.0f) - 12.0f) < 1e-5f, "math: Multiply  3*4=12");
+    r.check(std::abs(run(3, 12.0f, 4.0f) - 3.0f) < 1e-5f, "math: Divide  12/4=3");
+    r.check(run(3, 5.0f, 0.0f) == 0.0f, "math: Divide by zero -> 0 (no NaN/inf)");
+    r.check(std::isfinite(run(3, 5.0f, 0.0f)), "math: Divide by zero stays finite");
+    r.check(std::abs(run(4, 3.0f, 4.0f) - 3.0f) < 1e-5f, "math: Min(3,4)=3");
+    r.check(std::abs(run(5, 3.0f, 4.0f) - 4.0f) < 1e-5f, "math: Max(3,4)=4");
+
+    // Unwired B reads as 0: Subtract with A=0 negates B (classic invert use).
+    {
+        node.params[0].value = 1.0f; // Subtract
+        buf.clear();
+        for (int i = 0; i < N; ++i) buf.setSample(3, i, 0.5f); // only B wired
+        juce::MidiBuffer m;
+        proc.processBlock(buf, m);
+        r.check(std::abs(buf.getSample(2, N / 2) - (-0.5f)) < 1e-5f,
+                "math: unwired A(=0) - B inverts B");
+    }
+
+    // Output must not leak the raw inputs onto the audio bus.
+    r.check(buf.getSample(0, N / 2) == 0.0f && buf.getSample(1, N / 2) == 0.0f,
+            "math: audio channels stay silent");
+
+    // Save/load round-trip: node, script tag, and Operation value survive.
+    node.params[0].value = 3.0f; // Divide
+    const std::string text = ProjectFile::serializeForUndo(graph);
+    NodeGraph dst;
+    const bool ok = ProjectFile::loadFromString(text, dst);
+    r.check(ok, "math-saveload: project text parses back");
+    Node* d = dst.findNode(node.id);
+    r.check(d != nullptr && d->script == "__signalmath__",
+            "math-saveload: script tag survives");
+    r.check(d != nullptr && d->type == NodeType::SignalShape,
+            "math-saveload: node type survives");
+    bool foundOp = false;
+    if (d) for (auto& p : d->params)
+        if (p.name == "Operation") { foundOp = std::abs(p.value - 3.0f) < 0.01f; }
+    r.check(foundOp, "math-saveload: Operation value round-trips");
+    r.check(d != nullptr && d->pinsIn.size() == 2 && d->pinsOut.size() == 1,
+            "math-saveload: pins (2 in / 1 out) round-trip");
+}
+
+// ---------------------------------------------------------------------------
 // Voice container end-to-end audio: build a real NodeGraph with a VoiceContainer
 // whose inner patch is VoiceIn -> Signal Oscillator -> VoiceOut, drive it with a
 // synthetic MIDI buffer through PolyVoiceProcessor, and confirm the clone/build/
@@ -6393,6 +6473,7 @@ int runSelfTest(const juce::File& outDir) {
     testAssetLibrary(r);
     testVoiceAllocator(r);
     testVoiceInSignals(r);
+    testSignalMath(r);
     testVoiceContainerAudio(r);
     testVoiceContainerSaveLoad(r);
 

@@ -106,6 +106,15 @@
 <div class="note">
 <strong>The Signal Oscillator is monophonic on purpose.</strong> A single Signal Oscillator only plays one note at a time. You don't add polyphony to the oscillator — you let the Voice container provide it by cloning the patch. (Dropped outside a container, the Signal Oscillator still works as a standalone tone you can drive from any signal source — an LFO into its Pitch, say.)</div>
 
+<h2>Combining signals — the Signal Math module</h2>
+
+<p>Wires carry one signal each, but voices are built by <em>combining</em> signals — multiplying an oscillator by an envelope, mixing two modulators, scaling a pitch. The <strong>Signal Math</strong> module does exactly that. Add one from <strong>Add Node → Signal Shape → Signal Math (A op B)</strong>. It has two signal inputs, <strong>A</strong> and <strong>B</strong>, and one signal output, and you pick what it does to them with the <strong>Operation</strong> control on the node (click it for a menu): <strong>Add</strong>, <strong>Subtract</strong>, <strong>Multiply</strong>, <strong>Divide</strong>, <strong>Min</strong>, or <strong>Max</strong>.</p>
+
+<p>The everyday use is <strong>Multiply</strong>: feed a tone into A and a 0-to-1 control (an envelope, an LFO) into B, and the output is the tone with that control riding its volume — a per-sample volume control. <strong>Add</strong> mixes two signals; <strong>Subtract</strong> with nothing wired into A flips a signal upside-down (since an unwired input counts as zero, the output is <em>0 − B</em>). The math happens every sample, so it tracks fast modulation cleanly. Divide is protected — dividing by zero just gives zero rather than a blown-up signal.</p>
+
+<div class="tip">
+<strong>An unwired input is zero.</strong> That's worth remembering: a Multiply with only one side wired outputs silence (anything × 0 = 0), and an Add with one side wired just passes that side through. To multiply by a fixed amount, wire a steady control into the other input rather than expecting a hidden knob.</div>
+
 <h2>Current limitations</h2>
 
 <p>This is the first version of the feature. A few things are intentionally simple for now:</p>

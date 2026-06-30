@@ -236,6 +236,12 @@ private:
     // Recent projects
     std::vector<juce::String> recentProjects;
     bool autoLoadLastProject = true;
+
+    // View → "Auto-Fit Graph": keep the node graph continuously framed so the
+    // whole graph is always visible. Persisted in soundshop_prefs.xml; the
+    // NodeGraphComponent owns the live behaviour (a manual zoom/pan releases it
+    // and calls back to untick this). Off by default - it's an opt-in mode.
+    bool autoFitGraph = false;
     void addToRecentProjects(const juce::String& path);
     void loadRecentProjects();
     void saveRecentProjects();

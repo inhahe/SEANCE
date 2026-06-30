@@ -8,7 +8,8 @@
 namespace SoundShop {
 
 class NodeGraphComponent : public juce::Component,
-                           public juce::TooltipClient {
+                           public juce::TooltipClient,
+                           private juce::Timer {
 public:
     NodeGraphComponent(NodeGraph& graph);
 
@@ -38,6 +39,18 @@ public:
     // parked Master Out, an unrelated synth in another corner of the canvas).
     // Unknown ids are skipped; if none resolve, falls back to fitAll().
     void fitNodes(const std::vector<int>& nodeIds);
+
+    // Auto-Fit mode (View menu toggle). When on, the view is continuously kept
+    // framed to the whole graph: a lightweight timer watches the all-nodes
+    // bounding box and re-fits whenever it changes (node added / removed /
+    // moved / resized, project loaded, etc.) and on window resize. This is the
+    // single, robust change-detection point - far less fragile than sprinkling
+    // fitAll() calls at every node add/remove site. A manual zoom/pan releases
+    // the lock (auto-follow semantics) and fires onAutoFitViewChanged(false) so
+    // the host can untick the menu and persist the new state.
+    void setAutoFitView(bool on);
+    bool isAutoFitView() const { return autoFitView; }
+    std::function<void(bool)> onAutoFitViewChanged;
 
     // After a project load (or any external mutation of graph.viewZoom),
     // re-evaluate which view to show: restore the saved pan/zoom if one was
@@ -126,6 +139,20 @@ private:
     // Shared framing math for fitAll()/fitNodes(): zoom+pan so the given
     // canvas-space bounding box (plus margin) fits the viewport, centred.
     void applyFitBounds(float minX, float minY, float maxX, float maxY);
+
+    // Compute the union bounding box of every node (canvas space). Returns
+    // false (and leaves `out` untouched) when the graph is empty. Shared by
+    // fitAll() and the auto-fit timer's change detector.
+    bool computeAllNodesBounds(juce::Rectangle<float>& out) const;
+
+    // Auto-Fit state. autoFitView gates the whole feature; lastAutoFitBounds
+    // is the box we last fitted to, so the timer only re-fits when it actually
+    // changes (no needless work / view churn while the graph is static).
+    bool autoFitView = false;
+    bool haveLastAutoFitBounds = false;
+    juce::Rectangle<float> lastAutoFitBounds;
+    void timerCallback() override;          // auto-fit change detector
+    void releaseAutoFitForManualView();     // a manual zoom/pan turns auto-fit off
 
     // Interaction state
     enum class DragMode { None, Pan, MoveNode, DragLink, SelectBox, DragParam };

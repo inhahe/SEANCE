@@ -124,6 +124,13 @@ MainContentComponent::MainContentComponent() {
     graphComponent->onNodeDeleted = [this](int nodeId) {
         closeEditor(nodeId);
     };
+    // Auto-fit auto-released itself (the user manually zoomed/panned): mirror
+    // the new state into our preference, persist it, and refresh the menu tick.
+    graphComponent->onAutoFitViewChanged = [this](bool on) {
+        autoFitGraph = on;
+        savePreferences();
+        menuItemsChanged();
+    };
     graphComponent->getAudioFormat = [this]() {
         return std::make_pair(audioEngine.getSampleRate(),
                               audioEngine.getBlockSize());
@@ -426,6 +433,7 @@ MainContentComponent::MainContentComponent() {
     pluginSettings.load("soundshop_plugins.cfg");
     loadRecentProjects();
     loadPreferences();
+    if (graphComponent) graphComponent->setAutoFitView(autoFitGraph);
     loadKnownHistories();
 
     // Load last project or set up default graph
@@ -1281,6 +1289,7 @@ juce::PopupMenu MainContentComponent::getMenuForIndex(int idx, const juce::Strin
         menu.addItem(92, "Clear Recent Scripts");
     } else if (name == "View") {
         menu.addItem(30, "Fit All");
+        menu.addItem(401, "Auto-Fit Graph (always show whole graph)", true, autoFitGraph);
         menu.addItem(400, "Spectrum Analyzer");
     } else if (name == "Settings") {
         menu.addItem(39, "Audio Device...");
@@ -1556,6 +1565,11 @@ void MainContentComponent::menuItemSelected(int menuItemID, int) {
             break;
         }
         case 30: graphComponent->fitAll(); break;
+        case 401:
+            autoFitGraph = !autoFitGraph;
+            if (graphComponent) graphComponent->setAutoFitView(autoFitGraph);
+            savePreferences();
+            break;
         case 31: showScriptConsole(); break;
         case 32: autoLoadLastProject = !autoLoadLastProject; savePreferences(); break;
         case 33: graph.projectSampleRate = 0; audioEngine.setProjectSampleRate(0); break;
@@ -3975,6 +3989,7 @@ void MainContentComponent::loadPreferences() {
         return;
     }
     autoLoadLastProject = xml->getBoolAttribute("autoLoadLastProject", true);
+    autoFitGraph = xml->getBoolAttribute("autoFitGraph", false);
     autosaveEnabled = xml->getBoolAttribute("autosaveEnabled", true);
     autosaveIntervalSeconds = xml->getIntAttribute("autosaveIntervalSeconds", autoDefault);
     if (autosaveIntervalSeconds < 1) autosaveIntervalSeconds = 1;
@@ -3984,6 +3999,7 @@ void MainContentComponent::loadPreferences() {
 void MainContentComponent::savePreferences() {
     auto xml = std::make_unique<juce::XmlElement>("Preferences");
     xml->setAttribute("autoLoadLastProject", autoLoadLastProject);
+    xml->setAttribute("autoFitGraph", autoFitGraph);
     xml->setAttribute("autosaveEnabled", autosaveEnabled);
     xml->setAttribute("autosaveIntervalSeconds", autosaveIntervalSeconds);
     xml->setAttribute("autosaveLaptopNoticeShown", autosaveLaptopNoticeShown);

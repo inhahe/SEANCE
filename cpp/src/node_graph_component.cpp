@@ -1640,6 +1640,10 @@ void NodeGraphComponent::mouseDown(const juce::MouseEvent& e) {
 
 void NodeGraphComponent::mouseDrag(const juce::MouseEvent& e) {
     if (dragMode == DragMode::Pan) {
+        // A manual pan releases the auto-fit lock so the user can scroll the
+        // canvas freely (moving a NODE, by contrast, keeps auto-fit on and
+        // re-frames on release).
+        releaseAutoFitForManualView();
         panOffset += e.position - dragStart;
         dragStart = e.position;
         publishViewState();
@@ -1930,6 +1934,9 @@ void NodeGraphComponent::mouseExit(const juce::MouseEvent&) {
 }
 
 void NodeGraphComponent::mouseWheelMove(const juce::MouseEvent& e, const juce::MouseWheelDetails& wheel) {
+    // A manual zoom releases the auto-fit lock (auto-follow semantics) so the
+    // user's zoom actually sticks instead of being snapped back next tick.
+    releaseAutoFitForManualView();
     float oldZoom = zoom;
     zoom *= (1.0f + wheel.deltaY * 0.3f);
     zoom = juce::jlimit(0.1f, 4.0f, zoom);
@@ -2086,8 +2093,8 @@ void NodeGraphComponent::mouseDoubleClick(const juce::MouseEvent& e) {
     }
 }
 
-void NodeGraphComponent::fitAll() {
-    if (graph.nodes.empty()) return;
+bool NodeGraphComponent::computeAllNodesBounds(juce::Rectangle<float>& out) const {
+    if (graph.nodes.empty()) return false;
 
     float minX = 1e9f, minY = 1e9f, maxX = -1e9f, maxY = -1e9f;
     for (auto& node : graph.nodes) {
@@ -2097,7 +2104,56 @@ void NodeGraphComponent::fitAll() {
         maxX = std::max(maxX, b.getRight());
         maxY = std::max(maxY, b.getBottom());
     }
-    applyFitBounds(minX, minY, maxX, maxY);
+    out = juce::Rectangle<float>(minX, minY, maxX - minX, maxY - minY);
+    return true;
+}
+
+void NodeGraphComponent::fitAll() {
+    juce::Rectangle<float> b;
+    if (!computeAllNodesBounds(b)) return;
+    applyFitBounds(b.getX(), b.getY(), b.getRight(), b.getBottom());
+}
+
+void NodeGraphComponent::setAutoFitView(bool on) {
+    if (autoFitView == on) return;
+    autoFitView = on;
+    haveLastAutoFitBounds = false;   // force the next evaluation to re-fit
+    if (on) {
+        startTimerHz(15);
+        // Fit immediately when we already have a real size and the initial
+        // view decision has run; otherwise the first timer tick / resized()
+        // does it once laid out.
+        if (getWidth() > 0 && getHeight() > 0 && !pendingInitialFit)
+            fitAll();
+    } else {
+        stopTimer();
+    }
+}
+
+void NodeGraphComponent::releaseAutoFitForManualView() {
+    if (!autoFitView) return;
+    autoFitView = false;
+    stopTimer();
+    if (onAutoFitViewChanged) onAutoFitViewChanged(false);
+}
+
+void NodeGraphComponent::timerCallback() {
+    // Auto-fit change detector. Re-fit only when the graph's bounding box
+    // actually changed, and never while a drag is in progress (re-framing
+    // the whole canvas mid-drag is disorienting - the post-release tick
+    // catches the new layout) or before the initial view has been applied.
+    if (!autoFitView) return;
+    if (pendingInitialFit) return;
+    if (dragMode != DragMode::None) return;
+    if (getWidth() <= 0 || getHeight() <= 0) return;
+
+    juce::Rectangle<float> b;
+    if (!computeAllNodesBounds(b)) return;          // empty graph: nothing to fit
+    if (haveLastAutoFitBounds && b == lastAutoFitBounds) return;
+
+    lastAutoFitBounds = b;
+    haveLastAutoFitBounds = true;
+    applyFitBounds(b.getX(), b.getY(), b.getRight(), b.getBottom());
 }
 
 void NodeGraphComponent::fitNodes(const std::vector<int>& nodeIds) {
@@ -2164,6 +2220,11 @@ void NodeGraphComponent::resized() {
         }
         pendingInitialFit = false;
     }
+
+    // In auto-fit mode a window/panel resize must re-frame the whole graph
+    // (the timer only watches the node bounds, which don't change on resize).
+    if (autoFitView && getWidth() > 0 && getHeight() > 0 && !pendingInitialFit)
+        fitAll();
 }
 
 // ==============================================================================

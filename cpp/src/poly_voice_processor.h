@@ -3,6 +3,7 @@
 #include "transport.h"
 #include "graph_processor.h"
 #include "voice_nodes.h"
+#include "voice_allocator.h"
 #include <juce_audio_processors/juce_audio_processors.h>
 #include <memory>
 #include <vector>
@@ -64,18 +65,16 @@ private:
     double sampleRate = 44100.0;
     int blockSize = 512;
 
+    // Per-slot audio machinery. The allocation/lifecycle bookkeeping (active,
+    // gate, note, age, silence) lives in `alloc` and is indexed by the same slot
+    // number, so VoiceAllocator can be unit-tested without the audio graph.
     struct Voice {
         std::unique_ptr<GraphProcessor> gp;
         VoiceInProcessor* voiceIn = nullptr; // owned by gp's inner graph
-        bool active = false;
-        bool gateHeld = false;
-        int note = -1;
-        long long age = 0;        // allocation order, for steal-oldest
-        float silenceMs = 0.0f;   // time spent below the RMS floor after release
         juce::AudioBuffer<float> scratch;
     };
     std::vector<Voice> voices;
-    long long ageCounter = 0;
+    VoiceAllocator alloc;
     bool built = false;
 
     // A released voice is freed once its output RMS stays below this floor for
@@ -84,7 +83,6 @@ private:
     static constexpr float kFreeMs   = 250.0f;
 
     void buildVoices();
-    int  allocVoice();   // free slot, else steal oldest; returns index
     static VoiceInProcessor* findVoiceIn(GraphProcessor& gp);
 };
 

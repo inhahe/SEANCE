@@ -83,6 +83,7 @@ target_sources(SEANCE PRIVATE
     src/graph_processor.h
     src/voice_nodes.h
     src/signal_oscillator.h
+    src/voice_allocator.h
     src/poly_voice_processor.cpp
     src/poly_voice_processor.h
     src/plugin_host.cpp

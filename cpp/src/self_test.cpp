@@ -24,6 +24,7 @@
 #include "shape_expr.h"            // bakeShapeExpr (Builtin/Lua/Python/GLSL curve bakes)
 #include "builtin_synth.h"         // WaveExprParser - Builtin expression vocabulary
 #include "builtin_effects.h"       // ParametricEQProcessor - variable EQ band count
+#include "voice_allocator.h"       // VoiceAllocator - per-voice polyphony policy
 
 #include <juce_audio_formats/juce_audio_formats.h>
 #include <juce_graphics/juce_graphics.h>
@@ -5771,6 +5772,159 @@ void testAssetLibrary(Report& r) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// VoiceAllocator: the per-voice polyphony allocation/lifecycle policy behind the
+// Voice container (free-slot -> steal-oldest, note-matched note-off, RMS-based
+// voice-free). Pure bookkeeping, no audio graph, so it's checkable here. Mirrors
+// poly_voice_processor.cpp's use; see poly-voice-architecture.md.
+// ---------------------------------------------------------------------------
+void testVoiceAllocator(Report& r) {
+    r.section("Voice allocator (per-voice polyphony policy)");
+
+    // Helper RMS values: one above the free floor, one below.
+    const float floorRms = 1.0e-4f, freeMs = 250.0f;
+    const float loud = 0.5f, quiet = 0.0f;
+
+    // --- Basic allocation across distinct free slots ---
+    {
+        VoiceAllocator a;
+        a.resize(4);
+        r.check(a.size() == 4 && a.activeCount() == 0, "alloc: 4 empty slots");
+
+        auto r0 = a.noteOn(60);
+        auto r1 = a.noteOn(64);
+        auto r2 = a.noteOn(67);
+        r.check(r0.slot == 0 && r1.slot == 1 && r2.slot == 2,
+                "alloc: three notes take the first three free slots in order");
+        r.check(!r0.stole && !r1.stole && !r2.stole,
+                "alloc: filling free slots never reports a steal");
+        r.check(a.activeCount() == 3, "alloc: three voices active");
+        r.check(a.slots[0].note == 60 && a.slots[1].note == 64 && a.slots[2].note == 67,
+                "alloc: slots remember their note numbers");
+    }
+
+    // --- Steal-oldest when full ---
+    {
+        VoiceAllocator a;
+        a.resize(3);
+        a.noteOn(60); // age 1, slot 0
+        a.noteOn(62); // age 2, slot 1
+        a.noteOn(64); // age 3, slot 2
+        r.check(a.activeCount() == 3, "steal: all 3 slots busy");
+        auto s = a.noteOn(66); // must steal the oldest = slot 0
+        r.check(s.slot == 0 && s.stole, "steal: 4th note steals the oldest slot (0)");
+        r.check(a.slots[0].note == 66 && a.slots[0].gateHeld,
+                "steal: stolen slot now plays the new note and is gate-held");
+        r.check(a.activeCount() == 3, "steal: still exactly 3 active after a steal");
+        // The new oldest is slot 1 (age 2); steal again should take it.
+        auto s2 = a.noteOn(68);
+        r.check(s2.slot == 1 && s2.stole, "steal: next steal takes the new oldest (slot 1)");
+    }
+
+    // --- note-off releases the gate but keeps the voice sounding (tail) ---
+    {
+        VoiceAllocator a;
+        a.resize(4);
+        a.noteOn(60);
+        int slot = a.noteOff(60);
+        r.check(slot == 0, "noteOff: returns the slot that was playing the note");
+        r.check(a.slots[0].active && !a.slots[0].gateHeld,
+                "noteOff: voice stays active (release tail) with gate down");
+        r.check(a.noteOff(99) == -1, "noteOff: an unheld note returns -1");
+        // A released note is no longer matchable by a second note-off.
+        r.check(a.noteOff(60) == -1, "noteOff: releasing an already-released note returns -1");
+    }
+
+    // --- duplicate notes: note-off releases only ONE (the first) voice ---
+    {
+        VoiceAllocator a;
+        a.resize(4);
+        a.noteOn(60); // slot 0
+        a.noteOn(60); // slot 1 - same note, second voice
+        r.check(a.activeCount() == 2, "dup: same note twice uses two slots");
+        int slot = a.noteOff(60);
+        r.check(slot == 0, "dup: note-off releases the first held voice");
+        r.check(!a.slots[0].gateHeld && a.slots[1].gateHeld,
+                "dup: the second voice for that note is still held");
+        int slot2 = a.noteOff(60);
+        r.check(slot2 == 1, "dup: a second note-off releases the remaining voice");
+    }
+
+    // --- voice-free detection: released + silent for >= kFreeMs frees the slot ---
+    {
+        VoiceAllocator a;
+        a.resize(2);
+        a.noteOn(60); // slot 0
+        a.noteOff(60);
+        // 100 ms blocks of silence: needs >= 250 ms to free => frees on the 3rd.
+        r.check(!a.postRender(0, quiet, 100.0f, floorRms, freeMs),
+                "free: 100ms silence - not yet freed");
+        r.check(!a.postRender(0, quiet, 100.0f, floorRms, freeMs),
+                "free: 200ms silence - not yet freed");
+        r.check(a.slots[0].active, "free: still active at 200ms");
+        r.check(a.postRender(0, quiet, 100.0f, floorRms, freeMs),
+                "free: 300ms silence crosses kFreeMs -> freed");
+        r.check(!a.slots[0].active, "free: slot is now inactive and reusable");
+        // Reusing the freed slot is a fresh alloc, not a steal.
+        auto re = a.noteOn(72);
+        r.check(re.slot == 0 && !re.stole, "free: freed slot is reused without a steal");
+    }
+
+    // --- a still-loud released voice does NOT free, and resets its timer ---
+    {
+        VoiceAllocator a;
+        a.resize(1);
+        a.noteOn(60);
+        a.noteOff(60);
+        a.postRender(0, quiet, 100.0f, floorRms, freeMs); // 100ms of silence banked
+        // A loud block resets the silence timer.
+        r.check(!a.postRender(0, loud, 100.0f, floorRms, freeMs),
+                "free: a loud block does not free the voice");
+        r.check(a.slots[0].silenceMs == 0.0f, "free: a loud block resets the silence timer");
+        // Now it takes a fresh full kFreeMs of silence to free.
+        a.postRender(0, quiet, 100.0f, floorRms, freeMs);
+        a.postRender(0, quiet, 100.0f, floorRms, freeMs);
+        r.check(a.slots[0].active, "free: timer truly restarted (still active at 200ms)");
+        r.check(a.postRender(0, quiet, 100.0f, floorRms, freeMs),
+                "free: frees after a fresh 300ms of silence");
+    }
+
+    // --- a held (gate-down) voice never frees, however quiet ---
+    {
+        VoiceAllocator a;
+        a.resize(1);
+        a.noteOn(60); // still held
+        for (int i = 0; i < 10; ++i)
+            r.check(!a.postRender(0, quiet, 100.0f, floorRms, freeMs),
+                    "held: a gate-held voice never frees even when silent");
+        r.check(a.slots[0].active && a.slots[0].silenceMs == 0.0f,
+                "held: held voice keeps its silence timer pinned at zero");
+    }
+
+    // --- allNotesOff drops every gate but leaves voices in their tails ---
+    {
+        VoiceAllocator a;
+        a.resize(3);
+        a.noteOn(60); a.noteOn(62); a.noteOn(64);
+        a.allNotesOff();
+        bool anyHeld = false;
+        for (auto& s : a.slots) if (s.gateHeld) anyHeld = true;
+        r.check(!anyHeld, "panic: allNotesOff clears every gate");
+        r.check(a.activeCount() == 3, "panic: voices remain active for their release tails");
+    }
+
+    // --- degenerate: zero slots is safe ---
+    {
+        VoiceAllocator a;
+        a.resize(0);
+        auto s = a.noteOn(60);
+        r.check(s.slot == -1 && !s.stole, "edge: note-on with no slots returns -1");
+        r.check(a.noteOff(60) == -1, "edge: note-off with no slots returns -1");
+        r.check(!a.postRender(0, quiet, 100.0f, floorRms, freeMs),
+                "edge: postRender on an out-of-range slot is a safe no-op");
+    }
+}
+
 int runSelfTest(const juce::File& outDir) {
     outDir.createDirectory();
     Report r;
@@ -5790,6 +5944,7 @@ int runSelfTest(const juce::File& outDir) {
     testGranularFreeze(r);
     testFmOpEnvelopes(r);
     testAssetLibrary(r);
+    testVoiceAllocator(r);
 
     r.section("Summary");
     r.line("  PASSED: " + juce::String(r.passed));

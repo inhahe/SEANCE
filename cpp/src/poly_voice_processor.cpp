@@ -43,6 +43,7 @@ void PolyVoiceProcessor::buildVoices() {
         v.scratch.setSize(2, blockSize);
         voices.push_back(std::move(v));
     }
+    alloc.resize((int) voices.size());
     built = true;
 }
 
@@ -52,59 +53,44 @@ void PolyVoiceProcessor::prepareToPlay(double sr, int bs) {
     buildVoices();
 }
 
-int PolyVoiceProcessor::allocVoice() {
-    for (int i = 0; i < (int)voices.size(); ++i)
-        if (!voices[i].active) return i;
-    // All busy - steal the oldest.
-    int oldest = 0;
-    long long minAge = voices.empty() ? 0 : voices[0].age;
-    for (int i = 1; i < (int)voices.size(); ++i)
-        if (voices[i].age < minAge) { minAge = voices[i].age; oldest = i; }
-    if (!voices.empty() && voices[oldest].voiceIn)
-        voices[oldest].voiceIn->reset();
-    return oldest;
-}
-
 void PolyVoiceProcessor::processBlock(juce::AudioBuffer<float>& buf,
                                       juce::MidiBuffer& midi) {
     const int n = buf.getNumSamples();
     buf.clear();
     if (!built || voices.empty()) return;
 
-    // 1. Translate incoming MIDI into voice allocation + gate events.
+    // 1. Translate incoming MIDI into voice allocation + gate events. The policy
+    //    (free slot / steal-oldest / note matching) lives in VoiceAllocator; here
+    //    we just apply its decisions to the matching voice's audio objects.
     for (const auto meta : midi) {
         const auto m = meta.getMessage();
         const int off = meta.samplePosition;
         if (m.isNoteOn() && m.getVelocity() > 0) {
-            const int idx = allocVoice();
-            auto& v = voices[idx];
-            v.active = true;
-            v.gateHeld = true;
-            v.note = m.getNoteNumber();
-            v.age = ++ageCounter;
-            v.silenceMs = 0.0f;
+            const auto res = alloc.noteOn(m.getNoteNumber());
+            if (res.slot < 0) continue;
+            auto& v = voices[(size_t) res.slot];
+            if (res.stole && v.voiceIn) v.voiceIn->reset();
             if (v.voiceIn)
                 v.voiceIn->noteOn(off, m.getNoteNumber(), m.getFloatVelocity());
         } else if (m.isNoteOff() || (m.isNoteOn() && m.getVelocity() == 0)) {
-            for (auto& v : voices)
-                if (v.active && v.gateHeld && v.note == m.getNoteNumber()) {
-                    v.gateHeld = false;
-                    if (v.voiceIn) v.voiceIn->noteOff(off, m.getNoteNumber());
-                    break;
-                }
+            const int slot = alloc.noteOff(m.getNoteNumber());
+            if (slot >= 0 && voices[(size_t) slot].voiceIn)
+                voices[(size_t) slot].voiceIn->noteOff(off, m.getNoteNumber());
         } else if (m.isAllNotesOff() || m.isAllSoundOff()) {
-            for (auto& v : voices) {
-                if (!v.active) continue;
-                v.gateHeld = false;
-                if (v.voiceIn) v.voiceIn->noteOff(0, v.note);
+            for (int i = 0; i < alloc.size(); ++i) {
+                if (!alloc.slots[(size_t) i].active) continue;
+                if (voices[(size_t) i].voiceIn)
+                    voices[(size_t) i].voiceIn->noteOff(0, alloc.slots[(size_t) i].note);
             }
+            alloc.allNotesOff();
         }
     }
 
     // 2. Render each active voice into its scratch buffer and sum.
     const float blockMs = sampleRate > 0 ? 1000.0f * (float)n / (float)sampleRate : 0.0f;
-    for (auto& v : voices) {
-        if (!v.active) continue;
+    for (int i = 0; i < (int) voices.size(); ++i) {
+        if (!alloc.slots[(size_t) i].active) continue;
+        auto& v = voices[(size_t) i];
         if (v.scratch.getNumSamples() < n)
             v.scratch.setSize(2, n, false, false, true);
         v.scratch.clear();
@@ -118,14 +104,8 @@ void PolyVoiceProcessor::processBlock(juce::AudioBuffer<float>& buf,
         // Voice-free detection: a released voice whose output has decayed below
         // the floor for kFreeMs is done (envelope tail finished).
         const float rms = v.scratch.getRMSLevel(0, 0, n);
-        if (!v.gateHeld && rms < kFloorRms) {
-            v.silenceMs += blockMs;
-            if (v.silenceMs >= kFreeMs) {
-                v.active = false;
-                if (v.voiceIn) v.voiceIn->reset();
-            }
-        } else {
-            v.silenceMs = 0.0f;
+        if (alloc.postRender(i, rms, blockMs, kFloorRms, kFreeMs)) {
+            if (v.voiceIn) v.voiceIn->reset();
         }
     }
 }

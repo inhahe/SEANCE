@@ -1,6 +1,7 @@
 #pragma once
 #include "node_graph.h"
 #include <string>
+#include <vector>
 
 namespace SoundShop {
 
@@ -19,6 +20,8 @@ public:
         int numTracks = 0;        // MIDI tracks created (one per channel × sample)
         int numNotes = 0;
         std::string sampleDir;    // directory that received the WAVs (may be empty)
+        int groupId = -1;         // id of the container Group node (for view framing)
+        std::vector<int> nodeIds; // all nodes created by the import (group + children)
     };
 
     // Import a tracker module file into the graph

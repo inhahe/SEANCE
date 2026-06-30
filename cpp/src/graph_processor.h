@@ -258,11 +258,46 @@ public:
     // Rebuild the JUCE graph from our node graph
     void rebuildGraph(NodeGraph& graph, Transport& transport);
 
+    // Build the built-in AudioProcessor for a "normal" node (any synth, effect,
+    // timeline, SignalShape/Script, etc.), returning a freshly-owned processor.
+    // This is the graph-agnostic factory: it depends ONLY on the node, the
+    // transport, and the graph it belongs to - no GraphProcessor member state -
+    // so it can populate an INNER graph (e.g. a per-voice subgraph inside a
+    // Voice container) exactly as it populates the main graph. The caller is
+    // responsible for the main-graph-only special cases that this does NOT
+    // handle: the Output sink, hosted-plugin instance ownership transfer, and
+    // cache-playback substitution. Returns a PassthroughProcessor for anything
+    // unrecognized (never null). See poly-voice-architecture.md.
+    static std::unique_ptr<juce::AudioProcessor> createNodeProcessor(
+        Node& node, Transport& transport, NodeGraph& graph);
+
     double getSampleRate() const { return sampleRate; }
     int getBlockSize() const { return blockSize; }
 
     // Force a rebuild on the next audio callback (thread-safe)
     void requestRebuild() { rebuildRequested = true; }
+
+    // Request an immediate "panic": on the next audio callback, reset every
+    // processor in the graph so all trailing sound (synth release tails,
+    // reverb/echo/delay buffers, sustained voices, plugin tails) is silenced
+    // at once instead of ringing out. Thread-safe (UI thread sets the flag;
+    // the audio thread consumes it). Used by the transport Stop so pressing
+    // Stop cuts the sound dead, the way every DAW's Stop does. The graph keeps
+    // processing afterwards (musical-typing audition still works while stopped)
+    // - this is a one-shot state wipe, not a permanent mute.
+    void requestPanic() { panicRequested = true; }
+
+    // Scope filter for rebuildGraph (per-voice polyphony, see
+    // poly-voice-architecture.md). -1 (default) = the main/top-level graph:
+    // build only nodes whose voiceContainerId == -1 (top level). >= 0 = build
+    // only the inner subgraph of that VoiceContainer (nodes whose
+    // voiceContainerId == scope). PolyVoiceProcessor sets this to the container
+    // id on each per-voice GraphProcessor so the same connection-builder wires
+    // the inner clone. The cross-scope link filtering is automatic: a link is
+    // only wired if BOTH endpoints were built in this scope (they land in
+    // nodeMap/nodeInputMap), so out-of-scope links are skipped by the existing
+    // membership guard in the link loop.
+    void setBuildScope(int s) { buildScope = s; }
 
     // Get the AudioProcessor for a given node ID (returns null if not in graph)
     juce::AudioProcessor* getProcessorForNode(int nodeId);
@@ -371,6 +406,10 @@ private:
     int lastNodeCount = 0;
     int lastLinkCount = 0;
     std::atomic<bool> rebuildRequested{false};
+    std::atomic<bool> panicRequested{false};
+
+    // Which scope rebuildGraph builds (see setBuildScope). -1 = top level.
+    int buildScope = -1;
 };
 
 } // namespace SoundShop

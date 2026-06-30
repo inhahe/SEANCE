@@ -5,12 +5,14 @@
 #include "builtin_synth.h"
 #include "layered_wave_editor.h"
 #include "spectral_editor.h"
+#include "signal_eq_editor.h"
 #include "wavelet_painter.h"
 #include "trigger_node.h"
 #include "midi_mod_node.h"
 #include "midi_device_wizard.h"
 #include "xy_pad.h"
 #include "signal_shape_node.h"
+#include "midi_script_node.h"
 #include "spectrum_tap.h"
 #include "analyzer_nodes.h"
 #include "convolution_processor.h"
@@ -121,6 +123,13 @@ MainContentComponent::MainContentComponent() {
     };
     graphComponent->onNodeDeleted = [this](int nodeId) {
         closeEditor(nodeId);
+    };
+    // Auto-fit auto-released itself (the user manually zoomed/panned): mirror
+    // the new state into our preference, persist it, and refresh the menu tick.
+    graphComponent->onAutoFitViewChanged = [this](bool on) {
+        autoFitGraph = on;
+        savePreferences();
+        menuItemsChanged();
     };
     graphComponent->getAudioFormat = [this]() {
         return std::make_pair(audioEngine.getSampleRate(),
@@ -411,16 +420,39 @@ MainContentComponent::MainContentComponent() {
                 audioEngine.getGraphProcessor().getProcessorForNode(nodeId)))
             proc->fireManualTrigger();
     };
+    graphComponent->getNodeScriptError = [this](int nodeId) -> bool {
+        auto* p = audioEngine.getGraphProcessor().getProcessorForNode(nodeId);
+        if (auto* ms = dynamic_cast<MidiScriptProcessor*>(p))
+            return ms->hasScriptError();
+        if (auto* ss = dynamic_cast<SignalShapeProcessor*>(p))
+            return ss->hasScriptError();
+        return false;
+    };
 
     // Load prefs, plugin cache, recent projects (audio engine deferred to timer)
     pluginSettings.load("soundshop_plugins.cfg");
     loadRecentProjects();
     loadPreferences();
+    if (graphComponent) graphComponent->setAutoFitView(autoFitGraph);
     loadKnownHistories();
 
     // Load last project or set up default graph
     bool loaded = false;
-    if (autoLoadLastProject && !recentProjects.empty()) {
+    // A bare `.ssp` path on the command line overrides the auto-load-last
+    // behaviour: load exactly that file (used for `SEANCE.exe foo.ssp` and for
+    // opening a known project into an --ephemeral test session).
+    if (juce::String startup = startupProjectFile(); startup.isNotEmpty()) {
+        auto file = juce::File(startup);
+        if (file.existsAsFile()) {
+            {
+                std::lock_guard<std::recursive_mutex> graphLk(graph.mutationLock);
+                ProjectFile::load(startup.toStdString(), graph, nullptr);
+            }
+            if (graphComponent) graphComponent->notifyProjectLoaded();
+            loaded = true;
+        }
+    }
+    if (!loaded && autoLoadLastProject && !recentProjects.empty()) {
         auto file = juce::File(recentProjects[0]);
         if (file.existsAsFile()) {
             // Lock for the batch mutation (see node_graph.h mutationLock
@@ -644,31 +676,11 @@ void MainContentComponent::runDeferredStartupInit() {
     audioEngine.init();
     audioEngine.getPluginHost().loadScanCache("soundshop_plugins_cache.dat");
 
-    // Reload plugins for any nodes that were loaded before the audio engine was ready
-    {
-        bool anyLoaded = false;
-        for (auto& n : graph.nodes) {
-            if (n.pluginIndex >= 0 && !n.plugin) {
-                auto loaded = audioEngine.getPluginHost().loadPlugin(
-                    n.pluginIndex, audioEngine.getSampleRate(), audioEngine.getBlockSize());
-                if (loaded) {
-                    // Restore saved plugin state
-                    if (!n.pendingPluginState.empty() && loaded->instance) {
-                        juce::MemoryBlock stateData;
-                        stateData.fromBase64Encoding(n.pendingPluginState);
-                        if (stateData.getSize() > 0)
-                            loaded->instance->setStateInformation(
-                                stateData.getData(), (int)stateData.getSize());
-                        n.pendingPluginState.clear();
-                    }
-                    n.plugin = std::move(loaded);
-                    anyLoaded = true;
-                }
-            }
-        }
-        if (anyLoaded)
-            audioEngine.getGraphProcessor().requestRebuild();
-    }
+    // Instantiate plugins for any nodes loaded before the audio engine was ready.
+    // Done via the serial async loader so the window stays responsive instead of
+    // blocking the message thread for seconds while plugins initialise. Each node
+    // shows a loading badge; the audio graph is rebuilt as each plugin appears.
+    beginAsyncPluginLoad();
 
     // Restore CC mappings from loaded project
     syncCCMappingsFromGraph();
@@ -703,6 +715,101 @@ void MainContentComponent::runDeferredStartupInit() {
 
     // Heavy init done - the app is interactive now, so drop the busy cursor.
     juce::MouseCursor::hideWaitCursor();
+}
+
+void MainContentComponent::beginAsyncPluginLoad() {
+    // Build the FIFO of plugin nodes that still need instantiation and mark
+    // them Pending. Then start the serial loader. If nothing needs loading we
+    // leave projectLoading false so Save stays enabled.
+    // If a load chain is already draining (e.g. the user opened another project
+    // mid-load), we rebuild the queue but must NOT start a second callAsync chain
+    // - the in-flight one will pick up the refreshed queue on its next tick.
+    // While projectLoading is true there is exactly one pending processNextPluginLoad.
+    bool wasLoading = projectLoading;
+    pluginLoadQueue.clear();
+    {
+        std::lock_guard<std::recursive_mutex> graphLk(graph.mutationLock);
+        for (auto& n : graph.nodes) {
+            if (n.pluginIndex >= 0 && !n.plugin) {
+                n.pluginLoadState = PluginLoadState::Pending;
+                pluginLoadQueue.push_back(n.id);
+            }
+        }
+    }
+    if (pluginLoadQueue.empty()) {
+        projectLoading = false;
+        menuItemsChanged();
+        return;
+    }
+    projectLoading = true;
+    menuItemsChanged();   // reflect greyed Save immediately
+    if (graphComponent) graphComponent->repaint();
+    if (!wasLoading)
+        juce::MessageManager::callAsync([this] { processNextPluginLoad(); });
+}
+
+void MainContentComponent::processNextPluginLoad() {
+    // Drain the queue one node per call. Each tick: pick the next still-valid
+    // node, instantiate its plugin OFF the graph lock (heavy, message-thread
+    // only), then publish the result UNDER the lock and rebuild the audio graph.
+    // We never hold a Node* across the heavy call (graph.nodes may reallocate if
+    // the user adds nodes meanwhile) - we re-look-up by id before publishing.
+    while (!pluginLoadQueue.empty()) {
+        int nodeId = pluginLoadQueue.front();
+        pluginLoadQueue.erase(pluginLoadQueue.begin());
+
+        // Snapshot what we need under the lock, mark the node Loading.
+        int pluginIndex = -1;
+        std::string pendingState;
+        {
+            std::lock_guard<std::recursive_mutex> graphLk(graph.mutationLock);
+            Node* n = graph.findNode(nodeId);
+            if (!n || n->pluginIndex < 0 || n->plugin) continue; // gone / already loaded
+            pluginIndex = n->pluginIndex;
+            pendingState = n->pendingPluginState;
+            n->pluginLoadState = PluginLoadState::Loading;
+        }
+        if (graphComponent) graphComponent->repaint();
+
+        // Heavy: instantiate + restore state. No graph lock held here.
+        auto loaded = audioEngine.getPluginHost().loadPlugin(
+            pluginIndex, audioEngine.getSampleRate(), audioEngine.getBlockSize());
+        if (loaded && loaded->instance && !pendingState.empty()) {
+            juce::MemoryBlock stateData;
+            stateData.fromBase64Encoding(pendingState);
+            if (stateData.getSize() > 0)
+                loaded->instance->setStateInformation(
+                    stateData.getData(), (int)stateData.getSize());
+        }
+
+        // Publish under the lock so the audio thread sees a consistent node.
+        {
+            std::lock_guard<std::recursive_mutex> graphLk(graph.mutationLock);
+            Node* n = graph.findNode(nodeId);
+            if (n) {
+                if (loaded) {
+                    n->plugin = std::move(loaded);
+                    n->pendingPluginState.clear();
+                    n->pluginLoadState = PluginLoadState::Ready;
+                } else {
+                    n->pluginLoadState = PluginLoadState::Failed;
+                }
+            }
+        }
+        // (On failure loadPlugin already logged to stderr; we continue anyway.)
+        audioEngine.getGraphProcessor().requestRebuild();
+        if (graphComponent) graphComponent->repaint();
+
+        // Yield back to the message loop so the UI updates between plugins,
+        // then continue with the next one.
+        juce::MessageManager::callAsync([this] { processNextPluginLoad(); });
+        return;
+    }
+
+    // Queue drained - loading complete. Re-enable Save and refresh the menu.
+    projectLoading = false;
+    menuItemsChanged();
+    if (graphComponent) graphComponent->repaint();
 }
 
 bool MainContentComponent::keyPressed(const juce::KeyPress& key) {
@@ -850,6 +957,11 @@ void MainContentComponent::resized() {
 }
 
 void MainContentComponent::timerCallback() {
+    // While a project's plugins are loading asynchronously, repaint the graph
+    // each tick so the per-node "loading" spinner animates smoothly.
+    if (projectLoading && graphComponent)
+        graphComponent->repaint();
+
     // Power-state-aware autosave interval (#87): every ~5 seconds
     // (150 ticks at 30 Hz), check AC vs battery and adjust the
     // autosave interval. Desktops and AC-powered laptops use the
@@ -1116,8 +1228,16 @@ juce::PopupMenu MainContentComponent::getMenuForIndex(int idx, const juce::Strin
     if (name == "File") {
         menu.addItem(1, "New Project");
         menu.addItem(2, "Open Project...", true, false);
-        menu.addItem(3, "Save Project", true, false);
-        menu.addItem(4, "Save Project As...");
+        // Save is disabled while a project's plugins are still loading: saving
+        // mid-load would risk writing an incomplete graph. The greyed label
+        // tells the user why and that it's temporary.
+        if (projectLoading) {
+            menu.addItem(3, "Save Project  (loading plugins...)", false, false);
+            menu.addItem(4, "Save Project As...  (loading plugins...)", false, false);
+        } else {
+            menu.addItem(3, "Save Project", true, false);
+            menu.addItem(4, "Save Project As...");
+        }
         menu.addItem(5, "Export Audio...");
         menu.addItem(6, "Import MOD/S3M/IT/XM...");
         menu.addSeparator();
@@ -1169,6 +1289,7 @@ juce::PopupMenu MainContentComponent::getMenuForIndex(int idx, const juce::Strin
         menu.addItem(92, "Clear Recent Scripts");
     } else if (name == "View") {
         menu.addItem(30, "Fit All");
+        menu.addItem(401, "Auto-Fit Graph (always show whole graph)", true, autoFitGraph);
         menu.addItem(400, "Spectrum Analyzer");
     } else if (name == "Settings") {
         menu.addItem(39, "Audio Device...");
@@ -1248,6 +1369,7 @@ juce::PopupMenu MainContentComponent::getMenuForIndex(int idx, const juce::Strin
         menu.addItem(311, "Convolution Filter");
         menu.addItem(313, "Script (Signal + MIDI)");
         menu.addItem(314, "Algorithmic MIDI");
+        menu.addItem(315, "Voices (Polyphony)");
         menu.addSeparator();
         menu.addItem(312, "Keyboard Shortcuts");
         menu.addSeparator();
@@ -1396,6 +1518,7 @@ void MainContentComponent::menuItemSelected(int menuItemID, int) {
         case 312: openHelpDoc("keyboard-shortcuts.html"); break;
         case 313: openHelpDoc("signal-shape.html"); break;
         case 314: openHelpDoc("midi-script.html"); break;
+        case 315: openHelpDoc("voices.html"); break;
         case 320:
             juce::AlertWindow::showMessageBoxAsync(
                 juce::MessageBoxIconType::InfoIcon,
@@ -1444,6 +1567,11 @@ void MainContentComponent::menuItemSelected(int menuItemID, int) {
             break;
         }
         case 30: graphComponent->fitAll(); break;
+        case 401:
+            autoFitGraph = !autoFitGraph;
+            if (graphComponent) graphComponent->setAutoFitView(autoFitGraph);
+            savePreferences();
+            break;
         case 31: showScriptConsole(); break;
         case 32: autoLoadLastProject = !autoLoadLastProject; savePreferences(); break;
         case 33: graph.projectSampleRate = 0; audioEngine.setProjectSampleRate(0); break;
@@ -2233,6 +2361,25 @@ void MainContentComponent::showPluginUI(int nodeId) {
         juce::DialogWindow::LaunchOptions opts;
         opts.content.setOwned(editor);
         opts.dialogTitle = "Curve EQ: " + juce::String(node->name);
+        opts.dialogBackgroundColour = juce::Colour(22, 22, 28);
+        opts.escapeKeyTriggersCloseButton = true;
+        opts.useNativeTitleBar = false;
+        opts.resizable = true;
+        opts.componentToCentreAround = this;
+        SoundShop::launchToolDialog(opts);
+        return;
+    }
+
+    // Signal EQ editor: an Effect node whose script is "__signaleq__". Curve
+    // points (each a peaking bell with a signal-modulatable Freq + Gain) are
+    // dragged on a log-frequency / dB canvas.
+    if (node && node->type == NodeType::Effect && node->script == "__signaleq__") {
+        auto* editor = new SignalEQEditorComponent(graph, node->id, [this]() {
+            audioEngine.getGraphProcessor().requestRebuild();
+        });
+        juce::DialogWindow::LaunchOptions opts;
+        opts.content.setOwned(editor);
+        opts.dialogTitle = "Signal EQ: " + juce::String(node->name);
         opts.dialogBackgroundColour = juce::Colour(22, 22, 28);
         opts.escapeKeyTriggersCloseButton = true;
         opts.useNativeTitleBar = false;
@@ -3054,7 +3201,12 @@ void MainContentComponent::openProjectFile(const juce::String& path) {
     FactoryRefResolutionScope factoryRefScope;
     {
         std::lock_guard<std::recursive_mutex> graphLk(graph.mutationLock);
-        ProjectFile::load(path.toStdString(), graph, &audioEngine.getPluginHost());
+        // Pass nullptr for the plugin host so ProjectFile::load does NOT
+        // instantiate plugins synchronously on this (locked, message-thread)
+        // critical path. Plugin nodes are parsed with their pendingPluginState
+        // intact; beginAsyncPluginLoad() (below) instantiates them serially off
+        // the lock so the nodes appear immediately and the UI stays responsive.
+        ProjectFile::load(path.toStdString(), graph, nullptr);
         upgradeLegacyNodes();
 
         // Embed baked formula cycles for old projects (#crash-python314). A
@@ -3102,6 +3254,11 @@ void MainContentComponent::openProjectFile(const juce::String& path) {
     // to clobber the user's last view on every load.
     graphComponent->notifyProjectLoaded();
     graphComponent->repaint();
+
+    // Kick off serial async plugin instantiation. Nodes are already on screen;
+    // each plugin loads one at a time off this critical path, with a per-node
+    // loading badge. Save/Save As stay greyed until the queue drains.
+    beginAsyncPluginLoad();
 
     // Shared-history handling (#90): check for a sidecar and, if it
     // hasn't been seen by this user before, show the 3-option prompt.
@@ -3239,6 +3396,20 @@ void MainContentComponent::syncCCMappingsFromGraph() {
 }
 
 void MainContentComponent::saveProject(std::function<void()> onSaved) {
+    // Backstop for the keyboard shortcut (the menu item is greyed): refuse to
+    // save while plugins are still loading, since the graph isn't fully live yet.
+    if (projectLoading) {
+        juce::NativeMessageBox::showAsync(
+            juce::MessageBoxOptions()
+                .withIconType(juce::MessageBoxIconType::InfoIcon)
+                .withTitle("Still loading")
+                .withMessage("This project's plugins are still loading. Saving will be "
+                             "available as soon as they finish.")
+                .withButton("OK")
+                .withAssociatedComponent(this),
+            nullptr);
+        return;
+    }
     if (ProjectFile::currentPath.empty()) {
         // No filename yet - defer to Save As, which will run the file chooser
         // and call us back through onSaved on success.
@@ -3270,9 +3441,22 @@ void MainContentComponent::saveProject(std::function<void()> onSaved) {
 }
 
 void MainContentComponent::saveProjectAs(std::function<void()> onSaved) {
+    if (projectLoading) {
+        juce::NativeMessageBox::showAsync(
+            juce::MessageBoxOptions()
+                .withIconType(juce::MessageBoxIconType::InfoIcon)
+                .withTitle("Still loading")
+                .withMessage("This project's plugins are still loading. Saving will be "
+                             "available as soon as they finish.")
+                .withButton("OK")
+                .withAssociatedComponent(this),
+            nullptr);
+        return;
+    }
     syncCCMappingsToGraph();
     auto chooser = std::make_shared<juce::FileChooser>("Save Project", juce::File(), "*.ssp");
-    chooser->launchAsync(juce::FileBrowserComponent::saveMode,
+    chooser->launchAsync(juce::FileBrowserComponent::saveMode
+                             | juce::FileBrowserComponent::warnAboutOverwriting,
         [this, chooser, onSaved = std::move(onSaved)](const juce::FileChooser& fc) {
             auto file = fc.getResult();
             if (file == juce::File()) return; // user cancelled - don't fire onSaved
@@ -3343,7 +3527,14 @@ void MainContentComponent::importModFile() {
                 // which then gets saved, so the mod "doesn't save/reload".
                 graph.commitSnapshot("Import tracker module");
                 audioEngine.getGraphProcessor().requestRebuild();
-                graphComponent->fitAll();
+                // Frame the view on just the imported nodes, not the whole
+                // graph: a pre-existing Master Out / synth parked in another
+                // corner would otherwise inflate fitAll's bounding box and
+                // zoom the import down to a tiny cluster with empty margins.
+                if (!result.nodeIds.empty())
+                    graphComponent->fitNodes(result.nodeIds);
+                else
+                    graphComponent->fitAll();
             } else {
                 msg = "Import failed: " + juce::String(result.error);
             }
@@ -3512,7 +3703,8 @@ void MainContentComponent::exportAudioWithBeat(float maxBeat) {
             auto filter = "*" + ext;
             auto chooser = std::make_shared<juce::FileChooser>(
                 "Export Audio", juce::File(), filter);
-            chooser->launchAsync(juce::FileBrowserComponent::saveMode,
+            chooser->launchAsync(juce::FileBrowserComponent::saveMode
+                                     | juce::FileBrowserComponent::warnAboutOverwriting,
                 [this, chooser, opts, maxBeat](const juce::FileChooser& fc) {
                     auto file = fc.getResult();
                     if (file == juce::File()) return;
@@ -3623,7 +3815,12 @@ void MainContentComponent::openEditor(Node& node) {
 
     auto panel = std::make_unique<EditorPanel>();
     panel->nodeId = node.id;
-    panel->heightPx = 200;
+    // 220px default: with the default vertical zoom (visibleRange 15) this
+    // gives ~7.5px keyboard rows, tall enough for a per-row note-name label
+    // (font floor 6.5px) so the user can read every row's note. A shorter
+    // panel falls back to cramped labels; the user can still drag the panel
+    // taller via the resize handle at its top edge.
+    panel->heightPx = 220;
     panel->component = std::make_unique<PianoRollComponent>(graph, node, &transport);
     panel->component->onClose = [this](int nodeId) { closeEditor(nodeId); };
     // Resize handle at the top of the piano roll panel. The handle's
@@ -3634,6 +3831,14 @@ void MainContentComponent::openEditor(Node& node) {
     int nodeIdCopy = node.id;
     panel->component->onResizeDrag = [this, nodeIdCopy](int deltaPx) {
         resizeEditorPanel(nodeIdCopy, deltaPx);
+    };
+    // A track's time offset / parent change shifts not just this track but any
+    // children shown in OTHER stacked panels, and moves notes in the node
+    // graph's mini-timelines. Repaint every editor panel and the graph.
+    panel->component->onTimingChanged = [this]() {
+        for (auto& p : editorPanels)
+            p->component->repaint();
+        if (graphComponent) graphComponent->repaint();
     };
     addAndMakeVisible(panel->component.get());
     editorPanels.push_back(std::move(panel));
@@ -3794,6 +3999,7 @@ void MainContentComponent::loadPreferences() {
         return;
     }
     autoLoadLastProject = xml->getBoolAttribute("autoLoadLastProject", true);
+    autoFitGraph = xml->getBoolAttribute("autoFitGraph", false);
     autosaveEnabled = xml->getBoolAttribute("autosaveEnabled", true);
     autosaveIntervalSeconds = xml->getIntAttribute("autosaveIntervalSeconds", autoDefault);
     if (autosaveIntervalSeconds < 1) autosaveIntervalSeconds = 1;
@@ -3803,6 +4009,7 @@ void MainContentComponent::loadPreferences() {
 void MainContentComponent::savePreferences() {
     auto xml = std::make_unique<juce::XmlElement>("Preferences");
     xml->setAttribute("autoLoadLastProject", autoLoadLastProject);
+    xml->setAttribute("autoFitGraph", autoFitGraph);
     xml->setAttribute("autosaveEnabled", autosaveEnabled);
     xml->setAttribute("autosaveIntervalSeconds", autosaveIntervalSeconds);
     xml->setAttribute("autosaveLaptopNoticeShown", autosaveLaptopNoticeShown);
@@ -3831,6 +4038,14 @@ void setEphemeralSession(bool on) {
             .deleteRecursively();
     }
 }
+
+// Optional startup project file (set from a bare `.ssp` path on the command
+// line). When non-empty it's loaded in place of the most-recent project, so a
+// launch like `SEANCE.exe foo.ssp` (optionally with --ephemeral) opens that
+// file directly. See setStartupProjectFile() / the constructor's load path.
+static juce::String g_startupProjectFile;
+juce::String startupProjectFile() { return g_startupProjectFile; }
+void setStartupProjectFile(const juce::String& path) { g_startupProjectFile = path; }
 
 static juce::File getAutosaveDir() {
     if (g_ephemeralSession)
@@ -4796,7 +5011,8 @@ public:
     void saveScript() {
         fileChooser = std::make_shared<juce::FileChooser>(
             "Save Script", getLastDirectory(), "*.py");
-        fileChooser->launchAsync(juce::FileBrowserComponent::saveMode,
+        fileChooser->launchAsync(juce::FileBrowserComponent::saveMode
+                                     | juce::FileBrowserComponent::warnAboutOverwriting,
             [this](const juce::FileChooser& fc) {
                 auto file = fc.getResult();
                 if (file != juce::File()) {
@@ -5476,8 +5692,17 @@ void MainWindow::closeButtonPressed() {
 }
 
 void MainContentComponent::setupHotkeyCallbacks() {
-    hotkeyManager.setCallback(HotkeyAction::Play, [this]() { audioEngine.play(); transport.playing = true; });
-    hotkeyManager.setCallback(HotkeyAction::Stop, [this]() { audioEngine.stop(); transport.playing = false; });
+    // Spacebar (the default Play binding) toggles transport, matching every
+    // mainstream DAW: press once to start, again to stop. Route through the
+    // full onPlay()/onStop() handlers (not the raw engine calls) so the
+    // play-from-top-when-parked-at-end logic, recording teardown, the
+    // immediate all-sound panic on stop, and the Play/Pause button label all
+    // stay in sync regardless of whether the user clicks the button or hits
+    // the key. See REFERENCE.md -> Transport.
+    hotkeyManager.setCallback(HotkeyAction::Play, [this]() {
+        if (transport.playing) onStop(); else onPlay();
+    });
+    hotkeyManager.setCallback(HotkeyAction::Stop, [this]() { onStop(); });
     hotkeyManager.setCallback(HotkeyAction::Undo, [this]() { graph.undoTree.doUndo(); graphComponent->repaint(); });
     hotkeyManager.setCallback(HotkeyAction::Redo, [this]() { graph.undoTree.doRedo(); graphComponent->repaint(); });
     hotkeyManager.setCallback(HotkeyAction::SaveProject, [this]() { saveProject(); });

@@ -77,10 +77,16 @@ target_sources(SEANCE PRIVATE
     src/node_graph_component.h
     src/piano_roll_component.cpp
     src/piano_roll_component.h
+    src/track_nesting_menu.h
     src/audio_engine.cpp
     src/audio_engine.h
     src/graph_processor.cpp
     src/graph_processor.h
+    src/voice_nodes.h
+    src/signal_oscillator.h
+    src/voice_allocator.h
+    src/poly_voice_processor.cpp
+    src/poly_voice_processor.h
     src/plugin_host.cpp
     src/plugin_host.h
     src/plugin_settings.cpp
@@ -193,6 +199,8 @@ target_sources(SEANCE PRIVATE
     src/layered_wave_editor.h
     src/spectral_editor.cpp
     src/spectral_editor.h
+    src/signal_eq_editor.cpp
+    src/signal_eq_editor.h
     src/curve_editor.cpp
     src/curve_editor.h
     src/adsr_envelope.cpp

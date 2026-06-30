@@ -50,6 +50,13 @@ public:
         (void)sr; (void)bs;
     }
     void releaseResources() override {}
+    // Transport panic (Stop): cut all sounding/ringing voices immediately so SFZ
+    // release tails don't ring out after the user hits Stop.
+    void reset() override {
+#ifdef HAS_SFIZZ
+        if (sfizz) sfizz->allSoundOff();
+#endif
+    }
 
     void processBlock(juce::AudioBuffer<float>& buf, juce::MidiBuffer& midi) override {
 #ifdef HAS_SFIZZ

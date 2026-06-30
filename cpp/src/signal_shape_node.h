@@ -212,6 +212,13 @@ public:
     // by hand. Atomic so it's safe from any thread.
     void fireManualTrigger() { manualTriggerPending.store(true); }
 
+    // True when the most recent script (re)load failed to compile/link (Lua
+    // syntax error, Wasm load/link error, ...). Set on the AUDIO thread in
+    // reloadIfScriptChanged(); read on the MESSAGE thread by the node-graph
+    // editor to draw a red error badge. atomic<bool> so the cross-thread read
+    // is data-race-free. Builtin never errors here (lazy per-sample parse).
+    bool hasScriptError() const { return scriptHasError.load(std::memory_order_relaxed); }
+
 private:
     Node& node;
     Transport& transport;
@@ -238,6 +245,10 @@ private:
     // In that mode the trigger / phase / repeat / curve machinery is bypassed and
     // the script writes the output buffer directly via runBlock().
     bool runBlockMode = false;
+    // Set true after a failed runtime->load() (Lua/Wasm compile/link error);
+    // cleared on a successful load. Written on the audio thread, read on the
+    // message thread (see hasScriptError()).
+    std::atomic<bool> scriptHasError{false};
     // Scratch output buffer for block mode (filled by runBlock, then fanned out
     // to every Signal/Param output channel). Kept as a member so it isn't
     // reallocated on the audio thread every block.
@@ -347,7 +358,8 @@ private:
 // Signal s1..sN tail) and fires onChanged so the caller can rebuild the
 // graph. Existing cables to deleted pins are dropped by the graph rebuild
 // (orphan links are skipped in graph_processor::rebuildGraph).
-class SignalShapeEditorComponent : public juce::Component {
+class SignalShapeEditorComponent : public juce::Component,
+                                   private juce::Timer {
 public:
     // graph + nodeId: which SignalShape node we edit. We look up the live
     // Node by id on every access (never store a Node&) so vector
@@ -384,6 +396,10 @@ private:
     // does in the current language/rate (e.g. "transforms curve each sample" vs
     // "fills the whole block - phase/repeat/curve are bypassed").
     juce::Label   scriptNote;
+    // One-line red error strip shown only when the current program fails to
+    // compile. Fed by validateScript() (a message-thread linter, debounced via
+    // the Timer). Hidden while the script is clean.
+    juce::Label   errorLabel;
 
     // Embedded layer-stack editor: the SAME shared widget the Wavetable
     // editor uses for its layer rows (+ Layer button, per-layer shape/ratio/
@@ -450,12 +466,17 @@ private:
     // badly needs; it now lives behind this button (and its tooltip) so the
     // shape editor gets that room back. Click pops the reference in a
     // main-window-parented message box.
-    juce::TextButton varsHelpBtn { "Variables & functions\u2026" };
+    juce::TextButton varsHelpBtn { "Variables & functions..." };
 
     // Push `doc` into node.script (via SignalShapeDoc::encode) and notify.
     // Also reconciles node.pinsIn to match doc.signalInputCount when needed.
     void commitToNode();
     void loadFromNode();
+    void timerCallback() override;
+    // Compile the current program with a throwaway runtime and show/hide the
+    // error strip. Cheap for Lua (luaL_loadstring), a no-op for Builtin, and
+    // validates the .wasm path for WebAssembly. Debounced via the Timer.
+    void validateScript();
     // Show the expression editor (Builtin / Lua) or the .wasm file panel (Wasm),
     // toggle multi-line for Lua programs, and update the caption + contextual
     // note to match the current language/rate.

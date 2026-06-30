@@ -78,7 +78,10 @@
   <li><strong>Orbit</strong> — circles around a center point in 2D (or higher). The radius and speed are knobs. Produces evolving pad-like sounds where the traversal periodically revisits each region of the terrain.</li>
   <li><strong>Lissajous</strong> — two-dimensional patterns formed by independent X and Y oscillators with different rates. Standard Lissajous figures (figure-8, lemniscate, etc.) drawn through the terrain. Produces complex periodic timbres.</li>
   <li><strong>Path</strong> — user-defined polyline through 2D-or-higher space. Click points in the terrain visualizer to define the path; the traversal interpolates between them at a chosen speed. Two playback modes: Loop (jumps back to the start at the end) or Bounce (reverses direction at each end, ping-ponging).</li>
+  <li><strong>Static</strong> — no automatic motion. Use this when you want the circling oscillators turned <em>off</em> and would rather place the playback point yourself. The point is held at <em>Center X</em> / <em>Center Y</em>, so Radius and Speed are ignored. Move the Center sliders to pick the spot, or — for an expressive, alive sound — right-click the <em>Center X</em> or <em>Center Y</em> row and add a signal input, then wire an LFO, envelope, XY pad, or automation to sweep it.</li>
 </ul>
+
+<p>The <strong>Traversal</strong> row is a picker: click it to choose a mode from a popup menu (it doesn't drag between values). Hover any slider in the synth to see a tooltip explaining what it does; most sliders can also be driven by a signal cable — right-click the row to add an input.</p>
 
 <p>The terrain visualizer (the colored grid in the synth editor) shows you the 2D slice of the terrain you're currently working with, and overlays the traversal path on top. Drawing a path: pick the draw mode in the dropdown (Click Points or Freehand) and click/drag in the visualizer.</p>
 

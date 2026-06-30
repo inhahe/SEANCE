@@ -37,6 +37,14 @@ namespace SoundShop {
 void setEphemeralSession(bool on);
 bool isEphemeralSession();
 
+// Optional startup project file. When a non-empty path is set (from a bare
+// `.ssp` argument on the command line), MainContentComponent loads it at
+// construction instead of the most-recently-opened project. Combine with
+// --ephemeral to open a specific file in a throwaway session. Must be called
+// before MainContentComponent is constructed.
+void setStartupProjectFile(const juce::String& path);
+juce::String startupProjectFile();
+
 class MainContentComponent : public juce::Component,
                               public juce::MenuBarModel,
                               public juce::Timer {
@@ -196,6 +204,21 @@ private:
     void runDeferredStartupInit();
     bool deferredInitScheduled = false;
 
+    // ---- Async serial plugin loading (project open + startup) ----
+    // Plugin instantiation (createPluginInstance + setStateInformation) is slow
+    // and must run on the message thread (third-party plugins are not safe to
+    // instantiate off-thread). To keep nodes visible and the UI responsive, we
+    // don't load plugins on the synchronous load path any more. Instead, after a
+    // project is parsed, every plugin node is marked Pending and pushed onto
+    // pluginLoadQueue, then processNextPluginLoad() walks the queue one node per
+    // callAsync tick: the node goes Loading, the heavy work runs, then it's
+    // published Ready/Failed and the audio graph is rebuilt. projectLoading stays
+    // true (greying out Save/Save As) until the queue drains.
+    bool projectLoading = false;
+    std::vector<int> pluginLoadQueue;     // node IDs still to load (FIFO)
+    void beginAsyncPluginLoad();          // mark plugin nodes Pending, kick off the queue
+    void processNextPluginLoad();         // load one queued plugin, then schedule the next
+
     int saveFlashFrames = 0; // countdown for "Saved!" title flash
 
     // Hotplug detection for MIDI input devices. The timer polls
@@ -213,6 +236,12 @@ private:
     // Recent projects
     std::vector<juce::String> recentProjects;
     bool autoLoadLastProject = true;
+
+    // View → "Auto-Fit Graph": keep the node graph continuously framed so the
+    // whole graph is always visible. Persisted in soundshop_prefs.xml; the
+    // NodeGraphComponent owns the live behaviour (a manual zoom/pan releases it
+    // and calls back to untick this). Off by default - it's an opt-in mode.
+    bool autoFitGraph = false;
     void addToRecentProjects(const juce::String& path);
     void loadRecentProjects();
     void saveRecentProjects();

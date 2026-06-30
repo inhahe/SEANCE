@@ -182,6 +182,13 @@ void SoundFontProcessor::releaseResources() {
     for (auto& v : sfzVoices) v.active = false;
 }
 
+void SoundFontProcessor::reset() {
+    // Transport panic (Stop): same all-notes-off as releaseResources, but kept
+    // separate so the intent is explicit at the call site (graph-wide reset()).
+    if (sf2) tsf_note_off_all(sf2);
+    for (auto& v : sfzVoices) v.active = false;
+}
+
 std::vector<std::string> SoundFontProcessor::getPresetNames() const {
     std::vector<std::string> names;
     if (sf2) {

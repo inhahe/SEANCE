@@ -1,0 +1,212 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Voices (Polyphony) — SEANCE</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="wrap">
+<header>
+<h1>Voices (Polyphony)</h1>
+<nav>
+  <a href="index.html">Home</a>
+  <a href="graph-basics.html">Graph Basics</a>
+  <a href="terrain-synth.html">Terrain Synth</a>
+</nav>
+</header>
+
+<p>Every built-in synth in SEANCE is already polyphonic on its own — play a chord into a Wavetable or FM synth and it sounds all the notes. But the <em>recipe</em> for each note (the oscillators, filters, and envelopes) is sealed inside that instrument. What you couldn't do until now was take a few separate graph nodes — say an oscillator, a filter, and an envelope — and have that little patch played <strong>once per note you press</strong>, with all the copies summed together. The <strong>Voice container</strong> adds exactly that. It's how you build your own polyphonic instrument out of ordinary nodes.</p>
+
+<div class="tip">
+<strong>The one-sentence version:</strong> a Voice container is a node that holds a small patch (a "voice") and runs one independent copy of it per note you play, mixing them all to a single audio output.</div>
+
+<h2>Add one and hear it</h2>
+
+<p>Right-click an empty spot on the graph and open <strong>Add Node → Instruments → Voice subgraph (per-note polyphony)</strong>. Instead of one entry, you get a short menu of ready-made <strong>presets</strong> — pick one and a complete voice drops onto the canvas. Each is a single node with a <strong>MIDI input</strong> on the left and a <strong>stereo audio output</strong> on the right — it looks and wires up like any other instrument. Wire a note source into its MIDI input (a <a href="midi-input.html">Computer Keyboard</a> node, a Timeline, or a hardware MIDI input) and wire its audio output to your Mixer or the Output node.</p>
+
+<p>The presets are:</p>
+<ul>
+<li><strong>Basic (FM Synth)</strong> — a small FM synth inside, 8 voices. The neutral starting point if you want to build your own patch from scratch.</li>
+<li><strong>Warm Pad</strong> — a mellow triangle tone that swells in slowly and fades out gently, with three slightly-detuned copies stacked for width. Good for sustained background chords.</li>
+<li><strong>Pluck</strong> — a short, snappy attack with no sustain, like plucking a string. Each note rings briefly and decays.</li>
+<li><strong>Supersaw Lead</strong> — a big, fat lead with seven detuned sawtooth copies spread across the stereo field. It's <em>monophonic</em> (one note at a time) and <em>glides</em> between notes, the classic trance-lead sound.</li>
+<li><strong>Noise Perc</strong> — a burst of noise shaped into a short percussive hit, for snare/hat-style sounds.</li>
+</ul>
+
+<p>Every preset makes sound the moment you wire it up. Play a chord: each note spins up its own copy of the inner patch, and you hear them stack. That's polyphony built from a container instead of baked into a fixed instrument. (The <em>Basic</em> preset uses <strong>8 voices</strong>; the others come pre-tuned with their own voice counts, glide, and unison — all of which you can change afterwards, as described below.) Whichever preset you start from, you can drill inside and rebuild it however you like — the presets are just convenient starting points, not fixed instruments.</p>
+
+<div class="note">
+<strong>Why "8 voices"?</strong> That's how many notes can sound <em>at once</em>. The container builds 8 independent copies of the inner patch up front and hands a free one to each note you play. If you play a 9th note while 8 are still ringing, one of them is cut short to make room (this is called "voice stealing" — you choose which one below). Idle copies cost almost nothing, so a high voice count is cheap until you actually play that many notes.</div>
+
+<h2>Choosing how voices are stolen</h2>
+
+<p>When all the voices are busy and you play one more note, the container has to take one of the ringing voices away. <strong>Right-click the Voice node → Voice stealing</strong> to pick which one it sacrifices:</p>
+
+<ul>
+  <li><strong>Steal oldest</strong> (the default) — cuts the note that's been ringing the longest. The note you played first is usually the one you'll miss the least, so this feels natural for most playing.</li>
+  <li><strong>Steal quietest</strong> — cuts whichever voice is currently the softest. Because it picks the one you're least likely to hear, this is the gentlest option for pads and long, fading tails where chopping a still-loud note would jump out.</li>
+  <li><strong>Cycle voices (round-robin)</strong> — just goes around the voices in order, 1, 2, 3, …, regardless of how loud or old each is. It's the most predictable, which suits drum-style patches where every hit should land the same way.</li>
+</ul>
+
+<p>The change takes effect instantly — you can switch modes while the music is playing and hear the difference on the next stolen note. Your choice is saved with the project.</p>
+
+<h2>Glide (sliding between notes)</h2>
+
+<p><strong>Glide</strong> — also called <em>portamento</em> — makes the pitch <em>slide</em> smoothly from one note to the next instead of jumping. It's the swooping sound of a synth lead bending into each note. <strong>Right-click the Voice node → Glide</strong> and pick how long the slide takes (Off, or 20 up to 400 milliseconds).</p>
+
+<div class="note">
+<strong>Glide only happens when notes overlap.</strong> A slide needs a starting pitch, so the pitch only glides when a voice that's already sounding gets handed a new note (i.e. you play the next note before releasing the last). Play notes with gaps between them and each one starts cleanly on pitch; play them overlapping (legato) and they slide into each other. That overlap rule is what makes glide feel musical rather than random — and with a single voice it gives you the classic mono-synth slide.</div>
+
+<p>However long the slide, the note still <em>starts</em> the instant you press the key — only the pitch takes its time catching up, so the rhythm stays tight. Like the other settings, glide changes apply immediately and are saved with your project.</p>
+
+<h2>Going inside — drill in</h2>
+
+<p><strong>Double-click the Voice node</strong> to go inside it. The graph editor switches to a <em>scoped view</em>: it now shows only the nodes that live inside this container, and hides everything at the top level. A small <strong>breadcrumb chip</strong> appears in the top-left corner ("← Root / Voice") to remind you where you are.</p>
+
+<p>To come back out, either <strong>click the breadcrumb chip</strong> or press <strong>Esc</strong>. Anything you do inside — adding nodes, wiring cables, editing parameters — affects only this voice's patch.</p>
+
+<div class="tip">
+<strong>Nodes you add while inside join the voice automatically.</strong> Right-click → Add Node while you're scoped into a container and the new node is created <em>inside</em> that container, not at the top level. So drilling in is also how you build the patch.</div>
+
+<h2>The two boundary pucks: VoiceIn and VoiceOut</h2>
+
+<p>Inside the container you'll find two special little nodes that mark the edges of the patch:</p>
+
+<ul>
+  <li><strong>VoiceIn</strong> (left) — the <em>source</em> of everything about the note being played. It hands the note to your patch in two different forms at once (see below), so you can build the voice whichever way suits you.</li>
+  <li><strong>VoiceOut</strong> (right) — the <em>audio sink</em>. Whatever you wire into VoiceOut is this voice's sound; the container sums VoiceOut across all the sounding voices into its single output. Every patch must end at VoiceOut to be heard.</li>
+</ul>
+
+<p>VoiceIn offers the note in two forms:</p>
+
+<ol>
+  <li><strong>MIDI</strong> — the note as an ordinary MIDI stream. Wire this into any existing MIDI synth (FM, Wavetable, SoundFont, a hosted plugin) and it just works, one instance per voice. This is what the default patch uses, and it's the fastest way to make a container sing.</li>
+  <li><strong>Pitch / Gate / Velocity</strong> — the note broken out as three <a href="pin-kinds.html">control signals</a>: <strong>Pitch</strong> in Hz, a <strong>Gate</strong> that's 1 while the key is held and 0 after you let go, and <strong>Velocity</strong> (how hard you struck it). These are for building a voice out of raw signal-driven modules — the modular-synth path.</li>
+  <li><strong>Pressure / Timbre</strong> — two extra <a href="pin-kinds.html">control signals</a> that carry <em>per-note expression</em>. <strong>Pressure</strong> (0..1, resting at 0) follows how hard you lean on a held note; <strong>Timbre</strong> (0..1, resting at the centre 0.5) follows the "slide" axis of an expressive controller. Wire them into a filter cutoff, a volume, a wavetable position — anything — and that one note brightens or swells as you press, independently of every other note you're holding.</li>
+</ol>
+
+<h2>Expressive, per-note playing (MPE)</h2>
+
+<p>If you play a Voice container from an <strong>MPE controller</strong> (a Roli Seaboard, a LinnStrument, an MPE-capable keyboard, etc.), each note you hold gets its <em>own</em> pitch bend, pressure, and timbre — so you can bend one note of a chord while the others stay put, or swell a single voice with finger pressure. SEANCE routes each expression message to the right voice automatically; you just patch the <strong>Pressure</strong> and <strong>Timbre</strong> outputs of VoiceIn into whatever you want them to control.</p>
+
+<ul>
+  <li><strong>Pitch bend</strong> is folded straight into the <strong>Pitch</strong> output, so anything reading Pitch (a Signal Oscillator, the FM synth via MIDI, …) bends with no extra wiring. Per-note bends use a wide ±48-semitone range, the MPE standard.</li>
+  <li><strong>Pressure</strong> appears on the VoiceIn <strong>Pressure</strong> output, <strong>Timbre</strong> (the controller's slide / Y axis) on the <strong>Timbre</strong> output.</li>
+  <li>Playing from an ordinary keyboard or the piano roll instead? A normal pitch-bend or aftertouch gesture simply applies to <em>all</em> sounding notes at once — the same controls still work, just globally rather than per note.</li>
+</ul>
+
+<p>Try it: build the Signal Oscillator voice below, then wire <strong>VoiceIn Pressure → Signal Filter Cutoff</strong> (right-click the filter's Cutoff row → <em>Add Modulation Input</em> first) and play with pressure — each note opens up on its own.</p>
+
+<h2>Build a modular voice with the Signal Oscillator</h2>
+
+<p>The <strong>Signal Oscillator</strong> is the first instrument that reads its note straight from those Pitch/Gate/Velocity signals instead of from MIDI — which is what makes the signal half of VoiceIn useful. Add one from <strong>Add Node → Signal Shape → Signal Oscillator (pitch/gate → tone)</strong> while you're inside a container.</p>
+
+<p>It has three signal inputs and turns them into a tone:</p>
+
+<ul>
+  <li><strong>Pitch</strong> (Hz) — sets the oscillator's frequency, read every sample, so pitch can glide and bend smoothly.</li>
+  <li><strong>Gate</strong> (0/1) — starts the note (and its envelope's attack) the instant it rises above ½, and releases the note when it falls back to 0.</li>
+  <li><strong>Velocity</strong> (0..1) — how hard the note was struck; scales the envelope.</li>
+</ul>
+
+<p>It has a <strong>Waveform</strong> control (click it to pick: sine, saw, square, triangle, or pulse), a <strong>Volume</strong>, a <strong>Pulse Width</strong>, and the shared <strong>AHDSR envelope</strong> — right-click it → <em>Envelope (AHDSR)…</em> to shape the attack, decay, sustain, and release just like any other synth.</p>
+
+<p><strong>Pulse Width</strong> only matters when the Waveform is set to <em>Pulse</em>: it sets how much of each cycle is "on" — at 0.5 the pulse is a square; pushing it toward 0 or 1 makes a thinner, more nasal, reedy tone. The real fun is to <em>move</em> it: right-click the Pulse Width row → <strong>Add Modulation Input</strong> and wire a <a href="#">Signal LFO</a> into the new socket. Now the width sweeps back and forth on its own — the classic shimmering "PWM" sound you hear in string and pad patches.</p>
+
+<p>To wire up a complete modular voice:</p>
+
+<ol>
+  <li>Double-click the Voice container to go inside.</li>
+  <li>Delete the default FM synth (select it, press Delete).</li>
+  <li>Add a Signal Oscillator.</li>
+  <li>Wire <strong>VoiceIn Pitch → Signal Oscillator Pitch</strong>, <strong>VoiceIn Gate → Gate</strong>, and <strong>VoiceIn Velocity → Velocity</strong>. (You can leave Pressure and Timbre unconnected for now, or patch them into a filter once you add one.)</li>
+  <li>Wire <strong>Signal Oscillator audio → VoiceOut</strong>.</li>
+  <li>Press Esc to pop back out, and play.</li>
+</ol>
+
+<p>Now insert a filter, an LFO, a second oscillator — any nodes you like — between the oscillator and VoiceOut, and the whole patch is cloned per note. That's a synth voice you designed, made polyphonic by the container.</p>
+
+<div class="note">
+<strong>The Signal Oscillator is monophonic on purpose.</strong> A single Signal Oscillator only plays one note at a time. You don't add polyphony to the oscillator — you let the Voice container provide it by cloning the patch. (Dropped outside a container, the Signal Oscillator still works as a standalone tone you can drive from any signal source — an LFO into its Pitch, say.)</div>
+
+<h2>Combining signals — the Signal Math module</h2>
+
+<p>Wires carry one signal each, but voices are built by <em>combining</em> signals — multiplying an oscillator by an envelope, mixing two modulators, scaling a pitch. The <strong>Signal Math</strong> module does exactly that. Add one from <strong>Add Node → Signal Shape → Signal Math (A op B)</strong>. It has two signal inputs, <strong>A</strong> and <strong>B</strong>, and one signal output, and you pick what it does to them with the <strong>Operation</strong> control on the node (click it for a menu): <strong>Add</strong>, <strong>Subtract</strong>, <strong>Multiply</strong>, <strong>Divide</strong>, <strong>Min</strong>, or <strong>Max</strong>.</p>
+
+<p>The everyday use is <strong>Multiply</strong>: feed a tone into A and a 0-to-1 control (an envelope, an LFO) into B, and the output is the tone with that control riding its volume — a per-sample volume control. <strong>Add</strong> mixes two signals; <strong>Subtract</strong> with nothing wired into A flips a signal upside-down (since an unwired input counts as zero, the output is <em>0 − B</em>). The math happens every sample, so it tracks fast modulation cleanly. Divide is protected — dividing by zero just gives zero rather than a blown-up signal.</p>
+
+<div class="tip">
+<strong>An unwired input is zero.</strong> That's worth remembering: a Multiply with only one side wired outputs silence (anything × 0 = 0), and an Add with one side wired just passes that side through. To multiply by a fixed amount, wire a steady control into the other input rather than expecting a hidden knob.</div>
+
+<h2>Movement — the Signal LFO</h2>
+
+<p>An <strong>LFO</strong> (low-frequency oscillator) is a slow, repeating wave you use to <em>move</em> something — wobble a pitch (vibrato), pulse a volume (tremolo), sweep a filter. Add one from <strong>Add Node → Signal Shape → Signal LFO (modulation source)</strong>. It puts out a repeating control signal on its single output. Three controls on the node shape it: <strong>Rate</strong> (how many cycles per second), <strong>Shape</strong> (sine, triangle, saw, or square), and <strong>Polarity</strong> — <em>bipolar</em> swings below and above center (good for vibrato and pan), <em>unipolar</em> stays between 0 and 1 (good for driving a volume or any 0-to-1 amount).</p>
+
+<p>To add vibrato to a modular voice, wire the LFO's output through a Signal Math <strong>Add</strong> into the Signal Oscillator's Pitch, so the pitch is the note plus a little LFO wobble. For tremolo, <strong>Multiply</strong> the oscillator's audio by a unipolar LFO.</p>
+
+<div class="note">
+<strong>Sync makes each note's LFO start fresh.</strong> The LFO has a <strong>Sync</strong> input. Feed it the <strong>Gate</strong> from VoiceIn and every note restarts the LFO from the top of its cycle — so a plucked vibrato always begins the same way instead of catching the wobble wherever it happened to be. Leave Sync unwired and the LFO free-runs continuously. Because the container clones the whole patch per note, each voice gets its own independent LFO.</div>
+
+<h2>A different value every note — Sample &amp; Hold</h2>
+
+<p><strong>Sample &amp; Hold</strong> grabs a value the instant you tell it to and then holds that value steady until you tell it again. Add one from <strong>Add Node → Signal Shape → Sample &amp; Hold (stepped/random)</strong>. It has an <strong>In</strong> input (the value to grab), a <strong>Trigger</strong> input (a rising signal tells it to grab), and an output that holds the last grabbed value.</p>
+
+<p>Its most fun trick needs nothing wired to In: set the <strong>Source</strong> control on the node to <strong>Random</strong>, wire VoiceIn's <strong>Gate → Trigger</strong>, and every note gets its own fresh random number. Run that into a Signal Math <strong>Add</strong> on the oscillator's pitch (random detune per note), or into a filter amount, and the instrument stops sounding mechanical because no two notes are quite alike. The two Random options give you a value either side of zero (good for detune) or between 0 and 1 (good for amounts).</p>
+
+<p>With Source set to <strong>Input</strong> instead, it samples whatever you feed In at each trigger — for example, sampling a slow LFO on every note gives stepped, staircase movement instead of a smooth glide.</p>
+
+<h2>Yes/no decisions — Signal Logic</h2>
+
+<p><strong>Signal Logic</strong> answers a yes/no question every moment and puts out a clean on/off signal (a "gate") — 1 for yes, 0 for no. Add one from <strong>Add Node → Signal Shape → Signal Logic (compare / gate)</strong>. It has two inputs, <strong>A</strong> and <strong>B</strong>, and the <strong>Operation</strong> control on the node picks the question.</p>
+
+<p>The most useful question is <strong>A &gt; B</strong> — "is A above B?" Feed a signal into A and a threshold into B, and the output turns on whenever the signal climbs past that line. That's how you turn a smooth control into a trigger: for instance, fire a Sample &amp; Hold only when an LFO peaks. The other operations combine on/off signals: <strong>AND</strong> (both on), <strong>OR</strong> (either on), <strong>XOR</strong> (exactly one on), and <strong>NOT</strong> (flips A on↔off). Because the output is a tidy gate, you can wire it straight into anything that expects one — a Trigger, a Gate, or another Logic node's input to build up bigger conditions.</p>
+
+<h2>Noise voices — the Signal Noise generator</h2>
+
+<p>Not every voice is a pitched tone. Snares, hi-hats, wind, breath, and percussion are all <strong>noise</strong> shaped by an envelope — and the <strong>Signal Noise</strong> generator is the noise twin of the Signal Oscillator. Add one from <strong>Add Node → Signal Shape → Signal Noise (gate → noise burst)</strong>. Like the oscillator it lives naturally inside a Voice container: it has a <strong>Gate</strong> input that starts and stops the sound, and a <strong>Velocity</strong> input for how hard the note is struck — wire VoiceIn's Gate and Velocity straight into it.</p>
+
+<p>It has two controls. <strong>Type</strong> picks the colour of the noise: <em>White</em> is the brightest (a flat hiss), <em>Pink</em> is warmer, and <em>Brown</em> is the darkest, rumbliest version. <strong>Volume</strong> sets the level. Right out of the box its envelope is a short percussive hit, so a bare Signal Noise already sounds like a hi-hat or snare — and like any synth you can reshape that with <strong>right-click → Envelope (AHDSR)…</strong> to go from a tight tick to a long wash.</p>
+
+<p>The real fun is pairing it with the Signal Filter below: feed the noise through a <strong>Signal Filter</strong> and sweep the cutoff with an envelope, and you get everything from a tuned "tom" thump to a resonant sweep to a wind-up riser — all per note, all from two little nodes.</p>
+
+<h2>Shaping the tone — the Signal Filter</h2>
+
+<p>A <strong>Signal Filter</strong> brightens or darkens a sound by letting some frequencies through and holding others back — the single most useful tool for turning a raw, buzzy oscillator into something musical. Add one from <strong>Add Node → Effects → Signal Filter (resonant LP/HP/BP)</strong> and wire your audio through it (Audio In → Audio Out), just like any other effect. It has three controls:</p>
+
+<ul>
+  <li><strong>Type</strong> — click to pick. <em>Low-pass</em> keeps the lows and rolls off the highs (warmer, rounder); <em>High-pass</em> keeps the highs and removes the lows (thinner, airier); <em>Band-pass</em> keeps a band around the cutoff and drops everything else (nasal, focused).</li>
+  <li><strong>Cutoff</strong> — the frequency, in Hz, where the filter starts working. Drag it down to make a low-pass sound muffled, up to open it back up.</li>
+  <li><strong>Resonance</strong> — how much the filter emphasises the exact cutoff frequency. Low is gentle; turn it up and you get a sharp resonant peak that whistles and rings — the classic "wah" or "acid" sound.</li>
+</ul>
+
+<p>The real magic is <strong>sweeping the cutoff over time</strong>. Right-click the <strong>Cutoff</strong> row and choose <strong>Add Modulation Input</strong> — a small <em>Mod: Cutoff</em> socket appears on the node. Wire a <strong>Signal LFO</strong> into it for a slow wah that breathes, or an envelope so each note opens up bright and then closes down. Because everything inside a Voice container is its own copy, every note gets its <em>own</em> filter with its own moving cutoff — so a chord doesn't all sweep in lockstep; each note moves on its own.</p>
+
+<h2>Fattening the sound — Unison</h2>
+
+<p><strong>Unison</strong> stacks several slightly <em>detuned</em> copies of a voice on every note, spread across the stereo field. It's the secret behind big supersaw leads and lush pads: the tiny pitch differences between the copies beat against each other, turning a thin single oscillator into something wide and shimmering. Right-click the Voice container and open the <strong>Unison</strong> submenu:</p>
+
+<ul>
+  <li><strong>Count</strong> — how many copies to stack per note (Off, or 2 to 8). More copies = thicker, but each one uses up a voice: a 4-voice unison on an 8-voice container can only play two notes at once.</li>
+  <li><strong>Detune</strong> — how far apart the copies are tuned, in cents (hundredths of a semitone). <em>Subtle</em> is a gentle chorus; <em>Classic</em> is the familiar supersaw width; <em>Extreme</em> is a seasick, heavily-detuned wash.</li>
+  <li><strong>Stereo spread</strong> — how widely the copies fan out across left and right. <em>Mono</em> keeps them centred; <em>Full</em> throws the outer copies hard left and right for a huge stereo image.</li>
+</ul>
+
+<p>Try it on the Signal Oscillator voice: set Unison to 6 voices, Detune to Classic, Spread to Full, and play a single note — it blooms into a wide, animated chord-like swell, all from one key. Detune even rides along with pitch bend and glide, so bends stay fat. (Detune and spread only do something when the count is above Off, so they're greyed out until you turn unison on.)</p>
+
+<h2>Current limitations</h2>
+
+<p>This is the first version of the feature. A few things are intentionally simple for now:</p>
+
+<ul>
+  <li>The voice count is fixed when you create the container (default 8) — there's no live slider yet.</li>
+  <li>You can't put a Voice container inside another Voice container.</li>
+  <li>Adding a node that opens a file picker (a hosted plugin, a SoundFont, a WASM module) lands it at the top level even if you're scoped inside a container — drag it in afterward, or recreate it inside.</li>
+</ul>
+
+<footer>
+<a href="index.html">← Back to index</a>
+</footer>
+</div>
+</body>
+</html>

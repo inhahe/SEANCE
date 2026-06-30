@@ -304,12 +304,24 @@ bool ProjectFile::writeProject(std::ostream& f, NodeGraph& graph,
             }
             if (!node.cachedPluginStateBase64.empty())
                 writeStr(f, "pluginState", node.cachedPluginStateBase64);
+            else if (!node.pendingPluginState.empty())
+                // Plugin hasn't finished loading yet (async load in progress), so
+                // there's no live processor to query and no cached state. Fall
+                // back to the state we read from the file but haven't applied
+                // yet - otherwise an autosave mid-load would silently drop the
+                // plugin's saved state. See MainContentComponent::beginAsyncPluginLoad.
+                writeStr(f, "pluginState", node.pendingPluginState);
         }
         if (node.performanceMode) {
             writeInt(f, "performanceMode", 1);
             writeInt(f, "perfReleaseMode", node.performanceReleaseMode);
             writeInt(f, "perfVelocity", node.performanceVelocity ? 1 : 0);
         }
+        // Oscilloscope display settings - written only when non-default to keep
+        // files lean (only __oscilloscope__ nodes ever change these from default).
+        if (!node.scopeTriggered) writeInt(f, "scopeTriggered", 0);
+        if (node.scopeTrigLevel != 0.0f) writeFloat(f, "scopeTrigLevel", node.scopeTrigLevel);
+        if (!node.scopeTrigRising) writeInt(f, "scopeTrigRising", 0);
         if (node.mpeEnabled) {
             writeInt(f, "mpeEnabled", 1);
             writeInt(f, "mpePitchBendRange", node.mpePitchBendRange);
@@ -319,6 +331,17 @@ bool ProjectFile::writeProject(std::ostream& f, NodeGraph& graph,
         if (!node.anchorMarker.empty())
             writeStr(f, "anchorMarker", node.anchorMarker);
         writeInt(f, "groupExpanded", node.groupExpanded ? 1 : 0);
+        // Voice container (per-voice polyphony) - see poly-voice-architecture.md
+        if (node.voiceContainerId != -1)
+            writeInt(f, "voiceContainerId", node.voiceContainerId);
+        if (node.type == NodeType::VoiceContainer) {
+            writeInt(f, "voicePolyphony", node.voicePolyphony);
+            writeInt(f, "voiceStealMode", node.voiceStealMode);
+            writeFloat(f, "voiceGlideMs", node.voiceGlideMs);
+            writeInt(f, "voiceUnison", node.voiceUnison);
+            writeFloat(f, "voiceUnisonDetune", node.voiceUnisonDetune);
+            writeFloat(f, "voiceUnisonSpread", node.voiceUnisonSpread);
+        }
         // Save child IDs as comma-separated
         if (!node.childNodeIds.empty()) {
             std::string ids;
@@ -764,6 +787,9 @@ bool ProjectFile::readProject(std::istream& f, NodeGraph& graph, PluginHost* plu
                         "mpeEnabled", "mpePitchBendRange", "parentGroupId",
                         "groupBeatOffset", "anchorMarker", "groupExpanded",
                         "childNodeIds", "modPin",
+                        "voiceContainerId", "voicePolyphony", "voiceStealMode",
+                        "voiceGlideMs", "voiceUnison", "voiceUnisonDetune",
+                        "voiceUnisonSpread",
                         "modImportSavedSong", "modImportPrevRepeatMode",
                         "modImportPrevRepeatCount", "modImportPrevSongLength",
                         "modImportPrevLoopEnabled", "modImportPrevLoopStart",
@@ -855,12 +881,22 @@ bool ProjectFile::readProject(std::istream& f, NodeGraph& graph, PluginHost* plu
             else if (key == "performanceMode") curNode->performanceMode = (val == "1");
             else if (key == "perfReleaseMode") curNode->performanceReleaseMode = std::stoi(val);
             else if (key == "perfVelocity") curNode->performanceVelocity = (val == "1");
+            else if (key == "scopeTriggered") curNode->scopeTriggered = (val == "1");
+            else if (key == "scopeTrigLevel") curNode->scopeTrigLevel = std::stof(val);
+            else if (key == "scopeTrigRising") curNode->scopeTrigRising = (val == "1");
             else if (key == "mpeEnabled") curNode->mpeEnabled = (val == "1");
             else if (key == "mpePitchBendRange") curNode->mpePitchBendRange = std::stoi(val);
             else if (key == "parentGroupId") curNode->parentGroupId = std::stoi(val);
             else if (key == "groupBeatOffset") curNode->groupBeatOffset = std::stof(val);
             else if (key == "anchorMarker") curNode->anchorMarker = val;
             else if (key == "groupExpanded") curNode->groupExpanded = (val == "1");
+            else if (key == "voiceContainerId") curNode->voiceContainerId = std::stoi(val);
+            else if (key == "voicePolyphony") curNode->voicePolyphony = std::stoi(val);
+            else if (key == "voiceStealMode") curNode->voiceStealMode = std::stoi(val);
+            else if (key == "voiceGlideMs") curNode->voiceGlideMs = std::stof(val);
+            else if (key == "voiceUnison") curNode->voiceUnison = std::stoi(val);
+            else if (key == "voiceUnisonDetune") curNode->voiceUnisonDetune = std::stof(val);
+            else if (key == "voiceUnisonSpread") curNode->voiceUnisonSpread = std::stof(val);
             else if (key == "modImportSavedSong") curNode->modImportSavedSong = (val == "1");
             else if (key == "modImportPrevRepeatMode") curNode->modImportPrevRepeatMode = std::stoi(val);
             else if (key == "modImportPrevRepeatCount") curNode->modImportPrevRepeatCount = std::stoi(val);
@@ -1101,6 +1137,28 @@ bool ProjectFile::readProject(std::istream& f, NodeGraph& graph, PluginHost* plu
     // No-op for files already carrying the 4 envelopes and for non-FM nodes.
     for (auto& n : graph.nodes)
         ensureFmOpEnvelopes(n);
+
+    // VoiceIn: migrate any project that predates the MPE expression outputs.
+    // Old files carry only MIDI/Pitch/Gate/Velocity output pins; append the
+    // Pressure and Timbre Signal outputs (channels 5/6) so MPE patches built
+    // after the upgrade can wire them. Idempotent - skips if already present.
+    for (auto& n : graph.nodes) {
+        if (n.type != NodeType::VoiceIn) continue;
+        auto hasPin = [&](const std::string& nm) {
+            for (auto& p : n.pinsOut) if (p.name == nm) return true;
+            return false;
+        };
+        if (!hasPin("Pressure")) {
+            Pin p; p.id = graph.allocId(); p.name = "Pressure";
+            p.kind = PinKind::Signal; p.isInput = false; p.channels = 1;
+            n.pinsOut.push_back(p);
+        }
+        if (!hasPin("Timbre")) {
+            Pin p; p.id = graph.allocId(); p.name = "Timbre";
+            p.kind = PinKind::Signal; p.isInput = false; p.channels = 1;
+            n.pinsOut.push_back(p);
+        }
+    }
 
     // Same for live-referenced Waveform assets: push each referenced asset's
     // frame into the wavetable library entries that point at it, re-encoding

@@ -1,9 +1,10 @@
 #include "shape_expr.h"
 #include "builtin_synth.h"   // WaveExprParser
 #include "scripting.h"       // ScriptEngine (Python)
-#include "glsl_compute.h"    // glslComputeAvailable / glslDispatchCompute
+#include "glsl_compute.h"    // glslComputeAvailable / glslDispatchCompute / remapGlslErrorLog
 #include "glsl_waveform.h"   // shared GLSL waveform() bank wiring
 
+#include <juce_core/juce_core.h>  // juce::Logger (full GLSL log to seance.log)
 #include <algorithm>
 #include <cctype>
 #include <cmath>
@@ -93,6 +94,12 @@ static std::string trimCopy(const std::string& s) {
     while (a < b && std::isspace((unsigned char)s[a])) ++a;
     while (b > a && std::isspace((unsigned char)s[b - 1])) --b;
     return s.substr(a, b - a);
+}
+
+static int countNewlines(const std::string& s) {
+    int n = 0;
+    for (char c : s) if (c == '\n') ++n;
+    return n;
 }
 
 // A bare expression ("sin(x)") has no newline and no `return` - wrap it so the
@@ -275,14 +282,23 @@ static bool bakeGlsl(const std::string& src, bool domainRadians, int N,
         ? "  data[gid] = clamp(shapeValue(x, f, i, n), -1.0, 1.0);\n"
         : "  data[gid] = shapeValue(x, f, i, n);\n";
 
-    std::string shader =
+    // Build the scaffolding that precedes the user body separately so we can
+    // count how many generated lines sit above it; the GLSL info-log line
+    // numbers are then remapped back to the user's own source (see Python's
+    // identical userLineOffset trick in scripting.cpp).
+    const std::string prefix =
         "#version 430\n"
         "layout(local_size_x = 64) in;\n"
         "layout(std430, binding = 0) buffer Out { float data[]; };\n"
         "uniform int uTotal;\n"
         "const float TAU = 6.28318530717958648;\n"
         + wfFn +
-        "float shapeValue(float x, float f, int i, int n) {\n"
+        "float shapeValue(float x, float f, int i, int n) {\n";
+    const int userLineOffset = countNewlines(prefix);
+    const int userLineCount  = countNewlines(body) + 1;
+
+    std::string shader =
+        prefix
         + body + "\n"
         "}\n"
         "void main() {\n"
@@ -297,7 +313,11 @@ static bool bakeGlsl(const std::string& src, bool domainRadians, int N,
         "}\n";
 
     auto res = glslDispatchCompute(shader, N, { { "uTotal", { N } } });
-    if (!res.ok) { error = res.error; return false; }
+    if (!res.ok) {
+        juce::Logger::writeToLog("GLSL shape bake error:\n" + juce::String(res.error));
+        error = remapGlslErrorLog(res.error, userLineOffset, userLineCount);
+        return false;
+    }
     if ((int) res.data.size() != N) { error = "GLSL readback size mismatch"; return false; }
 
     out.resize(N);

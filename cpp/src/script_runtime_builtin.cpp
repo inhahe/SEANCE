@@ -20,12 +20,20 @@ public:
     // composition expression.
     bool isProgramRole() const { return role == ScriptRole::Midi || role == ScriptRole::Unified; }
 
-    bool load(const std::string& src, std::string& /*error*/) override {
+    bool load(const std::string& src, std::string& error) override {
         source = src;
         if (isProgramRole())
             splitSections();
         // Signal role: `source` IS the composition expression.
-        return true; // Builtin parses lazily per evaluation; never fails here.
+        //
+        // The evaluator itself is intentionally tolerant (it can never throw a
+        // syntax error mid-render), so a cheap structural pass here is what
+        // surfaces obvious mistakes — unbalanced parens, an unterminated string
+        // literal, an out-of-grammar character — to the editor strip / node
+        // badge. It does NOT flag unknown identifiers (those legitimately read
+        // as 0). On failure we still keep `source` loaded so evaluation degrades
+        // gracefully exactly as before; we just report the problem.
+        return WaveExprParser::validate(source, error);
     }
 
     void reset() override {

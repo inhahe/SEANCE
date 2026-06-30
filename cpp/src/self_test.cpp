@@ -24,6 +24,15 @@
 #include "shape_expr.h"            // bakeShapeExpr (Builtin/Lua/Python/GLSL curve bakes)
 #include "builtin_synth.h"         // WaveExprParser - Builtin expression vocabulary
 #include "builtin_effects.h"       // ParametricEQProcessor - variable EQ band count
+#include "voice_allocator.h"       // VoiceAllocator - per-voice polyphony policy
+#include "poly_voice_processor.h"   // PolyVoiceProcessor - end-to-end voice audio
+#include "signal_math.h"            // SignalMathProcessor - modular-kit math module
+#include "signal_lfo.h"             // SignalLFOProcessor - modular-kit LFO module
+#include "signal_sample_hold.h"     // SampleHoldProcessor - modular-kit S&H module
+#include "signal_logic.h"           // SignalLogicProcessor - modular-kit logic module
+#include "signal_filter.h"          // SignalFilterProcessor - modular-kit resonant filter
+#include "signal_noise.h"           // SignalNoiseProcessor - modular-kit gated noise
+#include "signal_oscillator.h"      // SignalOscillatorProcessor - Signal-driven oscillator
 
 #include <juce_audio_formats/juce_audio_formats.h>
 #include <juce_graphics/juce_graphics.h>
@@ -3254,6 +3263,25 @@ void testWarp(Report& r) {
 void testGlslCompute(Report& r, const juce::File&) {
     r.section("GLSL compute backend (headless GL 4.3)");
 
+    // remapGlslErrorLog is pure string processing (no GL needed) so it runs even
+    // on machines with no GL 4.3 driver. It rewrites driver info-log line numbers
+    // from the generated-shader space back to the user's own source. With 6
+    // generated lines above the body and a 3-line body, generated lines 7..9 map
+    // to user lines 1..3; lines inside the wrapper (<=6) or past the body (>9)
+    // are left untouched. Both NVIDIA "0(L)" and AMD/Mesa "0:L:" forms remap.
+    {
+        r.check(remapGlslErrorLog("0(7) : error C0000: syntax error", 6, 3)
+                    == "0(1) : error C0000: syntax error",
+                "remapGlslErrorLog: NVIDIA line 7 -> user line 1");
+        r.check(remapGlslErrorLog("ERROR: 0:8: 'x' : undeclared identifier", 6, 3)
+                    == "ERROR: 0:2: 'x' : undeclared identifier",
+                "remapGlslErrorLog: AMD line 8 -> user line 2");
+        r.check(remapGlslErrorLog("0(3) : error", 6, 3) == "0(3) : error",
+                "remapGlslErrorLog: wrapper line (<=offset) left unchanged");
+        r.check(remapGlslErrorLog("0(10) : error", 6, 3) == "0(10) : error",
+                "remapGlslErrorLog: line past user body left unchanged");
+    }
+
     std::string why;
     bool avail = glslComputeAvailable(&why);
     if (!avail) {
@@ -3481,6 +3509,15 @@ void testGlslCompute(Report& r, const juce::File&) {
                            /*domainRadians=*/true, 256, out, err);
         if (!r.check(ok && (int) out.size() == 256, "GLSL shape: multi-statement body bakes"))
             r.note("error: " + juce::String(err));
+
+        // A syntactically broken body must surface a compile error (ok=false,
+        // non-empty message) instead of silently baking garbage. The error text
+        // is the driver info log with line numbers remapped to the user's source.
+        err.clear();
+        ok = bakeShapeExpr(ShapeLang::Glsl, "return sin(x", /*domainRadians=*/true,
+                           128, out, err);
+        r.check(!ok && !err.empty(),
+                "GLSL shape: broken body reports compile error (not silent)");
     }
 }
 
@@ -3542,6 +3579,89 @@ static void testBuiltinMath(Report& r) {
             for (int i = 0; i < 64; ++i)
                 if (std::abs(prog[i] - inlineExpr[i]) > 1e-4f) { match = false; break; }
         r.check(match, "Builtin program (named waves summed) == inline expression");
+    }
+
+    // WaveExprParser::validate - structural checker that backs the Built-in
+    // language's error strip / node badge (Stage 2 of the script-error feature).
+    // It must accept every valid program but reject obvious structural mistakes,
+    // and crucially must NOT flag unknown identifiers (the evaluator reads those
+    // as 0 by design). The self-test doesn't otherwise exercise load(), so these
+    // assertions are the regression guard for the validator's allowlist.
+    {
+        std::string err;
+        auto ok  = [&](const char* p) { err.clear(); return WaveExprParser::validate(p, err); };
+        auto bad = [&](const char* p) { err.clear(); return !WaveExprParser::validate(p, err) && !err.empty(); };
+
+        // --- Valid programs must pass ---
+        r.check(ok("sin(x) + 0.5*sin(3*x)"),            "validate: plain expression passes");
+        r.check(ok("a = sin(x)\nb = 0.5*sin(3*x)\na+b"),"validate: multi-statement program passes");
+        r.check(ok("waveform(\"square\", x)"),          "validate: quoted name literal passes");
+        r.check(ok("init:\nphase = 0\nloop:\nnote(60,100,0.5)"), "validate: section headers + ':' pass");
+        r.check(ok("gate>0 ? freq : 0"),                "validate: ternary / comparison ops pass");
+        r.check(ok("foo + bar * baz"),                  "validate: unknown identifiers are NOT flagged");
+        r.check(ok("   \n\t ; \n "),                    "validate: whitespace/separator-only passes");
+
+        // --- Structural errors must be caught ---
+        r.check(bad("sin(x"),                           "validate: unclosed '(' rejected");
+        r.check(bad("sin(x))"),                         "validate: extra ')' rejected");
+        r.check(bad("waveform(\"square, x)"),           "validate: unterminated string rejected");
+        r.check(bad("x % 2"),                           "validate: out-of-grammar '%' rejected");
+        r.check(bad("a @ b"),                           "validate: out-of-grammar '@' rejected");
+        r.check(bad("x # comment"),                     "validate: out-of-grammar '#' rejected");
+
+        // --- Quote-awareness: an illegal char INSIDE a literal is fine ---
+        r.check(ok("waveform(\"50% duty\", x)"),        "validate: '%' inside a string literal is ignored");
+    }
+
+    // Python bake error reporting (script-error Stage 3). A Python shape bake
+    // wraps the user's source in generated scaffolding, so a raw Python line
+    // number points at machine code the user never sees. formatPythonError()
+    // must map both SyntaxError and runtime-traceback lines back onto the user's
+    // OWN 1-based line, and tag the message with the exception type. Guarded by
+    // pythonAvailable() so the suite still runs on Python-less builds.
+    if (ScriptEngine::pythonAvailable()) {
+        ScriptEngine::instance().init();
+        auto& eng = ScriptEngine::instance();
+        std::vector<float> out;
+
+        // Bare-expression runtime error -> user line 1.
+        {
+            std::string err;
+            bool ok = eng.bakeShapeExpr("1 / 0", /*domainRadians=*/true, 16, out, err);
+            r.check(!ok, "py-error: divide-by-zero bake fails");
+            r.check(err.find("ZeroDivisionError") != std::string::npos,
+                    "py-error: message names ZeroDivisionError");
+            r.check(err.find("(line 1)") != std::string::npos,
+                    "py-error: bare-expr runtime error maps to line 1");
+        }
+
+        // Multi-line runtime error -> user line 2 (the second of the user's lines).
+        {
+            std::string err;
+            bool ok = eng.bakeShapeExpr("a = sin(x)\nreturn a / 0",
+                                        /*domainRadians=*/true, 16, out, err);
+            r.check(!ok, "py-error: multi-line runtime error bake fails");
+            r.check(err.find("(line 2)") != std::string::npos,
+                    "py-error: multi-line runtime error maps to line 2");
+        }
+
+        // Syntax error on the second user line -> reported at line 2.
+        {
+            std::string err;
+            bool ok = eng.bakeShapeExpr("a = 1\nb = = 2\nreturn b",
+                                        /*domainRadians=*/true, 16, out, err);
+            r.check(!ok, "py-error: syntax-error bake fails");
+            r.check(err.find("SyntaxError") != std::string::npos
+                        || err.find("(line 2)") != std::string::npos,
+                    "py-error: syntax error reported (line 2 / SyntaxError)");
+        }
+
+        // A clean program still bakes fine (no false-positive error tagging).
+        {
+            std::string err;
+            bool ok = eng.bakeShapeExpr("sin(x)", /*domainRadians=*/true, 16, out, err);
+            r.check(ok && err.empty(), "py-error: valid program bakes with no error");
+        }
     }
 
     // Bucket A warp bindings: warpamp(method, x, amount) / warpphase(method,
@@ -4484,6 +4604,76 @@ void testAssetLibrary(Report& r) {
                    relDiff);
     }
 
+    // ---- Song length: mid-bar content end plays in full (no bar-rounding) ----
+    {
+        // Bug: a MIDI track whose last clip ends mid-bar (e.g. at beat 1.0 of a
+        // 4-beat bar) had the song-end MARKER drawn at the exact clip end, but
+        // PLAYBACK ran to the bar-rounded end (beat 4). The fix routes the
+        // auto-derived playback length through contentEndBeats() (un-rounded),
+        // so effectiveSongLengthBeats() matches the marker. getTimelineBeats()
+        // still rounds up for the grid/display width.
+        NodeGraph g;
+        int tlId = g.addNode("Track", NodeType::MidiTimeline, {},
+                             { Pin{0, "MIDI Out", PinKind::Midi, false} }).id;
+        Node* tl = g.findNode(tlId);
+        Clip c{}; c.name = "clip"; c.startBeat = 0.0f; c.lengthBeats = 1.0f;
+        tl->clips.push_back(c);
+
+        r.checkVal(std::abs(g.contentEndBeats() - 1.0) < 1e-6,
+                   "song-len: exact content end is un-rounded (1.0 beat)",
+                   (float) g.contentEndBeats());
+        r.checkVal(std::abs(g.effectiveSongLengthBeats() - 1.0) < 1e-6,
+                   "song-len: auto playback length matches the mid-bar marker",
+                   (float) g.effectiveSongLengthBeats());
+        // Display width still rounds up to a full 4-beat bar.
+        r.checkVal(std::abs(g.getTimelineBeats(*tl) - 4.0f) < 1e-6,
+                   "song-len: timeline display width still rounds up to a bar",
+                   g.getTimelineBeats(*tl));
+
+        // An explicit override still wins verbatim.
+        g.songLengthBeats = 2.5;
+        r.checkVal(std::abs(g.effectiveSongLengthBeats() - 2.5) < 1e-6,
+                   "song-len: explicit override wins over content end",
+                   (float) g.effectiveSongLengthBeats());
+        // growSongLengthToContent never shrinks an override that already
+        // exceeds content, and grows to the exact (un-rounded) content end.
+        g.songLengthBeats = 0.5;          // shorter than the 1.0-beat clip
+        g.growSongLengthToContent();
+        r.checkVal(std::abs(g.songLengthBeats - 1.0) < 1e-6,
+                   "song-len: grow-to-content uses exact (mid-bar) clip end",
+                   (float) g.songLengthBeats);
+    }
+
+    // ---- Wavetable library: unique "(copy N)" names on duplicate ------------
+    {
+        // Duplicating a library waveform must give the copy an incremented
+        // "(copy N)" name instead of a bare "(copy)" that collides with prior
+        // copies. makeUniqueCopyName picks the lowest free N and strips an
+        // existing copy suffix so repeated duplication increments.
+        WavetableDoc doc;
+        doc.addLibraryEntry(std::make_unique<LayeredWaveform>(), "Saw");
+
+        const std::string c1 = doc.makeUniqueCopyName("Saw");
+        r.check(c1 == "Saw (copy 1)", "wt-copy: first copy is \"(copy 1)\"");
+        doc.addLibraryEntry(std::make_unique<LayeredWaveform>(), c1);
+
+        const std::string c2 = doc.makeUniqueCopyName("Saw");
+        r.check(c2 == "Saw (copy 2)", "wt-copy: second copy increments to \"(copy 2)\"");
+        doc.addLibraryEntry(std::make_unique<LayeredWaveform>(), c2);
+
+        // Duplicating an existing copy strips its suffix and continues the run
+        // off the base name rather than nesting ("Saw (copy 1) (copy 1)").
+        const std::string c3 = doc.makeUniqueCopyName("Saw (copy 1)");
+        r.check(c3 == "Saw (copy 3)",
+                "wt-copy: duplicating a copy increments off the base, no nesting");
+
+        // A name that merely contains "(copy...)" as real text (not our suffix)
+        // is left intact as the base.
+        const std::string keep = doc.makeUniqueCopyName("My (copyright) wave");
+        r.check(keep == "My (copyright) wave (copy 1)",
+                "wt-copy: non-suffix parentheses are preserved as the base name");
+    }
+
     // ---- Named morph params: legacy "Warp N" migration (inc 2) --------------
     {
         // A pre-warpSlot project stored warp params as "Warp 1"/"Warp 2" with
@@ -5311,6 +5501,75 @@ void testAssetLibrary(Report& r) {
                 r.check(centralRMS(buf) < 1e-3,
                         "curveeq: zero curve silences the central region");
             }
+
+            // ---- Signal EQ -------------------------------------------------
+            // Same sine/RMS rig. The Signal EQ's response is a product of
+            // peaking bells (one per point), shared across the Zero-latency
+            // (biquad cascade) and FFT-exact engines. We pin: (a) a flat node
+            // passes a 440 Hz sine through unchanged in BOTH modes, and (b) a
+            // deep narrow dip ON 440 Hz strongly attenuates it in BOTH modes -
+            // proving the points map to filter bands and that Mode selects an
+            // engine without changing the magnitude target.
+            auto makeSignalEqNode = [&](NodeGraph& g, int mode,
+                                        std::vector<std::array<float,2>> pts) -> int {
+                int nId = g.addNode("seq", NodeType::Effect, {}, {}).id;
+                Node& nd = *g.findNode(nId);
+                nd.script = "__signaleq__";
+                nd.params.push_back({"Mode",     (float)mode, 0.0f,  1.0f});
+                nd.params.push_back({"Width",    8.0f,        0.1f, 24.0f});
+                nd.params.push_back({"Mix",      1.0f,        0.0f,  1.0f});
+                nd.params.push_back({"FFT Size", 11.0f,       8.0f, 12.0f});
+                for (size_t i = 0; i < pts.size(); ++i) {
+                    std::string pfx = "P" + std::to_string((int)i + 1) + " ";
+                    nd.params.push_back({pfx + "Freq", pts[i][0],  20.0f, 20000.0f});
+                    nd.params.push_back({pfx + "Gain", pts[i][1], -24.0f,    24.0f});
+                }
+                return nId;
+            };
+
+            for (int mode = 0; mode <= 1; ++mode) {
+                const char* mn = (mode == 0 ? "zero-latency" : "FFT");
+                // (a) Flat (3 points at 0 dB) preserves the sine.
+                {
+                    NodeGraph g;
+                    int nId = makeSignalEqNode(g, mode,
+                        {{200.0f, 0.0f}, {440.0f, 0.0f}, {5000.0f, 0.0f}});
+                    SignalEQProcessor proc(*g.findNode(nId));
+                    proc.prepareToPlay(sr, N);
+                    juce::AudioBuffer<float> buf; makeSine(buf);
+                    juce::AudioBuffer<float> dry; makeSine(dry);
+                    juce::MidiBuffer mb;
+                    proc.processBlock(buf, mb);
+                    double rWet = centralRMS(buf), rDry = centralRMS(dry);
+                    r.check(rDry > 1e-3 && std::abs(rWet - rDry) / rDry < 0.1,
+                            juce::String("signaleq: flat curve preserves RMS (")
+                                + mn + ")");
+                }
+                // (b) Deep narrow dip on 440 Hz attenuates the 440 Hz sine.
+                {
+                    NodeGraph g;
+                    int nId = makeSignalEqNode(g, mode, {{440.0f, -24.0f}});
+                    SignalEQProcessor proc(*g.findNode(nId));
+                    proc.prepareToPlay(sr, N);
+                    juce::AudioBuffer<float> buf; makeSine(buf);
+                    juce::AudioBuffer<float> dry; makeSine(dry);
+                    juce::MidiBuffer mb;
+                    proc.processBlock(buf, mb);
+                    double rWet = centralRMS(buf), rDry = centralRMS(dry);
+                    r.check(rDry > 1e-3 && rWet < 0.5 * rDry,
+                            juce::String("signaleq: -24 dB notch on tone cuts RMS (")
+                                + mn + ")");
+                }
+            }
+            // countPoints reflects the contiguous P<n> params.
+            {
+                NodeGraph g;
+                int nId = makeSignalEqNode(g, 0,
+                    {{100.0f, 3.0f}, {1000.0f, -6.0f}, {8000.0f, 2.0f}});
+                r.checkVal(SignalEQProcessor::countPoints(*g.findNode(nId)) == 3,
+                           "signaleq: countPoints counts contiguous points",
+                           SignalEQProcessor::countPoints(*g.findNode(nId)));
+            }
         }
     }
 
@@ -5521,6 +5780,1837 @@ void testAssetLibrary(Report& r) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// VoiceAllocator: the per-voice polyphony allocation/lifecycle policy behind the
+// Voice container (free-slot -> steal-oldest, note-matched note-off, RMS-based
+// voice-free). Pure bookkeeping, no audio graph, so it's checkable here. Mirrors
+// poly_voice_processor.cpp's use; see poly-voice-architecture.md.
+// ---------------------------------------------------------------------------
+void testVoiceAllocator(Report& r) {
+    r.section("Voice allocator (per-voice polyphony policy)");
+
+    // Helper RMS values: one above the free floor, one below.
+    const float floorRms = 1.0e-4f, freeMs = 250.0f;
+    const float loud = 0.5f, quiet = 0.0f;
+
+    // --- Basic allocation across distinct free slots ---
+    {
+        VoiceAllocator a;
+        a.resize(4);
+        r.check(a.size() == 4 && a.activeCount() == 0, "alloc: 4 empty slots");
+
+        auto r0 = a.noteOn(60);
+        auto r1 = a.noteOn(64);
+        auto r2 = a.noteOn(67);
+        r.check(r0.slot == 0 && r1.slot == 1 && r2.slot == 2,
+                "alloc: three notes take the first three free slots in order");
+        r.check(!r0.stole && !r1.stole && !r2.stole,
+                "alloc: filling free slots never reports a steal");
+        r.check(a.activeCount() == 3, "alloc: three voices active");
+        r.check(a.slots[0].note == 60 && a.slots[1].note == 64 && a.slots[2].note == 67,
+                "alloc: slots remember their note numbers");
+    }
+
+    // --- Steal-oldest when full ---
+    {
+        VoiceAllocator a;
+        a.resize(3);
+        a.noteOn(60); // age 1, slot 0
+        a.noteOn(62); // age 2, slot 1
+        a.noteOn(64); // age 3, slot 2
+        r.check(a.activeCount() == 3, "steal: all 3 slots busy");
+        auto s = a.noteOn(66); // must steal the oldest = slot 0
+        r.check(s.slot == 0 && s.stole, "steal: 4th note steals the oldest slot (0)");
+        r.check(a.slots[0].note == 66 && a.slots[0].gateHeld,
+                "steal: stolen slot now plays the new note and is gate-held");
+        r.check(a.activeCount() == 3, "steal: still exactly 3 active after a steal");
+        // The new oldest is slot 1 (age 2); steal again should take it.
+        auto s2 = a.noteOn(68);
+        r.check(s2.slot == 1 && s2.stole, "steal: next steal takes the new oldest (slot 1)");
+    }
+
+    // --- note-off releases the gate but keeps the voice sounding (tail) ---
+    {
+        VoiceAllocator a;
+        a.resize(4);
+        a.noteOn(60);
+        int slot = a.noteOff(60);
+        r.check(slot == 0, "noteOff: returns the slot that was playing the note");
+        r.check(a.slots[0].active && !a.slots[0].gateHeld,
+                "noteOff: voice stays active (release tail) with gate down");
+        r.check(a.noteOff(99) == -1, "noteOff: an unheld note returns -1");
+        // A released note is no longer matchable by a second note-off.
+        r.check(a.noteOff(60) == -1, "noteOff: releasing an already-released note returns -1");
+    }
+
+    // --- duplicate notes: note-off releases only ONE (the first) voice ---
+    {
+        VoiceAllocator a;
+        a.resize(4);
+        a.noteOn(60); // slot 0
+        a.noteOn(60); // slot 1 - same note, second voice
+        r.check(a.activeCount() == 2, "dup: same note twice uses two slots");
+        int slot = a.noteOff(60);
+        r.check(slot == 0, "dup: note-off releases the first held voice");
+        r.check(!a.slots[0].gateHeld && a.slots[1].gateHeld,
+                "dup: the second voice for that note is still held");
+        int slot2 = a.noteOff(60);
+        r.check(slot2 == 1, "dup: a second note-off releases the remaining voice");
+    }
+
+    // --- voice-free detection: released + silent for >= kFreeMs frees the slot ---
+    {
+        VoiceAllocator a;
+        a.resize(2);
+        a.noteOn(60); // slot 0
+        a.noteOff(60);
+        // 100 ms blocks of silence: needs >= 250 ms to free => frees on the 3rd.
+        r.check(!a.postRender(0, quiet, 100.0f, floorRms, freeMs),
+                "free: 100ms silence - not yet freed");
+        r.check(!a.postRender(0, quiet, 100.0f, floorRms, freeMs),
+                "free: 200ms silence - not yet freed");
+        r.check(a.slots[0].active, "free: still active at 200ms");
+        r.check(a.postRender(0, quiet, 100.0f, floorRms, freeMs),
+                "free: 300ms silence crosses kFreeMs -> freed");
+        r.check(!a.slots[0].active, "free: slot is now inactive and reusable");
+        // Reusing the freed slot is a fresh alloc, not a steal.
+        auto re = a.noteOn(72);
+        r.check(re.slot == 0 && !re.stole, "free: freed slot is reused without a steal");
+    }
+
+    // --- a still-loud released voice does NOT free, and resets its timer ---
+    {
+        VoiceAllocator a;
+        a.resize(1);
+        a.noteOn(60);
+        a.noteOff(60);
+        a.postRender(0, quiet, 100.0f, floorRms, freeMs); // 100ms of silence banked
+        // A loud block resets the silence timer.
+        r.check(!a.postRender(0, loud, 100.0f, floorRms, freeMs),
+                "free: a loud block does not free the voice");
+        r.check(a.slots[0].silenceMs == 0.0f, "free: a loud block resets the silence timer");
+        // Now it takes a fresh full kFreeMs of silence to free.
+        a.postRender(0, quiet, 100.0f, floorRms, freeMs);
+        a.postRender(0, quiet, 100.0f, floorRms, freeMs);
+        r.check(a.slots[0].active, "free: timer truly restarted (still active at 200ms)");
+        r.check(a.postRender(0, quiet, 100.0f, floorRms, freeMs),
+                "free: frees after a fresh 300ms of silence");
+    }
+
+    // --- a held (gate-down) voice never frees, however quiet ---
+    {
+        VoiceAllocator a;
+        a.resize(1);
+        a.noteOn(60); // still held
+        for (int i = 0; i < 10; ++i)
+            r.check(!a.postRender(0, quiet, 100.0f, floorRms, freeMs),
+                    "held: a gate-held voice never frees even when silent");
+        r.check(a.slots[0].active && a.slots[0].silenceMs == 0.0f,
+                "held: held voice keeps its silence timer pinned at zero");
+    }
+
+    // --- allNotesOff drops every gate but leaves voices in their tails ---
+    {
+        VoiceAllocator a;
+        a.resize(3);
+        a.noteOn(60); a.noteOn(62); a.noteOn(64);
+        a.allNotesOff();
+        bool anyHeld = false;
+        for (auto& s : a.slots) if (s.gateHeld) anyHeld = true;
+        r.check(!anyHeld, "panic: allNotesOff clears every gate");
+        r.check(a.activeCount() == 3, "panic: voices remain active for their release tails");
+    }
+
+    // --- steal-quietest: when full, the new note steals the quietest slot ---
+    {
+        VoiceAllocator a;
+        a.resize(3);
+        a.stealMode = VoiceAllocator::StealQuietest;
+        a.noteOn(60); a.noteOn(62); a.noteOn(64); // slots 0,1,2 all held & active
+        // Give each slot a distinct last-block level; slot 1 is quietest.
+        a.postRender(0, 0.40f, 10.0f, floorRms, freeMs);
+        a.postRender(1, 0.05f, 10.0f, floorRms, freeMs);
+        a.postRender(2, 0.30f, 10.0f, floorRms, freeMs);
+        auto s = a.noteOn(66);
+        r.check(s.slot == 1 && s.stole, "steal-quietest: steals the lowest-RMS slot (1)");
+        r.check(a.slots[1].note == 66 && a.slots[1].gateHeld,
+                "steal-quietest: stolen slot now plays the new note");
+        // After the steal, refresh levels: slot 0 now quietest.
+        a.postRender(0, 0.02f, 10.0f, floorRms, freeMs);
+        a.postRender(1, 0.50f, 10.0f, floorRms, freeMs);
+        a.postRender(2, 0.30f, 10.0f, floorRms, freeMs);
+        auto s2 = a.noteOn(68);
+        r.check(s2.slot == 0 && s2.stole, "steal-quietest: next steal takes the new quietest (0)");
+    }
+
+    // --- steal-quietest still prefers a free slot over stealing ---
+    {
+        VoiceAllocator a;
+        a.resize(3);
+        a.stealMode = VoiceAllocator::StealQuietest;
+        a.noteOn(60); // slot 0
+        a.postRender(0, 0.001f, 10.0f, floorRms, freeMs); // very quiet, but still free slots
+        auto s = a.noteOn(62);
+        r.check(s.slot == 1 && !s.stole,
+                "steal-quietest: a free slot wins over stealing a quiet active one");
+    }
+
+    // --- steal-round-robin: cycles slots predictably once full ---
+    {
+        VoiceAllocator a;
+        a.resize(3);
+        a.stealMode = VoiceAllocator::StealRoundRobin;
+        // Fill the free slots first (round-robin still prefers free).
+        r.check(a.noteOn(60).slot == 0 && a.noteOn(62).slot == 1 && a.noteOn(64).slot == 2,
+                "round-robin: free slots fill in order first");
+        // Now full: steals advance the cursor 0,1,2,0,...
+        auto a0 = a.noteOn(66);
+        auto a1 = a.noteOn(67);
+        auto a2 = a.noteOn(68);
+        auto a3 = a.noteOn(69);
+        r.check(a0.slot == 0 && a1.slot == 1 && a2.slot == 2 && a3.slot == 0,
+                "round-robin: steals cycle 0,1,2,0 regardless of age/level");
+        r.check(a0.stole && a1.stole && a2.stole && a3.stole,
+                "round-robin: each wrap-around allocation reports a steal");
+    }
+
+    // --- round-robin cursor resets on resize ---
+    {
+        VoiceAllocator a;
+        a.resize(2);
+        a.stealMode = VoiceAllocator::StealRoundRobin;
+        a.noteOn(60); a.noteOn(62);     // fill
+        a.noteOn(64);                   // steal slot 0 (cursor -> 0)
+        a.resize(2);                    // cursor reset to -1
+        a.stealMode = VoiceAllocator::StealRoundRobin;
+        a.noteOn(60); a.noteOn(62);     // fill again
+        auto s = a.noteOn(64);          // first steal after reset -> slot 0
+        r.check(s.slot == 0, "round-robin: resize() resets the cursor to start at slot 0");
+    }
+
+    // --- default stealMode is oldest (unset == 0) ---
+    {
+        VoiceAllocator a;
+        a.resize(2);
+        r.check(a.stealMode == VoiceAllocator::StealOldest,
+                "default: a fresh allocator steals oldest");
+        a.noteOn(60); a.noteOn(62);
+        auto s = a.noteOn(64);
+        r.check(s.slot == 0 && s.stole, "default: steals slot 0 (oldest) by default");
+    }
+
+    // --- degenerate: zero slots is safe ---
+    {
+        VoiceAllocator a;
+        a.resize(0);
+        auto s = a.noteOn(60);
+        r.check(s.slot == -1 && !s.stole, "edge: note-on with no slots returns -1");
+        r.check(a.noteOff(60) == -1, "edge: note-off with no slots returns -1");
+        r.check(!a.postRender(0, quiet, 100.0f, floorRms, freeMs),
+                "edge: postRender on an out-of-range slot is a safe no-op");
+        // round-robin with no slots must not divide by zero.
+        a.stealMode = VoiceAllocator::StealRoundRobin;
+        r.check(a.noteOn(60).slot == -1, "edge: round-robin with no slots is safe");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// VoiceIn signal emission: drive a VoiceInProcessor directly and inspect the
+// Pitch/Gate/Velocity control channels (2/3/4) sample-by-sample to prove the
+// note-on/off edges land on their EXACT within-block offset (M2: sample-accurate
+// gates), that pitch/velocity step with the gate, and that a release holds pitch
+// while only the gate falls. Also covers carry across blocks, multiple segments
+// in one block, and reset().
+// ---------------------------------------------------------------------------
+void testVoiceInSignals(Report& r) {
+    r.section("VoiceIn signals (sample-accurate gates)");
+
+    NodeGraph graph;
+    auto& node = graph.addNode("Voice In", NodeType::VoiceIn, {},
+        {Pin{0, "MIDI",     PinKind::Midi,   false},
+         Pin{0, "Pitch",    PinKind::Signal, false, 1},
+         Pin{0, "Gate",     PinKind::Signal, false, 1},
+         Pin{0, "Velocity", PinKind::Signal, false, 1}}, {0.0f, 0.0f});
+
+    VoiceInProcessor vip(node);
+    const int N = 512;
+    vip.prepareToPlay(48000.0, N);
+
+    // Channels: 0/1 audio (unused here), 2 = Pitch, 3 = Gate, 4 = Velocity.
+    juce::AudioBuffer<float> buf(5, N);
+    const float a5 = VoiceInProcessor::midiToHz(81); // 880 Hz
+
+    // --- Block 1: note-on at offset 100 (A5, vel 0.8). ---
+    {
+        buf.clear();
+        juce::MidiBuffer midi;
+        vip.noteOn(100, 81, 0.8f);
+        vip.processBlock(buf, midi);
+
+        r.check(buf.getSample(3, 99) == 0.0f, "gate: low at sample 99 (before offset)");
+        r.check(buf.getSample(3, 100) == 1.0f, "gate: high exactly at offset 100");
+        r.check(buf.getSample(3, N - 1) == 1.0f, "gate: stays high to end of block");
+
+        r.check(std::abs(buf.getSample(2, 99) - 440.0f) < 0.5f,
+                "pitch: carried default (440) before the note-on");
+        r.check(std::abs(buf.getSample(2, 100) - a5) < 0.5f,
+                "pitch: steps to 880 exactly at offset 100");
+
+        r.check(buf.getSample(4, 99) == 0.0f, "velocity: 0 before the note-on");
+        r.check(std::abs(buf.getSample(4, 100) - 0.8f) < 1e-4f,
+                "velocity: latched to 0.8 at offset 100");
+
+        // MIDI note-on must be emitted at the same offset.
+        bool foundOn = false;
+        for (const auto m : midi)
+            if (m.getMessage().isNoteOn() && m.samplePosition == 100) foundOn = true;
+        r.check(foundOn, "midi: note-on emitted at sample 100");
+    }
+
+    // --- Block 2: note-off at offset 200 - gate falls, pitch/velocity hold. ---
+    {
+        buf.clear();
+        juce::MidiBuffer midi;
+        vip.noteOff(200, 81);
+        vip.processBlock(buf, midi);
+
+        r.check(buf.getSample(3, 199) == 1.0f, "gate: still high at 199 (carried from block 1)");
+        r.check(buf.getSample(3, 200) == 0.0f, "gate: falls exactly at offset 200");
+        r.check(std::abs(buf.getSample(2, 0) - a5) < 0.5f,
+                "pitch: held at 880 through the release (block start)");
+        r.check(std::abs(buf.getSample(2, N - 1) - a5) < 0.5f,
+                "pitch: held at 880 through the release (block end)");
+        r.check(std::abs(buf.getSample(4, N - 1) - 0.8f) < 1e-4f,
+                "velocity: latched value held through release");
+    }
+
+    // --- Block 3: reset() drops the gate at the block start. ---
+    {
+        buf.clear();
+        juce::MidiBuffer midi;
+        vip.reset();
+        vip.processBlock(buf, midi);
+        r.check(buf.getSample(3, 0) == 0.0f && buf.getSample(3, N - 1) == 0.0f,
+                "reset: gate low across the whole block");
+        bool foundAllOff = false;
+        for (const auto m : midi)
+            if (m.getMessage().isAllNotesOff()) foundAllOff = true;
+        r.check(foundAllOff, "reset: emits all-notes-off");
+    }
+
+    // --- Block 4: multiple segments in ONE block (on @50, off @150, on @300). ---
+    {
+        buf.clear();
+        juce::MidiBuffer midi;
+        const float c4 = VoiceInProcessor::midiToHz(60); // 261.63 Hz
+        const float e4 = VoiceInProcessor::midiToHz(64); // 329.63 Hz
+        vip.noteOn(50, 60, 1.0f);
+        vip.noteOff(150, 60);
+        vip.noteOn(300, 64, 0.5f);
+        vip.processBlock(buf, midi);
+
+        r.check(buf.getSample(3, 49)  == 0.0f, "multi: gate low before first on (49)");
+        r.check(buf.getSample(3, 50)  == 1.0f, "multi: gate high at first on (50)");
+        r.check(buf.getSample(3, 149) == 1.0f, "multi: gate high before off (149)");
+        r.check(buf.getSample(3, 150) == 0.0f, "multi: gate low at off (150)");
+        r.check(buf.getSample(3, 299) == 0.0f, "multi: gate low before second on (299)");
+        r.check(buf.getSample(3, 300) == 1.0f, "multi: gate high at second on (300)");
+        r.check(std::abs(buf.getSample(2, 60)  - c4) < 0.5f, "multi: pitch C4 during first note");
+        r.check(std::abs(buf.getSample(2, 320) - e4) < 0.5f, "multi: pitch E4 during second note");
+    }
+
+    const float c4 = VoiceInProcessor::midiToHz(60); // 261.63 Hz
+    const float c5 = VoiceInProcessor::midiToHz(72); // 523.25 Hz
+
+    // --- Block 5: glide (portamento) C4 -> C5 over 10 ms (480 < 512 samples). ---
+    {
+        // Establish a current pitch with a plain (no-glide) note-on first.
+        buf.clear();
+        juce::MidiBuffer m;
+        vip.noteOn(0, 60, 1.0f);
+        vip.processBlock(buf, m);
+        r.check(std::abs(buf.getSample(2, 0) - c4) < 0.5f, "glide: plain note-on sets C4 instantly");
+
+        buf.clear();
+        juce::MidiBuffer m2;
+        vip.noteOn(0, 72, 1.0f, 10.0f); // 10 ms @ 48 kHz = 480 samples
+        vip.processBlock(buf, m2);
+        r.check(buf.getSample(2, 0) > c4 && buf.getSample(2, 0) < c5 - 1.0f,
+                "glide: pitch starts sliding up from C4 (not an instant jump)");
+        r.check(buf.getSample(2, 100) < buf.getSample(2, 400),
+                "glide: pitch rises monotonically through the slide");
+        r.check(std::abs(buf.getSample(2, 479) - c5) < 1.0f,
+                "glide: reaches the target C5 at the end of the ramp");
+        r.check(std::abs(buf.getSample(2, 511) - c5) < 1.0f,
+                "glide: holds the target after the ramp completes");
+        // Gate still steps instantly even while pitch glides.
+        r.check(buf.getSample(3, 0) == 1.0f, "glide: gate retriggers instantly (not ramped)");
+    }
+
+    // --- Block 6: glide spanning more than one block (20 ms = 960 > 512). ---
+    {
+        buf.clear();
+        juce::MidiBuffer m;
+        vip.noteOn(0, 60, 1.0f, 20.0f); // C5 -> C4 over 960 samples
+        vip.processBlock(buf, m);
+        const float endB1 = buf.getSample(2, 511);
+        r.check(endB1 < c5 - 1.0f && endB1 > c4,
+                "glide(cross-block): still mid-slide at the end of the first block");
+
+        buf.clear();
+        juce::MidiBuffer m2;
+        vip.processBlock(buf, m2); // no new events; ramp must continue on its own
+        r.check(buf.getSample(2, 0) < endB1,
+                "glide(cross-block): keeps sliding into the second block");
+        r.check(std::abs(buf.getSample(2, 511) - c4) < 1.0f,
+                "glide(cross-block): reaches the target by the end of the second block");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MPE per-note expression. Two halves:
+//  (1) Unit: drive a VoiceInProcessor's expression setters and read the
+//      Pressure (ch5) / Timbre (ch6) signals + the bent Pitch (ch2) directly -
+//      neutral defaults, smoothing toward target, pitch-bend folding, and the
+//      reset-to-neutral on a fresh note-on.
+//  (2) End-to-end routing: a real PolyVoiceProcessor + Signal Osc patch, proving
+//      a channel pitch-bend reaches the right voice (member channel targets one
+//      voice; master channel 1 broadcasts) measured by output zero-crossings.
+//  (3) Migration: an old 4-output VoiceIn gains Pressure/Timbre pins on load.
+// ---------------------------------------------------------------------------
+void testVoiceMpe(Report& r) {
+    r.section("MPE per-note expression (Pressure/Timbre/bend)");
+
+    // ---- (1) VoiceInProcessor expression signals -------------------------
+    {
+        NodeGraph graph;
+        auto& node = graph.addNode("Voice In", NodeType::VoiceIn, {},
+            {Pin{0, "MIDI",     PinKind::Midi,   false},
+             Pin{0, "Pitch",    PinKind::Signal, false, 1},
+             Pin{0, "Gate",     PinKind::Signal, false, 1},
+             Pin{0, "Velocity", PinKind::Signal, false, 1},
+             Pin{0, "Pressure", PinKind::Signal, false, 1},
+             Pin{0, "Timbre",   PinKind::Signal, false, 1}}, {0.0f, 0.0f});
+
+        VoiceInProcessor vip(node);
+        const int N = 512;
+        vip.prepareToPlay(48000.0, N);
+        juce::AudioBuffer<float> buf(7, N); // 0/1 audio, 2 pitch,3 gate,4 vel,5 pres,6 timbre
+
+        const float a4 = VoiceInProcessor::midiToHz(69); // 440 Hz
+
+        // Note-on: expression at neutral rest (pressure 0, timbre 0.5, no bend).
+        auto run = [&](){ buf.clear(); juce::MidiBuffer mb; vip.processBlock(buf, mb); };
+        vip.noteOn(0, 69, 1.0f);
+        run();
+        r.check(std::abs(buf.getSample(5, N - 1) - 0.0f) < 1e-4f, "expr: pressure rests at 0");
+        r.check(std::abs(buf.getSample(6, N - 1) - 0.5f) < 1e-4f, "expr: timbre rests at 0.5 (centre)");
+        r.check(std::abs(buf.getSample(2, N - 1) - a4) < 0.5f, "expr: pitch is the un-bent note at rest");
+
+        // Pressure ramps toward its target (smoothed, not instant).
+        vip.setPressure(1.0f);
+        run();
+        r.check(buf.getSample(5, 0) < 0.5f, "expr: pressure starts ramping (not an instant jump)");
+        for (int b = 0; b < 6; ++b) run();
+        r.check(buf.getSample(5, N - 1) > 0.95f, "expr: pressure settles near its target 1.0");
+
+        // Timbre ramps down toward 0.
+        vip.setTimbre(0.0f);
+        for (int b = 0; b < 8; ++b) run();
+        r.check(buf.getSample(6, N - 1) < 0.05f, "expr: timbre settles near its target 0.0");
+
+        // Pitch bend +12 semitones folds into Pitch -> ~2x frequency once settled.
+        vip.setPitchBend(12.0f);
+        for (int b = 0; b < 10; ++b) run();
+        r.check(std::abs(buf.getSample(2, N - 1) - a4 * 2.0f) < 4.0f,
+                "expr: +12 semitone bend doubles the Pitch signal");
+
+        // A fresh note-on snaps EVERY expression dimension back to neutral so the
+        // prior note's bend/pressure/timbre cannot bleed into the reused voice.
+        vip.noteOn(0, 69, 1.0f);
+        run();
+        r.check(std::abs(buf.getSample(2, 0) - a4) < 0.5f, "expr: note-on resets bend (pitch back to A4)");
+        r.check(std::abs(buf.getSample(5, 0) - 0.0f) < 1e-3f, "expr: note-on resets pressure to 0");
+        r.check(std::abs(buf.getSample(6, 0) - 0.5f) < 1e-3f, "expr: note-on resets timbre to 0.5");
+    }
+
+    // ---- (2) End-to-end routing through PolyVoiceProcessor ----------------
+    {
+        NodeGraph graph;
+        Transport transport;
+        int containerId;
+        {
+            auto& c = graph.addNode("Voice", NodeType::VoiceContainer,
+                {Pin{0, "MIDI", PinKind::Midi, true}},
+                {Pin{0, "Audio", PinKind::Audio, false}}, {0.0f, 0.0f});
+            c.voicePolyphony = 4;
+            containerId = c.id;
+        }
+        int viPitch, viGate, viVel;
+        {
+            auto& vi = graph.addNode("Voice In", NodeType::VoiceIn, {},
+                {Pin{0, "MIDI",     PinKind::Midi,   false},
+                 Pin{0, "Pitch",    PinKind::Signal, false, 1},
+                 Pin{0, "Gate",     PinKind::Signal, false, 1},
+                 Pin{0, "Velocity", PinKind::Signal, false, 1},
+                 Pin{0, "Pressure", PinKind::Signal, false, 1},
+                 Pin{0, "Timbre",   PinKind::Signal, false, 1}}, {-200.0f, 0.0f});
+            vi.voiceContainerId = containerId;
+            viPitch = vi.pinsOut[1].id;
+            viGate  = vi.pinsOut[2].id;
+            viVel   = vi.pinsOut[3].id;
+        }
+        int oscPitch, oscGate, oscVel, oscAudio;
+        {
+            auto& s = graph.addNode("Signal Osc", NodeType::Instrument,
+                {Pin{0, "Pitch",    PinKind::Signal, true, 1},
+                 Pin{0, "Gate",     PinKind::Signal, true, 1},
+                 Pin{0, "Velocity", PinKind::Signal, true, 1}},
+                {Pin{0, "Audio", PinKind::Audio, false}}, {0.0f, 0.0f});
+            s.voiceContainerId = containerId;
+            s.script = "__signalosc__";
+            s.params.push_back({"Waveform", 0.0f, 0.0f, 3.0f}); // sine
+            s.params.push_back({"Volume",   0.5f, 0.0f, 1.0f});
+            s.ahdsrEnvelope.attackMs  = 2.0f;
+            s.ahdsrEnvelope.decayMs   = 10.0f;
+            s.ahdsrEnvelope.sustain   = 1.0f; // steady tone for crossing measurement
+            s.ahdsrEnvelope.releaseMs = 40.0f;
+            oscPitch = s.pinsIn[0].id;
+            oscGate  = s.pinsIn[1].id;
+            oscVel   = s.pinsIn[2].id;
+            oscAudio = s.pinsOut[0].id;
+        }
+        int voAudio;
+        {
+            auto& vo = graph.addNode("Voice Out", NodeType::VoiceOut,
+                {Pin{0, "Audio", PinKind::Audio, true}}, {}, {200.0f, 0.0f});
+            vo.voiceContainerId = containerId;
+            voAudio = vo.pinsIn[0].id;
+        }
+        graph.addLink(viPitch, oscPitch);
+        graph.addLink(viGate,  oscGate);
+        graph.addLink(viVel,   oscVel);
+        graph.addLink(oscAudio, voAudio);
+
+        Node* container = graph.findNode(containerId);
+        if (!container) { r.check(false, "mpe-route: container exists"); return; }
+
+        const double sr = 44100.0;
+        const int bs = 512;
+        PolyVoiceProcessor poly(*container, graph, transport);
+        poly.setPlayConfigDetails(0, 2, sr, bs);
+        poly.prepareToPlay(sr, bs);
+
+        auto zc = [](juce::AudioBuffer<float>& b) {
+            int c = 0; const float* d = b.getReadPointer(0);
+            for (int i = 1; i < b.getNumSamples(); ++i)
+                if ((d[i - 1] <= 0.0f) != (d[i] <= 0.0f)) ++c;
+            return c;
+        };
+        // Settle: render `extra` blocks of empty MIDI, return last-block crossings.
+        auto settleZc = [&](int extra) {
+            juce::AudioBuffer<float> out(2, bs);
+            juce::MidiBuffer empty;
+            for (int i = 0; i < extra; ++i) poly.processBlock(out, empty);
+            return zc(out);
+        };
+
+        // Note 69 (A4, 220-ish crossings/block) on MEMBER channel 2.
+        {
+            juce::AudioBuffer<float> out(2, bs);
+            juce::MidiBuffer on;
+            on.addEvent(juce::MidiMessage::noteOn(2, 69, (juce::uint8) 110), 0);
+            poly.processBlock(out, on);
+        }
+        const int baseZc = settleZc(12);
+        r.check(baseZc > 0, "mpe-route: voice produces a tone (nonzero crossings)");
+
+        // +12 semitones on channel 2 (48-semi member range -> wheel 10240).
+        {
+            juce::AudioBuffer<float> out(2, bs);
+            juce::MidiBuffer bend;
+            bend.addEvent(juce::MidiMessage::pitchWheel(2, 10240), 0);
+            poly.processBlock(out, bend);
+        }
+        const int bentZc = settleZc(12);
+        r.check(bentZc > baseZc * 16 / 10,
+                "mpe-route: member-channel bend raises this voice's pitch (~2x)");
+
+        // A bend on an UNRELATED member channel (3) must NOT move the channel-2
+        // voice. Reset channel 2 to neutral first, then bend channel 3.
+        {
+            juce::AudioBuffer<float> out(2, bs);
+            juce::MidiBuffer reset; reset.addEvent(juce::MidiMessage::pitchWheel(2, 8192), 0);
+            poly.processBlock(out, reset);
+        }
+        settleZc(12);
+        {
+            juce::AudioBuffer<float> out(2, bs);
+            juce::MidiBuffer other; other.addEvent(juce::MidiMessage::pitchWheel(3, 10240), 0);
+            poly.processBlock(out, other);
+        }
+        const int isolatedZc = settleZc(12);
+        r.check(std::abs(isolatedZc - baseZc) < baseZc / 5,
+                "mpe-route: a bend on a different channel leaves this voice alone");
+
+        // Master-channel (1) bend broadcasts to all voices (incl. the ch-2 note),
+        // using the conventional +/-2 semitone range. +2 semis -> ~1.12x.
+        {
+            juce::AudioBuffer<float> out(2, bs);
+            juce::MidiBuffer master; master.addEvent(juce::MidiMessage::pitchWheel(1, 16383), 0);
+            poly.processBlock(out, master);
+        }
+        const int masterZc = settleZc(12);
+        r.check(masterZc > baseZc + baseZc / 20,
+                "mpe-route: master-channel bend broadcasts to the voice (+~2 semis)");
+    }
+
+    // ---- (3) Load migration: old 4-output VoiceIn gains Pressure/Timbre ----
+    {
+        NodeGraph graph;
+        graph.addNode("Voice In", NodeType::VoiceIn, {},
+            {Pin{0, "MIDI",     PinKind::Midi,   false},
+             Pin{0, "Pitch",    PinKind::Signal, false, 1},
+             Pin{0, "Gate",     PinKind::Signal, false, 1},
+             Pin{0, "Velocity", PinKind::Signal, false, 1}}, {0.0f, 0.0f});
+
+        const std::string text = ProjectFile::serializeForUndo(graph);
+
+        NodeGraph loaded;
+        const bool ok = ProjectFile::loadFromString(text, loaded);
+        r.check(ok, "mpe-migrate: old VoiceIn project loads");
+        Node* vi = nullptr;
+        for (auto& n : loaded.nodes) if (n.type == NodeType::VoiceIn) vi = &n;
+        r.check(vi != nullptr, "mpe-migrate: VoiceIn present after load");
+        if (vi) {
+            auto hasPin = [&](const std::string& nm) {
+                for (auto& p : vi->pinsOut) if (p.name == nm) return true;
+                return false;
+            };
+            r.check(hasPin("Pressure"), "mpe-migrate: Pressure output pin added on load");
+            r.check(hasPin("Timbre"),   "mpe-migrate: Timbre output pin added on load");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Unison: a struck note allocates a STACK of detuned/panned voices that release
+// together. Three parts: the VoiceAllocator group API (allocate a stack, release
+// the whole stack, clamp to polyphony, steal a whole stack), end-to-end audio
+// (a spread unison decorrelates L/R; the note frees to silence), and the
+// container field save/load round-trip.
+// ---------------------------------------------------------------------------
+void testVoiceUnison(Report& r) {
+    r.section("Unison (stacked detuned voices per note)");
+
+    // ---- (1) VoiceAllocator group allocation ------------------------------
+    {
+        VoiceAllocator a;
+        a.resize(8);
+        auto g = a.noteOnGroup(60, 1, 3);
+        r.check(g.count == 3, "uni-alloc: a 3-voice unison grabs 3 slots");
+        r.check(a.activeCount() == 3, "uni-alloc: 3 voices now active");
+        // All three share one group id and the note/channel.
+        long long grp = a.slots[(size_t) g.slot[0]].group;
+        bool sameGroup = true, sameNote = true;
+        for (int k = 0; k < g.count; ++k) {
+            if (a.slots[(size_t) g.slot[k]].group != grp) sameGroup = false;
+            if (a.slots[(size_t) g.slot[k]].note != 60)   sameNote = false;
+        }
+        r.check(sameGroup, "uni-alloc: every slot of the stack shares one group id");
+        r.check(sameNote,  "uni-alloc: every slot of the stack plays the note");
+
+        auto rel = a.noteOffGroup(60, 1);
+        r.check(rel.count == 3, "uni-off: note-off releases the whole 3-voice stack");
+        bool anyHeld = false;
+        for (auto& s : a.slots) if (s.gateHeld) anyHeld = true;
+        r.check(!anyHeld, "uni-off: no gate is left held after the stack release");
+        r.check(a.activeCount() == 3, "uni-off: voices stay active for their tails");
+    }
+
+    // Clamp: a unison larger than the polyphony can't exceed the slot count.
+    {
+        VoiceAllocator a;
+        a.resize(2);
+        auto g = a.noteOnGroup(60, 1, 4);
+        r.check(g.count == 2, "uni-clamp: unison clamps to the available slot count");
+    }
+
+    // Channel-matched release: two notes (same number) on different MPE channels
+    // are independent stacks; releasing one channel leaves the other held.
+    {
+        VoiceAllocator a;
+        a.resize(8);
+        a.noteOnGroup(60, 2, 2); // ch 2 stack
+        a.noteOnGroup(60, 3, 2); // ch 3 stack, same note number
+        auto rel = a.noteOffGroup(60, 2);
+        r.check(rel.count == 2, "uni-chan: note-off on ch2 releases only the ch2 stack");
+        int held = 0;
+        for (auto& s : a.slots) if (s.gateHeld) ++held;
+        r.check(held == 2, "uni-chan: the ch3 stack stays held");
+    }
+
+    // ---- (2) End-to-end: spread unison decorrelates the stereo field -------
+    {
+        NodeGraph graph;
+        Transport transport;
+        int containerId;
+        {
+            auto& c = graph.addNode("Voice", NodeType::VoiceContainer,
+                {Pin{0, "MIDI", PinKind::Midi, true}},
+                {Pin{0, "Audio", PinKind::Audio, false}}, {0.0f, 0.0f});
+            c.voicePolyphony = 8;
+            c.voiceUnison = 4;
+            c.voiceUnisonDetune = 20.0f;
+            c.voiceUnisonSpread = 1.0f; // full stereo spread
+            containerId = c.id;
+        }
+        int viPitch, viGate, viVel;
+        {
+            auto& vi = graph.addNode("Voice In", NodeType::VoiceIn, {},
+                {Pin{0, "MIDI",     PinKind::Midi,   false},
+                 Pin{0, "Pitch",    PinKind::Signal, false, 1},
+                 Pin{0, "Gate",     PinKind::Signal, false, 1},
+                 Pin{0, "Velocity", PinKind::Signal, false, 1},
+                 Pin{0, "Pressure", PinKind::Signal, false, 1},
+                 Pin{0, "Timbre",   PinKind::Signal, false, 1}}, {-200.0f, 0.0f});
+            vi.voiceContainerId = containerId;
+            viPitch = vi.pinsOut[1].id;
+            viGate  = vi.pinsOut[2].id;
+            viVel   = vi.pinsOut[3].id;
+        }
+        int oscPitch, oscGate, oscVel, oscAudio;
+        {
+            auto& s = graph.addNode("Signal Osc", NodeType::Instrument,
+                {Pin{0, "Pitch",    PinKind::Signal, true, 1},
+                 Pin{0, "Gate",     PinKind::Signal, true, 1},
+                 Pin{0, "Velocity", PinKind::Signal, true, 1}},
+                {Pin{0, "Audio", PinKind::Audio, false}}, {0.0f, 0.0f});
+            s.voiceContainerId = containerId;
+            s.script = "__signalosc__";
+            s.params.push_back({"Waveform", 0.0f, 0.0f, 3.0f});
+            s.params.push_back({"Volume",   0.5f, 0.0f, 1.0f});
+            s.ahdsrEnvelope.attackMs  = 2.0f;
+            s.ahdsrEnvelope.decayMs   = 10.0f;
+            s.ahdsrEnvelope.sustain   = 1.0f;
+            s.ahdsrEnvelope.releaseMs = 40.0f;
+            oscPitch = s.pinsIn[0].id;
+            oscGate  = s.pinsIn[1].id;
+            oscVel   = s.pinsIn[2].id;
+            oscAudio = s.pinsOut[0].id;
+        }
+        int voAudio;
+        {
+            auto& vo = graph.addNode("Voice Out", NodeType::VoiceOut,
+                {Pin{0, "Audio", PinKind::Audio, true}}, {}, {200.0f, 0.0f});
+            vo.voiceContainerId = containerId;
+            voAudio = vo.pinsIn[0].id;
+        }
+        graph.addLink(viPitch, oscPitch);
+        graph.addLink(viGate,  oscGate);
+        graph.addLink(viVel,   oscVel);
+        graph.addLink(oscAudio, voAudio);
+
+        Node* container = graph.findNode(containerId);
+        if (!container) { r.check(false, "uni-audio: container exists"); return; }
+
+        const double sr = 44100.0;
+        const int bs = 512;
+        PolyVoiceProcessor poly(*container, graph, transport);
+        poly.setPlayConfigDetails(0, 2, sr, bs);
+        poly.prepareToPlay(sr, bs);
+
+        juce::AudioBuffer<float> out(2, bs);
+        {
+            juce::MidiBuffer on;
+            on.addEvent(juce::MidiMessage::noteOn(1, 57, (juce::uint8) 110), 0); // A3
+            poly.processBlock(out, on);
+        }
+        juce::MidiBuffer empty;
+        for (int i = 0; i < 10; ++i) poly.processBlock(out, empty);
+
+        const float rmsL = out.getRMSLevel(0, 0, bs);
+        r.check(rmsL > 1.0e-2f, "uni-audio: a unison note produces a tone");
+
+        // Full spread => L and R carry different detuned voices => they differ.
+        const float* L = out.getReadPointer(0);
+        const float* R = out.getReadPointer(1);
+        float meanAbsDiff = 0.0f, meanAbs = 0.0f;
+        for (int i = 0; i < bs; ++i) {
+            meanAbsDiff += std::abs(L[i] - R[i]);
+            meanAbs     += 0.5f * (std::abs(L[i]) + std::abs(R[i]));
+        }
+        meanAbsDiff /= bs; meanAbs /= bs;
+        r.check(meanAbs > 1.0e-3f && meanAbsDiff > 0.1f * meanAbs,
+                "uni-audio: full stereo spread decorrelates L and R");
+
+        // Release the note -> the whole stack frees -> silence.
+        {
+            juce::MidiBuffer off;
+            off.addEvent(juce::MidiMessage::noteOff(1, 57), 0);
+            poly.processBlock(out, off);
+        }
+        for (int i = 0; i < 80; ++i) poly.processBlock(out, empty);
+        r.check(out.getRMSLevel(0, 0, bs) < 1.0e-4f,
+                "uni-audio: releasing the note frees the whole stack to silence");
+    }
+
+    // ---- (3) Save/load round-trip of the unison fields --------------------
+    {
+        NodeGraph graph;
+        {
+            auto& c = graph.addNode("Voice", NodeType::VoiceContainer,
+                {Pin{0, "MIDI", PinKind::Midi, true}},
+                {Pin{0, "Audio", PinKind::Audio, false}}, {0.0f, 0.0f});
+            c.voiceUnison = 6;
+            c.voiceUnisonDetune = 25.0f;
+            c.voiceUnisonSpread = 0.66f;
+        }
+        const std::string text = ProjectFile::serializeForUndo(graph);
+        NodeGraph loaded;
+        ProjectFile::loadFromString(text, loaded);
+        Node* c = nullptr;
+        for (auto& n : loaded.nodes) if (n.type == NodeType::VoiceContainer) c = &n;
+        r.check(c != nullptr, "uni-save: container present after load");
+        if (c) {
+            r.check(c->voiceUnison == 6, "uni-save: voiceUnison round-trips");
+            r.check(std::abs(c->voiceUnisonDetune - 25.0f) < 0.01f, "uni-save: detune round-trips");
+            r.check(std::abs(c->voiceUnisonSpread - 0.66f) < 0.01f, "uni-save: spread round-trips");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Signal Math module: per-sample arithmetic on two control signals. Verify each
+// operation and that the node + its Operation param survive a save/load round-trip.
+// ---------------------------------------------------------------------------
+void testSignalMath(Report& r) {
+    r.section("Signal Math module (modular kit)");
+
+    NodeGraph graph;
+    auto& node = graph.addNode("Signal Math", NodeType::SignalShape,
+        {Pin{0, "A", PinKind::Signal, true, 1},
+         Pin{0, "B", PinKind::Signal, true, 1}},
+        {Pin{0, "Out", PinKind::Signal, false, 1}}, {0.0f, 0.0f});
+    node.script = "__signalmath__";
+    node.params.push_back({"Operation", 0.0f, 0.0f, 5.0f});
+
+    SignalMathProcessor proc(node);
+    const int N = 64;
+    proc.prepareToPlay(48000.0, N);
+
+    // Layout: ch0/1 audio (unused), ch2 = A, ch3 = B, output Out on ch2.
+    juce::AudioBuffer<float> buf(4, N);
+    auto setInputs = [&](float aVal, float bVal) {
+        buf.clear();
+        for (int i = 0; i < N; ++i) {
+            buf.setSample(2, i, aVal);
+            buf.setSample(3, i, bVal);
+        }
+    };
+    auto run = [&](int op, float aVal, float bVal) -> float {
+        node.params[0].value = (float) op;
+        setInputs(aVal, bVal);
+        juce::MidiBuffer m;
+        proc.processBlock(buf, m);
+        return buf.getSample(2, N / 2);
+    };
+
+    r.check(std::abs(run(0, 3.0f, 4.0f) - 7.0f) < 1e-5f, "math: Add  3+4=7");
+    r.check(std::abs(run(1, 3.0f, 4.0f) - (-1.0f)) < 1e-5f, "math: Subtract  3-4=-1");
+    r.check(std::abs(run(2, 3.0f, 4.0f) - 12.0f) < 1e-5f, "math: Multiply  3*4=12");
+    r.check(std::abs(run(3, 12.0f, 4.0f) - 3.0f) < 1e-5f, "math: Divide  12/4=3");
+    r.check(run(3, 5.0f, 0.0f) == 0.0f, "math: Divide by zero -> 0 (no NaN/inf)");
+    r.check(std::isfinite(run(3, 5.0f, 0.0f)), "math: Divide by zero stays finite");
+    r.check(std::abs(run(4, 3.0f, 4.0f) - 3.0f) < 1e-5f, "math: Min(3,4)=3");
+    r.check(std::abs(run(5, 3.0f, 4.0f) - 4.0f) < 1e-5f, "math: Max(3,4)=4");
+
+    // Unwired B reads as 0: Subtract with A=0 negates B (classic invert use).
+    {
+        node.params[0].value = 1.0f; // Subtract
+        buf.clear();
+        for (int i = 0; i < N; ++i) buf.setSample(3, i, 0.5f); // only B wired
+        juce::MidiBuffer m;
+        proc.processBlock(buf, m);
+        r.check(std::abs(buf.getSample(2, N / 2) - (-0.5f)) < 1e-5f,
+                "math: unwired A(=0) - B inverts B");
+    }
+
+    // Output must not leak the raw inputs onto the audio bus.
+    r.check(buf.getSample(0, N / 2) == 0.0f && buf.getSample(1, N / 2) == 0.0f,
+            "math: audio channels stay silent");
+
+    // Save/load round-trip: node, script tag, and Operation value survive.
+    node.params[0].value = 3.0f; // Divide
+    const std::string text = ProjectFile::serializeForUndo(graph);
+    NodeGraph dst;
+    const bool ok = ProjectFile::loadFromString(text, dst);
+    r.check(ok, "math-saveload: project text parses back");
+    Node* d = dst.findNode(node.id);
+    r.check(d != nullptr && d->script == "__signalmath__",
+            "math-saveload: script tag survives");
+    r.check(d != nullptr && d->type == NodeType::SignalShape,
+            "math-saveload: node type survives");
+    bool foundOp = false;
+    if (d) for (auto& p : d->params)
+        if (p.name == "Operation") { foundOp = std::abs(p.value - 3.0f) < 0.01f; }
+    r.check(foundOp, "math-saveload: Operation value round-trips");
+    r.check(d != nullptr && d->pinsIn.size() == 2 && d->pinsOut.size() == 1,
+            "math-saveload: pins (2 in / 1 out) round-trip");
+}
+
+// ---------------------------------------------------------------------------
+// Signal LFO module: control-rate oscillator with optional per-voice sync.
+// ---------------------------------------------------------------------------
+void testSignalLFO(Report& r) {
+    r.section("Signal LFO module (modular kit)");
+
+    NodeGraph graph;
+    auto& node = graph.addNode("Signal LFO", NodeType::SignalShape,
+        {Pin{0, "Sync", PinKind::Signal, true, 1}},
+        {Pin{0, "Out", PinKind::Signal, false, 1}}, {0.0f, 0.0f});
+    node.script = "__signallfo__";
+    node.params.push_back({"Rate", 1.0f, 0.1f, 20.0f});
+    node.params.push_back({"Shape", 0.0f, 0.0f, 3.0f});
+    node.params.push_back({"Polarity", 0.0f, 0.0f, 1.0f});
+
+    SignalLFOProcessor proc(node);
+    const double SR = 1000.0; // 1 kHz -> at Rate 1 Hz one cycle == 1000 samples
+    const int N = 1000;
+    // Layout: ch0/1 audio, ch2 = Sync input AND Out output.
+    juce::AudioBuffer<float> buf(3, N);
+
+    auto setParam = [&](const char* name, float v) {
+        for (auto& p : node.params) if (p.name == name) p.value = v;
+    };
+
+    // --- Square wave, bipolar, free-run: +1 first half, -1 second half. ---
+    {
+        setParam("Shape", 3.0f); setParam("Polarity", 0.0f); setParam("Rate", 1.0f);
+        proc.prepareToPlay(SR, N);
+        buf.clear();
+        juce::MidiBuffer m;
+        proc.processBlock(buf, m);
+        r.check(buf.getSample(2, 0)   ==  1.0f, "lfo: square +1 at phase 0");
+        r.check(buf.getSample(2, 499) ==  1.0f, "lfo: square +1 just before half");
+        r.check(buf.getSample(2, 500) == -1.0f, "lfo: square -1 at half cycle");
+        r.check(buf.getSample(2, 999) == -1.0f, "lfo: square -1 at end of cycle");
+        r.check(buf.getSample(0, 10) == 0.0f && buf.getSample(1, 10) == 0.0f,
+                "lfo: audio channels stay silent");
+    }
+
+    // --- Sine, bipolar: starts at 0, stays within [-1,1], reaches ~+1 at 1/4. ---
+    {
+        setParam("Shape", 0.0f); setParam("Polarity", 0.0f); setParam("Rate", 1.0f);
+        proc.prepareToPlay(SR, N);
+        buf.clear();
+        juce::MidiBuffer m;
+        proc.processBlock(buf, m);
+        r.check(std::abs(buf.getSample(2, 0)) < 1e-5f, "lfo: sine starts at 0");
+        r.check(std::abs(buf.getSample(2, 250) - 1.0f) < 1e-2f, "lfo: sine peaks near +1 at quarter cycle");
+        bool inRange = true;
+        for (int i = 0; i < N; ++i)
+            if (buf.getSample(2, i) < -1.0001f || buf.getSample(2, i) > 1.0001f) inRange = false;
+        r.check(inRange, "lfo: sine stays within [-1, 1] (bipolar)");
+    }
+
+    // --- Unipolar sine: range [0,1], midpoint 0.5 at phase 0. ---
+    {
+        setParam("Shape", 0.0f); setParam("Polarity", 1.0f); setParam("Rate", 1.0f);
+        proc.prepareToPlay(SR, N);
+        buf.clear();
+        juce::MidiBuffer m;
+        proc.processBlock(buf, m);
+        r.check(std::abs(buf.getSample(2, 0) - 0.5f) < 1e-5f, "lfo: unipolar sine = 0.5 at phase 0");
+        bool inRange = true;
+        for (int i = 0; i < N; ++i)
+            if (buf.getSample(2, i) < -1e-4f || buf.getSample(2, i) > 1.0001f) inRange = false;
+        r.check(inRange, "lfo: unipolar sine stays within [0, 1]");
+    }
+
+    // --- Sync: a rising edge mid-block resets phase (square retriggers to +1). ---
+    {
+        setParam("Shape", 3.0f); setParam("Polarity", 0.0f); setParam("Rate", 1.0f);
+        proc.prepareToPlay(SR, N);
+        buf.clear();
+        // Sync low for 0..599, high from 600 on -> rising edge at 600.
+        for (int i = 600; i < N; ++i) buf.setSample(2, i, 1.0f);
+        juce::MidiBuffer m;
+        proc.processBlock(buf, m);
+        r.check(buf.getSample(2, 599) == -1.0f, "lfo: pre-sync in -1 half (phase 0.599)");
+        r.check(buf.getSample(2, 600) ==  1.0f, "lfo: sync rising edge resets phase -> +1");
+    }
+
+    // --- Save/load round-trip. ---
+    {
+        setParam("Shape", 2.0f); setParam("Polarity", 1.0f); setParam("Rate", 5.0f);
+        const std::string text = ProjectFile::serializeForUndo(graph);
+        NodeGraph dst;
+        const bool ok = ProjectFile::loadFromString(text, dst);
+        r.check(ok, "lfo-saveload: project text parses back");
+        Node* d = dst.findNode(node.id);
+        r.check(d != nullptr && d->script == "__signallfo__", "lfo-saveload: script tag survives");
+        auto pv = [&](const char* nm) -> float {
+            if (d) for (auto& p : d->params) if (p.name == nm) return p.value;
+            return -999.0f;
+        };
+        r.check(std::abs(pv("Rate") - 5.0f) < 0.01f, "lfo-saveload: Rate round-trips");
+        r.check(std::abs(pv("Shape") - 2.0f) < 0.01f, "lfo-saveload: Shape round-trips");
+        r.check(std::abs(pv("Polarity") - 1.0f) < 0.01f, "lfo-saveload: Polarity round-trips");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Sample & Hold module: latch a value on each trigger rising edge.
+// ---------------------------------------------------------------------------
+void testSampleHold(Report& r) {
+    r.section("Sample & Hold module (modular kit)");
+
+    NodeGraph graph;
+    auto& node = graph.addNode("Sample & Hold", NodeType::SignalShape,
+        {Pin{0, "In", PinKind::Signal, true, 1},
+         Pin{0, "Trigger", PinKind::Signal, true, 1}},
+        {Pin{0, "Out", PinKind::Signal, false, 1}}, {0.0f, 0.0f});
+    node.script = "__signalsh__";
+    node.params.push_back({"Source", 0.0f, 0.0f, 2.0f});
+
+    SampleHoldProcessor proc(node);
+    const int N = 512;
+    juce::AudioBuffer<float> buf(4, N); // ch2=In/Out, ch3=Trigger
+    auto setSource = [&](float v) { node.params[0].value = v; };
+
+    // --- Input mode: sample a ramp at two trigger edges, hold between. ---
+    {
+        setSource(0.0f);
+        proc.prepareToPlay(48000.0, N);
+        buf.clear();
+        for (int i = 0; i < N; ++i) buf.setSample(2, i, (float) i);       // In = ramp
+        for (int i = 100; i < 150; ++i) buf.setSample(3, i, 1.0f);        // edge @100
+        for (int i = 300; i < 350; ++i) buf.setSample(3, i, 1.0f);        // edge @300
+        juce::MidiBuffer m;
+        proc.processBlock(buf, m);
+        r.check(buf.getSample(2, 50)  == 0.0f,   "sh: holds initial 0 before first trigger");
+        r.check(buf.getSample(2, 100) == 100.0f, "sh: samples In(=100) at first trigger");
+        r.check(buf.getSample(2, 200) == 100.0f, "sh: holds steady between triggers");
+        r.check(buf.getSample(2, 299) == 100.0f, "sh: still holding just before second trigger");
+        r.check(buf.getSample(2, 300) == 300.0f, "sh: re-samples In(=300) at second trigger");
+        r.check(buf.getSample(2, 400) == 300.0f, "sh: holds the new value after");
+        r.check(buf.getSample(0, 10) == 0.0f && buf.getSample(1, 10) == 0.0f,
+                "sh: audio channels stay silent");
+    }
+
+    // --- Random ±1: one trigger, ignores In, value in [-1,1], then held. ---
+    {
+        setSource(1.0f);
+        proc.prepareToPlay(48000.0, N);
+        buf.clear();
+        for (int i = 0; i < N; ++i) buf.setSample(2, i, (float) i * 1000.0f); // huge In ramp
+        for (int i = 10; i < 20; ++i) buf.setSample(3, i, 1.0f);              // single edge @10
+        juce::MidiBuffer m;
+        proc.processBlock(buf, m);
+        r.check(buf.getSample(2, 5) == 0.0f, "sh-rand: initial 0 before trigger");
+        const float v = buf.getSample(2, 10);
+        r.check(v >= -1.0f && v <= 1.0f, "sh-rand: held value within [-1, 1] (ignores In ramp)");
+        r.check(buf.getSample(2, 400) == v, "sh-rand: holds the random value steady");
+    }
+
+    // --- Random 0..1: value in [0,1]. ---
+    {
+        setSource(2.0f);
+        proc.prepareToPlay(48000.0, N);
+        buf.clear();
+        for (int i = 10; i < 20; ++i) buf.setSample(3, i, 1.0f);
+        juce::MidiBuffer m;
+        proc.processBlock(buf, m);
+        const float v = buf.getSample(2, 200);
+        r.check(v >= 0.0f && v <= 1.0f, "sh-rand: held value within [0, 1]");
+    }
+
+    // --- Save/load round-trip. ---
+    {
+        setSource(2.0f);
+        const std::string text = ProjectFile::serializeForUndo(graph);
+        NodeGraph dst;
+        const bool ok = ProjectFile::loadFromString(text, dst);
+        r.check(ok, "sh-saveload: project text parses back");
+        Node* d = dst.findNode(node.id);
+        r.check(d != nullptr && d->script == "__signalsh__", "sh-saveload: script tag survives");
+        bool found = false;
+        if (d) for (auto& p : d->params)
+            if (p.name == "Source") found = std::abs(p.value - 2.0f) < 0.01f;
+        r.check(found, "sh-saveload: Source value round-trips");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Signal Logic module: comparison + boolean logic -> 0/1 gate.
+// ---------------------------------------------------------------------------
+void testSignalLogic(Report& r) {
+    r.section("Signal Logic module (modular kit)");
+
+    NodeGraph graph;
+    auto& node = graph.addNode("Signal Logic", NodeType::SignalShape,
+        {Pin{0, "A", PinKind::Signal, true, 1},
+         Pin{0, "B", PinKind::Signal, true, 1}},
+        {Pin{0, "Out", PinKind::Signal, false, 1}}, {0.0f, 0.0f});
+    node.script = "__signallogic__";
+    node.params.push_back({"Operation", 0.0f, 0.0f, 5.0f});
+
+    SignalLogicProcessor proc(node);
+    const int N = 16;
+    juce::AudioBuffer<float> buf(4, N); // ch2=A/Out, ch3=B
+    proc.prepareToPlay(48000.0, N);
+
+    auto run = [&](int op, float a, float b) -> float {
+        node.params[0].value = (float) op;
+        buf.clear();
+        for (int i = 0; i < N; ++i) { buf.setSample(2, i, a); buf.setSample(3, i, b); }
+        juce::MidiBuffer m;
+        proc.processBlock(buf, m);
+        return buf.getSample(2, N / 2);
+    };
+
+    r.check(run(0, 0.8f, 0.5f) == 1.0f, "logic: A>B true (0.8 > 0.5)");
+    r.check(run(0, 0.3f, 0.5f) == 0.0f, "logic: A>B false (0.3 > 0.5)");
+    r.check(run(1, 0.3f, 0.5f) == 1.0f, "logic: A<B true (0.3 < 0.5)");
+    r.check(run(1, 0.8f, 0.5f) == 0.0f, "logic: A<B false");
+    r.check(run(2, 1.0f, 1.0f) == 1.0f, "logic: AND true (both high)");
+    r.check(run(2, 1.0f, 0.0f) == 0.0f, "logic: AND false (one low)");
+    r.check(run(3, 1.0f, 0.0f) == 1.0f, "logic: OR true (one high)");
+    r.check(run(3, 0.0f, 0.0f) == 0.0f, "logic: OR false (both low)");
+    r.check(run(4, 1.0f, 0.0f) == 1.0f, "logic: XOR true (exactly one)");
+    r.check(run(4, 1.0f, 1.0f) == 0.0f, "logic: XOR false (both high)");
+    r.check(run(5, 0.0f, 0.0f) == 1.0f, "logic: NOT A true (A low)");
+    r.check(run(5, 1.0f, 0.0f) == 0.0f, "logic: NOT A false (A high)");
+    r.check(buf.getSample(0, 0) == 0.0f && buf.getSample(1, 0) == 0.0f,
+            "logic: audio channels stay silent");
+
+    // Save/load round-trip.
+    node.params[0].value = 4.0f; // XOR
+    const std::string text = ProjectFile::serializeForUndo(graph);
+    NodeGraph dst;
+    const bool ok = ProjectFile::loadFromString(text, dst);
+    r.check(ok, "logic-saveload: project text parses back");
+    Node* d = dst.findNode(node.id);
+    r.check(d != nullptr && d->script == "__signallogic__", "logic-saveload: script tag survives");
+    bool found = false;
+    if (d) for (auto& p : d->params)
+        if (p.name == "Operation") found = std::abs(p.value - 4.0f) < 0.01f;
+    r.check(found, "logic-saveload: Operation value round-trips");
+}
+
+void testSignalFilter(Report& r) {
+    r.section("Signal Filter module (resonant LP/HP/BP)");
+
+    NodeGraph graph;
+    auto& node = graph.addNode("Signal Filter", NodeType::Effect,
+        {Pin{0, "Audio In", PinKind::Audio, true}},
+        {Pin{0, "Audio Out", PinKind::Audio, false}}, {0.0f, 0.0f});
+    node.script = "__signalfilter__";
+    node.params.push_back({"Type", 0.0f, 0.0f, 2.0f});
+    node.params.push_back({"Cutoff", 1000.0f, 20.0f, 20000.0f});
+    node.params.push_back({"Resonance", 0.2f, 0.0f, 1.0f});
+
+    const double SR = 48000.0;
+    const int N = 512;
+
+    // Run a sine of frequency `freq` (or DC if freq==0) through the filter for a
+    // few blocks to reach steady state, then return the RMS of the final block.
+    auto rmsThrough = [&](int type, float cutoff, float freq) -> float {
+        node.params[0].value = (float) type;
+        node.params[1].value = cutoff;
+        SignalFilterProcessor proc(node);
+        proc.prepareToPlay(SR, N);
+        double phase = 0.0;
+        const double inc = 2.0 * juce::MathConstants<double>::pi * freq / SR;
+        juce::AudioBuffer<float> buf(2, N);
+        float rms = 0.0f;
+        for (int blk = 0; blk < 12; ++blk) {
+            for (int i = 0; i < N; ++i) {
+                float s = (freq <= 0.0f) ? 1.0f : (float) std::sin(phase);
+                phase += inc;
+                buf.setSample(0, i, s);
+                buf.setSample(1, i, s);
+            }
+            juce::MidiBuffer m;
+            proc.processBlock(buf, m);
+            // Measure on the last block only (steady state).
+            if (blk == 11) {
+                double acc = 0.0;
+                for (int i = 0; i < N; ++i) {
+                    float v = buf.getSample(0, i);
+                    acc += (double) v * v;
+                }
+                rms = (float) std::sqrt(acc / N);
+            }
+        }
+        return rms;
+    };
+
+    const float kSineRms = 0.707f; // RMS of a unit sine
+
+    // Low-pass: passes a low tone, rejects a high tone.
+    float lpLow  = rmsThrough(0, 500.0f, 50.0f);
+    float lpHigh = rmsThrough(0, 500.0f, 8000.0f);
+    r.check(lpLow > 0.5f, "filter LP: 50 Hz passes (rms " + juce::String(lpLow, 3) + ")");
+    r.check(lpHigh < 0.15f, "filter LP: 8 kHz rejected (rms " + juce::String(lpHigh, 3) + ")");
+    r.check(lpLow > lpHigh * 4.0f, "filter LP: low tone louder than high tone");
+
+    // High-pass: rejects DC, passes a high tone.
+    float hpDc   = rmsThrough(1, 500.0f, 0.0f);
+    float hpHigh = rmsThrough(1, 500.0f, 8000.0f);
+    r.check(hpDc < 0.1f, "filter HP: DC rejected (rms " + juce::String(hpDc, 3) + ")");
+    r.check(hpHigh > 0.5f, "filter HP: 8 kHz passes (rms " + juce::String(hpHigh, 3) + ")");
+
+    // Band-pass: rejects DC and a far-off tone, passes a tone at the cutoff.
+    float bpDc   = rmsThrough(2, 1000.0f, 0.0f);
+    float bpAt   = rmsThrough(2, 1000.0f, 1000.0f);
+    float bpFar  = rmsThrough(2, 1000.0f, 12000.0f);
+    r.check(bpDc < 0.1f, "filter BP: DC rejected (rms " + juce::String(bpDc, 3) + ")");
+    r.check(bpAt > bpDc + 0.2f && bpAt > bpFar, "filter BP: tone at cutoff passes strongest");
+
+    // Stability: output is always finite, even with high resonance + a step.
+    {
+        node.params[0].value = 0.0f;       // LP
+        node.params[1].value = 2000.0f;
+        node.params[2].value = 1.0f;       // max resonance
+        SignalFilterProcessor proc(node);
+        proc.prepareToPlay(SR, N);
+        juce::AudioBuffer<float> buf(2, N);
+        bool finite = true;
+        for (int blk = 0; blk < 8; ++blk) {
+            for (int i = 0; i < N; ++i) {
+                float s = (blk == 0 && i == 0) ? 1.0f : 0.0f; // impulse
+                buf.setSample(0, i, s);
+                buf.setSample(1, i, s);
+            }
+            juce::MidiBuffer m;
+            proc.processBlock(buf, m);
+            for (int i = 0; i < N; ++i)
+                if (!std::isfinite(buf.getSample(0, i))) finite = false;
+        }
+        r.check(finite, "filter: high-resonance impulse stays finite (no blow-up)");
+    }
+
+    // Save/load round-trip.
+    node.params[0].value = 2.0f;     // BP
+    node.params[1].value = 3500.0f;
+    node.params[2].value = 0.7f;
+    const std::string text = ProjectFile::serializeForUndo(graph);
+    NodeGraph dst;
+    const bool ok = ProjectFile::loadFromString(text, dst);
+    r.check(ok, "filter-saveload: project text parses back");
+    Node* d = dst.findNode(node.id);
+    r.check(d != nullptr && d->script == "__signalfilter__",
+            "filter-saveload: script tag survives");
+    if (d) {
+        auto val = [&](const char* nm) -> float {
+            for (auto& p : d->params) if (p.name == nm) return p.value;
+            return -999.0f;
+        };
+        r.check(std::abs(val("Type") - 2.0f) < 0.01f, "filter-saveload: Type round-trips");
+        r.check(std::abs(val("Cutoff") - 3500.0f) < 0.5f, "filter-saveload: Cutoff round-trips");
+        r.check(std::abs(val("Resonance") - 0.7f) < 0.01f, "filter-saveload: Resonance round-trips");
+    }
+}
+
+void testSignalNoise(Report& r) {
+    r.section("Signal Noise module (gated noise generator)");
+
+    NodeGraph graph;
+    auto& node = graph.addNode("Signal Noise", NodeType::Instrument,
+        {Pin{0, "Gate",     PinKind::Signal, true, 1},
+         Pin{0, "Velocity", PinKind::Signal, true, 1}},
+        {Pin{0, "Audio", PinKind::Audio, false}}, {0.0f, 0.0f});
+    node.script = "__signalnoise__";
+    node.params.push_back({"Type", 0.0f, 0.0f, 2.0f});
+    node.params.push_back({"Volume", 1.0f, 0.0f, 1.0f});
+    // Sustain held at 1.0 so a held gate gives a steady level to measure.
+    node.ahdsrEnvelope.attackMs  = 1.0f;
+    node.ahdsrEnvelope.decayMs   = 5.0f;
+    node.ahdsrEnvelope.sustain   = 1.0f;
+    node.ahdsrEnvelope.releaseMs = 5.0f;
+
+    const double SR = 48000.0;
+    const int N = 1024;
+
+    // Capture channel-0 output for `type` with the gate held high, after the
+    // attack/decay have settled to sustain. Returns the final block's samples.
+    auto capture = [&](int type, std::vector<float>& out) {
+        node.params[0].value = (float) type;
+        SignalNoiseProcessor proc(node);
+        proc.prepareToPlay(SR, N);
+        juce::AudioBuffer<float> buf(4, N); // ch0/1 audio, ch2 Gate, ch3 Vel
+        for (int blk = 0; blk < 6; ++blk) {
+            buf.clear();
+            for (int i = 0; i < N; ++i) { buf.setSample(2, i, 1.0f); buf.setSample(3, i, 1.0f); }
+            juce::MidiBuffer m;
+            proc.processBlock(buf, m);
+        }
+        out.assign(N, 0.0f);
+        for (int i = 0; i < N; ++i) out[i] = buf.getSample(0, i);
+    };
+
+    auto rms = [](const std::vector<float>& v) {
+        double acc = 0.0; for (float x : v) acc += (double)x * x;
+        return (float) std::sqrt(acc / juce::jmax((size_t)1, v.size()));
+    };
+    // Lag-1 autocorrelation: ~0 for white, strongly positive for brown.
+    auto lag1 = [](const std::vector<float>& v) {
+        double num = 0.0, den = 0.0;
+        for (size_t i = 1; i < v.size(); ++i) num += (double)v[i] * v[i - 1];
+        for (float x : v) den += (double)x * x;
+        return den > 0 ? (float)(num / den) : 0.0f;
+    };
+
+    std::vector<float> white, pink, brown;
+    capture(0, white);
+    capture(1, pink);
+    capture(2, brown);
+
+    r.check(rms(white) > 0.1f, "noise: white gate-on produces output (rms " + juce::String(rms(white), 3) + ")");
+    r.check(rms(pink)  > 0.05f, "noise: pink gate-on produces output");
+    r.check(rms(brown) > 0.05f, "noise: brown gate-on produces output");
+
+    // Spectral character via adjacent-sample correlation: white is near-zero,
+    // brown is heavily low-pass (smooth) so strongly correlated, pink between.
+    float cw = lag1(white), cp = lag1(pink), cb = lag1(brown);
+    r.check(std::abs(cw) < 0.2f, "noise: white is near-uncorrelated (lag1 " + juce::String(cw, 3) + ")");
+    r.check(cb > 0.8f, "noise: brown is strongly correlated (lag1 " + juce::String(cb, 3) + ")");
+    r.check(cp > cw && cb > cp, "noise: correlation white < pink < brown");
+
+    // Bounds: every sample stays inside [-1, 1].
+    bool inBounds = true;
+    for (auto* v : { &white, &pink, &brown })
+        for (float x : *v) if (x < -1.0001f || x > 1.0001f) inBounds = false;
+    r.check(inBounds, "noise: all output within [-1, 1]");
+
+    // Gate low -> silence after the envelope releases.
+    {
+        node.params[0].value = 0.0f;
+        SignalNoiseProcessor proc(node);
+        proc.prepareToPlay(SR, N);
+        juce::AudioBuffer<float> buf(4, N);
+        // One block gate-high then several gate-low to fully release.
+        for (int blk = 0; blk < 5; ++blk) {
+            buf.clear();
+            float g = (blk == 0) ? 1.0f : 0.0f;
+            for (int i = 0; i < N; ++i) { buf.setSample(2, i, g); buf.setSample(3, i, 1.0f); }
+            juce::MidiBuffer m;
+            proc.processBlock(buf, m);
+        }
+        std::vector<float> tail(N);
+        for (int i = 0; i < N; ++i) tail[i] = buf.getSample(0, i);
+        r.check(rms(tail) < 1e-4f, "noise: gate-off releases to silence");
+    }
+
+    // Save/load round-trip (Type, Volume, and the AHDSR envelope).
+    node.params[0].value = 1.0f; // Pink
+    node.params[1].value = 0.6f;
+    const std::string text = ProjectFile::serializeForUndo(graph);
+    NodeGraph dst;
+    const bool ok = ProjectFile::loadFromString(text, dst);
+    r.check(ok, "noise-saveload: project text parses back");
+    Node* d = dst.findNode(node.id);
+    r.check(d != nullptr && d->script == "__signalnoise__", "noise-saveload: script tag survives");
+    if (d) {
+        auto val = [&](const char* nm) -> float {
+            for (auto& p : d->params) if (p.name == nm) return p.value;
+            return -999.0f;
+        };
+        r.check(std::abs(val("Type") - 1.0f) < 0.01f, "noise-saveload: Type round-trips");
+        r.check(std::abs(val("Volume") - 0.6f) < 0.01f, "noise-saveload: Volume round-trips");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Voice container end-to-end audio: build a real NodeGraph with a VoiceContainer
+// whose inner patch is VoiceIn -> Signal Oscillator -> VoiceOut, drive it with a
+// synthetic MIDI buffer through PolyVoiceProcessor, and confirm the clone/build/
+// sum path actually makes (and stops making) sound. This is the auditory check
+// the design doc flagged as not unit-testable - made testable by using the
+// deterministic, signal-driven Signal Oscillator instead of a stochastic synth.
+// ---------------------------------------------------------------------------
+void testVoiceContainerAudio(Report& r) {
+    r.section("Voice container (end-to-end audio: clone + sum)");
+
+    NodeGraph graph;
+    Transport transport;
+
+    // --- Build the container + inner patch (mirrors the Add-Node handlers).
+    //     addNode reallocates graph.nodes, so capture stable IDs immediately. ---
+    int containerId;
+    {
+        auto& c = graph.addNode("Voice", NodeType::VoiceContainer,
+            {Pin{0, "MIDI", PinKind::Midi, true}},
+            {Pin{0, "Audio", PinKind::Audio, false}}, {0.0f, 0.0f});
+        c.voicePolyphony = 4;
+        containerId = c.id;
+    }
+
+    int viPitch, viGate, viVel;
+    {
+        auto& vi = graph.addNode("Voice In", NodeType::VoiceIn, {},
+            {Pin{0, "MIDI",     PinKind::Midi,   false},
+             Pin{0, "Pitch",    PinKind::Signal, false, 1},
+             Pin{0, "Gate",     PinKind::Signal, false, 1},
+             Pin{0, "Velocity", PinKind::Signal, false, 1}}, {-200.0f, 0.0f});
+        vi.voiceContainerId = containerId;
+        viPitch = vi.pinsOut[1].id;
+        viGate  = vi.pinsOut[2].id;
+        viVel   = vi.pinsOut[3].id;
+    }
+
+    int oscPitch, oscGate, oscVel, oscAudio;
+    {
+        auto& s = graph.addNode("Signal Osc", NodeType::Instrument,
+            {Pin{0, "Pitch",    PinKind::Signal, true, 1},
+             Pin{0, "Gate",     PinKind::Signal, true, 1},
+             Pin{0, "Velocity", PinKind::Signal, true, 1}},
+            {Pin{0, "Audio", PinKind::Audio, false}}, {0.0f, 0.0f});
+        s.voiceContainerId = containerId;
+        s.script = "__signalosc__";
+        s.params.push_back({"Waveform", 0.0f, 0.0f, 3.0f});
+        s.params.push_back({"Volume",   0.5f, 0.0f, 1.0f});
+        s.ahdsrEnvelope.attackMs  = 2.0f;
+        s.ahdsrEnvelope.decayMs   = 20.0f;
+        s.ahdsrEnvelope.sustain   = 0.8f;
+        s.ahdsrEnvelope.releaseMs = 40.0f;
+        oscPitch = s.pinsIn[0].id;
+        oscGate  = s.pinsIn[1].id;
+        oscVel   = s.pinsIn[2].id;
+        oscAudio = s.pinsOut[0].id;
+    }
+
+    int voAudio;
+    {
+        auto& vo = graph.addNode("Voice Out", NodeType::VoiceOut,
+            {Pin{0, "Audio", PinKind::Audio, true}}, {}, {200.0f, 0.0f});
+        vo.voiceContainerId = containerId;
+        voAudio = vo.pinsIn[0].id;
+    }
+
+    graph.addLink(viPitch, oscPitch);
+    graph.addLink(viGate,  oscGate);
+    graph.addLink(viVel,   oscVel);
+    graph.addLink(oscAudio, voAudio);
+
+    Node* container = graph.findNode(containerId);
+    r.check(container != nullptr, "vc-audio: container node exists");
+    if (!container) return;
+
+    const double sr = 44100.0;
+    const int bs = 512;
+    PolyVoiceProcessor poly(*container, graph, transport);
+    poly.setPlayConfigDetails(0, 2, sr, bs);
+    poly.prepareToPlay(sr, bs);
+
+    auto rmsOf = [](juce::AudioBuffer<float>& b) {
+        return b.getRMSLevel(0, 0, b.getNumSamples());
+    };
+    auto runBlocks = [&](juce::AudioBuffer<float>& out, juce::MidiBuffer& first, int extra) {
+        poly.processBlock(out, first);
+        juce::MidiBuffer empty;
+        for (int i = 0; i < extra; ++i) poly.processBlock(out, empty);
+        return rmsOf(out);
+    };
+
+    // No notes -> silence.
+    {
+        juce::AudioBuffer<float> out(2, bs);
+        juce::MidiBuffer midi;
+        poly.processBlock(out, midi);
+        r.check(rmsOf(out) < 1.0e-5f, "vc-audio: silent before any note");
+    }
+
+    // One held note -> a tone appears once the attack settles. This proves the
+    // whole chain: MIDI parse -> alloc -> VoiceIn drive -> inner-graph clone
+    // (buildScope) -> Signal Oscillator reads the control signals -> VoiceOut.
+    float rms1 = 0.0f;
+    {
+        juce::AudioBuffer<float> out(2, bs);
+        juce::MidiBuffer on;
+        on.addEvent(juce::MidiMessage::noteOn(1, 69, (juce::uint8) 110), 0); // A4
+        rms1 = runBlocks(out, on, 4);
+        r.check(rms1 > 1.0e-2f, "vc-audio: a held note produces a tone");
+    }
+
+    // Two more simultaneous notes -> three voices summed -> more energy than one
+    // (different pitches are incoherent, so the sum's RMS exceeds a single voice).
+    {
+        juce::AudioBuffer<float> out(2, bs);
+        juce::MidiBuffer on;
+        on.addEvent(juce::MidiMessage::noteOn(1, 72, (juce::uint8) 110), 0); // C5
+        on.addEvent(juce::MidiMessage::noteOn(1, 76, (juce::uint8) 110), 0); // E5
+        float rms3 = runBlocks(out, on, 4);
+        r.check(rms3 > rms1 * 1.2f, "vc-audio: three summed voices louder than one");
+    }
+
+    // Release everything -> after the release tail + the RMS free window, the
+    // container falls back to silence (no stuck/leaked voices).
+    {
+        juce::AudioBuffer<float> out(2, bs);
+        juce::MidiBuffer off;
+        off.addEvent(juce::MidiMessage::allNotesOff(1), 0);
+        float tail = runBlocks(out, off, 80); // ~80 blocks ~= 0.9s >> 40ms rel + 250ms free
+        r.check(tail < 1.0e-4f, "vc-audio: voices decay to silence after release");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Voice container save/load: the new membership fields (voiceContainerId,
+// voicePolyphony, voiceStealMode) and the container<->inner relationship must
+// survive a serialize/deserialize cycle. Uses the exact in-memory path that
+// commitSnapshot()/undo uses (serializeForUndo -> loadFromString), so this also
+// guards the undo round-trip. CLAUDE.md "Save/Load" checklist item.
+// ---------------------------------------------------------------------------
+void testVoiceContainerSaveLoad(Report& r) {
+    r.section("Voice container (save/load round-trip)");
+
+    NodeGraph src;
+    int containerId, innerId;
+    {
+        auto& c = src.addNode("Voice", NodeType::VoiceContainer,
+            {Pin{0, "MIDI", PinKind::Midi, true}},
+            {Pin{0, "Audio", PinKind::Audio, false}}, {0.0f, 0.0f});
+        c.voicePolyphony = 6;
+        c.voiceStealMode = 2;     // round-robin (non-default, to prove it round-trips)
+        c.voiceGlideMs   = 60.0f; // glide time (non-default)
+        containerId = c.id;
+    }
+    int viMidi, synMidi, synAudio, voAudio;
+    {
+        auto& vi = src.addNode("Voice In", NodeType::VoiceIn, {},
+            {Pin{0, "MIDI", PinKind::Midi, false}}, {-200.0f, 0.0f});
+        vi.voiceContainerId = containerId;
+        viMidi = vi.pinsOut[0].id;
+    }
+    {
+        auto& s = src.addNode("FM Synth", NodeType::Instrument,
+            {Pin{0, "MIDI", PinKind::Midi, true}},
+            {Pin{0, "Audio", PinKind::Audio, false}}, {0.0f, 0.0f});
+        s.voiceContainerId = containerId;
+        s.script = "__fmsynth__";
+        innerId = s.id;
+        synMidi  = s.pinsIn[0].id;
+        synAudio = s.pinsOut[0].id;
+    }
+    {
+        auto& vo = src.addNode("Voice Out", NodeType::VoiceOut,
+            {Pin{0, "Audio", PinKind::Audio, true}}, {}, {200.0f, 0.0f});
+        vo.voiceContainerId = containerId;
+        voAudio = vo.pinsIn[0].id;
+    }
+    src.addLink(viMidi, synMidi);
+    src.addLink(synAudio, voAudio);
+
+    const std::string text = ProjectFile::serializeForUndo(src);
+    NodeGraph dst;
+    const bool ok = ProjectFile::loadFromString(text, dst);
+    r.check(ok, "vc-saveload: project text parses back");
+    r.check(dst.nodes.size() == src.nodes.size(),
+            "vc-saveload: node count preserved");
+    r.check(dst.links.size() == src.links.size(),
+            "vc-saveload: link count preserved");
+
+    Node* c = dst.findNode(containerId);
+    r.check(c != nullptr && c->type == NodeType::VoiceContainer,
+            "vc-saveload: container survives with its type");
+    r.check(c != nullptr && c->voicePolyphony == 6,
+            "vc-saveload: voicePolyphony round-trips");
+    r.check(c != nullptr && c->voiceStealMode == 2,
+            "vc-saveload: voiceStealMode round-trips");
+    r.check(c != nullptr && std::abs(c->voiceGlideMs - 60.0f) < 0.01f,
+            "vc-saveload: voiceGlideMs round-trips");
+
+    Node* inner = dst.findNode(innerId);
+    r.check(inner != nullptr && inner->voiceContainerId == containerId,
+            "vc-saveload: inner node keeps its container membership");
+    r.check(inner != nullptr && inner->script == "__fmsynth__",
+            "vc-saveload: inner synth keeps its identity");
+
+    // Top-level membership (-1) must not leak onto inner nodes, and vice-versa.
+    int innerCount = 0;
+    for (auto& n : dst.nodes) if (n.voiceContainerId == containerId) ++innerCount;
+    r.check(innerCount == 3, "vc-saveload: all three inner nodes stay scoped");
+}
+
+// ---------------------------------------------------------------------------
+// Voice factory presets: buildVoicePreset() must produce a well-formed
+// container + inner patch for each preset id, with the right container settings
+// (polyphony / glide / unison), the right inner instrument, and a fully-wired
+// VoiceIn -> instrument -> VoiceOut chain. Then one preset is rendered
+// end-to-end to prove the built patch actually sounds, and one is round-tripped
+// through save/load. This exercises the SAME construction code the GUI menu
+// calls (the menu wrapper only adds commitSnapshot + rebuild on top).
+// ---------------------------------------------------------------------------
+void testVoicePresets(Report& r) {
+    r.section("Voice factory presets (buildVoicePreset)");
+
+    // Helper: count nodes scoped to a container, find the inner instrument
+    // (the one node that's neither VoiceIn nor VoiceOut), and confirm every
+    // inner node was tagged with the container id.
+    auto innerInstrument = [](NodeGraph& g, int cid) -> Node* {
+        for (auto& n : g.nodes)
+            if (n.voiceContainerId == cid
+                && n.type != NodeType::VoiceIn && n.type != NodeType::VoiceOut)
+                return &n;
+        return nullptr;
+    };
+
+    struct Expect { int preset; const char* name; int poly; int unison;
+                    float glide; const char* script; };
+    const Expect cases[] = {
+        {0, "Voice",         8, 1,  0.0f, "__fmsynth__"},
+        {1, "Warm Pad",      8, 3,  0.0f, "__signalosc__"},
+        {2, "Pluck",         8, 1,  0.0f, "__signalosc__"},
+        {3, "Supersaw Lead", 1, 7, 50.0f, "__signalosc__"},
+        {4, "Noise Perc",    8, 1,  0.0f, "__signalnoise__"},
+    };
+
+    for (const auto& e : cases) {
+        NodeGraph g;
+        const int cid = buildVoicePreset(g, Vec2{0.0f, 0.0f}, e.preset);
+        const std::string tag = std::string("preset[") + e.name + "]: ";
+
+        Node* c = g.findNode(cid);
+        r.check(c != nullptr && c->type == NodeType::VoiceContainer,
+                tag + "container created");
+        if (!c) continue;
+        r.check(c->name == e.name, tag + "container named");
+        r.check(c->voicePolyphony == e.poly, tag + "polyphony set");
+        r.check(c->voiceUnison == e.unison, tag + "unison set");
+        r.check(std::abs(c->voiceGlideMs - e.glide) < 0.01f, tag + "glide set");
+
+        // Exactly 3 inner nodes (VoiceIn + instrument + VoiceOut), all scoped.
+        int inner = 0, vin = 0, vout = 0;
+        for (auto& n : g.nodes) {
+            if (n.voiceContainerId != cid) continue;
+            ++inner;
+            if (n.type == NodeType::VoiceIn)  ++vin;
+            if (n.type == NodeType::VoiceOut) ++vout;
+        }
+        r.check(inner == 3, tag + "three inner nodes, all scoped");
+        r.check(vin == 1 && vout == 1, tag + "one VoiceIn and one VoiceOut");
+
+        Node* instr = innerInstrument(g, cid);
+        r.check(instr != nullptr && instr->script == e.script,
+                tag + "inner instrument is the expected kind");
+
+        // The instrument must be wired on both sides: at least one link into it
+        // (from VoiceIn) and exactly one out of it (to VoiceOut). 4 nodes total
+        // means 2-4 links depending on how many control pins the instr uses.
+        if (instr) {
+            int into = 0, outOf = 0;
+            for (auto& l : g.links) {
+                for (auto& pin : instr->pinsIn)  if (pin.id == l.endPin)   ++into;
+                for (auto& pin : instr->pinsOut) if (pin.id == l.startPin) ++outOf;
+            }
+            r.check(into >= 1,  tag + "instrument driven by VoiceIn");
+            r.check(outOf == 1, tag + "instrument feeds VoiceOut");
+        }
+    }
+
+    // End-to-end: the Pluck preset should actually sound when a note is played.
+    {
+        NodeGraph g;
+        Transport transport;
+        const int cid = buildVoicePreset(g, Vec2{0.0f, 0.0f}, 2); // Pluck
+        Node* c = g.findNode(cid);
+        r.check(c != nullptr, "preset-audio: container exists");
+        if (c) {
+            const double sr = 44100.0; const int bs = 512;
+            PolyVoiceProcessor poly(*c, g, transport);
+            poly.setPlayConfigDetails(0, 2, sr, bs);
+            poly.prepareToPlay(sr, bs);
+            juce::AudioBuffer<float> out(2, bs);
+            juce::MidiBuffer on;
+            on.addEvent(juce::MidiMessage::noteOn(1, 60, (juce::uint8)110), 0);
+            poly.processBlock(out, on);
+            juce::MidiBuffer empty;
+            float peak = 0.0f;
+            for (int i = 0; i < 3; ++i) {
+                poly.processBlock(out, empty);
+                peak = std::max(peak, out.getMagnitude(0, 0, bs));
+            }
+            r.check(peak > 1.0e-2f, "preset-audio: Pluck preset produces a tone");
+        }
+    }
+
+    // Save/load round-trip of a built preset (the Supersaw Lead, since it has
+    // the most non-default container settings to preserve).
+    {
+        NodeGraph src;
+        const int cid = buildVoicePreset(src, Vec2{0.0f, 0.0f}, 3);
+        const std::string text = ProjectFile::serializeForUndo(src);
+        NodeGraph dst;
+        const bool ok = ProjectFile::loadFromString(text, dst);
+        r.check(ok, "preset-saveload: project text parses back");
+        r.check(dst.nodes.size() == src.nodes.size(),
+                "preset-saveload: node count preserved");
+        Node* c = dst.findNode(cid);
+        r.check(c != nullptr && c->voicePolyphony == 1,
+                "preset-saveload: Supersaw polyphony (mono) round-trips");
+        r.check(c != nullptr && c->voiceUnison == 7,
+                "preset-saveload: Supersaw unison round-trips");
+        r.check(c != nullptr && std::abs(c->voiceGlideMs - 50.0f) < 0.01f,
+                "preset-saveload: Supersaw glide round-trips");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Signal Oscillator - Pulse waveform (M4 "more oscillator flavours"). The Pulse
+// shape (Waveform == 4) emits +1 for the first `Pulse Width` fraction of each
+// cycle and -1 for the rest, so the duty cycle of the output sign should track
+// the Pulse Width param. Drives the processor directly with constant control
+// signals (ch2 Pitch, ch3 Gate, ch4 Velocity) and measures the positive sample
+// fraction at two widths.
+// ---------------------------------------------------------------------------
+void testSignalOscPulse(Report& r) {
+    r.section("Signal Oscillator (Pulse waveform / PWM)");
+
+    auto dutyCycle = [&](float width) {
+        NodeGraph graph;
+        auto& n = graph.addNode("Signal Osc", NodeType::Instrument,
+            {Pin{0, "Pitch",    PinKind::Signal, true, 1},
+             Pin{0, "Gate",     PinKind::Signal, true, 1},
+             Pin{0, "Velocity", PinKind::Signal, true, 1}},
+            {Pin{0, "Audio", PinKind::Audio, false}}, {0.0f, 0.0f});
+        n.script = "__signalosc__";
+        n.params.push_back({"Waveform", 4.0f, 0.0f, 4.0f});      // Pulse
+        n.params.push_back({"Volume",   1.0f, 0.0f, 1.0f});
+        n.params.push_back({"Pulse Width", width, 0.05f, 0.95f});
+        // Near-instant attack, full sustain -> amp is ~1 almost immediately, so
+        // the output sign reflects the waveform (not the envelope ramp).
+        n.ahdsrEnvelope.attackMs  = 0.05f;
+        n.ahdsrEnvelope.decayMs   = 1.0f;
+        n.ahdsrEnvelope.sustain   = 1.0f;
+        n.ahdsrEnvelope.releaseMs = 50.0f;
+
+        const double sr = 48000.0; const int N = 512;
+        SignalOscillatorProcessor osc(n);
+        osc.prepareToPlay(sr, N);
+
+        juce::AudioBuffer<float> buf(5, N);   // 0/1 audio, 2 pitch, 3 gate, 4 vel
+        int pos = 0, neg = 0;
+        // Warm up a couple of blocks so the envelope is fully open, then count.
+        for (int blk = 0; blk < 8; ++blk) {
+            buf.clear();
+            for (int i = 0; i < N; ++i) {
+                buf.setSample(2, i, 200.0f); // 200 Hz pitch
+                buf.setSample(3, i, 1.0f);   // gate held
+                buf.setSample(4, i, 1.0f);   // full velocity
+            }
+            juce::MidiBuffer midi;
+            osc.processBlock(buf, midi);
+            if (blk < 4) continue;           // skip warmup blocks
+            for (int i = 0; i < N; ++i) {
+                const float s = buf.getSample(0, i);
+                if (s > 1.0e-3f) ++pos; else if (s < -1.0e-3f) ++neg;
+            }
+        }
+        const int total = pos + neg;
+        return total > 0 ? (float)pos / (float)total : 0.0f;
+    };
+
+    const float d25 = dutyCycle(0.25f);
+    const float d75 = dutyCycle(0.75f);
+    r.check(std::abs(d25 - 0.25f) < 0.06f,
+            "pulse: 25% width -> ~25% positive duty (" + juce::String(d25, 3) + ")");
+    r.check(std::abs(d75 - 0.75f) < 0.06f,
+            "pulse: 75% width -> ~75% positive duty (" + juce::String(d75, 3) + ")");
+    r.check(d75 > d25 + 0.2f, "pulse: wider Pulse Width raises the duty cycle");
+}
+
+// ---------------------------------------------------------------------------
+// Transport panic (Stop = immediate silence). When the transport stops, the
+// audio engine calls GraphProcessor::requestPanic(), which on the next audio
+// block calls juce::AudioProcessorGraph::reset() -> every node's reset(). Each
+// tail-bearing processor's reset() override must wipe its state so trailing
+// sound is cut at once instead of ringing out over the envelope release time.
+//
+// This drives a SignalOscillatorProcessor directly: hold the gate to open the
+// amp envelope, then release it. Without a panic the envelope enters its 200ms
+// Release stage and the first post-release block is still audibly loud. Calling
+// reset() (the panic lever) must instead hard-reset the envelope so that same
+// block is silent. We check BOTH halves so the test fails if reset() ever stops
+// actually clearing the envelope.
+// ---------------------------------------------------------------------------
+void testTransportPanic(Report& r) {
+    r.section("Transport panic (Stop silences trailing sound)");
+
+    auto buildOsc = [](Node& n) {
+        n.script = "__signalosc__";
+        n.params.clear();
+        n.params.push_back({"Waveform", 0.0f, 0.0f, 4.0f});   // sine
+        n.params.push_back({"Volume",   1.0f, 0.0f, 1.0f});
+        n.params.push_back({"Pulse Width", 0.5f, 0.05f, 0.95f});
+        n.ahdsrEnvelope.attackMs  = 0.5f;
+        n.ahdsrEnvelope.decayMs   = 1.0f;
+        n.ahdsrEnvelope.sustain   = 1.0f;
+        n.ahdsrEnvelope.releaseMs = 200.0f;   // long tail so the contrast is clear
+    };
+
+    const double sr = 48000.0; const int N = 512;
+
+    // Render `blocks` blocks holding the gate, then ONE block with the gate
+    // released. If `panic` is true, call reset() right before the released
+    // block (simulating the Stop panic). Returns the RMS of that final block.
+    auto releaseBlockRms = [&](bool panic) {
+        NodeGraph graph;
+        auto& n = graph.addNode("Signal Osc", NodeType::Instrument,
+            {Pin{0, "Pitch",    PinKind::Signal, true, 1},
+             Pin{0, "Gate",     PinKind::Signal, true, 1},
+             Pin{0, "Velocity", PinKind::Signal, true, 1}},
+            {Pin{0, "Audio", PinKind::Audio, false}}, {0.0f, 0.0f});
+        buildOsc(n);
+
+        SignalOscillatorProcessor osc(n);
+        osc.prepareToPlay(sr, N);
+        juce::AudioBuffer<float> buf(5, N); // 0/1 audio, 2 pitch, 3 gate, 4 vel
+
+        // Hold the gate to open the envelope.
+        for (int blk = 0; blk < 8; ++blk) {
+            buf.clear();
+            for (int i = 0; i < N; ++i) {
+                buf.setSample(2, i, 220.0f);
+                buf.setSample(3, i, 1.0f);
+                buf.setSample(4, i, 1.0f);
+            }
+            juce::MidiBuffer midi;
+            osc.processBlock(buf, midi);
+        }
+
+        if (panic) osc.reset(); // the Stop panic lever
+
+        // One block with the gate released.
+        buf.clear();
+        for (int i = 0; i < N; ++i) {
+            buf.setSample(2, i, 220.0f);
+            buf.setSample(3, i, 0.0f); // gate low -> release (or silent after reset)
+            buf.setSample(4, i, 1.0f);
+        }
+        juce::MidiBuffer midi;
+        osc.processBlock(buf, midi);
+
+        double sum = 0.0;
+        for (int i = 0; i < N; ++i) { float s = buf.getSample(0, i); sum += (double)s * s; }
+        return (float)std::sqrt(sum / N);
+    };
+
+    const float tailRms  = releaseBlockRms(false); // normal release tail
+    const float panicRms = releaseBlockRms(true);  // after panic reset()
+
+    r.check(tailRms > 1.0e-2f,
+            "panic: without reset, a released note still rings (tail RMS "
+            + juce::String(tailRms, 4) + ")");
+    r.check(panicRms < 1.0e-4f,
+            "panic: reset() cuts the release tail to silence (RMS "
+            + juce::String(panicRms, 6) + ")");
+    r.check(panicRms < tailRms * 0.01f,
+            "panic: reset() is >=100x quieter than the natural release tail");
+}
+
 int runSelfTest(const juce::File& outDir) {
     outDir.createDirectory();
     Report r;
@@ -5540,6 +7630,21 @@ int runSelfTest(const juce::File& outDir) {
     testGranularFreeze(r);
     testFmOpEnvelopes(r);
     testAssetLibrary(r);
+    testVoiceAllocator(r);
+    testVoiceInSignals(r);
+    testSignalMath(r);
+    testSignalLFO(r);
+    testSampleHold(r);
+    testSignalLogic(r);
+    testSignalFilter(r);
+    testSignalNoise(r);
+    testVoiceMpe(r);
+    testVoiceUnison(r);
+    testVoiceContainerAudio(r);
+    testVoiceContainerSaveLoad(r);
+    testVoicePresets(r);
+    testSignalOscPulse(r);
+    testTransportPanic(r);
 
     r.section("Summary");
     r.line("  PASSED: " + juce::String(r.passed));

@@ -867,6 +867,12 @@ struct WavetableDoc {
     int addLibraryEntry(std::unique_ptr<IWavetableFrame> wave,
                         std::string name = {});
 
+    // Build a unique "<base> (copy N)" name for duplicating the entry named
+    // `srcName`. Strips any existing " (copy)" / " (copy N)" suffix so repeated
+    // duplication increments rather than stacking ("Saw (copy 1)", "(copy 2)",
+    // …) and picks the lowest N not already present in the library.
+    std::string makeUniqueCopyName(const std::string& srcName) const;
+
     // Remove a library entry by id. Every cell that referenced it
     // becomes empty (-1). No-op for unknown ids. Returns true if an
     // entry was actually removed.

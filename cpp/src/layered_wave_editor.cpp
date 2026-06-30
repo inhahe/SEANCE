@@ -4231,6 +4231,41 @@ int WavetableDoc::addLibraryEntry(std::unique_ptr<IWavetableFrame> wave,
     return library.back().id;
 }
 
+std::string WavetableDoc::makeUniqueCopyName(const std::string& srcName) const {
+    auto rstrip = [](std::string s) {
+        while (!s.empty() && s.back() == ' ') s.pop_back();
+        return s;
+    };
+    // Strip an existing " (copy)" / " (copy N)" suffix so duplicating a copy
+    // increments the counter instead of nesting suffixes.
+    std::string base = rstrip(srcName);
+    if (!base.empty() && base.back() == ')') {
+        const size_t open = base.rfind(" (copy");
+        if (open != std::string::npos) {
+            // Characters between "(copy" and the closing ")": must be empty
+            // ("(copy)") or whitespace+digits ("(copy 3)") for this to count
+            // as a copy suffix we own.
+            const std::string inner =
+                base.substr(open + 6, base.size() - 1 - (open + 6));
+            bool isCopySuffix = true;
+            for (char c : inner) {
+                if (c == ' ' || (c >= '0' && c <= '9')) continue;
+                isCopySuffix = false;
+                break;
+            }
+            if (isCopySuffix) base = rstrip(base.substr(0, open));
+        }
+    }
+    auto nameTaken = [&](const std::string& n) {
+        for (const auto& e : library) if (e.name == n) return true;
+        return false;
+    };
+    for (int n = 1; ; ++n) {
+        std::string candidate = base + " (copy " + std::to_string(n) + ")";
+        if (!nameTaken(candidate)) return candidate;
+    }
+}
+
 bool WavetableDoc::removeLibraryEntry(int id) {
     if (id < 0) return false;
     const int idx = findLibraryIndexById(id);
@@ -7231,7 +7266,7 @@ public:
         std::string srcName = owner.wave.library[(size_t)srcLibIdx].name;
         if (srcName.empty())
             srcName = "Waveform " + std::to_string(srcLibIdx + 1);
-        const std::string newName = srcName + " (copy)";
+        const std::string newName = owner.wave.makeUniqueCopyName(srcName);
 
         const int newId = owner.wave.addLibraryEntry(srcWavePtr->clone(), newName);
         if (newId < 0) return;
@@ -8393,8 +8428,8 @@ public:
         std::string srcName = owner.wave.library[(size_t)srcIdx].name;
         if (srcName.empty())
             srcName = "Waveform " + std::to_string(srcIdx + 1);
-        const int newId = owner.wave.addLibraryEntry(srcWave->clone(),
-                                                     srcName + " (copy)");
+        const int newId = owner.wave.addLibraryEntry(
+            srcWave->clone(), owner.wave.makeUniqueCopyName(srcName));
         if (newId < 0) return;
         owner.currentLibraryId = newId;
         owner.wave.scatterFromGridSnapshot.reset();
@@ -9143,6 +9178,18 @@ LayeredWaveEditorComponent::LayeredWaveEditorComponent(NodeGraph& g, int nid, st
     : graph(g), nodeId(nid), onApply(std::move(apply))
 {
     openWaveEditors().push_back(this);
+    // Want keyboard focus so a click on any non-focusable surface (the waveform
+    // display, empty editor background) lands focus HERE. Without this, clicking
+    // outside the inline waveform-name TextEditor never removed its focus - JUCE's
+    // mouse-click focus search bubbles up to this editor (the name field's
+    // parent) and, finding no component that wants focus, keeps focus on the
+    // still-editing name field (juce_Component.cpp: a parent of the focused
+    // component aborts the search). The result was that clicking the waveform to
+    // resume editing left the name field "stuck" in edit mode, unlike the slider
+    // fields (which take focus on click and so commit the name via onFocusLost).
+    // Taking focus here drops the name field's focus -> commits it; our own
+    // keyPressed (Ctrl+Z/Y) keeps working after a background click too.
+    setWantsKeyboardFocus(true);
     // Decode existing state. Try wavetable first, then fall back to single
     // layered waveform (wrapped as a 1-frame wavetable), then default sine.
     auto* nd = graph.findNode(nodeId);

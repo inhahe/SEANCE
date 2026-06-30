@@ -25,7 +25,8 @@ namespace SoundShop {
 //     rewrite the node's pins.
 //   - Optional shape editor (embedded LayerStackComponent) sampled by shape().
 //   - "Language reference" help button + Close.
-class MidiScriptEditorComponent : public juce::Component {
+class MidiScriptEditorComponent : public juce::Component,
+                                  private juce::Timer {
 public:
     MidiScriptEditorComponent(NodeGraph& graph, int nodeId,
                               std::function<void()> onChanged);
@@ -35,6 +36,8 @@ public:
     void paint(juce::Graphics& g) override;
 
 private:
+    void timerCallback() override;
+
     NodeGraph& graph;
     int nodeId;
     std::function<void()> onChanged;
@@ -57,8 +60,20 @@ private:
     juce::Label    shapeLabel { {}, "Shape (sampled by shape(pos)):" };
     std::unique_ptr<LayerStackComponent> shapeStack;
 
-    juce::TextButton helpBtn  { "Language reference\u2026" };
+    juce::TextButton helpBtn  { "Language reference..." };
     juce::TextButton closeBtn { "Close" };
+
+    // One-line red error strip at the bottom, shown only when the current
+    // program fails to compile. Fed by validateScript() (a message-thread
+    // linter). Hidden when the script is clean.
+    juce::Label errorLabel;
+
+    // Compile the current program with a throwaway runtime and show/hide the
+    // error strip. Cheap and side-effect-free for Lua (luaL_loadstring) and a
+    // no-op for Builtin (it parses lazily and never reports load errors).
+    // Debounced via the Timer so a heavy Lua top-level isn't re-run on every
+    // keystroke.
+    void validateScript();
 
     void loadFromNode();
     void commitToNode();

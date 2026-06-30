@@ -220,7 +220,13 @@ void SignalShapeProcessor::reloadIfScriptChanged() {
     const std::string& src = (doc.language == ScriptLang::Wasm) ? doc.wasmPath
                                                                 : doc.expr;
     std::string err;
-    runtime->load(src, err);
+    bool ok = runtime->load(src, err);
+    // Latch the error state for the node-graph badge (read on the message
+    // thread) and log the failure so there's a persistent record.
+    scriptHasError.store(!ok, std::memory_order_relaxed);
+    if (!ok)
+        juce::Logger::writeToLog("Signal Shape \"" + juce::String(node.name)
+                                 + "\": " + juce::String(err));
     runtime->reset();
 
     // A streaming program (defines stream()) owns its own sample loop and pulls
@@ -1048,6 +1054,16 @@ SignalShapeEditorComponent::SignalShapeEditorComponent(NodeGraph& g, int nid,
     scriptNote.setJustificationType(juce::Justification::topLeft);
     scriptNote.setMinimumHorizontalScale(1.0f);
 
+    // Error strip (hidden until a compile fails).
+    addChildComponent(errorLabel);
+    errorLabel.setColour(juce::Label::textColourId, juce::Colours::orangered);
+    errorLabel.setColour(juce::Label::backgroundColourId, juce::Colour(0xff2a1414));
+    errorLabel.setFont(juce::Font(juce::Font::getDefaultMonospacedFontName(), 12.0f,
+                                  juce::Font::plain));
+    errorLabel.setMinimumHorizontalScale(1.0f);
+    errorLabel.setTooltip("The program failed to compile. The output stays at its "
+                          "neutral level until you fix the error.");
+
     addAndMakeVisible(triggerLabel);
     addAndMakeVisible(triggerEditor);
     triggerEditor.setMultiLine(false);
@@ -1313,6 +1329,7 @@ SignalShapeEditorComponent::SignalShapeEditorComponent(NodeGraph& g, int nid,
     // for more. The variables/functions reference is now a button (not an
     // always-visible block), freeing ~150px for the layer stack.
     setSize(720, 1016);
+    validateScript();   // surface any pre-existing error in the loaded script
 }
 
 SignalShapeEditorComponent::~SignalShapeEditorComponent() {
@@ -1403,6 +1420,38 @@ void SignalShapeEditorComponent::commitToNode() {
     if (!nd) return;
     nd->script = doc.encode();
     if (onChanged) onChanged();
+    // Re-lint after edits settle (300ms debounce) so a heavy Lua top-level
+    // isn't recompiled on every keystroke.
+    startTimer(300);
+}
+
+void SignalShapeEditorComponent::timerCallback() {
+    stopTimer();
+    validateScript();
+}
+
+void SignalShapeEditorComponent::validateScript() {
+    std::string err;
+    // Pick the effective rate from the capability matrix (mirrors
+    // SignalShapeProcessor::reloadIfScriptChanged).
+    ScriptRate effRate = doc.rate;
+    if (!scriptLangSupportsRate(doc.language, effRate))
+        effRate = (doc.language == ScriptLang::Wasm) ? ScriptRate::PerBlock
+                                                     : ScriptRate::PerSample;
+    if (auto rt = makeScriptRuntime(doc.language, ScriptRole::Unified, effRate)) {
+        // Wasm validates its binary path; Builtin/Lua compile the expression.
+        const std::string& src = (doc.language == ScriptLang::Wasm) ? doc.wasmPath
+                                                                    : doc.expr;
+        rt->load(src, err);
+    }
+    const bool hasErr = !err.empty();
+    if (hasErr)
+        errorLabel.setText("Script error: " + juce::String(err),
+                           juce::dontSendNotification);
+    if (errorLabel.isVisible() != hasErr) {
+        errorLabel.setVisible(hasErr);
+        resized();   // claim / release the bottom strip
+    }
 }
 
 void SignalShapeEditorComponent::updateLanguageUI() {
@@ -1455,10 +1504,10 @@ void SignalShapeEditorComponent::updateLanguageUI() {
 
     // Point the reference button at the active language.
     if (isLua) {
-        varsHelpBtn.setButtonText("Lua reference\u2026");
+        varsHelpBtn.setButtonText("Lua reference...");
         varsHelpBtn.setTooltip(kSignalShapeLuaHelp);
     } else {
-        varsHelpBtn.setButtonText("Variables & functions\u2026");
+        varsHelpBtn.setButtonText("Variables & functions...");
         varsHelpBtn.setTooltip(kSignalShapeHelp);
     }
 }
@@ -1576,8 +1625,9 @@ void SignalShapeEditorComponent::resized() {
     // it's a button in the bottom row, so all the space it used to take goes to
     // the layer stack.
     const int btnH     = 28;
+    const int errH     = errorLabel.isVisible() ? (22 + 6) : 0;  // bottom error strip
     const int fixedBottom = speedH + clockH + exprH + trigH + repeatH
-                          + sigH + midiH + kindH + btnH;
+                          + sigH + midiH + kindH + btnH + errH;
 
     if (layerStack) {
         // One WaveLayerEditor row is ~238px; reserve enough that at least one
@@ -1677,6 +1727,12 @@ void SignalShapeEditorComponent::resized() {
         kindLabel.setBounds(row.removeFromLeft(60));
         kindCombo.setBounds(row.removeFromLeft(120));
         r.removeFromTop(8);
+    }
+
+    // Error strip at the very bottom (only when a compile failed).
+    if (errorLabel.isVisible()) {
+        errorLabel.setBounds(r.removeFromBottom(22));
+        r.removeFromBottom(6);
     }
 
     // Bottom button row: Manual Trigger (left), the variables/functions help

@@ -8,7 +8,8 @@
 namespace SoundShop {
 
 class NodeGraphComponent : public juce::Component,
-                           public juce::TooltipClient {
+                           public juce::TooltipClient,
+                           private juce::Timer {
 public:
     NodeGraphComponent(NodeGraph& graph);
 
@@ -31,6 +32,25 @@ public:
     bool keyPressed(const juce::KeyPress& key) override;
 
     void fitAll();
+
+    // Frame the view on a specific set of nodes (by id), e.g. the nodes a
+    // tracker import just created, so the view focuses on what was added
+    // instead of zooming out to also include distant pre-existing nodes (a
+    // parked Master Out, an unrelated synth in another corner of the canvas).
+    // Unknown ids are skipped; if none resolve, falls back to fitAll().
+    void fitNodes(const std::vector<int>& nodeIds);
+
+    // Auto-Fit mode (View menu toggle). When on, the view is continuously kept
+    // framed to the whole graph: a lightweight timer watches the all-nodes
+    // bounding box and re-fits whenever it changes (node added / removed /
+    // moved / resized, project loaded, etc.) and on window resize. This is the
+    // single, robust change-detection point - far less fragile than sprinkling
+    // fitAll() calls at every node add/remove site. A manual zoom/pan releases
+    // the lock (auto-follow semantics) and fires onAutoFitViewChanged(false) so
+    // the host can untick the menu and persist the new state.
+    void setAutoFitView(bool on);
+    bool isAutoFitView() const { return autoFitView; }
+    std::function<void(bool)> onAutoFitViewChanged;
 
     // After a project load (or any external mutation of graph.viewZoom),
     // re-evaluate which view to show: restore the saved pan/zoom if one was
@@ -59,6 +79,15 @@ public:
     // graph may have rebuilt since the dialog opened).
     std::function<void(int)> onSignalShapeManualTrigger;
 
+    // Returns true when node `id` is a script-bearing node (MIDI Script, ...)
+    // whose live processor reports a compile/link error in its current script.
+    // main_window wires this to GraphProcessor::getProcessorForNode +
+    // dynamic_cast<MidiScriptProcessor*>::hasScriptError(). Used by drawNode to
+    // paint a red "!" error badge and getTooltip to explain it. May be null
+    // before wiring, or return false when the node isn't a script node / has no
+    // live processor yet.
+    std::function<bool(int)> getNodeScriptError;
+
     // Returns the audio graph's live {sampleRate, blockSize}. Wired by
     // main_window to the audio engine. Used by the cable right-click menu to
     // show the exact Param update rate (sampleRate / blockSize) and the block
@@ -82,9 +111,44 @@ public:
 private:
     NodeGraph& graph;
 
+    // Fallback tooltip for a param-row slider when the mouse isn't over a pin.
+    // Returns help text for the slider under canvasPos (currently Terrain
+    // Synth params), or "" if no row matches. Called by getTooltip().
+    juce::String paramRowTooltip(const Node& node, juce::Point<float> canvasPos);
+
     // View transform
     float zoom = 1.0f;
     juce::Point<float> panOffset{0, 0};
+
+    // --- Scoped inner-graph view (Voice container drill-in) ----------------
+    // Which container's interior the canvas currently shows. -1 = top level
+    // (only nodes with voiceContainerId == -1 are drawn/hit-tested). Set to a
+    // VoiceContainer's id to show only that container's inner nodes. The audio
+    // build, latency walk and save path iterate the FULL graph regardless of
+    // this - viewScope only filters what's visible/interactive on the canvas.
+    // See poly-voice-architecture.md.
+    int viewScope = -1;
+    bool nodeVisible(const Node& n) const { return n.voiceContainerId == viewScope; }
+    // A link is drawn/hit-tested only when BOTH its endpoint nodes are visible
+    // in the current scope. Cross-scope links never exist in practice (a
+    // container's external cables touch top-level nodes; inner cables touch
+    // inner nodes), so this also hides a container's outer cables while you're
+    // inside it, and vice-versa.
+    bool linkVisible(const Link& l) const {
+        const Node* a = nullptr; const Node* b = nullptr;
+        for (const auto& n : graph.nodes) {
+            for (const auto& p : n.pinsOut) if (p.id == l.startPin) a = &n;
+            for (const auto& p : n.pinsIn)  if (p.id == l.endPin)   b = &n;
+        }
+        return a && b && nodeVisible(*a) && nodeVisible(*b);
+    }
+    // Enter/exit a container's interior (re-fits the view to the new scope).
+    void enterScope(int containerId);
+    void exitScope();
+    // Screen-space rect of the breadcrumb "exit" chip drawn while scoped.
+    // Empty at top level; hit-tested in mouseDown to leave the scope.
+    juce::Rectangle<int> breadcrumbExitRect;
+    void drawBreadcrumb(juce::Graphics& g);
 
     // True until the first resized()/paint() callback applies the initial
     // view (either restoring the saved pan/zoom from graph.viewZoom/PanX/PanY
@@ -101,6 +165,24 @@ private:
     // fitAll). NodeGraph itself owns the saved view; the component just
     // mirrors its own working values into the graph as they change.
     void publishViewState();
+
+    // Shared framing math for fitAll()/fitNodes(): zoom+pan so the given
+    // canvas-space bounding box (plus margin) fits the viewport, centred.
+    void applyFitBounds(float minX, float minY, float maxX, float maxY);
+
+    // Compute the union bounding box of every node (canvas space). Returns
+    // false (and leaves `out` untouched) when the graph is empty. Shared by
+    // fitAll() and the auto-fit timer's change detector.
+    bool computeAllNodesBounds(juce::Rectangle<float>& out) const;
+
+    // Auto-Fit state. autoFitView gates the whole feature; lastAutoFitBounds
+    // is the box we last fitted to, so the timer only re-fits when it actually
+    // changes (no needless work / view churn while the graph is static).
+    bool autoFitView = false;
+    bool haveLastAutoFitBounds = false;
+    juce::Rectangle<float> lastAutoFitBounds;
+    void timerCallback() override;          // auto-fit change detector
+    void releaseAutoFitForManualView();     // a manual zoom/pan turns auto-fit off
 
     // Interaction state
     enum class DragMode { None, Pan, MoveNode, DragLink, SelectBox, DragParam };
@@ -121,6 +203,9 @@ private:
     int hoveredLinkId = -1;   // cable currently within right-click distance of
                               //   the cursor (highlighted so the user can see
                               //   what a right-click / click will target)
+    int hoveredPinId = -1;    // pin whose interactive region (dot + label row
+                              //   band, i.e. the whole right-clickable area) is
+                              //   under the cursor; highlighted on hover
 
     // Drawing helpers
     void drawGrid(juce::Graphics& g);
@@ -136,12 +221,31 @@ private:
     // pass the opposite of the source pin's direction so a target never
     // resolves to the wrong side / the source pin itself.
     int pinAtPoint(juce::Point<float> canvasPos, bool& isOutput, int wantInput = -1);
+    // The pin whose top-region ROW BAND (its dot AND readable label text)
+    // contains canvasPos, or nullptr. The row band is the full node width split
+    // at the node centre when a row carries both an input (left) and output
+    // (right) pin; a single-pin row owns its whole width. Assumes the caller has
+    // already confirmed the point is over `node`. `isInput` receives the side.
+    // Shared by right-click resolution and hover highlighting so the two agree.
+    const Pin* pinInRowBand(const Node& node, juce::Point<float> canvasPos,
+                            bool& isInput);
+    // Resolve the pin under the cursor for HOVER: the dot first (generous
+    // radius, may hang outside the node edge), then the row band. Returns the
+    // pin id (or -1) and sets isOut. Mirrors the right-click pin resolution.
+    int pinUnderCursor(juce::Point<float> canvasPos, bool& isOut);
     int linkAtPoint(juce::Point<float> canvasPos);
     juce::Rectangle<float> getNodeBounds(const Node& node) const;
     juce::Point<float> getPinPosition(const Node& node, const Pin& pin) const;
 
     // Context menu
     void showBackgroundMenu(juce::Point<float> canvasPos);
+    // Build a Voice (polyphonic) container plus a ready-made inner patch and
+    // container settings for the given factory preset. preset ids:
+    //   0 = Basic (FM Synth)   1 = Warm Pad   2 = Pluck
+    //   3 = Supersaw Lead      4 = Noise Perc
+    // Centres the new nodes around `p`. Commits one undo snapshot and fires
+    // onNodeEdited so the audio graph rebuilds. See poly-voice-architecture.md.
+    void createVoicePreset(juce::Point<float> p, int preset);
     void showNodeMenu(Node& node);
     void showLinkMenu(int linkId);
 

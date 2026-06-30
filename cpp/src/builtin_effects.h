@@ -157,6 +157,9 @@ public:
         }
     }
     void releaseResources() override {}
+    // Transport panic (Stop): flush the modulated delay line so no buffered
+    // signal keeps reading out after the sound is cut.
+    void reset() override { prepareToPlay(sampleRate, 0); phase = 0.0; }
     void processBlock(juce::AudioBuffer<float>& buf, juce::MidiBuffer&) override {
         applySignalModulations(node, buf);
         float rate  = paramByName(node, "Rate", 5.0f);
@@ -227,6 +230,9 @@ public:
         }
     }
     void releaseResources() override {}
+    // Transport panic (Stop): flush the feedback delay line so the flange
+    // recirculation doesn't keep ringing after the sound is cut.
+    void reset() override { prepareToPlay(sampleRate, 0); phase = 0.0; }
     void processBlock(juce::AudioBuffer<float>& buf, juce::MidiBuffer&) override {
         applySignalModulations(node, buf);
         float rate     = paramByName(node, "Rate", 0.3f);
@@ -293,6 +299,13 @@ public:
         for (auto& s : allpassState) s = {};
     }
     void releaseResources() override {}
+    // Transport panic (Stop): clear the allpass chain + feedback so the
+    // resonant swirl stops the instant the sound is cut.
+    void reset() override {
+        for (auto& s : allpassState) s = {};
+        lastOut[0] = lastOut[1] = 0.0f;
+        phase = 0.0;
+    }
     void processBlock(juce::AudioBuffer<float>& buf, juce::MidiBuffer&) override {
         applySignalModulations(node, buf);
         float rate     = paramByName(node, "Rate", 0.5f);
@@ -526,6 +539,9 @@ public:
         }
     }
     void releaseResources() override {}
+    // Transport panic (Stop): empty the delay/feedback buffer so the echo
+    // repeats stop immediately instead of decaying for seconds.
+    void reset() override { prepareToPlay(sampleRate, 0); }
     void processBlock(juce::AudioBuffer<float>& buf, juce::MidiBuffer&) override {
         applySignalModulations(node, buf);
         float delayMs  = paramByName(node, "Delay", 300.0f);
@@ -817,6 +833,9 @@ public:
         predelayWritePos = 0;
     }
     void releaseResources() override {}
+    // Transport panic (Stop): re-zero every comb/allpass and the pre-delay so
+    // the reverb tail is cut dead instead of ringing out for its decay time.
+    void reset() override { prepareToPlay(sampleRate, 0); }
 
     void processBlock(juce::AudioBuffer<float>& buf, juce::MidiBuffer&) override {
         applySignalModulations(node, buf);
@@ -1287,6 +1306,9 @@ class FMSynthProcessor : public juce::AudioProcessor {
 public:
     FMSynthProcessor(Node& n) : node(n) { voices.resize(16); }
     const juce::String getName() const override { return "FM Synth"; }
+    // Transport panic (Stop): drop every sounding voice so notes stop dead
+    // instead of finishing their release tail.
+    void reset() override { voices.clear(); }
     void prepareToPlay(double sr, int) override { sampleRate = sr; }
     void releaseResources() override {}
 
@@ -1517,6 +1539,9 @@ class PDSynthProcessor : public juce::AudioProcessor {
 public:
     PDSynthProcessor(Node& n) : node(n) { voices.resize(12); }
     const juce::String getName() const override { return "PD Synth"; }
+    // Transport panic (Stop): drop every sounding voice so notes stop dead
+    // instead of finishing their release tail.
+    void reset() override { voices.clear(); }
     void prepareToPlay(double sr, int) override { sampleRate = sr; }
     void releaseResources() override {}
 
@@ -1705,6 +1730,9 @@ class ParticleSynthProcessor : public juce::AudioProcessor {
 public:
     ParticleSynthProcessor(Node& n) : node(n) { grains.reserve(128); }
     const juce::String getName() const override { return "Particle"; }
+    // Transport panic (Stop): drop every in-flight grain so the particle
+    // cloud stops dead instead of finishing its tails.
+    void reset() override { grains.clear(); }
     void prepareToPlay(double sr, int) override { sampleRate = sr; }
     void releaseResources() override {}
 
@@ -2459,6 +2487,12 @@ public:
     const juce::String getName() const override { return "Wavelet Reverb"; }
     void prepareToPlay(double sr, int) override { sampleRate = sr; }
     void releaseResources() override {}
+    // Transport panic (Stop): zero the wavelet tail buffers so the reverb
+    // smear stops immediately when the sound is cut.
+    void reset() override {
+        tailBufL.assign(tailBufL.size(), 0.0f);
+        tailBufR.assign(tailBufR.size(), 0.0f);
+    }
 
     void processBlock(juce::AudioBuffer<float>& buf, juce::MidiBuffer&) override {
         applySignalModulations(node, buf);
@@ -2653,6 +2687,275 @@ private:
         gains = curve.evaluate(halfBins);
         for (auto& g : gains) g = juce::jlimit(0.0f, 8.0f, g); // sane magnitude range
         gainsBins = halfBins;
+    }
+};
+
+// ==============================================================================
+// SIGNAL EQ - curve-point equaliser whose every point is signal-modulatable
+//
+// Each "point" is a draggable handle in the (log-frequency, dB-gain) plane that
+// IS, mathematically, a peaking biquad: a bump (or dip) of height `P<n> Gain`
+// dB centred on `P<n> Freq` Hz, with a shared bandwidth set by the global Width
+// (Q). The combined response is the product of every point's bell. This unifies
+// "bins of arbitrary width and offset" and "curve points" into one model: move a
+// point's frequency to slide its bump, move its gain to raise/lower it, set
+// Width to make all bumps fat or narrow.
+//
+// Why points are stored AS node params (P<n> Freq / P<n> Gain): the generic
+// param panel then shows a slider per coordinate, each right-clickable to "Add
+// control input", so EVERY point coordinate is signal-modulatable for free via
+// the on-demand Param-pin mechanism (#88) - no bespoke modulation plumbing. It
+// also means save/load, undo, and automation all work with zero extra code
+// (params are already serialised). The editor dialog is pure sugar over the same
+// params (drag a handle = set two params).
+//
+// Two engines, user-selectable (Mode param), because the user asked for a
+// latency/CPU/character tradeoff to be exposed rather than chosen for them:
+//   Mode 0  Zero-latency  - cascade of RBJ peaking biquads, processed per
+//                           sample. Truly zero added latency (like every other
+//                           built-in effect; SEANCE compensates plugin latency
+//                           but a zero-latency design never needs aligning).
+//                           Minimum-phase: introduces phase shift around each
+//                           bump, the classic analog-EQ character.
+//   Mode 1  FFT exact      - block-local Hann overlap-add STFT (75% overlap),
+//                           multiplying each bin by the EXACT same magnitude
+//                           response the biquad cascade would produce (computed
+//                           from the same coefficients), but with phase
+//                           preserved -> linear/zero phase. Costs an FFT per
+//                           block and smears sharp transients slightly, the
+//                           price for a phase-clean curve. Still block-local, so
+//                           it adds NO inter-block latency either.
+// Both modes share updateCoefficients(), so the magnitude response is identical
+// between them - only the phase behaviour (and CPU/transient character) differs.
+//
+// Script: "__signaleq__"  (no payload; all state lives in params)
+// Params: Mode, Width, Mix, FFT Size, then P<n> Freq / P<n> Gain per point.
+// ==============================================================================
+class SignalEQProcessor : public juce::AudioProcessor {
+public:
+    SignalEQProcessor(Node& n) : node(n) {}
+    const juce::String getName() const override { return "Signal EQ"; }
+
+    void prepareToPlay(double sr, int) override {
+        sampleRate = sr;
+        for (auto& b : bands) b.reset();
+    }
+    void releaseResources() override {}
+
+    void processBlock(juce::AudioBuffer<float>& buf, juce::MidiBuffer&) override {
+        applySignalModulations(node, buf);
+
+        const int n = buf.getNumSamples();
+        const int ch = std::min(2, buf.getNumChannels());
+        if (n == 0 || ch == 0) return;
+
+        const int mode = (int)paramByName(node, "Mode", 0.0f);
+        const float mix = juce::jlimit(0.0f, 1.0f, paramByName(node, "Mix", 1.0f));
+
+        updateCoefficients();   // rebuild biquad bank from points + Width
+
+        if (mode == 0) {
+            // ---- Zero-latency biquad cascade ----
+            for (int c = 0; c < ch; ++c) {
+                float* data = buf.getWritePointer(c);
+                for (int i = 0; i < n; ++i) {
+                    float x = data[i];
+                    float y = x;
+                    for (auto& b : bands) {
+                        auto& s = b.state[c];
+                        const auto& co = b.co;
+                        float out = co.b0 * y + co.b1 * s.x1 + co.b2 * s.x2
+                                  - co.a1 * s.y1 - co.a2 * s.y2;
+                        s.x2 = s.x1; s.x1 = y;
+                        s.y2 = s.y1; s.y1 = out;
+                        y = out;
+                    }
+                    data[i] = x * (1.0f - mix) + y * mix;
+                }
+            }
+            return;
+        }
+
+        // ---- FFT exact (phase-clean) mode ----
+        int fftExp = juce::jlimit(8, 12, (int)paramByName(node, "FFT Size", 11.0f));
+        int fftSize = 1 << fftExp;
+        while (fftSize > n) fftSize /= 2;     // can't exceed the block
+        if (fftSize < 16) {                   // block too short to FFT -> fall back
+            for (int c = 0; c < ch; ++c) {
+                float* data = buf.getWritePointer(c);
+                for (int i = 0; i < n; ++i) {
+                    float x = data[i];
+                    float y = x;
+                    for (auto& b : bands) {
+                        auto& s = b.state[c];
+                        const auto& co = b.co;
+                        float out = co.b0 * y + co.b1 * s.x1 + co.b2 * s.x2
+                                  - co.a1 * s.y1 - co.a2 * s.y2;
+                        s.x2 = s.x1; s.x1 = y;
+                        s.y2 = s.y1; s.y1 = out;
+                        y = out;
+                    }
+                    data[i] = x * (1.0f - mix) + y * mix;
+                }
+            }
+            return;
+        }
+        int halfBins = fftSize / 2 + 1;
+        ensureFFTGains(halfBins, fftSize);
+
+        FFT fft(fftSize);
+        std::vector<float> window(fftSize);
+        for (int i = 0; i < fftSize; ++i)
+            window[i] = 0.5f * (1.0f - std::cos(6.28318530718f * i / fftSize)); // Hann
+        const int hop = std::max(1, fftSize / 4); // 75% overlap
+
+        for (int c = 0; c < ch; ++c) {
+            float* data = buf.getWritePointer(c);
+            std::vector<float> dry(data, data + n);
+            std::vector<float> out(n, 0.0f);
+            std::vector<float> norm(n, 0.0f);
+
+            auto processFrame = [&](int start) {
+                std::vector<float> windowed(fftSize);
+                for (int i = 0; i < fftSize; ++i)
+                    windowed[i] = data[start + i] * window[i];
+                std::vector<std::complex<float>> spec;
+                fft.forwardReal(windowed, spec);
+                for (int k = 0; k < halfBins && k < (int)spec.size(); ++k)
+                    spec[k] *= fftGains[(size_t)k];      // magnitude scale, phase kept
+                std::vector<float> time;
+                fft.inverseReal(spec, time);
+                for (int i = 0; i < fftSize; ++i) {
+                    out[start + i]  += time[i] * window[i];
+                    norm[start + i] += window[i] * window[i];
+                }
+            };
+
+            int start = 0;
+            for (; start + fftSize <= n; start += hop) processFrame(start);
+            if (n >= fftSize && ((n - fftSize) % hop) != 0) processFrame(n - fftSize);
+
+            for (int i = 0; i < n; ++i) {
+                float wet = norm[i] > 1e-6f ? out[i] / norm[i] : dry[i];
+                data[i] = dry[i] * (1.0f - mix) + wet * mix;
+            }
+        }
+    }
+
+    double getTailLengthSeconds() const override { return 0; }
+    bool acceptsMidi() const override { return true; }
+    bool producesMidi() const override { return true; }
+    bool isBusesLayoutSupported(const BusesLayout&) const override { return true; }
+    juce::AudioProcessorEditor* createEditor() override { return nullptr; }
+    bool hasEditor() const override { return false; }
+    int getNumPrograms() override { return 1; }
+    int getCurrentProgram() override { return 0; }
+    void setCurrentProgram(int) override {}
+    const juce::String getProgramName(int) override { return {}; }
+    void changeProgramName(int, const juce::String&) override {}
+    void getStateInformation(juce::MemoryBlock&) override {}
+    void setStateInformation(const void*, int) override {}
+
+    // Point-count limits. Like the Parametric EQ's bands, the active count is the
+    // number of contiguous "P<n> Freq" params present; points are added/removed
+    // via the node context menu (and the editor), pushing/popping the two
+    // P<n> Freq / P<n> Gain params as a pair.
+    static constexpr int kMaxPoints = 16;
+    static constexpr int kMinPoints = 1;
+
+    static int countPoints(const Node& node) {
+        int n = 0;
+        while (n < kMaxPoints) {
+            std::string key = "P" + std::to_string(n + 1) + " Freq";
+            bool found = false;
+            for (const auto& p : node.params)
+                if (p.name == key) { found = true; break; }
+            if (!found) break;
+            ++n;
+        }
+        return n;
+    }
+
+private:
+    Node& node;
+    double sampleRate = 44100;
+
+    struct Coeffs { float b0=1,b1=0,b2=0,a1=0,a2=0; };
+    struct BiquadState { float x1=0,x2=0,y1=0,y2=0; };
+    struct Band {
+        Coeffs co;
+        BiquadState state[2];
+        void reset() { state[0] = state[1] = {}; }
+    };
+    std::vector<Band> bands;
+
+    std::vector<float> fftGains;   // per-bin magnitude multiplier (FFT mode)
+    int   fftGainsBins = -1;
+    float fftGainsSig  = 0.0f;     // signature of last-built gains (cache key)
+
+    // RBJ peaking-EQ coefficients for one point (freq, gainDb) with shared Q.
+    Coeffs peakCoeffs(float freq, float gainDb, float Q) const {
+        freq = juce::jlimit(20.0f, (float)(sampleRate * 0.49), freq);
+        Q    = juce::jlimit(0.1f, 24.0f, Q);
+        const float kPi = 3.14159265358979323846f;
+        float w0 = 2.0f * kPi * freq / (float)sampleRate;
+        float cosw0 = std::cos(w0);
+        float sinw0 = std::sin(w0);
+        float alpha = sinw0 / (2.0f * Q);
+        float A = std::pow(10.0f, gainDb / 40.0f);
+        float b0 = 1.0f + alpha * A;
+        float b1 = -2.0f * cosw0;
+        float b2 = 1.0f - alpha * A;
+        float a0 = 1.0f + alpha / A;
+        float a1 = -2.0f * cosw0;
+        float a2 = 1.0f - alpha / A;
+        float inv = 1.0f / a0;
+        return { b0*inv, b1*inv, b2*inv, a1*inv, a2*inv };
+    }
+
+    void updateCoefficients() {
+        int np = countPoints(node);
+        float Q = juce::jlimit(0.1f, 24.0f, paramByName(node, "Width", 1.0f));
+        if ((int)bands.size() != np) bands.resize((size_t)np); // preserve state
+        for (int b = 0; b < np; ++b) {
+            std::string prefix = "P" + std::to_string(b + 1) + " ";
+            float freq = paramByName(node, (prefix + "Freq").c_str(), 1000.0f);
+            float gain = paramByName(node, (prefix + "Gain").c_str(), 0.0f);
+            bands[(size_t)b].co = peakCoeffs(freq, gain, Q);
+        }
+    }
+
+    // Build the per-bin magnitude response of the biquad cascade (called after
+    // updateCoefficients()). Magnitude of a digital biquad at angular freq w:
+    //   |H| = |b0 + b1 z^-1 + b2 z^-2| / |1 + a1 z^-1 + a2 z^-2|,  z^-1 = e^-jw.
+    // The cascade's magnitude is the product over bands - identical to what the
+    // biquad mode actually does, so switching Mode keeps the curve put.
+    void ensureFFTGains(int halfBins, int fftSize) {
+        // Cheap signature so we only rebuild when something changed.
+        float sig = (float)bands.size() * 7.0f + (float)fftSize;
+        for (auto& b : bands)
+            sig += b.co.b0 + b.co.b1 * 3.0f + b.co.b2 * 5.0f
+                 + b.co.a1 * 11.0f + b.co.a2 * 13.0f;
+        if (fftGainsBins == halfBins && std::abs(sig - fftGainsSig) < 1e-9f
+            && (int)fftGains.size() == halfBins) return;
+
+        fftGains.assign((size_t)halfBins, 1.0f);
+        const float kTwoPi = 6.28318530718f;
+        for (int k = 0; k < halfBins; ++k) {
+            float w = kTwoPi * (float)k / (float)fftSize;
+            std::complex<float> z1(std::cos(-w), std::sin(-w)); // e^-jw
+            std::complex<float> z2 = z1 * z1;
+            float mag = 1.0f;
+            for (auto& b : bands) {
+                std::complex<float> num = b.co.b0 + b.co.b1 * z1 + b.co.b2 * z2;
+                std::complex<float> den = 1.0f + b.co.a1 * z1 + b.co.a2 * z2;
+                float d = std::abs(den);
+                mag *= (d > 1e-12f) ? std::abs(num) / d : 1.0f;
+            }
+            fftGains[(size_t)k] = juce::jlimit(0.0f, 16.0f, mag);
+        }
+        fftGainsBins = halfBins;
+        fftGainsSig  = sig;
     }
 };
 
@@ -2853,6 +3156,9 @@ class AdditiveSynthProcessor : public juce::AudioProcessor {
 public:
     AdditiveSynthProcessor(Node& n) : node(n) { voices.resize(12); }
     const juce::String getName() const override { return "Additive"; }
+    // Transport panic (Stop): drop every sounding voice so notes stop dead
+    // instead of finishing their release tail.
+    void reset() override { voices.clear(); }
     void prepareToPlay(double sr, int) override { sampleRate = sr; }
     void releaseResources() override {}
 
@@ -3586,6 +3892,9 @@ class SpectralGrainProcessor : public juce::AudioProcessor {
 public:
     SpectralGrainProcessor(Node& n) : node(n) { voices.resize(8); }
     const juce::String getName() const override { return "Spectral Grain"; }
+    // Transport panic (Stop): drop every voice and in-flight grain so the
+    // granular cloud stops dead instead of ringing out.
+    void reset() override { voices.clear(); activeGrains.clear(); }
 
     void prepareToPlay(double sr, int) override {
         sampleRate = sr;

@@ -26,6 +26,12 @@ struct Vec2 {
 
 enum class PinKind { Audio, Midi, Param, Signal }; // Signal = audio-rate control signal (mono)
 
+// Transient (not serialized) per-node plugin instantiation state, used to drive
+// the async project-load path. When a project is opened, plugin nodes appear
+// immediately as Pending; a serial background loader walks them one at a time
+// (Loading), then marks each Ready or Failed. None = node has no plugin to load.
+enum class PluginLoadState { None, Pending, Loading, Ready, Failed };
+
 // Two pin kinds are compatible at the cable level if they're either the same
 // kind, or both control kinds (Param + Signal). Param is conceptually
 // block-rate and Signal is audio-rate, but at the routing layer we treat them
@@ -74,7 +80,35 @@ enum class NodeType {
     // wired anywhere a control cable is accepted (filter cutoff, wavetable
     // position, a different synth's Pressure input, etc.). One MIDI input, four
     // Signal outputs. See midi_breakout_node.h.
-    MidiBreakout
+    MidiBreakout,
+    // --- Per-voice polyphony (see poly-voice-architecture.md). NOTE: still
+    // append-only; node.type is stored as a raw int. ---
+    // VoiceContainer: a polyphonic instrument built from graph primitives. On
+    // the main canvas it is one node (MIDI in, audio out). Internally it owns an
+    // inner subgraph (nodes whose voiceContainerId == this node's id) that is
+    // instantiated N times - once per sounding MIDI note - and summed. Driven by
+    // PolyVoiceProcessor.
+    VoiceContainer,
+    // Voice-context source modules. These live INSIDE a VoiceContainer's inner
+    // graph and expose the per-note state of the voice they're being rendered
+    // for as a Signal output. The container writes each voice's value into the
+    // module's output before rendering that voice. No inputs.
+    // RESERVED: standalone context-signal source nodes. Superseded for M1 by the
+    // consolidated VoiceIn puck (which carries Pitch/Gate/Velocity as output pins
+    // alongside raw MIDI), so these are not built or offered in the UI yet. Kept
+    // in the enum (append-only - node.type is a raw int) for a possible future
+    // "separate context modules" mode. createNodeProcessor returns Passthrough.
+    VoicePitch,     // note pitch: Signal out (note number and/or Hz)
+    VoiceGate,      // 1.0 while the note is held, 0.0 after note-off
+    VoiceVelocity,  // note-on velocity, 0..1
+    // Voice boundary pucks. These live INSIDE a VoiceContainer's inner graph.
+    // VoiceIn is the single per-note context source: the container drives it with
+    // the current voice's MIDI (raw per-voice note stream, for MIDI-driven synths)
+    // AND its Pitch (Hz), Gate (0/1) and Velocity (0..1) as Signal outputs. VoiceOut
+    // is the inner audio sink - the per-voice patch's audio leaves through it and is
+    // summed across voices (mapped to the inner graph's output node, like Output).
+    VoiceIn,
+    VoiceOut
 };
 
 struct Pin {
@@ -398,6 +432,21 @@ struct Node {
 
     std::string script;
 
+    // Oscilloscope display settings (node.script == "__oscilloscope__").
+    //   scopeTriggered: true  = triggered acquisition - the display is aligned
+    //                           to a level crossing of the chosen slope so a
+    //                           periodic waveform appears stationary;
+    //                   false = roll mode - free-running strip chart, the most
+    //                           recent samples are drawn each frame (newest at
+    //                           the right edge), no edge alignment.
+    //   scopeTrigLevel:  trigger threshold in -1..1 (0 = zero crossing).
+    //   scopeTrigRising: edge slope to trigger on (true = rising, false = falling).
+    // Serialized in project_file.cpp only when non-default; defaults give a
+    // brand-new scope (and any pre-this-feature project) a stable triggered view.
+    bool  scopeTriggered = true;
+    float scopeTrigLevel = 0.0f;
+    bool  scopeTrigRising = true;
+
     // Performance mode - play preset melody by pressing any keys
     bool performanceMode = false;
     int performanceReleaseMode = 1;   // 0=OnKeyUp, 1=OnNextEvent (legato)
@@ -478,6 +527,11 @@ struct Node {
     bool pluginStateDirty = true;
     std::string cachedPluginStateBase64;
 
+    // Transient async-load state (NOT serialized). Drives the per-node loading
+    // badge and the serial background loader after a project open. See
+    // MainContentComponent::beginAsyncPluginLoad.
+    PluginLoadState pluginLoadState = PluginLoadState::None;
+
     // Group - contains child node IDs
     std::vector<int> childNodeIds;  // IDs of nodes inside this group
     int parentGroupId = -1;         // -1 = top-level (not in any group)
@@ -485,6 +539,20 @@ struct Node {
     std::string anchorMarker;       // if non-empty, groupBeatOffset is overridden by this marker's beat
     float absoluteBeatOffset = 0.0f; // cached: cascading offset through all parents (updated by resolveAnchors)
     bool groupExpanded = true;      // show children in graph view
+
+    // Voice container (per-voice polyphony) - see poly-voice-architecture.md.
+    // Kept SEPARATE from the timeline-group fields above so the two membership
+    // meanings never collide. A node with voiceContainerId >= 0 lives inside the
+    // inner per-note patch of that VoiceContainer node.
+    int voiceContainerId = -1;   // -1 = not inside any Voice container (top level)
+    int voicePolyphony = 8;      // VoiceContainer: number of simultaneous voices
+    int voiceStealMode = 0;      // VoiceContainer: 0=oldest, 1=quietest, 2=round-robin
+    float voiceGlideMs = 0.0f;   // VoiceContainer: portamento time when a voice is
+                                 // stolen for a new note (0 = off / instant pitch)
+    int voiceUnison = 1;         // VoiceContainer: stacked detuned voices per note
+                                 // (1 = off). Each note grabs this many slots.
+    float voiceUnisonDetune = 12.0f; // cents of detune spread across the stack
+    float voiceUnisonSpread = 0.5f;  // 0..1 stereo spread across the stack
 
     // MOD-import song-setting restore: when a module import overrides the
     // global song settings (repeat mode, song length, loop region), the
@@ -740,6 +808,8 @@ public:
     Node& createGroup(const std::string& name, Vec2 pos = {0, 0});
     void addToGroup(int groupId, int childId);
     void removeFromGroup(int childId);
+    // True if `ancestorId` appears in `nodeId`'s parent chain (cycle guard).
+    bool isAncestorOf(int ancestorId, int nodeId);
     void resolveAnchors();
     float getAbsoluteBeatOffset(int nodeId); // cascading offset through parent chain
 
@@ -913,13 +983,22 @@ public:
     SongRepeat songRepeatMode  = SongRepeat::None;
     int       songRepeatCount  = 1;   // only used when mode == NTimes
 
+    // Exact, un-rounded end of the last clip across all AudioTimeline /
+    // MidiTimeline nodes (max of clip.startBeat + clip.lengthBeats). Unlike
+    // getTimelineBeats(), this does NOT round up to a 4-beat bar, so it can
+    // land mid-bar. Used as the auto-derived playback song length so the
+    // audible end matches where content actually stops (and where the
+    // song-end marker is drawn). Returns 0 if no timeline has clips.
+    double contentEndBeats() const;
+
     // Returns the effective song-end beat used by the transport.  If
     // songLengthBeats was set explicitly (> 0), that value wins. Otherwise
-    // walks all AudioTimeline / MidiTimeline nodes and returns the largest
-    // getTimelineBeats() across them - i.e. the end of the last clip,
-    // rounded up to the next 4-beat bar. Returns 0 if there are no
-    // timelines with clips (in which case the engine treats the song as
-    // having no end and just plays until the user presses Stop).
+    // walks all AudioTimeline / MidiTimeline nodes and returns the exact
+    // end of the last clip (contentEndBeats(), un-rounded - playback may end
+    // mid-bar). Returns 0 if there are no timelines with clips (in which case
+    // the engine treats the song as having no end and just plays until the
+    // user presses Stop). Note: the timeline grid/display width still rounds
+    // up to a full bar via getTimelineBeats(); only the audible end is exact.
     double effectiveSongLengthBeats() const;
 
     // When content is added past an explicit song-length override (e.g. the
@@ -1207,5 +1286,16 @@ int pruneOrphanModPins(NodeGraph& graph, int nodeId);
 // defaults) and after project load (migrates old files). Safe to call
 // repeatedly.
 void ensureFmOpEnvelopes(Node& node);
+
+// Build a Voice (polyphonic) container plus a ready-made inner patch + container
+// settings for the given factory preset, centred around `pos`. Adds the nodes
+// and links to `graph` and returns the new container node's id (or -1 on a bad
+// preset id, though unknown ids fall back to the Basic preset). Does NOT commit
+// an undo snapshot or fire any rebuild callback - the caller owns those (the GUI
+// path commits + rebuilds; the self-test inspects the raw graph). Preset ids:
+//   0 = Basic (FM Synth)   1 = Warm Pad   2 = Pluck
+//   3 = Supersaw Lead      4 = Noise Perc
+// See poly-voice-architecture.md.
+int buildVoicePreset(NodeGraph& graph, Vec2 pos, int preset);
 
 } // namespace SoundShop

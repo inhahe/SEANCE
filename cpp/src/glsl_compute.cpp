@@ -2,6 +2,9 @@
 
 #include <mutex>
 #include <cstdio>
+#include <cctype>
+#include <cstdlib>
+#include <string>
 
 #if defined(_WIN32)
 
@@ -464,3 +467,52 @@ GlslDispatchResult glslDispatchComputePingPong(const std::string&, int, int,
 } // namespace SoundShop
 
 #endif
+
+// ---------------------------------------------------------------------------
+// Platform-independent: GLSL info-log line remapping (see glsl_compute.h). Pure
+// string processing, so it lives outside the Windows/non-Windows split.
+// ---------------------------------------------------------------------------
+namespace SoundShop {
+
+std::string remapGlslErrorLog(const std::string& log,
+                              int userLineOffset, int userLineCount) {
+    if (userLineCount <= 0 || log.empty()) return log;
+    std::string out;
+    out.reserve(log.size() + 16);
+    const size_t n = log.size();
+    size_t i = 0;
+    while (i < n) {
+        if (std::isdigit((unsigned char) log[i])) {
+            // First run of digits = the source-string index (e.g. "0").
+            size_t a = i;
+            while (a < n && std::isdigit((unsigned char) log[a])) ++a;
+            if (a < n && (log[a] == '(' || log[a] == ':')) {
+                const char sep = log[a];
+                const size_t lineStart = a + 1;
+                size_t b = lineStart;
+                while (b < n && std::isdigit((unsigned char) log[b])) ++b;
+                const bool closed = (b > lineStart) && b < n &&
+                                    ((sep == '(' && log[b] == ')') ||
+                                     (sep == ':' && log[b] == ':'));
+                if (closed) {
+                    const int line = std::atoi(log.substr(lineStart, b - lineStart).c_str());
+                    if (line > userLineOffset && line <= userLineOffset + userLineCount) {
+                        out.append(log, i, a - i);                 // src index, verbatim
+                        out.push_back(sep);
+                        out.append(std::to_string(line - userLineOffset));
+                        i = b;                                     // closer emitted next pass
+                        continue;
+                    }
+                }
+            }
+            // No remappable match: emit this digit run verbatim.
+            out.append(log, i, a - i);
+            i = a;
+            continue;
+        }
+        out.push_back(log[i++]);
+    }
+    return out;
+}
+
+} // namespace SoundShop

@@ -136,6 +136,14 @@ public:
     // reads this to decide whether to insert per-cable channel filters.
     int getOutputCount() const { return doc.outputCount; }
 
+    // True when the most recent script (re)load failed to compile/link (Lua
+    // syntax error, Wasm load/link error, ...). Set on the AUDIO thread in
+    // reloadIfScriptChanged(); read on the MESSAGE thread by the node-graph
+    // editor to draw a red error badge on the node. atomic<bool> so the
+    // cross-thread read is a clean data-race-free load. Builtin never errors
+    // here (it parses lazily per sample), so this stays false for Builtin.
+    bool hasScriptError() const { return scriptHasError.load(std::memory_order_relaxed); }
+
 private:
     Node& node;
     Transport& transport;
@@ -155,6 +163,11 @@ private:
     // Lua when PerSample).
     bool runBlockMode = false;
     bool wasPlaying = false;   // tracks the transport play rising edge
+
+    // Set true after a failed runtime->load() (Lua/Wasm compile/link error);
+    // cleared on a successful load. Written on the audio thread, read on the
+    // message thread (see hasScriptError()).
+    std::atomic<bool> scriptHasError{false};
 
     // Fill `vars` with the standard per-sample bindings for sample offset `s`
     // within the current block. Used by the per-sample dispatch loop and the

@@ -167,6 +167,24 @@ public:
                             IExprEmitSink* sink,
                             const std::function<float(float)>& shapeFn,
                             const std::function<float(int)>& noteToFreqFn = {});
+
+    // Lightweight *structural* validator for the built-in expression/program
+    // language. The evaluator itself is intentionally error-tolerant (unknown
+    // identifiers read as 0, a missing close paren is silently ignored, etc.)
+    // so it can never report a syntax error during real-time evaluation. This
+    // static does a cheap, side-effect-free structural pass over the source so
+    // the editor / node badge can surface obvious mistakes:
+    //   * unbalanced parentheses  (extra ')' or unclosed '(')
+    //   * an unterminated string literal ("softclip ...)
+    //   * a character that is not part of the grammar at all (e.g. '%', '@',
+    //     '#', '\', '~', '[' ... ), which would otherwise stall a per-sample
+    //     program on a non-advancing token.
+    // It deliberately does NOT flag unknown identifiers, preserving the
+    // tolerant "unknown -> 0" design. Returns true (and leaves `error` empty)
+    // when the source is structurally sound; false with a human-readable
+    // message (including a 1-based line number) otherwise. Quote-aware: parens
+    // and otherwise-illegal characters inside "..."/'...' literals are ignored.
+    static bool validate(const std::string& program, std::string& error);
 };
 
 // Voice for polyphonic playback
@@ -205,6 +223,11 @@ public:
     // post-note-off audio in this synth.  No magic constant - reads the
     // live param value so changing release shrinks/extends the tail.
     double getTailLengthSeconds() const override { return (double) getParam(3, 0.3f); }
+    // Transport panic (Stop): silence every voice at once so release tails are
+    // cut immediately instead of fading out over the ADSR release time.
+    void reset() override {
+        for (auto& v : voices) { v.active = false; v.envStage = SynthVoice::Off; v.envLevel = 0.0f; }
+    }
     bool acceptsMidi() const override { return true; }
     bool producesMidi() const override { return false; }
     bool isBusesLayoutSupported(const BusesLayout&) const override { return true; }

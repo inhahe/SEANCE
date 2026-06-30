@@ -1,5 +1,6 @@
 #include "piano_roll_component.h"
 #include "music_theory.h"
+#include "track_nesting_menu.h"
 #include "undo.h"
 #include <cmath>
 #include <set>
@@ -848,6 +849,9 @@ void PianoRollComponent::paint(juce::Graphics& g) {
         g.drawHorizontalLine(RESIZE_HANDLE_H - 1, 0.0f, (float)getWidth());
     }
 
+    // Per-track header strip (track name + parent/offset, drag to retime).
+    paintTrackHeader(g);
+
     auto area = getLocalBounds().toFloat();
     area.removeFromTop(toolbarHeight());
     area.removeFromRight(SCROLLBAR_SIZE);  // vertical scrollbar
@@ -933,31 +937,31 @@ void PianoRollComponent::paint(juce::Graphics& g) {
     }
 
     // Note-name labels (second pass). Drawn AFTER all row backgrounds /
-    // key fills so a label whose rect extends across several rows (sparse
-    // mode, below) isn't overdrawn by subsequent row fills. Two regimes:
-    //  - "Dense" (rowH >= 9): label every key, font scales with row
-    //    height. Normal case at default visibleRange=18 + comfortable panel.
-    //  - "Sparse" (rowH < 9): per-row text would be sub-8-px and either
-    //    unreadable or refused by the renderer. Label only the C-of-each-
-    //    octave anchor row, letting that label use up to a full octave's
-    //    worth of vertical space - so C3/C4/C5/... stay legible at
-    //    maximum vertical zoom-out. Without this, a 200-px-tall MIDI
-    //    panel (98 px of grid / 18 rows = ~5 px per row) shows no labels
-    //    at all and the keyboard column is unreadable.
+    // key fills so a label is never overdrawn by a later row fill. Goal:
+    // EVERY row carries its own note name so the user can read which note
+    // each row is, not just the C-of-octave anchors. Three regimes:
+    //  - "Per-row" (rowH >= 4.0): label every key. The font is shrunk to
+    //    fit the row (floored at 6.5 px - the smallest size that still
+    //    rasterises legibly here). At the default zoom/panel height rows are
+    //    ~7.5 px so each name sits cleanly on its own row; even a manually
+    //    shortened panel (~4-5 px rows) still shows a name on every row.
+    //  - "Sparse" (rowH < 4.0): rows are now too short to fit even a 6.5 px
+    //    glyph without illegible overlap, so fall back to one C-per-octave
+    //    anchor label (using up to a full octave of vertical space) so
+    //    C3/C4/C5/... stay readable at extreme vertical zoom-out.
     {
-        // Dense threshold of 6.5 px guarantees the user gets a label on
-        // every row when they zoom all the way in (visibleRange=12 -> at
-        // a 200-px default panel, rowH lands at ~7.7 px). Above this we
-        // print every key; below it we fall back to one C-per-octave so
-        // we don't draw garbage at extreme zoom-out.
-        const bool dense = rowH >= 6.5f;
-        // 0.85 fills the row a touch more aggressively than before -
-        // helpful at the new lower dense threshold where rowH can be
-        // ~7 px. Font floor at 7 matches the lowered dense threshold
-        // (rowH ~6.5 -> font ~5.5 -> clamp 7); ceiling 14 keeps sparse-
-        // mode labels from dwarfing their anchor row.
-        float labelH = dense ? rowH : juce::jmin(rowH * 12.0f, 16.0f);
-        float fontSize = juce::jlimit(7.0f, 14.0f, labelH * 0.85f);
+        // Per-row threshold of 4.0 px: below this even a 6.5 px font's
+        // glyphs would stack on top of each other into mush, so we drop to
+        // the C-per-octave fallback. At/above it we label every row.
+        const bool perRow = rowH >= 4.0f;
+        // In per-row mode the label rect is exactly one row tall and the
+        // font is shrunk to fit (floored at 6.5 so glyphs still rasterise);
+        // a slight font>rowH overflow is fine because the text is centred
+        // and only thin glyph extremes clip. In sparse mode the anchor
+        // label spans up to ~12 rows so the C name stays large and legible.
+        float labelH = perRow ? rowH : juce::jmin(rowH * 12.0f, 16.0f);
+        float fontSize = perRow ? juce::jlimit(6.5f, 12.0f, rowH * 1.05f)
+                                : juce::jlimit(7.0f, 14.0f, labelH * 0.85f);
         // JUCE 8: the deprecated Font(float) constructor renders as a
         // zero-glyph font in this codebase (same root cause as
         // Font::getStringWidth returning 0 - see notes in
@@ -965,18 +969,16 @@ void PianoRollComponent::paint(juce::Graphics& g) {
         // through FontOptions is the supported path and produces actual
         // glyphs.
         g.setFont(juce::Font(juce::FontOptions(fontSize)));
-        // In dense mode, centre the text vertically in the row. In sparse
-        // mode, top-align so each C label sits at its anchor row -
-        // centring across 12 rows would slide the label down into the
-        // next octave.
-        auto just = dense ? juce::Justification::centredLeft
-                          : juce::Justification::topLeft;
+        // Per-row: centre the name in its row. Sparse: top-align so each C
+        // label sits at its anchor row rather than sliding down an octave.
+        auto just = perRow ? juce::Justification::centredLeft
+                           : juce::Justification::topLeft;
 
         for (int i = 0; i < visRange; ++i) {
             int pitch = pitchHi - i;
             if (pitch < 0 || pitch > 127) continue;
             const bool isOctaveAnchor = (pitch % 12 == 0); // C
-            if (!dense && !isOctaveAnchor) continue;
+            if (!perRow && !isOctaveAnchor) continue;
             if (rowH <= 2.5f) continue;
 
             float y = i * rowH;
@@ -1527,6 +1529,111 @@ float PianoRollComponent::beatToScreenX(float beatLocal) const {
     return gridX + ((beatLocal + absOffset - state.hScroll) / visibleBeats) * gridW;
 }
 
+float PianoRollComponent::panelXToAbsBeat(float x, float capturedVisBeats, float capturedScroll) const {
+    float gridX = KEY_WIDTH;
+    float gridW = std::max(1.0f, (float)getWidth() - KEY_WIDTH - SCROLLBAR_SIZE);
+    float visibleBeats, scrollBeat;
+    if (capturedVisBeats > 0.0f) {
+        visibleBeats = capturedVisBeats;
+        scrollBeat = capturedScroll;
+    } else {
+        float absTotalBeats = graph.getTimelineBeats(*node) + node->absoluteBeatOffset;
+        visibleBeats = std::max(1.0f, absTotalBeats / std::max(state.hZoom, 0.1f));
+        scrollBeat = state.hScroll;
+    }
+    return scrollBeat + ((x - gridX) / gridW) * visibleBeats;
+}
+
+bool PianoRollComponent::isInTrackHeader(juce::Point<float> pos) const {
+    return pos.y >= (float)trackHeaderTop() && pos.y < (float)toolbarHeight()
+        && pos.x >= KEY_WIDTH && pos.x < (float)getWidth() - SCROLLBAR_SIZE;
+}
+
+void PianoRollComponent::paintTrackHeader(juce::Graphics& g) {
+    if (!node) return;
+    float gridX = KEY_WIDTH;
+    float gridW = std::max(1.0f, (float)getWidth() - KEY_WIDTH - SCROLLBAR_SIZE);
+    int top = trackHeaderTop();
+    int h = TRACK_HEADER_H;
+
+    // Band background.
+    g.setColour(juce::Colour(26, 26, 34));
+    g.fillRect(0, top, getWidth(), h);
+
+    // Left-gutter caption over the keyboard column.
+    g.setColour(juce::Colour(120, 120, 140));
+    g.setFont(juce::Font(10.0f));
+    g.drawText("Start", 2, top, (int)gridX - 4, h, juce::Justification::centredRight);
+
+    // Horizontal mapping (mirrors the grid below).
+    float totalBeats = graph.getTimelineBeats(*node);
+    float absOffset = node->absoluteBeatOffset;
+    float absTotalBeats = totalBeats + absOffset;
+    float visibleBeats = std::max(1.0f, absTotalBeats / std::max(state.hZoom, 0.1f));
+    float scrollBeat = juce::jlimit(0.0f, std::max(0.0f, absTotalBeats - visibleBeats), state.hScroll);
+    auto beatToX = [&](float b) { return gridX + ((b + absOffset - scrollBeat) / visibleBeats) * gridW; };
+
+    // The track as a clip-block from its start beat to its content end.
+    float x0 = beatToX(0.0f);
+    float x1 = beatToX(totalBeats);
+    float bx0 = juce::jlimit(gridX, gridX + gridW, x0);
+    float bx1 = juce::jlimit(gridX, gridX + gridW, x1);
+    juce::Rectangle<float> block(bx0, (float)top + 2.0f, std::max(3.0f, bx1 - bx0), (float)h - 4.0f);
+    bool isChild = node->parentGroupId >= 0;
+    juce::Colour blockCol = isChild ? juce::Colour(70, 115, 90) : juce::Colour(60, 85, 125);
+    g.setColour(blockCol);
+    g.fillRoundedRectangle(block, 3.0f);
+    g.setColour(blockCol.brighter(0.4f));
+    g.drawRoundedRectangle(block, 3.0f, 1.0f);
+    // Bright left edge = the start-beat grab affordance (only if the block's
+    // true start is in view, not clamped to the left edge).
+    if (x0 >= gridX - 0.5f) {
+        g.setColour(juce::Colours::white.withAlpha(0.75f));
+        g.fillRect(block.getX(), block.getY(), 2.0f, block.getHeight());
+    }
+
+    // Label: track name, parent, and own start offset.
+    juce::String label = juce::String(node->name);
+    if (isChild) {
+        auto* parent = graph.findNode(node->parentGroupId);
+        label += "  \xe2\x97\x82 child of " + juce::String(parent ? parent->name : "?");
+    }
+    if (node->groupBeatOffset != 0.0f || isChild)
+        label += "   @" + juce::String(node->groupBeatOffset, 2) + " beats";
+    g.setColour(juce::Colours::white);
+    g.setFont(juce::Font(11.0f));
+    int labX = (int)block.getX() + 6;
+    g.drawText(label, labX, top, getWidth() - labX - SCROLLBAR_SIZE - 4, h,
+               juce::Justification::centredLeft);
+
+    // Bottom hairline separating the strip from the grid.
+    g.setColour(juce::Colour(0, 0, 0).withAlpha(0.5f));
+    g.drawHorizontalLine(toolbarHeight() - 1, 0.0f, (float)getWidth());
+}
+
+void PianoRollComponent::showTrackHeaderMenu() {
+    if (!node) return;
+    const int myId = node->id;
+
+    juce::PopupMenu menu;
+    menu.addSectionHeader(juce::String(node->name));
+    // The parent/child + start-beat items are shared with the node-graph node
+    // menu (see track_nesting_menu.h) so the two entry points never drift.
+    TrackNestingMenu::addItems(menu, graph, *node);
+
+    menu.showMenuAsync(juce::PopupMenu::Options().withTargetComponent(this),
+        [this, myId](int result) {
+            if (result == 0) return;
+            TrackNestingMenu::handle(result, graph, myId, this,
+                [this](const char* desc) {
+                    graph.resolveAnchors();
+                    repaint();
+                    if (onTimingChanged) onTimingChanged();
+                    graph.commitSnapshot(desc);
+                });
+        });
+}
+
 PianoRollComponent::NoteHit PianoRollComponent::findNoteAt(juce::Point<float> screenPos) const {
     auto [beat, pitch] = screenToBeatPitch(screenPos);
     float gridX = KEY_WIDTH;
@@ -1557,6 +1664,64 @@ PianoRollComponent::NoteHit PianoRollComponent::findNoteAt(juce::Point<float> sc
     return {};
 }
 
+juce::String PianoRollComponent::getTooltip() {
+    // The TooltipWindow polls this whenever the mouse is at rest. Refresh the
+    // node pointer first (graph.nodes can reallocate between hovers, which
+    // would invalidate a stale node pointer) before touching clip data.
+    refreshNode();
+    if (!node) return {};
+
+    auto p = getMouseXYRelative().toFloat();
+    // Restrict to the note grid - skip the keyboard column, toolbar and the
+    // two scrollbars so hovering chrome never shows a note tooltip.
+    if (p.x < KEY_WIDTH || p.x > getWidth() - SCROLLBAR_SIZE) return {};
+    if (p.y < toolbarHeight() || p.y > getHeight() - SCROLLBAR_SIZE) return {};
+    if (isInExprLane(p)) return {};
+
+    // Same beat<->pixel mapping as findNoteAt / paint.
+    float gridX = KEY_WIDTH;
+    float gridW = getWidth() - KEY_WIDTH - SCROLLBAR_SIZE;
+    float totalBeats = graph.getTimelineBeats(*node);
+    float absOffset = node->absoluteBeatOffset;
+    float absTotalBeats = totalBeats + absOffset;
+    float visibleBeats = std::max(1.0f, absTotalBeats / std::max(state.hZoom, 0.1f));
+    float scrollBeat = state.hScroll;
+    auto beatToX = [&](float b) { return gridX + ((b + absOffset - scrollBeat) / visibleBeats) * gridW; };
+
+    auto [hoverBeat, hoverPitch] = screenToBeatPitch(p);
+    juce::ignoreUnused(hoverBeat);
+
+    juce::StringArray lines;
+    for (int ci = 0; ci < (int)node->clips.size(); ++ci) {
+        auto& clip = node->clips[ci];
+        for (int ni = 0; ni < (int)clip.notes.size(); ++ni) {
+            auto& n = clip.notes[ni];
+            if (n.pitch != hoverPitch) continue;
+            float absBeat = clip.startBeat + n.getOffset();
+            float nx1 = beatToX(absBeat);
+            float nx2 = beatToX(absBeat + n.getDuration());
+            if (p.x < nx1 || p.x > nx2) continue;
+
+            juce::String line = MusicTheory::noteName(n.pitch);
+            if (n.degree >= 0 && n.degree < 7)
+                line << " (" << MusicTheory::DEGREE_NAMES[n.degree] << ")";
+            line << "  vel " << n.velocity;
+            line << "  start " << juce::String(absBeat, 2)
+                 << "  len " << juce::String(n.getDuration(), 2);
+            if (std::abs(n.detune) > 0.01f)
+                line << "  " << (n.detune > 0 ? "+" : "")
+                     << juce::String(n.detune, 0) << "c";
+            if (node->clips.size() > 1 && !clip.name.empty())
+                line << "  [" << clip.name << "]";
+            lines.add(line);
+        }
+    }
+    if (lines.isEmpty()) return {};
+    if (lines.size() > 1)
+        lines.insert(0, juce::String(lines.size()) + " notes:");
+    return lines.joinIntoString("\n");
+}
+
 void PianoRollComponent::mouseDown(const juce::MouseEvent& e) {
     refreshNode(); if (!node) return;
 
@@ -1567,6 +1732,25 @@ void PianoRollComponent::mouseDown(const juce::MouseEvent& e) {
     if (e.y < RESIZE_HANDLE_H && onResizeDrag) {
         resizingHeight = true;
         resizeLastY = e.getScreenY();
+        return;
+    }
+
+    // Track-header strip: right-click opens the parent/offset menu; left-drag
+    // retimes the track (changes its own groupBeatOffset, which cascades to
+    // children). Capture the beat<->x mapping at drag start so it stays stable
+    // even as the derived timeline length shifts while dragging.
+    if (isInTrackHeader(e.position)) {
+        if (e.mods.isRightButtonDown()) {
+            showTrackHeaderMenu();
+            return;
+        }
+        float absTotalBeats = graph.getTimelineBeats(*node) + node->absoluteBeatOffset;
+        trackOffsetDragVisBeats = std::max(1.0f, absTotalBeats / std::max(state.hZoom, 0.1f));
+        trackOffsetDragScroll = state.hScroll;
+        trackOffsetStartOffset = node->groupBeatOffset;
+        trackOffsetDownAbsBeat = panelXToAbsBeat(e.position.x, trackOffsetDragVisBeats,
+                                                 trackOffsetDragScroll);
+        dragMode = DragTrackOffset;
         return;
     }
 
@@ -1863,6 +2047,29 @@ void PianoRollComponent::mouseDrag(const juce::MouseEvent& e) {
         return;
     }
 
+    // Track-header retime drag: move the track's own start offset by however
+    // many beats the cursor has travelled since mouseDown. Snap unless Alt is
+    // held. No undo step here - one snapshot is pushed on mouseUp.
+    if (dragMode == DragTrackOffset) {
+        float curAbs = panelXToAbsBeat(e.position.x, trackOffsetDragVisBeats,
+                                       trackOffsetDragScroll);
+        float newOffset = trackOffsetStartOffset + (curAbs - trackOffsetDownAbsBeat);
+        if (!e.mods.isAltDown()) {
+            float snap = state.snap > 0 ? state.snap : 0.0625f;
+            newOffset = std::round(newOffset / snap) * snap;
+        }
+        newOffset = std::max(0.0f, newOffset);
+        if (newOffset != node->groupBeatOffset) {
+            node->groupBeatOffset = newOffset;
+            node->anchorMarker.clear();   // explicit drag overrides any anchor
+            graph.resolveAnchors();
+            graph.dirty = true;
+            repaint();
+            if (onTimingChanged) onTimingChanged();
+        }
+        return;
+    }
+
     auto [beat, pitch] = screenToBeatPitch(e.position);
     float snap = state.snap > 0 ? state.snap : 0.0625f;
     bool altHeld = e.mods.isAltDown();
@@ -1997,6 +2204,16 @@ void PianoRollComponent::mouseUp(const juce::MouseEvent& e) {
     // rest of mouseUp would just be a no-op for it anyway.
     if (resizingHeight) {
         resizingHeight = false;
+        return;
+    }
+
+    // Commit a track-header retime: the offset was updated live during the
+    // drag; push one undo step for the whole gesture on release.
+    if (dragMode == DragTrackOffset) {
+        dragMode = DragNone;
+        graph.resolveAnchors();
+        if (onTimingChanged) onTimingChanged();
+        graph.commitSnapshot("Move track in time");
         return;
     }
 
@@ -2277,7 +2494,15 @@ void PianoRollComponent::mouseEnter(const juce::MouseEvent&) {
     // so Ctrl+C / Ctrl+V / Delete work while hovering, without first having to
     // click (which would place a stray note). Required for hover+Ctrl+V paste to
     // land where the ghost preview shows.
-    if (!hasKeyboardFocus(true))
+    //
+    // ...but ONLY when SEANCE is already the foreground application. On Windows,
+    // calling grabKeyboardFocus() inside a window that isn't the active window
+    // forces that window to the foreground (Win32 SetFocus activates the owning
+    // top-level window), which would yank SEANCE in front of whatever app the
+    // user is actually working in just because the mouse passed over our window.
+    // Guarding on isForegroundProcess() keeps focus-follows-mouse working when
+    // SEANCE is the active app while never stealing focus from another app.
+    if (juce::Process::isForegroundProcess() && !hasKeyboardFocus(true))
         grabKeyboardFocus();
 }
 

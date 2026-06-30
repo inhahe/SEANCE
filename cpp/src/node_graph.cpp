@@ -57,35 +57,39 @@ float NodeGraph::getTimelineBeats(const Node& node) const {
     return std::max(4.0f, std::ceil(end / 4.0f) * 4.0f);
 }
 
-double NodeGraph::effectiveSongLengthBeats() const {
-    // Explicit override wins.
-    if (songLengthBeats > 0) return songLengthBeats;
-
-    // Auto-derive: max getTimelineBeats() across all timeline nodes that
-    // actually have clips. getTimelineBeats() returns 4.0 for empty
-    // timelines, which would falsely make an empty project "4 beats long";
-    // skip them so a project with no clips at all returns 0 (= no end).
+double NodeGraph::contentEndBeats() const {
+    // Exact end of the last clip across all timeline nodes with clips, NOT
+    // rounded up to a bar (so it can land mid-bar). Empty timelines are
+    // skipped so a project with no clips returns 0 (= no end).
     double maxEnd = 0.0;
     for (const auto& n : nodes) {
         if (n.type != NodeType::AudioTimeline &&
             n.type != NodeType::MidiTimeline) continue;
         if (n.clips.empty()) continue;
-        double e = (double) getTimelineBeats(n);
-        if (e > maxEnd) maxEnd = e;
+        for (const auto& c : n.clips)
+            maxEnd = std::max(maxEnd, (double) (c.startBeat + c.lengthBeats));
     }
     return maxEnd;
+}
+
+double NodeGraph::effectiveSongLengthBeats() const {
+    // Explicit override wins.
+    if (songLengthBeats > 0) return songLengthBeats;
+
+    // Auto-derive: exact (un-rounded) end of the last clip across all timeline
+    // nodes. We deliberately use contentEndBeats() rather than the bar-rounded
+    // getTimelineBeats() so the audible song end matches where the song-end
+    // marker is drawn and where content actually stops - the song may end
+    // mid-bar. The timeline grid still rounds up for a clean display width.
+    return contentEndBeats();
 }
 
 double NodeGraph::growSongLengthToContent() {
     double prior = songLengthBeats;
     if (songLengthBeats <= 0) return prior;  // auto mode follows clips already
-    double contentEnd = 0.0;
-    for (const auto& n : nodes) {
-        if (n.type != NodeType::AudioTimeline &&
-            n.type != NodeType::MidiTimeline) continue;
-        if (n.clips.empty()) continue;
-        contentEnd = std::max(contentEnd, (double) getTimelineBeats(n));
-    }
+    // Use the exact (un-rounded) content end so growing the override matches
+    // the mid-bar playback end, not a bar-rounded value.
+    double contentEnd = contentEndBeats();
     if (contentEnd > songLengthBeats) {
         songLengthBeats = contentEnd;
         dirty = true;
@@ -145,10 +149,34 @@ Node& NodeGraph::createGroup(const std::string& name, Vec2 pos) {
     return addNode(name, NodeType::Group, {}, {}, pos);
 }
 
+// Is `ancestorId` somewhere in `nodeId`'s parent chain? Used to refuse
+// parent/child links that would form a cycle. Depth-bounded so a pre-existing
+// corrupt cycle can't hang the walk.
+bool NodeGraph::isAncestorOf(int ancestorId, int nodeId) {
+    int current = nodeId;
+    for (int depth = 0; current >= 0 && depth < 256; ++depth) {
+        auto* n = findNode(current);
+        if (!n) break;
+        if (n->parentGroupId == ancestorId) return true;
+        current = n->parentGroupId;
+    }
+    return false;
+}
+
 void NodeGraph::addToGroup(int groupId, int childId) {
     auto* group = findNode(groupId);
     auto* child = findNode(childId);
-    if (!group || !child || group->type != NodeType::Group) return;
+    if (!group || !child) return;
+    // A parent may be a dedicated Group container OR a timeline track
+    // (track-of-track parenting: a MIDI/Audio track can host children whose
+    // start beat is relative to it).
+    bool validParent = group->type == NodeType::Group
+                     || group->type == NodeType::MidiTimeline
+                     || group->type == NodeType::AudioTimeline;
+    if (!validParent) return;
+    // Never create a cycle: refuse self-parenting or parenting to one of this
+    // node's own descendants.
+    if (groupId == childId || isAncestorOf(childId, groupId)) return;
     if (child->parentGroupId == groupId) return;
     if (child->parentGroupId >= 0)
         removeFromGroup(childId);
@@ -554,6 +582,178 @@ void ensureFmOpEnvelopes(Node& node) {
             return sep == ' ' &&
                    (last == 'A' || last == 'D' || last == 'S' || last == 'R');
         }), node.params.end());
+}
+
+// ----------------------------------------------------------------------------
+// Voice (polyphonic) factory presets. See the header for the contract. addNode
+// reallocates graph.nodes, so we capture stable node/pin IDs right after each
+// creation and NEVER hold a Node& across the next addNode (no-dangling-refs).
+// ----------------------------------------------------------------------------
+int buildVoicePreset(NodeGraph& graph, Vec2 pos, int preset) {
+    struct Spec {
+        const char* name; int poly; int steal; float glideMs;
+        int unison; float detune; float spread;
+    };
+    // steal: 0=oldest 1=quietest 2=round-robin (matches Node::voiceStealMode)
+    Spec spec;
+    switch (preset) {
+        case 1:  spec = {"Warm Pad",      8, 0,   0.0f, 3, 8.0f,  0.6f}; break;
+        case 2:  spec = {"Pluck",         8, 0,   0.0f, 1, 12.0f, 0.5f}; break;
+        case 3:  spec = {"Supersaw Lead", 1, 0,  50.0f, 7, 25.0f, 1.0f}; break;
+        case 4:  spec = {"Noise Perc",    8, 0,   0.0f, 1, 12.0f, 0.5f}; break;
+        default: spec = {"Voice",         8, 0,   0.0f, 1, 12.0f, 0.5f}; preset = 0; break;
+    }
+
+    const float px = pos.x, py = pos.y;
+
+    // 1. The container itself (MIDI in -> Audio out), at the top level.
+    int containerId;
+    {
+        auto& c = graph.addNode(spec.name, NodeType::VoiceContainer,
+            {Pin{0, "MIDI", PinKind::Midi, true}},
+            {Pin{0, "Audio", PinKind::Audio, false}}, {px, py});
+        c.voicePolyphony     = spec.poly;
+        c.voiceStealMode     = spec.steal;
+        c.voiceGlideMs       = spec.glideMs;
+        c.voiceUnison        = spec.unison;
+        c.voiceUnisonDetune  = spec.detune;
+        c.voiceUnisonSpread  = spec.spread;
+        containerId = c.id;
+    }
+
+    // 2. Inner VoiceIn puck: per-note context source. Emits raw per-voice MIDI
+    //    plus Pitch(Hz)/Gate(0/1)/Velocity(0..1) and the MPE expression signals
+    //    Pressure(0..1)/Timbre(0..1).
+    int viMidiPin, viPitchPin, viGatePin, viVelPin;
+    {
+        auto& vi = graph.addNode("Voice In", NodeType::VoiceIn, {},
+            {Pin{0, "MIDI",     PinKind::Midi,   false},
+             Pin{0, "Pitch",    PinKind::Signal, false, 1},
+             Pin{0, "Gate",     PinKind::Signal, false, 1},
+             Pin{0, "Velocity", PinKind::Signal, false, 1},
+             Pin{0, "Pressure", PinKind::Signal, false, 1},
+             Pin{0, "Timbre",   PinKind::Signal, false, 1}},
+            {px - 240.0f, py + 170.0f});
+        vi.voiceContainerId = containerId;
+        if (vi.pinsOut.size() >= 6) {
+            vi.pinsOut[1].tooltip = "Pitch (Hz): this voice's note frequency, including pitch bend.";
+            vi.pinsOut[2].tooltip = "Gate (0/1): 1 while the key is held, 0 after release.";
+            vi.pinsOut[3].tooltip = "Velocity (0..1): how hard this note was struck.";
+            vi.pinsOut[4].tooltip = "Pressure (0..1): per-note pressure (MPE / aftertouch); 0 at rest.";
+            vi.pinsOut[5].tooltip = "Timbre (0..1): per-note timbre slide (MPE CC74); 0.5 = centre.";
+        }
+        viMidiPin  = vi.pinsOut[0].id;
+        viPitchPin = vi.pinsOut[1].id;
+        viGatePin  = vi.pinsOut[2].id;
+        viVelPin   = vi.pinsOut[3].id;
+    }
+
+    // 3. Inner VoiceOut sink: mapped to the inner graph's audio output.
+    int voAudioInPin;
+    {
+        auto& vo = graph.addNode("Voice Out", NodeType::VoiceOut,
+            {Pin{0, "Audio", PinKind::Audio, true}}, {},
+            {px + 240.0f, py + 170.0f});
+        vo.voiceContainerId = containerId;
+        voAudioInPin = vo.pinsIn[0].id;
+    }
+
+    // 4. Preset-specific inner instrument chain, wired VoiceIn -> instrument ->
+    //    VoiceOut. Each instrument carries voiceContainerId so it builds inside
+    //    every voice clone (one oscillator/synth per simultaneous note).
+    const Vec2 instPos{px, py + 170.0f};
+    if (preset == 0) {
+        // Basic: FM Synth, same defaults as the standalone FM Synth menu entry.
+        int synthMidiInPin, synthAudioOutPin;
+        {
+            auto& s = graph.addNode("FM Synth", NodeType::Instrument,
+                {Pin{0, "MIDI", PinKind::Midi, true}},
+                {Pin{0, "Audio", PinKind::Audio, false}}, instPos);
+            s.voiceContainerId = containerId;
+            s.script = "__fmsynth__";
+            s.params.push_back({"Algorithm", 0.0f, 0.0f, 7.0f});
+            s.params.push_back({"Feedback",  0.3f, 0.0f, 1.0f});
+            s.params.push_back({"Volume",    0.5f, 0.0f, 1.0f});
+            for (int i = 1; i <= 4; ++i) {
+                auto pp = "Op" + std::to_string(i) + " ";
+                s.params.push_back({pp + "Ratio", (float)i, 0.1f, 16.0f});
+                s.params.push_back({pp + "Level", i == 1 ? 1.0f : 0.5f, 0.0f, 1.0f});
+            }
+            ensureFmOpEnvelopes(s);
+            synthMidiInPin   = s.pinsIn[0].id;
+            synthAudioOutPin = s.pinsOut[0].id;
+        }
+        graph.addLink(viMidiPin, synthMidiInPin);
+        graph.addLink(synthAudioOutPin, voAudioInPin);
+    } else if (preset == 4) {
+        // Noise Perc: gated noise burst with a short percussive envelope.
+        int nGatePin, nVelPin, nAudioOutPin;
+        {
+            auto& n = graph.addNode("Signal Noise", NodeType::Instrument,
+                {Pin{0, "Gate",     PinKind::Signal, true, 1},
+                 Pin{0, "Velocity", PinKind::Signal, true, 1}},
+                {Pin{0, "Audio", PinKind::Audio, false}}, instPos);
+            n.voiceContainerId = containerId;
+            n.script = "__signalnoise__";
+            if (n.pinsIn.size() >= 2) {
+                n.pinsIn[0].tooltip = "Gate (0/1): starts the note while >= 0.5, releases on the falling edge.";
+                n.pinsIn[1].tooltip = "Velocity (0..1): how hard the note is struck; scales the envelope.";
+            }
+            n.params.push_back({"Type",   0.0f, 0.0f, 2.0f}); // 0=White 1=Pink 2=Brown
+            n.params.push_back({"Volume", 0.5f, 0.0f, 1.0f});
+            n.ahdsrEnvelope.attackMs  = 1.0f;
+            n.ahdsrEnvelope.decayMs   = 130.0f;
+            n.ahdsrEnvelope.sustain   = 0.0f;
+            n.ahdsrEnvelope.releaseMs = 80.0f;
+            nGatePin     = n.pinsIn[0].id;
+            nVelPin      = n.pinsIn[1].id;
+            nAudioOutPin = n.pinsOut[0].id;
+        }
+        graph.addLink(viGatePin, nGatePin);
+        graph.addLink(viVelPin,  nVelPin);
+        graph.addLink(nAudioOutPin, voAudioInPin);
+    } else {
+        // Warm Pad / Pluck / Supersaw Lead: a Signal Oscillator driven by the
+        // voice's Pitch/Gate/Velocity, with a preset-tuned amplitude envelope.
+        // waveform: 0=sine 1=saw 2=square 3=tri.
+        float waveform = 1.0f, atk = 5.0f, dec = 100.0f, sus = 0.7f, rel = 300.0f;
+        if (preset == 1) { waveform = 3.0f; atk = 400.0f; dec = 200.0f; sus = 0.85f; rel = 900.0f; } // Warm Pad: mellow triangle, slow swell
+        else if (preset == 2) { waveform = 1.0f; atk = 2.0f; dec = 200.0f; sus = 0.0f; rel = 150.0f; } // Pluck: fast saw decay, no sustain
+        else if (preset == 3) { waveform = 1.0f; atk = 8.0f; dec = 100.0f; sus = 0.9f; rel = 200.0f; } // Supersaw Lead: sustained saw
+
+        int oPitchPin, oGatePin, oVelPin, oAudioOutPin;
+        {
+            auto& n = graph.addNode("Signal Osc", NodeType::Instrument,
+                {Pin{0, "Pitch",    PinKind::Signal, true, 1},
+                 Pin{0, "Gate",     PinKind::Signal, true, 1},
+                 Pin{0, "Velocity", PinKind::Signal, true, 1}},
+                {Pin{0, "Audio", PinKind::Audio, false}}, instPos);
+            n.voiceContainerId = containerId;
+            n.script = "__signalosc__";
+            if (n.pinsIn.size() >= 3) {
+                n.pinsIn[0].tooltip = "Pitch (Hz): oscillator frequency, read every sample.";
+                n.pinsIn[1].tooltip = "Gate (0/1): starts the note while >= 0.5, releases on the falling edge.";
+                n.pinsIn[2].tooltip = "Velocity (0..1): how hard the note is struck; scales the envelope.";
+            }
+            n.params.push_back({"Waveform", waveform, 0.0f, 4.0f}); // 0=sine 1=saw 2=square 3=tri 4=pulse
+            n.params.push_back({"Volume",   0.5f, 0.0f, 1.0f});
+            n.params.push_back({"Pulse Width", 0.5f, 0.05f, 0.95f, "%.2f"}); // only audible on Pulse; modulatable (#88)
+            n.ahdsrEnvelope.attackMs  = atk;
+            n.ahdsrEnvelope.decayMs   = dec;
+            n.ahdsrEnvelope.sustain   = sus;
+            n.ahdsrEnvelope.releaseMs = rel;
+            oPitchPin    = n.pinsIn[0].id;
+            oGatePin     = n.pinsIn[1].id;
+            oVelPin      = n.pinsIn[2].id;
+            oAudioOutPin = n.pinsOut[0].id;
+        }
+        graph.addLink(viPitchPin, oPitchPin);
+        graph.addLink(viGatePin,  oGatePin);
+        graph.addLink(viVelPin,   oVelPin);
+        graph.addLink(oAudioOutPin, voAudioInPin);
+    }
+
+    return containerId;
 }
 
 } // namespace SoundShop

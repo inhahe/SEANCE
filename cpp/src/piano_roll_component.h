@@ -7,7 +7,8 @@
 namespace SoundShop {
 
 class PianoRollComponent : public juce::Component,
-                            public juce::ScrollBar::Listener {
+                            public juce::ScrollBar::Listener,
+                            public juce::TooltipClient {
 public:
     PianoRollComponent(NodeGraph& graph, Node& node, Transport* transport = nullptr);
     ~PianoRollComponent() override {
@@ -33,6 +34,14 @@ public:
     void mouseWheelMove(const juce::MouseEvent& e, const juce::MouseWheelDetails& w) override;
     bool keyPressed(const juce::KeyPress& key) override;
 
+    // Hover popup: when the mouse rests over a note in the grid, show every
+    // note under the cursor (name, scale degree, velocity, start beat,
+    // duration, detune). Multiple stacked/overlapping notes are all listed.
+    // Returns empty when not over a note so no tooltip appears. Implemented
+    // for juce::TooltipClient; the shared TooltipWindow lives on
+    // MainContentComponent.
+    juce::String getTooltip() override;
+
     // Refresh the node pointer from the graph. Call at the start of every
     // public entry point (paint, mouseDown, etc.) because graph.nodes can
     // reallocate when nodes are added, invalidating old pointers.
@@ -50,6 +59,18 @@ public:
     // event is consumed before reaching the toolbar. Exposed publicly so
     // toolbarHeight() can shift the toolbar down by this amount.
     static constexpr int RESIZE_HANDLE_H = 6;
+
+    // Per-track header strip: a horizontal band just above the note grid that
+    // shows the track as a clip-block sitting at its start beat. Drag it
+    // left/right to set this track's time offset; right-click it to set/clear
+    // its parent track. Folded into toolbarHeight() so every grid offset in
+    // paint()/mouseDown() accounts for it automatically.
+    static constexpr int TRACK_HEADER_H = 20;
+
+    // Wired by MainContentComponent: invoked after this track's time offset or
+    // parent changes, so the host can repaint ALL editor panels (a parent's
+    // move shifts its children, which live in other panels) and the node graph.
+    std::function<void()> onTimingChanged;
 
 private:
     NodeGraph& graph;
@@ -70,7 +91,7 @@ private:
 
     // Drag state
     enum DragModeEnum { DragNone, DragNote, DragResizeLeft, DragResizeRight, DragBox, DragExprPoint, DragSongEnd,
-                        DragLoopStart, DragLoopEnd };
+                        DragLoopStart, DragLoopEnd, DragTrackOffset };
     DragModeEnum dragMode = DragNone;
     // Grab tolerance (px) for the A-B loop region's start/end boundary lines.
     static constexpr float LOOP_EDGE_GRAB_PX = 5.0f;
@@ -91,6 +112,22 @@ private:
     // Node-local beat -> on-screen x (mirrors the beatToX used in paint).
     float beatToScreenX(float beatLocal) const;
     static constexpr float SONG_END_GRAB_PX = 5.0f;
+    // Track-offset drag (header strip). Captures the horizontal mapping and the
+    // node's own groupBeatOffset at gesture start so live dragging stays stable
+    // even as the derived timeline length (which feeds the beat<->x mapping)
+    // changes underneath the drag.
+    float trackOffsetStartOffset = 0;  // node.groupBeatOffset at mouseDown
+    float trackOffsetDownAbsBeat = 0;  // absolute beat under cursor at mouseDown
+    float trackOffsetDragVisBeats = 0; // captured visibleBeats
+    float trackOffsetDragScroll = 0;   // captured scrollBeat
+    // Map a panel x (absolute component coords) to an absolute beat using the
+    // current (or, mid-drag, captured) horizontal mapping. capturedVisBeats<=0
+    // means "compute the mapping live from node/state".
+    float panelXToAbsBeat(float x, float capturedVisBeats = -1.0f, float capturedScroll = 0.0f) const;
+    bool isInTrackHeader(juce::Point<float> pos) const; // pos in component coords
+    void showTrackHeaderMenu();
+    void paintTrackHeader(juce::Graphics& g);
+
     float dragStartBeat = 0;
     int dragStartPitch = 0;
     juce::Point<float> dragStartScreen, dragCurrentScreen;
@@ -236,7 +273,10 @@ private:
     // automatically accounts for the handle. The toolbar buttons are
     // laid out with a matching removeFromTop(RESIZE_HANDLE_H) at the
     // start of resized() so they sit below the handle, not under it.
-    int toolbarHeight() const { return (compactMode ? 28 : 82) + RESIZE_HANDLE_H; }
+    int toolbarHeight() const { return (compactMode ? 28 : 82) + RESIZE_HANDLE_H + TRACK_HEADER_H; }
+    // Top y of the track-header strip (it occupies the bottom TRACK_HEADER_H of
+    // the toolbar region, directly above the note grid).
+    int trackHeaderTop() const { return toolbarHeight() - TRACK_HEADER_H; }
 
     // Resize-handle gesture state. mouseDown in the top RESIZE_HANDLE_H
     // strip sets resizingHeight=true; subsequent mouseDrag events fire

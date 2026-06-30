@@ -25,6 +25,10 @@ public:
     const juce::String getName() const override { return "Convolution"; }
     void prepareToPlay(double sr, int bs) override;
     void releaseResources() override {}
+    // Transport panic (Stop): zero the running convolution state so the IR tail
+    // (which can be seconds long) is cut immediately instead of ringing out. The
+    // pre-FFT'd IR partitions are static and left intact. Implemented in the .cpp.
+    void reset() override;
     void processBlock(juce::AudioBuffer<float>& buf, juce::MidiBuffer& midi) override;
     double getTailLengthSeconds() const override;
     bool acceptsMidi() const override { return true; }

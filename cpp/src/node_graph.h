@@ -766,6 +766,8 @@ public:
     Node& createGroup(const std::string& name, Vec2 pos = {0, 0});
     void addToGroup(int groupId, int childId);
     void removeFromGroup(int childId);
+    // True if `ancestorId` appears in `nodeId`'s parent chain (cycle guard).
+    bool isAncestorOf(int ancestorId, int nodeId);
     void resolveAnchors();
     float getAbsoluteBeatOffset(int nodeId); // cascading offset through parent chain
 

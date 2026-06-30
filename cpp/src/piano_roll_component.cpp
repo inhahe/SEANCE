@@ -848,6 +848,9 @@ void PianoRollComponent::paint(juce::Graphics& g) {
         g.drawHorizontalLine(RESIZE_HANDLE_H - 1, 0.0f, (float)getWidth());
     }
 
+    // Per-track header strip (track name + parent/offset, drag to retime).
+    paintTrackHeader(g);
+
     auto area = getLocalBounds().toFloat();
     area.removeFromTop(toolbarHeight());
     area.removeFromRight(SCROLLBAR_SIZE);  // vertical scrollbar
@@ -1525,6 +1528,171 @@ float PianoRollComponent::beatToScreenX(float beatLocal) const {
     return gridX + ((beatLocal + absOffset - state.hScroll) / visibleBeats) * gridW;
 }
 
+float PianoRollComponent::panelXToAbsBeat(float x, float capturedVisBeats, float capturedScroll) const {
+    float gridX = KEY_WIDTH;
+    float gridW = std::max(1.0f, (float)getWidth() - KEY_WIDTH - SCROLLBAR_SIZE);
+    float visibleBeats, scrollBeat;
+    if (capturedVisBeats > 0.0f) {
+        visibleBeats = capturedVisBeats;
+        scrollBeat = capturedScroll;
+    } else {
+        float absTotalBeats = graph.getTimelineBeats(*node) + node->absoluteBeatOffset;
+        visibleBeats = std::max(1.0f, absTotalBeats / std::max(state.hZoom, 0.1f));
+        scrollBeat = state.hScroll;
+    }
+    return scrollBeat + ((x - gridX) / gridW) * visibleBeats;
+}
+
+bool PianoRollComponent::isInTrackHeader(juce::Point<float> pos) const {
+    return pos.y >= (float)trackHeaderTop() && pos.y < (float)toolbarHeight()
+        && pos.x >= KEY_WIDTH && pos.x < (float)getWidth() - SCROLLBAR_SIZE;
+}
+
+void PianoRollComponent::paintTrackHeader(juce::Graphics& g) {
+    if (!node) return;
+    float gridX = KEY_WIDTH;
+    float gridW = std::max(1.0f, (float)getWidth() - KEY_WIDTH - SCROLLBAR_SIZE);
+    int top = trackHeaderTop();
+    int h = TRACK_HEADER_H;
+
+    // Band background.
+    g.setColour(juce::Colour(26, 26, 34));
+    g.fillRect(0, top, getWidth(), h);
+
+    // Left-gutter caption over the keyboard column.
+    g.setColour(juce::Colour(120, 120, 140));
+    g.setFont(juce::Font(10.0f));
+    g.drawText("Start", 2, top, (int)gridX - 4, h, juce::Justification::centredRight);
+
+    // Horizontal mapping (mirrors the grid below).
+    float totalBeats = graph.getTimelineBeats(*node);
+    float absOffset = node->absoluteBeatOffset;
+    float absTotalBeats = totalBeats + absOffset;
+    float visibleBeats = std::max(1.0f, absTotalBeats / std::max(state.hZoom, 0.1f));
+    float scrollBeat = juce::jlimit(0.0f, std::max(0.0f, absTotalBeats - visibleBeats), state.hScroll);
+    auto beatToX = [&](float b) { return gridX + ((b + absOffset - scrollBeat) / visibleBeats) * gridW; };
+
+    // The track as a clip-block from its start beat to its content end.
+    float x0 = beatToX(0.0f);
+    float x1 = beatToX(totalBeats);
+    float bx0 = juce::jlimit(gridX, gridX + gridW, x0);
+    float bx1 = juce::jlimit(gridX, gridX + gridW, x1);
+    juce::Rectangle<float> block(bx0, (float)top + 2.0f, std::max(3.0f, bx1 - bx0), (float)h - 4.0f);
+    bool isChild = node->parentGroupId >= 0;
+    juce::Colour blockCol = isChild ? juce::Colour(70, 115, 90) : juce::Colour(60, 85, 125);
+    g.setColour(blockCol);
+    g.fillRoundedRectangle(block, 3.0f);
+    g.setColour(blockCol.brighter(0.4f));
+    g.drawRoundedRectangle(block, 3.0f, 1.0f);
+    // Bright left edge = the start-beat grab affordance (only if the block's
+    // true start is in view, not clamped to the left edge).
+    if (x0 >= gridX - 0.5f) {
+        g.setColour(juce::Colours::white.withAlpha(0.75f));
+        g.fillRect(block.getX(), block.getY(), 2.0f, block.getHeight());
+    }
+
+    // Label: track name, parent, and own start offset.
+    juce::String label = juce::String(node->name);
+    if (isChild) {
+        auto* parent = graph.findNode(node->parentGroupId);
+        label += "  \xe2\x97\x82 child of " + juce::String(parent ? parent->name : "?");
+    }
+    if (node->groupBeatOffset != 0.0f || isChild)
+        label += "   @" + juce::String(node->groupBeatOffset, 2) + " beats";
+    g.setColour(juce::Colours::white);
+    g.setFont(juce::Font(11.0f));
+    int labX = (int)block.getX() + 6;
+    g.drawText(label, labX, top, getWidth() - labX - SCROLLBAR_SIZE - 4, h,
+               juce::Justification::centredLeft);
+
+    // Bottom hairline separating the strip from the grid.
+    g.setColour(juce::Colour(0, 0, 0).withAlpha(0.5f));
+    g.drawHorizontalLine(toolbarHeight() - 1, 0.0f, (float)getWidth());
+}
+
+void PianoRollComponent::showTrackHeaderMenu() {
+    if (!node) return;
+    const int myId = node->id;
+
+    juce::PopupMenu menu;
+    menu.addSectionHeader(juce::String(node->name));
+
+    // "Make child of" submenu: every other timeline track that wouldn't form a
+    // cycle (i.e. not this node and not one of this node's descendants).
+    juce::PopupMenu parentSub;
+    bool anyCandidate = false;
+    for (auto& cand : graph.nodes) {
+        if (cand.id == myId) continue;
+        if (cand.type != NodeType::MidiTimeline && cand.type != NodeType::AudioTimeline
+            && cand.type != NodeType::Group)
+            continue;
+        // Skip descendants of this node (would create a parent/child cycle).
+        if (graph.isAncestorOf(myId, cand.id)) continue;
+        bool isCurrentParent = (node->parentGroupId == cand.id);
+        parentSub.addItem(10000 + cand.id, juce::String(cand.name),
+                          /*enabled*/ !isCurrentParent, /*ticked*/ isCurrentParent);
+        anyCandidate = true;
+    }
+    if (!anyCandidate)
+        parentSub.addItem(-1, "(no other tracks)", false, false);
+    menu.addSubMenu("Make child of", parentSub);
+
+    menu.addItem(2, "Clear parent", node->parentGroupId >= 0, false);
+    menu.addSeparator();
+    menu.addItem(3, "Set start beat\xe2\x80\xa6");
+
+    menu.showMenuAsync(juce::PopupMenu::Options().withTargetComponent(this),
+        [this, myId](int result) {
+            auto* n = graph.findNode(myId);
+            if (!n || result == 0) return;
+
+            auto finishTiming = [this](const char* desc) {
+                graph.resolveAnchors();
+                repaint();
+                if (onTimingChanged) onTimingChanged();
+                graph.commitSnapshot(desc);
+            };
+
+            if (result == 2) {
+                // Clear parent: detach but keep the absolute start where it is so
+                // the track doesn't visually jump (fold the inherited offset in).
+                if (n->parentGroupId >= 0) {
+                    float inherited = n->absoluteBeatOffset - n->groupBeatOffset;
+                    graph.removeFromGroup(myId);
+                    n->anchorMarker.clear();
+                    n->groupBeatOffset = std::max(0.0f, n->groupBeatOffset + inherited);
+                    finishTiming("Clear track parent");
+                }
+            } else if (result == 3) {
+                auto* aw = new juce::AlertWindow("Set Start Beat",
+                    "Start offset for \"" + juce::String(n->name) + "\" (in beats):",
+                    juce::MessageBoxIconType::NoIcon);
+                aw->addTextEditor("beat", juce::String(n->groupBeatOffset, 3));
+                aw->addButton("Set", 1, juce::KeyPress(juce::KeyPress::returnKey));
+                aw->addButton("Cancel", 0);
+                aw->enterModalState(true, juce::ModalCallbackFunction::create(
+                    [this, aw, myId, finishTiming](int res) {
+                        if (res == 1) {
+                            auto* nn = graph.findNode(myId);
+                            if (nn) {
+                                float v = aw->getTextEditorContents("beat").getFloatValue();
+                                nn->groupBeatOffset = std::max(0.0f, v);
+                                nn->anchorMarker.clear();
+                                finishTiming("Set track start beat");
+                            }
+                        }
+                        delete aw;
+                    }), true);
+            } else if (result >= 10000) {
+                int parentId = result - 10000;
+                if (parentId != myId && !graph.isAncestorOf(myId, parentId)) {
+                    graph.addToGroup(parentId, myId);
+                    finishTiming("Make track a child");
+                }
+            }
+        });
+}
+
 PianoRollComponent::NoteHit PianoRollComponent::findNoteAt(juce::Point<float> screenPos) const {
     auto [beat, pitch] = screenToBeatPitch(screenPos);
     float gridX = KEY_WIDTH;
@@ -1623,6 +1791,25 @@ void PianoRollComponent::mouseDown(const juce::MouseEvent& e) {
     if (e.y < RESIZE_HANDLE_H && onResizeDrag) {
         resizingHeight = true;
         resizeLastY = e.getScreenY();
+        return;
+    }
+
+    // Track-header strip: right-click opens the parent/offset menu; left-drag
+    // retimes the track (changes its own groupBeatOffset, which cascades to
+    // children). Capture the beat<->x mapping at drag start so it stays stable
+    // even as the derived timeline length shifts while dragging.
+    if (isInTrackHeader(e.position)) {
+        if (e.mods.isRightButtonDown()) {
+            showTrackHeaderMenu();
+            return;
+        }
+        float absTotalBeats = graph.getTimelineBeats(*node) + node->absoluteBeatOffset;
+        trackOffsetDragVisBeats = std::max(1.0f, absTotalBeats / std::max(state.hZoom, 0.1f));
+        trackOffsetDragScroll = state.hScroll;
+        trackOffsetStartOffset = node->groupBeatOffset;
+        trackOffsetDownAbsBeat = panelXToAbsBeat(e.position.x, trackOffsetDragVisBeats,
+                                                 trackOffsetDragScroll);
+        dragMode = DragTrackOffset;
         return;
     }
 
@@ -1919,6 +2106,29 @@ void PianoRollComponent::mouseDrag(const juce::MouseEvent& e) {
         return;
     }
 
+    // Track-header retime drag: move the track's own start offset by however
+    // many beats the cursor has travelled since mouseDown. Snap unless Alt is
+    // held. No undo step here - one snapshot is pushed on mouseUp.
+    if (dragMode == DragTrackOffset) {
+        float curAbs = panelXToAbsBeat(e.position.x, trackOffsetDragVisBeats,
+                                       trackOffsetDragScroll);
+        float newOffset = trackOffsetStartOffset + (curAbs - trackOffsetDownAbsBeat);
+        if (!e.mods.isAltDown()) {
+            float snap = state.snap > 0 ? state.snap : 0.0625f;
+            newOffset = std::round(newOffset / snap) * snap;
+        }
+        newOffset = std::max(0.0f, newOffset);
+        if (newOffset != node->groupBeatOffset) {
+            node->groupBeatOffset = newOffset;
+            node->anchorMarker.clear();   // explicit drag overrides any anchor
+            graph.resolveAnchors();
+            graph.dirty = true;
+            repaint();
+            if (onTimingChanged) onTimingChanged();
+        }
+        return;
+    }
+
     auto [beat, pitch] = screenToBeatPitch(e.position);
     float snap = state.snap > 0 ? state.snap : 0.0625f;
     bool altHeld = e.mods.isAltDown();
@@ -2053,6 +2263,16 @@ void PianoRollComponent::mouseUp(const juce::MouseEvent& e) {
     // rest of mouseUp would just be a no-op for it anyway.
     if (resizingHeight) {
         resizingHeight = false;
+        return;
+    }
+
+    // Commit a track-header retime: the offset was updated live during the
+    // drag; push one undo step for the whole gesture on release.
+    if (dragMode == DragTrackOffset) {
+        dragMode = DragNone;
+        graph.resolveAnchors();
+        if (onTimingChanged) onTimingChanged();
+        graph.commitSnapshot("Move track in time");
         return;
     }
 

@@ -4586,6 +4586,15 @@ void NodeGraphComponent::deleteNodeAndDescendants(int rootId) {
     graph.nodes.erase(std::remove_if(graph.nodes.begin(), graph.nodes.end(),
         [&](auto& n) { return victims.count(n.id) > 0; }), graph.nodes.end());
 
+    // Detach any surviving node whose parent was just deleted (the track-of-
+    // track parenting case: a child track's parent is a plain timeline, not a
+    // Group, so it isn't a victim). Becoming top-level keeps its own beat
+    // offset and avoids a dangling parentGroupId pointing at a gone node.
+    for (auto& n : graph.nodes)
+        if (n.parentGroupId >= 0 && victims.count(n.parentGroupId))
+            n.parentGroupId = -1;
+    graph.resolveAnchors();
+
     // Clear stale selections if the user had a victim selected.
     if (victims.count(selectedNodeId)) selectedNodeId = -1;
 

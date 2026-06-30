@@ -149,10 +149,34 @@ Node& NodeGraph::createGroup(const std::string& name, Vec2 pos) {
     return addNode(name, NodeType::Group, {}, {}, pos);
 }
 
+// Is `ancestorId` somewhere in `nodeId`'s parent chain? Used to refuse
+// parent/child links that would form a cycle. Depth-bounded so a pre-existing
+// corrupt cycle can't hang the walk.
+bool NodeGraph::isAncestorOf(int ancestorId, int nodeId) {
+    int current = nodeId;
+    for (int depth = 0; current >= 0 && depth < 256; ++depth) {
+        auto* n = findNode(current);
+        if (!n) break;
+        if (n->parentGroupId == ancestorId) return true;
+        current = n->parentGroupId;
+    }
+    return false;
+}
+
 void NodeGraph::addToGroup(int groupId, int childId) {
     auto* group = findNode(groupId);
     auto* child = findNode(childId);
-    if (!group || !child || group->type != NodeType::Group) return;
+    if (!group || !child) return;
+    // A parent may be a dedicated Group container OR a timeline track
+    // (track-of-track parenting: a MIDI/Audio track can host children whose
+    // start beat is relative to it).
+    bool validParent = group->type == NodeType::Group
+                     || group->type == NodeType::MidiTimeline
+                     || group->type == NodeType::AudioTimeline;
+    if (!validParent) return;
+    // Never create a cycle: refuse self-parenting or parenting to one of this
+    // node's own descendants.
+    if (groupId == childId || isAncestorOf(childId, groupId)) return;
     if (child->parentGroupId == groupId) return;
     if (child->parentGroupId >= 0)
         removeFromGroup(childId);

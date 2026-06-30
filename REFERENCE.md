@@ -619,6 +619,21 @@ Internally the handle adjusts the rightmost clip's `lengthBeats`; because the au
 
 **The song ends exactly where the END bar sits — including mid-bar.** Playback length is the *un-rounded* end of the last clip (`NodeGraph::contentEndBeats()`), so if you drag the END bar to beat 1 of a 4-beat bar, the song stops at beat 1, not the end of the bar. The visible **grid** still draws out to the next full bar (`getTimelineBeats()` rounds up) for a clean ruler, but that trailing grid is silent. (Previously the two disagreed: the marker sat at the exact clip end while playback ran on to the bar-rounded end.)
 
+### Track header strip (parenting & time offset)
+
+Every piano-roll panel has a thin **track-header strip** between the toolbar and the note grid (its own `TRACK_HEADER_H = 20`px band, folded into `toolbarHeight()` so the grid below shifts down automatically). The strip shows this track as a clip-block positioned along the same horizontal beat axis as the grid, with a bright left edge marking its start beat. Its label reads the track name, and — when the track is a child — `◂ child of <parent>` plus `@<n> beats` (the track's own start offset).
+
+The strip exposes the two halves of timeline parenting:
+
+- **Drag the strip left/right to retime the track.** Left-dragging anywhere in the strip changes the track's own start offset (`groupBeatOffset`). The drag snaps to the current Snap division (hold `Alt` for free placement), clamps at beat 0, and captures the beat↔pixel mapping at drag start so the motion stays stable even as the derived timeline length changes underneath. Because a node's absolute offset is the sum of its own offset and every ancestor's (`getAbsoluteBeatOffset`), **moving a parent moves all its children with it** — and if the child is shown in another stacked panel, that panel repaints live (`onTimingChanged`). Setting an offset clears any anchor-marker binding (an explicit drag wins). No undo step is created during the drag; one `commitSnapshot("Move track in time")` is pushed on release.
+
+- **Right-click the strip for the parent menu.** It offers:
+  - **Make child of ▸** — a submenu of every *other* timeline/group node that wouldn't create a cycle (descendants of this track are excluded; the current parent is shown ticked and disabled). Picking one calls `addToGroup`, so **any** MIDI/Audio timeline (not just a dedicated Group node) can be a parent. Undo step: `commitSnapshot("Make track a child")`.
+  - **Clear parent** — detaches the track. The inherited offset is folded into the track's own offset so it doesn't visually jump. Undo step: `commitSnapshot("Clear track parent")`.
+  - **Set start beat…** — a dialog for typing an exact offset in beats (parented to the main window). Undo step: `commitSnapshot("Set track start beat")`.
+
+`addToGroup` was relaxed from Group-only parents to also accept `MidiTimeline`/`AudioTimeline` parents, guarded by `isAncestorOf` so no parent/child cycle can form. When a parent timeline is deleted, any surviving child whose parent was the deleted node is detached to top-level (keeping its own offset) rather than left with a dangling `parentGroupId`. The relationship and offset are serialized generically (`parentGroupId` + `groupBeatOffset` in the project file), so save→load round-trips it.
+
 ---
 
 ## Layered Waveform editor

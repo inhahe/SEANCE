@@ -3830,6 +3830,14 @@ void MainContentComponent::openEditor(Node& node) {
     panel->component->onResizeDrag = [this, nodeIdCopy](int deltaPx) {
         resizeEditorPanel(nodeIdCopy, deltaPx);
     };
+    // A track's time offset / parent change shifts not just this track but any
+    // children shown in OTHER stacked panels, and moves notes in the node
+    // graph's mini-timelines. Repaint every editor panel and the graph.
+    panel->component->onTimingChanged = [this]() {
+        for (auto& p : editorPanels)
+            p->component->repaint();
+        if (graphComponent) graphComponent->repaint();
+    };
     addAndMakeVisible(panel->component.get());
     editorPanels.push_back(std::move(panel));
 

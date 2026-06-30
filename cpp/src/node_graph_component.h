@@ -120,6 +120,36 @@ private:
     float zoom = 1.0f;
     juce::Point<float> panOffset{0, 0};
 
+    // --- Scoped inner-graph view (Voice container drill-in) ----------------
+    // Which container's interior the canvas currently shows. -1 = top level
+    // (only nodes with voiceContainerId == -1 are drawn/hit-tested). Set to a
+    // VoiceContainer's id to show only that container's inner nodes. The audio
+    // build, latency walk and save path iterate the FULL graph regardless of
+    // this - viewScope only filters what's visible/interactive on the canvas.
+    // See poly-voice-architecture.md.
+    int viewScope = -1;
+    bool nodeVisible(const Node& n) const { return n.voiceContainerId == viewScope; }
+    // A link is drawn/hit-tested only when BOTH its endpoint nodes are visible
+    // in the current scope. Cross-scope links never exist in practice (a
+    // container's external cables touch top-level nodes; inner cables touch
+    // inner nodes), so this also hides a container's outer cables while you're
+    // inside it, and vice-versa.
+    bool linkVisible(const Link& l) const {
+        const Node* a = nullptr; const Node* b = nullptr;
+        for (const auto& n : graph.nodes) {
+            for (const auto& p : n.pinsOut) if (p.id == l.startPin) a = &n;
+            for (const auto& p : n.pinsIn)  if (p.id == l.endPin)   b = &n;
+        }
+        return a && b && nodeVisible(*a) && nodeVisible(*b);
+    }
+    // Enter/exit a container's interior (re-fits the view to the new scope).
+    void enterScope(int containerId);
+    void exitScope();
+    // Screen-space rect of the breadcrumb "exit" chip drawn while scoped.
+    // Empty at top level; hit-tested in mouseDown to leave the scope.
+    juce::Rectangle<int> breadcrumbExitRect;
+    void drawBreadcrumb(juce::Graphics& g);
+
     // True until the first resized()/paint() callback applies the initial
     // view (either restoring the saved pan/zoom from graph.viewZoom/PanX/PanY
     // or running fitAll() as a fallback). Prevents the user from briefly

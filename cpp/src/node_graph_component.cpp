@@ -226,9 +226,10 @@ void NodeGraphComponent::paint(juce::Graphics& g) {
 
     // Draw parent-child group lines
     for (auto& node : graph.nodes) {
+        if (!nodeVisible(node)) continue;
         if (node.parentGroupId >= 0) {
             auto* parent = graph.findNode(node.parentGroupId);
-            if (parent) {
+            if (parent && nodeVisible(*parent)) {
                 auto childCenter = canvasToScreen(getNodeBounds(node).getCentre());
                 auto parentCenter = canvasToScreen(getNodeBounds(*parent).getCentre());
                 g.setColour(juce::Colours::white.withAlpha(0.15f));
@@ -247,7 +248,7 @@ void NodeGraphComponent::paint(juce::Graphics& g) {
         return l.id == hoveredLinkId || l.id == selectedLinkId;
     };
     for (auto& link : graph.links)
-        if (!emphasised(link))
+        if (linkVisible(link) && !emphasised(link))
             drawLink(g, link);
 
     // Draw pending link
@@ -276,7 +277,8 @@ void NodeGraphComponent::paint(juce::Graphics& g) {
 
     // Draw nodes
     for (auto& node : graph.nodes)
-        drawNode(g, node);
+        if (nodeVisible(node))
+            drawNode(g, node);
 
     // Emphasised cables (selected and/or hovered) on top of everything, so the
     // highlight stays fully visible - traceable end-to-end and never occluded
@@ -284,11 +286,14 @@ void NodeGraphComponent::paint(juce::Graphics& g) {
     // different cable is selected. (Selection is also set by a right-click, so
     // the targeted cable stays lit while its context menu is open.)
     for (auto& link : graph.links)
-        if (link.id == selectedLinkId && link.id != hoveredLinkId)
+        if (link.id == selectedLinkId && link.id != hoveredLinkId && linkVisible(link))
             drawLink(g, link);
     for (auto& link : graph.links)
-        if (link.id == hoveredLinkId)
+        if (link.id == hoveredLinkId && linkVisible(link))
             drawLink(g, link);
+
+    // Breadcrumb / exit-scope chip, drawn last so it sits above everything.
+    drawBreadcrumb(g);
 }
 
 void NodeGraphComponent::drawGrid(juce::Graphics& g) {
@@ -1120,6 +1125,7 @@ void NodeGraphComponent::drawPendingLink(juce::Graphics& g) {
 Node* NodeGraphComponent::nodeAtPoint(juce::Point<float> canvasPos) {
     // Iterate in reverse so topmost node (drawn last) is found first
     for (int i = (int)graph.nodes.size() - 1; i >= 0; --i) {
+        if (!nodeVisible(graph.nodes[i])) continue;
         if (getNodeBounds(graph.nodes[i]).contains(canvasPos))
             return &graph.nodes[i];
     }
@@ -1147,6 +1153,7 @@ int NodeGraphComponent::pinAtPoint(juce::Point<float> canvasPos, bool& isOutput,
     bool  bestIsOut = false;
     float bestDist = hitRadius;
     for (auto& node : graph.nodes) {
+        if (!nodeVisible(node)) continue;
         if (wantInput != 1) {
             for (auto& pin : node.pinsOut) {
                 float d = getPinPosition(node, pin).getDistanceFrom(canvasPos);
@@ -1219,6 +1226,7 @@ int NodeGraphComponent::linkAtPoint(juce::Point<float> canvasPos) {
     float bestDist = 13.0f; // hit tolerance in px (generous so thin cables are
                             // easy to hover/click, esp. when zoomed out)
     for (auto& link : graph.links) {
+        if (!linkVisible(link)) continue; // only cables in the current scope
         juce::Point<float> start, end;
         bool foundSrc = false, foundDst = false;
         for (auto& node : graph.nodes) {
@@ -1266,6 +1274,14 @@ int NodeGraphComponent::linkAtPoint(juce::Point<float> canvasPos) {
 
 void NodeGraphComponent::mouseDown(const juce::MouseEvent& e) {
     auto canvasPos = screenToCanvas(e.position);
+
+    // Breadcrumb "exit scope" chip (screen-space, drawn while inside a Voice
+    // container) wins over everything else - it overlays the canvas top-left.
+    if (viewScope != -1 && !breadcrumbExitRect.isEmpty()
+        && breadcrumbExitRect.contains(e.getPosition())) {
+        exitScope();
+        return;
+    }
 
     if (e.mods.isRightButtonDown()) {
         // Resolve any pin directly under the cursor up front. The dot is drawn
@@ -1988,6 +2004,15 @@ void NodeGraphComponent::mouseDoubleClick(const juce::MouseEvent& e) {
         }
     }
 
+    // Double-click a Voice container = drill into its inner per-note patch.
+    // The canvas then shows only that container's inner nodes (VoiceIn ->
+    // synth -> VoiceOut and anything you add inside); a breadcrumb chip lets
+    // you climb back out.
+    if (node->type == NodeType::VoiceContainer) {
+        enterScope(node->id);
+        return;
+    }
+
     if (node->type == NodeType::TerrainSynth) {
         // Open terrain visualizer
         if (onShowPluginUI) onShowPluginUI(node->id); // reuse plugin UI callback for now
@@ -2100,13 +2125,17 @@ bool NodeGraphComponent::computeAllNodesBounds(juce::Rectangle<float>& out) cons
     if (graph.nodes.empty()) return false;
 
     float minX = 1e9f, minY = 1e9f, maxX = -1e9f, maxY = -1e9f;
+    bool any = false;
     for (auto& node : graph.nodes) {
+        if (!nodeVisible(node)) continue; // fit only the current scope's nodes
         auto b = getNodeBounds(node);
         minX = std::min(minX, b.getX());
         minY = std::min(minY, b.getY());
         maxX = std::max(maxX, b.getRight());
         maxY = std::max(maxY, b.getBottom());
+        any = true;
     }
+    if (!any) return false;
     out = juce::Rectangle<float>(minX, minY, maxX - minX, maxY - minY);
     return true;
 }
@@ -2115,6 +2144,72 @@ void NodeGraphComponent::fitAll() {
     juce::Rectangle<float> b;
     if (!computeAllNodesBounds(b)) return;
     applyFitBounds(b.getX(), b.getY(), b.getRight(), b.getBottom());
+}
+
+// ----------------------------------------------------------------------------
+// Scoped inner-graph view (Voice container drill-in). enterScope/exitScope
+// only change which nodes are visible/interactive on the canvas - they touch
+// no audio state. Clearing the transient selection/hover/drag avoids acting on
+// a node that just left the view. Each re-fits so the new scope is framed.
+// ----------------------------------------------------------------------------
+void NodeGraphComponent::enterScope(int containerId) {
+    if (viewScope == containerId) return;
+    viewScope = containerId;
+    selectedNodeId = -1;
+    selectedLinkId = -1;
+    hoveredLinkId = -1;
+    hoveredPinId = -1;
+    dragMode = DragMode::None;
+    releaseAutoFitForManualView();
+    fitAll();
+    repaint();
+}
+
+void NodeGraphComponent::exitScope() {
+    if (viewScope == -1) return;
+    viewScope = -1;
+    selectedNodeId = -1;
+    selectedLinkId = -1;
+    hoveredLinkId = -1;
+    hoveredPinId = -1;
+    dragMode = DragMode::None;
+    releaseAutoFitForManualView();
+    fitAll();
+    repaint();
+}
+
+void NodeGraphComponent::drawBreadcrumb(juce::Graphics& g) {
+    breadcrumbExitRect = {};
+    if (viewScope == -1) return; // only shown inside a container
+
+    // Resolve the container's display name for the label.
+    juce::String name = "Voice";
+    if (auto* c = graph.findNode(viewScope))
+        name = juce::String(c->name);
+
+    juce::String label = juce::String::fromUTF8("\xE2\x86\x90 ") // left arrow
+                       + "Root  /  " + name;
+
+    juce::Font font(juce::FontOptions(14.0f, juce::Font::bold));
+    int textW = (int)std::ceil(font.getStringWidthFloat(label));
+    const int padX = 12, h = 26, margin = 10;
+    juce::Rectangle<int> chip(margin, margin, textW + padX * 2, h);
+    breadcrumbExitRect = chip;
+
+    g.setColour(juce::Colour(110, 60, 130).withAlpha(0.92f)); // VoiceContainer violet
+    g.fillRoundedRectangle(chip.toFloat(), 6.0f);
+    g.setColour(juce::Colours::white.withAlpha(0.25f));
+    g.drawRoundedRectangle(chip.toFloat(), 6.0f, 1.0f);
+    g.setColour(juce::Colours::white);
+    g.setFont(font);
+    g.drawText(label, chip, juce::Justification::centred);
+
+    // Hint to the right of the chip.
+    g.setFont(juce::Font(juce::FontOptions(12.0f)));
+    g.setColour(juce::Colours::white.withAlpha(0.5f));
+    g.drawText("inside Voice patch - click chip or press Esc to exit",
+               chip.getRight() + 10, chip.getY(), 420, h,
+               juce::Justification::centredLeft);
 }
 
 void NodeGraphComponent::setAutoFitView(bool on) {
@@ -2293,11 +2388,14 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
     instMenu.addItem(105, "SFZ Instrument (.sfz)...");
     instMenu.addItem(103, "Drum Machine");
     instMenu.addItem(106, "Analog Drum Synth");
-    instMenu.addSeparator();
     // Voice container: a polyphonic wrapper whose inner patch (one VoiceIn ->
     // synth -> VoiceOut subgraph) is instantiated once per simultaneous note.
-    // See poly-voice-architecture.md.
-    instMenu.addItem(150, "Voice (polyphonic)...");
+    // Only offered at the top level - M1 forbids nesting one Voice container
+    // inside another's patch. See poly-voice-architecture.md.
+    if (viewScope == -1) {
+        instMenu.addSeparator();
+        instMenu.addItem(150, "Voice (polyphonic)...");
+    }
     menu.addSubMenu("Instruments", instMenu);
 
     juce::PopupMenu fxMenu;
@@ -2407,6 +2505,10 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
     auto pos = canvasPos;
     menu.showMenuAsync(juce::PopupMenu::Options(), [this, pos](int result) {
         if (result <= 0) return;
+
+        // Remember how many nodes existed before this creation so we can stamp
+        // any newly-created top-level nodes into the current scope (below).
+        const size_t nodeCountBefore = graph.nodes.size();
 
         auto p = juce::Point<float>{pos.x, pos.y};
 
@@ -3626,6 +3728,18 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
                 if (loaded) { n.plugin = std::move(loaded); n.pluginIndex = idx; }
             }
         }
+
+        // If we're inside a Voice container's inner view, any node just created
+        // belongs to that container's patch. Stamp newly-added top-level nodes
+        // into the current scope (skip ones a handler already tagged, e.g. the
+        // Voice-container branch's own inner pucks). Synchronous branches only;
+        // async file-chooser branches create their node later and land at the
+        // top level (an acceptable M1 limitation - you can drag them in later).
+        if (viewScope != -1) {
+            for (size_t i = nodeCountBefore; i < graph.nodes.size(); ++i)
+                if (graph.nodes[i].voiceContainerId == -1)
+                    graph.nodes[i].voiceContainerId = viewScope;
+        }
         repaint();
     });
 }
@@ -4542,6 +4656,11 @@ void NodeGraphComponent::showNodeMenu(Node& node) {
 }
 
 bool NodeGraphComponent::keyPressed(const juce::KeyPress& key) {
+    // Esc climbs out of a Voice container's inner view back to the top level.
+    if (key == juce::KeyPress::escapeKey && viewScope != -1) {
+        exitScope();
+        return true;
+    }
     if (key == juce::KeyPress::deleteKey || key == juce::KeyPress::backspaceKey) {
         if (selectedLinkId >= 0) {
             deleteSelectedLink();

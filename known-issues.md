@@ -779,7 +779,7 @@ node badge; Python (Stage 3) and GLSL (Stage 4) bake errors show a remapped
 `Script error: …` overlay with the user's own source line, full detail logged to
 `seance.log`.
 
-## Control Bank editor may not push undo steps / mark dirty (audit)
+## Control Bank editor may not push undo steps / mark dirty (audit) — RESOLVED
 
 **Observed:** 2026-06-09, noted while fixing the same gap in the Signal Shape
 editor (now resolved via a destructor `commitSnapshot`). Other modeless
@@ -788,6 +788,19 @@ Bank** in particular — may still lack a close-time `graph.commitSnapshot()`,
 so edits there leave no undo step and don't set `graph.dirty` (silent loss on
 quit). Audit each; the MIDI Script and Signal Shape editor destructors are the
 reference for the correct one-snapshot-per-session pattern.
+
+**Status (2026-06-30): RESOLVED — audited, Control Bank is fully covered.**
+`control_bank.cpp` now calls `graph.commitSnapshot(...)` on every mutating
+operation rather than relying on a single close-time snapshot, which is
+stricter than the destructor pattern: orientation toggle
+(`"Control bank orientation"`), add slider (`"Add control slider"`), remove
+slider (`"Remove control slider"`), rename slider (`"Rename control slider"`),
+and value changes (`"Set control value"`). The value path is drag-aware —
+slider-drag gestures snapshot once on `onDragEnd`, while non-drag edits
+(wheel / typed value) snapshot immediately in `onValueChange` (guarded by
+`!isMouseButtonDown()`), so there's no per-tick snapshot spam. Since
+`commitSnapshot` both pushes an undo step and marks the graph dirty, edits are
+recoverable and prompt-on-quit works. No silent-loss gap remains.
 
 ---
 

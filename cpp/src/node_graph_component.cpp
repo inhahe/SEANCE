@@ -4014,6 +4014,20 @@ void NodeGraphComponent::showNodeMenu(Node& node) {
                              true, node.mpeEnabled);
         }
     }
+    // Voice container: choose which active voice gets sacrificed when every
+    // voice is busy and a new note arrives. Radio-ticked to the current mode.
+    // Applied live - PolyVoiceProcessor re-reads voiceStealMode each block, so
+    // no rebuild is needed (a plain field write + dirty flag).
+    if (node.type == NodeType::VoiceContainer) {
+        juce::PopupMenu stealMenu;
+        stealMenu.addItem(210, "Steal oldest voice",   true, node.voiceStealMode == 0);
+        stealMenu.addItem(211, "Steal quietest voice", true, node.voiceStealMode == 1);
+        stealMenu.addItem(212, "Cycle voices (round-robin)", true, node.voiceStealMode == 2);
+        const char* modeName = node.voiceStealMode == 1 ? "quietest"
+                             : node.voiceStealMode == 2 ? "round-robin" : "oldest";
+        menu.addSubMenu("Voice stealing (" + juce::String(modeName) + ")", stealMenu);
+    }
+
     // Envelope editor on synths whose amplitude envelope IS the shared node
     // AHDSR. These read node.ahdsrEnvelope directly through the shared
     // AHDSREnvelopeRuntime: the Terrain/wavetable engine plus the Additive,
@@ -4224,6 +4238,16 @@ void NodeGraphComponent::showNodeMenu(Node& node) {
         } else if (result == 9) {
             node->mpeEnabled = !node->mpeEnabled;
             graph.dirty = true;
+        } else if (result == 210 || result == 211 || result == 212) {
+            // Voice-stealing mode for a VoiceContainer. PolyVoiceProcessor reads
+            // this field every block, so the change is audible immediately with
+            // no graph rebuild; commitSnapshot captures it for undo/save.
+            int mode = result - 210; // 0=oldest, 1=quietest, 2=round-robin
+            if (node->voiceStealMode != mode) {
+                node->voiceStealMode = mode;
+                graph.commitSnapshot("Set voice stealing mode");
+                if (onNodeEdited) onNodeEdited();
+            }
         } else if (result == 181) {
             // Plugin MPE toggle: adds/removes the parallel MCM generator node,
             // so it needs a graph rebuild (unlike the timeline toggle above,

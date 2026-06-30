@@ -2579,9 +2579,14 @@ These are documented design boundaries for the first milestone, not bugs:
 - **No nested containers** — a Voice container can't live inside another.
 - **Async-file-chooser nodes land at top level when scoped** (see the scoped-editor
   note above).
-- **End-to-end audio not yet auto-verified** — voice allocation/stealing has unit
-  coverage, but "do N voices sum correctly" is an auditory check that `--self-test`
-  can't make; play a chord into a container to confirm.
+
+The allocation/lifecycle policy and the end-to-end audio path are both covered by
+`--self-test`: `testVoiceAllocator` checks free-slot/steal-oldest, note-matched
+release, and RMS free-detection on the pure `VoiceAllocator`, while
+`testVoiceContainerAudio` builds a real container (VoiceIn → Signal Oscillator →
+VoiceOut), drives it with a synthetic MIDI buffer through `PolyVoiceProcessor`, and
+asserts a held note makes a tone, three notes sum louder than one, and the voices
+decay back to silence after release.
 
 ## Asset library (project stores)
 

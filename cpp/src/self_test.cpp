@@ -25,6 +25,7 @@
 #include "builtin_synth.h"         // WaveExprParser - Builtin expression vocabulary
 #include "builtin_effects.h"       // ParametricEQProcessor - variable EQ band count
 #include "voice_allocator.h"       // VoiceAllocator - per-voice polyphony policy
+#include "poly_voice_processor.h"   // PolyVoiceProcessor - end-to-end voice audio
 
 #include <juce_audio_formats/juce_audio_formats.h>
 #include <juce_graphics/juce_graphics.h>
@@ -5925,6 +5926,140 @@ void testVoiceAllocator(Report& r) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Voice container end-to-end audio: build a real NodeGraph with a VoiceContainer
+// whose inner patch is VoiceIn -> Signal Oscillator -> VoiceOut, drive it with a
+// synthetic MIDI buffer through PolyVoiceProcessor, and confirm the clone/build/
+// sum path actually makes (and stops making) sound. This is the auditory check
+// the design doc flagged as not unit-testable - made testable by using the
+// deterministic, signal-driven Signal Oscillator instead of a stochastic synth.
+// ---------------------------------------------------------------------------
+void testVoiceContainerAudio(Report& r) {
+    r.section("Voice container (end-to-end audio: clone + sum)");
+
+    NodeGraph graph;
+    Transport transport;
+
+    // --- Build the container + inner patch (mirrors the Add-Node handlers).
+    //     addNode reallocates graph.nodes, so capture stable IDs immediately. ---
+    int containerId;
+    {
+        auto& c = graph.addNode("Voice", NodeType::VoiceContainer,
+            {Pin{0, "MIDI", PinKind::Midi, true}},
+            {Pin{0, "Audio", PinKind::Audio, false}}, {0.0f, 0.0f});
+        c.voicePolyphony = 4;
+        containerId = c.id;
+    }
+
+    int viPitch, viGate, viVel;
+    {
+        auto& vi = graph.addNode("Voice In", NodeType::VoiceIn, {},
+            {Pin{0, "MIDI",     PinKind::Midi,   false},
+             Pin{0, "Pitch",    PinKind::Signal, false, 1},
+             Pin{0, "Gate",     PinKind::Signal, false, 1},
+             Pin{0, "Velocity", PinKind::Signal, false, 1}}, {-200.0f, 0.0f});
+        vi.voiceContainerId = containerId;
+        viPitch = vi.pinsOut[1].id;
+        viGate  = vi.pinsOut[2].id;
+        viVel   = vi.pinsOut[3].id;
+    }
+
+    int oscPitch, oscGate, oscVel, oscAudio;
+    {
+        auto& s = graph.addNode("Signal Osc", NodeType::Instrument,
+            {Pin{0, "Pitch",    PinKind::Signal, true, 1},
+             Pin{0, "Gate",     PinKind::Signal, true, 1},
+             Pin{0, "Velocity", PinKind::Signal, true, 1}},
+            {Pin{0, "Audio", PinKind::Audio, false}}, {0.0f, 0.0f});
+        s.voiceContainerId = containerId;
+        s.script = "__signalosc__";
+        s.params.push_back({"Waveform", 0.0f, 0.0f, 3.0f});
+        s.params.push_back({"Volume",   0.5f, 0.0f, 1.0f});
+        s.ahdsrEnvelope.attackMs  = 2.0f;
+        s.ahdsrEnvelope.decayMs   = 20.0f;
+        s.ahdsrEnvelope.sustain   = 0.8f;
+        s.ahdsrEnvelope.releaseMs = 40.0f;
+        oscPitch = s.pinsIn[0].id;
+        oscGate  = s.pinsIn[1].id;
+        oscVel   = s.pinsIn[2].id;
+        oscAudio = s.pinsOut[0].id;
+    }
+
+    int voAudio;
+    {
+        auto& vo = graph.addNode("Voice Out", NodeType::VoiceOut,
+            {Pin{0, "Audio", PinKind::Audio, true}}, {}, {200.0f, 0.0f});
+        vo.voiceContainerId = containerId;
+        voAudio = vo.pinsIn[0].id;
+    }
+
+    graph.addLink(viPitch, oscPitch);
+    graph.addLink(viGate,  oscGate);
+    graph.addLink(viVel,   oscVel);
+    graph.addLink(oscAudio, voAudio);
+
+    Node* container = graph.findNode(containerId);
+    r.check(container != nullptr, "vc-audio: container node exists");
+    if (!container) return;
+
+    const double sr = 44100.0;
+    const int bs = 512;
+    PolyVoiceProcessor poly(*container, graph, transport);
+    poly.setPlayConfigDetails(0, 2, sr, bs);
+    poly.prepareToPlay(sr, bs);
+
+    auto rmsOf = [](juce::AudioBuffer<float>& b) {
+        return b.getRMSLevel(0, 0, b.getNumSamples());
+    };
+    auto runBlocks = [&](juce::AudioBuffer<float>& out, juce::MidiBuffer& first, int extra) {
+        poly.processBlock(out, first);
+        juce::MidiBuffer empty;
+        for (int i = 0; i < extra; ++i) poly.processBlock(out, empty);
+        return rmsOf(out);
+    };
+
+    // No notes -> silence.
+    {
+        juce::AudioBuffer<float> out(2, bs);
+        juce::MidiBuffer midi;
+        poly.processBlock(out, midi);
+        r.check(rmsOf(out) < 1.0e-5f, "vc-audio: silent before any note");
+    }
+
+    // One held note -> a tone appears once the attack settles. This proves the
+    // whole chain: MIDI parse -> alloc -> VoiceIn drive -> inner-graph clone
+    // (buildScope) -> Signal Oscillator reads the control signals -> VoiceOut.
+    float rms1 = 0.0f;
+    {
+        juce::AudioBuffer<float> out(2, bs);
+        juce::MidiBuffer on;
+        on.addEvent(juce::MidiMessage::noteOn(1, 69, (juce::uint8) 110), 0); // A4
+        rms1 = runBlocks(out, on, 4);
+        r.check(rms1 > 1.0e-2f, "vc-audio: a held note produces a tone");
+    }
+
+    // Two more simultaneous notes -> three voices summed -> more energy than one
+    // (different pitches are incoherent, so the sum's RMS exceeds a single voice).
+    {
+        juce::AudioBuffer<float> out(2, bs);
+        juce::MidiBuffer on;
+        on.addEvent(juce::MidiMessage::noteOn(1, 72, (juce::uint8) 110), 0); // C5
+        on.addEvent(juce::MidiMessage::noteOn(1, 76, (juce::uint8) 110), 0); // E5
+        float rms3 = runBlocks(out, on, 4);
+        r.check(rms3 > rms1 * 1.2f, "vc-audio: three summed voices louder than one");
+    }
+
+    // Release everything -> after the release tail + the RMS free window, the
+    // container falls back to silence (no stuck/leaked voices).
+    {
+        juce::AudioBuffer<float> out(2, bs);
+        juce::MidiBuffer off;
+        off.addEvent(juce::MidiMessage::allNotesOff(1), 0);
+        float tail = runBlocks(out, off, 80); // ~80 blocks ~= 0.9s >> 40ms rel + 250ms free
+        r.check(tail < 1.0e-4f, "vc-audio: voices decay to silence after release");
+    }
+}
+
 int runSelfTest(const juce::File& outDir) {
     outDir.createDirectory();
     Report r;
@@ -5945,6 +6080,7 @@ int runSelfTest(const juce::File& outDir) {
     testFmOpEnvelopes(r);
     testAssetLibrary(r);
     testVoiceAllocator(r);
+    testVoiceContainerAudio(r);
 
     r.section("Summary");
     r.line("  PASSED: " + juce::String(r.passed));

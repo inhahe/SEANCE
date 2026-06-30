@@ -1,6 +1,7 @@
 #pragma once
 #include "node_graph.h"
 #include <juce_audio_processors/juce_audio_processors.h>
+#include <algorithm>
 #include <vector>
 #include <cmath>
 
@@ -46,37 +47,46 @@ public:
             midi.addEvent(e.msg, juce::jlimit(0, n > 0 ? n - 1 : 0, e.sampleOffset));
         pending.clear();
 
-        // Write the per-voice context signals. Pitch/Gate/Velocity are held
-        // constant across the block in v1 (sample-accurate ramps are M2). The
-        // control channels are 2,3,4 (see widenForControl: 2 audio + 3 signal).
-        writeConst(buf, 2, pitchHz);
-        writeConst(buf, 3, gate);
-        writeConst(buf, 4, velocity);
+        // Write the per-voice context signals as PIECEWISE-CONSTANT ramps so a
+        // note-on/off lands on its exact within-block sample offset (M2:
+        // sample-accurate gates). Each segment in `segs` is a value change at an
+        // offset; before the first segment the signal holds the value carried
+        // from the previous block. The control channels are 2,3,4 (see
+        // widenForControl: 2 audio + 3 signal -> Pitch ch2, Gate ch3, Vel ch4).
+        writeSignals(buf, n);
     }
 
     // ---- Driven by PolyVoiceProcessor (same audio thread) -------------------
 
     // Queue a note-on for this voice at the given within-block sample offset.
+    // Schedules the Pitch/Gate/Velocity step at that offset AND the MIDI note.
     void noteOn(int sampleOffset, int midiNote, float vel) {
-        velocity = juce::jlimit(0.0f, 1.0f, vel);
-        pitchHz  = midiToHz(midiNote);
-        gate     = 1.0f;
+        const float v  = juce::jlimit(0.0f, 1.0f, vel);
+        const float hz = midiToHz(midiNote);
+        pushSeg({ sampleOffset, 1.0f, hz, v });
         if (pending.size() < kMaxPending)
             pending.push_back({ juce::MidiMessage::noteOn(1, midiNote,
                                  (juce::uint8)juce::jlimit(1, 127, (int)std::lround(vel * 127.0f))),
                                  sampleOffset });
     }
 
-    // Queue a note-off (release). The voice keeps sounding through its tail.
+    // Queue a note-off (release) at the given offset. The voice keeps sounding
+    // through its tail, so Pitch/Velocity are held at their current values and
+    // only the Gate falls to 0.
     void noteOff(int sampleOffset, int midiNote) {
-        gate = 0.0f;
+        pushSeg({ sampleOffset, 0.0f, lastPitch(), lastVel() });
         if (pending.size() < kMaxPending)
             pending.push_back({ juce::MidiMessage::noteOff(1, midiNote), sampleOffset });
     }
 
-    // Hard reset (voice stolen / panic): drop gate and flush an all-notes-off.
+    // Hard reset (voice stolen / panic): drop the gate at the block start and
+    // flush an all-notes-off. Clears any segments already queued this block so
+    // a stale note-on can't survive the steal (and keeps `segs` ordered).
     void reset() {
-        gate = 0.0f;
+        const float p = lastPitch();
+        const float v = lastVel();
+        segs.clear();
+        pushSeg({ 0, 0.0f, p, v });
         pending.clear();
         if (pending.size() < kMaxPending)
             pending.push_back({ juce::MidiMessage::allNotesOff(1), 0 });
@@ -101,11 +111,49 @@ public:
     }
 
 private:
-    void writeConst(juce::AudioBuffer<float>& buf, int ch, float v) {
-        if (ch < buf.getNumChannels()) {
-            float* d = buf.getWritePointer(ch);
-            for (int i = 0, n = buf.getNumSamples(); i < n; ++i) d[i] = v;
+    // One scheduled value-change of the Pitch/Gate/Velocity signals, to take
+    // effect from `offset` samples into the current block.
+    struct Seg { int offset; float gate, pitch, vel; };
+
+    // The latest scheduled Pitch/Velocity this block (or the carried value if
+    // nothing is queued yet) - what a note-off should hold the tone at.
+    float lastPitch() const { return segs.empty() ? curPitch : segs.back().pitch; }
+    float lastVel()   const { return segs.empty() ? curVel   : segs.back().vel; }
+
+    void pushSeg(const Seg& s) {
+        if (segs.size() < kMaxSegs) segs.push_back(s);
+    }
+
+    // Render the three control signals as piecewise-constant ramps across the
+    // block, then carry the final values into the next block. Channels: Pitch
+    // = 2, Gate = 3, Velocity = 4 (matches widenForControl's layout). Segments
+    // are stable-sorted by offset so an out-of-order reset (offset 0) injected
+    // mid-stream still produces a monotonic ramp.
+    void writeSignals(juce::AudioBuffer<float>& buf, int n) {
+        std::stable_sort(segs.begin(), segs.end(),
+                         [](const Seg& a, const Seg& b) { return a.offset < b.offset; });
+        const int ch = buf.getNumChannels();
+        float* pp = (2 < ch) ? buf.getWritePointer(2) : nullptr; // Pitch
+        float* gp = (3 < ch) ? buf.getWritePointer(3) : nullptr; // Gate
+        float* vp = (4 < ch) ? buf.getWritePointer(4) : nullptr; // Velocity
+
+        size_t idx = 0;
+        float g = curGate, p = curPitch, v = curVel;
+        for (int i = 0; i < n; ++i) {
+            while (idx < segs.size() && segs[idx].offset <= i) {
+                g = segs[idx].gate; p = segs[idx].pitch; v = segs[idx].vel; ++idx;
+            }
+            if (pp) pp[i] = p;
+            if (gp) gp[i] = g;
+            if (vp) vp[i] = v;
         }
+        // Any segments past the block end still update the carried value so they
+        // take effect at the very start of the next block.
+        while (idx < segs.size()) {
+            g = segs[idx].gate; p = segs[idx].pitch; v = segs[idx].vel; ++idx;
+        }
+        curGate = g; curPitch = p; curVel = v;
+        segs.clear();
     }
 
     Node& node;
@@ -113,11 +161,15 @@ private:
 
     struct Ev { juce::MidiMessage msg; int sampleOffset; };
     static constexpr size_t kMaxPending = 64;
+    static constexpr size_t kMaxSegs    = 128;
     std::vector<Ev> pending;
+    std::vector<Seg> segs;
 
-    float pitchHz  = 440.0f;
-    float gate     = 0.0f;
-    float velocity = 0.0f;
+    // Carried signal values: the level at the START of the current block (= the
+    // level at the end of the previous one). Updated by writeSignals each block.
+    float curPitch = 440.0f;
+    float curGate  = 0.0f;
+    float curVel   = 0.0f;
 };
 
 } // namespace SoundShop

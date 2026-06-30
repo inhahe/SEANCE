@@ -6008,6 +6008,112 @@ void testVoiceAllocator(Report& r) {
 }
 
 // ---------------------------------------------------------------------------
+// VoiceIn signal emission: drive a VoiceInProcessor directly and inspect the
+// Pitch/Gate/Velocity control channels (2/3/4) sample-by-sample to prove the
+// note-on/off edges land on their EXACT within-block offset (M2: sample-accurate
+// gates), that pitch/velocity step with the gate, and that a release holds pitch
+// while only the gate falls. Also covers carry across blocks, multiple segments
+// in one block, and reset().
+// ---------------------------------------------------------------------------
+void testVoiceInSignals(Report& r) {
+    r.section("VoiceIn signals (sample-accurate gates)");
+
+    NodeGraph graph;
+    auto& node = graph.addNode("Voice In", NodeType::VoiceIn, {},
+        {Pin{0, "MIDI",     PinKind::Midi,   false},
+         Pin{0, "Pitch",    PinKind::Signal, false, 1},
+         Pin{0, "Gate",     PinKind::Signal, false, 1},
+         Pin{0, "Velocity", PinKind::Signal, false, 1}}, {0.0f, 0.0f});
+
+    VoiceInProcessor vip(node);
+    const int N = 512;
+    vip.prepareToPlay(48000.0, N);
+
+    // Channels: 0/1 audio (unused here), 2 = Pitch, 3 = Gate, 4 = Velocity.
+    juce::AudioBuffer<float> buf(5, N);
+    const float a5 = VoiceInProcessor::midiToHz(81); // 880 Hz
+
+    // --- Block 1: note-on at offset 100 (A5, vel 0.8). ---
+    {
+        buf.clear();
+        juce::MidiBuffer midi;
+        vip.noteOn(100, 81, 0.8f);
+        vip.processBlock(buf, midi);
+
+        r.check(buf.getSample(3, 99) == 0.0f, "gate: low at sample 99 (before offset)");
+        r.check(buf.getSample(3, 100) == 1.0f, "gate: high exactly at offset 100");
+        r.check(buf.getSample(3, N - 1) == 1.0f, "gate: stays high to end of block");
+
+        r.check(std::abs(buf.getSample(2, 99) - 440.0f) < 0.5f,
+                "pitch: carried default (440) before the note-on");
+        r.check(std::abs(buf.getSample(2, 100) - a5) < 0.5f,
+                "pitch: steps to 880 exactly at offset 100");
+
+        r.check(buf.getSample(4, 99) == 0.0f, "velocity: 0 before the note-on");
+        r.check(std::abs(buf.getSample(4, 100) - 0.8f) < 1e-4f,
+                "velocity: latched to 0.8 at offset 100");
+
+        // MIDI note-on must be emitted at the same offset.
+        bool foundOn = false;
+        for (const auto m : midi)
+            if (m.getMessage().isNoteOn() && m.samplePosition == 100) foundOn = true;
+        r.check(foundOn, "midi: note-on emitted at sample 100");
+    }
+
+    // --- Block 2: note-off at offset 200 - gate falls, pitch/velocity hold. ---
+    {
+        buf.clear();
+        juce::MidiBuffer midi;
+        vip.noteOff(200, 81);
+        vip.processBlock(buf, midi);
+
+        r.check(buf.getSample(3, 199) == 1.0f, "gate: still high at 199 (carried from block 1)");
+        r.check(buf.getSample(3, 200) == 0.0f, "gate: falls exactly at offset 200");
+        r.check(std::abs(buf.getSample(2, 0) - a5) < 0.5f,
+                "pitch: held at 880 through the release (block start)");
+        r.check(std::abs(buf.getSample(2, N - 1) - a5) < 0.5f,
+                "pitch: held at 880 through the release (block end)");
+        r.check(std::abs(buf.getSample(4, N - 1) - 0.8f) < 1e-4f,
+                "velocity: latched value held through release");
+    }
+
+    // --- Block 3: reset() drops the gate at the block start. ---
+    {
+        buf.clear();
+        juce::MidiBuffer midi;
+        vip.reset();
+        vip.processBlock(buf, midi);
+        r.check(buf.getSample(3, 0) == 0.0f && buf.getSample(3, N - 1) == 0.0f,
+                "reset: gate low across the whole block");
+        bool foundAllOff = false;
+        for (const auto m : midi)
+            if (m.getMessage().isAllNotesOff()) foundAllOff = true;
+        r.check(foundAllOff, "reset: emits all-notes-off");
+    }
+
+    // --- Block 4: multiple segments in ONE block (on @50, off @150, on @300). ---
+    {
+        buf.clear();
+        juce::MidiBuffer midi;
+        const float c4 = VoiceInProcessor::midiToHz(60); // 261.63 Hz
+        const float e4 = VoiceInProcessor::midiToHz(64); // 329.63 Hz
+        vip.noteOn(50, 60, 1.0f);
+        vip.noteOff(150, 60);
+        vip.noteOn(300, 64, 0.5f);
+        vip.processBlock(buf, midi);
+
+        r.check(buf.getSample(3, 49)  == 0.0f, "multi: gate low before first on (49)");
+        r.check(buf.getSample(3, 50)  == 1.0f, "multi: gate high at first on (50)");
+        r.check(buf.getSample(3, 149) == 1.0f, "multi: gate high before off (149)");
+        r.check(buf.getSample(3, 150) == 0.0f, "multi: gate low at off (150)");
+        r.check(buf.getSample(3, 299) == 0.0f, "multi: gate low before second on (299)");
+        r.check(buf.getSample(3, 300) == 1.0f, "multi: gate high at second on (300)");
+        r.check(std::abs(buf.getSample(2, 60)  - c4) < 0.5f, "multi: pitch C4 during first note");
+        r.check(std::abs(buf.getSample(2, 320) - e4) < 0.5f, "multi: pitch E4 during second note");
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Voice container end-to-end audio: build a real NodeGraph with a VoiceContainer
 // whose inner patch is VoiceIn -> Signal Oscillator -> VoiceOut, drive it with a
 // synthetic MIDI buffer through PolyVoiceProcessor, and confirm the clone/build/
@@ -6234,6 +6340,7 @@ int runSelfTest(const juce::File& outDir) {
     testFmOpEnvelopes(r);
     testAssetLibrary(r);
     testVoiceAllocator(r);
+    testVoiceInSignals(r);
     testVoiceContainerAudio(r);
     testVoiceContainerSaveLoad(r);
 

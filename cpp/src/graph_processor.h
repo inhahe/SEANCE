@@ -258,6 +258,19 @@ public:
     // Rebuild the JUCE graph from our node graph
     void rebuildGraph(NodeGraph& graph, Transport& transport);
 
+    // Build the built-in AudioProcessor for a "normal" node (any synth, effect,
+    // timeline, SignalShape/Script, etc.), returning a freshly-owned processor.
+    // This is the graph-agnostic factory: it depends ONLY on the node, the
+    // transport, and the graph it belongs to - no GraphProcessor member state -
+    // so it can populate an INNER graph (e.g. a per-voice subgraph inside a
+    // Voice container) exactly as it populates the main graph. The caller is
+    // responsible for the main-graph-only special cases that this does NOT
+    // handle: the Output sink, hosted-plugin instance ownership transfer, and
+    // cache-playback substitution. Returns a PassthroughProcessor for anything
+    // unrecognized (never null). See poly-voice-architecture.md.
+    static std::unique_ptr<juce::AudioProcessor> createNodeProcessor(
+        Node& node, Transport& transport, NodeGraph& graph);
+
     double getSampleRate() const { return sampleRate; }
     int getBlockSize() const { return blockSize; }
 

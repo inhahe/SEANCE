@@ -17,12 +17,24 @@ namespace SoundShop {
 // container drives clone v's instance with voice v's per-note state before
 // rendering that voice's block.
 //
-// Outputs (pin order fixed - see node creation in node_graph.cpp):
+// Outputs (pin order fixed - see node creation in node_graph_component.cpp):
 //   pin 0: "MIDI"     (Midi)   - raw per-voice note stream (fork (a): drives an
 //                                ordinary MIDI synth inside the patch).
 //   pin 1: "Pitch"    (Signal) - note frequency in Hz on control channel 2.
+//                                INCLUDES per-note pitch bend (MPE / channel
+//                                pitch wheel folded in multiplicatively).
 //   pin 2: "Gate"     (Signal) - 1.0 while held, 0.0 after note-off, channel 3.
 //   pin 3: "Velocity" (Signal) - note-on velocity 0..1 on control channel 4.
+//   pin 4: "Pressure" (Signal) - per-note pressure 0..1 on channel 5 (MPE
+//                                channel pressure / poly aftertouch; 0 at rest).
+//   pin 5: "Timbre"   (Signal) - per-note timbre 0..1 on channel 6 (MPE CC74 /
+//                                "slide"; 0.5 at rest = centre).
+//
+// The three expression dimensions (bend, pressure, timbre) are continuous
+// controllers: PolyVoiceProcessor sets a per-block TARGET from the matching MPE
+// message and VoiceIn ramps toward it with a short one-pole smoother (~5 ms) so
+// there is no zipper noise. They reset to neutral on every fresh note-on so one
+// note's expression never bleeds into the next note that reuses the voice.
 //
 // The container and the inner graph run on the SAME audio thread, sequentially
 // (drive VoiceIn, then run the voice's graph), so the plain members below need
@@ -32,7 +44,13 @@ public:
     explicit VoiceInProcessor(Node& n) : node(n) {}
 
     const juce::String getName() const override { return node.name; }
-    void prepareToPlay(double sr, int) override { sampleRate = sr; }
+    void prepareToPlay(double sr, int) override {
+        sampleRate = sr;
+        // One-pole smoothing coefficient for the expression signals (~5 ms time
+        // constant). coef = 1 - exp(-1/(tau*sr)); guarded for absurd sample rates.
+        const double tau = 0.005;
+        exprSmooth = (sr > 0.0) ? (float) (1.0 - std::exp(-1.0 / (tau * sr))) : 1.0f;
+    }
     void releaseResources() override {}
 
     void processBlock(juce::AudioBuffer<float>& buf, juce::MidiBuffer& midi) override {
@@ -67,6 +85,12 @@ public:
     void noteOn(int sampleOffset, int midiNote, float vel, float glideMs = 0.0f) {
         const float v  = juce::jlimit(0.0f, 1.0f, vel);
         const float hz = midiToHz(midiNote);
+        // Fresh note: snap every expression dimension back to neutral so the
+        // previous note's bend/pressure/timbre can't bleed into this one when
+        // the voice is reused. Subsequent MPE messages this block re-target them.
+        curBend = tgtBend = 0.0f;
+        curPressure = tgtPressure = 0.0f;
+        curTimbre = tgtTimbre = 0.5f;
         int glideSamples = 0;
         if (glideMs > 0.0f && sampleRate > 0.0)
             glideSamples = (int) std::lround(glideMs * 0.001 * sampleRate);
@@ -97,7 +121,19 @@ public:
         pending.clear();
         if (pending.size() < kMaxPending)
             pending.push_back({ juce::MidiMessage::allNotesOff(1), 0 });
+        // A stolen/panicked voice also drops its expression to neutral.
+        curBend = tgtBend = 0.0f;
+        curPressure = tgtPressure = 0.0f;
+        curTimbre = tgtTimbre = 0.5f;
     }
+
+    // ---- Per-note MPE expression (set per block by PolyVoiceProcessor) -------
+    // These set the TARGET; writeSignals ramps the live value toward it each
+    // sample. setPitchBend is in semitones (folded into the Pitch signal);
+    // pressure/timbre are 0..1 (timbre centre = 0.5).
+    void setPitchBend(float semitones) { tgtBend = semitones; }
+    void setPressure (float v01)       { tgtPressure = juce::jlimit(0.0f, 1.0f, v01); }
+    void setTimbre   (float v01)       { tgtTimbre   = juce::jlimit(0.0f, 1.0f, v01); }
 
     double getTailLengthSeconds() const override { return 0; }
     bool acceptsMidi() const override { return false; }
@@ -145,6 +181,8 @@ private:
         float* pp = (2 < ch) ? buf.getWritePointer(2) : nullptr; // Pitch
         float* gp = (3 < ch) ? buf.getWritePointer(3) : nullptr; // Gate
         float* vp = (4 < ch) ? buf.getWritePointer(4) : nullptr; // Velocity
+        float* zp = (5 < ch) ? buf.getWritePointer(5) : nullptr; // Pressure
+        float* yp = (6 < ch) ? buf.getWritePointer(6) : nullptr; // Timbre
 
         size_t idx = 0;
         float g = curGate, p = curPitch, v = curVel;
@@ -171,9 +209,19 @@ private:
                 if (--glideRemaining == 0) lp = glideTargetLog; // snap to exact
                 p = (float) std::exp(lp);
             }
-            if (pp) pp[i] = p;
+            // Smooth the expression signals toward their per-block targets so
+            // continuous controllers (bend/pressure/timbre) don't zipper.
+            curBend     += (tgtBend     - curBend)     * exprSmooth;
+            curPressure += (tgtPressure - curPressure) * exprSmooth;
+            curTimbre   += (tgtTimbre   - curTimbre)   * exprSmooth;
+            // Fold pitch bend into the Pitch signal multiplicatively (semitones).
+            const float hzOut = (curBend != 0.0f)
+                ? p * std::exp2(curBend * (1.0f / 12.0f)) : p;
+            if (pp) pp[i] = hzOut;
             if (gp) gp[i] = g;
             if (vp) vp[i] = v;
+            if (zp) zp[i] = curPressure;
+            if (yp) yp[i] = curTimbre;
         }
         // Any segments past the block end still update the carried value so they
         // take effect at the very start of the next block.
@@ -214,6 +262,14 @@ private:
     int    glideRemaining = 0;
     double glideStepLog   = 0.0;
     double glideTargetLog = 0.0;
+
+    // Per-note MPE expression. `cur` is the smoothed live value, `tgt` the per-
+    // block target set by setPitchBend/setPressure/setTimbre. Defaults are the
+    // neutral resting points (bend 0 semis, pressure 0, timbre 0.5 = centre).
+    float curBend = 0.0f, tgtBend = 0.0f;          // semitones
+    float curPressure = 0.0f, tgtPressure = 0.0f;  // 0..1
+    float curTimbre = 0.5f, tgtTimbre = 0.5f;      // 0..1 (centre 0.5)
+    float exprSmooth = 1.0f;                        // per-sample one-pole coef
 };
 
 } // namespace SoundShop

@@ -1131,6 +1131,28 @@ bool ProjectFile::readProject(std::istream& f, NodeGraph& graph, PluginHost* plu
     for (auto& n : graph.nodes)
         ensureFmOpEnvelopes(n);
 
+    // VoiceIn: migrate any project that predates the MPE expression outputs.
+    // Old files carry only MIDI/Pitch/Gate/Velocity output pins; append the
+    // Pressure and Timbre Signal outputs (channels 5/6) so MPE patches built
+    // after the upgrade can wire them. Idempotent - skips if already present.
+    for (auto& n : graph.nodes) {
+        if (n.type != NodeType::VoiceIn) continue;
+        auto hasPin = [&](const std::string& nm) {
+            for (auto& p : n.pinsOut) if (p.name == nm) return true;
+            return false;
+        };
+        if (!hasPin("Pressure")) {
+            Pin p; p.id = graph.allocId(); p.name = "Pressure";
+            p.kind = PinKind::Signal; p.isInput = false; p.channels = 1;
+            n.pinsOut.push_back(p);
+        }
+        if (!hasPin("Timbre")) {
+            Pin p; p.id = graph.allocId(); p.name = "Timbre";
+            p.kind = PinKind::Signal; p.isInput = false; p.channels = 1;
+            n.pinsOut.push_back(p);
+        }
+    }
+
     // Same for live-referenced Waveform assets: push each referenced asset's
     // frame into the wavetable library entries that point at it, re-encoding
     // the affected node scripts so the audio thread (which decodes node.script)

@@ -74,7 +74,20 @@
 <ol>
   <li><strong>MIDI</strong> — the note as an ordinary MIDI stream. Wire this into any existing MIDI synth (FM, Wavetable, SoundFont, a hosted plugin) and it just works, one instance per voice. This is what the default patch uses, and it's the fastest way to make a container sing.</li>
   <li><strong>Pitch / Gate / Velocity</strong> — the note broken out as three <a href="pin-kinds.html">control signals</a>: <strong>Pitch</strong> in Hz, a <strong>Gate</strong> that's 1 while the key is held and 0 after you let go, and <strong>Velocity</strong> (how hard you struck it). These are for building a voice out of raw signal-driven modules — the modular-synth path.</li>
+  <li><strong>Pressure / Timbre</strong> — two extra <a href="pin-kinds.html">control signals</a> that carry <em>per-note expression</em>. <strong>Pressure</strong> (0..1, resting at 0) follows how hard you lean on a held note; <strong>Timbre</strong> (0..1, resting at the centre 0.5) follows the "slide" axis of an expressive controller. Wire them into a filter cutoff, a volume, a wavetable position — anything — and that one note brightens or swells as you press, independently of every other note you're holding.</li>
 </ol>
+
+<h2>Expressive, per-note playing (MPE)</h2>
+
+<p>If you play a Voice container from an <strong>MPE controller</strong> (a Roli Seaboard, a LinnStrument, an MPE-capable keyboard, etc.), each note you hold gets its <em>own</em> pitch bend, pressure, and timbre — so you can bend one note of a chord while the others stay put, or swell a single voice with finger pressure. SEANCE routes each expression message to the right voice automatically; you just patch the <strong>Pressure</strong> and <strong>Timbre</strong> outputs of VoiceIn into whatever you want them to control.</p>
+
+<ul>
+  <li><strong>Pitch bend</strong> is folded straight into the <strong>Pitch</strong> output, so anything reading Pitch (a Signal Oscillator, the FM synth via MIDI, …) bends with no extra wiring. Per-note bends use a wide ±48-semitone range, the MPE standard.</li>
+  <li><strong>Pressure</strong> appears on the VoiceIn <strong>Pressure</strong> output, <strong>Timbre</strong> (the controller's slide / Y axis) on the <strong>Timbre</strong> output.</li>
+  <li>Playing from an ordinary keyboard or the piano roll instead? A normal pitch-bend or aftertouch gesture simply applies to <em>all</em> sounding notes at once — the same controls still work, just globally rather than per note.</li>
+</ul>
+
+<p>Try it: build the Signal Oscillator voice below, then wire <strong>VoiceIn Pressure → Signal Filter Cutoff</strong> (right-click the filter's Cutoff row → <em>Add Modulation Input</em> first) and play with pressure — each note opens up on its own.</p>
 
 <h2>Build a modular voice with the Signal Oscillator</h2>
 
@@ -96,7 +109,7 @@
   <li>Double-click the Voice container to go inside.</li>
   <li>Delete the default FM synth (select it, press Delete).</li>
   <li>Add a Signal Oscillator.</li>
-  <li>Wire <strong>VoiceIn Pitch → Signal Oscillator Pitch</strong>, <strong>VoiceIn Gate → Gate</strong>, and <strong>VoiceIn Velocity → Velocity</strong>.</li>
+  <li>Wire <strong>VoiceIn Pitch → Signal Oscillator Pitch</strong>, <strong>VoiceIn Gate → Gate</strong>, and <strong>VoiceIn Velocity → Velocity</strong>. (You can leave Pressure and Timbre unconnected for now, or patch them into a filter once you add one.)</li>
   <li>Wire <strong>Signal Oscillator audio → VoiceOut</strong>.</li>
   <li>Press Esc to pop back out, and play.</li>
 </ol>
@@ -164,7 +177,6 @@
 
 <ul>
   <li>The voice count is fixed when you create the container (default 8) — there's no live slider yet.</li>
-  <li>When all voices are busy, the <em>oldest</em> note is always the one stolen.</li>
   <li>You can't put a Voice container inside another Voice container.</li>
   <li>Adding a node that opens a file picker (a hosted plugin, a SoundFont, a WASM module) lands it at the top level even if you're scoped inside a container — drag it in afterward, or recreate it inside.</li>
 </ul>

@@ -2494,13 +2494,37 @@ Inside the container the patch is bounded by two special nodes, mirroring JUCE's
     existing MIDI-driven synth (FM, Waveform, SoundFont, a hosted plugin, …) work
     inside a voice **unmodified** — the default patch uses exactly this.
   - **Pitch** (Signal, Hz) — the note's frequency, written every sample.
+    **Includes per-note pitch bend** (MPE / channel pitch wheel folded in
+    multiplicatively, so a glide and a bend compose cleanly).
   - **Gate** (Signal, 0/1) — `1.0` while the note is held, `0.0` after note-off.
   - **Velocity** (Signal, 0..1) — the note-on velocity, latched for the note.
+  - **Pressure** (Signal, 0..1) — per-note pressure, `0` at rest. Driven by MPE
+    channel pressure (or polyphonic key pressure / aftertouch on the note's
+    channel). Wire it into a filter cutoff, an amp VCA, a wavetable position, … to
+    make pressing harder open/brighten/swell that one note.
+  - **Timbre** (Signal, 0..1) — per-note timbre, `0.5` at rest (centre). Driven by
+    MPE **CC74** ("slide" / the Y axis on an MPE controller). The canonical
+    second expression axis: wire it wherever a per-note tone-colour control fits.
 
-  The Pitch/Gate/Velocity outputs are **fork (b)**: the modular-synthesis path,
-  consumed by nodes that read control Signals directly (see Signal Oscillator
-  below). Pitch/Gate/Velocity arrive on control channels 2/3/4 of the buffer, the
-  standard Signal-pin-as-extra-channel mechanism.
+  The Pitch/Gate/Velocity/Pressure/Timbre outputs are **fork (b)**: the
+  modular-synthesis path, consumed by nodes that read control Signals directly
+  (see Signal Oscillator below). They arrive on control channels 2/3/4/5/6 of the
+  buffer, the standard Signal-pin-as-extra-channel mechanism.
+
+  **MPE / per-note expression.** `PolyVoiceProcessor` parses pitch wheel, channel
+  pressure, polyphonic key pressure, and CC74 out of the incoming MIDI and routes
+  each to the matching voice **by MIDI channel** (the channel the note was
+  allocated on is remembered per slot). A message on a **member channel** (2–16)
+  reaches only the voice(s) on that channel — true per-note expression from an MPE
+  controller, where every held note lands on its own channel. A message on the
+  **master channel 1** (also the non-MPE case, where a piano-roll/keyboard puts
+  everything on channel 1) **broadcasts to all voices** — so an ordinary mod/bend
+  still works as a global gesture. Pitch-bend range is the MPE default **±48
+  semitones** on member channels and the conventional **±2 semitones** on channel
+  1. The three dimensions are smoothed with a short (~5 ms) one-pole so continuous
+  controllers don't zipper, and **reset to neutral on every fresh note-on** so one
+  note's expression never bleeds into the next note that reuses the voice. None of
+  this needs configuration — patch the Pressure/Timbre outputs and play.
 - **VoiceOut** (right puck) — the audio sink for the patch. Whatever you wire into
   it is this voice's contribution; the container sums VoiceOut across all active
   voices into its single output. It is mapped to the inner graph's output node the
@@ -2793,7 +2817,14 @@ the pure `VoiceAllocator`; `testVoiceInSignals` drives a `VoiceInProcessor` dire
 and asserts the Pitch/Gate/Velocity edges land on their exact within-block sample
 offset (including multiple segments per block, carry across blocks, reset, and the
 glide ramp — start, monotonic slide, snap-to-target, hold, and a glide spanning
-multiple blocks); and `testVoiceContainerAudio` builds a real container
+multiple blocks); `testVoiceMpe` covers the per-note expression path in three
+parts — the `VoiceInProcessor` expression signals (neutral rest values, smoothing
+toward target, +12-semitone bend doubling the Pitch signal, and the reset-to-
+neutral on a fresh note-on), the end-to-end routing through `PolyVoiceProcessor`
+(a member-channel bend raises only the matching voice ≈2×, a bend on a different
+channel leaves it alone, and a master-channel-1 bend broadcasts to it), and the
+load migration that grows an old 4-output VoiceIn its Pressure/Timbre pins; and
+`testVoiceContainerAudio` builds a real container
 (VoiceIn → Signal Oscillator → VoiceOut), drives it with a synthetic MIDI buffer
 through `PolyVoiceProcessor`, and asserts a held note makes a tone, three notes sum
 louder than one, and the voices decay back to silence after release. The modular

@@ -2758,16 +2758,26 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
             }
 
             // 2. Inner VoiceIn puck: per-note context source. Emits raw per-voice
-            //    MIDI plus Pitch(Hz)/Gate(0/1)/Velocity(0..1) Signal channels.
+            //    MIDI plus Pitch(Hz)/Gate(0/1)/Velocity(0..1) and the MPE
+            //    expression signals Pressure(0..1)/Timbre(0..1) Signal channels.
             int voiceInMidiPin;
             {
                 auto& vi = graph.addNode("Voice In", NodeType::VoiceIn, {},
                     {Pin{0, "MIDI",     PinKind::Midi,   false},
                      Pin{0, "Pitch",    PinKind::Signal, false, 1},
                      Pin{0, "Gate",     PinKind::Signal, false, 1},
-                     Pin{0, "Velocity", PinKind::Signal, false, 1}},
+                     Pin{0, "Velocity", PinKind::Signal, false, 1},
+                     Pin{0, "Pressure", PinKind::Signal, false, 1},
+                     Pin{0, "Timbre",   PinKind::Signal, false, 1}},
                     {p.x - 240.0f, p.y + 170.0f});
                 vi.voiceContainerId = containerId;
+                if (vi.pinsOut.size() >= 6) {
+                    vi.pinsOut[1].tooltip = "Pitch (Hz): this voice's note frequency, including pitch bend.";
+                    vi.pinsOut[2].tooltip = "Gate (0/1): 1 while the key is held, 0 after release.";
+                    vi.pinsOut[3].tooltip = "Velocity (0..1): how hard this note was struck.";
+                    vi.pinsOut[4].tooltip = "Pressure (0..1): per-note pressure (MPE / aftertouch); 0 at rest.";
+                    vi.pinsOut[5].tooltip = "Timbre (0..1): per-note timbre slide (MPE CC74); 0.5 = centre.";
+                }
                 voiceInMidiPin = vi.pinsOut[0].id;
             }
 

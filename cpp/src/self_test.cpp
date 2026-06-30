@@ -6167,6 +6167,232 @@ void testVoiceInSignals(Report& r) {
 }
 
 // ---------------------------------------------------------------------------
+// MPE per-note expression. Two halves:
+//  (1) Unit: drive a VoiceInProcessor's expression setters and read the
+//      Pressure (ch5) / Timbre (ch6) signals + the bent Pitch (ch2) directly -
+//      neutral defaults, smoothing toward target, pitch-bend folding, and the
+//      reset-to-neutral on a fresh note-on.
+//  (2) End-to-end routing: a real PolyVoiceProcessor + Signal Osc patch, proving
+//      a channel pitch-bend reaches the right voice (member channel targets one
+//      voice; master channel 1 broadcasts) measured by output zero-crossings.
+//  (3) Migration: an old 4-output VoiceIn gains Pressure/Timbre pins on load.
+// ---------------------------------------------------------------------------
+void testVoiceMpe(Report& r) {
+    r.section("MPE per-note expression (Pressure/Timbre/bend)");
+
+    // ---- (1) VoiceInProcessor expression signals -------------------------
+    {
+        NodeGraph graph;
+        auto& node = graph.addNode("Voice In", NodeType::VoiceIn, {},
+            {Pin{0, "MIDI",     PinKind::Midi,   false},
+             Pin{0, "Pitch",    PinKind::Signal, false, 1},
+             Pin{0, "Gate",     PinKind::Signal, false, 1},
+             Pin{0, "Velocity", PinKind::Signal, false, 1},
+             Pin{0, "Pressure", PinKind::Signal, false, 1},
+             Pin{0, "Timbre",   PinKind::Signal, false, 1}}, {0.0f, 0.0f});
+
+        VoiceInProcessor vip(node);
+        const int N = 512;
+        vip.prepareToPlay(48000.0, N);
+        juce::AudioBuffer<float> buf(7, N); // 0/1 audio, 2 pitch,3 gate,4 vel,5 pres,6 timbre
+
+        const float a4 = VoiceInProcessor::midiToHz(69); // 440 Hz
+
+        // Note-on: expression at neutral rest (pressure 0, timbre 0.5, no bend).
+        auto run = [&](){ buf.clear(); juce::MidiBuffer mb; vip.processBlock(buf, mb); };
+        vip.noteOn(0, 69, 1.0f);
+        run();
+        r.check(std::abs(buf.getSample(5, N - 1) - 0.0f) < 1e-4f, "expr: pressure rests at 0");
+        r.check(std::abs(buf.getSample(6, N - 1) - 0.5f) < 1e-4f, "expr: timbre rests at 0.5 (centre)");
+        r.check(std::abs(buf.getSample(2, N - 1) - a4) < 0.5f, "expr: pitch is the un-bent note at rest");
+
+        // Pressure ramps toward its target (smoothed, not instant).
+        vip.setPressure(1.0f);
+        run();
+        r.check(buf.getSample(5, 0) < 0.5f, "expr: pressure starts ramping (not an instant jump)");
+        for (int b = 0; b < 6; ++b) run();
+        r.check(buf.getSample(5, N - 1) > 0.95f, "expr: pressure settles near its target 1.0");
+
+        // Timbre ramps down toward 0.
+        vip.setTimbre(0.0f);
+        for (int b = 0; b < 8; ++b) run();
+        r.check(buf.getSample(6, N - 1) < 0.05f, "expr: timbre settles near its target 0.0");
+
+        // Pitch bend +12 semitones folds into Pitch -> ~2x frequency once settled.
+        vip.setPitchBend(12.0f);
+        for (int b = 0; b < 10; ++b) run();
+        r.check(std::abs(buf.getSample(2, N - 1) - a4 * 2.0f) < 4.0f,
+                "expr: +12 semitone bend doubles the Pitch signal");
+
+        // A fresh note-on snaps EVERY expression dimension back to neutral so the
+        // prior note's bend/pressure/timbre cannot bleed into the reused voice.
+        vip.noteOn(0, 69, 1.0f);
+        run();
+        r.check(std::abs(buf.getSample(2, 0) - a4) < 0.5f, "expr: note-on resets bend (pitch back to A4)");
+        r.check(std::abs(buf.getSample(5, 0) - 0.0f) < 1e-3f, "expr: note-on resets pressure to 0");
+        r.check(std::abs(buf.getSample(6, 0) - 0.5f) < 1e-3f, "expr: note-on resets timbre to 0.5");
+    }
+
+    // ---- (2) End-to-end routing through PolyVoiceProcessor ----------------
+    {
+        NodeGraph graph;
+        Transport transport;
+        int containerId;
+        {
+            auto& c = graph.addNode("Voice", NodeType::VoiceContainer,
+                {Pin{0, "MIDI", PinKind::Midi, true}},
+                {Pin{0, "Audio", PinKind::Audio, false}}, {0.0f, 0.0f});
+            c.voicePolyphony = 4;
+            containerId = c.id;
+        }
+        int viPitch, viGate, viVel;
+        {
+            auto& vi = graph.addNode("Voice In", NodeType::VoiceIn, {},
+                {Pin{0, "MIDI",     PinKind::Midi,   false},
+                 Pin{0, "Pitch",    PinKind::Signal, false, 1},
+                 Pin{0, "Gate",     PinKind::Signal, false, 1},
+                 Pin{0, "Velocity", PinKind::Signal, false, 1},
+                 Pin{0, "Pressure", PinKind::Signal, false, 1},
+                 Pin{0, "Timbre",   PinKind::Signal, false, 1}}, {-200.0f, 0.0f});
+            vi.voiceContainerId = containerId;
+            viPitch = vi.pinsOut[1].id;
+            viGate  = vi.pinsOut[2].id;
+            viVel   = vi.pinsOut[3].id;
+        }
+        int oscPitch, oscGate, oscVel, oscAudio;
+        {
+            auto& s = graph.addNode("Signal Osc", NodeType::Instrument,
+                {Pin{0, "Pitch",    PinKind::Signal, true, 1},
+                 Pin{0, "Gate",     PinKind::Signal, true, 1},
+                 Pin{0, "Velocity", PinKind::Signal, true, 1}},
+                {Pin{0, "Audio", PinKind::Audio, false}}, {0.0f, 0.0f});
+            s.voiceContainerId = containerId;
+            s.script = "__signalosc__";
+            s.params.push_back({"Waveform", 0.0f, 0.0f, 3.0f}); // sine
+            s.params.push_back({"Volume",   0.5f, 0.0f, 1.0f});
+            s.ahdsrEnvelope.attackMs  = 2.0f;
+            s.ahdsrEnvelope.decayMs   = 10.0f;
+            s.ahdsrEnvelope.sustain   = 1.0f; // steady tone for crossing measurement
+            s.ahdsrEnvelope.releaseMs = 40.0f;
+            oscPitch = s.pinsIn[0].id;
+            oscGate  = s.pinsIn[1].id;
+            oscVel   = s.pinsIn[2].id;
+            oscAudio = s.pinsOut[0].id;
+        }
+        int voAudio;
+        {
+            auto& vo = graph.addNode("Voice Out", NodeType::VoiceOut,
+                {Pin{0, "Audio", PinKind::Audio, true}}, {}, {200.0f, 0.0f});
+            vo.voiceContainerId = containerId;
+            voAudio = vo.pinsIn[0].id;
+        }
+        graph.addLink(viPitch, oscPitch);
+        graph.addLink(viGate,  oscGate);
+        graph.addLink(viVel,   oscVel);
+        graph.addLink(oscAudio, voAudio);
+
+        Node* container = graph.findNode(containerId);
+        if (!container) { r.check(false, "mpe-route: container exists"); return; }
+
+        const double sr = 44100.0;
+        const int bs = 512;
+        PolyVoiceProcessor poly(*container, graph, transport);
+        poly.setPlayConfigDetails(0, 2, sr, bs);
+        poly.prepareToPlay(sr, bs);
+
+        auto zc = [](juce::AudioBuffer<float>& b) {
+            int c = 0; const float* d = b.getReadPointer(0);
+            for (int i = 1; i < b.getNumSamples(); ++i)
+                if ((d[i - 1] <= 0.0f) != (d[i] <= 0.0f)) ++c;
+            return c;
+        };
+        // Settle: render `extra` blocks of empty MIDI, return last-block crossings.
+        auto settleZc = [&](int extra) {
+            juce::AudioBuffer<float> out(2, bs);
+            juce::MidiBuffer empty;
+            for (int i = 0; i < extra; ++i) poly.processBlock(out, empty);
+            return zc(out);
+        };
+
+        // Note 69 (A4, 220-ish crossings/block) on MEMBER channel 2.
+        {
+            juce::AudioBuffer<float> out(2, bs);
+            juce::MidiBuffer on;
+            on.addEvent(juce::MidiMessage::noteOn(2, 69, (juce::uint8) 110), 0);
+            poly.processBlock(out, on);
+        }
+        const int baseZc = settleZc(12);
+        r.check(baseZc > 0, "mpe-route: voice produces a tone (nonzero crossings)");
+
+        // +12 semitones on channel 2 (48-semi member range -> wheel 10240).
+        {
+            juce::AudioBuffer<float> out(2, bs);
+            juce::MidiBuffer bend;
+            bend.addEvent(juce::MidiMessage::pitchWheel(2, 10240), 0);
+            poly.processBlock(out, bend);
+        }
+        const int bentZc = settleZc(12);
+        r.check(bentZc > baseZc * 16 / 10,
+                "mpe-route: member-channel bend raises this voice's pitch (~2x)");
+
+        // A bend on an UNRELATED member channel (3) must NOT move the channel-2
+        // voice. Reset channel 2 to neutral first, then bend channel 3.
+        {
+            juce::AudioBuffer<float> out(2, bs);
+            juce::MidiBuffer reset; reset.addEvent(juce::MidiMessage::pitchWheel(2, 8192), 0);
+            poly.processBlock(out, reset);
+        }
+        settleZc(12);
+        {
+            juce::AudioBuffer<float> out(2, bs);
+            juce::MidiBuffer other; other.addEvent(juce::MidiMessage::pitchWheel(3, 10240), 0);
+            poly.processBlock(out, other);
+        }
+        const int isolatedZc = settleZc(12);
+        r.check(std::abs(isolatedZc - baseZc) < baseZc / 5,
+                "mpe-route: a bend on a different channel leaves this voice alone");
+
+        // Master-channel (1) bend broadcasts to all voices (incl. the ch-2 note),
+        // using the conventional +/-2 semitone range. +2 semis -> ~1.12x.
+        {
+            juce::AudioBuffer<float> out(2, bs);
+            juce::MidiBuffer master; master.addEvent(juce::MidiMessage::pitchWheel(1, 16383), 0);
+            poly.processBlock(out, master);
+        }
+        const int masterZc = settleZc(12);
+        r.check(masterZc > baseZc + baseZc / 20,
+                "mpe-route: master-channel bend broadcasts to the voice (+~2 semis)");
+    }
+
+    // ---- (3) Load migration: old 4-output VoiceIn gains Pressure/Timbre ----
+    {
+        NodeGraph graph;
+        graph.addNode("Voice In", NodeType::VoiceIn, {},
+            {Pin{0, "MIDI",     PinKind::Midi,   false},
+             Pin{0, "Pitch",    PinKind::Signal, false, 1},
+             Pin{0, "Gate",     PinKind::Signal, false, 1},
+             Pin{0, "Velocity", PinKind::Signal, false, 1}}, {0.0f, 0.0f});
+
+        const std::string text = ProjectFile::serializeForUndo(graph);
+
+        NodeGraph loaded;
+        const bool ok = ProjectFile::loadFromString(text, loaded);
+        r.check(ok, "mpe-migrate: old VoiceIn project loads");
+        Node* vi = nullptr;
+        for (auto& n : loaded.nodes) if (n.type == NodeType::VoiceIn) vi = &n;
+        r.check(vi != nullptr, "mpe-migrate: VoiceIn present after load");
+        if (vi) {
+            auto hasPin = [&](const std::string& nm) {
+                for (auto& p : vi->pinsOut) if (p.name == nm) return true;
+                return false;
+            };
+            r.check(hasPin("Pressure"), "mpe-migrate: Pressure output pin added on load");
+            r.check(hasPin("Timbre"),   "mpe-migrate: Timbre output pin added on load");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Signal Math module: per-sample arithmetic on two control signals. Verify each
 // operation and that the node + its Operation param survive a save/load round-trip.
 // ---------------------------------------------------------------------------
@@ -6948,6 +7174,7 @@ int runSelfTest(const juce::File& outDir) {
     testSignalLogic(r);
     testSignalFilter(r);
     testSignalNoise(r);
+    testVoiceMpe(r);
     testVoiceContainerAudio(r);
     testVoiceContainerSaveLoad(r);
 

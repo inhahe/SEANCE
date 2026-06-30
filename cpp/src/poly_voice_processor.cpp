@@ -64,6 +64,20 @@ void PolyVoiceProcessor::processBlock(juce::AudioBuffer<float>& buf,
     // graph rebuild. jlimit guards against a stale/garbage serialized value.
     alloc.stealMode = juce::jlimit(0, 2, containerNode.voiceStealMode);
 
+    // Apply an MPE expression update to every voice the message addresses. A
+    // master/non-MPE channel (1) broadcasts to ALL active voices; a member
+    // channel (2-16) targets only the voice(s) allocated on that channel.
+    // `note >= 0` further restricts to a specific note (poly key pressure).
+    auto routeExpr = [this](int chan, int note, auto&& fn) {
+        for (int i = 0; i < alloc.size(); ++i) {
+            const auto& s = alloc.slots[(size_t) i];
+            if (!s.active) continue;
+            if (chan != 1 && s.channel != chan) continue;
+            if (note >= 0 && s.note != note) continue;
+            if (voices[(size_t) i].voiceIn) fn(*voices[(size_t) i].voiceIn);
+        }
+    };
+
     // 1. Translate incoming MIDI into voice allocation + gate events. The policy
     //    (free slot / steal-oldest / note matching) lives in VoiceAllocator; here
     //    we just apply its decisions to the matching voice's audio objects.
@@ -73,6 +87,9 @@ void PolyVoiceProcessor::processBlock(juce::AudioBuffer<float>& buf,
         if (m.isNoteOn() && m.getVelocity() > 0) {
             const auto res = alloc.noteOn(m.getNoteNumber());
             if (res.slot < 0) continue;
+            // Remember the note's MIDI channel so later per-note MPE expression
+            // (pitch bend / pressure / timbre on that channel) routes to it.
+            alloc.slots[(size_t) res.slot].channel = m.getChannel();
             auto& v = voices[(size_t) res.slot];
             if (res.stole && v.voiceIn) v.voiceIn->reset();
             if (v.voiceIn) {
@@ -84,6 +101,29 @@ void PolyVoiceProcessor::processBlock(juce::AudioBuffer<float>& buf,
                     ? juce::jmax(0.0f, containerNode.voiceGlideMs) : 0.0f;
                 v.voiceIn->noteOn(off, m.getNoteNumber(), m.getFloatVelocity(), glideMs);
             }
+        } else if (m.isPitchWheel()) {
+            // Per-note pitch bend. A member-channel (>1) bend bends only the
+            // voice(s) on that channel using the MPE default +/-48 semitone
+            // range; a channel-1 (master / non-MPE) bend bends ALL voices with
+            // the conventional +/-2 semitones. routeExpr applies the matching set.
+            const int chan = m.getChannel();
+            const float norm = (m.getPitchWheelValue() - 8192) / 8192.0f; // -1..~1
+            const float semis = norm * (chan == 1 ? 2.0f : 48.0f);
+            routeExpr(chan, -1, [&](VoiceInProcessor& vi){ vi.setPitchBend(semis); });
+        } else if (m.isChannelPressure()) {
+            const int chan = m.getChannel();
+            const float z = m.getChannelPressureValue() / 127.0f;
+            routeExpr(chan, -1, [&](VoiceInProcessor& vi){ vi.setPressure(z); });
+        } else if (m.isAftertouch()) {
+            // Polyphonic key pressure: note-specific, so also match the note.
+            const int chan = m.getChannel();
+            const float z = m.getAfterTouchValue() / 127.0f;
+            routeExpr(chan, m.getNoteNumber(), [&](VoiceInProcessor& vi){ vi.setPressure(z); });
+        } else if (m.isController() && m.getControllerNumber() == 74) {
+            // CC74 = MPE timbre ("slide" / Y axis).
+            const int chan = m.getChannel();
+            const float y = m.getControllerValue() / 127.0f;
+            routeExpr(chan, -1, [&](VoiceInProcessor& vi){ vi.setTimbre(y); });
         } else if (m.isNoteOff() || (m.isNoteOn() && m.getVelocity() == 0)) {
             const int slot = alloc.noteOff(m.getNoteNumber());
             if (slot >= 0 && voices[(size_t) slot].voiceIn)

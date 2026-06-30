@@ -34,6 +34,7 @@ struct VoiceAllocator {
         bool active     = false; // currently sounding (held or in release tail)
         bool gateHeld   = false; // key still down
         int  note       = -1;    // MIDI note this slot is playing
+        int  channel    = 1;     // MIDI channel of the note (for MPE routing)
         long long age   = 0;     // allocation order, for steal-oldest
         float silenceMs = 0.0f;  // time below the RMS floor after release
         float lastRms   = 0.0f;  // last block's RMS, for steal-quietest

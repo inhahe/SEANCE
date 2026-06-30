@@ -91,7 +91,12 @@ Internally:
    - **Pitch In** — note pitch (Hz and/or note number) as a Signal out.
    - **Gate In** — 1.0 while held, 0.0 after note-off (the envelope's trigger).
    - **Velocity In** — note-on velocity (0..1) as a Signal out.
-   - *(later: MPE per-note Pressure / Slide / Bend.)*
+   - **Pressure / Timbre** *(landed M3)* — MPE per-note expression. VoiceIn now
+     also exposes **Pressure** (channel pressure / poly aftertouch, 0..1) and
+     **Timbre** (CC74, 0..1, centre 0.5) Signal outs, and per-note pitch bend is
+     folded into the **Pitch** signal. `PolyVoiceProcessor` routes each expression
+     message to the matching voice by MIDI channel (member channel 2-16 → that one
+     voice at ±48 semis; master/non-MPE channel 1 → broadcast at ±2 semis).
    These are realized as tiny processors whose Signal-out channel the container
    **drives per voice**: before running voice *v*'s block, the container writes
    that voice's pitch/gate/velocity into voice *v*'s context-source processors.
@@ -224,9 +229,13 @@ loop (architectural call + an *auditory* "do N voices sum correctly" check that
 - **M3 (in progress):** real module kit — **Signal Math, Signal LFO, Sample &
   Hold, Signal Logic, a resonant Signal Filter (LP/HP/BP, cutoff/resonance
   modulatable via #88), and a gated Signal Noise generator (white/pink/brown, the
-  noise twin of the Signal Oscillator) are landed** (each with its own `--self-test`
-  coverage and docs across REFERENCE.md + the Voices tutorial). Still open: more
-  oscillator flavours, MPE per-note expression into the context, unison.
+  noise twin of the Signal Oscillator) are landed**; **MPE per-note expression is
+  landed** — VoiceIn gained Pressure/Timbre Signal outs and per-note pitch bend,
+  with `PolyVoiceProcessor` routing channel pressure / poly aftertouch / CC74 /
+  pitch wheel to the matching voice by MIDI channel (`testVoiceMpe` covers the
+  signals, the end-to-end routing, and the old-project load migration). Each with
+  its own `--self-test` coverage and docs across REFERENCE.md + the Voices
+  tutorial. Still open: more oscillator flavours, unison.
 - **M4:** presets, modular-familiarity niceties, docs across the three surfaces.
 
 ## Edit-while-playing safety

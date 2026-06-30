@@ -1606,6 +1606,31 @@ void NodeGraphComponent::mouseDown(const juce::MouseEvent& e) {
                         });
                         return;
                     }
+                    // Signal LFO's Shape and Polarity are discrete enums too.
+                    if (node->script == "__signallfo__"
+                        && (p.name == "Shape" || p.name == "Polarity")) {
+                        selectedNodeId = node->id;
+                        std::vector<const char*> labels = (p.name == "Shape")
+                            ? std::vector<const char*>{"Sine", "Triangle", "Saw", "Square"}
+                            : std::vector<const char*>{"Bipolar  (-1 .. +1)", "Unipolar  (0 .. 1)"};
+                        int cur = juce::jlimit(0, (int)labels.size() - 1, (int)std::round(p.value));
+                        juce::PopupMenu pm;
+                        for (int i = 0; i < (int)labels.size(); ++i)
+                            pm.addItem(i + 1, labels[i], true, i == cur);
+                        int nodeId = node->id;
+                        int paramIdx = idx;
+                        std::string desc = "Change Signal LFO " + p.name;
+                        pm.showMenuAsync({}, [this, nodeId, paramIdx, desc](int r) {
+                            if (r == 0) return;
+                            auto* nd = graph.findNode(nodeId);
+                            if (!nd || paramIdx >= (int)nd->params.size()) return;
+                            nd->params[paramIdx].value = (float)(r - 1);
+                            graph.dirty = true;
+                            graph.commitSnapshot(desc);
+                            repaint();
+                        });
+                        return;
+                    }
                     // Other discrete enum params (Pitch Detector's Algorithm
                     // and Mapping) also get a popup picker rather than a
                     // slider, for the same reason: discrete labelled states
@@ -2070,10 +2095,10 @@ void NodeGraphComponent::mouseDoubleClick(const juce::MouseEvent& e) {
     // distinguishing tag is the "__xypad__" script.
     if (node->type == NodeType::SignalShape) {
         int captured = node->id;
-        // Modular-kit signal utilities (Signal Math, etc.) live in the
-        // SignalShape family for coloring but have no program editor - their
+        // Modular-kit signal utilities (Signal Math, Signal LFO, etc.) live in
+        // the SignalShape family for coloring but have no program editor - their
         // params are edited directly on the node face. Double-click is a no-op.
-        if (node->script == "__signalmath__")
+        if (node->script == "__signalmath__" || node->script == "__signallfo__")
             return;
         if (node->script == "__xypad__") {
             auto* pad = new XYPadComponent(graph, captured);
@@ -2508,6 +2533,8 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
     sigMenu.addItem(151, "Signal Oscillator (pitch/gate -> tone)");
     // Modular-kit signal utility: per-sample arithmetic on two control signals.
     sigMenu.addItem(152, "Signal Math (A op B)");
+    // Modular-kit control-rate LFO with optional per-voice sync.
+    sigMenu.addItem(153, "Signal LFO (modulation source)");
     sigMenu.addSeparator();
     sigMenu.addItem(133, "XY Pad");
     sigMenu.addItem(135, "Control Bank");
@@ -2702,6 +2729,24 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
                 n.pinsOut[0].tooltip = "A (op) B, computed every sample.";
             // 0=Add 1=Subtract 2=Multiply 3=Divide 4=Min 5=Max
             n.params.push_back({"Operation", 0.0f, 0.0f, 5.0f});
+        } else if (result == 153) {
+            // Signal LFO: control-rate modulation source. One optional Signal
+            // input (Sync=ch2, rising edge resets phase) -> one Signal output
+            // (Out=ch2). NodeType::SignalShape tagged "__signallfo__"; routed to
+            // SignalLFOProcessor and excluded from the double-click editor.
+            auto& n = graph.addNode("Signal LFO", NodeType::SignalShape,
+                {Pin{0, "Sync", PinKind::Signal, true, 1}},
+                {Pin{0, "Out", PinKind::Signal, false, 1}}, {p.x, p.y});
+            n.script = "__signallfo__";
+            if (!n.pinsIn.empty())
+                n.pinsIn[0].tooltip = "Sync (optional): a rising edge (>= 0.5) resets the "
+                                      "LFO phase. Wire a Voice gate to retrigger per note. "
+                                      "Unwired = free-run.";
+            if (!n.pinsOut.empty())
+                n.pinsOut[0].tooltip = "LFO waveform (control signal).";
+            n.params.push_back({"Rate", 2.0f, 0.1f, 20.0f});    // Hz
+            n.params.push_back({"Shape", 0.0f, 0.0f, 3.0f});    // 0=sine 1=tri 2=saw 3=square
+            n.params.push_back({"Polarity", 0.0f, 0.0f, 1.0f}); // 0=bipolar 1=unipolar
         } else if (result == 6) {
             // WASM Script - open file chooser
             auto chooser = std::make_shared<juce::FileChooser>(

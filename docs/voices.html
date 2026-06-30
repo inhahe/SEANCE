@@ -115,6 +115,15 @@
 <div class="tip">
 <strong>An unwired input is zero.</strong> That's worth remembering: a Multiply with only one side wired outputs silence (anything × 0 = 0), and an Add with one side wired just passes that side through. To multiply by a fixed amount, wire a steady control into the other input rather than expecting a hidden knob.</div>
 
+<h2>Movement — the Signal LFO</h2>
+
+<p>An <strong>LFO</strong> (low-frequency oscillator) is a slow, repeating wave you use to <em>move</em> something — wobble a pitch (vibrato), pulse a volume (tremolo), sweep a filter. Add one from <strong>Add Node → Signal Shape → Signal LFO (modulation source)</strong>. It puts out a repeating control signal on its single output. Three controls on the node shape it: <strong>Rate</strong> (how many cycles per second), <strong>Shape</strong> (sine, triangle, saw, or square), and <strong>Polarity</strong> — <em>bipolar</em> swings below and above center (good for vibrato and pan), <em>unipolar</em> stays between 0 and 1 (good for driving a volume or any 0-to-1 amount).</p>
+
+<p>To add vibrato to a modular voice, wire the LFO's output through a Signal Math <strong>Add</strong> into the Signal Oscillator's Pitch, so the pitch is the note plus a little LFO wobble. For tremolo, <strong>Multiply</strong> the oscillator's audio by a unipolar LFO.</p>
+
+<div class="note">
+<strong>Sync makes each note's LFO start fresh.</strong> The LFO has a <strong>Sync</strong> input. Feed it the <strong>Gate</strong> from VoiceIn and every note restarts the LFO from the top of its cycle — so a plucked vibrato always begins the same way instead of catching the wobble wherever it happened to be. Leave Sync unwired and the LFO free-runs continuously. Because the container clones the whole patch per note, each voice gets its own independent LFO.</div>
+
 <h2>Current limitations</h2>
 
 <p>This is the first version of the feature. A few things are intentionally simple for now:</p>

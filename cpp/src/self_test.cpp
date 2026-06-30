@@ -27,6 +27,7 @@
 #include "voice_allocator.h"       // VoiceAllocator - per-voice polyphony policy
 #include "poly_voice_processor.h"   // PolyVoiceProcessor - end-to-end voice audio
 #include "signal_math.h"            // SignalMathProcessor - modular-kit math module
+#include "signal_lfo.h"             // SignalLFOProcessor - modular-kit LFO module
 
 #include <juce_audio_formats/juce_audio_formats.h>
 #include <juce_graphics/juce_graphics.h>
@@ -6241,6 +6242,107 @@ void testSignalMath(Report& r) {
 }
 
 // ---------------------------------------------------------------------------
+// Signal LFO module: control-rate oscillator with optional per-voice sync.
+// ---------------------------------------------------------------------------
+void testSignalLFO(Report& r) {
+    r.section("Signal LFO module (modular kit)");
+
+    NodeGraph graph;
+    auto& node = graph.addNode("Signal LFO", NodeType::SignalShape,
+        {Pin{0, "Sync", PinKind::Signal, true, 1}},
+        {Pin{0, "Out", PinKind::Signal, false, 1}}, {0.0f, 0.0f});
+    node.script = "__signallfo__";
+    node.params.push_back({"Rate", 1.0f, 0.1f, 20.0f});
+    node.params.push_back({"Shape", 0.0f, 0.0f, 3.0f});
+    node.params.push_back({"Polarity", 0.0f, 0.0f, 1.0f});
+
+    SignalLFOProcessor proc(node);
+    const double SR = 1000.0; // 1 kHz -> at Rate 1 Hz one cycle == 1000 samples
+    const int N = 1000;
+    // Layout: ch0/1 audio, ch2 = Sync input AND Out output.
+    juce::AudioBuffer<float> buf(3, N);
+
+    auto setParam = [&](const char* name, float v) {
+        for (auto& p : node.params) if (p.name == name) p.value = v;
+    };
+
+    // --- Square wave, bipolar, free-run: +1 first half, -1 second half. ---
+    {
+        setParam("Shape", 3.0f); setParam("Polarity", 0.0f); setParam("Rate", 1.0f);
+        proc.prepareToPlay(SR, N);
+        buf.clear();
+        juce::MidiBuffer m;
+        proc.processBlock(buf, m);
+        r.check(buf.getSample(2, 0)   ==  1.0f, "lfo: square +1 at phase 0");
+        r.check(buf.getSample(2, 499) ==  1.0f, "lfo: square +1 just before half");
+        r.check(buf.getSample(2, 500) == -1.0f, "lfo: square -1 at half cycle");
+        r.check(buf.getSample(2, 999) == -1.0f, "lfo: square -1 at end of cycle");
+        r.check(buf.getSample(0, 10) == 0.0f && buf.getSample(1, 10) == 0.0f,
+                "lfo: audio channels stay silent");
+    }
+
+    // --- Sine, bipolar: starts at 0, stays within [-1,1], reaches ~+1 at 1/4. ---
+    {
+        setParam("Shape", 0.0f); setParam("Polarity", 0.0f); setParam("Rate", 1.0f);
+        proc.prepareToPlay(SR, N);
+        buf.clear();
+        juce::MidiBuffer m;
+        proc.processBlock(buf, m);
+        r.check(std::abs(buf.getSample(2, 0)) < 1e-5f, "lfo: sine starts at 0");
+        r.check(std::abs(buf.getSample(2, 250) - 1.0f) < 1e-2f, "lfo: sine peaks near +1 at quarter cycle");
+        bool inRange = true;
+        for (int i = 0; i < N; ++i)
+            if (buf.getSample(2, i) < -1.0001f || buf.getSample(2, i) > 1.0001f) inRange = false;
+        r.check(inRange, "lfo: sine stays within [-1, 1] (bipolar)");
+    }
+
+    // --- Unipolar sine: range [0,1], midpoint 0.5 at phase 0. ---
+    {
+        setParam("Shape", 0.0f); setParam("Polarity", 1.0f); setParam("Rate", 1.0f);
+        proc.prepareToPlay(SR, N);
+        buf.clear();
+        juce::MidiBuffer m;
+        proc.processBlock(buf, m);
+        r.check(std::abs(buf.getSample(2, 0) - 0.5f) < 1e-5f, "lfo: unipolar sine = 0.5 at phase 0");
+        bool inRange = true;
+        for (int i = 0; i < N; ++i)
+            if (buf.getSample(2, i) < -1e-4f || buf.getSample(2, i) > 1.0001f) inRange = false;
+        r.check(inRange, "lfo: unipolar sine stays within [0, 1]");
+    }
+
+    // --- Sync: a rising edge mid-block resets phase (square retriggers to +1). ---
+    {
+        setParam("Shape", 3.0f); setParam("Polarity", 0.0f); setParam("Rate", 1.0f);
+        proc.prepareToPlay(SR, N);
+        buf.clear();
+        // Sync low for 0..599, high from 600 on -> rising edge at 600.
+        for (int i = 600; i < N; ++i) buf.setSample(2, i, 1.0f);
+        juce::MidiBuffer m;
+        proc.processBlock(buf, m);
+        r.check(buf.getSample(2, 599) == -1.0f, "lfo: pre-sync in -1 half (phase 0.599)");
+        r.check(buf.getSample(2, 600) ==  1.0f, "lfo: sync rising edge resets phase -> +1");
+    }
+
+    // --- Save/load round-trip. ---
+    {
+        setParam("Shape", 2.0f); setParam("Polarity", 1.0f); setParam("Rate", 5.0f);
+        const std::string text = ProjectFile::serializeForUndo(graph);
+        NodeGraph dst;
+        const bool ok = ProjectFile::loadFromString(text, dst);
+        r.check(ok, "lfo-saveload: project text parses back");
+        Node* d = dst.findNode(node.id);
+        r.check(d != nullptr && d->script == "__signallfo__", "lfo-saveload: script tag survives");
+        auto pv = [&](const char* nm) -> float {
+            if (d) for (auto& p : d->params) if (p.name == nm) return p.value;
+            return -999.0f;
+        };
+        r.check(std::abs(pv("Rate") - 5.0f) < 0.01f, "lfo-saveload: Rate round-trips");
+        r.check(std::abs(pv("Shape") - 2.0f) < 0.01f, "lfo-saveload: Shape round-trips");
+        r.check(std::abs(pv("Polarity") - 1.0f) < 0.01f, "lfo-saveload: Polarity round-trips");
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Voice container end-to-end audio: build a real NodeGraph with a VoiceContainer
 // whose inner patch is VoiceIn -> Signal Oscillator -> VoiceOut, drive it with a
 // synthetic MIDI buffer through PolyVoiceProcessor, and confirm the clone/build/
@@ -6474,6 +6576,7 @@ int runSelfTest(const juce::File& outDir) {
     testVoiceAllocator(r);
     testVoiceInSignals(r);
     testSignalMath(r);
+    testSignalLFO(r);
     testVoiceContainerAudio(r);
     testVoiceContainerSaveLoad(r);
 

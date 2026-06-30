@@ -25,6 +25,7 @@
 #include "voice_nodes.h"
 #include "signal_oscillator.h"
 #include "signal_math.h"
+#include "signal_lfo.h"
 #include "poly_voice_processor.h"
 #include <algorithm>
 #include <cmath>
@@ -638,6 +639,10 @@ std::unique_ptr<juce::AudioProcessor> GraphProcessor::createNodeProcessor(
         // here before the generic SignalShapeProcessor (which would try to run
         // it as a signal-shape program).
         return std::make_unique<SignalMathProcessor>(node);
+    } else if (node.type == NodeType::SignalShape && node.script == "__signallfo__") {
+        // Modular-kit control-rate LFO. Same SignalShape-family dispatch as
+        // Signal Math, intercepted before the generic SignalShapeProcessor.
+        return std::make_unique<SignalLFOProcessor>(node);
     } else if (node.type == NodeType::SignalShape) {
         return std::make_unique<SignalShapeProcessor>(node, transport);
     } else if (node.type == NodeType::MidiScript) {

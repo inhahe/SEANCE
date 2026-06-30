@@ -2627,6 +2627,28 @@ the raw input Signals downstream as audio. Save/load is the generic node path
 `--self-test` (each operation, divide-by-zero safety, unwired-input behavior, the
 silent audio bus, and the Operation-param round-trip).
 
+#### Signal LFO (`__signallfo__`)
+
+**Add Node → Signal Shape → Signal LFO (modulation source)** creates a
+`SignalLFOProcessor` (`signal_lfo.h`) — a control-rate oscillator for
+modulation:
+
+- **Input (Signal):** **Sync** (channel 2), optional. A **rising edge** (≥ 0.5)
+  resets the phase to 0. Wire a Voice container's **VoiceIn Gate → Sync** and the
+  LFO **retriggers at the start of every note**; unwired (reads as 0) it
+  free-runs. Because each voice clone owns its own `SignalLFOProcessor`, per-voice
+  LFOs have independent phase.
+- **Output (Signal):** **Out** (channel 2) — the waveform.
+- **Params:** **Rate** (Hz, 0.1–20, continuous slider); **Shape** (popup enum: 0
+  sine, 1 triangle, 2 saw, 3 square); **Polarity** (popup enum: 0 **bipolar**
+  −1…+1, 1 **unipolar** 0…1). Unipolar is the convenient form for driving a 0..1
+  parameter; bipolar suits pitch/pan around a center.
+
+Phase persists across blocks (it's stateful). The audio bus stays silent.
+Covered by `testSignalLFO` in `--self-test` (waveform values, sine bounds,
+bipolar vs unipolar range, mid-block sync reset, and the param save/load
+round-trip).
+
 ### Save / load, dirty tracking, undo
 
 Inner nodes and links serialize through the **same** generic path as any node —
@@ -2667,7 +2689,9 @@ through `PolyVoiceProcessor`, and asserts a held note makes a tone, three notes 
 louder than one, and the voices decay back to silence after release. The modular
 kit has its own coverage: `testSignalMath` runs every Signal Math operation,
 checks divide-by-zero safety, unwired-input (=0) behavior, the silent audio bus,
-and the Operation-param save/load round-trip.
+and the Operation-param save/load round-trip; `testSignalLFO` checks LFO waveform
+values, sine bounds, bipolar/unipolar range, mid-block sync reset, and its param
+round-trip.
 
 ## Asset library (project stores)
 

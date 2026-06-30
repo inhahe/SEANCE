@@ -233,9 +233,13 @@ loop (architectural call + an *auditory* "do N voices sum correctly" check that
   landed** — VoiceIn gained Pressure/Timbre Signal outs and per-note pitch bend,
   with `PolyVoiceProcessor` routing channel pressure / poly aftertouch / CC74 /
   pitch wheel to the matching voice by MIDI channel (`testVoiceMpe` covers the
-  signals, the end-to-end routing, and the old-project load migration). Each with
-  its own `--self-test` coverage and docs across REFERENCE.md + the Voices
-  tutorial. Still open: more oscillator flavours, unison.
+  signals, the end-to-end routing, and the old-project load migration);
+  **unison is landed** — a struck note allocates a detuned, stereo-spread *stack*
+  of voices (`VoiceAllocator::noteOnGroup`/`noteOffGroup` group the slots so the
+  stack releases together; `testVoiceUnison` covers the group API, the L/R
+  decorrelation, and the field save/load). Each with its own `--self-test`
+  coverage and docs across REFERENCE.md + the Voices tutorial. Still open: more
+  oscillator flavours.
 - **M4:** presets, modular-familiarity niceties, docs across the three surfaces.
 
 ## Edit-while-playing safety

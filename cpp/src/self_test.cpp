@@ -6393,6 +6393,193 @@ void testVoiceMpe(Report& r) {
 }
 
 // ---------------------------------------------------------------------------
+// Unison: a struck note allocates a STACK of detuned/panned voices that release
+// together. Three parts: the VoiceAllocator group API (allocate a stack, release
+// the whole stack, clamp to polyphony, steal a whole stack), end-to-end audio
+// (a spread unison decorrelates L/R; the note frees to silence), and the
+// container field save/load round-trip.
+// ---------------------------------------------------------------------------
+void testVoiceUnison(Report& r) {
+    r.section("Unison (stacked detuned voices per note)");
+
+    // ---- (1) VoiceAllocator group allocation ------------------------------
+    {
+        VoiceAllocator a;
+        a.resize(8);
+        auto g = a.noteOnGroup(60, 1, 3);
+        r.check(g.count == 3, "uni-alloc: a 3-voice unison grabs 3 slots");
+        r.check(a.activeCount() == 3, "uni-alloc: 3 voices now active");
+        // All three share one group id and the note/channel.
+        long long grp = a.slots[(size_t) g.slot[0]].group;
+        bool sameGroup = true, sameNote = true;
+        for (int k = 0; k < g.count; ++k) {
+            if (a.slots[(size_t) g.slot[k]].group != grp) sameGroup = false;
+            if (a.slots[(size_t) g.slot[k]].note != 60)   sameNote = false;
+        }
+        r.check(sameGroup, "uni-alloc: every slot of the stack shares one group id");
+        r.check(sameNote,  "uni-alloc: every slot of the stack plays the note");
+
+        auto rel = a.noteOffGroup(60, 1);
+        r.check(rel.count == 3, "uni-off: note-off releases the whole 3-voice stack");
+        bool anyHeld = false;
+        for (auto& s : a.slots) if (s.gateHeld) anyHeld = true;
+        r.check(!anyHeld, "uni-off: no gate is left held after the stack release");
+        r.check(a.activeCount() == 3, "uni-off: voices stay active for their tails");
+    }
+
+    // Clamp: a unison larger than the polyphony can't exceed the slot count.
+    {
+        VoiceAllocator a;
+        a.resize(2);
+        auto g = a.noteOnGroup(60, 1, 4);
+        r.check(g.count == 2, "uni-clamp: unison clamps to the available slot count");
+    }
+
+    // Channel-matched release: two notes (same number) on different MPE channels
+    // are independent stacks; releasing one channel leaves the other held.
+    {
+        VoiceAllocator a;
+        a.resize(8);
+        a.noteOnGroup(60, 2, 2); // ch 2 stack
+        a.noteOnGroup(60, 3, 2); // ch 3 stack, same note number
+        auto rel = a.noteOffGroup(60, 2);
+        r.check(rel.count == 2, "uni-chan: note-off on ch2 releases only the ch2 stack");
+        int held = 0;
+        for (auto& s : a.slots) if (s.gateHeld) ++held;
+        r.check(held == 2, "uni-chan: the ch3 stack stays held");
+    }
+
+    // ---- (2) End-to-end: spread unison decorrelates the stereo field -------
+    {
+        NodeGraph graph;
+        Transport transport;
+        int containerId;
+        {
+            auto& c = graph.addNode("Voice", NodeType::VoiceContainer,
+                {Pin{0, "MIDI", PinKind::Midi, true}},
+                {Pin{0, "Audio", PinKind::Audio, false}}, {0.0f, 0.0f});
+            c.voicePolyphony = 8;
+            c.voiceUnison = 4;
+            c.voiceUnisonDetune = 20.0f;
+            c.voiceUnisonSpread = 1.0f; // full stereo spread
+            containerId = c.id;
+        }
+        int viPitch, viGate, viVel;
+        {
+            auto& vi = graph.addNode("Voice In", NodeType::VoiceIn, {},
+                {Pin{0, "MIDI",     PinKind::Midi,   false},
+                 Pin{0, "Pitch",    PinKind::Signal, false, 1},
+                 Pin{0, "Gate",     PinKind::Signal, false, 1},
+                 Pin{0, "Velocity", PinKind::Signal, false, 1},
+                 Pin{0, "Pressure", PinKind::Signal, false, 1},
+                 Pin{0, "Timbre",   PinKind::Signal, false, 1}}, {-200.0f, 0.0f});
+            vi.voiceContainerId = containerId;
+            viPitch = vi.pinsOut[1].id;
+            viGate  = vi.pinsOut[2].id;
+            viVel   = vi.pinsOut[3].id;
+        }
+        int oscPitch, oscGate, oscVel, oscAudio;
+        {
+            auto& s = graph.addNode("Signal Osc", NodeType::Instrument,
+                {Pin{0, "Pitch",    PinKind::Signal, true, 1},
+                 Pin{0, "Gate",     PinKind::Signal, true, 1},
+                 Pin{0, "Velocity", PinKind::Signal, true, 1}},
+                {Pin{0, "Audio", PinKind::Audio, false}}, {0.0f, 0.0f});
+            s.voiceContainerId = containerId;
+            s.script = "__signalosc__";
+            s.params.push_back({"Waveform", 0.0f, 0.0f, 3.0f});
+            s.params.push_back({"Volume",   0.5f, 0.0f, 1.0f});
+            s.ahdsrEnvelope.attackMs  = 2.0f;
+            s.ahdsrEnvelope.decayMs   = 10.0f;
+            s.ahdsrEnvelope.sustain   = 1.0f;
+            s.ahdsrEnvelope.releaseMs = 40.0f;
+            oscPitch = s.pinsIn[0].id;
+            oscGate  = s.pinsIn[1].id;
+            oscVel   = s.pinsIn[2].id;
+            oscAudio = s.pinsOut[0].id;
+        }
+        int voAudio;
+        {
+            auto& vo = graph.addNode("Voice Out", NodeType::VoiceOut,
+                {Pin{0, "Audio", PinKind::Audio, true}}, {}, {200.0f, 0.0f});
+            vo.voiceContainerId = containerId;
+            voAudio = vo.pinsIn[0].id;
+        }
+        graph.addLink(viPitch, oscPitch);
+        graph.addLink(viGate,  oscGate);
+        graph.addLink(viVel,   oscVel);
+        graph.addLink(oscAudio, voAudio);
+
+        Node* container = graph.findNode(containerId);
+        if (!container) { r.check(false, "uni-audio: container exists"); return; }
+
+        const double sr = 44100.0;
+        const int bs = 512;
+        PolyVoiceProcessor poly(*container, graph, transport);
+        poly.setPlayConfigDetails(0, 2, sr, bs);
+        poly.prepareToPlay(sr, bs);
+
+        juce::AudioBuffer<float> out(2, bs);
+        {
+            juce::MidiBuffer on;
+            on.addEvent(juce::MidiMessage::noteOn(1, 57, (juce::uint8) 110), 0); // A3
+            poly.processBlock(out, on);
+        }
+        juce::MidiBuffer empty;
+        for (int i = 0; i < 10; ++i) poly.processBlock(out, empty);
+
+        const float rmsL = out.getRMSLevel(0, 0, bs);
+        r.check(rmsL > 1.0e-2f, "uni-audio: a unison note produces a tone");
+
+        // Full spread => L and R carry different detuned voices => they differ.
+        const float* L = out.getReadPointer(0);
+        const float* R = out.getReadPointer(1);
+        float meanAbsDiff = 0.0f, meanAbs = 0.0f;
+        for (int i = 0; i < bs; ++i) {
+            meanAbsDiff += std::abs(L[i] - R[i]);
+            meanAbs     += 0.5f * (std::abs(L[i]) + std::abs(R[i]));
+        }
+        meanAbsDiff /= bs; meanAbs /= bs;
+        r.check(meanAbs > 1.0e-3f && meanAbsDiff > 0.1f * meanAbs,
+                "uni-audio: full stereo spread decorrelates L and R");
+
+        // Release the note -> the whole stack frees -> silence.
+        {
+            juce::MidiBuffer off;
+            off.addEvent(juce::MidiMessage::noteOff(1, 57), 0);
+            poly.processBlock(out, off);
+        }
+        for (int i = 0; i < 80; ++i) poly.processBlock(out, empty);
+        r.check(out.getRMSLevel(0, 0, bs) < 1.0e-4f,
+                "uni-audio: releasing the note frees the whole stack to silence");
+    }
+
+    // ---- (3) Save/load round-trip of the unison fields --------------------
+    {
+        NodeGraph graph;
+        {
+            auto& c = graph.addNode("Voice", NodeType::VoiceContainer,
+                {Pin{0, "MIDI", PinKind::Midi, true}},
+                {Pin{0, "Audio", PinKind::Audio, false}}, {0.0f, 0.0f});
+            c.voiceUnison = 6;
+            c.voiceUnisonDetune = 25.0f;
+            c.voiceUnisonSpread = 0.66f;
+        }
+        const std::string text = ProjectFile::serializeForUndo(graph);
+        NodeGraph loaded;
+        ProjectFile::loadFromString(text, loaded);
+        Node* c = nullptr;
+        for (auto& n : loaded.nodes) if (n.type == NodeType::VoiceContainer) c = &n;
+        r.check(c != nullptr, "uni-save: container present after load");
+        if (c) {
+            r.check(c->voiceUnison == 6, "uni-save: voiceUnison round-trips");
+            r.check(std::abs(c->voiceUnisonDetune - 25.0f) < 0.01f, "uni-save: detune round-trips");
+            r.check(std::abs(c->voiceUnisonSpread - 0.66f) < 0.01f, "uni-save: spread round-trips");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Signal Math module: per-sample arithmetic on two control signals. Verify each
 // operation and that the node + its Operation param survive a save/load round-trip.
 // ---------------------------------------------------------------------------
@@ -7175,6 +7362,7 @@ int runSelfTest(const juce::File& outDir) {
     testSignalFilter(r);
     testSignalNoise(r);
     testVoiceMpe(r);
+    testVoiceUnison(r);
     testVoiceContainerAudio(r);
     testVoiceContainerSaveLoad(r);
 

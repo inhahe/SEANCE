@@ -171,6 +171,18 @@
 
 <p>The real magic is <strong>sweeping the cutoff over time</strong>. Right-click the <strong>Cutoff</strong> row and choose <strong>Add Modulation Input</strong> — a small <em>Mod: Cutoff</em> socket appears on the node. Wire a <strong>Signal LFO</strong> into it for a slow wah that breathes, or an envelope so each note opens up bright and then closes down. Because everything inside a Voice container is its own copy, every note gets its <em>own</em> filter with its own moving cutoff — so a chord doesn't all sweep in lockstep; each note moves on its own.</p>
 
+<h2>Fattening the sound — Unison</h2>
+
+<p><strong>Unison</strong> stacks several slightly <em>detuned</em> copies of a voice on every note, spread across the stereo field. It's the secret behind big supersaw leads and lush pads: the tiny pitch differences between the copies beat against each other, turning a thin single oscillator into something wide and shimmering. Right-click the Voice container and open the <strong>Unison</strong> submenu:</p>
+
+<ul>
+  <li><strong>Count</strong> — how many copies to stack per note (Off, or 2 to 8). More copies = thicker, but each one uses up a voice: a 4-voice unison on an 8-voice container can only play two notes at once.</li>
+  <li><strong>Detune</strong> — how far apart the copies are tuned, in cents (hundredths of a semitone). <em>Subtle</em> is a gentle chorus; <em>Classic</em> is the familiar supersaw width; <em>Extreme</em> is a seasick, heavily-detuned wash.</li>
+  <li><strong>Stereo spread</strong> — how widely the copies fan out across left and right. <em>Mono</em> keeps them centred; <em>Full</em> throws the outer copies hard left and right for a huge stereo image.</li>
+</ul>
+
+<p>Try it on the Signal Oscillator voice: set Unison to 6 voices, Detune to Classic, Spread to Full, and play a single note — it blooms into a wide, animated chord-like swell, all from one key. Detune even rides along with pitch bend and glide, so bends stay fat. (Detune and spread only do something when the count is above Off, so they're greyed out until you turn unison on.)</p>
+
 <h2>Current limitations</h2>
 
 <p>This is the first version of the feature. A few things are intentionally simple for now:</p>

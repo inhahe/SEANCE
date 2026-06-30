@@ -36,12 +36,15 @@ struct VoiceAllocator {
         int  note       = -1;    // MIDI note this slot is playing
         int  channel    = 1;     // MIDI channel of the note (for MPE routing)
         long long age   = 0;     // allocation order, for steal-oldest
+        long long group = -1;    // unison-stack id: every slot of one struck note
+                                 // shares it, so note-off releases the whole stack
         float silenceMs = 0.0f;  // time below the RMS floor after release
         float lastRms   = 0.0f;  // last block's RMS, for steal-quietest
     };
 
     std::vector<Slot> slots;
     long long ageCounter = 0;
+    long long groupCounter = 0;  // hands out unison-stack ids
     int stealMode = StealOldest; // refreshed each block by PolyVoiceProcessor
     int rrCursor  = -1;          // last round-robin slot handed out
 
@@ -49,6 +52,7 @@ struct VoiceAllocator {
     void resize(int n) {
         slots.assign((size_t) (n < 0 ? 0 : n), Slot{});
         ageCounter = 0;
+        groupCounter = 0;
         rrCursor = -1;
     }
 
@@ -111,6 +115,71 @@ struct VoiceAllocator {
         s.age = ++ageCounter;
         s.silenceMs = 0.0f;
         return r;
+    }
+
+    // ---- Unison: allocate / release a STACK of slots per struck note --------
+    //
+    // A note with unison U grabs U slots in one go, all sharing a fresh `group`
+    // id so the matching note-off releases the whole stack together. PolyVoice-
+    // Processor then detunes/pans each slot of the stack. The result is fixed-
+    // size (no heap on the audio thread); kMaxUnison caps a stack.
+    struct GroupResult {
+        static constexpr int kMaxUnison = 8;
+        int  slot[kMaxUnison];
+        bool stole[kMaxUnison];
+        int  count = 0;
+    };
+
+    GroupResult noteOnGroup(int note, int channel, int unison) {
+        GroupResult g;
+        if (unison < 1) unison = 1;
+        if (unison > GroupResult::kMaxUnison) unison = GroupResult::kMaxUnison;
+        if (unison > (int) slots.size()) unison = (int) slots.size();
+        const long long grp = ++groupCounter;
+        for (int u = 0; u < unison; ++u) {
+            const int slot = pickSlot();
+            if (slot < 0) break;
+            Slot& s = slots[(size_t) slot];
+            g.stole[g.count] = s.active; // reusing a sounding voice == a steal
+            g.slot[g.count]  = slot;
+            ++g.count;
+            s.active = true;
+            s.gateHeld = true;
+            s.note = note;
+            s.channel = channel;
+            s.group = grp;
+            s.age = ++ageCounter;
+            s.silenceMs = 0.0f;
+        }
+        return g;
+    }
+
+    struct ReleaseResult {
+        int slot[GroupResult::kMaxUnison];
+        int count = 0;
+    };
+
+    // Release the newest still-held stack matching `note` (and `channel`, unless
+    // channel <= 0 = any). Drops the gate on every slot of that stack and returns
+    // them so the caller can drive each VoiceIn's note-off. The slots stay active
+    // for their release tails.
+    ReleaseResult noteOffGroup(int note, int channel) {
+        ReleaseResult rr;
+        long long bestGrp = -1, bestAge = -1;
+        for (auto& s : slots)
+            if (s.active && s.gateHeld && s.note == note
+                && (channel <= 0 || s.channel == channel) && s.age > bestAge) {
+                bestAge = s.age; bestGrp = s.group;
+            }
+        if (bestGrp < 0) return rr;
+        for (int i = 0; i < (int) slots.size(); ++i) {
+            Slot& s = slots[(size_t) i];
+            if (s.active && s.gateHeld && s.group == bestGrp) {
+                s.gateHeld = false;
+                if (rr.count < GroupResult::kMaxUnison) rr.slot[rr.count++] = i;
+            }
+        }
+        return rr;
     }
 
     // Release the first still-held slot playing `note`. Returns its slot, or -1.

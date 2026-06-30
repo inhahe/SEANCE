@@ -2583,6 +2583,23 @@ instrument. Internally:
   and saves with the project. Implemented as a portamento ramp inside
   `VoiceInProcessor` that persists across blocks (a glide longer than one buffer
   keeps sliding).
+- **Unison.** Right-click the container → **Unison** to stack several **detuned,
+  stereo-spread** copies of the voice per note for a thicker, wider sound. The
+  submenu sets the **count** (Off / 2 / 3 / 4 / 6 / 8, radio-ticked), a **Detune**
+  amount (0 / 6 / 12 / 25 / 50 cents — disabled while Off), and a **Stereo spread**
+  (Mono / Narrow 33% / Wide 66% / Full 100% — also disabled while Off). A struck
+  note allocates a whole **stack** of that many voice slots (`VoiceAllocator::
+  noteOnGroup`, all sharing one `group` id so the note-off releases the stack
+  together via `noteOffGroup`); each slot is detuned symmetrically across ±the
+  detune amount and balance-panned across ±the spread, with a `1/√count`
+  normalisation so the perceived level stays steady as you add voices. Detune
+  rides into the **Pitch** signal alongside MPE bend (`VoiceInProcessor::
+  setUnisonDetune`), so it composes with glide and pitch bend. **Unison consumes
+  polyphony**: a 4-voice unison on an 8-voice container plays two notes at once,
+  and a stack that needs more slots than remain steals a whole older stack. The
+  count clamps to the slot count. All three fields (`voiceUnison`,
+  `voiceUnisonDetune`, `voiceUnisonSpread`) are re-read live each block (no
+  rebuild → no voice glitch), snapshot for undo, and save with the project.
 - **Voice-free detection.** A voice is reclaimed once its gate is released **and**
   its output RMS has stayed below a floor (`kFloorRms = 1e-4`) for `kFreeMs = 250`
   ms. CPU therefore scales with **active** polyphony, not N — idle voices are
@@ -2823,8 +2840,14 @@ toward target, +12-semitone bend doubling the Pitch signal, and the reset-to-
 neutral on a fresh note-on), the end-to-end routing through `PolyVoiceProcessor`
 (a member-channel bend raises only the matching voice ≈2×, a bend on a different
 channel leaves it alone, and a master-channel-1 bend broadcasts to it), and the
-load migration that grows an old 4-output VoiceIn its Pressure/Timbre pins; and
-`testVoiceContainerAudio` builds a real container
+load migration that grows an old 4-output VoiceIn its Pressure/Timbre pins;
+`testVoiceUnison` covers the unison stack — the `VoiceAllocator` group API
+(allocating a stack that shares one group id, releasing the whole stack on
+note-off, clamping to the polyphony, and channel-matched release so two same-note
+stacks on different MPE channels stay independent), the end-to-end audio (a
+full-spread unison decorrelates the L/R channels and the note frees the whole
+stack to silence on release), and the `voiceUnison`/`Detune`/`Spread` save/load
+round-trip; and `testVoiceContainerAudio` builds a real container
 (VoiceIn → Signal Oscillator → VoiceOut), drives it with a synthetic MIDI buffer
 through `PolyVoiceProcessor`, and asserts a held note makes a tone, three notes sum
 louder than one, and the voices decay back to silence after release. The modular

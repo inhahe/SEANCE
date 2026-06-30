@@ -549,6 +549,10 @@ struct Node {
     int voiceStealMode = 0;      // VoiceContainer: 0=oldest, 1=quietest, 2=round-robin
     float voiceGlideMs = 0.0f;   // VoiceContainer: portamento time when a voice is
                                  // stolen for a new note (0 = off / instant pitch)
+    int voiceUnison = 1;         // VoiceContainer: stacked detuned voices per note
+                                 // (1 = off). Each note grabs this many slots.
+    float voiceUnisonDetune = 12.0f; // cents of detune spread across the stack
+    float voiceUnisonSpread = 0.5f;  // 0..1 stereo spread across the stack
 
     // MOD-import song-setting restore: when a module import overrides the
     // global song settings (repeat mode, song length, loop region), the

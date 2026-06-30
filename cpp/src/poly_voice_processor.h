@@ -72,6 +72,10 @@ private:
         std::unique_ptr<GraphProcessor> gp;
         VoiceInProcessor* voiceIn = nullptr; // owned by gp's inner graph
         juce::AudioBuffer<float> scratch;
+        // Per-voice stereo balance gains for its slot in a unison stack (1,1 =
+        // centred / no spread). Set when the container assigns the slot to a
+        // unison position; applied when the voice's audio is summed into the mix.
+        float panGainL = 1.0f, panGainR = 1.0f;
     };
     std::vector<Voice> voices;
     VoiceAllocator alloc;

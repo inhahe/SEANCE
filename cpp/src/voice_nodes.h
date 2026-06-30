@@ -135,6 +135,12 @@ public:
     void setPressure (float v01)       { tgtPressure = juce::jlimit(0.0f, 1.0f, v01); }
     void setTimbre   (float v01)       { tgtTimbre   = juce::jlimit(0.0f, 1.0f, v01); }
 
+    // Unison detune for this voice's slot in cents, folded into the Pitch signal
+    // alongside pitch bend. A structural per-slot constant (NOT reset on note-on,
+    // unlike the MPE expression dimensions): the container sets it when it assigns
+    // the slot to a position in a unison stack. 0 = no detune (default).
+    void setUnisonDetune(float cents) { unisonDetuneCents = cents; }
+
     double getTailLengthSeconds() const override { return 0; }
     bool acceptsMidi() const override { return false; }
     bool producesMidi() const override { return true; }
@@ -214,9 +220,11 @@ private:
             curBend     += (tgtBend     - curBend)     * exprSmooth;
             curPressure += (tgtPressure - curPressure) * exprSmooth;
             curTimbre   += (tgtTimbre   - curTimbre)   * exprSmooth;
-            // Fold pitch bend into the Pitch signal multiplicatively (semitones).
-            const float hzOut = (curBend != 0.0f)
-                ? p * std::exp2(curBend * (1.0f / 12.0f)) : p;
+            // Fold pitch bend AND unison detune into the Pitch signal
+            // multiplicatively (both expressed in semitones; cents/100).
+            const float semis = curBend + unisonDetuneCents * 0.01f;
+            const float hzOut = (semis != 0.0f)
+                ? p * std::exp2(semis * (1.0f / 12.0f)) : p;
             if (pp) pp[i] = hzOut;
             if (gp) gp[i] = g;
             if (vp) vp[i] = v;
@@ -270,6 +278,10 @@ private:
     float curPressure = 0.0f, tgtPressure = 0.0f;  // 0..1
     float curTimbre = 0.5f, tgtTimbre = 0.5f;      // 0..1 (centre 0.5)
     float exprSmooth = 1.0f;                        // per-sample one-pole coef
+
+    // Unison detune for this voice's slot, in cents (structural, not reset on
+    // note-on). Folded into the Pitch signal alongside pitch bend.
+    float unisonDetuneCents = 0.0f;
 };
 
 } // namespace SoundShop

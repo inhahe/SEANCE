@@ -85,21 +85,33 @@ void PolyVoiceProcessor::processBlock(juce::AudioBuffer<float>& buf,
         const auto m = meta.getMessage();
         const int off = meta.samplePosition;
         if (m.isNoteOn() && m.getVelocity() > 0) {
-            const auto res = alloc.noteOn(m.getNoteNumber());
-            if (res.slot < 0) continue;
-            // Remember the note's MIDI channel so later per-note MPE expression
-            // (pitch bend / pressure / timbre on that channel) routes to it.
-            alloc.slots[(size_t) res.slot].channel = m.getChannel();
-            auto& v = voices[(size_t) res.slot];
-            if (res.stole && v.voiceIn) v.voiceIn->reset();
-            if (v.voiceIn) {
-                // Portamento applies only when this voice was STOLEN mid-note
-                // (the pitch slides from the old note to the new one). A fresh /
-                // freed voice has no meaningful "previous pitch", so it starts on
-                // pitch with no glide. glide time is a live container field.
-                const float glideMs = res.stole
-                    ? juce::jmax(0.0f, containerNode.voiceGlideMs) : 0.0f;
-                v.voiceIn->noteOn(off, m.getNoteNumber(), m.getFloatVelocity(), glideMs);
+            // Allocate a whole UNISON STACK for this note (1 slot when unison is
+            // off). Every slot of the stack shares a group id so the note-off
+            // releases them together; each is detuned and panned across the stack.
+            const int uni = juce::jlimit(1, VoiceAllocator::GroupResult::kMaxUnison,
+                                         containerNode.voiceUnison);
+            const auto grp = alloc.noteOnGroup(m.getNoteNumber(), m.getChannel(), uni);
+            const float detune = juce::jmax(0.0f, containerNode.voiceUnisonDetune);
+            const float spread = juce::jlimit(0.0f, 1.0f, containerNode.voiceUnisonSpread);
+            // Equal RMS across the stack: detuned voices are decorrelated, so the
+            // sum grows ~sqrt(count); 1/sqrt(count) keeps perceived level steady.
+            const float norm = grp.count > 0 ? 1.0f / std::sqrt((float) grp.count) : 1.0f;
+            for (int k = 0; k < grp.count; ++k) {
+                const int slot = grp.slot[k];
+                auto& v = voices[(size_t) slot];
+                // Symmetric position in [-1, 1] for this slot in the stack.
+                const float t = grp.count > 1 ? (2.0f * k / (grp.count - 1) - 1.0f) : 0.0f;
+                if (v.voiceIn) {
+                    v.voiceIn->setUnisonDetune(t * detune);
+                    if (grp.stole[k]) v.voiceIn->reset();
+                    const float glideMs = grp.stole[k]
+                        ? juce::jmax(0.0f, containerNode.voiceGlideMs) : 0.0f;
+                    v.voiceIn->noteOn(off, m.getNoteNumber(), m.getFloatVelocity(), glideMs);
+                }
+                // Stereo balance: centre unity, full pan kills the far channel.
+                const float pan = t * spread;
+                v.panGainL = (1.0f - juce::jmax(0.0f, pan)) * norm;
+                v.panGainR = (1.0f + juce::jmin(0.0f, pan)) * norm;
             }
         } else if (m.isPitchWheel()) {
             // Per-note pitch bend. A member-channel (>1) bend bends only the
@@ -125,9 +137,12 @@ void PolyVoiceProcessor::processBlock(juce::AudioBuffer<float>& buf,
             const float y = m.getControllerValue() / 127.0f;
             routeExpr(chan, -1, [&](VoiceInProcessor& vi){ vi.setTimbre(y); });
         } else if (m.isNoteOff() || (m.isNoteOn() && m.getVelocity() == 0)) {
-            const int slot = alloc.noteOff(m.getNoteNumber());
-            if (slot >= 0 && voices[(size_t) slot].voiceIn)
-                voices[(size_t) slot].voiceIn->noteOff(off, m.getNoteNumber());
+            // Release the whole unison stack struck for this note on this channel.
+            const auto rel = alloc.noteOffGroup(m.getNoteNumber(), m.getChannel());
+            for (int k = 0; k < rel.count; ++k) {
+                auto& v = voices[(size_t) rel.slot[k]];
+                if (v.voiceIn) v.voiceIn->noteOff(off, m.getNoteNumber());
+            }
         } else if (m.isAllNotesOff() || m.isAllSoundOff()) {
             for (int i = 0; i < alloc.size(); ++i) {
                 if (!alloc.slots[(size_t) i].active) continue;
@@ -150,8 +165,9 @@ void PolyVoiceProcessor::processBlock(juce::AudioBuffer<float>& buf,
         if (v.gp->getGraph())
             v.gp->getGraph()->processBlock(v.scratch, emptyMidi);
 
-        for (int c = 0; c < 2 && c < buf.getNumChannels(); ++c)
-            buf.addFrom(c, 0, v.scratch, c, 0, n);
+        // Sum with the voice's unison balance (unity 1,1 when unison is off).
+        if (buf.getNumChannels() > 0) buf.addFrom(0, 0, v.scratch, 0, 0, n, v.panGainL);
+        if (buf.getNumChannels() > 1) buf.addFrom(1, 0, v.scratch, 1, 0, n, v.panGainR);
 
         // Voice-free detection: a released voice whose output has decayed below
         // the floor for kFreeMs is done (envelope tail finished).

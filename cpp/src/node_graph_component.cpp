@@ -4333,6 +4333,44 @@ void NodeGraphComponent::showNodeMenu(Node& node) {
         juce::String glLabel = node.voiceGlideMs <= 0.5f
             ? "off" : juce::String((int) std::lround(node.voiceGlideMs)) + " ms";
         menu.addSubMenu("Glide (" + glLabel + ")", glideMenu);
+
+        // Unison: stack several detuned copies of the voice per note for a
+        // thicker, wider sound. The count consumes polyphony (a 4-voice unison
+        // on an 8-voice container plays 2 notes at once). Detune/spread are only
+        // meaningful when the count is > 1, so they're disabled at Off.
+        juce::PopupMenu uniMenu;
+        struct { int id; const char* label; int n; } uc[] = {
+            { 230, "Off (1 voice)", 1 }, { 231, "2 voices", 2 },
+            { 232, "3 voices", 3 }, { 233, "4 voices", 4 },
+            { 234, "6 voices", 6 }, { 235, "8 voices", 8 },
+        };
+        for (auto& u : uc)
+            uniMenu.addItem(u.id, u.label, true, node.voiceUnison == u.n);
+
+        const bool uniOn = node.voiceUnison > 1;
+        juce::PopupMenu detuneMenu;
+        struct { int id; const char* label; float c; } dc[] = {
+            { 240, "0 cents", 0.0f }, { 241, "Subtle (6 cents)", 6.0f },
+            { 242, "Classic (12 cents)", 12.0f }, { 243, "Wide (25 cents)", 25.0f },
+            { 244, "Extreme (50 cents)", 50.0f },
+        };
+        for (auto& d : dc)
+            detuneMenu.addItem(d.id, d.label, uniOn,
+                               std::abs(node.voiceUnisonDetune - d.c) < 0.5f);
+        uniMenu.addSubMenu("Detune", detuneMenu, uniOn);
+
+        juce::PopupMenu spreadMenu;
+        struct { int id; const char* label; float s; } sc[] = {
+            { 250, "Mono (0%)", 0.0f }, { 251, "Narrow (33%)", 0.33f },
+            { 252, "Wide (66%)", 0.66f }, { 253, "Full (100%)", 1.0f },
+        };
+        for (auto& s : sc)
+            spreadMenu.addItem(s.id, s.label, uniOn,
+                               std::abs(node.voiceUnisonSpread - s.s) < 0.02f);
+        uniMenu.addSubMenu("Stereo spread", spreadMenu, uniOn);
+
+        juce::String uniLabel = uniOn ? juce::String(node.voiceUnison) + " voices" : "off";
+        menu.addSubMenu("Unison (" + uniLabel + ")", uniMenu);
     }
 
     // Envelope editor on synths whose amplitude envelope IS the shared node
@@ -4568,6 +4606,30 @@ void NodeGraphComponent::showNodeMenu(Node& node) {
             if (std::abs(node->voiceGlideMs - v) > 0.5f) {
                 node->voiceGlideMs = v;
                 graph.commitSnapshot("Set voice glide");
+            }
+        } else if (result >= 230 && result <= 235) {
+            // Unison voice count. Read live each block by PolyVoiceProcessor at
+            // note-on time (it allocates a stack of this many slots), so like the
+            // steal mode / glide it needs no graph rebuild - just a field write.
+            const int counts[] = { 1, 2, 3, 4, 6, 8 };
+            int n = counts[result - 230];
+            if (node->voiceUnison != n) {
+                node->voiceUnison = n;
+                graph.commitSnapshot("Set unison voices");
+            }
+        } else if (result >= 240 && result <= 244) {
+            const float cents[] = { 0.0f, 6.0f, 12.0f, 25.0f, 50.0f };
+            float c = cents[result - 240];
+            if (std::abs(node->voiceUnisonDetune - c) > 0.5f) {
+                node->voiceUnisonDetune = c;
+                graph.commitSnapshot("Set unison detune");
+            }
+        } else if (result >= 250 && result <= 253) {
+            const float spread[] = { 0.0f, 0.33f, 0.66f, 1.0f };
+            float s = spread[result - 250];
+            if (std::abs(node->voiceUnisonSpread - s) > 0.02f) {
+                node->voiceUnisonSpread = s;
+                graph.commitSnapshot("Set unison spread");
             }
         } else if (result == 181) {
             // Plugin MPE toggle: adds/removes the parallel MCM generator node,

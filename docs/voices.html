@@ -124,6 +124,14 @@
 <div class="note">
 <strong>Sync makes each note's LFO start fresh.</strong> The LFO has a <strong>Sync</strong> input. Feed it the <strong>Gate</strong> from VoiceIn and every note restarts the LFO from the top of its cycle — so a plucked vibrato always begins the same way instead of catching the wobble wherever it happened to be. Leave Sync unwired and the LFO free-runs continuously. Because the container clones the whole patch per note, each voice gets its own independent LFO.</div>
 
+<h2>A different value every note — Sample &amp; Hold</h2>
+
+<p><strong>Sample &amp; Hold</strong> grabs a value the instant you tell it to and then holds that value steady until you tell it again. Add one from <strong>Add Node → Signal Shape → Sample &amp; Hold (stepped/random)</strong>. It has an <strong>In</strong> input (the value to grab), a <strong>Trigger</strong> input (a rising signal tells it to grab), and an output that holds the last grabbed value.</p>
+
+<p>Its most fun trick needs nothing wired to In: set the <strong>Source</strong> control on the node to <strong>Random</strong>, wire VoiceIn's <strong>Gate → Trigger</strong>, and every note gets its own fresh random number. Run that into a Signal Math <strong>Add</strong> on the oscillator's pitch (random detune per note), or into a filter amount, and the instrument stops sounding mechanical because no two notes are quite alike. The two Random options give you a value either side of zero (good for detune) or between 0 and 1 (good for amounts).</p>
+
+<p>With Source set to <strong>Input</strong> instead, it samples whatever you feed In at each trigger — for example, sampling a slow LFO on every note gives stepped, staircase movement instead of a smooth glide.</p>
+
 <h2>Current limitations</h2>
 
 <p>This is the first version of the feature. A few things are intentionally simple for now:</p>

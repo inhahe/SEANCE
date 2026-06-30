@@ -2649,6 +2649,27 @@ Covered by `testSignalLFO` in `--self-test` (waveform values, sine bounds,
 bipolar vs unipolar range, mid-block sync reset, and the param save/load
 round-trip).
 
+#### Sample & Hold (`__signalsh__`)
+
+**Add Node → Signal Shape → Sample & Hold (stepped/random)** creates a
+`SampleHoldProcessor` (`signal_sample_hold.h`). On each trigger it latches a
+value and holds it until the next trigger — the classic source of stepped and
+random-per-note modulation:
+
+- **Inputs (Signal):** **In** (channel 2 — the value sampled in Input mode) and
+  **Trigger** (channel 3 — a **rising edge** ≥ 0.5 takes a sample). Wire a Voice
+  container's **VoiceIn Gate → Trigger** for one fresh value per note.
+- **Output (Signal):** **Out** (channel 2) — the most recently held value.
+- **Param — Source** (popup enum): **0 Input** (hold the In signal), **1 Random
+  ±1** (hold a fresh random value in −1…+1, ignoring In), **2 Random 0…1** (random
+  in 0…1, ignoring In). The built-in random source means "random per note" works
+  with **nothing wired to In** — just feed the gate to Trigger.
+
+Each voice clone owns its own instance **and its own RNG state**, so per-voice
+random values vary between voices. Covered by `testSampleHold` in `--self-test`
+(input sampling + hold across two triggers, random modes ignoring In and staying
+in range, hold steadiness, the silent audio bus, and the Source param round-trip).
+
 ### Save / load, dirty tracking, undo
 
 Inner nodes and links serialize through the **same** generic path as any node —
@@ -2691,7 +2712,8 @@ kit has its own coverage: `testSignalMath` runs every Signal Math operation,
 checks divide-by-zero safety, unwired-input (=0) behavior, the silent audio bus,
 and the Operation-param save/load round-trip; `testSignalLFO` checks LFO waveform
 values, sine bounds, bipolar/unipolar range, mid-block sync reset, and its param
-round-trip.
+round-trip; `testSampleHold` checks input sampling and hold across triggers, the
+random modes' range and In-independence, and its Source param round-trip.
 
 ## Asset library (project stores)
 

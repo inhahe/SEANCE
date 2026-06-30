@@ -28,6 +28,7 @@
 #include "poly_voice_processor.h"   // PolyVoiceProcessor - end-to-end voice audio
 #include "signal_math.h"            // SignalMathProcessor - modular-kit math module
 #include "signal_lfo.h"             // SignalLFOProcessor - modular-kit LFO module
+#include "signal_sample_hold.h"     // SampleHoldProcessor - modular-kit S&H module
 
 #include <juce_audio_formats/juce_audio_formats.h>
 #include <juce_graphics/juce_graphics.h>
@@ -6343,6 +6344,88 @@ void testSignalLFO(Report& r) {
 }
 
 // ---------------------------------------------------------------------------
+// Sample & Hold module: latch a value on each trigger rising edge.
+// ---------------------------------------------------------------------------
+void testSampleHold(Report& r) {
+    r.section("Sample & Hold module (modular kit)");
+
+    NodeGraph graph;
+    auto& node = graph.addNode("Sample & Hold", NodeType::SignalShape,
+        {Pin{0, "In", PinKind::Signal, true, 1},
+         Pin{0, "Trigger", PinKind::Signal, true, 1}},
+        {Pin{0, "Out", PinKind::Signal, false, 1}}, {0.0f, 0.0f});
+    node.script = "__signalsh__";
+    node.params.push_back({"Source", 0.0f, 0.0f, 2.0f});
+
+    SampleHoldProcessor proc(node);
+    const int N = 512;
+    juce::AudioBuffer<float> buf(4, N); // ch2=In/Out, ch3=Trigger
+    auto setSource = [&](float v) { node.params[0].value = v; };
+
+    // --- Input mode: sample a ramp at two trigger edges, hold between. ---
+    {
+        setSource(0.0f);
+        proc.prepareToPlay(48000.0, N);
+        buf.clear();
+        for (int i = 0; i < N; ++i) buf.setSample(2, i, (float) i);       // In = ramp
+        for (int i = 100; i < 150; ++i) buf.setSample(3, i, 1.0f);        // edge @100
+        for (int i = 300; i < 350; ++i) buf.setSample(3, i, 1.0f);        // edge @300
+        juce::MidiBuffer m;
+        proc.processBlock(buf, m);
+        r.check(buf.getSample(2, 50)  == 0.0f,   "sh: holds initial 0 before first trigger");
+        r.check(buf.getSample(2, 100) == 100.0f, "sh: samples In(=100) at first trigger");
+        r.check(buf.getSample(2, 200) == 100.0f, "sh: holds steady between triggers");
+        r.check(buf.getSample(2, 299) == 100.0f, "sh: still holding just before second trigger");
+        r.check(buf.getSample(2, 300) == 300.0f, "sh: re-samples In(=300) at second trigger");
+        r.check(buf.getSample(2, 400) == 300.0f, "sh: holds the new value after");
+        r.check(buf.getSample(0, 10) == 0.0f && buf.getSample(1, 10) == 0.0f,
+                "sh: audio channels stay silent");
+    }
+
+    // --- Random ±1: one trigger, ignores In, value in [-1,1], then held. ---
+    {
+        setSource(1.0f);
+        proc.prepareToPlay(48000.0, N);
+        buf.clear();
+        for (int i = 0; i < N; ++i) buf.setSample(2, i, (float) i * 1000.0f); // huge In ramp
+        for (int i = 10; i < 20; ++i) buf.setSample(3, i, 1.0f);              // single edge @10
+        juce::MidiBuffer m;
+        proc.processBlock(buf, m);
+        r.check(buf.getSample(2, 5) == 0.0f, "sh-rand: initial 0 before trigger");
+        const float v = buf.getSample(2, 10);
+        r.check(v >= -1.0f && v <= 1.0f, "sh-rand: held value within [-1, 1] (ignores In ramp)");
+        r.check(buf.getSample(2, 400) == v, "sh-rand: holds the random value steady");
+    }
+
+    // --- Random 0..1: value in [0,1]. ---
+    {
+        setSource(2.0f);
+        proc.prepareToPlay(48000.0, N);
+        buf.clear();
+        for (int i = 10; i < 20; ++i) buf.setSample(3, i, 1.0f);
+        juce::MidiBuffer m;
+        proc.processBlock(buf, m);
+        const float v = buf.getSample(2, 200);
+        r.check(v >= 0.0f && v <= 1.0f, "sh-rand: held value within [0, 1]");
+    }
+
+    // --- Save/load round-trip. ---
+    {
+        setSource(2.0f);
+        const std::string text = ProjectFile::serializeForUndo(graph);
+        NodeGraph dst;
+        const bool ok = ProjectFile::loadFromString(text, dst);
+        r.check(ok, "sh-saveload: project text parses back");
+        Node* d = dst.findNode(node.id);
+        r.check(d != nullptr && d->script == "__signalsh__", "sh-saveload: script tag survives");
+        bool found = false;
+        if (d) for (auto& p : d->params)
+            if (p.name == "Source") found = std::abs(p.value - 2.0f) < 0.01f;
+        r.check(found, "sh-saveload: Source value round-trips");
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Voice container end-to-end audio: build a real NodeGraph with a VoiceContainer
 // whose inner patch is VoiceIn -> Signal Oscillator -> VoiceOut, drive it with a
 // synthetic MIDI buffer through PolyVoiceProcessor, and confirm the clone/build/
@@ -6577,6 +6660,7 @@ int runSelfTest(const juce::File& outDir) {
     testVoiceInSignals(r);
     testSignalMath(r);
     testSignalLFO(r);
+    testSampleHold(r);
     testVoiceContainerAudio(r);
     testVoiceContainerSaveLoad(r);
 

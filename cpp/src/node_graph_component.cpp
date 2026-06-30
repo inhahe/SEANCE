@@ -1606,6 +1606,28 @@ void NodeGraphComponent::mouseDown(const juce::MouseEvent& e) {
                         });
                         return;
                     }
+                    // Sample & Hold's Source is a discrete enum (popup picker).
+                    if (node->script == "__signalsh__" && p.name == "Source") {
+                        selectedNodeId = node->id;
+                        const char* labels[] = { "Input  (sample the In signal)",
+                            "Random  (-1 .. +1)", "Random  (0 .. 1)" };
+                        int cur = juce::jlimit(0, 2, (int)std::round(p.value));
+                        juce::PopupMenu pm;
+                        for (int i = 0; i < 3; ++i)
+                            pm.addItem(i + 1, labels[i], true, i == cur);
+                        int nodeId = node->id;
+                        int paramIdx = idx;
+                        pm.showMenuAsync({}, [this, nodeId, paramIdx](int r) {
+                            if (r == 0) return;
+                            auto* nd = graph.findNode(nodeId);
+                            if (!nd || paramIdx >= (int)nd->params.size()) return;
+                            nd->params[paramIdx].value = (float)(r - 1);
+                            graph.dirty = true;
+                            graph.commitSnapshot("Change Sample & Hold source");
+                            repaint();
+                        });
+                        return;
+                    }
                     // Signal LFO's Shape and Polarity are discrete enums too.
                     if (node->script == "__signallfo__"
                         && (p.name == "Shape" || p.name == "Polarity")) {
@@ -2098,7 +2120,8 @@ void NodeGraphComponent::mouseDoubleClick(const juce::MouseEvent& e) {
         // Modular-kit signal utilities (Signal Math, Signal LFO, etc.) live in
         // the SignalShape family for coloring but have no program editor - their
         // params are edited directly on the node face. Double-click is a no-op.
-        if (node->script == "__signalmath__" || node->script == "__signallfo__")
+        if (node->script == "__signalmath__" || node->script == "__signallfo__"
+            || node->script == "__signalsh__")
             return;
         if (node->script == "__xypad__") {
             auto* pad = new XYPadComponent(graph, captured);
@@ -2535,6 +2558,8 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
     sigMenu.addItem(152, "Signal Math (A op B)");
     // Modular-kit control-rate LFO with optional per-voice sync.
     sigMenu.addItem(153, "Signal LFO (modulation source)");
+    // Modular-kit sample & hold (stepped / random-per-note modulation).
+    sigMenu.addItem(154, "Sample & Hold (stepped/random)");
     sigMenu.addSeparator();
     sigMenu.addItem(133, "XY Pad");
     sigMenu.addItem(135, "Control Bank");
@@ -2747,6 +2772,24 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
             n.params.push_back({"Rate", 2.0f, 0.1f, 20.0f});    // Hz
             n.params.push_back({"Shape", 0.0f, 0.0f, 3.0f});    // 0=sine 1=tri 2=saw 3=square
             n.params.push_back({"Polarity", 0.0f, 0.0f, 1.0f}); // 0=bipolar 1=unipolar
+        } else if (result == 154) {
+            // Sample & Hold: latch a value on each Trigger rising edge. Two
+            // Signal inputs (In=ch2, Trigger=ch3) -> one Signal output (Out=ch2).
+            // NodeType::SignalShape tagged "__signalsh__"; SampleHoldProcessor.
+            auto& n = graph.addNode("Sample & Hold", NodeType::SignalShape,
+                {Pin{0, "In", PinKind::Signal, true, 1},
+                 Pin{0, "Trigger", PinKind::Signal, true, 1}},
+                {Pin{0, "Out", PinKind::Signal, false, 1}}, {p.x, p.y});
+            n.script = "__signalsh__";
+            if (n.pinsIn.size() >= 2) {
+                n.pinsIn[0].tooltip = "In: the value sampled in Input mode. Ignored in Random modes.";
+                n.pinsIn[1].tooltip = "Trigger: a rising edge (>= 0.5) takes a fresh sample. "
+                                      "Wire a Voice gate for one value per note.";
+            }
+            if (!n.pinsOut.empty())
+                n.pinsOut[0].tooltip = "The most recently held value.";
+            // 0=Input 1=Random(-1..1) 2=Random(0..1)
+            n.params.push_back({"Source", 0.0f, 0.0f, 2.0f});
         } else if (result == 6) {
             // WASM Script - open file chooser
             auto chooser = std::make_shared<juce::FileChooser>(

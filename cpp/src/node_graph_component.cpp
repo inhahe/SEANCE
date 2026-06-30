@@ -2472,6 +2472,10 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
     // outputs + a MIDI-emitting program is the classic MIDI Script.)
     sigMenu.addItem(130, "Script (signal + MIDI)");
     sigMenu.addItem(143, "MIDI Breakout (MIDI -> signals)");
+    // Signal-driven oscillator: turns Pitch/Gate/Velocity control signals into
+    // a tone. The natural inner voice for a Voice container (wire VoiceIn's
+    // Pitch/Gate/Velocity into it), but usable standalone too.
+    sigMenu.addItem(151, "Signal Oscillator (pitch/gate -> tone)");
     sigMenu.addSeparator();
     sigMenu.addItem(133, "XY Pad");
     sigMenu.addItem(135, "Control Bank");
@@ -2625,6 +2629,28 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
 
             graph.commitSnapshot("Add Voice container");
             if (onNodeEdited) onNodeEdited();
+        } else if (result == 151) {
+            // Signal Oscillator: Pitch/Gate/Velocity Signal inputs -> tone.
+            // Pin order fixes the control-channel mapping (Pitch=ch2, Gate=ch3,
+            // Velocity=ch4; see SignalOscillatorProcessor). Amplitude uses the
+            // shared node AHDSR so the envelope editor works on it.
+            auto& n = graph.addNode("Signal Osc", NodeType::Instrument,
+                {Pin{0, "Pitch",    PinKind::Signal, true, 1},
+                 Pin{0, "Gate",     PinKind::Signal, true, 1},
+                 Pin{0, "Velocity", PinKind::Signal, true, 1}},
+                {Pin{0, "Audio", PinKind::Audio, false}}, {p.x, p.y});
+            n.script = "__signalosc__";
+            if (n.pinsIn.size() >= 3) {
+                n.pinsIn[0].tooltip = "Pitch (Hz): oscillator frequency, read every sample.";
+                n.pinsIn[1].tooltip = "Gate (0/1): starts the note while >= 0.5, releases on the falling edge.";
+                n.pinsIn[2].tooltip = "Velocity (0..1): how hard the note is struck; scales the envelope.";
+            }
+            n.params.push_back({"Waveform", 0.0f, 0.0f, 3.0f}); // 0=sine 1=saw 2=square 3=tri
+            n.params.push_back({"Volume",   0.5f, 0.0f, 1.0f});
+            n.ahdsrEnvelope.attackMs  = 5.0f;
+            n.ahdsrEnvelope.decayMs   = 100.0f;
+            n.ahdsrEnvelope.sustain   = 0.7f;
+            n.ahdsrEnvelope.releaseMs = 300.0f;
         } else if (result == 6) {
             // WASM Script - open file chooser
             auto chooser = std::make_shared<juce::FileChooser>(

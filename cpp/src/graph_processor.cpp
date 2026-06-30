@@ -23,6 +23,7 @@
 #include "drum_synth.h"
 #include "spatializer_3d.h"
 #include "voice_nodes.h"
+#include "signal_oscillator.h"
 #include "poly_voice_processor.h"
 #include <algorithm>
 #include <cmath>
@@ -603,6 +604,8 @@ std::unique_ptr<juce::AudioProcessor> GraphProcessor::createNodeProcessor(
         return wasmProc;
     } else if (node.type == NodeType::Instrument && node.script == "__fmsynth__") {
         return std::make_unique<FMSynthProcessor>(node);
+    } else if (node.type == NodeType::Instrument && node.script == "__signalosc__") {
+        return std::make_unique<SignalOscillatorProcessor>(node);
     } else if (node.type == NodeType::Instrument &&
                node.script.rfind("__spectralgrain__:", 0) == 0) {
         return std::make_unique<SpectralGrainProcessor>(node);

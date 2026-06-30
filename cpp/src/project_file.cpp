@@ -304,6 +304,13 @@ bool ProjectFile::writeProject(std::ostream& f, NodeGraph& graph,
             }
             if (!node.cachedPluginStateBase64.empty())
                 writeStr(f, "pluginState", node.cachedPluginStateBase64);
+            else if (!node.pendingPluginState.empty())
+                // Plugin hasn't finished loading yet (async load in progress), so
+                // there's no live processor to query and no cached state. Fall
+                // back to the state we read from the file but haven't applied
+                // yet - otherwise an autosave mid-load would silently drop the
+                // plugin's saved state. See MainContentComponent::beginAsyncPluginLoad.
+                writeStr(f, "pluginState", node.pendingPluginState);
         }
         if (node.performanceMode) {
             writeInt(f, "performanceMode", 1);

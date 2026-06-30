@@ -446,6 +446,45 @@ void NodeGraphComponent::drawNode(juce::Graphics& g, Node& node) {
         g.drawText("!", disc, juce::Justification::centred);
     }
 
+    // Async plugin-load badge: shown at the node's top-LEFT corner (the script
+    // error badge owns the top-right) while a project's plugins are loading
+    // serially in the background. Pending = dim hollow ring ("queued"); Loading
+    // = animated blue spinner ("instantiating now"); Failed = amber "x" disc.
+    // Ready/None draw nothing. The MainContentComponent 30Hz timer repaints us
+    // while loading so the spinner animates. Tooltip explains each state.
+    if (node.pluginLoadState == PluginLoadState::Pending ||
+        node.pluginLoadState == PluginLoadState::Loading ||
+        node.pluginLoadState == PluginLoadState::Failed) {
+        float r = std::max(6.0f, 8.0f * zoom);
+        auto tl = canvasToScreen(bounds.getTopLeft());
+        juce::Rectangle<float> disc(tl.x - r, tl.y - r, r * 2, r * 2);
+        if (node.pluginLoadState == PluginLoadState::Pending) {
+            g.setColour(juce::Colours::black.withAlpha(0.45f));
+            g.fillEllipse(disc);
+            g.setColour(juce::Colours::lightgrey.withAlpha(0.7f));
+            g.drawEllipse(disc.reduced(r * 0.35f), std::max(1.0f, 1.5f * zoom));
+        } else if (node.pluginLoadState == PluginLoadState::Loading) {
+            g.setColour(juce::Colours::black.withAlpha(0.55f));
+            g.fillEllipse(disc);
+            // Rotating arc spinner driven off the wall clock.
+            float ang = (float)((juce::Time::getMillisecondCounter() % 1000) / 1000.0
+                                * juce::MathConstants<double>::twoPi);
+            juce::Path arc;
+            float ar = r * 0.6f;
+            arc.addCentredArc(disc.getCentreX(), disc.getCentreY(), ar, ar, 0.0f,
+                              ang, ang + juce::MathConstants<float>::pi * 1.3f, true);
+            g.setColour(juce::Colours::aqua);
+            g.strokePath(arc, juce::PathStrokeType(std::max(1.5f, 2.0f * zoom)));
+        } else { // Failed
+            g.setColour(juce::Colours::darkorange);
+            g.fillEllipse(disc);
+            g.setColour(juce::Colours::white);
+            g.drawEllipse(disc, std::max(1.0f, zoom));
+            g.setFont(juce::Font(r * 1.4f, juce::Font::bold));
+            g.drawText("x", disc, juce::Justification::centred);
+        }
+    }
+
     // Pins
     float pinY = bounds.getY() + HEADER_HEIGHT;
     auto drawPin = [&](const Pin& pin, bool isInput, bool hasOpposite, bool withLabel = true) {
@@ -1853,6 +1892,15 @@ juce::String NodeGraphComponent::getTooltip() {
     }
     // No pin under the cursor - fall back to a param-row tooltip (slider help).
     if (auto* node = nodeAtPoint(canvasPos)) {
+        // A node showing the plugin-load badge explains its state here.
+        if (node->pluginLoadState == PluginLoadState::Pending)
+            return "Plugin queued - waiting to load. Plugins load one at a time "
+                   "after a project opens; this one's turn is coming up.";
+        if (node->pluginLoadState == PluginLoadState::Loading)
+            return "Loading plugin... instantiating and restoring its saved state.";
+        if (node->pluginLoadState == PluginLoadState::Failed)
+            return "Plugin failed to load. It may be missing, blocklisted, or "
+                   "incompatible. The node is kept so you can replace the plugin.";
         // A node showing the red script-error badge explains it here so the
         // user knows the script didn't compile and where to fix it.
         if (getNodeScriptError && getNodeScriptError(node->id))

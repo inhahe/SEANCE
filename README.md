@@ -231,6 +231,8 @@ nothing collides, and suffixes name clashes ("Bass" → "Bass 2"). See
 
 Loaded plugins are scanned and indexed at startup (cached so subsequent launches are fast); plugin scan directories are configurable via Settings → Plugin Settings, and plugins that crash during scan are automatically blocklisted so the next scan skips them.
 
+Opening a project that hosts plugins never freezes the UI: the nodes appear instantly and each plugin instantiates in the background, one at a time, with a per-node loading badge (spinner while loading, dim ring while queued, an error mark if it fails to load). Saving is briefly disabled until every plugin finishes loading.
+
 ### Built-in effects
 
 All built-in effects can be combined freely with cables — pre-effect, post-effect, parallel, sidechained, time-gated, signal-modulated. Each one is a node in the graph with a left-side audio in pin and a right-side audio out pin (some also have signal modulation inputs for audio-rate or block-rate parameter control).

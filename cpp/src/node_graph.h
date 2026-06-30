@@ -26,6 +26,12 @@ struct Vec2 {
 
 enum class PinKind { Audio, Midi, Param, Signal }; // Signal = audio-rate control signal (mono)
 
+// Transient (not serialized) per-node plugin instantiation state, used to drive
+// the async project-load path. When a project is opened, plugin nodes appear
+// immediately as Pending; a serial background loader walks them one at a time
+// (Loading), then marks each Ready or Failed. None = node has no plugin to load.
+enum class PluginLoadState { None, Pending, Loading, Ready, Failed };
+
 // Two pin kinds are compatible at the cable level if they're either the same
 // kind, or both control kinds (Param + Signal). Param is conceptually
 // block-rate and Signal is audio-rate, but at the routing layer we treat them
@@ -477,6 +483,11 @@ struct Node {
     // tick in the autosave path bounds staleness to a known interval.
     bool pluginStateDirty = true;
     std::string cachedPluginStateBase64;
+
+    // Transient async-load state (NOT serialized). Drives the per-node loading
+    // badge and the serial background loader after a project open. See
+    // MainContentComponent::beginAsyncPluginLoad.
+    PluginLoadState pluginLoadState = PluginLoadState::None;
 
     // Group - contains child node IDs
     std::vector<int> childNodeIds;  // IDs of nodes inside this group

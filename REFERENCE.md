@@ -37,6 +37,7 @@ here.
 - [Terrain-synth self-test (`--self-test`)](#terrain-synth-self-test---self-test)
 - [Ephemeral session (`--ephemeral`)](#ephemeral-session---ephemeral)
 - [Opening a project from the command line](#opening-a-project-from-the-command-line)
+- [Asynchronous plugin loading](#asynchronous-plugin-loading)
 
 ---
 
@@ -2848,3 +2849,60 @@ behaviour. Editor panels saved in the project's `[Editors]` section are restored
 just as they are for an auto-loaded project. Parsed in `main.cpp::initialise`
 (stored via `SoundShop::setStartupProjectFile`); loaded in the
 `MainContentComponent` constructor before the auto-load fallback.
+
+---
+
+## Asynchronous plugin loading
+
+<a name="asynchronous-plugin-loading"></a>Opening a project that hosts VST3/AU
+plugins no longer blocks the UI while those plugins instantiate. Plugin
+instantiation (`createPluginInstance` + restoring the saved `setStateInformation`
+state) is slow — often a second or more per plugin — and **must** run on the
+message thread (third-party plugins are not safe to instantiate off-thread, and
+SEANCE deliberately loads them **one at a time**, not thread-per-core, for the
+same reason). Previously the whole project froze until every plugin finished;
+now the nodes appear immediately and each plugin loads in the background.
+
+**How it works.** `ProjectFile::load` is called with a `nullptr` plugin host on
+the interactive open path (`openProjectFile`) and at startup, so it parses every
+node — keeping each plugin node's saved state in `pendingPluginState` — without
+instantiating anything while holding `NodeGraph::mutationLock`. The graph is
+painted right away. Then `MainContentComponent::beginAsyncPluginLoad()` marks
+every not-yet-loaded plugin node **Pending**, pushes its id onto a FIFO queue,
+and `processNextPluginLoad()` walks the queue one node per `callAsync` tick: the
+node flips to **Loading**, the heavy `loadPlugin` + `setStateInformation` runs
+**off** the graph lock, then the result is published **under** the lock
+(`node.plugin` set, `pendingPluginState` cleared) and the audio graph is rebuilt.
+The loader never holds a `Node*` across the heavy call — it re-looks-up by id —
+so the queue is safe even if you add/remove nodes mid-load. Opening a second
+project while the first is still loading rebuilds the queue without starting a
+duplicate loader chain. (The **autosave crash-recovery** path still loads plugins
+synchronously, because it immediately applies per-plugin override blobs that need
+the live processors.)
+
+**Per-node loading badge.** While a project's plugins resolve, each plugin node
+shows a small badge at its **top-left** corner (the script-error badge owns the
+top-right):
+
+- **Pending** — a dim grey hollow ring: queued, waiting its turn.
+- **Loading** — an animated aqua arc spinner (driven by the 30 Hz UI timer):
+  instantiating now.
+- **Failed** — an amber "x" disc: the plugin couldn't be instantiated (missing,
+  blocklisted, or incompatible). The node is kept so you can replace the plugin.
+- **Ready / none** — no badge.
+
+Each state has a hover tooltip explaining it. The spinner only animates (and the
+graph only repaints every tick) while loading is in progress.
+
+**Save is gated during load.** *Save Project* and *Save Project As…* are greyed
+in the File menu — their labels read *"(loading plugins…)"* — until the queue
+drains, because the audio graph isn't fully live yet. The keyboard shortcut is
+backstopped by a brief "Still loading" dialog. As soon as the last plugin
+resolves, `projectLoading` clears and the menu refreshes (`menuItemsChanged`),
+re-enabling Save.
+
+**Mid-load save safety.** The slow autosave can still fire while plugins are
+loading. To avoid silently dropping a not-yet-applied plugin's saved state,
+`writeProject` falls back to writing `node.pendingPluginState` when a plugin node
+has no live processor to query and no cached state — so an autosave mid-load
+preserves the plugin state read from the file.

@@ -204,6 +204,21 @@ private:
     void runDeferredStartupInit();
     bool deferredInitScheduled = false;
 
+    // ---- Async serial plugin loading (project open + startup) ----
+    // Plugin instantiation (createPluginInstance + setStateInformation) is slow
+    // and must run on the message thread (third-party plugins are not safe to
+    // instantiate off-thread). To keep nodes visible and the UI responsive, we
+    // don't load plugins on the synchronous load path any more. Instead, after a
+    // project is parsed, every plugin node is marked Pending and pushed onto
+    // pluginLoadQueue, then processNextPluginLoad() walks the queue one node per
+    // callAsync tick: the node goes Loading, the heavy work runs, then it's
+    // published Ready/Failed and the audio graph is rebuilt. projectLoading stays
+    // true (greying out Save/Save As) until the queue drains.
+    bool projectLoading = false;
+    std::vector<int> pluginLoadQueue;     // node IDs still to load (FIFO)
+    void beginAsyncPluginLoad();          // mark plugin nodes Pending, kick off the queue
+    void processNextPluginLoad();         // load one queued plugin, then schedule the next
+
     int saveFlashFrames = 0; // countdown for "Saved!" title flash
 
     // Hotplug detection for MIDI input devices. The timer polls

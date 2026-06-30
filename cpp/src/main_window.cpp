@@ -668,31 +668,11 @@ void MainContentComponent::runDeferredStartupInit() {
     audioEngine.init();
     audioEngine.getPluginHost().loadScanCache("soundshop_plugins_cache.dat");
 
-    // Reload plugins for any nodes that were loaded before the audio engine was ready
-    {
-        bool anyLoaded = false;
-        for (auto& n : graph.nodes) {
-            if (n.pluginIndex >= 0 && !n.plugin) {
-                auto loaded = audioEngine.getPluginHost().loadPlugin(
-                    n.pluginIndex, audioEngine.getSampleRate(), audioEngine.getBlockSize());
-                if (loaded) {
-                    // Restore saved plugin state
-                    if (!n.pendingPluginState.empty() && loaded->instance) {
-                        juce::MemoryBlock stateData;
-                        stateData.fromBase64Encoding(n.pendingPluginState);
-                        if (stateData.getSize() > 0)
-                            loaded->instance->setStateInformation(
-                                stateData.getData(), (int)stateData.getSize());
-                        n.pendingPluginState.clear();
-                    }
-                    n.plugin = std::move(loaded);
-                    anyLoaded = true;
-                }
-            }
-        }
-        if (anyLoaded)
-            audioEngine.getGraphProcessor().requestRebuild();
-    }
+    // Instantiate plugins for any nodes loaded before the audio engine was ready.
+    // Done via the serial async loader so the window stays responsive instead of
+    // blocking the message thread for seconds while plugins initialise. Each node
+    // shows a loading badge; the audio graph is rebuilt as each plugin appears.
+    beginAsyncPluginLoad();
 
     // Restore CC mappings from loaded project
     syncCCMappingsFromGraph();
@@ -727,6 +707,101 @@ void MainContentComponent::runDeferredStartupInit() {
 
     // Heavy init done - the app is interactive now, so drop the busy cursor.
     juce::MouseCursor::hideWaitCursor();
+}
+
+void MainContentComponent::beginAsyncPluginLoad() {
+    // Build the FIFO of plugin nodes that still need instantiation and mark
+    // them Pending. Then start the serial loader. If nothing needs loading we
+    // leave projectLoading false so Save stays enabled.
+    // If a load chain is already draining (e.g. the user opened another project
+    // mid-load), we rebuild the queue but must NOT start a second callAsync chain
+    // - the in-flight one will pick up the refreshed queue on its next tick.
+    // While projectLoading is true there is exactly one pending processNextPluginLoad.
+    bool wasLoading = projectLoading;
+    pluginLoadQueue.clear();
+    {
+        std::lock_guard<std::recursive_mutex> graphLk(graph.mutationLock);
+        for (auto& n : graph.nodes) {
+            if (n.pluginIndex >= 0 && !n.plugin) {
+                n.pluginLoadState = PluginLoadState::Pending;
+                pluginLoadQueue.push_back(n.id);
+            }
+        }
+    }
+    if (pluginLoadQueue.empty()) {
+        projectLoading = false;
+        menuItemsChanged();
+        return;
+    }
+    projectLoading = true;
+    menuItemsChanged();   // reflect greyed Save immediately
+    if (graphComponent) graphComponent->repaint();
+    if (!wasLoading)
+        juce::MessageManager::callAsync([this] { processNextPluginLoad(); });
+}
+
+void MainContentComponent::processNextPluginLoad() {
+    // Drain the queue one node per call. Each tick: pick the next still-valid
+    // node, instantiate its plugin OFF the graph lock (heavy, message-thread
+    // only), then publish the result UNDER the lock and rebuild the audio graph.
+    // We never hold a Node* across the heavy call (graph.nodes may reallocate if
+    // the user adds nodes meanwhile) - we re-look-up by id before publishing.
+    while (!pluginLoadQueue.empty()) {
+        int nodeId = pluginLoadQueue.front();
+        pluginLoadQueue.erase(pluginLoadQueue.begin());
+
+        // Snapshot what we need under the lock, mark the node Loading.
+        int pluginIndex = -1;
+        std::string pendingState;
+        {
+            std::lock_guard<std::recursive_mutex> graphLk(graph.mutationLock);
+            Node* n = graph.findNode(nodeId);
+            if (!n || n->pluginIndex < 0 || n->plugin) continue; // gone / already loaded
+            pluginIndex = n->pluginIndex;
+            pendingState = n->pendingPluginState;
+            n->pluginLoadState = PluginLoadState::Loading;
+        }
+        if (graphComponent) graphComponent->repaint();
+
+        // Heavy: instantiate + restore state. No graph lock held here.
+        auto loaded = audioEngine.getPluginHost().loadPlugin(
+            pluginIndex, audioEngine.getSampleRate(), audioEngine.getBlockSize());
+        if (loaded && loaded->instance && !pendingState.empty()) {
+            juce::MemoryBlock stateData;
+            stateData.fromBase64Encoding(pendingState);
+            if (stateData.getSize() > 0)
+                loaded->instance->setStateInformation(
+                    stateData.getData(), (int)stateData.getSize());
+        }
+
+        // Publish under the lock so the audio thread sees a consistent node.
+        {
+            std::lock_guard<std::recursive_mutex> graphLk(graph.mutationLock);
+            Node* n = graph.findNode(nodeId);
+            if (n) {
+                if (loaded) {
+                    n->plugin = std::move(loaded);
+                    n->pendingPluginState.clear();
+                    n->pluginLoadState = PluginLoadState::Ready;
+                } else {
+                    n->pluginLoadState = PluginLoadState::Failed;
+                }
+            }
+        }
+        // (On failure loadPlugin already logged to stderr; we continue anyway.)
+        audioEngine.getGraphProcessor().requestRebuild();
+        if (graphComponent) graphComponent->repaint();
+
+        // Yield back to the message loop so the UI updates between plugins,
+        // then continue with the next one.
+        juce::MessageManager::callAsync([this] { processNextPluginLoad(); });
+        return;
+    }
+
+    // Queue drained - loading complete. Re-enable Save and refresh the menu.
+    projectLoading = false;
+    menuItemsChanged();
+    if (graphComponent) graphComponent->repaint();
 }
 
 bool MainContentComponent::keyPressed(const juce::KeyPress& key) {
@@ -874,6 +949,11 @@ void MainContentComponent::resized() {
 }
 
 void MainContentComponent::timerCallback() {
+    // While a project's plugins are loading asynchronously, repaint the graph
+    // each tick so the per-node "loading" spinner animates smoothly.
+    if (projectLoading && graphComponent)
+        graphComponent->repaint();
+
     // Power-state-aware autosave interval (#87): every ~5 seconds
     // (150 ticks at 30 Hz), check AC vs battery and adjust the
     // autosave interval. Desktops and AC-powered laptops use the
@@ -1140,8 +1220,16 @@ juce::PopupMenu MainContentComponent::getMenuForIndex(int idx, const juce::Strin
     if (name == "File") {
         menu.addItem(1, "New Project");
         menu.addItem(2, "Open Project...", true, false);
-        menu.addItem(3, "Save Project", true, false);
-        menu.addItem(4, "Save Project As...");
+        // Save is disabled while a project's plugins are still loading: saving
+        // mid-load would risk writing an incomplete graph. The greyed label
+        // tells the user why and that it's temporary.
+        if (projectLoading) {
+            menu.addItem(3, "Save Project  (loading plugins...)", false, false);
+            menu.addItem(4, "Save Project As...  (loading plugins...)", false, false);
+        } else {
+            menu.addItem(3, "Save Project", true, false);
+            menu.addItem(4, "Save Project As...");
+        }
         menu.addItem(5, "Export Audio...");
         menu.addItem(6, "Import MOD/S3M/IT/XM...");
         menu.addSeparator();
@@ -3097,7 +3185,12 @@ void MainContentComponent::openProjectFile(const juce::String& path) {
     FactoryRefResolutionScope factoryRefScope;
     {
         std::lock_guard<std::recursive_mutex> graphLk(graph.mutationLock);
-        ProjectFile::load(path.toStdString(), graph, &audioEngine.getPluginHost());
+        // Pass nullptr for the plugin host so ProjectFile::load does NOT
+        // instantiate plugins synchronously on this (locked, message-thread)
+        // critical path. Plugin nodes are parsed with their pendingPluginState
+        // intact; beginAsyncPluginLoad() (below) instantiates them serially off
+        // the lock so the nodes appear immediately and the UI stays responsive.
+        ProjectFile::load(path.toStdString(), graph, nullptr);
         upgradeLegacyNodes();
 
         // Embed baked formula cycles for old projects (#crash-python314). A
@@ -3145,6 +3238,11 @@ void MainContentComponent::openProjectFile(const juce::String& path) {
     // to clobber the user's last view on every load.
     graphComponent->notifyProjectLoaded();
     graphComponent->repaint();
+
+    // Kick off serial async plugin instantiation. Nodes are already on screen;
+    // each plugin loads one at a time off this critical path, with a per-node
+    // loading badge. Save/Save As stay greyed until the queue drains.
+    beginAsyncPluginLoad();
 
     // Shared-history handling (#90): check for a sidecar and, if it
     // hasn't been seen by this user before, show the 3-option prompt.
@@ -3282,6 +3380,20 @@ void MainContentComponent::syncCCMappingsFromGraph() {
 }
 
 void MainContentComponent::saveProject(std::function<void()> onSaved) {
+    // Backstop for the keyboard shortcut (the menu item is greyed): refuse to
+    // save while plugins are still loading, since the graph isn't fully live yet.
+    if (projectLoading) {
+        juce::NativeMessageBox::showAsync(
+            juce::MessageBoxOptions()
+                .withIconType(juce::MessageBoxIconType::InfoIcon)
+                .withTitle("Still loading")
+                .withMessage("This project's plugins are still loading. Saving will be "
+                             "available as soon as they finish.")
+                .withButton("OK")
+                .withAssociatedComponent(this),
+            nullptr);
+        return;
+    }
     if (ProjectFile::currentPath.empty()) {
         // No filename yet - defer to Save As, which will run the file chooser
         // and call us back through onSaved on success.
@@ -3313,6 +3425,18 @@ void MainContentComponent::saveProject(std::function<void()> onSaved) {
 }
 
 void MainContentComponent::saveProjectAs(std::function<void()> onSaved) {
+    if (projectLoading) {
+        juce::NativeMessageBox::showAsync(
+            juce::MessageBoxOptions()
+                .withIconType(juce::MessageBoxIconType::InfoIcon)
+                .withTitle("Still loading")
+                .withMessage("This project's plugins are still loading. Saving will be "
+                             "available as soon as they finish.")
+                .withButton("OK")
+                .withAssociatedComponent(this),
+            nullptr);
+        return;
+    }
     syncCCMappingsToGraph();
     auto chooser = std::make_shared<juce::FileChooser>("Save Project", juce::File(), "*.ssp");
     chooser->launchAsync(juce::FileBrowserComponent::saveMode

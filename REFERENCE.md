@@ -2591,20 +2591,25 @@ exactly like adding or rewiring any other node.
 These are documented design boundaries for the first milestone, not bugs:
 
 - **Fixed N** chosen at creation (default 8); no live re-voice slider yet.
-- **Block-granular gates** — a note-on/off takes effect at the block boundary, not
-  the exact sample offset (sample-accurate gate timing is M2).
 - **No nested containers** — a Voice container can't live inside another.
 - **Async-file-chooser nodes land at top level when scoped** (see the scoped-editor
   note above).
 
 > **M2 progress:** voice stealing now offers oldest / quietest / round-robin (was
-> oldest-only in M1) — see **Voice stealing** above.
+> oldest-only in M1) — see **Voice stealing** above. Gates are now
+> **sample-accurate**: a note-on/off in the Signal fork lands on its exact
+> within-block sample offset (VoiceIn writes Pitch/Gate/Velocity as a
+> piecewise-constant ramp rather than a flat per-block constant), matching the
+> MIDI fork which was already sample-accurate.
 
 The allocation/lifecycle policy and the end-to-end audio path are both covered by
 `--self-test`: `testVoiceAllocator` checks free-slot allocation, all three steal
 modes (oldest / quietest / round-robin, including round-robin cursor reset and the
 "free slot wins over a steal" rule), note-matched release, and RMS free-detection on
-the pure `VoiceAllocator`, while `testVoiceContainerAudio` builds a real container
+the pure `VoiceAllocator`; `testVoiceInSignals` drives a `VoiceInProcessor` directly
+and asserts the Pitch/Gate/Velocity edges land on their exact within-block sample
+offset (including multiple segments per block, carry across blocks, and reset); and
+`testVoiceContainerAudio` builds a real container
 (VoiceIn → Signal Oscillator → VoiceOut), drives it with a synthetic MIDI buffer
 through `PolyVoiceProcessor`, and asserts a held note makes a tone, three notes sum
 louder than one, and the voices decay back to silence after release.

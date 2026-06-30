@@ -945,15 +945,25 @@ void NodeGraphComponent::drawLink(juce::Graphics& g, Link& link) {
         float tMidGlow = 0.5f - (tagCountGlow - 1) * 0.12f * 0.5f;
         float endR = PIN_RADIUS * zoom;
         float tagR = std::max(4.0f, 5.0f * zoom);
-        struct { juce::Point<float> pos; float r; } glowCircles[3] = {
-            { start,                  endR },
-            { end,                    endR },
-            { bezierAtGlow(tMidGlow), tagR },
+        // The middle identity dot is drawn in its own distinct per-link colour
+        // (getDistinctColor below), not the wire's pin-kind colour. Its halo
+        // blends the two - wire colour mixed 50/50 with the dot colour - so the
+        // glow around the dot reads as "this wire" and "this tag" at once, while
+        // the two end pin dots keep the plain wire-kind halo.
+        uint32_t dcol = getDistinctColor(link.id);
+        juce::Colour dotColour((juce::uint8)((dcol >> 16) & 0xFF),
+                               (juce::uint8)((dcol >> 8) & 0xFF),
+                               (juce::uint8)(dcol & 0xFF));
+        juce::Colour midGlowCol = glowCol.interpolatedWith(dotColour, 0.5f);
+        struct { juce::Point<float> pos; float r; juce::Colour col; } glowCircles[3] = {
+            { start,                  endR, glowCol    },
+            { end,                    endR, glowCol    },
+            { bezierAtGlow(tMidGlow), tagR, midGlowCol },
         };
         for (const auto& c : glowCircles)
             for (int i = 3; i >= 1; --i) {
                 float gr = c.r + (float)i * 3.0f * zoom;
-                g.setColour(glowCol.withAlpha(0.13f));
+                g.setColour(c.col.withAlpha(0.13f));
                 g.fillEllipse(c.pos.x - gr, c.pos.y - gr, gr * 2.0f, gr * 2.0f);
             }
     }

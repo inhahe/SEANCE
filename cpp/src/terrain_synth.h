@@ -515,6 +515,11 @@ public:
     // Tail = ADSR release (param idx 3).  No magic constant - reads the
     // live param value so changing release shrinks/extends the tail.
     double getTailLengthSeconds() const override { return (double) getParam(3, 0.3f); }
+    // Transport panic (Stop): hard-reset every voice's amp envelope so release
+    // tails are cut immediately instead of fading out over the release time.
+    void reset() override {
+        for (auto& v : voices) v.env.hardReset();
+    }
     bool acceptsMidi() const override { return true; }
     bool producesMidi() const override { return false; }
     bool isBusesLayoutSupported(const BusesLayout&) const override { return true; }

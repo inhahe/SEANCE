@@ -61,6 +61,10 @@ public:
     const juce::String getName() const override { return node.name; }
     void prepareToPlay(double sr, int bs) override;
     void releaseResources() override;
+    // Transport panic (Stop): kill all active SFZ voices and SF2 notes at once
+    // so release tails are cut immediately instead of ringing out. Implemented
+    // in the .cpp where the tinysoundfont API is in scope.
+    void reset() override;
     void processBlock(juce::AudioBuffer<float>& buf, juce::MidiBuffer& midi) override;
     // Tail: SFZ is data-driven (max ampegRelease across loaded regions);
     // SF2 envelope state is opaque inside tinysoundfont, so we fall back

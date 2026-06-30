@@ -1460,6 +1460,15 @@ void GraphProcessor::processBlock(NodeGraph& graph, Transport& transport,
         latencyListener.commitLatencies();
     }
 
+    // Transport "panic" (see requestPanic): wipe every processor's internal
+    // state so all trailing sound is cut at once. AudioProcessorGraph::reset()
+    // walks every node and calls reset() on its processor; our built-in synths
+    // clear their voices, the delay/reverb effects flush their buffers, and
+    // hosted plugins get their own reset(). One-shot - the graph keeps running
+    // afterwards, so audition/musical-typing while stopped is unaffected.
+    if (panicRequested.exchange(false) && processorGraph)
+        processorGraph->reset();
+
     // Process the graph
     juce::AudioBuffer<float> buf(numChannels, numSamples);
     buf.clear();

@@ -223,6 +223,11 @@ public:
     // post-note-off audio in this synth.  No magic constant - reads the
     // live param value so changing release shrinks/extends the tail.
     double getTailLengthSeconds() const override { return (double) getParam(3, 0.3f); }
+    // Transport panic (Stop): silence every voice at once so release tails are
+    // cut immediately instead of fading out over the ADSR release time.
+    void reset() override {
+        for (auto& v : voices) { v.active = false; v.envStage = SynthVoice::Off; v.envLevel = 0.0f; }
+    }
     bool acceptsMidi() const override { return true; }
     bool producesMidi() const override { return false; }
     bool isBusesLayoutSupported(const BusesLayout&) const override { return true; }

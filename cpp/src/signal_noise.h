@@ -46,6 +46,9 @@ public:
         for (int c = 0; c < 2; ++c) { pink[c] = PinkState{}; brown[c] = 0.0f; }
     }
     void releaseResources() override {}
+    // Transport panic (Stop): hard-reset the amp envelope so any release tail
+    // is cut immediately instead of fading out over the Release time.
+    void reset() override { env.hardReset(); gateHigh = false; }
 
     void processBlock(juce::AudioBuffer<float>& buf, juce::MidiBuffer&) override {
         const int n  = buf.getNumSamples();

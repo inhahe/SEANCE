@@ -5692,8 +5692,17 @@ void MainWindow::closeButtonPressed() {
 }
 
 void MainContentComponent::setupHotkeyCallbacks() {
-    hotkeyManager.setCallback(HotkeyAction::Play, [this]() { audioEngine.play(); transport.playing = true; });
-    hotkeyManager.setCallback(HotkeyAction::Stop, [this]() { audioEngine.stop(); transport.playing = false; });
+    // Spacebar (the default Play binding) toggles transport, matching every
+    // mainstream DAW: press once to start, again to stop. Route through the
+    // full onPlay()/onStop() handlers (not the raw engine calls) so the
+    // play-from-top-when-parked-at-end logic, recording teardown, the
+    // immediate all-sound panic on stop, and the Play/Pause button label all
+    // stay in sync regardless of whether the user clicks the button or hits
+    // the key. See REFERENCE.md -> Transport.
+    hotkeyManager.setCallback(HotkeyAction::Play, [this]() {
+        if (transport.playing) onStop(); else onPlay();
+    });
+    hotkeyManager.setCallback(HotkeyAction::Stop, [this]() { onStop(); });
     hotkeyManager.setCallback(HotkeyAction::Undo, [this]() { graph.undoTree.doUndo(); graphComponent->repaint(); });
     hotkeyManager.setCallback(HotkeyAction::Redo, [this]() { graph.undoTree.doRedo(); graphComponent->repaint(); });
     hotkeyManager.setCallback(HotkeyAction::SaveProject, [this]() { saveProject(); });

@@ -7522,6 +7522,95 @@ void testSignalOscPulse(Report& r) {
     r.check(d75 > d25 + 0.2f, "pulse: wider Pulse Width raises the duty cycle");
 }
 
+// ---------------------------------------------------------------------------
+// Transport panic (Stop = immediate silence). When the transport stops, the
+// audio engine calls GraphProcessor::requestPanic(), which on the next audio
+// block calls juce::AudioProcessorGraph::reset() -> every node's reset(). Each
+// tail-bearing processor's reset() override must wipe its state so trailing
+// sound is cut at once instead of ringing out over the envelope release time.
+//
+// This drives a SignalOscillatorProcessor directly: hold the gate to open the
+// amp envelope, then release it. Without a panic the envelope enters its 200ms
+// Release stage and the first post-release block is still audibly loud. Calling
+// reset() (the panic lever) must instead hard-reset the envelope so that same
+// block is silent. We check BOTH halves so the test fails if reset() ever stops
+// actually clearing the envelope.
+// ---------------------------------------------------------------------------
+void testTransportPanic(Report& r) {
+    r.section("Transport panic (Stop silences trailing sound)");
+
+    auto buildOsc = [](Node& n) {
+        n.script = "__signalosc__";
+        n.params.clear();
+        n.params.push_back({"Waveform", 0.0f, 0.0f, 4.0f});   // sine
+        n.params.push_back({"Volume",   1.0f, 0.0f, 1.0f});
+        n.params.push_back({"Pulse Width", 0.5f, 0.05f, 0.95f});
+        n.ahdsrEnvelope.attackMs  = 0.5f;
+        n.ahdsrEnvelope.decayMs   = 1.0f;
+        n.ahdsrEnvelope.sustain   = 1.0f;
+        n.ahdsrEnvelope.releaseMs = 200.0f;   // long tail so the contrast is clear
+    };
+
+    const double sr = 48000.0; const int N = 512;
+
+    // Render `blocks` blocks holding the gate, then ONE block with the gate
+    // released. If `panic` is true, call reset() right before the released
+    // block (simulating the Stop panic). Returns the RMS of that final block.
+    auto releaseBlockRms = [&](bool panic) {
+        NodeGraph graph;
+        auto& n = graph.addNode("Signal Osc", NodeType::Instrument,
+            {Pin{0, "Pitch",    PinKind::Signal, true, 1},
+             Pin{0, "Gate",     PinKind::Signal, true, 1},
+             Pin{0, "Velocity", PinKind::Signal, true, 1}},
+            {Pin{0, "Audio", PinKind::Audio, false}}, {0.0f, 0.0f});
+        buildOsc(n);
+
+        SignalOscillatorProcessor osc(n);
+        osc.prepareToPlay(sr, N);
+        juce::AudioBuffer<float> buf(5, N); // 0/1 audio, 2 pitch, 3 gate, 4 vel
+
+        // Hold the gate to open the envelope.
+        for (int blk = 0; blk < 8; ++blk) {
+            buf.clear();
+            for (int i = 0; i < N; ++i) {
+                buf.setSample(2, i, 220.0f);
+                buf.setSample(3, i, 1.0f);
+                buf.setSample(4, i, 1.0f);
+            }
+            juce::MidiBuffer midi;
+            osc.processBlock(buf, midi);
+        }
+
+        if (panic) osc.reset(); // the Stop panic lever
+
+        // One block with the gate released.
+        buf.clear();
+        for (int i = 0; i < N; ++i) {
+            buf.setSample(2, i, 220.0f);
+            buf.setSample(3, i, 0.0f); // gate low -> release (or silent after reset)
+            buf.setSample(4, i, 1.0f);
+        }
+        juce::MidiBuffer midi;
+        osc.processBlock(buf, midi);
+
+        double sum = 0.0;
+        for (int i = 0; i < N; ++i) { float s = buf.getSample(0, i); sum += (double)s * s; }
+        return (float)std::sqrt(sum / N);
+    };
+
+    const float tailRms  = releaseBlockRms(false); // normal release tail
+    const float panicRms = releaseBlockRms(true);  // after panic reset()
+
+    r.check(tailRms > 1.0e-2f,
+            "panic: without reset, a released note still rings (tail RMS "
+            + juce::String(tailRms, 4) + ")");
+    r.check(panicRms < 1.0e-4f,
+            "panic: reset() cuts the release tail to silence (RMS "
+            + juce::String(panicRms, 6) + ")");
+    r.check(panicRms < tailRms * 0.01f,
+            "panic: reset() is >=100x quieter than the natural release tail");
+}
+
 int runSelfTest(const juce::File& outDir) {
     outDir.createDirectory();
     Report r;
@@ -7555,6 +7644,7 @@ int runSelfTest(const juce::File& outDir) {
     testVoiceContainerSaveLoad(r);
     testVoicePresets(r);
     testSignalOscPulse(r);
+    testTransportPanic(r);
 
     r.section("Summary");
     r.line("  PASSED: " + juce::String(r.passed));

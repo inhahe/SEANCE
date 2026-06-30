@@ -277,6 +277,16 @@ public:
     // Force a rebuild on the next audio callback (thread-safe)
     void requestRebuild() { rebuildRequested = true; }
 
+    // Request an immediate "panic": on the next audio callback, reset every
+    // processor in the graph so all trailing sound (synth release tails,
+    // reverb/echo/delay buffers, sustained voices, plugin tails) is silenced
+    // at once instead of ringing out. Thread-safe (UI thread sets the flag;
+    // the audio thread consumes it). Used by the transport Stop so pressing
+    // Stop cuts the sound dead, the way every DAW's Stop does. The graph keeps
+    // processing afterwards (musical-typing audition still works while stopped)
+    // - this is a one-shot state wipe, not a permanent mute.
+    void requestPanic() { panicRequested = true; }
+
     // Scope filter for rebuildGraph (per-voice polyphony, see
     // poly-voice-architecture.md). -1 (default) = the main/top-level graph:
     // build only nodes whose voiceContainerId == -1 (top level). >= 0 = build
@@ -396,6 +406,7 @@ private:
     int lastNodeCount = 0;
     int lastLinkCount = 0;
     std::atomic<bool> rebuildRequested{false};
+    std::atomic<bool> panicRequested{false};
 
     // Which scope rebuildGraph builds (see setBuildScope). -1 = top level.
     int buildScope = -1;

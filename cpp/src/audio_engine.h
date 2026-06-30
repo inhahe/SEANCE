@@ -103,6 +103,13 @@ public:
     void stop();
     void pause() { playing = false; }
 
+    // Immediately silence all trailing sound (synth release tails, reverb/echo
+    // buffers, sustained voices, plugin tails) by asking the graph processor to
+    // reset every node on the next audio block. Called from stop() so the
+    // transport Stop cuts the sound dead like a standard DAW. Safe to call from
+    // the UI thread.
+    void panic() { graphProcessor.requestPanic(); }
+
     // Move the playhead back to the start of playback - the loop start if a
     // user loop region is active, otherwise beat 0. Used when Play is pressed
     // while the playhead is parked at/past the song end so playback restarts

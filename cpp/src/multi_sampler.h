@@ -150,6 +150,9 @@ public:
     const juce::String getName() const override { return "MultiSampler"; }
     void  prepareToPlay(double sr, int /*bs*/) override;
     void  releaseResources() override {}
+    // Transport panic (Stop): drop every active voice at once so sample tails
+    // and release fades are cut immediately instead of ringing out.
+    void  reset() override { voices.clear(); }
     void  processBlock(juce::AudioBuffer<float>& buf, juce::MidiBuffer& midi) override;
     // Tail = how long the sampler can keep producing audio after the last
     // note-off.  Derived from the doc, not a magic constant:

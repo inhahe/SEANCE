@@ -1138,6 +1138,10 @@ void AudioEngine::keyboardNoteOff(int midiNote) {
 
 void AudioEngine::stop() {
     playing = false;
+    // Cut all trailing sound immediately (synth releases, reverb/echo tails,
+    // sustained voices, plugin tails) - matches the "Stop = silence now"
+    // behaviour every DAW has. The flag is consumed on the next audio block.
+    panic();
     // Flush the captured audio into the Output node's cache so the user
     // (or the Capture button) can access it without re-rendering. This
     // runs on the UI thread after the audio thread has seen playing=false

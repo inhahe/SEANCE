@@ -178,6 +178,15 @@ double ConvolutionProcessor::getTailLengthSeconds() const {
     return (double)ir.size() / sampleRate;
 }
 
+void ConvolutionProcessor::reset() {
+    // Wipe the running convolution state so the IR tail is cut immediately.
+    // The IR and its pre-FFT'd partitions are static, so leave them intact.
+    std::fill(inputHistory.begin(),  inputHistory.end(),  0.0f);
+    std::fill(overlapBuffer.begin(), overlapBuffer.end(), 0.0f);
+    std::fill(inputBuffer.begin(),   inputBuffer.end(),   0.0f);
+    inputBufferPos = 0;
+}
+
 void ConvolutionProcessor::setupDirect() {
     useFFT = false;
     inputHistory.assign(ir.size(), 0.0f);

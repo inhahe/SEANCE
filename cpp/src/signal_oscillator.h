@@ -44,6 +44,9 @@ public:
         gateHigh = false;
     }
     void releaseResources() override {}
+    // Transport panic (Stop): hard-reset the amp envelope so any release tail
+    // is cut immediately instead of fading out over the Release time.
+    void reset() override { env.hardReset(); phase = 0.0; gateHigh = false; }
 
     void processBlock(juce::AudioBuffer<float>& buf, juce::MidiBuffer&) override {
         const int n  = buf.getNumSamples();

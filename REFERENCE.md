@@ -197,6 +197,22 @@ Two transport buttons light up with a shared blue accent (`RGB(64,132,223)`) to 
 
 The blue is deliberately distinct from the green/red used by the **Metro**, **Mon** (monitor), and computer-keyboard-MIDI toggles. An un-lit transport button uses the default button colour (no hardcoded grey), so it matches every other un-lit button.
 
+### Spacebar toggles play/stop
+
+Pressing **Space** toggles the transport, matching the universal DAW convention: press once to start playing from the playhead, press again to stop. The spacebar is the default binding for the **Play** hotkey (`HotkeyManager`); the callback checks `transport.playing` and routes to the same `onStop()` / `onPlay()` handlers the on-screen **Play/Pause** and **Stop** buttons use. Because it goes through those handlers (not the raw engine calls), the play-from-top-when-parked-at-end logic, recording teardown, the Play/Pause button label, and the stop-silences-everything behaviour below all stay in sync no matter whether you click or use the key.
+
+### Stop silences all trailing sound immediately
+
+When the transport stops, **all trailing sound is cut at once** rather than ringing out — synth amp-envelope release tails, reverb / echo / delay / convolution buffers, sustained voices, and hosted-plugin tails all go silent immediately. This matches what every mainstream DAW does on Stop.
+
+Mechanism: `AudioEngine::stop()` calls `panic()`, which sets a one-shot `std::atomic<bool> panicRequested` flag on the `GraphProcessor`. On the very next audio callback the flag is consumed and `juce::AudioProcessorGraph::reset()` is called, which propagates `reset()` to **every** node processor in the graph. Each tail-bearing built-in processor implements `reset()` to wipe its state:
+
+- **Synths** — clear their voice containers / hard-reset per-voice amp envelopes (FM, PD, Additive, Particle, Spectral Grain, Built-in, Terrain, Drum, MultiSampler, Signal Oscillator, Signal Noise, SoundFont/SFZ, sfizz).
+- **Time-based effects** — zero their delay/feedback/tail buffers (Echo, Reverb, Wavelet Reverb, Vibrato, Flanger, Phaser, Convolution).
+- **Hosted VST3/plugins** — receive the standard `reset()` that JUCE forwards to the plugin.
+
+The reset is a **one-shot state wipe, not a permanent mute**: the graph keeps processing afterwards, so audition / musical-typing while stopped is unaffected. Memoryless processors (filters, EQ, compressor, distortion, etc.) need no `reset()` since they produce no audible tail.
+
 ---
 
 ## Computer Keyboard node

@@ -64,6 +64,9 @@ public:
     const juce::String getName() const override { return node.name; }
     void prepareToPlay(double sr, int) override { sampleRate = sr; }
     void releaseResources() override {}
+    // Transport panic (Stop): kill every drum voice at once so decay tails are
+    // cut immediately instead of ringing out.
+    void reset() override { for (auto& v : voices) v.active = false; }
     void processBlock(juce::AudioBuffer<float>& buf, juce::MidiBuffer& midi) override;
     // Tail = max(per-voice effective exponential decay) × kInaudible.
     // Defined in drum_synth.cpp so the decay constants don't drift away

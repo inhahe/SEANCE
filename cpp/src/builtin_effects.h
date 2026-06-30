@@ -157,6 +157,9 @@ public:
         }
     }
     void releaseResources() override {}
+    // Transport panic (Stop): flush the modulated delay line so no buffered
+    // signal keeps reading out after the sound is cut.
+    void reset() override { prepareToPlay(sampleRate, 0); phase = 0.0; }
     void processBlock(juce::AudioBuffer<float>& buf, juce::MidiBuffer&) override {
         applySignalModulations(node, buf);
         float rate  = paramByName(node, "Rate", 5.0f);
@@ -227,6 +230,9 @@ public:
         }
     }
     void releaseResources() override {}
+    // Transport panic (Stop): flush the feedback delay line so the flange
+    // recirculation doesn't keep ringing after the sound is cut.
+    void reset() override { prepareToPlay(sampleRate, 0); phase = 0.0; }
     void processBlock(juce::AudioBuffer<float>& buf, juce::MidiBuffer&) override {
         applySignalModulations(node, buf);
         float rate     = paramByName(node, "Rate", 0.3f);
@@ -293,6 +299,13 @@ public:
         for (auto& s : allpassState) s = {};
     }
     void releaseResources() override {}
+    // Transport panic (Stop): clear the allpass chain + feedback so the
+    // resonant swirl stops the instant the sound is cut.
+    void reset() override {
+        for (auto& s : allpassState) s = {};
+        lastOut[0] = lastOut[1] = 0.0f;
+        phase = 0.0;
+    }
     void processBlock(juce::AudioBuffer<float>& buf, juce::MidiBuffer&) override {
         applySignalModulations(node, buf);
         float rate     = paramByName(node, "Rate", 0.5f);
@@ -526,6 +539,9 @@ public:
         }
     }
     void releaseResources() override {}
+    // Transport panic (Stop): empty the delay/feedback buffer so the echo
+    // repeats stop immediately instead of decaying for seconds.
+    void reset() override { prepareToPlay(sampleRate, 0); }
     void processBlock(juce::AudioBuffer<float>& buf, juce::MidiBuffer&) override {
         applySignalModulations(node, buf);
         float delayMs  = paramByName(node, "Delay", 300.0f);
@@ -817,6 +833,9 @@ public:
         predelayWritePos = 0;
     }
     void releaseResources() override {}
+    // Transport panic (Stop): re-zero every comb/allpass and the pre-delay so
+    // the reverb tail is cut dead instead of ringing out for its decay time.
+    void reset() override { prepareToPlay(sampleRate, 0); }
 
     void processBlock(juce::AudioBuffer<float>& buf, juce::MidiBuffer&) override {
         applySignalModulations(node, buf);
@@ -1287,6 +1306,9 @@ class FMSynthProcessor : public juce::AudioProcessor {
 public:
     FMSynthProcessor(Node& n) : node(n) { voices.resize(16); }
     const juce::String getName() const override { return "FM Synth"; }
+    // Transport panic (Stop): drop every sounding voice so notes stop dead
+    // instead of finishing their release tail.
+    void reset() override { voices.clear(); }
     void prepareToPlay(double sr, int) override { sampleRate = sr; }
     void releaseResources() override {}
 
@@ -1517,6 +1539,9 @@ class PDSynthProcessor : public juce::AudioProcessor {
 public:
     PDSynthProcessor(Node& n) : node(n) { voices.resize(12); }
     const juce::String getName() const override { return "PD Synth"; }
+    // Transport panic (Stop): drop every sounding voice so notes stop dead
+    // instead of finishing their release tail.
+    void reset() override { voices.clear(); }
     void prepareToPlay(double sr, int) override { sampleRate = sr; }
     void releaseResources() override {}
 
@@ -1705,6 +1730,9 @@ class ParticleSynthProcessor : public juce::AudioProcessor {
 public:
     ParticleSynthProcessor(Node& n) : node(n) { grains.reserve(128); }
     const juce::String getName() const override { return "Particle"; }
+    // Transport panic (Stop): drop every in-flight grain so the particle
+    // cloud stops dead instead of finishing its tails.
+    void reset() override { grains.clear(); }
     void prepareToPlay(double sr, int) override { sampleRate = sr; }
     void releaseResources() override {}
 
@@ -2459,6 +2487,12 @@ public:
     const juce::String getName() const override { return "Wavelet Reverb"; }
     void prepareToPlay(double sr, int) override { sampleRate = sr; }
     void releaseResources() override {}
+    // Transport panic (Stop): zero the wavelet tail buffers so the reverb
+    // smear stops immediately when the sound is cut.
+    void reset() override {
+        tailBufL.assign(tailBufL.size(), 0.0f);
+        tailBufR.assign(tailBufR.size(), 0.0f);
+    }
 
     void processBlock(juce::AudioBuffer<float>& buf, juce::MidiBuffer&) override {
         applySignalModulations(node, buf);
@@ -3122,6 +3156,9 @@ class AdditiveSynthProcessor : public juce::AudioProcessor {
 public:
     AdditiveSynthProcessor(Node& n) : node(n) { voices.resize(12); }
     const juce::String getName() const override { return "Additive"; }
+    // Transport panic (Stop): drop every sounding voice so notes stop dead
+    // instead of finishing their release tail.
+    void reset() override { voices.clear(); }
     void prepareToPlay(double sr, int) override { sampleRate = sr; }
     void releaseResources() override {}
 
@@ -3855,6 +3892,9 @@ class SpectralGrainProcessor : public juce::AudioProcessor {
 public:
     SpectralGrainProcessor(Node& n) : node(n) { voices.resize(8); }
     const juce::String getName() const override { return "Spectral Grain"; }
+    // Transport panic (Stop): drop every voice and in-flight grain so the
+    // granular cloud stops dead instead of ringing out.
+    void reset() override { voices.clear(); activeGrains.clear(); }
 
     void prepareToPlay(double sr, int) override {
         sampleRate = sr;

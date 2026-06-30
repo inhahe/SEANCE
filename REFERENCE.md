@@ -2522,10 +2522,28 @@ instrument. Internally:
   inner `getGraph()->processBlock(...)` (not `GraphProcessor::processBlock`, which
   would re-inject the metronome and click).
 - **Voice allocation & lifecycle.** The container parses its incoming
-  `MidiBuffer`: a **note-on** allocates a free voice (or **steals the oldest** when
-  all N are busy), sets that voice's VoiceIn pitch/velocity, raises its gate, and
-  forwards the note as MIDI into the clone. A **note-off** drops that voice's gate;
-  the voice keeps running so its envelope release tail finishes.
+  `MidiBuffer`: a **note-on** allocates a free voice (or **steals** one per the
+  selected steal mode when all N are busy — see below), sets that voice's VoiceIn
+  pitch/velocity, raises its gate, and forwards the note as MIDI into the clone. A
+  **note-off** drops that voice's gate; the voice keeps running so its envelope
+  release tail finishes.
+- **Voice stealing.** When every voice is busy and a new note arrives, one active
+  voice must be sacrificed. Right-click the container → **Voice stealing** to pick
+  the policy (radio-ticked to the current choice). A free voice always wins over
+  stealing; the mode only decides *which active voice* loses:
+  - **Steal oldest** (default) — reuse the longest-sounding voice. The musical
+    default: the note you played first is usually the one you miss least.
+  - **Steal quietest** — reuse the voice whose last block was quietest (lowest
+    RMS). Least audible interruption, ideal for pads and long release tails where
+    cutting a still-loud voice would be obvious.
+  - **Cycle voices (round-robin)** — hand out voices in a fixed 0,1,2,… cycle,
+    ignoring age and level. Predictable; handy for drum-style patches.
+
+  The choice is stored in `node.voiceStealMode` (0/1/2) and re-read by
+  `PolyVoiceProcessor` **every block**, so switching modes is audible immediately
+  with no graph rebuild. It snapshots for undo and saves with the project. The
+  policy itself lives in the JUCE-free `VoiceAllocator` (`voice_allocator.h`),
+  unit-tested in isolation.
 - **Voice-free detection.** A voice is reclaimed once its gate is released **and**
   its output RMS has stayed below a floor (`kFloorRms = 1e-4`) for `kFreeMs = 250`
   ms. CPU therefore scales with **active** polyphony, not N — idle voices are
@@ -2573,20 +2591,23 @@ exactly like adding or rewiring any other node.
 These are documented design boundaries for the first milestone, not bugs:
 
 - **Fixed N** chosen at creation (default 8); no live re-voice slider yet.
-- **Steal-oldest** only (quietest / round-robin are M2).
 - **Block-granular gates** — a note-on/off takes effect at the block boundary, not
   the exact sample offset (sample-accurate gate timing is M2).
 - **No nested containers** — a Voice container can't live inside another.
 - **Async-file-chooser nodes land at top level when scoped** (see the scoped-editor
   note above).
 
+> **M2 progress:** voice stealing now offers oldest / quietest / round-robin (was
+> oldest-only in M1) — see **Voice stealing** above.
+
 The allocation/lifecycle policy and the end-to-end audio path are both covered by
-`--self-test`: `testVoiceAllocator` checks free-slot/steal-oldest, note-matched
-release, and RMS free-detection on the pure `VoiceAllocator`, while
-`testVoiceContainerAudio` builds a real container (VoiceIn → Signal Oscillator →
-VoiceOut), drives it with a synthetic MIDI buffer through `PolyVoiceProcessor`, and
-asserts a held note makes a tone, three notes sum louder than one, and the voices
-decay back to silence after release.
+`--self-test`: `testVoiceAllocator` checks free-slot allocation, all three steal
+modes (oldest / quietest / round-robin, including round-robin cursor reset and the
+"free slot wins over a steal" rule), note-matched release, and RMS free-detection on
+the pure `VoiceAllocator`, while `testVoiceContainerAudio` builds a real container
+(VoiceIn → Signal Oscillator → VoiceOut), drives it with a synthetic MIDI buffer
+through `PolyVoiceProcessor`, and asserts a held note makes a tone, three notes sum
+louder than one, and the voices decay back to silence after release.
 
 ## Asset library (project stores)
 

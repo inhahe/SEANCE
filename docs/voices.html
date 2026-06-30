@@ -28,7 +28,19 @@
 <p>It comes pre-loaded with a working patch — a small FM synth inside — and <strong>8 voices</strong>, so it makes sound the moment you wire it up. Play a chord: each note spins up its own copy of the inner patch, and you hear them stack. That's polyphony built from a container instead of baked into a fixed instrument.</p>
 
 <div class="note">
-<strong>Why "8 voices"?</strong> That's how many notes can sound <em>at once</em>. The container builds 8 independent copies of the inner patch up front and hands a free one to each note you play. If you play a 9th note while 8 are still ringing, the oldest one is cut short to make room (this is called "voice stealing"). Idle copies cost almost nothing, so a high voice count is cheap until you actually play that many notes.</div>
+<strong>Why "8 voices"?</strong> That's how many notes can sound <em>at once</em>. The container builds 8 independent copies of the inner patch up front and hands a free one to each note you play. If you play a 9th note while 8 are still ringing, one of them is cut short to make room (this is called "voice stealing" — you choose which one below). Idle copies cost almost nothing, so a high voice count is cheap until you actually play that many notes.</div>
+
+<h2>Choosing how voices are stolen</h2>
+
+<p>When all the voices are busy and you play one more note, the container has to take one of the ringing voices away. <strong>Right-click the Voice node → Voice stealing</strong> to pick which one it sacrifices:</p>
+
+<ul>
+  <li><strong>Steal oldest</strong> (the default) — cuts the note that's been ringing the longest. The note you played first is usually the one you'll miss the least, so this feels natural for most playing.</li>
+  <li><strong>Steal quietest</strong> — cuts whichever voice is currently the softest. Because it picks the one you're least likely to hear, this is the gentlest option for pads and long, fading tails where chopping a still-loud note would jump out.</li>
+  <li><strong>Cycle voices (round-robin)</strong> — just goes around the voices in order, 1, 2, 3, …, regardless of how loud or old each is. It's the most predictable, which suits drum-style patches where every hit should land the same way.</li>
+</ul>
+
+<p>The change takes effect instantly — you can switch modes while the music is playing and hear the difference on the next stolen note. Your choice is saved with the project.</p>
 
 <h2>Going inside — drill in</h2>
 

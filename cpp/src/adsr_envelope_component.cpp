@@ -60,6 +60,18 @@ AHDSREnvelopeComponent::AHDSREnvelopeComponent(AHDSREnvelope& e,
         addAndMakeVisible(*l);
     }
 
+    // Plain-language sub-labels beneath each term (novice-first: A/H/D/S/R is
+    // jargon, so we name what each control actually does in 2-3 words). Smaller
+    // and dimmer than the term so the canonical name still reads first.
+    for (auto* l : { &attackSub, &holdSub, &decaySub, &sustainSub,
+                     &releaseSub, &velSub }) {
+        l->setJustificationType(juce::Justification::centredTop);
+        l->setFont(juce::Font(9.5f, juce::Font::plain));
+        l->setColour(juce::Label::textColourId, juce::Colour(150, 158, 172));
+        l->setMinimumHorizontalScale(0.7f);  // shrink-to-fit narrow columns
+        addAndMakeVisible(*l);
+    }
+
     // Tooltips. CLAUDE.md flags ADSR jargon as unsuitable for non-
     // musicians, so we add a plain-language note next to each technical
     // label.
@@ -70,6 +82,15 @@ AHDSREnvelopeComponent::AHDSREnvelopeComponent(AHDSREnvelope& e,
     releaseLbl.setTooltip("Time (ms) for the volume to fade OUT after the key is released.");
     velLbl    .setTooltip("How much the key strike strength affects volume. 0 = ignore velocity (every note plays at full volume, organ-like). 1 = full velocity scaling (soft key press = soft note, piano-like).");
     sustainS  .setTooltip("Volume the note holds at while the key stays pressed (0..1).");
+
+    // Mirror each tooltip onto its sub-label so hovering the descriptor shows
+    // the same detail as hovering the term.
+    attackSub .setTooltip(attackLbl.getTooltip());
+    holdSub   .setTooltip(holdLbl.getTooltip());
+    decaySub  .setTooltip(decayLbl.getTooltip());
+    sustainSub.setTooltip(sustainLbl.getTooltip());
+    releaseSub.setTooltip(releaseLbl.getTooltip());
+    velSub    .setTooltip(velLbl.getTooltip());
 
     // Per-segment tension (curve-bend) knobs. Rotary, -1..1, detented at 0
     // (the linear midpoint). These are the simple one-knob shapers; the
@@ -766,18 +787,18 @@ void AHDSREnvelopeComponent::resized() {
     auto sliders = r.removeFromTop(sliderH);
     int n = 6;
     int w = sliders.getWidth() / n;
-    auto laySlider = [&](juce::Slider& s, juce::Label& l, int i) {
+    auto laySlider = [&](juce::Slider& s, juce::Label& l, juce::Label& sub, int i) {
         auto col = sliders.withX(sliders.getX() + i * w).withWidth(w);
-        auto lb  = col.removeFromTop(16);
-        l.setBounds(lb);
+        l.setBounds(col.removeFromTop(15));        // bold term
+        sub.setBounds(col.removeFromTop(12));      // dim plain-language descriptor
         s.setBounds(col.reduced(2, 0));
     };
-    laySlider(attackS,  attackLbl,  0);
-    laySlider(holdS,    holdLbl,    1);
-    laySlider(decayS,   decayLbl,   2);
-    laySlider(sustainS, sustainLbl, 3);
-    laySlider(releaseS, releaseLbl, 4);
-    laySlider(velS,     velLbl,     5);
+    laySlider(attackS,  attackLbl,  attackSub,  0);
+    laySlider(holdS,    holdLbl,    holdSub,    1);
+    laySlider(decayS,   decayLbl,   decaySub,   2);
+    laySlider(sustainS, sustainLbl, sustainSub, 3);
+    laySlider(releaseS, releaseLbl, releaseSub, 4);
+    laySlider(velS,     velLbl,     velSub,     5);
 
     r.removeFromTop(4);
 

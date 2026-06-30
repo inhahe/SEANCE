@@ -2136,6 +2136,14 @@ Instruments keep their envelope inside the plugin.
   sliders span the bottom of the editor (the sixth is **Velocity
   Sensitivity**: 0 = organ-like uniform volume, 1 = piano-like — how hard
   you press the key scales the envelope's peak amplitude).
+- Each slider carries a **two-line label**: the canonical term in bold
+  (Attack / Hold / Decay / Sustain / Release / Velocity) with a small dim
+  plain-language descriptor under it — *(fade in)*, *(hold at peak)*, *(fall
+  to sustain)*, *(held level)*, *(fade out)*, *(touch response)*. SEANCE is
+  built for non-musicians, so the descriptor names what the control does
+  without making the user hover; the full sentence still lives in the slider
+  tooltip. (The sixth slider's term reads **Velocity** rather than the older
+  "Vel Sens" abbreviation.)
 - Time sliders are skewed so the bottom half of the throw maps to the
   0-100ms range musicians actually want fine control over; a linear
   0-10000 slider would shove all useful values into a few pixels.

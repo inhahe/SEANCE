@@ -91,8 +91,18 @@ private:
     juce::Label decayLbl   { {}, "Decay"    };
     juce::Label sustainLbl { {}, "Sustain"  };
     juce::Label releaseLbl { {}, "Release"  };
-    juce::Label velLbl     { {}, "Vel Sens" };
+    juce::Label velLbl     { {}, "Velocity" };
     juce::Slider attackS, holdS, decayS, sustainS, releaseS, velS;
+
+    // Plain-language sub-labels under each technical term. SEANCE is built
+    // for non-musicians, so A/H/D/S/R jargon gets a 2-3 word descriptor that
+    // stays on screen (the full sentence still lives in the slider tooltips).
+    juce::Label attackSub  { {}, "(fade in)"        };
+    juce::Label holdSub    { {}, "(hold at peak)"   };
+    juce::Label decaySub   { {}, "(fall to sustain)"};
+    juce::Label sustainSub { {}, "(held level)"     };
+    juce::Label releaseSub { {}, "(fade out)"       };
+    juce::Label velSub     { {}, "(touch response)" };
 
     // Per-segment tension (curve-bend) knobs - the single-linear-control
     // way to reshape a ramp without opening the full curve editor. Each

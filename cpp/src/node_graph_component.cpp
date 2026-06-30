@@ -1606,6 +1606,30 @@ void NodeGraphComponent::mouseDown(const juce::MouseEvent& e) {
                         });
                         return;
                     }
+                    // Signal Noise's Type is a discrete enum (White / Pink /
+                    // Brown) - popup picker.
+                    if (p.name == "Type" && node->script == "__signalnoise__") {
+                        selectedNodeId = node->id;
+                        const char* labels[] = { "White  (bright, flat spectrum)",
+                            "Pink  (warmer, -3 dB/octave)",
+                            "Brown  (darkest, -6 dB/octave)" };
+                        int cur = juce::jlimit(0, 2, (int)std::round(p.value));
+                        juce::PopupMenu pm;
+                        for (int i = 0; i < 3; ++i)
+                            pm.addItem(i + 1, labels[i], true, i == cur);
+                        int nodeId = node->id;
+                        int paramIdx = idx;
+                        pm.showMenuAsync({}, [this, nodeId, paramIdx](int r) {
+                            if (r == 0) return;
+                            auto* nd = graph.findNode(nodeId);
+                            if (!nd || paramIdx >= (int)nd->params.size()) return;
+                            nd->params[paramIdx].value = (float)(r - 1);
+                            graph.dirty = true;
+                            graph.commitSnapshot("Change Signal Noise type");
+                            repaint();
+                        });
+                        return;
+                    }
                     // Signal Filter's Type is a discrete enum (Low-pass /
                     // High-pass / Band-pass) - popup picker.
                     if (p.name == "Type" && node->script == "__signalfilter__") {
@@ -2621,6 +2645,9 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
     // a tone. The natural inner voice for a Voice container (wire VoiceIn's
     // Pitch/Gate/Velocity into it), but usable standalone too.
     sigMenu.addItem(151, "Signal Oscillator (pitch/gate -> tone)");
+    // Signal-driven gated noise generator: the noise counterpart to the
+    // oscillator (snare/hat/wind/breath voices). Gate/Velocity in -> noise.
+    sigMenu.addItem(156, "Signal Noise (gate -> noise burst)");
     // Modular-kit signal utility: per-sample arithmetic on two control signals.
     sigMenu.addItem(152, "Signal Math (A op B)");
     // Modular-kit control-rate LFO with optional per-voice sync.
@@ -2804,6 +2831,28 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
             n.ahdsrEnvelope.decayMs   = 100.0f;
             n.ahdsrEnvelope.sustain   = 0.7f;
             n.ahdsrEnvelope.releaseMs = 300.0f;
+        } else if (result == 156) {
+            // Signal Noise: gated noise generator (the noise counterpart to the
+            // Signal Oscillator). Two Signal inputs (Gate=ch2, Velocity=ch3) ->
+            // stereo noise. Pin order fixes the control-channel mapping (see
+            // SignalNoiseProcessor). Amplitude uses the shared node AHDSR so the
+            // envelope editor works on it. Default envelope is a short percussive
+            // hit (snare/hat-ish) rather than the oscillator's sustained shape.
+            auto& n = graph.addNode("Signal Noise", NodeType::Instrument,
+                {Pin{0, "Gate",     PinKind::Signal, true, 1},
+                 Pin{0, "Velocity", PinKind::Signal, true, 1}},
+                {Pin{0, "Audio", PinKind::Audio, false}}, {p.x, p.y});
+            n.script = "__signalnoise__";
+            if (n.pinsIn.size() >= 2) {
+                n.pinsIn[0].tooltip = "Gate (0/1): starts the note while >= 0.5, releases on the falling edge.";
+                n.pinsIn[1].tooltip = "Velocity (0..1): how hard the note is struck; scales the envelope.";
+            }
+            n.params.push_back({"Type",   0.0f, 0.0f, 2.0f}); // 0=White 1=Pink 2=Brown
+            n.params.push_back({"Volume", 0.5f, 0.0f, 1.0f});
+            n.ahdsrEnvelope.attackMs  = 1.0f;
+            n.ahdsrEnvelope.decayMs   = 120.0f;
+            n.ahdsrEnvelope.sustain   = 0.0f;
+            n.ahdsrEnvelope.releaseMs = 80.0f;
         } else if (result == 152) {
             // Signal Math: per-sample binary arithmetic on two control signals.
             // Two Signal inputs (A=ch2, B=ch3) -> one Signal output (Out=ch2).

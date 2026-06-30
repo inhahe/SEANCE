@@ -31,6 +31,7 @@
 #include "signal_sample_hold.h"     // SampleHoldProcessor - modular-kit S&H module
 #include "signal_logic.h"           // SignalLogicProcessor - modular-kit logic module
 #include "signal_filter.h"          // SignalFilterProcessor - modular-kit resonant filter
+#include "signal_noise.h"           // SignalNoiseProcessor - modular-kit gated noise
 
 #include <juce_audio_formats/juce_audio_formats.h>
 #include <juce_graphics/juce_graphics.h>
@@ -6599,6 +6600,115 @@ void testSignalFilter(Report& r) {
     }
 }
 
+void testSignalNoise(Report& r) {
+    r.section("Signal Noise module (gated noise generator)");
+
+    NodeGraph graph;
+    auto& node = graph.addNode("Signal Noise", NodeType::Instrument,
+        {Pin{0, "Gate",     PinKind::Signal, true, 1},
+         Pin{0, "Velocity", PinKind::Signal, true, 1}},
+        {Pin{0, "Audio", PinKind::Audio, false}}, {0.0f, 0.0f});
+    node.script = "__signalnoise__";
+    node.params.push_back({"Type", 0.0f, 0.0f, 2.0f});
+    node.params.push_back({"Volume", 1.0f, 0.0f, 1.0f});
+    // Sustain held at 1.0 so a held gate gives a steady level to measure.
+    node.ahdsrEnvelope.attackMs  = 1.0f;
+    node.ahdsrEnvelope.decayMs   = 5.0f;
+    node.ahdsrEnvelope.sustain   = 1.0f;
+    node.ahdsrEnvelope.releaseMs = 5.0f;
+
+    const double SR = 48000.0;
+    const int N = 1024;
+
+    // Capture channel-0 output for `type` with the gate held high, after the
+    // attack/decay have settled to sustain. Returns the final block's samples.
+    auto capture = [&](int type, std::vector<float>& out) {
+        node.params[0].value = (float) type;
+        SignalNoiseProcessor proc(node);
+        proc.prepareToPlay(SR, N);
+        juce::AudioBuffer<float> buf(4, N); // ch0/1 audio, ch2 Gate, ch3 Vel
+        for (int blk = 0; blk < 6; ++blk) {
+            buf.clear();
+            for (int i = 0; i < N; ++i) { buf.setSample(2, i, 1.0f); buf.setSample(3, i, 1.0f); }
+            juce::MidiBuffer m;
+            proc.processBlock(buf, m);
+        }
+        out.assign(N, 0.0f);
+        for (int i = 0; i < N; ++i) out[i] = buf.getSample(0, i);
+    };
+
+    auto rms = [](const std::vector<float>& v) {
+        double acc = 0.0; for (float x : v) acc += (double)x * x;
+        return (float) std::sqrt(acc / juce::jmax((size_t)1, v.size()));
+    };
+    // Lag-1 autocorrelation: ~0 for white, strongly positive for brown.
+    auto lag1 = [](const std::vector<float>& v) {
+        double num = 0.0, den = 0.0;
+        for (size_t i = 1; i < v.size(); ++i) num += (double)v[i] * v[i - 1];
+        for (float x : v) den += (double)x * x;
+        return den > 0 ? (float)(num / den) : 0.0f;
+    };
+
+    std::vector<float> white, pink, brown;
+    capture(0, white);
+    capture(1, pink);
+    capture(2, brown);
+
+    r.check(rms(white) > 0.1f, "noise: white gate-on produces output (rms " + juce::String(rms(white), 3) + ")");
+    r.check(rms(pink)  > 0.05f, "noise: pink gate-on produces output");
+    r.check(rms(brown) > 0.05f, "noise: brown gate-on produces output");
+
+    // Spectral character via adjacent-sample correlation: white is near-zero,
+    // brown is heavily low-pass (smooth) so strongly correlated, pink between.
+    float cw = lag1(white), cp = lag1(pink), cb = lag1(brown);
+    r.check(std::abs(cw) < 0.2f, "noise: white is near-uncorrelated (lag1 " + juce::String(cw, 3) + ")");
+    r.check(cb > 0.8f, "noise: brown is strongly correlated (lag1 " + juce::String(cb, 3) + ")");
+    r.check(cp > cw && cb > cp, "noise: correlation white < pink < brown");
+
+    // Bounds: every sample stays inside [-1, 1].
+    bool inBounds = true;
+    for (auto* v : { &white, &pink, &brown })
+        for (float x : *v) if (x < -1.0001f || x > 1.0001f) inBounds = false;
+    r.check(inBounds, "noise: all output within [-1, 1]");
+
+    // Gate low -> silence after the envelope releases.
+    {
+        node.params[0].value = 0.0f;
+        SignalNoiseProcessor proc(node);
+        proc.prepareToPlay(SR, N);
+        juce::AudioBuffer<float> buf(4, N);
+        // One block gate-high then several gate-low to fully release.
+        for (int blk = 0; blk < 5; ++blk) {
+            buf.clear();
+            float g = (blk == 0) ? 1.0f : 0.0f;
+            for (int i = 0; i < N; ++i) { buf.setSample(2, i, g); buf.setSample(3, i, 1.0f); }
+            juce::MidiBuffer m;
+            proc.processBlock(buf, m);
+        }
+        std::vector<float> tail(N);
+        for (int i = 0; i < N; ++i) tail[i] = buf.getSample(0, i);
+        r.check(rms(tail) < 1e-4f, "noise: gate-off releases to silence");
+    }
+
+    // Save/load round-trip (Type, Volume, and the AHDSR envelope).
+    node.params[0].value = 1.0f; // Pink
+    node.params[1].value = 0.6f;
+    const std::string text = ProjectFile::serializeForUndo(graph);
+    NodeGraph dst;
+    const bool ok = ProjectFile::loadFromString(text, dst);
+    r.check(ok, "noise-saveload: project text parses back");
+    Node* d = dst.findNode(node.id);
+    r.check(d != nullptr && d->script == "__signalnoise__", "noise-saveload: script tag survives");
+    if (d) {
+        auto val = [&](const char* nm) -> float {
+            for (auto& p : d->params) if (p.name == nm) return p.value;
+            return -999.0f;
+        };
+        r.check(std::abs(val("Type") - 1.0f) < 0.01f, "noise-saveload: Type round-trips");
+        r.check(std::abs(val("Volume") - 0.6f) < 0.01f, "noise-saveload: Volume round-trips");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Voice container end-to-end audio: build a real NodeGraph with a VoiceContainer
 // whose inner patch is VoiceIn -> Signal Oscillator -> VoiceOut, drive it with a
@@ -6837,6 +6947,7 @@ int runSelfTest(const juce::File& outDir) {
     testSampleHold(r);
     testSignalLogic(r);
     testSignalFilter(r);
+    testSignalNoise(r);
     testVoiceContainerAudio(r);
     testVoiceContainerSaveLoad(r);
 

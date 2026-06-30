@@ -2594,13 +2594,17 @@ audio → VoiceOut**.
 
 ### Modular kit — signal utilities (M3)
 
-Beyond the Signal Oscillator, a growing **kit of small signal-processing
-modules** lets you build modulation and shaping inside a voice (or anywhere
-control Signals flow) out of native nodes instead of a script. Each is a tiny,
-stateless-or-near-stateless `NodeType::SignalShape` node (so it gets the
-signal-family orange color), tagged by a `script` string and dispatched in
-`GraphProcessor::createNodeProcessor`. They have **no editor** — their params are
-edited directly on the node face — so double-clicking one is a no-op.
+Beyond the Signal Oscillator, a growing **kit of small modules** lets you build
+modulation, shaping, and sources inside a voice (or anywhere signals flow) out of
+native nodes instead of a script. The control-signal utilities (Math, LFO, Sample
+& Hold, Logic) are tiny, stateless-or-near-stateless `NodeType::SignalShape` nodes
+(signal-family orange), tagged by a `script` string and dispatched in
+`GraphProcessor::createNodeProcessor`; they have **no editor** (params are edited
+on the node face, so double-clicking is a no-op). Two members are different node
+kinds because they handle audio rather than control signals: the **Signal Filter**
+is a blue `NodeType::Effect`, and the **Signal Noise** generator is a brown
+`NodeType::Instrument` (it carries the shared AHDSR envelope, like the Signal
+Oscillator). Both are documented below alongside the utilities.
 
 #### Signal Math (`__signalmath__`)
 
@@ -2721,6 +2725,40 @@ can have its cutoff swept independently. Covered by `testSignalFilter` in
 rejects DC and peaks at cutoff, high-resonance stability, and the Type/Cutoff/
 Resonance save-load round-trip).
 
+#### Signal Noise (`__signalnoise__`)
+
+**Add Node → Signal Shape → Signal Noise (gate → noise burst)** creates a
+`SignalNoiseProcessor` (`signal_noise.h`). It's the **noise counterpart to the
+Signal Oscillator** — a gated, enveloped monophonic source — so it's a brown
+`NodeType::Instrument`, not a control utility. Noise has no pitch, so it reads two
+control Signals (instead of the oscillator's three) and turns them into an
+enveloped burst:
+
+- **Inputs (Signal):** **Gate** (channel 2 — note on while ≥ 0.5, release on the
+  falling edge, drives the AHDSR) and **Velocity** (channel 3 — latched on the gate
+  rising edge, scales the envelope).
+- **Output (Audio):** stereo noise on channels 0/1, with **decorrelated left/right**
+  channels for natural stereo width.
+- **Param — Type** (popup enum): **0 White** (flat spectrum, brightest), **1 Pink**
+  (−3 dB/octave, warmer — Paul Kellet's economical 7-pole filter), **2 Brown**
+  (−6 dB/octave, darkest — a leaky integral of white).
+- **Param — Volume** (0–1).
+- **Amplitude envelope:** the shared node AHDSR (`node.ahdsrEnvelope`), edited via
+  right-click → **Envelope (AHDSR)…** exactly like any tonal synth. The default is a
+  short percussive hit (1 ms attack, 120 ms decay, 0 sustain, 80 ms release) rather
+  than the oscillator's sustained shape — so a bare Signal Noise already sounds like
+  a snare/hat without touching the envelope.
+
+Because it carries a gate + envelope it's a **drop-in voice primitive**: wire
+VoiceIn's Gate/Velocity into it inside a Voice container and you have a noise voice
+(snares, hats, wind, breath, percussion). Run its output through a **Signal Filter**
+(modulating the cutoff with an envelope or LFO) for tuned-noise and resonant-sweep
+timbres. Each per-voice clone keeps its own RNG and filter state, so stacked notes
+don't share a noise stream. Covered by `testSignalNoise` in `--self-test` (gate-on
+produces output in all three colours, white is near-uncorrelated while brown is
+strongly low-pass / correlated, output stays in [−1, 1], gate-off releases to
+silence, and the Type/Volume save-load round-trip).
+
 ### Save / load, dirty tracking, undo
 
 Inner nodes and links serialize through the **same** generic path as any node —
@@ -2769,7 +2807,11 @@ random modes' range and In-independence, and its Source param round-trip;
 round-trip; and `testSignalFilter` runs the resonant filter in all three modes
 (low-pass passes a 50 Hz tone and rejects 8 kHz, high-pass rejects DC and passes
 8 kHz, band-pass rejects DC and peaks at the cutoff), confirms a high-resonance
-impulse stays finite, and round-trips the Type/Cutoff/Resonance params.
+impulse stays finite, and round-trips the Type/Cutoff/Resonance params; and
+`testSignalNoise` confirms a held gate produces output in all three colours, that
+adjacent-sample correlation rises white < pink < brown (brown being heavily
+low-pass), that output stays in [−1, 1], that the gate releases to silence, and the
+Type/Volume round-trip.
 
 ## Asset library (project stores)
 

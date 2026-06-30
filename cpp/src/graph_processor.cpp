@@ -24,6 +24,7 @@
 #include "spatializer_3d.h"
 #include "voice_nodes.h"
 #include "signal_oscillator.h"
+#include "signal_noise.h"
 #include "signal_math.h"
 #include "signal_lfo.h"
 #include "signal_sample_hold.h"
@@ -611,6 +612,8 @@ std::unique_ptr<juce::AudioProcessor> GraphProcessor::createNodeProcessor(
         return std::make_unique<FMSynthProcessor>(node);
     } else if (node.type == NodeType::Instrument && node.script == "__signalosc__") {
         return std::make_unique<SignalOscillatorProcessor>(node);
+    } else if (node.type == NodeType::Instrument && node.script == "__signalnoise__") {
+        return std::make_unique<SignalNoiseProcessor>(node);
     } else if (node.type == NodeType::Instrument &&
                node.script.rfind("__spectralgrain__:", 0) == 0) {
         return std::make_unique<SpectralGrainProcessor>(node);

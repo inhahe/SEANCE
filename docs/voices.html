@@ -138,6 +138,14 @@
 
 <p>The most useful question is <strong>A &gt; B</strong> — "is A above B?" Feed a signal into A and a threshold into B, and the output turns on whenever the signal climbs past that line. That's how you turn a smooth control into a trigger: for instance, fire a Sample &amp; Hold only when an LFO peaks. The other operations combine on/off signals: <strong>AND</strong> (both on), <strong>OR</strong> (either on), <strong>XOR</strong> (exactly one on), and <strong>NOT</strong> (flips A on↔off). Because the output is a tidy gate, you can wire it straight into anything that expects one — a Trigger, a Gate, or another Logic node's input to build up bigger conditions.</p>
 
+<h2>Noise voices — the Signal Noise generator</h2>
+
+<p>Not every voice is a pitched tone. Snares, hi-hats, wind, breath, and percussion are all <strong>noise</strong> shaped by an envelope — and the <strong>Signal Noise</strong> generator is the noise twin of the Signal Oscillator. Add one from <strong>Add Node → Signal Shape → Signal Noise (gate → noise burst)</strong>. Like the oscillator it lives naturally inside a Voice container: it has a <strong>Gate</strong> input that starts and stops the sound, and a <strong>Velocity</strong> input for how hard the note is struck — wire VoiceIn's Gate and Velocity straight into it.</p>
+
+<p>It has two controls. <strong>Type</strong> picks the colour of the noise: <em>White</em> is the brightest (a flat hiss), <em>Pink</em> is warmer, and <em>Brown</em> is the darkest, rumbliest version. <strong>Volume</strong> sets the level. Right out of the box its envelope is a short percussive hit, so a bare Signal Noise already sounds like a hi-hat or snare — and like any synth you can reshape that with <strong>right-click → Envelope (AHDSR)…</strong> to go from a tight tick to a long wash.</p>
+
+<p>The real fun is pairing it with the Signal Filter below: feed the noise through a <strong>Signal Filter</strong> and sweep the cutoff with an envelope, and you get everything from a tuned "tom" thump to a resonant sweep to a wind-up riser — all per note, all from two little nodes.</p>
+
 <h2>Shaping the tone — the Signal Filter</h2>
 
 <p>A <strong>Signal Filter</strong> brightens or darkens a sound by letting some frequencies through and holding others back — the single most useful tool for turning a raw, buzzy oscillator into something musical. Add one from <strong>Add Node → Effects → Signal Filter (resonant LP/HP/BP)</strong> and wire your audio through it (Audio In → Audio Out), just like any other effect. It has three controls:</p>

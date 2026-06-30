@@ -4263,18 +4263,22 @@ void NodeGraphComponent::showNodeMenu(Node& node) {
             int mode = result - 210; // 0=oldest, 1=quietest, 2=round-robin
             if (node->voiceStealMode != mode) {
                 node->voiceStealMode = mode;
+                // PolyVoiceProcessor re-reads voiceStealMode every block, so the
+                // change is live. Deliberately NOT calling onNodeEdited() (which
+                // forces a graph rebuild): a rebuild would re-run buildVoices()
+                // and reset every voice's oscillator phase + envelope, glitching
+                // any sounding notes. commitSnapshot still covers undo/save/dirty.
                 graph.commitSnapshot("Set voice stealing mode");
-                if (onNodeEdited) onNodeEdited();
             }
         } else if (result >= 220 && result <= 224) {
             // Voice glide (portamento) time. Like the steal mode, PolyVoiceProcessor
-            // reads voiceGlideMs live, so the change applies without a rebuild.
+            // reads voiceGlideMs live each block, so no rebuild is needed (and a
+            // rebuild would glitch sounding voices - see the note above).
             const float ms[] = { 0.0f, 20.0f, 60.0f, 150.0f, 400.0f };
             float v = ms[result - 220];
             if (std::abs(node->voiceGlideMs - v) > 0.5f) {
                 node->voiceGlideMs = v;
                 graph.commitSnapshot("Set voice glide");
-                if (onNodeEdited) onNodeEdited();
             }
         } else if (result == 181) {
             // Plugin MPE toggle: adds/removes the parallel MCM generator node,

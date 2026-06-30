@@ -95,7 +95,7 @@ private:
     std::string path;
 
     juce::Label      pathLabel;
-    juce::TextButton chooseBtn { "Choose .wasm file\u2026" };
+    juce::TextButton chooseBtn { "Choose .wasm file..." };
     juce::Label      hintLabel;
     std::shared_ptr<juce::FileChooser> chooser;
 };

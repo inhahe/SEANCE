@@ -60,7 +60,7 @@ private:
     juce::Label    shapeLabel { {}, "Shape (sampled by shape(pos)):" };
     std::unique_ptr<LayerStackComponent> shapeStack;
 
-    juce::TextButton helpBtn  { "Language reference\u2026" };
+    juce::TextButton helpBtn  { "Language reference..." };
     juce::TextButton closeBtn { "Close" };
 
     // One-line red error strip at the bottom, shown only when the current

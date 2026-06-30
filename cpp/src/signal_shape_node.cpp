@@ -1504,10 +1504,10 @@ void SignalShapeEditorComponent::updateLanguageUI() {
 
     // Point the reference button at the active language.
     if (isLua) {
-        varsHelpBtn.setButtonText("Lua reference\u2026");
+        varsHelpBtn.setButtonText("Lua reference...");
         varsHelpBtn.setTooltip(kSignalShapeLuaHelp);
     } else {
-        varsHelpBtn.setButtonText("Variables & functions\u2026");
+        varsHelpBtn.setButtonText("Variables & functions...");
         varsHelpBtn.setTooltip(kSignalShapeHelp);
     }
 }

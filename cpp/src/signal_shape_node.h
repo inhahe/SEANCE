@@ -466,7 +466,7 @@ private:
     // badly needs; it now lives behind this button (and its tooltip) so the
     // shape editor gets that room back. Click pops the reference in a
     // main-window-parented message box.
-    juce::TextButton varsHelpBtn { "Variables & functions\u2026" };
+    juce::TextButton varsHelpBtn { "Variables & functions..." };
 
     // Push `doc` into node.script (via SignalShapeDoc::encode) and notify.
     // Also reconciles node.pinsIn to match doc.signalInputCount when needed.

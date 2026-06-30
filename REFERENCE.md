@@ -649,6 +649,8 @@ The strip exposes the two halves of timeline parenting:
   - **Clear parent** — detaches the track. The inherited offset is folded into the track's own offset so it doesn't visually jump. Undo step: `commitSnapshot("Clear track parent")`.
   - **Set start beat…** — a dialog for typing an exact offset in beats (parented to the main window). Undo step: `commitSnapshot("Set track start beat")`.
 
+**Also reachable from the node graph (discoverability).** The same three items appear under a **"Track nesting & timing ▸"** submenu when you **right-click a timeline node on the main graph canvas** — so you no longer have to know to open the editor and right-click the (easy-to-miss) header strip. Both entry points share one implementation (`TrackNestingMenu::addItems` / `handle` in `track_nesting_menu.h`) so they can never drift apart; the node-menu path runs the same `resolveAnchors` + `commitSnapshot` refresh (timing offsets are read live during playback, so no audio-graph rebuild is needed).
+
 `addToGroup` was relaxed from Group-only parents to also accept `MidiTimeline`/`AudioTimeline` parents, guarded by `isAncestorOf` so no parent/child cycle can form. When a parent timeline is deleted, any surviving child whose parent was the deleted node is detached to top-level (keeping its own offset) rather than left with a dangling `parentGroupId`. The relationship and offset are serialized generically (`parentGroupId` + `groupBeatOffset` in the project file), so save→load round-trips it.
 
 ---
@@ -2461,9 +2463,11 @@ full milestone plan live in `poly-voice-architecture.md` at the repo root.
 
 ### What it looks like on the canvas
 
-- **Add Node → Instruments → Voice (polyphonic)** opens a submenu of **factory
-  presets** (see below). The submenu only appears at the **top level** — you
-  cannot nest a Voice container inside another one in M1.
+- **Add Node → Instruments → Voice subgraph (per-note polyphony)** opens a
+  submenu of **factory presets** (see below). The submenu is labelled "subgraph"
+  (with a disabled "cloned per note, like Bitwig's Poly Grid" hint line) so it's
+  findable by anyone hunting for modular/per-note polyphony. It only appears at
+  the **top level** — you cannot nest a Voice container inside another one in M1.
 - On the main canvas the container is a **single node** with one **MIDI input**
   (left) and one **stereo audio output** (right). Because node colour is inferred
   from pins (`getVisualCategory`), a MIDI-in / audio-out node reads as an
@@ -2475,8 +2479,8 @@ full milestone plan live in `poly-voice-architecture.md` at the repo root.
 
 ### Factory presets
 
-The **Voice (polyphonic)** submenu offers ready-made voices so you don't have to
-wire an inner patch by hand. Each entry builds the full container shell (VoiceIn
+The **Voice subgraph (per-note polyphony)** submenu offers ready-made voices so
+you don't have to wire an inner patch by hand. Each entry builds the full container shell (VoiceIn
 puck + inner instrument + VoiceOut puck) **and** pre-tunes the container's
 polyphony / glide / unison settings, then drops it on the canvas as one undo
 step ("Add Voice container (*name*)"). Pick one and play — drill in afterwards to

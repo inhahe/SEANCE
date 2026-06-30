@@ -1,5 +1,6 @@
 #include "node_graph_component.h"
 #include "dialog_helpers.h"
+#include "track_nesting_menu.h"
 #include "music_theory.h"
 #include "layered_wave_editor.h"
 #include "spectral_editor.h"
@@ -2627,13 +2628,20 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
         // others come pre-wired (Signal Osc / Signal Noise) and pre-tuned. IDs
         // 150 (basic) + 160..163 (named presets) -> createVoicePreset().
         juce::PopupMenu voiceMenu;
+        // A disabled one-liner explaining what this is, since PopupMenu items
+        // can't carry hover tooltips and "Voice" alone doesn't say "subgraph".
+        voiceMenu.addItem(-1, "An inner patch cloned per note (like Bitwig's Poly Grid)", false, false);
+        voiceMenu.addSeparator();
         voiceMenu.addItem(150, "Basic (FM Synth)...");
         voiceMenu.addSeparator();
         voiceMenu.addItem(160, "Warm Pad");
         voiceMenu.addItem(161, "Pluck");
         voiceMenu.addItem(162, "Supersaw Lead");
         voiceMenu.addItem(163, "Noise Perc");
-        instMenu.addSubMenu("Voice (polyphonic)", voiceMenu);
+        // Labelled "subgraph" so users hunting for per-note / modular polyphony
+        // (Poly-Grid-style) actually find it - "Voice (polyphonic)" alone was
+        // easy to miss. Double-click the created node to edit the inner patch.
+        instMenu.addSubMenu("Voice subgraph (per-note polyphony)", voiceMenu);
     }
     menu.addSubMenu("Instruments", instMenu);
 
@@ -4274,6 +4282,16 @@ void NodeGraphComponent::showNodeMenu(Node& node) {
         menu.addItem(163, node.recordArmed ? "Disarm Recording" : "Record Here",
                      true, node.recordArmed);
     }
+    // Track nesting & timing: make this track a child of another (its clips then
+    // start at an offset within the parent), clear the parent, or set the start
+    // beat. The SAME menu lives on the piano-roll track-header strip, but that's
+    // easy to miss - surfacing it on the node's right-click menu is the
+    // discoverable path. Both share track_nesting_menu.h so they never drift.
+    if (TrackNestingMenu::appliesTo(node)) {
+        juce::PopupMenu nestMenu;
+        TrackNestingMenu::addItems(nestMenu, graph, node);
+        menu.addSubMenu("Track nesting & timing", nestMenu);
+    }
     if (node.plugin || node.type == NodeType::Instrument || node.type == NodeType::Effect) {
         menu.addItem(4, "Show Plugin UI");
         menu.addItem(7, "Presets...");
@@ -4552,6 +4570,20 @@ void NodeGraphComponent::showNodeMenu(Node& node) {
     menu.showMenuAsync(juce::PopupMenu::Options(), [this, nodeId](int result) {
         auto* node = graph.findNode(nodeId);
         if (!node) return;
+
+        // Track nesting & timing (shared with the piano-roll header menu).
+        // Timing offsets are read live during playback, so no audio rebuild is
+        // needed - resolveAnchors + repaint + snapshot mirrors the piano roll's
+        // finishTiming. An open editor repaints from graph state on its timer.
+        if (TrackNestingMenu::owns(result)) {
+            TrackNestingMenu::handle(result, graph, nodeId, this,
+                [this](const char* desc) {
+                    graph.resolveAnchors();
+                    repaint();
+                    graph.commitSnapshot(desc);
+                });
+            return;
+        }
 
         if (result == 1) {
             // Delete node (and, if it's a Group container, every node

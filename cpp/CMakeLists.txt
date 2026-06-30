@@ -77,6 +77,7 @@ target_sources(SEANCE PRIVATE
     src/node_graph_component.h
     src/piano_roll_component.cpp
     src/piano_roll_component.h
+    src/track_nesting_menu.h
     src/audio_engine.cpp
     src/audio_engine.h
     src/graph_processor.cpp

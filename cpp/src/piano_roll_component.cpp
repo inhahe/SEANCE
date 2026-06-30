@@ -1,5 +1,6 @@
 #include "piano_roll_component.h"
 #include "music_theory.h"
+#include "track_nesting_menu.h"
 #include "undo.h"
 #include <cmath>
 #include <set>
@@ -1616,80 +1617,20 @@ void PianoRollComponent::showTrackHeaderMenu() {
 
     juce::PopupMenu menu;
     menu.addSectionHeader(juce::String(node->name));
-
-    // "Make child of" submenu: every other timeline track that wouldn't form a
-    // cycle (i.e. not this node and not one of this node's descendants).
-    juce::PopupMenu parentSub;
-    bool anyCandidate = false;
-    for (auto& cand : graph.nodes) {
-        if (cand.id == myId) continue;
-        if (cand.type != NodeType::MidiTimeline && cand.type != NodeType::AudioTimeline
-            && cand.type != NodeType::Group)
-            continue;
-        // Skip descendants of this node (would create a parent/child cycle).
-        if (graph.isAncestorOf(myId, cand.id)) continue;
-        bool isCurrentParent = (node->parentGroupId == cand.id);
-        parentSub.addItem(10000 + cand.id, juce::String(cand.name),
-                          /*enabled*/ !isCurrentParent, /*ticked*/ isCurrentParent);
-        anyCandidate = true;
-    }
-    if (!anyCandidate)
-        parentSub.addItem(-1, "(no other tracks)", false, false);
-    menu.addSubMenu("Make child of", parentSub);
-
-    menu.addItem(2, "Clear parent", node->parentGroupId >= 0, false);
-    menu.addSeparator();
-    menu.addItem(3, "Set start beat\xe2\x80\xa6");
+    // The parent/child + start-beat items are shared with the node-graph node
+    // menu (see track_nesting_menu.h) so the two entry points never drift.
+    TrackNestingMenu::addItems(menu, graph, *node);
 
     menu.showMenuAsync(juce::PopupMenu::Options().withTargetComponent(this),
         [this, myId](int result) {
-            auto* n = graph.findNode(myId);
-            if (!n || result == 0) return;
-
-            auto finishTiming = [this](const char* desc) {
-                graph.resolveAnchors();
-                repaint();
-                if (onTimingChanged) onTimingChanged();
-                graph.commitSnapshot(desc);
-            };
-
-            if (result == 2) {
-                // Clear parent: detach but keep the absolute start where it is so
-                // the track doesn't visually jump (fold the inherited offset in).
-                if (n->parentGroupId >= 0) {
-                    float inherited = n->absoluteBeatOffset - n->groupBeatOffset;
-                    graph.removeFromGroup(myId);
-                    n->anchorMarker.clear();
-                    n->groupBeatOffset = std::max(0.0f, n->groupBeatOffset + inherited);
-                    finishTiming("Clear track parent");
-                }
-            } else if (result == 3) {
-                auto* aw = new juce::AlertWindow("Set Start Beat",
-                    "Start offset for \"" + juce::String(n->name) + "\" (in beats):",
-                    juce::MessageBoxIconType::NoIcon);
-                aw->addTextEditor("beat", juce::String(n->groupBeatOffset, 3));
-                aw->addButton("Set", 1, juce::KeyPress(juce::KeyPress::returnKey));
-                aw->addButton("Cancel", 0);
-                aw->enterModalState(true, juce::ModalCallbackFunction::create(
-                    [this, aw, myId, finishTiming](int res) {
-                        if (res == 1) {
-                            auto* nn = graph.findNode(myId);
-                            if (nn) {
-                                float v = aw->getTextEditorContents("beat").getFloatValue();
-                                nn->groupBeatOffset = std::max(0.0f, v);
-                                nn->anchorMarker.clear();
-                                finishTiming("Set track start beat");
-                            }
-                        }
-                        delete aw;
-                    }), true);
-            } else if (result >= 10000) {
-                int parentId = result - 10000;
-                if (parentId != myId && !graph.isAncestorOf(myId, parentId)) {
-                    graph.addToGroup(parentId, myId);
-                    finishTiming("Make track a child");
-                }
-            }
+            if (result == 0) return;
+            TrackNestingMenu::handle(result, graph, myId, this,
+                [this](const char* desc) {
+                    graph.resolveAnchors();
+                    repaint();
+                    if (onTimingChanged) onTimingChanged();
+                    graph.commitSnapshot(desc);
+                });
         });
 }
 

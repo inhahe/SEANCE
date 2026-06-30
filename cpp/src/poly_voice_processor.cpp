@@ -59,6 +59,11 @@ void PolyVoiceProcessor::processBlock(juce::AudioBuffer<float>& buf,
     buf.clear();
     if (!built || voices.empty()) return;
 
+    // Refresh the steal policy from the container each block so a live menu
+    // change (Voice stealing submenu) takes effect immediately without a
+    // graph rebuild. jlimit guards against a stale/garbage serialized value.
+    alloc.stealMode = juce::jlimit(0, 2, containerNode.voiceStealMode);
+
     // 1. Translate incoming MIDI into voice allocation + gate events. The policy
     //    (free slot / steal-oldest / note matching) lives in VoiceAllocator; here
     //    we just apply its decisions to the matching voice's audio objects.

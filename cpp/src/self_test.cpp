@@ -5914,6 +5914,84 @@ void testVoiceAllocator(Report& r) {
         r.check(a.activeCount() == 3, "panic: voices remain active for their release tails");
     }
 
+    // --- steal-quietest: when full, the new note steals the quietest slot ---
+    {
+        VoiceAllocator a;
+        a.resize(3);
+        a.stealMode = VoiceAllocator::StealQuietest;
+        a.noteOn(60); a.noteOn(62); a.noteOn(64); // slots 0,1,2 all held & active
+        // Give each slot a distinct last-block level; slot 1 is quietest.
+        a.postRender(0, 0.40f, 10.0f, floorRms, freeMs);
+        a.postRender(1, 0.05f, 10.0f, floorRms, freeMs);
+        a.postRender(2, 0.30f, 10.0f, floorRms, freeMs);
+        auto s = a.noteOn(66);
+        r.check(s.slot == 1 && s.stole, "steal-quietest: steals the lowest-RMS slot (1)");
+        r.check(a.slots[1].note == 66 && a.slots[1].gateHeld,
+                "steal-quietest: stolen slot now plays the new note");
+        // After the steal, refresh levels: slot 0 now quietest.
+        a.postRender(0, 0.02f, 10.0f, floorRms, freeMs);
+        a.postRender(1, 0.50f, 10.0f, floorRms, freeMs);
+        a.postRender(2, 0.30f, 10.0f, floorRms, freeMs);
+        auto s2 = a.noteOn(68);
+        r.check(s2.slot == 0 && s2.stole, "steal-quietest: next steal takes the new quietest (0)");
+    }
+
+    // --- steal-quietest still prefers a free slot over stealing ---
+    {
+        VoiceAllocator a;
+        a.resize(3);
+        a.stealMode = VoiceAllocator::StealQuietest;
+        a.noteOn(60); // slot 0
+        a.postRender(0, 0.001f, 10.0f, floorRms, freeMs); // very quiet, but still free slots
+        auto s = a.noteOn(62);
+        r.check(s.slot == 1 && !s.stole,
+                "steal-quietest: a free slot wins over stealing a quiet active one");
+    }
+
+    // --- steal-round-robin: cycles slots predictably once full ---
+    {
+        VoiceAllocator a;
+        a.resize(3);
+        a.stealMode = VoiceAllocator::StealRoundRobin;
+        // Fill the free slots first (round-robin still prefers free).
+        r.check(a.noteOn(60).slot == 0 && a.noteOn(62).slot == 1 && a.noteOn(64).slot == 2,
+                "round-robin: free slots fill in order first");
+        // Now full: steals advance the cursor 0,1,2,0,...
+        auto a0 = a.noteOn(66);
+        auto a1 = a.noteOn(67);
+        auto a2 = a.noteOn(68);
+        auto a3 = a.noteOn(69);
+        r.check(a0.slot == 0 && a1.slot == 1 && a2.slot == 2 && a3.slot == 0,
+                "round-robin: steals cycle 0,1,2,0 regardless of age/level");
+        r.check(a0.stole && a1.stole && a2.stole && a3.stole,
+                "round-robin: each wrap-around allocation reports a steal");
+    }
+
+    // --- round-robin cursor resets on resize ---
+    {
+        VoiceAllocator a;
+        a.resize(2);
+        a.stealMode = VoiceAllocator::StealRoundRobin;
+        a.noteOn(60); a.noteOn(62);     // fill
+        a.noteOn(64);                   // steal slot 0 (cursor -> 0)
+        a.resize(2);                    // cursor reset to -1
+        a.stealMode = VoiceAllocator::StealRoundRobin;
+        a.noteOn(60); a.noteOn(62);     // fill again
+        auto s = a.noteOn(64);          // first steal after reset -> slot 0
+        r.check(s.slot == 0, "round-robin: resize() resets the cursor to start at slot 0");
+    }
+
+    // --- default stealMode is oldest (unset == 0) ---
+    {
+        VoiceAllocator a;
+        a.resize(2);
+        r.check(a.stealMode == VoiceAllocator::StealOldest,
+                "default: a fresh allocator steals oldest");
+        a.noteOn(60); a.noteOn(62);
+        auto s = a.noteOn(64);
+        r.check(s.slot == 0 && s.stole, "default: steals slot 0 (oldest) by default");
+    }
+
     // --- degenerate: zero slots is safe ---
     {
         VoiceAllocator a;
@@ -5923,6 +6001,9 @@ void testVoiceAllocator(Report& r) {
         r.check(a.noteOff(60) == -1, "edge: note-off with no slots returns -1");
         r.check(!a.postRender(0, quiet, 100.0f, floorRms, freeMs),
                 "edge: postRender on an out-of-range slot is a safe no-op");
+        // round-robin with no slots must not divide by zero.
+        a.stealMode = VoiceAllocator::StealRoundRobin;
+        r.check(a.noteOn(60).slot == -1, "edge: round-robin with no slots is safe");
     }
 }
 

@@ -54,6 +54,9 @@ public:
 
         const float volume   = paramValue("Volume", 0.5f);
         const int   waveform = (int)std::lround(paramValue("Waveform", 0.0f));
+        // Pulse duty cycle (only used by the Pulse waveform). Clamp away from
+        // 0/1 so the pulse never degenerates to DC silence. Modulatable via #88.
+        const float pulseW   = juce::jlimit(0.02f, 0.98f, paramValue("Pulse Width", 0.5f));
 
         float* d0 = ch > 0 ? buf.getWritePointer(0) : nullptr;
         float* d1 = ch > 1 ? buf.getWritePointer(1) : nullptr;
@@ -78,7 +81,7 @@ public:
             const double freq = (double)juce::jmax(0.0f, lastPitchHz);
             phase += freq / (sampleRate > 0.0 ? sampleRate : 44100.0);
             if (phase >= 1.0) phase -= std::floor(phase);
-            const float s = oscSample(waveform, (float)phase) * amp * volume;
+            const float s = oscSample(waveform, (float)phase, pulseW) * amp * volume;
 
             if (d0) d0[i] = s;
             if (d1) d1[i] = s;
@@ -112,11 +115,12 @@ private:
         return def;
     }
 
-    static float oscSample(int waveform, float ph) {
+    static float oscSample(int waveform, float ph, float pulseW = 0.5f) {
         switch (waveform) {
             case 1:  return 2.0f * ph - 1.0f;                  // saw
             case 2:  return ph < 0.5f ? 1.0f : -1.0f;          // square
             case 3:  return 4.0f * std::abs(ph - 0.5f) - 1.0f; // triangle
+            case 4:  return ph < pulseW ? 1.0f : -1.0f;        // pulse (variable width)
             default: return std::sin(ph * juce::MathConstants<float>::twoPi); // sine
         }
     }

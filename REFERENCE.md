@@ -2641,8 +2641,14 @@ the VoiceIn Pitch/Gate/Velocity outputs real rather than decorative:
   frequency), **Gate** (0/1 — the envelope fires note-on on the rising edge and
   note-off on the falling edge), **Velocity** (0..1 — latched on the gate's rising
   edge, scales the envelope).
-- **Params:** **Waveform** (0 = sine, 1 = saw, 2 = square, 3 = triangle) and
-  **Volume**.
+- **Params:** **Waveform** (0 = sine, 1 = saw, 2 = square, 3 = triangle, 4 =
+  pulse) — a **discrete enum** edited by a **click-to-pick popup** (like the
+  Signal Filter's Type), not a drag-scrubbed slider, so you can't park it between
+  shapes; **Volume**; and **Pulse Width** (0.05..0.95, default 0.5). Pulse Width
+  is the duty cycle of the Pulse waveform (0.5 = a square, away from 0.5 = a
+  thinner, more nasal pulse). It only affects the Pulse shape but is always
+  present so it can be **modulated via #88** — right-click its row → *Add
+  Modulation Input* and wire a Signal LFO into it for classic **PWM** movement.
 - **Envelope:** it uses the **shared AHDSR** (`node.ahdsrEnvelope`), so
   right-click → **Envelope (AHDSR)…** opens the normal envelope editor on it with
   no special-casing (it isn't in the `ownEnvelope` exclusion list, so it counts as

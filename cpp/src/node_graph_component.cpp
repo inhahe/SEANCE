@@ -1723,6 +1723,32 @@ void NodeGraphComponent::mouseDown(const juce::MouseEvent& e) {
                         });
                         return;
                     }
+                    // Signal Oscillator's Waveform is a discrete enum (Sine /
+                    // Saw / Square / Triangle / Pulse) - popup picker, so it's
+                    // not drag-scrubbed or parked between waveforms.
+                    if (node->script == "__signalosc__" && p.name == "Waveform") {
+                        selectedNodeId = node->id;
+                        const char* labels[] = { "Sine  (pure, smooth)",
+                            "Saw  (bright, buzzy)", "Square  (hollow)",
+                            "Triangle  (mellow)",
+                            "Pulse  (variable width - see Pulse Width)" };
+                        int cur = juce::jlimit(0, 4, (int)std::round(p.value));
+                        juce::PopupMenu pm;
+                        for (int i = 0; i < 5; ++i)
+                            pm.addItem(i + 1, labels[i], true, i == cur);
+                        int nodeId = node->id;
+                        int paramIdx = idx;
+                        pm.showMenuAsync({}, [this, nodeId, paramIdx](int r) {
+                            if (r == 0) return;
+                            auto* nd = graph.findNode(nodeId);
+                            if (!nd || paramIdx >= (int)nd->params.size()) return;
+                            nd->params[paramIdx].value = (float)(r - 1);
+                            graph.dirty = true;
+                            graph.commitSnapshot("Change Signal Osc waveform");
+                            repaint();
+                        });
+                        return;
+                    }
                     // Other discrete enum params (Pitch Detector's Algorithm
                     // and Mapping) also get a popup picker rather than a
                     // slider, for the same reason: discrete labelled states
@@ -2064,6 +2090,22 @@ juce::String NodeGraphComponent::paramRowTooltip(const Node& node,
             return juce::String("Emphasis right at the cutoff (0 = none, 1 = a "
                                 "sharp resonant peak that can ring or whistle). "
                                 "Maps to filter Q 0.5-10.") + kMod;
+    }
+    // Signal Oscillator: Waveform is a click-to-pick enum; Pulse Width is only
+    // audible on the Pulse waveform and is modulatable (PWM) via a signal cable.
+    if (node.script == "__signalosc__") {
+        const std::string& nm = node.params[idx].name;
+        if (nm == "Waveform")
+            return "Oscillator shape: Sine (pure), Saw (bright/buzzy), Square "
+                   "(hollow), Triangle (mellow), or Pulse (variable width). "
+                   "Click to pick.";
+        if (nm == "Pulse Width")
+            return juce::String("Duty cycle of the Pulse waveform: 0.5 = a square, "
+                                "lower/higher = a thinner, more nasal pulse. Only "
+                                "affects the Pulse shape. Right-click this row to "
+                                "add a signal input so an LFO can sweep it (PWM).");
+        if (nm == "Volume")
+            return "Output level of this oscillator (0 = silent, 1 = full).";
     }
     return {};
 }
@@ -2792,8 +2834,11 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
                 n.pinsIn[1].tooltip = "Gate (0/1): starts the note while >= 0.5, releases on the falling edge.";
                 n.pinsIn[2].tooltip = "Velocity (0..1): how hard the note is struck; scales the envelope.";
             }
-            n.params.push_back({"Waveform", 0.0f, 0.0f, 3.0f}); // 0=sine 1=saw 2=square 3=tri
+            n.params.push_back({"Waveform", 0.0f, 0.0f, 4.0f}); // 0=sine 1=saw 2=square 3=tri 4=pulse (enum picker)
             n.params.push_back({"Volume",   0.5f, 0.0f, 1.0f});
+            // Pulse Width is only audible on the Pulse waveform, but it's always
+            // present (and modulatable via #88) so an LFO can sweep it for PWM.
+            n.params.push_back({"Pulse Width", 0.5f, 0.05f, 0.95f, "%.2f"});
             n.ahdsrEnvelope.attackMs  = 5.0f;
             n.ahdsrEnvelope.decayMs   = 100.0f;
             n.ahdsrEnvelope.sustain   = 0.7f;

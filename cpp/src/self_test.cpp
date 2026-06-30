@@ -32,6 +32,7 @@
 #include "signal_logic.h"           // SignalLogicProcessor - modular-kit logic module
 #include "signal_filter.h"          // SignalFilterProcessor - modular-kit resonant filter
 #include "signal_noise.h"           // SignalNoiseProcessor - modular-kit gated noise
+#include "signal_oscillator.h"      // SignalOscillatorProcessor - Signal-driven oscillator
 
 #include <juce_audio_formats/juce_audio_formats.h>
 #include <juce_graphics/juce_graphics.h>
@@ -7457,6 +7458,70 @@ void testVoicePresets(Report& r) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Signal Oscillator - Pulse waveform (M4 "more oscillator flavours"). The Pulse
+// shape (Waveform == 4) emits +1 for the first `Pulse Width` fraction of each
+// cycle and -1 for the rest, so the duty cycle of the output sign should track
+// the Pulse Width param. Drives the processor directly with constant control
+// signals (ch2 Pitch, ch3 Gate, ch4 Velocity) and measures the positive sample
+// fraction at two widths.
+// ---------------------------------------------------------------------------
+void testSignalOscPulse(Report& r) {
+    r.section("Signal Oscillator (Pulse waveform / PWM)");
+
+    auto dutyCycle = [&](float width) {
+        NodeGraph graph;
+        auto& n = graph.addNode("Signal Osc", NodeType::Instrument,
+            {Pin{0, "Pitch",    PinKind::Signal, true, 1},
+             Pin{0, "Gate",     PinKind::Signal, true, 1},
+             Pin{0, "Velocity", PinKind::Signal, true, 1}},
+            {Pin{0, "Audio", PinKind::Audio, false}}, {0.0f, 0.0f});
+        n.script = "__signalosc__";
+        n.params.push_back({"Waveform", 4.0f, 0.0f, 4.0f});      // Pulse
+        n.params.push_back({"Volume",   1.0f, 0.0f, 1.0f});
+        n.params.push_back({"Pulse Width", width, 0.05f, 0.95f});
+        // Near-instant attack, full sustain -> amp is ~1 almost immediately, so
+        // the output sign reflects the waveform (not the envelope ramp).
+        n.ahdsrEnvelope.attackMs  = 0.05f;
+        n.ahdsrEnvelope.decayMs   = 1.0f;
+        n.ahdsrEnvelope.sustain   = 1.0f;
+        n.ahdsrEnvelope.releaseMs = 50.0f;
+
+        const double sr = 48000.0; const int N = 512;
+        SignalOscillatorProcessor osc(n);
+        osc.prepareToPlay(sr, N);
+
+        juce::AudioBuffer<float> buf(5, N);   // 0/1 audio, 2 pitch, 3 gate, 4 vel
+        int pos = 0, neg = 0;
+        // Warm up a couple of blocks so the envelope is fully open, then count.
+        for (int blk = 0; blk < 8; ++blk) {
+            buf.clear();
+            for (int i = 0; i < N; ++i) {
+                buf.setSample(2, i, 200.0f); // 200 Hz pitch
+                buf.setSample(3, i, 1.0f);   // gate held
+                buf.setSample(4, i, 1.0f);   // full velocity
+            }
+            juce::MidiBuffer midi;
+            osc.processBlock(buf, midi);
+            if (blk < 4) continue;           // skip warmup blocks
+            for (int i = 0; i < N; ++i) {
+                const float s = buf.getSample(0, i);
+                if (s > 1.0e-3f) ++pos; else if (s < -1.0e-3f) ++neg;
+            }
+        }
+        const int total = pos + neg;
+        return total > 0 ? (float)pos / (float)total : 0.0f;
+    };
+
+    const float d25 = dutyCycle(0.25f);
+    const float d75 = dutyCycle(0.75f);
+    r.check(std::abs(d25 - 0.25f) < 0.06f,
+            "pulse: 25% width -> ~25% positive duty (" + juce::String(d25, 3) + ")");
+    r.check(std::abs(d75 - 0.75f) < 0.06f,
+            "pulse: 75% width -> ~75% positive duty (" + juce::String(d75, 3) + ")");
+    r.check(d75 > d25 + 0.2f, "pulse: wider Pulse Width raises the duty cycle");
+}
+
 int runSelfTest(const juce::File& outDir) {
     outDir.createDirectory();
     Report r;
@@ -7489,6 +7554,7 @@ int runSelfTest(const juce::File& outDir) {
     testVoiceContainerAudio(r);
     testVoiceContainerSaveLoad(r);
     testVoicePresets(r);
+    testSignalOscPulse(r);
 
     r.section("Summary");
     r.line("  PASSED: " + juce::String(r.passed));

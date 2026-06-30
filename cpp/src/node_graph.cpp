@@ -735,8 +735,9 @@ int buildVoicePreset(NodeGraph& graph, Vec2 pos, int preset) {
                 n.pinsIn[1].tooltip = "Gate (0/1): starts the note while >= 0.5, releases on the falling edge.";
                 n.pinsIn[2].tooltip = "Velocity (0..1): how hard the note is struck; scales the envelope.";
             }
-            n.params.push_back({"Waveform", waveform, 0.0f, 3.0f});
+            n.params.push_back({"Waveform", waveform, 0.0f, 4.0f}); // 0=sine 1=saw 2=square 3=tri 4=pulse
             n.params.push_back({"Volume",   0.5f, 0.0f, 1.0f});
+            n.params.push_back({"Pulse Width", 0.5f, 0.05f, 0.95f, "%.2f"}); // only audible on Pulse; modulatable (#88)
             n.ahdsrEnvelope.attackMs  = atk;
             n.ahdsrEnvelope.decayMs   = dec;
             n.ahdsrEnvelope.sustain   = sus;

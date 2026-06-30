@@ -110,7 +110,9 @@
   <li><strong>Velocity</strong> (0..1) — how hard the note was struck; scales the envelope.</li>
 </ul>
 
-<p>It has a <strong>Waveform</strong> control (sine / saw / square / triangle), a <strong>Volume</strong>, and the shared <strong>AHDSR envelope</strong> — right-click it → <em>Envelope (AHDSR)…</em> to shape the attack, decay, sustain, and release just like any other synth.</p>
+<p>It has a <strong>Waveform</strong> control (click it to pick: sine, saw, square, triangle, or pulse), a <strong>Volume</strong>, a <strong>Pulse Width</strong>, and the shared <strong>AHDSR envelope</strong> — right-click it → <em>Envelope (AHDSR)…</em> to shape the attack, decay, sustain, and release just like any other synth.</p>
+
+<p><strong>Pulse Width</strong> only matters when the Waveform is set to <em>Pulse</em>: it sets how much of each cycle is "on" — at 0.5 the pulse is a square; pushing it toward 0 or 1 makes a thinner, more nasal, reedy tone. The real fun is to <em>move</em> it: right-click the Pulse Width row → <strong>Add Modulation Input</strong> and wire a <a href="#">Signal LFO</a> into the new socket. Now the width sweeps back and forth on its own — the classic shimmering "PWM" sound you hear in string and pad patches.</p>
 
 <p>To wire up a complete modular voice:</p>
 

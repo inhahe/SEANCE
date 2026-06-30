@@ -1,8 +1,13 @@
 # Per-Voice Polyphony — the Voice container ("Poly Grid") architecture
 
-Status: **design approved, implementation in progress.** This document is the
-canonical spec for the per-voice polyphony feature. Keep it in sync as the
-implementation lands.
+Status: **M1 landed (forks (a) + (b) shipped).** The Voice container, its
+`PolyVoiceProcessor` engine, the VoiceIn/VoiceOut boundary pucks, the scoped
+drill-in editor with breadcrumb, and the Signal-driven oscillator are all built
+and in the Release build. Open fork #2 (below) was resolved **"do both"**: the
+container forwards each voice's note as MIDI into its clone (a) *and* exposes
+Pitch/Gate/Velocity Signal context that the new **Signal Oscillator** reads (b).
+This document remains the canonical spec; M2/M3/M4 polish items below are still
+open. Keep it in sync as further work lands.
 
 ## Problem
 

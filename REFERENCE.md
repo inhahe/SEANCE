@@ -34,6 +34,7 @@ here.
 - [Script (signal + MIDI)](#script-signal--midi)
 - [Control Bank](#control-bank)
 - [Shared AHDSR envelope](#shared-ahdsr-envelope)
+- [Voice container (per-voice polyphony)](#voice-container-per-voice-polyphony)
 - [Asset library (project stores)](#asset-library-project-stores)
 - [Terrain-synth self-test (`--self-test`)](#terrain-synth-self-test---self-test)
 - [Ephemeral session (`--ephemeral`)](#ephemeral-session---ephemeral)
@@ -2431,6 +2432,156 @@ otherwise reach — a filter cutoff, a wavetable position, a *different*
 synth, an effect knob — not for re-driving the synth that already gets it.
 (There is intentionally no MIDI *output* on this node; it is a pure
 MIDI-to-control tap.)
+
+## Voice container (per-voice polyphony)
+
+The **Voice container** is a node that holds an **inner subgraph — a per-note
+patch — and instantiates it once per sounding MIDI note**, summing every active
+copy. It is SEANCE's answer to a Bitwig-Grid-style "poly" wrapper: instead of
+polyphony being sealed inside a single monolithic instrument, you build a voice
+out of ordinary graph nodes (oscillators, filters, envelopes, Script nodes, …)
+and the container makes that little patch polyphonic. Design rationale and the
+full milestone plan live in `poly-voice-architecture.md` at the repo root.
+
+### What it looks like on the canvas
+
+- **Add Node → Instruments → Voice (polyphonic)…** creates the container. (The
+  menu item only appears at the **top level** — you cannot nest a Voice
+  container inside another one in M1.)
+- On the main canvas the container is a **single node** with one **MIDI input**
+  (left) and one **stereo audio output** (right). Because node colour is inferred
+  from pins (`getVisualCategory`), a MIDI-in / audio-out node reads as an
+  **instrument** automatically — no special-case colour. Wire a MIDI source
+  (Timeline, Computer Keyboard, MIDI Input, …) into it and its audio out to a
+  Mixer / Output exactly like any built-in synth.
+- It ships with a default inner patch so it makes sound immediately: a **VoiceIn
+  puck → FM synth → VoiceOut puck**, at **8 voices**.
+
+### Drilling in — the scoped inner editor
+
+- **Double-click the container** to drill into its inner graph. The editor
+  enters a **scoped view**: it draws and hit-tests **only** the nodes that belong
+  to that container (`viewScope` in `node_graph_component.cpp`; `nodeVisible(n)`
+  ⇔ `n.voiceContainerId == viewScope`, `linkVisible(l)` ⇔ both endpoints
+  visible). Top-level nodes are hidden while you're inside; inner nodes are hidden
+  while you're at the top.
+- A **breadcrumb chip** (violet, top-left, "← Root / *name*") shows you're inside
+  a container. **Click the chip** or press **Esc** to pop back out to the top
+  level. The same scoped component is what would back a future detached pop-out
+  window.
+- Selection, hover, drag, rubber-band, "fit all", and link hit-testing all
+  respect the scope — you can only touch what you can see. **Global** passes
+  (save/load, audio-graph rebuild, latency/PDC walk) deliberately iterate the
+  **whole** graph regardless of scope, so the hidden nodes still process audio
+  and still get serialized.
+- **Nodes you create while scoped are auto-stamped into the container.** Any node
+  added from the right-click menu while `viewScope != -1` gets
+  `voiceContainerId = viewScope`, so it joins the patch you're editing rather than
+  landing at the top level. *(Known M1 gap: nodes created through an **async file
+  chooser** — hosted plugins, WASM modules, SoundFonts — currently land at the
+  top level even when you're scoped, because the chooser callback runs after the
+  scope-stamp pass. Drag them in or recreate them at the right level for now.)*
+
+### The boundary pucks: VoiceIn and VoiceOut
+
+Inside the container the patch is bounded by two special nodes, mirroring JUCE's
+`AudioGraphIOProcessor` I/O nodes and Max/PD inlets/outlets:
+
+- **VoiceIn** (left puck) — the origin of the per-note context. It has these
+  outputs:
+  - **MIDI** — this voice's note forwarded as a real MIDI stream (note-on at the
+    allocation offset, note-off on release). This is **fork (a)**: it lets any
+    existing MIDI-driven synth (FM, Waveform, SoundFont, a hosted plugin, …) work
+    inside a voice **unmodified** — the default patch uses exactly this.
+  - **Pitch** (Signal, Hz) — the note's frequency, written every sample.
+  - **Gate** (Signal, 0/1) — `1.0` while the note is held, `0.0` after note-off.
+  - **Velocity** (Signal, 0..1) — the note-on velocity, latched for the note.
+
+  The Pitch/Gate/Velocity outputs are **fork (b)**: the modular-synthesis path,
+  consumed by nodes that read control Signals directly (see Signal Oscillator
+  below). Pitch/Gate/Velocity arrive on control channels 2/3/4 of the buffer, the
+  standard Signal-pin-as-extra-channel mechanism.
+- **VoiceOut** (right puck) — the audio sink for the patch. Whatever you wire into
+  it is this voice's contribution; the container sums VoiceOut across all active
+  voices into its single output. It is mapped to the inner graph's output node the
+  same way the top-level **Output** node is.
+
+### The engine — `PolyVoiceProcessor`
+
+The container is realized as **one** `juce::AudioProcessor` (`PolyVoiceProcessor`,
+`poly_voice_processor.cpp`) inserted as a single node in the main JUCE graph, so
+main-graph mixing, routing, and plugin-delay compensation treat it like any other
+instrument. Internally:
+
+- **N inner-graph clones.** It builds **N independent `GraphProcessor` clones**,
+  each with `setBuildScope(containerId)` so `rebuildGraph` includes **only** that
+  container's inner nodes/links (the pre-existing nodeMap membership guard
+  auto-scopes the links — zero wiring duplication). All clones read the **same**
+  `Node` objects for parameters; they differ only in DSP state (oscillator phase,
+  filter memory, envelope stage) and per-voice context. Each clone runs via its
+  inner `getGraph()->processBlock(...)` (not `GraphProcessor::processBlock`, which
+  would re-inject the metronome and click).
+- **Voice allocation & lifecycle.** The container parses its incoming
+  `MidiBuffer`: a **note-on** allocates a free voice (or **steals the oldest** when
+  all N are busy), sets that voice's VoiceIn pitch/velocity, raises its gate, and
+  forwards the note as MIDI into the clone. A **note-off** drops that voice's gate;
+  the voice keeps running so its envelope release tail finishes.
+- **Voice-free detection.** A voice is reclaimed once its gate is released **and**
+  its output RMS has stayed below a floor (`kFloorRms = 1e-4`) for `kFreeMs = 250`
+  ms. CPU therefore scales with **active** polyphony, not N — idle voices are
+  skipped.
+
+### Signal Oscillator (the fork-(b) instrument)
+
+**Add Node → Signal Shape → Signal Oscillator (pitch/gate → tone)**
+creates a `SignalOscillatorProcessor` (`signal_oscillator.h`, dispatched as
+`NodeType::Instrument` with `script == "__signalosc__"`). It is the first node
+that **takes its note from control Signals instead of a MIDI stream**, which makes
+the VoiceIn Pitch/Gate/Velocity outputs real rather than decorative:
+
+- **Inputs (all Signal):** **Pitch** (Hz, read every sample → oscillator
+  frequency), **Gate** (0/1 — the envelope fires note-on on the rising edge and
+  note-off on the falling edge), **Velocity** (0..1 — latched on the gate's rising
+  edge, scales the envelope).
+- **Params:** **Waveform** (0 = sine, 1 = saw, 2 = square, 3 = triangle) and
+  **Volume**.
+- **Envelope:** it uses the **shared AHDSR** (`node.ahdsrEnvelope`), so
+  right-click → **Envelope (AHDSR)…** opens the normal envelope editor on it with
+  no special-casing (it isn't in the `ownEnvelope` exclusion list, so it counts as
+  a tonal synth). Default envelope: A 5 ms / D 100 ms / S 0.7 / R 300 ms.
+- **Monophonic by design.** It is deliberately a one-voice oscillator — polyphony
+  comes from the **container** cloning the patch, not from the oscillator. Dropped
+  outside a Voice container it still works as a standalone Signal-controlled tone
+  generator (wire any Signal source into Pitch/Gate/Velocity).
+
+To build a fully modular voice, drill into a Voice container, delete the default
+FM synth, drop in a Signal Oscillator, and wire **VoiceIn Pitch → Pitch**,
+**VoiceIn Gate → Gate**, **VoiceIn Velocity → Velocity**, then **Signal Oscillator
+audio → VoiceOut**.
+
+### Save / load, dirty tracking, undo
+
+Inner nodes and links serialize through the **same** generic path as any node —
+they just carry a `voiceContainerId` membership field that ties them to their
+container, plus the container's polyphony count. Container creation and all
+inner-graph edits go through the normal `commitSnapshot()` snapshot-undo path
+(they are topology changes), so they participate in dirty tracking and Ctrl+Z
+exactly like adding or rewiring any other node.
+
+### Known M1 limitations
+
+These are documented design boundaries for the first milestone, not bugs:
+
+- **Fixed N** chosen at creation (default 8); no live re-voice slider yet.
+- **Steal-oldest** only (quietest / round-robin are M2).
+- **Block-granular gates** — a note-on/off takes effect at the block boundary, not
+  the exact sample offset (sample-accurate gate timing is M2).
+- **No nested containers** — a Voice container can't live inside another.
+- **Async-file-chooser nodes land at top level when scoped** (see the scoped-editor
+  note above).
+- **End-to-end audio not yet auto-verified** — voice allocation/stealing has unit
+  coverage, but "do N voices sum correctly" is an auditory check that `--self-test`
+  can't make; play a chord into a container to confirm.
 
 ## Asset library (project stores)
 

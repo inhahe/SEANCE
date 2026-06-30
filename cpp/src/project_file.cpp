@@ -317,6 +317,11 @@ bool ProjectFile::writeProject(std::ostream& f, NodeGraph& graph,
             writeInt(f, "perfReleaseMode", node.performanceReleaseMode);
             writeInt(f, "perfVelocity", node.performanceVelocity ? 1 : 0);
         }
+        // Oscilloscope display settings - written only when non-default to keep
+        // files lean (only __oscilloscope__ nodes ever change these from default).
+        if (!node.scopeTriggered) writeInt(f, "scopeTriggered", 0);
+        if (node.scopeTrigLevel != 0.0f) writeFloat(f, "scopeTrigLevel", node.scopeTrigLevel);
+        if (!node.scopeTrigRising) writeInt(f, "scopeTrigRising", 0);
         if (node.mpeEnabled) {
             writeInt(f, "mpeEnabled", 1);
             writeInt(f, "mpePitchBendRange", node.mpePitchBendRange);
@@ -862,6 +867,9 @@ bool ProjectFile::readProject(std::istream& f, NodeGraph& graph, PluginHost* plu
             else if (key == "performanceMode") curNode->performanceMode = (val == "1");
             else if (key == "perfReleaseMode") curNode->performanceReleaseMode = std::stoi(val);
             else if (key == "perfVelocity") curNode->performanceVelocity = (val == "1");
+            else if (key == "scopeTriggered") curNode->scopeTriggered = (val == "1");
+            else if (key == "scopeTrigLevel") curNode->scopeTrigLevel = std::stof(val);
+            else if (key == "scopeTrigRising") curNode->scopeTrigRising = (val == "1");
             else if (key == "mpeEnabled") curNode->mpeEnabled = (val == "1");
             else if (key == "mpePitchBendRange") curNode->mpePitchBendRange = std::stoi(val);
             else if (key == "parentGroupId") curNode->parentGroupId = std::stoi(val);

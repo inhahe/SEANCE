@@ -404,6 +404,21 @@ struct Node {
 
     std::string script;
 
+    // Oscilloscope display settings (node.script == "__oscilloscope__").
+    //   scopeTriggered: true  = triggered acquisition - the display is aligned
+    //                           to a level crossing of the chosen slope so a
+    //                           periodic waveform appears stationary;
+    //                   false = roll mode - free-running strip chart, the most
+    //                           recent samples are drawn each frame (newest at
+    //                           the right edge), no edge alignment.
+    //   scopeTrigLevel:  trigger threshold in -1..1 (0 = zero crossing).
+    //   scopeTrigRising: edge slope to trigger on (true = rising, false = falling).
+    // Serialized in project_file.cpp only when non-default; defaults give a
+    // brand-new scope (and any pre-this-feature project) a stable triggered view.
+    bool  scopeTriggered = true;
+    float scopeTrigLevel = 0.0f;
+    bool  scopeTrigRising = true;
+
     // Performance mode - play preset melody by pressing any keys
     bool performanceMode = false;
     int performanceReleaseMode = 1;   // 0=OnKeyUp, 1=OnNextEvent (legato)

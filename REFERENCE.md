@@ -30,6 +30,7 @@ here.
 - [Convolution Filter](#convolution-filter)
 - [MIDI Modulator](#midi-modulator)
 - [Trigger Node](#trigger-node)
+- [Analyzer / visualizer nodes (Spectrum Analyzer, Oscilloscope, Spectrogram)](#analyzer--visualizer-nodes-spectrum-analyzer-oscilloscope-spectrogram)
 - [Script (signal + MIDI)](#script-signal--midi)
 - [Control Bank](#control-bank)
 - [Shared AHDSR envelope](#shared-ahdsr-envelope)
@@ -1600,6 +1601,30 @@ Five buttons replace the current rule list with a common starting configuration 
 ### Note traffic
 
 Stacking rules multiplies note traffic: a chord rule sends 3+ notes per incoming note; chaining triggers compounds further. Watch downstream synth voice counts.
+
+---
+
+## Analyzer / visualizer nodes (Spectrum Analyzer, Oscilloscope, Spectrogram)
+
+Three passthrough **Effect** nodes that tap the audio flowing through them and draw it in a non-modal, resizable floating window (double-click the node to open). Audio passes through unchanged, so they sit inline anywhere in a chain — drop one mid-signal to see what a specific effect or instrument is producing, distinct from the global **View → Spectrum Analyzer** which always measures the master output.
+
+All three share one backing class, `AnalyzerProcessor`, which copies each input block into a per-node ring buffer (`AnalyzerCapture`, 4096 samples, `analyzer_nodes.h`). The processor fills it on the audio thread; the editor component polls a snapshot at UI rate. The capture is looked up by node id through `AnalyzerCaptureRegistry` and held by `shared_ptr`, so it survives briefly after you disconnect the cable (you keep seeing the last buffer) and is freed once both the processor and editor let go.
+
+- **Spectrum Analyzer** (`__spectrum__`) — live FFT bar display. Bar count derives from the window width (~one bar per 4 px), so a wider window shows finer spectral detail; height scales the bars.
+- **Spectrogram** (`__spectrogram__`) — scrolling time-frequency waterfall; new FFT frames enter at the right and fade out at the left. Log-frequency vertical axis, magma colour ramp. The FFT size scales with window height (next power of two ≥ 2·H, capped at 4096), so a taller window resolves finer frequency detail.
+
+### Oscilloscope (`__oscilloscope__`)
+
+Time-domain waveform display; L (blue) and R (orange) overlaid. One pixel of canvas width = one captured sample, so dragging wider shows more samples per frame (capped at 4096 samples / ~93 ms @ 44.1 kHz once the ring fills — a "(buffer cap reached)" note appears at the cap). A top-right overlay shows the current sample count and equivalent time span.
+
+A control strip across the top picks the **acquisition mode**:
+
+- **Triggered** (default) — the trace is aligned to a **level crossing** of the chosen slope, so a periodic waveform appears stationary (classic oscilloscope sync). The scope snapshots a window up to twice as wide as it displays, then searches the early portion for the first sample where the L channel crosses the trigger **level** with the chosen **slope** (Rising: `prev < level && cur >= level`; Falling: `prev > level && cur <= level`) and draws forward from there. If no crossing is found it falls back to the most-recent N samples (so a flat/non-crossing signal still shows something). A faint dashed green line marks the trigger level.
+  - **Slope** button — toggles **Rising** / **Falling** (which direction the signal must cross the level to start the trace).
+  - **Level** slider — trigger threshold in **−1..1** (0 = zero crossing).
+- **Roll** — free-running strip chart: the newest N samples are drawn each frame with the newest at the right edge, no edge alignment. The Slope and Level controls grey out (their tooltip explains why and points back to Triggered mode).
+
+The mode, slope, and level persist on the node (`Node::scopeTriggered` / `scopeTrigLevel` / `scopeTrigRising`, serialized in `project_file.cpp` only when non-default — old projects without these keys open in Triggered mode at zero level / rising). Editing any control writes the node fields and calls `graph.commitSnapshot("Oscilloscope settings")`, so changes are undoable and mark the project dirty; the level slider commits once on drag-end rather than per tick.
 
 ---
 

@@ -120,18 +120,41 @@ private:
 
 // ==============================================================================
 // OscilloscopeComponent: time-domain waveform display.
+//
+// Two acquisition modes (persisted per-node, see Node::scopeTriggered):
+//   - Triggered: the trace is aligned to a level crossing of the chosen slope
+//     so a periodic waveform appears stationary (classic oscilloscope sync).
+//   - Roll: free-running strip chart - the most recent samples are drawn each
+//     frame with the newest at the right edge, no edge alignment.
+// A top control strip exposes the mode, the trigger slope (Rising/Falling), and
+// the trigger level; the slope/level controls grey out in Roll mode.
 // ==============================================================================
 class OscilloscopeComponent : public juce::Component, private juce::Timer {
 public:
     OscilloscopeComponent(NodeGraph& graph, int nodeId);
     void paint(juce::Graphics& g) override;
-    void resized() override {}
+    void resized() override;
     void timerCallback() override { repaint(); }
 
 private:
     NodeGraph& graph;
     int nodeId;
     std::shared_ptr<AnalyzerCapture> capture;
+
+    // Control strip widgets. Their state mirrors the persisted Node fields;
+    // edits push back to the node and commit one undo snapshot.
+    juce::ComboBox      modeBox;      // Triggered / Roll
+    juce::TextButton    slopeBtn;     // Rising / Falling (triggered only)
+    juce::Slider        levelSlider;  // trigger level -1..1 (triggered only)
+    juce::Label         levelLabel;   // "Level"
+    juce::TooltipWindow tooltips { this };
+
+    Node* findNode() const { return graph.findNode(nodeId); }
+    void loadControlsFromNode();      // widget state  <- node fields
+    void updateControlEnablement();   // grey slope/level in Roll mode (+ why tooltip)
+    void commitScopeSettings();       // node fields <- widgets, then commitSnapshot
+
+    static constexpr int kControlStripH = 30;
 };
 
 // ==============================================================================

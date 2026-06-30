@@ -42,6 +42,15 @@
 
 <p>The change takes effect instantly — you can switch modes while the music is playing and hear the difference on the next stolen note. Your choice is saved with the project.</p>
 
+<h2>Glide (sliding between notes)</h2>
+
+<p><strong>Glide</strong> — also called <em>portamento</em> — makes the pitch <em>slide</em> smoothly from one note to the next instead of jumping. It's the swooping sound of a synth lead bending into each note. <strong>Right-click the Voice node → Glide</strong> and pick how long the slide takes (Off, or 20 up to 400 milliseconds).</p>
+
+<div class="note">
+<strong>Glide only happens when notes overlap.</strong> A slide needs a starting pitch, so the pitch only glides when a voice that's already sounding gets handed a new note (i.e. you play the next note before releasing the last). Play notes with gaps between them and each one starts cleanly on pitch; play them overlapping (legato) and they slide into each other. That overlap rule is what makes glide feel musical rather than random — and with a single voice it gives you the classic mono-synth slide.</div>
+
+<p>However long the slide, the note still <em>starts</em> the instant you press the key — only the pitch takes its time catching up, so the rhythm stays tight. Like the other settings, glide changes apply immediately and are saved with your project.</p>
+
 <h2>Going inside — drill in</h2>
 
 <p><strong>Double-click the Voice node</strong> to go inside it. The graph editor switches to a <em>scoped view</em>: it now shows only the nodes that live inside this container, and hides everything at the top level. A small <strong>breadcrumb chip</strong> appears in the top-left corner ("← Root / Voice") to remind you where you are.</p>

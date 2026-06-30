@@ -6311,7 +6311,8 @@ void testVoiceContainerSaveLoad(Report& r) {
             {Pin{0, "MIDI", PinKind::Midi, true}},
             {Pin{0, "Audio", PinKind::Audio, false}}, {0.0f, 0.0f});
         c.voicePolyphony = 6;
-        c.voiceStealMode = 0;
+        c.voiceStealMode = 2;     // round-robin (non-default, to prove it round-trips)
+        c.voiceGlideMs   = 60.0f; // glide time (non-default)
         containerId = c.id;
     }
     int viMidi, synMidi, synAudio, voAudio;
@@ -6354,6 +6355,10 @@ void testVoiceContainerSaveLoad(Report& r) {
             "vc-saveload: container survives with its type");
     r.check(c != nullptr && c->voicePolyphony == 6,
             "vc-saveload: voicePolyphony round-trips");
+    r.check(c != nullptr && c->voiceStealMode == 2,
+            "vc-saveload: voiceStealMode round-trips");
+    r.check(c != nullptr && std::abs(c->voiceGlideMs - 60.0f) < 0.01f,
+            "vc-saveload: voiceGlideMs round-trips");
 
     Node* inner = dst.findNode(innerId);
     r.check(inner != nullptr && inner->voiceContainerId == containerId,

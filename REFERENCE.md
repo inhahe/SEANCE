@@ -2544,6 +2544,21 @@ instrument. Internally:
   with no graph rebuild. It snapshots for undo and saves with the project. The
   policy itself lives in the JUCE-free `VoiceAllocator` (`voice_allocator.h`),
   unit-tested in isolation.
+- **Glide (portamento).** Right-click the container → **Glide** to pick a slide
+  time (Off / 20 / 60 / 150 / 400 ms, radio-ticked). When a sounding voice is
+  **stolen** for a new note, its Pitch signal **slides** from the old note to the
+  new one over the glide time instead of jumping — a ramp linear in log-frequency
+  (constant semitones/sec), so an octave takes the same time as a tone. The **Gate
+  still steps instantly**, so the envelope retriggers on time even while the pitch
+  glides. A **fresh** voice (one that wasn't already sounding) has no meaningful
+  previous pitch and so starts **on pitch with no glide** — which means glide only
+  happens when notes **overlap** (classic fingered/legato portamento): with
+  polyphony 1, overlapping notes glide and gapped notes don't. The value lives in
+  `node.voiceGlideMs` (float, default 0), is re-read live each block by
+  `PolyVoiceProcessor` (passed to `VoiceIn` only on a steal), snapshots for undo,
+  and saves with the project. Implemented as a portamento ramp inside
+  `VoiceInProcessor` that persists across blocks (a glide longer than one buffer
+  keeps sliding).
 - **Voice-free detection.** A voice is reclaimed once its gate is released **and**
   its output RMS has stayed below a floor (`kFloorRms = 1e-4`) for `kFreeMs = 250`
   ms. CPU therefore scales with **active** polyphony, not N — idle voices are
@@ -2596,7 +2611,8 @@ These are documented design boundaries for the first milestone, not bugs:
   note above).
 
 > **M2 progress:** voice stealing now offers oldest / quietest / round-robin (was
-> oldest-only in M1) — see **Voice stealing** above. Gates are now
+> oldest-only in M1) — see **Voice stealing** above; **glide (portamento)** slides
+> the pitch when a voice is stolen — see **Glide** above. Gates are now
 > **sample-accurate**: a note-on/off in the Signal fork lands on its exact
 > within-block sample offset (VoiceIn writes Pitch/Gate/Velocity as a
 > piecewise-constant ramp rather than a flat per-block constant), matching the
@@ -2608,8 +2624,9 @@ modes (oldest / quietest / round-robin, including round-robin cursor reset and t
 "free slot wins over a steal" rule), note-matched release, and RMS free-detection on
 the pure `VoiceAllocator`; `testVoiceInSignals` drives a `VoiceInProcessor` directly
 and asserts the Pitch/Gate/Velocity edges land on their exact within-block sample
-offset (including multiple segments per block, carry across blocks, and reset); and
-`testVoiceContainerAudio` builds a real container
+offset (including multiple segments per block, carry across blocks, reset, and the
+glide ramp — start, monotonic slide, snap-to-target, hold, and a glide spanning
+multiple blocks); and `testVoiceContainerAudio` builds a real container
 (VoiceIn → Signal Oscillator → VoiceOut), drives it with a synthetic MIDI buffer
 through `PolyVoiceProcessor`, and asserts a held note makes a tone, three notes sum
 louder than one, and the voices decay back to silence after release.

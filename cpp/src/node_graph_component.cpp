@@ -193,6 +193,9 @@ juce::Colour NodeGraphComponent::getNodeColor(const Node& node) const {
         case NodeType::MidiInput:     return juce::Colour(50, 130, 70); // green - matches MIDI wire color
         case NodeType::MidiScript:    return juce::Colour(40, 140, 90); // green family - a MIDI generator
         case NodeType::MidiBreakout:  return juce::Colour(40, 140, 110); // MIDI green, control-signal tint
+        case NodeType::VoiceContainer: return juce::Colour(110, 60, 130); // polyphonic instrument wrapper - violet
+        case NodeType::VoiceIn:       return juce::Colour(50, 120, 110); // per-note context source - teal-green
+        case NodeType::VoiceOut:      return juce::Colour(110, 70, 90);  // inner audio sink - muted red (Output family)
         default:                      return juce::Colour(80, 80, 80);
     }
 }
@@ -2290,6 +2293,11 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
     instMenu.addItem(105, "SFZ Instrument (.sfz)...");
     instMenu.addItem(103, "Drum Machine");
     instMenu.addItem(106, "Analog Drum Synth");
+    instMenu.addSeparator();
+    // Voice container: a polyphonic wrapper whose inner patch (one VoiceIn ->
+    // synth -> VoiceOut subgraph) is instantiated once per simultaneous note.
+    // See poly-voice-architecture.md.
+    instMenu.addItem(150, "Voice (polyphonic)...");
     menu.addSubMenu("Instruments", instMenu);
 
     juce::PopupMenu fxMenu;
@@ -2441,6 +2449,80 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
                 {Pin{0, "In", PinKind::Audio, true}}, {}, {p.x, p.y});
         } else if (result == 5) {
             graph.createGroup("Group", {p.x, p.y});
+        } else if (result == 150) {
+            // Voice (polyphonic) container: a wrapper whose inner patch is
+            // instantiated once per simultaneous note and summed. Creating it
+            // also seeds a default inner patch (VoiceIn -> FM synth -> VoiceOut),
+            // all tagged with voiceContainerId = container.id so the top-level
+            // build skips them and each voice clone builds them in isolation.
+            // See poly-voice-architecture.md.
+            //
+            // addNode reallocates graph.nodes, so we capture stable node/pin IDs
+            // immediately after each creation and NEVER hold a Node& across the
+            // next addNode (CLAUDE.md no-dangling-references rule).
+
+            // 1. The container itself (MIDI in -> Audio out), at the top level.
+            int containerId;
+            {
+                auto& c = graph.addNode("Voice", NodeType::VoiceContainer,
+                    {Pin{0, "MIDI", PinKind::Midi, true}},
+                    {Pin{0, "Audio", PinKind::Audio, false}}, {p.x, p.y});
+                c.voicePolyphony = 8;
+                containerId = c.id;
+            }
+
+            // 2. Inner VoiceIn puck: per-note context source. Emits raw per-voice
+            //    MIDI plus Pitch(Hz)/Gate(0/1)/Velocity(0..1) Signal channels.
+            int voiceInMidiPin;
+            {
+                auto& vi = graph.addNode("Voice In", NodeType::VoiceIn, {},
+                    {Pin{0, "MIDI",     PinKind::Midi,   false},
+                     Pin{0, "Pitch",    PinKind::Signal, false, 1},
+                     Pin{0, "Gate",     PinKind::Signal, false, 1},
+                     Pin{0, "Velocity", PinKind::Signal, false, 1}},
+                    {p.x - 240.0f, p.y + 170.0f});
+                vi.voiceContainerId = containerId;
+                voiceInMidiPin = vi.pinsOut[0].id;
+            }
+
+            // 3. Inner synth (FM Synth by default) - MIDI in, Audio out. Same
+            //    defaults as the standalone FM Synth menu entry (result 107).
+            int synthMidiInPin, synthAudioOutPin;
+            {
+                auto& s = graph.addNode("FM Synth", NodeType::Instrument,
+                    {Pin{0, "MIDI", PinKind::Midi, true}},
+                    {Pin{0, "Audio", PinKind::Audio, false}}, {p.x, p.y + 170.0f});
+                s.voiceContainerId = containerId;
+                s.script = "__fmsynth__";
+                s.params.push_back({"Algorithm", 0.0f, 0.0f, 7.0f});
+                s.params.push_back({"Feedback",  0.3f, 0.0f, 1.0f});
+                s.params.push_back({"Volume",    0.5f, 0.0f, 1.0f});
+                for (int i = 1; i <= 4; ++i) {
+                    auto pp = "Op" + std::to_string(i) + " ";
+                    s.params.push_back({pp + "Ratio", (float)i, 0.1f, 16.0f});
+                    s.params.push_back({pp + "Level", i == 1 ? 1.0f : 0.5f, 0.0f, 1.0f});
+                }
+                ensureFmOpEnvelopes(s);
+                synthMidiInPin   = s.pinsIn[0].id;
+                synthAudioOutPin = s.pinsOut[0].id;
+            }
+
+            // 4. Inner VoiceOut sink: mapped to the inner graph's audio output.
+            int voiceOutAudioInPin;
+            {
+                auto& vo = graph.addNode("Voice Out", NodeType::VoiceOut,
+                    {Pin{0, "Audio", PinKind::Audio, true}}, {},
+                    {p.x + 240.0f, p.y + 170.0f});
+                vo.voiceContainerId = containerId;
+                voiceOutAudioInPin = vo.pinsIn[0].id;
+            }
+
+            // 5. Wire the default inner patch.
+            graph.addLink(voiceInMidiPin,   synthMidiInPin);
+            graph.addLink(synthAudioOutPin, voiceOutAudioInPin);
+
+            graph.commitSnapshot("Add Voice container");
+            if (onNodeEdited) onNodeEdited();
         } else if (result == 6) {
             // WASM Script - open file chooser
             auto chooser = std::make_shared<juce::FileChooser>(

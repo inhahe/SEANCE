@@ -5,6 +5,37 @@ top. When something is fixed, delete the entry (git history is the archive).
 
 ---
 
+## OPEN (dead code): measured-HRTF loaders for the 3D Spatializer are never called
+
+**Noticed:** 2026-06-30, while writing the REFERENCE.md section for the 3D
+Spatializer. The README lists "Measured HRTF datasets (SOFA / WAV)" under
+**Roadmap** (correct — it's not shipped), but there are two half-written loader
+functions that look like the feature is partly built and could mislead a future
+reader into thinking it just needs hooking up:
+
+- `Spatializer3DProcessor::loadHrtfDirectory` (`spatializer_3d.cpp:97`) — parses
+  `hrtf_az{N}_el{M}_L/R.wav` files into `measuredHrtfs`, plus
+  `selectMeasuredHrtf` (`:152`) to pick the nearest entry.
+- `HRTFTable::loadFromDirectory` (`hrtf_data.cpp:193`) — a *different* loader for
+  MIT-KEMAR-style `H{elev}e{azimuth}a.wav` names, with `hasExternalData()`.
+
+**Nothing calls any of them** (verified by grep): no UI, no menu item, no
+project-file hook. `Spatializer3DProcessor::processBlock` only ever calls
+`HRTFTable::instance().lookup()` (the synthetic spherical-head model), so even
+if `measuredHrtfs` were populated it would be ignored — `selectMeasuredHrtf`
+writes `currentIR_*` but `processBlock` immediately overwrites them from the
+synthetic table each block. There is also **no `.sofa` parser at all** despite
+the Roadmap wording.
+
+**Proper fix (when the Roadmap item is built):** decide on ONE loader path
+(fold the spatializer-local one into `HRTFTable` so the convolution actually
+reads measured IRs), add a real `.sofa` reader, and wire a "Load HRTF dataset…"
+action onto the node's right-click menu + a project-file field so the choice
+persists. Until then, the two stubs are dead weight — either build the feature
+or delete the stubs so they stop implying it's half-done.
+
+---
+
 ## OPEN (latent): node pin-vector mutations don't hold `mutationLock`
 
 **Noticed:** 2026-06-23, while fixing the new-MIDI-timeline crash

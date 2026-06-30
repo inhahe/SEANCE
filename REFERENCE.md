@@ -28,6 +28,7 @@ here.
 - [Effect layers and groups](#effect-layers-and-groups)
 - [Pitch Detector](#pitch-detector)
 - [Convolution Filter](#convolution-filter)
+- [3D Spatializer (binaural / holophonic)](#3d-spatializer-binaural--holophonic)
 - [MIDI Modulator](#midi-modulator)
 - [Trigger Node](#trigger-node)
 - [Analyzer / visualizer nodes (Spectrum Analyzer, Oscilloscope, Spectrogram)](#analyzer--visualizer-nodes-spectrum-analyzer-oscilloscope-spectrogram)
@@ -1530,6 +1531,40 @@ Maximum **4096 samples**. Longer files are truncated; the **IR Length** slider l
 ### Room IR capture
 
 **Tools → Capture Room IR…** opens the capture dialog. Plays a sine sweep through speakers, records the room with a microphone, deconvolves to produce an IR, and loads it into a new Convolution Filter node ready to use.
+
+---
+
+## 3D Spatializer (binaural / holophonic)
+
+Places a sound source anywhere in 3D space *around the listener's head* using **HRTF** (Head-Related Transfer Function) processing. This is the "holophonic" / binaural-audio effect — the technique behind binaural recordings where sounds seem to come from above, behind, or beside you. **It only works on headphones**: the left/right ear cues that create the illusion partly cancel when played over speakers.
+
+Add it via right-click → **Effects → 3D Spatializer (binaural / holophonic)** — it's at the bottom of the Effects submenu. The node has one **Audio In** and one stereo **Audio Out**; insert it anywhere in an audio chain (typically just before the Mixer/Output).
+
+### Position parameters
+
+Three knobs on the node define where the source sits relative to the listener:
+
+| Param | Range | Meaning |
+|-------|-------|---------|
+| **Azimuth** | −180°…+180° | Horizontal angle. `0` = dead ahead, `+90` = hard right, `−90` = hard left, `±180` = directly behind. |
+| **Elevation** | −90°…+90° | Vertical angle. `0` = ear level, `+90` = straight up, `−90` = straight down. |
+| **Distance** | 0…1 | `0` = close and loud, `1` = far and quiet. Implemented as a level attenuation (gain `1 / (1 + 3·distance)`); it does not add reverb or air-absorption colouring. |
+
+All three are ordinary modulatable params: automate them in a piano-roll automation lane, or drive them with a Param/Signal cable (on-demand modulation pin), to **move the source around the head in real time** — e.g. an LFO on Azimuth orbits the sound, an envelope on Distance makes it swoop in. Param changes are smoothed internally (one-pole, ~0.05/block) so fast modulation doesn't click, and the per-direction HRTF impulse response is crossfaded as the angle changes.
+
+### How the spatialisation works
+
+Per block the effect: (1) sums the input to mono, (2) looks up the binaural impulse-response pair (one per ear) for the current azimuth/elevation, (3) crossfades toward that IR to avoid clicks, (4) convolves the mono signal with each ear's 64-tap IR, and (5) applies the distance gain. The convolution tail is only 64 samples (≈1.5 ms at 44.1 kHz), so the node is effectively memoryless — it is not in the transport-panic reset list because there is no audible tail to cut.
+
+The HRTF itself comes from a **synthetic spherical-head model** (`HRTFTable`, in `hrtf_data.cpp`): Woodworth interaural-time-delay + frequency-dependent head-shadow low-pass + a pinna comb filter, precomputed at 13 azimuths × 14 elevations (182 direction pairs, 64 samples/ear). At runtime it bilinearly interpolates the four nearest grid points; negative azimuths reuse the mirrored positive-azimuth entry with the ears swapped.
+
+### Save / load and undo
+
+The node serialises generically — the `__spatializer3d__` script token plus the three params round-trip through save/load like any other effect. Creating the node is one `commitSnapshot` undo step; param-knob drags commit on release like every other param.
+
+### Known limitation — measured HRTF datasets are not wired up
+
+Loading **measured HRTF datasets** (MIT KEMAR / CIPIC / SOFA) is a README **Roadmap** item, not a shipped feature — and the half-written code for it is **not reachable**. Two loader stubs exist (`Spatializer3DProcessor::loadHrtfDirectory` for `hrtf_az*_el*_L.wav` files, and `HRTFTable::loadFromDirectory` for MIT-KEMAR-style names) but **nothing calls either function** — there is no UI, no menu item, no project-file hook, and no `.sofa` parser at all. The spatializer always uses the synthetic model above. Tracked in `known-issues.md`; until a loader is wired in, treat the 3D Spatializer as synthetic-HRTF-only.
 
 ---
 

@@ -267,6 +267,17 @@ private:
     // latency, so an all-zero graph does no work and draws no badges.
     std::unordered_map<int, int> latencyBadgeTotals;
     double latencyBadgeSampleRate = 0.0;
+
+    // Transient per-paint cache for freeze visibility. A node is "audibly inert"
+    // when every path it has to an Output/VoiceOut sink is walled off by an
+    // active freeze (a node currently substituted by its cache on the audio
+    // thread), so editing it can't change what you hear until that freeze is
+    // lifted. Maps the inert node's id -> the id of the frozen node responsible
+    // (for the "unfreeze X" tooltip hint), or -1 if it couldn't be attributed.
+    // Presence in the map == inert. Recomputed at the top of paint() via
+    // updateFreezeInertState(); empty (and free) whenever nothing is frozen.
+    std::unordered_map<int, int> freezeInertBy;
+    void updateFreezeInertState();
     // Right-click menu for a single pin (triggered anywhere across the pin's
     // row, including its label text). For a control-input pin (one bound to a
     // ModPin) this offers Switch Set/Mod and Remove; for any other pin it

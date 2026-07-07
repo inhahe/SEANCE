@@ -276,6 +276,11 @@ void NodeGraphComponent::paint(juce::Graphics& g) {
         }
     }
 
+    // Freeze visibility: work out which nodes are audibly inert (walled off from
+    // the output by an active downstream freeze) so drawNode can dim them and
+    // getTooltip can explain why. Bails immediately when nothing is frozen.
+    updateFreezeInertState();
+
     // Draw nodes
     for (auto& node : graph.nodes)
         if (nodeVisible(node))
@@ -295,6 +300,100 @@ void NodeGraphComponent::paint(juce::Graphics& g) {
 
     // Breadcrumb / exit-scope chip, drawn last so it sits above everything.
     drawBreadcrumb(g);
+}
+
+void NodeGraphComponent::updateFreezeInertState() {
+    freezeInertBy.clear();
+
+    // "Active freeze" = a node currently substituted by its cache on the audio
+    // thread (manual Freeze sets enabled + valid). These act as walls: the
+    // cached audio replaces everything upstream, and the node is swapped for a
+    // pure audio player that passes nothing through, so audio/MIDI/param routes
+    // into a freeze all dead-end there.
+    auto isFrozen = [](const Node& n) { return n.cache.enabled && n.cache.valid; };
+    bool anyFrozen = false;
+    for (auto& n : graph.nodes) if (isFrozen(n)) { anyFrozen = true; break; }
+    if (!anyFrozen) return; // nothing frozen -> nothing inert, no work
+
+    // Adjacency over cables of any kind (a frozen wall blocks every kind).
+    auto upstreamOf = [&](int nodeId, std::vector<int>& out) {
+        out.clear();
+        auto* node = graph.findNode(nodeId);
+        if (!node) return;
+        for (auto& link : graph.links)
+            for (auto& pin : node->pinsIn)
+                if (pin.id == link.endPin)
+                    for (auto& other : graph.nodes)
+                        for (auto& op : other.pinsOut)
+                            if (op.id == link.startPin)
+                                out.push_back(other.id);
+    };
+    auto downstreamOf = [&](int nodeId, std::vector<int>& out) {
+        out.clear();
+        auto* node = graph.findNode(nodeId);
+        if (!node) return;
+        for (auto& link : graph.links)
+            for (auto& pin : node->pinsOut)
+                if (pin.id == link.startPin)
+                    for (auto& other : graph.nodes)
+                        for (auto& ip : other.pinsIn)
+                            if (ip.id == link.endPin)
+                                out.push_back(other.id);
+    };
+
+    // Seed from the audible sinks in the current graph scope.
+    std::vector<int> sinks;
+    for (auto& n : graph.nodes)
+        if (n.type == NodeType::Output || n.type == NodeType::VoiceOut)
+            sinks.push_back(n.id);
+    if (sinks.empty()) return;
+
+    // Reverse reachability from the sinks. `freezeIsWall=false` reaches every
+    // node connected to a sink by any route; `true` stops at frozen nodes. A
+    // node that's in the first set but not the second is connected to output
+    // ONLY through a freeze -> audibly inert. (Disconnected nodes are in
+    // neither set, so they're never mis-flagged as freeze-blocked.)
+    auto reverseReach = [&](bool freezeIsWall) {
+        std::unordered_set<int> seen(sinks.begin(), sinks.end());
+        std::vector<int> stack = sinks, ups;
+        while (!stack.empty()) {
+            int cur = stack.back(); stack.pop_back();
+            if (freezeIsWall) {
+                auto* n = graph.findNode(cur);
+                bool isSeed = std::find(sinks.begin(), sinks.end(), cur) != sinks.end();
+                if (n && isFrozen(*n) && !isSeed) continue; // don't expand past a wall
+            }
+            upstreamOf(cur, ups);
+            for (int up : ups)
+                if (seen.insert(up).second)
+                    stack.push_back(up);
+        }
+        return seen;
+    };
+
+    auto connected = reverseReach(false);
+    auto audible   = reverseReach(true);
+
+    // Attribute each inert node to the nearest frozen node downstream of it, so
+    // the tooltip can say exactly which freeze to lift.
+    std::vector<int> downs;
+    for (auto& n : graph.nodes) {
+        if (isFrozen(n)) continue;
+        if (!connected.count(n.id) || audible.count(n.id)) continue;
+        int blocker = -1;
+        std::unordered_set<int> seen{n.id};
+        std::vector<int> stack{n.id};
+        while (!stack.empty() && blocker < 0) {
+            int cur = stack.back(); stack.pop_back();
+            downstreamOf(cur, downs);
+            for (int dn : downs) {
+                auto* dnNode = graph.findNode(dn);
+                if (dnNode && isFrozen(*dnNode)) { blocker = dn; break; }
+                if (seen.insert(dn).second) stack.push_back(dn);
+            }
+        }
+        freezeInertBy[n.id] = blocker;
+    }
 }
 
 void NodeGraphComponent::drawGrid(juce::Graphics& g) {
@@ -334,6 +433,18 @@ void NodeGraphComponent::drawNode(juce::Graphics& g, Node& node) {
                 : col.brighter(0.3f));
     g.drawRoundedRectangle(screenBounds, 6.0f * zoom,
                             (isSelected || isActiveEditor) ? 2.5f : 1.0f);
+
+    // Freeze visibility: a node whose every path to the output is walled off by
+    // an active downstream freeze is "audibly inert" - editing it changes
+    // nothing you can hear until that freeze is lifted. Veil it in desaturated
+    // slate (deliberately NOT the red mute overlay, and NOT plain grey-disabled,
+    // whose meaning is reserved for genuinely disabled controls) so the user
+    // isn't left tweaking a knob that silently does nothing. getTooltip() names
+    // the frozen node responsible and how to lift it.
+    if (freezeInertBy.count(node.id) > 0) {
+        g.setColour(juce::Colour(20, 24, 32).withAlpha(0.6f));
+        g.fillRoundedRectangle(screenBounds, 6.0f * zoom);
+    }
 
     // Title
     float fontSize = std::max(10.0f, 14.0f * zoom);
@@ -387,13 +498,15 @@ void NodeGraphComponent::drawNode(juce::Graphics& g, Node& node) {
         g.fillEllipse(dotX - 2 * zoom, barY - 1 * zoom, 4 * zoom, barH + 2 * zoom);
     }
 
-    // Cache indicator (top-right of title)
-    if (node.cache.valid) {
-        float indR = 4 * zoom;
-        float indX = titleArea.getRight() - indR * 2 - 4 * zoom;
-        float indY = titleArea.getCentreY() - indR;
+    // Freeze / cacheability indicator (top-right of title).
+    if (node.cache.enabled && node.cache.valid) {
+        // Playing from cache. Show an unmistakable "FROZEN" tag rather than the
+        // old 4px dot, which was far too subtle - users tweaked upstream knobs,
+        // heard nothing, and had no idea a freeze was in play.
+        auto tag = titleArea.removeFromRight(52 * zoom);
         g.setColour(node.cache.useDisk ? juce::Colours::cyan : juce::Colours::limegreen);
-        g.fillEllipse(indX, indY, indR * 2, indR * 2);
+        g.setFont(juce::Font(std::max(7.0f, 9.0f * zoom), juce::Font::bold));
+        g.drawText("FROZEN", tag, juce::Justification::centredRight);
     } else if (!node.cache.deterministic) {
         float indR = 4 * zoom;
         float indX = titleArea.getRight() - indR * 2 - 4 * zoom;
@@ -2144,6 +2257,23 @@ juce::String NodeGraphComponent::getTooltip() {
         if (getNodeScriptError && getNodeScriptError(node->id))
             return "Script error - this node's program failed to compile.\n"
                    "Open the editor (double-click) to see the error message.";
+        // Frozen node: it's playing from a cached render, so its upstream chain
+        // is silenced. Explain the state and how to undo it.
+        if (node->cache.enabled && node->cache.valid)
+            return "Frozen - this node is playing from a cached render to save CPU. "
+                   "Its upstream chain is dimmed and silent; edits up there won't be "
+                   "heard. Right-click -> Unfreeze to make it live again.";
+        // Inert node: an active freeze downstream is swallowing everything this
+        // node feeds, so nothing you change here is audible right now.
+        if (auto it = freezeInertBy.find(node->id); it != freezeInertBy.end()) {
+            juce::String who = "a node downstream";
+            if (auto* fz = graph.findNode(it->second))
+                who = "\"" + juce::String(fz->name) + "\"";
+            return "Inaudible right now - the frozen node " + who + " downstream is "
+                   "playing from its cache, so edits here won't be heard until you "
+                   "right-click it and choose Unfreeze. (You can still edit now to set "
+                   "it up for when you unfreeze.)";
+        }
         return paramRowTooltip(*node, canvasPos);
     }
     return {};

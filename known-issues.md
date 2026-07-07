@@ -5,6 +5,61 @@ top. When something is fixed, delete the entry (git history is the archive).
 
 ---
 
+## OPEN (planned refactor): batch-freeze N nodes in one render pass instead of N full renders
+
+**Noticed:** 2026-07-07, during the cache-design discussion. `freezeNode`
+(`main_window.cpp:3304`) does a **full-project offline render for every node the
+user freezes**. Freeze node A → render the whole song and capture A. Freeze node
+B → render the whole song *again* and capture B. Freezing N nodes therefore
+costs N full renders, even though a single traversal already computes every
+node's output — capturing several during one pass is nearly free.
+
+**Desired design (arm-then-render, multi-tap):**
+
+1. The user *arms* any number of nodes as freeze targets (a pending state,
+   e.g. an outlined FROZEN tag) without rendering anything yet.
+2. A single "Freeze armed nodes" command runs the graph **once**; every armed
+   node writes its output to its own cache during that one pass.
+3. All armed nodes flip to frozen together.
+
+Notes:
+- **Default to faster-than-realtime offline capture** (no audio device), which
+  is what `freezeNode` already does; a "capture while I listen" live mode is a
+  reasonable *option* but should not be the default (slower, less deterministic).
+- **Dependency ordering needs no special handling.** If armed node B is
+  downstream of armed node A, B's captured output legitimately already contains
+  A's contribution — freezing is about what a node *outputs*, not isolating it.
+  The single traversal gets this right for free.
+- **Prerequisite (freeze persistence) is now done** — freezes survive save/reload
+  (`project_file.cpp` serializes cache metadata; `rehydrateNodeCaches` re-attaches
+  the on-disk PCM by node id). Batch-freeze can now be built on top.
+
+---
+
+## OPEN (UX/naming): "auto-cache" menu label implies auto-freezing, which it doesn't do
+
+**Noticed:** 2026-07-07, same cache trace. The node right-click menu offers
+"Enable auto-cache" / "Disable auto-cache" (`node_graph_component.cpp:4509`,
+toggling `cache.autoCache`, default `true`). The name reads as "automatically
+freeze this node for me," but `autoCache` never renders a cache — nothing in the
+codebase autonomously freezes a node. `autoCache` is purely a **reuse +
+hash-invalidation gate**: it lets an *already-existing* cache be reused and
+auto-invalidated when inputs change (`AudioCacheManager::isCacheValid`,
+`audio_cache.cpp:162`). The only thing that ever *produces* a cache is the
+explicit "Freeze (cache audio)" command (or the Output-mix capture on stop,
+which is excluded from live substitution). In practice the hash-checked branch
+(`graph_processor.cpp:816`) barely fires for live interior-node playback at all;
+its real beneficiaries are offline export and the capture-from-song dialog,
+which use it to skip a redundant re-render.
+
+**Proper fix:** rename the toggle to something honest, e.g. "Reuse freeze until
+inputs change" (or fold it into the Freeze submenu as "Auto-invalidate on
+edit"), and update the tooltip to say it controls *reuse/invalidation*, not
+auto-freezing. No behavioral change needed — purely label + tooltip. Update
+REFERENCE.md's cache section in the same commit.
+
+---
+
 ## OPEN (dead code): measured-HRTF loaders for the 3D Spatializer are never called
 
 **Noticed:** 2026-06-30, while writing the REFERENCE.md section for the 3D

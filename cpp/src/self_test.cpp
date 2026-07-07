@@ -2433,6 +2433,76 @@ void testWarp(Report& r) {
         }
     }
 
+    // ---- Freeze persistence: node cache metadata round-trips through a save ---
+    // Regression for the "freezes don't survive save/reload" bug. A real save
+    // (writeProject with includeBlobs=true) must emit the freeze metadata for a
+    // disk-backed frozen node, and a reload must restore enabled/valid/useDisk/
+    // inputHash/sampleRate/numSamples so rehydrateNodeCaches can re-attach the
+    // PCM. Undo snapshots (includeBlobs=false) must NOT carry any of it - freeze
+    // state is out-of-band session state for undo, and reparsing a snapshot must
+    // never imply a disk cache. This test only exercises the metadata layer (no
+    // real PCM file), which is the part project_file.cpp owns.
+    {
+        NodeGraph g;
+        int aId = g.addNode("FrozenSynth", NodeType::Instrument, {},
+                            { Pin{0, "Audio Out", PinKind::Audio, false} }).id;
+        int bId = g.addNode("AutoOff", NodeType::Instrument, {},
+                            { Pin{0, "Audio Out", PinKind::Audio, false} }).id;
+        if (Node* a = g.findNode(aId)) {
+            a->cache.enabled = true;
+            a->cache.valid = true;
+            a->cache.useDisk = true;               // disk-backed freeze
+            a->cache.inputHash = 0xABCDEF1234567890ull;
+            a->cache.sampleRate = 48000.0;
+            a->cache.startSample = 0;
+            a->cache.numSamples = 123456;
+        }
+        // Node B: no freeze, but the user turned auto-cache OFF - a preference
+        // that must persist independently of any cached audio.
+        if (Node* b = g.findNode(bId))
+            b->cache.autoCache = false;
+
+        // Real save (blobs on) - freeze payload expected.
+        std::ostringstream oss;
+        ProjectFile::writeProject(oss, g, nullptr, /*includeView*/ true,
+                                  /*includeBlobs*/ true);
+        NodeGraph g2;
+        bool ld = ProjectFile::loadFromString(oss.str(), g2);
+        r.check(ld, "freeze persist: project round-trips");
+
+        const Node* a2 = g2.findNode(aId);
+        r.check(a2 && a2->cache.enabled && a2->cache.valid && a2->cache.useDisk,
+                "freeze persist: frozen flags survive save/reload");
+        if (a2) {
+            r.check(a2->cache.inputHash == 0xABCDEF1234567890ull,
+                    "freeze persist: inputHash survives (unsigned 64-bit)");
+            r.checkVal(std::abs(a2->cache.sampleRate - 48000.0) < 1.0,
+                       "freeze persist: sampleRate survives", (float)a2->cache.sampleRate);
+            r.checkVal(a2->cache.numSamples == 123456,
+                       "freeze persist: numSamples survives", (float)a2->cache.numSamples);
+        }
+        const Node* b2 = g2.findNode(bId);
+        r.check(b2 && !b2->cache.autoCache,
+                "freeze persist: auto-cache=off preference survives");
+        r.check(b2 && !b2->cache.valid && !b2->cache.enabled,
+                "freeze persist: non-frozen node stays unfrozen");
+
+        // Undo snapshot (blobs off) - NO freeze payload. The frozen node must
+        // come back with a default (non-frozen) cache so undo/redo never implies
+        // a disk cache that isn't there.
+        std::string snap = ProjectFile::serializeForUndo(g);
+        NodeGraph g3;
+        ProjectFile::loadFromString(snap, g3);
+        const Node* a3 = g3.findNode(aId);
+        r.check(a3 && !a3->cache.enabled && !a3->cache.valid && !a3->cache.useDisk,
+                "freeze persist: undo snapshot omits freeze payload");
+        const Node* b3 = g3.findNode(bId);
+        // autoCache is NOT gated on includeBlobs (it's a preference), so it
+        // still travels in snapshots.
+        r.check(b3 && !b3->cache.autoCache,
+                "freeze persist: auto-cache preference travels in snapshots too");
+    }
+
     // ---- Per-frame morph: two frames carry INDEPENDENT chains ----------------
     {
         // The whole point of moving the morph chain onto the frame: editing one

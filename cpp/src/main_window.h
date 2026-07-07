@@ -194,6 +194,12 @@ private:
     void showPluginPresets(int nodeId);
     void showMidiMap(int nodeId);
     void freezeNode(int nodeId);
+    // After loading a project from `projectPath`, point the cache manager at
+    // that project's soundshop_cache folder and re-attach each persisted freeze
+    // to its on-disk PCM file (lazy: the audio thread loads it on first use).
+    // Freezes whose cache file is missing are silently dropped so the node
+    // renders live instead of playing silence.
+    void rehydrateNodeCaches(const juce::String& projectPath);
     void syncCCMappingsToGraph();
     void syncCCMappingsFromGraph();
 

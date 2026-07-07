@@ -812,7 +812,17 @@ void GraphProcessor::rebuildGraph(NodeGraph& graph, Transport& transport) {
         bool useCache = false;
         if (node.type != NodeType::Output) {
             if (node.cache.enabled && node.cache.valid) {
-                useCache = true;
+                // Manual freeze. The PCM may live on disk rather than memory -
+                // memory is freed after a save (saveToDisk), and a freeze
+                // restored from a reloaded project comes back on-disk-only. Pull
+                // it in before playback. This is the same audio-thread disk read
+                // the auto-cache branch below already performs during a rebuild.
+                if (node.cache.useDisk && node.cache.left.empty())
+                    cacheManager.loadFromDisk(node);
+                // Only substitute the cache if we actually have PCM now. A
+                // missing disk file (project moved without its soundshop_cache
+                // folder) must fall through to a live render, not play silence.
+                useCache = !node.cache.left.empty();
             } else if (node.cache.autoCache && cacheManager.isCacheValid(node, graph)) {
                 // Auto-cache hit - try loading from disk if needed
                 if (node.cache.useDisk && node.cache.left.empty())

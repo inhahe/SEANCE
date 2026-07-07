@@ -362,6 +362,30 @@ bool ProjectFile::writeProject(std::ostream& f, NodeGraph& graph,
             writeFloat(f, "modImportPrevLoopStart", (float)node.modImportPrevLoopStart);
             writeFloat(f, "modImportPrevLoopEnd", (float)node.modImportPrevLoopEnd);
         }
+        // Audio cache / freeze state. The auto-cache toggle is a user preference
+        // (default true) so persist it whenever it's off, regardless of whether
+        // a cache exists. The freeze payload itself (enabled/valid/on-disk PCM)
+        // is only persisted on real saves - undo snapshots pass includeBlobs
+        // =false and must not carry freeze state (reparsing a snapshot must not
+        // touch the disk cache). The PCM lives in a sibling soundshop_cache/
+        // file named by node id; here we persist only the metadata needed to
+        // re-attach it on load (see rehydrateNodeCaches). saveProject runs
+        // saveToDisk before this, so a frozen node arrives here with
+        // useDisk=true and its buffers already flushed.
+        if (!node.cache.autoCache) writeInt(f, "cacheAuto", 0);
+        // Require useDisk: only freezes actually backed by a soundshop_cache/
+        // file are re-attachable on load. This also excludes the Output node's
+        // memory-only stop-capture cache (never flushed to disk - see
+        // saveProject), which is transient session state, not a saved freeze.
+        if (includeBlobs && node.cache.hasCachedAudio() && node.cache.useDisk) {
+            writeInt(f, "cacheEnabled", node.cache.enabled ? 1 : 0);
+            writeInt(f, "cacheValid", 1);
+            writeInt(f, "cacheUseDisk", node.cache.useDisk ? 1 : 0);
+            writeStr(f, "cacheHash", std::to_string(node.cache.inputHash));
+            writeFloat(f, "cacheSampleRate", (float)node.cache.sampleRate);
+            writeStr(f, "cacheStartSample", std::to_string(node.cache.startSample));
+            writeStr(f, "cacheNumSamples", std::to_string(node.cache.numSamples));
+        }
 
         for (auto& pin : node.pinsIn) {
             f << "[PinIn]\n";
@@ -911,6 +935,19 @@ bool ProjectFile::readProject(std::istream& f, NodeGraph& graph, PluginHost* plu
                 while (std::getline(ss, token, ','))
                     if (!token.empty()) curNode->childNodeIds.push_back(std::stoi(token));
             }
+            // Audio cache / freeze metadata (see writeProject). The on-disk PCM
+            // is re-attached after load by rehydrateNodeCaches, which resolves
+            // diskPath against the loaded file's soundshop_cache/ folder and
+            // drops the freeze if the file is gone. deterministic is left to
+            // AudioCacheManager::updateDeterminism (it depends on live CC maps).
+            else if (key == "cacheAuto") curNode->cache.autoCache = (val == "1");
+            else if (key == "cacheEnabled") curNode->cache.enabled = (val == "1");
+            else if (key == "cacheValid") curNode->cache.valid = (val == "1");
+            else if (key == "cacheUseDisk") curNode->cache.useDisk = (val == "1");
+            else if (key == "cacheHash") { try { curNode->cache.inputHash = std::stoull(val); } catch (...) {} }
+            else if (key == "cacheSampleRate") { try { curNode->cache.sampleRate = std::stod(val); } catch (...) {} }
+            else if (key == "cacheStartSample") { try { curNode->cache.startSample = std::stoll(val); } catch (...) {} }
+            else if (key == "cacheNumSamples") { try { curNode->cache.numSamples = std::stoll(val); } catch (...) {} }
             // NOTE: "modPin=" lines are parsed earlier (before the section
             // dispatch) because they are written after the [Param] blocks, so
             // the active section is "[Param]" — not "[Node]" — when they're

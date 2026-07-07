@@ -447,6 +447,7 @@ MainContentComponent::MainContentComponent() {
             {
                 std::lock_guard<std::recursive_mutex> graphLk(graph.mutationLock);
                 ProjectFile::load(startup.toStdString(), graph, nullptr);
+                rehydrateNodeCaches(startup);
             }
             if (graphComponent) graphComponent->notifyProjectLoaded();
             loaded = true;
@@ -463,6 +464,7 @@ MainContentComponent::MainContentComponent() {
             {
                 std::lock_guard<std::recursive_mutex> graphLk(graph.mutationLock);
                 ProjectFile::load(recentProjects[0].toStdString(), graph, nullptr);
+                rehydrateNodeCaches(recentProjects[0]);
             }
             // Re-apply the saved pan/zoom from the loaded graph (or fit-all
             // if none was persisted) on the next paint.
@@ -3207,6 +3209,7 @@ void MainContentComponent::openProjectFile(const juce::String& path) {
         // intact; beginAsyncPluginLoad() (below) instantiates them serially off
         // the lock so the nodes appear immediately and the UI stays responsive.
         ProjectFile::load(path.toStdString(), graph, nullptr);
+        rehydrateNodeCaches(path);
         upgradeLegacyNodes();
 
         // Embed baked formula cycles for old projects (#crash-python314). A
@@ -3381,6 +3384,45 @@ void MainContentComponent::freezeNode(int nodeId) {
             node->name.c_str(), (long long)totalSamples, totalSeconds);
 }
 
+void MainContentComponent::rehydrateNodeCaches(const juce::String& projectPath) {
+    // ProjectFile::load restored each node's cache *metadata* (enabled/valid/
+    // useDisk/inputHash/sampleRate/numSamples) but no PCM - that lives in a
+    // sibling soundshop_cache/node_<id>.cache file. Point the cache manager at
+    // that folder and re-attach each persisted freeze to its file, lazily: the
+    // audio thread pages the samples in on first playback (graph_processor's
+    // cache branch). If a freeze's file is missing (project copied without its
+    // cache folder), drop the freeze so the node renders live rather than
+    // playing silence.
+    auto projFile = juce::File(projectPath);
+    auto cacheDir = projFile.getParentDirectory().getChildFile("soundshop_cache");
+    auto& cm = audioEngine.getGraphProcessor().getCacheManager();
+    cm.setCacheDir(cacheDir.getFullPathName().toStdString());
+
+    for (auto& n : graph.nodes) {
+        // Only nodes that came back marked as an on-disk cache need re-attaching.
+        // (A cacheValid node with useDisk=false would have carried its PCM in
+        // memory, but we never serialize the samples themselves, so in practice
+        // every persisted freeze is useDisk=true. Guard on it anyway.)
+        if (!(n.cache.valid && n.cache.useDisk)) continue;
+        auto file = cacheDir.getChildFile("node_" + juce::String(n.id) + ".cache");
+        if (file.existsAsFile()) {
+            n.cache.diskPath = file.getFullPathName().toStdString();
+            n.cache.left.clear();   // lazy - paged in on first use
+            n.cache.right.clear();
+        } else {
+            // Cache file gone - forget the freeze entirely so the node plays
+            // live. Leaving valid=true would route it through a silent cache.
+            n.cache.valid = false;
+            n.cache.enabled = false;
+            n.cache.useDisk = false;
+            n.cache.numSamples = 0;
+            n.cache.diskPath.clear();
+            fprintf(stderr, "Freeze cache missing for node %d ('%s') - node will "
+                    "render live.\n", n.id, n.name.c_str());
+        }
+    }
+}
+
 void MainContentComponent::syncCCMappingsToGraph() {
     auto mappings = audioEngine.getGraphProcessor().getAutomation().getCCMappings();
     graph.ccMappings.clear();
@@ -3424,9 +3466,22 @@ void MainContentComponent::saveProject(std::function<void()> onSaved) {
     auto projFile = juce::File(ProjectFile::currentPath);
     cm.setCacheDir(projFile.getParentDirectory()
         .getChildFile("soundshop_cache").getFullPathName().toStdString());
-    for (auto& n : graph.nodes)
-        if (n.cache.valid && n.cache.numSamples > 0 && !n.cache.left.empty())
+    for (auto& n : graph.nodes) {
+        // The Output node's cache is transient live-capture state (populated on
+        // Play->Stop, read from memory by the song-capture dialog and never
+        // played back from the graph's cache branch). Persisting/flushing it
+        // would both bloat saves and break the in-memory song cache, so skip it.
+        if (n.type == NodeType::Output) continue;
+        if (!(n.cache.valid && n.cache.numSamples > 0)) continue;
+        // A freeze restored from a reloaded project (or one whose memory was
+        // freed by a prior save) is on-disk-only. Page it back in so saveToDisk
+        // can (re)write it under this project's cache dir - crucial for Save As,
+        // where the destination folder differs from where the PCM lives now.
+        if (n.cache.left.empty() && n.cache.useDisk)
+            cm.loadFromDisk(n);
+        if (!n.cache.left.empty())
             cm.saveToDisk(n, audioEngine.getSampleRate());
+    }
     cm.cleanupStaleFiles(graph);
 
     ProjectFile::save(ProjectFile::currentPath, graph, &audioEngine.getGraphProcessor());

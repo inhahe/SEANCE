@@ -13090,8 +13090,9 @@ void LayeredWaveEditorComponent::resized() {
     }
 
     // Middle: either the layered-frame layer rows + viewport, the embedded
-    // spectral / wavelet / granular sub-editor, or a placeholder for frame
-    // types that don't yet have a dedicated editor (currently SampleFrame).
+    // spectral / wavelet / granular / inharmonic sub-editor, or a placeholder
+    // for frame types that don't yet have a dedicated editor (currently
+    // SampleFrame).
     // + Layer is meaningful ONLY for LayeredWaveform; we hide it for every
     // other type so the user isn't offered an action that doesn't apply.
     const bool haveFrame = (currentEditingFrame() != nullptr);
@@ -13111,11 +13112,12 @@ void LayeredWaveEditorComponent::resized() {
     //      (or has no editor type) - the embed is left over from a
     //      previous binding and would hide the +Layer button + rows.
     //   2. embeddedFrameEditor is null (or wrong type), but the current
-    //      frame is spectral/wavelet/granular - we'd fall through to the
-    //      "no editor for this type" placeholder.
+    //      frame is spectral/wavelet/granular/inharmonic - we'd fall through
+    //      to the "no editor for this type" placeholder.
     // Either way, kick a rebuildRows() to reconcile, which itself calls
     // updateFrameEditorEmbed().
-    const bool embedNeeded   = (tid == "spectral" || tid == "wavelet" || tid == "granular");
+    const bool embedNeeded   = (tid == "spectral" || tid == "wavelet" || tid == "granular"
+                                || tid == "inharmonic");
     const bool embedMatches  = embeddedFrameEditor && embeddedFrameType == tid;
     const bool embedStale    = haveFrame &&
                                ((embedNeeded != (embeddedFrameEditor != nullptr))

@@ -381,7 +381,7 @@ This is one of the things that sets SEANCE apart from typical home DAWs. Three i
 
 ### Audio I/O
 
-- **VST3 plugin hosting** on all platforms; **AU** on macOS; **LV2 / LADSPA** on Linux.
+- **VST3 plugin hosting** on all platforms; **LV2** on all platforms; **AU** on macOS; **LADSPA** on Linux.
 - **Export to WAV, FLAC, OGG, Opus, M4A, WMA.** Choose format, channels (mono/stereo), sample rate, and format-specific options (bit depth, quality, or bitrate) upfront, then pick a filename.
 - **Pitch shifting / time stretching** via Rubber Band.
 - **ASIO support** on Windows for low-latency hardware audio.

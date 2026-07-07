@@ -25,21 +25,21 @@ void PluginHost::scanForPlugins(const std::vector<std::string>& dirs,
     availablePlugins.clear();
     knownPlugins->clear();
 
+    // Scan every format the build registered. addDefaultFormatsToManager only
+    // adds formats enabled via the JUCE_PLUGINHOST_* compile flags (VST3 + LV2
+    // everywhere, AU on macOS, LADSPA on Linux), so iterating all of them is
+    // exactly the supported set — no need to hardcode a name allow-list.
     for (auto* format : formatManager.getFormats()) {
         auto name = format->getName();
-        if (name != "VST3" && name != "AudioUnit")
-            continue;
-
         fprintf(stderr, "Scanning %s plugins...\n", name.toRawUTF8());
 
-        // Build search paths from user dirs, or use defaults
-        juce::FileSearchPath searchPaths;
-        if (dirs.empty()) {
-            searchPaths = format->getDefaultLocationsToSearch();
-        } else {
-            for (auto& d : dirs)
-                searchPaths.add(juce::File(d));
-        }
+        // Search the user-configured dirs AND this format's own default install
+        // locations. Merging both matters for formats like LV2 whose standard
+        // paths (e.g. the Windows/Linux LV2 dirs) aren't in the user list — a
+        // VST3-only user dir list would otherwise hide every LV2 plugin.
+        juce::FileSearchPath searchPaths = format->getDefaultLocationsToSearch();
+        for (auto& d : dirs)
+            searchPaths.addIfNotAlreadyThere(juce::File(d));
 
         juce::File deadPluginsFile; // could persist this to skip known-bad files
         juce::PluginDirectoryScanner scanner(

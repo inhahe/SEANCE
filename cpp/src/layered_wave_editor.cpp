@@ -1607,14 +1607,24 @@ public:
         // viewport takes the middle and scrolls.
         const int bottomReserved = btnRowGap + btnH + warpGap + warpH;
         auto listArea = a.removeFromTop(std::max(60, a.getHeight() - bottomReserved));
+
+        // "+ Partial" lives in a header row at the TOP of the partial list, so
+        // the "add another element to the stack" action sits in the same place
+        // as the layered editor's "+ Layer" button (which anchors the top of its
+        // layer list). Same left-aligned position and width (110 px) for
+        // cross-editor muscle memory.
+        auto addRow = listArea.removeFromTop(btnH);
+        addBtn.setBounds(addRow.removeFromLeft(110));
+        listArea.removeFromTop(4);
+
         headerLabel.setBounds(listArea.removeFromTop(headerH));
         partialsViewport.setBounds(listArea);
         layoutPartialsContent();
 
+        // Bottom row keeps the stack-level actions (Bell preset, Preview). The
+        // "add" button used to live here too; it moved to the list header above.
         a.removeFromTop(btnRowGap);
         auto btnRow = a.removeFromTop(btnH);
-        addBtn.setBounds(btnRow.removeFromLeft(96));
-        btnRow.removeFromLeft(8);
         bellBtn.setBounds(btnRow.removeFromLeft(72));
         btnRow.removeFromLeft(8);
         playBtn.setBounds(btnRow.removeFromLeft(80));

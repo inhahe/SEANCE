@@ -5,37 +5,6 @@ top. When something is fixed, delete the entry (git history is the archive).
 
 ---
 
-## OPEN (planned refactor): batch-freeze N nodes in one render pass instead of N full renders
-
-**Noticed:** 2026-07-07, during the cache-design discussion. `freezeNode`
-(`main_window.cpp:3304`) does a **full-project offline render for every node the
-user freezes**. Freeze node A → render the whole song and capture A. Freeze node
-B → render the whole song *again* and capture B. Freezing N nodes therefore
-costs N full renders, even though a single traversal already computes every
-node's output — capturing several during one pass is nearly free.
-
-**Desired design (arm-then-render, multi-tap):**
-
-1. The user *arms* any number of nodes as freeze targets (a pending state,
-   e.g. an outlined FROZEN tag) without rendering anything yet.
-2. A single "Freeze armed nodes" command runs the graph **once**; every armed
-   node writes its output to its own cache during that one pass.
-3. All armed nodes flip to frozen together.
-
-Notes:
-- **Default to faster-than-realtime offline capture** (no audio device), which
-  is what `freezeNode` already does; a "capture while I listen" live mode is a
-  reasonable *option* but should not be the default (slower, less deterministic).
-- **Dependency ordering needs no special handling.** If armed node B is
-  downstream of armed node A, B's captured output legitimately already contains
-  A's contribution — freezing is about what a node *outputs*, not isolating it.
-  The single traversal gets this right for free.
-- **Prerequisite (freeze persistence) is now done** — freezes survive save/reload
-  (`project_file.cpp` serializes cache metadata; `rehydrateNodeCaches` re-attaches
-  the on-disk PCM by node id). Batch-freeze can now be built on top.
-
----
-
 ## OPEN (UX/naming): "auto-cache" menu label implies auto-freezing, which it doesn't do
 
 **Noticed:** 2026-07-07, same cache trace. The node right-click menu offers

@@ -714,6 +714,13 @@ struct Node {
     };
     AudioCache cache;
 
+    // Transient (NOT serialized): the node is armed as a target for the next
+    // batch "Freeze armed nodes" pass. Arming is a pending user action, not
+    // saved project state - a reload starts with nothing armed. Multiple nodes
+    // can be armed, then frozen together in a single render pass (freezeNodes)
+    // rather than one full-project render each. Cleared when the freeze runs.
+    bool armedForFreeze = false;
+
     // Effect regions: time-bounded activation of links/groups on this track.
     // Drawn as colored bars on the track's timeline. Each region gates either
     // a single link (linkId >= 0) or an entire effect group (groupId >= 0).

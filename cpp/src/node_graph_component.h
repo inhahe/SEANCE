@@ -69,6 +69,10 @@ public:
     std::function<void(int)> onShowPluginPresets; // called with node ID
     std::function<void(int)> onShowMidiMap;       // called with node ID
     std::function<void(int)> onFreezeNode;        // called with node ID
+    // Batch freeze: freeze every currently-armed node in a single render pass.
+    // main_window collects graph.nodes where armedForFreeze==true and calls
+    // freezeNodes(). No-op if nothing is armed.
+    std::function<void()> onFreezeArmedNodes;
     std::function<void(int)> onRunScript;         // called with node ID
     std::function<void(juce::String)> onOpenHelpDoc; // called with docs/<file> relative path
     // Fire a one-shot manual trigger on the live SignalShape processor for

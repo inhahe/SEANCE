@@ -507,6 +507,14 @@ void NodeGraphComponent::drawNode(juce::Graphics& g, Node& node) {
         g.setColour(node.cache.useDisk ? juce::Colours::cyan : juce::Colours::limegreen);
         g.setFont(juce::Font(std::max(7.0f, 9.0f * zoom), juce::Font::bold));
         g.drawText("FROZEN", tag, juce::Justification::centredRight);
+    } else if (node.armedForFreeze) {
+        // Armed as a target for the next batch-freeze pass. Amber "ARMED" tag so
+        // the user can see, at a glance, exactly which nodes will be captured
+        // when they choose "Freeze N armed nodes".
+        auto tag = titleArea.removeFromRight(48 * zoom);
+        g.setColour(juce::Colours::orange);
+        g.setFont(juce::Font(std::max(7.0f, 9.0f * zoom), juce::Font::bold));
+        g.drawText("ARMED", tag, juce::Justification::centredRight);
     } else if (!node.cache.deterministic) {
         float indR = 4 * zoom;
         float indX = titleArea.getRight() - indR * 2 - 4 * zoom;
@@ -4636,6 +4644,18 @@ void NodeGraphComponent::showNodeMenu(Node& node) {
         menu.addItem(10, "Unfreeze (disable cache)");
     else
         menu.addItem(10, "Freeze (cache audio)");
+    // Batch freeze: arm this node, then freeze all armed nodes in one render.
+    if (!node.cache.enabled) {
+        menu.addItem(12, node.armedForFreeze ? "Disarm from batch freeze"
+                                             : "Arm for batch freeze",
+                     true, node.armedForFreeze);
+        int armedCount = 0;
+        for (auto& n : graph.nodes) if (n.armedForFreeze) ++armedCount;
+        if (armedCount > 0)
+            menu.addItem(13, "Freeze " + juce::String(armedCount) +
+                             " armed node" + (armedCount == 1 ? "" : "s") +
+                             " (one pass)");
+    }
     menu.addItem(11, node.cache.autoCache ? "Disable auto-cache" : "Enable auto-cache",
                  true, node.cache.autoCache);
     if (node.cache.valid)
@@ -4883,6 +4903,12 @@ void NodeGraphComponent::showNodeMenu(Node& node) {
                 node->cache.valid = false;
                 if (onFreezeNode) onFreezeNode(nodeId);
             }
+        } else if (result == 12) {
+            // Toggle arm-for-batch-freeze (transient; not serialized).
+            node->armedForFreeze = !node->armedForFreeze;
+        } else if (result == 13) {
+            // Freeze every armed node in a single render pass.
+            if (onFreezeArmedNodes) onFreezeArmedNodes();
         } else if (result == 11) {
             node->cache.autoCache = !node->cache.autoCache;
             if (!node->cache.autoCache) node->cache.invalidate();

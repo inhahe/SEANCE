@@ -413,6 +413,11 @@ MainContentComponent::MainContentComponent() {
     graphComponent->onShowPluginPresets = [this](int nodeId) { showPluginPresets(nodeId); };
     graphComponent->onShowMidiMap = [this](int nodeId) { showMidiMap(nodeId); };
     graphComponent->onFreezeNode = [this](int nodeId) { freezeNode(nodeId); };
+    graphComponent->onFreezeArmedNodes = [this]() {
+        std::vector<int> armed;
+        for (auto& n : graph.nodes) if (n.armedForFreeze) armed.push_back(n.id);
+        if (!armed.empty()) freezeNodes(armed);
+    };
     graphComponent->onRunScript = [this](int nodeId) { showScriptConsoleForNode(nodeId); };
     graphComponent->onOpenHelpDoc = [this](juce::String rel) { openHelpDoc(rel); };
     graphComponent->onSignalShapeManualTrigger = [this](int nodeId) {
@@ -3304,84 +3309,175 @@ void MainContentComponent::openProjectFile(const juce::String& path) {
     }
 }
 
-void MainContentComponent::freezeNode(int nodeId) {
-    auto* node = graph.findNode(nodeId);
-    if (!node) return;
+namespace {
+// A sink AudioProcessor added to the offline render graph as an extra fan-out
+// from a target node's output. It records every sample it receives so, after a
+// single full-project render, each armed node's *own* output is captured in its
+// tap - correctly isolating the node's signal instead of the full mix. This is
+// what makes batch freeze one render pass for N nodes AND fixes the old
+// single-node freeze bug (which stored the whole output mix).
+class FreezeTapProcessor : public juce::AudioProcessor {
+public:
+    FreezeTapProcessor()
+        : juce::AudioProcessor(BusesProperties().withInput(
+              "Tap", juce::AudioChannelSet::stereo(), true)) {}
+    const juce::String getName() const override { return "Freeze Tap"; }
+    void prepareToPlay(double, int) override {}
+    void releaseResources() override {}
+    void reserveSamples(int64_t n) {
+        left.reserve((size_t)std::max<int64_t>(0, n));
+        right.reserve((size_t)std::max<int64_t>(0, n));
+    }
+    void processBlock(juce::AudioBuffer<float>& buf, juce::MidiBuffer&) override {
+        const int n = buf.getNumSamples();
+        const int ch = buf.getNumChannels();
+        const float* l = ch > 0 ? buf.getReadPointer(0) : nullptr;
+        const float* r = ch > 1 ? buf.getReadPointer(1) : l;
+        for (int s = 0; s < n; ++s) {
+            left.push_back(l ? l[s] : 0.0f);
+            right.push_back(r ? r[s] : 0.0f);
+        }
+    }
+    double getTailLengthSeconds() const override { return 0; }
+    bool acceptsMidi() const override { return false; }
+    bool producesMidi() const override { return false; }
+    bool isBusesLayoutSupported(const BusesLayout&) const override { return true; }
+    juce::AudioProcessorEditor* createEditor() override { return nullptr; }
+    bool hasEditor() const override { return false; }
+    int getNumPrograms() override { return 1; }
+    int getCurrentProgram() override { return 0; }
+    void setCurrentProgram(int) override {}
+    const juce::String getProgramName(int) override { return {}; }
+    void changeProgramName(int, const juce::String&) override {}
+    void getStateInformation(juce::MemoryBlock&) override {}
+    void setStateInformation(const void*, int) override {}
 
-    // Calculate project length in beats
+    std::vector<float> left, right;
+};
+} // namespace
+
+void MainContentComponent::freezeNode(int nodeId) {
+    freezeNodes({ nodeId });
+}
+
+void MainContentComponent::freezeNodes(const std::vector<int>& nodeIds) {
+    // Resolve targets: existing, non-Output nodes only (the Output sink is never
+    // cached - it's the mix bus). De-dupe.
+    std::vector<int> targets;
+    for (int id : nodeIds) {
+        auto* n = graph.findNode(id);
+        if (!n || n->type == NodeType::Output) continue;
+        if (std::find(targets.begin(), targets.end(), id) == targets.end())
+            targets.push_back(id);
+    }
+    if (targets.empty()) return;
+
+    // Project length in beats (+ a tail so release/reverb aren't chopped).
     float maxBeat = 0;
     for (auto& n : graph.nodes)
         for (auto& c : n.clips)
             maxBeat = std::max(maxBeat, c.startBeat + c.lengthBeats);
     if (maxBeat <= 0) maxBeat = 4;
-    maxBeat += 4; // tail
+    maxBeat += 4;
 
     double sr = audioEngine.getSampleRate();
     if (sr <= 0) sr = 48000;
-    int blockSize = 512;
+    const int blockSize = 512;
 
     double totalSeconds = transport.tempoMap.beatsToSeconds(maxBeat);
     int64_t totalSamples = (int64_t)(totalSeconds * sr);
+    if (totalSamples <= 0) return;
 
-    // Offline render of the entire graph, capturing this node's output
     Transport offlineTransport;
     offlineTransport.bpm = graph.bpm;
     offlineTransport.tempoMap = transport.tempoMap;
     offlineTransport.sampleRate = sr;
     offlineTransport.playing = true;
 
-    // Temporarily disable this node's cache to get fresh render
-    node->cache.valid = false;
+    // Clear each target's existing cache so the offline render re-computes it
+    // live (otherwise a stale freeze would feed its own cache back into the tap).
+    for (int id : targets) {
+        auto* n = graph.findNode(id);
+        n->cache.valid = false;
+        n->cache.enabled = false;
+    }
 
     GraphProcessor offlineGP;
     offlineGP.prepare(graph, sr, blockSize);
     offlineGP.rebuildGraph(graph, offlineTransport);
+
+    auto* jg = offlineGP.getGraph();
+    if (!jg) return;
+    const auto& nodeMap = offlineGP.getNodeMap();
+
+    // Add one tap per target, wired as an extra fan-out from the target's output
+    // (nodeMap = the OUTPUT side, i.e. the pan node when one exists). Keep raw
+    // pointers to the taps so we can read them back after the render.
+    std::vector<std::pair<int, FreezeTapProcessor*>> taps; // (nodeId, tap)
+    for (int id : targets) {
+        auto it = nodeMap.find(id);
+        if (it == nodeMap.end()) continue;
+        auto srcJuceId = it->second;
+        auto* srcNode = jg->getNodeForId(srcJuceId);
+        if (!srcNode || !srcNode->getProcessor()) continue;
+        int outCh = srcNode->getProcessor()->getTotalNumOutputChannels();
+
+        auto tapProc = std::make_unique<FreezeTapProcessor>();
+        tapProc->reserveSamples(totalSamples);
+        auto* tapRaw = tapProc.get();
+        auto tapNode = jg->addNode(std::move(tapProc));
+        if (!tapNode) continue;
+
+        for (int ch = 0; ch < std::min(2, outCh); ++ch)
+            jg->addConnection({ { srcJuceId, ch }, { tapNode->nodeID, ch } });
+
+        taps.push_back({ id, tapRaw });
+    }
+    if (taps.empty()) return;
+
+    // Re-prepare so the newly-added taps are folded into the render sequence.
+    // prepare() does NOT rebuild the graph, so the taps and their connections
+    // survive.
     offlineGP.prepare(graph, sr, blockSize);
 
-    // Allocate cache
-    node->cache.left.resize(totalSamples, 0.0f);
-    node->cache.right.resize(totalSamples, 0.0f);
-    node->cache.sampleRate = sr;
-    node->cache.startSample = 0;
-    node->cache.numSamples = totalSamples;
-
-    // Render full project, capturing from the graph
-    // We render the whole graph and then read the node's contribution
-    // For simplicity, render the full mix - the cache represents this node's output
+    // Single offline render of the whole project. Each tap accumulates its
+    // node's output as the render proceeds.
+    juce::AudioBuffer<float> buf(2, blockSize);
     for (int64_t pos = 0; pos < totalSamples; pos += blockSize) {
         int thisBlock = (int)std::min((int64_t)blockSize, totalSamples - pos);
         offlineTransport.positionSamples = pos;
-
-        // Process through the JUCE graph
-        juce::AudioBuffer<float> buf(2, thisBlock);
+        buf.setSize(2, thisBlock, false, false, true);
         buf.clear();
         juce::MidiBuffer midi;
-
-        auto* juceGraph = offlineGP.getGraph();
-        if (juceGraph)
-            juceGraph->processBlock(buf, midi);
-
-        // Get this node's processor output
-        auto* proc = offlineGP.getProcessorForNode(nodeId);
-        if (proc) {
-            // The processor already ran as part of the graph.
-            // For the cache we store the full mix reaching this node.
-            // This is a simplification - ideally we'd tap the node's output only.
-        }
-
-        // Store the mix (this captures everything up to and including this node)
-        for (int s = 0; s < thisBlock; ++s) {
-            node->cache.left[pos + s] = buf.getSample(0, s);
-            node->cache.right[pos + s] = buf.getSample(1, s);
-        }
+        jg->processBlock(buf, midi);
     }
 
-    node->cache.valid = true;
-    node->cache.enabled = true;
-    graph.dirty = true;
+    // Move each tap's captured PCM into its node's cache and mark it frozen.
+    auto& cm = offlineGP.getCacheManager();
+    cm.updateDeterminism(graph);
+    for (auto& [id, tap] : taps) {
+        auto* node = graph.findNode(id);
+        if (!node) continue;
+        int64_t captured = (int64_t)std::min(tap->left.size(), tap->right.size());
+        node->cache.left = std::move(tap->left);
+        node->cache.right = std::move(tap->right);
+        node->cache.sampleRate = sr;
+        node->cache.startSample = 0;
+        node->cache.numSamples = captured;
+        node->cache.useDisk = false;
+        node->cache.valid = true;
+        node->cache.enabled = true;
+        node->cache.inputHash = cm.computeNodeHash(*node, graph);
+        node->armedForFreeze = false;
 
-    fprintf(stderr, "Froze node '%s': %lld samples (%.1f sec)\n",
-            node->name.c_str(), (long long)totalSamples, totalSeconds);
+        fprintf(stderr, "Froze node '%s': %lld samples (%.1f sec)\n",
+                node->name.c_str(), (long long)captured, totalSeconds);
+    }
+
+    graph.dirty = true;
+    projectDirty = true;
+    // Apply the freezes to the live graph immediately.
+    audioEngine.getGraphProcessor().requestRebuild();
 }
 
 void MainContentComponent::rehydrateNodeCaches(const juce::String& projectPath) {

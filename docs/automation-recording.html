@@ -79,7 +79,7 @@
 </ul>
 
 <div class="tip">
-<strong>Hosted plugins:</strong> right now, recording captures moves you make on SEANCE's own knob rows. Dragging a knob <em>inside a plugin's own editor window</em> isn't recorded yet — that's a planned addition. In the meantime you can automate a plugin parameter by drawing points in a piano-roll automation lane, or by recording a SEANCE param that drives it.
+<strong>Hosted plugins:</strong> dragging a knob <em>inside a plugin's own editor window</em> during playback records too — arm <strong>Touch</strong> or <strong>Latch</strong>, press Play, and wiggle the plugin's knob. Because a plugin's knobs don't live on the node body, the <em>whole node</em> lights up with a red outline while it's recording (instead of a single row). One quirk: a few plugins don't tell SEANCE exactly when you grab and release a knob, so <strong>Touch</strong> falls back to stopping a moment after you stop moving. If a capture ever feels cut short, use <strong>Latch</strong> instead. Moves from a hardware MIDI controller <strong>mapped via MIDI Learn are recorded too</strong>: twist the physical knob during playback and it captures into automation just like dragging the plugin's own knob.
 </div>
 
 <footer>

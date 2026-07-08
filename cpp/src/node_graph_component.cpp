@@ -501,6 +501,20 @@ void NodeGraphComponent::drawNode(juce::Graphics& g, Node& node) {
         g.drawText("A:" + tagStr, tag, juce::Justification::centred);
     }
 
+    // Hosted-plugin recording indicator. Plugin params have no param rows to
+    // glow, so when the user is actively recording a knob-drag from the plugin's
+    // own editor we outline the whole node in red (mirrors the per-row recording
+    // glow used for native params).
+    {
+        bool pluginRecording = false;
+        for (auto& kv : node.pluginParamRec)
+            if (kv.second.writing) { pluginRecording = true; break; }
+        if (pluginRecording) {
+            g.setColour(juce::Colour(220, 60, 60).withAlpha(0.9f));
+            g.drawRoundedRectangle(screenBounds, 6.0f * zoom, std::max(1.5f, 2.5f * zoom));
+        }
+    }
+
     // Pan indicator (small bar in title)
     if (node.pan != 0.0f && zoom > 0.4f) {
         float barW = 30 * zoom;

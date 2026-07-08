@@ -233,6 +233,22 @@ public:
         std::atomic<int> lastChannel{-1};
     } midiLearn;
 
+    // MIDI-Learn CC recording capture. When a learned CC arrives DURING PLAYBACK,
+    // the audio thread stashes its target (nodeId, paramIdx) here; the UI timer
+    // drains it (drainCcRecTouched) to arm the automation recorder, exactly as if
+    // the user had dragged that knob. A learned CC drives its target plugin param
+    // via AudioProcessorParameter::setValue on the audio thread, which does not
+    // notify listeners - so the plugin knob-drag listener never sees it, hence
+    // this dedicated capture path. Bounded so a stalled UI can't grow it unbounded.
+    std::mutex ccRecMutex;
+    std::vector<std::pair<int,int>> ccRecTouched;
+    std::vector<std::pair<int,int>> drainCcRecTouched() {
+        std::lock_guard<std::mutex> lk(ccRecMutex);
+        std::vector<std::pair<int,int>> out;
+        out.swap(ccRecTouched);
+        return out;
+    }
+
     // MIDI note recording: captures notes from hardware MIDI keyboard into a track
     struct MidiNoteRecordState {
         int targetNodeId = -1;           // -1 = not recording

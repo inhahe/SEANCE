@@ -1145,6 +1145,12 @@ void MainContentComponent::timerCallback() {
     else if (!transport.playing && recPrevPlaying) endAutomationPass();
     recPrevPlaying = transport.playing;
 
+    // Fold in any hosted-plugin knob-drags (from the plugin's own editor) that
+    // the audio/plugin thread queued since the last tick, flipping per-param
+    // writing flags. Always drained (so the queue can't grow unbounded); only
+    // acted on while the transport is rolling.
+    processPluginParamEvents();
+
     // Record (capture) and read (playback) automation during playback. Both run
     // in this one loop so point-writing lives in a single place; the UI controls
     // only flip per-param recWriting via handleParamGesture().
@@ -1177,6 +1183,53 @@ void MainContentComponent::timerCallback() {
                         float normalized = (val - p.minVal) /
                             std::max(0.001f, p.maxVal - p.minVal);
                         autoValues.push_back({node.id, pi, juce::jlimit(0.0f, 1.0f, normalized)});
+                    }
+                }
+            }
+
+            // ---- Hosted-plugin param lanes (no Param rows) ----
+            // Record axis: sample the live normalized value straight off the
+            // processor for every plugin param currently writing. Read axis:
+            // drive muted-unless-ignored plugin params from their lane. Both use
+            // normalized (0..1) values - what AudioProcessorParameter wants.
+            if (node.plugin) {
+                auto* proc = audioEngine.getGraphProcessor().getProcessorForNode(node.id);
+                int nParams = proc ? (int)proc->getParameters().size() : 0;
+
+                // Record: writing plugin params sampled from the processor.
+                for (auto& kv : node.pluginParamRec) {
+                    auto& rec = kv.second;
+                    if (!rec.writing) continue;
+                    int idx = kv.first;
+                    // Touch fallback for gesture-less plugins: end the write once
+                    // the knob has been idle past a short window (a real gesture
+                    // end, when present, has already cleared writing).
+                    if (!rec.gestureActive
+                        && resolveArmModeNode(graph.autoArmGlobal, node) == AutoArmMode::Touch
+                        && (juce::Time::getMillisecondCounterHiRes() - rec.lastChangeMs) > 250.0) {
+                        rec.writing = false;
+                        rec.recLastBeat = -1.0f;
+                        continue;
+                    }
+                    if (proc && idx >= 0 && idx < nParams) {
+                        float v = proc->getParameters()[idx]->getValue();
+                        recordAutomationPointLane(node.pluginParamAutomation[idx],
+                                                  rec.recLastBeat, rec.recDidWrite, beat, v);
+                    }
+                }
+
+                // Read: drive plugin params from their lanes (unless muted).
+                if (!node.ignoreAutomation && proc) {
+                    for (auto& lkv : node.pluginParamAutomation) {
+                        int idx = lkv.first;
+                        auto recIt = node.pluginParamRec.find(idx);
+                        if (recIt != node.pluginParamRec.end() && recIt->second.writing)
+                            continue; // don't read-drive a param we're recording
+                        auto& lane = lkv.second;
+                        if (lane.points.empty() || idx < 0 || idx >= nParams) continue;
+                        float val = lane.evaluate(beat);
+                        if (val >= -0.5f)
+                            autoValues.push_back({node.id, idx, juce::jlimit(0.0f, 1.0f, val)});
                     }
                 }
             }
@@ -2951,6 +3004,23 @@ void MainContentComponent::beginAutomationPass() {
             bool absLocked = p.modulated && graph.paramHasAbsoluteInput(node.id, pi);
             p.recWriting = (m == AutoArmMode::Write) && !absLocked;
         }
+
+        // Hosted-plugin params: clear last pass's transient rec state. A node
+        // resolving to Write flattens ALL its plugin params to static this pass,
+        // so pre-arm one rec entry per plugin param (Touch/Latch arm on the
+        // user's first knob-drag instead, via processPluginParamEvents).
+        node.pluginParamRec.clear();
+        if (node.plugin
+            && resolveArmModeNode(graph.autoArmGlobal, node) == AutoArmMode::Write) {
+            if (auto* proc = audioEngine.getGraphProcessor().getProcessorForNode(node.id)) {
+                int n = (int)proc->getParameters().size();
+                for (int i = 0; i < n; ++i) {
+                    auto& rec = node.pluginParamRec[i];
+                    rec.writing = true;
+                    rec.recLastBeat = -1.0f;
+                }
+            }
+        }
     }
 }
 
@@ -2973,6 +3043,18 @@ void MainContentComponent::endAutomationPass() {
             p.recLastBeat = -1.0f;
             p.recDidWrite = false;
         }
+
+        // Hosted-plugin param lanes: thin the ones we recorded into. Values are
+        // normalized (0..1), so a fixed small eps applies to every param.
+        for (auto& kv : node.pluginParamRec) {
+            if (kv.second.recDidWrite) {
+                auto lit = node.pluginParamAutomation.find(kv.first);
+                if (lit != node.pluginParamAutomation.end())
+                    simplifyAutomationLane(lit->second, 0.005f);
+                anyRecorded = true;
+            }
+        }
+        node.pluginParamRec.clear();
     }
     if (anyRecorded) {
         graph.dirty = true;
@@ -3006,6 +3088,72 @@ void MainContentComponent::handleParamGesture(int nodeId, int paramIdx, bool beg
         if (m == AutoArmMode::Touch) {
             p.recWriting = false;
             p.recLastBeat = -1.0f;
+        }
+    }
+}
+
+void MainContentComponent::processPluginParamEvents() {
+    // Drain queued hosted-plugin knob events (see GraphProcessor::drainParamEvents)
+    // and flip per-plugin-param writing flags, mirroring handleParamGesture for
+    // native params. Draining always happens so the queue can't grow unbounded;
+    // events only take effect while the transport is rolling. kind: 0=gestureBegin
+    // 1=gestureEnd 2=parameterChanged. Many plugins never send gestures and only
+    // fire parameterChanged - in that case Touch arms on the first change and ends
+    // via the idle timeout in timerCallback (keyed off lastChangeMs).
+    // Always drain BOTH queues (plugin gesture events + learned-CC touches) so
+    // neither grows unbounded, but only act on them while the transport rolls.
+    auto events = audioEngine.getGraphProcessor().drainParamEvents();
+    auto ccTouchedEarly = audioEngine.drainCcRecTouched();
+    if (!transport.playing) return;
+
+    const double nowMs = juce::Time::getMillisecondCounterHiRes();
+    for (auto& ev : events) {
+        auto* node = graph.findNode(ev.nodeId);
+        if (!node || !node->plugin) continue; // only hosted plugins have these
+        AutoArmMode m = resolveArmModeNode(graph.autoArmGlobal, *node);
+        if (m == AutoArmMode::Off) continue; // hard gate / not armed
+        auto& rec = node->pluginParamRec[ev.paramIdx];
+        rec.lastChangeMs = nowMs;
+        switch (ev.kind) {
+            case 0: // gesture begin
+                rec.gestureActive = true;
+                if (m == AutoArmMode::Touch || m == AutoArmMode::Latch) {
+                    rec.writing = true;
+                    rec.recLastBeat = -1.0f; // fresh punch-in segment
+                }
+                break;
+            case 1: // gesture end
+                rec.gestureActive = false;
+                if (m == AutoArmMode::Touch) {
+                    rec.writing = false;
+                    rec.recLastBeat = -1.0f;
+                }
+                break;
+            case 2: // parameterChanged - covers gesture-less plugins
+                if (!rec.gestureActive && !rec.writing
+                    && (m == AutoArmMode::Touch || m == AutoArmMode::Latch)) {
+                    rec.writing = true;
+                    rec.recLastBeat = -1.0f;
+                }
+                break;
+        }
+    }
+
+    // MIDI-Learn CC moves. A learned CC that drives a plugin param is applied on
+    // the audio thread via setValue (no listener callback), so it arrives here via
+    // AudioEngine's dedicated capture queue instead of drainParamEvents. Treat each
+    // touch like a gesture-less parameterChanged: arm Touch/Latch and let the timer
+    // sample the (already CC-driven) live value + end Touch on the idle timeout.
+    for (auto& [nodeId, paramIdx] : ccTouchedEarly) {
+        auto* node = graph.findNode(nodeId);
+        if (!node || !node->plugin) continue; // learned CC only reaches plugin params
+        AutoArmMode m = resolveArmModeNode(graph.autoArmGlobal, *node);
+        if (m != AutoArmMode::Touch && m != AutoArmMode::Latch) continue;
+        auto& rec = node->pluginParamRec[paramIdx];
+        rec.lastChangeMs = nowMs;
+        if (!rec.gestureActive && !rec.writing) {
+            rec.writing = true;
+            rec.recLastBeat = -1.0f;
         }
     }
 }

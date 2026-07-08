@@ -444,6 +444,14 @@ bool ProjectFile::writeProject(std::ostream& f, NodeGraph& graph,
               << "," << mp.depth
               << "," << (mp.mode == Node::ModPin::Mode::Absolute ? 1 : 0) << "\n";
         }
+        // Recorded automation for hosted-plugin params (node-scope, since plugin
+        // params have no [Param] block). One line per point: pluginAuto=<paramIdx>,
+        // <beat>,<normValue>. Values are normalized 0..1. Emitted only for lanes
+        // that actually hold points, so plain plugin nodes stay unchanged.
+        for (auto& kv : node.pluginParamAutomation) {
+            for (auto& ap : kv.second.points)
+                f << "pluginAuto=" << kv.first << "," << ap.beat << "," << ap.value << "\n";
+        }
         for (auto& clip : node.clips) {
             f << "[Clip]\n";
             writeStr(f, "name", clip.name);
@@ -787,6 +795,21 @@ bool ProjectFile::readProject(std::istream& f, NodeGraph& graph, PluginHost* plu
             else if (key == "soloed") curNode->soloed = (val == "1");
             else if (key == "armMode") curNode->armMode = (AutoArmMode)std::stoi(val);
             else if (key == "ignoreAuto") curNode->ignoreAutomation = (val == "1");
+            else if (key == "pluginAuto") {
+                // pluginAuto=<paramIdx>,<beat>,<normValue> - one recorded point on
+                // a hosted-plugin param lane (see writeProject).
+                auto c1 = val.find(',');
+                auto c2 = (c1 == std::string::npos) ? std::string::npos
+                                                    : val.find(',', c1 + 1);
+                if (c1 != std::string::npos && c2 != std::string::npos) {
+                    try {
+                        int idx = std::stoi(val.substr(0, c1));
+                        float beat = std::stof(val.substr(c1 + 1, c2 - c1 - 1));
+                        float v = std::stof(val.substr(c2 + 1));
+                        curNode->pluginParamAutomation[idx].points.push_back({ beat, v });
+                    } catch (...) {}
+                }
+            }
             else if (key == "scriptLines") {
                 // New multi-line-safe format (see writeProject above).
                 int n = 0;
@@ -813,7 +836,7 @@ bool ProjectFile::readProject(std::istream& f, NodeGraph& graph, PluginHost* plu
                     val.rfind("__multisampler__:", 0) == 0) {
                     static const std::set<std::string> kNodeKeys = {
                         "id", "name", "type", "posX", "posY", "muted",
-                        "soloed", "armMode", "ignoreAuto", "script", "scriptLines",
+                        "soloed", "armMode", "ignoreAuto", "pluginAuto", "script", "scriptLines",
                         "midiInputSourceId", "envAttackCurve",
                         "envDecayCurve", "envReleaseCurve", "envAtkPt",
                         "envDecPt", "envRelPt", "ahdsrEnvelope",

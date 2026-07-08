@@ -1706,6 +1706,74 @@ void testTerrainData(Report& r, const juce::File& dir) {
                     "autocascade: per-param bypass suppresses read");
         }
 
+        // ---- hosted-plugin param automation lanes: round-trip + helpers ------
+        // Plugin params have no Param row, so their recorded lanes live in
+        // Node::pluginParamAutomation (normalized 0..1) and serialize via
+        // pluginAuto= lines. The actual knob-drag capture needs a live plugin
+        // (covered manually - see known-issues.md), but the data plumbing,
+        // node-scope resolver, and lane recorder are testable here.
+        {
+            NodeGraph g;
+            auto& n = g.addNode("vst", NodeType::Effect, {}, {});
+            // Param 4: a two-point sweep; param 9: a single point.
+            n.pluginParamAutomation[4].points = { {0.0f, 0.10f}, {8.0f, 0.90f} };
+            n.pluginParamAutomation[9].points = { {2.0f, 0.50f} };
+
+            std::ostringstream oss;
+            ProjectFile::writeProject(oss, g, nullptr, false, false);
+            NodeGraph g2;
+            std::istringstream iss(oss.str());
+            ProjectFile::readProject(iss, g2, nullptr);
+
+            r.check(g2.nodes.size() == 1, "pluginauto: node round-trips");
+            auto& n2 = g2.nodes[0];
+            r.check(n2.pluginParamAutomation.size() == 2,
+                    "pluginauto: both plugin lanes round-trip");
+            auto it4 = n2.pluginParamAutomation.find(4);
+            auto it9 = n2.pluginParamAutomation.find(9);
+            r.check(it4 != n2.pluginParamAutomation.end()
+                    && it4->second.points.size() == 2,
+                    "pluginauto: lane[4] keeps both points");
+            r.check(it9 != n2.pluginParamAutomation.end()
+                    && it9->second.points.size() == 1,
+                    "pluginauto: lane[9] keeps its point");
+            if (it4 != n2.pluginParamAutomation.end() && it4->second.points.size() == 2) {
+                r.check(std::abs(it4->second.points[1].beat - 8.0f) < 1e-3f
+                        && std::abs(it4->second.points[1].value - 0.90f) < 1e-3f,
+                        "pluginauto: lane[4] point values round-trip");
+            }
+            // A plain plugin node with no lanes emits no pluginAuto= lines.
+            r.check(oss.str().find("pluginAuto=") != std::string::npos,
+                    "pluginauto: pluginAuto lines are emitted when lanes exist");
+
+            // Node-scope resolver: hard Off gate + node override + inherit.
+            Node pn; pn.armMode = AutoArmMode::Latch;
+            r.check(resolveArmModeNode(AutoArmMode::Off, pn) == AutoArmMode::Off,
+                    "pluginauto: node resolver honours the global Off gate");
+            r.check(resolveArmModeNode(AutoArmMode::Touch, pn) == AutoArmMode::Latch,
+                    "pluginauto: node override beats global");
+            Node pn2; // Inherit
+            r.check(resolveArmModeNode(AutoArmMode::Touch, pn2) == AutoArmMode::Touch,
+                    "pluginauto: node inherits global when unset");
+
+            // Lane recorder: an overwrite sweep replaces the just-passed span.
+            AutomationLane lane;
+            float last = -1.0f; bool did = false;
+            recordAutomationPointLane(lane, last, did, 0.0f, 0.2f);
+            recordAutomationPointLane(lane, last, did, 1.0f, 0.4f);
+            recordAutomationPointLane(lane, last, did, 2.0f, 0.6f);
+            r.check(did && lane.points.size() == 3,
+                    "pluginauto: lane recorder appends points forward");
+            // Re-sweep from 1.0 overwrites the (1,2] span instead of layering.
+            last = -1.0f;
+            recordAutomationPointLane(lane, last, did, 1.0f, 0.4f);
+            recordAutomationPointLane(lane, last, did, 2.0f, 0.9f);
+            bool has2 = false; int count2 = 0;
+            for (auto& p : lane.points) if (std::abs(p.beat - 2.0f) < 1e-4f) { has2 = true; ++count2; }
+            r.check(has2 && count2 == 1,
+                    "pluginauto: overwrite sweep replaces (not layers) the span");
+        }
+
         // ---- backward-compat: legacy inline base64 blob still loads ---------
         // Old projects embedded the grid as gzip+base64 in the 4th field (no
         // store). make/parse with a null store reproduce and decode that form.

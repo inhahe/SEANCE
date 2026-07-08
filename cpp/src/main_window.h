@@ -80,6 +80,7 @@ public:
     void beginAutomationPass();  // play-start: arm every Write-resolved param
     void endAutomationPass();    // stop: simplify recorded lanes + one snapshot
     void handleParamGesture(int nodeId, int paramIdx, bool begin); // Touch/Latch arm
+    void processPluginParamEvents(); // drain hosted-plugin knob events into rec state
     void syncAutoButton();       // refresh the transport Auto button label + colour
     bool recPrevPlaying = false; // edge-detect play<->stop transitions in timer
 

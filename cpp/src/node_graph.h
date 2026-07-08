@@ -201,6 +201,18 @@ enum class AutoArmMode {
     Write
 };
 
+// Short human label for an AutoArmMode (menus, tooltips, effective-state UI).
+inline const char* autoArmModeName(AutoArmMode m) {
+    switch (m) {
+        case AutoArmMode::Inherit: return "Inherit";
+        case AutoArmMode::Off:     return "Off";
+        case AutoArmMode::Touch:   return "Touch";
+        case AutoArmMode::Latch:   return "Latch";
+        case AutoArmMode::Write:   return "Write";
+    }
+    return "Off";
+}
+
 struct Param {
     std::string name;
     float value;
@@ -231,6 +243,24 @@ struct Param {
     // baseValue/value are split or identical this block.
     float baseValue = 0.0f;
     bool  modulated = false;
+
+    // Transient automation-recording state (NOT serialized). Driven by the
+    // playback timer's capture loop, never by save/load.
+    //   recWriting  - true while this param should have its live value written
+    //                 into `automation` each tick. Set on a Touch/Latch gesture
+    //                 begin, or at play-start for a Write-resolved param;
+    //                 cleared on release (Touch) or transport stop (all).
+    //   recLastBeat - sweep cursor: the last beat a point was written in the
+    //                 CURRENT contiguous write segment (-1 = segment not started
+    //                 yet). Reset to -1 on a Touch release so the next punch-in
+    //                 starts a fresh sweep and the untouched gap keeps its
+    //                 existing automation instead of being wiped.
+    //   recDidWrite - true if ANY point was written this pass (survives Touch
+    //                 punch-out unlike recLastBeat). Drives end-of-pass
+    //                 simplify + one-snapshot; cleared when the pass ends.
+    bool  recWriting = false;
+    float recLastBeat = -1.0f;
+    bool  recDidWrite = false;
 
     // Warp slot key (unified warp/morph model). >= 0 marks this as the
     // modulation param for warp-chain op `warpSlot` (0-based); -1 = not a warp
@@ -800,6 +830,61 @@ inline AutoArmMode resolveArmMode(AutoArmMode global, const Node& node, const Pa
 // bypassed. Both are non-destructive mutes (the lane points are preserved).
 inline bool automationReadEnabled(const Node& node, const Param& param) {
     return !node.ignoreAutomation && !param.bypassAutomation;
+}
+
+// Record one automation point for a param at the current playhead beat, called
+// once per timer tick while `p.recWriting` is set. As the playhead sweeps
+// forward, existing points in the just-passed span (recLastBeat, beat] are
+// removed and replaced (so re-recording over a region overwrites rather than
+// layering). A backward jump (loop wrap) starts a fresh sweep segment. Points
+// are kept sorted by beat via ordered insert. The dense per-tick points are
+// thinned by simplifyAutomationLane() at end of pass.
+inline void recordAutomationPoint(Param& p, float beat, float value) {
+    auto& pts = p.automation.points;
+    if (p.recLastBeat >= 0.0f && beat >= p.recLastBeat) {
+        // Overwrite-sweep: drop existing points in (recLastBeat, beat].
+        const float lo = p.recLastBeat, hi = beat;
+        pts.erase(std::remove_if(pts.begin(), pts.end(),
+            [lo, hi](const AutomationPoint& ap) {
+                return ap.beat > lo + 1e-6f && ap.beat <= hi + 1e-6f;
+            }), pts.end());
+    }
+    // Avoid an exact-duplicate point when the playhead hasn't advanced.
+    if (!pts.empty() && std::abs(pts.back().beat - beat) < 1e-6f
+        && p.recLastBeat >= 0.0f && beat >= p.recLastBeat) {
+        pts.back().value = value;
+    } else {
+        // Ordered insert (points beyond `beat` may exist from prior recordings
+        // or authored automation, so append-then-hope is not safe).
+        auto it = std::lower_bound(pts.begin(), pts.end(), beat,
+            [](const AutomationPoint& ap, float b) { return ap.beat < b; });
+        pts.insert(it, { beat, value });
+    }
+    p.recLastBeat = beat;
+    p.recDidWrite = true;
+}
+
+// Collinear-reduction pass run once at end of a recording pass: drops any point
+// that lies (within `eps`) on the straight line between its neighbours, so a
+// static Write pass collapses to two endpoints while a genuine sweep keeps its
+// shape. `eps` is in the param's value units (caller scales by param range).
+inline void simplifyAutomationLane(AutomationLane& lane, float eps) {
+    auto& p = lane.points;
+    if (p.size() < 3) return;
+    std::vector<AutomationPoint> out;
+    out.reserve(p.size());
+    out.push_back(p.front());
+    for (size_t i = 1; i + 1 < p.size(); ++i) {
+        const AutomationPoint& a = out.back();
+        const AutomationPoint& b = p[i];
+        const AutomationPoint& c = p[i + 1];
+        float span = c.beat - a.beat;
+        float t = (std::abs(span) > 1e-9f) ? (b.beat - a.beat) / span : 0.0f;
+        float interp = a.value + t * (c.value - a.value);
+        if (std::abs(interp - b.value) > eps) out.push_back(b);
+    }
+    out.push_back(p.back());
+    p = std::move(out);
 }
 
 // Thread-safe write to a live node's `script`.

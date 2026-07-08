@@ -179,6 +179,28 @@ struct AutomationLane {
     }
 };
 
+// Automation record mode - governs whether live control moves are captured
+// into automation lanes during playback, and how. Forms a cascade:
+//   global (session) -> node -> param
+// Lower scopes default to Inherit and defer upward; the global scope is always
+// explicit (never Inherit). See resolveArmMode() below the Node struct.
+//   Off    - do not record here.
+//   Touch  - write to the lane only while the control is actively held; on
+//            release the param snaps back to reading its lane.
+//   Latch  - start writing when the control is first grabbed and keep writing
+//            the held value through the rest of the transport pass.
+//   Write  - overwrite the whole pass at the current value whether or not the
+//            control is touched (the destructive "flatten to static" tool).
+//            NODE/PARAM SCOPE ONLY - never selectable globally, so no single
+//            switch can wipe every lane in the project.
+enum class AutoArmMode {
+    Inherit = 0, // defer to the parent scope; invalid at global scope
+    Off,
+    Touch,
+    Latch,
+    Write
+};
+
 struct Param {
     std::string name;
     float value;
@@ -187,6 +209,19 @@ struct Param {
     std::string format = "%.2f";
     AutomationLane automation; // recorded automation for this param
     bool autoWriteArmed = false; // when armed, "Write Automation to Selection" includes this param
+
+    // Automation record cascade - per-param override (record axis). Inherit =
+    // follow the owning node's mode (which itself may inherit the global mode).
+    // Serialized so a project remembers "this knob is set to Latch"; the global
+    // mode that actually gates recording is session-only, so a reload never
+    // silently starts recording. See resolveArmMode().
+    AutoArmMode armMode = AutoArmMode::Inherit;
+
+    // Read axis - per-param lane bypass. When true this param ignores its own
+    // automation lane during playback (the lane is preserved, just muted), so
+    // the user can audition the param held still without losing the recording.
+    // Serialized. See automationReadEnabled().
+    bool bypassAutomation = false;
 
     // Signal modulation support (#88). When a Signal cable drives this
     // param, `baseValue` holds the user's intended setting and `value`
@@ -721,6 +756,19 @@ struct Node {
     // rather than one full-project render each. Cleared when the freeze runs.
     bool armedForFreeze = false;
 
+    // Automation record cascade - per-node override (record axis). Inherit =
+    // follow the global session mode. A node override refines recording for all
+    // of this node's params when globally armed (e.g. global Touch but this
+    // synth on Write). Serialized. See resolveArmMode().
+    AutoArmMode armMode = AutoArmMode::Inherit;
+
+    // Read axis - per-node automation ignore. When true, none of this node's
+    // param lanes drive their params during playback (all lanes preserved, just
+    // muted at the node level). Lets the user A/B a whole node with vs without
+    // its recorded automation in one toggle. Serialized. See
+    // automationReadEnabled().
+    bool ignoreAutomation = false;
+
     // Effect regions: time-bounded activation of links/groups on this track.
     // Drawn as colored bars on the track's timeline. Each region gates either
     // a single link (linkId >= 0) or an entire effect group (groupId >= 0).
@@ -731,6 +779,28 @@ struct Node {
     bool recordArmed = false;     // armed for recording
     bool inputMonitor = false;    // pass input through to output in real-time
 };
+
+// Resolve the effective automation record mode for one param, given the global
+// session mode. Global Off is a HARD GATE: nothing records regardless of node
+// or param overrides, so loading a project (which restores overrides but leaves
+// the global mode at its Off default) can never silently begin recording. When
+// globally armed (Touch/Latch), the cascade refines per param then per node;
+// Inherit at both defers to the global mode. Write only ever originates from a
+// node/param override (it is never a valid global value).
+inline AutoArmMode resolveArmMode(AutoArmMode global, const Node& node, const Param& param) {
+    if (global == AutoArmMode::Off || global == AutoArmMode::Inherit)
+        return AutoArmMode::Off;                 // master gate: no recording
+    if (param.armMode != AutoArmMode::Inherit) return param.armMode;
+    if (node.armMode  != AutoArmMode::Inherit) return node.armMode;
+    return global;                                // Touch or Latch
+}
+
+// Read axis: should this param's lane drive it during playback? False if the
+// owning node ignores automation wholesale or this param's lane is individually
+// bypassed. Both are non-destructive mutes (the lane points are preserved).
+inline bool automationReadEnabled(const Node& node, const Param& param) {
+    return !node.ignoreAutomation && !param.bypassAutomation;
+}
 
 // Thread-safe write to a live node's `script`.
 //
@@ -947,6 +1017,12 @@ public:
     double loopStartBeat = 0;
     double loopEndBeat = 0;
     double projectSampleRate = 0; // 0 = use device rate
+
+    // Global automation record mode (record axis root of the cascade). Session
+    // state - deliberately NOT serialized, so opening a project always starts
+    // with recording disarmed (Off) and node/param overrides dormant. Set by the
+    // transport-bar "Auto" control. See resolveArmMode().
+    AutoArmMode autoArmGlobal = AutoArmMode::Off;
 
     // Saved view state for the main node-graph component. Persisted to
     // the project file so reopening the project restores the user's

@@ -231,6 +231,11 @@ bool ProjectFile::writeProject(std::ostream& f, NodeGraph& graph,
         writeFloat(f, "posY", node.pos.y);
         if (node.muted) writeInt(f, "muted", 1);
         if (node.soloed) writeInt(f, "soloed", 1);
+        // Automation record override (record axis) + wholesale ignore (read
+        // axis) for this node. Only emitted when non-default. armMode absent
+        // => Inherit; ignoreAuto absent => false.
+        if (node.armMode != AutoArmMode::Inherit) writeInt(f, "armMode", (int)node.armMode);
+        if (node.ignoreAutomation) writeInt(f, "ignoreAuto", 1);
         // node.script can be multi-line for some node types - most notably
         // MultiSampler, whose encode() produces dozens of lines (one per
         // zone field). The old `writeStr(f, "script", val)` form wrote
@@ -423,6 +428,11 @@ bool ProjectFile::writeProject(std::ostream& f, NodeGraph& graph,
             // pre-per-frame layout). Lets two frames carry the same warp op
             // without their modulation params colliding on (warpLayer,warpSlot).
             if (param.warpFrameId >= 0) writeInt(f, "warpFrameId", param.warpFrameId);
+            // Automation record override (record axis) + lane bypass (read axis).
+            // Only emitted when non-default so ordinary params round-trip
+            // unchanged. armMode absent => Inherit; bypassAuto absent => false.
+            if (param.armMode != AutoArmMode::Inherit) writeInt(f, "armMode", (int)param.armMode);
+            if (param.bypassAutomation) writeInt(f, "bypassAuto", 1);
             for (auto& ap : param.automation.points)
                 f << "auto=" << ap.beat << "," << ap.value << "\n";
         }
@@ -775,6 +785,8 @@ bool ProjectFile::readProject(std::istream& f, NodeGraph& graph, PluginHost* plu
             else if (key == "posY") curNode->pos.y = std::stof(val);
             else if (key == "muted") curNode->muted = (val == "1");
             else if (key == "soloed") curNode->soloed = (val == "1");
+            else if (key == "armMode") curNode->armMode = (AutoArmMode)std::stoi(val);
+            else if (key == "ignoreAuto") curNode->ignoreAutomation = (val == "1");
             else if (key == "scriptLines") {
                 // New multi-line-safe format (see writeProject above).
                 int n = 0;
@@ -801,7 +813,7 @@ bool ProjectFile::readProject(std::istream& f, NodeGraph& graph, PluginHost* plu
                     val.rfind("__multisampler__:", 0) == 0) {
                     static const std::set<std::string> kNodeKeys = {
                         "id", "name", "type", "posX", "posY", "muted",
-                        "soloed", "script", "scriptLines",
+                        "soloed", "armMode", "ignoreAuto", "script", "scriptLines",
                         "midiInputSourceId", "envAttackCurve",
                         "envDecayCurve", "envReleaseCurve", "envAtkPt",
                         "envDecPt", "envRelPt", "ahdsrEnvelope",
@@ -974,6 +986,8 @@ bool ProjectFile::readProject(std::istream& f, NodeGraph& graph, PluginHost* plu
             else if (key == "warpLayer") p.warpLayer = std::stoi(val);
             else if (key == "layerField") p.layerField = std::stoi(val);
             else if (key == "warpFrameId") p.warpFrameId = std::stoi(val);
+            else if (key == "armMode") p.armMode = (AutoArmMode)std::stoi(val);
+            else if (key == "bypassAuto") p.bypassAutomation = (val == "1");
             else if (key == "auto") {
                 auto comma = val.find(',');
                 if (comma != std::string::npos)

@@ -186,8 +186,12 @@ bool AudioCacheManager::saveToDisk(Node& node, double sampleRate) {
     auto dir = juce::File(cacheDir);
     if (!dir.exists()) dir.createDirectory();
 
-    // Filename from hash
-    auto filename = juce::String::toHexString((int64_t)node.cache.inputHash) + ".cache";
+    // Filename keyed by node id. Node ids are unique within a project and the
+    // cache dir is per-project (<projectDir>/soundshop_cache), so this is
+    // collision-free and stable across edits - unlike the old hash-based name,
+    // which collided whenever two frozen nodes shared inputHash==0 (a manual
+    // freeze never populates inputHash) and thus clobbered each other's file.
+    auto filename = "node_" + juce::String(node.id) + ".cache";
     auto file = dir.getChildFile(filename);
     node.cache.diskPath = file.getFullPathName().toStdString();
 
@@ -246,11 +250,13 @@ void AudioCacheManager::cleanupStaleFiles(const NodeGraph& graph) {
     auto dir = juce::File(cacheDir);
     if (!dir.exists()) return;
 
-    // Collect all valid hashes
+    // Keep the cache file for every node that still has a live cache - either in
+    // memory (freshly rendered) or lazily on disk (restored from a reloaded
+    // project, memory not yet paged in). Keyed by node id to match saveToDisk.
     std::unordered_set<std::string> validFiles;
     for (auto& node : graph.nodes) {
-        if (node.cache.inputHash != 0) {
-            auto filename = juce::String::toHexString((int64_t)node.cache.inputHash) + ".cache";
+        if (node.cache.useDisk || (node.cache.valid && node.cache.numSamples > 0)) {
+            auto filename = "node_" + juce::String(node.id) + ".cache";
             validFiles.insert(filename.toStdString());
         }
     }

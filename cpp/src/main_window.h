@@ -194,6 +194,17 @@ private:
     void showPluginPresets(int nodeId);
     void showMidiMap(int nodeId);
     void freezeNode(int nodeId);
+    // Batch freeze: render the graph ONCE and capture each listed node's own
+    // output into its cache via a per-node tap. Freezing N nodes this way costs
+    // one render pass, not N. freezeNode() is a thin wrapper for the 1-node
+    // case. Nodes that don't exist or are the Output sink are skipped.
+    void freezeNodes(const std::vector<int>& nodeIds);
+    // After loading a project from `projectPath`, point the cache manager at
+    // that project's soundshop_cache folder and re-attach each persisted freeze
+    // to its on-disk PCM file (lazy: the audio thread loads it on first use).
+    // Freezes whose cache file is missing are silently dropped so the node
+    // renders live instead of playing silence.
+    void rehydrateNodeCaches(const juce::String& projectPath);
     void syncCCMappingsToGraph();
     void syncCCMappingsFromGraph();
 

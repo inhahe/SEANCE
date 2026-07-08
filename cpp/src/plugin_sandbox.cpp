@@ -287,8 +287,14 @@ int runPluginSandboxChild(const std::string& pipeName) {
     juce::AudioPluginFormatManager formatManager;
     // JUCE 8 removed addDefaultFormats(); add formats individually.
     formatManager.addFormat(new juce::VST3PluginFormat());
+#if JUCE_PLUGINHOST_LV2
+    formatManager.addFormat(new juce::LV2PluginFormat());
+#endif
 #if JUCE_PLUGINHOST_AU
     formatManager.addFormat(new juce::AudioUnitPluginFormat());
+#endif
+#if JUCE_PLUGINHOST_LADSPA
+    formatManager.addFormat(new juce::LADSPAPluginFormat());
 #endif
     std::unique_ptr<juce::AudioPluginInstance> plugin;
     double sampleRate = 44100;

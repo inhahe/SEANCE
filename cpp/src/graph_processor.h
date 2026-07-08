@@ -309,6 +309,22 @@ public:
     // cumulative ("to here") latency readouts in the node right-click menu.
     std::unordered_map<int, int> snapshotNodeLatencies() { return latencyListener.snapshot(); }
 
+    // A hosted-plugin parameter event captured from a plugin's own editor. kind:
+    // 0=gestureBegin 1=gestureEnd 2=parameterChanged; value carries the normalized
+    // value for kind 2. Queued by the listener (off the audio/plugin thread),
+    // drained by the UI timer via drainParamEvents().
+    struct ParamEvent { int nodeId; int paramIdx; int kind; float value; };
+
+    // Drain queued hosted-plugin parameter events (knob-drags the user made in a
+    // plugin's own editor). Thread-safe; called by the UI timer to feed
+    // automation recording. Returns and clears the pending events.
+    std::vector<ParamEvent> drainParamEvents() {
+        std::lock_guard<std::mutex> lk(latencyListener.mtx);
+        std::vector<ParamEvent> out;
+        out.swap(latencyListener.paramEvents);
+        return out;
+    }
+
     // Automation
     AutomationManager& getAutomation() { return automation; }
     void applyAutomation(const std::vector<AutomationValue>& values);
@@ -370,7 +386,30 @@ private:
             std::lock_guard<std::mutex> lk(mtx);
             return lastLatencyByNode;
         }
-        void audioProcessorParameterChanged(juce::AudioProcessor*, int, float) override {}
+        // -------- Plugin-param user-gesture capture (automation recording) -----
+        // This listener is already attached to every processor, so it doubles as
+        // the hook for recording knob-drags the user makes inside a hosted
+        // plugin's OWN editor window. We can't touch the NodeGraph from whatever
+        // thread the plugin notifies on, so events are queued here and drained by
+        // the UI timer (drainParamEvents). kind: 0=gestureBegin 1=gestureEnd
+        // 2=parameterChanged. `value` carries the normalized value for kind 2.
+        std::vector<ParamEvent> paramEvents;  // GraphProcessor::ParamEvent
+        void pushParamEvt(juce::AudioProcessor* p, int idx, int kind, float value) {
+            std::lock_guard<std::mutex> lk(mtx);
+            auto it = procNodeId.find(p);
+            if (it == procNodeId.end()) return; // unknown processor - ignore
+            if (paramEvents.size() < 4096)      // bound memory if UI stalls
+                paramEvents.push_back({ it->second, idx, kind, value });
+        }
+        void audioProcessorParameterChangeGestureBegin(juce::AudioProcessor* p, int idx) override {
+            pushParamEvt(p, idx, 0, 0.0f);
+        }
+        void audioProcessorParameterChangeGestureEnd(juce::AudioProcessor* p, int idx) override {
+            pushParamEvt(p, idx, 1, 0.0f);
+        }
+        void audioProcessorParameterChanged(juce::AudioProcessor* p, int idx, float v) override {
+            pushParamEvt(p, idx, 2, v);
+        }
         void audioProcessorChanged(juce::AudioProcessor* p,
                                    const ChangeDetails& details) override {
             if (!details.latencyChanged || !rebuildFlag || !p) return;

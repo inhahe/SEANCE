@@ -577,6 +577,32 @@ struct Node {
     int pluginIndex = -1; // index into PluginHost::availablePlugins, -1 = none
     std::string pendingPluginState; // base64-encoded state to restore after plugin loads
 
+    // Automation lanes for hosted-plugin (VST3/AU) parameters, keyed by plugin
+    // parameter index. Native params carry their lane inline (Param::automation);
+    // a hosted plugin exposes its parameters through JUCE's AudioProcessorParameter
+    // interface and has NO Param row, so their recorded lanes live here instead.
+    // Lane values are NORMALIZED (0..1) - exactly what AudioProcessorParameter::
+    // setValue() consumes on playback (native lanes store real param units). These
+    // are recorded by dragging a knob inside the plugin's OWN editor window (via
+    // GraphProcessor's AudioProcessorListener) and are read/muted uniformly with
+    // native lanes through ignoreAutomation. Serialized (see project_file.cpp).
+    std::map<int, AutomationLane> pluginParamAutomation;
+
+    // Transient per-plugin-param recording state (NOT serialized), mirroring the
+    // Param::recWriting/recLastBeat/recDidWrite trio. Created on demand as the
+    // user drives plugin params during a recording pass. gestureActive tracks
+    // whether a real begin/endChangeGesture pair is bracketing the moves (many
+    // plugins omit gestures and only fire parameterChanged, so Touch mode falls
+    // back to a short idle timeout keyed off lastChangeMs).
+    struct PluginParamRec {
+        bool  writing       = false;
+        float recLastBeat   = -1.0f;
+        bool  recDidWrite   = false;
+        bool  gestureActive = false;
+        double lastChangeMs = 0.0;
+    };
+    std::map<int, PluginParamRec> pluginParamRec;
+
     // Per-plugin dirty tracking for the slow autosave path (#86). When a
     // plugin's parameters change via host automation, MIDI Learn CC, or
     // any other host-driven path, this flag is set so the next autosave
@@ -825,6 +851,16 @@ inline AutoArmMode resolveArmMode(AutoArmMode global, const Node& node, const Pa
     return global;                                // Touch or Latch
 }
 
+// Node-scope variant, for hosted-plugin parameters which have no Param row (and
+// therefore no per-param override) - only the node override + global apply. Same
+// hard Off gate as the param-scope resolver.
+inline AutoArmMode resolveArmModeNode(AutoArmMode global, const Node& node) {
+    if (global == AutoArmMode::Off || global == AutoArmMode::Inherit)
+        return AutoArmMode::Off;
+    if (node.armMode != AutoArmMode::Inherit) return node.armMode;
+    return global;
+}
+
 // Read axis: should this param's lane drive it during playback? False if the
 // owning node ignores automation wholesale or this param's lane is individually
 // bypassed. Both are non-destructive mutes (the lane points are preserved).
@@ -839,11 +875,16 @@ inline bool automationReadEnabled(const Node& node, const Param& param) {
 // layering). A backward jump (loop wrap) starts a fresh sweep segment. Points
 // are kept sorted by beat via ordered insert. The dense per-tick points are
 // thinned by simplifyAutomationLane() at end of pass.
-inline void recordAutomationPoint(Param& p, float beat, float value) {
-    auto& pts = p.automation.points;
-    if (p.recLastBeat >= 0.0f && beat >= p.recLastBeat) {
+// Core lane-level recorder, parameterised on the lane + its per-sweep state so
+// it can serve BOTH native params (Param::automation) and hosted-plugin param
+// lanes (Node::pluginParamAutomation), which have no Param row. See the Param
+// overload below.
+inline void recordAutomationPointLane(AutomationLane& lane, float& recLastBeat,
+                                      bool& recDidWrite, float beat, float value) {
+    auto& pts = lane.points;
+    if (recLastBeat >= 0.0f && beat >= recLastBeat) {
         // Overwrite-sweep: drop existing points in (recLastBeat, beat].
-        const float lo = p.recLastBeat, hi = beat;
+        const float lo = recLastBeat, hi = beat;
         pts.erase(std::remove_if(pts.begin(), pts.end(),
             [lo, hi](const AutomationPoint& ap) {
                 return ap.beat > lo + 1e-6f && ap.beat <= hi + 1e-6f;
@@ -851,7 +892,7 @@ inline void recordAutomationPoint(Param& p, float beat, float value) {
     }
     // Avoid an exact-duplicate point when the playhead hasn't advanced.
     if (!pts.empty() && std::abs(pts.back().beat - beat) < 1e-6f
-        && p.recLastBeat >= 0.0f && beat >= p.recLastBeat) {
+        && recLastBeat >= 0.0f && beat >= recLastBeat) {
         pts.back().value = value;
     } else {
         // Ordered insert (points beyond `beat` may exist from prior recordings
@@ -860,8 +901,12 @@ inline void recordAutomationPoint(Param& p, float beat, float value) {
             [](const AutomationPoint& ap, float b) { return ap.beat < b; });
         pts.insert(it, { beat, value });
     }
-    p.recLastBeat = beat;
-    p.recDidWrite = true;
+    recLastBeat = beat;
+    recDidWrite = true;
+}
+
+inline void recordAutomationPoint(Param& p, float beat, float value) {
+    recordAutomationPointLane(p.automation, p.recLastBeat, p.recDidWrite, beat, value);
 }
 
 // Collinear-reduction pass run once at end of a recording pass: drops any point

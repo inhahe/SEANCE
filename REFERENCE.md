@@ -285,9 +285,15 @@ The graph makes capture state visible ("signal flow is always visible"):
 - A param whose lane is **muted** (node-ignore or per-param bypass) shows a **grey dot** (only when it actually has points).
 - A node with a **record-mode override** shows an **`A:<mode>`** badge in its title; a node with **ignore-automation** shows a **slashed-A** badge.
 
-### Hosted VST3/AU plugin knobs — not yet captured
+### Hosted VST3/AU plugin knobs
 
-Recording currently captures **SEANCE's own native param rows**. Dragging a knob **inside a hosted plugin's own editor window** is **not** yet recorded (the design — attaching a `juce::AudioProcessorListener` per plugin and marshalling `parameterGestureChanged`/`parameterValueChanged` back into `handleParamGesture` — is specified as a planned task in `known-issues.md`). You *can* still automate a plugin param today by exposing it as a native param row and recording that, or by drawing points in a clip automation lane.
+Dragging a knob **inside a hosted plugin's own editor window** during playback **is** recorded, the same way native knobs are. Because a plugin's parameters aren't SEANCE native param rows (they live behind JUCE's `AudioProcessorParameter` interface), their recorded lanes are stored separately on the node (`pluginParamAutomation`, keyed by plugin-param index, normalized 0..1) rather than in a `Param` row — but from the user's side it behaves identically: arm **Auto → Touch/Latch** (or a per-node **Write** override), play, wiggle a knob in the plugin window, stop, and it plays back. While a plugin knob is recording, the **whole node is outlined in red** (plugin params have no on-body rows to glow individually).
+
+Under the hood SEANCE listens for the plugin's own `AudioProcessorListener` gesture/value callbacks (queued off the audio thread, drained by the UI timer), samples the live normalized value each tick, and writes back on playback via `setValue` — which does **not** notify listeners, so playback can't feed back into the recorder.
+
+**Caveat — gesture-less plugins.** Some plugins move a parameter without sending `begin/endChangeGesture` (only a bare value-change). Touch still works for these: it arms on the first change and ends after a short (~250 ms) idle gap instead of on gesture-release. Latch and Write are unaffected (they run to Stop). If a particular plugin's Touch captures feel clipped, use **Latch** or a per-node **Write** override instead.
+
+**Still not captured:** MIDI-learned CC moves during playback (a planned addition — see `known-issues.md`).
 
 ---
 

@@ -5,61 +5,40 @@ top. When something is fixed, delete the entry (git history is the archive).
 
 ---
 
-## PLANNED: automation recording doesn't yet capture hosted-plugin (VST3/AU) editor knob-drags
+## NEEDS MANUAL VERIFICATION: hosted-plugin (VST3/AU) editor knob-drag recording
 
-**What works today.** The knob-drag automation-recording system (transport **Auto**
-button → Off/Touch/Latch, plus per-node/per-param cascade overrides incl. Write —
-see REFERENCE.md → [Automation recording](REFERENCE.md#automation-recording-knob-drag-capture))
-records **SEANCE's own native param rows** drawn on the node body. Play-start arms
-Write params (`beginAutomationPass`), the UI timer sweeps points via
-`recordAutomationPoint`, and stop simplifies + commits one snapshot
-(`endAutomationPass`). Native knob gestures reach it through
-`NodeGraphComponent::onParamGesture → MainContentComponent::handleParamGesture`.
+**Implemented** (phase 5) but **not covered by self-tests** — it can only be
+exercised by dragging a real plugin's knobs, so it needs a manual pass with an
+actual VST3.
 
-**The gap.** Dragging a knob **inside a hosted plugin's own editor window** does
-*not* get recorded — SEANCE never observes those gestures. The old
-`AudioEngine::recordParamChange(nodeId, paramIdx, value)` stub (documented but with
-no callers) was the placeholder for this and is now superseded by the cascade design.
+**How it works.** Because hosted plugin params are *not* SEANCE native param rows
+(they live behind JUCE's `AudioProcessorParameter` interface, read live from the
+processor), they have no `Param::automation` lane. Their recorded lanes instead
+live in `Node::pluginParamAutomation` (a `std::map<int,AutomationLane>` keyed by
+plugin-param index, values normalized 0..1) with transient rec state in
+`Node::pluginParamRec`. The listener is the already-attached
+`GraphProcessor::LatencyChangeListener`, extended to queue
+`audioProcessorParameterChangeGestureBegin/End` + `audioProcessorParameterChanged`
+events (`drainParamEvents`). The UI timer drains them (`processPluginParamEvents`),
+flips per-param writing flags per the node/global cascade, samples the live
+normalized value each tick, and on stop simplifies + commits one snapshot. Read-back
+pushes lane values through `applyAutomation` (`setValue`, which does NOT notify
+listeners, so playback can't feed back into the recorder). Save/load via
+`pluginAuto=` node lines; undo via the same `serializeForUndo` path.
 
-**The proper fix (fully specified).**
-1. **Attach a listener per hosted plugin.** In `GraphProcessor::rebuildGraph`
-   (`graph_processor.cpp` ~line 951, right after
-   `processorGraph->addNode(std::move(node.plugin->instance))`), attach a
-   `juce::AudioProcessorListener` to `graphNode->getProcessor()`, capturing the
-   stable `nodeId`. Own the listeners in a `std::vector<std::unique_ptr<…>>` on
-   `GraphProcessor`, **cleared at the top of every rebuild** (like
-   `latencyListener.beginRebuild()`), since the plugin processors are recreated
-   each rebuild.
-2. **React to gestures + value changes.**
-   `audioProcessorParameterChangeGestureBegin/End(proc, pluginParamIdx)` →
-   arm/disarm; `audioProcessorParameterChanged(proc, pluginParamIdx, newNorm)` →
-   the live value. These fire only on genuine user edits (the graph drives playback
-   via `AudioProcessorParameter::setValue`, which does **not** notify listeners —
-   only `setValueNotifyingHost` does — so our own automation playback won't feed
-   back into the recorder).
-3. **Marshal to the message thread.** Callbacks may arrive on the audio thread;
-   wrap the hand-off in `juce::MessageManager::callAsync`. Capture only the
-   `GraphProcessor*` + plain `int/float`s (never the listener object, which may be
-   destroyed by a rebuild before the async runs).
-4. **Translate + reuse the existing pipeline.** Plugin param index == node param
-   index for plugin nodes (the read path already does
-   `node.params[pi] → getParameters()[pi]`, see `automation.cpp::applyValues` and
-   the timer loop in `main_window.cpp`). So: on gesture begin/end call
-   `handleParamGesture(nodeId, pluginParamIdx, begin)`; on value-change set
-   `node.params[pluginParamIdx].value = minVal + norm*(maxVal-minVal)` so the timer
-   records the live value. All arming/sweeping/simplify/undo machinery is reused
-   unchanged.
+**Known caveat (gesture-less plugins).** Plugins that change a param via
+`setValueNotifyingHost` *without* bracketing `begin/endChangeGesture` still record:
+Touch arms on the first `parameterChanged` and ends via a 250 ms idle timeout
+(`processPluginParamEvents` / the timer). This is heuristic — a plugin that streams
+continuous changes then pauses mid-drag could clip the tail. Latch/Write are
+unaffected (they run to Stop regardless).
 
-**Caveat to document when built:** plugins that change a param via
-`setValueNotifyingHost` *without* bracketing gestures won't arm Touch/Latch (no
-begin event). Decide whether to also treat a bare value-change as an implicit
-touch, or leave those plugins to the Write override.
+**Also not yet captured:** MIDI-learned CC moves during playback (the CC path
+targets plugin params via `AutomationManager`, but isn't wired into the recorder).
 
-**Why deferred:** touches the audio-graph rebuild + a listener lifecycle across
-rebuilds, and can't be verified without manually dragging a real VST3's knobs
-(self-tests can't cover it). Built as its own phase after the native-knob core
-(committed) so a half-verified audio-thread change didn't land on top of a working
-feature.
+**To verify manually:** load a VST3, Auto→Touch, Play, drag a knob in the plugin's
+own window, Stop, rewind, Play → the knob should retrace the move. Check per-node
+red recording outline appears while dragging.
 
 ---
 

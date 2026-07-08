@@ -1112,7 +1112,12 @@ void MainContentComponent::timerCallback() {
         float beat = (float)transport.positionBeats();
         std::vector<AutomationValue> autoValues;
         for (auto& node : graph.nodes) {
+            // Read axis: a node-level "ignore automation" toggle mutes every
+            // lane on the node (non-destructive - points are preserved).
+            if (node.ignoreAutomation) continue;
             for (int pi = 0; pi < (int)node.params.size(); ++pi) {
+                // Read axis: per-param lane bypass mutes just this lane.
+                if (node.params[pi].bypassAutomation) continue;
                 auto& lane = node.params[pi].automation;
                 if (!lane.points.empty()) {
                     float val = lane.evaluate(beat);

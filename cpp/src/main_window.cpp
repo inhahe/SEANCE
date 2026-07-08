@@ -3100,8 +3100,11 @@ void MainContentComponent::processPluginParamEvents() {
     // 1=gestureEnd 2=parameterChanged. Many plugins never send gestures and only
     // fire parameterChanged - in that case Touch arms on the first change and ends
     // via the idle timeout in timerCallback (keyed off lastChangeMs).
+    // Always drain BOTH queues (plugin gesture events + learned-CC touches) so
+    // neither grows unbounded, but only act on them while the transport rolls.
     auto events = audioEngine.getGraphProcessor().drainParamEvents();
-    if (events.empty() || !transport.playing) return;
+    auto ccTouchedEarly = audioEngine.drainCcRecTouched();
+    if (!transport.playing) return;
 
     const double nowMs = juce::Time::getMillisecondCounterHiRes();
     for (auto& ev : events) {
@@ -3133,6 +3136,24 @@ void MainContentComponent::processPluginParamEvents() {
                     rec.recLastBeat = -1.0f;
                 }
                 break;
+        }
+    }
+
+    // MIDI-Learn CC moves. A learned CC that drives a plugin param is applied on
+    // the audio thread via setValue (no listener callback), so it arrives here via
+    // AudioEngine's dedicated capture queue instead of drainParamEvents. Treat each
+    // touch like a gesture-less parameterChanged: arm Touch/Latch and let the timer
+    // sample the (already CC-driven) live value + end Touch on the idle timeout.
+    for (auto& [nodeId, paramIdx] : ccTouchedEarly) {
+        auto* node = graph.findNode(nodeId);
+        if (!node || !node->plugin) continue; // learned CC only reaches plugin params
+        AutoArmMode m = resolveArmModeNode(graph.autoArmGlobal, *node);
+        if (m != AutoArmMode::Touch && m != AutoArmMode::Latch) continue;
+        auto& rec = node->pluginParamRec[paramIdx];
+        rec.lastChangeMs = nowMs;
+        if (!rec.gestureActive && !rec.writing) {
+            rec.writing = true;
+            rec.recLastBeat = -1.0f;
         }
     }
 }

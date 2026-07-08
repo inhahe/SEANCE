@@ -33,8 +33,14 @@ Touch arms on the first `parameterChanged` and ends via a 250 ms idle timeout
 continuous changes then pauses mid-drag could clip the tail. Latch/Write are
 unaffected (they run to Stop regardless).
 
-**Also not yet captured:** MIDI-learned CC moves during playback (the CC path
-targets plugin params via `AutomationManager`, but isn't wired into the recorder).
+**MIDI-learned CC moves are also captured.** A learned CC that drives a plugin
+param is applied on the audio thread via `setValue` (no listener callback), so it
+can't arrive through `drainParamEvents`. Instead the audio callback captures each
+matched CC target into `AudioEngine::ccRecTouched` (drained by
+`drainCcRecTouched`); `processPluginParamEvents` treats each touch like a
+gesture-less `parameterChanged` (arms Touch/Latch, ends Touch on the 250 ms idle
+timeout), and the timer samples the already-CC-driven live value. Same caveat as
+gesture-less plugins applies to the Touch tail.
 
 **To verify manually:** load a VST3, Auto→Touch, Play, drag a knob in the plugin's
 own window, Stop, rewind, Play → the knob should retrace the move. Check per-node

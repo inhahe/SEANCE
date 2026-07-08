@@ -293,7 +293,7 @@ Under the hood SEANCE listens for the plugin's own `AudioProcessorListener` gest
 
 **Caveat — gesture-less plugins.** Some plugins move a parameter without sending `begin/endChangeGesture` (only a bare value-change). Touch still works for these: it arms on the first change and ends after a short (~250 ms) idle gap instead of on gesture-release. Latch and Write are unaffected (they run to Stop). If a particular plugin's Touch captures feel clipped, use **Latch** or a per-node **Write** override instead.
 
-**Still not captured:** MIDI-learned CC moves during playback (a planned addition — see `known-issues.md`).
+**MIDI-learned CC moves are captured too.** If you've MIDI-Learned a hardware CC to a plugin parameter (right-click the knob → MIDI Learn), moving that controller during playback records into automation exactly like dragging the plugin knob directly — arm Touch/Latch/Write, play, twist the physical knob, stop, and it replays. Because the learned CC is applied on the audio thread (bypassing the plugin's listener callbacks), SEANCE captures the matched CC target separately and samples the resulting live value each tick. The same gesture-less Touch caveat applies (arms on the first CC move, ends on the ~250 ms idle gap).
 
 ---
 

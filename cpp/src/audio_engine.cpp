@@ -501,6 +501,21 @@ void AudioEngine::audioDeviceIOCallbackWithContext(
                 return false;
             };
 
+            // Capture learned-CC targets for automation recording. Only while
+            // playing (recording is a playback-time activity); the UI timer drains
+            // and decides whether Auto is armed. See AudioEngine::drainCcRecTouched.
+            if (playing.load()) {
+                std::lock_guard<std::mutex> lk(ccRecMutex);
+                for (auto& [id, msg] : events) {
+                    if (!msg.isController()) continue;
+                    int ch = msg.getChannel(), cc = msg.getControllerNumber();
+                    for (auto& m : ccMappings)
+                        if (m.midiChannel == ch && m.ccNumber == cc
+                            && ccRecTouched.size() < 4096)
+                            ccRecTouched.push_back({ m.nodeId, m.paramIdx });
+                }
+            }
+
             for (auto& [id, msg] : events) {
                 // Skip trained CCs - they're already handled by the CC
                 // mapping pass above; forwarding them would double-apply.

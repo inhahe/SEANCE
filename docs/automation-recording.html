@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Recording Automation — SEANCE</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="wrap">
+<header>
+<h1>Recording Automation</h1>
+<nav>
+  <a href="index.html">Home</a>
+  <a href="graph-basics.html">Graph Basics</a>
+  <a href="piano-roll.html">Piano Roll</a>
+</nav>
+</header>
+
+<p><strong>Automation</strong> is a knob that moves itself over time. Instead of drawing those moves by hand in a piano-roll lane, you can <em>perform</em> them: press Play, grab a knob and wiggle it, and SEANCE writes your moves into that parameter so they play back the same way next time. This is the classic "write automation" workflow, and it's what the transport's <strong>Auto</strong> button does.</p>
+
+<div class="tip">
+<strong>Automation vs. Freeze.</strong> These sound similar but do different jobs. <em>Automation recording</em> captures the <strong>knob moves you make</strong> — the authored parameter motion. <em>Freeze</em> (right-click a node → Freeze) records the node's <strong>actual sound</strong> to audio, so a patch with a free-running LFO or internal randomness plays back <em>bit-for-bit identically</em>. Reach for automation when you want to <em>shape</em> a parameter over time; reach for Freeze when you want to <em>lock</em> a sound exactly as you last heard it.
+</div>
+
+<h2>The Auto button — three modes</h2>
+
+<p>The <strong>Auto</strong> button on the transport bar cycles through the global record mode each time you click it. It turns <span style="color:#c83c3c;font-weight:bold">red</span> when armed:</p>
+
+<ul>
+  <li><strong>Off</strong> — nothing records, ever. This is a safety gate: while Auto is Off, no knob can overwrite its automation, so you can play a project back without any risk of clobbering your work. (Start here.)</li>
+  <li><strong>Touch</strong> — a knob records <em>only while you're holding it</em>. Grab it, drag, let go — just the part you touched is rewritten; everywhere you didn't touch keeps its old automation. This is the everyday "punch in a fix here and there" mode.</li>
+  <li><strong>Latch</strong> — a knob starts recording the moment you <em>first grab it</em> and keeps recording (holding the last value) <em>until you press Stop</em>, even after you let go. Use it to overwrite everything from a point onward.</li>
+</ul>
+
+<h2>Record a move</h2>
+
+<ol>
+  <li>Click <strong>Auto</strong> until it reads <strong>Touch</strong> (it turns red).</li>
+  <li>Press <strong>Play</strong> (or Space).</li>
+  <li>Grab a parameter — the value rows on the bottom of any node — and drag it while the song plays. The row lights up with a <span style="color:#c83c3c;font-weight:bold">red outline</span> to show it's recording.</li>
+  <li>Let go, and press <strong>Stop</strong>. Your move is now saved into that parameter's automation lane. Rewind and press Play again to hear it play back on its own.</li>
+</ol>
+
+<p>Made a mistake? <strong>Ctrl+Z</strong> undoes the whole recording pass in one step. Want to redo a section? Just record over it again — the new pass replaces the old points wherever you touch.</p>
+
+<h2>Per-node and per-param control</h2>
+
+<p>The Auto button sets the <em>global</em> mode, but you can override it for a single node or a single parameter — handy when you want to arm just one knob and leave everything else alone.</p>
+
+<ul>
+  <li><strong>Right-click a parameter row → Automation</strong> — set that one knob to Inherit (follow the global Auto button), Off, Touch, Latch, or <strong>Write</strong>. The submenu header shows the mode that will actually take effect after combining global + node + param.</li>
+  <li><strong>Right-click a node → Automation</strong> — the same choices, applied as the default for every knob on that node.</li>
+</ul>
+
+<p>The order of priority is <strong>parameter → node → global</strong>: a parameter override beats a node override, which beats the Auto button. And because the global Off is a hard gate, <em>nothing</em> records while Auto is Off, no matter what a node or param override says — so loading a project can never quietly overwrite your automation.</p>
+
+<div class="tip">
+<strong>What's "Write"?</strong> Write records the <em>entire pass</em> at the knob's current value whether or not you touch it — it flattens that parameter to one steady value across the whole song. It's the "just make this stay put" tool. Because a global Write could wipe every lane in the project at once, Write is only offered as a per-node or per-param override, never on the Auto button.
+</div>
+
+<h2>Muting automation without deleting it</h2>
+
+<p>Sometimes you want to hear a knob <em>without</em> its recorded automation for a moment — to compare, or to tweak it by hand. You can mute lanes non-destructively; the points stay saved and resume the instant you un-mute:</p>
+
+<ul>
+  <li><strong>Right-click a node → Automation → Ignore automation on this node</strong> — mutes every lane on that node.</li>
+  <li><strong>Right-click a param row → Automation → Bypass this lane</strong> — mutes just that one parameter.</li>
+</ul>
+
+<h2>Reading the graph</h2>
+
+<p>SEANCE shows you the recording state right on the node so you're never guessing:</p>
+
+<ul>
+  <li>A <span style="color:#c83c3c;font-weight:bold">hollow red dot</span> after a param name = it's <strong>armed</strong> (grabbing it during playback will record).</li>
+  <li>A <span style="color:#c83c3c;font-weight:bold">solid red outline</span> around a param row = it's <strong>recording right now</strong>.</li>
+  <li>A <span style="color:#888">grey dot</span> = that param has automation but the lane is <strong>muted</strong>.</li>
+  <li>An <strong>A:</strong> badge (or a slashed <strong>A</strong>) in a node's title bar = that node has an automation override (or has its automation ignored).</li>
+</ul>
+
+<div class="tip">
+<strong>Hosted plugins:</strong> right now, recording captures moves you make on SEANCE's own knob rows. Dragging a knob <em>inside a plugin's own editor window</em> isn't recorded yet — that's a planned addition. In the meantime you can automate a plugin parameter by drawing points in a piano-roll automation lane, or by recording a SEANCE param that drives it.
+</div>
+
+<footer>
+<a href="index.html">← Back to index</a>
+</footer>
+</div>
+</body>
+</html>

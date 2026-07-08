@@ -1646,6 +1646,66 @@ void testTerrainData(Report& r, const juce::File& dir) {
                        "store: loaded blob bit-exact with baked grid", maxErr);
         }
 
+        // ---- automation record/read cascade: serialization round-trip -------
+        // Per-node armMode + ignoreAutomation and per-param armMode +
+        // bypassAutomation must survive save/load; the global session mode must
+        // NOT persist (a reload always starts disarmed). Also spot-check the
+        // resolver's gate + cascade precedence.
+        {
+            NodeGraph g;
+            auto& n = g.addNode("synth", NodeType::Instrument, {}, {});
+            n.armMode = AutoArmMode::Write;
+            n.ignoreAutomation = true;
+            n.params.push_back({ "Cutoff", 0.5f, 0.0f, 1.0f });
+            n.params.push_back({ "Res",    0.2f, 0.0f, 1.0f });
+            n.params[0].armMode = AutoArmMode::Latch;
+            n.params[0].bypassAutomation = true;
+            // params[1] left at defaults (Inherit / not bypassed)
+            g.autoArmGlobal = AutoArmMode::Touch; // session-only, must be dropped
+
+            std::ostringstream oss;
+            ProjectFile::writeProject(oss, g, nullptr, /*includeView*/false,
+                                      /*includeBlobs*/false);
+            NodeGraph g2;
+            std::istringstream iss(oss.str());
+            ProjectFile::readProject(iss, g2, nullptr);
+
+            r.check(g2.nodes.size() == 1, "autocascade: node round-trips");
+            auto& n2 = g2.nodes[0];
+            r.check(n2.armMode == AutoArmMode::Write, "autocascade: node armMode round-trips");
+            r.check(n2.ignoreAutomation, "autocascade: node ignoreAutomation round-trips");
+            r.check(n2.params.size() == 2, "autocascade: params round-trip");
+            r.check(n2.params[0].armMode == AutoArmMode::Latch,
+                    "autocascade: param armMode round-trips");
+            r.check(n2.params[0].bypassAutomation,
+                    "autocascade: param bypassAutomation round-trips");
+            r.check(n2.params[1].armMode == AutoArmMode::Inherit,
+                    "autocascade: default param armMode stays Inherit");
+            r.check(!n2.params[1].bypassAutomation,
+                    "autocascade: default param not bypassed");
+            r.check(g2.autoArmGlobal == AutoArmMode::Off,
+                    "autocascade: global mode is session-only (reload disarms)");
+
+            // Resolver: global Off is a hard gate regardless of overrides.
+            r.check(resolveArmMode(AutoArmMode::Off, n2, n2.params[0]) == AutoArmMode::Off,
+                    "autocascade: global Off gates all recording");
+            // Globally armed: param override wins over node override.
+            r.check(resolveArmMode(AutoArmMode::Touch, n2, n2.params[0]) == AutoArmMode::Latch,
+                    "autocascade: param override beats node override");
+            // Globally armed, param inherits -> node override applies.
+            r.check(resolveArmMode(AutoArmMode::Touch, n2, n2.params[1]) == AutoArmMode::Write,
+                    "autocascade: node override applies when param inherits");
+            // Read axis: node ignore suppresses all lanes; else per-param bypass.
+            r.check(!automationReadEnabled(n2, n2.params[1]),
+                    "autocascade: node ignore suppresses reads");
+            Node clean; Param cp; cp.bypassAutomation = false;
+            r.check(automationReadEnabled(clean, cp),
+                    "autocascade: default node/param reads its lane");
+            cp.bypassAutomation = true;
+            r.check(!automationReadEnabled(clean, cp),
+                    "autocascade: per-param bypass suppresses read");
+        }
+
         // ---- backward-compat: legacy inline base64 blob still loads ---------
         // Old projects embedded the grid as gzip+base64 in the 4th field (no
         // store). make/parse with a null store reproduce and decode that form.

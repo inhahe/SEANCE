@@ -483,6 +483,23 @@ void NodeGraphComponent::drawNode(juce::Graphics& g, Node& node) {
         g.setFont(juce::Font(std::max(8.0f, 10.0f * zoom), juce::Font::bold));
         g.drawText("R", titleArea.removeFromRight(16 * zoom), juce::Justification::centred);
     }
+    // Node-level automation override badges. A node arm-mode override (Off/Touch/
+    // Latch/Write) that differs from Inherit shows a compact tag with the mode's
+    // first letter; "ignore automation" shows a slashed-A so the user can see at a
+    // glance that this node's lanes are muted on playback even when zoomed out.
+    if (node.ignoreAutomation && zoom > 0.4f) {
+        auto tag = titleArea.removeFromRight(20 * zoom);
+        g.setColour(juce::Colours::grey);
+        g.setFont(juce::Font(std::max(8.0f, 10.0f * zoom), juce::Font::bold));
+        g.drawText(juce::CharPointer_UTF8("A\u0338"), tag, juce::Justification::centred);
+    } else if (node.armMode != AutoArmMode::Inherit && zoom > 0.4f) {
+        auto tag = titleArea.removeFromRight(20 * zoom);
+        bool armed = node.armMode != AutoArmMode::Off;
+        g.setColour(armed ? juce::Colour(220, 60, 60) : juce::Colours::grey);
+        g.setFont(juce::Font(std::max(8.0f, 10.0f * zoom), juce::Font::bold));
+        juce::String tagStr = juce::String(autoArmModeName(node.armMode)).substring(0, 1);
+        g.drawText("A:" + tagStr, tag, juce::Justification::centred);
+    }
 
     // Pan indicator (small bar in title)
     if (node.pan != 0.0f && zoom > 0.4f) {
@@ -848,6 +865,17 @@ void NodeGraphComponent::drawNode(juce::Graphics& g, Node& node) {
                 }
             }
 
+            // Live recording glow: while this param is actively capturing a pass
+            // (Touch held / Latch grabbed / Write armed and transport rolling), the
+            // whole row gets a red outline so "this knob is being written right now"
+            // is unmistakable - the "signal flow is always visible" principle
+            // applied to automation capture.
+            if (p.recWriting) {
+                g.setColour(juce::Colour(220, 60, 60).withAlpha(0.85f));
+                g.drawRoundedRectangle(rowRect.expanded(1.0f), 3.0f,
+                                       std::max(1.5f, 2.0f * zoom));
+            }
+
             // Armed indicator: red dot next to the name when armed for auto-write
             if (p.autoWriteArmed) {
                 float dotX = rowRect.getX() + 2;
@@ -943,8 +971,28 @@ void NodeGraphComponent::drawNode(juce::Graphics& g, Node& node) {
                     if (cc.nodeId == node.id && cc.paramIdx == pi) {
                         g.setColour(juce::Colours::limegreen);
                         g.fillEllipse(indX, indY, indSz, indSz);
+                        indX += indSz + 2;
                         break;
                     }
+                }
+                // Red hollow dot = armed to record: the global/node/param cascade
+                // resolves to a recording mode (Touch/Latch/Write), so grabbing
+                // this knob during playback will capture automation. Hollow so it
+                // reads as "ready to record" and is distinct from the solid-red
+                // live-recording glow around the whole row.
+                if (resolveArmMode(graph.autoArmGlobal, node, p) != AutoArmMode::Off) {
+                    g.setColour(juce::Colour(220, 60, 60));
+                    g.drawEllipse(indX, indY, indSz, indSz, 1.2f);
+                    indX += indSz + 2;
+                }
+                // Grey dot = this param's automation lane is muted on playback
+                // (node "ignore automation" or per-param "bypass lane"), so its
+                // recorded points exist but aren't being read. Only shown when
+                // there are points to mute.
+                if (!p.automation.points.empty() && !automationReadEnabled(node, p)) {
+                    g.setColour(juce::Colours::grey);
+                    g.fillEllipse(indX, indY, indSz, indSz);
+                    indX += indSz + 2;
                 }
             }
 
@@ -1534,6 +1582,32 @@ void NodeGraphComponent::mouseDown(const juce::MouseEvent& e) {
                             pm.addItem(12, "Add Absolute Input (Set) - cable sets this value directly");
                             pm.addItem(13, "Add Modulation Input (Mod) - cable swings around the knob");
                         }
+                        // Automation recording (the record/read cascade). Kept in
+                        // its own submenu, distinct from the older flat-line
+                        // "Auto-Write" items above. Record mode overrides the
+                        // node/global default for this one param; the effective
+                        // resolved mode is shown in the header. Bypass mutes just
+                        // this param's lane on playback (points preserved).
+                        {
+                            juce::PopupMenu autoSub;
+                            AutoArmMode eff = resolveArmMode(graph.autoArmGlobal, *node, p);
+                            autoSub.addSectionHeader(
+                                juce::String("Record mode (now: ") + autoArmModeName(eff) + ")");
+                            autoSub.addItem(20, "Inherit (follow node / global)", true,
+                                            p.armMode == AutoArmMode::Inherit);
+                            autoSub.addItem(21, "Off (never record this param)", true,
+                                            p.armMode == AutoArmMode::Off);
+                            autoSub.addItem(22, "Touch (record while held)", true,
+                                            p.armMode == AutoArmMode::Touch);
+                            autoSub.addItem(23, "Latch (record to end of pass)", true,
+                                            p.armMode == AutoArmMode::Latch);
+                            autoSub.addItem(24, "Write (overwrite whole pass at current value)", true,
+                                            p.armMode == AutoArmMode::Write);
+                            autoSub.addSeparator();
+                            autoSub.addItem(25, "Bypass lane on playback (mute, keep points)", true,
+                                            p.bypassAutomation);
+                            pm.addSubMenu("Automation", autoSub);
+                        }
                         int nodeId = node->id;
                         int paramIdx = idx;
                         pm.showMenuAsync({}, [this, nodeId, paramIdx, hasModPin](int r) {
@@ -1553,6 +1627,22 @@ void NodeGraphComponent::mouseDown(const juce::MouseEvent& e) {
                             else if (r == 11) switchControlInputMode(nodeId, paramIdx);
                             else if (r == 12) addControlInput(nodeId, paramIdx, /*absolute=*/true);
                             else if (r == 13) addControlInput(nodeId, paramIdx, /*absolute=*/false);
+                            else if (r >= 20 && r <= 24 && paramIdx < (int)nd->params.size()) {
+                                AutoArmMode m = (r == 20) ? AutoArmMode::Inherit
+                                              : (r == 21) ? AutoArmMode::Off
+                                              : (r == 22) ? AutoArmMode::Touch
+                                              : (r == 23) ? AutoArmMode::Latch
+                                                          : AutoArmMode::Write;
+                                nd->params[paramIdx].armMode = m;
+                                graph.dirty = true;
+                                graph.commitSnapshot("Set param automation mode");
+                            }
+                            else if (r == 25 && paramIdx < (int)nd->params.size()) {
+                                nd->params[paramIdx].bypassAutomation =
+                                    !nd->params[paramIdx].bypassAutomation;
+                                graph.dirty = true;
+                                graph.commitSnapshot("Toggle param automation bypass");
+                            }
                             repaint();
                         });
                         return;
@@ -1902,6 +1992,9 @@ void NodeGraphComponent::mouseDown(const juce::MouseEvent& e) {
                     dragNodeId = node->id;
                     dragParamIdx = idx;
                     dragParamStartValue = p.value;
+                    // Automation recording: signal the gesture start so Touch/
+                    // Latch capture can arm (no-op unless armed + playing).
+                    if (onParamGesture) onParamGesture(node->id, idx, true);
                     dragParamLeftX = paramRowsLeft;
                     dragParamWidth = paramRowsRight - paramRowsLeft;
                     dragStart = e.position;
@@ -2071,6 +2164,11 @@ void NodeGraphComponent::mouseUp(const juce::MouseEvent& e) {
             }
         }
     }
+    // Automation recording: signal the gesture end for a param drag so Touch
+    // capture stops (Latch/Write keep going until transport stop). Do this
+    // before clearing dragNodeId/dragParamIdx.
+    if (dragMode == DragMode::DragParam && onParamGesture)
+        onParamGesture(dragNodeId, dragParamIdx, false);
     dragMode = DragMode::None;
     dragNodeId = -1;
     dragParamIdx = -1;
@@ -4663,6 +4761,31 @@ void NodeGraphComponent::showNodeMenu(Node& node) {
             juce::String((int)(node.cache.numSamples / std::max(1.0, node.cache.sampleRate))) +
             "s)", false);
 
+    // Automation recording override for this whole node (the record/read
+    // cascade). Only meaningful when the node has params. The node record-mode
+    // override refines the global Auto mode for every param on the node (unless
+    // a param sets its own override); "Ignore automation" mutes all of this
+    // node's lanes on playback without deleting them.
+    if (!node.params.empty()) {
+        menu.addSeparator();
+        juce::PopupMenu autoSub;
+        autoSub.addSectionHeader(juce::String("Record mode (this node's default)"));
+        autoSub.addItem(300, "Inherit (follow global Auto)", true,
+                        node.armMode == AutoArmMode::Inherit);
+        autoSub.addItem(301, "Off (never record this node)", true,
+                        node.armMode == AutoArmMode::Off);
+        autoSub.addItem(302, "Touch (record while held)", true,
+                        node.armMode == AutoArmMode::Touch);
+        autoSub.addItem(303, "Latch (record to end of pass)", true,
+                        node.armMode == AutoArmMode::Latch);
+        autoSub.addItem(304, "Write (overwrite whole pass at current value)", true,
+                        node.armMode == AutoArmMode::Write);
+        autoSub.addSeparator();
+        autoSub.addItem(305, "Ignore automation on this node (mute all lanes)", true,
+                        node.ignoreAutomation);
+        menu.addSubMenu("Automation", autoSub);
+    }
+
     // Latency readout (disabled info items). Most built-in nodes report 0; a
     // hosted plugin's lookahead/linear-phase processing reports its delay, which
     // the audio graph compensates automatically. Two lines, ALWAYS both shown so
@@ -4815,6 +4938,24 @@ void NodeGraphComponent::showNodeMenu(Node& node) {
                 node->voiceUnisonSpread = s;
                 graph.commitSnapshot("Set unison spread");
             }
+        } else if (result >= 300 && result <= 304) {
+            // Per-node automation record mode (default for all params on the
+            // node unless a param overrides). Just a field write - the resolver
+            // reads it live in the playback timer, so no rebuild is needed.
+            AutoArmMode m = (result == 300) ? AutoArmMode::Inherit
+                          : (result == 301) ? AutoArmMode::Off
+                          : (result == 302) ? AutoArmMode::Touch
+                          : (result == 303) ? AutoArmMode::Latch
+                                            : AutoArmMode::Write;
+            if (node->armMode != m) {
+                node->armMode = m;
+                graph.commitSnapshot("Set node automation mode");
+            }
+        } else if (result == 305) {
+            // Toggle "ignore automation on this node" - a non-destructive mute
+            // of every lane on the node during playback (lanes are preserved).
+            node->ignoreAutomation = !node->ignoreAutomation;
+            graph.commitSnapshot("Toggle node automation ignore");
         } else if (result == 181) {
             // Plugin MPE toggle: adds/removes the parallel MCM generator node,
             // so it needs a graph rebuild (unlike the timeline toggle above,

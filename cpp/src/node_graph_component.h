@@ -73,6 +73,10 @@ public:
     // main_window collects graph.nodes where armedForFreeze==true and calls
     // freezeNodes(). No-op if nothing is armed.
     std::function<void()> onFreezeArmedNodes;
+    // Automation recording: a user grabbed (begin=true) or released (begin=false)
+    // a node param's value slider. main_window wires this to handleParamGesture()
+    // to arm/disarm Touch/Latch capture. Args: nodeId, paramIdx, begin.
+    std::function<void(int, int, bool)> onParamGesture;
     std::function<void(int)> onRunScript;         // called with node ID
     std::function<void(juce::String)> onOpenHelpDoc; // called with docs/<file> relative path
     // Fire a one-shot manual trigger on the live SignalShape processor for

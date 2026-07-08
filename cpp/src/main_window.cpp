@@ -340,6 +340,32 @@ MainContentComponent::MainContentComponent() {
             loopBtn.removeColour(juce::TextButton::buttonColourId);
     };
 
+    addAndMakeVisible(autoBtn);
+    autoBtn.setTooltip(
+        "Automation recording (the global switch). Click to cycle Off / Touch / Latch:\n"
+        "  \x95 Off - knobs are manual; existing automation still plays back.\n"
+        "  \x95 Touch - while playing, a knob you drag records ONLY while you hold it.\n"
+        "  \x95 Latch - while playing, once you grab a knob it keeps recording your\n"
+        "     value until you press Stop.\n"
+        "Recording only happens while the transport is playing. Per-node and\n"
+        "per-param overrides (right-click a node or a param) can force Off, a\n"
+        "different mode, or Write (overwrite the whole pass) for specific targets.\n"
+        "To lock the exact sound instead, use Freeze. See Help for details.");
+    autoBtn.onClick = [this]() {
+        // Cycle Off -> Touch -> Latch -> Off. Write is deliberately NOT reachable
+        // here (node/param scope only) so no single switch can flatten every lane.
+        switch (graph.autoArmGlobal) {
+            case AutoArmMode::Off:   graph.autoArmGlobal = AutoArmMode::Touch; break;
+            case AutoArmMode::Touch: graph.autoArmGlobal = AutoArmMode::Latch; break;
+            default:                 graph.autoArmGlobal = AutoArmMode::Off;   break;
+        }
+        // If we armed mid-playback, catch up: arm any now-Write-resolved params
+        // (Touch/Latch still wait for a gesture). Harmless when stopped.
+        if (transport.playing) beginAutomationPass();
+        syncAutoButton();
+    };
+    syncAutoButton();
+
     addAndMakeVisible(songBtn);
     songBtn.setTooltip("Project-wide Song Length and Repeat settings. "
                        "Song Length is where playback auto-stops (in beats); 0 means no explicit end. "
@@ -417,6 +443,9 @@ MainContentComponent::MainContentComponent() {
         std::vector<int> armed;
         for (auto& n : graph.nodes) if (n.armedForFreeze) armed.push_back(n.id);
         if (!armed.empty()) freezeNodes(armed);
+    };
+    graphComponent->onParamGesture = [this](int nodeId, int paramIdx, bool begin) {
+        handleParamGesture(nodeId, paramIdx, begin);
     };
     graphComponent->onRunScript = [this](int nodeId) { showScriptConsoleForNode(nodeId); };
     graphComponent->onOpenHelpDoc = [this](juce::String rel) { openHelpDoc(rel); };
@@ -918,6 +947,7 @@ void MainContentComponent::resized() {
     placeBtn(fitAllBtn, 50);
     placeBtn(metroBtn, 80);
     placeBtn(loopBtn, 42);
+    placeBtn(autoBtn, 82);
     placeBtn(songBtn, 46);
     placeBtn(monitorBtn, 64);
     placeBtn(captureBtn, 60);
@@ -1107,20 +1137,45 @@ void MainContentComponent::timerCallback() {
         }
     }
 
-    // Apply recorded automation during playback
+    // Automation-recording pass edges. Placed after transport.playing has been
+    // reconciled with the engine (above) so it also catches programmatic stops
+    // (song-end auto-stop), not just the Stop button. Play-start arms every
+    // Write-resolved param; stop simplifies + commits one undo snapshot.
+    if (transport.playing && !recPrevPlaying) beginAutomationPass();
+    else if (!transport.playing && recPrevPlaying) endAutomationPass();
+    recPrevPlaying = transport.playing;
+
+    // Record (capture) and read (playback) automation during playback. Both run
+    // in this one loop so point-writing lives in a single place; the UI controls
+    // only flip per-param recWriting via handleParamGesture().
     if (transport.playing) {
         float beat = (float)transport.positionBeats();
         std::vector<AutomationValue> autoValues;
         for (auto& node : graph.nodes) {
             for (int pi = 0; pi < (int)node.params.size(); ++pi) {
-                auto& lane = node.params[pi].automation;
+                auto& p = node.params[pi];
+                // ---- Record axis: capture the live value into the lane ----
+                if (p.recWriting) {
+                    // Absolute-cable ("Set") params are wholly driven by the
+                    // cable and can't be hand-authored, so never record them.
+                    bool absLocked = p.modulated && graph.paramHasAbsoluteInput(node.id, pi);
+                    if (!absLocked) {
+                        float v = p.modulated ? p.baseValue : p.value;
+                        recordAutomationPoint(p, beat, v);
+                    }
+                    continue; // never read-drive a param we're actively recording
+                }
+                // ---- Read axis: drive the param from its lane ----
+                // node-level ignore mutes all lanes; per-param bypass mutes one.
+                if (node.ignoreAutomation || p.bypassAutomation) continue;
+                auto& lane = p.automation;
                 if (!lane.points.empty()) {
                     float val = lane.evaluate(beat);
                     if (val >= -0.5f) { // valid (not sentinel)
-                        node.params[pi].value = val;
+                        p.value = val;
                         // Also push to plugin
-                        float normalized = (val - node.params[pi].minVal) /
-                            std::max(0.001f, node.params[pi].maxVal - node.params[pi].minVal);
+                        float normalized = (val - p.minVal) /
+                            std::max(0.001f, p.maxVal - p.minVal);
                         autoValues.push_back({node.id, pi, juce::jlimit(0.0f, 1.0f, normalized)});
                     }
                 }
@@ -1377,6 +1432,7 @@ juce::PopupMenu MainContentComponent::getMenuForIndex(int idx, const juce::Strin
         menu.addItem(313, "Script (Signal + MIDI)");
         menu.addItem(314, "Algorithmic MIDI");
         menu.addItem(315, "Voices (Polyphony)");
+        menu.addItem(316, "Recording Automation");
         menu.addSeparator();
         menu.addItem(312, "Keyboard Shortcuts");
         menu.addSeparator();
@@ -1526,6 +1582,7 @@ void MainContentComponent::menuItemSelected(int menuItemID, int) {
         case 313: openHelpDoc("signal-shape.html"); break;
         case 314: openHelpDoc("midi-script.html"); break;
         case 315: openHelpDoc("voices.html"); break;
+        case 316: openHelpDoc("automation-recording.html"); break;
         case 320:
             juce::AlertWindow::showMessageBoxAsync(
                 juce::MessageBoxIconType::InfoIcon,
@@ -2876,6 +2933,99 @@ void MainContentComponent::onStop() {
     transport.playing = false;
     audioEngine.stop();
     playBtn.setButtonText("Play");
+}
+
+void MainContentComponent::beginAutomationPass() {
+    // A new playback pass begins. Arm every param that RESOLVES to Write so it
+    // overwrites its whole pass at its current value whether or not the user
+    // touches it (the "flatten to static" mode - node/param scope only, so this
+    // can never wipe every lane in the project). Touch/Latch params arm later,
+    // on their gesture begin, via handleParamGesture(). Reset per-param sweep
+    // state for a clean pass either way.
+    for (auto& node : graph.nodes) {
+        for (int pi = 0; pi < (int)node.params.size(); ++pi) {
+            auto& p = node.params[pi];
+            p.recLastBeat = -1.0f;
+            p.recDidWrite = false;
+            AutoArmMode m = resolveArmMode(graph.autoArmGlobal, node, p);
+            bool absLocked = p.modulated && graph.paramHasAbsoluteInput(node.id, pi);
+            p.recWriting = (m == AutoArmMode::Write) && !absLocked;
+        }
+    }
+}
+
+void MainContentComponent::endAutomationPass() {
+    // The pass ended (Stop, pause, or programmatic song-end). Thin every lane we
+    // recorded into (collinear reduction collapses a static Write to two
+    // endpoints while keeping the shape of a genuine sweep), then commit ONE
+    // undo snapshot for the whole pass - consistent with SEANCE's gesture-
+    // endpoint undo policy. Clear all transient recording state.
+    bool anyRecorded = false;
+    for (auto& node : graph.nodes) {
+        for (auto& p : node.params) {
+            if (p.recDidWrite) {
+                float eps = (p.maxVal - p.minVal) * 0.005f;
+                if (eps <= 0.0f) eps = 1e-4f;
+                simplifyAutomationLane(p.automation, eps);
+                anyRecorded = true;
+            }
+            p.recWriting = false;
+            p.recLastBeat = -1.0f;
+            p.recDidWrite = false;
+        }
+    }
+    if (anyRecorded) {
+        graph.dirty = true;
+        projectDirty = true;
+        graph.commitSnapshot("Record automation");
+    }
+}
+
+void MainContentComponent::handleParamGesture(int nodeId, int paramIdx, bool begin) {
+    // A user grabbed (begin) or released (end) a param control. Only Touch/Latch
+    // recording is gesture-driven (Write arms at play-start); and only while the
+    // transport is actually rolling. The per-tick point-writing happens in
+    // timerCallback() - here we just flip recWriting.
+    if (!transport.playing) return;
+    auto* node = graph.findNode(nodeId);
+    if (!node || paramIdx < 0 || paramIdx >= (int)node->params.size()) return;
+    auto& p = node->params[paramIdx];
+    // Absolute-cable params are cable-driven; never hand-record them.
+    if (p.modulated && graph.paramHasAbsoluteInput(nodeId, paramIdx)) return;
+    AutoArmMode m = resolveArmMode(graph.autoArmGlobal, *node, p);
+    if (begin) {
+        if (m == AutoArmMode::Touch || m == AutoArmMode::Latch) {
+            p.recWriting = true;
+            p.recLastBeat = -1.0f; // fresh sweep segment (punch-in)
+        }
+    } else {
+        // Release. Touch stops writing and ends the segment (so the untouched
+        // gap before the next punch-in keeps its existing automation). Latch
+        // keeps writing the held value until the pass ends. Write (if this
+        // param resolved to it) is unaffected - it stops only at pass end.
+        if (m == AutoArmMode::Touch) {
+            p.recWriting = false;
+            p.recLastBeat = -1.0f;
+        }
+    }
+}
+
+void MainContentComponent::syncAutoButton() {
+    // Armed (Touch/Latch) uses a red accent to read as "recording-enabled",
+    // distinct from the blue transport accent on Play/Loop.
+    static const juce::Colour kAutoArmedColour(200, 60, 60);
+    const char* label = "Auto: Off";
+    bool armed = false;
+    switch (graph.autoArmGlobal) {
+        case AutoArmMode::Touch: label = "Auto: Touch"; armed = true; break;
+        case AutoArmMode::Latch: label = "Auto: Latch"; armed = true; break;
+        default: break; // Off (Inherit/Write never appear at global scope)
+    }
+    autoBtn.setButtonText(label);
+    if (armed)
+        autoBtn.setColour(juce::TextButton::buttonColourId, kAutoArmedColour);
+    else
+        autoBtn.removeColour(juce::TextButton::buttonColourId);
 }
 
 void MainContentComponent::onRecord() {

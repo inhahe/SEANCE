@@ -74,6 +74,15 @@ public:
     void onStop();
     void onRecord();
 
+    // Automation recording (see resolveArmMode / recordAutomationPoint in
+    // node_graph.h). The actual per-tick point-writing lives in timerCallback();
+    // these manage the pass lifecycle and gesture arming.
+    void beginAutomationPass();  // play-start: arm every Write-resolved param
+    void endAutomationPass();    // stop: simplify recorded lanes + one snapshot
+    void handleParamGesture(int nodeId, int paramIdx, bool begin); // Touch/Latch arm
+    void syncAutoButton();       // refresh the transport Auto button label + colour
+    bool recPrevPlaying = false; // edge-detect play<->stop transitions in timer
+
     // File operations
     void newProject();
     void showMidiDeviceWizard();
@@ -121,6 +130,7 @@ private:
     juce::TextButton fitAllBtn{"Fit All"};
     juce::TextButton metroBtn{"Metronome"};
     juce::TextButton loopBtn{"Loop"};
+    juce::TextButton autoBtn{"Auto: Off"}; // global automation-record mode (Off/Touch/Latch)
     juce::TextButton songBtn{"Song"};
     juce::TextButton monitorBtn{"Monitor"};
     juce::ComboBox timeSigCombo;

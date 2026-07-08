@@ -1432,6 +1432,7 @@ juce::PopupMenu MainContentComponent::getMenuForIndex(int idx, const juce::Strin
         menu.addItem(313, "Script (Signal + MIDI)");
         menu.addItem(314, "Algorithmic MIDI");
         menu.addItem(315, "Voices (Polyphony)");
+        menu.addItem(316, "Recording Automation");
         menu.addSeparator();
         menu.addItem(312, "Keyboard Shortcuts");
         menu.addSeparator();
@@ -1581,6 +1582,7 @@ void MainContentComponent::menuItemSelected(int menuItemID, int) {
         case 313: openHelpDoc("signal-shape.html"); break;
         case 314: openHelpDoc("midi-script.html"); break;
         case 315: openHelpDoc("voices.html"); break;
+        case 316: openHelpDoc("automation-recording.html"); break;
         case 320:
             juce::AlertWindow::showMessageBoxAsync(
                 juce::MessageBoxIconType::InfoIcon,

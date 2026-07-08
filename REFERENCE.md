@@ -14,6 +14,7 @@ here.
 
 - [Graph fundamentals](#graph-fundamentals)
 - [Transport bar](#transport-bar)
+- [Automation recording (knob-drag capture)](#automation-recording-knob-drag-capture)
 - [Computer Keyboard node](#computer-keyboard-node)
 - [MIDI input and routing](#midi-input-and-routing)
 - [Piano roll](#piano-roll)
@@ -211,6 +212,7 @@ Two transport buttons light up with a shared blue accent (`RGB(64,132,223)`) to 
 
 - **Play** is lit blue **while audio is actually playing** and reverts to its normal look the moment playback stops — including programmatic stops, e.g. the song auto-stopping at its end. (It tracks the engine's real playing state, not just the Play/Stop clicks.)
 - **Loop** is lit blue **while looping is enabled** and unlit otherwise. The state follows every way looping can change — the button itself, a project load, undo/redo, the piano-roll loop-region menu, or a tracker import.
+- **Auto** turns **red** (`RGB(200,60,60)`) while the global automation-record mode is armed (Touch or Latch) and shows its default look when Off. See [Automation recording](#automation-recording-knob-drag-capture) below.
 
 The blue is deliberately distinct from the green/red used by the **Metro**, **Mon** (monitor), and computer-keyboard-MIDI toggles. An un-lit transport button uses the default button colour (no hardcoded grey), so it matches every other un-lit button.
 
@@ -229,6 +231,63 @@ Mechanism: `AudioEngine::stop()` calls `panic()`, which sets a one-shot `std::at
 - **Hosted VST3/plugins** — receive the standard `reset()` that JUCE forwards to the plugin.
 
 The reset is a **one-shot state wipe, not a permanent mute**: the graph keeps processing afterwards, so audition / musical-typing while stopped is unaffected. Memoryless processors (filters, EQ, compressor, distortion, etc.) need no `reset()` since they produce no audible tail.
+
+---
+
+## Automation recording (knob-drag capture)
+
+SEANCE can **record the knob/slider moves you make during playback** straight into the target parameter's automation lane, so the move plays back the next time — the classic DAW "automation write" workflow. This is distinct from **Freeze** (which renders a node's *sound* to audio to reproduce it exactly, including free-running LFO phase and internal randomness): automation recording captures **authored parameter motion**, not the rendered signal.
+
+### The three record modes
+
+The **Auto** button on the transport bar cycles the **global record mode**: **Off → Touch → Latch → Off**.
+
+- **Off** — nothing is recorded, ever. This is a **hard gate**: no per-node or per-param override can record while global is Off, so loading a project or hitting Play can never silently overwrite your automation. (This is why "Write" is not offered globally — see below.)
+- **Touch** — a param records **only while you hold it**. Grab the knob, drag, release — the points under the drag are (over)written; everywhere you *didn't* touch keeps its existing automation. This is punch-in/punch-out per gesture.
+- **Latch** — a param starts recording the moment you **first grab it** and keeps recording (at the last value) **until the playback pass ends** (transport stop), even after you let go. Use it to overwrite from a point onward.
+
+A fourth mode, **Write**, exists only as a **per-node or per-param override**, never globally: it records the **entire pass** at the control's current value whether or not you touch it — the "flatten this param to a static value across the whole song" tool. Because a single global switch set to Write could wipe every lane in the project on the next Play, Write is deliberately scope-limited.
+
+### The record cascade (global → node → param)
+
+Every param resolves its effective record mode from three levels, most-specific first:
+
+1. **Param override** (`Param::armMode`) — right-click a param row → **Automation** submenu → Inherit / Off / Touch / Latch / Write.
+2. **Node override** (`Node::armMode`) — right-click the node → **Automation** submenu → same choices; the default for every param on that node.
+3. **Global** (the **Auto** button).
+
+`resolveArmMode(global, node, param)` (in `node_graph.h`) implements this: **Off/Inherit global is a hard gate returning Off**; otherwise a param override wins, else a node override, else the global mode. The param-row **Automation** submenu shows the *resolved effective mode* in its header so you can see what will actually happen. **Global arm is session-only** (never saved); node and param overrides **are** saved with the project.
+
+### The read (playback) axis — muting lanes without deleting them
+
+Independently of recording, you can **mute automation on playback** non-destructively:
+
+- **Node → Automation → Ignore automation on this node** (`Node::ignoreAutomation`) — mutes *every* lane on the node.
+- **Param row → Automation → Bypass this lane** (`Param::bypassAutomation`) — mutes one param's lane.
+
+`automationReadEnabled(node, param)` gates the read path; the points stay on disk and resume driving the param the moment you un-mute. Both toggles are saved with the project. There is deliberately **no global read-mute** — muting is always node- or param-scoped.
+
+### How a pass works (capture pipeline)
+
+All point-writing happens in **one place** — the UI playback timer (`MainContentComponent::timerCallback`). The graph editor's knob-drag only flips a per-param `recWriting` flag via `onParamGesture → handleParamGesture`; the timer does the rest:
+
+- **Play-start** (`beginAutomationPass`) arms every param whose resolved mode is **Write** (they record for the whole pass) and resets each param's sweep cursor.
+- **During playback**, for each param with `recWriting` set, `recordAutomationPoint` **sweeps out** any existing points in `(lastBeat, currentBeat]` and inserts a new point at the playhead — so re-recording over a region cleanly replaces it. Absolute-cable-driven ("Set") params are never recorded (the cable owns them).
+- **Touch release** clears `recWriting` and resets the cursor, so the untouched remainder of the pass keeps its old automation (punch-out). **Latch** keeps `recWriting` set until stop.
+- **Stop** (`endAutomationPass`) runs a collinear-point **simplify** on each recorded lane (epsilon = 0.5 % of the param's range) and commits **one undo snapshot** ("Record automation") for the whole pass, marking the project dirty.
+
+### On-screen feedback
+
+The graph makes capture state visible ("signal flow is always visible"):
+
+- An **armed** param (resolved mode ≠ Off under the current cascade) shows a **hollow red dot** after its name.
+- A param **recording right now** gets a **solid red outline** around its whole row.
+- A param whose lane is **muted** (node-ignore or per-param bypass) shows a **grey dot** (only when it actually has points).
+- A node with a **record-mode override** shows an **`A:<mode>`** badge in its title; a node with **ignore-automation** shows a **slashed-A** badge.
+
+### Hosted VST3/AU plugin knobs — not yet captured
+
+Recording currently captures **SEANCE's own native param rows**. Dragging a knob **inside a hosted plugin's own editor window** is **not** yet recorded (the design — attaching a `juce::AudioProcessorListener` per plugin and marshalling `parameterGestureChanged`/`parameterValueChanged` back into `handleParamGesture` — is specified as a planned task in `known-issues.md`). You *can* still automate a plugin param today by exposing it as a native param row and recording that, or by drawing points in a clip automation lane.
 
 ---
 

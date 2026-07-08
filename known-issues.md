@@ -5,6 +5,64 @@ top. When something is fixed, delete the entry (git history is the archive).
 
 ---
 
+## PLANNED: automation recording doesn't yet capture hosted-plugin (VST3/AU) editor knob-drags
+
+**What works today.** The knob-drag automation-recording system (transport **Auto**
+button → Off/Touch/Latch, plus per-node/per-param cascade overrides incl. Write —
+see REFERENCE.md → [Automation recording](REFERENCE.md#automation-recording-knob-drag-capture))
+records **SEANCE's own native param rows** drawn on the node body. Play-start arms
+Write params (`beginAutomationPass`), the UI timer sweeps points via
+`recordAutomationPoint`, and stop simplifies + commits one snapshot
+(`endAutomationPass`). Native knob gestures reach it through
+`NodeGraphComponent::onParamGesture → MainContentComponent::handleParamGesture`.
+
+**The gap.** Dragging a knob **inside a hosted plugin's own editor window** does
+*not* get recorded — SEANCE never observes those gestures. The old
+`AudioEngine::recordParamChange(nodeId, paramIdx, value)` stub (documented but with
+no callers) was the placeholder for this and is now superseded by the cascade design.
+
+**The proper fix (fully specified).**
+1. **Attach a listener per hosted plugin.** In `GraphProcessor::rebuildGraph`
+   (`graph_processor.cpp` ~line 951, right after
+   `processorGraph->addNode(std::move(node.plugin->instance))`), attach a
+   `juce::AudioProcessorListener` to `graphNode->getProcessor()`, capturing the
+   stable `nodeId`. Own the listeners in a `std::vector<std::unique_ptr<…>>` on
+   `GraphProcessor`, **cleared at the top of every rebuild** (like
+   `latencyListener.beginRebuild()`), since the plugin processors are recreated
+   each rebuild.
+2. **React to gestures + value changes.**
+   `audioProcessorParameterChangeGestureBegin/End(proc, pluginParamIdx)` →
+   arm/disarm; `audioProcessorParameterChanged(proc, pluginParamIdx, newNorm)` →
+   the live value. These fire only on genuine user edits (the graph drives playback
+   via `AudioProcessorParameter::setValue`, which does **not** notify listeners —
+   only `setValueNotifyingHost` does — so our own automation playback won't feed
+   back into the recorder).
+3. **Marshal to the message thread.** Callbacks may arrive on the audio thread;
+   wrap the hand-off in `juce::MessageManager::callAsync`. Capture only the
+   `GraphProcessor*` + plain `int/float`s (never the listener object, which may be
+   destroyed by a rebuild before the async runs).
+4. **Translate + reuse the existing pipeline.** Plugin param index == node param
+   index for plugin nodes (the read path already does
+   `node.params[pi] → getParameters()[pi]`, see `automation.cpp::applyValues` and
+   the timer loop in `main_window.cpp`). So: on gesture begin/end call
+   `handleParamGesture(nodeId, pluginParamIdx, begin)`; on value-change set
+   `node.params[pluginParamIdx].value = minVal + norm*(maxVal-minVal)` so the timer
+   records the live value. All arming/sweeping/simplify/undo machinery is reused
+   unchanged.
+
+**Caveat to document when built:** plugins that change a param via
+`setValueNotifyingHost` *without* bracketing gestures won't arm Touch/Latch (no
+begin event). Decide whether to also treat a bare value-change as an implicit
+touch, or leave those plugins to the Write override.
+
+**Why deferred:** touches the audio-graph rebuild + a listener lifecycle across
+rebuilds, and can't be verified without manually dragging a real VST3's knobs
+(self-tests can't cover it). Built as its own phase after the native-knob core
+(committed) so a half-verified audio-thread change didn't land on top of a working
+feature.
+
+---
+
 ## OPEN (UX/naming): "auto-cache" menu label implies auto-freezing, which it doesn't do
 
 **Noticed:** 2026-07-07, same cache trace. The node right-click menu offers

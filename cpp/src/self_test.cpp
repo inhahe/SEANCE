@@ -5294,6 +5294,56 @@ void testAssetLibrary(Report& r) {
                 "convlib: ConvolutionIR asset survives save/load");
     }
 
+    // ---- timeline nesting: no depth cap, cycle-safe --------------------------
+    {
+        // MIDI timelines can be nested as children of other timelines. The
+        // absolute beat offset is the sum of groupBeatOffset up the parent chain.
+        // The walk uses a visited-set loop detector (not an arbitrary depth cap),
+        // so nesting can go arbitrarily deep AND a corrupt cyclic chain can't hang.
+        NodeGraph g;
+        const int N = 64; // deliberately well past the old depth cap of 20
+        std::vector<int> ids;
+        ids.reserve(N);
+        for (int i = 0; i < N; ++i)
+            ids.push_back(g.addNode("tl", NodeType::MidiTimeline, {}, {}).id);
+        // Set offsets by id AFTER creating all nodes (addNode can reallocate the
+        // node vector, so never hold a Node& across an addNode call).
+        for (int id : ids)
+            if (auto* n = g.findNode(id)) n->groupBeatOffset = 2.0f;
+        // Chain them: ids[0] is the root, each subsequent node is a child of the
+        // previous one -> a 64-deep nest.
+        for (int i = 1; i < N; ++i)
+            g.addToGroup(ids[i - 1], ids[i]);
+
+        // Deepest node's absolute offset = 64 * 2.0 = 128 (the old cap would have
+        // truncated at 20 levels -> 40).
+        r.checkVal(std::abs(g.getAbsoluteBeatOffset(ids[N - 1]) - 128.0f) < 1e-3f,
+                   "nesting: 64-deep timeline chain sums the full offset (no cap)",
+                   g.getAbsoluteBeatOffset(ids[N - 1]));
+
+        // addToGroup refuses a cycle: making the root a child of the deepest node
+        // would close the loop, so it must be rejected and leave the root's parent
+        // unchanged (-1).
+        g.addToGroup(ids[N - 1], ids[0]);
+        const Node* root = g.findNode(ids[0]);
+        r.check(root && root->parentGroupId == -1,
+                "nesting: addToGroup refuses a cycle (deep descendant -> root)");
+
+        // Even a forcibly-corrupted cyclic chain must terminate (not hang). Force
+        // a 3-cycle by hand and confirm both chain walks return.
+        int a = g.addNode("a", NodeType::MidiTimeline, {}, {}).id;
+        int b = g.addNode("b", NodeType::MidiTimeline, {}, {}).id;
+        int c = g.addNode("c", NodeType::MidiTimeline, {}, {}).id;
+        if (auto* na = g.findNode(a)) { na->groupBeatOffset = 1.0f; na->parentGroupId = b; }
+        if (auto* nb = g.findNode(b)) { nb->groupBeatOffset = 1.0f; nb->parentGroupId = c; }
+        if (auto* nc = g.findNode(c)) { nc->groupBeatOffset = 1.0f; nc->parentGroupId = a; }
+        float cyc = g.getAbsoluteBeatOffset(a);   // must return, not spin forever
+        r.check(std::isfinite(cyc) && std::abs(cyc - 3.0f) < 1e-3f,
+                "nesting: cyclic parent chain terminates (each node counted once)");
+        r.check(!g.isAncestorOf(ids[0], a),
+                "nesting: isAncestorOf terminates on a cyclic chain");
+    }
+
     // ---- Spectrum Tap live-references a FrequencyGraph asset per bin --------
     {
         // encode/decode must carry the per-bin asset id alongside the cached

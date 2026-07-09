@@ -150,11 +150,14 @@ Node& NodeGraph::createGroup(const std::string& name, Vec2 pos) {
 }
 
 // Is `ancestorId` somewhere in `nodeId`'s parent chain? Used to refuse
-// parent/child links that would form a cycle. Depth-bounded so a pre-existing
-// corrupt cycle can't hang the walk.
+// parent/child links that would form a cycle. A `visited` set makes the walk
+// terminate on any pre-existing corrupt cycle (each node is examined at most
+// once), so there is no arbitrary cap on how deeply timelines/groups may nest.
 bool NodeGraph::isAncestorOf(int ancestorId, int nodeId) {
+    std::set<int> visited;
     int current = nodeId;
-    for (int depth = 0; current >= 0 && depth < 256; ++depth) {
+    while (current >= 0) {
+        if (!visited.insert(current).second) break; // already seen -> cycle
         auto* n = findNode(current);
         if (!n) break;
         if (n->parentGroupId == ancestorId) return true;
@@ -332,15 +335,19 @@ void NodeGraph::deleteTime(float fromBeat, float toBeat, int nodeId) {
 }
 
 float NodeGraph::getAbsoluteBeatOffset(int nodeId) {
+    // Sum groupBeatOffset up the parent chain. A `visited` set stops the walk if
+    // the chain is ever corrupt/cyclic (each node contributes at most once),
+    // which removes any need for an arbitrary nesting-depth cap - timelines can
+    // be nested arbitrarily deep.
     float total = 0;
+    std::set<int> visited;
     int current = nodeId;
-    int depth = 0;
-    while (current >= 0 && depth < 20) { // depth limit to prevent infinite loops
+    while (current >= 0) {
+        if (!visited.insert(current).second) break; // already seen -> cycle
         auto* node = findNode(current);
         if (!node) break;
         total += node->groupBeatOffset;
         current = node->parentGroupId;
-        depth++;
     }
     return total;
 }

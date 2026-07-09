@@ -735,6 +735,8 @@ The strip exposes the two halves of timeline parenting:
 
 `addToGroup` was relaxed from Group-only parents to also accept `MidiTimeline`/`AudioTimeline` parents, guarded by `isAncestorOf` so no parent/child cycle can form. When a parent timeline is deleted, any surviving child whose parent was the deleted node is detached to top-level (keeping its own offset) rather than left with a dangling `parentGroupId`. The relationship and offset are serialized generically (`parentGroupId` + `groupBeatOffset` in the project file), so save→load round-trips it.
 
+**Nesting depth is unbounded.** There is no cap on how deeply timelines may nest. Both parent-chain walks — `isAncestorOf` (cycle check on link) and `getAbsoluteBeatOffset` (sum of every ancestor's `groupBeatOffset`) — use a `visited`-set loop detector rather than an arbitrary depth limit, so a chain of any depth accumulates its full offset, and even a corrupt/cyclic `parentGroupId` chain (e.g. from a hand-edited project file) terminates cleanly with each node counted once instead of hanging. (Earlier builds capped `getAbsoluteBeatOffset` at 20 levels, which silently truncated the offset past that depth.)
+
 ---
 
 ## Layered Waveform editor

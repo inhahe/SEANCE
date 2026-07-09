@@ -24,6 +24,7 @@
 #include "shape_expr.h"            // bakeShapeExpr (Builtin/Lua/Python/GLSL curve bakes)
 #include "builtin_synth.h"         // WaveExprParser - Builtin expression vocabulary
 #include "builtin_effects.h"       // ParametricEQProcessor - variable EQ band count
+#include "convolution_processor.h"  // ConvolutionProcessor - PDC latency reporting
 #include "voice_allocator.h"       // VoiceAllocator - per-voice polyphony policy
 #include "poly_voice_processor.h"   // PolyVoiceProcessor - end-to-end voice audio
 #include "signal_math.h"            // SignalMathProcessor - modular-kit math module
@@ -5871,6 +5872,39 @@ void testAssetLibrary(Report& r) {
                 "pdc: JUCE graph delay-compensates a parallel dry path against a latency node");
         r.checkVal(g.getLatencySamples() == kLat,
                    "pdc: graph reports the max-path latency", g.getLatencySamples());
+    }
+
+    // ---- convolution filter reports latency for PDC -------------------------
+    {
+        // The Convolution Filter has two algorithm paths chosen by IR length:
+        //   short IR  (< 1024 samples) -> direct time-domain, ZERO added latency
+        //   long IR  (>= 1024 samples) -> partitioned overlap-add FFT, which
+        //     buffers a full partition (512) before it can emit output.
+        // Only that artificial block-buffering delay is reported via
+        // setLatencySamples so the graph's PDC time-aligns the effect against
+        // parallel branches. The IR's own group delay is deliberately NOT
+        // reported (it's part of the intended filtering sound).
+        Node shortNode, longNode;
+
+        // Short IR: a 101-sample lowpass -> direct path.
+        auto shortIR = ConvolutionProcessor::generateLowpass(2000.0f, 50, 44100.0);
+        shortNode.script = ConvolutionProcessor::encodeIR(shortIR);
+        ConvolutionProcessor shortConv(shortNode);
+        shortConv.prepareToPlay(44100.0, 512);
+        r.checkVal(shortConv.getLatencySamples() == 0,
+                   "convolution: short IR (direct path) reports zero latency",
+                   shortConv.getLatencySamples());
+
+        // Long IR: 2000 samples of arbitrary content -> overlap-add path.
+        std::vector<float> longIR(2000, 0.0f);
+        longIR[0] = 1.0f;
+        longIR[1500] = 0.5f; // ensure >= 1024 so the FFT path is chosen
+        longNode.script = ConvolutionProcessor::encodeIR(longIR);
+        ConvolutionProcessor longConv(longNode);
+        longConv.prepareToPlay(44100.0, 512);
+        r.checkVal(longConv.getLatencySamples() == 512,
+                   "convolution: long IR (overlap-add path) reports 512-sample latency",
+                   longConv.getLatencySamples());
     }
 
     // ---- import / merge: dedup by content, id remap, name-clash suffix ------

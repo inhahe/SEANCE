@@ -190,6 +190,13 @@ void ConvolutionProcessor::reset() {
 void ConvolutionProcessor::setupDirect() {
     useFFT = false;
     inputHistory.assign(ir.size(), 0.0f);
+    // Direct time-domain convolution writes every output sample in place from
+    // the running input history - no block buffering - so it adds ZERO
+    // algorithmic latency. (The IR's own group delay is part of the intended
+    // filtering, not reported here: reporting it would time-advance the effect
+    // through PDC and corrupt the sound. Only artificial processing delay is
+    // ever reported.)
+    setLatencySamples(0);
 }
 
 void ConvolutionProcessor::setupOverlapAdd() {
@@ -216,6 +223,17 @@ void ConvolutionProcessor::setupOverlapAdd() {
     overlapBuffer.assign(fftSize, 0.0f);
     inputBuffer.assign(partitionSize, 0.0f);
     inputBufferPos = 0;
+
+    // The overlap-add path buffers a full partition of input before it can emit
+    // the corresponding output (processOverlapAdd reads output one partition
+    // behind the write cursor), so it adds exactly partitionSize samples of
+    // artificial processing delay. Report it so the graph's plugin-delay
+    // compensation time-aligns this branch with parallel dry/other branches.
+    // NOTE: this is ONLY the block-buffering delay. The IR's own group delay
+    // (~ir.size()/2) is part of the intended filtering and is deliberately NOT
+    // reported - compensating it would time-advance the effect and corrupt the
+    // sound. Only artificial processing delay is ever reported.
+    setLatencySamples(partitionSize);
 }
 
 void ConvolutionProcessor::processDirect(float* data, int numSamples) {

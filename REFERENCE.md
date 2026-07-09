@@ -1603,6 +1603,19 @@ A frequency-response preview updates live as you draw.
 
 Maximum **4096 samples**. Longer files are truncated; the **IR Length** slider lets you trim further to reduce CPU (convolution cost is roughly proportional to IR length).
 
+### Latency and delay compensation
+
+The filter picks its algorithm from the IR length, and this affects processing latency:
+
+- **Short IRs (< 1024 samples)** run **direct time-domain** convolution, which writes each output sample in place with **zero added latency**.
+- **Long IRs (≥ 1024 samples)** switch to a **partitioned overlap-add FFT** for efficiency. This path buffers one 512-sample partition of input before it can emit the matching output, so it adds a fixed **512 samples** of processing latency (~11.6 ms at 44.1 kHz).
+
+That 512-sample delay is **reported to the graph's plugin-delay compensation** (via `setLatencySamples`), so a long-IR convolution stays time-aligned with any parallel dry path or other branch it's mixed back against — the graph delays the other branches to match. Switching the IR between the short and long regimes (e.g. dragging the **IR Length** slider across 1024) updates the reported latency automatically.
+
+The IR's own **group delay** (its internal build-up before the main peak) is *not* reported or compensated — that delay is part of the intended filtering sound, and time-advancing it would corrupt the effect. Only the artificial block-buffering delay is ever reported.
+
+> **Merging convolutions:** SEANCE can combine two chained convolution nodes into one node whose IR is the pre-convolution of both (`IR_combined = IR₁ ∗ IR₂`) to save CPU. This can also *reduce* total latency when it collapses two long-IR (FFT-path) stages into one — you pay the 512-sample buffering once instead of twice. Note the corner case: merging two short IRs whose combined length crosses 1024 pushes the result onto the FFT path, which *adds* 512 samples that neither original stage had.
+
 ### Zoom and grid
 
 - Mouse wheel — horizontal scroll

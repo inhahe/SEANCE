@@ -1599,6 +1599,15 @@ A frequency-response preview updates live as you draw.
 
 **3. Loading from a file** — **Load File…** picks a `.wav`, `.aiff`, or `.flac`. The audio becomes the IR.
 
+### Saving to / loading from the library
+
+Two buttons next to the **IR length** slider tie the editor into the project's [asset library](#asset-library-project-stores):
+
+- **Save to Library** — prompts for a name (defaulting to the node's name) and publishes the current IR as a **Convolution IR** asset. It then shows up under **Edit → Asset Library → Convolution IRs**, where it can be renamed, starred, duplicated, or archived like any other asset, and it travels with the project's library on **Export/Import**.
+- **Load from Library** — pops up a list of every saved IR; picking one loads it into the editor as an **independent copy** (further edits here never touch the stored asset — same as loading from a `.wav`). If nothing has been saved yet, a note tells you so.
+
+This lets you build up a personal collection of room/cabinet/EQ impulse responses once and reuse them across any Convolution Filter in the project.
+
 ### IR length
 
 Maximum **4096 samples**. Longer files are truncated; the **IR Length** slider lets you trim further to reduce CPU (convolution cost is roughly proportional to IR length).
@@ -3125,6 +3134,16 @@ has one tab per asset kind:
   equation text *and* its authoring language for formula curves, the control points
   for Drawn/Points, and the per-sample buffer for Drawn/Freehand all round-trip, so
   a stored curve can always be re-edited in the form it was authored.
+- <a name="convolution-ir-library"></a>**Convolution IRs** — a convolution
+  **impulse response** (a time-domain sample list). The payload is exactly the
+  encoding stored on a Convolution Filter node's script
+  (`ConvolutionProcessor::encodeIR`, the `"__convolution__:<len>,<sample>,…"`
+  form). Published from the **Convolution Filter** editor's **Save to Library**
+  button, and loaded back via its **Load from Library** button (a popup listing
+  every stored IR). Unlike the Frequency Graphs, IRs load as an **independent
+  copy** — the loaded IR is dropped into the node and can be edited freely without
+  touching the stored asset (there is no live link, matching how the editor loads
+  an IR from a `.wav` file). See [Convolution Filter](#convolution-filter).
 
 Each tab lists its assets with **Rename**, **Duplicate**, **Star** / **Unstar**,
 and **Archive** (soft-delete) / **Restore**, plus two filter toggles: **Show

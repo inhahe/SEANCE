@@ -158,6 +158,8 @@ SEANCE's convolution node has an editor with three ways to build an IR:
   - **Freehand** — draw individual sample values directly with the mouse. Good for sharp transients and surgical per-sample edits.
 - **Load a .wav** — pick any audio file as the IR. Use real cabinet IRs, real room reverbs, anything you have on disk.
 
+Any IR you build can be **saved to the project's asset library** (and loaded back into any other Convolution Filter) with the editor's **Save to Library** / **Load from Library** buttons — so a collection of room, cabinet, and EQ impulse responses is reusable across the whole project.
+
 The editor includes a **frequency response preview** that updates as you draw, so you can see what filter shape your time-domain IR is producing in the frequency domain. Mouse-wheel zoom (up to 128×) reveals individual samples as stems with sample-boundary grids when zoomed in enough.
 
 #### Room IR capture

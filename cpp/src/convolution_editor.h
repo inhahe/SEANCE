@@ -62,6 +62,8 @@ private:
     juce::Label cutoffLbl, orderLbl, bwLbl, delayLbl, fbLbl, echoLbl;
     juce::TextButton applyPresetBtn{"Generate"};
     juce::TextButton loadFileBtn{"Load IR File..."};
+    juce::TextButton saveToLibBtn{"Save to Library"};
+    juce::TextButton loadFromLibBtn{"Load from Library"};
     juce::TextButton applyBtn{"Apply"};
     juce::TextButton closeBtn{"Close"};
 
@@ -78,6 +80,8 @@ private:
     void generateFromPreset();
     void renderFromControlPoints();
     void loadFromFile();
+    void saveToLibrary();       // publish the current IR as a ConvolutionIR asset
+    void showLibraryBrowser();  // pick a stored IR and load it (independent copy)
 
     juce::Rectangle<float> getIRArea() const;
     juce::Rectangle<float> getFreqArea() const;

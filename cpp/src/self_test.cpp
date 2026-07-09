@@ -5252,6 +5252,48 @@ void testAssetLibrary(Report& r) {
         }
     }
 
+    // ---- convolution IR library round-trip ----------------------------------
+    {
+        // A Convolution Filter's impulse response can be published to the asset
+        // library as a ConvolutionIR asset and loaded back into any Convolution
+        // Filter. The payload is exactly the node-script encoding
+        // (ConvolutionProcessor::encodeIR), so publish -> decode reproduces the IR.
+
+        // Tag <-> kind round-trips through the stable string.
+        AssetKind k;
+        r.check(std::string(assetKindTag(AssetKind::ConvolutionIR)) == "convolution_ir" &&
+                    assetKindFromTag("convolution_ir", k) && k == AssetKind::ConvolutionIR,
+                "convlib: AssetKind <-> 'convolution_ir' tag round-trips");
+
+        std::vector<float> ir = { 1.0f, -0.5f, 0.25f, 0.0f, 0.125f, -0.0625f };
+        std::string payload = ConvolutionProcessor::encodeIR(ir);
+
+        NodeGraph g;
+        int idA = g.assets.add(AssetKind::ConvolutionIR, "Small Room", "", payload);
+        int idB = g.assets.add(AssetKind::ConvolutionIR, "Big Hall", "",
+                               ConvolutionProcessor::encodeIR({ 1.0f, 0.0f, 0.0f }));
+        r.check(idA != idB && idA >= AssetLibrary::kUserIdBase,
+                "convlib: two IRs get distinct user-space ids");
+
+        // Loading back reproduces the exact sample list.
+        const AssetEntry* e = g.assets.find(idA);
+        std::vector<float> back = e ? ConvolutionProcessor::decodeIR(e->payload)
+                                    : std::vector<float>{};
+        bool same = back.size() == ir.size();
+        for (size_t i = 0; same && i < ir.size(); ++i)
+            same = std::abs(back[i] - ir[i]) < 1e-6f;
+        r.check(same, "convlib: stored IR decodes back to the original samples");
+
+        // Survives a project save/load with kind + payload intact.
+        std::ostringstream oss;
+        ProjectFile::writeProject(oss, g, nullptr, false, true);
+        NodeGraph g2; std::istringstream iss(oss.str());
+        ProjectFile::readProject(iss, g2, nullptr);
+        const AssetEntry* le = g2.assets.find(idA);
+        r.check(le && le->kind == AssetKind::ConvolutionIR && le->payload == payload,
+                "convlib: ConvolutionIR asset survives save/load");
+    }
+
     // ---- Spectrum Tap live-references a FrequencyGraph asset per bin --------
     {
         // encode/decode must carry the per-bin asset id alongside the cached

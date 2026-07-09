@@ -360,6 +360,7 @@ AssetLibraryComponent::AssetLibraryComponent(
     add("ADHSR Curves", AssetKind::AhdsrCurve);
     add("Morph Algorithms", AssetKind::MorphAlgorithm);
     add("Frequency Graphs", AssetKind::FrequencyGraph);
+    add("Convolution IRs", AssetKind::ConvolutionIR);
     addAndMakeVisible(tabs);
 
     addAndMakeVisible(importBtn);

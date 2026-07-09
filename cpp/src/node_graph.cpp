@@ -235,6 +235,12 @@ void NodeGraph::insertTime(float atBeat, float duration, int nodeId) {
         for (auto& m : markers)
             if (m.beat >= atBeat) m.beat += duration;
     }
+    // Markers just moved, so any child timeline anchored to a marker must have
+    // its groupBeatOffset (and the cascading absoluteBeatOffset cache) re-read.
+    // This is what makes anchored children ripple left/right when time is
+    // inserted upstream. Safe to call in single-node scope too: it only rewrites
+    // offsets for anchored nodes and recomputes the derived absolute cache.
+    resolveAnchors();
     dirty = true;
 }
 
@@ -331,6 +337,12 @@ void NodeGraph::deleteTime(float fromBeat, float toBeat, int nodeId) {
         for (auto& m : markers)
             if (m.beat >= toBeat) m.beat -= duration;
     }
+    // Markers just moved/were removed, so re-resolve any child timeline anchored
+    // to a marker (this makes anchored children ripple left when time is cut
+    // upstream) and refresh the cascading absoluteBeatOffset cache. If a child
+    // was anchored to a marker that fell inside the deleted range, that marker
+    // is gone, resolveMarkerBeat returns <0, and the child keeps its last offset.
+    resolveAnchors();
     dirty = true;
 }
 

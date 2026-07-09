@@ -1020,9 +1020,12 @@ public:
     void resolveAnchors();
     float getAbsoluteBeatOffset(int nodeId); // cascading offset through parent chain
 
-    // Insert/delete time
-    void insertTime(float atBeat, float duration, int nodeId = -1); // -1 = all nodes
-    void deleteTime(float fromBeat, float toBeat, int nodeId = -1); // update groupBeatOffset from anchor markers
+    // Insert/delete time. Both shift clips/notes/CC/automation (and markers in
+    // all-tracks scope), then call resolveAnchors() so any child timeline
+    // anchored to a marker ripples with it and the absoluteBeatOffset cache is
+    // rebuilt. nodeId = -1 => all nodes.
+    void insertTime(float atBeat, float duration, int nodeId = -1);
+    void deleteTime(float fromBeat, float toBeat, int nodeId = -1);
     Node* findNode(int id);
 
     // Snapshot automation: write the current value of all armed params as

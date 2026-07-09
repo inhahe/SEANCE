@@ -5344,6 +5344,47 @@ void testAssetLibrary(Report& r) {
                 "nesting: isAncestorOf terminates on a cyclic chain");
     }
 
+    // ---- anchored child ripples when time is inserted/cut upstream -----------
+    {
+        // A nested timeline whose start offset is anchored to a named marker must
+        // follow that marker when insert/deleteTime shifts it. insertTime and
+        // deleteTime call resolveAnchors() internally, so the child's
+        // groupBeatOffset (and cascading absoluteBeatOffset) re-read the marker's
+        // new beat with no explicit call from the UI/scripting layer.
+        NodeGraph g;
+        int parent = g.addNode("parent", NodeType::MidiTimeline, {}, {}).id;
+        int child  = g.addNode("child",  NodeType::MidiTimeline, {}, {}).id;
+        g.markers.push_back(Marker{1, "cue", 8.0f});
+        g.addToGroup(parent, child);
+        if (auto* c = g.findNode(child)) {
+            c->groupBeatOffset = 8.0f;   // starts at the marker
+            c->anchorMarker = "cue";     // bound to it
+        }
+        g.resolveAnchors();
+        r.checkVal(std::abs(g.findNode(child)->groupBeatOffset - 8.0f) < 1e-3f,
+                   "anchor: child starts at its anchored marker (beat 8)",
+                   g.findNode(child)->groupBeatOffset);
+
+        // Insert 4 beats at beat 2 (all-tracks scope). Marker "cue" moves 8 -> 12,
+        // and the anchored child must ripple right to follow it.
+        g.insertTime(2.0f, 4.0f, -1);
+        r.checkVal(std::abs(g.resolveMarkerBeat("cue") - 12.0f) < 1e-3f,
+                   "anchor: insertTime shifts the marker (8 -> 12)",
+                   g.resolveMarkerBeat("cue"));
+        r.checkVal(std::abs(g.findNode(child)->groupBeatOffset - 12.0f) < 1e-3f,
+                   "anchor: child offset ripples right with the marker (insert)",
+                   g.findNode(child)->groupBeatOffset);
+
+        // Cut 4 beats from beat 2. Marker "cue" moves 12 -> 8, child follows back.
+        g.deleteTime(2.0f, 6.0f, -1);
+        r.checkVal(std::abs(g.resolveMarkerBeat("cue") - 8.0f) < 1e-3f,
+                   "anchor: deleteTime shifts the marker back (12 -> 8)",
+                   g.resolveMarkerBeat("cue"));
+        r.checkVal(std::abs(g.findNode(child)->groupBeatOffset - 8.0f) < 1e-3f,
+                   "anchor: child offset ripples left with the marker (delete)",
+                   g.findNode(child)->groupBeatOffset);
+    }
+
     // ---- Spectrum Tap live-references a FrequencyGraph asset per bin --------
     {
         // encode/decode must carry the per-bin asset id alongside the cached

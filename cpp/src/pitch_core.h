@@ -76,6 +76,55 @@
 
 namespace SoundShop {
 
+// ============================================================================
+// LatencyDelay -- a plain N-sample delay line.
+//
+// Every consumer of PhaseVocoderShifter needs one. The shifter delays its
+// output by latencySamples(), and the graph's PDC compensates for that against
+// OTHER paths in the node graph -- but it knows nothing about paths INSIDE a
+// node. So a node's dry signal, or any parallel unshifted band, must be delayed
+// by the same amount by hand or it will be misaligned against the wet path by
+// the full latency (32 ms at the default settings, which is a slapback echo,
+// not a mix).
+// ============================================================================
+class LatencyDelay {
+public:
+    // Allocates. `samples` may be 0, in which case process() is a pass-through.
+    void prepare(int samples) {
+        delay = std::max(0, samples);
+        buf.assign((size_t)std::max(1, delay), 0.0f);
+        pos = 0;
+    }
+
+    void reset() {
+        std::fill(buf.begin(), buf.end(), 0.0f);
+        pos = 0;
+    }
+
+    int delaySamples() const { return delay; }
+
+    // Allocation-free. in and out may alias (the stored sample is read out
+    // before the incoming one overwrites it).
+    void process(const float* in, float* out, int n) {
+        if (delay <= 0) {
+            if (out != in) std::copy(in, in + n, out);
+            return;
+        }
+        for (int i = 0; i < n; ++i) {
+            const float held = buf[(size_t)pos];
+            buf[(size_t)pos] = in[i];
+            out[i] = held;
+            if (++pos >= delay) pos = 0;
+        }
+    }
+
+    size_t capacityBytes() const { return buf.capacity() * sizeof(float); }
+
+private:
+    std::vector<float> buf;
+    int delay = 0, pos = 0;
+};
+
 class PhaseVocoderShifter {
 public:
     using cplx = std::complex<float>;

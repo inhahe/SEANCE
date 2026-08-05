@@ -23,62 +23,25 @@ against it would be a straightforward licence violation.
 
 **Options:**
 - Buy a commercial Rubber Band licence (Particular Programs Ltd sell one).
-- Replace it with an in-house pitch-shift core and drop the dependency. This
-  is the same core the wavelet pitch shifters need anyway (see the entries
-  below), so one piece of work solves both problems.
+- Replace it with an in-house pitch-shift core and drop the dependency.
 - Keep it, and accept that SEANCE ships GPL.
+
+**Status: the blocker to option 2 is gone.** `PhaseVocoderShifter`
+(`cpp/src/pitch_core.h`) is an in-house, allocation-free, self-tested pitch
+shifter, already in production use by Ind. Pitch Shift and Formant Pitch Shift.
+The remaining work is to re-base `PitchShiftProcessor`
+(`pitch_shift_processor.cpp`) onto it and delete the `third_party/rubberband`
+subtree plus the `HAS_RUBBERBAND` branch in `cpp/CMakeLists.txt:346`.
+
+The one capability Rubber Band has that `PhaseVocoderShifter` does not is
+**time stretching** (changing duration at constant pitch). Nothing in SEANCE
+uses that today, but check before deleting — if a future time-stretch feature
+is wanted, the phase vocoder is a natural place to grow it (a synthesis hop
+different from the analysis hop is the whole change).
 
 Note the build already treats Rubber Band as optional (`HAS_RUBBERBAND`, and
 CMake prints "NOT FOUND (pitch shift disabled)" when the directory is absent),
-so removing it is a supported configuration rather than a rewrite — but it
-currently costs you the Pitch Shift node.
-
----
-
-## BUG: resampling pitch shifters chop each block on upward shifts
-
-**Found:** 2026-08-05, while making the wavelet suite allocation-free.
-
-`IndependentPitchShiftProcessor` and `FormantPitchShiftProcessor` (both in
-`builtin_effects.h`) transpose by resampling **inside the current block**:
-
-```cpp
-float srcPos = (float)i * ratio;     // source sample for output sample i
-int i0 = (int)srcPos;
-if (i0 + 1 < n) shifted[i] = sig[i0] * (1 - frac) + sig[i0 + 1] * frac;
-else if (i0 < n) shifted[i] = sig[i0];
-// else: silence
-```
-
-For an upward shift this runs off the end of the block. At +12 semitones
-(ratio 2) every output sample past the halfway point wants a source sample
-that does not exist in this block, so it is left at zero. Each block is
-therefore a correctly-shifted first half followed by a **hard-zeroed second
-half**, repeating at the block rate — a 50%-duty-cycle gate at ~94 Hz for a
-512-sample block at 48 kHz. That is severe amplitude modulation, not a subtle
-artifact.
-
-Measured by `wavelet-fx: ... does not zero the tail of every block`: the
-fraction of each block's output energy landing in its last quarter is
-**0.00000** for both effects (a healthy continuous effect gives ~0.25).
-
-Downward shifts do not zero anything but are equally wrong in a different
-way: `srcPos` only ever reaches `ratio * (n-1) < n`, so each block replays a
-time-stretched copy of its own first `ratio` fraction, restarting every block.
-
-**Root cause, shared by both:** resampling changes *duration*. Changing pitch
-at constant duration needs state that outlives one block — either overlap-add
-granular resynthesis reading from a ring buffer of input history, or a phase
-vocoder. A block-local resampler cannot do it no matter how the edges are
-patched, so this is not fixable with a bounds tweak.
-
-**Relation to the other pitch shifters:** all three pitch shifters in the
-wavelet suite are currently broken — this pair by block-chopping, and Wavelet
-Pitch Shift for the separate reasons in the entry below. Worth deciding on
-them together, since a single correct pitch-shift core (or RubberBand, which
-is already linked into the build) could serve all three, with the wavelet part
-of each node reduced to the band-splitting/formant-envelope work that is
-actually its distinctive contribution.
+so removing it is a supported configuration rather than a rewrite.
 
 ---
 
@@ -147,15 +110,25 @@ meaningfully depend on its sound — there is no compatibility burden.
 
 **Open product question (needs a decision before the work is done):** even
 done correctly, an FFT-CWT scale-shift shifter is unlikely to clear the 10x
-realtime bar the other effects hit. The alternatives are to reimplement this
-node on RubberBand (already linked into the build) while keeping the node's
-name and slot, to restrict it to offline/bounce rendering, or to drop it —
-its stated selling point (transient preservation) is already served by
-Independent Pitch Shift (169x realtime) and Formant Pitch Shift (131x).
+realtime bar the other effects hit. The alternatives are:
 
-Until this is resolved the node ships broken and the
-`wavelet-cpu: Pitch Shift` self-test is a **known, expected failure** — it is
-left red deliberately so the bug stays visible rather than being suppressed.
+1. Rewrite it properly as above and accept it is offline/bounce-only.
+2. Reimplement it on `PhaseVocoderShifter` (`cpp/src/pitch_core.h`), keeping
+   the node's name and slot. Cheap, correct, and real-time — but then the node
+   is no longer meaningfully "wavelet" anything, so it would be duplicating
+   Ind. Pitch Shift with a misleading name.
+3. Drop it. Its stated selling point (transient preservation) is already
+   served by Independent Pitch Shift, which as of 2026-08-05 genuinely works:
+   0 cents error at +12 semitones, 13.7x realtime.
+
+Option 3 looks strongest and 2 looks worst. **This is the one pitch-shifter
+question still open** — the other two nodes are fixed.
+
+Until this is resolved the node ships broken. Its self-tests are
+`knownBug()` assertions, written as the checks a *correct* implementation must
+pass, so whoever fixes it gets an immediate verdict — and if the node ever
+starts passing them, the harness reports that as a failure so the stale entry
+here cannot be forgotten.
 
 ---
 

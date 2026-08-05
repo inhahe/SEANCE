@@ -4,6 +4,7 @@
 #include "wavelet.h"
 #include "pitch_detect.h"
 #include "fft_util.h"
+#include "pitch_core.h"     // PhaseVocoderShifter + LatencyDelay (pitch shifters)
 #include "builtin_synth.h"
 #include "curve_editor.h"   // SpectralCurve + CurveEq script helpers (Curve EQ)
 #include "warp.h"           // warpAmpValue + Waveshaper script helpers (Waveshaper FX)
@@ -3006,6 +3007,15 @@ public:
         transSig.reserve((size_t)pad);
         tonalSig.reserve((size_t)pad);
         shifted.reserve((size_t)bs);
+        for (int c = 0; c < 2; ++c) {
+            shifter[c].prepare();
+            // The transient and dry paths bypass the shifter, so they must be
+            // delayed by hand to stay time-aligned with the shifted tonal path.
+            transDelay[c].prepare(shifter[c].latencySamples());
+            dryDelay[c].prepare(shifter[c].latencySamples());
+        }
+        // Report it so the graph's PDC aligns this node against its siblings.
+        setLatencySamples(shifter[0].latencySamples());
     }
     void releaseResources() override {}
 
@@ -3021,7 +3031,10 @@ public:
         int   levels    = juce::jlimit(1, 8, (int)paramByName(node, "Levels", 4.0f));
         float mix       = juce::jlimit(0.0f, 1.0f, paramByName(node, "Mix", 1.0f));
 
-        if (std::abs(semitones) < 0.01f) return;
+        // No early-out at 0 semitones: this node reports a fixed latency, so it
+        // must always produce output with that latency. Bypassing here would
+        // make the node jump forward 32 ms the moment Semitones crossed zero.
+        // The shifter is transparent at ratio 1 (measured -0.003 dB).
         float ratio = std::pow(2.0f, semitones / 12.0f);
 
         const auto& filt = scratch.useFilter("db4");
@@ -3052,20 +3065,25 @@ public:
                 else tonalSig[i] = sig[i];
             }
 
-            // Reconstruct tonal, pitch-shift it via resampling.
+            // Reconstruct tonal, then pitch-shift it with the phase vocoder.
+            //
+            // This used to resample tonalSig within the block (srcPos = i*ratio),
+            // which changes DURATION as well as pitch: an octave up consumed the
+            // whole block but only filled half of it, so the tail of every block
+            // was silence - a hard gate at the block rate. Constant-duration
+            // shifting needs state that outlives the block, which is what the
+            // PhaseVocoderShifter holds. See "resampling pitch shifters chop each
+            // block on upward shifts" in known-issues.md for the measurements.
             idwtPR(tonalSig, actualLevels, filt, scratch.ws);
-            // Simple pitch shift via resampling (linear interp).
             shifted.assign((size_t)n, 0.0f);
-            for (int i = 0; i < n; ++i) {
-                float srcPos = (float)i * ratio;
-                int i0 = (int)srcPos;
-                float frac = srcPos - i0;
-                if (i0 + 1 < n) shifted[i] = tonalSig[i0] * (1.0f - frac) + tonalSig[i0 + 1] * frac;
-                else if (i0 < n) shifted[i] = tonalSig[i0];
-            }
+            shifter[c].setPitchRatio(ratio);
+            shifter[c].process(tonalSig.data(), shifted.data(), n);
 
-            // Reconstruct transients (unshifted).
+            // Reconstruct transients (unshifted), then delay them - and the dry
+            // copy - by the shifter's latency so all three paths line up.
             idwtPR(transSig, actualLevels, filt, scratch.ws);
+            transDelay[c].process(transSig.data(), transSig.data(), n);
+            dryDelay[c].process(dry.data(), dry.data(), n);
 
             // Recombine.
             for (int i = 0; i < n; ++i)
@@ -3092,7 +3110,11 @@ private:
     double sampleRate = 44100;
     WaveletFxScratch scratch;
     std::vector<float> transSig, tonalSig;  // threshold split of the coefficients
-    std::vector<float> shifted;             // resampled tonal part
+    std::vector<float> shifted;             // pitch-shifted tonal part
+    PhaseVocoderShifter shifter[2];         // one per channel - sharing would
+                                            // cross-contaminate the phase
+                                            // accumulators and collapse stereo
+    LatencyDelay transDelay[2], dryDelay[2];
 };
 
 // ==============================================================================
@@ -3814,9 +3836,11 @@ private:
 //
 // Pitch-shifts audio while preserving formants (the resonant
 // frequencies that make a voice sound like THAT voice, not a chipmunk).
-// Method: decompose into wavelet bands, pitch-shift each band via
-// resampling, but keep the spectral envelope (formant shape) by
-// scaling band gains back to their original levels after the shift.
+// Method: pitch-shift with the phase vocoder, then re-impose the ORIGINAL
+// per-wavelet-band energy envelope on the result. Shifting moves the formants
+// along with the pitch (that is the chipmunk effect); restoring the band
+// energies puts the spectral envelope back where it was while leaving the
+// pitch shifted.
 //
 // Params: Semitones (-24..+24), Formant Lock (0..1, how much formant
 //         to preserve - 0=no preservation, 1=full), Levels, Mix
@@ -3833,6 +3857,15 @@ public:
         shifted.reserve((size_t)bs);
         shiftPad.reserve((size_t)pad);
         origEnergy.reserve(9);   // at most 8 levels + the approximation band
+        for (int c = 0; c < 2; ++c) {
+            shifter[c].prepare();
+            // The dry copy is both the wet/dry partner AND the source of the
+            // formant envelope, so it must be delayed to line up with the
+            // shifted signal - otherwise the envelope measured is the one from
+            // 32 ms earlier, and on speech that is a whole different phoneme.
+            dryDelay[c].prepare(shifter[c].latencySamples());
+        }
+        setLatencySamples(shifter[0].latencySamples());
     }
     void releaseResources() override {}
 
@@ -3847,7 +3880,8 @@ public:
         int   levels     = juce::jlimit(1, 8, (int)paramByName(node, "Levels", 5.0f));
         float mix        = juce::jlimit(0.0f, 1.0f, paramByName(node, "Mix", 1.0f));
 
-        if (std::abs(semitones) < 0.01f) return;
+        // No early-out at 0 semitones - see the note in Ind. Pitch Shift; this
+        // node reports a fixed latency and must always honour it.
         float ratio = std::pow(2.0f, semitones / 12.0f);
 
         const auto& filt = scratch.useFilter("db4");
@@ -3858,7 +3892,19 @@ public:
             float* data = buf.getWritePointer(c);
             const int padLen = scratch.load(data, n);
 
-            // 1. Measure per-band energy before shift (= formant envelope).
+            // 1. Pitch-shift first, then delay the dry copy to match, so that
+            //    everything measured below is time-aligned with the shifted
+            //    signal it is going to be applied to.
+            shifted.assign((size_t)n, 0.0f);
+            shifter[c].setPitchRatio(ratio);
+            shifter[c].process(data, shifted.data(), n);
+            dryDelay[c].process(dry.data(), dry.data(), n);
+
+            // 2. Measure per-band energy of the (delayed) original = the formant
+            //    envelope we want to keep. sig currently holds the UNdelayed
+            //    input from load(), so refill it from the delayed dry.
+            for (int i = 0; i < n; ++i) sig[(size_t)i] = dry[(size_t)i];
+            for (int i = n; i < padLen; ++i) sig[(size_t)i] = 0.0f;
             int actualLevels = dwt(sig, levels, filt, scratch.ws);
             int approxLen = padLen;
             for (int l = 0; l < actualLevels; ++l) approxLen /= 2;
@@ -3875,17 +3921,6 @@ public:
                     e += sig[i] * sig[i];
                 origEnergy[band + 1] = e / std::max(1, bandLen);
                 bandStart += bandLen;
-            }
-
-            // 2. Reconstruct and pitch-shift via resampling.
-            idwtPR(sig, actualLevels, filt, scratch.ws);
-            shifted.assign((size_t)n, 0.0f);
-            for (int i = 0; i < n; ++i) {
-                float srcPos = (float)i * ratio;
-                int i0 = (int)srcPos;
-                float frac = srcPos - i0;
-                if (i0 + 1 < n) shifted[i] = sig[i0] * (1.0f - frac) + sig[i0 + 1] * frac;
-                else if (i0 < n) shifted[i] = sig[i0];
             }
 
             // 3. Re-decompose the shifted signal and adjust band gains
@@ -3942,9 +3977,11 @@ private:
     Node& node;
     double sampleRate = 44100;
     WaveletFxScratch scratch;
-    std::vector<float> shifted;     // resampled (pitch-shifted) time signal
+    std::vector<float> shifted;     // pitch-shifted time signal
     std::vector<float> shiftPad;    // padded re-decomposition of `shifted`
     std::vector<float> origEnergy;  // per-band energy = the formant envelope
+    PhaseVocoderShifter shifter[2]; // one per channel
+    LatencyDelay dryDelay[2];
 };
 
 // ==============================================================================

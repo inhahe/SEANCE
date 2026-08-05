@@ -3864,52 +3864,94 @@ void testWarp(Report& r) {
         }
     }
 
-    // ---- The resampling pitch shifters: are they block-chopping? --------
+    // ---- The two node-level pitch shifters, end to end ------------------
     //
-    // Independent Pitch Shift and Formant Pitch Shift both transpose by
-    // resampling INSIDE the current block: `srcPos = i * ratio`, reading
-    // source sample `i * ratio` to produce output sample `i`. For an upward
-    // shift (ratio > 1) that runs off the end of the block - at ratio 2 every
-    // output sample past the halfway point wants a source sample that does not
-    // exist, and the code emits silence for it. So each block would be a
-    // correctly-shifted first half followed by a zeroed second half, repeating
-    // at the block rate (~94 Hz at 512/48k).
+    // Independent Pitch Shift and Formant Pitch Shift used to transpose by
+    // resampling INSIDE the current block: `srcPos = i * ratio`, reading source
+    // sample `i * ratio` to produce output sample `i`. For an upward shift that
+    // runs off the end of the block - at ratio 2 every output sample past the
+    // halfway point wanted a source sample that did not exist, and the code
+    // emitted silence for it. Each block was a correctly-shifted first half
+    // followed by a zeroed second half: a 50%-duty gate at the block rate
+    // (~94 Hz at 512/48k), measured here as a last-quarter energy fraction of
+    // 0.00000 against a healthy 0.25. Both now run on PhaseVocoderShifter.
     //
-    // A single big block cannot show this, so this drives a continuous tone
-    // through many consecutive blocks and looks at where the energy lands
-    // WITHIN each block. For a healthy continuous effect the last quarter of a
-    // block holds about a quarter of the block's energy.
+    // Two things are checked, and the continuity one is the reason this test
+    // drives many consecutive blocks rather than one big buffer: a single call
+    // cannot reveal block-rate structure.
     {
         const int BS = 512;
-        const int NBLOCKS = 16;
         const double SR = 48000.0;
+        const double inHz = 440.0;
 
-        auto tailEnergyFraction = [&](juce::AudioProcessor& proc, double ratioUp) {
+        auto dominantHz = [&](const float* d, int n) {
+            double bestP = -1, bestF = 0;
+            for (double f = 100; f <= 4000; f += 1.0) {
+                double re = 0, im = 0;
+                for (int i = 0; i < n; ++i) {
+                    double a = 6.28318530718 * f * i / SR;
+                    re += d[i] * std::cos(a); im += d[i] * std::sin(a);
+                }
+                double p = re * re + im * im;
+                if (p > bestP) { bestP = p; bestF = f; }
+            }
+            return bestF;
+        };
+
+        // Drive a continuous 440 Hz tone through the node and return the
+        // steady-state output. `skipBlocks` must clear the node's reported
+        // latency, or the ramp-up is what gets measured.
+        auto runNode = [&](juce::AudioProcessor& proc, int keepBlocks) {
             proc.prepareToPlay(SR, BS);
+            const int skipBlocks = proc.getLatencySamples() / BS + 4;
             juce::AudioBuffer<float> buf(2, BS);
             juce::MidiBuffer mb;
-            double tailE = 0, totalE = 0;
+            std::vector<float> out;
+            out.reserve((size_t)(keepBlocks * BS));
             int phase = 0;
-            for (int b = 0; b < NBLOCKS; ++b) {
+            for (int b = 0; b < skipBlocks + keepBlocks; ++b) {
                 for (int c = 0; c < 2; ++c)
                     for (int i = 0; i < BS; ++i)
                         buf.getWritePointer(c)[i] =
-                            0.5f * (float)std::sin(6.28318530718 * 440.0 * (phase + i) / SR);
+                            0.5f * (float)std::sin(6.28318530718 * inHz * (phase + i) / SR);
                 proc.processBlock(buf, mb);
-                // Skip the first couple of blocks so any startup transient in
-                // the effect is not what we measure.
-                if (b >= 2) {
+                if (b >= skipBlocks) {
                     const float* d = buf.getReadPointer(0);
-                    for (int i = 0; i < BS; ++i) {
-                        double e = (double)d[i] * d[i];
-                        totalE += e;
-                        if (i >= (BS * 3) / 4) tailE += e;
-                    }
+                    out.insert(out.end(), d, d + BS);
                 }
                 phase += BS;
             }
-            juce::ignoreUnused(ratioUp);
+            return out;
+        };
+
+        auto tailFraction = [&](const std::vector<float>& out) {
+            double tailE = 0, totalE = 0;
+            for (size_t b = 0; b * BS < out.size(); ++b)
+                for (int i = 0; i < BS; ++i) {
+                    double v = out[b * BS + (size_t)i];
+                    totalE += v * v;
+                    if (i >= (BS * 3) / 4) tailE += v * v;
+                }
             return totalE > 1e-20 ? tailE / totalE : 0.0;
+        };
+
+        auto checkShifter = [&](const char* label, juce::AudioProcessor& proc) {
+            auto out = runNode(proc, 12);
+            double frac = tailFraction(out);
+            r.checkVal(std::abs(frac - 0.25) <= 0.06,
+                       juce::String("wavelet-fx: ") + label + " +12 spreads energy evenly "
+                       "across the block (last-quarter energy fraction, 0.25 = uniform)",
+                       frac);
+            double outHz = dominantHz(out.data(), (int)out.size());
+            double cents = 1200.0 * std::log2(outHz / (inHz * 2.0));
+            r.checkVal(std::abs(cents) <= 50.0,
+                       juce::String("wavelet-fx: ") + label + " +12 lands within 50 cents "
+                       "of 880 Hz (cents error)",
+                       cents);
+            r.checkVal(proc.getLatencySamples() > 0,
+                       juce::String("wavelet-fx: ") + label + " reports its pitch-shifter "
+                       "latency for PDC (samples)",
+                       proc.getLatencySamples());
         };
 
         {
@@ -3922,12 +3964,7 @@ void testWarp(Report& r) {
             nd.params.push_back({"Levels",      4.0f,   1.0f,  8.0f});
             nd.params.push_back({"Mix",         1.0f,   0.0f,  1.0f});
             IndependentPitchShiftProcessor proc(nd);
-            double frac = tailEnergyFraction(proc, 2.0);
-            r.knownBug(frac > 0.10,
-                       "wavelet-fx: Ind. Pitch Shift +12 does not zero the tail of "
-                       "every block (last-quarter energy fraction, ~0.25 = healthy)",
-                       frac,
-                       "resampling pitch shifters chop each block on upward shifts");
+            checkShifter("Ind. Pitch Shift", proc);
         }
         {
             NodeGraph g;
@@ -3938,12 +3975,7 @@ void testWarp(Report& r) {
             nd.params.push_back({"Levels",        5.0f,   1.0f,  8.0f});
             nd.params.push_back({"Mix",           1.0f,   0.0f,  1.0f});
             FormantPitchShiftProcessor proc(nd);
-            double frac = tailEnergyFraction(proc, 2.0);
-            r.knownBug(frac > 0.10,
-                       "wavelet-fx: Formant Pitch Shift +12 does not zero the tail of "
-                       "every block (last-quarter energy fraction, ~0.25 = healthy)",
-                       frac,
-                       "resampling pitch shifters chop each block on upward shifts");
+            checkShifter("Formant Pitch Shift", proc);
         }
     }
 

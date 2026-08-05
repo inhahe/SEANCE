@@ -32,9 +32,12 @@
 // Bin-mapping phase vocoder (the classic Bernsee `smbPitchShift` structure),
 // not stretch-then-resample. Bin mapping keeps the hop constant on both the
 // analysis and synthesis side, which makes the buffering trivial, keeps the
-// whole thing allocation-free, and makes it testable in isolation. The two
-// consumer nodes do their own transient/formant handling on top, so a plain
-// spectral shifter is the right primitive to hand them.
+// whole thing allocation-free, and makes it testable in isolation. Consumers
+// layer their own transient/band handling on top, so a plain spectral shifter
+// is the right primitive to hand them -- with the one exception of formant
+// preservation (setFormantPreserve), which is built in because it has to
+// happen between the shift and the inverse FFT and cannot be bolted on from
+// outside.
 //
 //   analysis  : window -> FFT -> per-bin magnitude and TRUE frequency, recovered
 //               from the phase advance between frames rather than assuming each
@@ -135,9 +138,13 @@ public:
     //                  latency stays around 32 ms and transients stay crisp.
     //   overlapIn   -- frames per fftSize. 4 (75% overlap) is the standard
     //                  Hann choice and the one the normalisation below assumes.
-    void prepare(int fftOrder = 11, int overlapIn = 4) {
+    //   sampleRateIn -- only used to size the cepstral lifter for formant
+    //                  preservation (see setFormantPreserve). Everything else
+    //                  in this class works in bins and is rate-agnostic.
+    void prepare(int fftOrder = 11, int overlapIn = 4, double sampleRateIn = 48000.0) {
         fftOrder = std::clamp(fftOrder, 6, 15);
         overlap  = std::clamp(overlapIn, 2, 8);
+        sampleRate = sampleRateIn > 0.0 ? sampleRateIn : 48000.0;
 
         fftSize = 1 << fftOrder;
         hop     = fftSize / overlap;
@@ -178,8 +185,43 @@ public:
         // spectrum can ever make push_back reallocate on the audio thread.
         peaks.reserve(nBins);
 
+        // Formant-preservation scratch (see setFormantPreserve). Sized
+        // unconditionally so toggling the flag at runtime never allocates.
+        env.resize(nBins);
+        cepWork.resize((size_t)fftSize);
+        // Quefrency cutoff for the cepstral lifter, in samples. Everything
+        // below this quefrency is "slowly varying across frequency" and is
+        // taken to be the vocal-tract/instrument-body envelope; everything
+        // above it is the harmonic comb of the excitation. 1.2 ms sits above
+        // the period of the highest pitch we care about separating (~830 Hz)
+        // and well below the shortest formant structure, which is the standard
+        // compromise. Expressed in seconds so it does not silently change
+        // meaning when the sample rate or FFT size changes.
+        cepCut = std::clamp((int)(sampleRate * 0.0012), 8, fftSize / 8);
+
         reset();
     }
+
+    // Formant preservation. Off by default.
+    //
+    // Plain pitch shifting scales the WHOLE spectrum, envelope included, so a
+    // voice shifted up an octave gets its formants dragged up an octave too --
+    // the "chipmunk" sound. Preservation puts the original spectral envelope
+    // back afterwards, so the pitch moves but the timbre (which vowel it is,
+    // which instrument it sounds like) stays put.
+    //
+    // Method: cepstral liftering. Take the log magnitude spectrum, transform to
+    // the cepstrum, keep only the low-quefrency part (see cepCut above), and
+    // transform back -- that gives a smooth envelope with the harmonic comb
+    // removed. After shifting, bin k holds what came from bin k/ratio, so its
+    // envelope is wrong by env(k)/env(k/ratio); multiplying that ratio back in
+    // restores the original envelope.
+    //
+    // Costs two extra FFTs per frame, so it is gated on the flag AND skipped
+    // entirely at ratio 1 (where the correction is identically 1). Callers that
+    // never enable it pay nothing.
+    void setFormantPreserve(bool on) { formantPreserve = on; }
+    bool formantPreserveEnabled() const { return formantPreserve; }
 
     bool isPrepared() const { return fftSize > 0; }
 
@@ -231,8 +273,9 @@ public:
         return (window.capacity() + inFifo.capacity() + outFifo.capacity()
                 + outAccum.capacity() + frame.capacity() + lastPhase.capacity()
                 + sumPhase.capacity() + anaMag.capacity() + anaPhase.capacity()
-                + anaFreq.capacity() + synMag.capacity() + synPhase.capacity()) * sizeof(float)
-               + work.capacity() * sizeof(cplx)
+                + anaFreq.capacity() + synMag.capacity() + synPhase.capacity()
+                + env.capacity()) * sizeof(float)
+               + (work.capacity() + cepWork.capacity()) * sizeof(cplx)
                + peaks.capacity() * sizeof(int);
     }
 
@@ -342,6 +385,11 @@ private:
             peaks.push_back(best);
         }
 
+        // Envelope must be measured from the ANALYSIS spectrum, before synMag
+        // is built, because it is the input's envelope we are restoring.
+        const bool doFormant = formantPreserve && std::abs(ratio - 1.0f) > 1e-4f;
+        if (doFormant) computeEnvelope();
+
         std::fill(synMag.begin(),   synMag.end(),   0.0f);
         std::fill(synPhase.begin(), synPhase.end(), 0.0f);
 
@@ -385,6 +433,22 @@ private:
             }
         }
 
+        // ---- Restore the original spectral envelope -------------------------
+        // Bin k of the shifted spectrum carries what was at bin k/ratio, so it
+        // arrives wearing env(k/ratio) when it should be wearing env(k).
+        if (doFormant) {
+            for (int k = 0; k <= half; ++k) {
+                if (synMag[(size_t)k] <= 0.0f) continue;
+                const float srcEnv = envAt((float)k / ratio, half);
+                if (srcEnv <= 1e-9f) continue;
+                // Clamp the correction to +/-20 dB. Where the source envelope is
+                // near zero (above the shifted signal's Nyquist, or in a deep
+                // spectral valley) the raw ratio explodes and would amplify
+                // nothing but numerical noise into a loud artefact.
+                synMag[(size_t)k] *= std::clamp(env[(size_t)k] / srcEnv, 0.1f, 10.0f);
+            }
+        }
+
         for (int k = 0; k <= half; ++k) {
             const float p = synPhase[(size_t)k];
             work[(size_t)k] = cplx(synMag[(size_t)k] * std::cos(p),
@@ -395,6 +459,41 @@ private:
 
         for (int i = 0; i < fftSize; ++i)
             outAccum[(size_t)i] += frame[(size_t)i] * window[(size_t)i] * olaScale;
+    }
+
+    // Smooth spectral envelope of the current analysis frame, into env[].
+    // Cepstral liftering; see setFormantPreserve for why. Allocation-free.
+    void computeEnvelope() {
+        const int half = fftSize / 2;
+
+        // Log magnitude, floored. The floor matters: log(0) is -inf, and a
+        // single -inf anywhere makes the whole cepstrum NaN.
+        for (int k = 0; k <= half; ++k)
+            cepWork[(size_t)k] = cplx(std::log(std::max(anaMag[(size_t)k], 1e-6f)), 0.0f);
+        for (int k = 1; k < half; ++k)
+            cepWork[(size_t)(fftSize - k)] = cepWork[(size_t)k];
+
+        // Real, even input -> real, even cepstrum. `inverse` scales by 1/n and
+        // `forward` does not, so the pair below is an exact round trip and the
+        // only thing that changes the data is the lifter between them.
+        fft->inverse(cepWork.data());
+
+        for (int q = cepCut; q <= fftSize - cepCut; ++q)
+            cepWork[(size_t)q] = cplx(0.0f, 0.0f);
+
+        fft->forward(cepWork.data());
+
+        for (int k = 0; k <= half; ++k)
+            env[(size_t)k] = std::exp(cepWork[(size_t)k].real());
+    }
+
+    // env[] sampled at a fractional bin index, linearly interpolated.
+    float envAt(float x, int half) const {
+        if (x <= 0.0f)            return env[0];
+        if (x >= (float)half)     return env[(size_t)half];
+        const int   i = (int)x;
+        const float f = x - (float)i;
+        return env[(size_t)i] * (1.0f - f) + env[(size_t)(i + 1)] * f;
     }
 
     static float wrapPi(float x) {
@@ -413,10 +512,14 @@ private:
     float ratio = 1.0f;
     float olaScale = 1.0f;
     bool pendingTransient = false;
+    bool formantPreserve = false;
+    double sampleRate = 48000.0;
+    int cepCut = 0;
 
     std::vector<float> window, inFifo, outFifo, outAccum, frame;
     std::vector<float> lastPhase, sumPhase, anaMag, anaPhase, anaFreq, synMag, synPhase;
-    std::vector<cplx>  work;
+    std::vector<float> env;
+    std::vector<cplx>  work, cepWork;
     // Peak bin indices for the current frame. clear() + push_back() into a
     // capacity reserved in prepare() -- never grows on the audio thread.
     std::vector<int>   peaks;

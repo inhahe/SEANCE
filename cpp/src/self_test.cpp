@@ -4441,6 +4441,173 @@ void testWarp(Report& r) {
                        "pitch-core: stereo pair runs at >=10x realtime (realtime factor)",
                        best);
         }
+
+        // 8. Formant preservation.
+        //
+        //    Plain pitch shifting scales the whole spectrum, envelope included,
+        //    so a voice shifted up an octave gets its formants dragged up too -
+        //    the chipmunk sound. Preservation is supposed to move the pitch and
+        //    leave the timbre alone.
+        //
+        //    Test signal is a crude voice: a 200 Hz pulse train (the excitation,
+        //    which carries the PITCH) through a fixed resonator at 1500 Hz (the
+        //    formant, which carries the TIMBRE). Shifting up an octave must move
+        //    the 200 Hz to 400 Hz in both modes; what distinguishes the modes is
+        //    whether the 1500 Hz resonance moves with it.
+        //
+        //    The statistic is the spectral centroid, which tracks where the
+        //    envelope sits without needing to resolve individual formants.
+        {
+            const int NSIG = 32768;
+
+            auto makeVoice = [&](std::vector<float>& dst) {
+                dst.assign((size_t)NSIG, 0.0f);
+                // Two-pole resonator at 1500 Hz, driven by a 200 Hz pulse train.
+                const double f0 = 1500.0, q = 12.0;
+                const double w = 6.28318530718 * f0 / SR;
+                const double rr2 = std::exp(-w / (2.0 * q));
+                const double a1 = -2.0 * rr2 * std::cos(w), a2 = rr2 * rr2;
+                double y1 = 0, y2 = 0;
+                const int period = (int)(SR / 200.0);
+                for (int i = 0; i < NSIG; ++i) {
+                    const double x = (i % period == 0) ? 1.0 : 0.0;
+                    const double y = x - a1 * y1 - a2 * y2;
+                    y2 = y1; y1 = y;
+                    dst[(size_t)i] = (float)(y * 0.3);
+                }
+            };
+
+            // Spectral centroid over 100 Hz - 8 kHz, magnitude-weighted.
+            auto centroidHz = [&](const std::vector<float>& v, int from, int count) {
+                const int N = 8192;
+                if (from + N > (int)v.size()) return 0.0;
+                FFT f(N);
+                std::vector<FFT::cplx> spec((size_t)N);
+                std::vector<float> win((size_t)N);
+                for (int i = 0; i < N; ++i)
+                    win[(size_t)i] = v[(size_t)(from + i)]
+                        * 0.5f * (1.0f - std::cos(6.28318530718f * (float)i / (float)N));
+                f.forwardReal(win.data(), spec.data());
+                double num = 0, den = 0;
+                const int kLo = (int)(100.0 * N / SR), kHi = (int)(8000.0 * N / SR);
+                for (int k = kLo; k <= kHi; ++k) {
+                    const double m = std::abs(spec[(size_t)k]);
+                    const double hz = (double)k * SR / N;
+                    num += m * hz; den += m;
+                }
+                (void)count;
+                return den > 0 ? num / den : 0.0;
+            };
+
+            std::vector<float> voice;
+            makeVoice(voice);
+
+            auto shiftVoice = [&](bool formant) {
+                PhaseVocoderShifter ps;
+                ps.prepare(11, 4, SR);
+                ps.setFormantPreserve(formant);
+                ps.setPitchRatio(2.0f);
+                std::vector<float> out((size_t)NSIG, 0.0f);
+                ps.process(voice.data(), out.data(), NSIG);
+                return out;
+            };
+
+            const int SKIP = 8192;               // past the ramp-up
+            const double cIn   = centroidHz(voice, SKIP, 0);
+            auto plain  = shiftVoice(false);
+            auto formed = shiftVoice(true);
+            const double cPlain = centroidHz(plain,  SKIP, 0);
+            const double cForm  = centroidHz(formed, SKIP, 0);
+
+            r.checkVal(cIn > 0 && cPlain / cIn >= 1.5,
+                       "pitch-core: WITHOUT formant preservation, +12 drags the spectral "
+                       "centroid up with the pitch (out/in centroid ratio, ~2 = formants "
+                       "moved an octave)",
+                       cIn > 0 ? cPlain / cIn : 0.0);
+            r.checkVal(cIn > 0 && cForm / cIn <= 1.25,
+                       "pitch-core: WITH formant preservation, +12 leaves the spectral "
+                       "centroid put (out/in centroid ratio, ~1 = timbre preserved)",
+                       cIn > 0 ? cForm / cIn : 0.0);
+            r.checkVal(cPlain > cForm * 1.3,
+                       "pitch-core: formant preservation makes a large, unambiguous "
+                       "difference (centroid ratio between the two modes)",
+                       cForm > 0 ? cPlain / cForm : 0.0);
+
+            // The pitch must still shift by the full octave in formant mode -
+            // an implementation that "preserves formants" by simply shifting
+            // less would pass the centroid test above and be useless.
+            {
+                PhaseVocoderShifter ps;
+                ps.prepare(11, 4, SR);
+                ps.setFormantPreserve(true);
+                ps.setPitchRatio(2.0f);
+                std::vector<float> in((size_t)BS), tmp((size_t)BS), out;
+                const int skip = ps.latencySamples() + 4 * ps.fftLength();
+                int phase = 0;
+                while ((int)out.size() < skip + 16384) {
+                    for (int i = 0; i < BS; ++i)
+                        in[(size_t)i] = 0.5f * (float)std::sin(6.28318530718 * inHz * (phase + i) / SR);
+                    ps.process(in.data(), tmp.data(), BS);
+                    out.insert(out.end(), tmp.begin(), tmp.end());
+                    phase += BS;
+                }
+                const double hz = dominantHz(out.data() + skip, 16384);
+                const double cents = 1200.0 * std::log2(hz / (inHz * 2.0));
+                r.checkVal(std::abs(cents) <= 25.0,
+                           "pitch-core: formant preservation still shifts the pitch a full "
+                           "octave (cents error vs 880 Hz)", cents);
+            }
+
+            // Formant mode costs two extra FFTs per frame, so it gets its own
+            // CPU measurement rather than inheriting the plain-mode figure.
+            {
+                PhaseVocoderShifter l, rr;
+                l.prepare(11, 4, SR); rr.prepare(11, 4, SR);
+                l.setFormantPreserve(true); rr.setFormantPreserve(true);
+                l.setPitchRatio(1.5f); rr.setPitchRatio(1.5f);
+                std::vector<float> in((size_t)BS), outL((size_t)BS), outR((size_t)BS);
+                for (int i = 0; i < BS; ++i)
+                    in[(size_t)i] = 0.3f * (float)std::sin(6.28318530718 * 330.0 * i / SR);
+                const int BLOCKS = 200;
+                l.process(in.data(), outL.data(), BS);   // warm-up, untimed
+                double best = 0.0;
+                for (int rep = 0; rep < 3; ++rep) {
+                    auto t0 = std::chrono::steady_clock::now();
+                    for (int b = 0; b < BLOCKS; ++b) {
+                        l.process(in.data(), outL.data(), BS);
+                        rr.process(in.data(), outR.data(), BS);
+                    }
+                    auto t1 = std::chrono::steady_clock::now();
+                    double wall = std::chrono::duration<double>(t1 - t0).count();
+                    best = std::max(best, wall > 1e-9 ? (double)(BLOCKS * BS) / SR / wall : 1e9);
+                }
+                r.checkVal(best >= 10.0,
+                           "pitch-core: stereo pair with formant preservation runs at "
+                           ">=10x realtime (realtime factor)", best);
+            }
+
+            // Allocation-freedom must hold in formant mode too - it adds two
+            // buffers, and they are sized in prepare() precisely so that
+            // toggling the flag mid-stream cannot allocate on the audio thread.
+            {
+                PhaseVocoderShifter ps;
+                ps.prepare(11, 4, SR);
+                std::vector<float> in((size_t)BS), out((size_t)BS);
+                for (int i = 0; i < BS; ++i)
+                    in[(size_t)i] = 0.2f * (float)std::sin(6.28318530718 * 220.0 * i / SR);
+                ps.process(in.data(), out.data(), BS);
+                const size_t before = ps.capacityBytes();
+                for (int b = 0; b < 200; ++b) {
+                    ps.setFormantPreserve((b / 10) % 2 == 0);   // toggle mid-stream
+                    ps.setPitchRatio(0.5f + 0.01f * (float)(b % 100));
+                    ps.process(in.data(), out.data(), BS);
+                }
+                const double grew = (double)ps.capacityBytes() - (double)before;
+                r.checkVal(grew == 0.0,
+                           "pitch-core: toggling formant preservation mid-stream allocates "
+                           "nothing (capacity growth, bytes)", grew);
+            }
+        }
     }
 
     // ---- Bucket C: whole-buffer spectral / wavelet warps ----------------

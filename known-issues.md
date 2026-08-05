@@ -20,8 +20,8 @@ and not in any build, but it should be deleted from working copies so nobody
 wires it back up by accident. Left for the user rather than done automatically,
 because deleting untracked files is unrecoverable.
 
-Also worth doing: drop Rubber Band from whatever setup script downloads the
-optional dependencies, so a fresh clone stops fetching it.
+`cpp/setup_dependencies.bat` no longer downloads it, so a fresh clone will not
+reacquire it — this is purely about existing working copies.
 
 ---
 

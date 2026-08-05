@@ -8,7 +8,10 @@ PitchShiftProcessor::~PitchShiftProcessor() = default;
 
 void PitchShiftProcessor::prepareToPlay(double sr, int bs) {
     sampleRate = sr;
-    blockSize = bs;
+    // The block size is deliberately unused: PhaseVocoderShifter is a
+    // sample-driven FIFO with no opinion about block boundaries, so it copes
+    // with any block size, including one that varies call to call.
+    juce::ignoreUnused(bs);
 
     for (auto& s : shifter)
         s.prepare(11, 4, sr);

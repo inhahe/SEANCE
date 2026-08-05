@@ -68,8 +68,7 @@ public:
 
 private:
     Node& node;
-    double sampleRate = 44100;
-    int blockSize = 512;
+    double sampleRate = 44100;   // only needed to express the tail in seconds
 
     // One shifter per channel: sharing one would cross-contaminate the phase
     // accumulators and collapse the stereo image.

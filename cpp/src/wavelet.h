@@ -426,6 +426,15 @@ inline void morletWavelet(std::vector<float>& realOut, std::vector<float>& imagO
     }
 }
 
+// WARNING -- cwt()/icwt() currently have NO callers. Their only consumer was
+// Wavelet Pitch Shift, removed for being non-functional. They are kept as
+// scaffolding for a future rewrite, but DO NOT build on them as-is: icwt() is
+// not the inverse of cwt() (it discards the imaginary part and normalises by a
+// sum of 1/scale^2 weights instead of the Morlet admissibility constant, so
+// there is no unity-gain path even at ratio 1), and cwt() uses direct
+// time-domain convolution, which is ~7x too slow for real time. Both defects
+// and their remedies are written up in known-issues.md.
+//
 // Forward CWT: convolve the signal with the Morlet wavelet at each scale.
 // `minScale` and `maxScale` define the range; `numScales` logarithmically
 // spaced scales are computed within that range.

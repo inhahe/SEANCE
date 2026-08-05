@@ -3741,13 +3741,6 @@ void testWarp(Report& r) {
                            + " runs >=10x realtime (x realtime)", rt);
         };
         // Same measurement, but for an effect whose slowness is a tracked bug.
-        auto budgetKnownBug = [&](const char* label, juce::AudioProcessor& proc) {
-            double rt = realtimeFactor(proc);
-            r.knownBug(rt >= MIN_RT,
-                       juce::String("wavelet-cpu: ") + label
-                           + " runs >=10x realtime (x realtime)", rt,
-                       "Wavelet Pitch Shift is comprehensively non-functional");
-        };
 
         { NodeGraph g; Node& nd = makeNode(g, {{"Transient",2.0f,0,2},{"Sustain",0.5f,0,2},
                                                {"Threshold",0.3f,0,1},{"Levels",4.0f,1,8}});
@@ -3765,8 +3758,6 @@ void testWarp(Report& r) {
                                                {"Levels",4.0f,1,6},{"Low Gain",0.0f,-12,12},
                                                {"High Gain",0.0f,-12,12},{"Mix",1.0f,0,1}});
           WaveletMultibandCompProcessor p(nd);    budget("Multiband Comp", p); }
-        { NodeGraph g; Node& nd = makeNode(g, {{"Semitones",7.0f,-24,24},{"Mix",1.0f,0,1}});
-          WaveletPitchShiftProcessor p(nd);       budgetKnownBug("Pitch Shift", p); }
         { NodeGraph g; Node& nd = makeNode(g, {{"Decay",0.7f,0,1},{"Color",1.0f,0,3},
                                                {"Levels",5.0f,1,8},{"Mix",0.3f,0,1}});
           WaveletReverbProcessor p(nd);           budget("Reverb (1/f)", p); }
@@ -3789,80 +3780,6 @@ void testWarp(Report& r) {
         { NodeGraph g; Node& nd = makeNode(g, {{"Semitones",7.0f,-24,24},{"Formant Lock",0.8f,0,1},
                                                {"Levels",5.0f,1,8},{"Mix",1.0f,0,1}});
           FormantPitchShiftProcessor p(nd);       budget("Formant Pitch Shift", p); }
-    }
-
-    // ---- Wavelet Pitch Shift: does it actually transpose? ---------------
-    //
-    // A pitch shifter has exactly two obligations: put the energy at the
-    // requested frequency, and keep the level roughly intact. This node does
-    // neither, so these are knownBug() checks - see "Wavelet Pitch Shift is
-    // comprehensively non-functional" in known-issues.md for the full
-    // diagnosis. They are written as the assertions a CORRECT implementation
-    // must satisfy, so whoever fixes the node can flip them to checkVal() and
-    // immediately know whether the rewrite worked.
-    {
-        const int N = 4096;                 // one big block, so block-edge
-        const double SR = 48000.0;          // effects are not what we measure
-        const double inHz = 440.0;
-
-        // Dominant frequency by coarse DFT peak-pick over the musical range.
-        auto dominantHz = [&](const float* d, int n) {
-            double bestP = -1, bestF = 0;
-            for (double f = 100; f <= 4000; f += 2.0) {
-                double re = 0, im = 0;
-                for (int i = 0; i < n; ++i) {
-                    double a = 6.28318530718 * f * i / SR;
-                    re += d[i] * std::cos(a); im += d[i] * std::sin(a);
-                }
-                double p = re * re + im * im;
-                if (p > bestP) { bestP = p; bestF = f; }
-            }
-            return bestF;
-        };
-        auto rms = [](const float* d, int n) {
-            double s = 0;
-            for (int i = 0; i < n; ++i) s += (double)d[i] * d[i];
-            return std::sqrt(s / n);
-        };
-
-        for (float semis : {12.0f, 7.0f, 1.0f}) {
-            NodeGraph g;
-            int nId = g.addNode("pshift", NodeType::Effect, {}, {}).id;
-            Node& nd = *g.findNode(nId);
-            nd.params.push_back({"Semitones", semis, -24.0f, 24.0f});
-            nd.params.push_back({"Mix", 1.0f, 0.0f, 1.0f});
-
-            WaveletPitchShiftProcessor proc(nd);
-            proc.prepareToPlay(SR, N);
-            juce::AudioBuffer<float> buf(2, N);
-            for (int c = 0; c < 2; ++c)
-                for (int i = 0; i < N; ++i)
-                    buf.getWritePointer(c)[i] =
-                        0.5f * (float)std::sin(6.28318530718 * inHz * i / SR);
-
-            double inLevel = rms(buf.getReadPointer(0), N);
-            juce::MidiBuffer mb;
-            proc.processBlock(buf, mb);
-            double outHz    = dominantHz(buf.getReadPointer(0), N);
-            double outLevel = rms(buf.getReadPointer(0), N);
-
-            double expect = inHz * std::pow(2.0, semis / 12.0);
-            // Within a quarter tone of the requested pitch.
-            double centsErr = 1200.0 * std::log2(outHz / expect);
-            r.knownBug(std::abs(centsErr) <= 50.0,
-                       juce::String("wavelet-fx: Pitch Shift +") + juce::String(semis, 0)
-                           + " semitones lands within 50 cents of "
-                           + juce::String(expect, 1) + " Hz (cents error)",
-                       centsErr,
-                       "Wavelet Pitch Shift is comprehensively non-functional");
-            // And does not throw the level away (within +/-12 dB).
-            double gainDb = 20.0 * std::log10(std::max(1e-12, outLevel / inLevel));
-            r.knownBug(std::abs(gainDb) <= 12.0,
-                       juce::String("wavelet-fx: Pitch Shift +") + juce::String(semis, 0)
-                           + " semitones preserves level within 12 dB (dB change)",
-                       gainDb,
-                       "Wavelet Pitch Shift is comprehensively non-functional");
-        }
     }
 
     // ---- The two node-level pitch shifters, end to end ------------------

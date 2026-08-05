@@ -2937,7 +2937,8 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
     fxMenu.addItem(228, "Wavelet Bitcrush");
     fxMenu.addItem(229, "Octave Shift (wavelet)");
     fxMenu.addItem(230, "Wavelet Multiband Comp");
-    fxMenu.addItem(231, "Wavelet Pitch Shift");
+    // 231 was "Wavelet Pitch Shift", removed as non-functional; use
+    // "Ind. Pitch Shift", which does the transient-preserving job it promised.
     fxMenu.addItem(232, "Wavelet Reverb (1/f)");
     fxMenu.addItem(233, "Independent Pitch Shift");
     fxMenu.addItem(234, "Wavelet Complexity");
@@ -4153,10 +4154,6 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
                     {"Color",  1.0f, 0.0f, 3.0f}, // 0=white 1=pink 2=brown
                     {"Levels", 5.0f, 1.0f, 8.0f},
                     {"Mix",    0.3f, 0.0f, 1.0f},
-                }); break;
-                case 231: makeEffect("Wavelet Pitch", "__waveletpitch__", {
-                    {"Semitones", 0.0f, -24.0f, 24.0f},
-                    {"Mix",       1.0f,   0.0f,  1.0f},
                 }); break;
                 case 230: makeEffect("Wavelet MB Comp", "__waveletmbcomp__", {
                     {"Threshold", -20.0f, -60.0f, 0.0f},

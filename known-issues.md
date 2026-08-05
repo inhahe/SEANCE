@@ -25,12 +25,12 @@ reacquire it — this is purely about existing working copies.
 
 ---
 
-## BUG: Wavelet Pitch Shift is comprehensively non-functional
+## REMOVED: Wavelet Pitch Shift (kept here as the rebuild spec)
 
 **Found:** 2026-08-05, by adding a CPU-budget self-test to the wavelet suite.
 
-`WaveletPitchShiftProcessor` (`builtin_effects.h:2398`) does not work in any
-respect. Four independent defects, all measured, not inferred:
+**Resolved 2026-08-05 by deleting the node.** `WaveletPitchShiftProcessor` did
+not work in any respect. Four independent defects, all measured, not inferred:
 
 **1. It is 7x too slow to run in real time.** Measured **1.45x realtime** by
 `wavelet-cpu: Pitch Shift ...` — one instance alone consumes ~70% of a single
@@ -88,29 +88,31 @@ meaningfully depend on its sound — there is no compatibility burden.
   complex multiply plus an inverse FFT. Rough estimate ~1.4M flops per block
   per channel versus 5.5M today.
 
-**Open product question (needs a decision before the work is done):** even
-done correctly, an FFT-CWT scale-shift shifter is unlikely to clear the 10x
-realtime bar the other effects hit. The alternatives are:
+**Why it was dropped rather than fixed.** Its stated selling point was
+transient preservation, and `IndependentPitchShiftProcessor` already delivers
+exactly that — it splits transient from tonal via wavelet thresholding, shifts
+only the tonal part, and recombines, so drum punch and plucked attacks survive.
+As of 2026-08-05 that node genuinely works (0 cents error at +12 semitones,
+13.7x realtime). A CWT scale-shift shifter would therefore have been a second,
+much slower node competing with a working one. Even done correctly it is
+unlikely to clear the 10x-realtime bar every other wavelet effect meets, so it
+would have had to ship offline/bounce-only.
 
-1. Rewrite it properly as above and accept it is offline/bounce-only.
-2. Reimplement it on `PhaseVocoderShifter` (`cpp/src/pitch_core.h`), keeping
-   the node's name and slot. Cheap, correct, and real-time — but then the node
-   is no longer meaningfully "wavelet" anything, so it would be duplicating
-   Ind. Pitch Shift with a misleading name.
-3. Drop it. Its stated selling point (transient preservation) is already
-   served by Independent Pitch Shift, which as of 2026-08-05 genuinely works:
-   0 cents error at +12 semitones, 13.7x realtime.
+The rejected alternative worth recording: reimplementing it on
+`PhaseVocoderShifter` while keeping the name. That is cheap and real-time, but
+the node would no longer be "wavelet" anything — it would duplicate Ind. Pitch
+Shift under a misleading label.
 
-Option 3 looks strongest and 2 looks worst. **This is the one pitch-shifter
-question still open** — the other two nodes are fixed.
+**What removal touched.** The class, the `__waveletpitch__` factory branch, the
+Effects-menu entry (id 231, now an intentional gap), the creation site, and the
+`knownBug()` self-tests. `cwt()`/`icwt()` in `wavelet.h` were left in place but
+carry a warning comment: they now have no callers, and they are the two
+functions the remedies above would replace.
 
-Until this is resolved the node ships broken. Its self-tests are
-`knownBug()` assertions, written as the checks a *correct* implementation must
-pass, so whoever fixes it gets an immediate verdict — and if the node ever
-starts passing them, the harness reports that as a failure so the stale entry
-here cannot be forgotten.
-
----
+**Loading an old project** that contains a `__waveletpitch__` node is safe: the
+factory falls through to `PassthroughProcessor`. Note this makes such a node
+*louder* than before, since it used to emit ~-58 dB. Nothing can meaningfully
+depend on its previous sound.
 
 ## BUG: most wavelet effect nodes still allocate on the audio thread
 
@@ -135,9 +137,9 @@ Denoiser, Wavelet Bitcrush, Octave Shift, Wavelet Multiband Comp, Wavelet Reverb
 Independent Pitch Shift, Wavelet Complexity, Asymmetric Filter, Wavelet Pitch
 Tracker, Wavelet Vocoder, Formant Pitch Shift.
 
-**Deliberately not converted: Wavelet Pitch Shift.** It is being rewritten from
-scratch (see the entry above), so making its current allocations tidy would be
-throwaway work.
+**Deliberately not converted: Wavelet Pitch Shift.** Skipped because it was
+slated for a rewrite; the node has since been deleted outright (see the entry
+above), so the skipped work would have been thrown away entirely.
 
 Two traps worth remembering for the same conversion elsewhere:
 - `std::vector<bool>` cannot be reused without reallocating (it is a bitset
@@ -158,7 +160,7 @@ is the plugin candidate; nothing else has been checked.
 
 **Found:** 2026-08-05. `REFERENCE.md` has no entry for **any** of the wavelet
 effects — Transient Split, Wavelet Denoiser, Wavelet Bitcrush, Octave Shift,
-Wavelet Multiband Comp, Wavelet Pitch Shift, Wavelet Reverb, Wavelet Complexity,
+Wavelet Multiband Comp, Wavelet Reverb, Wavelet Complexity,
 Asymmetric Filter, Wavelet Pitch Tracker, Wavelet Vocoder, Formant Pitch Shift,
 Independent Pitch Shift. They exist only as entries in the "Add node" menu and as
 one-line mentions of *planned* wavelet ideas in the README's roadmap section.

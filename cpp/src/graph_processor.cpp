@@ -740,8 +740,11 @@ std::unique_ptr<juce::AudioProcessor> GraphProcessor::createNodeProcessor(
         return std::make_unique<IndependentPitchShiftProcessor>(node);
     } else if (node.type == NodeType::Effect && node.script == "__waveletreverb__") {
         return std::make_unique<WaveletReverbProcessor>(node);
-    } else if (node.type == NodeType::Effect && node.script == "__waveletpitch__") {
-        return std::make_unique<WaveletPitchShiftProcessor>(node);
+    // NOTE: "__waveletpitch__" (Wavelet Pitch Shift) was removed -- it was
+    // non-functional in four independent ways (see known-issues.md). Old
+    // projects containing one fall through to PassthroughProcessor below, which
+    // is deliberate: the node emitted ~-58 dB of wrong-pitch noise, so nothing
+    // can meaningfully depend on its sound.
     } else if (node.type == NodeType::Effect && node.script == "__octaveshift__") {
         return std::make_unique<OctaveShiftProcessor>(node);
     } else if (node.type == NodeType::Effect && node.script == "__waveletbitcrush__") {

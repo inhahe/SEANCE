@@ -35,6 +35,7 @@
 #include "signal_noise.h"           // SignalNoiseProcessor - modular-kit gated noise
 #include "signal_oscillator.h"      // SignalOscillatorProcessor - Signal-driven oscillator
 #include "pitch_core.h"             // PhaseVocoderShifter - in-house pitch-shift core
+#include "pitch_shift_processor.h"  // PitchShiftProcessor - the Rubber Band node
 
 #include <juce_audio_formats/juce_audio_formats.h>
 #include <juce_graphics/juce_graphics.h>
@@ -3976,6 +3977,198 @@ void testWarp(Report& r) {
             nd.params.push_back({"Mix",           1.0f,   0.0f,  1.0f});
             FormantPitchShiftProcessor proc(nd);
             checkShifter("Formant Pitch Shift", proc);
+        }
+
+        // ---- The Rubber Band node -------------------------------------
+        //
+        // `PitchShiftProcessor` has had no test coverage at all. It matters now
+        // because it is the ONLY remaining user of `third_party/rubberband`,
+        // which is GPL v2 and statically linked - see the licensing entry in
+        // known-issues.md. Whether that dependency can simply be deleted turns
+        // on what this node actually delivers today, so: measure it.
+        //
+        // Its params are read BY INDEX (getParam(0/1/2)), not by name, so the
+        // order below is load-bearing: 0 = Pitch, 1 = Time ratio, 2 = Formant.
+        {
+            NodeGraph g;
+            int nId = g.addNode("rb", NodeType::Effect, {}, {}).id;
+            Node& nd = *g.findNode(nId);
+            nd.params.push_back({"Pitch",      12.0f, -24.0f, 24.0f});
+            nd.params.push_back({"Time Ratio",  1.0f,   0.25f,  4.0f});
+            nd.params.push_back({"Formant",     1.0f,   0.0f,   1.0f});
+            PitchShiftProcessor proc(nd);
+            auto out = runNode(proc, 12);
+            double outHz = dominantHz(out.data(), (int)out.size());
+            double cents = 1200.0 * std::log2(outHz / (inHz * 2.0));
+            r.checkVal(std::abs(cents) <= 50.0,
+                       "rubberband: Pitch Shift +12 lands within 50 cents of 880 Hz "
+                       "(cents error)", cents);
+            r.checkVal(std::abs(tailFraction(out) - 0.25) <= 0.06,
+                       "rubberband: Pitch Shift +12 spreads energy evenly across the "
+                       "block (last-quarter energy fraction, 0.25 = uniform)",
+                       tailFraction(out));
+        }
+
+        // Time stretching in a live graph. This is the one capability the
+        // in-house core does not have, so it is the whole argument for keeping
+        // Rubber Band - which makes it worth measuring rather than assuming.
+        //
+        // Time stretching means changing the SPACING of events, so that is what
+        // is measured: a click train at a known period in, median inter-click
+        // period out. Level is deliberately NOT the measurement - a first pass
+        // here checked level, found it roughly preserved, and would have
+        // concluded the feature works. It does not follow: a node that ignores
+        // Time Ratio entirely also preserves level perfectly.
+        //
+        // What the numbers below actually pin down is that Time Ratio is
+        // unusable on a live node, but in two DIFFERENT ways depending on the
+        // direction, neither of which is "the node ignores it":
+        //
+        //   R > 1 (longer output): Rubber Band produces R samples per sample
+        //     consumed, but `processBlock` only ever retrieves `numSamples`.
+        //     The surplus backs up inside the stretcher forever, so the node's
+        //     true latency grows without bound - about (1 - 1/R) of a block per
+        //     block, i.e. half a block per block at R = 2. The emitted stream
+        //     really is stretched (spacing -> R * PERIOD), which is exactly the
+        //     statement that it is falling behind real time by a factor R.
+        //
+        //   R < 1 (shorter output): the stretcher produces fewer samples than
+        //     the block needs, so `processBlock` zero-fills the remainder. That
+        //     starvation padding cancels the compression almost exactly - the
+        //     click PERIOD comes back unchanged - and what the user gets instead
+        //     of a tempo change is a stream full of dropouts. Part B measures
+        //     those dropouts directly, because the unchanged period on its own
+        //     is indistinguishable from the node doing nothing.
+        {
+            const int PERIOD = 4800;          // 100 ms between clicks at 48k
+            const int NBLOCKS = 200;
+
+            // Onset detector: peak envelope over 128-sample windows, then rising
+            // edges through 20% of the loudest window.
+            //
+            // The two obvious detectors both give WRONG answers on this signal,
+            // and disagreed with each other by 4x, which is what prompted
+            // dumping the waveform and looking at it:
+            //   - "local maximum above half the global peak" misses the quieter
+            //     copies of a smeared click and reports 2x the true spacing.
+            //   - per-sample hysteresis re-arms INSIDE one click, because a
+            //     stretched click is a burst with quiet stretches within it, and
+            //     reports half the true spacing.
+            // Window-enveloping first collapses each burst into one contiguous
+            // above-threshold run, so one click gives exactly one rising edge.
+            //
+            // The median (not the mean) of the gaps is the statistic, because
+            // starvation at R < 1 swallows occasional clicks whole, and a
+            // dropped click merges two gaps into one double-length outlier.
+            auto medianOnsetGap = [](const std::vector<float>& sig) {
+                const int W = 128;
+                const int nw = (int)sig.size() / W;
+                if (nw < 2) return 0.0;
+                std::vector<float> env((size_t)nw, 0.0f);
+                float top = 0.0f;
+                for (int w = 0; w < nw; ++w) {
+                    float m = 0.0f;
+                    for (int i = 0; i < W; ++i)
+                        m = std::max(m, std::abs(sig[(size_t)(w * W + i)]));
+                    env[(size_t)w] = m;
+                    top = std::max(top, m);
+                }
+                if (top <= 0.0f) return 0.0;
+                const float thr = 0.2f * top;
+                std::vector<int> gaps;
+                int prev = -1;
+                for (int w = 1; w < nw; ++w) {
+                    if (env[(size_t)(w - 1)] <= thr && env[(size_t)w] > thr) {
+                        if (prev >= 0) gaps.push_back((w - prev) * W);
+                        prev = w;
+                    }
+                }
+                if (gaps.empty()) return 0.0;
+                std::sort(gaps.begin(), gaps.end());
+                return (double)gaps[gaps.size() / 2];
+            };
+
+            // Part A: what happens to the spacing of events.
+            struct Case { float ratio; double expectFactor; const char* what; };
+            const Case cases[] = {
+                { 0.5f, 1.0, "starvation padding cancels the compression, so the "
+                             "tempo is unchanged and the user gets dropouts instead" },
+                { 2.0f, 2.0, "the emitted stream really is stretched, which means "
+                             "the node falls behind real time without bound" },
+            };
+
+            for (const Case& cs : cases) {
+                NodeGraph g;
+                int nId = g.addNode("rbt", NodeType::Effect, {}, {}).id;
+                Node& nd = *g.findNode(nId);
+                nd.params.push_back({"Pitch",       0.0f, -24.0f, 24.0f});
+                nd.params.push_back({"Time Ratio", cs.ratio, 0.25f, 4.0f});
+                nd.params.push_back({"Formant",     1.0f,   0.0f,   1.0f});
+                PitchShiftProcessor proc(nd);
+                proc.prepareToPlay(SR, BS);
+
+                juce::AudioBuffer<float> b(2, BS);
+                juce::MidiBuffer mb;
+                std::vector<float> out;
+                out.reserve((size_t)(NBLOCKS * BS));
+                for (int blk = 0; blk < NBLOCKS; ++blk) {
+                    b.clear();
+                    for (int i = 0; i < BS; ++i)
+                        if ((blk * BS + i) % PERIOD == 0)
+                            for (int c = 0; c < 2; ++c) b.getWritePointer(c)[i] = 1.0f;
+                    proc.processBlock(b, mb);
+                    const float* d = b.getReadPointer(0);
+                    out.insert(out.end(), d, d + BS);
+                }
+
+                const double expect = PERIOD * cs.expectFactor;
+                const double gap = medianOnsetGap(out);
+                r.checkVal(gap > 0 && std::abs(gap - expect) <= expect * 0.10,
+                           juce::String("rubberband: Time Ratio ")
+                               + juce::String(cs.ratio, 2) + " -> click period "
+                               + juce::String((int)expect) + " (in " + juce::String(PERIOD)
+                               + "): " + cs.what,
+                           gap);
+            }
+
+            // Part B: the dropouts that Part A's unchanged period is hiding.
+            // Feed a CONTINUOUS tone at R < 1 and count samples the node left
+            // at exactly zero. A working effect leaves none; this one starves
+            // every block and zero-fills the tail, so the output is shredded.
+            {
+                NodeGraph g;
+                int nId = g.addNode("rbd", NodeType::Effect, {}, {}).id;
+                Node& nd = *g.findNode(nId);
+                nd.params.push_back({"Pitch",       0.0f, -24.0f, 24.0f});
+                nd.params.push_back({"Time Ratio",  0.5f,  0.25f,  4.0f});
+                nd.params.push_back({"Formant",     1.0f,   0.0f,   1.0f});
+                PitchShiftProcessor proc(nd);
+                proc.prepareToPlay(SR, BS);
+
+                juce::AudioBuffer<float> b(2, BS);
+                juce::MidiBuffer mb;
+                int zeros = 0, total = 0;
+                const int SETTLE = 20;   // let the initial fill-up finish first
+                for (int blk = 0; blk < 120; ++blk) {
+                    for (int i = 0; i < BS; ++i) {
+                        const double t = (double)(blk * BS + i) / SR;
+                        const float v = 0.5f * (float)std::sin(2.0 * juce::MathConstants<double>::pi * 440.0 * t);
+                        for (int c = 0; c < 2; ++c) b.getWritePointer(c)[i] = v;
+                    }
+                    proc.processBlock(b, mb);
+                    if (blk < SETTLE) continue;
+                    const float* d = b.getReadPointer(0);
+                    for (int i = 0; i < BS; ++i, ++total)
+                        if (d[i] == 0.0f) ++zeros;
+                }
+                const double zeroFrac = total > 0 ? (double)zeros / (double)total : 0.0;
+                r.checkVal(zeroFrac >= 0.25,
+                           "rubberband: Time Ratio 0.50 on a continuous tone leaves a "
+                           "large fraction of the output at exactly zero - the stretcher "
+                           "starves and processBlock zero-fills the block tail "
+                           "(zero-sample fraction)",
+                           zeroFrac);
+            }
         }
     }
 

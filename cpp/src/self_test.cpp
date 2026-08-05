@@ -4009,6 +4009,39 @@ void testWarp(Report& r) {
                        tailFraction(out));
         }
 
+        // The Formant knob (param 2) is never read: `processBlock` only ever
+        // calls getParam(0) and getParam(1), and the stretcher is constructed
+        // with OptionFormantPreserved unconditionally. So the knob does nothing
+        // in either position. Prove that by measurement before deleting it -
+        // reading the code is not proof that no other path consumes the param.
+        //
+        // Note this does NOT mean formant preservation is absent; it is always
+        // on and simply not switchable. Dropping Rubber Band therefore does
+        // lose always-on formant preservation from THIS node, which is why the
+        // dedicated Formant Pitch Shift node is the replacement for that need.
+        {
+            auto renderWithFormant = [&](float formant) {
+                NodeGraph g;
+                int nId = g.addNode("rbf", NodeType::Effect, {}, {}).id;
+                Node& nd = *g.findNode(nId);
+                nd.params.push_back({"Pitch",      12.0f, -24.0f, 24.0f});
+                nd.params.push_back({"Time Ratio",  1.0f,   0.25f,  4.0f});
+                nd.params.push_back({"Formant",  formant,   0.0f,   1.0f});
+                PitchShiftProcessor proc(nd);
+                return runNode(proc, 12);
+            };
+            auto a = renderWithFormant(0.0f);
+            auto b = renderWithFormant(1.0f);
+            double maxDiff = 0.0;
+            const size_t nCmp = std::min(a.size(), b.size());
+            for (size_t i = 0; i < nCmp; ++i)
+                maxDiff = std::max(maxDiff, (double)std::abs(a[i] - b[i]));
+            r.checkVal(nCmp > 0 && maxDiff == 0.0,
+                       "rubberband: the Formant knob is a dead control - Formant 0 and "
+                       "Formant 1 render bit-identical output (max sample difference)",
+                       maxDiff);
+        }
+
         // Time stretching in a live graph. This is the one capability the
         // in-house core does not have, so it is the whole argument for keeping
         // Rubber Band - which makes it worth measuring rather than assuming.

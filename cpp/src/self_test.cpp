@@ -3671,10 +3671,15 @@ void testWarp(Report& r) {
         // Source material: a tone plus noise, so transient detectors and
         // threshold-based branches actually take their expensive paths
         // rather than early-outing on silence.
-        juce::AudioBuffer<float> src(2, BS);
+        // 3 channels: 0/1 are the stereo audio, 2 is a Signal-pin input. The
+        // Vocoder reads its modulator from channel 2 and returns immediately
+        // if the buffer has fewer than 3 channels, so a stereo-only buffer
+        // would "measure" it at ~200000x realtime while doing no work at all.
+        const int SRC_CH = 3;
+        juce::AudioBuffer<float> src(SRC_CH, BS);
         {
             juce::Random rng(20260805);
-            for (int c = 0; c < 2; ++c) {
+            for (int c = 0; c < SRC_CH; ++c) {
                 float* d = src.getWritePointer(c);
                 for (int i = 0; i < BS; ++i)
                     d[i] = 0.4f * std::sin(6.28318530718f * 220.0f * (float)i / (float)SR)
@@ -3683,7 +3688,7 @@ void testWarp(Report& r) {
         }
 
         auto realtimeFactor = [&](juce::AudioProcessor& proc) {
-            juce::AudioBuffer<float> buf(2, BS);
+            juce::AudioBuffer<float> buf(SRC_CH, BS);
             juce::MidiBuffer mb;
             proc.prepareToPlay(SR, BS);
 
@@ -3694,7 +3699,7 @@ void testWarp(Report& r) {
 
             auto t0 = std::chrono::steady_clock::now();
             for (int b = 0; b < BLOCKS; ++b) {
-                for (int c = 0; c < 2; ++c)
+                for (int c = 0; c < SRC_CH; ++c)
                     buf.copyFrom(c, 0, src, c, 0, BS);   // memcpy, not a realloc
                 proc.processBlock(buf, mb);
             }

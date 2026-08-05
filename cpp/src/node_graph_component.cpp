@@ -3910,9 +3910,12 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
                 {Pin{0, "Audio In", PinKind::Audio, true}},
                 {Pin{0, "Audio Out", PinKind::Audio, false}}, {p.x, p.y});
             n.script = "__pitchshift__";
+            // Two params, both of which work. There used to be a third, Time
+            // Ratio, which could not work in a live node (a processBlock must
+            // emit as many samples as it is handed, so a duration change has
+            // nowhere to go) - it went with the Rubber Band dependency.
             n.params.push_back({"Pitch (semi)", 0.0f, -24.0f, 24.0f});
-            n.params.push_back({"Time Ratio",   1.0f, 0.25f,  4.0f});
-            n.params.push_back({"Formant",       1.0f, 0.0f,   1.0f});
+            n.params.push_back({"Formant",      0.0f,   0.0f,  1.0f});
         } else if (result >= 260 && result <= 269) {
             // Waveshaper (amplitude morph): one node per Bucket-A warp method.
             // The DSP is WaveshaperProcessor, which reads its method from the

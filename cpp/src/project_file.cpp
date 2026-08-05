@@ -1258,6 +1258,20 @@ bool ProjectFile::readProject(std::istream& f, NodeGraph& graph, PluginHost* plu
     // synth (reads warp amounts by warpSlot) finds them. Idempotent.
     reconcileAllWarpParams(graph);
 
+    // Drop the Pitch Shift node's obsolete "Time Ratio" param. It was removed
+    // along with the Rubber Band dependency because it cannot work in a live
+    // node, but projects saved before that still carry it, and without this it
+    // would show up forever as a knob that does nothing. Params are read by
+    // name so a stale entry is harmless to the DSP - this is purely so the UI
+    // does not display a dead control. Idempotent.
+    for (auto& n : graph.nodes) {
+        if (n.script != "__pitchshift__") continue;
+        auto& ps = n.params;
+        ps.erase(std::remove_if(ps.begin(), ps.end(),
+                                [](const Param& p) { return p.name == "Time Ratio"; }),
+                 ps.end());
+    }
+
     // Same for live-referenced FrequencyGraph assets: mirror each referenced
     // curve into the spectrum-tap bins that point at it, re-encoding the
     // affected node scripts. Free function in spectrum_tap.cpp.

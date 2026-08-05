@@ -837,6 +837,23 @@ struct Node {
     bool inputMonitor = false;    // pass input through to output in real-time
 };
 
+// Read a named param off a node, returning `def` when it is absent.
+//
+// Lives here, next to Node, rather than in builtin_effects.h, because every
+// processor that reads params needs it and not all of them want that header.
+//
+// Reading params BY NAME is the house rule; do not index node.params directly.
+// Indices are positional, so inserting or removing a param silently re-points
+// every later one - and saved projects keep whatever param list they were saved
+// with, so an old file loaded into new code lands on the wrong values rather
+// than failing loudly. PitchShiftProcessor read by index and that is precisely
+// what made deleting its dead Time Ratio param hazardous.
+inline float paramByName(const Node& node, const char* name, float def) {
+    for (auto& p : node.params)
+        if (p.name == name) return p.value;
+    return def;
+}
+
 // Resolve the effective automation record mode for one param, given the global
 // session mode. Global Off is a HARD GATE: nothing records regardless of node
 // or param overrides, so loading a project (which restores overrides but leaves

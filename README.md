@@ -261,7 +261,7 @@ All built-in effects can be combined freely with cables — pre-effect, post-eff
 
 - **Echo / Delay** — repeating echoes with feedback. Configurable delay time, feedback amount, and number of repeats. Slap-back to ambient washes depending on settings.
 - **Convolution filter** — apply any impulse response (preset, hand-drawn, or loaded .wav) to any audio. Used for filters, real-room reverbs, guitar cabinet sims, EQ matching. See the [Convolution](#convolution) concept above.
-- **Pitch Shifter** — change pitch independently of speed via Rubber Band. Drop your vocals down an octave without slowing them down, or pitch up a sample without speeding it up.
+- **Pitch Shifter** — change pitch without changing speed. Drop your vocals down an octave without slowing them down, or pitch up a sample without speeding it up. A **Formant** switch keeps the timbre in place while the pitch moves, so a voice pitched up still sounds like the same person instead of a chipmunk.
 
 **Reverb and spatial**
 
@@ -386,7 +386,7 @@ This is one of the things that sets SEANCE apart from typical home DAWs. Three i
 
 - **VST3 plugin hosting** on all platforms; **LV2** on all platforms; **AU** on macOS; **LADSPA** on Linux.
 - **Export to WAV, FLAC, OGG, Opus, M4A, WMA.** Choose format, channels (mono/stereo), sample rate, and format-specific options (bit depth, quality, or bitrate) upfront, then pick a filename.
-- **Pitch shifting / time stretching** via Rubber Band.
+- **Pitch shifting**, with optional formant preservation, via SEANCE's own phase vocoder — no third-party dependency.
 - **ASIO support** on Windows for low-latency hardware audio.
 - **Configurable project sample rate** with internal resampling.
 - **Audio bounce** to render an audio clip from any node in the graph.
@@ -524,7 +524,6 @@ Wavelets give you joint time + frequency resolution that traditional FFT-based e
 
 ### Optional dependencies (downloaded by setup script)
 
-- **Rubber Band** — pitch shifting / time stretching
 - **libopenmpt** — MOD / S3M / IT / XM import
 - **libopus + libogg** — Opus audio export
 - **wasm3** — WASM script nodes

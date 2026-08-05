@@ -28,6 +28,7 @@ here.
 - [Terrain Synth](#terrain-synth)
 - [Effect layers and groups](#effect-layers-and-groups)
 - [Pitch Detector](#pitch-detector)
+- [Pitch Shift node](#pitch-shift-node)
 - [Convolution Filter](#convolution-filter)
 - [3D Spatializer (binaural / holophonic)](#3d-spatializer-binaural--holophonic)
 - [MIDI Modulator](#midi-modulator)
@@ -1508,6 +1509,81 @@ Note that this only prevents *new* drift. A wavetable whose Position base was al
 ### MIDI controller behavior
 
 Same as the [MIDI input](#midi-input-and-routing) section's "Built-in controller responses" table. Sustain pedal, mod-wheel vibrato (6 Hz default), pitch bend (±2 semitones), velocity sensitivity, and the per-voice [Pressure input pin](#pressure-input-pin) all apply.
+
+---
+
+## Pitch Shift node
+
+Changes the pitch of an audio signal **without changing its duration**. Two
+params, both on the node face:
+
+| Param | Range | Meaning |
+|---|---|---|
+| **Pitch (semi)** | −24 … +24 | How far to transpose, in semitones. 12 = up an octave, −12 = down an octave, 0 = unity. |
+| **Formant** | 0 / 1 | Off: the whole spectrum scales, so a voice pitched up sounds like a chipmunk. On: the original **spectral envelope** is restored after shifting, so the pitch moves but the timbre stays put — the same voice, singing higher. |
+
+### How it works
+
+A **phase vocoder** (`PhaseVocoderShifter`, `cpp/src/pitch_core.h`), not
+stretch-then-resample. A 2048-point FFT at 75% overlap; each frame's spectral
+peaks are found and every peak is translated *together with its whole mainlobe*,
+with the surrounding bins' phases locked to the peak's. Moving whole peaks
+rather than individual bins is what keeps the level right — mapping each bin
+independently tears mainlobes apart and costs about 4.5 dB on an octave shift.
+
+A peak's *synthesis* frequency comes from its true frequency (recovered from the
+phase advance between frames) times the ratio, not from its bin index, so
+resolution is not limited to whole bins: a one-semitone shift really is one
+semitone. Measured accuracy is under 8 cents across ±12 semitones.
+
+**Formant** preservation uses cepstral liftering: the log-magnitude spectrum is
+transformed to the cepstrum, only the low-quefrency part is kept (1.2 ms, which
+separates the slowly-varying vocal-tract envelope from the harmonic comb), and
+transformed back to give a smooth envelope. After shifting, bin *k* carries what
+came from bin *k*/ratio, so multiplying by env(*k*)/env(*k*/ratio) puts the
+original envelope back. The correction is clamped to ±20 dB, because in deep
+spectral valleys the raw ratio explodes and would amplify numerical noise into
+an audible artefact. It costs two extra FFTs per frame, so it is skipped
+entirely when the switch is off *and* when the pitch sits at unity.
+
+### Latency
+
+The node reports **1536 samples** of latency (32 ms at 48 kHz) — the FFT size
+minus one hop. The graph's plugin delay compensation uses that to keep the node
+aligned against every other path, so you never compensate by hand.
+
+The node deliberately does **not** short-circuit at 0 semitones. A fixed-latency
+node that early-outs would jump forward by its full latency the instant the knob
+crossed zero: an audible click, and a phase discontinuity against everything the
+graph has already delay-compensated.
+
+### What happened to Time Ratio
+
+Earlier versions of this node wrapped the **Rubber Band** library and exposed a
+third param, **Time Ratio**, for time stretching. Both are gone.
+
+Rubber Band is GPL v2 and was statically linked, which made the whole binary
+GPL-encumbered — incompatible with shipping SEANCE as a commercial plugin.
+Before removing it all three params were measured, and only Pitch worked:
+
+- **Time Ratio** could not work, and the reason is structural rather than a bug:
+  a `processBlock` must emit exactly as many samples as it is handed, so a
+  change of duration has nowhere to go. At ratio 2.0 the surplus backed up
+  inside the stretcher indefinitely (latency growing half a block per block); at
+  ratio 0.5 it starved and zero-filled, leaving **50% of a continuous tone as
+  exact silence** while the tempo stayed unchanged.
+- **Formant** was never read at all — the stretcher was constructed with formant
+  preservation permanently on, so the knob rendered bit-identical output in
+  either position.
+
+Formant preservation was therefore rebuilt into the in-house core, so nothing
+was lost and the knob now genuinely works. Time Ratio was removed outright. **A
+real time-stretch feature has to be offline/clip-based** — rendering a clip to a
+new length — rather than a live effect node.
+
+Projects saved with the old three-param node load fine: params are read by name,
+and the obsolete `Time Ratio` entry is stripped on load so it cannot linger as a
+dead knob.
 
 ---
 

@@ -16,12 +16,8 @@
 
 namespace SoundShop {
 
-// Helper: read a named param from the node, return def if not found.
-inline float paramByName(const Node& node, const char* name, float def) {
-    for (auto& p : node.params)
-        if (p.name == name) return p.value;
-    return def;
-}
+// paramByName() moved to node_graph.h, next to Node, so that processors which
+// do not want this whole header can still read their params by name.
 
 // Number of single-loop cycles a feedback delay takes to decay to -60 dB
 // (the standard "RT60" inaudibility threshold).  feedback is the linear

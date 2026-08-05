@@ -5,71 +5,23 @@ top. When something is fixed, delete the entry (git history is the archive).
 
 ---
 
-## LICENSING: SEANCE statically links GPL v2 code (Rubber Band)
+## CLEANUP: delete the now-unused `cpp/third_party/rubberband` directory
 
-**Found:** 2026-08-05, while deciding how to fix the pitch shifters.
+**Found:** 2026-08-05, finishing the Rubber Band removal.
 
-`third_party/rubberband` is **GPL v2** (`third_party/rubberband/COPYING`), and
-`cpp/CMakeLists.txt:346` builds it into a static `rubberband` library that is
-linked unconditionally whenever the source tree is present — which it is. It
-backs the `PitchShiftProcessor` node (`pitch_shift_processor.cpp`).
+The GPL v2 licensing problem is **resolved** — `PitchShiftProcessor` now runs on
+the in-house `PhaseVocoderShifter`, and `cpp/CMakeLists.txt` no longer builds or
+links Rubber Band at all. Verified: the shipped `SEANCE.exe` contains zero
+occurrences of the `RubberBand` symbol prefix.
 
-The GPL is viral across static linking, so as things stand SEANCE as a whole is
-GPL-encumbered. That does not stop you *selling* it, but it does mean you must
-ship source under the GPL and every recipient may redistribute freely — which
-is incompatible with the commercial plugin plan that motivates the whole
-wavelet-suite hardening effort. Shipping a proprietary VST3 statically linked
-against it would be a straightforward licence violation.
+What remains is housekeeping. `cpp/third_party/rubberband/` (2.3 MB of GPL v2
+source) is still on disk. It is untracked/gitignored, so it is not in the repo
+and not in any build, but it should be deleted from working copies so nobody
+wires it back up by accident. Left for the user rather than done automatically,
+because deleting untracked files is unrecoverable.
 
-**Options:**
-- Buy a commercial Rubber Band licence (Particular Programs Ltd sell one).
-- Replace it with an in-house pitch-shift core and drop the dependency.
-- Keep it, and accept that SEANCE ships GPL.
-
-**Status: the blocker to option 2 is gone.** `PhaseVocoderShifter`
-(`cpp/src/pitch_core.h`) is an in-house, allocation-free, self-tested pitch
-shifter, already in production use by Ind. Pitch Shift and Formant Pitch Shift.
-The remaining work is to re-base `PitchShiftProcessor`
-(`pitch_shift_processor.cpp`) onto it and delete the `third_party/rubberband`
-subtree plus the `HAS_RUBBERBAND` branch in `cpp/CMakeLists.txt:346`.
-
-The one capability Rubber Band has that `PhaseVocoderShifter` does not is
-**time stretching** (changing duration at constant pitch), exposed as the node's
-**Time Ratio** param. That was the only real argument for keeping the
-dependency, so it was measured rather than assumed — and **it does not work on a
-live graph node.** The tests are `rubberband: Time Ratio ...` in `self_test.cpp`.
-
-The root cause is structural, not a bug to fix: `processBlock` must emit exactly
-as many samples as it is handed, so a duration change has nowhere to go. It
-fails differently in each direction:
-
-- **Ratio > 1** (measured at 2.0): Rubber Band produces 2 samples per sample
-  consumed but only `numSamples` are ever retrieved, so the surplus backs up
-  inside the stretcher **forever** — true latency grows by half a block per
-  block, without bound. A 4800-sample click period comes out at 9856 (~9600),
-  i.e. the emitted stream really is stretched, which is exactly the statement
-  that the node is falling behind real time by a factor of 2.
-- **Ratio < 1** (measured at 0.5): the stretcher starves and `processBlock`
-  zero-fills the tail of every block. That padding cancels the compression
-  almost exactly — the click period comes back at 4992 vs. 4800 in, i.e.
-  **unchanged** — so instead of a tempo change the user gets dropouts:
-  **50.1% of the output of a continuous tone is exactly zero.**
-
-So nothing of value is lost by deleting Rubber Band; the Time Ratio param is
-already non-functional and should be removed along with it. A genuine
-time-stretch feature has to be offline/clip-based (render a clip to a new
-length), not a live effect node — and at that point `PhaseVocoderShifter` grows
-it naturally, since a synthesis hop differing from the analysis hop is the whole
-change.
-
-Beware measuring this the easy way: a first pass checked whether Time Ratio
-preserved output *level*, found that it roughly did, and would have concluded
-the feature works. It does not follow — a node that ignores Time Ratio entirely
-also preserves level perfectly. Spacing of events is the measurement.
-
-Note the build already treats Rubber Band as optional (`HAS_RUBBERBAND`, and
-CMake prints "NOT FOUND (pitch shift disabled)" when the directory is absent),
-so removing it is a supported configuration rather than a rewrite.
+Also worth doing: drop Rubber Band from whatever setup script downloads the
+optional dependencies, so a fresh clone stops fetching it.
 
 ---
 

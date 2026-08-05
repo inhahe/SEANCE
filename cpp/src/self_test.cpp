@@ -3979,229 +3979,98 @@ void testWarp(Report& r) {
             checkShifter("Formant Pitch Shift", proc);
         }
 
-        // ---- The Rubber Band node -------------------------------------
+        // ---- The Pitch Shift node ---------------------------------------
         //
-        // `PitchShiftProcessor` has had no test coverage at all. It matters now
-        // because it is the ONLY remaining user of `third_party/rubberband`,
-        // which is GPL v2 and statically linked - see the licensing entry in
-        // known-issues.md. Whether that dependency can simply be deleted turns
-        // on what this node actually delivers today, so: measure it.
+        // This node used to wrap Rubber Band and had NO test coverage at all.
+        // That mattered, because it was the only remaining user of the GPL v2
+        // `third_party/rubberband`, so whether the dependency could be deleted
+        // rested entirely on what the node actually delivered. Measuring it
+        // found that of its three params only Pitch worked: Time Ratio could
+        // not work in a live node (a processBlock must emit as many samples as
+        // it is handed, so a duration change has nowhere to go - at ratio 2 the
+        // surplus backed up forever, at ratio 0.5 it starved and zero-filled
+        // half the output), and Formant was never read at all, rendering
+        // bit-identical at 0 and 1. Both are gone; both remaining params work.
         //
-        // Its params are read BY INDEX (getParam(0/1/2)), not by name, so the
-        // order below is load-bearing: 0 = Pitch, 1 = Time ratio, 2 = Formant.
+        // Params are read BY NAME now, so these must match the names the
+        // node-creation site uses. The constants exist so a rename cannot
+        // silently desync them and leave everything reading defaults.
+        auto makePitchShiftNode = [&](NodeGraph& g, float semis, float formant) -> Node& {
+            int nId = g.addNode("ps", NodeType::Effect, {}, {}).id;
+            Node& nd = *g.findNode(nId);
+            nd.params.push_back({PitchShiftProcessor::kPitchParam, semis, -24.0f, 24.0f});
+            nd.params.push_back({PitchShiftProcessor::kFormantParam, formant, 0.0f, 1.0f});
+            return nd;
+        };
+
         {
             NodeGraph g;
-            int nId = g.addNode("rb", NodeType::Effect, {}, {}).id;
-            Node& nd = *g.findNode(nId);
-            nd.params.push_back({"Pitch",      12.0f, -24.0f, 24.0f});
-            nd.params.push_back({"Time Ratio",  1.0f,   0.25f,  4.0f});
-            nd.params.push_back({"Formant",     1.0f,   0.0f,   1.0f});
+            Node& nd = makePitchShiftNode(g, 12.0f, 0.0f);
             PitchShiftProcessor proc(nd);
             auto out = runNode(proc, 12);
             double outHz = dominantHz(out.data(), (int)out.size());
             double cents = 1200.0 * std::log2(outHz / (inHz * 2.0));
             r.checkVal(std::abs(cents) <= 50.0,
-                       "rubberband: Pitch Shift +12 lands within 50 cents of 880 Hz "
+                       "pitch-shift-node: +12 lands within 50 cents of 880 Hz "
                        "(cents error)", cents);
             r.checkVal(std::abs(tailFraction(out) - 0.25) <= 0.06,
-                       "rubberband: Pitch Shift +12 spreads energy evenly across the "
-                       "block (last-quarter energy fraction, 0.25 = uniform)",
+                       "pitch-shift-node: +12 spreads energy evenly across the block "
+                       "(last-quarter energy fraction, 0.25 = uniform)",
                        tailFraction(out));
+            r.checkVal(proc.getLatencySamples() > 0,
+                       "pitch-shift-node: reports its latency so the graph can PDC it "
+                       "(samples)", (double)proc.getLatencySamples());
         }
 
-        // The Formant knob (param 2) is never read: `processBlock` only ever
-        // calls getParam(0) and getParam(1), and the stretcher is constructed
-        // with OptionFormantPreserved unconditionally. So the knob does nothing
-        // in either position. Prove that by measurement before deleting it -
-        // reading the code is not proof that no other path consumes the param.
-        //
-        // Note this does NOT mean formant preservation is absent; it is always
-        // on and simply not switchable. Dropping Rubber Band therefore does
-        // lose always-on formant preservation from THIS node, which is why the
-        // dedicated Formant Pitch Shift node is the replacement for that need.
+        // The Formant knob used to be inert. It is now wired to the core's
+        // cepstral formant preservation, so the SAME comparison that once
+        // proved it dead (render at 0, render at 1, diff them) must now show a
+        // real difference. Keeping the test in this shape is deliberate: it is
+        // the direct regression guard against the knob going inert again.
         {
-            auto renderWithFormant = [&](float formant) {
+            auto render = [&](float formant) {
                 NodeGraph g;
-                int nId = g.addNode("rbf", NodeType::Effect, {}, {}).id;
-                Node& nd = *g.findNode(nId);
-                nd.params.push_back({"Pitch",      12.0f, -24.0f, 24.0f});
-                nd.params.push_back({"Time Ratio",  1.0f,   0.25f,  4.0f});
-                nd.params.push_back({"Formant",  formant,   0.0f,   1.0f});
+                Node& nd = makePitchShiftNode(g, 12.0f, formant);
                 PitchShiftProcessor proc(nd);
                 return runNode(proc, 12);
             };
-            auto a = renderWithFormant(0.0f);
-            auto b = renderWithFormant(1.0f);
+            auto a = render(0.0f);
+            auto b = render(1.0f);
             double maxDiff = 0.0;
             const size_t nCmp = std::min(a.size(), b.size());
             for (size_t i = 0; i < nCmp; ++i)
                 maxDiff = std::max(maxDiff, (double)std::abs(a[i] - b[i]));
-            r.checkVal(nCmp > 0 && maxDiff == 0.0,
-                       "rubberband: the Formant knob is a dead control - Formant 0 and "
-                       "Formant 1 render bit-identical output (max sample difference)",
+            r.checkVal(nCmp > 0 && maxDiff > 1e-4,
+                       "pitch-shift-node: the Formant knob is a LIVE control - Formant 0 "
+                       "and Formant 1 render audibly different output (max sample "
+                       "difference; this param was inert under Rubber Band)",
                        maxDiff);
         }
 
-        // Time stretching in a live graph. This is the one capability the
-        // in-house core does not have, so it is the whole argument for keeping
-        // Rubber Band - which makes it worth measuring rather than assuming.
-        //
-        // Time stretching means changing the SPACING of events, so that is what
-        // is measured: a click train at a known period in, median inter-click
-        // period out. Level is deliberately NOT the measurement - a first pass
-        // here checked level, found it roughly preserved, and would have
-        // concluded the feature works. It does not follow: a node that ignores
-        // Time Ratio entirely also preserves level perfectly.
-        //
-        // What the numbers below actually pin down is that Time Ratio is
-        // unusable on a live node, but in two DIFFERENT ways depending on the
-        // direction, neither of which is "the node ignores it":
-        //
-        //   R > 1 (longer output): Rubber Band produces R samples per sample
-        //     consumed, but `processBlock` only ever retrieves `numSamples`.
-        //     The surplus backs up inside the stretcher forever, so the node's
-        //     true latency grows without bound - about (1 - 1/R) of a block per
-        //     block, i.e. half a block per block at R = 2. The emitted stream
-        //     really is stretched (spacing -> R * PERIOD), which is exactly the
-        //     statement that it is falling behind real time by a factor R.
-        //
-        //   R < 1 (shorter output): the stretcher produces fewer samples than
-        //     the block needs, so `processBlock` zero-fills the remainder. That
-        //     starvation padding cancels the compression almost exactly - the
-        //     click PERIOD comes back unchanged - and what the user gets instead
-        //     of a tempo change is a stream full of dropouts. Part B measures
-        //     those dropouts directly, because the unchanged period on its own
-        //     is indistinguishable from the node doing nothing.
+        // A stale "Time Ratio" left over in an old project must not disturb
+        // anything. This is the payoff for reading params by name: the same
+        // node with a junk extra param renders bit-identically. Under the old
+        // by-index reading, an extra param would have re-pointed every later
+        // one and silently changed what the node did.
         {
-            const int PERIOD = 4800;          // 100 ms between clicks at 48k
-            const int NBLOCKS = 200;
-
-            // Onset detector: peak envelope over 128-sample windows, then rising
-            // edges through 20% of the loudest window.
-            //
-            // The two obvious detectors both give WRONG answers on this signal,
-            // and disagreed with each other by 4x, which is what prompted
-            // dumping the waveform and looking at it:
-            //   - "local maximum above half the global peak" misses the quieter
-            //     copies of a smeared click and reports 2x the true spacing.
-            //   - per-sample hysteresis re-arms INSIDE one click, because a
-            //     stretched click is a burst with quiet stretches within it, and
-            //     reports half the true spacing.
-            // Window-enveloping first collapses each burst into one contiguous
-            // above-threshold run, so one click gives exactly one rising edge.
-            //
-            // The median (not the mean) of the gaps is the statistic, because
-            // starvation at R < 1 swallows occasional clicks whole, and a
-            // dropped click merges two gaps into one double-length outlier.
-            auto medianOnsetGap = [](const std::vector<float>& sig) {
-                const int W = 128;
-                const int nw = (int)sig.size() / W;
-                if (nw < 2) return 0.0;
-                std::vector<float> env((size_t)nw, 0.0f);
-                float top = 0.0f;
-                for (int w = 0; w < nw; ++w) {
-                    float m = 0.0f;
-                    for (int i = 0; i < W; ++i)
-                        m = std::max(m, std::abs(sig[(size_t)(w * W + i)]));
-                    env[(size_t)w] = m;
-                    top = std::max(top, m);
-                }
-                if (top <= 0.0f) return 0.0;
-                const float thr = 0.2f * top;
-                std::vector<int> gaps;
-                int prev = -1;
-                for (int w = 1; w < nw; ++w) {
-                    if (env[(size_t)(w - 1)] <= thr && env[(size_t)w] > thr) {
-                        if (prev >= 0) gaps.push_back((w - prev) * W);
-                        prev = w;
-                    }
-                }
-                if (gaps.empty()) return 0.0;
-                std::sort(gaps.begin(), gaps.end());
-                return (double)gaps[gaps.size() / 2];
-            };
-
-            // Part A: what happens to the spacing of events.
-            struct Case { float ratio; double expectFactor; const char* what; };
-            const Case cases[] = {
-                { 0.5f, 1.0, "starvation padding cancels the compression, so the "
-                             "tempo is unchanged and the user gets dropouts instead" },
-                { 2.0f, 2.0, "the emitted stream really is stretched, which means "
-                             "the node falls behind real time without bound" },
-            };
-
-            for (const Case& cs : cases) {
-                NodeGraph g;
-                int nId = g.addNode("rbt", NodeType::Effect, {}, {}).id;
-                Node& nd = *g.findNode(nId);
-                nd.params.push_back({"Pitch",       0.0f, -24.0f, 24.0f});
-                nd.params.push_back({"Time Ratio", cs.ratio, 0.25f, 4.0f});
-                nd.params.push_back({"Formant",     1.0f,   0.0f,   1.0f});
-                PitchShiftProcessor proc(nd);
-                proc.prepareToPlay(SR, BS);
-
-                juce::AudioBuffer<float> b(2, BS);
-                juce::MidiBuffer mb;
-                std::vector<float> out;
-                out.reserve((size_t)(NBLOCKS * BS));
-                for (int blk = 0; blk < NBLOCKS; ++blk) {
-                    b.clear();
-                    for (int i = 0; i < BS; ++i)
-                        if ((blk * BS + i) % PERIOD == 0)
-                            for (int c = 0; c < 2; ++c) b.getWritePointer(c)[i] = 1.0f;
-                    proc.processBlock(b, mb);
-                    const float* d = b.getReadPointer(0);
-                    out.insert(out.end(), d, d + BS);
-                }
-
-                const double expect = PERIOD * cs.expectFactor;
-                const double gap = medianOnsetGap(out);
-                r.checkVal(gap > 0 && std::abs(gap - expect) <= expect * 0.10,
-                           juce::String("rubberband: Time Ratio ")
-                               + juce::String(cs.ratio, 2) + " -> click period "
-                               + juce::String((int)expect) + " (in " + juce::String(PERIOD)
-                               + "): " + cs.what,
-                           gap);
-            }
-
-            // Part B: the dropouts that Part A's unchanged period is hiding.
-            // Feed a CONTINUOUS tone at R < 1 and count samples the node left
-            // at exactly zero. A working effect leaves none; this one starves
-            // every block and zero-fills the tail, so the output is shredded.
-            {
-                NodeGraph g;
-                int nId = g.addNode("rbd", NodeType::Effect, {}, {}).id;
-                Node& nd = *g.findNode(nId);
-                nd.params.push_back({"Pitch",       0.0f, -24.0f, 24.0f});
-                nd.params.push_back({"Time Ratio",  0.5f,  0.25f,  4.0f});
-                nd.params.push_back({"Formant",     1.0f,   0.0f,   1.0f});
-                PitchShiftProcessor proc(nd);
-                proc.prepareToPlay(SR, BS);
-
-                juce::AudioBuffer<float> b(2, BS);
-                juce::MidiBuffer mb;
-                int zeros = 0, total = 0;
-                const int SETTLE = 20;   // let the initial fill-up finish first
-                for (int blk = 0; blk < 120; ++blk) {
-                    for (int i = 0; i < BS; ++i) {
-                        const double t = (double)(blk * BS + i) / SR;
-                        const float v = 0.5f * (float)std::sin(2.0 * juce::MathConstants<double>::pi * 440.0 * t);
-                        for (int c = 0; c < 2; ++c) b.getWritePointer(c)[i] = v;
-                    }
-                    proc.processBlock(b, mb);
-                    if (blk < SETTLE) continue;
-                    const float* d = b.getReadPointer(0);
-                    for (int i = 0; i < BS; ++i, ++total)
-                        if (d[i] == 0.0f) ++zeros;
-                }
-                const double zeroFrac = total > 0 ? (double)zeros / (double)total : 0.0;
-                r.checkVal(zeroFrac >= 0.25,
-                           "rubberband: Time Ratio 0.50 on a continuous tone leaves a "
-                           "large fraction of the output at exactly zero - the stretcher "
-                           "starves and processBlock zero-fills the block tail "
-                           "(zero-sample fraction)",
-                           zeroFrac);
-            }
+            NodeGraph g1, g2;
+            Node& a = makePitchShiftNode(g1, 12.0f, 0.0f);
+            int nId = g2.addNode("ps2", NodeType::Effect, {}, {}).id;
+            Node& b = *g2.findNode(nId);
+            b.params.push_back({PitchShiftProcessor::kPitchParam, 12.0f, -24.0f, 24.0f});
+            b.params.push_back({"Time Ratio", 0.5f, 0.25f, 4.0f});   // the ghost
+            b.params.push_back({PitchShiftProcessor::kFormantParam, 0.0f, 0.0f, 1.0f});
+            PitchShiftProcessor pa(a), pb(b);
+            auto oa = runNode(pa, 12);
+            auto ob = runNode(pb, 12);
+            double maxDiff = 0.0;
+            const size_t nCmp = std::min(oa.size(), ob.size());
+            for (size_t i = 0; i < nCmp; ++i)
+                maxDiff = std::max(maxDiff, (double)std::abs(oa[i] - ob[i]));
+            r.checkVal(nCmp > 0 && maxDiff == 0.0,
+                       "pitch-shift-node: a leftover Time Ratio param from an old project "
+                       "changes nothing (max sample difference vs the same node without "
+                       "it)", maxDiff);
         }
     }
 

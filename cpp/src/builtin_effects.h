@@ -2179,7 +2179,13 @@ class OctaveShiftProcessor : public juce::AudioProcessor {
 public:
     OctaveShiftProcessor(Node& n) : node(n) {}
     const juce::String getName() const override { return "Octave Shift"; }
-    void prepareToPlay(double sr, int) override { sampleRate = sr; }
+    void prepareToPlay(double sr, int bs) override {
+        sampleRate = sr;
+        scratch.prepare(bs);
+        int pad = 1;
+        while (pad < bs) pad *= 2;
+        shifted.reserve((size_t)pad);
+    }
     void releaseResources() override {}
 
     void processBlock(juce::AudioBuffer<float>& buf, juce::MidiBuffer&) override {
@@ -2192,22 +2198,21 @@ public:
         float mix = juce::jlimit(0.0f, 1.0f, paramByName(node, "Mix", 0.5f));
         if (shift == 0) return; // no change
 
-        auto filt = getWaveletFilter("db4");
-        int padLen = 1;
-        while (padLen < n) padLen *= 2;
+        const auto& filt = scratch.useFilter("db4");
+        auto& sig = scratch.sig;
+        auto& dry = scratch.dry;
 
         for (int c = 0; c < ch; ++c) {
             float* data = buf.getWritePointer(c);
-            std::vector<float> sig(padLen, 0.0f);
-            for (int i = 0; i < n; ++i) sig[i] = data[i];
-            std::vector<float> dry(data, data + n);
+            const int padLen = scratch.load(data, n);
 
             int levels = 6;
-            int actualLevels = dwt(sig, levels, filt);
+            int actualLevels = dwt(sig, levels, filt, scratch.ws);
 
             // Shift bands: positive shift = move coefficients to higher
             // bands (higher frequency = octave up); negative = lower.
-            std::vector<float> shifted(padLen, 0.0f);
+            // assign() re-zeroes without allocating (capacity is reserved).
+            shifted.assign((size_t)padLen, 0.0f);
             if (shift > 0) {
                 // Octave up: copy each band to the next-higher band.
                 // The finest detail band wraps / gets dropped; the
@@ -2251,7 +2256,7 @@ public:
                 }
             }
 
-            idwtPR(shifted, actualLevels, filt);
+            idwtPR(shifted, actualLevels, filt, scratch.ws);
             for (int i = 0; i < n; ++i)
                 data[i] = dry[i] * (1.0f - mix) + shifted[i] * mix;
         }
@@ -2273,6 +2278,8 @@ public:
 private:
     Node& node;
     double sampleRate = 44100;
+    WaveletFxScratch scratch;
+    std::vector<float> shifted;   // band-reassigned coefficient stream
 };
 
 // ==============================================================================
@@ -2295,7 +2302,7 @@ class WaveletMultibandCompProcessor : public juce::AudioProcessor {
 public:
     WaveletMultibandCompProcessor(Node& n) : node(n) {}
     const juce::String getName() const override { return "Wavelet MB Comp"; }
-    void prepareToPlay(double sr, int) override { sampleRate = sr; }
+    void prepareToPlay(double sr, int bs) override { sampleRate = sr; scratch.prepare(bs); }
     void releaseResources() override {}
 
     void processBlock(juce::AudioBuffer<float>& buf, juce::MidiBuffer&) override {
@@ -2312,17 +2319,15 @@ public:
         float mix      = juce::jlimit(0.0f, 1.0f, paramByName(node, "Mix", 1.0f));
 
         float threshLin = std::pow(10.0f, threshDb / 20.0f);
-        auto filt = getWaveletFilter("db4");
-        int padLen = 1;
-        while (padLen < n) padLen *= 2;
+        const auto& filt = scratch.useFilter("db4");
+        auto& sig = scratch.sig;
+        auto& dry = scratch.dry;
 
         for (int c = 0; c < ch; ++c) {
             float* data = buf.getWritePointer(c);
-            std::vector<float> sig(padLen, 0.0f);
-            for (int i = 0; i < n; ++i) sig[i] = data[i];
-            std::vector<float> dry(data, data + n);
+            const int padLen = scratch.load(data, n);
 
-            int actualLevels = dwt(sig, levels, filt);
+            int actualLevels = dwt(sig, levels, filt, scratch.ws);
 
             // Per-band compression: compute peak of each band, apply gain
             // reduction if peak exceeds threshold.
@@ -2353,7 +2358,7 @@ public:
                 bandStart += bandLen;
             }
 
-            idwtPR(sig, actualLevels, filt);
+            idwtPR(sig, actualLevels, filt, scratch.ws);
             for (int i = 0; i < n; ++i)
                 data[i] = dry[i] * (1.0f - mix) + sig[i] * mix;
         }
@@ -2375,6 +2380,7 @@ public:
 private:
     Node& node;
     double sampleRate = 44100;
+    WaveletFxScratch scratch;
 };
 
 // ==============================================================================

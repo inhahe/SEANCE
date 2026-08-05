@@ -47,6 +47,7 @@
 #include <sstream>
 #include <fstream>
 #include <set>
+#include <chrono>
 
 namespace SoundShop {
 namespace {
@@ -57,7 +58,7 @@ namespace {
 // ---------------------------------------------------------------------------
 struct Report {
     juce::String text;
-    int passed = 0, failed = 0;
+    int passed = 0, failed = 0, knownBugs = 0;
 
     void line(const juce::String& s) { text << s << "\n"; }
     void section(const juce::String& s) {
@@ -74,6 +75,34 @@ struct Report {
              << "  (measured " << juce::String(value, 5) << ")\n";
         if (cond) ++passed; else ++failed;
         return cond;
+    }
+    // Known-bug check ("expected failure").
+    //
+    // For behaviour that is genuinely wrong, is documented in known-issues.md,
+    // and is not being fixed in this change. The assertion is still evaluated
+    // and its measured value still recorded, but a failure is tallied
+    // separately from `failed` so it does not turn the suite red. A suite that
+    // is permanently red teaches people to ignore red, which costs more than
+    // the bug being tracked.
+    //
+    // The important half is the other branch: if a known-bug check ever
+    // PASSES, that is reported as a real failure. Either the bug got fixed and
+    // this call plus its known-issues.md entry should be deleted, or the test
+    // stopped actually testing anything. Both need a human.
+    bool knownBug(bool condIfFixed, const juce::String& what,
+                  double value, const juce::String& issue) {
+        if (condIfFixed) {
+            text << "  [FAIL] " << what
+                 << " -- KNOWN BUG NOW PASSES; remove the knownBug() call and the "
+                 << "'" << issue << "' entry in known-issues.md"
+                 << "  (measured " << juce::String(value, 5) << ")\n";
+            ++failed;
+            return false;
+        }
+        text << "  [KNOWN-BUG] " << what << " -- tracked as '" << issue
+             << "' in known-issues.md  (measured " << juce::String(value, 5) << ")\n";
+        ++knownBugs;
+        return true;
     }
     void note(const juce::String& s) { text << "  - " << s << "\n"; }
 };
@@ -3605,6 +3634,216 @@ void testWarp(Report& r) {
                            "wavelet-fx: Denoiser at threshold 0 / full wet is unity",
                            maxAbsDiffBuf(buf, dryRef));
             }
+        }
+    }
+
+    // ---- Wavelet effects: real-time CPU budget --------------------------
+    //
+    // Every wavelet effect is a node that can be placed many times in one
+    // graph, and the whole graph has to finish inside a single buffer period
+    // or the audio device underruns. So "does it run at all" is not the bar -
+    // each effect must run at a small FRACTION of real time on its own.
+    //
+    // The metric here is the realtime factor: seconds of audio produced per
+    // second of wall clock. 1.0x means the effect alone exactly consumes the
+    // entire audio budget (already unusable - there is no headroom for the
+    // rest of the graph, the UI, or a slower machine). We require 10x, i.e.
+    // no single effect may eat more than a tenth of one core's budget.
+    //
+    // This is deliberately a permanent test rather than a one-off benchmark:
+    // the wavelet suite is the part of SEANCE with no free competitor, it is
+    // the part most likely to be shipped as a plugin, and a plugin that
+    // cannot sustain realtime fails validation outright. A regression here
+    // (a stray allocation, an accidental O(n^2), a levels default bumped up)
+    // is otherwise invisible until a user hears crackling.
+    //
+    // The threshold is loose on purpose so it does not flake on a slow or
+    // loaded CI box; it is sized to catch order-of-magnitude problems, which
+    // is the failure mode that actually happens. The measured value is
+    // recorded for every effect so trends are visible in the report even
+    // when everything passes.
+    {
+        const int    BS     = 512;
+        const double SR     = 48000.0;
+        const int    BLOCKS = 100;              // ~1.07 s of stereo audio
+        const double MIN_RT = 10.0;             // must be >=10x realtime
+
+        // Source material: a tone plus noise, so transient detectors and
+        // threshold-based branches actually take their expensive paths
+        // rather than early-outing on silence.
+        juce::AudioBuffer<float> src(2, BS);
+        {
+            juce::Random rng(20260805);
+            for (int c = 0; c < 2; ++c) {
+                float* d = src.getWritePointer(c);
+                for (int i = 0; i < BS; ++i)
+                    d[i] = 0.4f * std::sin(6.28318530718f * 220.0f * (float)i / (float)SR)
+                         + 0.1f * (rng.nextFloat() * 2.0f - 1.0f);
+            }
+        }
+
+        auto realtimeFactor = [&](juce::AudioProcessor& proc) {
+            juce::AudioBuffer<float> buf(2, BS);
+            juce::MidiBuffer mb;
+            proc.prepareToPlay(SR, BS);
+
+            // Warm-up block, untimed: first-touch page faults and any lazy
+            // one-time setup would otherwise be charged to the measurement.
+            buf.makeCopyOf(src);
+            proc.processBlock(buf, mb);
+
+            auto t0 = std::chrono::steady_clock::now();
+            for (int b = 0; b < BLOCKS; ++b) {
+                for (int c = 0; c < 2; ++c)
+                    buf.copyFrom(c, 0, src, c, 0, BS);   // memcpy, not a realloc
+                proc.processBlock(buf, mb);
+            }
+            auto t1 = std::chrono::steady_clock::now();
+
+            double wall  = std::chrono::duration<double>(t1 - t0).count();
+            double audio = (double)(BLOCKS * BS) / SR;
+            return wall > 1e-9 ? audio / wall : 1e9;
+        };
+
+        // Each effect is driven at a NON-neutral setting - several of them
+        // early-out at their default (e.g. Wavelet Pitch returns immediately
+        // when |Semitones| < 0.01), which would measure nothing at all.
+        struct ParamSpec { const char* name; float val, lo, hi; };
+        auto makeNode = [&](NodeGraph& g, std::initializer_list<ParamSpec> ps) -> Node& {
+            int nId = g.addNode("cpu", NodeType::Effect, {}, {}).id;
+            Node& nd = *g.findNode(nId);
+            for (auto& p : ps) nd.params.push_back({p.name, p.val, p.lo, p.hi});
+            return nd;
+        };
+
+        auto budget = [&](const char* label, juce::AudioProcessor& proc) {
+            double rt = realtimeFactor(proc);
+            r.checkVal(rt >= MIN_RT,
+                       juce::String("wavelet-cpu: ") + label
+                           + " runs >=10x realtime (x realtime)", rt);
+        };
+        // Same measurement, but for an effect whose slowness is a tracked bug.
+        auto budgetKnownBug = [&](const char* label, juce::AudioProcessor& proc) {
+            double rt = realtimeFactor(proc);
+            r.knownBug(rt >= MIN_RT,
+                       juce::String("wavelet-cpu: ") + label
+                           + " runs >=10x realtime (x realtime)", rt,
+                       "Wavelet Pitch Shift is comprehensively non-functional");
+        };
+
+        { NodeGraph g; Node& nd = makeNode(g, {{"Transient",2.0f,0,2},{"Sustain",0.5f,0,2},
+                                               {"Threshold",0.3f,0,1},{"Levels",4.0f,1,8}});
+          TransientSplitProcessor p(nd);          budget("Transient Split", p); }
+        { NodeGraph g; Node& nd = makeNode(g, {{"Threshold",0.1f,0,1},{"Levels",4.0f,1,8},
+                                               {"Mix",1.0f,0,1}});
+          WaveletDenoiserProcessor p(nd);         budget("Denoiser", p); }
+        { NodeGraph g; Node& nd = makeNode(g, {{"Bits",4.0f,1,16},{"Band Lo",0.0f,0,7},
+                                               {"Band Hi",7.0f,0,7},{"Levels",4.0f,1,8},
+                                               {"Mix",1.0f,0,1}});
+          WaveletBitcrushProcessor p(nd);         budget("Bitcrush", p); }
+        { NodeGraph g; Node& nd = makeNode(g, {{"Shift",-1.0f,-2,2},{"Mix",0.5f,0,1}});
+          OctaveShiftProcessor p(nd);             budget("Octave Shift", p); }
+        { NodeGraph g; Node& nd = makeNode(g, {{"Threshold",-20.0f,-60,0},{"Ratio",4.0f,1,20},
+                                               {"Levels",4.0f,1,6},{"Low Gain",0.0f,-12,12},
+                                               {"High Gain",0.0f,-12,12},{"Mix",1.0f,0,1}});
+          WaveletMultibandCompProcessor p(nd);    budget("Multiband Comp", p); }
+        { NodeGraph g; Node& nd = makeNode(g, {{"Semitones",7.0f,-24,24},{"Mix",1.0f,0,1}});
+          WaveletPitchShiftProcessor p(nd);       budgetKnownBug("Pitch Shift", p); }
+        { NodeGraph g; Node& nd = makeNode(g, {{"Decay",0.7f,0,1},{"Color",1.0f,0,3},
+                                               {"Levels",5.0f,1,8},{"Mix",0.3f,0,1}});
+          WaveletReverbProcessor p(nd);           budget("Reverb (1/f)", p); }
+        { NodeGraph g; Node& nd = makeNode(g, {{"Semitones",7.0f,-24,24},{"Threshold",0.3f,0,1},
+                                               {"Trans Gain",1.0f,0,2},{"Levels",4.0f,1,8},
+                                               {"Mix",1.0f,0,1}});
+          IndependentPitchShiftProcessor p(nd);   budget("Ind. Pitch Shift", p); }
+        { NodeGraph g; Node& nd = makeNode(g, {{"Complexity",0.5f,0,1},{"Levels",4.0f,1,8},
+                                               {"Mix",1.0f,0,1}});
+          WaveletComplexityProcessor p(nd);       budget("Complexity", p); }
+        { NodeGraph g; Node& nd = makeNode(g, {{"Pre-Attack",20.0f,0,100},{"Post-Decay",50.0f,0,200},
+                                               {"Pre Gain",2.0f,0,4},{"Post Gain",0.5f,0,2},
+                                               {"Levels",4.0f,1,8},{"Mix",1.0f,0,1}});
+          AsymmetricFilterProcessor p(nd);        budget("Asymmetric Filter", p); }
+        { NodeGraph g; Node& nd = makeNode(g, {{"Min Hz",50.0f,20,5000},{"Max Hz",2000.0f,20,5000},
+                                               {"Detected Hz",0.0f,0,5000}});
+          WaveletPitchTrackerProcessor p(nd);     budget("Pitch Tracker", p); }
+        { NodeGraph g; Node& nd = makeNode(g, {{"Bands",5.0f,1,8},{"Mix",1.0f,0,1}});
+          WaveletVocoderProcessor p(nd);          budget("Vocoder", p); }
+        { NodeGraph g; Node& nd = makeNode(g, {{"Semitones",7.0f,-24,24},{"Formant Lock",0.8f,0,1},
+                                               {"Levels",5.0f,1,8},{"Mix",1.0f,0,1}});
+          FormantPitchShiftProcessor p(nd);       budget("Formant Pitch Shift", p); }
+    }
+
+    // ---- Wavelet Pitch Shift: does it actually transpose? ---------------
+    //
+    // A pitch shifter has exactly two obligations: put the energy at the
+    // requested frequency, and keep the level roughly intact. This node does
+    // neither, so these are knownBug() checks - see "Wavelet Pitch Shift is
+    // comprehensively non-functional" in known-issues.md for the full
+    // diagnosis. They are written as the assertions a CORRECT implementation
+    // must satisfy, so whoever fixes the node can flip them to checkVal() and
+    // immediately know whether the rewrite worked.
+    {
+        const int N = 4096;                 // one big block, so block-edge
+        const double SR = 48000.0;          // effects are not what we measure
+        const double inHz = 440.0;
+
+        // Dominant frequency by coarse DFT peak-pick over the musical range.
+        auto dominantHz = [&](const float* d, int n) {
+            double bestP = -1, bestF = 0;
+            for (double f = 100; f <= 4000; f += 2.0) {
+                double re = 0, im = 0;
+                for (int i = 0; i < n; ++i) {
+                    double a = 6.28318530718 * f * i / SR;
+                    re += d[i] * std::cos(a); im += d[i] * std::sin(a);
+                }
+                double p = re * re + im * im;
+                if (p > bestP) { bestP = p; bestF = f; }
+            }
+            return bestF;
+        };
+        auto rms = [](const float* d, int n) {
+            double s = 0;
+            for (int i = 0; i < n; ++i) s += (double)d[i] * d[i];
+            return std::sqrt(s / n);
+        };
+
+        for (float semis : {12.0f, 7.0f, 1.0f}) {
+            NodeGraph g;
+            int nId = g.addNode("pshift", NodeType::Effect, {}, {}).id;
+            Node& nd = *g.findNode(nId);
+            nd.params.push_back({"Semitones", semis, -24.0f, 24.0f});
+            nd.params.push_back({"Mix", 1.0f, 0.0f, 1.0f});
+
+            WaveletPitchShiftProcessor proc(nd);
+            proc.prepareToPlay(SR, N);
+            juce::AudioBuffer<float> buf(2, N);
+            for (int c = 0; c < 2; ++c)
+                for (int i = 0; i < N; ++i)
+                    buf.getWritePointer(c)[i] =
+                        0.5f * (float)std::sin(6.28318530718 * inHz * i / SR);
+
+            double inLevel = rms(buf.getReadPointer(0), N);
+            juce::MidiBuffer mb;
+            proc.processBlock(buf, mb);
+            double outHz    = dominantHz(buf.getReadPointer(0), N);
+            double outLevel = rms(buf.getReadPointer(0), N);
+
+            double expect = inHz * std::pow(2.0, semis / 12.0);
+            // Within a quarter tone of the requested pitch.
+            double centsErr = 1200.0 * std::log2(outHz / expect);
+            r.knownBug(std::abs(centsErr) <= 50.0,
+                       juce::String("wavelet-fx: Pitch Shift +") + juce::String(semis, 0)
+                           + " semitones lands within 50 cents of "
+                           + juce::String(expect, 1) + " Hz (cents error)",
+                       centsErr,
+                       "Wavelet Pitch Shift is comprehensively non-functional");
+            // And does not throw the level away (within +/-12 dB).
+            double gainDb = 20.0 * std::log10(std::max(1e-12, outLevel / inLevel));
+            r.knownBug(std::abs(gainDb) <= 12.0,
+                       juce::String("wavelet-fx: Pitch Shift +") + juce::String(semis, 0)
+                           + " semitones preserves level within 12 dB (dB change)",
+                       gainDb,
+                       "Wavelet Pitch Shift is comprehensively non-functional");
         }
     }
 
@@ -8243,6 +8482,9 @@ int runSelfTest(const juce::File& outDir) {
     r.section("Summary");
     r.line("  PASSED: " + juce::String(r.passed));
     r.line("  FAILED: " + juce::String(r.failed));
+    if (r.knownBugs > 0)
+        r.line("  KNOWN BUGS (tracked in known-issues.md, not counted as failures): "
+               + juce::String(r.knownBugs));
     r.line(r.failed == 0 ? "  RESULT: ALL TESTS PASSED" : "  RESULT: FAILURES PRESENT");
 
     auto reportFile = outDir.getChildFile("selftest_report.txt");

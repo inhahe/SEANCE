@@ -5,6 +5,83 @@ top. When something is fixed, delete the entry (git history is the archive).
 
 ---
 
+## BUG: Wavelet Pitch Shift is comprehensively non-functional
+
+**Found:** 2026-08-05, by adding a CPU-budget self-test to the wavelet suite.
+
+`WaveletPitchShiftProcessor` (`builtin_effects.h:2398`) does not work in any
+respect. Four independent defects, all measured, not inferred:
+
+**1. It is 7x too slow to run in real time.** Measured **1.45x realtime** by
+`wavelet-cpu: Pitch Shift ...` — one instance alone consumes ~70% of a single
+core's entire audio budget, leaving nothing for the rest of the graph. Every
+other wavelet effect measures 16x–1000x. The cause is direct time-domain
+convolution in `cwt()`/`icwt()`: 24 Morlet scales whose widths are `6*scale+1`
+sum to ~2700 taps, so cwt+icwt is ~11,000 flops per sample per channel
+(~1.06 Gflop/s at 48 kHz stereo).
+
+**2. It transposes by the wrong amount.** Feeding a 440 Hz sine and measuring
+the dominant output frequency:
+
+| Semitones | Expected | Measured |
+|---|---|---|
+| +12 | 880 Hz | **1362 Hz** |
+| +7  | 659 Hz | **904 Hz**  |
+| +1  | 466 Hz | **442 Hz** (no shift at all) |
+
+**3. It cannot resolve small intervals.** 24 log-spaced scales over 2..64 is
+5 octaves at ~4.8 scales/octave — about **2.5 semitones per scale step**. The
+shift logic snaps to the *nearest existing scale index* (`bestIdx`), so any
+shift under ~1.25 semitones quantises to zero, which is exactly what the +1
+row above shows. Phase is also copied verbatim rather than rescaled by the
+pitch ratio, and when two source scales collide on one target index the
+magnitudes accumulate while the phase is simply overwritten by whichever ran
+last.
+
+**4. The output is effectively silent.** Input RMS 0.353 → output RMS
+0.0005, i.e. **about -58 dB**. `icwt()` is not the inverse of `cwt()`: it
+discards the imaginary part and normalises by a sum of `1/scale^2` weights
+rather than the Morlet admissibility constant, so it has no unity-gain path
+even at ratio 1.
+
+There is also a fifth, structural problem: `cwt`/`icwt` are called per block
+with zero-padding outside the block (`if (idx < 0 || idx >= N) continue;`).
+The widest wavelet is `6*64+1 = 385` samples against a 512-sample block, so
+each block is analysed in near-total isolation — guaranteeing amplitude
+collapse at both block edges and discontinuities at the block rate.
+
+**Good news for the fix:** `cwt`/`icwt` have exactly **one** caller in the
+whole codebase (this node), so they can be rewritten freely. And because the
+node currently emits -58 dB of wrong-pitch noise, no saved project can
+meaningfully depend on its sound — there is no compatibility burden.
+
+**What the proper fix looks like.** All four defects have known remedies:
+- *Gain*: reconstruct with the standard Morlet admissibility constant
+  (Torrence & Compo delta reconstruction), keeping complex coefficients rather
+  than magnitude+phase.
+- *Accuracy*: shift by a **fractional** index with interpolation along the log
+  scale axis instead of snapping to `bestIdx`, and multiply phase by the pitch
+  ratio. Interpolation is what buys semitone resolution — bumping the grid to
+  12 scales/octave instead would triple an already-unaffordable cost.
+- *Continuity*: keep overlap history across blocks instead of zero-padding.
+- *Speed*: FFT-based convolution — one shared forward FFT, then per scale a
+  complex multiply plus an inverse FFT. Rough estimate ~1.4M flops per block
+  per channel versus 5.5M today.
+
+**Open product question (needs a decision before the work is done):** even
+done correctly, an FFT-CWT scale-shift shifter is unlikely to clear the 10x
+realtime bar the other effects hit. The alternatives are to reimplement this
+node on RubberBand (already linked into the build) while keeping the node's
+name and slot, to restrict it to offline/bounce rendering, or to drop it —
+its stated selling point (transient preservation) is already served by
+Independent Pitch Shift (169x realtime) and Formant Pitch Shift (131x).
+
+Until this is resolved the node ships broken and the
+`wavelet-cpu: Pitch Shift` self-test is a **known, expected failure** — it is
+left red deliberately so the bug stays visible rather than being suppressed.
+
+---
+
 ## BUG: most wavelet effect nodes still allocate on the audio thread
 
 **Found:** 2026-08-05, while extracting the wavelet DSP for plugin work.

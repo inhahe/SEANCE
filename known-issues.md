@@ -5,6 +5,36 @@ top. When something is fixed, delete the entry (git history is the archive).
 
 ---
 
+## LICENSING: SEANCE statically links GPL v2 code (Rubber Band)
+
+**Found:** 2026-08-05, while deciding how to fix the pitch shifters.
+
+`third_party/rubberband` is **GPL v2** (`third_party/rubberband/COPYING`), and
+`cpp/CMakeLists.txt:346` builds it into a static `rubberband` library that is
+linked unconditionally whenever the source tree is present — which it is. It
+backs the `PitchShiftProcessor` node (`pitch_shift_processor.cpp`).
+
+The GPL is viral across static linking, so as things stand SEANCE as a whole is
+GPL-encumbered. That does not stop you *selling* it, but it does mean you must
+ship source under the GPL and every recipient may redistribute freely — which
+is incompatible with the commercial plugin plan that motivates the whole
+wavelet-suite hardening effort. Shipping a proprietary VST3 statically linked
+against it would be a straightforward licence violation.
+
+**Options:**
+- Buy a commercial Rubber Band licence (Particular Programs Ltd sell one).
+- Replace it with an in-house pitch-shift core and drop the dependency. This
+  is the same core the wavelet pitch shifters need anyway (see the entries
+  below), so one piece of work solves both problems.
+- Keep it, and accept that SEANCE ships GPL.
+
+Note the build already treats Rubber Band as optional (`HAS_RUBBERBAND`, and
+CMake prints "NOT FOUND (pitch shift disabled)" when the directory is absent),
+so removing it is a supported configuration rather than a rewrite — but it
+currently costs you the Pitch Shift node.
+
+---
+
 ## BUG: resampling pitch shifters chop each block on upward shifts
 
 **Found:** 2026-08-05, while making the wavelet suite allocation-free.

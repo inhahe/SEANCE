@@ -11,23 +11,33 @@ top. When something is fixed, delete the entry (git history is the archive).
 broken** — this is a fragile pattern that is *held* safe by runtime discipline,
 plus the enabler for extracting effects as standalone plugins.
 
-**The pattern.** Every native processor takes and stores a reference into the
-graph's node vector — e.g. `ConvolutionProcessor(Node& node)` with a `Node& node;`
-member; ~37 effect classes in `builtin_effects.h` alone, plus the synths, signal
-nodes and analyzers. `GraphProcessor::createNodeProcessor` hands out these
-references and the processor reads its parameters off the `Node` live on the
-audio thread every block. `NodeGraph::nodes` is a `std::vector<Node>`, so **any
-reallocation or element shift invalidates every outstanding reference.** This
-directly violates the CLAUDE.md rule "never store `Node&` across call boundaries
-where `graph.nodes` could reallocate — store `int nodeId` and look it up."
+**Stage 1 landed 2026-08-05:** `NodeGraph::nodes` is now a **`std::deque<Node>`**
+instead of a `std::vector<Node>`. deque guarantees that `push_back` /
+`emplace_back` never invalidate references or pointers to existing elements, so
+the *growth* half of the hazard — which is what all three shipped crashes below
+actually were — is now impossible by construction rather than prevented by
+discipline. What remains is under "Why it is still debt".
 
-**It has already caused three shipped crashes:** `SEANCE.exe.63000.dmp` (MOD
+**The pattern.** Every native processor takes and stores a reference into the
+graph's node container — e.g. `ConvolutionProcessor(Node& node)` with a
+`Node& node;` member; ~37 effect classes in `builtin_effects.h` alone, plus the
+synths, signal nodes and analyzers. `GraphProcessor::createNodeProcessor` hands
+out these references and the processor reads its parameters off the `Node` live
+on the audio thread every block. This still violates the spirit of the CLAUDE.md
+rule "never store `Node&` across call boundaries — store `int nodeId` and look it
+up"; the deque makes the pattern survivable, not correct.
+
+**It has already caused three shipped crashes** — all three were vector growth,
+and all three are structurally fixed by the deque: `SEANCE.exe.63000.dmp` (MOD
 import `addNode` loop), `.118460.dmp` (new MIDI timeline — reallocation
 move-constructed every Node, nulling the moved-from `shared_ptr`, and the audio
 thread locked a null `*node.mpePassthroughMutex`), `.80308.dmp` (deleting the
 wavetable node).
 
 **Why it is safe right now** (verified 2026-08-05, all paths re-checked):
+- `nodes` is a `std::deque`, so **appending a node never moves an existing one**
+  and no outstanding `Node&` is invalidated by graph growth. Note deque does
+  *not* save you from mid-container `erase` or from `clear()`.
 - `NodeGraph::mutationLock` is a `recursive_mutex`; the audio callback takes a
   **try-lock** and emits silence rather than blocking.
 - `addNode()` / `addLink()` lock internally, so even a single interactive add is
@@ -38,18 +48,33 @@ wavetable node).
   `project_file.cpp:637` (load, via the `onLoadSnapshot` lock).
 - The rebuild trigger in `GraphProcessor::processBlock` is
   `rebuildRequested || nodes.size() != lastNodeCount || links.size() != lastLinkCount`.
-  A mutation that reallocates but leaves the **count unchanged** would slip past
-  the size heuristic and strand every processor on freed storage. Undo is exactly
-  that shape (snapshot restore does `nodes.clear()` + repopulate; undoing a rename
-  or param tweak keeps the count identical). **That hole is closed** because
-  `main_window.cpp`'s `onLoadSnapshot` ends with an explicit `requestRebuild()`.
-  This is load-bearing — if that call is ever removed, undo becomes a
-  use-after-free.
+  A mutation that destroys elements but leaves the **count unchanged** would slip
+  past the size heuristic and strand every processor on freed storage. Undo is
+  exactly that shape (snapshot restore does `nodes.clear()` + repopulate; undoing
+  a rename or param tweak keeps the count identical) and the deque does *not*
+  help there, because `clear()` destroys everything. **That hole is closed**
+  because `main_window.cpp`'s `onLoadSnapshot` ends with an explicit
+  `requestRebuild()`. This is load-bearing — if that call is ever removed, undo
+  becomes a use-after-free.
 
-**Why it is still debt.** Safety depends on every future processor and every
-future mutation site remembering the lock, with no compile-time enforcement. The
-adjacent race is *still open* — see "node pin-vector mutations don't hold
-`mutationLock`" below, where several editors mutate `pinsIn`/`pinsOut` unlocked.
+**Why it is still debt.** The deque removes the growth hazard, but node *removal*
+(`erase`, `clear()`) still invalidates references, so safety on those paths still
+depends on every future mutation site remembering `mutationLock` and on the
+rebuild being triggered, with no compile-time enforcement. The adjacent race is
+*still open* — see "node pin-vector mutations don't hold `mutationLock`" below,
+where several editors mutate `pinsIn`/`pinsOut` unlocked. And `Node` remains
+shared mutable state in *both* directions: `applySignalModulations`
+(`signal_modulation.h:49`) writes back into `node.params[]` from the audio thread
+while the UI reads the same fields.
+
+**Stage 2 (not started).** Migrate processors to owned params. Scope measured
+2026-08-05: 131 `Node&` constructor sites, 75 `Node&` members across 34 files,
+164 `paramByName()` call sites (which are also a linear *string-compare scan on
+the audio thread*, `builtin_effects.h:19`), 51 `applySignalModulations()` sites.
+Too large to do atomically against a green 1020-test build — pilot the pattern on
+two or three processors first, including one that uses signal modulation, and
+settle how the UI reads back the audio-thread-written modulated value before
+grinding through the rest.
 
 **Proper fix.** Stop reading parameters through a `Node&` entirely: give each
 processor a `juce::AudioProcessorValueTreeState` (or an equivalent param

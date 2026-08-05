@@ -1,6 +1,7 @@
 #pragma once
 #include <string>
 #include <vector>
+#include <deque>
 #include <map>
 #include <memory>
 #include <functional>
@@ -1070,7 +1071,30 @@ public:
                 p.autoWriteArmed = armed;
     }
 
-    std::vector<Node> nodes;
+    // DEQUE, NOT VECTOR - deliberate and load-bearing.
+    //
+    // Processors hold a `Node&` into this container and read it on the audio
+    // thread every block (see the mutationLock comment below and the "processors
+    // hold Node&" entry in known-issues.md). With std::vector, a single
+    // push_back that grew the vector move-constructed every Node into new
+    // storage and left every outstanding reference dangling - the mechanism
+    // behind three shipped crashes (SEANCE.exe .63000.dmp MOD import,
+    // .118460.dmp new MIDI timeline, and the reallocation half of .80308.dmp).
+    //
+    // std::deque guarantees that push_back/emplace_back do NOT invalidate
+    // references or pointers to existing elements (only iterators). So adding a
+    // node can no longer strand a live processor, structurally, for every
+    // processor at once - rather than relying on every call site remembering to
+    // take mutationLock.
+    //
+    // What this does NOT fix, so don't drop the other guards:
+    //   - erase() from the middle still shifts and invalidates references. That
+    //     path is separately protected (every erase site holds mutationLock, and
+    //     the node-count change triggers GraphProcessor::rebuildGraph).
+    //   - Torn reads of a Node's *fields* while the GUI thread mutates them are
+    //     unaffected; mutationLock still covers that.
+    // Also note deque has no reserve() - there is nothing to pre-size.
+    std::deque<Node> nodes;
     std::vector<Link> links;
     std::vector<int> openEditors;  // node IDs - never store Node*
 

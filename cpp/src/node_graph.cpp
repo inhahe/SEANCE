@@ -379,7 +379,9 @@ void NodeGraph::resolveAnchors() {
 }
 
 void NodeGraph::setupDefaultGraph() {
-    nodes.reserve(16);
+    // (No reserve: `nodes` is a std::deque for stable element addresses - see
+    // the declaration comment in node_graph.h. deque has no reserve(), and
+    // needs none: it never reallocates existing elements.)
 
     // Seed the curated built-in morph chains into the project's asset library so
     // the morph picker (and the Asset Library panel) are never empty on a fresh

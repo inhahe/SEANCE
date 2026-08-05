@@ -95,22 +95,32 @@ per node - thousands per second. `malloc` can block on a global lock, so this is
 genuine dropout source, and it is an automatic fail in plugin validation
 (pluginval strictness 10 flags allocation in `processBlock`).
 
-**Fixed so far** — `wavelet.h` now has `WaveletWorkspace` (caller-owned transform
+**Fixed** — `wavelet.h` now has `WaveletWorkspace` (caller-owned transform
 scratch) and `WaveletFxScratch` (workspace + cached filter bank + padded/dry
 buffers). `prepare()` in `prepareToPlay` sizes everything once; the steady state is
 allocation-free, covered by the `wavelet-scratch: ... never reallocates` tests.
-Converted: **Transient Split**, **Wavelet Denoiser**, **Wavelet Bitcrush**.
 
-**Still allocating** (same mechanical conversion — hold a `WaveletFxScratch`, call
-`prepare()` from `prepareToPlay`, replace the local vectors and the per-block
-`getWaveletFilter()`), all in `builtin_effects.h`:
-Octave Shift, Wavelet Multiband Comp, Wavelet Pitch Shift, Wavelet Reverb,
+All twelve *working* wavelet effects are converted: Transient Split, Wavelet
+Denoiser, Wavelet Bitcrush, Octave Shift, Wavelet Multiband Comp, Wavelet Reverb,
 Independent Pitch Shift, Wavelet Complexity, Asymmetric Filter, Wavelet Pitch
 Tracker, Wavelet Vocoder, Formant Pitch Shift.
 
-Note the same class of bug likely exists outside the wavelet family (any
-`processBlock` that constructs a `std::vector`/`juce::AudioBuffer` locally) — worth
-a sweep once the wavelet ones are done.
+**Deliberately not converted: Wavelet Pitch Shift.** It is being rewritten from
+scratch (see the entry above), so making its current allocations tidy would be
+throwaway work.
+
+Two traps worth remembering for the same conversion elsewhere:
+- `std::vector<bool>` cannot be reused without reallocating (it is a bitset
+  specialisation, not a container of bools). Wavelet Complexity's keep-mask is a
+  `juce::uint8` vector for this reason.
+- `reserve()` + `clear()`/`assign()`/`resize()` is the allocation-free idiom;
+  constructing a vector with a size argument always allocates, even into an
+  existing variable.
+
+**Remaining work: sweep the same class of bug outside the wavelet family.** Any
+`processBlock` that constructs a local `std::vector`, `juce::AudioBuffer`, or
+`juce::String` has the identical defect. The wavelet suite was audited because it
+is the plugin candidate; nothing else has been checked.
 
 ---
 

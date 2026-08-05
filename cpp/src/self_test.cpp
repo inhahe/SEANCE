@@ -3687,6 +3687,13 @@ void testWarp(Report& r) {
             }
         }
 
+        // Best of N repeats, not a single timing. Interference from other
+        // processes can only ever make a run SLOWER, never faster, so the
+        // maximum across repeats is a far more stable estimator of the true
+        // throughput than one sample or an average. Without this the whole
+        // suite drifts by ~2x depending on machine load, which would make an
+        // effect sitting near the threshold flake intermittently.
+        const int REPEATS = 3;
         auto realtimeFactor = [&](juce::AudioProcessor& proc) {
             juce::AudioBuffer<float> buf(SRC_CH, BS);
             juce::MidiBuffer mb;
@@ -3697,17 +3704,21 @@ void testWarp(Report& r) {
             buf.makeCopyOf(src);
             proc.processBlock(buf, mb);
 
-            auto t0 = std::chrono::steady_clock::now();
-            for (int b = 0; b < BLOCKS; ++b) {
-                for (int c = 0; c < SRC_CH; ++c)
-                    buf.copyFrom(c, 0, src, c, 0, BS);   // memcpy, not a realloc
-                proc.processBlock(buf, mb);
-            }
-            auto t1 = std::chrono::steady_clock::now();
+            double best = 0.0;
+            for (int rep = 0; rep < REPEATS; ++rep) {
+                auto t0 = std::chrono::steady_clock::now();
+                for (int b = 0; b < BLOCKS; ++b) {
+                    for (int c = 0; c < SRC_CH; ++c)
+                        buf.copyFrom(c, 0, src, c, 0, BS);   // memcpy, not a realloc
+                    proc.processBlock(buf, mb);
+                }
+                auto t1 = std::chrono::steady_clock::now();
 
-            double wall  = std::chrono::duration<double>(t1 - t0).count();
-            double audio = (double)(BLOCKS * BS) / SR;
-            return wall > 1e-9 ? audio / wall : 1e9;
+                double wall  = std::chrono::duration<double>(t1 - t0).count();
+                double audio = (double)(BLOCKS * BS) / SR;
+                best = std::max(best, wall > 1e-9 ? audio / wall : 1e9);
+            }
+            return best;
         };
 
         // Each effect is driven at a NON-neutral setting - several of them

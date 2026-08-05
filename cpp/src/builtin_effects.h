@@ -2492,7 +2492,14 @@ public:
         tailBufR.resize(8192, 0.0f);
     }
     const juce::String getName() const override { return "Wavelet Reverb"; }
-    void prepareToPlay(double sr, int) override { sampleRate = sr; }
+    void prepareToPlay(double sr, int) override {
+        sampleRate = sr;
+        // Sized by the TAIL length, not the block length: this effect
+        // transforms the whole 8192-sample tail buffer every block, so that
+        // is what the workspace and the working copy have to hold.
+        scratch.prepare((int)tailBufL.size());
+        revSig.resize(tailBufL.size(), 0.0f);
+    }
     void releaseResources() override {}
     // Transport panic (Stop): zero the wavelet tail buffers so the reverb
     // smear stops immediately when the sound is cut.
@@ -2512,8 +2519,13 @@ public:
         int   levels = juce::jlimit(1, 8, (int)paramByName(node, "Levels", 5.0f));
         float mix    = juce::jlimit(0.0f, 1.0f, paramByName(node, "Mix", 0.3f));
 
-        auto filt = getWaveletFilter("db4");
+        const auto& filt = scratch.useFilter("db4");
         int tailLen = (int)tailBufL.size();
+        // Guard against processBlock running before prepareToPlay sized these.
+        if ((int)revSig.size() != tailLen) {
+            revSig.assign((size_t)tailLen, 0.0f);
+            scratch.prepare(tailLen);
+        }
 
         for (int c = 0; c < ch; ++c) {
             float* data = buf.getWritePointer(c);
@@ -2526,9 +2538,11 @@ public:
             for (int i = 0; i < n && (tailLen - n + i) >= 0; ++i)
                 tail[tailLen - n + i] = data[i];
 
-            // DWT the tail buffer.
-            std::vector<float> sig = tail;
-            int actualLevels = dwt(sig, levels, filt);
+            // DWT the tail buffer. assign() into an already-correctly-sized
+            // vector copies without allocating.
+            auto& sig = revSig;
+            sig.assign(tail.begin(), tail.end());
+            int actualLevels = dwt(sig, levels, filt, scratch.ws);
 
             // Apply 1/f weighting: each band's gain = 1 / (band+1)^color
             int approxLen = tailLen;
@@ -2543,7 +2557,7 @@ public:
             }
 
             // IDWT to get the reverb tail.
-            idwtPR(sig, actualLevels, filt);
+            idwtPR(sig, actualLevels, filt, scratch.ws);
 
             // Mix into output.
             for (int i = 0; i < n; ++i)
@@ -2573,6 +2587,8 @@ private:
     Node& node;
     double sampleRate = 44100;
     std::vector<float> tailBufL, tailBufR;
+    WaveletFxScratch scratch;
+    std::vector<float> revSig;   // working copy of the tail being transformed
 };
 
 // ==============================================================================
@@ -2982,7 +2998,15 @@ class IndependentPitchShiftProcessor : public juce::AudioProcessor {
 public:
     IndependentPitchShiftProcessor(Node& n) : node(n) {}
     const juce::String getName() const override { return "Ind. Pitch Shift"; }
-    void prepareToPlay(double sr, int) override { sampleRate = sr; }
+    void prepareToPlay(double sr, int bs) override {
+        sampleRate = sr;
+        scratch.prepare(bs);
+        int pad = 1;
+        while (pad < bs) pad *= 2;
+        transSig.reserve((size_t)pad);
+        tonalSig.reserve((size_t)pad);
+        shifted.reserve((size_t)bs);
+    }
     void releaseResources() override {}
 
     void processBlock(juce::AudioBuffer<float>& buf, juce::MidiBuffer&) override {
@@ -3000,25 +3024,24 @@ public:
         if (std::abs(semitones) < 0.01f) return;
         float ratio = std::pow(2.0f, semitones / 12.0f);
 
-        auto filt = getWaveletFilter("db4");
-        int padLen = 1;
-        while (padLen < n) padLen *= 2;
+        const auto& filt = scratch.useFilter("db4");
+        auto& sig = scratch.sig;
+        auto& dry = scratch.dry;
 
         for (int c = 0; c < ch; ++c) {
             float* data = buf.getWritePointer(c);
-            std::vector<float> sig(padLen, 0.0f);
-            for (int i = 0; i < n; ++i) sig[i] = data[i];
-            std::vector<float> dry(data, data + n);
+            const int padLen = scratch.load(data, n);
 
-            int actualLevels = dwt(sig, levels, filt);
+            int actualLevels = dwt(sig, levels, filt, scratch.ws);
 
             // Separate: threshold-based split into transient + tonal.
             float maxCoeff = 0;
             for (auto v : sig) maxCoeff = std::max(maxCoeff, std::abs(v));
             float thresh = threshold * maxCoeff;
 
-            std::vector<float> transSig(padLen, 0.0f);
-            std::vector<float> tonalSig(padLen, 0.0f);
+            // assign() re-zeroes without allocating (capacity is reserved).
+            transSig.assign((size_t)padLen, 0.0f);
+            tonalSig.assign((size_t)padLen, 0.0f);
             int approxLen = padLen;
             for (int l = 0; l < actualLevels; ++l) approxLen /= 2;
             // Keep approximation in tonal.
@@ -3030,9 +3053,9 @@ public:
             }
 
             // Reconstruct tonal, pitch-shift it via resampling.
-            idwtPR(tonalSig, actualLevels, filt);
+            idwtPR(tonalSig, actualLevels, filt, scratch.ws);
             // Simple pitch shift via resampling (linear interp).
-            std::vector<float> shifted(n, 0.0f);
+            shifted.assign((size_t)n, 0.0f);
             for (int i = 0; i < n; ++i) {
                 float srcPos = (float)i * ratio;
                 int i0 = (int)srcPos;
@@ -3042,7 +3065,7 @@ public:
             }
 
             // Reconstruct transients (unshifted).
-            idwtPR(transSig, actualLevels, filt);
+            idwtPR(transSig, actualLevels, filt, scratch.ws);
 
             // Recombine.
             for (int i = 0; i < n; ++i)
@@ -3067,6 +3090,9 @@ public:
 private:
     Node& node;
     double sampleRate = 44100;
+    WaveletFxScratch scratch;
+    std::vector<float> transSig, tonalSig;  // threshold split of the coefficients
+    std::vector<float> shifted;             // resampled tonal part
 };
 
 // ==============================================================================
@@ -3084,7 +3110,13 @@ class WaveletComplexityProcessor : public juce::AudioProcessor {
 public:
     WaveletComplexityProcessor(Node& n) : node(n) {}
     const juce::String getName() const override { return "Complexity"; }
-    void prepareToPlay(double, int) override {}
+    void prepareToPlay(double, int bs) override {
+        scratch.prepare(bs);
+        int pad = 1;
+        while (pad < bs) pad *= 2;
+        coeffs.reserve((size_t)pad);
+        kept.reserve((size_t)pad);
+    }
     void releaseResources() override {}
 
     void processBlock(juce::AudioBuffer<float>& buf, juce::MidiBuffer&) override {
@@ -3097,32 +3129,33 @@ public:
         int   levels     = juce::jlimit(1, 8, (int)paramByName(node, "Levels", 4.0f));
         float mix        = juce::jlimit(0.0f, 1.0f, paramByName(node, "Mix", 1.0f));
 
-        auto filt = getWaveletFilter("db4");
-        int padLen = 1;
-        while (padLen < n) padLen *= 2;
+        const auto& filt = scratch.useFilter("db4");
+        auto& sig = scratch.sig;
+        auto& dry = scratch.dry;
 
         for (int c = 0; c < ch; ++c) {
             float* data = buf.getWritePointer(c);
-            std::vector<float> sig(padLen, 0.0f);
-            for (int i = 0; i < n; ++i) sig[i] = data[i];
-            std::vector<float> dry(data, data + n);
+            const int padLen = scratch.load(data, n);
 
-            int actualLevels = dwt(sig, levels, filt);
+            int actualLevels = dwt(sig, levels, filt, scratch.ws);
 
             // Sort coefficients by magnitude and zero out the smallest.
+            // resize()/assign() against reserved capacity does not allocate.
             int keep = std::max(1, (int)(padLen * complexity));
-            std::vector<std::pair<float, int>> coeffs(padLen);
+            coeffs.resize((size_t)padLen);
             for (int i = 0; i < padLen; ++i)
-                coeffs[i] = {std::abs(sig[i]), i};
+                coeffs[(size_t)i] = {std::abs(sig[(size_t)i]), i};
             std::partial_sort(coeffs.begin(), coeffs.begin() + keep, coeffs.end(),
                 [](auto& a, auto& b) { return a.first > b.first; });
-            // Zero everything not in the top-keep set.
-            std::vector<bool> kept(padLen, false);
-            for (int i = 0; i < keep; ++i) kept[coeffs[i].second] = true;
+            // Zero everything not in the top-keep set. This is a uint8_t mask
+            // rather than std::vector<bool>: the bool specialisation is a
+            // bitset that cannot be reused without reallocating.
+            kept.assign((size_t)padLen, 0);
+            for (int i = 0; i < keep; ++i) kept[(size_t)coeffs[(size_t)i].second] = 1;
             for (int i = 0; i < padLen; ++i)
-                if (!kept[i]) sig[i] = 0;
+                if (!kept[(size_t)i]) sig[(size_t)i] = 0;
 
-            idwtPR(sig, actualLevels, filt);
+            idwtPR(sig, actualLevels, filt, scratch.ws);
             for (int i = 0; i < n; ++i)
                 data[i] = dry[i] * (1.0f - mix) + sig[i] * mix;
         }
@@ -3143,6 +3176,9 @@ public:
     void setStateInformation(const void*, int) override {}
 private:
     Node& node;
+    WaveletFxScratch scratch;
+    std::vector<std::pair<float, int>> coeffs;  // (magnitude, index) for the sort
+    std::vector<juce::uint8> kept;              // top-N mask; NOT vector<bool>
 };
 
 // ==============================================================================
@@ -3319,7 +3355,15 @@ class AsymmetricFilterProcessor : public juce::AudioProcessor {
 public:
     AsymmetricFilterProcessor(Node& n) : node(n) {}
     const juce::String getName() const override { return "Asymmetric Filter"; }
-    void prepareToPlay(double sr, int) override { sampleRate = sr; }
+    void prepareToPlay(double sr, int bs) override {
+        sampleRate = sr;
+        scratch.prepare(bs);
+        int pad = 1;
+        while (pad < bs) pad *= 2;
+        // Worst case every coefficient in the finest band is a transient.
+        transients.reserve((size_t)pad / 2 + 1);
+        gainEnv.reserve((size_t)pad);
+    }
     void releaseResources() override {}
 
     void processBlock(juce::AudioBuffer<float>& buf, juce::MidiBuffer&) override {
@@ -3338,17 +3382,15 @@ public:
         int preSamples  = (int)(preMs * 0.001 * sampleRate);
         int postSamples = (int)(postMs * 0.001 * sampleRate);
 
-        auto filt = getWaveletFilter("db4");
-        int padLen = 1;
-        while (padLen < n) padLen *= 2;
+        const auto& filt = scratch.useFilter("db4");
+        auto& sig = scratch.sig;
+        auto& dry = scratch.dry;
 
         for (int c = 0; c < ch; ++c) {
             float* data = buf.getWritePointer(c);
-            std::vector<float> sig(padLen, 0.0f);
-            for (int i = 0; i < n; ++i) sig[i] = data[i];
-            std::vector<float> dry(data, data + n);
+            const int padLen = scratch.load(data, n);
 
-            int actualLevels = dwt(sig, levels, filt);
+            int actualLevels = dwt(sig, levels, filt, scratch.ws);
 
             // Detect transients: find peaks in the finest detail level.
             int approxLen = padLen;
@@ -3358,7 +3400,9 @@ public:
             int finestLen = padLen / 2;
 
             // Find transient positions (peaks in finest detail).
-            std::vector<int> transients;
+            // clear() keeps the reserved capacity, so the push_backs below
+            // never reallocate on the audio thread.
+            transients.clear();
             float maxFine = 0;
             for (int i = finestStart; i < finestStart + finestLen; ++i)
                 maxFine = std::max(maxFine, std::abs(sig[i]));
@@ -3367,7 +3411,7 @@ public:
                 if (std::abs(sig[i]) > transThresh) transients.push_back(i - finestStart);
 
             // Build a gain envelope that's asymmetric around each transient.
-            std::vector<float> gainEnv(padLen, 1.0f);
+            gainEnv.assign((size_t)padLen, 1.0f);
             for (int t : transients) {
                 // Pre-attack region: ramp up preGain before the transient
                 for (int i = std::max(0, t - preSamples); i < t; ++i) {
@@ -3385,7 +3429,7 @@ public:
             for (int i = 0; i < padLen; ++i)
                 sig[i] *= gainEnv[i];
 
-            idwtPR(sig, actualLevels, filt);
+            idwtPR(sig, actualLevels, filt, scratch.ws);
             for (int i = 0; i < n; ++i)
                 data[i] = dry[i] * (1.0f - mix) + sig[i] * mix;
         }
@@ -3410,6 +3454,9 @@ public:
 private:
     Node& node;
     double sampleRate = 44100;
+    WaveletFxScratch scratch;
+    std::vector<int>   transients;  // coefficient indices flagged as attacks
+    std::vector<float> gainEnv;     // per-coefficient asymmetric gain
 };
 
 // ==============================================================================
@@ -3436,7 +3483,7 @@ class WaveletPitchTrackerProcessor : public juce::AudioProcessor {
 public:
     WaveletPitchTrackerProcessor(Node& n) : node(n) {}
     const juce::String getName() const override { return "Pitch Tracker"; }
-    void prepareToPlay(double sr, int) override { sampleRate = sr; }
+    void prepareToPlay(double sr, int bs) override { sampleRate = sr; scratch.prepare(bs); }
     void releaseResources() override {}
 
     void processBlock(juce::AudioBuffer<float>& buf, juce::MidiBuffer&) override {
@@ -3447,18 +3494,14 @@ public:
         float minHz = std::max(20.0f, paramByName(node, "Min Hz", 50.0f));
         float maxHz = std::min(5000.0f, paramByName(node, "Max Hz", 2000.0f));
 
-        // Read mono input.
-        const float* input = buf.getReadPointer(0);
-        std::vector<float> sig(input, input + n);
+        // Read mono input. load() copies it into the scratch buffer and
+        // zero-pads to the next power of two, without allocating.
+        const int padLen = scratch.load(buf.getReadPointer(0), n);
+        auto& sig = scratch.sig;
 
-        // Pad to power of 2.
-        int padLen = 1;
-        while (padLen < n) padLen *= 2;
-        sig.resize(padLen, 0.0f);
-
-        auto filt = getWaveletFilter("db4");
+        const auto& filt = scratch.useFilter("db4");
         int levels = std::min(8, (int)(std::log2(padLen) - 2));
-        int actualLevels = dwt(sig, levels, filt);
+        int actualLevels = dwt(sig, levels, filt, scratch.ws);
 
         // Find the dominant wavelet level: the one with the highest energy.
         int approxLen = padLen;
@@ -3512,6 +3555,7 @@ public:
 private:
     Node& node;
     double sampleRate = 44100;
+    WaveletFxScratch scratch;
 };
 
 // ==============================================================================
@@ -3666,7 +3710,13 @@ class WaveletVocoderProcessor : public juce::AudioProcessor {
 public:
     WaveletVocoderProcessor(Node& n) : node(n) {}
     const juce::String getName() const override { return "Wavelet Vocoder"; }
-    void prepareToPlay(double sr, int) override { sampleRate = sr; }
+    void prepareToPlay(double sr, int bs) override {
+        sampleRate = sr;
+        scratch.prepare(bs);
+        int pad = 1;
+        while (pad < bs) pad *= 2;
+        modulator.reserve((size_t)pad);
+    }
     void releaseResources() override {}
 
     void processBlock(juce::AudioBuffer<float>& buf, juce::MidiBuffer&) override {
@@ -3682,20 +3732,24 @@ public:
         bool hasModulator = buf.getNumChannels() > 2;
         if (!hasModulator) return; // no modulator -> passthrough
 
-        auto filt = getWaveletFilter("db4");
-        int padLen = 1;
-        while (padLen < n) padLen *= 2;
+        const auto& filt = scratch.useFilter("db4");
 
         float* carrierData = buf.getWritePointer(0);
         const float* modData = buf.getReadPointer(2);
-        std::vector<float> dry(carrierData, carrierData + n);
 
-        // Pad and DWT both signals.
-        std::vector<float> carrier(padLen, 0.0f), modulator(padLen, 0.0f);
-        for (int i = 0; i < n; ++i) { carrier[i] = carrierData[i]; modulator[i] = modData[i]; }
+        // load() fills scratch.sig (padded carrier) and scratch.dry (the
+        // unpadded original) in one pass, without allocating.
+        const int padLen = scratch.load(carrierData, n);
+        auto& carrier = scratch.sig;
+        auto& dry     = scratch.dry;
 
-        int actualLevels = dwt(carrier, bands, filt);
-        dwt(modulator, bands, filt);
+        // The modulator needs its own padded buffer; assign()+resize() against
+        // reserved capacity keeps it allocation-free.
+        modulator.assign(modData, modData + n);
+        modulator.resize((size_t)padLen, 0.0f);
+
+        int actualLevels = dwt(carrier, bands, filt, scratch.ws);
+        dwt(modulator, bands, filt, scratch.ws);
 
         // For each band: compute the modulator's energy, compute the
         // carrier's energy, scale carrier by modulator/carrier ratio.
@@ -3726,7 +3780,7 @@ public:
             bandStart += bandLen;
         }
 
-        idwtPR(carrier, actualLevels, filt);
+        idwtPR(carrier, actualLevels, filt, scratch.ws);
 
         for (int i = 0; i < n; ++i)
             carrierData[i] = dry[i] * (1.0f - mix) + carrier[i] * mix;
@@ -3751,6 +3805,8 @@ public:
 private:
     Node& node;
     double sampleRate = 44100;
+    WaveletFxScratch scratch;
+    std::vector<float> modulator;   // padded modulator (Signal pin) coefficients
 };
 
 // ==============================================================================
@@ -3769,7 +3825,15 @@ class FormantPitchShiftProcessor : public juce::AudioProcessor {
 public:
     FormantPitchShiftProcessor(Node& n) : node(n) {}
     const juce::String getName() const override { return "Formant Pitch"; }
-    void prepareToPlay(double sr, int) override { sampleRate = sr; }
+    void prepareToPlay(double sr, int bs) override {
+        sampleRate = sr;
+        scratch.prepare(bs);
+        int pad = 1;
+        while (pad < bs) pad *= 2;
+        shifted.reserve((size_t)bs);
+        shiftPad.reserve((size_t)pad);
+        origEnergy.reserve(9);   // at most 8 levels + the approximation band
+    }
     void releaseResources() override {}
 
     void processBlock(juce::AudioBuffer<float>& buf, juce::MidiBuffer&) override {
@@ -3786,22 +3850,20 @@ public:
         if (std::abs(semitones) < 0.01f) return;
         float ratio = std::pow(2.0f, semitones / 12.0f);
 
-        auto filt = getWaveletFilter("db4");
-        int padLen = 1;
-        while (padLen < n) padLen *= 2;
+        const auto& filt = scratch.useFilter("db4");
+        auto& sig = scratch.sig;
+        auto& dry = scratch.dry;
 
         for (int c = 0; c < ch; ++c) {
             float* data = buf.getWritePointer(c);
-            std::vector<float> sig(padLen, 0.0f);
-            for (int i = 0; i < n; ++i) sig[i] = data[i];
-            std::vector<float> dry(data, data + n);
+            const int padLen = scratch.load(data, n);
 
             // 1. Measure per-band energy before shift (= formant envelope).
-            int actualLevels = dwt(sig, levels, filt);
+            int actualLevels = dwt(sig, levels, filt, scratch.ws);
             int approxLen = padLen;
             for (int l = 0; l < actualLevels; ++l) approxLen /= 2;
 
-            std::vector<float> origEnergy(actualLevels + 1);
+            origEnergy.assign((size_t)actualLevels + 1, 0.0f);
             float aE = 0;
             for (int i = 0; i < approxLen; ++i) aE += sig[i] * sig[i];
             origEnergy[0] = aE / std::max(1, approxLen);
@@ -3816,8 +3878,8 @@ public:
             }
 
             // 2. Reconstruct and pitch-shift via resampling.
-            idwtPR(sig, actualLevels, filt);
-            std::vector<float> shifted(n, 0.0f);
+            idwtPR(sig, actualLevels, filt, scratch.ws);
+            shifted.assign((size_t)n, 0.0f);
             for (int i = 0; i < n; ++i) {
                 float srcPos = (float)i * ratio;
                 int i0 = (int)srcPos;
@@ -3828,9 +3890,9 @@ public:
 
             // 3. Re-decompose the shifted signal and adjust band gains
             //    to match the original formant envelope.
-            std::vector<float> shiftPad(padLen, 0.0f);
-            for (int i = 0; i < n; ++i) shiftPad[i] = shifted[i];
-            dwt(shiftPad, levels, filt);
+            shiftPad.assign((size_t)padLen, 0.0f);
+            for (int i = 0; i < n; ++i) shiftPad[(size_t)i] = shifted[(size_t)i];
+            dwt(shiftPad, levels, filt, scratch.ws);
 
             // Scale each band to match original energy (= formant restoration).
             {
@@ -3856,7 +3918,7 @@ public:
                 bandStart += bandLen;
             }
 
-            idwtPR(shiftPad, actualLevels, filt);
+            idwtPR(shiftPad, actualLevels, filt, scratch.ws);
 
             for (int i = 0; i < n; ++i)
                 data[i] = dry[i] * (1.0f - mix) + shiftPad[i] * mix;
@@ -3879,6 +3941,10 @@ public:
 private:
     Node& node;
     double sampleRate = 44100;
+    WaveletFxScratch scratch;
+    std::vector<float> shifted;     // resampled (pitch-shifted) time signal
+    std::vector<float> shiftPad;    // padded re-decomposition of `shifted`
+    std::vector<float> origEnergy;  // per-band energy = the formant envelope
 };
 
 // ==============================================================================

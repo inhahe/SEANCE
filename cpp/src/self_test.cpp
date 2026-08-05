@@ -35,7 +35,7 @@
 #include "signal_noise.h"           // SignalNoiseProcessor - modular-kit gated noise
 #include "signal_oscillator.h"      // SignalOscillatorProcessor - Signal-driven oscillator
 #include "pitch_core.h"             // PhaseVocoderShifter - in-house pitch-shift core
-#include "pitch_shift_processor.h"  // PitchShiftProcessor - the Rubber Band node
+#include "pitch_shift_processor.h"  // PitchShiftProcessor - the Pitch Shift node
 
 #include <juce_audio_formats/juce_audio_formats.h>
 #include <juce_graphics/juce_graphics.h>

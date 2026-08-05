@@ -20,12 +20,12 @@
 //     so small intervals did nothing and large ones landed hundreds of cents
 //     off. Tracked separately -- it is not a consumer of this class.
 //
-// The obvious alternative was to re-base everything on Rubber Band, which is
-// already vendored. That is the wrong direction: Rubber Band is GPL v2 and is
-// linked statically, so it makes the whole binary GPL-encumbered. Growing that
-// dependency deepens a licensing blocker instead of removing it. This class is
-// the replacement, and once the consumers are moved over the Rubber Band
-// dependency can be dropped entirely.
+// The obvious alternative was to re-base everything on Rubber Band, which was
+// vendored at the time. That was the wrong direction: Rubber Band is GPL v2 and
+// was linked statically, so it made the whole binary GPL-encumbered. Growing
+// that dependency would have deepened a licensing blocker instead of removing
+// it. This class is the replacement, and all of the consumers have since been
+// moved over -- the Rubber Band dependency is gone from the build entirely.
 //
 // HOW IT WORKS
 // ------------

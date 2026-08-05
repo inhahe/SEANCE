@@ -5,6 +5,69 @@ top. When something is fixed, delete the entry (git history is the archive).
 
 ---
 
+## TECH DEBT (architectural): processors hold `Node&`; params should come from an APVTS
+
+**Noticed:** 2026-08-05, auditing the `Node&` lifetime question. **Not currently
+broken** — this is a fragile pattern that is *held* safe by runtime discipline,
+plus the enabler for extracting effects as standalone plugins.
+
+**The pattern.** Every native processor takes and stores a reference into the
+graph's node vector — e.g. `ConvolutionProcessor(Node& node)` with a `Node& node;`
+member; ~37 effect classes in `builtin_effects.h` alone, plus the synths, signal
+nodes and analyzers. `GraphProcessor::createNodeProcessor` hands out these
+references and the processor reads its parameters off the `Node` live on the
+audio thread every block. `NodeGraph::nodes` is a `std::vector<Node>`, so **any
+reallocation or element shift invalidates every outstanding reference.** This
+directly violates the CLAUDE.md rule "never store `Node&` across call boundaries
+where `graph.nodes` could reallocate — store `int nodeId` and look it up."
+
+**It has already caused three shipped crashes:** `SEANCE.exe.63000.dmp` (MOD
+import `addNode` loop), `.118460.dmp` (new MIDI timeline — reallocation
+move-constructed every Node, nulling the moved-from `shared_ptr`, and the audio
+thread locked a null `*node.mpePassthroughMutex`), `.80308.dmp` (deleting the
+wavetable node).
+
+**Why it is safe right now** (verified 2026-08-05, all paths re-checked):
+- `NodeGraph::mutationLock` is a `recursive_mutex`; the audio callback takes a
+  **try-lock** and emits silence rather than blocking.
+- `addNode()` / `addLink()` lock internally, so even a single interactive add is
+  covered without the caller remembering.
+- All five structural mutation sites hold the lock: `node_graph_component.cpp`
+  :5397 and :5565 (`deleteNodeAndDescendants`, held to end of function),
+  `scripting.cpp:834`, `main_window.cpp:3265` (new project),
+  `project_file.cpp:637` (load, via the `onLoadSnapshot` lock).
+- The rebuild trigger in `GraphProcessor::processBlock` is
+  `rebuildRequested || nodes.size() != lastNodeCount || links.size() != lastLinkCount`.
+  A mutation that reallocates but leaves the **count unchanged** would slip past
+  the size heuristic and strand every processor on freed storage. Undo is exactly
+  that shape (snapshot restore does `nodes.clear()` + repopulate; undoing a rename
+  or param tweak keeps the count identical). **That hole is closed** because
+  `main_window.cpp`'s `onLoadSnapshot` ends with an explicit `requestRebuild()`.
+  This is load-bearing — if that call is ever removed, undo becomes a
+  use-after-free.
+
+**Why it is still debt.** Safety depends on every future processor and every
+future mutation site remembering the lock, with no compile-time enforcement. The
+adjacent race is *still open* — see "node pin-vector mutations don't hold
+`mutationLock`" below, where several editors mutate `pinsIn`/`pinsOut` unlocked.
+
+**Proper fix.** Stop reading parameters through a `Node&` entirely: give each
+processor a `juce::AudioProcessorValueTreeState` (or an equivalent param
+abstraction) owned by the processor, and have the graph *push* values into it on
+edit rather than having the audio thread *pull* them out of a shared vector. The
+processor then owns its state, holds no reference into `graph.nodes`, and the
+whole reallocation hazard class disappears rather than being guarded.
+
+**Why this is worth doing beyond the race.** This is the same refactor required to
+ship any effect as a standalone VST3/AU. The DSP already subclasses
+`juce::AudioProcessor` — which is exactly what a plugin wrapper needs — so the
+only things binding it to the app are (a) the `Node&` parameter source and (b) the
+editors living in the app's component hierarchy. Doing this once removes the
+crash-hazard class *and* unblocks plugin extraction. Sequence it before any
+serious plugin-productization work so the extraction isn't done twice.
+
+---
+
 ## NEEDS MANUAL VERIFICATION: hosted-plugin (VST3/AU) editor knob-drag recording
 
 **Implemented** (phase 5) but **not covered by self-tests** — it can only be

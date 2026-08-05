@@ -34,6 +34,7 @@
 #include "signal_filter.h"          // SignalFilterProcessor - modular-kit resonant filter
 #include "signal_noise.h"           // SignalNoiseProcessor - modular-kit gated noise
 #include "signal_oscillator.h"      // SignalOscillatorProcessor - Signal-driven oscillator
+#include "pitch_core.h"             // PhaseVocoderShifter - in-house pitch-shift core
 
 #include <juce_audio_formats/juce_audio_formats.h>
 #include <juce_graphics/juce_graphics.h>
@@ -3943,6 +3944,244 @@ void testWarp(Report& r) {
                        "every block (last-quarter energy fraction, ~0.25 = healthy)",
                        frac,
                        "resampling pitch shifters chop each block on upward shifts");
+        }
+    }
+
+    // ---- PhaseVocoderShifter: the in-house pitch-shift core -------------
+    //
+    // This is the replacement for both the block-chopping resamplers above and
+    // (eventually) the GPL Rubber Band dependency, so it is tested directly
+    // rather than only through the nodes that will consume it. The three
+    // obligations, in order of importance:
+    //
+    //   1. put the energy at the requested pitch, accurately enough that a
+    //      one-semitone shift is audibly one semitone (the specific thing the
+    //      old implementations could not do),
+    //   2. keep the level intact,
+    //   3. produce a continuous signal with no block-rate structure.
+    //
+    // Plus a capacity check, because this runs on the audio thread and the
+    // whole point of the design is that process() never allocates.
+    {
+        const double SR = 48000.0;
+        const int    BS = 512;
+        const double inHz = 440.0;
+
+        // Coarse DFT peak-pick, 1 Hz resolution over the musical range. Fine
+        // enough that the quantisation is ~4 cents at 440 Hz, well inside the
+        // tolerances below.
+        auto dominantHz = [&](const float* d, int n) {
+            double bestP = -1, bestF = 0;
+            for (double f = 100; f <= 4000; f += 1.0) {
+                double re = 0, im = 0;
+                for (int i = 0; i < n; ++i) {
+                    double a = 6.28318530718 * f * i / SR;
+                    re += d[i] * std::cos(a); im += d[i] * std::sin(a);
+                }
+                double p = re * re + im * im;
+                if (p > bestP) { bestP = p; bestF = f; }
+            }
+            return bestF;
+        };
+        auto rmsOf = [](const std::vector<float>& v) {
+            double s = 0;
+            for (float x : v) s += (double)x * x;
+            return v.empty() ? 0.0 : std::sqrt(s / (double)v.size());
+        };
+
+        // Drive a continuous sine through the shifter in BS-sized blocks and
+        // return the steady-state output, with the pipeline latency plus a
+        // safety margin discarded so the ramp-up is never measured.
+        auto runTone = [&](PhaseVocoderShifter& ps, int keepSamples) {
+            const int skip = ps.latencySamples() + 4 * ps.fftLength();
+            std::vector<float> out;
+            out.reserve((size_t)(skip + keepSamples + BS));
+            std::vector<float> in((size_t)BS), tmp((size_t)BS);
+            int phase = 0;
+            while ((int)out.size() < skip + keepSamples) {
+                for (int i = 0; i < BS; ++i)
+                    in[(size_t)i] = 0.5f * (float)std::sin(6.28318530718 * inHz * (phase + i) / SR);
+                ps.process(in.data(), tmp.data(), BS);
+                out.insert(out.end(), tmp.begin(), tmp.end());
+                phase += BS;
+            }
+            return std::vector<float>(out.begin() + skip, out.begin() + skip + keepSamples);
+        };
+
+        // 1. Pitch accuracy. 25 cents is a quarter of a semitone - tight enough
+        //    that no interval can be confused with its neighbour, and well
+        //    inside what a listener would call in tune.
+        for (float semis : {-12.0f, -7.0f, -1.0f, 0.0f, 1.0f, 7.0f, 12.0f}) {
+            PhaseVocoderShifter ps;
+            ps.prepare(11, 4);
+            ps.setPitchRatio(PhaseVocoderShifter::ratioForSemitones(semis));
+            auto out = runTone(ps, 4096);
+            double outHz  = dominantHz(out.data(), (int)out.size());
+            double expect = inHz * std::pow(2.0, semis / 12.0);
+            double cents  = 1200.0 * std::log2(outHz / expect);
+            r.checkVal(std::abs(cents) <= 25.0,
+                       juce::String("pitch-core: ") + juce::String(semis, 0)
+                           + " semitones lands within 25 cents of "
+                           + juce::String(expect, 1) + " Hz (cents error)",
+                       cents);
+        }
+
+        // 2. Level preservation. A phase vocoder redistributes energy between
+        //    bins, so exact unity is not the bar; 3 dB is. Unison is checked
+        //    tighter because there the overlap-add normalisation is the only
+        //    thing acting and any error in it shows up directly.
+        {
+            const double inLevel = 0.5 / std::sqrt(2.0);   // RMS of a 0.5 sine
+            for (float semis : {-12.0f, 0.0f, 12.0f}) {
+                PhaseVocoderShifter ps;
+                ps.prepare(11, 4);
+                ps.setPitchRatio(PhaseVocoderShifter::ratioForSemitones(semis));
+                auto out = runTone(ps, 4096);
+                double db = 20.0 * std::log10(std::max(1e-12, rmsOf(out) / inLevel));
+                double tol = (semis == 0.0f) ? 1.0 : 3.0;
+                r.checkVal(std::abs(db) <= tol,
+                           juce::String("pitch-core: ") + juce::String(semis, 0)
+                               + " semitones preserves level within "
+                               + juce::String(tol, 0) + " dB (dB change)",
+                           db);
+            }
+        }
+
+        // 3. No block-rate structure. This is the exact measurement that
+        //    condemned the old resamplers: they scored 0.00000 here because the
+        //    tail of every block was silence. A continuous effect scores ~0.25.
+        {
+            PhaseVocoderShifter ps;
+            ps.prepare(11, 4);
+            ps.setPitchRatio(2.0f);
+            auto out = runTone(ps, BS * 12);
+            double tailE = 0, totalE = 0;
+            for (int b = 0; b * BS < (int)out.size(); ++b) {
+                for (int i = 0; i < BS; ++i) {
+                    double e = (double)out[(size_t)(b * BS + i)] * out[(size_t)(b * BS + i)];
+                    totalE += e;
+                    if (i >= (BS * 3) / 4) tailE += e;
+                }
+            }
+            double frac = totalE > 1e-20 ? tailE / totalE : 0.0;
+            r.checkVal(std::abs(frac - 0.25) <= 0.05,
+                       "pitch-core: +12 semitones spreads energy evenly across the block "
+                       "(last-quarter energy fraction, 0.25 = uniform)",
+                       frac);
+        }
+
+        // 4. Block-size independence. process() is a sample-driven FIFO, so a
+        //    stream chopped into ragged blocks must produce the same samples as
+        //    the same stream in one call. Callers get arbitrary block sizes from
+        //    the host, and PDC assumes a fixed latency regardless.
+        {
+            const int TOTAL = 8192;
+            std::vector<float> in((size_t)TOTAL);
+            for (int i = 0; i < TOTAL; ++i)
+                in[(size_t)i] = 0.5f * (float)std::sin(6.28318530718 * inHz * i / SR);
+
+            PhaseVocoderShifter a, b;
+            a.prepare(11, 4); b.prepare(11, 4);
+            a.setPitchRatio(1.5f); b.setPitchRatio(1.5f);
+
+            std::vector<float> oneShot((size_t)TOTAL), ragged((size_t)TOTAL);
+            a.process(in.data(), oneShot.data(), TOTAL);
+
+            const int chunks[] = { 1, 7, 64, 333, 512, 1000 };
+            int pos = 0, ci = 0;
+            while (pos < TOTAL) {
+                int n = std::min(chunks[ci % 6], TOTAL - pos);
+                b.process(in.data() + pos, ragged.data() + pos, n);
+                pos += n; ++ci;
+            }
+            double maxDiff = 0;
+            for (int i = 0; i < TOTAL; ++i)
+                maxDiff = std::max(maxDiff, (double)std::abs(oneShot[(size_t)i] - ragged[(size_t)i]));
+            r.checkVal(maxDiff < 1e-6,
+                       "pitch-core: ragged block sizes give bit-comparable output to one "
+                       "big call (max sample difference)",
+                       maxDiff);
+        }
+
+        // 5. Allocation-freedom on the audio thread. Capacity is the observable
+        //    proxy: if any internal buffer grew, process() called the allocator.
+        //    Checked across a ratio change and a transient trigger too, since
+        //    those are the other things a caller does mid-stream.
+        {
+            PhaseVocoderShifter ps;
+            ps.prepare(11, 4);
+            ps.setPitchRatio(1.0f);
+            std::vector<float> in((size_t)BS, 0.0f), out((size_t)BS);
+            for (int i = 0; i < BS; ++i)
+                in[(size_t)i] = 0.25f * (float)std::sin(6.28318530718 * 220.0 * i / SR);
+            ps.process(in.data(), out.data(), BS);      // warm up, settle capacities
+
+            const size_t before = ps.capacityBytes();
+            for (int b = 0; b < 200; ++b) {
+                ps.setPitchRatio(1.0f + 0.5f * (float)((b % 5) - 2) * 0.4f);
+                if (b % 17 == 0) ps.triggerTransient();
+                ps.process(in.data(), out.data(), BS);
+            }
+            const size_t after = ps.capacityBytes();
+            r.checkVal(after == before,
+                       "pitch-core: 200 blocks with ratio changes and transient triggers "
+                       "allocate nothing (buffer capacity growth in bytes)",
+                       (double)after - (double)before);
+        }
+
+        // 6. Stability: no NaN/Inf, and silence in gives silence out. A phase
+        //    vocoder divides nothing, but atan2 on an all-zero bin and the phase
+        //    integrator are both places where garbage could creep in and then
+        //    persist forever in the accumulators.
+        {
+            PhaseVocoderShifter ps;
+            ps.prepare(11, 4);
+            ps.setPitchRatio(1.7f);
+            std::vector<float> in((size_t)BS, 0.0f), out((size_t)BS);
+            double worst = 0;
+            bool finite = true;
+            for (int b = 0; b < 40; ++b) {
+                ps.process(in.data(), out.data(), BS);
+                for (float x : out) {
+                    if (!std::isfinite(x)) finite = false;
+                    worst = std::max(worst, (double)std::abs(x));
+                }
+            }
+            r.check(finite, "pitch-core: silence in stays finite");
+            r.checkVal(worst < 1e-6,
+                       "pitch-core: silence in gives silence out (peak output)", worst);
+        }
+
+        // 7. CPU budget, same 10x-realtime bar the wavelet effects are held to.
+        //    Measured for a STEREO pair, because that is what a node actually
+        //    instantiates - a mono figure would flatter it by 2x. Best-of-3:
+        //    machine interference only ever makes a run slower, so the minimum
+        //    time is a far more stable estimator than a mean.
+        {
+            PhaseVocoderShifter l, rr;
+            l.prepare(11, 4); rr.prepare(11, 4);
+            l.setPitchRatio(1.5f); rr.setPitchRatio(1.5f);
+            std::vector<float> in((size_t)BS), outL((size_t)BS), outR((size_t)BS);
+            for (int i = 0; i < BS; ++i)
+                in[(size_t)i] = 0.3f * (float)std::sin(6.28318530718 * 330.0 * i / SR);
+
+            const int BLOCKS = 200;
+            l.process(in.data(), outL.data(), BS);      // warm-up, untimed
+            double best = 0.0;
+            for (int rep = 0; rep < 3; ++rep) {
+                auto t0 = std::chrono::steady_clock::now();
+                for (int b = 0; b < BLOCKS; ++b) {
+                    l.process(in.data(), outL.data(), BS);
+                    rr.process(in.data(), outR.data(), BS);
+                }
+                auto t1 = std::chrono::steady_clock::now();
+                double wall  = std::chrono::duration<double>(t1 - t0).count();
+                double audio = (double)(BLOCKS * BS) / SR;
+                best = std::max(best, wall > 1e-9 ? audio / wall : 1e9);
+            }
+            r.checkVal(best >= 10.0,
+                       "pitch-core: stereo pair runs at >=10x realtime (realtime factor)",
+                       best);
         }
     }
 

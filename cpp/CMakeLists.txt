@@ -182,6 +182,7 @@ target_sources(SEANCE PRIVATE
     src/mod_import.h
     src/fft_util.cpp
     src/fft_util.h
+    src/pitch_core.h
     src/wavetable_frame.h
     src/wavelet_frame.h
     src/wavelet_frame.cpp

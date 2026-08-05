@@ -3379,6 +3379,235 @@ void testWarp(Report& r) {
                 "inharmonic: un-warped frame omits the ;warp: section");
     }
 
+    // ---- Real-time-safe wavelet transform (shared WaveletWorkspace) ------
+    // The wavelet effect nodes run dwt()/idwt() on the audio thread. They used
+    // to allocate scratch inside the transform (two vectors per level per
+    // channel per block, plus a freshly-built filter bank) - a hard real-time
+    // violation. The scratch now lives in a caller-owned WaveletWorkspace that
+    // is sized once in prepareToPlay and reused across blocks.
+    //
+    // The risk that introduces is stale scratch: the workspace is generally
+    // LARGER than the current transform needs and still holds the previous
+    // block's data, so any read of an unwritten scratch slot would silently
+    // leak old audio into the new block. These tests pin that down.
+    {
+        auto makeChirp = [](int n, float k) {
+            std::vector<float> b((size_t)n);
+            for (int i = 0; i < n; ++i) {
+                float t = (float)i / (float)n;
+                b[(size_t)i] = std::sin(6.28318530718f * k * t * t) * (0.3f + 0.7f * t);
+            }
+            return b;
+        };
+        auto maxDiff = [](const std::vector<float>& a, const std::vector<float>& b) {
+            double d = 0.0;
+            size_t n = std::min(a.size(), b.size());
+            for (size_t i = 0; i < n; ++i) d = std::max(d, (double)std::abs(a[i] - b[i]));
+            return d;
+        };
+
+        const auto filt = getWaveletFilter("sym4");
+
+        // 1. A fresh workspace and the allocating convenience overload must
+        //    agree exactly - the overload just wraps a local workspace, so any
+        //    difference means the two paths have drifted apart.
+        {
+            std::vector<float> a = makeChirp(256, 9.0f), b = a;
+            WaveletWorkspace ws;
+            int la = dwt(a, 4, filt, ws);
+            int lb = dwt(b, 4, filt);
+            r.check(la == lb, "wavelet-ws: workspace dwt reports the same level count");
+            r.checkVal(maxDiff(a, b) == 0.0,
+                       "wavelet-ws: workspace dwt is bit-identical to the allocating overload",
+                       maxDiff(a, b));
+            idwt(a, la, filt, ws);
+            idwt(b, lb, filt);
+            r.checkVal(maxDiff(a, b) == 0.0,
+                       "wavelet-ws: workspace idwt is bit-identical to the allocating overload",
+                       maxDiff(a, b));
+        }
+
+        // 2. A workspace pre-sized far larger than the signal, and already
+        //    dirtied by a previous transform, must give the same answer as a
+        //    virgin one. This is the stale-scratch regression guard.
+        {
+            std::vector<float> ref = makeChirp(128, 5.0f), reuse = ref;
+
+            WaveletWorkspace fresh;
+            int lref = dwt(ref, 5, filt, fresh);
+            idwt(ref, lref, filt, fresh);
+
+            WaveletWorkspace dirty;
+            dirty.ensure(8192);                       // much bigger than needed
+            std::vector<float> junk = makeChirp(4096, 40.0f);
+            dwt(junk, 6, filt, dirty);                // leave real data in the scratch
+            int lre = dwt(reuse, 5, filt, dirty);
+            idwt(reuse, lre, filt, dirty);
+
+            r.check(lref == lre, "wavelet-ws: oversized dirty workspace gives the same level count");
+            r.checkVal(maxDiff(ref, reuse) == 0.0,
+                       "wavelet-ws: oversized dirty workspace leaks nothing into the result",
+                       maxDiff(ref, reuse));
+        }
+
+        // 3. The two synthesis conventions, pinned.
+        //
+        //    idwtPR is the true adjoint of the analysis, so it reconstructs
+        //    exactly. idwt is the legacy painter convention, which does NOT -
+        //    it loses well over half the energy. Every wavelet EFFECT node runs
+        //    "analyse real audio -> tweak coefficients -> resynthesise" and so
+        //    must use the PR inverse; using the legacy one made even a neutral
+        //    setting badly colour the signal. The legacy pair stays for the
+        //    wavelet painter / fractal terrain, which author coefficients by
+        //    hand and depend on its exact sound.
+        {
+            std::vector<float> x = makeChirp(512, 13.0f);
+
+            std::vector<float> pr = x;
+            WaveletWorkspace ws;
+            int l = dwt(pr, 4, filt, ws);
+            idwtPR(pr, l, filt, ws);
+            r.checkVal(maxDiff(x, pr) < 1e-4,
+                       "wavelet-pr: idwtPR(dwt(x)) reconstructs x exactly",
+                       maxDiff(x, pr));
+
+            std::vector<float> legacy = x;
+            int l2 = dwt(legacy, 4, filt, ws);
+            idwt(legacy, l2, filt, ws);
+            double ex = 0, ey = 0;
+            for (size_t i = 0; i < x.size(); ++i) {
+                ex += (double)x[i] * x[i];
+                ey += (double)legacy[i] * legacy[i];
+            }
+            r.checkVal(ey / ex < 0.75,
+                       "wavelet-pr: the legacy inverse is lossy (documented, frozen)",
+                       ey / ex);
+        }
+
+        // 4. WaveletFxScratch::load zero-pads to a power of two, keeps an
+        //    untouched dry copy, and stays correct when the block size shrinks
+        //    (the buffers are reused, so a shorter block must not expose the
+        //    tail of the longer one).
+        {
+            WaveletFxScratch s;
+            s.prepare(512);
+            std::vector<float> big = makeChirp(400, 7.0f);
+            int pad = s.load(big.data(), 400);
+            r.check(pad == 512, "wavelet-scratch: load pads 400 samples up to 512");
+            r.check((int)s.sig.size() == 512 && (int)s.dry.size() == 400,
+                    "wavelet-scratch: sig is the padded length, dry is the raw length");
+            bool tailZero = true;
+            for (int i = 400; i < 512; ++i) if (s.sig[(size_t)i] != 0.0f) tailZero = false;
+            r.check(tailZero, "wavelet-scratch: pad region is zeroed");
+
+            std::vector<float> small = makeChirp(100, 3.0f);
+            int pad2 = s.load(small.data(), 100);
+            r.check(pad2 == 128, "wavelet-scratch: a shorter block re-pads to 128");
+            r.check((int)s.sig.size() == 128 && (int)s.dry.size() == 100,
+                    "wavelet-scratch: buffers shrink to the new block, no stale tail");
+            bool tail2Zero = true;
+            for (int i = 100; i < 128; ++i) if (s.sig[(size_t)i] != 0.0f) tail2Zero = false;
+            r.check(tail2Zero, "wavelet-scratch: pad region is re-zeroed after a shrink");
+            bool dryMatches = true;
+            for (int i = 0; i < 100; ++i)
+                if (s.dry[(size_t)i] != small[(size_t)i]) dryMatches = false;
+            r.check(dryMatches, "wavelet-scratch: dry copy matches the input exactly");
+        }
+
+        // 5. The whole point: after prepare(), repeated blocks must not
+        //    reallocate. Capacity is the observable proxy - if any buffer grows
+        //    its capacity during steady-state processing, something in the path
+        //    is still allocating on the audio thread.
+        {
+            WaveletFxScratch s;
+            s.prepare(512);
+            std::vector<float> block = makeChirp(512, 11.0f);
+            s.load(block.data(), 512);               // first block sizes everything
+            const size_t capSig    = s.sig.capacity();
+            const size_t capDry    = s.dry.capacity();
+            const size_t capApprox = s.ws.approx.capacity();
+            const size_t capDetail = s.ws.detail.capacity();
+            const size_t capRecon  = s.ws.recon.capacity();
+            for (int b = 0; b < 32; ++b) {
+                s.useFilter("sym4");
+                s.load(block.data(), 512);
+                int l = dwt(s.sig, 5, filt, s.ws);
+                idwt(s.sig, l, filt, s.ws);
+            }
+            r.check(s.sig.capacity() == capSig && s.dry.capacity() == capDry,
+                    "wavelet-scratch: signal/dry buffers never reallocate in steady state");
+            r.check(s.ws.approx.capacity() == capApprox
+                    && s.ws.detail.capacity() == capDetail
+                    && s.ws.recon.capacity() == capRecon,
+                    "wavelet-scratch: transform scratch never reallocates in steady state");
+        }
+
+        // 6. The symptom that made the wrong inverse worth chasing: a wavelet
+        //    effect at neutral settings must pass audio through UNCHANGED.
+        //    Transient Split with both gains at 1.0 splits every coefficient
+        //    into exactly one of two complementary streams, so summing them has
+        //    to give the input back. With the legacy inverse it did not - it
+        //    dropped well over half the energy, i.e. the "neutral" setting was
+        //    a heavy, unavoidable colouration on the flagship wavelet effect.
+        {
+            const int N = 512;
+            auto fillSine = [&](juce::AudioBuffer<float>& b) {
+                b.setSize(2, N);
+                for (int c = 0; c < 2; ++c)
+                    for (int i = 0; i < N; ++i)
+                        b.getWritePointer(c)[i] =
+                            0.5f * std::sin(6.28318530718f * 8.0f * (float)i / (float)N);
+            };
+            auto maxAbsDiffBuf = [&](const juce::AudioBuffer<float>& a,
+                                     const juce::AudioBuffer<float>& b) {
+                double d = 0.0;
+                for (int c = 0; c < 2; ++c)
+                    for (int i = 0; i < N; ++i)
+                        d = std::max(d, (double)std::abs(a.getReadPointer(c)[i]
+                                                       - b.getReadPointer(c)[i]));
+                return d;
+            };
+
+            {
+                NodeGraph g;
+                int nId = g.addNode("tsplit", NodeType::Effect, {}, {}).id;
+                Node& nd = *g.findNode(nId);
+                nd.params.push_back({"Transient", 1.0f, 0.0f, 2.0f});
+                nd.params.push_back({"Sustain",   1.0f, 0.0f, 2.0f});
+                nd.params.push_back({"Threshold", 0.3f, 0.0f, 1.0f});
+                nd.params.push_back({"Levels",    4.0f, 1.0f, 8.0f});
+
+                TransientSplitProcessor proc(nd);
+                proc.prepareToPlay(48000.0, N);
+                juce::AudioBuffer<float> buf, dryRef;
+                fillSine(buf); fillSine(dryRef);
+                juce::MidiBuffer mb;
+                proc.processBlock(buf, mb);
+                r.checkVal(maxAbsDiffBuf(buf, dryRef) < 1e-4,
+                           "wavelet-fx: Transient Split at gains 1/1 is unity (no colouration)",
+                           maxAbsDiffBuf(buf, dryRef));
+            }
+            {
+                NodeGraph g;
+                int nId = g.addNode("denoise", NodeType::Effect, {}, {}).id;
+                Node& nd = *g.findNode(nId);
+                nd.params.push_back({"Threshold", 0.0f, 0.0f, 1.0f});
+                nd.params.push_back({"Levels",    4.0f, 1.0f, 8.0f});
+                nd.params.push_back({"Mix",       1.0f, 0.0f, 1.0f});
+
+                WaveletDenoiserProcessor proc(nd);
+                proc.prepareToPlay(48000.0, N);
+                juce::AudioBuffer<float> buf, dryRef;
+                fillSine(buf); fillSine(dryRef);
+                juce::MidiBuffer mb;
+                proc.processBlock(buf, mb);
+                r.checkVal(maxAbsDiffBuf(buf, dryRef) < 1e-4,
+                           "wavelet-fx: Denoiser at threshold 0 / full wet is unity",
+                           maxAbsDiffBuf(buf, dryRef));
+            }
+        }
+    }
+
     // ---- Bucket C: whole-buffer spectral / wavelet warps ----------------
     // The scripting primitives behind spectralwarp()/waveletwarp() in Lua /
     // Python / WASM. They transform the buffer into a representation, warp each

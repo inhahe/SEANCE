@@ -5,6 +5,55 @@ top. When something is fixed, delete the entry (git history is the archive).
 
 ---
 
+## BUG: most wavelet effect nodes still allocate on the audio thread
+
+**Found:** 2026-08-05, while extracting the wavelet DSP for plugin work.
+
+Every wavelet effect node runs `dwt()`/`idwt()` inside `processBlock`. Written
+naively that is a heap allocation storm on the real-time thread: `getWaveletFilter()`
+rebuilds the whole 4-vector filter bank **every block**, the padded/dry buffers are
+`std::vector`s constructed per channel per block, and `dwtStep`/`idwtStep` each
+allocated two more per level per channel. Order of 35 malloc/free pairs per block
+per node - thousands per second. `malloc` can block on a global lock, so this is a
+genuine dropout source, and it is an automatic fail in plugin validation
+(pluginval strictness 10 flags allocation in `processBlock`).
+
+**Fixed so far** — `wavelet.h` now has `WaveletWorkspace` (caller-owned transform
+scratch) and `WaveletFxScratch` (workspace + cached filter bank + padded/dry
+buffers). `prepare()` in `prepareToPlay` sizes everything once; the steady state is
+allocation-free, covered by the `wavelet-scratch: ... never reallocates` tests.
+Converted: **Transient Split**, **Wavelet Denoiser**, **Wavelet Bitcrush**.
+
+**Still allocating** (same mechanical conversion — hold a `WaveletFxScratch`, call
+`prepare()` from `prepareToPlay`, replace the local vectors and the per-block
+`getWaveletFilter()`), all in `builtin_effects.h`:
+Octave Shift, Wavelet Multiband Comp, Wavelet Pitch Shift, Wavelet Reverb,
+Independent Pitch Shift, Wavelet Complexity, Asymmetric Filter, Wavelet Pitch
+Tracker, Wavelet Vocoder, Formant Pitch Shift.
+
+Note the same class of bug likely exists outside the wavelet family (any
+`processBlock` that constructs a `std::vector`/`juce::AudioBuffer` locally) — worth
+a sweep once the wavelet ones are done.
+
+---
+
+## DOC GAP: the wavelet effect suite is absent from REFERENCE.md
+
+**Found:** 2026-08-05. `REFERENCE.md` has no entry for **any** of the wavelet
+effects — Transient Split, Wavelet Denoiser, Wavelet Bitcrush, Octave Shift,
+Wavelet Multiband Comp, Wavelet Pitch Shift, Wavelet Reverb, Wavelet Complexity,
+Asymmetric Filter, Wavelet Pitch Tracker, Wavelet Vocoder, Formant Pitch Shift,
+Independent Pitch Shift. They exist only as entries in the "Add node" menu and as
+one-line mentions of *planned* wavelet ideas in the README's roadmap section.
+
+This matters more than a normal doc gap: this suite is the part of SEANCE with no
+free equivalent (unlike the wavetable synth, which competes with Vital), so it is
+the most likely thing to be productised. Each needs the usual REFERENCE treatment -
+what it does, every param with units and range, what the neutral setting is, and
+which wavelet family it uses. Add a "Wavelet effects" section with a TOC entry.
+
+---
+
 ## TECH DEBT (architectural): processors hold `Node&`; params should come from an APVTS
 
 **Noticed:** 2026-08-05, auditing the `Node&` lifetime question. **Not currently

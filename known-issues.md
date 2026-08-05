@@ -5,6 +5,53 @@ top. When something is fixed, delete the entry (git history is the archive).
 
 ---
 
+## BUG: resampling pitch shifters chop each block on upward shifts
+
+**Found:** 2026-08-05, while making the wavelet suite allocation-free.
+
+`IndependentPitchShiftProcessor` and `FormantPitchShiftProcessor` (both in
+`builtin_effects.h`) transpose by resampling **inside the current block**:
+
+```cpp
+float srcPos = (float)i * ratio;     // source sample for output sample i
+int i0 = (int)srcPos;
+if (i0 + 1 < n) shifted[i] = sig[i0] * (1 - frac) + sig[i0 + 1] * frac;
+else if (i0 < n) shifted[i] = sig[i0];
+// else: silence
+```
+
+For an upward shift this runs off the end of the block. At +12 semitones
+(ratio 2) every output sample past the halfway point wants a source sample
+that does not exist in this block, so it is left at zero. Each block is
+therefore a correctly-shifted first half followed by a **hard-zeroed second
+half**, repeating at the block rate — a 50%-duty-cycle gate at ~94 Hz for a
+512-sample block at 48 kHz. That is severe amplitude modulation, not a subtle
+artifact.
+
+Measured by `wavelet-fx: ... does not zero the tail of every block`: the
+fraction of each block's output energy landing in its last quarter is
+**0.00000** for both effects (a healthy continuous effect gives ~0.25).
+
+Downward shifts do not zero anything but are equally wrong in a different
+way: `srcPos` only ever reaches `ratio * (n-1) < n`, so each block replays a
+time-stretched copy of its own first `ratio` fraction, restarting every block.
+
+**Root cause, shared by both:** resampling changes *duration*. Changing pitch
+at constant duration needs state that outlives one block — either overlap-add
+granular resynthesis reading from a ring buffer of input history, or a phase
+vocoder. A block-local resampler cannot do it no matter how the edges are
+patched, so this is not fixable with a bounds tweak.
+
+**Relation to the other pitch shifters:** all three pitch shifters in the
+wavelet suite are currently broken — this pair by block-chopping, and Wavelet
+Pitch Shift for the separate reasons in the entry below. Worth deciding on
+them together, since a single correct pitch-shift core (or RubberBand, which
+is already linked into the build) could serve all three, with the wavelet part
+of each node reduced to the band-splitting/formant-envelope work that is
+actually its distinctive contribution.
+
+---
+
 ## BUG: Wavelet Pitch Shift is comprehensively non-functional
 
 **Found:** 2026-08-05, by adding a CPU-budget self-test to the wavelet suite.

@@ -3863,6 +3863,89 @@ void testWarp(Report& r) {
         }
     }
 
+    // ---- The resampling pitch shifters: are they block-chopping? --------
+    //
+    // Independent Pitch Shift and Formant Pitch Shift both transpose by
+    // resampling INSIDE the current block: `srcPos = i * ratio`, reading
+    // source sample `i * ratio` to produce output sample `i`. For an upward
+    // shift (ratio > 1) that runs off the end of the block - at ratio 2 every
+    // output sample past the halfway point wants a source sample that does not
+    // exist, and the code emits silence for it. So each block would be a
+    // correctly-shifted first half followed by a zeroed second half, repeating
+    // at the block rate (~94 Hz at 512/48k).
+    //
+    // A single big block cannot show this, so this drives a continuous tone
+    // through many consecutive blocks and looks at where the energy lands
+    // WITHIN each block. For a healthy continuous effect the last quarter of a
+    // block holds about a quarter of the block's energy.
+    {
+        const int BS = 512;
+        const int NBLOCKS = 16;
+        const double SR = 48000.0;
+
+        auto tailEnergyFraction = [&](juce::AudioProcessor& proc, double ratioUp) {
+            proc.prepareToPlay(SR, BS);
+            juce::AudioBuffer<float> buf(2, BS);
+            juce::MidiBuffer mb;
+            double tailE = 0, totalE = 0;
+            int phase = 0;
+            for (int b = 0; b < NBLOCKS; ++b) {
+                for (int c = 0; c < 2; ++c)
+                    for (int i = 0; i < BS; ++i)
+                        buf.getWritePointer(c)[i] =
+                            0.5f * (float)std::sin(6.28318530718 * 440.0 * (phase + i) / SR);
+                proc.processBlock(buf, mb);
+                // Skip the first couple of blocks so any startup transient in
+                // the effect is not what we measure.
+                if (b >= 2) {
+                    const float* d = buf.getReadPointer(0);
+                    for (int i = 0; i < BS; ++i) {
+                        double e = (double)d[i] * d[i];
+                        totalE += e;
+                        if (i >= (BS * 3) / 4) tailE += e;
+                    }
+                }
+                phase += BS;
+            }
+            juce::ignoreUnused(ratioUp);
+            return totalE > 1e-20 ? tailE / totalE : 0.0;
+        };
+
+        {
+            NodeGraph g;
+            int nId = g.addNode("indps", NodeType::Effect, {}, {}).id;
+            Node& nd = *g.findNode(nId);
+            nd.params.push_back({"Semitones",  12.0f, -24.0f, 24.0f});
+            nd.params.push_back({"Threshold",   1.0f,   0.0f,  1.0f}); // all tonal
+            nd.params.push_back({"Trans Gain",  0.0f,   0.0f,  2.0f});
+            nd.params.push_back({"Levels",      4.0f,   1.0f,  8.0f});
+            nd.params.push_back({"Mix",         1.0f,   0.0f,  1.0f});
+            IndependentPitchShiftProcessor proc(nd);
+            double frac = tailEnergyFraction(proc, 2.0);
+            r.knownBug(frac > 0.10,
+                       "wavelet-fx: Ind. Pitch Shift +12 does not zero the tail of "
+                       "every block (last-quarter energy fraction, ~0.25 = healthy)",
+                       frac,
+                       "resampling pitch shifters chop each block on upward shifts");
+        }
+        {
+            NodeGraph g;
+            int nId = g.addNode("fps", NodeType::Effect, {}, {}).id;
+            Node& nd = *g.findNode(nId);
+            nd.params.push_back({"Semitones",    12.0f, -24.0f, 24.0f});
+            nd.params.push_back({"Formant Lock",  0.0f,   0.0f,  1.0f});
+            nd.params.push_back({"Levels",        5.0f,   1.0f,  8.0f});
+            nd.params.push_back({"Mix",           1.0f,   0.0f,  1.0f});
+            FormantPitchShiftProcessor proc(nd);
+            double frac = tailEnergyFraction(proc, 2.0);
+            r.knownBug(frac > 0.10,
+                       "wavelet-fx: Formant Pitch Shift +12 does not zero the tail of "
+                       "every block (last-quarter energy fraction, ~0.25 = healthy)",
+                       frac,
+                       "resampling pitch shifters chop each block on upward shifts");
+        }
+    }
+
     // ---- Bucket C: whole-buffer spectral / wavelet warps ----------------
     // The scripting primitives behind spectralwarp()/waveletwarp() in Lua /
     // Python / WASM. They transform the buffer into a representation, warp each

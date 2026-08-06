@@ -283,6 +283,23 @@ All built-in effects can be combined freely with cables — pre-effect, post-eff
 - **Waveshaper (amplitude morph)** — a family of ten amplitude-domain waveshaping nodes, one per shaping curve: **Soft Clip**, **Hard Clip**, **Wavefold**, **Wavewrap**, **Rectify**, **Quantize (bitcrush)**, **Tube Saturate**, **Tape Saturate**, **Flip (invert)**, and **Chebyshev**. Each applies its curve sample-by-sample to the incoming audio, controlled by a single amount/drive knob (the knob is labelled per method — Drive / Fold / Wrap / Amount / Crush). They share the same `warpAmpValue` shaping primitives the wavetable synth uses for per-frame morphing, so a sound you shape inside a wavetable frame and a sound you shape on the wire come out identical. Add one from the node menu under **Waveshaper (amplitude morph)**.
 - **Mid/Side Encode + Decode** — utility pair for mastering. Encode splits stereo into Mid (center) + Side (width); Decode recombines them. Wire EQ or compression between them to process mid and side independently.
 
+**Wavelet effects**
+
+A family of twelve effects built on the **discrete wavelet transform** rather than the FFT — a class of processing that's essentially absent from commercial DAWs. An FFT has to pick one window length and lives with the compromise: long enough to resolve bass means long enough to smear a drum hit. A wavelet transform looks at low frequencies with long windows and high frequencies with short ones automatically, so these effects can be surgical about the sustained part of a sound while leaving the attack untouched. Every one of them has a **guaranteed-clean neutral setting**, verified by self-tests that run the full forward+inverse transform at full wet. See [Wavelet effects](REFERENCE.md#wavelet-effects) in REFERENCE.md for every parameter, the band↔frequency mapping, and the neutral setting of each node.
+
+- **Transient/Sustain Split** — separate the attack of a sound from its body and rebalance them independently. Drop the sustain for a bone-dry percussive version of anything; drop the transients for the pad hiding inside a plucked instrument.
+- **Wavelet Denoiser** — wavelet-shrinkage noise reduction that removes broadband hiss *without* smearing transients, which is the thing spectral gating can't do.
+- **Wavelet Bitcrush** — bit-reduction that only hits the frequency bands you pick. Crunchy lo-fi bass under clean highs, or sizzle on top of a clean low end.
+- **Octave Shift** — clean whole-octave shifting and sub-bass generation by moving energy between wavelet bands. No resampling, no time-stretch, so transients keep their timing.
+- **Wavelet Multiband Comp** — multiband dynamics where the bands are decomposition levels rather than crossover filters, so they sum back perfectly instead of phasing. Doubles as a spectral tilt.
+- **Wavelet Reverb (1/f)** — a fractal, self-similar ambience with no delay lines and no room model. A **Color** knob sweeps the tail from white through pink to brown.
+- **Independent Pitch Shift** — pitch-shifts only the tonal content and leaves transients where they were, so a drum loop can be pitched without going soft.
+- **Wavelet Complexity** — one "how much detail?" knob that keeps only the largest N wavelet coefficients, progressively dissolving a sound into a sketch of itself.
+- **Asymmetric Filter** — a filter that reacts *before* the transient. No causal filter can do this; working on a whole block in the wavelet domain removes the constraint, so you can swell into an attack or duck ahead of it.
+- **Wavelet Vocoder** — a vocoder whose bands are octave-wide wavelet levels instead of fixed FFT bins, so consonants stay crisp instead of being smeared to the length of a window.
+- **Formant Pitch Shift** — pitch shifting without the chipmunk effect: shifts the pitch, then puts the original spectral envelope back. Sweeping the **Formant Lock** knob on its own is a size/gender morph.
+- **Pitch Detector** — precise pitch-to-signal node: measures the fundamental of incoming audio (YIN or autocorrelation, your choice) and emits it as a 0..1 control signal across a frequency band you set, with log or linear mapping. Min Hz trades latency for low-frequency reach. Wire the output into any param to pitch-follow. (A legacy octave-resolution **Wavelet Pitch Tracker** node is kept for old projects.)
+
 **MIDI processors**
 
 - **MIDI Modulator** — uses signal inputs to modulate MIDI attributes (velocity, pitch bend, mod wheel, aftertouch, any CC) on a passing MIDI stream at sample-accurate rate. Add as many signal inputs as you want; each one maps to a different MIDI target.
@@ -401,29 +418,17 @@ This is one of the things that sets SEANCE apart from typical home DAWs. Three i
 
 A non-exhaustive list of planned and in-progress features. Things below are *planned*, not promised — order and scope may shift.
 
-### Wavelet-based audio (large planned area)
+### Wavelet-based audio
 
-Wavelets give you joint time + frequency resolution that traditional FFT-based effects can't match — sharp transients keep their attack while sustained tones get analyzed at high frequency resolution. This unlocks a whole class of effects that aren't widely available in commercial DAWs:
+The **effects half of this area has shipped** — twelve nodes, listed under [Built-in effects → Wavelet effects](#built-in-effects) above and specified in [REFERENCE.md](REFERENCE.md#wavelet-effects). The core DWT / IDWT (Daubechies + Symlet families) and a Morlet CWT are in place, and the *Wavelet Space* waveform editor lets you author a cycle by painting coefficients directly. What's left is mostly the **synthesis** side, where wavelets are used to store and generate waveforms rather than to process a signal:
 
-- **DWT / IDWT and CWT utilities** — the core forward/inverse wavelet transforms (Daubechies, Symlet, Biorthogonal families) plus continuous wavelet transform for non-dyadic scale operations.
 - **Wavetable mipmap pyramid** — anti-aliased wavetable pitch-up via wavelet-based oversampling.
 - **Wavelet-basis wavetable storage** — store wavetables in the wavelet domain for cheaper interpolation.
-- **Wavetable complexity knob** — sparsify wavelet coefficients to smoothly simplify a complex waveform.
+- **Wavetable complexity knob** — sparsify wavelet coefficients to smoothly simplify a complex *waveform*. (The audio-effect version of this, **Wavelet Complexity**, has shipped; this is the same idea applied inside a wavetable frame.)
 - **Self-similar / fractal wavetable generator** — build wavetables from fractal recursion.
 - **Wavelet-domain morphing** in scatter wavetables.
-- **Transient/sustain split node** — separate the attack from the body of any sound, route them independently.
-- **Octave-band wavelet multiband compressor** — compression with naturally-shaped octave bands instead of artificial crossovers.
-- **Wavelet shrinkage denoiser** — surgical noise reduction that preserves transients.
-- **Wavelet bitcrush** — bit-reduction artifacts that hit only at the frequencies you choose.
-- **Asymmetric / non-causal wavelet filters** — filters that anticipate transients ahead of where they happen.
-- **Self-similar / 1/f wavelet reverb** — fractal reverb tails.
-- **Scale-shift wavelet pitch shifter** — pitch shifting via wavelet scale modification rather than time stretching.
-- **Free dyadic octave shifter / sub-octave** — clean octave doubling and sub-bass generation.
-- **Independent transient + tonal pitch shifting** — keep drums punchy while pitching melodic content.
-- **Adaptive resolution wavelet pitch tracker** — pitch detection that handles vibrato and bends gracefully.
-- **Pitch Detector** — precise pitch-to-signal node: measures the fundamental of incoming audio (YIN or autocorrelation, your choice) and emits it as a 0..1 control signal across a frequency band you set, with log or linear mapping. Window/hop control trades latency for low-frequency reach. Wire the output into any param to pitch-follow.
-- **Formant-preserving pitch shift via wavelet packets** — vocal pitch shifting without the chipmunk effect.
-- **Wavelet-band vocoder** — vocoder using wavelet bands instead of fixed FFT bins.
+- **Biorthogonal wavelet families** — currently db1/Haar, db2, db4 and sym4 are implemented; biorthogonal filter banks would add linear-phase options.
+- **Scale-shift wavelet pitch shifter** — pitch shifting via true wavelet scale modification rather than time stretching. The shipped **Octave Shift** node approximates this by reassigning coefficients between bands, which is clean for whole octaves but not exact; a real scale-shift implementation would also handle non-octave intervals.
 
 ### Synthesis
 

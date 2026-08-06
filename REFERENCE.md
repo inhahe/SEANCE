@@ -28,6 +28,7 @@ here.
 - [Frequency-domain (spectral) synth](#frequency-domain-spectral-synth)
 - [Terrain Synth](#terrain-synth)
 - [Effect layers and groups](#effect-layers-and-groups)
+- [Wavelet effects](#wavelet-effects)
 - [Pitch Detector](#pitch-detector)
 - [Pitch Shift node](#pitch-shift-node)
 - [Convolution Filter](#convolution-filter)
@@ -1725,6 +1726,315 @@ Per-group override: `EffectGroup::crossfadeSec`. Zero (the default) means "inher
 ### Routing strip
 
 Above the piano roll, a narrow strip appears when any layers exist. Shows each gated wire as a horizontal "wire" bar with 3D shading, colored to match the wire/group. The horizontal axis matches the piano roll below — read across to see which wires are active at which beats. The strip auto-hides when there are no layers.
+
+---
+
+## Wavelet effects
+
+Twelve `Effect` nodes built on the **discrete wavelet transform (DWT)** rather than the FFT. All of them live in right-click → **Effects**, in one run between *Ring Modulator* and *SMS*.
+
+**Why wavelets, in plain language.** An FFT chops audio into fixed-length windows and asks "how much of each frequency is in this window?". That is a fair question for a sustained note and a bad one for a drum hit — a window long enough to resolve bass is long enough to smear the attack. A wavelet transform asks a *scale*-shaped question instead: it looks at low frequencies with long windows and high frequencies with short ones, automatically. The practical consequence is that a wavelet effect can be surgical about the sustained part of a sound while leaving transients alone (or vice versa), which is what most of the nodes below trade on.
+
+Contents:
+
+- [Shared behaviour](#shared-behaviour-all-wavelet-effects)
+- [Transient/Sustain Split](#transientsustain-split)
+- [Wavelet Denoiser](#wavelet-denoiser)
+- [Wavelet Bitcrush](#wavelet-bitcrush)
+- [Octave Shift (wavelet)](#octave-shift-wavelet)
+- [Wavelet Multiband Comp](#wavelet-multiband-comp)
+- [Wavelet Reverb (1/f)](#wavelet-reverb-1f)
+- [Independent Pitch Shift](#independent-pitch-shift)
+- [Wavelet Complexity](#wavelet-complexity)
+- [Asymmetric Filter](#asymmetric-filter)
+- [Wavelet Vocoder](#wavelet-vocoder)
+- [Formant Pitch Shift](#formant-pitch-shift)
+- [Wavelet Pitch Tracker (legacy)](#wavelet-pitch-tracker-legacy)
+- [Neutral settings at a glance](#neutral-settings-at-a-glance)
+
+### Shared behaviour (all wavelet effects)
+
+Every node in this family has the same skeleton, so learning it once covers all twelve:
+
+1. Take the current audio block, zero-pad it to the next power of two.
+2. Forward DWT to **Levels** depth.
+3. Do something to the coefficients — that "something" is the whole difference between the nodes.
+4. Inverse DWT.
+5. Crossfade against the untouched dry copy using **Mix**.
+
+Consequences worth knowing:
+
+- **Processing is per-block and stereo is per-channel.** Left and right are transformed independently (at most two channels are touched). Nothing except the Reverb carries wavelet state across block boundaries, so any threshold that is expressed as "a fraction of the largest coefficient" is measured **against the current block only**. That makes those thresholds automatically program-adaptive — they follow the material without a knob — but it also means a very aggressive setting can produce a seam at block boundaries.
+- **`Levels` is the decomposition depth**, and it is what turns the effect from broadband to surgical. With `Levels = L` at sample rate `SR`, detail **band `b`** (band 0 = coarsest / lowest, band `L-1` = finest / highest) covers roughly `SR/2^(L-b+1) … SR/2^(L-b)` Hz, and the leftover **approximation band** holds everything below `SR/2^(L+1)`. At `Levels = 4`, 48 kHz: approximation ≈ 0–1.5 kHz, band 0 ≈ 1.5–3 kHz, band 1 ≈ 3–6 kHz, band 2 ≈ 6–12 kHz, band 3 ≈ 12–24 kHz. Raising Levels pushes the split points down and gives finer control in the bass at the cost of more transform work. Levels is capped by the block length — a short block cannot support eight levels, so the node silently uses as many as fit (`actualLevels`).
+- **`Mix` is a plain dry/wet crossfade** on the node's output; `Mix = 0` bypasses the wavelet path entirely.
+- **Wavelet family per node.** SEANCE ships four filter banks (`db1`/Haar, `db2`, `db4`, `sym4`); each effect picks the one that suits its job and doesn't expose the choice as a knob (the *Wavelet Space* waveform editor does — see the README). **`db4`** is the default across the family: 8-tap Daubechies, smooth enough that reconstruction artifacts stay inaudible on tonal material. **Bitcrush uses `db2`** (4-tap) because a shorter filter localises the quantisation grit tightly in time instead of spreading it. **Denoiser uses `sym4`**, a symmetric Symlet with near-linear phase, which matters when you are shrinking coefficients and don't want the surviving ones to shift.
+- **Neutral settings are guaranteed, and tested.** Every effect below with a neutral parameter position is covered by a self-test (`wavelet-fx:` in `--self-test`) asserting that at that setting the output is bit-for-bit the input to within `1e-4`, **at full wet**, so the full forward + inverse transform still runs. This is a stronger claim than "Mix = 0 is clean": it proves the round-trip is lossless. (It was added because it wasn't — an earlier inverse transform dropped over half the signal's energy, which made every "bypass" setting a heavy colouration. See the note in `known-issues.md`.) Each of those tests is paired with a check that moving one knob off neutral *does* change the output, so the guarantee can't be satisfied by an effect that does nothing.
+- **Latency.** All of these are zero-latency except **Independent Pitch Shift** and **Formant Pitch Shift**, which run a phase vocoder (2048-point FFT, 75% overlap → **1536 samples ≈ 32 ms** at 48 kHz). Both report that to the graph's plugin-delay compensation, so parallel branches stay aligned. Both also deliberately keep running at 0 semitones rather than bypassing, because a node that reports fixed latency has to honour it — bypassing at zero would make the signal jump 32 ms forward the moment the knob crossed zero.
+
+---
+
+### Transient/Sustain Split
+
+`__transientsplit__`. Separates the **attack** of a sound from its **body** and lets you rebalance them. Large wavelet coefficients are short-lived spikes — the pick, the stick, the consonant; small ones are the sustained tone underneath. The node sorts every coefficient into one of two complementary streams by magnitude, reconstructs each separately, and sums them back with independent gains.
+
+Turn **Sustain** down to get a dry, percussive version of anything (drums lose their room, a guitar loses its ring). Turn **Transient** down for the opposite — the pad hiding inside a plucked instrument. Turn **Transient** *up* past 1 to re-add attack to a sound that a compressor flattened.
+
+| Param | Default | Range | Meaning |
+|---|---|---|---|
+| **Transient** | 1.0 | 0 – 2 | Gain on the transient stream. 1 = untouched, 0 = removed, 2 = +6 dB. |
+| **Sustain** | 1.0 | 0 – 2 | Gain on the sustain stream, same scale. |
+| **Threshold** | 0.3 | 0 – 1 | Where the split happens, as a fraction of the block's largest coefficient. Lower = more material counts as transient. |
+| **Levels** | 4 | 1 – 8 | DWT depth. |
+
+**Neutral:** Transient = 1, Sustain = 1. The two streams are complementary by construction, so summing them at unity must give the input back regardless of Threshold. This node has no Mix param — the two gains already span dry.
+
+Wavelet family: `db4`.
+
+---
+
+### Wavelet Denoiser
+
+`__denoiser__`. Broadband noise reduction by **wavelet shrinkage** (the classic Donoho–Johnstone method): forward DWT, pull every detail coefficient toward zero by a fixed amount, inverse DWT. Noise is spread thinly across all coefficients, so it falls below the threshold and vanishes; real signal is concentrated in a few large coefficients, which survive (reduced by the threshold, not zeroed — "soft" shrinkage, which avoids the musical-noise chirping that hard gating produces).
+
+The advantage over spectral gating is that transients keep their edge. A gate has to pick a window length and smears anything shorter than it; shrinkage has no window to smear across.
+
+The approximation band is never thresholded — the lowest band is left alone so the fundamental of a bass note can't be shrunk away.
+
+| Param | Default | Range | Meaning |
+|---|---|---|---|
+| **Threshold** | 0.1 | 0 – 1 | Noise floor estimate, as a fraction of the block's largest coefficient. Raise until the hiss goes, then back off — too high and sustained tones start to sound gated. |
+| **Levels** | 4 | 1 – 8 | DWT depth. |
+| **Mix** | 1.0 | 0 – 1 | Dry/wet. Blending some dry back in is a good way to soften over-aggressive settings. |
+
+**Neutral:** Threshold = 0 (nothing falls below zero, so nothing is shrunk).
+
+Wavelet family: `sym4` — symmetric and near-linear-phase, so the coefficients that survive shrinkage stay where they were in time.
+
+---
+
+### Wavelet Bitcrush
+
+`__waveletbitcrush__`. Bit-reduction that only hits **the frequencies you choose**. A conventional bitcrusher quantises the waveform, so the grit lands everywhere at once. This one quantises wavelet coefficients within a selected band range, so you can have crunchy lo-fi bass under clean highs, sizzle on top of a clean low end, or the full 8-bit treatment.
+
+| Param | Default | Range | Meaning |
+|---|---|---|---|
+| **Bits** | 4 | 1 – 16 | Quantisation resolution: step size is `1 / 2^Bits`. 16 is effectively transparent; 1–3 is destructive. |
+| **Band Lo** | 0 | 0 – 7 | Lowest detail band to crush. Band 0 is the coarsest (lowest-frequency) detail band; see [Shared behaviour](#shared-behaviour-all-wavelet-effects) for the Hz mapping. |
+| **Band Hi** | 7 | 0 – 7 | Highest detail band to crush. Bands above `Levels-1` don't exist and are ignored, so with the default `Levels = 4` only bands 0–3 do anything. |
+| **Levels** | 4 | 1 – 8 | DWT depth — also how many bands there are to select between. |
+| **Mix** | 1.0 | 0 – 1 | Dry/wet. |
+
+The **approximation band is never crushed**, only detail bands, so the very bottom of the spectrum stays clean no matter what Band Lo is set to.
+
+**Neutral:** Bits = 16 — a step of 1/65536, which every coefficient survives to within about 8·10⁻⁶.
+
+Wavelet family: `db2` — a short 4-tap filter keeps each quantisation error localised in time, which is what makes the artifact read as *grit* rather than as a smeared buzz.
+
+---
+
+### Octave Shift (wavelet)
+
+`__octaveshift__`. Shifts pitch by whole octaves by moving energy between wavelet bands. Because octave bands *are* the DWT's natural decomposition levels, no resampling or time-stretching is involved — there is no window to smear, so transients keep their timing and their edge.
+
+This is the node for sub-bass generation (Shift = −1 blended under the dry signal) and for cheap octave-doubling, not for musical intervals — for anything that isn't a whole octave use [Independent Pitch Shift](#independent-pitch-shift) or the [Pitch Shift node](#pitch-shift-node).
+
+| Param | Default | Range | Meaning |
+|---|---|---|---|
+| **Shift** | −1 | −2 … +2 | Octaves. 0 = off, −1 = one octave down (sub), +2 = two octaves up. |
+| **Mix** | 0.5 | 0 – 1 | Dry/wet. The default of 0.5 is deliberate: a sub-octave is normally wanted *underneath* the original, not instead of it. |
+
+**Neutral:** Shift = 0. Note that this is an **early-out** — the node returns before the transform runs, so at Shift = 0 the Mix knob does nothing and the audio is untouched by construction rather than by round-trip.
+
+Implementation caveat: the shift is done by **reassigning each band's coefficients to a neighbouring band** and reconstructing, which is an approximation to a true octave shift rather than an exact resampling. Bands that fall off either end are dropped, and the copy truncates when the source and destination band lengths differ. In practice it sounds like a clean, slightly hollow octave — good for sub reinforcement, characterful rather than transparent for an octave-up lead. A true scale-shift implementation is on the roadmap.
+
+Wavelet family: `db4`. Levels is fixed internally at 6 (not exposed) — enough bands for a two-octave move at any supported block size.
+
+---
+
+### Wavelet Multiband Comp
+
+`__waveletmbcomp__`. Multiband compression where the bands are **DWT decomposition levels** instead of crossover filters. A conventional multiband compressor splits with filters, and those filters have phase responses that don't perfectly cancel when the bands are summed — the classic "phasey" multiband sound. Wavelet levels are perfectly reconstructing by construction, so the bands sum back to the original exactly when no gain is applied.
+
+Also doubles as a **spectral tilt** tool via the two gain knobs, which interpolate a per-band gain ramp from the lowest band to the highest.
+
+| Param | Default | Range | Meaning |
+|---|---|---|---|
+| **Threshold** | −20 dB | −60 … 0 dB | Level above which a band starts being compressed. Shared across all bands. |
+| **Ratio** | 4 | 1 – 20 | Compression ratio. 1 = off, 20 ≈ limiting. Shared across all bands. |
+| **Levels** | 4 | 1 – 6 | Number of octave bands. |
+| **Low Gain** | 0 dB | −12 … +12 dB | Post-compression trim on the **lowest** band. |
+| **High Gain** | 0 dB | −12 … +12 dB | Post-compression trim on the **highest** band. Bands in between get a linear interpolation of the two, so Low −6 / High +6 is a bright tilt. |
+| **Mix** | 1.0 | 0 – 1 | Dry/wet — set below 1 for parallel ("New York") compression. |
+
+**Neutral:** Ratio = 1 with both gains at 0 dB. At Ratio = 1 the gain computer is an identity (`dbReduction = dbOver · (1 − 1/1) = 0`) whatever the band peak is.
+
+Behaviour caveat: gain reduction is computed **per band, per block, from that block's peak**, and applied as a single static gain to the whole block. There is no attack or release — so this behaves like a fast per-band leveller rather than a classic compressor with a time constant, and it can't be used for pumping or for shaping attack. Attack/Release params are a planned addition; for envelope-shaped dynamics use the ordinary **Compressor** node (right-click → Effects → Compressor), which has Attack/Release and a sidechain input.
+
+Wavelet family: `db4`.
+
+---
+
+### Wavelet Reverb (1/f)
+
+`__waveletreverb__`. A short, diffuse ambience built by weighting wavelet bands with a `1/f^Color` curve — i.e. a **self-similar / fractal** tail rather than a simulated room. There are no delay lines, no early reflections and no room model: the "space" comes from the statistics of the weighting, which is why it sounds smooth and grainless in a way delay-network reverbs don't.
+
+Best used as a wash / bloom on pads and textures. It is not a room simulator — for that, capture or load an impulse response into the [Convolution Filter](#convolution-filter).
+
+| Param | Default | Range | Meaning |
+|---|---|---|---|
+| **Decay** | 0.7 | 0 – 1 | How much of the tail survives each buffer shift. 1 = no attenuation, 0 = dry. |
+| **Color** | 1.0 | 0 – 3 | Spectral slope of the tail: each band is weighted `1/(band+1)^Color`. **0 = white** (all bands equal, bright and hissy), **1 = pink** (natural, the default), **2 = brown** (dark and rounded), 3 = very dark. |
+| **Levels** | 5 | 1 – 8 | DWT depth on the tail buffer — how many bands the colour curve is spread over. |
+| **Mix** | 0.3 | 0 – 1 | Dry/wet. Reverb is normally a send-style effect, hence the low default. |
+
+**Tail length is hard-bounded at 8192 samples** (≈ 186 ms at 44.1 kHz, ≈ 171 ms at 48 kHz) regardless of Decay — that's the size of the internal buffer the whole thing operates on, and it's reported to the graph via `getTailLengthSeconds()`. Pressing **Stop** zeroes the tail buffers, so the wash cuts immediately rather than ringing on after the transport stops.
+
+**Neutral:** Decay = 1, Color = 0, Mix = 1. This is the least obvious neutral in the family: with every band weight at 1 and no attenuation on the shift, the samples that come out of the tail buffer are exactly the ones just written into it — and it is still a full 8192-point round-trip, which makes it the most demanding of the transform tests.
+
+Caveat: **Decay is applied once per processing block, not per sample**, so the audible decay time depends on the audio device's buffer size — the same Decay setting rings noticeably longer at 512 samples/block than at 64. Logged in `known-issues.md`; the fix is to derive a per-block coefficient from a decay time in seconds.
+
+Wavelet family: `db4`.
+
+---
+
+### Independent Pitch Shift
+
+`__indpitchshift__`. Pitch-shifts **only the tonal part** of a sound and leaves the transients at their original pitch and timing. Pitch-shifting a full drum loop normally destroys it — the shifter smears the hits and the whole thing goes soft. This node splits transient from tonal in the wavelet domain first (the same split as [Transient/Sustain Split](#transientsustain-split)), shifts just the tonal stream through a phase vocoder, and recombines, so the drums stay punchy while the melodic content moves.
+
+| Param | Default | Range | Meaning |
+|---|---|---|---|
+| **Semitones** | 0 | −24 … +24 | Shift amount applied to the tonal stream. |
+| **Threshold** | 0.3 | 0 – 1 | Transient/tonal split point, as a fraction of the block's largest coefficient. |
+| **Trans Gain** | 1.0 | 0 – 2 | Gain on the (unshifted) transient stream. Push above 1 to keep attacks prominent against a heavily shifted body. |
+| **Levels** | 4 | 1 – 8 | DWT depth for the split. |
+| **Mix** | 1.0 | 0 – 1 | Dry/wet. |
+
+**Latency: 1536 samples (≈ 32 ms at 48 kHz)**, reported to plugin-delay compensation. Both the transient stream and the dry copy are internally delayed by the same amount, so all three paths stay sample-aligned. There is **no neutral bypass** — at 0 semitones the shifter still runs (measured at −0.003 dB, i.e. transparent) rather than early-outing, because the node has to keep honouring its reported latency.
+
+Wavelet family: `db4`. Shifting is done by a 2048-point / 75%-overlap phase vocoder shared with the [Pitch Shift node](#pitch-shift-node) (`pitch_core.h`) — constant-duration by construction, which an in-block resampler is not.
+
+---
+
+### Wavelet Complexity
+
+`__waveletcomplexity__`. A single "how much detail?" knob. The node keeps only the **N largest** wavelet coefficients and zeroes the rest, so turning it down progressively strips a sound back to its essentials — like a resolution dial for audio. At 100% nothing is discarded; at very low settings only a handful of coefficients survive and the sound reduces to a rough sketch of itself.
+
+Useful for lo-fi textures, for gradually dissolving a sound into an ambience, and (automated) for build-ups where a part gains detail as it arrives.
+
+| Param | Default | Range | Meaning |
+|---|---|---|---|
+| **Complexity** | 0.5 | 0 – 1 | Fraction of coefficients kept. 1 = keep everything, 0 = keep just one. |
+| **Levels** | 4 | 1 – 8 | DWT depth. |
+| **Mix** | 1.0 | 0 – 1 | Dry/wet. |
+
+**Neutral:** Complexity = 1.0 (the keep-set is the entire coefficient set).
+
+Wavelet family: `db4`.
+
+---
+
+### Asymmetric Filter
+
+`__asymfilter__`. A filter that reacts **before** a transient happens. Every causal filter — every analogue filter, every conventional plugin — can only respond after the fact, because it can't know what's coming. Working in the wavelet domain on a whole block at once removes that constraint: the node locates transients first, then applies a gain envelope that is *shaped differently ahead of each onset than behind it*. The result is a swell into an attack or a duck ahead of it, which no causal processor can do.
+
+| Param | Default | Range | Meaning |
+|---|---|---|---|
+| **Pre-Attack** | 20 ms | 0 – 100 ms | How far ahead of each detected onset the pre-region starts. |
+| **Post-Decay** | 50 ms | 0 – 200 ms | How far behind each onset the post-region extends. |
+| **Pre Gain** | 2.0 | 0 – 4 | Gain reached immediately before the onset. > 1 swells into the hit; < 1 ducks ahead of it. |
+| **Post Gain** | 0.5 | 0 – 2 | Gain immediately after the onset, recovering to 1 over Post-Decay. < 1 tightens/gates the tail. |
+| **Levels** | 4 | 1 – 8 | DWT depth. |
+| **Mix** | 1.0 | 0 – 1 | Dry/wet. |
+
+Onsets are found as peaks in the finest detail band, using a fixed threshold of half that band's peak — there is no sensitivity knob yet.
+
+**Neutral:** Pre Gain = 1 and Post Gain = 1. Both ramps collapse to a constant 1 (`1 + (1−1)·frac`), so the envelope stays flat even where transients are detected. Detection still runs — this is not an early-out.
+
+Caveats, both logged in `known-issues.md`:
+
+- The ms values are converted to **coefficient counts** at the sample rate, but one padded block only holds a few hundred to a couple of thousand coefficients. At 48 kHz a 512-sample block is 512 coefficients ≈ 10.7 ms, so any Pre-Attack setting above about 10 ms already covers the whole block and further increases do nothing audible. The knob is therefore much more sensitive at the bottom of its range than the ms labels suggest, and its effective range depends on the audio buffer size.
+- Onset positions are found in the finest detail band but the gain envelope is laid out across the **whole concatenated coefficient array**, whose axis isn't time — a given index means 2 samples of time in the finest band and `2^Levels` samples in the approximation band. So the pre/post regions don't land exactly where the ms labels imply. The effect is real and musical, but treat the two time knobs as *shape* controls rather than as literal milliseconds until this is reworked.
+
+Wavelet family: `db4`.
+
+---
+
+### Wavelet Vocoder
+
+`__waveletvocoder__`. A vocoder using **wavelet bands instead of fixed FFT bins**. The classic use is making an instrument talk: feed a pad or a saw into the audio input (the *carrier*) and a voice into the Modulator input, and the pad takes on the voice's spectral shape. The wavelet version differs from an FFT vocoder in that its bands are octave-wide and its time resolution scales with frequency, so consonants stay crisp instead of being smeared to the length of an FFT window.
+
+The node has an extra **Modulator** input pin (a Signal-kind input on channel 2) alongside the usual Audio In.
+
+| Param | Default | Range | Meaning |
+|---|---|---|---|
+| **Bands** | 5 | 1 – 8 | Number of wavelet bands the modulator's envelope is measured over. Fewer = coarser, more robotic; more = more intelligible. |
+| **Mix** | 1.0 | 0 – 1 | Dry/wet against the unprocessed carrier. |
+
+Behaviour notes:
+
+- **No modulator connected = clean passthrough.** The node checks for the modulator channel and returns the carrier untouched if it isn't there, so an unwired vocoder is silent-by-omission rather than silent outright.
+- **The output is mono.** After processing, channel 0 is copied over channel 1. Place any stereo widening after this node, not before.
+- Per-band gain is capped at 10× to stop a near-silent carrier band from exploding.
+
+**Neutral:** this is the one effect in the family with **no neutral knob position** — imposing the modulator's spectral envelope is the entire job, and no parameter setting makes that an identity. Its identity is a property of the *signals* instead: feed the same audio into both the carrier and the modulator and every band's scale factor becomes `sqrt(modE/carE) = 1`, so the carrier comes back untouched. That is how the self-test pins it.
+
+Wavelet family: `db4`.
+
+---
+
+### Formant Pitch Shift
+
+`__formantpitch__`. Pitch shifting **without the chipmunk effect**. Ordinary pitch shifting moves the formants — the fixed resonances of a throat or a body — along with the pitch, which is exactly what makes a shifted voice sound like a different, smaller creature. This node shifts the pitch, then measures the *original* signal's per-band energy profile and re-imposes it on the result, putting the spectral envelope back where it was while leaving the pitch moved.
+
+| Param | Default | Range | Meaning |
+|---|---|---|---|
+| **Semitones** | 0 | −24 … +24 | Pitch shift amount. |
+| **Formant Lock** | 0.8 | 0 – 1 | How much of the original formant envelope is restored. 0 = none (a plain pitch shift, chipmunk included), 1 = full restoration. The default leaves a little of the natural shift in, which usually sounds less processed. Sweeping this knob *on its own* is a gender/size morph. |
+| **Levels** | 5 | 1 – 8 | DWT depth — how finely the formant envelope is sampled. |
+| **Mix** | 1.0 | 0 – 1 | Dry/wet. |
+
+**Latency: 1536 samples (≈ 32 ms at 48 kHz)**, reported to plugin-delay compensation. The dry copy is internally delayed to match, which matters more here than elsewhere: the dry path is also where the formant envelope is measured, and on speech an un-delayed measurement would be sampling a phoneme from 32 ms earlier. As with Independent Pitch Shift there is **no bypass at 0 semitones** — the node must keep honouring its reported latency.
+
+Wavelet family: `db4`; the shift itself uses the shared phase vocoder from `pitch_core.h`.
+
+---
+
+### Wavelet Pitch Tracker (legacy)
+
+`__pitchtracker__`. Detects the fundamental pitch of incoming audio by finding the wavelet level with the strongest energy, and emits it as a normalised Signal.
+
+> **Superseded — use the [Pitch Detector](#pitch-detector) instead.** This node only resolves pitch to octave-band accuracy, and it has a signal-routing bug: it writes the detected value to channel 0 (the audio bus) instead of channel 2, so the "Pitch Out" pin actually carries silence and the node's signal output is effectively dead. It is kept only so that old projects still load. The Pitch Detector is accurate (true YIN / autocorrelation with parabolic interpolation), correctly wired, and adds algorithm choice, hop control, and log/linear mapping. Both bugs are written up in `known-issues.md`.
+
+| Param | Default | Range | Meaning |
+|---|---|---|---|
+| **Min Hz** | 50 | 20 – 5000 | Bottom of the detection/output range. |
+| **Max Hz** | 2000 | 20 – 5000 | Top of the detection/output range. |
+| **Detected Hz** | 0 | read-only | Most recent detection, for display. |
+
+Pins: Audio In, Audio Out, and a **Pitch Out** Signal output.
+
+Wavelet family: `db4`.
+
+---
+
+### Neutral settings at a glance
+
+The parameter position at which each effect is mathematically an identity. Everything in this table is asserted by the `wavelet-fx:` self-tests at **full wet**, paired with a check that moving off it does change the sound.
+
+| Effect | Neutral setting |
+|---|---|
+| Transient/Sustain Split | Transient = 1, Sustain = 1 |
+| Wavelet Denoiser | Threshold = 0 |
+| Wavelet Bitcrush | Bits = 16 |
+| Octave Shift | Shift = 0 *(early-out — does not exercise the transform)* |
+| Wavelet Multiband Comp | Ratio = 1, Low Gain = High Gain = 0 dB |
+| Wavelet Reverb | Decay = 1, Color = 0 |
+| Wavelet Complexity | Complexity = 1.0 |
+| Asymmetric Filter | Pre Gain = 1, Post Gain = 1 |
+| Wavelet Vocoder | *(no neutral knob)* modulator signal == carrier signal |
+| Independent Pitch Shift | *(none — always runs, reports 32 ms latency)* |
+| Formant Pitch Shift | *(none — always runs, reports 32 ms latency)* |
+| Every effect with a **Mix** param | Mix = 0 (bypasses the wavelet path entirely) |
 
 ---
 

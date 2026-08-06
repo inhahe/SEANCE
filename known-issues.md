@@ -536,20 +536,22 @@ assert it doesn't grow over a parameter sweep) for proving a conversion worked.
 
 ## DOC GAP: the wavelet effect suite is absent from REFERENCE.md
 
-**Found:** 2026-08-05. `REFERENCE.md` has no entry for **any** of the wavelet
-effects — Transient Split, Wavelet Denoiser, Wavelet Bitcrush, Octave Shift,
-Wavelet Multiband Comp, Wavelet Reverb, Wavelet Complexity,
-Asymmetric Filter, Wavelet Pitch Tracker, Wavelet Vocoder, Formant Pitch Shift,
-Independent Pitch Shift. They exist only as entries in the "Add node" menu and as
-one-line mentions of *planned* wavelet ideas in the README's roadmap section.
+**Found:** 2026-08-05. **FIXED 2026-08-06** — `REFERENCE.md` now has a
+`## Wavelet effects` section (TOC entry included) covering all twelve nodes:
+a shared-behaviour preamble (block-based DWT, the band↔Hz mapping for `Levels`,
+what `Mix` does, which wavelet family each node uses and why, which nodes report
+latency), then one subsection per effect with a param table (default / range /
+units), the neutral setting, and the honest caveats. A closing
+"Neutral settings at a glance" table cross-references the `wavelet-fx:`
+self-tests. Writing it turned up two real bugs, logged separately below
+("Wavelet Reverb's Decay is per-block" and "Asymmetric Filter's ms knobs").
 
-This matters more than a normal doc gap: this suite is the part of SEANCE with no
-free equivalent (unlike the wavetable synth, which competes with Vital), so it is
-the most likely thing to be productised. Each needs the usual REFERENCE treatment -
-what it does, every param with units and range, what the neutral setting is, and
-which wavelet family it uses. Add a "Wavelet effects" section with a TOC entry.
+Original rationale, kept because it still applies to anything added to this
+suite: this is the part of SEANCE with no free equivalent (unlike the wavetable
+synth, which competes with Vital), so it is the most likely thing to be
+productised — every new wavelet node needs the same treatment on day one.
 
-**Same gap, the grain synths (found 2026-08-06).** `REFERENCE.md` describes how
+**Same gap, the grain synths (found 2026-08-06, STILL OPEN).** `REFERENCE.md` describes how
 **Particle Cloud** and **Spectral Grain** relate to the shared AHDSR envelope,
 but never lists their params — "Density" appears in neither `REFERENCE.md`, the
 README, nor `docs/`. That became worth logging when both synths gained a hard
@@ -560,6 +562,92 @@ write that down. Whoever adds the params section should cover: Density (grains
 per second), Grain Size (ms), Spread, Attack/Release (as a fraction of grain
 length), Shape, Volume — and note the ceiling and that it drops the newest grain
 rather than stealing the oldest.
+
+---
+
+## BUG: Wavelet Reverb's Decay is applied per BLOCK, so the tail length depends on the audio buffer size
+
+**Found:** 2026-08-06, while writing the REFERENCE.md wavelet section — the
+neutral setting (Decay = 1) had to be explained, which meant working out what
+Decay actually does.
+
+`WaveletReverbProcessor::processBlock` (`builtin_effects.h`) ages the tail with
+
+```cpp
+for (int i = 0; i < tailLen - n; ++i)
+    tail[i] = tail[i + n] * decay;
+```
+
+Each sample migrates left by `n` (the block size) once per block and is
+multiplied by `decay` once per block. Over its life in the 8192-sample buffer a
+sample is therefore attenuated `tailLen / n` times — **16 times at a 512-sample
+buffer, 128 times at a 64-sample buffer.** At Decay = 0.9 that is 0.9^16 ≈ 0.19
+versus 0.9^128 ≈ 1.4e-6: the same knob position is a usable ambience on one
+audio device and effectively dry on another. Nothing else in SEANCE has
+buffer-size-dependent audible behaviour, and it makes the node impossible to
+preset or to reproduce between machines.
+
+**Repro:** add a Wavelet Reverb at Decay ≈ 0.9, Mix 1.0, play a percussive
+source, then change the audio device buffer size in Preferences. The tail
+shortens dramatically as the buffer gets smaller.
+
+**Proper fix:** make Decay a **time**, not a per-shift multiplier. Expose it as
+an RT60-style decay in seconds (or keep the 0–1 knob and map it onto one), and
+derive the per-block coefficient as `powf(targetGain, (float)n / (float)tailLen)`
+— or better, `expf(-(float)n / (decaySeconds * sampleRate))` — so the audible
+decay is invariant under block size and sample rate. The self-test's
+`Decay = 1` neutrality case still passes under either formulation (a decay time
+of infinity gives a coefficient of exactly 1), so the existing test stays valid;
+add a new one that runs the same input at two block sizes and asserts the tail
+envelopes match.
+
+Note the tail is also hard-bounded at 8192 samples (≈171 ms at 48 kHz)
+regardless of Decay, which is short for a reverb. If the decay-time rework
+happens, sizing the buffer from the requested decay time is the natural
+companion change.
+
+---
+
+## BUG: Asymmetric Filter's Pre-Attack / Post-Decay are labelled in ms but indexed in coefficients
+
+**Found:** 2026-08-06, same pass as the entry above.
+
+`AsymmetricFilterProcessor::processBlock` converts the two time knobs with
+`preSamples = (int)(preMs * 0.001 * sampleRate)` and then uses those counts as
+**indices into `gainEnv`**, which is `padLen` entries long and spans the
+concatenated wavelet coefficient array. Two things are wrong with that:
+
+1. **The counts overflow the block.** At 48 kHz the default Pre-Attack of 20 ms
+   is 960 samples, but a 512-sample block pads to 512 coefficients — the
+   pre-region already covers the entire block. Every Pre-Attack setting above
+   roughly `1000 * blockSize / sampleRate` ms (≈10.7 ms at 512/48 k) behaves
+   identically, so most of the knob's travel is dead and where the dead zone
+   starts moves with the audio buffer size.
+2. **The coefficient axis is not a time axis.** Onsets are detected in the
+   finest detail band (`t = i - finestStart`, so `t` counts *finest-band*
+   coefficients, each worth 2 input samples) but `gainEnv` is indexed across the
+   whole array, where an index in the approximation band is worth `2^Levels`
+   input samples. So a "20 ms pre-attack region" is neither 20 ms nor
+   consistently scaled across bands, and small `t` values land in the
+   approximation region rather than near the onset.
+
+The node still sounds like something useful — that is why this is a
+correctness/labelling bug rather than a broken-feature bug — but the params
+don't mean what they say, and it can't be presetted reliably.
+
+**Proper fix:** build the gain envelope in the **time domain** at the onset
+positions (converted out of finest-band coefficient index by multiplying by 2),
+then map that envelope onto each band by decimating it by that band's stride, so
+one wall-clock millisecond covers the same wall-clock span in every band. Clamp
+`preSamples`/`postSamples` to the padded block length and note in the tooltip
+that the usable range is bounded by the audio buffer size — or, better, keep
+enough history to make the ms values honest independent of block size. While in
+there: the onset threshold is hardcoded at `0.5 * maxFine`; it should be a
+Sensitivity param.
+
+**Documented meanwhile:** `REFERENCE.md` → Wavelet effects → Asymmetric Filter
+carries both caveats explicitly, telling the user to treat the two knobs as
+shape controls rather than literal milliseconds.
 
 ---
 

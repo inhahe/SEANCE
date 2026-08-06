@@ -175,7 +175,7 @@ triaged below. Re-run it before trusting this list again — it is a snapshot.
   selectable size), `FFT`'s allocation-free pointer API, and a gain table
   precomputed per size in `prepareToPlay`. Guarded by a capacity-growth test.
 
-### Fixed (commit `d0c14b4`)
+### Fixed (commit `231ef5d`)
 
 - **`SignalEQProcessor`** (`builtin_effects.h`) — same shape as Curve EQ: an
   `FFT` plus seven `std::vector`s per block in FFT mode (`Mode` = 1). Converted

@@ -157,11 +157,22 @@ a + b</code></pre>
 
 <p>This toggle only changes the <em>gain</em> math; it doesn't add or remove any Position knob. Position knobs come purely from how your dots are spread out (see below), so you need at least two dots spanning an axis before there's anything to automate either way.</p>
 
-<h3>The 3D anaglyph viewport</h3>
+<h3>Seeing the arrangement in real 3D</h3>
 
-<p>For 3D scatter spaces (or higher, with the projection combo controlling which axes are shown), there's an optional anaglyph 3D rendering mode. Toggle <strong>3D</strong> in the toolbar, put on red/cyan glasses, and the frame positions appear in stereoscopic depth. This is mostly useful as a visualization aid when you're trying to keep track of where many scatter frames sit relative to each other in a 3D-or-higher space.</p>
+<p>Once your waveforms are spread across three or more dimensions, a flat picture stops being much help — dots that are far apart in depth land on top of each other on screen. So the arrangement view can draw itself in genuine stereoscopic 3D. The <strong>View</strong> dropdown at the top of the sidebar has four settings:</p>
 
-<p>The IPD, viewing distance, and depth sliders let you tune the stereo for your eyes and screen — average IPD is around 63 mm, typical viewing distance ~60 cm. Adjust depth for more or less dramatic 3D protrusion.</p>
+<ul>
+  <li><strong>Flat 2D</strong> — the normal picture. This is the default.</li>
+  <li><strong>3D Anaglyph (red-cyan glasses)</strong> — one picture with the two eyes tinted red and cyan. Put on a pair of red/cyan paper glasses and the arrangement pops into depth. Easiest to get working, but colours get muddy, so it's better for judging <em>layout</em> than for reading the dot colours.</li>
+  <li><strong>3D Cross-eyed stereoscope</strong> — draws two copies side by side. Cross your eyes slightly until a third copy floats into place between them, then let it sharpen. No glasses needed, but it takes a bit of practice and some people find it tiring.</li>
+  <li><strong>3D Parallel stereoscope</strong> — the same two copies, swapped over, for people who fuse by relaxing their eyes <em>outwards</em> (looking "through" the screen) rather than crossing them. This is also the arrangement a Holmes stereoscope or a VR-style viewer expects.</li>
+</ul>
+
+<p><strong>If the depth looks inside-out</strong> — near dots reading as far away, the cube turning itself the wrong way as you orbit — you're on the wrong one of the two side-by-side modes for the way you're fusing. Just switch between <em>Cross-eyed</em> and <em>Parallel</em>; they're the same pair of images in the opposite order.</p>
+
+<p>All three 3D modes are live, not a snapshot: <strong>right-drag anywhere in the view to orbit the camera</strong>, and the rotation sliders in the sidebar turn the remaining planes for spaces with more than three dimensions. Clicking, dragging and Shift+clicking dots all still work — in the side-by-side modes just work in whichever half your pointer is in.</p>
+
+<p>The depth effect is calculated from real viewing geometry (eye spacing, how far you sit from the screen, and your screen's pixel density, which SEANCE detects for you), so it should fuse comfortably at a normal desk distance. It's purely a visualization aid — nothing here changes the sound.</p>
 
 <h2 id="morphing-shape-bending-warp">Morphing &amp; shape-bending (warp)</h2>
 

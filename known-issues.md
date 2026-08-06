@@ -1507,3 +1507,41 @@ completion uninterrupted**, and if anything looks off, verify no
 targets the desynced-state symptom; the build tooling itself is not broken,
 so this is a rare/transient hazard, not a guaranteed recurrence on every
 layout-changing header edit.
+
+## Stereoscopic viewport geometry (IPD / viewing distance / depth) has no UI
+
+**Where:** `cpp/src/layered_wave_editor.cpp` — `ScatterView` members `ipdMm`
+(63), `viewingDistMm` (600), `sceneDepthMm` (60), consumed by
+`applyParallax()`. `dpi` is the only one actually written at runtime
+(`LayeredWaveEditorComponent` auto-detects it from the JUCE display, ~line
+9487).
+
+The four stereoscopic View modes (Flat 2D / Anaglyph / Cross-eyed / Parallel)
+compute per-eye disparity from real viewing geometry: a point at depth *z* is
+offset by `(IPD/2) · z/(D+z)` mm, converted to pixels via the display DPI.
+Three of those four inputs are hardcoded defaults that no control can change.
+The comment above the members claims "The parent editor pushes these in from
+its sliders so the parallax matches the user's actual eyes / screen" — those
+sliders do not exist, and never did. (`grep ipdMm` finds only the declaration
+and the one use site.)
+
+This matters more than a normal missing-control gap because stereo fusion is
+physiological, not cosmetic. Someone whose IPD is well off 63 mm, or who sits
+much closer/farther than 600 mm, gets disparity that is wrong rather than
+merely suboptimal — at best the image is uncomfortable to fuse, at worst it
+won't fuse at all and the mode looks broken. Scene depth is the "how dramatic"
+control and is the one most likely to be wanted routinely: 60 mm is a
+conservative setting chosen to fuse easily, so users who fuse well have no way
+to ask for more depth.
+
+**Proper fix:** three sliders in the arrangement view's sidebar, shown only
+when the View combo is on a 3D mode (and greyed with an explaining tooltip
+otherwise, per the grayed-out-controls rule). Ranges roughly IPD 50–75 mm,
+viewing distance 300–1200 mm, scene depth 0–200 mm. They should persist with
+the editor's view preferences rather than the wavetable document — they
+describe the *user's eyes and desk*, not the patch, so they must not travel
+with a shared `.ssp`/wavetable file. DPI stays auto-detected with no control.
+
+Two doc surfaces described these sliders as if they existed
+(`REFERENCE.md` § "3D anaglyph viewport" and `docs/wavetables.html`); both were
+corrected to describe the shipping UI, and REFERENCE.md now points here.

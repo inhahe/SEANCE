@@ -926,15 +926,24 @@ The **Selected waveform position** strip in the sidebar shows one slider per **g
 
 **Distance fades volume** (`absoluteBlend`) — a per-wavetable toggle below the **Blend width** slider. By default the blend weights are **normalized** (sum-to-1) Shepard weights, so the blend always equals a full-volume weighted average of the frames — moving Position around changes *which* frames you hear but never the overall loudness. With *Distance fades volume* on, the blend switches to **compact-support Wendland C²** weights used directly as **gain** (no normalization): each scatter dot becomes a "loudness island" that's loudest at its center and fades to silence at the edge of its radius (here the Blend-width slider is the literal fade radius in normalized [0,1] units), and a Position sitting in the gap outside every frame's radius is **intentionally silent**. This only affects the gain math — it does **not** create or remove any Position axis (that's purely the dots' spatial spread, above), so it's only meaningful once you have two or more dots to span an axis. The same `absoluteBlend` flag drives the Grid-mode **Empty cells fade volume** toggle (below) — the two modes share one persisted field, relabeled per mode.
 
-### 3D anaglyph viewport
+### Stereoscopic 3D viewport
 
-For 3D-or-higher scatter spaces, the toolbar's **3D** toggle enables a red/cyan anaglyph rendering of the frame positions. The projection combo selects which axes are shown when the space has more than 3 dimensions. Tuning sliders:
+<a name="stereoscopic-3d-viewport"></a>The arrangement view can render the frame positions with real stereoscopic depth. The **View** combo at the top of the arrangement view's sidebar picks the mode (`ScatterView::StereoMode`):
 
-- **IPD** — interpupillary distance; typical adult ~63 mm
-- **Viewing distance** — your eyes to the screen; typical ~60 cm
-- **Depth** — how dramatic the 3D protrusion is
+| View mode | What it draws | What you need |
+|---|---|---|
+| **Flat 2D** (default) | One monoscopic projection, no rotation applied. | Nothing. |
+| **3D Anaglyph (red-cyan glasses)** | One composite image with the left eye in the red channel and the right eye in cyan. | Red/cyan paper glasses. |
+| **3D Cross-eyed stereoscope** | Side-by-side pair; the **left** half carries the **right** eye's image. You cross your eyes until the two halves fuse into a third image in the middle. | Nothing — but it takes practice. |
+| **3D Parallel stereoscope** | The same side-by-side pair with the eye assignment swapped, so the left half is the left eye. Viewed "wall-eyed" (diverging, as if looking through the screen). This is how a Holmes stereoscope or a VR headset presents a pair. | Nothing, or a stereoscope. |
 
-Visualization aid only; doesn't affect the audio.
+Cross-eyed and parallel are the same two images in the opposite order — the only code difference is the sign of `leftEyeSign`. Pick whichever fusing technique you can do; if a mode looks *inverted* (near things reading as far), you're using the wrong one for your technique, so switch to the other.
+
+**All three 3D modes** (not just anaglyph) count as `is3D()`, which turns on the yaw/pitch rotation, reads the Z projection axis, and enables perspective size scaling. **Right-drag orbits the camera** around the (X,Z) and (Y,Z) planes; other plane angles come from the rotation sliders in the sidebar. In a split mode the two halves each carry a corner label (`(left eye)` / `(right eye)`; anaglyph labels itself `(red-cyan glasses)`), and mouse hit-testing resolves against whichever half the pointer is in (`sceneRectForPoint`), so clicking and dragging dots keeps working in stereo.
+
+**Parallax is computed from real-world geometry**, not a fudge factor (`applyParallax`). The screen plane sits at z=0 with the viewer's eyes at distance *D* in front; a point at depth *z* gets a per-eye disparity of `(IPD/2) · z/(D+z)`, converted from mm to pixels via the display DPI. Points behind the screen get uncrossed disparity and fuse behind it; points in front fall out of the same formula with crossed disparity. The inputs are currently fixed at **IPD 63 mm**, **viewing distance 600 mm** and **scene depth 60 mm** (the physical depth the unit cube maps to), with **DPI auto-detected** from the JUCE display at construction. They are not yet exposed as sliders — see `known-issues.md`.
+
+The projection combo selects which axes drive screen X/Y/Z when the space has more than 3 dimensions. Visualization aid only; none of this affects the audio.
 
 ### Frame types
 

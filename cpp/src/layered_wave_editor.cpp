@@ -5909,8 +5909,15 @@ public:
             || stereoMode == StereoMode::Parallel;
     }
 
-    // Real-world stereo geometry. The parent editor pushes these in from
-    // its sliders so the parallax matches the user's actual eyes / screen.
+    // Real-world stereo geometry, feeding applyParallax(). Only `dpi` is
+    // currently set at runtime (auto-detected from the JUCE display by
+    // LayeredWaveEditorComponent); the other three are fixed defaults with
+    // no UI yet. The values below are conservative - chosen to fuse easily
+    // for most people rather than to give the most dramatic depth. See
+    // known-issues.md ("Stereoscopic viewport geometry ... has no UI") for
+    // why exposing them matters: stereo fusion depends on the viewer's
+    // actual eye spacing and seating distance, so a bad match doesn't just
+    // look less good, it can fail to fuse at all.
     float ipdMm = 63.0f;          // interpupillary distance
     float viewingDistMm = 600.0f; // distance from eyes to screen
     float sceneDepthMm  = 60.0f;  // physical depth of the unit cube

@@ -236,7 +236,7 @@ triaged below. Re-run it before trusting this list again — it is a snapshot.
     closing it properly means routing bin-count changes exclusively through the
     rebuild path, not micro-optimising the fallback.
 
-### Fixed (commit `HASH_TERRAIN`)
+### Fixed (commit `09ef5a8`)
 
 - **`TerrainSynthProcessor`** (`terrain_synth.cpp`) — by far the worst of the
   set. The original triage listed the per-*block* allocations; reading the code

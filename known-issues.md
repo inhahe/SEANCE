@@ -636,7 +636,7 @@ companion change.
 
 ---
 
-## MOSTLY FIXED (2026-08-06, HASH_YYY): Asymmetric Filter's Pre-Attack / Post-Decay were labelled in ms but indexed in coefficients
+## MOSTLY FIXED (2026-08-06, be38ce9): Asymmetric Filter's Pre-Attack / Post-Decay were labelled in ms but indexed in coefficients
 
 **Fixed — problem 2, the wrong axis.** The gain envelope is now built along the
 **time** axis in samples, from onset positions converted out of finest-band

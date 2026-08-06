@@ -6835,6 +6835,95 @@ void testAssetLibrary(Report& r) {
                    "spectralgrain: cloud still audible during the sweep", peak);
     }
 
+    // ---- Every built-in synth survives a transport Stop ----------------------
+    //
+    // Transport panic calls AudioProcessorGraph::reset(), which calls reset()
+    // on every processor. Four of the builtin_effects.h synths implemented that
+    // as `voices.clear()` - but their voice pool is only ever sized in the
+    // CONSTRUCTOR, so nothing ever refilled it. After a single press of Stop:
+    // allocVoice() found no free voice, fell through to its steal path, and
+    // returned voices[0] on an empty vector (out of bounds); the render loop
+    // then iterated zero voices. The synth went permanently silent and stayed
+    // that way for the rest of the session.
+    //
+    // This checks the two halves that matter for every one of them: panic
+    // really does silence a held note, AND the synth still plays afterwards.
+    //
+    // Verified by reinstating both defects. voices.clear() makes "still plays
+    // after a transport Stop" read exactly 0.00000 for FM / PD / Additive
+    // (against 0.19-0.43 for the fixed code). Dropping ParticleSynth's
+    // noteAmpEnv.hardReset() makes "actually silences a held note" read
+    // 0.39244 (against 0.00000) - its spawn loop is gated on the envelope, so
+    // clearing the grain list alone let the cloud regrow within a millisecond.
+    {
+        auto panicRoundTrip = [&r](const char* label, const char* script,
+                                   std::vector<Param> params,
+                                   auto&& makeProc) {
+            Node node;
+            node.id     = 1;
+            node.name   = "selftest-panic";
+            node.script = script;
+            node.params = std::move(params);
+
+            const int bs = 512;
+            auto proc = makeProc(node);
+            proc->prepareToPlay(44100.0, bs);
+            juce::AudioBuffer<float> buf(2, bs);
+
+            auto play = [&](int blocks, bool noteOn) {
+                float pk = 0.0f;
+                for (int b = 0; b < blocks; ++b) {
+                    buf.clear();
+                    juce::MidiBuffer midi;
+                    if (noteOn && b == 0)
+                        midi.addEvent(juce::MidiMessage::noteOn(1, 60, (juce::uint8)110), 0);
+                    proc->processBlock(buf, midi);
+                    for (int s = 0; s < bs; ++s)
+                        pk = std::max(pk, std::abs(buf.getSample(0, s)));
+                }
+                return pk;
+            };
+
+            const float before = play(10, true);
+            r.checkVal(before > 1e-4f,
+                       juce::String(label) + ": sounds before the transport Stop", before);
+
+            proc->reset();     // <- the transport-panic path
+
+            // The note is still HELD (no note-off was sent), so this is the
+            // case where panic has to do the work.
+            const float during = play(4, false);
+            r.checkVal(during < 1e-4f,
+                       juce::String(label) + ": transport Stop actually silences a held note",
+                       during);
+
+            const float after = play(10, true);
+            r.checkVal(after > 1e-4f,
+                       juce::String(label) + ": still plays after a transport Stop",
+                       after);
+        };
+
+        panicRoundTrip("panic/fmsynth", "",
+                       { { "Algorithm", 0.0f, 0.0f, 7.0f },
+                         { "Volume",    0.5f, 0.0f, 1.0f } },
+                       [](Node& n) { return std::make_unique<FMSynthProcessor>(n); });
+
+        panicRoundTrip("panic/pdsynth", "",
+                       { { "Volume", 0.5f, 0.0f, 1.0f } },
+                       [](Node& n) { return std::make_unique<PDSynthProcessor>(n); });
+
+        panicRoundTrip("panic/additive", "",
+                       { { "Partials", 16.0f, 1.0f, 64.0f },
+                         { "Volume",    0.5f, 0.0f,  1.0f } },
+                       [](Node& n) { return std::make_unique<AdditiveSynthProcessor>(n); });
+
+        panicRoundTrip("panic/particlesynth", "",
+                       { { "Density",    60.0f, 1.0f, 200.0f },
+                         { "Grain Size", 40.0f, 1.0f, 500.0f },
+                         { "Volume",      0.5f, 0.0f,   1.0f } },
+                       [](Node& n) { return std::make_unique<ParticleSynthProcessor>(n); });
+    }
+
     // ---- SpectralGrain still plays after a transport Stop --------------------
     //
     // reset() (the transport-panic hook) used to be `voices.clear()`. Nothing

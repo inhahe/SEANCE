@@ -1327,11 +1327,23 @@ private:
 // ==============================================================================
 class FMSynthProcessor : public juce::AudioProcessor {
 public:
-    FMSynthProcessor(Node& n) : node(n) { voices.resize(16); }
+    // Polyphony. Fixed for the processor's lifetime - see reset().
+    static constexpr int kMaxVoices = 16;
+
+    FMSynthProcessor(Node& n) : node(n) { voices.assign(kMaxVoices, Voice{}); }
     const juce::String getName() const override { return "FM Synth"; }
     // Transport panic (Stop): drop every sounding voice so notes stop dead
     // instead of finishing their release tail.
-    void reset() override { voices.clear(); }
+    // Transport panic (Stop): silence every voice.
+    // NB: this RESETS the voices, it does NOT remove them. This used to be
+    // voices.clear(), which permanently emptied the pool - the pool is only
+    // ever sized in the constructor, so nothing refilled it. After one press of
+    // Stop, allocVoice() fell through to its steal path and dereferenced
+    // voices[0] on an empty vector (out of bounds), and the render loop then
+    // iterated zero voices, leaving the synth silent for the rest of the
+    // session. Anything that empties `voices` must also refill it; not
+    // emptying it is safer.
+    void reset() override { for (auto& v : voices) v = Voice{}; }
     void prepareToPlay(double sr, int) override { sampleRate = sr; }
     void releaseResources() override {}
 
@@ -1540,6 +1552,10 @@ private:
     };
     std::vector<Voice> voices;
     Voice& allocVoice() {
+        // Guarantee a pool before indexing it: returning voices[0] on an empty
+        // vector is out-of-bounds, and it is not obvious from the call site
+        // that `voices` is non-empty.
+        if (voices.empty()) voices.assign(kMaxVoices, Voice{});
         for (auto& v : voices) if (!v.active) return v;
         float oldest = -1; int idx = 0;
         for (int i = 0; i < (int)voices.size(); ++i)
@@ -1569,11 +1585,23 @@ private:
 // ==============================================================================
 class PDSynthProcessor : public juce::AudioProcessor {
 public:
-    PDSynthProcessor(Node& n) : node(n) { voices.resize(12); }
+    // Polyphony. Fixed for the processor's lifetime - see reset().
+    static constexpr int kMaxVoices = 12;
+
+    PDSynthProcessor(Node& n) : node(n) { voices.assign(kMaxVoices, Voice{}); }
     const juce::String getName() const override { return "PD Synth"; }
     // Transport panic (Stop): drop every sounding voice so notes stop dead
     // instead of finishing their release tail.
-    void reset() override { voices.clear(); }
+    // Transport panic (Stop): silence every voice.
+    // NB: this RESETS the voices, it does NOT remove them. This used to be
+    // voices.clear(), which permanently emptied the pool - the pool is only
+    // ever sized in the constructor, so nothing refilled it. After one press of
+    // Stop, allocVoice() fell through to its steal path and dereferenced
+    // voices[0] on an empty vector (out of bounds), and the render loop then
+    // iterated zero voices, leaving the synth silent for the rest of the
+    // session. Anything that empties `voices` must also refill it; not
+    // emptying it is safer.
+    void reset() override { for (auto& v : voices) v = Voice{}; }
     void prepareToPlay(double sr, int) override { sampleRate = sr; }
     void releaseResources() override {}
 
@@ -1732,6 +1760,10 @@ private:
     };
     std::vector<Voice> voices;
     Voice& allocVoice() {
+        // Guarantee a pool before indexing it: returning voices[0] on an empty
+        // vector is out-of-bounds, and it is not obvious from the call site
+        // that `voices` is non-empty.
+        if (voices.empty()) voices.assign(kMaxVoices, Voice{});
         for (auto& v : voices) if (!v.active) return v;
         float oldest = -1; int idx = 0;
         for (int i = 0; i < (int)voices.size(); ++i)
@@ -1770,7 +1802,17 @@ public:
     const juce::String getName() const override { return "Particle"; }
     // Transport panic (Stop): drop every in-flight grain so the particle
     // cloud stops dead instead of finishing its tails.
-    void reset() override { grains.clear(); }
+    // The note envelope has to be hard-reset too, not just the grain list: the
+    // spawn loop is gated on noteAmpEnv.isActive(), so clearing `grains` alone
+    // silenced the cloud for a fraction of a millisecond and then let it grow
+    // straight back - panic did nothing at all for a held note. (This synth
+    // ignores All Notes Off, so panic is the only thing that can stop it.)
+    void reset() override {
+        grains.clear();
+        noteActive = false;
+        noteAmpEnv.hardReset();
+        spawnTimer = 0.0f;
+    }
     void prepareToPlay(double sr, int) override {
         sampleRate = sr;
         // Reserve the hard cap up front so the per-sample spawn loop below can
@@ -3355,11 +3397,23 @@ private:
 // ==============================================================================
 class AdditiveSynthProcessor : public juce::AudioProcessor {
 public:
-    AdditiveSynthProcessor(Node& n) : node(n) { voices.resize(12); }
+    // Polyphony. Fixed for the processor's lifetime - see reset().
+    static constexpr int kMaxVoices = 12;
+
+    AdditiveSynthProcessor(Node& n) : node(n) { voices.assign(kMaxVoices, Voice{}); }
     const juce::String getName() const override { return "Additive"; }
     // Transport panic (Stop): drop every sounding voice so notes stop dead
     // instead of finishing their release tail.
-    void reset() override { voices.clear(); }
+    // Transport panic (Stop): silence every voice.
+    // NB: this RESETS the voices, it does NOT remove them. This used to be
+    // voices.clear(), which permanently emptied the pool - the pool is only
+    // ever sized in the constructor, so nothing refilled it. After one press of
+    // Stop, allocVoice() fell through to its steal path and dereferenced
+    // voices[0] on an empty vector (out of bounds), and the render loop then
+    // iterated zero voices, leaving the synth silent for the rest of the
+    // session. Anything that empties `voices` must also refill it; not
+    // emptying it is safer.
+    void reset() override { for (auto& v : voices) v = Voice{}; }
     void prepareToPlay(double sr, int) override { sampleRate = sr; }
     void releaseResources() override {}
 
@@ -3486,6 +3540,10 @@ private:
     };
     std::vector<Voice> voices;
     Voice& allocVoice() {
+        // Guarantee a pool before indexing it: returning voices[0] on an empty
+        // vector is out-of-bounds, and it is not obvious from the call site
+        // that `voices` is non-empty.
+        if (voices.empty()) voices.assign(kMaxVoices, Voice{});
         for (auto& v : voices) if (!v.active) return v;
         float oldest = -1; int idx = 0;
         for (int i = 0; i < (int)voices.size(); ++i)

@@ -40,6 +40,7 @@
 #include "multitrack_recorder.h"    // MultitrackRecorder - live input capture
 #include "pan_processor.h"          // PanProcessor - the mute/solo/record-mute chokepoint
 #include "soundfont_processor.h"    // SoundFontProcessor - .sf2 / .sfz instrument node
+#include "signal_shape_node.h"      // SignalShapeProcessor - the scriptable Signal node
 
 #include <juce_audio_formats/juce_audio_formats.h>
 #include <juce_graphics/juce_graphics.h>
@@ -6058,6 +6059,112 @@ void testAssetLibrary(Report& r) {
         r.checkVal(peak > 1e-3, "soundfont: sampler audible after the sweep", peak);
 
         sfDir.deleteRecursively();
+    }
+
+    // ---- SignalShapeProcessor renders without allocating --------------------
+    //
+    // The Signal Shape node's per-sample loop was the worst offender found in
+    // the allocation sweep (agent-todo item 3), because the cost scaled with the
+    // expression vocabulary rather than being one buffer:
+    //   - `std::vector<const float*> sigChans` built per block (and handed to
+    //     the block-mode runtime as ScriptBlockCtx::sig, so it had to outlive
+    //     the call anyway).
+    //   - `std::unordered_map<std::string,float> vars` CONSTRUCTED PER BLOCK:
+    //     a bucket array plus one node allocation for each of the ~12 fixed
+    //     variables and every s1..sN, then all of it freed at the end of the
+    //     block. Roughly 15 allocations per callback.
+    //   - `std::function<float(float)> shapeFn` constructed per block. It fits
+    //     MSVC's small-buffer optimisation today, but whether a std::function
+    //     heap-allocates is an implementation detail we shouldn't bet the audio
+    //     thread on.
+    //   - `ScriptVars sv` on the transport play edge, same map cost.
+    //   - the per-sample s-list binding rebuilt a `"s" + std::to_string(i+1)`
+    //     key for every input of every sample.
+    // All are now members; `vars` survives across blocks so operator[] only
+    // overwrites, and is rebuilt only when the s-list width changes.
+    //
+    // The capacity proxy counts `vars.bucket_count() + vars.size()`, so both a
+    // rehash and a single newly-inserted key (one node allocation) register.
+    {
+        Transport transport;
+        transport.sampleRate = 44100.0;
+        transport.bpm        = 120.0;
+        transport.playing    = true;
+
+        SignalShapeDoc doc = SignalShapeDoc::defaultLFO();
+        doc.expr             = "curve * 0.5 + s1 * 0.25 + gate * 0.25";
+        doc.triggerExpr      = "gate";      // exercises the trigger-eval path too
+        doc.signalInputCount = 2;
+        doc.layers.layers.push_back(WaveLayer{});   // a real shape to sample
+
+        Node node;
+        node.id     = 1;
+        node.type   = NodeType::SignalShape;
+        node.name   = "selftest-signalshape";
+        node.script = doc.encode();
+        node.pinsIn .push_back(Pin{ 1, "MIDI In", PinKind::Midi,   true,  2 });
+        node.pinsIn .push_back(Pin{ 2, "s1",      PinKind::Signal, true,  1 });
+        node.pinsIn .push_back(Pin{ 3, "s2",      PinKind::Signal, true,  1 });
+        node.pinsOut.push_back(Pin{ 100, "o1",    PinKind::Signal, false, 1 });
+        node.params.push_back({ "Rate",      2.0f, 0.0f, 20.0f });
+        node.params.push_back({ "Beat Sync", 0.0f, 0.0f, 1.0f });
+        node.params.push_back({ "Phase",     0.0f, 0.0f, 1.0f });
+        node.params.push_back({ "Output",    0.5f, 0.0f, 1.0f });
+
+        const int maxBlock = 512;
+        SignalShapeProcessor proc(node, transport);
+        proc.prepareToPlay(44100.0, maxBlock);
+
+        // 2 audio channels + 2 control channels (s1/s2 in, o1 out share them).
+        juce::AudioBuffer<float> buf(4, maxBlock);
+        int64_t pos = 0;
+        auto runBlock = [&](int len, bool noteOn) {
+            juce::AudioBuffer<float> view(buf.getArrayOfWritePointers(),
+                                          buf.getNumChannels(), len);
+            view.clear();
+            // Feed the control inputs something non-constant so s1/s2 actually
+            // move and the expression can't be folded away.
+            for (int ch = 2; ch < 4; ++ch)
+                for (int s = 0; s < len; ++s)
+                    view.setSample(ch, s, 0.5f + 0.4f * std::sin(0.01f * (s + ch)));
+            juce::MidiBuffer midi;
+            if (noteOn)
+                midi.addEvent(juce::MidiMessage::noteOn(1, 60, (juce::uint8)100), 0);
+            proc.processBlock(view, midi);
+            transport.positionSamples = (pos += len);
+        };
+
+        // Warm up: cross the play edge (which runs the start() hook and its own
+        // variable map) and let every lazily-sized buffer settle.
+        runBlock(maxBlock, true);
+        for (int i = 0; i < 3; ++i) runBlock(maxBlock, false);
+
+        const size_t before = proc.scratchCapacityBytes();
+
+        const int lens[] = { 512, 480, 256, 64, 333, 512 };
+        for (int pass = 0; pass < 60; ++pass) {
+            node.params[0].value = 0.5f + (pass % 9);       // Rate
+            node.params[1].value = (float)(pass % 2);       // Beat Sync
+            node.params[2].value = (pass % 7) / 7.0f;       // Phase
+            runBlock(lens[pass % 6], (pass % 5) == 0);
+        }
+        const size_t after = proc.scratchCapacityBytes();
+        r.checkVal(after == before,
+                   "signalshape: 60 blocks sweeping Rate / Beat Sync / Phase / "
+                   "block length allocate nothing (scratch capacity growth, bytes)",
+                   (double)after - (double)before);
+
+        // Non-vacuity: the node must be driving its output channel, and the
+        // output must actually vary - a stuck constant would pass a peak test
+        // while proving the expression never ran.
+        runBlock(maxBlock, true);
+        float lo = 1e9f, hi = -1e9f;
+        for (int s = 0; s < maxBlock; ++s) {
+            float v = buf.getSample(2, s);
+            lo = std::min(lo, v); hi = std::max(hi, v);
+        }
+        r.checkVal(hi - lo > 1e-4f,
+                   "signalshape: output still modulating after the sweep", hi - lo);
     }
 
     // ---- Song length: mid-bar content end plays in full (no bar-rounding) ----

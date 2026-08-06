@@ -180,7 +180,7 @@ public:
     SignalShapeProcessor(Node& node, Transport& transport);
 
     const juce::String getName() const override { return node.name; }
-    void prepareToPlay(double sr, int bs) override { sampleRate = sr; }
+    void prepareToPlay(double sr, int bs) override;
     void releaseResources() override {}
     void processBlock(juce::AudioBuffer<float>& buf, juce::MidiBuffer& midi) override;
     double getTailLengthSeconds() const override { return 0; }
@@ -294,6 +294,63 @@ private:
     // (the same hazard the terrain synth hit). Kept as a member to avoid
     // reallocating on the audio thread.
     juce::AudioBuffer<float> ctrlIn;
+
+    // ---- audio-thread scratch (see scratchCapacityBytes) --------------------
+    // All three of these were locals in processBlock, i.e. heap traffic on every
+    // callback:
+    //   sigChans  - read pointers for the s1..sN control inputs. Also handed to
+    //               the block-mode runtime as ScriptBlockCtx::sig, so it has to
+    //               outlive the call anyway.
+    //   vars      - the expression variable bindings. Worst of the three: a
+    //               fresh unordered_map per block meant a bucket array plus a
+    //               node allocation for every one of the ~12 fixed keys and each
+    //               s1..sN. Kept alive across blocks, operator[] on an existing
+    //               key only overwrites the value. Rebuilt (varsSigCount) when
+    //               the input count changes, so a shrunk s-list can't leave a
+    //               stale sN readable by an expression.
+    //   startVars - the play-edge start() hook's bindings; same reuse.
+    std::vector<const float*> sigChans;
+    ScriptVars                vars;
+    int                       varsSigCount = -1;
+    ScriptVars                startVars;
+    // Cached "s1".."sN" key names, so the per-sample binding doesn't rebuild a
+    // std::string for every input of every sample.
+    std::vector<std::string>  sigVarNames;
+
+    // shape(pos) sampler handed to the expression parser. Built once (it only
+    // captures `this`, and shapeSamples is a member, so it stays valid across
+    // rebuilds) instead of being reconstructed per block. std::function is
+    // allowed to heap-allocate for captures that don't fit its small-buffer
+    // optimisation, and that's an implementation detail we shouldn't be betting
+    // the audio thread on.
+    std::function<float(float)> shapeFn;
+
+public:
+    // Total bytes held by the audio-thread scratch above. The self-test asserts
+    // this doesn't grow across a render, which is how we prove processBlock is
+    // allocation-free without hooking global operator new (SEANCE hosts
+    // third-party VST3s, whose allocations a global hook would also catch).
+    // `vars` contributes both its bucket count and its size: a rehash grows the
+    // former, and a newly inserted key (one node allocation) grows the latter.
+    size_t scratchCapacityBytes() const {
+        size_t n = sigChans.capacity() * sizeof(const float*)
+                 + blockOut.capacity() * sizeof(float)
+                 + outPtrs.capacity()  * sizeof(float*)
+                 + outBufs.capacity()  * sizeof(std::vector<float>)
+                 + (vars.bucket_count()      + vars.size())      * sizeof(void*)
+                 + (startVars.bucket_count() + startVars.size()) * sizeof(void*)
+                 + midiInEvents.capacity() * sizeof(ScriptMidiEvent)
+                 + lastOuts.capacity() * sizeof(float)
+                 + sigVarNames.capacity() * sizeof(std::string);
+        // ctrlIn is deliberately not counted: setSize(..., avoidReallocating)
+        // reports the *requested* sample count, which tracks the host block
+        // size, so it would make the proxy fluctuate for a buffer that only ever
+        // grows (and only when a block is longer than any seen before).
+        for (const auto& b : outBufs) n += b.capacity() * sizeof(float);
+        return n;
+    }
+
+private:
 
     // MIDI state tracked across blocks (used by gate / freq / note / vel
     // expression variables).

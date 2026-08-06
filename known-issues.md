@@ -324,24 +324,61 @@ this one didn't, and presumably why it went unnoticed. Fixed to `substr(8)`; the
 self-test now asserts `proc.isSFZ()` after construction, which pins the offset
 down for good.
 
+### Fixed (commit `HASH_SS`) — `SignalShapeProcessor`
+
+The worst offender of the sweep, because the cost scaled with the expression
+vocabulary rather than being one buffer. Per block, `processBlock` constructed:
+
+- `std::vector<const float*> sigChans` — the s1..sN read pointers. Also handed
+  to the block-mode runtime as `ScriptBlockCtx::sig`, so it had to outlive the
+  call anyway. Now a member; `clear()` + `push_back` keeps the capacity.
+- `std::unordered_map<std::string,float> vars` — **a whole map per block**: a
+  bucket array plus one node allocation for each of the ~12 fixed variables and
+  every s1..sN, all freed again at the end of the block. Roughly 15 allocations
+  per callback. Now a member that survives across blocks, so `operator[]` on an
+  existing key only overwrites the value. Rebuilt only when `signalInputCount`
+  changes (tracked by `varsSigCount`), so shrinking the s-list can't leave a
+  stale `sN` visible to an expression.
+- `std::function<float(float)> shapeFn` — the `shape(pos)` sampler. Built once
+  now (in the constructor and in `prepareToPlay`; it captures only `this`, and
+  `shapeSamples` is a member, so a shape rebuild doesn't invalidate it). It fits
+  MSVC's small-buffer optimisation today, but whether a `std::function`
+  heap-allocates is an implementation detail not worth betting the audio thread
+  on.
+- `ScriptVars sv` on the transport play edge (two sites) — same map cost, now
+  the reused `startVars` member.
+- Not an allocation but on the same hot path: the per-sample s-list binding
+  rebuilt a `"s" + std::to_string(i + 1)` key for every input of every sample.
+  Cached as `sigVarNames`.
+- `outPtrs.assign` / `blockOut.assign` / `outBufs.assign` → `resize`. Growing to
+  a size within capacity is *guaranteed* not to reallocate for `resize`;
+  `assign` carries no such guarantee.
+
+`prepareToPlay` (previously an inline one-liner that only stored the sample
+rate) now pre-sizes all of it and seeds both maps with their fixed keys.
+
+Proved by `signalshape:` in `--self-test`: 60 blocks sweeping Rate / Beat Sync /
+Phase / block length with note traffic and moving control inputs, asserting zero
+growth in `scratchCapacityBytes()`. That proxy counts `vars.bucket_count() +
+vars.size()`, so both a rehash and a single newly-inserted key (one node
+allocation) register. Paired with a check that the output is still *modulating*,
+not merely non-zero — a stuck constant would pass a peak test while proving the
+expression never ran.
+
 ### Still allocating — not yet fixed, in rough priority order
 
-1. **`SignalShapeProcessor`** (`signal_shape_node.cpp` ~480, ~661) — a
-   `std::vector<const float*> sigChans` per block, and worse, a
-   `std::function<float(float)>` **constructed per block** at 661 (a
-   `std::function` holding a non-trivial capture heap-allocates).
-2. **`MidiScriptProcessor`** (`midi_script_node.cpp` ~317) —
+1. **`MidiScriptProcessor`** (`midi_script_node.cpp` ~317) —
    `std::vector<const float*> sigChans` per block.
-3. **`ArpeggiatorProcessor`** (`builtin_effects.h` ~621) — `seq` and
+2. **`ArpeggiatorProcessor`** (`builtin_effects.h` ~621) — `seq` and
    `baseNotes` vectors per block, plus `push_back` into them. Small (bounded by
    held notes) but on every block.
-4. **`FMSynthProcessor`** (`builtin_effects.h` ~1327) — `std::string p(opNames[i])`
+3. **`FMSynthProcessor`** (`builtin_effects.h` ~1327) — `std::string p(opNames[i])`
    per operator per block, purely to build a param name.
-5. **`AudioTimelineProcessor`** (`graph_processor.cpp` ~510) —
+4. **`AudioTimelineProcessor`** (`graph_processor.cpp` ~510) —
     `juce::AudioBuffer readBuf` per block **when a clip is streaming from disk**.
     Guarded by the file-read path, so it doesn't fire on every block, but it is
     on the audio thread.
-6. **`ParticleSynthProcessor`** / **`SpectralGrainProcessor`**
+5. **`ParticleSynthProcessor`** / **`SpectralGrainProcessor`**
     (`builtin_effects.h` ~1795, ~3980) — `grains.push_back` / `activeGrains.push_back`
     per grain spawn. Reallocates only when the grain count exceeds capacity, so
     a `reserve()` of the max grain count in `prepareToPlay` closes it.

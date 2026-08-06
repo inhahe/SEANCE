@@ -1427,6 +1427,7 @@ juce::PopupMenu MainContentComponent::getMenuForIndex(int idx, const juce::Strin
         menu.addItem(309, "Trigger Node");
         menu.addItem(310, "MIDI Modulator");
         menu.addItem(311, "Convolution Filter");
+        menu.addItem(318, "Wavelet Effects");
         menu.addItem(313, "Script (Signal + MIDI)");
         menu.addItem(314, "Algorithmic MIDI");
         menu.addItem(315, "Voices (Polyphony)");
@@ -1583,6 +1584,7 @@ void MainContentComponent::menuItemSelected(int menuItemID, int) {
         case 315: openHelpDoc("voices.html"); break;
         case 316: openHelpDoc("automation-recording.html"); break;
         case 317: openHelpDoc("recording-audio.html"); break;
+        case 318: openHelpDoc("wavelet-effects.html"); break;
         case 320:
             juce::AlertWindow::showMessageBoxAsync(
                 juce::MessageBoxIconType::InfoIcon,

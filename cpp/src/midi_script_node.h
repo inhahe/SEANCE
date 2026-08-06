@@ -115,7 +115,7 @@ public:
     MidiScriptProcessor(Node& node, Transport& transport);
 
     const juce::String getName() const override { return node.name; }
-    void prepareToPlay(double sr, int bs) override { sampleRate = sr; }
+    void prepareToPlay(double sr, int bs) override;
     void releaseResources() override {}
     void processBlock(juce::AudioBuffer<float>& buf, juce::MidiBuffer& midi) override;
     double getTailLengthSeconds() const override { return 0; }
@@ -172,9 +172,12 @@ private:
     // Fill `vars` with the standard per-sample bindings for sample offset `s`
     // within the current block. Used by the per-sample dispatch loop and the
     // transport-start hook.
+    // Reads the s1..sN inputs from the `sigChans` / `sigVarNames` members rather
+    // than taking them as parameters - they're audio-thread scratch owned by
+    // this processor, refilled at the top of each block.
     void buildVars(ScriptVars& vars, int s,
-                   double sr, double secPerSample, float gateVal, float freqHz,
-                   const std::vector<const float*>& sigChans, int sigCount) const;
+                   double sr, double secPerSample, float gateVal,
+                   float freqHz) const;
     // Bind the shape(pos) sampler on the current runtime (after a shape rebuild).
     void bindShape();
 
@@ -207,6 +210,36 @@ private:
     // audio thread. New notes beyond this are dropped (their note-off would be
     // unmanaged anyway).
     static constexpr size_t kMaxPendingOffs = 512;
+
+    // ---- audio-thread scratch (see scratchCapacityBytes) --------------------
+    // Both were locals in processBlock, i.e. heap traffic on every callback.
+    // `vars` was the expensive one: a fresh unordered_map per block meant a
+    // bucket array plus a node allocation for each of the 11 fixed keys and
+    // every s1..sN. Kept alive across blocks now, so buildVars' operator[] only
+    // overwrites values. Rebuilt (varsSigCount) when the input count changes, so
+    // a shrunk s-list can't leave a stale sN readable by a program.
+    std::vector<const float*> sigChans;
+    ScriptVars                vars;
+    int                       varsSigCount = -1;
+    // Cached "s1".."sN" key names, so buildVars doesn't construct a std::string
+    // per input per sample.
+    std::vector<std::string>  sigVarNames;
+
+public:
+    // Total bytes held by the audio-thread scratch above. The self-test asserts
+    // this doesn't grow across a render - see scratchCapacityBytes in
+    // signal_shape_node.h for why this proxy rather than a global new hook.
+    // `vars` contributes bucket_count + size so both a rehash and a single
+    // newly-inserted key (one node allocation) register.
+    size_t scratchCapacityBytes() const {
+        return sigChans.capacity()     * sizeof(const float*)
+             + sigVarNames.capacity()  * sizeof(std::string)
+             + midiInEvents.capacity() * sizeof(ScriptMidiEvent)
+             + pendingOffs.capacity()  * sizeof(PendingNoteOff)
+             + (vars.bucket_count() + vars.size()) * sizeof(void*);
+    }
+
+private:
 
     float getParam(int idx, float def) const;
 

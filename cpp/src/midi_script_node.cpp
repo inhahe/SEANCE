@@ -178,9 +178,7 @@ static float sampleShapeTbl(const std::vector<float>& tbl, float phase);
 // Build the standard per-sample variable bindings at sample offset `s`.
 void MidiScriptProcessor::buildVars(ScriptVars& vars,
                                     int s, double sr, double secPerSample,
-                                    float gateVal, float freqHz,
-                                    const std::vector<const float*>& sigChans,
-                                    int sigCount) const {
+                                    float gateVal, float freqHz) const {
     double secAtSample  = (double)(transport.positionSamples + s) / sr;
     double beatAtSample = transport.positionBeats() + transport.bpm / (60.0 * sr) * s;
     vars["t"]       = (float)secAtSample;
@@ -194,8 +192,10 @@ void MidiScriptProcessor::buildVars(ScriptVars& vars,
     vars["vel"]     = lastVelocity;
     vars["gate"]    = gateVal;
     vars["freq"]    = freqHz;
-    for (int i = 0; i < sigCount; ++i)
-        vars["s" + std::to_string(i + 1)] = sigChans[i] ? sigChans[i][s] : 0.0f;
+    // Key names come from the cached sigVarNames rather than being rebuilt as
+    // "s" + to_string(i + 1) for every input of every sample.
+    for (size_t i = 0; i < sigChans.size() && i < sigVarNames.size(); ++i)
+        vars[sigVarNames[i]] = sigChans[i] ? sigChans[i][s] : 0.0f;
 }
 
 // Bind the shape(pos) sampler on the runtime. Captures `this` so it always reads
@@ -282,6 +282,30 @@ static float sampleShapeTbl(const std::vector<float>& tbl, float phase) {
     return tbl[i0] * (1.0f - t) + tbl[i1] * t;
 }
 
+void MidiScriptProcessor::prepareToPlay(double sr, int bs) {
+    sampleRate = sr;
+    juce::ignoreUnused(bs);
+
+    // Pre-size the audio-thread scratch so processBlock never reaches the
+    // allocator, and seed `vars` with every key the program can bind so the
+    // first block doesn't pay for a map node per variable. varsSigCount is set
+    // to match, so the s-list rebuild in processBlock only fires if the doc
+    // actually changes the input count afterwards.
+    const int sigCount = juce::jmax(0, doc.signalInputCount);
+    sigChans.reserve((size_t) sigCount);
+    pendingOffs.reserve(kMaxPendingOffs);
+    vars.reserve(16 + (size_t) sigCount);
+    for (const char* k : { "t", "beat", "bar", "bpm", "playing", "sr",
+                           "dt", "note", "vel", "gate", "freq" })
+        vars[k] = 0.0f;
+    sigVarNames.clear();
+    for (int i = 0; i < sigCount; ++i) {
+        sigVarNames.push_back("s" + std::to_string(i + 1));
+        vars[sigVarNames.back()] = 0.0f;
+    }
+    varsSigCount = sigCount;
+}
+
 void MidiScriptProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::MidiBuffer& midiIn) {
     reloadIfScriptChanged();
 
@@ -313,9 +337,21 @@ void MidiScriptProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Midi
     // channels 2+ (one per Signal pin in declaration order). Read them per
     // sample for the s1..sN variables. We do NOT clear the audio buffer's
     // control channels because nothing downstream reads this node's audio.
+    // `sigChans` is a member: clear() keeps the capacity, so once it has grown
+    // to the widest s-list this node has ever had, refilling it here never
+    // touches the allocator. It used to be a local, i.e. one allocation per
+    // block. `sigVarNames` caches the matching variable names.
     const int sigCount = doc.signalInputCount;
-    std::vector<const float*> sigChans;
-    sigChans.reserve(sigCount);
+    if (varsSigCount != sigCount) {
+        // The key set changed: drop the old bindings so a shrunk s-list can't
+        // leave a stale sN visible to the program, and rebuild the name cache.
+        vars.clear();
+        sigVarNames.clear();
+        for (int i = 0; i < sigCount; ++i)
+            sigVarNames.push_back("s" + std::to_string(i + 1));
+        varsSigCount = sigCount;
+    }
+    sigChans.clear();
     for (int i = 0; i < sigCount; ++i) {
         int ch = 2 + i;
         sigChans.push_back((ch < numCh) ? buf.getReadPointer(ch) : nullptr);
@@ -348,8 +384,9 @@ void MidiScriptProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Midi
     sink.outputCount = doc.outputCount;
     sink.pendingOffs = &pendingOffs;
 
-    ScriptVars vars;
-    vars.reserve(16 + sigCount);
+    // `vars` is a member - see the scratch block in the header. It survives
+    // across blocks, so the operator[] writes in buildVars only overwrite
+    // values instead of allocating a map node per key per block.
 
     const double sr = juce::jmax(1.0, transport.sampleRate);
     const double secPerSample = 1.0 / sr;
@@ -363,7 +400,7 @@ void MidiScriptProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Midi
         // ---- Per-block dispatch (Lua block-rate / Wasm) ---------------------
         // Run the start hook first (offset 0) so a one-shot can emit a downbeat.
         if (playStart) {
-            buildVars(vars, 0, sr, secPerSample, gateVal, freqHz, sigChans, sigCount);
+            buildVars(vars, 0, sr, secPerSample, gateVal, freqHz);
             sink.sampleOffset = 0;
             runtime->onStart(vars, &sink);
         }
@@ -389,13 +426,13 @@ void MidiScriptProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Midi
         // ---- Per-sample dispatch (Builtin / Lua sample-rate) ----------------
         // Run the start hook once, at sample offset 0, with a live sink.
         if (playStart) {
-            buildVars(vars, 0, sr, secPerSample, gateVal, freqHz, sigChans, sigCount);
+            buildVars(vars, 0, sr, secPerSample, gateVal, freqHz);
             sink.sampleOffset = 0;
             runtime->onStart(vars, &sink);
         }
 
         for (int s = 0; s < numSamples; ++s) {
-            buildVars(vars, s, sr, secPerSample, gateVal, freqHz, sigChans, sigCount);
+            buildVars(vars, s, sr, secPerSample, gateVal, freqHz);
             sink.sampleOffset = s;
             runtime->runMidi(vars, &sink);
         }

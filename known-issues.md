@@ -365,20 +365,37 @@ allocation) register. Paired with a check that the output is still *modulating*,
 not merely non-zero — a stuck constant would pass a peak test while proving the
 expression never ran.
 
+### Fixed (commit `HASH_MS`) — `MidiScriptProcessor`
+
+Sibling of the Signal Shape node and had exactly the same problem, so the same
+fix: `sigChans` and the `vars` binding map were both `processBlock` locals, so
+every callback built and tore down an `unordered_map` with a node allocation per
+variable (11 fixed keys plus s1..sN), and `buildVars` rebuilt a
+`"s" + std::to_string(i + 1)` key for every input of every sample. All are now
+members; `buildVars` reads the s-list from them instead of taking it as a
+parameter. `prepareToPlay` (previously an inline one-liner storing only the
+sample rate) pre-sizes the scratch, seeds `vars` with every key the program can
+bind, reserves `pendingOffs` to its `kMaxPendingOffs` hard cap, and sets
+`varsSigCount` to match so the s-list rebuild only fires if the doc later
+changes the input count.
+
+Proved by `midiscript:` in `--self-test`: 60 blocks at six block lengths driving
+a program that reads s1/s2 and calls `note()` (so `pendingOffs` is exercised
+across block boundaries too), asserting zero growth in `scratchCapacityBytes()`,
+paired with a check that the program was still emitting MIDI during the sweep.
+
 ### Still allocating — not yet fixed, in rough priority order
 
-1. **`MidiScriptProcessor`** (`midi_script_node.cpp` ~317) —
-   `std::vector<const float*> sigChans` per block.
-2. **`ArpeggiatorProcessor`** (`builtin_effects.h` ~621) — `seq` and
+1. **`ArpeggiatorProcessor`** (`builtin_effects.h` ~621) — `seq` and
    `baseNotes` vectors per block, plus `push_back` into them. Small (bounded by
    held notes) but on every block.
-3. **`FMSynthProcessor`** (`builtin_effects.h` ~1327) — `std::string p(opNames[i])`
+2. **`FMSynthProcessor`** (`builtin_effects.h` ~1327) — `std::string p(opNames[i])`
    per operator per block, purely to build a param name.
-4. **`AudioTimelineProcessor`** (`graph_processor.cpp` ~510) —
+3. **`AudioTimelineProcessor`** (`graph_processor.cpp` ~510) —
     `juce::AudioBuffer readBuf` per block **when a clip is streaming from disk**.
     Guarded by the file-read path, so it doesn't fire on every block, but it is
     on the audio thread.
-5. **`ParticleSynthProcessor`** / **`SpectralGrainProcessor`**
+4. **`ParticleSynthProcessor`** / **`SpectralGrainProcessor`**
     (`builtin_effects.h` ~1795, ~3980) — `grains.push_back` / `activeGrains.push_back`
     per grain spawn. Reallocates only when the grain count exceeds capacity, so
     a `reserve()` of the max grain count in `prepareToPlay` closes it.

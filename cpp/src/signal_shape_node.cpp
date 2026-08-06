@@ -377,13 +377,22 @@ void SignalShapeProcessor::prepareToPlay(double sr, int bs) {
     // member, so a shape rebuild doesn't invalidate it.
     shapeFn = [this](float pos) { return sampleShape(shapeSamples, pos); };
 
-    // Seed the variable maps with their fixed keys so the first block doesn't
-    // pay for ~12 node allocations. The s1..sN keys are added lazily by the
-    // per-sample binding (and rebuilt when signalInputCount changes).
-    vars.reserve(16 + (size_t) juce::jmax(0, doc.signalInputCount));
+    // Seed the variable maps with every key the program can bind so the first
+    // block doesn't pay for a map node per variable. varsSigCount is set to
+    // match, so the s-list rebuild in processBlock only fires if the doc
+    // actually changes the input count afterwards.
+    const int sigCount = juce::jmax(0, doc.signalInputCount);
+    vars.reserve(16 + (size_t) sigCount);
     for (const char* k : { "curve", "x", "phase", "t", "beat", "bpm",
                            "gate", "freq", "note", "vel", "rep", "rate" })
         vars[k] = 0.0f;
+    sigVarNames.clear();
+    for (int i = 0; i < sigCount; ++i) {
+        sigVarNames.push_back("s" + std::to_string(i + 1));
+        vars[sigVarNames.back()] = 0.0f;
+    }
+    varsSigCount = sigCount;
+
     startVars.reserve(8);
     for (const char* k : { "bpm", "note", "vel", "gate", "freq", "rate" })
         startVars[k] = 0.0f;

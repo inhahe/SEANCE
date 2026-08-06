@@ -41,6 +41,7 @@
 #include "pan_processor.h"          // PanProcessor - the mute/solo/record-mute chokepoint
 #include "soundfont_processor.h"    // SoundFontProcessor - .sf2 / .sfz instrument node
 #include "signal_shape_node.h"      // SignalShapeProcessor - the scriptable Signal node
+#include "midi_script_node.h"       // MidiScriptProcessor - algorithmic MIDI generator
 
 #include <juce_audio_formats/juce_audio_formats.h>
 #include <juce_graphics/juce_graphics.h>
@@ -6165,6 +6166,79 @@ void testAssetLibrary(Report& r) {
         }
         r.checkVal(hi - lo > 1e-4f,
                    "signalshape: output still modulating after the sweep", hi - lo);
+    }
+
+    // ---- MidiScriptProcessor renders without allocating ---------------------
+    //
+    // Same shape as the Signal Shape node above (they're sibling scriptable
+    // nodes): `sigChans` and the `vars` binding map were both locals in
+    // processBlock, so every callback built and tore down a map with a node
+    // allocation per variable, and buildVars rebuilt a "s"+to_string(i+1) key
+    // for every input of every sample. Both are members now.
+    {
+        Transport transport;
+        transport.sampleRate = 44100.0;
+        transport.bpm        = 120.0;
+        transport.playing    = true;
+
+        MidiScriptDoc doc = MidiScriptDoc::defaultDoc();
+        // A program that actually emits, and that reads the signal inputs so
+        // the s-list binding isn't dead code. `note()` schedules a note-off,
+        // exercising pendingOffs across blocks too.
+        doc.program          = "(s1 > 0.6) ? note(48 + s2 * 12, 100, 0.05) : 0";
+        doc.signalInputCount = 2;
+
+        Node node;
+        node.id     = 1;
+        node.type   = NodeType::MidiScript;
+        node.name   = "selftest-midiscript";
+        node.script = doc.encode();
+        node.pinsIn .push_back(Pin{ 1, "MIDI In", PinKind::Midi,   true,  2 });
+        node.pinsIn .push_back(Pin{ 2, "s1",      PinKind::Signal, true,  1 });
+        node.pinsIn .push_back(Pin{ 3, "s2",      PinKind::Signal, true,  1 });
+        node.pinsOut.push_back(Pin{ 100, "MIDI Out", PinKind::Midi, false, 2 });
+
+        const int maxBlock = 512;
+        MidiScriptProcessor proc(node, transport);
+        proc.prepareToPlay(44100.0, maxBlock);
+
+        juce::AudioBuffer<float> buf(4, maxBlock);   // 2 audio + s1/s2 on 2..3
+        int64_t pos = 0;
+        int totalEmitted = 0;
+        auto runBlock = [&](int len) {
+            juce::AudioBuffer<float> view(buf.getArrayOfWritePointers(),
+                                          buf.getNumChannels(), len);
+            view.clear();
+            for (int ch = 2; ch < 4; ++ch)
+                for (int s = 0; s < len; ++s)
+                    view.setSample(ch, s, 0.5f + 0.45f * std::sin(0.02f * (s + 7 * ch)));
+            juce::MidiBuffer midi;
+            proc.processBlock(view, midi);
+            totalEmitted += midi.getNumEvents();
+            transport.positionSamples = (pos += len);
+        };
+
+        // Warm up: cross the play edge (start hook + its own bindings) and let
+        // the note scheduler reach steady state.
+        for (int i = 0; i < 4; ++i) runBlock(maxBlock);
+
+        const size_t before = proc.scratchCapacityBytes();
+        const int emittedBefore = totalEmitted;
+
+        const int lens[] = { 512, 480, 256, 64, 333, 512 };
+        for (int pass = 0; pass < 60; ++pass) runBlock(lens[pass % 6]);
+
+        const size_t after = proc.scratchCapacityBytes();
+        r.checkVal(after == before,
+                   "midiscript: 60 blocks at varying block lengths allocate "
+                   "nothing (scratch capacity growth, bytes)",
+                   (double)after - (double)before);
+
+        // Non-vacuity: the program has to have been emitting throughout, or the
+        // sweep never reached the interesting code.
+        r.checkVal(totalEmitted - emittedBefore > 0,
+                   "midiscript: program still emitting MIDI during the sweep",
+                   (double)(totalEmitted - emittedBefore));
     }
 
     // ---- Song length: mid-bar content end plays in full (no bar-rounding) ----

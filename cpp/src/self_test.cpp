@@ -3581,11 +3581,7 @@ void testWarp(Report& r) {
 
         // 6. The symptom that made the wrong inverse worth chasing: a wavelet
         //    effect at neutral settings must pass audio through UNCHANGED.
-        //    Transient Split with both gains at 1.0 splits every coefficient
-        //    into exactly one of two complementary streams, so summing them has
-        //    to give the input back. With the legacy inverse it did not - it
-        //    dropped well over half the energy, i.e. the "neutral" setting was
-        //    a heavy, unavoidable colouration on the flagship wavelet effect.
+        //    One case per effect below.
         {
             const int N = 512;
             auto fillSine = [&](juce::AudioBuffer<float>& b) {
@@ -3605,42 +3601,227 @@ void testWarp(Report& r) {
                 return d;
             };
 
-            {
+            // Every wavelet effect, driven at its NEUTRAL setting - the
+            // parameter combination where it is mathematically an identity -
+            // and required to hand the input back.
+            //
+            // This is a stronger check than it looks. In every case below the
+            // neutral setting still runs the full forward DWT and inverse; only
+            // the between-transform coefficient surgery is a no-op. So each of
+            // these is really "the transform round-trip is lossless for this
+            // effect's filter and level count", which is exactly what was
+            // broken before the PR-inverse switch in 1d9a0c0 - the old inverse
+            // dropped over half the energy, making every "bypass" setting a
+            // heavy colouration.
+            //
+            // Deliberately NOT tested via Mix=0: that path never touches the
+            // wavelet code, so it would pass even with a completely broken
+            // transform. Every case here runs at Mix=1 (full wet).
+            //
+            // Each case is PAIRED with a non-vacuity check: the same processor,
+            // one parameter moved off neutral, asserting the output now differs
+            // materially. Without that pairing a unity assertion would sail
+            // through if processBlock did nothing at all - which is exactly the
+            // failure mode a "bypass is clean" test must not be blind to.
+            auto runOnce = [&](std::vector<Param>& params,
+                               std::function<std::unique_ptr<juce::AudioProcessor>(Node&)>& make) {
                 NodeGraph g;
-                int nId = g.addNode("tsplit", NodeType::Effect, {}, {}).id;
+                int nId = g.addNode("neutral", NodeType::Effect, {}, {}).id;
                 Node& nd = *g.findNode(nId);
-                nd.params.push_back({"Transient", 1.0f, 0.0f, 2.0f});
-                nd.params.push_back({"Sustain",   1.0f, 0.0f, 2.0f});
-                nd.params.push_back({"Threshold", 0.3f, 0.0f, 1.0f});
-                nd.params.push_back({"Levels",    4.0f, 1.0f, 8.0f});
-
-                TransientSplitProcessor proc(nd);
-                proc.prepareToPlay(48000.0, N);
+                for (auto& p : params) nd.params.push_back(p);
+                auto proc = make(nd);
+                proc->prepareToPlay(48000.0, N);
                 juce::AudioBuffer<float> buf, dryRef;
                 fillSine(buf); fillSine(dryRef);
                 juce::MidiBuffer mb;
-                proc.processBlock(buf, mb);
-                r.checkVal(maxAbsDiffBuf(buf, dryRef) < 1e-4,
-                           "wavelet-fx: Transient Split at gains 1/1 is unity (no colouration)",
-                           maxAbsDiffBuf(buf, dryRef));
-            }
+                proc->processBlock(buf, mb);
+                return maxAbsDiffBuf(buf, dryRef);
+            };
+            auto checkNeutral = [&](const char* label,
+                                    std::vector<Param> params,
+                                    std::function<std::unique_ptr<juce::AudioProcessor>(Node&)> make,
+                                    const char* activeParam, float activeValue) {
+                const double neutral = runOnce(params, make);
+                r.checkVal(neutral < 1e-4,
+                           juce::String("wavelet-fx: ") + label, neutral);
+                // Same node, one knob off neutral: the effect has to bite.
+                for (auto& p : params) if (p.name == activeParam) p.value = activeValue;
+                const double active = runOnce(params, make);
+                r.checkVal(active > 1e-3,
+                           juce::String("wavelet-fx: ") + label
+                             + " - and NOT unity once " + activeParam + " moves off it",
+                           active);
+            };
+
+            // Transient Split with both gains at 1.0 sorts every coefficient
+            // into exactly one of two complementary streams, so summing them
+            // has to give the input back. This is the case that exposed the
+            // legacy inverse: it dropped well over half the energy, i.e. the
+            // "neutral" setting was a heavy, unavoidable colouration on the
+            // flagship wavelet effect.
+            checkNeutral("Transient Split at gains 1/1 is unity (no colouration)",
+                         { {"Transient", 1.0f, 0.0f, 2.0f},
+                           {"Sustain", 1.0f, 0.0f, 2.0f},
+                           {"Threshold", 0.3f, 0.0f, 1.0f},
+                           {"Levels", 4.0f, 1.0f, 8.0f} },
+                         [](Node& nd) { return std::make_unique<TransientSplitProcessor>(nd); },
+                         "Transient", 0.0f);
+
+            // Threshold 0 puts no coefficient below it, so nothing is shrunk.
+            checkNeutral("Denoiser at threshold 0 / full wet is unity",
+                         { {"Threshold", 0.0f, 0.0f, 1.0f},
+                           {"Levels", 4.0f, 1.0f, 8.0f},
+                           {"Mix", 1.0f, 0.0f, 1.0f} },
+                         [](Node& nd) { return std::make_unique<WaveletDenoiserProcessor>(nd); },
+                         "Threshold", 0.9f);
+
+            // Bits=16 is the finest quantisation the param allows: a step of
+            // 1/65536, so every coefficient survives rounding to within ~8e-6.
+            checkNeutral("Bitcrush at Bits=16 / full wet is unity",
+                         { {"Bits", 16.0f, 1.0f, 16.0f},
+                           {"Band Lo", 0.0f, 0.0f, 7.0f},
+                           {"Band Hi", 7.0f, 0.0f, 7.0f},
+                           {"Levels", 4.0f, 1.0f, 8.0f},
+                           {"Mix", 1.0f, 0.0f, 1.0f} },
+                         [](Node& nd) { return std::make_unique<WaveletBitcrushProcessor>(nd); },
+                         "Bits", 2.0f);
+
+            // Shift=0 means "don't move any band". Note this one short-circuits
+            // before the transform, so unlike its siblings it only proves the
+            // early-out, not the round-trip - which is the honest scope of the
+            // param's neutral position.
+            checkNeutral("Octave Shift at Shift=0 is unity",
+                         { {"Shift", 0.0f, -2.0f, 2.0f},
+                           {"Mix", 1.0f, 0.0f, 1.0f} },
+                         [](Node& nd) { return std::make_unique<OctaveShiftProcessor>(nd); },
+                         "Shift", -1.0f);
+
+            // Ratio=1 makes the gain computer an identity whatever the band
+            // peak is (dbReduction = dbOver * (1 - 1/1) = 0), and both tilt
+            // gains at 0 dB leave the per-band trim at unity.
+            checkNeutral("MB Comp at Ratio=1 / 0 dB tilt is unity",
+                         { {"Threshold", -20.0f, -60.0f, 0.0f},
+                           {"Ratio", 1.0f, 1.0f, 20.0f},
+                           {"Levels", 4.0f, 1.0f, 6.0f},
+                           {"Low Gain", 0.0f, -24.0f, 24.0f},
+                           {"High Gain", 0.0f, -24.0f, 24.0f},
+                           {"Mix", 1.0f, 0.0f, 1.0f} },
+                         [](Node& nd) { return std::make_unique<WaveletMultibandCompProcessor>(nd); },
+                         "Ratio", 20.0f);
+
+            // Complexity=1 keeps every coefficient (keep = padLen), so the
+            // partial_sort and the keep-mask select the whole set.
+            checkNeutral("Complexity at 1.0 (keep everything) is unity",
+                         { {"Complexity", 1.0f, 0.0f, 1.0f},
+                           {"Levels", 4.0f, 1.0f, 8.0f},
+                           {"Mix", 1.0f, 0.0f, 1.0f} },
+                         [](Node& nd) { return std::make_unique<WaveletComplexityProcessor>(nd); },
+                         "Complexity", 0.02f);
+
+            // Both gains at 1.0 flatten the asymmetric envelope: the pre-attack
+            // ramp becomes 1 + (1-1)*frac and the post-decay becomes
+            // 1 + (1-1)*(1-frac), so gainEnv stays 1 even where transients are
+            // detected. Detection still runs - this is not an early-out.
+            checkNeutral("Asymmetric Filter at gains 1/1 is unity",
+                         { {"Pre-Attack", 20.0f, 0.0f, 200.0f},
+                           {"Post-Decay", 50.0f, 0.0f, 500.0f},
+                           {"Pre Gain", 1.0f, 0.0f, 4.0f},
+                           {"Post Gain", 1.0f, 0.0f, 4.0f},
+                           {"Levels", 4.0f, 1.0f, 8.0f},
+                           {"Mix", 1.0f, 0.0f, 1.0f} },
+                         [](Node& nd) { return std::make_unique<AsymmetricFilterProcessor>(nd); },
+                         "Post Gain", 0.0f);
+
+            // The reverb's neutral is the least obvious of the set. It works
+            // on an 8192-sample tail buffer: each block shifts the tail left by
+            // n and writes the new input into the last n slots, transforms the
+            // whole tail, weights each band by 1/(band+1)^Color, inverts, and
+            // takes the last n samples back out. So with Color=0 (every weight
+            // = 1) and Decay=1 (the shift doesn't attenuate), the samples that
+            // come out are exactly the ones just written in - full wet, and
+            // still a complete 8192-point round-trip.
+            checkNeutral("Reverb at Decay=1 / Color=0 / full wet is unity",
+                         { {"Decay", 1.0f, 0.0f, 1.0f},
+                           {"Color", 0.0f, 0.0f, 3.0f},
+                           {"Levels", 5.0f, 1.0f, 8.0f},
+                           {"Mix", 1.0f, 0.0f, 1.0f} },
+                         [](Node& nd) { return std::make_unique<WaveletReverbProcessor>(nd); },
+                         "Color", 3.0f);
+
+            // The vocoder is the one effect with no neutral *parameter* - it
+            // imposes the modulator's per-band energy on the carrier, so there
+            // is no knob position that makes it an identity. Its identity is a
+            // property of the SIGNALS instead: feed the same audio as carrier
+            // (ch 0) and modulator (ch 2) and every band's scale factor is
+            // sqrt(modE/carE) = 1, so the carrier must come back untouched.
+            //
+            // Needs its own block because it wants >2 channels, and because it
+            // mono-ises (it copies ch0 over ch1), so only ch0 is comparable.
             {
                 NodeGraph g;
-                int nId = g.addNode("denoise", NodeType::Effect, {}, {}).id;
+                int nId = g.addNode("vocoder", NodeType::Effect, {}, {}).id;
                 Node& nd = *g.findNode(nId);
-                nd.params.push_back({"Threshold", 0.0f, 0.0f, 1.0f});
-                nd.params.push_back({"Levels",    4.0f, 1.0f, 8.0f});
-                nd.params.push_back({"Mix",       1.0f, 0.0f, 1.0f});
+                nd.params.push_back({"Bands", 5.0f, 1.0f, 8.0f});
+                nd.params.push_back({"Mix",   1.0f, 0.0f, 1.0f});
 
-                WaveletDenoiserProcessor proc(nd);
+                WaveletVocoderProcessor proc(nd);
                 proc.prepareToPlay(48000.0, N);
-                juce::AudioBuffer<float> buf, dryRef;
-                fillSine(buf); fillSine(dryRef);
+
+                juce::AudioBuffer<float> buf(3, N);
+                buf.clear();
+                for (int i = 0; i < N; ++i) {
+                    const float v =
+                        0.5f * std::sin(6.28318530718f * 8.0f * (float)i / (float)N);
+                    buf.getWritePointer(0)[i] = v;   // carrier
+                    buf.getWritePointer(2)[i] = v;   // modulator - identical
+                }
+                std::vector<float> dryRef(buf.getReadPointer(0),
+                                          buf.getReadPointer(0) + N);
                 juce::MidiBuffer mb;
                 proc.processBlock(buf, mb);
-                r.checkVal(maxAbsDiffBuf(buf, dryRef) < 1e-4,
-                           "wavelet-fx: Denoiser at threshold 0 / full wet is unity",
-                           maxAbsDiffBuf(buf, dryRef));
+
+                double d = 0.0;
+                for (int i = 0; i < N; ++i)
+                    d = std::max(d, (double)std::abs(buf.getReadPointer(0)[i]
+                                                   - dryRef[(size_t)i]));
+                r.checkVal(d < 1e-4,
+                           "wavelet-fx: Vocoder with modulator == carrier is unity", d);
+
+                // Non-vacuity for the above: a modulator with a *different*
+                // spectrum has to reshape the carrier. (The same sine eight
+                // octaves up, so its band energies land somewhere else.)
+                for (int i = 0; i < N; ++i) {
+                    buf.getWritePointer(0)[i] = dryRef[(size_t)i];
+                    buf.getWritePointer(2)[i] =
+                        0.5f * std::sin(6.28318530718f * 64.0f * (float)i / (float)N);
+                }
+                juce::MidiBuffer mb3;
+                proc.processBlock(buf, mb3);
+                double dActive = 0.0;
+                for (int i = 0; i < N; ++i)
+                    dActive = std::max(dActive, (double)std::abs(buf.getReadPointer(0)[i]
+                                                               - dryRef[(size_t)i]));
+                r.checkVal(dActive > 1e-3,
+                           "wavelet-fx: Vocoder - and NOT unity once the modulator "
+                           "differs from the carrier", dActive);
+
+                // And the documented "nothing plugged into the Signal input"
+                // behaviour: with no channel 2 there is no modulator, so the
+                // node must pass the carrier straight through rather than
+                // muting (scale would otherwise be sqrt(0/carE) = 0 per band).
+                juce::AudioBuffer<float> stereo(2, N);
+                for (int c = 0; c < 2; ++c)
+                    for (int i = 0; i < N; ++i)
+                        stereo.getWritePointer(c)[i] =
+                            0.5f * std::sin(6.28318530718f * 8.0f * (float)i / (float)N);
+                juce::AudioBuffer<float> stereoRef;
+                fillSine(stereoRef);
+                juce::MidiBuffer mb2;
+                proc.processBlock(stereo, mb2);
+                r.checkVal(maxAbsDiffBuf(stereo, stereoRef) < 1e-6,
+                           "wavelet-fx: Vocoder with no modulator connected is a "
+                           "passthrough, not silence",
+                           maxAbsDiffBuf(stereo, stereoRef));
             }
         }
     }

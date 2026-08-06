@@ -6835,6 +6835,157 @@ void testAssetLibrary(Report& r) {
                    "spectralgrain: cloud still audible during the sweep", peak);
     }
 
+    // ---- SpectralGrain still plays after a transport Stop --------------------
+    //
+    // reset() (the transport-panic hook) used to be `voices.clear()`. Nothing
+    // ever refilled the pool - prepareToPlay only regenerates the grain bank -
+    // so afterwards allocVoice() fell through to its steal path and returned
+    // voices[0] on an EMPTY vector (out-of-bounds write into the freed-but-owned
+    // buffer), and the render loop then iterated zero voices, leaving the node
+    // permanently silent. Hitting Stop once bricked the node for the session.
+    {
+        Node node;
+        node.id     = 1;
+        node.name   = "selftest-spectralgrain-reset";
+        node.script = "__spectralgrain__:exp(-f/10)";
+        node.params.push_back({ "Density",    80.0f, 1.0f, 2000.0f });
+        node.params.push_back({ "Grain Size", 60.0f, 1.0f,  500.0f });
+        node.params.push_back({ "Volume",      0.8f, 0.0f,    1.0f });
+
+        const int bs = 512;
+        SpectralGrainProcessor proc(node);
+        proc.prepareToPlay(44100.0, bs);
+        juce::AudioBuffer<float> buf(2, bs);
+
+        // Runs `blocks` blocks, firing a note-on in the first, and returns the
+        // peak. 8 blocks at 44.1 kHz is ~93 ms, comfortably past the 12.5 ms
+        // first spawn at Density 80.
+        auto playPeak = [&](int blocks) {
+            float pk = 0.0f;
+            for (int b = 0; b < blocks; ++b) {
+                buf.clear();
+                juce::MidiBuffer midi;
+                if (b == 0)
+                    midi.addEvent(juce::MidiMessage::noteOn(1, 60, (juce::uint8)110), 0);
+                proc.processBlock(buf, midi);
+                for (int s = 0; s < bs; ++s)
+                    pk = std::max(pk, std::abs(buf.getSample(0, s)));
+            }
+            return pk;
+        };
+
+        const float beforeStop = playPeak(8);
+        r.checkVal(beforeStop > 1e-4f,
+                   "spectralgrain: note sounds before the transport Stop", beforeStop);
+
+        proc.reset();                     // <- the transport-panic path
+        r.checkVal(proc.activeVoiceCount() == 0,
+                   "spectralgrain: Stop silences every voice",
+                   (double)proc.activeVoiceCount());
+        r.checkVal(proc.activeGrainCount() == 0,
+                   "spectralgrain: Stop drops every in-flight grain",
+                   (double)proc.activeGrainCount());
+
+        const float afterStop = playPeak(8);
+        // Verified by reinstating the bug: it reads exactly 0.00000 (there are
+        // no voices left to render), against 0.33737 for the fixed code - so
+        // the margin is total, and 1e-4 only guards against denormal noise.
+        r.checkVal(afterStop > 1e-4f,
+                   "spectralgrain: node still plays after a transport Stop "
+                   "(reset must not empty the voice pool)", afterStop);
+    }
+
+    // ---- SpectralGrain advances each grain once per SAMPLE, not per voice ----
+    //
+    // activeGrains is one pool shared by all voices, but the render loop used
+    // to sit inside the per-voice loop, so every grain's read position was
+    // stepped once per ACTIVE VOICE. With V voices sounding, grains played V
+    // times too fast (V times shorter, and at V times the pitch ratio) and were
+    // summed V times.
+    //
+    // The observable that pins this down is grain LIFETIME, via the steady-state
+    // cloud size. Each voice spawns at `Density` grains/sec and each grain lives
+    // `Grain Size` seconds, so at equilibrium:
+    //
+    //     grains == voices x Density x GrainSize
+    //
+    // With the bug the lifetime is GrainSize/V instead, which cancels the V and
+    // pins the count at Density x GrainSize regardless of how many notes are
+    // held. So the single-voice case is IDENTICAL either way (that's the control
+    // below) and the polyphonic case differs by exactly the voice count.
+    {
+        auto steadyGrains = [](const std::vector<int>& notes, float grainMs) {
+            Node node;
+            node.id     = 1;
+            node.name   = "selftest-spectralgrain-rate";
+            node.script = "__spectralgrain__:exp(-f/10)";
+            node.params.push_back({ "Density",   100.0f, 1.0f, 2000.0f });
+            node.params.push_back({ "Grain Size", grainMs, 1.0f, 500.0f });
+            node.params.push_back({ "Volume",      0.5f, 0.0f,    1.0f });
+            // Long sustain so every voice is still held (and so still spawning)
+            // for the whole measurement.
+            node.ahdsrEnvelope.attackMs = 1.0f;
+            node.ahdsrEnvelope.decayMs  = 1.0f;
+            node.ahdsrEnvelope.sustain  = 1.0f;
+
+            const int bs = 512;
+            SpectralGrainProcessor proc(node);
+            proc.prepareToPlay(44100.0, bs);
+            juce::AudioBuffer<float> buf(2, bs);
+
+            // 40 blocks = ~465 ms, i.e. ~4.6 grain lifetimes: long past the
+            // point where spawning and expiry balance.
+            for (int b = 0; b < 40; ++b) {
+                buf.clear();
+                juce::MidiBuffer midi;
+                if (b == 0)
+                    for (int n : notes)
+                        midi.addEvent(juce::MidiMessage::noteOn(1, n, (juce::uint8)110), 0);
+                proc.processBlock(buf, midi);
+            }
+            return std::pair<double, double>{ (double)proc.activeGrainCount(),
+                                              (double)proc.activeVoiceCount() };
+        };
+
+        // All notes are 69 (A4) so every grain's rate is exactly 1.0 and the
+        // derivation above has no pitch term. Four note-ons on the same number
+        // still take four separate voice slots.
+        auto [g1, v1] = steadyGrains({ 69 },                 100.0f);
+        auto [g4, v4] = steadyGrains({ 69, 69, 69, 69 },     100.0f);
+
+        r.checkVal(v1 == 1.0 && v4 == 4.0,
+                   "spectralgrain: the rate test really is holding 1 vs 4 voices", v4);
+
+        // Density 100 x GrainSize 0.1 s = 10 grains per voice.
+        r.checkVal(g1 > 8.0 && g1 < 12.0,
+                   "spectralgrain: one voice holds Density x GrainSize grains", g1);
+        // Verified by reinstating the bug (grain positions stepped once per
+        // active voice): grains-per-voice reads 3.00 against 10.00 for the
+        // fixed code, i.e. the cloud stops growing with polyphony. 8..12 sits
+        // well clear of 3 while still allowing spawn-phase jitter.
+        const double perVoice = g4 / juce::jmax(1.0, v4);
+        r.checkVal(perVoice > 8.0 && perVoice < 12.0,
+                   "spectralgrain: grain lifetime is independent of how many "
+                   "voices are sounding (grains per voice, 4-note chord)", perVoice);
+
+        // ...and the same derivation is what proves Grain Size still means
+        // something past the FFT frame. kGrainFFTSize is 1024 samples = 23.2 ms
+        // at 44.1 kHz; grain length used to be clamped to it, so 50 ms and
+        // 100 ms produced IDENTICAL clouds (~2 grains each at Density 100).
+        // Now they scale with the knob: 100 x 0.05 = 5 and 100 x 0.1 = 10.
+        auto [gShort, vShort] = steadyGrains({ 69 }, 50.0f);
+        r.checkVal(gShort > 3.5 && gShort < 6.5,
+                   "spectralgrain: Grain Size 50 ms holds ~5 grains at Density 100",
+                   gShort);
+        const double sizeRatio = g1 / juce::jmax(1.0, gShort);
+        // Verified by reinstating the clamp: both sides then read 2.00 grains
+        // and this ratio reads exactly 1.00000 - the knob was completely inert
+        // above 23 ms. Fixed code reads 2.00000 (10.00 vs 5.00 grains).
+        r.checkVal(sizeRatio > 1.6,
+                   "spectralgrain: Grain Size keeps scaling past the FFT frame "
+                   "(100 ms vs 50 ms grain count ratio)", sizeRatio);
+    }
+
     // ---- PitchDetectorProcessor renders without allocating ------------------
     //
     // The per-hop analysis copy was a local std::vector<float> sized to

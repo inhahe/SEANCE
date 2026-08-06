@@ -4214,14 +4214,30 @@ public:
     // the self-test can assert the reserve is actually big enough.
     static constexpr size_t kMaxActiveGrains = 1024;
 
-    SpectralGrainProcessor(Node& n) : node(n) { voices.resize(8); }
+    // Polyphony. Fixed for the lifetime of the processor: the voice vector is
+    // indexed by ActiveGrain::voiceIdx, so it must never shrink.
+    static constexpr int kMaxVoices = 8;
+
+    SpectralGrainProcessor(Node& n) : node(n) { voices.assign(kMaxVoices, Voice{}); }
     const juce::String getName() const override { return "Spectral Grain"; }
-    // Transport panic (Stop): drop every voice and in-flight grain so the
-    // granular cloud stops dead instead of ringing out.
-    void reset() override { voices.clear(); activeGrains.clear(); }
+    // Transport panic (Stop): silence every voice and drop every in-flight
+    // grain so the granular cloud stops dead instead of ringing out.
+    // NB: this RESETS the voices, it does not remove them. An earlier version
+    // called voices.clear(), which permanently emptied the pool - prepareToPlay
+    // never refilled it, so the next note-on ran allocVoice()'s steal path and
+    // dereferenced voices[0] on an empty vector (UB), after which the node was
+    // silent for the rest of the session. Anything that empties `voices` must
+    // also be paired with a refill; simply not emptying it is safer.
+    void reset() override {
+        for (auto& v : voices) v = Voice{};
+        activeGrains.clear();
+    }
 
     void prepareToPlay(double sr, int) override {
         sampleRate = sr;
+        // Defensive: guarantee a full voice pool even if some future path
+        // resizes it. allocVoice() indexes this unconditionally.
+        if ((int)voices.size() != kMaxVoices) voices.assign(kMaxVoices, Voice{});
         regenerateGrains();
         // Reserve to the hard cap so the spawn loop below never reallocates on
         // the audio thread. The cap is enforced at the push_back, so capacity
@@ -4243,8 +4259,16 @@ public:
         ampTables.prepare(effectiveEnv);
         float volume = paramByName(node, "Volume", 0.5f);
 
-        int grainSizeSamples = (int)(grainMs * 0.001f * (float)sampleRate);
-        grainSizeSamples = std::min(grainSizeSamples, (int)grainBank[0].size());
+        // Grain length is whatever the knob asks for. It is NOT clamped to the
+        // bank waveform's length: each bank entry is an inverse real FFT of a
+        // full spectrum, so it is exactly periodic with period kGrainFFTSize
+        // and the read below wraps through it seamlessly. Clamping here (which
+        // is what the code used to do) silently pinned every grain to
+        // kGrainFFTSize samples - 21 ms at 48 kHz - so the whole upper part of
+        // the Grain Size range did nothing at all, and a grain played above
+        // A4 ran off the end of the bank and died early, making grain duration
+        // depend on the note you played.
+        int grainSizeSamples = std::max(1, (int)(grainMs * 0.001f * (float)sampleRate));
         float spawnInterval = 1.0f / density;
         float dt = 1.0f / (float)sampleRate;
 
@@ -4268,9 +4292,25 @@ public:
         }
         distributeMpeMessages(midi, voices);
 
+        // `activeGrains` is ONE pool shared by every voice, and each grain
+        // carries the index of the voice that spawned it. So the render is two
+        // passes per sample: first advance the voices and note each one's
+        // current gain, then walk the grain pool EXACTLY ONCE, scaling each
+        // grain by its owning voice's gain.
+        //
+        // The obvious-looking alternative - summing the pool inside the voice
+        // loop - is a bug: it advanced every grain's read position once per
+        // active voice, so with V voices sounding, every grain played V times
+        // too fast (V times shorter, V octaves-worth of pitch error) and was
+        // also summed V times. And because g.rate is baked from the SPAWNING
+        // voice's pitch, every voice rendered every other voice's grains at the
+        // wrong pitch, so a chord came out as one smeared pitch rather than
+        // distinct notes. It was also O(V*G) instead of O(G).
         for (int s = 0; s < numSamples; ++s) {
-            float out = 0;
-            for (auto& v : voices) {
+            float voiceGain[kMaxVoices] = {};
+
+            for (int vi = 0; vi < (int)voices.size(); ++vi) {
+                auto& v = voices[(size_t)vi];
                 if (!v.active) continue;
 
                 // Amplitude envelope from the shared runtime (velocity folded
@@ -4292,6 +4332,7 @@ public:
                     g.grainIdx = rng() % grainBank.size();
                     g.pos = 0;
                     g.len = grainSizeSamples;
+                    g.voiceIdx = vi;
                     float baseFreq = 440.0f * std::pow(2.0f, (v.note - 69 + v.mpe.pitchBend) / 12.0f);
                     g.rate = baseFreq / 440.0f; // pitch ratio relative to A4
                     activeGrains.push_back(g);
@@ -4299,23 +4340,31 @@ public:
 
                 v.time += dt;
 
-                // Sum active grains for this voice
-                float voiceOut = 0;
-                for (auto it = activeGrains.begin(); it != activeGrains.end();) {
-                    auto& g = *it;
-                    int idx = (int)g.pos;
-                    if (idx >= g.len || idx >= (int)grainBank[g.grainIdx].size()) {
-                        it = activeGrains.erase(it);
-                        continue;
-                    }
-                    // Hann window
-                    float w = 0.5f * (1.0f - std::cos(6.28318f * g.pos / g.len));
-                    voiceOut += grainBank[g.grainIdx][idx] * w;
-                    g.pos += g.rate;
-                    ++it;
-                }
                 float pMul = 1.0f + node.aftertouchSensitivity * effectivePressure(v.mpe);
-                out += voiceOut * env * pMul;
+                voiceGain[vi] = env * pMul;
+            }
+
+            // Grains whose voice has gone silent read voiceGain == 0 here, so
+            // they contribute nothing and simply expire on their own length.
+            // (allocVoice() drops them outright when it recycles the slot, so a
+            // new note can never inherit the previous note's grains.)
+            float out = 0;
+            for (auto it = activeGrains.begin(); it != activeGrains.end();) {
+                auto& g = *it;
+                const auto& wave = grainBank[(size_t)g.grainIdx];
+                if ((int)g.pos >= g.len || wave.empty()) {
+                    it = activeGrains.erase(it);
+                    continue;
+                }
+                // The bank waveform is one period of the defined spectrum, so
+                // reading it modulo its length loops it seamlessly - that's what
+                // lets a grain be longer than the FFT frame without a click.
+                const int idx = (int)g.pos % (int)wave.size();
+                // Hann window, over the grain's OWN length (not the bank's)
+                float w = 0.5f * (1.0f - std::cos(6.28318f * g.pos / g.len));
+                out += wave[(size_t)idx] * w * voiceGain[g.voiceIdx];
+                g.pos += g.rate;
+                ++it;
             }
 
             if (activeGrains.size() > 1)
@@ -4412,12 +4461,25 @@ private:
         AHDSREnvelopeRuntime ampEnv;  // shared amplitude envelope runtime
     };
     std::vector<Voice> voices;
+    // Hands out a voice slot, recycling the oldest if all are busy. Any grains
+    // still tagged with the recycled slot are dropped first: grains outlive the
+    // voice that spawned them (that's what getTailLengthSeconds accounts for),
+    // so without this a new note would adopt the previous note's in-flight
+    // grains and re-amplify them under its own envelope.
     Voice& allocVoice() {
-        for (auto& v : voices) if (!v.active) return v;
-        float oldest = -1; int idx = 0;
+        int idx = -1;
         for (int i = 0; i < (int)voices.size(); ++i)
-            if (voices[i].time > oldest) { oldest = voices[i].time; idx = i; }
-        return voices[idx];
+            if (!voices[(size_t)i].active) { idx = i; break; }
+        if (idx < 0) {
+            float oldest = -1;
+            idx = 0;
+            for (int i = 0; i < (int)voices.size(); ++i)
+                if (voices[(size_t)i].time > oldest) { oldest = voices[(size_t)i].time; idx = i; }
+        }
+        activeGrains.erase(std::remove_if(activeGrains.begin(), activeGrains.end(),
+                                          [idx](const ActiveGrain& g) { return g.voiceIdx == idx; }),
+                           activeGrains.end());
+        return voices[(size_t)idx];
     }
 
     struct ActiveGrain {
@@ -4425,6 +4487,7 @@ private:
         float pos = 0;
         int len = 0;
         float rate = 1.0f;
+        int voiceIdx = 0;   // owning voice; indexes `voices` (and voiceGain[])
     };
     std::vector<ActiveGrain> activeGrains;
     std::mt19937 rng{1234};
@@ -4434,6 +4497,17 @@ public:
     }
     // See ParticleSynthProcessor::reservedGrainCount - same non-vacuity hook.
     size_t reservedGrainCount() const { return activeGrains.capacity(); }
+    // How many grains are sounding right now. The self-test uses this to pin
+    // down grain LIFETIME (steady-state count == voices x Density x GrainSize),
+    // which is the observable that catches grains being advanced once per voice
+    // instead of once per sample.
+    size_t activeGrainCount() const { return activeGrains.size(); }
+    // Live voice count, for the same steady-state derivation.
+    int activeVoiceCount() const {
+        int n = 0;
+        for (const auto& v : voices) if (v.active) ++n;
+        return n;
+    }
 };
 
 // ==============================================================================

@@ -2500,6 +2500,30 @@ public:
             scratch.prepare(tailLen);
         }
 
+        // Per-block decay coefficient.
+        //
+        // `Decay` is defined as the attenuation a sample has accumulated by the
+        // time it has migrated all the way OUT of the tail buffer - decay^16 -
+        // NOT as a per-block multiplier. That distinction is the whole point:
+        // a sample is aged once per block and lives in the buffer for
+        // tailLen/n blocks, so applying `decay` verbatim each block made the
+        // audible tail length depend on the audio device's buffer size (16
+        // attenuations at 512 samples/block, 128 at 64 - the same knob position
+        // was a usable ambience on one device and effectively dry on another).
+        // Deriving the coefficient from n cancels that out exactly.
+        //
+        // kBufferDecays = 16 is picked so that at the common 512-sample buffer
+        // the exponent is exactly 1 and the coefficient comes out as plain
+        // `decay` - i.e. projects made before this fix sound unchanged, and
+        // every other buffer size now matches them instead of diverging.
+        // It is also sample-rate coherent: the total is decay^16 across the
+        // buffer whatever the rate, so the tail still fades to the same place
+        // by the point the hard buffer boundary cuts it off.
+        constexpr float kBufferDecays = 16.0f;
+        const float blockDecay = (decay >= 1.0f)
+            ? 1.0f
+            : std::pow(decay, kBufferDecays * (float)n / (float)tailLen);
+
         for (int c = 0; c < ch; ++c) {
             float* data = buf.getWritePointer(c);
             auto& tail = (c == 0) ? tailBufL : tailBufR;
@@ -2507,7 +2531,7 @@ public:
             // Add new input to the tail buffer (shift + accumulate).
             // Shift existing tail left by n samples and add new input.
             for (int i = 0; i < tailLen - n; ++i)
-                tail[i] = tail[i + n] * decay;
+                tail[i] = tail[i + n] * blockDecay;
             for (int i = 0; i < n && (tailLen - n + i) >= 0; ++i)
                 tail[tailLen - n + i] = data[i];
 

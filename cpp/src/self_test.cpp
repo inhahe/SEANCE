@@ -3824,6 +3824,129 @@ void testWarp(Report& r) {
                            maxAbsDiffBuf(stereo, stereoRef));
             }
         }
+
+        // 7. The Wavelet Reverb's decay must not depend on the audio device's
+        //    buffer size. The tail is aged once per processBlock, so applying
+        //    the Decay knob verbatim each block attenuated a sample
+        //    tailLen/blockSize times over its life - 16 times at a 512-sample
+        //    buffer but 128 at a 64-sample one. At Decay = 0.7 that is 0.003
+        //    versus 1.4e-6: the same preset was an ambience on one machine and
+        //    silence on another. The fix derives the per-block coefficient from
+        //    the block size; this test is what pins it down.
+        //
+        //    Getting a clean reading here took three attempts, so the reasoning
+        //    is worth recording - the obvious tests all measure something else.
+        //
+        //    a) "Burst, then watch the tail fade during silence" fails because
+        //       this node does not ring. It emits only the LAST `n` samples of
+        //       the transformed tail, and those sit exactly on top of the freshly
+        //       written input, so once the input stops the content marches left
+        //       out of the readout window within a couple of hundred samples and
+        //       the output is gone long before any decay curve is visible.
+        //       (Confirmed: with Color = 0 the node is bit-exact unity, which is
+        //       another way of saying the readout window only ever contains the
+        //       new block.) What Decay actually controls is how heavily the older
+        //       content is faded BEFORE the transform, i.e. how much history
+        //       bleeds into the current output through the long wavelet basis
+        //       functions.
+        //    b) "Compare raw output level at two block sizes" fails because the
+        //       readout window is the region most distorted by the transform's
+        //       right-hand boundary, so level per sample is block-size dependent
+        //       no matter what the decay does - measured 2.4x between 64 and 512
+        //       with the decay behaving perfectly.
+        //    c) "Divide out (b) using each block size's own Decay = 1 run, under
+        //       a steady tone" fails because a sample is aged once per block, so
+        //       the attenuation profile along the buffer is a STAIRCASE whose
+        //       step is the per-block coefficient. Multiplied into a continuous
+        //       tone that staircase is a train of amplitude discontinuities, and
+        //       their broadband splatter swamps the decay: it made Decay = 0.9
+        //       measure LOUDER than Decay = 1.
+        //
+        //    What works is an impulse. The staircase then multiplies an almost
+        //    entirely zero buffer, so it generates no artefacts of its own, and
+        //    the single non-zero sample carries exactly the accumulated
+        //    attenuation for its age as it migrates out. Summing |output| and
+        //    dividing by the same run at Decay = 1 gives the mean attenuation
+        //    over the ages the readout can see - the quantity the bug corrupted,
+        //    with the boundary geometry of (b) cancelled by the self-ratio.
+        //
+        //    The `kSkip` window is essential and was the last thing to get
+        //    right. Summed over the impulse's WHOLE life the reading is
+        //    dominated by its first few hundred samples, when it is still inside
+        //    the readout window and has barely been aged at all - and a metric
+        //    dominated by un-aged output is blind to the ageing rate. Measured:
+        //    with the bug deliberately reinstated that version scored 0.927,
+        //    i.e. it passed more comfortably than the fixed code did (0.756).
+        //    Skipping the first 1024 samples restricts the measurement to ages
+        //    where Decay has actually had a chance to act.
+        //
+        //    Levels = 8 / Color = 3 widen the window into history: the level-8
+        //    db4 scaling function spans (8-1)*(2^8-1)+1 = 1786 samples, and
+        //    crushing the short detail bands (gains 1, 1/8, 1/27, ...) leaves
+        //    that long blur as the output.
+        //
+        //    Verified by reinstating the bug: this test reads 1.09 against the
+        //    fixed code and 122204 against the broken code, so the margin is
+        //    five orders of magnitude and the tolerance below is nowhere near
+        //    the limiting factor.
+        {
+            auto impulseLevel = [](int bs, float decay) {
+                NodeGraph g;
+                int nId = g.addNode("rev", NodeType::Effect, {}, {}).id;
+                Node& nd = *g.findNode(nId);
+                nd.params.push_back({"Decay",  decay, 0.0f, 1.0f});
+                nd.params.push_back({"Color",  3.0f, 0.0f, 3.0f}); // must be > 0:
+                nd.params.push_back({"Levels", 8.0f, 1.0f, 8.0f}); // at Color 0 the
+                nd.params.push_back({"Mix",    1.0f, 0.0f, 1.0f}); // node is unity
+                WaveletReverbProcessor proc(nd);
+                proc.prepareToPlay(48000.0, bs);
+
+                const int kTotal = 8192;   // one full traversal of the tail
+                const int kSkip  = 1024;   // ...but ignore the impulse's youth
+                juce::AudioBuffer<float> buf(2, bs);
+                juce::MidiBuffer mb;
+
+                double level = 0.0;
+                for (int s = 0; s < kTotal; s += bs) {
+                    buf.clear();
+                    if (s == 0)              // impulse at absolute sample 0, so
+                        for (int c = 0; c < 2; ++c)   // both runs age it over
+                            buf.getWritePointer(c)[0] = 1.0f;  // the same clock
+                    proc.processBlock(buf, mb);
+                    if (s < kSkip) continue;
+                    for (int i = 0; i < bs; ++i)
+                        level += std::abs((double)buf.getReadPointer(0)[i]);
+                }
+                return level;
+            };
+
+            const double open512 = impulseLevel(512, 1.0f);
+            const double open64  = impulseLevel(64,  1.0f);
+            // Non-vacuity first: if the node emitted nothing there would be
+            // nothing to compare and the ratio checks below would pass on 0/0.
+            r.checkVal(open512 > 1e-3 && open64 > 1e-3,
+                       "wavelet-fx: Reverb smears an impulse at Levels 8 / Color 3",
+                       juce::jmin(open512, open64));
+
+            const double att512 = impulseLevel(512, 0.9f) / juce::jmax(1e-12, open512);
+            const double att64  = impulseLevel(64,  0.9f) / juce::jmax(1e-12, open64);
+            // ...and the knob must actually attenuate, or a node that ignored
+            // Decay entirely would satisfy the block-size check trivially.
+            r.checkVal(att512 < 0.95,
+                       "wavelet-fx: Reverb's Decay knob attenuates the tail",
+                       att512);
+
+            const double ratio = att512 / juce::jmax(1e-12, att64);
+            // The tolerance is set by the design, not by the fix: the two runs
+            // approximate the same exponential with staircases of different step
+            // size (10% at 512 samples, 1.3% at 64), and the readout reaches
+            // 1786 + n samples back, so the range of ages being averaged differs
+            // by the block size too. Those leave a residual 9% (measured 1.086);
+            // the bug leaves 122204.
+            r.checkVal(ratio > 0.8 && ratio < 1.25,
+                       "wavelet-fx: Reverb decay is independent of the audio "
+                       "buffer size (512 vs 64 samples)", ratio);
+        }
     }
 
     // ---- Wavelet effects: real-time CPU budget --------------------------

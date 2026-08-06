@@ -1891,7 +1891,7 @@ Best used as a wash / bloom on pads and textures. It is not a room simulator —
 
 **Neutral:** Decay = 1, Color = 0, Mix = 1. This is the least obvious neutral in the family: with every band weight at 1 and no attenuation on the shift, the samples that come out of the tail buffer are exactly the ones just written into it — and it is still a full 8192-point round-trip, which makes it the most demanding of the transform tests.
 
-Caveat: **Decay is applied once per processing block, not per sample**, so the audible decay time depends on the audio device's buffer size — the same Decay setting rings noticeably longer at 512 samples/block than at 64. Logged in `known-issues.md`; the fix is to derive a per-block coefficient from a decay time in seconds.
+**Decay is defined as the attenuation across a full traversal of the tail buffer**, not as a per-block multiplier. The tail is aged once per `processBlock`, so a sample is attenuated `8192 / blockSize` times over its life — 16 times at a 512-sample buffer but 128 times at a 64-sample one. Applying the knob value verbatim each block therefore made the same preset a usable bloom on one audio device and effectively dry on another (at Decay = 0.7, 0.003 vs 1.4 × 10⁻⁶ surviving). The per-block coefficient is instead derived as `Decay^(16 · blockSize / 8192)`, so the total across the buffer is `Decay¹⁶` at every buffer size. The exponent 16 is chosen so that at the common 512-sample buffer the coefficient is exactly `Decay` — projects made before this fix sound unchanged, and every other buffer size now matches them instead of diverging. Guarded by the `wavelet-fx: Reverb decay is independent of the audio buffer size` self-test.
 
 Wavelet family: `db4`.
 

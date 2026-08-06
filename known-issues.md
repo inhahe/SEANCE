@@ -565,7 +565,35 @@ rather than stealing the oldest.
 
 ---
 
-## BUG: Wavelet Reverb's Decay is applied per BLOCK, so the tail length depends on the audio buffer size
+## FIXED (2026-08-06, HASH_XXX): Wavelet Reverb's Decay was applied per BLOCK, so the tail depended on the audio buffer size
+
+**Fix:** the per-block coefficient is now derived from the block size —
+`blockDecay = powf(decay, 16.0f * n / tailLen)` — so a sample accumulates
+`decay^16` over a full traversal of the buffer at *every* block size. The
+exponent 16 was chosen so that at the common 512-sample buffer the coefficient
+comes out as plain `decay`: projects made before the fix sound unchanged, and
+every other buffer size now matches them instead of diverging. `decay >= 1` is
+short-circuited to exactly 1 so the existing neutrality test stays bit-exact.
+
+Guarded by `wavelet-fx: Reverb decay is independent of the audio buffer size
+(512 vs 64 samples)` in `self_test.cpp`. Writing that test was considerably
+harder than the fix, and the reasoning is recorded in a long comment above it —
+three plausible measurement designs each turned out to measure something other
+than the decay (the node doesn't ring, so there's no fade to watch; its raw
+output level is block-size dependent by design, because the readout window sits
+in the transform's boundary region; and the attenuation staircase splatters
+broadband energy when multiplied into a continuous tone, which made Decay = 0.9
+measure *louder* than Decay = 1). The version that works feeds an impulse and
+skips its first 1024 samples, so the reading isn't dominated by output the decay
+hasn't acted on yet. Verified by reinstating the bug: it reads 1.09 against the
+fixed code and 122204 against the broken code.
+
+**Not fixed:** the tail is still hard-bounded at 8192 samples (≈171 ms at
+48 kHz) regardless of Decay, which is short for a reverb, and Decay is still a
+dimensionless 0–1 knob rather than a time in seconds. Sizing the buffer from a
+requested decay time remains the natural follow-up. Original report below.
+
+---
 
 **Found:** 2026-08-06, while writing the REFERENCE.md wavelet section — the
 neutral setting (Decay = 1) had to be explained, which meant working out what

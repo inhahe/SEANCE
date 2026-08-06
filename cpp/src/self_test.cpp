@@ -3947,6 +3947,80 @@ void testWarp(Report& r) {
                        "wavelet-fx: Reverb decay is independent of the audio "
                        "buffer size (512 vs 64 samples)", ratio);
         }
+
+        // 8. The Asymmetric Filter must put its pre-attack region where the ms
+        //    knob says it is: immediately BEFORE the onset, on the time axis.
+        //
+        //    It used to lay the envelope out across the concatenated wavelet
+        //    coefficient array, which is not a time axis - one step in the
+        //    approximation band is 2^Levels samples and one step in the finest
+        //    detail band is 2 - and it indexed that array with onset positions
+        //    counted in finest-band coefficients. So a "20 ms pre-attack" was
+        //    neither 20 ms nor the same width in any two bands, and its low
+        //    indices landed in the approximation region at the START of the
+        //    block instead of next to the onset. Now the envelope is built in
+        //    samples and resampled onto each band by that band's stride.
+        //
+        //    Test signal: a quiet 200 Hz tone (something for the gain to act on)
+        //    plus one loud click at sample 700. The tone is low enough in
+        //    frequency to leave the finest detail band alone, so the click is
+        //    unambiguously the only onset. With Pre Gain = 4 and Post Gain = 1,
+        //    wet-minus-dry has to concentrate just before sample 700 and leave
+        //    the start of the block alone.
+        {
+            const int   kN     = 1024;
+            const int   kOnset = 700;
+            const float kPreMs = 5.0f;   // 240 samples at 48 kHz -> [460, 700)
+
+            NodeGraph g;
+            int nId = g.addNode("asym", NodeType::Effect, {}, {}).id;
+            Node& nd = *g.findNode(nId);
+            nd.params.push_back({"Pre-Attack", kPreMs, 0.0f, 100.0f});
+            nd.params.push_back({"Post-Decay",   1.0f, 0.0f, 200.0f});
+            nd.params.push_back({"Pre Gain",     4.0f, 0.0f,   4.0f});
+            nd.params.push_back({"Post Gain",    1.0f, 0.0f,   2.0f});
+            nd.params.push_back({"Sensitivity",  0.5f, 0.0f,   1.0f});
+            nd.params.push_back({"Levels",       4.0f, 1.0f,   8.0f});
+            nd.params.push_back({"Mix",          1.0f, 0.0f,   1.0f});
+            AsymmetricFilterProcessor proc(nd);
+            proc.prepareToPlay(48000.0, kN);
+
+            juce::AudioBuffer<float> buf(2, kN), dry(2, kN);
+            for (int c = 0; c < 2; ++c)
+                for (int i = 0; i < kN; ++i)
+                    dry.getWritePointer(c)[i] =
+                        0.2f * std::sin(6.28318530718f * 200.0f * (float)i / 48000.0f)
+                        + (i == kOnset ? 1.0f : 0.0f);
+            buf.makeCopyOf(dry);
+            juce::MidiBuffer mb;
+            proc.processBlock(buf, mb);
+
+            auto diffOver = [&](int a, int b) {
+                double d = 0.0;
+                for (int i = a; i < b; ++i)
+                    d += std::abs((double)buf.getReadPointer(0)[i]
+                                  - (double)dry.getReadPointer(0)[i]);
+                return d;
+            };
+            // The db4 basis at 4 levels has a support of (8-1)*(2^4-1)+1 = 106
+            // samples, so any change smears about that far either side of where
+            // it is applied. The two windows are 150 samples clear of the
+            // pre-attack region's edges, comfortably outside that.
+            const double inRegion  = diffOver(500, 800);
+            const double atBlockStart = diffOver(0, 310);
+            r.checkVal(inRegion > 1e-3,
+                       "wavelet-fx: Asymmetric Filter's pre-attack region "
+                       "changes the audio at all", inRegion);
+            const double leak = atBlockStart / juce::jmax(1e-12, inRegion);
+            // Verified by reinstating the bug: laying the envelope out along the
+            // coefficient array instead reads 0.28 here (against 0.00 for the
+            // fixed code), and its in-region figure collapses from 48.8 to 2.1 -
+            // so the old version was applying most of its gain nowhere near the
+            // onset it had just detected.
+            r.checkVal(leak < 0.05,
+                       "wavelet-fx: Asymmetric Filter's pre-attack lands before "
+                       "the onset, not at the start of the block", leak);
+        }
     }
 
     // ---- Wavelet effects: real-time CPU budget --------------------------

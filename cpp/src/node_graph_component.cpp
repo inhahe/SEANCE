@@ -4129,12 +4129,13 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
                     break;
                 }
                 case 235: makeEffect("Asymmetric Filter", "__asymfilter__", {
-                    {"Pre-Attack", 20.0f, 0.0f, 100.0f},
-                    {"Post-Decay", 50.0f, 0.0f, 200.0f},
-                    {"Pre Gain",    2.0f, 0.0f,   4.0f},
-                    {"Post Gain",   0.5f, 0.0f,   2.0f},
-                    {"Levels",      4.0f, 1.0f,   8.0f},
-                    {"Mix",         1.0f, 0.0f,   1.0f},
+                    {"Pre-Attack",  20.0f, 0.0f, 100.0f},
+                    {"Post-Decay",  50.0f, 0.0f, 200.0f},
+                    {"Pre Gain",     2.0f, 0.0f,   4.0f},
+                    {"Post Gain",    0.5f, 0.0f,   2.0f},
+                    {"Sensitivity",  0.5f, 0.0f,   1.0f},
+                    {"Levels",       4.0f, 1.0f,   8.0f},
+                    {"Mix",          1.0f, 0.0f,   1.0f},
                 }); break;
                 case 234: makeEffect("Complexity", "__waveletcomplexity__", {
                     {"Complexity", 0.5f, 0.0f, 1.0f},

@@ -1943,17 +1943,17 @@ Wavelet family: `db4`.
 | **Post-Decay** | 50 ms | 0 – 200 ms | How far behind each onset the post-region extends. |
 | **Pre Gain** | 2.0 | 0 – 4 | Gain reached immediately before the onset. > 1 swells into the hit; < 1 ducks ahead of it. |
 | **Post Gain** | 0.5 | 0 – 2 | Gain immediately after the onset, recovering to 1 over Post-Decay. < 1 tightens/gates the tail. |
+| **Sensitivity** | 0.5 | 0 – 1 | Onset threshold, as a fraction of the block's loudest finest-band coefficient. 0 treats everything as an onset; 1 keeps only the single loudest. |
 | **Levels** | 4 | 1 – 8 | DWT depth. |
 | **Mix** | 1.0 | 0 – 1 | Dry/wet. |
 
-Onsets are found as peaks in the finest detail band, using a fixed threshold of half that band's peak — there is no sensitivity knob yet.
+Onsets are found as peaks in the finest detail band. The threshold is **program-adaptive** — a fraction of that band's own peak within the block, not an absolute level — so the node behaves the same on a quiet take and a loud one without re-dialling. Sensitivity's default of 0.5 is the value that used to be hardcoded, so projects saved before the param existed are unchanged.
+
+**The gain envelope is built along the time axis, in samples, and then resampled onto each band by that band's stride.** This matters more than it sounds. The concatenated coefficient array is *not* a time axis: one step in the approximation band is worth `2^Levels` input samples while one step in the finest detail band is worth 2. An envelope laid out directly across that array would put the "20 ms before the onset" region in a different place, and at a different width, in every band. Each coefficient takes the **mean** of the envelope across the span of time it represents rather than a point sample, because the coarse bands stride up to 256 samples at a time and point sampling would alias a short pre-attack ramp into them — or step straight over it. Guarded by the `wavelet-fx: Asymmetric Filter's pre-attack lands before the onset, not at the start of the block` self-test.
 
 **Neutral:** Pre Gain = 1 and Post Gain = 1. Both ramps collapse to a constant 1 (`1 + (1−1)·frac`), so the envelope stays flat even where transients are detected. Detection still runs — this is not an early-out.
 
-Caveats, both logged in `known-issues.md`:
-
-- The ms values are converted to **coefficient counts** at the sample rate, but one padded block only holds a few hundred to a couple of thousand coefficients. At 48 kHz a 512-sample block is 512 coefficients ≈ 10.7 ms, so any Pre-Attack setting above about 10 ms already covers the whole block and further increases do nothing audible. The knob is therefore much more sensitive at the bottom of its range than the ms labels suggest, and its effective range depends on the audio buffer size.
-- Onset positions are found in the finest detail band but the gain envelope is laid out across the **whole concatenated coefficient array**, whose axis isn't time — a given index means 2 samples of time in the finest band and `2^Levels` samples in the approximation band. So the pre/post regions don't land exactly where the ms labels imply. The effect is real and musical, but treat the two time knobs as *shape* controls rather than as literal milliseconds until this is reworked.
+Remaining limitation, logged in `known-issues.md`: the analysis window is **one zero-padded audio block**, so neither time region can be longer than that however the knob is set, and both are clamped to it. At 48 kHz a 512-sample block is ≈ 10.7 ms, so with a small device buffer the top of the Pre-Attack range flattens out — the *shape* keeps changing as the envelope is redistributed, but the region can't extend past the block. Lifting this needs a fixed-size analysis frame with reported latency, decoupled from the device buffer, rather than a bigger clamp.
 
 Wavelet family: `db4`.
 

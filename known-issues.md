@@ -636,7 +636,46 @@ companion change.
 
 ---
 
-## BUG: Asymmetric Filter's Pre-Attack / Post-Decay are labelled in ms but indexed in coefficients
+## MOSTLY FIXED (2026-08-06, HASH_YYY): Asymmetric Filter's Pre-Attack / Post-Decay were labelled in ms but indexed in coefficients
+
+**Fixed — problem 2, the wrong axis.** The gain envelope is now built along the
+**time** axis in samples, from onset positions converted out of finest-band
+coefficient index (× 2, that band's stride), and then resampled onto each band by
+that band's own stride. Each coefficient takes the **mean** of the envelope over
+the span of time it represents rather than a point sample: the coarse bands
+stride up to `2^Levels` samples at a time, so point sampling would alias a short
+pre-attack ramp into them or step straight over it. A `double` prefix sum makes
+each of those means an O(1) subtraction, so the pass stays allocation-free and
+the CPU budget test is unchanged (100× realtime).
+
+Guarded by `wavelet-fx: Asymmetric Filter's pre-attack lands before the onset,
+not at the start of the block`. Verified by reinstating the bug: it reads 0.00
+against the fixed code and 0.28 against the broken code, and the broken version's
+in-region figure collapses from 48.8 to 2.1 — i.e. the old code applied most of
+its gain nowhere near the onset it had just detected.
+
+**Also fixed:** the hardcoded `0.5 * maxFine` onset threshold is now a
+**Sensitivity** param (0–1, default 0.5 = the old constant, so existing projects
+are unchanged). It stays a fraction of the block's own peak rather than an
+absolute level, so it doesn't need re-dialling between a quiet and a loud take.
+
+**Still open — problem 1, the range bound.** `preSamples`/`postSamples` are now
+*clamped* to the padded block length rather than silently overflowing it, so the
+behaviour is honest, but the underlying limit is unchanged: the analysis window
+is one audio block, so at 48 kHz / 512 samples nothing above ≈10.7 ms can extend
+any further, and where the knob flattens still moves with the device buffer size.
+Clamping is not the real fix and was not intended as one. **The real fix is a
+fixed-size analysis frame decoupled from the device buffer** — buffer input into
+(say) 4096-sample frames, process each frame whole, and report the framing
+latency to PDC. Since the DWT round-trip is exact, overlap-adding at 50% hop with
+sqrt-Hann analysis and synthesis windows would reconstruct the neutral setting
+bit-exactly (sqrt-Hann² = Hann, which is COLA at that hop), so the existing unity
+test would survive the rework — and it would also remove the per-block envelope
+discontinuities that exist today at every block boundary.
+
+Original report below.
+
+---
 
 **Found:** 2026-08-06, same pass as the entry above.
 

@@ -3521,6 +3521,7 @@ public:
         // Worst case every coefficient in the finest band is a transient.
         transients.reserve((size_t)pad / 2 + 1);
         gainEnv.reserve((size_t)pad);
+        envPrefix.reserve((size_t)pad + 1);
     }
     void releaseResources() override {}
 
@@ -3536,9 +3537,20 @@ public:
         float postGain = paramByName(node, "Post Gain", 0.5f);
         int   levels   = juce::jlimit(1, 8, (int)paramByName(node, "Levels", 4.0f));
         float mix      = juce::jlimit(0.0f, 1.0f, paramByName(node, "Mix", 1.0f));
+        // Onset threshold as a fraction of the block's loudest detail
+        // coefficient. Program-adaptive rather than absolute, so it behaves the
+        // same on a quiet and a loud take. 0 makes everything an onset, 1 keeps
+        // only the single loudest. Defaults to the 0.5 that used to be hardcoded
+        // here, so projects saved before this param existed are unchanged.
+        float sens     = juce::jlimit(0.0f, 1.0f, paramByName(node, "Sensitivity", 0.5f));
 
-        int preSamples  = (int)(preMs * 0.001 * sampleRate);
-        int postSamples = (int)(postMs * 0.001 * sampleRate);
+        // The analysis window is one zero-padded block, so a pre/post region can
+        // never be longer than that however the knob is set. Clamping here is
+        // what makes that honest instead of silently wrapping into nonsense.
+        int padLen = 1;
+        while (padLen < n) padLen *= 2;
+        int preSamples  = juce::jlimit(1, padLen, (int)(preMs  * 0.001 * sampleRate));
+        int postSamples = juce::jlimit(1, padLen, (int)(postMs * 0.001 * sampleRate));
 
         const auto& filt = scratch.useFilter("db4");
         auto& sig = scratch.sig;
@@ -3546,7 +3558,7 @@ public:
 
         for (int c = 0; c < ch; ++c) {
             float* data = buf.getWritePointer(c);
-            const int padLen = scratch.load(data, n);
+            scratch.load(data, n);
 
             int actualLevels = dwt(sig, levels, filt, scratch.ws);
 
@@ -3557,18 +3569,33 @@ public:
             int finestStart = padLen / 2;
             int finestLen = padLen / 2;
 
-            // Find transient positions (peaks in finest detail).
+            // Find transient positions (peaks in finest detail), stored as
+            // TIME positions in samples. The finest detail band has padLen/2
+            // coefficients spanning padLen samples, so its stride is 2 - that
+            // factor is the conversion out of coefficient index into a real
+            // sample offset, and it is what lets the ms knobs below mean
+            // something.
             // clear() keeps the reserved capacity, so the push_backs below
             // never reallocate on the audio thread.
             transients.clear();
             float maxFine = 0;
             for (int i = finestStart; i < finestStart + finestLen; ++i)
                 maxFine = std::max(maxFine, std::abs(sig[i]));
-            float transThresh = maxFine * 0.5f;
+            float transThresh = maxFine * sens;
             for (int i = finestStart; i < finestStart + finestLen; ++i)
-                if (std::abs(sig[i]) > transThresh) transients.push_back(i - finestStart);
+                if (std::abs(sig[i]) > transThresh)
+                    transients.push_back((i - finestStart) * 2);
 
             // Build a gain envelope that's asymmetric around each transient.
+            //
+            // This is built along the TIME axis, in samples, NOT along the
+            // concatenated coefficient array. The two are not the same axis:
+            // one step in the approximation band is worth 2^Levels samples
+            // while one step in the finest detail band is worth 2, so an
+            // envelope laid out across the coefficient array puts the "20 ms
+            // before the onset" region in a different place - and at a
+            // different width - in every band, and drops its low indices into
+            // the approximation region rather than near the onset at all.
             gainEnv.assign((size_t)padLen, 1.0f);
             for (int t : transients) {
                 // Pre-attack region: ramp up preGain before the transient
@@ -3583,9 +3610,37 @@ public:
                 }
             }
 
-            // Apply gain envelope to all coefficients.
+            // Resample the time-domain envelope onto each band by that band's
+            // stride, so one wall-clock millisecond covers the same wall-clock
+            // span everywhere. Each coefficient takes the MEAN of the envelope
+            // across the span of time it represents rather than a point sample:
+            // the coarse bands stride 2^Levels samples at a time, so point
+            // sampling would alias a short pre-attack ramp into them (or step
+            // straight over it). A prefix sum makes every one of those means an
+            // O(1) subtraction, in double because differencing two float
+            // running totals of a few thousand terms loses more precision than
+            // the neutral-setting unity test tolerates.
+            envPrefix.assign((size_t)padLen + 1, 0.0);
             for (int i = 0; i < padLen; ++i)
-                sig[i] *= gainEnv[i];
+                envPrefix[(size_t)i + 1] = envPrefix[(size_t)i] + (double)gainEnv[(size_t)i];
+            auto meanEnv = [this](int a, int b) {
+                return (float)((envPrefix[(size_t)b] - envPrefix[(size_t)a])
+                               / (double)(b - a));
+            };
+
+            // Approximation band first, then the detail bands coarsest-first -
+            // the same layout dwt() writes and idwtPR() expects.
+            const int approxStride = padLen / approxLen;   // == 2^actualLevels
+            for (int i = 0; i < approxLen; ++i)
+                sig[(size_t)i] *= meanEnv(i * approxStride, (i + 1) * approxStride);
+            int bandStart = approxLen;
+            for (int band = 0; band < actualLevels; ++band) {
+                const int bandLen = approxLen << band;
+                const int stride  = padLen / bandLen;
+                for (int i = 0; i < bandLen; ++i)
+                    sig[(size_t)(bandStart + i)] *= meanEnv(i * stride, (i + 1) * stride);
+                bandStart += bandLen;
+            }
 
             idwtPR(sig, actualLevels, filt, scratch.ws);
             for (int i = 0; i < n; ++i)
@@ -3613,8 +3668,9 @@ private:
     Node& node;
     double sampleRate = 44100;
     WaveletFxScratch scratch;
-    std::vector<int>   transients;  // coefficient indices flagged as attacks
-    std::vector<float> gainEnv;     // per-coefficient asymmetric gain
+    std::vector<int>    transients; // onset positions, in SAMPLES not coefficients
+    std::vector<float>  gainEnv;    // asymmetric gain along the time axis
+    std::vector<double> envPrefix;  // running sum of gainEnv, for O(1) band means
 };
 
 // ==============================================================================

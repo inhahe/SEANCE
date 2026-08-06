@@ -137,9 +137,11 @@
   <li>Raise <strong>Pre Gain</strong> to 2.0 or more: you get a swell rushing <em>into</em> every hit, the reverse-cymbal effect without any reversed audio.</li>
   <li>Or drop <strong>Pre Gain</strong> below 1.0 for the opposite — the sound ducks out of the way just before each attack, which makes the attack land much harder.</li>
   <li><strong>Post Gain</strong> shapes what happens behind each hit. Below 1.0 it tightens or gates the tail.</li>
+  <li><strong>Pre-Attack</strong> and <strong>Post-Decay</strong> set how long those two regions last, in milliseconds. Short pre-attack times give a sharp lift right on the edge of the hit; longer ones give a slow swell.</li>
+  <li>If it's picking up too much — every little tick counts as a hit — raise <strong>Sensitivity</strong>. Lower it to catch quieter hits too. It's measured relative to the loudest thing in each chunk, so it doesn't need re-dialling when the track gets louder or quieter.</li>
 </ol>
 
-<p>The <strong>Pre-Attack</strong> and <strong>Post-Decay</strong> knobs are labelled in milliseconds, but treat them as shape controls rather than literal times — most of their useful range is at the bottom, and how much of it does anything depends on your audio buffer size. Sweep them and listen rather than reading the numbers.</p>
+<p>One limit worth knowing: the node can only look ahead as far as one chunk of audio, so very long Pre-Attack times get capped. If the top of the knob's range stops doing anything, that's why — a smaller audio buffer in <em>Settings → Audio Device…</em> means a shorter cap.</p>
 
 <h2>Recipe: even out a mix band by band, or tilt it brighter</h2>
 

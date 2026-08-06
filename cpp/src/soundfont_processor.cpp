@@ -127,16 +127,18 @@ bool SFZInstrument::loadFromFile(const std::string& path) {
     return !regions.empty();
 }
 
-std::vector<const SFZRegion*> SFZInstrument::findRegions(int midiNote, int velocity) const {
-    std::vector<const SFZRegion*> matches;
+void SFZInstrument::findRegions(int midiNote, int velocity,
+                                std::vector<const SFZRegion*>& out) const {
+    // clear() keeps capacity, so once `out` has grown to the widest match set
+    // this appends without touching the allocator.
+    out.clear();
     for (auto& r : regions) {
         if (midiNote >= r.lokey && midiNote <= r.hikey &&
             velocity >= r.lovel && velocity <= r.hivel &&
             !r.samples.empty()) {
-            matches.push_back(&r);
+            out.push_back(&r);
         }
     }
-    return matches;
 }
 
 // ==============================================================================
@@ -154,8 +156,14 @@ SoundFontProcessor::~SoundFontProcessor() {
 void SoundFontProcessor::loadFile() {
     auto& script = node.script;
 
+    // NB: the tags are 8 characters INCLUDING the colon ("__sf2__:"), so the
+    // path starts at index 8. This used to be substr(7), which left a stray ':'
+    // on the front of every path - tsf_load_filename / juce::File then couldn't
+    // find the file, so .sf2 and .sfz instrument nodes silently loaded nothing
+    // and rendered silence. (SfizzProcessor got the equivalent offset right,
+    // which is why the sfizz path worked and this one didn't.)
     if (script.rfind("__sf2__:", 0) == 0) {
-        std::string path = script.substr(7);
+        std::string path = script.substr(8);
         if (sf2) { tsf_close(sf2); sf2 = nullptr; }
         sf2 = tsf_load_filename(path.c_str());
         if (sf2) {
@@ -166,14 +174,25 @@ void SoundFontProcessor::loadFile() {
             tsf_set_max_voices(sf2, 64);
         }
     } else if (script.rfind("__sfz__:", 0) == 0) {
-        std::string path = script.substr(7);
+        std::string path = script.substr(8);
         sfz.loadFromFile(path);
+        // Region count just changed, so re-reserve the note-on match scratch.
+        // A load can happen after prepareToPlay (the user picks a new SFZ), and
+        // findRegions runs on the audio thread.
+        regionMatches.reserve(sfz.regions.size());
     }
 }
 
 void SoundFontProcessor::prepareToPlay(double sr, int bs) {
     sampleRate = sr;
     if (sf2) tsf_set_output(sf2, TSF_STEREO_INTERLEAVED, (int)sr, 0.0f);
+
+    // Pre-size the audio-thread scratch so processBlock never allocates.
+    // TSF writes interleaved stereo, hence 2x the block. regionMatches is
+    // bounded by the region count - a note-on can in principle match every
+    // region (layered velocity/key zones), so reserve the lot.
+    interleaved.resize((size_t)std::max(1, bs) * 2);
+    regionMatches.reserve(sfz.regions.size());
 }
 
 void SoundFontProcessor::releaseResources() {
@@ -241,8 +260,14 @@ void SoundFontProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::MidiB
                     msg.getControllerNumber(), msg.getControllerValue());
         }
 
-        // Render audio (TSF outputs interleaved stereo)
-        std::vector<float> interleaved(numSamples * 2, 0.0f);
+        // Render audio (TSF outputs interleaved stereo). `interleaved` is a
+        // member sized in prepareToPlay - it used to be a local, i.e. a heap
+        // allocation on every audio callback. resize() down to the block never
+        // reallocates; a block longer than prepareToPlay promised grows it once
+        // and then stays put.
+        if ((int)interleaved.size() < numSamples * 2)
+            interleaved.resize((size_t)numSamples * 2);
+        std::fill(interleaved.begin(), interleaved.begin() + numSamples * 2, 0.0f);
         tsf_render_float(sf2, interleaved.data(), numSamples, 0);
 
         // Deinterleave to JUCE buffer
@@ -266,8 +291,8 @@ void SoundFontProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::MidiB
         if (msg.isNoteOn()) {
             int note = msg.getNoteNumber();
             int vel = msg.getVelocity();
-            auto matches = sfz.findRegions(note, vel);
-            for (auto* region : matches) {
+            sfz.findRegions(note, vel, regionMatches);
+            for (auto* region : regionMatches) {
                 // Find a free voice
                 int vi = -1;
                 float minLev = 999;

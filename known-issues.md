@@ -294,26 +294,54 @@ triaged below. Re-run it before trusting this list again — it is a snapshot.
     thread, not performed on the audio thread), not something to paper over
     here.
 
+### Fixed (commit `HASH_SF`) — `SoundFontProcessor`
+
+Two allocation sites, plus a much more serious bug found on the way in.
+
+- `std::vector<float> interleaved(numSamples * 2, 0.0f)` was a **local** in the
+  SF2/TSF render path, i.e. a heap allocation on literally every audio callback.
+  Now a member, sized in `prepareToPlay` and `resize`d (never `assign`ed) if a
+  host hands over a block longer than promised.
+- `SFZInstrument::findRegions` returned `std::vector<const SFZRegion*>` **by
+  value**, so every note-on allocated. Now takes an out-parameter and does
+  `clear()` + `push_back`; the caller's `regionMatches` member is reserved to
+  the region count in `prepareToPlay` *and* in `loadFile` (a user can pick a new
+  .sfz after prepare, changing the region count).
+- Both proved by `soundfont:` in `--self-test`: warm up, snapshot
+  `scratchCapacityBytes()`, then 60 blocks of note-on/note-off traffic at six
+  different block lengths, assert zero capacity growth, plus a non-vacuity peak
+  check. The instrument is generated on the fly (a looping sine `.wav` and a
+  two-region `.sfz` in the temp dir) so there's no binary fixture and no
+  dependency on a SoundFont being installed.
+
+**The real find: `.sf2` and `.sfz` instrument nodes never loaded anything.**
+`loadFile()` stripped the script tag with `script.substr(7)`, but `"__sf2__:"`
+and `"__sfz__:"` are **8** characters including the colon — so every path
+arrived with a leading `':'`, `tsf_load_filename` / `juce::File` couldn't find
+it, and the node rendered silence. `SfizzProcessor` got the equivalent offset
+right (`substr(10)` for `"__sfizz__:"`), which is why the sfizz path worked and
+this one didn't, and presumably why it went unnoticed. Fixed to `substr(8)`; the
+self-test now asserts `proc.isSFZ()` after construction, which pins the offset
+down for good.
+
 ### Still allocating — not yet fixed, in rough priority order
 
-1. **`SoundFontProcessor`** (`soundfont_processor.cpp` ~245) —
-   `std::vector<float> interleaved(numSamples * 2)` per block.
-2. **`SignalShapeProcessor`** (`signal_shape_node.cpp` ~480, ~661) — a
+1. **`SignalShapeProcessor`** (`signal_shape_node.cpp` ~480, ~661) — a
    `std::vector<const float*> sigChans` per block, and worse, a
    `std::function<float(float)>` **constructed per block** at 661 (a
    `std::function` holding a non-trivial capture heap-allocates).
-3. **`MidiScriptProcessor`** (`midi_script_node.cpp` ~317) —
+2. **`MidiScriptProcessor`** (`midi_script_node.cpp` ~317) —
    `std::vector<const float*> sigChans` per block.
-4. **`ArpeggiatorProcessor`** (`builtin_effects.h` ~621) — `seq` and
+3. **`ArpeggiatorProcessor`** (`builtin_effects.h` ~621) — `seq` and
    `baseNotes` vectors per block, plus `push_back` into them. Small (bounded by
    held notes) but on every block.
-5. **`FMSynthProcessor`** (`builtin_effects.h` ~1327) — `std::string p(opNames[i])`
+4. **`FMSynthProcessor`** (`builtin_effects.h` ~1327) — `std::string p(opNames[i])`
    per operator per block, purely to build a param name.
-6. **`AudioTimelineProcessor`** (`graph_processor.cpp` ~510) —
+5. **`AudioTimelineProcessor`** (`graph_processor.cpp` ~510) —
     `juce::AudioBuffer readBuf` per block **when a clip is streaming from disk**.
     Guarded by the file-read path, so it doesn't fire on every block, but it is
     on the audio thread.
-7. **`ParticleSynthProcessor`** / **`SpectralGrainProcessor`**
+6. **`ParticleSynthProcessor`** / **`SpectralGrainProcessor`**
     (`builtin_effects.h` ~1795, ~3980) — `grains.push_back` / `activeGrains.push_back`
     per grain spawn. Reallocates only when the grain count exceeds capacity, so
     a `reserve()` of the max grain count in `prepareToPlay` closes it.

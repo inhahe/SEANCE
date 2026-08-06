@@ -39,6 +39,7 @@
 #include "graph_processor.h"        // AudioTimelineProcessor - audio-clip playback
 #include "multitrack_recorder.h"    // MultitrackRecorder - live input capture
 #include "pan_processor.h"          // PanProcessor - the mute/solo/record-mute chokepoint
+#include "soundfont_processor.h"    // SoundFontProcessor - .sf2 / .sfz instrument node
 
 #include <juce_audio_formats/juce_audio_formats.h>
 #include <juce_graphics/juce_graphics.h>
@@ -5952,6 +5953,111 @@ void testAssetLibrary(Report& r) {
             peak = std::max(peak, (double)std::abs(buf.getSample(0, i)));
         r.checkVal(peak > 1e-3, "terrain-alloc: synth still audible after the sweep",
                    peak);
+    }
+
+    // ---- SoundFontProcessor: loads its file, and renders without allocating --
+    //
+    // Two things are under test here, both found in the audio-thread allocation
+    // sweep (agent-todo item 3).
+    //
+    // 1. loadFile() stripped the script tag with substr(7), but "__sfz__:" is
+    //    EIGHT characters, so every path arrived with a leading ':' and neither
+    //    tsf_load_filename nor juce::File could find it. .sf2 and .sfz nodes
+    //    loaded nothing and rendered silence - the whole node type was dead.
+    //    The region-count assertion below is what pins the offset down.
+    // 2. processBlock allocated on every callback: `interleaved` was a local
+    //    std::vector sized to the block, and findRegions returned a fresh
+    //    std::vector<const SFZRegion*> by value on every note-on. Both are now
+    //    members sized in prepareToPlay / loadFile, so total reserved scratch is
+    //    the observable proxy - any growth across the sweep means the allocator
+    //    was reached from the audio thread.
+    //
+    // The instrument is built on the fly (a looping sine .wav plus a two-region
+    // .sfz) so the test carries no binary fixture and doesn't depend on a
+    // SoundFont being installed. SFZ rather than SF2 because SF2 has no
+    // human-writable text form.
+    {
+        auto sfDir = juce::File::getSpecialLocation(juce::File::tempDirectory)
+                         .getChildFile("seance_selftest_sfz");
+        sfDir.deleteRecursively();
+        sfDir.createDirectory();
+
+        const double sr = 44100.0;
+        const int    sampleLen = (int)sr;              // 1 s, looped
+        std::vector<float> tone((size_t)sampleLen);
+        for (int i = 0; i < sampleLen; ++i)
+            tone[(size_t)i] = 0.5f * std::sin(2.0 * juce::MathConstants<double>::pi
+                                              * 220.0 * i / sr);
+        auto wav = sfDir.getChildFile("tone.wav");
+        r.check(writeWavFloat(wav, tone, sr), "soundfont: test sample written");
+
+        // Two regions splitting the velocity range, so a note-on has to match
+        // exactly one and regionMatches is genuinely repopulated per note.
+        auto sfzFile = sfDir.getChildFile("inst.sfz");
+        sfzFile.replaceWithText(
+            "<group> loop_mode=loop_continuous loop_start=0 loop_end="
+            + juce::String(sampleLen - 1) + " ampeg_release=0.05\n"
+            "<region> sample=tone.wav lokey=0 hikey=127 pitch_keycenter=57 lovel=0 hivel=63\n"
+            "<region> sample=tone.wav lokey=0 hikey=127 pitch_keycenter=57 lovel=64 hivel=127\n");
+
+        Node node;
+        node.id   = 1;
+        node.type = NodeType::Instrument;
+        node.name = "selftest-sfz";
+        node.script = "__sfz__:" + sfzFile.getFullPathName().toStdString();
+        node.pinsIn .push_back(Pin{ 1, "MIDI",  PinKind::Midi,  true,  2 });
+        node.pinsOut.push_back(Pin{ 100, "Audio", PinKind::Audio, false, 2 });
+        node.params.push_back({ "Volume",   0.8f, 0.0f, 1.0f });
+        node.params.push_back({ "Vel Sens", 0.0f, 0.0f, 1.0f });
+
+        const int maxBlock = 512;
+        SoundFontProcessor proc(node);
+        r.check(proc.isSFZ(), "soundfont: .sfz path resolves from the node script "
+                              "(regression: substr(7) left a stray ':')");
+        proc.prepareToPlay(sr, maxBlock);
+
+        juce::AudioBuffer<float> buf(2, maxBlock);
+        auto runBlock = [&](int len, int noteOn, int noteOff) {
+            juce::AudioBuffer<float> view(buf.getArrayOfWritePointers(),
+                                          buf.getNumChannels(), len);
+            view.clear();
+            juce::MidiBuffer midi;
+            if (noteOn  >= 0) midi.addEvent(juce::MidiMessage::noteOn (1, noteOn,
+                                              (juce::uint8)100), 0);
+            if (noteOff >= 0) midi.addEvent(juce::MidiMessage::noteOff(1, noteOff), 0);
+            proc.processBlock(view, midi);
+        };
+
+        // Warm up: sound a note and render a few blocks so every lazily-sized
+        // buffer settles before the capacity snapshot.
+        runBlock(maxBlock, 57, -1);
+        for (int i = 0; i < 3; ++i) runBlock(maxBlock, -1, -1);
+
+        const size_t before = proc.scratchCapacityBytes();
+
+        // Sweep block length (480 is a common host size; 333 is deliberately
+        // awkward) with continuous note-on/note-off traffic, so both the render
+        // path and the per-note-on region match run every pass.
+        const int lens[] = { 512, 480, 256, 64, 333, 512 };
+        for (int pass = 0; pass < 60; ++pass) {
+            const int nn = 55 + (pass % 7);
+            runBlock(lens[pass % 6], nn, (pass % 3 == 0) ? 55 + ((pass + 3) % 7) : -1);
+        }
+        const size_t after = proc.scratchCapacityBytes();
+        r.checkVal(after == before,
+                   "soundfont: 60 blocks of note traffic at varying block lengths "
+                   "allocate nothing (scratch capacity growth, bytes)",
+                   (double)after - (double)before);
+
+        // Non-vacuity: the sampler must actually be producing sound, otherwise
+        // the sweep above proves nothing.
+        runBlock(maxBlock, 57, -1);
+        double peak = 0;
+        for (int i = 0; i < maxBlock; ++i)
+            peak = std::max(peak, (double)std::abs(buf.getSample(0, i)));
+        r.checkVal(peak > 1e-3, "soundfont: sampler audible after the sweep", peak);
+
+        sfDir.deleteRecursively();
     }
 
     // ---- Song length: mid-bar content end plays in full (no bar-rounding) ----

@@ -444,12 +444,56 @@ the capacity proxy is easy to make vacuous:
 exposes no capacity accessor, and the FM fix removes a construction outright
 rather than relocating storage. Both are fixed by inspection.
 
-### Still allocating — not yet fixed
+### Still open — `AudioTimelineProcessor` does file I/O on the audio thread
 
-1. **`AudioTimelineProcessor`** (`graph_processor.cpp` ~510) —
-    `juce::AudioBuffer readBuf` per block **when a clip is streaming from disk**.
-    Guarded by the file-read path, so it doesn't fire on every block, but it is
-    on the audio thread.
+This was the last entry on the "still allocating" list, but reading it shows the
+allocation is the *least* of what's wrong, and it can't be closed with the
+capacity-reserve recipe the rest of the sweep used. Recorded here in full rather
+than fixed, because the honest fix is an architecture change, and reserving
+`readBuf` in isolation would be a stop-gap pointing away from that architecture
+(a preloaded or streamed design has no such buffer at all).
+
+`AudioTimelineProcessor::processBlock` (`graph_processor.cpp` ~437) calls
+`getAudio(clip.audioFilePath)` per clip per block, and `getAudio` is only ever
+called from there. Three distinct audio-thread hazards, worst first:
+
+1. **Blocking disk reads every block.** `audio->reader->read(...)` (~line 511) is
+   a synchronous read straight off a `FileInputStream`. A cold cache, a spinning
+   disk, or a network share can stall the callback for milliseconds — orders of
+   magnitude past the block deadline.
+2. **The whole file is *opened* on the audio thread.** On a cache miss `getAudio`
+   does `File::existsAsFile()`, `formatManager.createReaderFor(file)` (opens the
+   file and parses its header — for Ogg/MP3 that's a decoder spin-up),
+   `make_shared`, a `std::map` insert, **and an `fprintf(stderr, ...)`**. So the
+   first block in which any clip becomes audible does a file open, several
+   allocations and a blocking stderr write. A plausible explanation for a glitch
+   on the first bar after pressing play on a freshly loaded project.
+3. **`juce::AudioBuffer<float> readBuf(fileChannels, fileSamplesToRead)`**
+   (~line 510) — the original triage entry. One allocation per streaming clip
+   per block.
+
+**The proper fix** is to get file access off the audio thread entirely. Two
+shapes, both real options:
+
+- *Preload into memory.* When a clip's `audioFilePath` is set (project load,
+  drag-drop, end of a recording), decode the file into a `juce::AudioBuffer` on
+  a background thread and publish it into the cache; `processBlock` then only
+  reads memory. Simple, removes all three hazards at once, and matches SEANCE's
+  "moderate project sizes" scope — but a 5-minute stereo 44.1 kHz file is
+  ~105 MB as float, so a big project could balloon.
+- *Real streaming.* A per-clip background-filled ring buffer
+  (`juce::BufferingAudioSource` over an `AudioFormatReaderSource`, or a
+  hand-rolled equivalent, since clip playback also needs the slip offset and
+  rate conversion). Bounded memory, more machinery, and it needs a policy for
+  what to play when the buffer underruns.
+
+Either way the cache must be **populated from the message thread** and the audio
+thread must only ever *look up*, never create. Note also that the sample-rate
+conversion at ~line 516 is nearest-neighbour (`(int)(s * fileRatio)`), which
+aliases audibly on any file whose rate doesn't match the device; whichever
+design lands should carry a real resampler.
+
+Not scheduled. Nothing else from the sweep remains.
 
 ### Noticed while testing — `ParticleSynthProcessor` can exceed 0 dBFS
 

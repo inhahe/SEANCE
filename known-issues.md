@@ -195,7 +195,7 @@ triaged below. Re-run it before trusting this list again — it is a snapshot.
     EQ's bail-to-dry.
   Guarded by a capacity-growth test that also sweeps Mode and the point count.
 
-### Fixed (commit `SMS`, see git log for `perf: stop SMS allocating`)
+### Fixed (commit `59dff56`)
 
 - **`SMSProcessor`** (`builtin_effects.h`) — worst of the three: an `FFT` plus
   eight `std::vector`s **per frame**, not per block, so a single 2048-sample

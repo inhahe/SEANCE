@@ -2748,9 +2748,34 @@ public:
     SignalEQProcessor(Node& n) : node(n) {}
     const juce::String getName() const override { return "Signal EQ"; }
 
-    void prepareToPlay(double sr, int) override {
+    void prepareToPlay(double sr, int maxBlock) override {
         sampleRate = sr;
         for (auto& b : bands) b.reset();
+
+        // Size every audio-thread buffer here, once, so processBlock never
+        // reaches the allocator. The transform size is min(2^12, block), so the
+        // FFT ladder and the frame scratch only need to cover the largest block
+        // the host promised (capped at the FFT Size param's own 4096 ceiling).
+        maxBlockSize = std::max(1, maxBlock);
+        const int maxFft = std::max(16, std::min(1 << 12, nextPow2AtMost(maxBlockSize)));
+        ffts.prepare(16, maxFft);
+        window.assign((size_t) maxFft, 0.0f);
+        work.assign((size_t) maxFft, {});
+        timeBuf.assign((size_t) maxFft, 0.0f);
+        dry.assign((size_t) maxBlockSize, 0.0f);
+        out.assign((size_t) maxBlockSize, 0.0f);
+        norm.assign((size_t) maxBlockSize, 0.0f);
+        // Unlike Curve EQ the gain table can't be precomputed: every point
+        // coordinate is signal-modulatable, so the curve can change per block.
+        // Reserve the largest row instead and refill in place.
+        fftGains.reserve((size_t) (maxFft / 2 + 1));
+        fftGains.clear();
+        fftGainsBins = -1;
+        // Points are added/removed from the editor, but the resize lands on the
+        // audio thread via updateCoefficients - reserve the hard maximum so it
+        // is only ever a size change, never a reallocation.
+        bands.reserve((size_t) kMaxPoints);
+        windowN = -1;      // force the Hann window to be recomputed
     }
     void releaseResources() override {}
 
@@ -2767,24 +2792,7 @@ public:
         updateCoefficients();   // rebuild biquad bank from points + Width
 
         if (mode == 0) {
-            // ---- Zero-latency biquad cascade ----
-            for (int c = 0; c < ch; ++c) {
-                float* data = buf.getWritePointer(c);
-                for (int i = 0; i < n; ++i) {
-                    float x = data[i];
-                    float y = x;
-                    for (auto& b : bands) {
-                        auto& s = b.state[c];
-                        const auto& co = b.co;
-                        float out = co.b0 * y + co.b1 * s.x1 + co.b2 * s.x2
-                                  - co.a1 * s.y1 - co.a2 * s.y2;
-                        s.x2 = s.x1; s.x1 = y;
-                        s.y2 = s.y1; s.y1 = out;
-                        y = out;
-                    }
-                    data[i] = x * (1.0f - mix) + y * mix;
-                }
-            }
+            processBiquad(buf, ch, n, mix);   // zero-latency cascade
             return;
         }
 
@@ -2792,54 +2800,38 @@ public:
         int fftExp = juce::jlimit(8, 12, (int)paramByName(node, "FFT Size", 11.0f));
         int fftSize = 1 << fftExp;
         while (fftSize > n) fftSize /= 2;     // can't exceed the block
-        if (fftSize < 16) {                   // block too short to FFT -> fall back
-            for (int c = 0; c < ch; ++c) {
-                float* data = buf.getWritePointer(c);
-                for (int i = 0; i < n; ++i) {
-                    float x = data[i];
-                    float y = x;
-                    for (auto& b : bands) {
-                        auto& s = b.state[c];
-                        const auto& co = b.co;
-                        float out = co.b0 * y + co.b1 * s.x1 + co.b2 * s.x2
-                                  - co.a1 * s.y1 - co.a2 * s.y2;
-                        s.x2 = s.x1; s.x1 = y;
-                        s.y2 = s.y1; s.y1 = out;
-                        y = out;
-                    }
-                    data[i] = x * (1.0f - mix) + y * mix;
-                }
-            }
+        // Too short to FFT, or a block bigger than prepareToPlay promised (which
+        // would overrun the scratch): fall back to the biquad cascade rather
+        // than allocate. Same magnitude response, so the curve stays put.
+        if (fftSize < 16 || n > (int) dry.size() || fftSize > (int) window.size()) {
+            processBiquad(buf, ch, n, mix);
             return;
         }
-        int halfBins = fftSize / 2 + 1;
-        ensureFFTGains(halfBins, fftSize);
+        const int halfBins = fftSize / 2 + 1;
 
-        FFT fft(fftSize);
-        std::vector<float> window(fftSize);
-        for (int i = 0; i < fftSize; ++i)
-            window[i] = 0.5f * (1.0f - std::cos(6.28318530718f * i / fftSize)); // Hann
+        const FFT* fft = ffts.forSize(fftSize);
+        if (!fft) { processBiquad(buf, ch, n, mix); return; }
+        ensureFFTGains(halfBins, fftSize);
+        ensureWindow(fftSize);
+
         const int hop = std::max(1, fftSize / 4); // 75% overlap
 
         for (int c = 0; c < ch; ++c) {
             float* data = buf.getWritePointer(c);
-            std::vector<float> dry(data, data + n);
-            std::vector<float> out(n, 0.0f);
-            std::vector<float> norm(n, 0.0f);
+            std::copy(data, data + n, dry.begin());
+            std::fill(out.begin(), out.begin() + n, 0.0f);
+            std::fill(norm.begin(), norm.begin() + n, 0.0f);
 
             auto processFrame = [&](int start) {
-                std::vector<float> windowed(fftSize);
                 for (int i = 0; i < fftSize; ++i)
-                    windowed[i] = data[start + i] * window[i];
-                std::vector<std::complex<float>> spec;
-                fft.forwardReal(windowed, spec);
-                for (int k = 0; k < halfBins && k < (int)spec.size(); ++k)
-                    spec[k] *= fftGains[(size_t)k];      // magnitude scale, phase kept
-                std::vector<float> time;
-                fft.inverseReal(spec, time);
+                    timeBuf[(size_t) i] = data[start + i] * window[(size_t) i];
+                fft->forwardReal(timeBuf.data(), work.data());
+                for (int k = 0; k < halfBins; ++k)
+                    work[(size_t) k] *= fftGains[(size_t) k];  // magnitude scale, phase kept
+                fft->inverseReal(work.data(), timeBuf.data());
                 for (int i = 0; i < fftSize; ++i) {
-                    out[start + i]  += time[i] * window[i];
-                    norm[start + i] += window[i] * window[i];
+                    out[(size_t)(start + i)]  += timeBuf[(size_t) i] * window[(size_t) i];
+                    norm[(size_t)(start + i)] += window[(size_t) i] * window[(size_t) i];
                 }
             };
 
@@ -2848,8 +2840,9 @@ public:
             if (n >= fftSize && ((n - fftSize) % hop) != 0) processFrame(n - fftSize);
 
             for (int i = 0; i < n; ++i) {
-                float wet = norm[i] > 1e-6f ? out[i] / norm[i] : dry[i];
-                data[i] = dry[i] * (1.0f - mix) + wet * mix;
+                float wet = norm[(size_t) i] > 1e-6f ? out[(size_t) i] / norm[(size_t) i]
+                                                     : dry[(size_t) i];
+                data[i] = dry[(size_t) i] * (1.0f - mix) + wet * mix;
             }
         }
     }
@@ -2888,6 +2881,21 @@ public:
         return n;
     }
 
+    // Total bytes reserved by every audio-thread scratch buffer. The self-test
+    // watches this across a run of blocks: if it grows, processBlock reached the
+    // allocator, which is the bug this design exists to prevent. (Same
+    // capacity-as-proxy technique as PhaseVocoderShifter::capacityBytes.)
+    size_t scratchCapacityBytes() const {
+        return window.capacity() * sizeof(float)
+             + work.capacity() * sizeof(FFT::cplx)
+             + timeBuf.capacity() * sizeof(float)
+             + dry.capacity() * sizeof(float)
+             + out.capacity() * sizeof(float)
+             + norm.capacity() * sizeof(float)
+             + fftGains.capacity() * sizeof(float)
+             + bands.capacity() * sizeof(Band);
+    }
+
 private:
     Node& node;
     double sampleRate = 44100;
@@ -2901,9 +2909,57 @@ private:
     };
     std::vector<Band> bands;
 
+    // ---- audio-thread scratch, all sized in prepareToPlay ------------------
+    FFTLadder ffts;                       // one prebuilt FFT per usable size
+    std::vector<float> window;            // Hann, contents rebuilt on size change
+    std::vector<FFT::cplx> work;          // one frame's spectrum
+    std::vector<float> timeBuf;           // one frame, time domain
+    std::vector<float> dry, out, norm;    // block-length accumulators
+    int maxBlockSize = 0;
+    int windowN = -1;                     // fftSize `window` currently holds
+
     std::vector<float> fftGains;   // per-bin magnitude multiplier (FFT mode)
     int   fftGainsBins = -1;
     float fftGainsSig  = 0.0f;     // signature of last-built gains (cache key)
+
+    // Largest power of two <= v (v >= 1).
+    static int nextPow2AtMost(int v) {
+        int p = 1;
+        while ((p << 1) > 0 && (p << 1) <= v) p <<= 1;
+        return p;
+    }
+
+    // Refill the Hann window when the transform size changes. Writes into the
+    // buffer prepareToPlay sized, so it never reallocates.
+    void ensureWindow(int fftSize) {
+        if (windowN == fftSize) return;
+        for (int i = 0; i < fftSize; ++i)
+            window[(size_t) i] = 0.5f * (1.0f - std::cos(6.28318530718f * i / fftSize));
+        windowN = fftSize;
+    }
+
+    // Zero-latency RBJ peaking cascade. Also the fallback whenever the FFT path
+    // can't run (block too short, or bigger than prepareToPlay promised) - the
+    // magnitude response is identical by construction, so the curve is unchanged.
+    void processBiquad(juce::AudioBuffer<float>& buf, int ch, int n, float mix) {
+        for (int c = 0; c < ch; ++c) {
+            float* data = buf.getWritePointer(c);
+            for (int i = 0; i < n; ++i) {
+                float x = data[i];
+                float y = x;
+                for (auto& b : bands) {
+                    auto& s = b.state[c];
+                    const auto& co = b.co;
+                    float o = co.b0 * y + co.b1 * s.x1 + co.b2 * s.x2
+                            - co.a1 * s.y1 - co.a2 * s.y2;
+                    s.x2 = s.x1; s.x1 = y;
+                    s.y2 = s.y1; s.y1 = o;
+                    y = o;
+                }
+                data[i] = x * (1.0f - mix) + y * mix;
+            }
+        }
+    }
 
     // RBJ peaking-EQ coefficients for one point (freq, gainDb) with shared Q.
     Coeffs peakCoeffs(float freq, float gainDb, float Q) const {
@@ -2951,7 +3007,10 @@ private:
         if (fftGainsBins == halfBins && std::abs(sig - fftGainsSig) < 1e-9f
             && (int)fftGains.size() == halfBins) return;
 
-        fftGains.assign((size_t)halfBins, 1.0f);
+        // resize (not assign) into the capacity prepareToPlay reserved: growing
+        // to a size <= capacity is guaranteed not to reallocate, so this stays
+        // allocation-free even though the row length changes with FFT Size.
+        fftGains.resize((size_t)halfBins);
         const float kTwoPi = 6.28318530718f;
         for (int k = 0; k < halfBins; ++k) {
             float w = kTwoPi * (float)k / (float)fftSize;

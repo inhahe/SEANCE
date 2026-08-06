@@ -6988,6 +6988,88 @@ void testAssetLibrary(Report& r) {
                            "signaleq: countPoints counts contiguous points",
                            SignalEQProcessor::countPoints(*g.findNode(nId)));
             }
+
+            // Allocation-freedom on the audio thread (same bug, same proxy, as
+            // the Curve EQ check above). Signal EQ is the harsher case: every
+            // point coordinate is signal-modulatable, so the per-bin gain table
+            // genuinely has to be rebuilt on the audio thread - it can't be
+            // precomputed at prepare time the way Curve EQ's can. The sweep
+            // therefore also moves the points and changes how many there are,
+            // which is what resizes both the band bank and the gain row.
+            {
+                NodeGraph g;
+                int nId = makeSignalEqNode(g, 1,
+                    {{200.0f, 3.0f}, {440.0f, -6.0f}, {5000.0f, 2.0f}});
+                Node& nd = *g.findNode(nId);
+
+                const int maxBlock = 2048;
+                SignalEQProcessor proc(nd);
+                proc.prepareToPlay(sr, maxBlock);
+
+                juce::AudioBuffer<float> buf(2, maxBlock);
+                juce::MidiBuffer mb;
+                auto fill = [&](int len) {
+                    for (int ch = 0; ch < 2; ++ch)
+                        for (int i = 0; i < len; ++i)
+                            buf.setSample(ch, i, 0.25f * (float)std::sin(
+                                6.28318530718 * 440.0 * i / sr));
+                };
+                auto setParam = [&](const char* name, float v) {
+                    for (auto& p : nd.params) if (p.name == name) p.value = v;
+                };
+
+                fill(maxBlock);
+                proc.processBlock(buf, mb);          // warm up, settle capacities
+                const size_t before = proc.scratchCapacityBytes();
+
+                const int lens[] = { 2048, 1024, 512, 777, 256, 2048, 333 };
+                for (int pass = 0; pass < 48; ++pass) {
+                    setParam("Mode",     (float)(pass % 3 == 2 ? 0 : 1));
+                    setParam("FFT Size", (float)(8 + (pass % 5)));
+                    setParam("Mix",      (float)(pass % 2));
+                    setParam("Width",    1.0f + (float)(pass % 12));
+                    // Move the points every pass: forces the gain table rebuild.
+                    setParam("P1 Freq",  120.0f + 40.0f * (float)(pass % 9));
+                    setParam("P2 Gain",  -12.0f + (float)(pass % 7));
+                    // Grow the point count up to the hard maximum and back down,
+                    // exercising the band-bank resize on the audio thread.
+                    const int wantPts = 1 + (pass % SignalEQProcessor::kMaxPoints);
+                    while (SignalEQProcessor::countPoints(nd) < wantPts) {
+                        std::string pfx = "P" + std::to_string(
+                            SignalEQProcessor::countPoints(nd) + 1) + " ";
+                        nd.params.push_back({pfx + "Freq", 1000.0f, 20.0f, 20000.0f});
+                        nd.params.push_back({pfx + "Gain",    0.0f, -24.0f,  24.0f});
+                    }
+                    while (SignalEQProcessor::countPoints(nd) > wantPts)
+                        nd.params.pop_back();
+
+                    const int len = lens[pass % (int)(sizeof(lens)/sizeof(lens[0]))];
+                    juce::AudioBuffer<float> view(buf.getArrayOfWritePointers(), 2, len);
+                    fill(len);
+                    proc.processBlock(view, mb);
+                }
+                const size_t after = proc.scratchCapacityBytes();
+                r.checkVal(after == before,
+                           "signaleq: 48 blocks sweeping Mode / FFT Size / Mix / point "
+                           "count / block length allocate nothing (capacity growth, bytes)",
+                           (double)after - (double)before);
+
+                // Guard against the check above passing vacuously: the smallest
+                // swept block must still come out as audio, in both engines.
+                for (int mode = 0; mode <= 1; ++mode) {
+                    setParam("Mode", (float)mode);
+                    juce::AudioBuffer<float> small(buf.getArrayOfWritePointers(), 2, 256);
+                    fill(256);
+                    proc.processBlock(small, mb);
+                    double acc = 0;
+                    for (int i = 0; i < 256; ++i) {
+                        float s = small.getSample(0, i); acc += s * s;
+                    }
+                    r.check(std::sqrt(acc / 256) > 1e-4,
+                            juce::String("signaleq: still produces audio at the smallest "
+                                         "swept block size (mode ") + juce::String(mode) + ")");
+                }
+            }
         }
     }
 

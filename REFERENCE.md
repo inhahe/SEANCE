@@ -1371,6 +1371,33 @@ The **Signal EQ** effect is the **signal-controllable** equaliser: a set of **cu
 
 **Serialization:** none beyond the generic node fields — the script is the bare tag `__signaleq__`, and **all** state (global params, per-point Freq/Gain params, modulated `baseValue`s, and the modPin bindings) round-trips through the standard `[Node]`/`[Param]`/`modPin=` serialization in `project_file.cpp`. Undo is `commitSnapshot(...)` on every structural edit (add/remove point, add control input) and on drag-end.
 
+### <a name="sms"></a>SMS (harmonic / noise split)
+
+The **SMS** effect (*spectral modeling synthesis*) splits any incoming sound into two halves and gives each its own volume control:
+
+- **Deterministic (harmonic)** — the strong spectral peaks. The tonal, pitched part: the note itself, the bowed string, the vowel.
+- **Stochastic (noise)** — everything left over once the peaks are subtracted. Breath, bow scrape, consonants, cymbal wash, room hiss.
+
+Turn **Noise Gain** up and **Harmonic Gain** down to make a voice all breath and no pitch; do the reverse to get an unnaturally pure, "de-aired" tone. It's also the cheapest way to make a pad sound airier without touching its pitch or EQ.
+
+**Created from** the node-graph right-click → **Add effect** → **SMS (harmonic/noise split)**. Params:
+
+| Param | Range | Meaning |
+|---|---|---|
+| **Threshold** | 0–1 | How loud a bin has to be, *relative to the loudest bin in that frame*, to count as harmonic. `0` = every bin is harmonic (so the noise half is empty and the node is a bypass); `1` = only the single loudest bin is harmonic. Default `0.1`. |
+| **Harmonic Gain** | 0–3 | Level of the deterministic half. |
+| **Noise Gain** | 0–3 | Level of the stochastic half. |
+| **FFT Size** | 8–12 | Transform size as a power of two (256–4096). Default `10` = 1024. Bigger = finer frequency resolution (better peak isolation on low, slow material), smaller = better time resolution (less smearing of transients). |
+| **Mix** | 0–1 | Dry/wet. |
+
+Because the split is relative to each frame's own loudest bin, Threshold behaves consistently as the input level changes — you don't have to re-tune it when you turn the source up.
+
+**DSP — zero latency (`SMSProcessor`, `builtin_effects.h`).** A *block-local* Hann overlap-add STFT at 50% overlap (`FFT Size` clamped **down to a power of two** that fits the host block). Per frame: window → forward FFT → find each bin's magnitude and the frame maximum → bins at or above `Threshold × max` are copied into a peaks-only spectrum → inverse FFT gives the harmonic signal → the residual is `windowed − harmonic`. The two are scaled by their gains, summed, re-windowed, and overlap-added; the sum is then **normalised by the accumulated window power**, so with `Threshold = 0` and both gains at 1 the node is *exactly* unity gain and bit-for-bit transparent. Samples that no frame covered (the first/last partial window of a block) pass the dry signal through rather than fading to silence. Like the two EQs it is block-local and therefore adds **no latency**.
+
+> Before 2026-08 the overlap-add was **not** normalised. Hann² at 50% overlap sums to `0.5·(1 + cos²)`, which ripples between 0.5 and 1.0 — so SMS imposed an audible tremolo at the frame rate (≈43 Hz at FFT Size 1024 / 44.1 kHz) and ran about 2.5 dB quiet. Existing projects will hear SMS as slightly louder and no longer wobbling. The same change also fixed a crash: the transform size used to be clamped with `fftSize = n`, handing a **non-power-of-two** size to the FFT whenever the host block wasn't a power of two (480 samples is common), which indexed its bit-reversal table past its end and corrupted the heap.
+
+**Serialization:** none beyond the generic node fields — the script is the bare tag `__sms__` and all five params round-trip through the standard `[Node]`/`[Param]` serialization. All params are signal-modulatable via the on-demand [Param-pin mechanism (#88)](#on-demand-modulation-pins).
+
 ### Serialization
 
 `__spectral2__:<fftSize>|<mag.encode()>|<phase.encode()>` — each curve's `encode()` embeds its mode, expression (with `,`→`;` and `|`→`\x1F` escaping so it's safe inside the `|`-delimited blob), and language key. Two optional trailing `|`-fields follow, each self-identified by a prefix so order is flexible and unknown fields are skipped: `warp:<chain>` (the per-bin warp chain) and `refs:<magAssetId>:<phaseAssetId>` (the FrequencyGraph live-reference ids, emitted only when a curve is linked). `refs:` is written *after* `warp:` so an old decoder — which only checked `parts[3]` for a `warp:` prefix — still finds its warp and harmlessly ignores the ref field. The older `__spectral__:<fftSize>:<phaseMode>:<magExpr>|<phaseExpr>` format still decodes (as Built-in equations). Baked sample buffers are transient and re-created via `SpectralCurve::rebake()` on load.

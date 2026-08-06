@@ -195,36 +195,58 @@ triaged below. Re-run it before trusting this list again — it is a snapshot.
     EQ's bail-to-dry.
   Guarded by a capacity-growth test that also sweeps Mode and the point count.
 
+### Fixed (commit `SMS`, see git log for `perf: stop SMS allocating`)
+
+- **`SMSProcessor`** (`builtin_effects.h`) — worst of the three: an `FFT` plus
+  eight `std::vector`s **per frame**, not per block, so a single 2048-sample
+  block at FFT Size 256 hit the allocator ~15 times over. Converted to the same
+  `FFTLadder` + prepared-scratch design as the two EQs. Two real bugs fell out
+  of writing the tests for it (SMS had none before):
+  - **Heap corruption on non-power-of-two host blocks.** The transform size was
+    clamped with `if (fftSize > n) fftSize = n;` — which hands a
+    non-power-of-two size straight to `FFT`, whose `assert(isPow2)` is compiled
+    out in Release. `logN` then rounds *up*, so the bit-reversal permutation
+    produces indices past the end of the spectrum buffer and `transform()`
+    writes outside it. 480 samples is an entirely ordinary host block size.
+    Now rounds down to a power of two, and the `FFTLadder` lookup returns
+    nullptr for anything it wasn't built for, so the class of mistake can't
+    recur.
+  - **Unnormalised overlap-add.** Hann² at 50% overlap sums to `0.5·(1+cos²)`,
+    rippling between 0.5 and 1.0 — so SMS imposed a tremolo at the frame rate
+    (~43 Hz at FFT Size 1024 / 44.1 kHz) and ran ~2.5 dB quiet. (The code even
+    carried a comment claiming it was "constant 1.0 after normalization"; there
+    was no normalization.) Now divides by the accumulated window power, and a
+    test pins `Threshold = 0` at exactly unity gain.
+  Also gained a tail frame so the end of each block isn't left dry.
+
 ### Still allocating — not yet fixed, in rough priority order
 
-1. **`SMSProcessor`** (`builtin_effects.h` ~4210) — same shape, 8 vectors per
-   block including a `std::vector<std::complex<float>>` per frame.
-2. **`SpectrumTapProcessor::processBlock`** (`spectrum_tap.cpp` ~309) — three
+1. **`SpectrumTapProcessor::processBlock`** (`spectrum_tap.cpp` ~309) — three
    `std::vector`s sized by `bins.size()` per block (`binParamIdx`, `sigOut`,
    `customTarget`). Cheap fix: make them members sized when the bin list changes.
-3. **`TerrainSynthProcessor`** (`terrain_synth.cpp` ~2722-2951) — several per
+2. **`TerrainSynthProcessor`** (`terrain_synth.cpp` ~2722-2951) — several per
    block: `qpos`, `weights`, `dists`, `blended`, `coeffs`, `occCoord`, plus
    `std::string pname` at ~2887 (a `std::string` built per block to name a
    param — should be a `static constexpr` lookup). Also `v.granStreams.resize`
    / `v.inhStreams.resize` per voice. Biggest single offender by count.
-4. **`SoundFontProcessor`** (`soundfont_processor.cpp` ~245) —
+3. **`SoundFontProcessor`** (`soundfont_processor.cpp` ~245) —
    `std::vector<float> interleaved(numSamples * 2)` per block.
-5. **`SignalShapeProcessor`** (`signal_shape_node.cpp` ~480, ~661) — a
+4. **`SignalShapeProcessor`** (`signal_shape_node.cpp` ~480, ~661) — a
    `std::vector<const float*> sigChans` per block, and worse, a
    `std::function<float(float)>` **constructed per block** at 661 (a
    `std::function` holding a non-trivial capture heap-allocates).
-6. **`MidiScriptProcessor`** (`midi_script_node.cpp` ~317) —
+5. **`MidiScriptProcessor`** (`midi_script_node.cpp` ~317) —
    `std::vector<const float*> sigChans` per block.
-7. **`ArpeggiatorProcessor`** (`builtin_effects.h` ~621) — `seq` and
+6. **`ArpeggiatorProcessor`** (`builtin_effects.h` ~621) — `seq` and
    `baseNotes` vectors per block, plus `push_back` into them. Small (bounded by
    held notes) but on every block.
-8. **`FMSynthProcessor`** (`builtin_effects.h` ~1327) — `std::string p(opNames[i])`
+7. **`FMSynthProcessor`** (`builtin_effects.h` ~1327) — `std::string p(opNames[i])`
    per operator per block, purely to build a param name.
-9. **`AudioTimelineProcessor`** (`graph_processor.cpp` ~510) —
+8. **`AudioTimelineProcessor`** (`graph_processor.cpp` ~510) —
     `juce::AudioBuffer readBuf` per block **when a clip is streaming from disk**.
     Guarded by the file-read path, so it doesn't fire on every block, but it is
     on the audio thread.
-10. **`ParticleSynthProcessor`** / **`SpectralGrainProcessor`**
+9. **`ParticleSynthProcessor`** / **`SpectralGrainProcessor`**
     (`builtin_effects.h` ~1795, ~3980) — `grains.push_back` / `activeGrains.push_back`
     per grain spawn. Reallocates only when the grain count exceeds capacity, so
     a `reserve()` of the max grain count in `prepareToPlay` closes it.

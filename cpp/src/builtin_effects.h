@@ -4274,7 +4274,26 @@ class SMSProcessor : public juce::AudioProcessor {
 public:
     SMSProcessor(Node& n) : node(n) {}
     const juce::String getName() const override { return "SMS"; }
-    void prepareToPlay(double sr, int) override { sampleRate = sr; }
+    void prepareToPlay(double sr, int maxBlock) override {
+        sampleRate = sr;
+        // Size every audio-thread buffer once, here, so processBlock never
+        // reaches the allocator. The transform size is min(2^12, block) rounded
+        // down to a power of two, so the ladder and the frame scratch only need
+        // to cover the largest block the host promised.
+        maxBlockSize = std::max(1, maxBlock);
+        const int maxFft = std::max(4, std::min(1 << 12, nextPow2AtMost(maxBlockSize)));
+        ffts.prepare(4, maxFft);
+        window.assign((size_t) maxFft, 0.0f);
+        windowed.assign((size_t) maxFft, 0.0f);
+        spectrum.assign((size_t) maxFft, {});
+        harmSpectrum.assign((size_t) maxFft, {});
+        harmonic.assign((size_t) maxFft, 0.0f);
+        mags.assign((size_t) (maxFft / 2 + 1), 0.0f);
+        dry.assign((size_t) maxBlockSize, 0.0f);
+        output.assign((size_t) maxBlockSize, 0.0f);
+        norm.assign((size_t) maxBlockSize, 0.0f);
+        windowN = -1;      // force the Hann window to be recomputed
+    }
     void releaseResources() override {}
 
     void processBlock(juce::AudioBuffer<float>& buf, juce::MidiBuffer&) override {
@@ -4289,68 +4308,94 @@ public:
         int   fftExp       = juce::jlimit(8, 12, (int)paramByName(node, "FFT Size", 10.0f));
         float mix          = juce::jlimit(0.0f, 1.0f, paramByName(node, "Mix", 1.0f));
 
+        // Round DOWN to the largest power of two that fits in the block. This
+        // used to clamp with `fftSize = n`, which handed a non-power-of-two
+        // size straight to FFT - whose bit-reversal table is then indexed past
+        // its end, corrupting the heap on any host block that isn't a power of
+        // two (480 samples is common). The ladder lookup below can't be fooled
+        // that way: a size it wasn't built for returns nullptr.
         int fftSize = 1 << fftExp;
-        if (fftSize > n) fftSize = n; // can't exceed block size
-        // Round down to power of 2 that fits.
         while (fftSize > n) fftSize /= 2;
         if (fftSize < 4) return;
 
-        int halfBins = fftSize / 2 + 1;
-        FFT fft(fftSize);
+        // A block larger than prepareToPlay promised would overrun the scratch.
+        // Bail (leaving the block dry) rather than allocate on the audio thread;
+        // the next correctly sized block resumes normally.
+        if (n > (int) dry.size() || fftSize > (int) window.size()) return;
+
+        const FFT* fft = ffts.forSize(fftSize);
+        if (!fft) return;
+
+        const int halfBins = fftSize / 2 + 1;
+        ensureWindow(fftSize);
 
         for (int c = 0; c < ch; ++c) {
             float* data = buf.getWritePointer(c);
-            std::vector<float> dry(data, data + n);
+            std::copy(data, data + n, dry.begin());
 
             // Process in overlapping frames (hop = fftSize/2).
-            std::vector<float> output(n, 0.0f);
-            std::vector<float> window(fftSize);
-            for (int i = 0; i < fftSize; ++i)
-                window[i] = 0.5f * (1.0f - std::cos(6.28318f * i / fftSize)); // Hann
+            std::fill(output.begin(), output.begin() + n, 0.0f);
+            std::fill(norm.begin(), norm.begin() + n, 0.0f);
 
-            int hop = fftSize / 2;
-            for (int frame = 0; frame + fftSize <= n; frame += hop) {
+            const int hop = fftSize / 2;
+
+            auto processFrame = [&](int frame) {
                 // Window the input.
-                std::vector<float> windowed(fftSize);
                 for (int i = 0; i < fftSize; ++i)
-                    windowed[i] = data[frame + i] * window[i];
+                    windowed[(size_t) i] = data[frame + i] * window[(size_t) i];
 
                 // Forward FFT.
-                std::vector<std::complex<float>> spectrum;
-                fft.forwardReal(windowed, spectrum);
+                fft->forwardReal(windowed.data(), spectrum.data());
 
                 // Find magnitude peaks.
                 float maxMag = 0;
-                std::vector<float> mags(halfBins);
                 for (int k = 0; k < halfBins; ++k) {
-                    mags[k] = std::abs(spectrum[k]);
-                    maxMag = std::max(maxMag, mags[k]);
+                    mags[(size_t) k] = std::abs(spectrum[(size_t) k]);
+                    maxMag = std::max(maxMag, mags[(size_t) k]);
                 }
-                float thresh = threshold * maxMag;
+                const float thresh = threshold * maxMag;
 
-                // Separate: peaks above threshold = deterministic.
-                std::vector<std::complex<float>> harmSpectrum(halfBins, {0,0});
-                for (int k = 0; k < halfBins; ++k) {
-                    if (mags[k] >= thresh)
-                        harmSpectrum[k] = spectrum[k];
-                }
+                // Separate: peaks above threshold = deterministic. inverseReal
+                // reads bins [0, halfBins) and fills the conjugate half itself,
+                // so only that range needs clearing.
+                for (int k = 0; k < halfBins; ++k)
+                    harmSpectrum[(size_t) k] = (mags[(size_t) k] >= thresh)
+                                                 ? spectrum[(size_t) k]
+                                                 : FFT::cplx{0.0f, 0.0f};
 
-                // IFFT harmonic part.
-                std::vector<float> harmonic;
-                fft.inverseReal(harmSpectrum, harmonic);
+                // IFFT harmonic part (clobbers harmSpectrum).
+                fft->inverseReal(harmSpectrum.data(), harmonic.data());
 
                 // Residual = original windowed - harmonic.
-                // Overlap-add both parts with gains.
-                for (int i = 0; i < fftSize && (frame + i) < n; ++i) {
-                    float h = harmonic[i] * harmonicGain;
-                    float r = (windowed[i] - harmonic[i]) * noiseGain;
-                    output[frame + i] += (h + r) * window[i]; // re-window for OLA
+                // Overlap-add both parts with gains, tracking the window power
+                // so the sum can be normalised below.
+                for (int i = 0; i < fftSize; ++i) {
+                    float h = harmonic[(size_t) i] * harmonicGain;
+                    float rr = (windowed[(size_t) i] - harmonic[(size_t) i]) * noiseGain;
+                    output[(size_t)(frame + i)] += (h + rr) * window[(size_t) i]; // re-window for OLA
+                    norm[(size_t)(frame + i)] += window[(size_t) i] * window[(size_t) i];
                 }
-            }
+            };
 
-            // Normalize OLA (Hann + 50% overlap = constant 1.0 after normalization).
-            for (int i = 0; i < n; ++i)
-                data[i] = dry[i] * (1.0f - mix) + output[i] * mix;
+            int frame = 0;
+            for (; frame + fftSize <= n; frame += hop) processFrame(frame);
+            // Cover the block tail so the end isn't left dry (skip if the last
+            // hop already landed exactly on n-fftSize).
+            if (n >= fftSize && ((n - fftSize) % hop) != 0) processFrame(n - fftSize);
+
+            // Normalise the overlap-add. Hann^2 at 50% overlap sums to
+            // 0.5*(1+cos^2), i.e. it ripples between 0.5 and 1.0 - so the old
+            // un-normalised version imposed an audible tremolo at the frame
+            // rate (~43 Hz at FFT Size 1024 / 44.1 kHz) and lost ~2.5 dB
+            // overall. Dividing by the accumulated window power makes the
+            // deterministic+stochastic round trip exactly unity at any hop.
+            // Samples no frame reached (the first/last partial window) keep the
+            // dry signal rather than fading to silence.
+            for (int i = 0; i < n; ++i) {
+                float wet = norm[(size_t) i] > 1e-6f ? output[(size_t) i] / norm[(size_t) i]
+                                                     : dry[(size_t) i];
+                data[i] = dry[(size_t) i] * (1.0f - mix) + wet * mix;
+            }
         }
     }
 
@@ -4367,9 +4412,53 @@ public:
     void changeProgramName(int, const juce::String&) override {}
     void getStateInformation(juce::MemoryBlock&) override {}
     void setStateInformation(const void*, int) override {}
+
+    // Total bytes reserved by every audio-thread scratch buffer. The self-test
+    // watches this across a run of blocks: if it grows, processBlock reached the
+    // allocator. (Same capacity-as-proxy technique as Curve EQ / Signal EQ.)
+    size_t scratchCapacityBytes() const {
+        return window.capacity() * sizeof(float)
+             + windowed.capacity() * sizeof(float)
+             + spectrum.capacity() * sizeof(FFT::cplx)
+             + harmSpectrum.capacity() * sizeof(FFT::cplx)
+             + harmonic.capacity() * sizeof(float)
+             + mags.capacity() * sizeof(float)
+             + dry.capacity() * sizeof(float)
+             + output.capacity() * sizeof(float)
+             + norm.capacity() * sizeof(float);
+    }
+
 private:
     Node& node;
     double sampleRate = 44100;
+
+    // ---- audio-thread scratch, all sized in prepareToPlay ------------------
+    FFTLadder ffts;                       // one prebuilt FFT per usable size
+    std::vector<float> window;            // Hann, contents rebuilt on size change
+    std::vector<float> windowed;          // one frame, windowed input
+    std::vector<FFT::cplx> spectrum;      // one frame's spectrum
+    std::vector<FFT::cplx> harmSpectrum;  // peaks-only copy of it
+    std::vector<float> harmonic;          // IFFT of the peaks-only spectrum
+    std::vector<float> mags;              // per-bin magnitudes
+    std::vector<float> dry, output, norm; // block-length accumulators
+    int maxBlockSize = 0;
+    int windowN = -1;                     // fftSize `window` currently holds
+
+    // Largest power of two <= v (v >= 1).
+    static int nextPow2AtMost(int v) {
+        int p = 1;
+        while ((p << 1) > 0 && (p << 1) <= v) p <<= 1;
+        return p;
+    }
+
+    // Refill the Hann window when the transform size changes. Writes into the
+    // buffer prepareToPlay sized, so it never reallocates.
+    void ensureWindow(int fftSize) {
+        if (windowN == fftSize) return;
+        for (int i = 0; i < fftSize; ++i)
+            window[(size_t) i] = 0.5f * (1.0f - std::cos(6.28318f * i / fftSize));
+        windowN = fftSize;
+    }
 };
 
 } // namespace SoundShop

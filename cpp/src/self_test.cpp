@@ -7070,6 +7070,162 @@ void testAssetLibrary(Report& r) {
                                          "swept block size (mode ") + juce::String(mode) + ")");
                 }
             }
+
+            // ---- SMS (spectral modeling synthesis) -------------------------
+            // Splits the signal into deterministic (spectral peaks above
+            // Threshold) and stochastic (everything else) halves, each with its
+            // own gain. These are the node's first tests.
+            auto makeSmsNode = [&](NodeGraph& g, float threshold, float harmGain,
+                                   float noiseGain, float fftExp = 10.0f) -> int {
+                int nId = g.addNode("sms", NodeType::Effect, {}, {}).id;
+                Node& nd = *g.findNode(nId);
+                nd.params.push_back({"Threshold",     threshold, 0.0f,  1.0f});
+                nd.params.push_back({"Harmonic Gain", harmGain,  0.0f,  4.0f});
+                nd.params.push_back({"Noise Gain",    noiseGain, 0.0f,  4.0f});
+                nd.params.push_back({"FFT Size",      fftExp,    8.0f, 12.0f});
+                nd.params.push_back({"Mix",           1.0f,      0.0f,  1.0f});
+                return nId;
+            };
+
+            // (a) Threshold 0 puts EVERY bin in the deterministic half, so the
+            //     residual is exactly zero and the output must be the input
+            //     again at unity gain. This pins the whole round trip - window
+            //     -> FFT -> IFFT -> overlap-add -> normalise - and in
+            //     particular the normalisation: before it existed, Hann^2 at
+            //     50% overlap summed to 0.5*(1+cos^2), so this ratio came out
+            //     at 0.77 with a tremolo riding on it.
+            {
+                NodeGraph g;
+                int nId = makeSmsNode(g, 0.0f, 1.0f, 1.0f);
+                SMSProcessor proc(*g.findNode(nId));
+                proc.prepareToPlay(sr, N);
+                juce::AudioBuffer<float> buf; makeSine(buf);
+                juce::AudioBuffer<float> dryB; makeSine(dryB);
+                juce::MidiBuffer mb;
+                proc.processBlock(buf, mb);
+                double rWet = centralRMS(buf), rDry = centralRMS(dryB);
+                r.checkVal(rDry > 1e-3 && std::abs(rWet / rDry - 1.0) < 0.02,
+                           "sms: threshold 0 reproduces the input at unity gain",
+                           rDry > 1e-3 ? rWet / rDry : 0.0);
+            }
+
+            // (b) The actual claim of the node: keeping only the deterministic
+            //     half preserves a pure tone but throws away most of a noise
+            //     signal. Both are measured against their own dry level so the
+            //     OLA scaling above cancels out.
+            {
+                auto keepRatio = [&](bool noiseInput) {
+                    NodeGraph g;
+                    int nId = makeSmsNode(g, 0.85f, 1.0f, 0.0f);
+                    SMSProcessor proc(*g.findNode(nId));
+                    proc.prepareToPlay(sr, N);
+                    juce::AudioBuffer<float> buf(1, N);
+                    float* d = buf.getWritePointer(0);
+                    std::mt19937 rngLocal(9876);
+                    std::uniform_real_distribution<float> uni(-0.5f, 0.5f);
+                    for (int i = 0; i < N; ++i)
+                        d[i] = noiseInput ? uni(rngLocal)
+                                          : 0.5f * (float)std::sin(2.0 * 3.14159265358979
+                                                                   * 440.0 * i / sr);
+                    juce::AudioBuffer<float> dryB(1, N);
+                    dryB.copyFrom(0, 0, buf, 0, 0, N);
+                    juce::MidiBuffer mb;
+                    proc.processBlock(buf, mb);
+                    double rD = centralRMS(dryB);
+                    return rD > 1e-6 ? centralRMS(buf) / rD : 0.0;
+                };
+                const double tone  = keepRatio(false);
+                const double noise = keepRatio(true);
+                r.checkVal(tone > 3.0 * noise,
+                           "sms: harmonic-only keeps far more of a tone than of noise",
+                           noise > 1e-9 ? tone / noise : 0.0);
+            }
+
+            // (c) Regression: a block length that is not a power of two. The
+            //     old code clamped the transform size with `fftSize = n`, which
+            //     handed a non-power-of-two size to FFT; its bit-reversal table
+            //     is then indexed past its end, writing outside the spectrum
+            //     buffer. 480 samples is a perfectly ordinary host block size.
+            {
+                NodeGraph g;
+                int nId = makeSmsNode(g, 0.2f, 1.0f, 1.0f);
+                SMSProcessor proc(*g.findNode(nId));
+                proc.prepareToPlay(sr, 512);
+                juce::AudioBuffer<float> buf(1, 480);
+                float* d = buf.getWritePointer(0);
+                for (int i = 0; i < 480; ++i)
+                    d[i] = 0.5f * (float)std::sin(2.0 * 3.14159265358979 * 440.0 * i / sr);
+                juce::MidiBuffer mb;
+                proc.processBlock(buf, mb);
+                bool finite = true, nonZero = false;
+                for (int i = 0; i < 480; ++i) {
+                    const float s = buf.getSample(0, i);
+                    if (!std::isfinite(s)) finite = false;
+                    if (std::abs(s) > 1e-5f) nonZero = true;
+                }
+                r.check(finite && nonZero,
+                        "sms: non-power-of-two block (480) processes cleanly");
+            }
+
+            // (d) Allocation-freedom, same capacity-as-proxy check as the two
+            //     EQs. SMS built an FFT plus eight vectors PER FRAME, so a
+            //     single 2048-sample block at FFT Size 8 hit the allocator ~15
+            //     times over.
+            {
+                NodeGraph g;
+                int nId = makeSmsNode(g, 0.3f, 1.0f, 1.0f);
+                Node& nd = *g.findNode(nId);
+
+                const int maxBlock = 2048;
+                SMSProcessor proc(nd);
+                proc.prepareToPlay(sr, maxBlock);
+
+                juce::AudioBuffer<float> buf(2, maxBlock);
+                juce::MidiBuffer mb;
+                auto fill = [&](int len) {
+                    for (int ch = 0; ch < 2; ++ch)
+                        for (int i = 0; i < len; ++i)
+                            buf.setSample(ch, i, 0.25f * (float)std::sin(
+                                6.28318530718 * 440.0 * i / sr));
+                };
+                auto setParam = [&](const char* name, float v) {
+                    for (auto& p : nd.params) if (p.name == name) p.value = v;
+                };
+
+                fill(maxBlock);
+                proc.processBlock(buf, mb);          // warm up, settle capacities
+                const size_t before = proc.scratchCapacityBytes();
+
+                const int lens[] = { 2048, 1024, 512, 480, 777, 256, 2048, 333 };
+                for (int pass = 0; pass < 40; ++pass) {
+                    setParam("FFT Size",      (float)(8 + (pass % 5)));
+                    setParam("Threshold",     (float)(pass % 5) * 0.25f);
+                    setParam("Harmonic Gain", (float)(pass % 3));
+                    setParam("Noise Gain",    (float)(pass % 4) * 0.5f);
+                    setParam("Mix",           (float)(pass % 2));
+                    const int len = lens[pass % (int)(sizeof(lens)/sizeof(lens[0]))];
+                    juce::AudioBuffer<float> view(buf.getArrayOfWritePointers(), 2, len);
+                    fill(len);
+                    proc.processBlock(view, mb);
+                }
+                const size_t after = proc.scratchCapacityBytes();
+                r.checkVal(after == before,
+                           "sms: 40 blocks sweeping FFT Size / gains / block length "
+                           "allocate nothing (capacity growth, bytes)",
+                           (double)after - (double)before);
+
+                // Non-vacuity: the smallest swept block must still emit audio.
+                setParam("Harmonic Gain", 1.0f);
+                setParam("Noise Gain",    1.0f);
+                setParam("Mix",           1.0f);
+                juce::AudioBuffer<float> small(buf.getArrayOfWritePointers(), 2, 256);
+                fill(256);
+                proc.processBlock(small, mb);
+                double acc = 0;
+                for (int i = 0; i < 256; ++i) { float s = small.getSample(0, i); acc += s*s; }
+                r.check(std::sqrt(acc / 256) > 1e-4,
+                        "sms: still produces audio at the smallest swept block size");
+            }
         }
     }
 

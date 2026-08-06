@@ -324,7 +324,7 @@ this one didn't, and presumably why it went unnoticed. Fixed to `substr(8)`; the
 self-test now asserts `proc.isSFZ()` after construction, which pins the offset
 down for good.
 
-### Fixed (commit `HASH_SS`) — `SignalShapeProcessor`
+### Fixed (commit `e3a6c61`) — `SignalShapeProcessor`
 
 The worst offender of the sweep, because the cost scaled with the expression
 vocabulary rather than being one buffer. Per block, `processBlock` constructed:

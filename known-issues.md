@@ -549,6 +549,18 @@ the most likely thing to be productised. Each needs the usual REFERENCE treatmen
 what it does, every param with units and range, what the neutral setting is, and
 which wavelet family it uses. Add a "Wavelet effects" section with a TOC entry.
 
+**Same gap, the grain synths (found 2026-08-06).** `REFERENCE.md` describes how
+**Particle Cloud** and **Spectral Grain** relate to the shared AHDSR envelope,
+but never lists their params — "Density" appears in neither `REFERENCE.md`, the
+README, nor `docs/`. That became worth logging when both synths gained a hard
+ceiling of **1024 simultaneous grains** (commit `93f6ee3`, an audio-thread
+allocation fix): the ceiling *is* user-observable, in that Density past the point
+where the cloud saturates stops making it denser. There's currently nowhere to
+write that down. Whoever adds the params section should cover: Density (grains
+per second), Grain Size (ms), Spread, Attack/Release (as a fraction of grain
+length), Shape, Volume — and note the ceiling and that it drops the newest grain
+rather than stealing the oldest.
+
 ---
 
 ## TECH DEBT (architectural): processors hold `Node&`; params should come from an APVTS

@@ -551,17 +551,141 @@ suite: this is the part of SEANCE with no free equivalent (unlike the wavetable
 synth, which competes with Vital), so it is the most likely thing to be
 productised — every new wavelet node needs the same treatment on day one.
 
-**Same gap, the grain synths (found 2026-08-06, STILL OPEN).** `REFERENCE.md` describes how
-**Particle Cloud** and **Spectral Grain** relate to the shared AHDSR envelope,
-but never lists their params — "Density" appears in neither `REFERENCE.md`, the
-README, nor `docs/`. That became worth logging when both synths gained a hard
-ceiling of **1024 simultaneous grains** (commit `93f6ee3`, an audio-thread
-allocation fix): the ceiling *is* user-observable, in that Density past the point
-where the cloud saturates stops making it denser. There's currently nowhere to
-write that down. Whoever adds the params section should cover: Density (grains
-per second), Grain Size (ms), Spread, Attack/Release (as a fraction of grain
-length), Shape, Volume — and note the ceiling and that it drops the newest grain
-rather than stealing the oldest.
+**Same gap, the grain synths (found 2026-08-06, FIXED 2026-08-06).** `REFERENCE.md`
+described how **Particle Cloud** and **Spectral Grain** relate to the shared
+AHDSR envelope but never listed their params — "Density" appeared in neither
+`REFERENCE.md`, the README, nor `docs/`.
+
+**Fix:** `REFERENCE.md` gained a `## Granular synths (Particle Cloud, Spectral
+Grain)` section (TOC entry included): the Density × Grain Size product that
+governs cloud thickness, a param table per node, Particle Cloud's per-grain
+random stereo panning and linear grain envelope, Spectral Grain's bank model
+(16 IFFTs of one spectrum, `f` = bin index at a fixed 1024-point FFT, note
+number as playback rate), the level/clipping difference between the two, the
+grain ceiling, and Stop behaviour.
+
+`README.md` was also missing **Spectral Grain entirely** from its instrument
+inventory — a whole node type absent from the feature tour — so it gained a
+bullet, and the Particle Cloud bullet now links into the new reference anchor.
+
+As with the wavelet pass, writing it turned up real bugs — five this time,
+logged separately below ("transport Stop permanently silenced four built-in
+synths", and the three Spectral Grain defects).
+
+**Third surface, deliberately not done: `docs/` has no granular tutorial.**
+Neither node is mentioned on any tutorial page. Nothing in this pass *required*
+one — the fixes changed no documented workflow, since there was no documented
+workflow — but "make an evolving pad with a grain cloud" is a good fit for a
+task-oriented page next to `wavelet-effects.html`, and the Density × Grain Size
+interaction is exactly the sort of thing a tutorial teaches better than a spec
+table. If written, add it to `MainContentComponent`'s Help menu and
+`docs/index.html`.
+
+**Correction to this entry's original rationale.** It claimed the 1024-grain
+ceiling "*is* user-observable, in that Density past the point where the cloud
+saturates stops making it denser." **That is false and the docs must not repeat
+it.** Steady-state grain count is `Density × GrainSize × voices`, so at the
+param maxima the reachable ceiling is 100 grains for Particle Cloud
+(200/s × 0.5 s, monophonic) and 320 for Spectral Grain (200/s × 0.2 s × 8
+voices) — 3–10× under the cap. A Signal cable can't get there either:
+`applySignalModulations` ends with `p.value = std::clamp(modVal, p.minVal,
+p.maxVal)`, so a cable cannot push a param past its declared range. The 1024
+cap is an audio-thread safety net that is unreachable by an order of magnitude,
+and it is documented as such.
+
+---
+
+## FIXED (2026-08-06, c6d6345): pressing transport Stop permanently silenced four built-in synths
+
+**Severity: this was the worst bug in the tree.** One press of **Stop** made FM
+Synth, Phase Distortion Synth, Additive Synth and Spectral Grain go silent for
+the *rest of the session*, with no error and no way to recover short of
+deleting and re-adding the node.
+
+Transport panic calls `AudioProcessorGraph::reset()`, which calls `reset()` on
+every processor. All four implemented that as `voices.clear()` — but their voice
+pool is sized **only in the constructor** (`voices.resize(16)` / `resize(12)` /
+`resize(8)`); `prepareToPlay` never refilled it. So after Stop:
+
+1. `allocVoice()` scanned an empty vector, found no free voice;
+2. fell through to its steal path, which computes `idx = 0` and does
+   `return voices[idx]` — **out of bounds on an empty vector**, writing the new
+   note's state into the freed-but-still-owned buffer;
+3. the render loop's `for (auto& v : voices)` then iterated **zero** voices.
+
+Silent, permanent, and undefined behaviour on the audio thread.
+
+**Fix:** `reset()` now resets the voices in place (`for (auto& v : voices) v =
+Voice{};`) rather than removing them, each class grows a `kMaxVoices` constant
+so the pool size has one definition, and `allocVoice()` refuses to index an
+empty pool. Particle Cloud had the mirror-image defect — its `reset()` cleared
+the grain list but left `noteAmpEnv` running, and the spawn loop is gated on
+that envelope, so for a held note panic silenced the cloud for a fraction of a
+millisecond and then let it grow straight back. It now calls
+`noteAmpEnv.hardReset()` too.
+
+Guarded by twelve assertions (`panic/fmsynth:`, `panic/pdsynth:`,
+`panic/additive:`, `panic/particlesynth:`) covering both halves for each synth:
+panic really silences a held note, *and* the synth still plays afterwards. Both
+defects were reinstated to confirm the tests catch them (the three
+`voices.clear()` synths read exactly 0.00000 for "still plays after a transport
+Stop"; Particle Cloud reads 0.39244 for "actually silences a held note").
+
+**Related gap, still open:** none of the synths in `builtin_effects.h` handle
+MIDI **All Notes Off** / **All Sound Off**, though `builtin_synth.cpp`,
+`drum_synth.cpp`, `multi_sampler.cpp`, `poly_voice_processor.cpp`,
+`soundfont_processor.cpp` and `terrain_synth.cpp` all do. `GraphProcessor`
+emits `allNotesOff` on every channel when the transport stops
+(`graph_processor.cpp:94`), so those synths ignore it and rely entirely on the
+panic path above. That's fine for Stop but wrong for any other source of an
+All Notes Off (a controller's panic button, an incoming MIDI file). The fix is
+a shared helper — the message means "release every held note" — applied to each
+MIDI-accepting processor in `builtin_effects.h`.
+
+---
+
+## FIXED (2026-08-06, 7146029): Spectral Grain advanced every grain once per VOICE instead of once per sample
+
+`activeGrains` is a single pool shared by all voices, but the grain render loop
+sat **inside** the per-voice loop. With V voices sounding, every grain's read
+position was stepped V times per sample, so each grain played V× too fast (V×
+shorter, and at V× the pitch ratio) and was summed V times. And because
+`g.rate` is baked from the *spawning* voice's pitch while every voice rendered
+every grain, a chord came out as one smeared pitch rather than distinct notes.
+It was also `O(V·G)` where `O(G)` would do.
+
+**Fix:** `ActiveGrain` carries a `voiceIdx`, and the render is two passes per
+sample — advance the voices into a small `voiceGain[kMaxVoices]` array, then
+walk the grain pool **once**, scaling each grain by its owning voice's gain.
+`allocVoice()` drops a recycled slot's leftover grains so a new note can't
+inherit the previous note's cloud.
+
+Guarded by `spectralgrain: grain lifetime is independent of how many voices are
+sounding`. The observable is grain **lifetime** via the steady-state cloud size
+(`grains = voices × Density × GrainSize`), which is identical either way for one
+voice — that's the control assertion — and differs by the voice count for a
+chord. Reinstating the bug reads 3.00 grains/voice against 10.00 fixed.
+
+---
+
+## FIXED (2026-08-06, 7146029): Spectral Grain's Grain Size knob was inert above 21 ms, and grain length depended on the note played
+
+Grain length was clamped with `std::min(grainSizeSamples, grainBank[0].size())`.
+The bank is `kGrainFFTSize` = **1024 samples**, i.e. 21 ms at 48 kHz, so the
+entire upper 90% of the Grain Size range (1–200 ms) did nothing at all. Worse,
+a grain played *above* A4 reads the bank faster than 1 sample/sample, so it ran
+off the end and died early — **grain duration depended on which note you
+played**, which is not something a "Grain Size" control should do.
+
+**Fix:** bank entries are inverse *real* FFTs of a full spectrum and are
+therefore exactly periodic with period `kGrainFFTSize`, so the read now wraps
+(`(int)g.pos % wave.size()`) and loops seamlessly. Grain length is whatever the
+knob asks for, at any pitch, with no click. The Hann window is taken over the
+grain's own length rather than the bank's.
+
+Guarded by `spectralgrain: Grain Size keeps scaling past the FFT frame`.
+Reinstating the clamp makes the 100 ms / 50 ms grain-count ratio read exactly
+1.00000 (both sides pinned at 2 grains) against 2.00000 fixed.
 
 ---
 

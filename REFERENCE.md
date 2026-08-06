@@ -26,6 +26,7 @@ here.
 - [Waveshaper (amplitude morph) effects](#waveshaper-amplitude-morph-effects)
 - [Standalone single-cycle oscillators (frame synths)](#standalone-single-cycle-oscillators-frame-synths)
 - [Frequency-domain (spectral) synth](#frequency-domain-spectral-synth)
+- [Granular synths (Particle Cloud, Spectral Grain)](#granular-synths-particle-cloud-spectral-grain)
 - [Terrain Synth](#terrain-synth)
 - [Effect layers and groups](#effect-layers-and-groups)
 - [Wavelet effects](#wavelet-effects)
@@ -1404,6 +1405,164 @@ Because the split is relative to each frame's own loudest bin, Threshold behaves
 `__spectral2__:<fftSize>|<mag.encode()>|<phase.encode()>` — each curve's `encode()` embeds its mode, expression (with `,`→`;` and `|`→`\x1F` escaping so it's safe inside the `|`-delimited blob), and language key. Two optional trailing `|`-fields follow, each self-identified by a prefix so order is flexible and unknown fields are skipped: `warp:<chain>` (the per-bin warp chain) and `refs:<magAssetId>:<phaseAssetId>` (the FrequencyGraph live-reference ids, emitted only when a curve is linked). `refs:` is written *after* `warp:` so an old decoder — which only checked `parts[3]` for a `warp:` prefix — still finds its warp and harmlessly ignores the ref field. The older `__spectral__:<fftSize>:<phaseMode>:<magExpr>|<phaseExpr>` format still decodes (as Built-in equations). Baked sample buffers are transient and re-created via `SpectralCurve::rebake()` on load.
 
 The SpectrumTap script is `__spectrumtap__|<fftSize>|<curve0>|<curve1>|…` where each `<curveK>` is empty (biquad default) or a `SpectralCurve::encode()` payload. Bins linked to a `FrequencyGraph` asset append a trailing `|#refs|<slot>:<assetId>|…` section carrying the reference ids; the cached curve still persists in its slot so a deleted asset degrades gracefully. Pre-`#refs` decoders treat the `#refs` token as an un-decodable (hence biquad) slot and ignore it, so the format is backward compatible.
+
+---
+
+## Granular synths (Particle Cloud, Spectral Grain)
+
+Two instrument nodes build sound out of **grains** — short bursts, tens of
+milliseconds each, sprayed on top of one another fast enough to fuse into a
+continuous texture. They share the idea and almost nothing else: **Particle
+Cloud** synthesises each grain from a plain waveform, and **Spectral Grain**
+plays grains cut from a bank of IFFTs of a spectrum you define.
+
+Both take MIDI in and audio out, both are added from *Add Node → Instrument*,
+and both use the [shared AHDSR envelope](#shared-ahdsr-envelope) as a
+note-level VCA over the whole cloud — that envelope is *not* a set of params on
+the node, it lives on `node.ahdsrEnvelope` and is edited by right-clicking the
+node → *Envelope (AHDSR)…*.
+
+### The two rates that decide everything
+
+The single most useful thing to know about either node is how its two main
+knobs interact. Grains are spawned at **Density** per second and each one lives
+for **Grain Size** milliseconds, so the number sounding at once settles at:
+
+```
+grains = Density × Grain Size (in seconds) × (voices sounding)
+```
+
+That product, not either knob alone, is what you hear as "thickness":
+
+- **Density high, Grain Size low** — many short grains. Crisp, granular,
+  pointillist; individual grains are audible as texture.
+- **Density low, Grain Size high** — few long grains. Smooth and pad-like,
+  because each grain's own fade-in/fade-out is long enough to be a slow swell.
+- **Both low** — you drop below the fusion threshold and start hearing
+  individual events. This is where the glitchy/sparse sounds live.
+- **Both high** — a dense wash. Note that this is also where the output gets
+  loudest; see *Level* below.
+
+### Particle Cloud (`__particlesynth__`)
+
+Monophonic (one held note at a time). Each grain is an independently
+randomised burst of a chosen waveform.
+
+| Param | Default | Range | Meaning |
+|---|---|---|---|
+| **Density** | 30 | 1 – 200 | Grains spawned per second. |
+| **Spread** | 7 | 0 – 24 | Pitch randomisation, in **semitones**, applied per grain as a symmetric ± range around the played note. 0 = every grain on pitch; 24 = ±2 octaves of scatter. |
+| **Grain Size** | 50 | 1 – 500 ms | How long each grain lasts. |
+| **Attack** | 0.1 | 0 – 1 | Each grain's own fade-in, as a **fraction of that grain's length** — not a time. So it scales automatically when you move Grain Size. |
+| **Release** | 0.3 | 0 – 1 | Same, for each grain's fade-out. Attack + Release above 1.0 simply means the grain never reaches full level. |
+| **Shape** | 0 (sine) | 0 – 3 | Grain waveform: **0 = sine, 1 = saw, 2 = square, 3 = noise**. |
+| **Volume** | 0.5 | 0 – 1 | Output level. |
+
+*Spread* is what separates this node from just playing a note: with Spread at 0
+and a sine Shape it is a slightly grainy oscillator, and everything interesting
+comes from widening it. Because the randomisation is per grain and uniform, a
+wide Spread over a dense cloud reads as a **noise band** centred on the played
+note rather than as a chord.
+
+Each grain's envelope is a straight **linear** ramp up over *Attack* and down
+over *Release*, with a flat top in between — deliberately not a smooth window,
+because the corner is part of the node's character.
+
+Grains are also **panned randomly** across the stereo field, one position per
+grain, using an equal-power (sin/cos) law. This is not a param — it's always
+on, and it's the main reason a dense Particle Cloud sounds wide without any
+external stereo processing. A sparse cloud, by contrast, scatters audibly
+across the image.
+
+Grain spawning continues through the AHDSR **release** stage, so a long release
+gives a cloud that thins out gradually rather than one that stops spawning at
+note-off and leaves only its tails.
+
+### Spectral Grain (`__spectralgrain__:<magnitude expression>`)
+
+**8-voice polyphonic.** Instead of a waveform, you define a *magnitude
+spectrum* as an expression in `f` (the FFT bin index), and the node pre-renders
+a bank of **16 grains**, each an inverse FFT of that same spectrum with
+different random phases. Playback picks a bank entry at random per grain, so
+the timbre is fixed but the phase relationships keep shifting — that's what
+produces the shimmering, never-quite-repeating character.
+
+The default expression is `exp(-f/10)`, a steep low-pass roll-off.
+
+| Param | Default | Range | Meaning |
+|---|---|---|---|
+| **Density** | 20 | 1 – 200 | Grains spawned per second, **per voice**. |
+| **Grain Size** | 40 | 1 – 200 ms | How long each grain lasts. |
+| **Volume** | 0.5 | 0 – 1 | Output level. |
+
+Notes on the model:
+
+- The grain bank is generated at a fixed **1024-point** FFT, which is what
+  fixes the meaning of `f`: bin `f` is `f × sampleRate / 1024` Hz at the
+  reference pitch A4. Changing the expression regenerates the bank.
+- MIDI note number sets a **playback rate** (`2^((note − 69)/12)`), i.e. the
+  bank waveform is read faster or slower. So the whole spectrum transposes with
+  the note, as with a sampler, rather than each partial being retuned.
+- A bank entry is one *period* of the defined spectrum and therefore exactly
+  periodic, so grains longer than 1024 samples simply loop through it. Grain
+  Size is honoured across its whole range and is independent of the note
+  played. (Before 2026-08 grain length was clamped to the bank length — 21 ms
+  at 48 kHz — so most of the Grain Size range was inert and a grain played
+  above A4 ran off the end of the bank and died early, making grain duration
+  depend on the note. See `known-issues.md`.)
+- Each grain belongs to the voice that spawned it and is rendered under that
+  voice's envelope, so a chord really is several distinct pitches. Grains
+  outlive their voice's note-off (that is what `getTailLengthSeconds` accounts
+  for), but a voice slot being recycled for a new note drops its leftovers so
+  the new note can't inherit the old cloud.
+
+### Level
+
+Both nodes divide the summed cloud by `√(grain count)` before *Volume*, which is
+the right *statistical* correction for summing uncorrelated signals — but it's
+an average, not a bound. A cloud whose grains happen to line up in phase can
+still come out well above the nominal level. The two nodes then differ:
+
+- **Spectral Grain** hard-clips its output to ±1.0. Past the point where the
+  clipper engages, raising Density makes the cloud *dirtier* rather than
+  louder, so pull Volume down as you raise Density if you want it clean.
+- **Particle Cloud has no output limiter at all** and can exceed 0 dBFS on
+  dense settings. Watch the meter on whatever it feeds; adding a limiter or
+  soft-clip here is tracked in `known-issues.md`.
+
+Either way, **Volume is not a linear trim at high Density** on these nodes.
+
+### Grain ceiling
+
+Each node caps its simultaneously-sounding grains at **1024**
+(`ParticleSynthProcessor::kMaxGrains`, `SpectralGrainProcessor::kMaxActiveGrains`).
+The cap exists so the grain list can be reserved once in `prepareToPlay` and
+never reallocate on the audio thread; when it's hit, the **newest** grain is
+dropped rather than the oldest being stolen, so a saturated cloud keeps
+sounding instead of stuttering.
+
+**You will not reach it by turning knobs.** At the param maxima the ceiling is
+100 grains for Particle Cloud (200/s × 0.5 s, monophonic) and 320 for Spectral
+Grain (200/s × 0.2 s × 8 voices) — three to ten times under the cap. Signal
+cables can't get you there either: `applySignalModulations` clamps a modulated
+param to its declared range, so a cable can't push Density past 200. The cap is
+a safety net for the audio thread, not a knob you can run into.
+
+### Transport Stop
+
+Both nodes implement the transport-panic hook, so pressing **Stop** cuts the
+cloud dead — every in-flight grain is dropped and every voice silenced —
+rather than letting hundreds of grain tails ring out. Neither node responds to
+MIDI *All Notes Off*, so panic is the only thing that stops a held note on
+them.
+
+### Serialization
+
+Nothing bespoke. Particle Cloud's script is the bare tag `__particlesynth__`;
+Spectral Grain's is `__spectralgrain__:` followed by the magnitude expression.
+All params and the node AHDSR round-trip through the standard node
+serialisation. All params are signal-modulatable via the on-demand
+[Param-pin mechanism (#88)](#on-demand-modulation-pins).
 
 ---
 

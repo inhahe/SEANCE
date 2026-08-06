@@ -174,78 +174,21 @@ MainContentComponent::MainContentComponent() {
     playBtn.onClick = [this]() { onPlay(); };
     stopBtn.onClick = [this]() { onStop(); };
     recordBtn.onClick = [this]() { onRecord(); };
-    // Set by findPlacement when the visible area was too crowded - tells the
-    // caller to fitAll() after the new node has been added so the refit
-    // includes it.
-    auto needsFitAfterPlacement = std::make_shared<bool>(false);
-    auto findPlacement = [this, needsFitAfterPlacement]() -> Vec2 {
-        *needsFitAfterPlacement = false;
-        // Place new tracks in the user's currently visible canvas rect.
-        // If no empty slot fits there, fit-all to expand the view and then
-        // place at the bottom of the (now wider) visible area.
-        const float nodeW = 200, nodeH = 80, padX = 30, padY = 20;
-        const float marginX = 40, marginY = 40;
-
-        // Compute visible canvas rect from the graph component's screen size.
-        auto screenW = (float)graphComponent->getWidth();
-        auto screenH = (float)graphComponent->getHeight();
-        auto tl = graphComponent->screenToCanvas({0.0f, 0.0f});
-        auto br = graphComponent->screenToCanvas({screenW, screenH});
-
-        // Collect existing timeline node positions for collision testing.
-        std::vector<Vec2> taken;
-        for (auto& n : graph.nodes)
-            if (n.type == NodeType::MidiTimeline || n.type == NodeType::AudioTimeline)
-                taken.push_back(n.pos);
-
-        auto isOccupied = [&](float x, float y) {
-            for (auto& t : taken)
-                if (std::abs(t.x - x) < nodeW && std::abs(t.y - y) < nodeH)
-                    return true;
-            return false;
-        };
-
-        // Walk slots inside the visible rect, column by column.
-        float startX = tl.x + marginX;
-        float startY = tl.y + marginY;
-        float endX   = br.x - marginX - nodeW;
-        float endY   = br.y - marginY - nodeH;
-        for (float x = startX; x <= endX; x += nodeW + padX) {
-            for (float y = startY; y <= endY; y += nodeH + padY) {
-                if (!isOccupied(x, y)) return {x, y};
-            }
-        }
-
-        // No empty slot in the visible area. Place the new node just below
-        // the bottom-most existing node, then signal the caller to fit-all
-        // *after* the node is added so the refit includes it.
-        float bottomMost = startY;
-        for (auto& t : taken)
-            if (t.y + nodeH > bottomMost) bottomMost = t.y + nodeH;
-        *needsFitAfterPlacement = true;
-        return {startX, bottomMost + padY};
-    };
-
-    addMidiBtn.onClick = [this, findPlacement, needsFitAfterPlacement]() {
-        auto pos = findPlacement();
+    addMidiBtn.onClick = [this]() {
+        bool needsFit = false;
+        auto pos = findFreeTimelineSlot(needsFit);
         auto& n = graph.addNode("MIDI Track", NodeType::MidiTimeline,
             {Pin{0, "MIDI In", PinKind::Midi, true}},
             {Pin{0, "MIDI", PinKind::Midi, false}}, pos);
         n.clips.push_back({"Clip 1", 0, 4, juce::Colours::cornflowerblue.getARGB()});
-        if (*needsFitAfterPlacement) graphComponent->fitAll();
+        if (needsFit) graphComponent->fitAll();
         graphComponent->repaint();
     };
-    addAudioBtn.onClick = [this, findPlacement, needsFitAfterPlacement]() {
-        auto pos = findPlacement();
-        auto& n = graph.addNode("Audio Track", NodeType::AudioTimeline,
-            {Pin{0, "Audio In", PinKind::Audio, true}},  // input pin for recording/monitoring
-            {Pin{0, "Audio", PinKind::Audio, false}}, pos);
-        n.clips.push_back({"Clip 1", 0, 4, juce::Colours::forestgreen.getARGB()});
-        // Recording params
-        n.params.push_back({"Input Channel", -1.0f, -1.0f, 31.0f}); // -1 = none, 0-31 = channel
-        n.params.push_back({"Volume", 1.0f, 0.0f, 1.0f});
-        n.params.push_back({"Pan", 0.0f, -1.0f, 1.0f});
-        if (*needsFitAfterPlacement) graphComponent->fitAll();
+    addAudioBtn.onClick = [this]() {
+        bool needsFit = false;
+        auto pos = findFreeTimelineSlot(needsFit);
+        graph.addAudioTrack("Audio Track", pos);
+        if (needsFit) graphComponent->fitAll();
         graphComponent->repaint();
     };
     fitAllBtn.onClick = [this]() { graphComponent->fitAll(); };
@@ -1420,6 +1363,9 @@ juce::PopupMenu MainContentComponent::getMenuForIndex(int idx, const juce::Strin
         menu.addSeparator();
         menu.addItem(32, "Reload Last Project on Startup", true, autoLoadLastProject);
         menu.addSeparator();
+        menu.addItem(42, "Auto-Create Tracks for Audio Inputs", true, autoCreateInputTracks);
+        menu.addItem(43, "Play Tracks Back While Recording Them", true, playbackWhileRecording);
+        menu.addSeparator();
         {
             juce::PopupMenu tuningMenu;
             for (int i = 0; i < (int)TuningSystem::COUNT; ++i)
@@ -1692,6 +1638,12 @@ void MainContentComponent::menuItemSelected(int menuItemID, int) {
             break;
         case 31: showScriptConsole(); break;
         case 32: autoLoadLastProject = !autoLoadLastProject; savePreferences(); break;
+        case 42: autoCreateInputTracks = !autoCreateInputTracks; savePreferences(); break;
+        case 43:
+            playbackWhileRecording = !playbackWhileRecording;
+            applyRecordingPrefsToGraph();   // takes effect mid-take, not just next one
+            savePreferences();
+            break;
         case 33: graph.projectSampleRate = 0; audioEngine.setProjectSampleRate(0); break;
         case 34: graph.projectSampleRate = 44100; audioEngine.setProjectSampleRate(44100); break;
         case 35: graph.projectSampleRate = 48000; audioEngine.setProjectSampleRate(48000); break;
@@ -3013,6 +2965,29 @@ void MainContentComponent::onStop() {
     playBtn.setButtonText("Play");
 }
 
+void MainContentComponent::finishTakeBeforeGraphSwap() {
+    // New/Open project throw graph.nodes away and rebuild it. Every recorder
+    // holds *node ids* into the graph that is about to disappear, so a take
+    // left running across the swap would finalize onto whichever node happened
+    // to inherit that id in the new project - dropping a stray clip on an
+    // unrelated track, and leaving it flagged mid-take (hence silent, via
+    // PanProcessor's record mute) with nothing in the UI to explain it.
+    //
+    // Stopping first is also just the honest behaviour: the take is written to
+    // disk and turned into a clip on the project it was actually recorded into,
+    // which the user can still save or undo, instead of being discarded.
+    if (audioEngine.getMultitrackRecorder().isRecording()
+        || audioEngine.getRecordingManager().isRecording()
+        || audioEngine.isMidiRecording()
+        || transport.playing)
+        onStop();
+
+    // Belt and braces for any path that got a node flagged without a matching
+    // stop (a failed take, a crash-recovery load). A stuck flag is silent audio
+    // with no visible cause, so it is worth clearing unconditionally.
+    MultitrackRecorder::clearRecordingFlags(graph);
+}
+
 void MainContentComponent::beginAutomationPass() {
     // A new playback pass begins. Arm every param that RESOLVES to Write so it
     // overwrites its whole pass at its current value whether or not the user
@@ -3242,6 +3217,13 @@ void MainContentComponent::onRecord() {
         graphComponent->repaint();
     }
 
+    // Give every live input somewhere to land before we look for armed tracks,
+    // so a freshly plugged-in mic records on the very first press.
+    if (ensureInputTracksForRecording() > 0) {
+        audioEngine.getGraphProcessor().requestRebuild();
+        graphComponent->repaint();
+    }
+
     // Check if any Audio Tracks are armed for multi-track recording
     bool anyArmed = false;
     for (auto& n : graph.nodes)
@@ -3279,6 +3261,7 @@ void MainContentComponent::onRecord() {
 }
 
 void MainContentComponent::newProject() {
+    finishTakeBeforeGraphSwap();
     editorPanels.clear();
     editorPanelHeight = 250;
     // Clearing + rebuilding the graph is a structural mutation the audio
@@ -3518,6 +3501,7 @@ void MainContentComponent::upgradeLegacyNodes() {
 }
 
 void MainContentComponent::openProjectFile(const juce::String& path) {
+    finishTakeBeforeGraphSwap();
     editorPanels.clear();
     // Hold the graph mutation lock for the load + legacy-node fixup.
     // ProjectFile::load clears graph.nodes/links and rebuilds them from the
@@ -4452,6 +4436,91 @@ void MainContentComponent::saveRecentProjects() {
 // Preferences
 // ==============================================================================
 
+// First free slot for a new timeline node, inside the user's currently visible
+// canvas rect. If nothing fits there, place below the bottom-most existing
+// track and set `needsFitAfterPlacement` so the caller can fitAll() *after*
+// adding the node (so the refit includes it).
+Vec2 MainContentComponent::findFreeTimelineSlot(bool& needsFitAfterPlacement) {
+    needsFitAfterPlacement = false;
+    const float nodeW = 200, nodeH = 80, padX = 30, padY = 20;
+    const float marginX = 40, marginY = 40;
+
+    auto screenW = (float) graphComponent->getWidth();
+    auto screenH = (float) graphComponent->getHeight();
+    auto tl = graphComponent->screenToCanvas({0.0f, 0.0f});
+    auto br = graphComponent->screenToCanvas({screenW, screenH});
+
+    std::vector<Vec2> taken;
+    for (auto& n : graph.nodes)
+        if (n.type == NodeType::MidiTimeline || n.type == NodeType::AudioTimeline)
+            taken.push_back(n.pos);
+
+    auto isOccupied = [&](float x, float y) {
+        for (auto& t : taken)
+            if (std::abs(t.x - x) < nodeW && std::abs(t.y - y) < nodeH)
+                return true;
+        return false;
+    };
+
+    float startX = tl.x + marginX;
+    float startY = tl.y + marginY;
+    float endX   = br.x - marginX - nodeW;
+    float endY   = br.y - marginY - nodeH;
+    for (float x = startX; x <= endX; x += nodeW + padX)
+        for (float y = startY; y <= endY; y += nodeH + padY)
+            if (!isOccupied(x, y)) return {x, y};
+
+    float bottomMost = startY;
+    for (auto& t : taken)
+        if (t.y + nodeH > bottomMost) bottomMost = t.y + nodeH;
+    needsFitAfterPlacement = true;
+    return {startX, bottomMost + padY};
+}
+
+// Make sure every live input channel on the audio device has an armed Audio
+// Track to record into. Called at the top of onRecord so plugging in a mic and
+// pressing record Just Works, with no prior knowledge that a track needs to
+// exist and be pointed at a channel by hand.
+//
+// Off => the old behaviour: only tracks the user explicitly armed via
+// "Record Here" are captured.
+int MainContentComponent::ensureInputTracksForRecording() {
+    if (!autoCreateInputTracks) return 0;
+
+    auto inputs = audioEngine.getAvailableInputs();
+    if (inputs.empty()) return 0;
+
+    std::vector<InputTrackSpec> specs;
+    specs.reserve(inputs.size());
+    for (const auto& in : inputs)
+        specs.push_back({ in.channel, in.trackName.toStdString() });
+
+    // Wire new tracks into the first Output node, if the project has one.
+    int outputPinId = -1;
+    for (auto& n : graph.nodes)
+        if (n.type == NodeType::Output && !n.pinsIn.empty()) {
+            outputPinId = n.pinsIn[0].id;
+            break;
+        }
+
+    bool needsFit = false;
+    auto created = ensureInputTracks(graph, specs, outputPinId,
+        [this, &needsFit]() {
+            bool thisOne = false;
+            auto pos = findFreeTimelineSlot(thisOne);
+            needsFit = needsFit || thisOne;
+            return pos;
+        });
+
+    if (!created.empty()) {
+        if (needsFit) graphComponent->fitAll();
+        graph.commitSnapshot(created.size() == 1
+            ? "Add track for audio input"
+            : "Add tracks for audio inputs");
+    }
+    return (int) created.size();
+}
+
 static juce::File getPreferencesFile() {
     return juce::File::getSpecialLocation(juce::File::currentExecutableFile)
                .getSiblingFile("soundshop_prefs.xml");
@@ -4475,6 +4544,16 @@ void MainContentComponent::loadPreferences() {
     autosaveIntervalSeconds = xml->getIntAttribute("autosaveIntervalSeconds", autoDefault);
     if (autosaveIntervalSeconds < 1) autosaveIntervalSeconds = 1;
     autosaveLaptopNoticeShown = xml->getBoolAttribute("autosaveLaptopNoticeShown", false);
+    autoCreateInputTracks = xml->getBoolAttribute("autoCreateInputTracks", true);
+    playbackWhileRecording = xml->getBoolAttribute("playbackWhileRecording", false);
+    applyRecordingPrefsToGraph();
+}
+
+// The audio thread reads the mute rule off NodeGraph (PanProcessor has the
+// graph, not the window), so any change to the preference has to be mirrored
+// there. Called from loadPreferences and from the Settings menu handler.
+void MainContentComponent::applyRecordingPrefsToGraph() {
+    graph.playbackWhileRecording = playbackWhileRecording;
 }
 
 void MainContentComponent::savePreferences() {
@@ -4484,6 +4563,8 @@ void MainContentComponent::savePreferences() {
     xml->setAttribute("autosaveEnabled", autosaveEnabled);
     xml->setAttribute("autosaveIntervalSeconds", autosaveIntervalSeconds);
     xml->setAttribute("autosaveLaptopNoticeShown", autosaveLaptopNoticeShown);
+    xml->setAttribute("autoCreateInputTracks", autoCreateInputTracks);
+    xml->setAttribute("playbackWhileRecording", playbackWhileRecording);
     xml->writeTo(getPreferencesFile());
 }
 

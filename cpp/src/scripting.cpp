@@ -366,9 +366,10 @@ static PyObject* py_add_audio_track(PyObject*, PyObject* args) {
     if (!PyArg_ParseTuple(args, "|sff", &name, &x, &y)) return nullptr;
     if (!g_currentGraph) Py_RETURN_NONE;
 
-    auto& n = g_currentGraph->addNode(name, NodeType::AudioTimeline,
-        {}, {Pin{0, "Audio", PinKind::Audio, false}}, {x, y});
-    n.clips.push_back({"Clip 1", 0, 4, 0xFF66CC88});
+    // Same helper the toolbar and canvas menu use, so a scripted track is armable
+    // for recording like a hand-made one (it used to get neither the Audio In pin
+    // nor the recording params).
+    g_currentGraph->addAudioTrack(name, {x, y});
     g_currentGraph->dirty = true;
     return PyLong_FromLong((long)(g_currentGraph->nodes.size() - 1));
 }

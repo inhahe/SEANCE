@@ -145,6 +145,17 @@ void NodeGraph::addLink(int outPin, int inPin) {
     dirty = true;
 }
 
+Node& NodeGraph::addAudioTrack(const std::string& name, Vec2 pos) {
+    auto& n = addNode(name, NodeType::AudioTimeline,
+        { Pin{0, "Audio In", PinKind::Audio, true} },   // recording / monitoring
+        { Pin{0, "Audio", PinKind::Audio, false} }, pos);
+    n.clips.push_back({"Clip 1", 0, 4, juce::Colours::forestgreen.getARGB()});
+    n.params.push_back({"Input Channel", -1.0f, -1.0f, 31.0f});  // -1 = none, 0-31 = channel
+    n.params.push_back({"Volume", 1.0f, 0.0f, 1.0f});
+    n.params.push_back({"Pan", 0.0f, -1.0f, 1.0f});
+    return n;
+}
+
 Node* NodeGraph::findNode(int id) {
     for (auto& n : nodes)
         if (n.id == id) return &n;

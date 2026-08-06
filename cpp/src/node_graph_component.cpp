@@ -3054,8 +3054,7 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
                 {Pin{0, "MIDI", PinKind::Midi, false}}, {p.x, p.y});
             n.clips.push_back({"Clip 1", 0, 4, juce::Colours::cornflowerblue.getARGB()});
         } else if (result == 2) {
-            graph.addNode("Audio Track", NodeType::AudioTimeline,
-                {}, {Pin{0, "Audio", PinKind::Audio, false}}, {p.x, p.y});
+            graph.addAudioTrack("Audio Track", {p.x, p.y});
         } else if (result == 3) {
             graph.addNode("Mixer", NodeType::Mixer,
                 {Pin{0, "In 1", PinKind::Audio, true}, Pin{0, "In 2", PinKind::Audio, true}},

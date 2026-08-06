@@ -4,6 +4,83 @@
 
 namespace SoundShop {
 
+// Make `base` unique among existing node names by appending " 2", " 3", ...
+static std::string uniqueNodeName(NodeGraph& graph, const std::string& base) {
+    auto taken = [&](const std::string& candidate) {
+        for (auto& n : graph.nodes)
+            if (n.name == candidate) return true;
+        return false;
+    };
+    if (!taken(base)) return base;
+    for (int i = 2; i < 1000; ++i) {
+        auto candidate = base + " " + std::to_string(i);
+        if (!taken(candidate)) return candidate;
+    }
+    return base;
+}
+
+std::vector<int> ensureInputTracks(NodeGraph& graph,
+                                   const std::vector<InputTrackSpec>& specs,
+                                   int outputPinId,
+                                   const std::function<Vec2()>& placement) {
+    std::vector<int> createdIds;
+
+    for (const auto& spec : specs) {
+        if (spec.channel < 0) continue;
+
+        // Is some Audio Track already assigned to this input? Match on the
+        // "Input Channel" param, not on recordArmed - a finished take clears
+        // recordArmed, so an armed-only test would make every subsequent record
+        // press create yet another duplicate track for the same microphone.
+        int existingId = -1;
+        for (auto& n : graph.nodes) {
+            if (n.type != NodeType::AudioTimeline) continue;
+            if ((int) paramByName(n, "Input Channel", -1.0f) == spec.channel) {
+                existingId = n.id;
+                break;
+            }
+        }
+
+        if (existingId >= 0) {
+            if (auto* n = graph.findNode(existingId)) {
+                n->recordInputChannel = spec.channel;
+                n->recordArmed = true;
+            }
+            continue;
+        }
+
+        // Nothing for this input yet - build one. addAudioTrack can reallocate
+        // graph.nodes, so everything after it goes through the id.
+        auto& created = graph.addAudioTrack(
+            uniqueNodeName(graph, spec.trackName), placement());
+        const int newId = created.id;
+
+        if (auto* n = graph.findNode(newId)) {
+            for (auto& p : n->params)
+                if (p.name == "Input Channel") p.value = (float) spec.channel;
+            n->recordInputChannel = spec.channel;
+            n->recordArmed = true;
+            // A track created for recording starts empty; the placeholder clip
+            // addAudioTrack adds for hand-made tracks would just be an empty
+            // 4-beat block the user has to delete.
+            n->clips.clear();
+        }
+
+        // Wire it to the output so the take is audible on the next pass without
+        // the user dragging a cable. Multiple tracks into one input pin is fine:
+        // the JUCE graph sums connections that share a destination.
+        if (outputPinId >= 0) {
+            if (auto* n = graph.findNode(newId))
+                if (!n->pinsOut.empty())
+                    graph.addLink(n->pinsOut[0].id, outputPinId);
+        }
+
+        createdIds.push_back(newId);
+    }
+
+    return createdIds;
+}
+
 MultitrackRecorder::MultitrackRecorder() {
     writerThread.startThread(juce::Thread::Priority::normal);
 }
@@ -15,6 +92,11 @@ MultitrackRecorder::~MultitrackRecorder() {
         tracks.clear();
     }
     writerThread.stopThread(2000);
+}
+
+void MultitrackRecorder::clearRecordingFlags(NodeGraph& graph) {
+    for (auto& node : graph.nodes)
+        node.recordingNow = false;
 }
 
 void MultitrackRecorder::startRecording(NodeGraph& graph, Transport& transport,
@@ -79,6 +161,11 @@ void MultitrackRecorder::startRecording(NodeGraph& graph, Transport& transport,
     }
 
     if (staged.empty()) return;
+
+    // Flag the tracks as live so PanProcessor can silence them for the duration
+    // of the take (unless the user asked to hear tracks while recording).
+    for (auto& state : staged)
+        if (auto* n = graph.findNode(state.nodeId)) n->recordingNow = true;
 
     const juce::ScopedLock sl(trackLock);
     tracks = std::move(staged);
@@ -161,6 +248,12 @@ void MultitrackRecorder::stopRecording(NodeGraph& graph, Transport& transport,
     droppedSamples = 0;
     for (auto& track : finished)
         droppedSamples += track.samplesDropped;
+
+    // Un-mute every track in its own pass, before the clip-creation loop below,
+    // which has several `continue`s. A track left with recordingNow set would
+    // stay silent forever with nothing in the UI to explain it.
+    for (auto& track : finished)
+        if (auto* n = graph.findNode(track.nodeId)) n->recordingNow = false;
 
     for (auto& track : finished) {
         if (!track.active || track.samplesRecorded <= 0) {

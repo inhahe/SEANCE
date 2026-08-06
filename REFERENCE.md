@@ -253,7 +253,35 @@ Every armed track with a valid input channel records **simultaneously and indepe
 
 Each track's **Input Monitor** toggle mixes its input channel into the output while you play, so you can hear yourself; it's applied with the node's own Volume and Pan.
 
-> **You have to create the tracks yourself.** SEANCE does not scan the audio device and auto-generate one Audio Track per available input. Arming is deliberate — an unarmed track is never recorded into.
+### Tracks are created for you (Settings → Auto-Create Tracks for Audio Inputs)
+
+You do not actually have to do step 1 and 2 by hand. With **Auto-Create Tracks for Audio Inputs** on (the default), pressing **Play & Record** first walks every **active input channel on the current audio device** and makes sure each one has somewhere to land:
+
+- An input that **already has an Audio Track** pointed at it re-uses that track — it is simply re-armed. Nothing is duplicated, ever, no matter how many times you press record. (The "is this input covered?" test is on the track's **Input Channel** param, not on whether it happens to be armed right now: a finished take disarms its track, so an armed-only test would spawn a fresh duplicate on every second press.)
+- An input with **no track yet** gets a new Audio Track, which is:
+  - **placed where it fits** — the same free-slot search the **+ Audio Track** button uses, so it never lands on top of an existing node, and the canvas re-fits if the new node fell outside the current view;
+  - **named after the input**: the kind (**Mic** / **Line In** / **Input**, inferred from the device and channel names), the channel number (only when there's more than one input, so a single-mic setup just says `Mic`), and the shortened device name — e.g. `Mic 1 (C615)`, `Line In 2 (Focusrite)`. A name already taken by another node gets a numeric suffix (`Mic 1 (C615) 2`);
+  - **armed** on that channel, with its **Input Channel** param set;
+  - **cabled to the Output node**, so the take is audible on the next pass without you dragging anything. Several tracks feeding one input pin is fine — the audio graph sums connections that share a destination;
+  - **empty** — no placeholder clip, unlike a hand-made Audio Track.
+- Creating tracks is a single undo step (**"Add track(s) for audio input(s)"**), separate from the **"Record audio"** step the take itself produces.
+
+Turn the setting off if you want the old fully-manual behaviour, where only tracks you built and armed yourself are ever recorded into.
+
+### Hearing the track you're recording into (Settings → Play Tracks Back While Recording Them)
+
+While a take is in progress, the track being recorded into is **muted by default**. Otherwise you'd hear the previous take on that same track playing back underneath the one you're performing, which is confusing and — with input monitoring on — a feedback risk.
+
+The mute applies only when **both** conditions hold:
+
+1. the track is **mid-take right now** (`Node::recordingNow`, set by `MultitrackRecorder::startRecording` and cleared by `stopRecording`), **and**
+2. **Settings → Play Tracks Back While Recording Them** is **off**.
+
+Every other track in the project keeps playing normally — you still hear the song you're performing along to. Turning the setting on mid-take takes effect immediately, because the two facts are stored separately and recombined every block rather than baked into one flag.
+
+Implementation notes: the rule lives in `PanProcessor::currentlyMuted()`, alongside the ordinary mute and solo rules, so the record mute inherits `muteFader`'s declicking for free and never clicks when a take starts or ends. `Node::recordingNow` is **transient session state** — never serialized, never part of an undo snapshot — and `MultitrackRecorder::clearRecordingFlags()` resets it across the whole graph on any path that swaps the graph wholesale (new project, open project, undo), so a node can't be left silent with nothing in the UI to explain why.
+
+`testAutoInputTracks` in the self-test covers all of this offline: creation, naming, wiring, the no-duplicate re-use path, the numeric suffix, and all four states of the two-condition mute.
 
 ### What happens on stop
 

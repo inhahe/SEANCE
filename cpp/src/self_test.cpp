@@ -38,6 +38,7 @@
 #include "pitch_shift_processor.h"  // PitchShiftProcessor - the Pitch Shift node
 #include "graph_processor.h"        // AudioTimelineProcessor - audio-clip playback
 #include "multitrack_recorder.h"    // MultitrackRecorder - live input capture
+#include "pan_processor.h"          // PanProcessor - the mute/solo/record-mute chokepoint
 
 #include <juce_audio_formats/juce_audio_formats.h>
 #include <juce_graphics/juce_graphics.h>
@@ -9215,6 +9216,137 @@ void testMultitrackRecording(Report& r, const juce::File& dir) {
     recDir.deleteRecursively();
 }
 
+// ensureInputTracks(): the "press Record and every live mic gets a track"
+// decision logic, plus the two-condition record mute that goes with it.
+//
+// The subtle one is re-use. A take disarms its track when it finishes, so
+// anything that decided "already covered?" by looking at recordArmed would
+// spawn a fresh duplicate track on every single record press. The check has to
+// be on the "Input Channel" param, which persists.
+void testAutoInputTracks(Report& r) {
+    r.section("Auto-created tracks for live audio inputs");
+
+    NodeGraph g;
+    int outId = g.addNode("Output", NodeType::Output,
+                          { Pin{0, "Audio In", PinKind::Audio, true} }, {}).id;
+    const int outPin = g.findNode(outId)->pinsIn[0].id;
+
+    // Placement is the only part that needs a canvas, so the test supplies a
+    // trivial stand-in and walks it right so we can see each call land.
+    float nextX = 0;
+    auto place = [&] { nextX += 100; return Vec2{nextX, 50}; };
+
+    std::vector<InputTrackSpec> specs = {
+        { 0, "Mic 1 (C615)" },
+        { 1, "Line In 2 (Focusrite)" },
+    };
+
+    auto created = ensureInputTracks(g, specs, outPin, place);
+    r.checkVal(created.size() == 2,
+               "auto-track: one track created per live input",
+               (float) created.size());
+
+    for (size_t i = 0; i < created.size(); ++i) {
+        auto* n = g.findNode(created[i]);
+        if (!r.check(n != nullptr, "auto-track: created node is findable")) continue;
+        juce::String who = juce::String(n->name) + ": ";
+        r.check(n->type == NodeType::AudioTimeline,
+                ("auto-track: " + who + "is an Audio Track"));
+        r.check(n->name == specs[i].trackName,
+                ("auto-track: " + who + "named after the device kind and channel"));
+        r.checkVal((int) paramByName(*n, "Input Channel", -1.0f) == specs[i].channel,
+                   ("auto-track: " + who + "Input Channel param points at the device channel"),
+                   paramByName(*n, "Input Channel", -1.0f));
+        r.check(n->recordArmed && n->recordInputChannel == specs[i].channel,
+                ("auto-track: " + who + "armed on that channel"));
+        // A track built for recording starts empty - the placeholder clip a
+        // hand-made Audio Track gets would just be a 4-beat block to delete.
+        r.check(n->clips.empty(), ("auto-track: " + who + "starts with no placeholder clip"));
+
+        // Wired to the output, so the take is audible next pass without the
+        // user dragging a cable.
+        bool wired = false;
+        for (auto& l : g.links)
+            if (!n->pinsOut.empty() && l.startPin == n->pinsOut[0].id && l.endPin == outPin)
+                wired = true;
+        r.check(wired, ("auto-track: " + who + "cabled to the output node"));
+    }
+
+    // Second press: the tracks exist but are disarmed (a take clears the flag).
+    // Nothing new must be created; the existing tracks must be re-armed.
+    const size_t nodesAfterFirst = g.nodes.size();
+    const size_t linksAfterFirst = g.links.size();
+    for (int id : created) g.findNode(id)->recordArmed = false;
+
+    auto again = ensureInputTracks(g, specs, outPin, place);
+    r.checkVal(again.empty(),
+               "auto-track: a second record press re-uses the tracks instead of duplicating",
+               (float) again.size());
+    r.checkVal(g.nodes.size() == nodesAfterFirst,
+               "auto-track: node count unchanged on re-use", (float) g.nodes.size());
+    r.checkVal(g.links.size() == linksAfterFirst,
+               "auto-track: no duplicate cable to the output", (float) g.links.size());
+    for (int id : created)
+        r.check(g.findNode(id)->recordArmed,
+                "auto-track: existing track re-armed for the new take");
+
+    // A name already taken gets a numeric suffix rather than two identical
+    // nodes the user cannot tell apart.
+    ensureInputTracks(g, { { 5, "Mic 1 (C615)" } }, outPin, place);
+    bool suffixed = false;
+    for (auto& n : g.nodes) if (n.name == "Mic 1 (C615) 2") suffixed = true;
+    r.check(suffixed, "auto-track: a clashing track name gets a numeric suffix");
+
+    // Channel -1 means "no input assigned" and must never make a track.
+    const size_t before = g.nodes.size();
+    ensureInputTracks(g, { { -1, "Nothing" } }, outPin, place);
+    r.checkVal(g.nodes.size() == before,
+               "auto-track: an unassigned input creates nothing", (float) g.nodes.size());
+
+    // --- the two-condition record mute -------------------------------------
+    // Silence a track only when BOTH it is mid-take AND the user has not asked
+    // to hear tracks while recording them.
+    auto rmsThroughPan = [&](int nodeId) {
+        PanProcessor pan(*g.findNode(nodeId), g);
+        pan.prepareToPlay(44100.0, 512);
+        juce::AudioBuffer<float> buf(2, 512);
+        juce::MidiBuffer midi;
+        for (int ch = 0; ch < 2; ++ch)
+            for (int i = 0; i < 512; ++i) buf.setSample(ch, i, 0.5f);
+        pan.processBlock(buf, midi);
+        double sum = 0;
+        for (int i = 0; i < 512; ++i) { float s = buf.getSample(0, i); sum += (double) s * s; }
+        return (float) std::sqrt(sum / 512);
+    };
+
+    const int trackId = created[0];
+    g.globalCrossfadeSec = 0.0f;   // no ramp, so one block shows the end state
+    g.findNode(trackId)->recordingNow = false;
+    g.playbackWhileRecording = false;
+    r.check(rmsThroughPan(trackId) > 0.4f,
+            "record-mute: a track that is not recording passes audio");
+
+    g.findNode(trackId)->recordingNow = true;
+    r.check(rmsThroughPan(trackId) < 1e-4f,
+            "record-mute: mid-take with playback-while-recording off, the track is silent");
+
+    g.playbackWhileRecording = true;
+    r.check(rmsThroughPan(trackId) > 0.4f,
+            "record-mute: mid-take with playback-while-recording on, the track is audible");
+
+    // Only the recording track is affected - its neighbours keep playing, so
+    // recording an overdub doesn't silence the song you are playing along to.
+    g.playbackWhileRecording = false;
+    r.check(rmsThroughPan(created[1]) > 0.4f,
+            "record-mute: a track that is not mid-take is unaffected");
+
+    // Belt-and-braces: replacing the graph (new project / undo) must be able to
+    // clear the flag, or a node could stay silent with nothing in the UI to say why.
+    MultitrackRecorder::clearRecordingFlags(g);
+    r.check(!g.findNode(trackId)->recordingNow,
+            "record-mute: clearRecordingFlags un-sticks a track left mid-take");
+}
+
 int runSelfTest(const juce::File& outDir) {
     outDir.createDirectory();
     Report r;
@@ -9251,6 +9383,7 @@ int runSelfTest(const juce::File& outDir) {
     testTransportPanic(r);
     testAudioTrackNesting(r, outDir);
     testMultitrackRecording(r, outDir);
+    testAutoInputTracks(r);
 
     r.section("Summary");
     r.line("  PASSED: " + juce::String(r.passed));

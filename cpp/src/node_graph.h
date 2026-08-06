@@ -835,6 +835,16 @@ struct Node {
     int recordInputChannel = -1;  // which audio input channel to record from (-1 = none)
     bool recordArmed = false;     // armed for recording
     bool inputMonitor = false;    // pass input through to output in real-time
+
+    // True only while a take is actually being captured into this track. Set by
+    // MultitrackRecorder::startRecording, cleared by stopRecording. Transient
+    // session state - never serialized, never part of an undo snapshot.
+    //
+    // Stored as the bare fact ("is recording") rather than as an already-
+    // combined mute so PanProcessor can apply NodeGraph::playbackWhileRecording
+    // fresh each block: flipping that preference mid-take then takes effect
+    // immediately instead of at the start of the next one.
+    bool recordingNow = false;
 };
 
 // Read a named param off a node, returning `def` when it is absent.
@@ -1029,6 +1039,13 @@ public:
                   Vec2 pos = {0, 0});
     void addLink(int outPin, int inPin);
 
+    // The one place an Audio Track node is built. Every creation path goes
+    // through here so the recording params ("Input Channel" / "Volume" / "Pan")
+    // can never be missing - a track with no "Input Channel" param cannot be
+    // armed for recording at all, which is the bug the canvas right-click menu
+    // used to have while the toolbar button was fine.
+    Node& addAudioTrack(const std::string& name, Vec2 pos = {0, 0});
+
     // Group operations
     Node& createGroup(const std::string& name, Vec2 pos = {0, 0});
     void addToGroup(int groupId, int childId);
@@ -1197,6 +1214,16 @@ public:
     // with recording disarmed (Off) and node/param overrides dormant. Set by the
     // transport-bar "Auto" control. See resolveArmMode().
     AutoArmMode autoArmGlobal = AutoArmMode::Off;
+
+    // Mirror of the app preference "Play Tracks Back While Recording Them".
+    // Lives here, not on MainContentComponent, because the consumer is
+    // PanProcessor on the audio thread, which is handed the graph but not the
+    // window. A track is silenced when it is recording (Node::recordingNow)
+    // AND this is false - the two-condition rule that keeps an open mic from
+    // being fed back into the speakers it is sitting next to. Session state,
+    // not project data: it is not serialized into the .ssp, it is pushed here
+    // from soundshop_prefs.xml by applyRecordingPrefsToGraph().
+    bool playbackWhileRecording = false;
 
     // Saved view state for the main node-graph component. Persisted to
     // the project file so reopening the project restores the user's

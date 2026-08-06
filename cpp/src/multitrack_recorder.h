@@ -6,6 +6,7 @@
 #include <memory>
 #include <atomic>
 #include <string>
+#include <functional>
 
 namespace SoundShop {
 
@@ -31,6 +32,30 @@ struct TrackRecordState {
     bool active = false;
 };
 
+// One hardware input that wants a track to record into.
+struct InputTrackSpec {
+    int channel = -1;        // device input channel index
+    std::string trackName;   // name to give a newly created track
+};
+
+// Make sure every spec'd input has an Audio Track armed to record from it.
+//
+//  * a track whose "Input Channel" param already matches is re-used and armed,
+//    never duplicated - otherwise every record press would spawn another track,
+//    since a take disarms its track when it finishes;
+//  * anything missing is created at placement(), named, armed, and (when
+//    `outputPinId` >= 0) wired to that pin so the take is audible on playback
+//    without the user having to drag a cable;
+//  * a name already taken by another node gets a numeric suffix.
+//
+// Returns the ids of the tracks it created (empty when everything already
+// existed). Split out of MainContentComponent so the decision logic is testable
+// without a window - only `placement` needs the canvas.
+std::vector<int> ensureInputTracks(NodeGraph& graph,
+                                   const std::vector<InputTrackSpec>& specs,
+                                   int outputPinId,
+                                   const std::function<Vec2()>& placement);
+
 class MultitrackRecorder {
 public:
     MultitrackRecorder();
@@ -55,6 +80,11 @@ public:
 
     // Stop recording on all tracks - finalize WAV files, create clips.
     void stopRecording(NodeGraph& graph, Transport& transport, double sampleRate);
+
+    // Belt-and-braces reset of Node::recordingNow across the whole graph, for
+    // paths that replace the graph wholesale (new/open project, undo) where a
+    // node flagged as recording would otherwise be silent with no way back.
+    static void clearRecordingFlags(NodeGraph& graph);
 
     bool isRecording() const { return recording.load(); }
     int getActiveTrackCount() const { return (int) tracks.size(); }

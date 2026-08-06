@@ -221,6 +221,62 @@ void AudioEngine::logInputDeviceDiagnostics(const char* context) {
     fflush(stderr);
 }
 
+// Pull the human-readable part out of a Windows endpoint name:
+// "Microphone (2- USB Audio Device)" -> "USB Audio Device". Windows wraps the
+// hardware name in parentheses after the jack type, and prefixes duplicates
+// with "2- ", "3- " etc. Both are noise on a 200px-wide node title.
+static juce::String shortenDeviceName(const juce::String& full) {
+    juce::String s = full.trim();
+    int open = s.indexOfChar('(');
+    if (open >= 0 && s.endsWithChar(')'))
+        s = s.substring(open + 1, s.length() - 1).trim();
+    // Strip a leading duplicate-index marker like "2- ".
+    int dash = s.indexOfChar('-');
+    if (dash > 0 && dash <= 2 && s.substring(0, dash).containsOnly("0123456789"))
+        s = s.substring(dash + 1).trim();
+    return s;
+}
+
+std::vector<AudioEngine::AudioInputSource> AudioEngine::getAvailableInputs() const {
+    std::vector<AudioInputSource> out;
+    if (!deviceManager) return out;
+    auto* dev = deviceManager->getCurrentAudioDevice();
+    if (!dev) return out;
+
+    const auto names    = dev->getInputChannelNames();
+    const auto active   = dev->getActiveInputChannels();
+    const auto setup    = deviceManager->getAudioDeviceSetup();
+    const juce::String deviceName = setup.inputDeviceName.isNotEmpty()
+                                  ? setup.inputDeviceName : dev->getName();
+    const juce::String shortDevice = shortenDeviceName(deviceName);
+
+    for (int ch = 0; ch < names.size(); ++ch) {
+        if (!active[ch]) continue;
+        AudioInputSource src;
+        src.channel     = ch;
+        src.deviceName  = deviceName;
+        src.channelName = names[ch];
+
+        const juce::String hay = (deviceName + " " + names[ch]).toLowerCase();
+        if (hay.contains("mic"))            src.kind = "Mic";
+        else if (hay.contains("line"))      src.kind = "Line In";
+        else                                src.kind = "Input";
+        out.push_back(std::move(src));
+    }
+
+    // Number the channels only when there is more than one to tell apart -
+    // "Mic 1 (C615)" is just noise on a machine with a single mono mic.
+    const bool numbered = out.size() > 1;
+    for (auto& src : out) {
+        juce::String n = src.kind;
+        if (numbered) n += " " + juce::String(src.channel + 1);
+        if (shortDevice.isNotEmpty() && !shortDevice.equalsIgnoreCase(src.kind))
+            n += " (" + shortDevice + ")";
+        src.trackName = n;
+    }
+    return out;
+}
+
 bool AudioEngine::ensureAudioInputEnabled() {
     if (!deviceManager) return false;
     auto setup = deviceManager->getAudioDeviceSetup();

@@ -20,6 +20,7 @@
 #include <vector>
 #include <complex>
 #include <cstddef>
+#include <memory>
 
 namespace SoundShop {
 
@@ -76,6 +77,40 @@ private:
     std::vector<int>  bitRev;       // bit-reversal permutation, length n
 
     void transform(cplx* data, bool inverse) const;
+};
+
+// ---------------------------------------------------------------------------
+// FFTLadder - one ready-built FFT per power-of-two size an effect might pick.
+//
+// Constructing an FFT allocates its twiddle and bit-reversal tables, so an
+// effect whose transform size is chosen inside processBlock (from a "FFT Size"
+// param, or clamped to the host block size) cannot construct one there without
+// allocating on the audio thread.
+//
+// Rebuilding lazily "only when the size changes" is not good enough either:
+// the size changes exactly when the user drags the FFT Size knob, so the
+// allocation would land in the middle of the gesture - precisely when a
+// dropout is most audible.
+//
+// So build the whole ladder up front in prepareToPlay and let processBlock
+// pick a size with a pointer lookup. The memory is trivial: every size from
+// 16 to 4096 together is well under 100 KB.
+// ---------------------------------------------------------------------------
+class FFTLadder {
+public:
+    // Build an FFT for each power of two in [minSize, maxSize]. Call from
+    // prepareToPlay (or any other non-audio-thread setup path). Re-preparing
+    // with the same bounds is a no-op, so calling it every prepareToPlay is free.
+    void prepare(int minSize, int maxSize);
+
+    // The FFT for exactly `n`, or nullptr if `n` is outside the prepared range
+    // or not a power of two. Never allocates - safe on the audio thread.
+    const FFT* forSize(int n) const;
+
+private:
+    // Indexed by log2(size); entries outside the prepared range stay null.
+    std::vector<std::unique_ptr<FFT>> bySizeLog2;
+    int preparedMin = 0, preparedMax = 0;
 };
 
 } // namespace SoundShop

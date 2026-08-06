@@ -6854,6 +6854,72 @@ void testAssetLibrary(Report& r) {
                         "curveeq: zero curve silences the central region");
             }
 
+            // Allocation-freedom on the audio thread. Curve EQ used to build a
+            // whole FFT (twiddle + bit-reversal tables) and seven std::vectors
+            // on EVERY block, and re-evaluate the curve whenever the transform
+            // size changed - i.e. a dropout in the middle of an FFT Size drag,
+            // which is exactly when it is most audible.
+            //
+            // Capacity is the observable proxy: if any scratch buffer grew,
+            // processBlock reached the allocator. Sweeping FFT Size and Mix and
+            // feeding ragged block lengths covers everything a user gesture or
+            // a host can vary underneath it.
+            {
+                NodeGraph g;
+                int nId = g.addNode("ceq", NodeType::Effect, {}, {}).id;
+                Node& nd = *g.findNode(nId);
+                nd.params.push_back({"FFT Size", 11.0f, 8.0f, 12.0f});
+                nd.params.push_back({"Mix",       1.0f, 0.0f,  1.0f});
+                SpectralCurve c; c.expression = "1 - 0.5 * f";
+                nd.script = CurveEq::encode(c, -1);
+
+                const int maxBlock = 2048;
+                CurveEQProcessor proc(nd);
+                proc.prepareToPlay(sr, maxBlock);
+
+                juce::AudioBuffer<float> buf(2, maxBlock);
+                juce::MidiBuffer mb;
+                auto fill = [&](int len) {
+                    for (int ch = 0; ch < 2; ++ch)
+                        for (int i = 0; i < len; ++i)
+                            buf.setSample(ch, i, 0.25f * (float)std::sin(
+                                6.28318530718 * 440.0 * i / sr));
+                };
+
+                fill(maxBlock);
+                proc.processBlock(buf, mb);          // warm up, settle capacities
+                const size_t before = proc.scratchCapacityBytes();
+
+                const int lens[] = { 2048, 1024, 512, 777, 256, 2048, 333 };
+                for (int pass = 0; pass < 40; ++pass) {
+                    for (auto& p : nd.params) {
+                        if (p.name == "FFT Size") p.value = (float)(8 + (pass % 5));
+                        if (p.name == "Mix")      p.value = (float)(pass % 2);
+                    }
+                    const int len = lens[pass % (int)(sizeof(lens)/sizeof(lens[0]))];
+                    juce::AudioBuffer<float> view(buf.getArrayOfWritePointers(), 2, len);
+                    fill(len);
+                    proc.processBlock(view, mb);
+                }
+                const size_t after = proc.scratchCapacityBytes();
+                r.checkVal(after == before,
+                           "curveeq: 40 blocks sweeping FFT Size / Mix / block length "
+                           "allocate nothing (scratch capacity growth in bytes)",
+                           (double)after - (double)before);
+
+                // The whole point of the sweep is that it actually reached the
+                // different transform sizes - otherwise the check above passes
+                // vacuously. A block shorter than the selected FFT clamps down,
+                // so the smallest length must still produce audio.
+                juce::AudioBuffer<float> small(buf.getArrayOfWritePointers(), 2, 256);
+                fill(256);
+                proc.processBlock(small, mb);
+                double acc = 0;
+                for (int i = 0; i < 256; ++i) { float s = small.getSample(0, i); acc += s*s; }
+                r.check(std::sqrt(acc / 256) > 1e-4,
+                        "curveeq: still produces audio at the smallest swept block size");
+            }
+
             // ---- Signal EQ -------------------------------------------------
             // Same sine/RMS rig. The Signal EQ's response is a product of
             // peaking bells (one per point), shared across the Zero-latency

@@ -2522,7 +2522,24 @@ class CurveEQProcessor : public juce::AudioProcessor {
 public:
     CurveEQProcessor(Node& n) : node(n) { decodeCurve(); }
     const juce::String getName() const override { return "Curve EQ"; }
-    void prepareToPlay(double sr, int) override { sampleRate = sr; decodeCurve(); }
+    void prepareToPlay(double sr, int maxBlock) override {
+        sampleRate = sr;
+        // Size every audio-thread buffer here, once, so processBlock never
+        // allocates. The transform size is min(2^12, block), so the ladder and
+        // the frame scratch only ever need to cover the largest block the host
+        // will hand us (capped at the param's own 4096 ceiling).
+        maxBlockSize = std::max(1, maxBlock);
+        const int maxFft = std::max(16, std::min(1 << 12, nextPow2AtMost(maxBlockSize)));
+        ffts.prepare(16, maxFft);
+        window.assign((size_t) maxFft, 0.0f);
+        work.assign((size_t) maxFft, {});
+        timeBuf.assign((size_t) maxFft, 0.0f);
+        dry.assign((size_t) maxBlockSize, 0.0f);
+        out.assign((size_t) maxBlockSize, 0.0f);
+        norm.assign((size_t) maxBlockSize, 0.0f);
+        windowN = -1;      // force the Hann window to be recomputed
+        decodeCurve();     // after `window` is sized - it bounds the gain table
+    }
     void releaseResources() override {}
 
     void processBlock(juce::AudioBuffer<float>& buf, juce::MidiBuffer&) override {
@@ -2539,34 +2556,34 @@ public:
         if (fftSize < 16) return;           // too small to filter meaningfully
         int halfBins = fftSize / 2 + 1;
 
-        ensureGains(halfBins);
+        // A block larger than prepareToPlay promised would overrun the scratch.
+        // Bail rather than allocate on the audio thread; the next correctly
+        // sized block resumes normally.
+        if (n > (int) dry.size() || fftSize > (int) window.size()) return;
 
-        FFT fft(fftSize);
-        std::vector<float> window(fftSize);
-        for (int i = 0; i < fftSize; ++i)
-            window[i] = 0.5f * (1.0f - std::cos(6.28318530718f * i / fftSize)); // Hann
+        const FFT* fft = ffts.forSize(fftSize);
+        if (!fft) return;
+        if (!ensureGains(fftSize)) return;
+        ensureWindow(fftSize);
 
         const int hop = std::max(1, fftSize / 4); // 75% overlap
 
         for (int c = 0; c < ch; ++c) {
             float* data = buf.getWritePointer(c);
-            std::vector<float> dry(data, data + n);
-            std::vector<float> out(n, 0.0f);
-            std::vector<float> norm(n, 0.0f);
+            std::copy(data, data + n, dry.begin());
+            std::fill(out.begin(), out.begin() + n, 0.0f);
+            std::fill(norm.begin(), norm.begin() + n, 0.0f);
 
             auto processFrame = [&](int start) {
-                std::vector<float> windowed(fftSize);
                 for (int i = 0; i < fftSize; ++i)
-                    windowed[i] = data[start + i] * window[i];
-                std::vector<std::complex<float>> spec;
-                fft.forwardReal(windowed, spec);
-                for (int k = 0; k < halfBins && k < (int)spec.size(); ++k)
-                    spec[k] *= gains[(size_t)k];       // magnitude scale, phase kept
-                std::vector<float> time;
-                fft.inverseReal(spec, time);
+                    timeBuf[(size_t) i] = data[start + i] * window[(size_t) i];
+                fft->forwardReal(timeBuf.data(), work.data());
+                for (int k = 0; k < halfBins; ++k)
+                    work[(size_t) k] *= (*gains)[(size_t) k]; // magnitude scale, phase kept
+                fft->inverseReal(work.data(), timeBuf.data());
                 for (int i = 0; i < fftSize; ++i) {
-                    out[start + i]  += time[i] * window[i];   // synthesis window
-                    norm[start + i] += window[i] * window[i];
+                    out[(size_t)(start + i)]  += timeBuf[(size_t) i] * window[(size_t) i];
+                    norm[(size_t)(start + i)] += window[(size_t) i] * window[(size_t) i];
                 }
             };
 
@@ -2577,8 +2594,9 @@ public:
             if (n >= fftSize && ((n - fftSize) % hop) != 0) processFrame(n - fftSize);
 
             for (int i = 0; i < n; ++i) {
-                float wet = norm[i] > 1e-6f ? out[i] / norm[i] : dry[i];
-                data[i] = dry[i] * (1.0f - mix) + wet * mix;
+                float wet = norm[(size_t) i] > 1e-6f ? out[(size_t) i] / norm[(size_t) i]
+                                                     : dry[(size_t) i];
+                data[i] = dry[(size_t) i] * (1.0f - mix) + wet * mix;
             }
         }
     }
@@ -2597,12 +2615,58 @@ public:
     void getStateInformation(juce::MemoryBlock&) override {}
     void setStateInformation(const void*, int) override {}
 
+    // Total bytes reserved by every audio-thread scratch buffer. The self-test
+    // watches this across a run of blocks: if it grows, processBlock reached
+    // the allocator, which is the bug this design exists to prevent. (Same
+    // capacity-as-proxy technique as PhaseVocoderShifter::capacityBytes.)
+    size_t scratchCapacityBytes() const {
+        size_t b = window.capacity() * sizeof(float)
+                 + work.capacity() * sizeof(FFT::cplx)
+                 + timeBuf.capacity() * sizeof(float)
+                 + dry.capacity() * sizeof(float)
+                 + out.capacity() * sizeof(float)
+                 + norm.capacity() * sizeof(float);
+        for (const auto& g : gainsBySizeLog2) b += g.capacity() * sizeof(float);
+        return b;
+    }
+
 private:
     Node& node;
     double sampleRate = 44100;
     SpectralCurve curve;
-    std::vector<float> gains;     // per-bin magnitude multiplier, sized halfBins
-    int gainsBins = -1;
+
+    // ---- audio-thread scratch, all sized in prepareToPlay ------------------
+    FFTLadder ffts;                       // one prebuilt FFT per usable size
+    std::vector<float> window;            // Hann, contents rebuilt on size change
+    std::vector<FFT::cplx> work;          // one frame's spectrum
+    std::vector<float> timeBuf;           // one frame, time domain
+    std::vector<float> dry, out, norm;    // block-length accumulators
+    int maxBlockSize = 0;
+    int windowN = -1;                     // fftSize `window` currently holds
+
+    // Per-bin magnitude multipliers, precomputed for every FFT size we can
+    // select. Evaluating the curve allocates, and the size we need is only
+    // known on the audio thread, so the whole table is built here instead -
+    // the curve cannot change without a prepareToPlay (editor edits rebuild
+    // the graph), so a precomputed table can never go stale.
+    std::vector<std::vector<float>> gainsBySizeLog2;
+    const std::vector<float>* gains = nullptr;   // the row for this block
+
+    // Largest power of two <= v (v >= 1).
+    static int nextPow2AtMost(int v) {
+        int p = 1;
+        while ((p << 1) > 0 && (p << 1) <= v) p <<= 1;
+        return p;
+    }
+
+    // Refill the Hann window when the transform size changes. Writes into the
+    // buffer prepareToPlay sized, so it never reallocates.
+    void ensureWindow(int fftSize) {
+        if (windowN == fftSize) return;
+        for (int i = 0; i < fftSize; ++i)
+            window[(size_t) i] = 0.5f * (1.0f - std::cos(6.28318530718f * i / fftSize));
+        windowN = fftSize;
+    }
 
     void decodeCurve() {
         int assetId = -1;
@@ -2610,14 +2674,31 @@ private:
             curve = SpectralCurve();
             curve.expression = "1";   // flat (unity) fallback
         }
-        gainsBins = -1;               // force gain recompute
+        rebuildGainTable();
     }
 
-    void ensureGains(int halfBins) {
-        if (gainsBins == halfBins && (int)gains.size() == halfBins) return;
-        gains = curve.evaluate(halfBins);
-        for (auto& g : gains) g = juce::jlimit(0.0f, 8.0f, g); // sane magnitude range
-        gainsBins = halfBins;
+    void rebuildGainTable() {
+        const int maxFft = std::max(16, (int) window.size());
+        const int maxExp = 12;
+        gainsBySizeLog2.assign((size_t) maxExp + 1, {});
+        for (int e = 4; e <= maxExp; ++e) {          // 16 .. 4096
+            const int sz = 1 << e;
+            if (sz > maxFft) break;
+            auto g = curve.evaluate(sz / 2 + 1);
+            for (auto& v : g) v = juce::jlimit(0.0f, 8.0f, v); // sane magnitude range
+            gainsBySizeLog2[(size_t) e] = std::move(g);
+        }
+    }
+
+    // Point `gains` at the precomputed row for this size. Returns false when
+    // the size has no row (shouldn't happen - the FFT lookup gates it first).
+    bool ensureGains(int fftSize) {
+        int e = 0;
+        while ((1 << e) < fftSize) ++e;
+        if (e >= (int) gainsBySizeLog2.size() || gainsBySizeLog2[(size_t) e].empty())
+            return false;
+        gains = &gainsBySizeLog2[(size_t) e];
+        return true;
     }
 };
 

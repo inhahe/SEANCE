@@ -1488,11 +1488,23 @@ void GraphProcessor::processBlock(NodeGraph& graph, Transport& transport,
     if (panicRequested.exchange(false) && processorGraph)
         processorGraph->reset();
 
-    // Process the graph
-    juce::AudioBuffer<float> buf(numChannels, numSamples);
-    buf.clear();
-    juce::MidiBuffer midi;
-    processorGraph->processBlock(buf, midi);
+    // Process the graph.
+    //
+    // renderBuf and renderMidi are members, not locals: this is the single
+    // hottest path in the app (every audio callback, forever), and a local
+    // AudioBuffer allocates and frees numChannels * numSamples floats each
+    // time. setSize's last argument is avoidReallocating, so once the buffer
+    // has seen the host's largest block it never touches the allocator again;
+    // the block size only ever changes when the device does.
+    //
+    // juce::MidiBuffer likewise keeps its storage across clear(), so hoisting
+    // it out of the callback stops it re-growing for every block that carries
+    // events.
+    renderBuf.setSize(numChannels, numSamples, false, false, true);
+    renderBuf.clear();
+    renderMidi.clear();
+    processorGraph->processBlock(renderBuf, renderMidi);
+    juce::AudioBuffer<float>& buf = renderBuf;
 
     // Copy to output
     for (int c = 0; c < std::min(numChannels, buf.getNumChannels()); ++c)

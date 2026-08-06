@@ -13,6 +13,7 @@
 #include <vector>
 #include <random>
 #include <complex>
+#include <bitset>
 
 namespace SoundShop {
 
@@ -594,22 +595,32 @@ class ArpeggiatorProcessor : public juce::AudioProcessor {
 public:
     ArpeggiatorProcessor(Node& n) : node(n) {}
     const juce::String getName() const override { return "Arpeggiator"; }
-    void prepareToPlay(double sr, int) override { sampleRate = sr; }
+    void prepareToPlay(double sr, int) override {
+        sampleRate = sr;
+        // Worst case: 128 held notes x 4 octave copies, doubled by the up-down
+        // pattern's descending tail. Reserved once here so the per-block rebuild
+        // below never reaches the allocator.
+        seq.reserve(128 * 4 * 2);
+    }
     void releaseResources() override {}
     void processBlock(juce::AudioBuffer<float>& buf, juce::MidiBuffer& midi) override {
         float rate    = paramByName(node, "Rate", 8.0f); // notes per second
         int pattern   = (int)paramByName(node, "Pattern", 0.0f);
         int octaves   = juce::jlimit(1, 4, (int)paramByName(node, "Octaves", 1.0f));
 
-        // Collect held notes
+        // Collect held notes. A 128-bit mask rather than a std::set: MIDI notes
+        // are 0..127, so the set was allocating a tree node on the audio thread
+        // for every note-on and it bought nothing - walking the mask in index
+        // order already yields the ascending order the sequence builder wanted,
+        // which is why the separate baseNotes copy and std::sort are gone.
         for (auto metadata : midi) {
             auto msg = metadata.getMessage();
-            if (msg.isNoteOn()) heldNotes.insert(msg.getNoteNumber());
-            if (msg.isNoteOff()) heldNotes.erase(msg.getNoteNumber());
+            if (msg.isNoteOn())  heldNotes.set  ((size_t) msg.getNoteNumber());
+            if (msg.isNoteOff()) heldNotes.reset((size_t) msg.getNoteNumber());
         }
         midi.clear(); // we'll generate our own MIDI output
 
-        if (heldNotes.empty()) {
+        if (heldNotes.none()) {
             if (lastNote >= 0) {
                 midi.addEvent(juce::MidiMessage::noteOff(1, lastNote), 0);
                 lastNote = -1;
@@ -617,22 +628,25 @@ public:
             return;
         }
 
-        // Build the note sequence
-        std::vector<int> seq;
-        std::vector<int> baseNotes(heldNotes.begin(), heldNotes.end());
-        std::sort(baseNotes.begin(), baseNotes.end());
+        // Build the note sequence. `seq` is a member reserved in prepareToPlay,
+        // and clear() keeps the capacity, so the rebuild is allocation-free.
+        seq.clear();
         for (int oct = 0; oct < octaves; ++oct)
-            for (int n : baseNotes) {
+            for (int n = 0; n < 128; ++n) {
+                if (!heldNotes.test((size_t) n)) continue;
                 int note = n + oct * 12;
                 if (note <= 127) seq.push_back(note);
             }
 
         if (pattern == 1) std::reverse(seq.begin(), seq.end());
         else if (pattern == 2) {
-            auto down = seq;
-            std::reverse(down.begin(), down.end());
-            if (down.size() > 2) { down.erase(down.begin()); down.pop_back(); }
-            seq.insert(seq.end(), down.begin(), down.end());
+            // Up-down: append the descending tail in place instead of copying
+            // the whole sequence into a scratch vector and reversing that. With
+            // more than two notes the turnaround notes aren't repeated, so the
+            // tail runs from the second-to-last element down to the second.
+            const int n = (int) seq.size();
+            if (n > 2) for (int i = n - 2; i >= 1; --i) seq.push_back(seq[(size_t) i]);
+            else       for (int i = n - 1; i >= 0; --i) seq.push_back(seq[(size_t) i]);
         }
 
         if (seq.empty()) return;
@@ -672,9 +686,16 @@ public:
 private:
     Node& node;
     double sampleRate = 44100, sampleCounter = 0;
-    std::set<int> heldNotes;
+    // Held notes as a 128-bit mask (MIDI pitch = bit index), and the generated
+    // sequence as a reserved member. Both replace per-block heap traffic; see
+    // processBlock. scratchCapacityBytes() lets the self-test assert it stays
+    // put across a render.
+    std::bitset<128> heldNotes;
+    std::vector<int> seq;
     int seqIdx = -1, lastNote = -1;
     std::mt19937 rng{42};
+public:
+    size_t scratchCapacityBytes() const { return seq.capacity() * sizeof(int); }
 };
 
 // ==============================================================================
@@ -694,7 +715,11 @@ public:
         bool includeThirds = paramByName(node, "Include Thirds", 0.0f) > 0.5f;
         float levelDecay   = paramByName(node, "Level Decay", 0.5f);
 
-        juce::MidiBuffer output;
+        // `output` is a member, not a local: swapWith below hands us the old
+        // input buffer's storage, and MidiBuffer::clear() keeps it allocated, so
+        // after the first few blocks this stops touching the allocator. As a
+        // local it was a fresh heap buffer on every callback.
+        output.clear();
         for (auto metadata : midi) {
             auto msg = metadata.getMessage();
             output.addEvent(msg, metadata.samplePosition); // pass original
@@ -770,6 +795,7 @@ public:
     void setStateInformation(const void*, int) override {}
 private:
     Node& node;
+    juce::MidiBuffer output;   // audio-thread scratch, see processBlock
 };
 
 // VelocityScaleProcessor was replaced by the more general
@@ -1322,11 +1348,20 @@ public:
         // per operator, held in node.opEnvelopes - see below).
         struct OpParams { float ratio, level; };
         OpParams ops[4];
-        const char* opNames[] = {"Op1","Op2","Op3","Op4"};
+        // Param names are string literals, not built per block. This used to be
+        // `std::string p(opNames[i]); paramByName(node, (p + " Ratio").c_str())`
+        // - eight std::string constructions and eight concatenations on the
+        // audio thread every callback, purely to spell a name that never
+        // changes. "Op1 Ratio" is short enough for MSVC's small-string buffer so
+        // it probably wasn't reaching the heap in practice, but that's an
+        // implementation detail, and the whole dance was pointless anyway.
+        static constexpr const char* kRatioNames[] =
+            { "Op1 Ratio", "Op2 Ratio", "Op3 Ratio", "Op4 Ratio" };
+        static constexpr const char* kLevelNames[] =
+            { "Op1 Level", "Op2 Level", "Op3 Level", "Op4 Level" };
         for (int i = 0; i < 4; ++i) {
-            std::string p(opNames[i]);
-            ops[i].ratio = paramByName(node, (p+" Ratio").c_str(), (float)(i+1));
-            ops[i].level = paramByName(node, (p+" Level").c_str(), i==0?1.0f:0.5f);
+            ops[i].ratio = paramByName(node, kRatioNames[i], (float)(i+1));
+            ops[i].level = paramByName(node, kLevelNames[i], i==0?1.0f:0.5f);
         }
 
         // Per-operator AHDSR envelopes. node.opEnvelopes holds exactly 4 once
@@ -1725,12 +1760,23 @@ private:
 // ==============================================================================
 class ParticleSynthProcessor : public juce::AudioProcessor {
 public:
-    ParticleSynthProcessor(Node& n) : node(n) { grains.reserve(128); }
+    // Upper bound on simultaneously sounding grains. Reserved in the ctor and
+    // in prepareToPlay, and enforced in the spawn loop, so `grains` never
+    // reallocates on the audio thread. Public so the self-test can assert the
+    // reserve is actually big enough rather than just that it didn't move.
+    static constexpr size_t kMaxGrains = 1024;
+
+    ParticleSynthProcessor(Node& n) : node(n) { grains.reserve(kMaxGrains); }
     const juce::String getName() const override { return "Particle"; }
     // Transport panic (Stop): drop every in-flight grain so the particle
     // cloud stops dead instead of finishing its tails.
     void reset() override { grains.clear(); }
-    void prepareToPlay(double sr, int) override { sampleRate = sr; }
+    void prepareToPlay(double sr, int) override {
+        sampleRate = sr;
+        // Reserve the hard cap up front so the per-sample spawn loop below can
+        // push_back without ever hitting the audio thread's allocator.
+        grains.reserve(kMaxGrains);
+    }
     void releaseResources() override {}
 
     void processBlock(juce::AudioBuffer<float>& buf, juce::MidiBuffer& midi) override {
@@ -1780,6 +1826,13 @@ public:
                 spawnTimer += dt;
                 while (spawnTimer >= spawnInterval) {
                     spawnTimer -= spawnInterval;
+                    // Hard cap: Density x Grain Size is unbounded, so without
+                    // this the push_back could grow past the reserved capacity
+                    // and allocate on the audio thread. Dropping the *newest*
+                    // grain (rather than stealing the oldest) keeps the already
+                    // sounding cloud intact - a runaway Density just stops
+                    // getting denser instead of turning into a stutter.
+                    if (grains.size() >= kMaxGrains) break;
                     Grain g;
                     float baseFreq = 440.0f * std::pow(2.0f, (heldNote - 69) / 12.0f);
                     // Randomize pitch
@@ -1838,9 +1891,10 @@ public:
             if (buf.getNumChannels() >= 1) buf.addSample(0, s, outL);
             if (buf.getNumChannels() >= 2) buf.addSample(1, s, outR);
         }
-
-        // Safety: cap grain count
-        if (grains.size() > 1024) grains.erase(grains.begin(), grains.begin() + 512);
+        // NB: there used to be a "safety: cap grain count" erase of the oldest
+        // 512 grains here. It can no longer fire - the spawn loop refuses to
+        // exceed kMaxGrains - and it was the wrong shape anyway (it cut off
+        // grains that were already sounding, mid-envelope).
     }
 
     // Tail = the note-level AHDSR release (grains keep spawning through it)
@@ -1882,6 +1936,17 @@ private:
     AHDSREnvelopeRuntime noteAmpEnv;
     AHDSREnvelope effectiveEnv;
     AHDSRCurveTables ampTables;
+
+public:
+    // Total bytes of audio-thread scratch this processor has reserved. The
+    // self-test warms the processor up, snapshots this, sweeps parameters and
+    // block sizes, and asserts it hasn't moved - a proxy for "processBlock
+    // never allocates". See known-issues.md.
+    size_t scratchCapacityBytes() const { return grains.capacity() * sizeof(Grain); }
+    // How many grains the reserve actually covers. The self-test asserts this
+    // reaches kMaxGrains, so "capacity didn't grow" can't pass just because the
+    // cloud stayed small.
+    size_t reservedGrainCount() const { return grains.capacity(); }
 };
 
 // ==============================================================================
@@ -3663,6 +3728,9 @@ public:
     void prepareToPlay(double sr, int) override {
         sampleRate = sr;
         ring.assign(kMaxWindow, 0.0f);
+        // Sized to the largest window the Min Hz floor can produce, so the
+        // per-hop copy below never resizes on the audio thread.
+        analysisWin.assign(kMaxWindow, 0.0f);
         writePos = 0;
         filled = 0;
         sinceHop = 0;
@@ -3709,7 +3777,11 @@ public:
         // Re-run detection once a hop has elapsed and the window is full.
         if (sinceHop >= hop && filled >= window) {
             sinceHop = 0;
-            std::vector<float> w(window);
+            // `analysisWin` is a member sized to kMaxWindow in prepareToPlay.
+            // It used to be a local sized to `window`, i.e. a heap allocation on
+            // the audio thread every hop (and `window` is derived from the Min
+            // Hz param, so turning that knob changed the size).
+            std::vector<float>& w = analysisWin;
             int start = ((writePos - window) % kMaxWindow + kMaxWindow) % kMaxWindow;
             for (int i = 0; i < window; ++i)
                 w[i] = ring[(start + i) % kMaxWindow];
@@ -3755,10 +3827,19 @@ private:
     Node& node;
     double sampleRate = 44100;
     std::vector<float> ring;
+    std::vector<float> analysisWin;   // per-hop analysis copy, see prepareToPlay
     int writePos = 0;
     int filled = 0;
     int sinceHop = 0;
     float lastNormalized = 0.0f;
+public:
+    // Total bytes of audio-thread scratch, watched by the self-test across a
+    // parameter sweep. `analysisWin` used to be a per-hop local vector, so any
+    // growth here means processBlock is back on the allocator.
+    size_t scratchCapacityBytes() const {
+        return ring.capacity() * sizeof(float)
+             + analysisWin.capacity() * sizeof(float);
+    }
 };
 
 // ==============================================================================
@@ -4047,6 +4128,12 @@ private:
 // ==============================================================================
 class SpectralGrainProcessor : public juce::AudioProcessor {
 public:
+    // Ceiling on the simultaneously-sounding grain cloud across all voices.
+    // Doubles as the reserved capacity (see prepareToPlay) so spawning is
+    // allocation-free, and as a runaway guard on the Density param. Public so
+    // the self-test can assert the reserve is actually big enough.
+    static constexpr size_t kMaxActiveGrains = 1024;
+
     SpectralGrainProcessor(Node& n) : node(n) { voices.resize(8); }
     const juce::String getName() const override { return "Spectral Grain"; }
     // Transport panic (Stop): drop every voice and in-flight grain so the
@@ -4056,6 +4143,10 @@ public:
     void prepareToPlay(double sr, int) override {
         sampleRate = sr;
         regenerateGrains();
+        // Reserve to the hard cap so the spawn loop below never reallocates on
+        // the audio thread. The cap is enforced at the push_back, so capacity
+        // and size can never diverge.
+        activeGrains.reserve(kMaxActiveGrains);
     }
     void releaseResources() override {}
 
@@ -4111,6 +4202,12 @@ public:
                 v.spawnTimer += dt;
                 while (v.spawnTimer >= spawnInterval && v.held) {
                     v.spawnTimer -= spawnInterval;
+                    // Hard cap: Density x block length is unbounded, so without
+                    // this the push_back could grow past the reserved capacity
+                    // and allocate on the audio thread (and a runaway density
+                    // could grow the cloud without limit). Dropping the newest
+                    // grain is inaudible next to the hundreds already sounding.
+                    if (activeGrains.size() >= kMaxActiveGrains) break;
                     ActiveGrain g;
                     g.grainIdx = rng() % grainBank.size();
                     g.pos = 0;
@@ -4149,8 +4246,10 @@ public:
                 buf.addSample(c, s, out);
         }
 
-        if (activeGrains.size() > 2048)
-            activeGrains.erase(activeGrains.begin(), activeGrains.begin() + 1024);
+        // NB: the old "safety" erase of the oldest 1024 grains that lived here
+        // can no longer fire - the spawn loop refuses to exceed kMaxActiveGrains
+        // (half that) - and it was the wrong shape anyway: it cut grains that
+        // were mid-envelope, which is audible as a click.
     }
 
     // Tail = AHDSR release + the longest grain still ringing out.
@@ -4249,6 +4348,12 @@ private:
     };
     std::vector<ActiveGrain> activeGrains;
     std::mt19937 rng{1234};
+public:
+    size_t scratchCapacityBytes() const {
+        return activeGrains.capacity() * sizeof(ActiveGrain);
+    }
+    // See ParticleSynthProcessor::reservedGrainCount - same non-vacuity hook.
+    size_t reservedGrainCount() const { return activeGrains.capacity(); }
 };
 
 // ==============================================================================

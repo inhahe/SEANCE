@@ -384,21 +384,82 @@ a program that reads s1/s2 and calls `note()` (so `pendingOffs` is exercised
 across block boundaries too), asserting zero growth in `scratchCapacityBytes()`,
 paired with a check that the program was still emitting MIDI during the sweep.
 
-### Still allocating — not yet fixed, in rough priority order
+### Fixed (commit `HASH_BE`) — the `builtin_effects.h` sweep
 
-1. **`ArpeggiatorProcessor`** (`builtin_effects.h` ~621) — `seq` and
-   `baseNotes` vectors per block, plus `push_back` into them. Small (bounded by
-   held notes) but on every block.
-2. **`FMSynthProcessor`** (`builtin_effects.h` ~1327) — `std::string p(opNames[i])`
-   per operator per block, purely to build a param name.
-3. **`AudioTimelineProcessor`** (`graph_processor.cpp` ~510) —
+Five processors in one pass. The triage list had only named two of them; reading
+the code turned up three more, and in two cases the named site wasn't the worst
+one in the function.
+
+**`ArpeggiatorProcessor`.** Held notes lived in a `std::set<int>`, so every
+note-on allocated a tree node on the audio thread — and it bought nothing, since
+walking a `std::bitset<128>` in index order already yields the ascending order
+the sequence builder wanted. That's why the separate `baseNotes` copy and its
+`std::sort` are gone too. `seq` is now a member reserved in `prepareToPlay` to
+the true worst case (128 held notes × 4 octave copies × 2 for the up-down
+pattern's descending tail); `clear()` keeps the capacity. The up-down pattern
+used to copy the whole sequence into a scratch vector and reverse it, and now
+appends its tail in place.
+
+**`MixtureProcessor`.** `juce::MidiBuffer output` was a `processBlock` local —
+a fresh heap buffer per callback. Now a member: `swapWith` hands it the old
+input's storage and `MidiBuffer::clear()` keeps the allocation
+(`Array::clearQuick`), so after a few blocks it stops touching the allocator.
+
+**`FMSynthProcessor`.** Built a `std::string` per operator per block purely to
+concatenate a param name. Replaced with two `static constexpr const char*`
+tables. (These particular strings are short enough for MSVC's SSO, so this was
+probably not reaching the heap in practice — but the dance was pointless
+regardless and the next operator name added could have crossed the line.)
+
+**`PitchDetectorProcessor`.** The per-hop analysis copy was a local
+`std::vector<float>` sized to `window` — and `window` is *derived from the
+Min Hz param*, so turning that knob resized a heap buffer on the audio thread.
+Now a member sized once to `kMaxWindow` in `prepareToPlay`.
+
+**`ParticleSynthProcessor` / `SpectralGrainProcessor`.** Unbounded
+`push_back` per grain spawn with no `reserve`. Both now reserve a hard cap
+(`kMaxGrains` / `kMaxActiveGrains`, 1024) and *enforce* it at the spawn site, so
+capacity and size can never diverge. The cap doubles as a runaway guard on the
+Density param; it drops the *newest* grain rather than stealing the oldest, so a
+runaway Density just stops getting denser instead of turning into a stutter.
+Both classes had a vestigial "safety: cap grain count" that erased the oldest
+half of the cloud — dead now (the spawn guard fires first) and the wrong shape
+anyway, since it cut grains mid-envelope, which is audible as a click. Removed.
+
+Proved by `arpeggiator:`, `particlesynth:`, `spectralgrain:` and `pitchdetect:`
+in `--self-test`, all following the established recipe: warm up, snapshot
+`scratchCapacityBytes()`, sweep parameters and block lengths, assert zero
+growth, paired with a non-vacuity check. Two extra precautions in these, because
+the capacity proxy is easy to make vacuous:
+
+- Each test **warms up at the *small* end** (a 6-note chord, Density 5) and only
+  then sweeps to the worst case. Warming up already-saturated would settle the
+  capacity at its ceiling under *either* implementation, so the assertion would
+  pass even with the `reserve` deleted.
+- Each asserts the reserve is **big enough** (`before >= 128*4*2*sizeof(int)`,
+  `reservedGrainCount() >= kMaxGrains`), so "capacity didn't grow" can't pass
+  merely because the sequence or cloud never got long.
+
+`MixtureProcessor` and `FMSynthProcessor` have no capacity test: `MidiBuffer`
+exposes no capacity accessor, and the FM fix removes a construction outright
+rather than relocating storage. Both are fixed by inspection.
+
+### Still allocating — not yet fixed
+
+1. **`AudioTimelineProcessor`** (`graph_processor.cpp` ~510) —
     `juce::AudioBuffer readBuf` per block **when a clip is streaming from disk**.
     Guarded by the file-read path, so it doesn't fire on every block, but it is
     on the audio thread.
-4. **`ParticleSynthProcessor`** / **`SpectralGrainProcessor`**
-    (`builtin_effects.h` ~1795, ~3980) — `grains.push_back` / `activeGrains.push_back`
-    per grain spawn. Reallocates only when the grain count exceeds capacity, so
-    a `reserve()` of the max grain count in `prepareToPlay` closes it.
+
+### Noticed while testing — `ParticleSynthProcessor` can exceed 0 dBFS
+
+The `particlesynth:` self-test measures a peak of ~1.2 at Volume 0.5. The
+`1/sqrt(grainCount)` normalisation is a statistical average, not a bound, so
+correlated grains overshoot; unlike `SpectralGrainProcessor` (which ends its
+sample loop with a `jlimit(-1, 1)`) the particle synth has no clamp. Pre-existing
+behaviour, not a regression from the allocation work, and arguably the node
+shouldn't hard-clip on its own — but it means a Particle node can clip whatever
+it feeds. Decide between a limiter, a soft-clip, or leaving it to the user.
 
 ### Triaged as benign (verified, do not re-report)
 

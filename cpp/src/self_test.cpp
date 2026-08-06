@@ -6241,6 +6241,313 @@ void testAssetLibrary(Report& r) {
                    (double)(totalEmitted - emittedBefore));
     }
 
+    // ---- ArpeggiatorProcessor renders without allocating --------------------
+    //
+    // The arpeggiator used to keep held notes in a std::set<int> (a tree-node
+    // allocation on the audio thread per note-on) and rebuild `seq` plus a
+    // `baseNotes` copy as processBlock locals every callback. Held notes are a
+    // std::bitset<128> now (MIDI pitch = bit index, and walking it already
+    // yields ascending order, so the sort went too) and `seq` is a member
+    // reserved to the worst case in prepareToPlay.
+    {
+        Node node;
+        node.id   = 1;
+        node.name = "selftest-arp";
+        node.params.push_back({ "Rate",    8.0f, 0.1f, 50.0f });
+        node.params.push_back({ "Pattern", 0.0f, 0.0f,  3.0f });
+        node.params.push_back({ "Octaves", 1.0f, 1.0f,  4.0f });
+
+        auto setParam = [&](const char* name, float v) {
+            for (auto& p : node.params) if (p.name == name) p.value = v;
+        };
+
+        const int maxBlock = 512;
+        ArpeggiatorProcessor proc(node);
+        proc.prepareToPlay(44100.0, maxBlock);
+
+        juce::AudioBuffer<float> buf(2, maxBlock);
+        int totalEmitted = 0;
+        // Re-asserts a chord of `held` notes (48, 49, ... ) each time it's
+        // asked to, so a stray note-off can never leave the arp idle - which
+        // would make the whole test vacuous.
+        auto runBlock = [&](int len, int held) {
+            juce::AudioBuffer<float> view(buf.getArrayOfWritePointers(), 2, len);
+            view.clear();
+            juce::MidiBuffer midi;
+            for (int i = 0; i < held; ++i)
+                midi.addEvent(juce::MidiMessage::noteOn(1, i, (juce::uint8)100), 0);
+            proc.processBlock(view, midi);
+            totalEmitted += midi.getNumEvents();
+        };
+
+        // Warm up on a small chord ON PURPOSE. If the reserve in prepareToPlay
+        // were ever removed, `seq` would settle at a handful of ints here and
+        // the wide chords below would then have to grow it - which is exactly
+        // what the capacity assertion is looking for. Warming up at the worst
+        // case instead would make this test pass vacuously.
+        for (int i = 0; i < 4; ++i) runBlock(maxBlock, 6);
+
+        const size_t before = proc.scratchCapacityBytes();
+        const int emittedBefore = totalEmitted;
+
+        const int lens[] = { 512, 480, 256, 64, 333, 512 };
+        for (int pass = 0; pass < 60; ++pass) {
+            // Sweep everything that changes the sequence length: the pattern
+            // (up-down roughly doubles it), the octave count (x4) and the rate.
+            setParam("Pattern", (float)(pass % 4));
+            setParam("Octaves", (float)(1 + pass % 4));
+            setParam("Rate",    4.0f + (float)(pass % 17));
+            // Ramp the held-note count all the way to a full 128-note keyboard,
+            // which with 4 octaves and the up-down pattern is the worst case
+            // prepareToPlay reserves for.
+            runBlock(lens[pass % 6], 2 + (pass * 128) / 60);
+        }
+
+        const size_t after = proc.scratchCapacityBytes();
+        r.checkVal(after == before,
+                   "arpeggiator: 60 blocks sweeping Pattern / Octaves / Rate up "
+                   "to a full 128-note chord allocate nothing (scratch capacity "
+                   "growth, bytes)",
+                   (double)after - (double)before);
+        // The reserve has to be big enough for that worst case, or the check
+        // above only proves the sequence never got long - not that it couldn't.
+        r.checkVal(before >= 128 * 4 * 2 * sizeof(int),
+                   "arpeggiator: prepareToPlay reserves the worst-case sequence "
+                   "(bytes)", (double)before);
+        r.checkVal(totalEmitted - emittedBefore > 0,
+                   "arpeggiator: still emitting notes during the sweep",
+                   (double)(totalEmitted - emittedBefore));
+    }
+
+    // ---- ParticleSynthProcessor renders without allocating ------------------
+    //
+    // The grain cloud grew by push_back with no reserve and no ceiling, so a
+    // high Density allocated on the audio thread mid-block. `grains` is now
+    // reserved to kMaxGrains and the spawn loop refuses to exceed it. The
+    // sweep deliberately drives Density to absurd values to hit that ceiling.
+    {
+        Node node;
+        node.id   = 1;
+        node.name = "selftest-particle";
+        node.params.push_back({ "Density",    30.0f, 1.0f, 5000.0f });
+        node.params.push_back({ "Spread",      7.0f, 0.0f,   24.0f });
+        node.params.push_back({ "Grain Size", 50.0f, 1.0f,  500.0f });
+        node.params.push_back({ "Attack",      0.1f, 0.0f,    1.0f });
+        node.params.push_back({ "Release",     0.3f, 0.0f,    1.0f });
+        node.params.push_back({ "Shape",       0.0f, 0.0f,    3.0f });
+        node.params.push_back({ "Volume",      0.5f, 0.0f,    1.0f });
+
+        auto setParam = [&](const char* name, float v) {
+            for (auto& p : node.params) if (p.name == name) p.value = v;
+        };
+
+        const int maxBlock = 512;
+        ParticleSynthProcessor proc(node);
+        proc.prepareToPlay(44100.0, maxBlock);
+
+        juce::AudioBuffer<float> buf(2, maxBlock);
+        float peak = 0.0f;
+        auto runBlock = [&](int len, bool noteOn) {
+            juce::AudioBuffer<float> view(buf.getArrayOfWritePointers(), 2, len);
+            view.clear();
+            juce::MidiBuffer midi;
+            if (noteOn)
+                midi.addEvent(juce::MidiMessage::noteOn(1, 60, (juce::uint8)110), 0);
+            proc.processBlock(view, midi);
+            for (int ch = 0; ch < 2; ++ch)
+                for (int s = 0; s < len; ++s)
+                    peak = std::max(peak, std::abs(view.getSample(ch, s)));
+        };
+
+        // Warm up at a LOW density on purpose: if the reserve in prepareToPlay
+        // were removed, the cloud would settle small here and the saturating
+        // sweep below would have to grow it - which is what we want to catch.
+        // Warming up already-saturated would make the assertion vacuous.
+        setParam("Density", 5.0f);
+        runBlock(maxBlock, true);
+        for (int i = 0; i < 3; ++i) runBlock(maxBlock, false);
+
+        const size_t before = proc.scratchCapacityBytes();
+        peak = 0.0f;
+
+        const int lens[] = { 512, 480, 256, 64, 333, 512 };
+        for (int pass = 0; pass < 60; ++pass) {
+            setParam("Density",    1.0f + (float)((pass * 397) % 5000));
+            setParam("Grain Size", 1.0f + (float)((pass * 73) % 500));
+            setParam("Spread",     (float)(pass % 25));
+            setParam("Shape",      (float)(pass % 4));
+            runBlock(lens[pass % 6], pass % 7 == 0);
+        }
+
+        const size_t after = proc.scratchCapacityBytes();
+        r.checkVal(after == before,
+                   "particlesynth: 60 blocks sweeping Density / Grain Size / "
+                   "Shape allocate nothing (scratch capacity growth, bytes)",
+                   (double)after - (double)before);
+        r.checkVal(proc.reservedGrainCount() >= ParticleSynthProcessor::kMaxGrains,
+                   "particlesynth: reserve covers the whole grain ceiling",
+                   (double)proc.reservedGrainCount());
+        r.checkVal(peak > 1e-4f,
+                   "particlesynth: cloud still audible during the sweep", peak);
+    }
+
+    // ---- SpectralGrainProcessor renders without allocating ------------------
+    //
+    // Same shape as the particle synth: activeGrains was an unbounded
+    // push_back. Reserved to kMaxActiveGrains with the ceiling enforced at the
+    // spawn site. Note this one is polyphonic, so the sweep holds several
+    // voices to multiply the spawn rate.
+    {
+        Node node;
+        node.id     = 1;
+        node.name   = "selftest-spectralgrain";
+        node.script = "__spectralgrain__:exp(-f/10)";
+        node.params.push_back({ "Density",    20.0f, 1.0f, 2000.0f });
+        node.params.push_back({ "Grain Size", 40.0f, 1.0f,  500.0f });
+        node.params.push_back({ "Volume",      0.5f, 0.0f,    1.0f });
+
+        auto setParam = [&](const char* name, float v) {
+            for (auto& p : node.params) if (p.name == name) p.value = v;
+        };
+
+        const int maxBlock = 512;
+        SpectralGrainProcessor proc(node);
+        proc.prepareToPlay(44100.0, maxBlock);
+
+        juce::AudioBuffer<float> buf(2, maxBlock);
+        float peak = 0.0f;
+        auto runBlock = [&](int len, bool chordOn) {
+            juce::AudioBuffer<float> view(buf.getArrayOfWritePointers(), 2, len);
+            view.clear();
+            juce::MidiBuffer midi;
+            if (chordOn)
+                for (int n : { 48, 55, 60, 64, 67, 72 })
+                    midi.addEvent(juce::MidiMessage::noteOn(1, n, (juce::uint8)110), 0);
+            proc.processBlock(view, midi);
+            for (int ch = 0; ch < 2; ++ch)
+                for (int s = 0; s < len; ++s)
+                    peak = std::max(peak, std::abs(view.getSample(ch, s)));
+        };
+
+        // Low-density warm-up for the same non-vacuity reason as the particle
+        // synth above: the saturating sweep must be what grows the cloud.
+        setParam("Density", 5.0f);
+        runBlock(maxBlock, true);
+        for (int i = 0; i < 3; ++i) runBlock(maxBlock, false);
+
+        const size_t before = proc.scratchCapacityBytes();
+        peak = 0.0f;
+
+        const int lens[] = { 512, 480, 256, 64, 333, 512 };
+        for (int pass = 0; pass < 60; ++pass) {
+            setParam("Density",    1.0f + (float)((pass * 397) % 2000));
+            setParam("Grain Size", 1.0f + (float)((pass * 73) % 500));
+            runBlock(lens[pass % 6], pass % 7 == 0);
+        }
+
+        const size_t after = proc.scratchCapacityBytes();
+        r.checkVal(after == before,
+                   "spectralgrain: 60 blocks sweeping Density / Grain Size "
+                   "allocate nothing (scratch capacity growth, bytes)",
+                   (double)after - (double)before);
+        r.checkVal(proc.reservedGrainCount() >= SpectralGrainProcessor::kMaxActiveGrains,
+                   "spectralgrain: reserve covers the whole grain ceiling",
+                   (double)proc.reservedGrainCount());
+        r.checkVal(peak > 1e-4f,
+                   "spectralgrain: cloud still audible during the sweep", peak);
+    }
+
+    // ---- PitchDetectorProcessor renders without allocating ------------------
+    //
+    // The per-hop analysis copy was a local std::vector<float> sized to
+    // `window`, which is DERIVED from the Min Hz param - so turning that knob
+    // resized a heap buffer on the audio thread. It's a member sized once to
+    // kMaxWindow now. The sweep moves Min Hz across its whole range, which is
+    // exactly the motion that used to reallocate.
+    {
+        Node node;
+        node.id   = 1;
+        node.name = "selftest-pitchdetect";
+        node.params.push_back({ "Algorithm",    0.0f,   0.0f,     1.0f });
+        node.params.push_back({ "Hop",          0.0f,   0.0f,  8192.0f });
+        node.params.push_back({ "Mapping",      0.0f,   0.0f,     1.0f });
+        node.params.push_back({ "Min Hz",      50.0f,   5.0f,  1000.0f });
+        node.params.push_back({ "Max Hz",    2000.0f, 100.0f, 10000.0f });
+        node.params.push_back({ "Detected Hz",  0.0f,   0.0f, 20000.0f });
+
+        auto setParam = [&](const char* name, float v) {
+            for (auto& p : node.params) if (p.name == name) p.value = v;
+        };
+        auto getParam = [&](const char* name) {
+            for (auto& p : node.params) if (p.name == name) return p.value;
+            return 0.0f;
+        };
+
+        const double sr = 44100.0;
+        const int maxBlock = 512;
+        PitchDetectorProcessor proc(node);
+        proc.prepareToPlay(sr, maxBlock);
+
+        // 4 channels: audio in on 0/1, the normalized pitch comes out on 2.
+        juce::AudioBuffer<float> buf(4, maxBlock);
+        int64_t phasePos = 0;
+        float sigLo = 1.0f, sigHi = -1.0f;
+        auto runBlock = [&](int len, double hz) {
+            juce::AudioBuffer<float> view(buf.getArrayOfWritePointers(), 4, len);
+            view.clear();
+            for (int s = 0; s < len; ++s) {
+                float v = 0.4f * (float)std::sin(
+                    juce::MathConstants<double>::twoPi * hz * (double)(phasePos + s) / sr);
+                view.setSample(0, s, v);
+                view.setSample(1, s, v);
+            }
+            phasePos += len;
+            juce::MidiBuffer midi;
+            proc.processBlock(view, midi);
+            for (int s = 0; s < len; ++s) {
+                const float o = view.getSample(2, s);
+                sigLo = std::min(sigLo, o);
+                sigHi = std::max(sigHi, o);
+            }
+        };
+
+        // Warm up: fill the ring buffer at the widest window (lowest Min Hz)
+        // so every scratch buffer is at its final size before the snapshot.
+        setParam("Min Hz", 5.0f);
+        for (int i = 0; i < 64; ++i) runBlock(maxBlock, 440.0);
+
+        const size_t before = proc.scratchCapacityBytes();
+
+        const int lens[] = { 512, 480, 256, 64, 333, 512 };
+        for (int pass = 0; pass < 60; ++pass) {
+            setParam("Min Hz",    5.0f + (float)((pass * 37) % 400));
+            setParam("Max Hz",  800.0f + (float)((pass * 211) % 4000));
+            setParam("Algorithm", (float)(pass % 2));
+            setParam("Mapping",   (float)(pass % 2));
+            setParam("Hop",       (float)(64 << (pass % 5)));
+            runBlock(lens[pass % 6], 440.0);
+        }
+
+        const size_t after = proc.scratchCapacityBytes();
+        r.checkVal(after == before,
+                   "pitchdetect: 60 blocks sweeping Min Hz / Algorithm / Hop "
+                   "allocate nothing (scratch capacity growth, bytes)",
+                   (double)after - (double)before);
+
+        // Non-vacuity: the detector must actually have locked onto the 440 Hz
+        // tone at some point, or the expensive path never ran.
+        setParam("Min Hz",  50.0f);
+        setParam("Max Hz", 2000.0f);
+        setParam("Hop",      0.0f);
+        for (int i = 0; i < 32; ++i) runBlock(maxBlock, 440.0);
+        const float detected = getParam("Detected Hz");
+        r.checkVal(std::abs(detected - 440.0f) < 10.0f,
+                   "pitchdetect: locked onto the 440 Hz probe tone (Hz)", detected);
+        r.checkVal(sigHi > 1e-4f && sigHi <= 1.0f && sigLo >= 0.0f,
+                   "pitchdetect: normalized pitch emitted on the Signal output "
+                   "throughout the sweep (max)", sigHi);
+    }
+
     // ---- Song length: mid-bar content end plays in full (no bar-rounding) ----
     {
         // Bug: a MIDI track whose last clip ends mid-bar (e.g. at beat 1.0 of a

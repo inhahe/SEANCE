@@ -236,31 +236,84 @@ triaged below. Re-run it before trusting this list again — it is a snapshot.
     closing it properly means routing bin-count changes exclusively through the
     rebuild path, not micro-optimising the fallback.
 
+### Fixed (commit `HASH_TERRAIN`)
+
+- **`TerrainSynthProcessor`** (`terrain_synth.cpp`) — by far the worst of the
+  set. The original triage listed the per-*block* allocations; reading the code
+  turned up much worse ones per *sample*:
+  - **`Terrain::sample`** built a fresh `std::vector<int> indices(nd)` inside
+    its corner loop — **2^nd heap allocations per call**, and it is called once
+    per output sample per active voice (twice in graintable mode). A 2D terrain
+    playing an eight-note chord was on the order of 1.4 million allocations a
+    second. Now uses stack arrays and accumulates the flat index directly. Also
+    fixed a latent out-of-bounds read: it indexed `coord[d]` unconditionally,
+    which `sampleMipmap`'s 1-element fallback violated on any multi-dimensional
+    terrain. There is now a single `product(dims) == data.size()` check per call
+    instead of a `jlimit` per corner, so the unchecked `at()` can't run off the
+    end when dims and data desync.
+  - **`Traversal::evaluate` returned a `std::vector<float>` by value**, once per
+    sample. Converted to an out-parameter (`evaluate(coord, ...)`); the Path and
+    Physics branches now copy element-wise instead of assigning a whole vector.
+  - **`auto pitchCoord = coord` / `coordA` / `coordB`** — up to three more
+    vector copies per sample *per voice*. `coordA` was never even modified, so
+    it was a copy for nothing.
+  - **Position params were addressed by building a `std::string`.** `"Position "
+    + std::to_string(k + 1)` plus a linear scan over `node.params`, for every
+    axis of every sample. The names are now cached in `wtPositionNames`
+    (rebuilt wherever `wtEffectiveAxes` is set) and the *values* are resolved
+    once per block — they're plain node params and cannot change mid-block.
+  - **Scatter blend**: `qpos`/`weights`/`dists`/`blended`/`coeffs` per block,
+    plus `getWaveletFilter("db2")` returning three vectors by value, plus the
+    `dwt`/`idwt` convenience overloads that construct a `WaveletWorkspace`
+    internally — *per frame*. Roughly 40 allocations a block with eight frames.
+    All now members; `wavelet.h` documents those overloads as offline-only and
+    the workspace-taking ones are used instead.
+  - **`refreshPartialBank`** (AdditiveBank mode, once per block) constructed an
+    `FFT` — rebuilding its twiddle and bit-reversal tables from scratch — and
+    used the allocating `forwardReal` overload. Now an `FFTLadder` prepared in
+    `prepareToPlay`, because the transform size follows the terrain and a script
+    reload can change it without a `prepareToPlay`, so lazy rebuild-on-change
+    would still allocate mid-stream.
+  - **`computeGranularWeights` / `computeInharmonicWeights`** built a fresh
+    `std::vector<std::vector<float>>` of every entry's position per block — one
+    allocation per side-table entry. Now gathered into grow-only member rows;
+    `computeSideTableWeights` takes an explicit `entryCount` because the scratch
+    can be longer than the live entry list.
+  Guarded by a capacity-growth test (`terrain-alloc`) sweeping Position, Synth
+  Mode and block length over 60 blocks, with a non-vacuity check that the synth
+  is still audible. The test earned its keep immediately: it caught the
+  AdditiveBank buffers sizing on first use, which is why the warm-up visits all
+  three Synth Modes before the measurement.
+  - Left as-is, deliberately: `st.phase.resize`, `v.granStreams.resize`,
+    `v.inhStreams.resize` and `ensureScatterScratch` all allocate only when the
+    wavetable's *shape* changes, which is a message-thread edit. Same
+    grow-once-then-never pattern as the triaged-benign entries below.
+  - Not closed: `reloadIfScriptChanged()` is called from `processBlock` and
+    parses scripts / rebuilds terrains, which allocates freely. That's a
+    structural problem (script reloads should be handed over from the message
+    thread, not performed on the audio thread), not something to paper over
+    here.
+
 ### Still allocating — not yet fixed, in rough priority order
 
-1. **`TerrainSynthProcessor`** (`terrain_synth.cpp` ~2722-2951) — several per
-   block: `qpos`, `weights`, `dists`, `blended`, `coeffs`, `occCoord`, plus
-   `std::string pname` at ~2887 (a `std::string` built per block to name a
-   param — should be a `static constexpr` lookup). Also `v.granStreams.resize`
-   / `v.inhStreams.resize` per voice. Biggest single offender by count.
-2. **`SoundFontProcessor`** (`soundfont_processor.cpp` ~245) —
+1. **`SoundFontProcessor`** (`soundfont_processor.cpp` ~245) —
    `std::vector<float> interleaved(numSamples * 2)` per block.
-3. **`SignalShapeProcessor`** (`signal_shape_node.cpp` ~480, ~661) — a
+2. **`SignalShapeProcessor`** (`signal_shape_node.cpp` ~480, ~661) — a
    `std::vector<const float*> sigChans` per block, and worse, a
    `std::function<float(float)>` **constructed per block** at 661 (a
    `std::function` holding a non-trivial capture heap-allocates).
-4. **`MidiScriptProcessor`** (`midi_script_node.cpp` ~317) —
+3. **`MidiScriptProcessor`** (`midi_script_node.cpp` ~317) —
    `std::vector<const float*> sigChans` per block.
-5. **`ArpeggiatorProcessor`** (`builtin_effects.h` ~621) — `seq` and
+4. **`ArpeggiatorProcessor`** (`builtin_effects.h` ~621) — `seq` and
    `baseNotes` vectors per block, plus `push_back` into them. Small (bounded by
    held notes) but on every block.
-6. **`FMSynthProcessor`** (`builtin_effects.h` ~1327) — `std::string p(opNames[i])`
+5. **`FMSynthProcessor`** (`builtin_effects.h` ~1327) — `std::string p(opNames[i])`
    per operator per block, purely to build a param name.
-7. **`AudioTimelineProcessor`** (`graph_processor.cpp` ~510) —
+6. **`AudioTimelineProcessor`** (`graph_processor.cpp` ~510) —
     `juce::AudioBuffer readBuf` per block **when a clip is streaming from disk**.
     Guarded by the file-read path, so it doesn't fire on every block, but it is
     on the audio thread.
-8. **`ParticleSynthProcessor`** / **`SpectralGrainProcessor`**
+7. **`ParticleSynthProcessor`** / **`SpectralGrainProcessor`**
     (`builtin_effects.h` ~1795, ~3980) — `grains.push_back` / `activeGrains.push_back`
     per grain spawn. Reallocates only when the grain count exceeds capacity, so
     a `reserve()` of the max grain count in `prepareToPlay` closes it.

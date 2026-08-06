@@ -5823,6 +5823,137 @@ void testAssetLibrary(Report& r) {
                    relDiff);
     }
 
+    // ---- TerrainSynth: processBlock is allocation-free -----------------------
+    // TerrainSynthProcessor::processBlock used to reach the allocator on almost
+    // every line of its hot loop: Traversal::evaluate returned a std::vector BY
+    // VALUE once per SAMPLE, the SamplePerPoint path copied that vector twice
+    // more per sample PER VOICE (pitchCoord / coordA / coordB), the grid
+    // occupancy lookup built a fresh coord vector per sample, and the Position
+    // params were addressed by rebuilding a std::string ("Position 3") and
+    // linear-scanning node.params for every axis of every sample. Per block
+    // there were more: the scatter blend allocated weights/dists/blended/coeffs,
+    // fetched the db2 filter by value, and called the dwt/idwt convenience
+    // overloads that construct a WaveletWorkspace internally - roughly 40
+    // allocations a block with eight frames.
+    //
+    // malloc can block on a global lock, which the user hears as a dropout, and
+    // it's an automatic fail under pluginval strictness 10 (which gates the
+    // planned plugin spin-offs). Total reserved scratch is the observable proxy:
+    // prepareToPlay sizes everything up front, so any growth across a sweep
+    // means processBlock reached the allocator. Paired with a non-vacuity check
+    // so the sweep can't pass by rendering silence.
+    {
+        Transport transport;
+        transport.sampleRate = 44100.0;
+        transport.bpm = 120.0;
+
+        // Four scatter dots along one axis, so the wavelet-domain blend runs
+        // with several contributing frames (the heaviest per-block path).
+        WavetableDoc doc;
+        doc.mode = WavetableMode::Scatter;
+        doc.scatterDims = 1;
+        doc.tableSize = 2048;                 // power of two -> wavelet morph on
+        for (int i = 0; i < 4; ++i) {
+            auto lw = std::make_unique<LayeredWaveform>();
+            lw->layers.push_back(WaveLayer{});
+            int fid = doc.addLibraryEntry(std::move(lw), "w" + std::to_string(i));
+            ScatterFrame sf;
+            sf.waveformId = fid;
+            sf.position = { i / 3.0f };
+            doc.scatterFrames.push_back(sf);
+        }
+
+        Node node;
+        node.id = 1;
+        node.type = NodeType::TerrainSynth;
+        node.name = "selftest-terrain-alloc";
+        node.script = doc.encode();
+        node.pinsIn.push_back(Pin{ 1, "MIDI", PinKind::Midi, true, 2 });
+        node.pinsIn.push_back(Pin{ 2, "Sig X", PinKind::Signal, true, 1 });
+        node.pinsOut.push_back(Pin{ 100, "Audio", PinKind::Audio, false, 2 });
+        node.params.push_back({ "Volume",     1.0f, 0.0f, 1.0f });
+        node.params.push_back({ "Synth Mode", 0.0f, 0.0f, 2.0f });
+        node.params.push_back({ "Position",   0.5f, 0.0f, 1.0f });
+        node.ahdsrEnvelope.attackMs  = 1.0f;
+        node.ahdsrEnvelope.holdMs    = 60000.0f;   // hold for the whole sweep
+        node.ahdsrEnvelope.decayMs   = 1.0f;
+        node.ahdsrEnvelope.sustain   = 1.0f;
+        node.ahdsrEnvelope.releaseMs = 1.0f;
+        node.ahdsrEnvelope.velocitySensitivity = 0.0f;
+        AHDSREnvelope::setDefaultCurves(node.ahdsrEnvelope);
+
+        const int maxBlock = 512;
+        TerrainSynthProcessor proc(node, transport);
+        proc.prepareToPlay(44100.0, maxBlock);
+
+        juce::AudioBuffer<float> buf(3, maxBlock);   // 2 audio + 1 Sig X
+        auto runBlock = [&](int len, bool noteOn) {
+            juce::AudioBuffer<float> view(buf.getArrayOfWritePointers(),
+                                          buf.getNumChannels(), len);
+            view.clear();
+            juce::MidiBuffer midi;
+            if (noteOn)
+                midi.addEvent(juce::MidiMessage::noteOn(1, 69, (juce::uint8)100), 0);
+            proc.processBlock(view, midi);
+        };
+
+        auto idxOf = [&](const char* nm) {
+            for (size_t i = 0; i < node.params.size(); ++i)
+                if (node.params[i].name == nm) return (int)i;
+            return -1;
+        };
+        const int posIdx  = idxOf("Position");
+        const int modeIdx = idxOf("Synth Mode");
+        r.check(posIdx >= 0 && modeIdx >= 0,
+                "terrain-alloc: Position / Synth Mode params present");
+
+        // Warm up: sound a note and let every lazily-sized buffer settle. Six
+        // voices so the per-voice scratch is exercised too, and all three Synth
+        // Modes because AdditiveBank is the only one that touches the partial
+        // analysis buffers - measuring `before` without visiting it would score
+        // its legitimate one-time sizing as a leak.
+        runBlock(maxBlock, true);
+        for (int nn = 60; nn < 66; ++nn) {
+            juce::AudioBuffer<float> view(buf.getArrayOfWritePointers(), 3, maxBlock);
+            view.clear();
+            juce::MidiBuffer midi;
+            midi.addEvent(juce::MidiMessage::noteOn(1, nn, (juce::uint8)100), 0);
+            proc.processBlock(view, midi);
+        }
+        for (int mode = 0; mode < 3; ++mode) {
+            node.params[(size_t)modeIdx].value = (float)mode;
+            for (int i = 0; i < 3; ++i) runBlock(maxBlock, false);
+        }
+
+        const size_t before = proc.scratchCapacityBytes();
+
+        // Sweep block length, Position and Synth Mode. Block length varies
+        // because a host is free to change it (480 is common), Position moves
+        // the scatter query so the blend recomputes, and Synth Mode switches
+        // between the Direct / AM-sine / Additive render paths.
+        const int lens[] = { 512, 480, 256, 64, 333, 512 };
+        for (int pass = 0; pass < 60; ++pass) {
+            node.params[(size_t)posIdx].value  = (pass % 11) / 10.0f;
+            node.params[(size_t)modeIdx].value = (float)(pass % 3);
+            runBlock(lens[pass % 6], false);
+        }
+        const size_t after = proc.scratchCapacityBytes();
+        r.checkVal(after == before,
+                   "terrain-alloc: 60 blocks sweeping Position / Synth Mode / "
+                   "block length allocate nothing (scratch capacity growth, bytes)",
+                   (double)after - (double)before);
+
+        // Non-vacuity: the synth must still be making sound at the end of the
+        // sweep, so the loop above was doing real work rather than bailing.
+        node.params[(size_t)modeIdx].value = 0.0f;   // Direct
+        runBlock(maxBlock, false);
+        double peak = 0;
+        for (int i = 0; i < maxBlock; ++i)
+            peak = std::max(peak, (double)std::abs(buf.getSample(0, i)));
+        r.checkVal(peak > 1e-3, "terrain-alloc: synth still audible after the sweep",
+                   peak);
+    }
+
     // ---- Song length: mid-bar content end plays in full (no bar-rounding) ----
     {
         // Bug: a MIDI track whose last clip ends mid-bar (e.g. at beat 1.0 of a

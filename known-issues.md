@@ -219,7 +219,7 @@ triaged below. Re-run it before trusting this list again — it is a snapshot.
     test pins `Threshold = 0` at exactly unity gain.
   Also gained a tail frame so the end of each block isn't left dry.
 
-### Fixed (commit `SPECTAP`)
+### Fixed (commit `de3f0d2`)
 
 - **`SpectrumTapProcessor::processBlock`** (`spectrum_tap.cpp`) — three
   `std::vector`s sized by `bins.size()` on every callback (`binParamIdx`,

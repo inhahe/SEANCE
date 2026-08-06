@@ -149,10 +149,96 @@ Two traps worth remembering for the same conversion elsewhere:
   constructing a vector with a size argument always allocates, even into an
   existing variable.
 
-**Remaining work: sweep the same class of bug outside the wavelet family.** Any
-`processBlock` that constructs a local `std::vector`, `juce::AudioBuffer`, or
-`juce::String` has the identical defect. The wavelet suite was audited because it
-is the plugin candidate; nothing else has been checked.
+**Sweep outside the wavelet family: DONE 2026-08-06.** See the entry below.
+
+---
+
+## BUG: audio-thread allocation outside the wavelet family (sweep results)
+
+**Found:** 2026-08-06, completing the "sweep the same class of bug elsewhere"
+item above. Method: a script that brace-matches every `processBlock` body in
+`cpp/src` and flags local `std::vector` / `juce::AudioBuffer` / `juce::String` /
+`std::string` construction, `new`, `make_unique`, `resize`, `push_back`,
+`emplace_back`, `setSize`, and `std::function` construction. 66 raw hits,
+triaged below. Re-run it before trusting this list again — it is a snapshot.
+
+### Fixed (commit `14c2615`)
+
+- **`GraphProcessor::processBlock`** (`graph_processor.cpp`) — built a fresh
+  `juce::AudioBuffer` **and** `juce::MidiBuffer` on *every audio callback*, the
+  hottest path in the app. Now members reused via
+  `setSize(..., avoidReallocating=true)` / `clear()`.
+- **`CurveEQProcessor`** (`builtin_effects.h`) — constructed a whole `FFT`
+  (twiddle + bit-reversal tables) plus seven `std::vector`s per block, and
+  re-evaluated the response curve on every transform-size change (i.e. during
+  an FFT Size knob drag). Now uses the new `FFTLadder` (one prebuilt FFT per
+  selectable size), `FFT`'s allocation-free pointer API, and a gain table
+  precomputed per size in `prepareToPlay`. Guarded by a capacity-growth test.
+
+### Still allocating — not yet fixed, in rough priority order
+
+1. **`SignalEQProcessor`** (`builtin_effects.h` ~2790) — **identical** code to
+   Curve EQ before the fix: `FFT` + 7 vectors per block. The Curve EQ fix is a
+   direct template; this is the obvious next one. Only bites in FFT mode
+   (`Mode` = 1); the zero-latency biquad path is clean.
+2. **`SMSProcessor`** (`builtin_effects.h` ~4210) — same shape, 8 vectors per
+   block including a `std::vector<std::complex<float>>` per frame.
+3. **`SpectrumTapProcessor::processBlock`** (`spectrum_tap.cpp` ~309) — three
+   `std::vector`s sized by `bins.size()` per block (`binParamIdx`, `sigOut`,
+   `customTarget`). Cheap fix: make them members sized when the bin list changes.
+4. **`TerrainSynthProcessor`** (`terrain_synth.cpp` ~2722-2951) — several per
+   block: `qpos`, `weights`, `dists`, `blended`, `coeffs`, `occCoord`, plus
+   `std::string pname` at ~2887 (a `std::string` built per block to name a
+   param — should be a `static constexpr` lookup). Also `v.granStreams.resize`
+   / `v.inhStreams.resize` per voice. Biggest single offender by count.
+5. **`SoundFontProcessor`** (`soundfont_processor.cpp` ~245) —
+   `std::vector<float> interleaved(numSamples * 2)` per block.
+6. **`SignalShapeProcessor`** (`signal_shape_node.cpp` ~480, ~661) — a
+   `std::vector<const float*> sigChans` per block, and worse, a
+   `std::function<float(float)>` **constructed per block** at 661 (a
+   `std::function` holding a non-trivial capture heap-allocates).
+7. **`MidiScriptProcessor`** (`midi_script_node.cpp` ~317) —
+   `std::vector<const float*> sigChans` per block.
+8. **`ArpeggiatorProcessor`** (`builtin_effects.h` ~621) — `seq` and
+   `baseNotes` vectors per block, plus `push_back` into them. Small (bounded by
+   held notes) but on every block.
+9. **`FMSynthProcessor`** (`builtin_effects.h` ~1327) — `std::string p(opNames[i])`
+   per operator per block, purely to build a param name.
+10. **`AudioTimelineProcessor`** (`graph_processor.cpp` ~510) —
+    `juce::AudioBuffer readBuf` per block **when a clip is streaming from disk**.
+    Guarded by the file-read path, so it doesn't fire on every block, but it is
+    on the audio thread.
+11. **`ParticleSynthProcessor`** / **`SpectralGrainProcessor`**
+    (`builtin_effects.h` ~1795, ~3980) — `grains.push_back` / `activeGrains.push_back`
+    per grain spawn. Reallocates only when the grain count exceeds capacity, so
+    a `reserve()` of the max grain count in `prepareToPlay` closes it.
+
+### Triaged as benign (verified, do not re-report)
+
+- `pan_processor.h:48` — `juce::AudioBuffer(float* const*, ...)` is the
+  pointer-**wrapping** constructor. Wraps, never allocates.
+- `poly_voice_processor.cpp:161`, `terrain_synth.cpp:2456/2460`,
+  `signal_shape_node.cpp:403` — `setSize(..., avoidReallocating=true)`. No
+  allocation once the buffer has seen the largest block.
+- `signal_lfo.h:53`, `signal_logic.h:47`, `signal_math.h:60`,
+  `signal_sample_hold.h:49` — `scratch.resize(n)` on a member. Allocates only on
+  the first block after a size increase, then never. Would be tidier to size
+  these in `prepareToPlay`, but they are not a steady-state defect.
+- `main_window.cpp:3644` (`FreezeTapProcessor`) — `push_back` into a vector the
+  caller pre-`reserve`s via `reserveSamples()`. Correct by construction, though
+  it does depend on the caller reserving enough.
+- `terrain_synth.cpp:3100`, `3137` — false positives; those are `const&`
+  function/lambda parameters, not constructions.
+
+**Why this matters beyond dropouts:** allocation in `processBlock` is an
+automatic fail in plugin validation (pluginval strictness 10), so every entry in
+the "still allocating" list is also a blocker for the plugin spin-offs in
+`agent-todo.md`.
+
+**The reusable tools now exist:** `FFTLadder` in `fft_util.h` for anything that
+picks a transform size at run time, `FFT`'s pointer API for allocation-free
+transforms, and the capacity-growth test idiom (`scratchCapacityBytes()` +
+assert it doesn't grow over a parameter sweep) for proving a conversion worked.
 
 ---
 

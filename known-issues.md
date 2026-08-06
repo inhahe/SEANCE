@@ -365,7 +365,7 @@ allocation) register. Paired with a check that the output is still *modulating*,
 not merely non-zero — a stuck constant would pass a peak test while proving the
 expression never ran.
 
-### Fixed (commit `HASH_MS`) — `MidiScriptProcessor`
+### Fixed (commit `fd854f1`) — `MidiScriptProcessor`
 
 Sibling of the Signal Shape node and had exactly the same problem, so the same
 fix: `sigChans` and the `vars` binding map were both `processBlock` locals, so

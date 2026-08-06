@@ -446,6 +446,7 @@ Wavelets give you joint time + frequency resolution that traditional FFT-based e
 ### MIDI and recording
 
 - **Per-node recording** ("Record Here" mark) — arm individual nodes for MIDI capture instead of arming whole tracks, so anything in the graph can be recorded into.
+- **Multitrack live audio recording** — arm any number of Audio Tracks, each pointed at its own hardware input channel, and record them all at once while the song plays. Every take lands on the timeline as a normal audio clip at the beat you started from, backed by a 24-bit WAV, so it plays back with the song from then on and saves with the project. Takes have no length limit, and if the disk ever falls behind, the dropout is reported rather than silently swallowed. See [REFERENCE.md → Recording live audio](REFERENCE.md#recording-live-audio-mic--line-in).
 - **Trigger node v2** — multiple MIDI/Signal output pins, per-rule output assignment, signal-rule delay support, beats/ms unit picker.
 - **Trigger node enhancements** — note-off triggers (actions fire on note release, not just note-on), free-drawn Curve shape, and a threshold-trigger input (audio level → trigger bridge so loud audio events can fire triggers without MIDI).
 

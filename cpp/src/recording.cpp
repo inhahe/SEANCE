@@ -6,13 +6,18 @@ namespace SoundShop {
 RecordingManager::RecordingManager() {}
 
 void RecordingManager::startRecording(Node& node, int numChannels, double sampleRate,
-                                       const std::string& outputDir) {
+                                       const std::string& outputDir, Transport& transport) {
     if (recording.load()) return;
 
     recordingNodeId = node.id;
     recordingSampleRate = sampleRate;
     recordingChannels = numChannels;
     totalSamplesRecorded = 0;
+
+    // Where the take lands. Clip::startBeat is node-local while the transport is
+    // absolute, so strip the nesting offset that AudioTimelineProcessor will add
+    // back on during playback.
+    recordStartBeat = transport.positionBeats() - node.absoluteBeatOffset;
 
     // Create output file
     auto dir = juce::File(outputDir);

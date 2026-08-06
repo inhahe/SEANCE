@@ -14,6 +14,7 @@ here.
 
 - [Graph fundamentals](#graph-fundamentals)
 - [Transport bar](#transport-bar)
+- [Recording live audio (mic / line-in)](#recording-live-audio-mic--line-in)
 - [Automation recording (knob-drag capture)](#automation-recording-knob-drag-capture)
 - [Computer Keyboard node](#computer-keyboard-node)
 - [MIDI input and routing](#midi-input-and-routing)
@@ -232,6 +233,46 @@ Mechanism: `AudioEngine::stop()` calls `panic()`, which sets a one-shot `std::at
 - **Hosted VST3/plugins** — receive the standard `reset()` that JUCE forwards to the plugin.
 
 The reset is a **one-shot state wipe, not a permanent mute**: the graph keeps processing afterwards, so audition / musical-typing while stopped is unaffected. Memoryless processors (filters, EQ, compressor, distortion, etc.) need no `reset()` since they produce no audible tail.
+
+---
+
+## Recording live audio (mic / line-in)
+
+SEANCE can capture live audio while the song plays, and the take **sticks**: it lands on the timeline as an ordinary audio clip backed by a WAV on disk, so it plays back with everything else on the next pass and survives save/load.
+
+### Arming tracks
+
+Recording is **per Audio Track node**, and you arm as many as you like:
+
+1. Create an **Audio Track** node for each input you want to capture.
+2. Set that node's **Input Channel** param to the hardware input channel it should listen to (0 = the first input on the audio device, 1 = the second, and so on).
+3. Right-click the node → **Record Here** to arm it.
+4. Press **Play & Record**.
+
+Every armed track with a valid input channel records **simultaneously and independently**, each to its own file and its own clip. There is no fixed limit on how many — the ceiling is however many input channels the audio device actually presents. Two mics into a 2-in interface means two armed Audio Tracks on channels 0 and 1, and you get two separate tracks of audio, not one interleaved blob.
+
+Each track's **Input Monitor** toggle mixes its input channel into the output while you play, so you can hear yourself; it's applied with the node's own Volume and Pan.
+
+> **You have to create the tracks yourself.** SEANCE does not scan the audio device and auto-generate one Audio Track per available input. Arming is deliberate — an unarmed track is never recorded into.
+
+### What happens on stop
+
+Pressing **Stop** finalizes every armed take:
+
+- Each track's audio is written to a **24-bit mono WAV** in a `recordings/` folder next to the executable, named `<track name>_<timestamp>.wav`.
+- A clip pointing at that file is appended to the track, colored red, starting **at the beat the playhead was on when you hit record** — not at beat 0.
+- The track is **disarmed**, so an accidental second pass can't overwrite the take.
+- The whole thing is committed as a single undo step, **"Record audio"**, so <kbd>Ctrl</kbd>+<kbd>Z</kbd> removes the take and the project is correctly marked dirty.
+
+Because the clip is a normal audio clip, everything that works on audio clips works on it: slip, trim, move, nest the track under another track, bounce, export.
+
+**Clip position is stored node-local.** The playhead reports an *absolute* beat, but `Clip::startBeat` is relative to its node, and `AudioTimelineProcessor` adds the track's `absoluteBeatOffset` back on at playback. Both recorders therefore subtract that offset when placing the clip — otherwise recording into a [nested track](#track-header-strip-parenting--time-offset) would double-count the nesting offset and the take would play late by exactly the parent's offset. Both directions are regression-tested by `testMultitrackRecording`, which records two inputs into nested tracks and plays the result back.
+
+### Disk overruns are reported, never silent
+
+Samples go from the audio callback straight into a `juce::AudioFormatWriter::ThreadedWriter` per track, which hands them to one shared background thread that does the file I/O. The audio thread never allocates and never blocks on the disk, so **takes have no length limit** — they run as long as the drive has room.
+
+Each track's FIFO holds **four seconds** of headroom, so an ordinary disk or antivirus stall doesn't cost you audio. If the drive still falls behind and the FIFO overruns, the lost samples are **counted, logged, and reported in a dialog on stop** ("Recording dropped audio", with the number of seconds lost). A take with gaps in it is never handed back silently — only the performer can decide whether to keep it or redo it.
 
 ---
 

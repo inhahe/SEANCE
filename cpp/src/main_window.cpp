@@ -1485,6 +1485,7 @@ juce::PopupMenu MainContentComponent::getMenuForIndex(int idx, const juce::Strin
         menu.addItem(314, "Algorithmic MIDI");
         menu.addItem(315, "Voices (Polyphony)");
         menu.addItem(316, "Recording Automation");
+        menu.addItem(317, "Recording Audio");
         menu.addSeparator();
         menu.addItem(312, "Keyboard Shortcuts");
         menu.addSeparator();
@@ -1635,6 +1636,7 @@ void MainContentComponent::menuItemSelected(int menuItemID, int) {
         case 314: openHelpDoc("midi-script.html"); break;
         case 315: openHelpDoc("voices.html"); break;
         case 316: openHelpDoc("automation-recording.html"); break;
+        case 317: openHelpDoc("recording-audio.html"); break;
         case 320:
             juce::AlertWindow::showMessageBoxAsync(
                 juce::MessageBoxIconType::InfoIcon,
@@ -2966,13 +2968,37 @@ void MainContentComponent::onStop() {
         auto* node = graph.findNode(nodeId);
         if (node) audioEngine.getRecordingManager().stopRecording(*node, transport);
         recordBtn.setButtonText("Play & Record");
+        // Finishing a take adds clips/take lanes to the graph. That is a
+        // structural mutation like any other, so it gets its own undo step
+        // (and, via undo-tree growth, marks the project dirty).
+        graph.commitSnapshot("Record audio");
     }
     // Stop multi-track recording
     if (audioEngine.getMultitrackRecorder().isRecording()) {
-        audioEngine.getMultitrackRecorder().stopRecording(
-            graph, transport, audioEngine.getSampleRate());
+        auto& rec = audioEngine.getMultitrackRecorder();
+        rec.stopRecording(graph, transport, audioEngine.getSampleRate());
         recordBtn.setButtonText("Play & Record");
         audioEngine.getGraphProcessor().requestRebuild();
+        graph.commitSnapshot("Record audio");
+
+        // A take with gaps in it must never be handed over silently - the
+        // performance is gone and only the user can decide to redo it.
+        if (auto dropped = rec.getDroppedSampleCount(); dropped > 0) {
+            double secs = (double) dropped / audioEngine.getSampleRate();
+            juce::NativeMessageBox::showAsync(
+                juce::MessageBoxOptions()
+                    .withIconType(juce::MessageBoxIconType::WarningIcon)
+                    .withTitle("Recording dropped audio")
+                    .withMessage(
+                        "About " + juce::String(secs, 2) + " seconds of the take "
+                        "could not be written to disk in time, so the recording "
+                        "has gaps.\n\n"
+                        "This usually means the drive was too busy. Recording to a "
+                        "faster drive, or arming fewer tracks at once, should fix it.")
+                    .withButton("OK")
+                    .withAssociatedComponent(this),
+                nullptr);
+        }
     }
     // Stop MIDI recording
     if (audioEngine.isMidiRecording()) {
@@ -3244,7 +3270,7 @@ void MainContentComponent::onRecord() {
         auto outputDir = juce::File::getSpecialLocation(juce::File::currentExecutableFile)
                              .getParentDirectory().getChildFile("recordings").getFullPathName().toStdString();
         audioEngine.getRecordingManager().startRecording(
-            *recordNode, 2, audioEngine.getSampleRate(), outputDir);
+            *recordNode, 2, audioEngine.getSampleRate(), outputDir, transport);
     }
 
     // Start playback

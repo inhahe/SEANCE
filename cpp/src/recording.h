@@ -12,8 +12,11 @@ class RecordingManager {
 public:
     RecordingManager();
 
-    // Start recording on a node (creates a new take lane or clip)
-    void startRecording(Node& node, int numChannels, double sampleRate, const std::string& outputDir);
+    // Start recording on a node (creates a new take lane or clip).
+    // `transport` fixes the beat the take starts at; without it every take would
+    // land at beat 0 no matter where the playhead was.
+    void startRecording(Node& node, int numChannels, double sampleRate,
+                        const std::string& outputDir, Transport& transport);
 
     // Called from audio thread - append samples
     void processSamples(const float* const* inputData, int numChannels, int numSamples);

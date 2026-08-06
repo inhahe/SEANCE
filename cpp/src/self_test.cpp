@@ -37,6 +37,7 @@
 #include "pitch_core.h"             // PhaseVocoderShifter - in-house pitch-shift core
 #include "pitch_shift_processor.h"  // PitchShiftProcessor - the Pitch Shift node
 #include "graph_processor.h"        // AudioTimelineProcessor - audio-clip playback
+#include "multitrack_recorder.h"    // MultitrackRecorder - live input capture
 
 #include <juce_audio_formats/juce_audio_formats.h>
 #include <juce_graphics/juce_graphics.h>
@@ -9091,6 +9092,129 @@ void testAudioTrackNesting(Report& r, const juce::File& dir) {
             "audio-nest: un-nesting moves the clip back to beat 0");
 }
 
+// Records live input into two nested tracks at once and plays the result back.
+// Guards three things that were each broken independently:
+//   * the take lands where the playhead was, not at beat 0;
+//   * Clip::startBeat is stored node-local, so a take on a nested track does
+//     not double-count the nesting offset the processor adds back on;
+//   * every armed input gets its own file and its own clip.
+void testMultitrackRecording(Report& r, const juce::File& dir) {
+    r.section("Multitrack recording (per-input capture, nesting-correct placement)");
+
+    const double sr = 44100.0;
+    const int    N  = 512;
+    const int    blocks = 86;                      // ~1 s of capture
+    const int64_t expectedSamples = (int64_t) blocks * N;
+
+    // parent (offset 8) -> two armed audio tracks on inputs 0 and 1.
+    NodeGraph g;
+    int parentId = g.addNode("parent", NodeType::MidiTimeline, {}, {}).id;
+    int trackAId = g.addNode("micA", NodeType::AudioTimeline, {},
+                             { Pin{0, "Audio", PinKind::Audio, false} }).id;
+    int trackBId = g.addNode("micB", NodeType::AudioTimeline, {},
+                             { Pin{0, "Audio", PinKind::Audio, false} }).id;
+    // Fields by id only after the last addNode - addNode can reallocate nodes.
+    if (auto* p = g.findNode(parentId)) p->groupBeatOffset = 8.0f;
+    for (int id : { trackAId, trackBId }) {
+        auto* n = g.findNode(id);
+        n->recordArmed = true;
+        n->recordInputChannel = (id == trackAId ? 0 : 1);
+    }
+    g.addToGroup(parentId, trackAId);
+    g.addToGroup(parentId, trackBId);
+    g.resolveAnchors();
+
+    Transport tr;
+    tr.bpm = 120.0;
+    tr.sampleRate = sr;
+    tr.tempoMap.setGlobalBpm(120.0);
+    tr.playing = true;
+    tr.positionSamples = (int64_t)(10.0 * 60.0 / tr.bpm * sr);   // absolute beat 10
+
+    auto recDir = dir.getChildFile("recordings_selftest");
+    recDir.deleteRecursively();
+
+    MultitrackRecorder rec;
+    rec.startRecording(g, tr, sr, recDir.getFullPathName().toStdString());
+    r.check(rec.isRecording(), "record: both armed tracks started");
+    r.checkVal(rec.getActiveTrackCount() == 2,
+               "record: one capture stream per armed input",
+               (float) rec.getActiveTrackCount());
+
+    // Feed the two inputs distinct steady tones.
+    std::vector<float> chan0(N), chan1(N);
+    double phase = 0.0;
+    for (int b = 0; b < blocks; ++b) {
+        for (int i = 0; i < N; ++i, phase += 1.0) {
+            chan0[(size_t) i] = 0.5f * (float) std::sin(2.0 * juce::MathConstants<double>::pi
+                                                        * 440.0 * phase / sr);
+            chan1[(size_t) i] = 0.25f * (float) std::sin(2.0 * juce::MathConstants<double>::pi
+                                                         * 660.0 * phase / sr);
+        }
+        const float* in[2] = { chan0.data(), chan1.data() };
+        rec.processSamples(in, 2, N);
+    }
+
+    rec.stopRecording(g, tr, sr);
+    r.check(!rec.isRecording(), "record: stopped cleanly");
+    r.checkVal(rec.getDroppedSampleCount() == 0,
+               "record: no samples were dropped on the way to disk",
+               (float) rec.getDroppedSampleCount());
+
+    // Each track should have exactly one clip, on disk, at local beat 2
+    // (absolute beat 10 minus the 8-beat parent offset).
+    for (int id : { trackAId, trackBId }) {
+        auto* n = g.findNode(id);
+        juce::String who = juce::String(n->name) + ": ";
+        if (!r.check(n->clips.size() == 1, ("record: " + who + "got exactly one clip")))
+            continue;
+
+        const Clip& c = n->clips[0];
+        r.checkVal(std::abs(c.startBeat - 2.0f) < 1e-3f,
+                   ("record: " + who + "clip start is node-local (absolute 10 - offset 8)"),
+                   c.startBeat);
+        r.check(!c.audioFilePath.empty() && juce::File(c.audioFilePath).existsAsFile(),
+                ("record: " + who + "wav was written to disk"));
+        // 1 s at 120 BPM is 2 beats.
+        r.checkVal(std::abs(c.lengthBeats - 2.0f) < 0.05f,
+                   ("record: " + who + "clip length matches the captured duration"),
+                   c.lengthBeats);
+        r.check(!n->recordArmed, ("record: " + who + "disarmed after the take"));
+
+        juce::WavAudioFormat wavFormat;
+        std::unique_ptr<juce::AudioFormatReader> rd(
+            wavFormat.createReaderFor(new juce::FileInputStream(juce::File(c.audioFilePath)), true));
+        if (r.check(rd != nullptr, ("record: " + who + "wav is readable"))) {
+            r.checkVal(rd->lengthInSamples == expectedSamples,
+                       ("record: " + who + "every sample the callback saw reached the file"),
+                       (float) rd->lengthInSamples);
+        }
+    }
+
+    // Round trip: play the freshly recorded take back. It must sound at the
+    // absolute beat it was recorded at (10), not at the raw local beat (2).
+    auto rmsAtBeat = [&](int nodeId, double beat) {
+        AudioTimelineProcessor proc(*g.findNode(nodeId), tr, g);
+        proc.prepareToPlay(sr, N);
+        tr.positionSamples = (int64_t)(beat * 60.0 / tr.bpm * sr);
+        juce::AudioBuffer<float> buf(2, N);
+        juce::MidiBuffer midi;
+        proc.processBlock(buf, midi);
+        double sum = 0.0;
+        for (int i = 0; i < N; ++i) { float s = buf.getSample(0, i); sum += (double) s * s; }
+        return (float) std::sqrt(sum / N);
+    };
+
+    const float back = rmsAtBeat(trackAId, 10.5);
+    r.check(back > 1.0e-2f,
+            "record: the take plays back at the beat it was recorded at (RMS "
+            + juce::String(back, 4) + ")");
+    r.check(rmsAtBeat(trackAId, 2.5) < 1.0e-6f,
+            "record: the take does not also sound at the un-offset beat");
+
+    recDir.deleteRecursively();
+}
+
 int runSelfTest(const juce::File& outDir) {
     outDir.createDirectory();
     Report r;
@@ -9126,6 +9250,7 @@ int runSelfTest(const juce::File& outDir) {
     testSignalOscPulse(r);
     testTransportPanic(r);
     testAudioTrackNesting(r, outDir);
+    testMultitrackRecording(r, outDir);
 
     r.section("Summary");
     r.line("  PASSED: " + juce::String(r.passed));

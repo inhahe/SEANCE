@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Recording Audio — SEANCE</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="wrap">
+<header>
+<h1>Recording Audio</h1>
+<nav>
+  <a href="index.html">Home</a>
+  <a href="graph-basics.html">Graph Basics</a>
+  <a href="automation-recording.html">Recording Automation</a>
+</nav>
+</header>
+
+<p>You can sing, play, or talk into your computer while the song is playing, and SEANCE will keep it. The take turns into a normal block of audio sitting on the timeline, so from then on it just plays along with everything else — and it saves with your project.</p>
+
+<p>You can also record <strong>several inputs at the same time</strong> — two mics, or a mic and a guitar — and each one lands on its own separate track instead of being mushed together.</p>
+
+<div class="tip">
+<strong>Recording audio vs. recording automation.</strong> This page is about capturing <em>sound</em> coming into your computer. If you want to capture <em>knob moves</em> you make during playback, that's a different feature — see <a href="automation-recording.html">Recording Automation</a>.
+</div>
+
+<h2>Record one microphone</h2>
+
+<ol>
+  <li>Right-click empty canvas → add an <strong>Audio Track</strong> node. This is the track your recording will land on.</li>
+  <li>On that node, find the <strong>Input Channel</strong> value row and set it to <strong>0</strong>. That means "the first input on my sound device" — for a single plugged-in mic, that's the one you want.</li>
+  <li>Right-click the node → <strong>Record Here</strong>. The track is now armed.</li>
+  <li>Wire the track's <strong>Audio</strong> output to your Output node, so you'll hear it back.</li>
+  <li>Move the playhead to where you want the take to start, then press <strong>Play &amp; Record</strong>.</li>
+  <li>Perform. When you're done, press <strong>Stop</strong>.</li>
+</ol>
+
+<p>A red block appears on the track, starting exactly where the playhead was when you hit record. Rewind, press <strong>Play</strong>, and you'll hear it back with the rest of the song. Save the project and it'll still be there next time you open it.</p>
+
+<div class="tip">
+<strong>Hear yourself while you play.</strong> Turn on the track's <strong>Input Monitor</strong> toggle and your live input is piped to the speakers as you perform, using that track's own Volume and Pan. Use headphones — monitoring through speakers with a mic open will howl.
+</div>
+
+<h2>Record several inputs at once</h2>
+
+<p>There's no special "multitrack mode" to switch on. Just arm more than one track:</p>
+
+<ol>
+  <li>Make one <strong>Audio Track</strong> per input you want to capture.</li>
+  <li>Give each one a <em>different</em> <strong>Input Channel</strong> — 0 for the first input on your device, 1 for the second, and so on.</li>
+  <li>Right-click each → <strong>Record Here</strong>.</li>
+  <li>Press <strong>Play &amp; Record</strong> once. Every armed track records at the same time.</li>
+</ol>
+
+<p>On Stop you get one separate block of audio per track, which is what you want — you can now set the levels of the two mics independently, or put an effect on only one of them.</p>
+
+<p>There's no limit on how many you can arm; the real limit is how many inputs your sound device actually has. A plain laptop or a USB mic usually has one (channel 0). A 2-input audio interface gives you channels 0 and 1.</p>
+
+<div class="tip">
+<strong>You make the tracks yourself.</strong> SEANCE doesn't look at your sound device and automatically build a track for every input it finds. That's deliberate — a track is only ever recorded into if you explicitly armed it, so an accidental Play can't overwrite something you wanted to keep.
+</div>
+
+<h2>After the take</h2>
+
+<ul>
+  <li><strong>Don't like it?</strong> <strong>Ctrl+Z</strong> removes the whole take in one step.</li>
+  <li><strong>The track disarms itself</strong> when you stop, so pressing Play again can't record over what you just captured. Right-click → <strong>Record Here</strong> again when you're ready for another pass.</li>
+  <li><strong>It's a normal audio block now.</strong> Drag it, trim it, slide the audio inside it, add effects after the track, bounce it — everything that works on imported audio works on your recording.</li>
+  <li><strong>The actual file</strong> is a 24-bit WAV in a <code>recordings</code> folder next to the SEANCE program, named after the track and the time you recorded it.</li>
+</ul>
+
+<h2>If something goes wrong</h2>
+
+<p><strong>Nothing was recorded.</strong> The most common cause is that the track wasn't armed — check for the Record Here mark before you press Play &amp; Record. After that, check that the <strong>Input Channel</strong> matches a real input, and that your microphone is selected as the input device in the audio settings.</p>
+
+<p><strong>"Recording dropped audio" popped up.</strong> Your drive couldn't keep up and some of the take is missing. Recording to a faster drive, or arming fewer tracks at once, fixes it. SEANCE tells you when this happens rather than quietly handing you a take with holes in it — so if you <em>don't</em> see this message, nothing was lost.</p>
+
+<p><strong>How long can a take be?</strong> As long as you like. There's no time limit — only free space on your drive.</p>
+
+<footer>
+<a href="index.html">← Back to index</a>
+</footer>
+</div>
+</body>
+</html>

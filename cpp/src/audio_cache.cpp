@@ -86,6 +86,11 @@ uint64_t AudioCacheManager::computeNodeHash(const Node& node, const NodeGraph& g
         }
     }
 
+    // Track nesting shifts every clip on this node by the cascading parent
+    // offset, so two otherwise-identical nodes at different nesting offsets
+    // render differently and must not share a cache entry.
+    h = hashCombine(h, hashFloat(node.absoluteBeatOffset));
+
     // Hash clip data (notes, CC events, audio file paths)
     for (auto& clip : node.clips) {
         h = hashCombine(h, hashFloat(clip.startBeat));

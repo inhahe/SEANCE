@@ -322,11 +322,10 @@ MainContentComponent::MainContentComponent() {
                        "(initially set to the full project length - drag the loop region in the routing strip to adjust).");
     loopBtn.onClick = [this]() {
         if (!graph.loopEnabled) {
-            // Enable loop: default to full project length
-            float maxBeat = 0;
-            for (auto& n : graph.nodes)
-                for (auto& c : n.clips)
-                    maxBeat = std::max(maxBeat, c.startBeat + c.lengthBeats);
+            // Enable loop: default to full project length. contentEndBeats()
+            // includes each track's cascading nesting offset, so a track nested
+            // under another one isn't cut out of the loop range.
+            float maxBeat = (float) graph.contentEndBeats();
             if (maxBeat <= 0) maxBeat = 4;
             graph.loopStartBeat = 0;
             graph.loopEndBeat = maxBeat;
@@ -3671,10 +3670,8 @@ void MainContentComponent::freezeNodes(const std::vector<int>& nodeIds) {
     if (targets.empty()) return;
 
     // Project length in beats (+ a tail so release/reverb aren't chopped).
-    float maxBeat = 0;
-    for (auto& n : graph.nodes)
-        for (auto& c : n.clips)
-            maxBeat = std::max(maxBeat, c.startBeat + c.lengthBeats);
+    // contentEndBeats() accounts for track nesting offsets.
+    float maxBeat = (float) graph.contentEndBeats();
     if (maxBeat <= 0) maxBeat = 4;
     maxBeat += 4;
 
@@ -4007,10 +4004,9 @@ void MainContentComponent::importModFile() {
 }
 
 void MainContentComponent::exportAudio() {
-    float maxBeat = 0;
-    for (auto& n : graph.nodes)
-        for (auto& c : n.clips)
-            maxBeat = std::max(maxBeat, c.startBeat + c.lengthBeats);
+    // contentEndBeats() includes each track's cascading nesting offset, so a
+    // nested track's tail isn't chopped off the end of the render.
+    float maxBeat = (float) graph.contentEndBeats();
     if (maxBeat <= 0) maxBeat = 4;
     maxBeat += 4;
 
@@ -6355,10 +6351,8 @@ void MainWindow::tryQuit() {
 
 void MainContentComponent::bounceToAudioTrack() {
     // Calculate project length from the last clip end + 4 beats of tail.
-    float maxBeat = 0;
-    for (auto& n : graph.nodes)
-        for (auto& c : n.clips)
-            maxBeat = std::max(maxBeat, c.startBeat + c.lengthBeats);
+    // contentEndBeats() accounts for track nesting offsets.
+    float maxBeat = (float) graph.contentEndBeats();
     if (maxBeat <= 0) {
         juce::AlertWindow::showMessageBoxAsync(juce::MessageBoxIconType::InfoIcon,
             "Nothing to bounce", "Add some clips to the timeline first.");

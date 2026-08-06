@@ -36,6 +36,7 @@
 #include "signal_oscillator.h"      // SignalOscillatorProcessor - Signal-driven oscillator
 #include "pitch_core.h"             // PhaseVocoderShifter - in-house pitch-shift core
 #include "pitch_shift_processor.h"  // PitchShiftProcessor - the Pitch Shift node
+#include "graph_processor.h"        // AudioTimelineProcessor - audio-clip playback
 
 #include <juce_audio_formats/juce_audio_formats.h>
 #include <juce_graphics/juce_graphics.h>
@@ -8993,6 +8994,103 @@ void testTransportPanic(Report& r) {
             "panic: reset() is >=100x quieter than the natural release tail");
 }
 
+// Audio tracks nest under other tracks exactly like MIDI tracks do
+// (TrackNestingMenu accepts AudioTimeline, MidiTimeline and Group). The
+// nesting offset is node-level: clip beats stay local and the cascading
+// absoluteBeatOffset shifts the whole track.
+//
+// Regression: AudioTimelineProcessor::processBlock used to read clip.startBeat
+// raw, so a nested audio track DREW at its offset position (the piano roll's
+// beatToX adds absoluteBeatOffset) but PLAYED at the un-offset one - a silent
+// audio/visual desync. The MIDI generator in the same file always applied the
+// offset, which is why only audio tracks were affected.
+void testAudioTrackNesting(Report& r, const juce::File& dir) {
+    r.section("Audio track nesting (clips play at the cascading parent offset)");
+
+    const double sr = 44100.0;
+    const int    N  = 512;
+
+    // 4 seconds of steady tone, so any block landing inside the clip has a
+    // clearly non-zero RMS no matter where in the clip it falls.
+    std::vector<float> samples((size_t)(sr * 4.0), 0.0f);
+    for (size_t i = 0; i < samples.size(); ++i)
+        samples[i] = 0.5f * (float)std::sin(2.0 * juce::MathConstants<double>::pi
+                                            * 440.0 * (double)i / sr);
+    auto wav = dir.getChildFile("nested_audio_track.wav");
+    if (!writeWavFloat(wav, samples, sr)) {
+        r.check(false, "audio-nest: could not write the test wav");
+        return;
+    }
+
+    // parent track (offset 8 beats) -> child audio track with one 4-beat clip
+    // at local beat 0. At 120 BPM a beat is 0.5 s, so the clip must sound over
+    // absolute beats 8..12 and be silent over 0..4.
+    NodeGraph g;
+    int parentId = g.addNode("parent", NodeType::MidiTimeline, {}, {}).id;
+    int childId  = g.addNode("child",  NodeType::AudioTimeline, {},
+                             { Pin{0, "Audio", PinKind::Audio, false} }).id;
+    // Set fields by id only after every addNode call - addNode can reallocate
+    // graph.nodes, so a Node& taken earlier would dangle.
+    if (auto* p = g.findNode(parentId)) p->groupBeatOffset = 8.0f;
+    g.addToGroup(parentId, childId);
+    {
+        Clip c{};
+        c.name = "clip";
+        c.startBeat = 0.0f;
+        c.lengthBeats = 4.0f;
+        c.audioFilePath = wav.getFullPathName().toStdString();
+        g.findNode(childId)->clips.push_back(c);
+    }
+    g.resolveAnchors();
+
+    r.checkVal(std::abs(g.findNode(childId)->absoluteBeatOffset - 8.0f) < 1e-3f,
+               "audio-nest: child audio track inherits the 8-beat parent offset",
+               g.findNode(childId)->absoluteBeatOffset);
+
+    Transport tr;
+    tr.bpm = 120.0;
+    tr.sampleRate = sr;
+    tr.tempoMap.setGlobalBpm(120.0);
+    tr.playing = true;
+
+    AudioTimelineProcessor proc(*g.findNode(childId), tr, g);
+    proc.prepareToPlay(sr, N);
+
+    auto rmsAtBeat = [&](double beat) {
+        tr.positionSamples = (int64_t)(beat * 60.0 / tr.bpm * sr);
+        juce::AudioBuffer<float> buf(2, N);
+        juce::MidiBuffer midi;
+        proc.processBlock(buf, midi);
+        double sum = 0.0;
+        for (int i = 0; i < N; ++i) { float s = buf.getSample(0, i); sum += (double)s * s; }
+        return (float)std::sqrt(sum / N);
+    };
+
+    const float atBeat2  = rmsAtBeat(2.0);   // where the clip would play un-nested
+    const float atBeat10 = rmsAtBeat(10.0);  // where it must actually play
+
+    r.check(atBeat10 > 1.0e-2f,
+            "audio-nest: nested clip sounds at its offset position (beat 10, RMS "
+            + juce::String(atBeat10, 4) + ")");
+    r.check(atBeat2 < 1.0e-6f,
+            "audio-nest: nothing plays at the un-offset position (beat 2, RMS "
+            + juce::String(atBeat2, 8) + ")");
+
+    // Song length has to include the offset too, or an export would stop
+    // before the nested track's tail (clip ends at local beat 4 -> absolute 12).
+    r.checkVal(std::abs(g.contentEndBeats() - 12.0) < 1e-6,
+               "audio-nest: contentEndBeats includes the nesting offset",
+               (float) g.contentEndBeats());
+
+    // Detaching folds the inherited offset away again: the same clip is back at
+    // beats 0..4, which is what "Clear parent" in the nesting menu relies on.
+    g.removeFromGroup(childId);
+    if (auto* c = g.findNode(childId)) c->groupBeatOffset = 0.0f;
+    g.resolveAnchors();
+    r.check(rmsAtBeat(2.0) > 1.0e-2f,
+            "audio-nest: un-nesting moves the clip back to beat 0");
+}
+
 int runSelfTest(const juce::File& outDir) {
     outDir.createDirectory();
     Report r;
@@ -9027,6 +9125,7 @@ int runSelfTest(const juce::File& outDir) {
     testVoicePresets(r);
     testSignalOscPulse(r);
     testTransportPanic(r);
+    testAudioTrackNesting(r, outDir);
 
     r.section("Summary");
     r.line("  PASSED: " + juce::String(r.passed));

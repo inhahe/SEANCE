@@ -61,13 +61,19 @@ double NodeGraph::contentEndBeats() const {
     // Exact end of the last clip across all timeline nodes with clips, NOT
     // rounded up to a bar (so it can land mid-bar). Empty timelines are
     // skipped so a project with no clips returns 0 (= no end).
+    //
+    // Clip beats are node-local, so a track nested under another track (audio
+    // or MIDI) plays absoluteBeatOffset beats later than its clips claim. That
+    // offset has to be added here or the song would end -- and an export would
+    // stop -- before a nested track's tail had played.
     double maxEnd = 0.0;
     for (const auto& n : nodes) {
         if (n.type != NodeType::AudioTimeline &&
             n.type != NodeType::MidiTimeline) continue;
         if (n.clips.empty()) continue;
         for (const auto& c : n.clips)
-            maxEnd = std::max(maxEnd, (double) (c.startBeat + c.lengthBeats));
+            maxEnd = std::max(maxEnd,
+                (double) (n.absoluteBeatOffset + c.startBeat + c.lengthBeats));
     }
     return maxEnd;
 }

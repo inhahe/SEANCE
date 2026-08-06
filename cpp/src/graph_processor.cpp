@@ -451,14 +451,20 @@ void AudioTimelineProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::M
     double globalFadeBeats = std::max(0.0,
         (double)graph.globalCrossfadeSec * (double)transport.bpm / 60.0);
 
+    // Cascading group offset, same as the MIDI timeline path above. When this
+    // track is nested under another track (or a Group), every clip on it slides
+    // by the accumulated offset of the whole parent chain. Without this the
+    // clips would draw at the offset position but play at the un-offset one.
+    double nodeOffset = node.absoluteBeatOffset;
+
     for (auto& clip : node.clips) {
         if (clip.audioFilePath.empty()) continue;
 
         auto audio = getAudio(clip.audioFilePath);
         if (!audio || !audio->reader) continue;
 
-        double clipStart = clip.startBeat;
-        double clipEnd = clip.startBeat + clip.lengthBeats;
+        double clipStart = nodeOffset + clip.startBeat;
+        double clipEnd = clipStart + clip.lengthBeats;
         double maxEdgeFade = std::max(0.0, clip.lengthBeats * 0.5);
         double effFadeIn  = std::min(maxEdgeFade,
             std::max((double)clip.fadeInBeats,  globalFadeBeats));

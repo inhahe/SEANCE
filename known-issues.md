@@ -294,7 +294,7 @@ triaged below. Re-run it before trusting this list again — it is a snapshot.
     thread, not performed on the audio thread), not something to paper over
     here.
 
-### Fixed (commit `HASH_SF`) — `SoundFontProcessor`
+### Fixed (commit `d0a6480`) — `SoundFontProcessor`
 
 Two allocation sites, plus a much more serious bug found on the way in.
 

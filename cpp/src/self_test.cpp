@@ -6924,6 +6924,198 @@ void testAssetLibrary(Report& r) {
                        [](Node& n) { return std::make_unique<ParticleSynthProcessor>(n); });
     }
 
+    // ---- Every built-in synth honours All Notes Off / All Sound Off ----------
+    //
+    // None of the synths in builtin_effects.h handled either message, though
+    // six other synth files do. GraphProcessor emits All Notes Off on all 16
+    // channels when the transport stops (graph_processor.cpp:94), and a
+    // controller's panic button or the end of a MIDI file send them too. A
+    // synth that ignores them never receives the matching note-off, so a held
+    // note sounds forever.
+    //
+    // Verified by deleting the handling again: every synth reads 0.17-0.51 for
+    // "All Sound Off cuts the note dead" (against 0.00000 fixed) and 0.13-0.30
+    // for "the note is gone once the release has run" - i.e. the note simply
+    // sustains forever, exactly as reported. The arpeggiator emits 4 more
+    // note-ons after the panic instead of 0.
+    //
+    // The two messages differ and both halves are checked:
+    //   All Sound Off (CC#120) - silent immediately.
+    //   All Notes Off (CC#123) - enters the RELEASE stage, so it must still be
+    //                            audible right after the message and silent
+    //                            once the release has run.
+    {
+        auto checkPanic = [&r](const char* label, std::vector<Param> params,
+                               auto&& makeProc) {
+            const int bs = 512;
+
+            // Plays 6 blocks with a note-on in the first, then sends `panic`,
+            // then reports (level in the 2 blocks right after, level once the
+            // release has had 60 blocks - 700 ms - to finish).
+            auto run = [&](const juce::MidiMessage& panic) {
+                Node node;
+                node.id     = 1;
+                node.name   = "selftest-allnotesoff";
+                node.params = params;
+                // Long, obvious release so "released but still ringing" and
+                // "cut dead" are far apart.
+                node.ahdsrEnvelope.releaseMs = 400.0f;
+
+                auto proc = makeProc(node);
+                proc->prepareToPlay(44100.0, bs);
+                juce::AudioBuffer<float> buf(2, bs);
+
+                auto blocks = [&](int n, const juce::MidiMessage* m) {
+                    float pk = 0.0f;
+                    for (int b = 0; b < n; ++b) {
+                        buf.clear();
+                        juce::MidiBuffer midi;
+                        if (m && b == 0) midi.addEvent(*m, 0);
+                        proc->processBlock(buf, midi);
+                        for (int s = 0; s < bs; ++s)
+                            pk = std::max(pk, std::abs(buf.getSample(0, s)));
+                    }
+                    return pk;
+                };
+
+                const auto on = juce::MidiMessage::noteOn(1, 60, (juce::uint8)110);
+                const float held = blocks(6, &on);
+                const float just = blocks(2, &panic);
+                // Run the 400 ms release out (60 blocks = 700 ms) and DISCARD
+                // that level - it is dominated by the start of the release,
+                // which is still near full volume. Only the level after it has
+                // finished says whether the note actually ended.
+                blocks(60, nullptr);
+                const float late = blocks(4, nullptr);
+                return std::array<float, 3>{ held, just, late };
+            };
+
+            const auto soundOff = run(juce::MidiMessage::allSoundOff(1));
+            r.checkVal(soundOff[0] > 1e-4f,
+                       juce::String(label) + ": sounds before All Sound Off", soundOff[0]);
+            r.checkVal(soundOff[1] < 1e-4f,
+                       juce::String(label) + ": All Sound Off cuts the note dead", soundOff[1]);
+
+            const auto notesOff = run(juce::MidiMessage::allNotesOff(1));
+            r.checkVal(notesOff[1] > 1e-4f,
+                       juce::String(label) + ": All Notes Off lets the note RELEASE "
+                       "rather than cutting it", notesOff[1]);
+            r.checkVal(notesOff[2] < 1e-4f,
+                       juce::String(label) + ": the note is gone once the release has run",
+                       notesOff[2]);
+        };
+
+        checkPanic("allnotesoff/fmsynth",
+                   { { "Algorithm", 0.0f, 0.0f, 7.0f }, { "Volume", 0.5f, 0.0f, 1.0f } },
+                   [](Node& n) { return std::make_unique<FMSynthProcessor>(n); });
+        checkPanic("allnotesoff/pdsynth",
+                   { { "Volume", 0.5f, 0.0f, 1.0f } },
+                   [](Node& n) { return std::make_unique<PDSynthProcessor>(n); });
+        checkPanic("allnotesoff/additive",
+                   { { "Partials", 16.0f, 1.0f, 64.0f }, { "Volume", 0.5f, 0.0f, 1.0f } },
+                   [](Node& n) { return std::make_unique<AdditiveSynthProcessor>(n); });
+        checkPanic("allnotesoff/particlesynth",
+                   { { "Density", 60.0f, 1.0f, 200.0f },
+                     { "Grain Size", 40.0f, 1.0f, 500.0f },
+                     { "Volume", 0.5f, 0.0f, 1.0f } },
+                   [](Node& n) { return std::make_unique<ParticleSynthProcessor>(n); });
+
+        // Spectral Grain needs its magnitude expression, so it can't go through
+        // the helper above (which builds a bare Node).
+        {
+            const int bs = 512;
+            auto run = [&](const juce::MidiMessage& panic) {
+                Node node;
+                node.id     = 1;
+                node.script = "__spectralgrain__:exp(-f/10)";
+                node.params = { { "Density",    80.0f, 1.0f, 200.0f },
+                                { "Grain Size", 40.0f, 1.0f, 200.0f },
+                                { "Volume",      0.8f, 0.0f,   1.0f } };
+                node.ahdsrEnvelope.releaseMs = 400.0f;
+
+                SpectralGrainProcessor proc(node);
+                proc.prepareToPlay(44100.0, bs);
+                juce::AudioBuffer<float> buf(2, bs);
+                auto blocks = [&](int n, const juce::MidiMessage* m) {
+                    float pk = 0.0f;
+                    for (int b = 0; b < n; ++b) {
+                        buf.clear();
+                        juce::MidiBuffer midi;
+                        if (m && b == 0) midi.addEvent(*m, 0);
+                        proc.processBlock(buf, midi);
+                        for (int s = 0; s < bs; ++s)
+                            pk = std::max(pk, std::abs(buf.getSample(0, s)));
+                    }
+                    return pk;
+                };
+                const auto on = juce::MidiMessage::noteOn(1, 60, (juce::uint8)110);
+                const float held = blocks(6, &on);
+                const float just = blocks(2, &panic);
+                // Run the 400 ms release out (60 blocks = 700 ms) and DISCARD
+                // that level - it is dominated by the start of the release,
+                // which is still near full volume. Only the level after it has
+                // finished says whether the note actually ended.
+                blocks(60, nullptr);
+                const float late = blocks(4, nullptr);
+                return std::array<float, 3>{ held, just, late };
+            };
+            const auto so = run(juce::MidiMessage::allSoundOff(1));
+            r.checkVal(so[0] > 1e-4f,
+                       "allnotesoff/spectralgrain: sounds before All Sound Off", so[0]);
+            r.checkVal(so[1] < 1e-4f,
+                       "allnotesoff/spectralgrain: All Sound Off cuts the note dead", so[1]);
+            const auto no = run(juce::MidiMessage::allNotesOff(1));
+            r.checkVal(no[1] > 1e-4f,
+                       "allnotesoff/spectralgrain: All Notes Off lets the note RELEASE "
+                       "rather than cutting it", no[1]);
+            r.checkVal(no[2] < 1e-4f,
+                       "allnotesoff/spectralgrain: the note is gone once the release has run",
+                       no[2]);
+        }
+
+        // The Arpeggiator is the worst case: it CLEARS the incoming MIDI buffer
+        // and emits its own, so a panic it ignores never reaches the synth
+        // downstream either - one stuck arp jams the whole chain.
+        {
+            Node node;
+            node.id = 1;
+            // Rate is notes per SECOND: at 16, a note lands every ~2756
+            // samples, i.e. roughly every 5th 512-sample block.
+            node.params = { { "Rate", 16.0f, 1.0f, 32.0f },
+                            { "Pattern", 0.0f, 0.0f, 4.0f },
+                            { "Octaves", 1.0f, 1.0f, 4.0f },
+                            { "Gate", 0.5f, 0.05f, 1.0f } };
+            ArpeggiatorProcessor proc(node);
+            proc.prepareToPlay(44100.0, 512);
+
+            auto countNoteOns = [&](int blocks, const juce::MidiMessage* m) {
+                int n = 0;
+                for (int b = 0; b < blocks; ++b) {
+                    juce::AudioBuffer<float> buf(2, 512);
+                    buf.clear();
+                    juce::MidiBuffer midi;
+                    if (m && b == 0) midi.addEvent(*m, 0);
+                    proc.processBlock(buf, midi);
+                    for (auto meta : midi)
+                        if (meta.getMessage().isNoteOn()) ++n;
+                }
+                return n;
+            };
+
+            const auto on = juce::MidiMessage::noteOn(1, 60, (juce::uint8)110);
+            const int running = countNoteOns(20, &on);
+            r.checkVal(running > 0,
+                       "allnotesoff/arpeggiator: arpeggiating before the panic",
+                       (double)running);
+            const auto panic = juce::MidiMessage::allNotesOff(1);
+            countNoteOns(1, &panic);
+            const int after = countNoteOns(20, nullptr);
+            r.checkVal(after == 0,
+                       "allnotesoff/arpeggiator: All Notes Off releases the stuck chord",
+                       (double)after);
+        }
+    }
+
     // ---- SpectralGrain still plays after a transport Stop --------------------
     //
     // reset() (the transport-panic hook) used to be `voices.clear()`. Nothing

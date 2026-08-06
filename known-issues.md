@@ -631,16 +631,26 @@ defects were reinstated to confirm the tests catch them (the three
 `voices.clear()` synths read exactly 0.00000 for "still plays after a transport
 Stop"; Particle Cloud reads 0.39244 for "actually silences a held note").
 
-**Related gap, still open:** none of the synths in `builtin_effects.h` handle
-MIDI **All Notes Off** / **All Sound Off**, though `builtin_synth.cpp`,
-`drum_synth.cpp`, `multi_sampler.cpp`, `poly_voice_processor.cpp`,
-`soundfont_processor.cpp` and `terrain_synth.cpp` all do. `GraphProcessor`
-emits `allNotesOff` on every channel when the transport stops
-(`graph_processor.cpp:94`), so those synths ignore it and rely entirely on the
-panic path above. That's fine for Stop but wrong for any other source of an
-All Notes Off (a controller's panic button, an incoming MIDI file). The fix is
-a shared helper — the message means "release every held note" — applied to each
-MIDI-accepting processor in `builtin_effects.h`.
+**Related gap, also FIXED (2026-08-06):** none of the synths in
+`builtin_effects.h` handled MIDI **All Notes Off** (CC#123) or **All Sound
+Off** (CC#120), though `builtin_synth.cpp`, `drum_synth.cpp`,
+`multi_sampler.cpp`, `poly_voice_processor.cpp`, `soundfont_processor.cpp` and
+`terrain_synth.cpp` all did. A held note on FM / PD / Additive / Particle Cloud
+/ Spectral Grain therefore **sounded forever** on a controller's panic button
+or at the end of a MIDI file, because the matching note-off never arrived.
+
+The **Arpeggiator** was the worst of them: it clears the incoming MIDI buffer
+and emits its own, so a panic it ignored never reached the synth downstream
+either — one stuck arp jammed the entire chain, and its stuck chord kept
+re-triggering the note it was jamming.
+
+**Fix:** a shared `isMidiPanicMessage()` in `signal_modulation.h` distinguishes
+the two — All Notes Off means "let go of every key" (voices enter their
+**release** stage and ring out) while All Sound Off means "be silent now"
+(voices are cut dead) — and each of the six processors handles both. Guarded by
+22 assertions under `allnotesoff/` covering both flavours *and* both halves of
+the All Notes Off semantics (still audible right after the message; silent once
+the release has run), so a future "fix" that just hard-cuts on CC#123 fails.
 
 ---
 

@@ -230,7 +230,7 @@ When the transport stops, **all trailing sound is cut at once** rather than ring
 
 Mechanism: `AudioEngine::stop()` calls `panic()`, which sets a one-shot `std::atomic<bool> panicRequested` flag on the `GraphProcessor`. On the very next audio callback the flag is consumed and `juce::AudioProcessorGraph::reset()` is called, which propagates `reset()` to **every** node processor in the graph. Each tail-bearing built-in processor implements `reset()` to wipe its state:
 
-- **Synths** — clear their voice containers / hard-reset per-voice amp envelopes (FM, PD, Additive, Particle, Spectral Grain, Built-in, Terrain, Drum, MultiSampler, Signal Oscillator, Signal Noise, SoundFont/SFZ, sfizz).
+- **Synths** — silence every voice in place and hard-reset the per-voice amp envelopes (FM, PD, Additive, Particle, Spectral Grain, Built-in, Terrain, Drum, MultiSampler, Signal Oscillator, Signal Noise, SoundFont/SFZ, sfizz). Note *in place*: a `reset()` that **removes** the voices instead is a bug, because the voice pool is sized once at construction and nothing refills it — this cost FM, PD, Additive and Spectral Grain a permanent silencing on the first press of Stop until it was fixed (see `known-issues.md`). The `panic/…` self-tests assert both halves for each synth: Stop silences a held note, *and* the synth still plays afterwards.
 - **Time-based effects** — zero their delay/feedback/tail buffers (Echo, Reverb, Wavelet Reverb, Vibrato, Flanger, Phaser, Convolution).
 - **Hosted VST3/plugins** — receive the standard `reset()` that JUCE forwards to the plugin.
 
@@ -439,6 +439,7 @@ The rows below describe each controller's behavior; the "Implemented by" notes c
 | **Channel pressure / aftertouch** | Multiplies per-voice volume by the aftertouch sensitivity (default 0.5, saved per node). Also exposed as a **Param** (block-rate, orange) input pin — wire any Param or Signal source into the synth's Aftertouch pin to drive the same swell. It's a Param rather than a Signal pin because the synth consumes it as the **block mean** (averaged across the whole block) so a slow LFO drives a smooth swell instead of bleeding its audio shape into the amplitude. The pin is system-managed: it's auto-created on tonal/note-triggered synths and any project that saved it as the old amber Signal pin is silently normalized to Param on load (safe because the type was never the user's choice). |
 | **Polyphonic key pressure** | Per-*note* aftertouch (each held key can be pushed independently). Routed to the matching voice by note number, then **added** to channel pressure and clamped to 0..1 before the sensitivity multiply (`effectivePressure()` in `signal_modulation.h`). This is the one MIDI dimension that *cannot* ride a mono Signal cable — a single signal value can't say which note it belongs to — so it's consumed inside the synth voice allocator keyed by note number, never as a cable. Implemented via the shared `distributeMpeMessages()` helper across the standalone synths (Wavetable, FM, Phase Distortion, Additive, Spectral Grain); `TerrainSynth` handles it with its own equivalent inline path. |
 | **Velocity**            | Scaled by the per-synth *Vel Sens* param (0..1). 0 ignores velocity, 1 maps full range. |
+| **All Notes Off (CC#123) / All Sound Off (CC#120)** | The two MIDI "stop everything" messages, and they are **not** the same: All Notes Off means *let go of every key*, so voices enter their **release** stage and ring out naturally; All Sound Off means *be silent now*, so voices are cut dead with no release. Both are honoured by every MIDI-accepting synth. A controller's panic button, the end of a MIDI file, and SEANCE's own transport stop (`GraphProcessor` emits All Notes Off on all 16 channels) all send them — a synth that ignores them sounds a held note forever, because the matching note-off never arrives. Shared helper: `isMidiPanicMessage()` in `signal_modulation.h`. The **Arpeggiator** honours them too, which matters more than it looks: it clears the incoming MIDI buffer and emits its own, so a panic *it* dropped would never reach the synth downstream either. |
 
 Drum Machine uses the separate `DrumSynthProcessor`, which also handles CC#64 — but with the freeze-the-decay semantics described above, since drum voices have no note-off-driven release stage to defer.
 
@@ -1548,13 +1549,18 @@ cables can't get you there either: `applySignalModulations` clamps a modulated
 param to its declared range, so a cable can't push Density past 200. The cap is
 a safety net for the audio thread, not a knob you can run into.
 
-### Transport Stop
+### Stopping a cloud
 
-Both nodes implement the transport-panic hook, so pressing **Stop** cuts the
-cloud dead — every in-flight grain is dropped and every voice silenced —
-rather than letting hundreds of grain tails ring out. Neither node responds to
-MIDI *All Notes Off*, so panic is the only thing that stops a held note on
-them.
+Two independent paths stop these nodes, and they mean different things:
+
+- **Transport Stop** fires the panic hook, which cuts the cloud dead — every
+  in-flight grain dropped, every voice silenced — rather than letting hundreds
+  of grain tails ring out.
+- **MIDI *All Notes Off* (CC#123)** releases the held note, so the cloud thins
+  out through the AHDSR release rather than stopping instantly. **MIDI *All
+  Sound Off* (CC#120)** cuts it dead like Stop does. Both are handled by every
+  MIDI-accepting synth in `builtin_effects.h` (see `isMidiPanicMessage()` in
+  `signal_modulation.h`).
 
 ### Serialization
 

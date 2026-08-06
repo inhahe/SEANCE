@@ -617,6 +617,14 @@ public:
             auto msg = metadata.getMessage();
             if (msg.isNoteOn())  heldNotes.set  ((size_t) msg.getNoteNumber());
             if (msg.isNoteOff()) heldNotes.reset((size_t) msg.getNoteNumber());
+            // Panic (controller panic button, MIDI file end, transport stop):
+            // let go of every key. Without this the arp never sees the matching
+            // note-offs and keeps arpeggiating the stuck chord forever - and
+            // because it clears the incoming buffer and generates its own MIDI,
+            // the panic message never reaches the synth downstream either, so
+            // one stuck arp jams the whole chain. Both flavours mean "stop"
+            // here; the arp has no envelope to release, so they're identical.
+            if (bool rel = false; isMidiPanicMessage(msg, rel)) heldNotes.reset();
         }
         midi.clear(); // we'll generate our own MIDI output
 
@@ -1408,6 +1416,19 @@ public:
                     if (v.active && v.held && v.note == msg.getNoteNumber())
                         { v.held = false; v.relTime = v.time;
                           for (int i = 0; i < 4; ++i) v.opEnvRt[i].noteOff(); }
+            } else if (bool rel = false; isMidiPanicMessage(msg, rel)) {
+                // Controller panic / MIDI file end / transport stop.
+                for (auto& v : voices) {
+                    if (!v.active) continue;
+                    v.held = false;
+                    if (rel) {                          // All Notes Off: release
+                        v.relTime = v.time;
+                        for (int i = 0; i < 4; ++i) v.opEnvRt[i].noteOff();
+                    } else {                            // All Sound Off: cut dead
+                        for (int i = 0; i < 4; ++i) v.opEnvRt[i].hardReset();
+                        v.active = false;
+                    }
+                }
             }
         }
         // Distribute MPE / per-note expression (pitch bend, channel + poly
@@ -1639,6 +1660,14 @@ public:
                 for (auto& v : voices)
                     if (v.active && v.held && v.note == msg.getNoteNumber())
                         { v.held = false; v.ampEnv.noteOff(); }
+            } else if (bool rel = false; isMidiPanicMessage(msg, rel)) {
+                // Controller panic / MIDI file end / transport stop.
+                for (auto& v : voices) {
+                    if (!v.active) continue;
+                    v.held = false;
+                    if (rel) v.ampEnv.noteOff();       // All Notes Off: release
+                    else { v.ampEnv.hardReset(); v.active = false; }  // All Sound Off
+                }
             }
         }
         // Distribute MPE per-channel messages to voices (#78)
@@ -1852,6 +1881,16 @@ public:
             } else if (msg.isNoteOff() && msg.getNoteNumber() == heldNote) {
                 noteActive = false;
                 noteAmpEnv.noteOff();
+            } else if (bool rel = false; isMidiPanicMessage(msg, rel)) {
+                // Controller panic / MIDI file end / transport stop.
+                noteActive = false;
+                if (rel) {
+                    noteAmpEnv.noteOff();   // All Notes Off: cloud thins out
+                } else {                    // All Sound Off: cut dead
+                    noteAmpEnv.hardReset();
+                    grains.clear();
+                    spawnTimer = 0.0f;
+                }
             }
         }
 
@@ -3457,6 +3496,14 @@ public:
                 for (auto& v : voices)
                     if (v.active && v.held && v.note == msg.getNoteNumber())
                         { v.held = false; v.ampEnv.noteOff(); }
+            } else if (bool rel = false; isMidiPanicMessage(msg, rel)) {
+                // Controller panic / MIDI file end / transport stop.
+                for (auto& v : voices) {
+                    if (!v.active) continue;
+                    v.held = false;
+                    if (rel) v.ampEnv.noteOff();       // All Notes Off: release
+                    else { v.ampEnv.hardReset(); v.active = false; }  // All Sound Off
+                }
             }
         }
         distributeMpeMessages(midi, voices);
@@ -4346,6 +4393,14 @@ public:
                 for (auto& v : voices)
                     if (v.active && v.held && v.note == msg.getNoteNumber())
                         { v.held = false; v.ampEnv.noteOff(); }
+            } else if (bool rel = false; isMidiPanicMessage(msg, rel)) {
+                // Controller panic / MIDI file end / transport stop.
+                for (auto& v : voices) {
+                    if (!v.active) continue;
+                    v.held = false;
+                    if (rel) v.ampEnv.noteOff();       // All Notes Off: release
+                    else { v.ampEnv.hardReset(); v.active = false; }  // All Sound Off
+                }
             }
         }
         distributeMpeMessages(midi, voices);

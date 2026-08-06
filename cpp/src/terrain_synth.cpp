@@ -2099,38 +2099,17 @@ std::vector<float> TerrainSynthProcessor::scatterQueryPosition() {
             qpos[axis] = juce::jlimit(0.0f, 1.0f, getParamByName(node, pname.c_str(), 0.5f));
     }
 
-    // === TEMP SCATTER DIAGNOSTIC (throwaway) ===
-    // Log qpos + the node's Position params whenever the query moves, so we can
-    // see if the Position sliders actually reach the synth. Throttled to real
-    // changes to avoid hammering the disk every block.
-    {
-        static std::vector<float> sLast;
-        bool changed = (sLast.size() != qpos.size());
-        for (size_t i = 0; !changed && i < qpos.size(); ++i)
-            if (std::abs(sLast[i] - qpos[i]) > 0.005f) changed = true;
-        if (changed) {
-            sLast = qpos;
-            juce::String line;
-            line << "qpos=[";
-            for (size_t i = 0; i < qpos.size(); ++i)
-                line << juce::String(qpos[i], 3) << (i + 1 < qpos.size() ? "," : "");
-            line << "]  effAxes=[";
-            for (size_t i = 0; i < wtEffectiveAxes.size(); ++i)
-                line << wtEffectiveAxes[i] << (i + 1 < wtEffectiveAxes.size() ? "," : "");
-            line << "]  dims=" << wtScatterDims
-                 << "  frames=" << (int)wtScatterFramePositions.size()
-                 << "  params{";
-            for (const auto& p : node.params)
-                if (p.name.rfind("Position", 0) == 0)
-                    line << p.name << "=" << juce::String(p.value, 3)
-                         << (p.modulated ? "(mod)" : "") << " ";
-            line << "}\n";
-            juce::File f("D:/temp/scatter_diag.txt");
-            f.appendText(line);
-        }
-    }
-    // === END TEMP DIAGNOSTIC ===
-
+    // NOTE: this function runs on the AUDIO THREAD (processBlock calls it once
+    // per block for the scatter blend). Do not add logging here. A throwaway
+    // diagnostic used to live at this spot that opened and appended to
+    // "D:/temp/scatter_diag.txt" whenever the query moved by >0.005 - i.e.
+    // continuously for the whole duration of a Position drag. A file open+append
+    // takes milliseconds against an ~11 ms block budget, so it guaranteed
+    // dropouts exactly while the user was performing; it also kept its
+    // throttling state in a function-local `static`, shared without
+    // synchronisation across every TerrainSynth instance. If you need to see
+    // what the query is doing, capture it into a member and have the editor's
+    // timer read it on the message thread.
     return qpos;
 }
 

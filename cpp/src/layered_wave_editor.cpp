@@ -4390,10 +4390,14 @@ int WavetableDoc::gridCellCount() const {
     return n;
 }
 
-// === TEMP WAVETABLE DIAGNOSTIC (throwaway) ===
-// Dump the grid/cell/scatter/library state to D:/temp/wt_diag.txt so we can see
+// Dump the grid/cell/scatter/library state to the application log so we can see
 // exactly when gridDims and cellWaveformIds desync, and whether cells point at
-// the expected library entries. Called from the conversion + axis-edit paths.
+// the expected library entries. Called from the conversion + axis-edit paths,
+// all of which run on the message thread.
+//
+// This used to append to a hardcoded "D:/temp/wt_diag.txt", which only worked on
+// one developer's machine and silently no-op'd everywhere else. juce::Logger is
+// wired up in main.cpp to route through stderr, so it works anywhere.
 void WavetableDoc::debugDumpState(const char* tag) const {
     juce::String s;
     s << "--- " << tag << " ---\n";
@@ -4436,9 +4440,8 @@ void WavetableDoc::debugDumpState(const char* tag) const {
         }
         s << "\n";
     }
-    juce::File("D:/temp/wt_diag.txt").appendText(s);
+    juce::Logger::writeToLog(s);
 }
-// === END TEMP DIAGNOSTIC ===
 
 std::vector<int> WavetableDoc::cellIdxToGridCoord(int idx) const {
     const int total = gridCellCount();

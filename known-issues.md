@@ -384,7 +384,7 @@ a program that reads s1/s2 and calls `note()` (so `pendingOffs` is exercised
 across block boundaries too), asserting zero growth in `scratchCapacityBytes()`,
 paired with a check that the program was still emitting MIDI during the sweep.
 
-### Fixed (commit `HASH_BE`) — the `builtin_effects.h` sweep
+### Fixed (commit `93f6ee3`) — the `builtin_effects.h` sweep
 
 Five processors in one pass. The triage list had only named two of them; reading
 the code turned up three more, and in two cases the named site wasn't the worst

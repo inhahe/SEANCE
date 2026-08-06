@@ -565,7 +565,7 @@ rather than stealing the oldest.
 
 ---
 
-## FIXED (2026-08-06, HASH_XXX): Wavelet Reverb's Decay was applied per BLOCK, so the tail depended on the audio buffer size
+## FIXED (2026-08-06, 33060be): Wavelet Reverb's Decay was applied per BLOCK, so the tail depended on the audio buffer size
 
 **Fix:** the per-block coefficient is now derived from the block size —
 `blockDecay = powf(decay, 16.0f * n / tailLen)` — so a sample accumulates

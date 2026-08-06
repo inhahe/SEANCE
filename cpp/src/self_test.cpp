@@ -6503,6 +6503,71 @@ void testAssetLibrary(Report& r) {
                         cv[0].expression == "exp(-f/3)",
                     "spectap: erased asset -> bin falls back to independent");
         }
+
+        // Allocation-freedom on the audio thread. processBlock used to build
+        // three std::vectors sized by the bin count on EVERY callback
+        // (binParamIdx, sigOut, customTarget). They now live in rebuildBins(),
+        // which only runs when the bin count actually changes - and that
+        // changes the node's pin count, so it happens off the audio thread via
+        // a graph rebuild. Capacity is the observable proxy: any growth means
+        // processBlock reached the allocator.
+        {
+            NodeGraph g3;
+            int tapId = g3.addNode("tap", NodeType::Effect, {}, {}).id;
+            Node& nd = *g3.findNode(tapId);
+            // "Bin N: ..." params carry centre freq in minVal, bandwidth in maxVal.
+            const float centres[] = { 100.0f, 400.0f, 1200.0f, 4000.0f };
+            for (int i = 0; i < 4; ++i)
+                nd.params.push_back({ "Bin " + std::to_string(i + 1) + ": tap",
+                                      0.0f, centres[i], centres[i] * 0.5f });
+            nd.script = "__spectrumtap__";     // all bins in biquad mode
+
+            const double sr2 = 44100.0;
+            const int maxBlock = 1024;
+            SpectrumTapProcessor proc(nd);
+            proc.prepareToPlay(sr2, maxBlock);
+
+            // Channels: 0/1 audio passthrough, 2+ one Signal Out per bin.
+            juce::AudioBuffer<float> buf(2 + 4, maxBlock);
+            juce::MidiBuffer mb;
+            auto fill = [&](int len) {
+                for (int c = 0; c < buf.getNumChannels(); ++c)
+                    for (int i = 0; i < len; ++i)
+                        buf.setSample(c, i, c < 2
+                            ? 0.4f * (float)std::sin(6.28318530718 * 400.0 * i / sr2)
+                            : 0.0f);
+            };
+
+            fill(maxBlock);
+            proc.processBlock(buf, mb);        // warm up, settle capacities
+            const size_t before = proc.scratchCapacityBytes();
+
+            const int lens[] = { 1024, 512, 333, 64, 1024, 480 };
+            for (int pass = 0; pass < 30; ++pass) {
+                const int len = lens[pass % (int)(sizeof(lens)/sizeof(lens[0]))];
+                juce::AudioBuffer<float> view(buf.getArrayOfWritePointers(),
+                                              buf.getNumChannels(), len);
+                fill(len);
+                proc.processBlock(view, mb);
+            }
+            const size_t after = proc.scratchCapacityBytes();
+            r.checkVal(after == before,
+                       "spectap: 30 blocks of varying length allocate nothing "
+                       "(scratch capacity growth in bytes)",
+                       (double)after - (double)before);
+
+            // Non-vacuity: the bin straddling the 400 Hz tone must actually be
+            // reporting energy on its Signal Out channel, so the loop above did
+            // real work rather than bailing out early.
+            fill(maxBlock);
+            proc.processBlock(buf, mb);
+            double peak = 0;
+            for (int i = 0; i < maxBlock; ++i)
+                peak = std::max(peak, (double)std::abs(buf.getSample(2 + 1, i)));
+            r.checkVal(peak > 1e-3,
+                       "spectap: the 400 Hz bin reports energy for a 400 Hz tone",
+                       peak);
+        }
     }
 
     // ---- Spectral (FFT) mag/phase curves live-reference FrequencyGraph -------

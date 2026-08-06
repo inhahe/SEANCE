@@ -240,6 +240,13 @@ void SpectrumTapProcessor::rebuildBins() {
     } else {
         binFftWeights.clear();
     }
+
+    // Size the per-bin audio-thread scratch to match. This is the only place
+    // the bin count changes, so processBlock can refill these in place instead
+    // of building three fresh vectors on every callback.
+    binParamIdx.assign(bins.size(), -1);
+    sigOut.assign(bins.size(), nullptr);
+    customTarget.assign(bins.size(), 0.0f);
 }
 
 void SpectrumTapProcessor::ensureFFTReady() {
@@ -298,6 +305,12 @@ void SpectrumTapProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mid
 
     int numSamples = buf.getNumSamples();
     if (numSamples == 0 || bins.empty()) return;
+    // rebuildBins() sizes the three scratch vectors below in lock-step with
+    // `bins`. If they somehow disagree, bail rather than resize here (that
+    // would be an allocation on the audio thread) - the next rebuild fixes it.
+    if (binParamIdx.size() != bins.size() || sigOut.size() != bins.size()
+        || customTarget.size() != bins.size())
+        return;
 
     // Use channel 0 (mono analysis). Audio passes through unchanged.
     const float* input = buf.getReadPointer(0);
@@ -306,7 +319,7 @@ void SpectrumTapProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mid
     // Cache the param indices for each bin once per block (the bins vector
     // is rebuilt in lock-step with the "Bin " params, so the i-th bin maps
     // to the i-th "Bin " param).
-    std::vector<int> binParamIdx(bins.size(), -1);
+    std::fill(binParamIdx.begin(), binParamIdx.end(), -1);
     {
         int count = 0;
         for (int pi = 0; pi < (int)node.params.size(); ++pi) {
@@ -326,18 +339,16 @@ void SpectrumTapProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mid
     // inherently unipolar - silence = 0, loud = 1 - and consumers using the
     // bipolar additive modulation in signal_modulation.h scale this by depth
     // anyway).
-    std::vector<float*> sigOut(bins.size(), nullptr);
     for (int bi = 0; bi < (int)bins.size(); ++bi) {
         int ch = 2 + bi;
-        if (ch < numChannels)
-            sigOut[bi] = buf.getWritePointer(ch);
+        sigOut[bi] = (ch < numChannels) ? buf.getWritePointer(ch) : nullptr;
     }
 
     // Push samples into the FFT ring buffer and trigger one FFT per block
     // (only when custom-response bins exist). The FFT writes a per-block
     // envelope target for each custom bin; per-sample smoothing toward
     // that target lives in the inner loop below.
-    std::vector<float> customTarget(bins.size(), 0.0f);
+    std::fill(customTarget.begin(), customTarget.end(), 0.0f);
     bool haveCustomTarget = false;
     if (anyCustomBin && fft) {
         ensureFFTReady();

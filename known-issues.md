@@ -219,34 +219,48 @@ triaged below. Re-run it before trusting this list again — it is a snapshot.
     test pins `Threshold = 0` at exactly unity gain.
   Also gained a tail frame so the end of each block isn't left dry.
 
+### Fixed (commit `SPECTAP`)
+
+- **`SpectrumTapProcessor::processBlock`** (`spectrum_tap.cpp`) — three
+  `std::vector`s sized by `bins.size()` on every callback (`binParamIdx`,
+  `sigOut`, `customTarget`). Now members sized in `rebuildBins()`, the only
+  place the bin count changes — and that changes the node's pin count, so it
+  happens off the audio thread via a graph rebuild. `processBlock` refills them
+  in place and bails (rather than resizing) if they ever disagree with `bins`.
+  Guarded by a capacity-growth test.
+  - The *other* allocation in this file is deliberately left: `processBlock`
+    calls `rebuildBins()` itself when the "Bin " param count no longer matches
+    `bins`, and that path allocates freely (`decodeScript`, `SpectralCurve`, a
+    new `FFT`). It's a safety net that shouldn't normally fire — adding or
+    removing a bin changes the pin count and therefore rebuilds the graph — so
+    closing it properly means routing bin-count changes exclusively through the
+    rebuild path, not micro-optimising the fallback.
+
 ### Still allocating — not yet fixed, in rough priority order
 
-1. **`SpectrumTapProcessor::processBlock`** (`spectrum_tap.cpp` ~309) — three
-   `std::vector`s sized by `bins.size()` per block (`binParamIdx`, `sigOut`,
-   `customTarget`). Cheap fix: make them members sized when the bin list changes.
-2. **`TerrainSynthProcessor`** (`terrain_synth.cpp` ~2722-2951) — several per
+1. **`TerrainSynthProcessor`** (`terrain_synth.cpp` ~2722-2951) — several per
    block: `qpos`, `weights`, `dists`, `blended`, `coeffs`, `occCoord`, plus
    `std::string pname` at ~2887 (a `std::string` built per block to name a
    param — should be a `static constexpr` lookup). Also `v.granStreams.resize`
    / `v.inhStreams.resize` per voice. Biggest single offender by count.
-3. **`SoundFontProcessor`** (`soundfont_processor.cpp` ~245) —
+2. **`SoundFontProcessor`** (`soundfont_processor.cpp` ~245) —
    `std::vector<float> interleaved(numSamples * 2)` per block.
-4. **`SignalShapeProcessor`** (`signal_shape_node.cpp` ~480, ~661) — a
+3. **`SignalShapeProcessor`** (`signal_shape_node.cpp` ~480, ~661) — a
    `std::vector<const float*> sigChans` per block, and worse, a
    `std::function<float(float)>` **constructed per block** at 661 (a
    `std::function` holding a non-trivial capture heap-allocates).
-5. **`MidiScriptProcessor`** (`midi_script_node.cpp` ~317) —
+4. **`MidiScriptProcessor`** (`midi_script_node.cpp` ~317) —
    `std::vector<const float*> sigChans` per block.
-6. **`ArpeggiatorProcessor`** (`builtin_effects.h` ~621) — `seq` and
+5. **`ArpeggiatorProcessor`** (`builtin_effects.h` ~621) — `seq` and
    `baseNotes` vectors per block, plus `push_back` into them. Small (bounded by
    held notes) but on every block.
-7. **`FMSynthProcessor`** (`builtin_effects.h` ~1327) — `std::string p(opNames[i])`
+6. **`FMSynthProcessor`** (`builtin_effects.h` ~1327) — `std::string p(opNames[i])`
    per operator per block, purely to build a param name.
-8. **`AudioTimelineProcessor`** (`graph_processor.cpp` ~510) —
+7. **`AudioTimelineProcessor`** (`graph_processor.cpp` ~510) —
     `juce::AudioBuffer readBuf` per block **when a clip is streaming from disk**.
     Guarded by the file-read path, so it doesn't fire on every block, but it is
     on the audio thread.
-9. **`ParticleSynthProcessor`** / **`SpectralGrainProcessor`**
+8. **`ParticleSynthProcessor`** / **`SpectralGrainProcessor`**
     (`builtin_effects.h` ~1795, ~3980) — `grains.push_back` / `activeGrains.push_back`
     per grain spawn. Reallocates only when the grain count exceeds capacity, so
     a `reserve()` of the max grain count in `prepareToPlay` closes it.

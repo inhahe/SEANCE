@@ -4404,10 +4404,14 @@ Two things that look like they should work and don't:
   the dialog invisible.** It's the right recipe for `DialogWindow` but not here:
   `AlertWindow`'s peer is created *during construction* (`TopLevelWindow`'s ctor,
   then again via `lookAndFeelChanged()` → `setDropShadowEnabled()` →
-  `addToDesktop()`), both before the subclass vtable is live. The flag change
-  then lands late and re-creates the peer out from under `enterModalState()`'s
-  `setVisible(true)`, and no window is ever shown. Use the look-and-feel hook,
-  which is the value `AlertWindow` actually reads at the moment it reads it.
+  `addToDesktop()`), both before the subclass vtable is live, so the override is
+  never consulted — and the late flag mismatch that follows leaves no window on
+  screen at all. Use the look-and-feel hook, which is the value `AlertWindow`
+  actually reads at the moment it reads it. (`DialogWindow` gets away with the
+  subclass recipe only because it re-applies its flags from several
+  post-construction paths — `lookAndFeelChanged()`, `setResizable()`,
+  `setUsingNativeTitleBar()`. That redundancy is why `ToolDialogWindow` works;
+  deleting any one of those calls leaves it correct.)
 - **`AlertWindow` and `NativeMessageBox` number their buttons differently.**
   `AlertWindow` reports button *X* of *N* as `(X + 1) % N` — first button 1, last
   button (and Escape) 0 — while `NativeMessageBox::showAsync` reports a plain
@@ -4415,9 +4419,30 @@ Two things that look like they should work and don't:
   inverts every `if (result == 1)`. `showAlertAsync`/`showAlert` do the remap so
   a call site can switch API without touching its result checks.
 
-**How to verify.** There is no compile-time check; test it. Run the app, open the
-dialog, and enumerate its windows with `cpp/build/uitest/enumall.ps1 -ProcId <pid>`
-(lists invisible windows too; `winstyle.ps1` covers visible ones). Expect:
+**Two guards keep this from being re-broken.** Both exist because every failure
+mode here is silent — a phantom taskbar button, or a dialog that simply never
+appears, neither of which produces a compile error, a crash, or a log line.
+
+- **Build-time lint** — `cpp/cmake/check_dialog_patterns.cmake`, wired as the
+  `seance_dialog_lint` target that `SEANCE` depends on, so it runs on every
+  build before compilation. It fails the build if any file derives from
+  `juce::AlertWindow`, or if `getDesktopWindowStyleFlags()` is overridden
+  anywhere outside `dialog_helpers.cpp`, and the error explains which route to
+  use instead. Comments are exempt, so this page's own examples don't trip it.
+- **Self-test** — `testDialogTaskbarFlags()` in `self_test.cpp` asserts that the
+  app look-and-feel strips the flag, that a *live* `AlertWindow`'s peer really
+  lacks it, and that a real `ToolDialogWindow`'s peer does too. It reads the
+  peer's actual style flags rather than the look-and-feel's return value,
+  because the two came apart before. Deleting `installAppLookAndFeel()` from
+  `main.cpp` turns the two `AlertWindow` checks red (verified by mutation) —
+  which is the whole point, since that one line is all that protects ~25
+  dialogs and nothing else references it. This is also why the install sits at
+  the very top of `initialise()`, above the `--self-test` dispatch: anything
+  installed after that early return is invisible to the test suite.
+
+**How to verify by hand.** Run the app, open the dialog, and enumerate its
+windows with `cpp/build/uitest/enumall.ps1 -ProcId <pid>` (lists invisible
+windows too; `winstyle.ps1` covers visible ones). Expect:
 
 - main window — `ex=0x40100 TOOL=False APP=True` (it *should* have the button)
 - JUCE alert / tool dialog — `ex=0x180 TOOL=True APP=False`

@@ -50,6 +50,21 @@ juce_add_gui_app(SEANCE
     COMPANY_NAME "SEANCE"
 )
 
+# Guard the dialog/taskbar rules (CLAUDE.md: a dialog must never earn its own
+# Windows taskbar button). The failure mode this catches is silent - an
+# AlertWindow subclass that overrides getDesktopWindowStyleFlags() compiles
+# cleanly and then simply never shows its window - so it is worth a build error.
+# Runs before SEANCE compiles, and on every build rather than only at configure
+# time, since the thing it inspects is source text.
+add_custom_target(seance_dialog_lint ALL
+    COMMAND ${CMAKE_COMMAND}
+            -DSEANCE_SRC_DIR=${CMAKE_CURRENT_SOURCE_DIR}/src
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/check_dialog_patterns.cmake
+    COMMENT "Checking dialog taskbar rules"
+    VERBATIM
+)
+add_dependencies(SEANCE seance_dialog_lint)
+
 target_sources(SEANCE PRIVATE
     src/main.cpp
     src/dialog_helpers.cpp

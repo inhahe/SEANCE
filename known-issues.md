@@ -2401,8 +2401,17 @@ note grid shifts automatically:
     `NativeMessageBox::showAsync` uses a plain 0-based index. A name-for-name
     swap compiles cleanly and silently inverts every `if (result == 1)`. Use
     `SoundShop::showAlertAsync` / `showAlert` in `dialog_helpers.h`, which remap.
-  Checks: `cpp/build/uitest/winstyle.ps1`, or `enumall.ps1 -ProcId <pid>` which
-  also lists invisible windows. A fixed JUCE alert reads
+  Both traps are now guarded rather than just documented, because both failure
+  modes are silent (a phantom taskbar button; a dialog that never appears):
+  `cpp/cmake/check_dialog_patterns.cmake` fails the build on an AlertWindow
+  subclass or a stray `getDesktopWindowStyleFlags` override, and
+  `testDialogTaskbarFlags()` in `self_test.cpp` asserts the flag is really
+  absent from a live AlertWindow's and ToolDialogWindow's peers. The self-test
+  was mutation-checked: deleting `installAppLookAndFeel()` from `main.cpp` turns
+  it red, and that install now sits above the `--self-test` dispatch so the
+  suite exercises the real production wiring.
+  Manual checks: `cpp/build/uitest/winstyle.ps1`, or `enumall.ps1 -ProcId <pid>`
+  which also lists invisible windows. A fixed JUCE alert reads
   `ex=0x180 TOOL=True APP=False`; a native message box reads
   `cls=#32770 APP=False owner=<main hwnd>`; only the main window should be
   `APP=True`.

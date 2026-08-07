@@ -27,6 +27,20 @@ public:
     bool moreThanOneInstanceAllowed() override { return true; }
 
     void initialise(const juce::String& commandLine) override {
+        // Install the app look-and-feel first, before any early-exit branch
+        // below can return. It has no dependencies (it creates no windows and
+        // reads no state), and two things depend on it being this early:
+        //   - every juce::AlertWindow builds its desktop peer from
+        //     LookAndFeel::getAlertBoxWindowFlags(), so the look-and-feel has to
+        //     be in place before the first window exists or that alert lands on
+        //     the Windows taskbar as a phantom second SEANCE;
+        //   - --self-test returns without ever reaching the bottom of this
+        //     function, so anything installed after the dispatch below is
+        //     invisible to the test suite. testDialogTaskbarFlags() asserts the
+        //     taskbar flag is stripped, which only means something if the real
+        //     production wiring ran first.
+        SoundShop::installAppLookAndFeel();
+
         // Check for plugin sandbox child mode (#85).
         // If launched with --plugin-sandbox <pipe-name>, run as a
         // sandboxed plugin host child process instead of the main UI.
@@ -78,11 +92,6 @@ public:
         }
 
         initLogging();
-
-        // Must precede the first window: AlertWindow reads
-        // getAlertBoxWindowFlags() when it builds its peer, and this is what
-        // keeps every alert out of the Windows taskbar.
-        SoundShop::installAppLookAndFeel();
 
         mainWindow = std::make_unique<SoundShop::MainWindow>(getApplicationName());
     }

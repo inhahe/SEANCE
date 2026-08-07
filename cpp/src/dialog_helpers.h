@@ -21,16 +21,28 @@ namespace SoundShop {
 // Why here and not on an AlertWindow subclass? Overriding
 // getDesktopWindowStyleFlags() on a subclass is the documented recipe for
 // TopLevelWindow (and is what ToolDialogWindow does for DialogWindow), but it
-// does NOT work for AlertWindow: AlertWindow's peer is created during
-// construction - TopLevelWindow's ctor, then again from
+// does NOT work for AlertWindow, and fails in the worst possible way: the
+// dialog silently never appears. Measured - with such a subclass, clicking the
+// Song Length button produced no window whatsoever and EnumWindows found
+// nothing; neutralising the override to a plain call to the base class brought
+// the dialog straight back.
+//
+// The verified cause is that AlertWindow's peer is created *during its own
+// construction* - TopLevelWindow's ctor, then again from
 // AlertWindow::lookAndFeelChanged() -> setDropShadowEnabled() -> addToDesktop()
 // - both of which run before the subclass vtable is live, so the peer is built
-// with the taskbar flag anyway. The later flag change then re-creates the peer
-// out from under enterModalState()'s setVisible(true), and the dialog never
-// appears at all. (Measured: with such a subclass, clicking the Song Length
-// button produced no window whatsoever, and EnumWindows found nothing.)
-// getAlertBoxWindowFlags() is the value AlertWindow actually reads, at the
-// point it reads it, so it's the extension point that works.
+// from the base flags and the override is never consulted. What exactly then
+// goes wrong with the late mismatch is not worth pinning down, because the
+// right answer is not to create it: getAlertBoxWindowFlags() is the value
+// AlertWindow actually reads, at the point it reads it, so it is the extension
+// point that works. (DialogWindow gets away with the subclass recipe only
+// because it re-applies its flags from several post-construction paths;
+// AlertWindow's single re-apply is inside its own constructor.)
+//
+// Two things keep this from being re-broken: testDialogTaskbarFlags() in
+// self_test.cpp asserts the flag is actually absent from a live AlertWindow's
+// peer, and cpp/cmake/check_dialog_patterns.cmake fails the build if anyone
+// adds an AlertWindow subclass or a stray getDesktopWindowStyleFlags override.
 class AppLookAndFeel final : public juce::LookAndFeel_V4 {
 public:
     int getAlertBoxWindowFlags() override {

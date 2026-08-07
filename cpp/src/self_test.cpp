@@ -38,6 +38,7 @@
 #include "pitch_shift_processor.h"  // PitchShiftProcessor - the Pitch Shift node
 #include "graph_processor.h"        // AudioTimelineProcessor - audio-clip playback
 #include "time_gate_processor.h"    // TimeGateProcessor - local-beat effect-layer gating
+#include "dialog_helpers.h"         // AppLookAndFeel / ToolDialogWindow - taskbar flags
 #include "multitrack_recorder.h"    // MultitrackRecorder - live input capture
 #include "pan_processor.h"          // PanProcessor - the mute/solo/record-mute chokepoint
 #include "soundfont_processor.h"    // SoundFontProcessor - .sf2 / .sfz instrument node
@@ -11403,6 +11404,91 @@ void testMultitrackRecording(Report& r, const juce::File& dir) {
 // anything that decided "already covered?" by looking at recordArmed would
 // spawn a fresh duplicate track on every single record press. The check has to
 // be on the "Input Channel" param, which persists.
+// ===========================================================================
+// Dialogs stay off the Windows taskbar
+// ===========================================================================
+//
+// CLAUDE.md: a dialog must never earn its own taskbar button - the shell reads
+// an unowned WS_EX_APPWINDOW popup as a second copy of SEANCE. Every
+// juce::AlertWindow in the app (~25 of them) is kept off the taskbar by exactly
+// one line, installAppLookAndFeel() in main.cpp, which strips
+// ComponentPeer::windowAppearsOnTaskbar from LookAndFeel::getAlertBoxWindowFlags().
+//
+// That single line is the whole fix and nothing else references it, so deleting
+// it - or reordering it after an early return in initialise() - would silently
+// regress every alert in the app with no compile error and no visible symptom
+// until someone happened to look at their taskbar. Hence this test.
+//
+// It deliberately checks the *peer's actual style flags*, not just the
+// look-and-feel's return value. The value is only a request; what matters is
+// what AlertWindow built its window from, and the two came apart before (an
+// AlertWindow subclass overriding getDesktopWindowStyleFlags() never had its
+// override consulted, because the peer is created during construction). Reading
+// the peer is the only way to test the thing that actually reaches the OS.
+void testDialogTaskbarFlags(Report& r) {
+    r.section("Dialogs stay off the Windows taskbar");
+
+    const int taskbar = juce::ComponentPeer::windowAppearsOnTaskbar;
+
+    // The look-and-feel must already be installed by the time any test runs -
+    // main.cpp does it at the very top of initialise(), above the --self-test
+    // dispatch. If this fails, the install moved below an early return.
+    const int lnfFlags = juce::LookAndFeel::getDefaultLookAndFeel().getAlertBoxWindowFlags();
+    r.check((lnfFlags & taskbar) == 0,
+            "alert flags: the app look-and-feel strips windowAppearsOnTaskbar");
+
+    // End-to-end: a real AlertWindow, and the flags its real peer was built
+    // with. TopLevelWindow's constructor puts it on the desktop, so the peer
+    // exists immediately; it is never made visible, so nothing appears
+    // on screen during the test run.
+    juce::AlertWindow aw("Self-test", "Self-test", juce::MessageBoxIconType::NoIcon);
+    if (auto* peer = juce::ComponentPeer::getPeerFor(&aw)) {
+        // This is also what guards the assumption the whole fix rests on -
+        // that AlertWindow sources its flags from the look-and-feel. If a JUCE
+        // upgrade decoupled the two, the look-and-feel check above would still
+        // pass while every dialog silently regressed; this one would go red.
+        r.check((peer->getStyleFlags() & taskbar) == 0,
+                "alert flags: a live AlertWindow's peer has no taskbar flag");
+    } else {
+        r.check(false, "alert flags: AlertWindow created a desktop peer");
+    }
+
+    // The other dialog route: custom components go through the launch*ToolDialog
+    // helpers, whose ToolDialogWindow drops the same flag by overriding
+    // getDesktopWindowStyleFlags(). That override does work - but for a reason
+    // worth being humble about, which is why it is tested rather than reasoned
+    // about. A DialogWindow is put on the desktop by its base constructor too,
+    // with the *base* flags, so at that instant the override is no more visible
+    // than AlertWindow's is; what saves it is that ResizableWindow/DialogWindow
+    // re-apply the flags through several post-construction paths
+    // (lookAndFeelChanged(), setResizable(), setUsingNativeTitleBar(), ...), by
+    // which time the vtable is ToolDialogWindow's. It is genuinely redundant -
+    // deleting any single one of those calls leaves the behaviour correct
+    // (measured) - so this test exists to catch a JUCE upgrade removing the
+    // last of them, not to pin any particular one.
+    //
+    // launchManagedToolDialog is the non-modal variant, so this neither blocks
+    // nor leaves anything behind; it does briefly show a small window.
+    auto content = std::make_unique<juce::Component>();
+    content->setSize(120, 60);
+    juce::DialogWindow::LaunchOptions opts;
+    opts.content.setOwned(content.release());
+    opts.dialogTitle = "Self-test";
+    opts.useNativeTitleBar = false;
+    opts.resizable = false;
+    if (auto* dlg = launchManagedToolDialog(opts)) {
+        if (auto* peer = dlg->getPeer())
+            r.check((peer->getStyleFlags() & taskbar) == 0,
+                    "tool dialog: ToolDialogWindow's peer has no taskbar flag");
+        else
+            r.check(false, "tool dialog: dialog created a desktop peer");
+        dlg->setVisible(false);
+        delete dlg;   // launchManagedToolDialog hands lifetime to the caller
+    } else {
+        r.check(false, "tool dialog: launchManagedToolDialog returned a window");
+    }
+}
+
 void testAutoInputTracks(Report& r) {
     r.section("Auto-created tracks for live audio inputs");
 
@@ -11564,6 +11650,7 @@ int runSelfTest(const juce::File& outDir) {
     testAudioTrackNesting(r, outDir);
     testMultitrackRecording(r, outDir);
     testAutoInputTracks(r);
+    testDialogTaskbarFlags(r);
 
     r.section("Summary");
     r.line("  PASSED: " + juce::String(r.passed));

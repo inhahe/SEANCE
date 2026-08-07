@@ -68,24 +68,31 @@
 
 <p>Sometimes you want to activate <em>multiple wires at once</em> — e.g., a reverb send AND a delay send AND a filter mod, all gated as one "chorus effects on" layer. That's what an <strong>Effect Group</strong> is: a named bag of wires that can be activated together.</p>
 
-<p>To create an effect group:</p>
+<h3>Making a group</h3>
+
+<p>The quickest way is from the same place you make layers:</p>
 <ol>
-  <li>Right-click a wire → <em>Effect Group → New Group…</em></li>
-  <li>Give it a name</li>
-  <li>Right-click other wires → <em>Effect Group → Add to [group name]</em></li>
+  <li><strong>Right-click the Effects lane</strong> at the beat where the bundle should come in, and choose <em>Add layer at beat N…</em></li>
+  <li>Pick the first entry, <strong><em>New group of wires…</em></strong></li>
+  <li>A list of every wire in your project appears, each with its colour square. <strong>Tick the ones that belong together</strong> — the reverb send, the delay send, the filter mod.</li>
+  <li>Type a name (optional, but "Chorus FX" beats "Group #3") and press <strong>Create</strong>.</li>
 </ol>
 
-<p>Then go to the Effects lane of the track you want to control it from, right-click → <em>Add layer…</em>, and pick the group instead of a single wire. All wires in the group now activate and deactivate together. Each group gets its own color drawn on member wires (circles for wire identity, diamonds for group membership).</p>
+<p>You get the group <em>and</em> a layer for it, right where you clicked. Shape it like any other layer. All the wires in it now switch on and off together.</p>
 
-<h2>The routing strip</h2>
+<p>There's a second route, handy when you're already looking at the graph: right-click a wire → <em>Effect Group → New Group…</em>, then right-click each other wire → <em>Effect Group → Add to [group name]</em>.</p>
 
-<p>Above the stack of track editors, a narrow band labelled <strong>Routing</strong> appears as soon as any layers exist anywhere in the project. Where a track's Effects lane shows <em>that track's</em> layers, the routing strip is the overview: one row per gated wire, no matter which track its layers live on.</p>
+<p>Each group gets its own color drawn on member wires (circles for wire identity, diamonds for group membership).</p>
 
-<p>Each row shows a small colour chip on the left, then the beats where that wire is switched on as a shaded tube — with the wire's name written along it, e.g. <em>Wavetable&nbsp;→&nbsp;Master Out</em>. Short tubes have no room for the name, so hovering any row tells you what it is.</p>
+<h2>The layer legend</h2>
 
-<p>The time axis lines up with the topmost track editor underneath it, so you can read straight down from a tube in the strip to the notes it's gating.</p>
+<p>Above the stack of track editors, a thin band labelled <strong>Layers:</strong> appears as soon as any layers exist anywhere in the project. It's a list of coloured chips — one per wire or group that's gated <em>anywhere</em>, no matter which track its layers live on.</p>
 
-<p>The strip is read-only — it's a map, not an editor. To change a layer, go to its track's Effects lane.</p>
+<p>It exists because a layer, once drawn, is just a colour. A collapsed Effects lane is a stack of unlabelled tubes, and the graph marks gated wires with the same colours. The legend is the one place that says which colour is which.</p>
+
+<p>It deliberately isn't a timeline. Every piano roll scrolls and zooms on its own, so there's no shared time axis for a project-wide band to draw bars against — and a bar drawn on a borrowed axis just repeats, bigger, what that one track's Effects lane already shows. For <em>timing</em>, use the Effects lane; for <em>identity</em>, use the legend.</p>
+
+<p><strong>Hover a chip</strong> for the full story: its name, the wires inside it if it's a group, and every track that switches it on with the beats it covers.</p>
 
 <h2>Crossfade edges</h2>
 

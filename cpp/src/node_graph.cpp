@@ -824,4 +824,58 @@ int buildVoicePreset(NodeGraph& graph, Vec2 pos, int preset) {
     return containerId;
 }
 
+// ---------------------------------------------------------------------------
+// Wire / gate naming (see the declarations in node_graph.h)
+// ---------------------------------------------------------------------------
+
+juce::String NodeGraph::wireLabel(int linkId) const {
+    static const juce::String arrow = juce::String::fromUTF8(" \xe2\x86\x92 ");
+
+    // Resolve one link to (source node, source plug, dest node, dest plug).
+    auto endpoints = [this](const Link& l, juce::String& sN, juce::String& sP,
+                            juce::String& dN, juce::String& dP) {
+        for (const auto& n : nodes) {
+            for (const auto& p : n.pinsOut)
+                if (p.id == l.startPin) { sN = n.name; sP = p.name; }
+            for (const auto& p : n.pinsIn)
+                if (p.id == l.endPin)   { dN = n.name; dP = p.name; }
+        }
+        return sN.isNotEmpty() && dN.isNotEmpty();
+    };
+
+    const Link* self = nullptr;
+    for (const auto& l : links)
+        if (l.id == linkId) { self = &l; break; }
+    if (!self) return {};
+
+    juce::String sN, sP, dN, dP;
+    if (!endpoints(*self, sN, sP, dN, dP)) return {};
+    const juce::String plain = sN + arrow + dN;
+
+    // Qualify with plug names only when some OTHER wire produces the same plain
+    // label - adding them unconditionally makes every entry noisy for no gain.
+    for (const auto& l : links) {
+        if (l.id == linkId) continue;
+        juce::String oN, oP, oD, oDP;
+        if (!endpoints(l, oN, oP, oD, oDP)) continue;
+        if (oN + arrow + oD == plain)
+            return plain + "  (" + sP + arrow + dP + ")";
+    }
+    return plain;
+}
+
+juce::String NodeGraph::gateLabel(const EffectRegion& r) const {
+    if (r.groupId >= 0) {
+        if (auto* g = findEffectGroup(r.groupId))
+            return g->name.empty() ? ("Group #" + juce::String(g->id))
+                                   : juce::String(g->name);
+        return "(missing group)";
+    }
+    if (r.linkId >= 0) {
+        auto s = wireLabel(r.linkId);
+        return s.isEmpty() ? juce::String("(missing wire)") : s;
+    }
+    return "(unassigned)";
+}
+
 } // namespace SoundShop

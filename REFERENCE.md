@@ -1908,7 +1908,8 @@ Only while expanded:
 - **Move** — drag a tube's middle. The length is preserved; the start clamps at beat 0.
 - **Resize** — drag either end. The 5 px hot zone at each end shows a ↔ cursor. Each edge clamps against the other so a layer always keeps positive length (minimum = one pixel's worth of beats at the current zoom).
 - **Snap** — see below. Hold **Alt** while dragging for completely free positioning.
-- **Add** — right-click empty lane space → **Add layer at beat N…** → pick a group or a `Source → Destination` wire. The new layer starts at the clicked beat (snapped) and runs 4 beats. Every entry carries a **colour swatch** showing the exact colour of the tube it will create, since colour is the only identity a tube has once it is drawn. Two wires joining the same pair of nodes would otherwise produce identical rows, so those — and only those — are qualified with their pin names: `Voice In 2 → Signal Osc   (Gate → Gate)`.
+- **Add** — right-click empty lane space → **Add layer at beat N…** → pick a group or a `Source → Destination` wire. The new layer starts at the clicked beat (snapped) and runs 4 beats. Every entry carries a **colour swatch** showing the exact colour of the tube it will create, since colour is the only identity a tube has once it is drawn. Names come from `NodeGraph::wireLabel()`, so two wires joining the same pair of nodes — and only those — are qualified with their pin names: `Voice In 2 → Signal Osc   (Gate → Gate)`.
+- **New group of wires…** — the first entry in that same submenu. See [Effect groups](#effect-groups).
 - **Delete** — right-click a tube → **Delete layer "name"**.
 
 The menu opens **at the pointer**, and the same is true of the `Start` strip's track-nesting menu below it.
@@ -1953,9 +1954,17 @@ Layers are persisted per node as `[FxRegion]` sections inside the owning `[Node]
 
 ### Effect groups
 
-A named bag of wires that activate together. Built via right-click → **Effect Group → New Group…** then right-click → **Effect Group → Add to [group name]** on additional wires.
+A named bag of wires that activate together. Once layered, a group's gate opens/closes all member wires simultaneously. Member-wire visual indicators: a **circle** for individual-wire layers, a **diamond** for group membership.
 
-Once layered, a group's gate opens/closes all member wires simultaneously. Member-wire visual indicators: a **circle** for individual-wire layers, a **diamond** for group membership.
+Two ways to build one:
+
+**From the Effects lane** — right-click the lane → **Add layer at beat N…** → **New group of wires…**. A dialog lists every wire in the project as a checklist, each row prefixed with the wire's palette colour, with an optional name field. Ticking wires and pressing **Create** makes the group *and* adds a layer for it at the clicked beat, in one step.
+
+**From the graph** — right-click a wire → **Effect Group → New Group…** to create a group containing that one wire, then right-click each additional wire → **Effect Group → Add to [group name]**. Use this when you're already in the graph and thinking about cables.
+
+The lane route exists because the graph route wasn't discoverable: groups are wanted while shaping layers in a piano roll, and requiring the user to go find a cable to learn that groups exist meant most never did. It also collapses "make the group" and "gate the group" into a single action — splitting them is what made groups feel like a separate feature you had to already know about. `Create` stays disabled (with a tooltip saying why) until at least one wire is ticked.
+
+The dialog is a `DialogWindow` launched through `launchToolDialog()`, not a `juce::AlertWindow`: AlertWindow's peer gets `WS_EX_APPWINDOW` with no owner, which earns a second SEANCE button on the Windows taskbar.
 
 ### Crossfade duration
 
@@ -1963,28 +1972,31 @@ Global default is **50 ms** (`NodeGraph::globalCrossfadeSec = 0.05f` in `node_gr
 
 Per-group override: `EffectGroup::crossfadeSec`. Zero (the default) means "inherit the global value"; any positive value overrides. Stored in the project file only when non-zero (`project_file.cpp:92-93`).
 
-### Routing strip
+### Layer legend
 
-A project-wide companion to the per-track Effects lane (`routing_strip.cpp`). A narrow band appears directly above the stack of editor panels whenever any layers exist *anywhere in the project*, and auto-hides when there are none.
+A thin band (`layer_legend.cpp`) directly above the stack of editor panels, listing every wire or effect group that is time-gated *anywhere in the project* as a row of coloured chips. It auto-hides when nothing is gated.
 
-Where the Effects lane answers "what is gated **on this track**", the routing strip answers "what is gated **anywhere**" — including layers that live on a different track but gate a wire you're looking at. It is **read-only**; editing happens in the lane.
+It is a **legend, not a timeline**, and that distinction is the whole design.
 
-Layout, top to bottom:
+**Why a legend.** Once a layer is drawn, its only identity is a colour: a collapsed Effects lane is a stack of unlabelled tubes, and the graph tags gated wires with the same palette colour. Nothing else in the app says which colour is which wire, so the project needs exactly one place that does. That is this band's job, and it is the only job it has that isn't done better somewhere else.
 
-| Band | Height | Contents |
+**Why it stopped drawing bars.** It used to plot each wire's active spans as tubes on a time axis, and the axis was a fiction. `PianoRollState::hZoom` / `hScroll` are **per-node**, so every editor panel scrolls and zooms independently and there is no project-wide time axis for a project-wide band to plot against. Borrowing the topmost panel's axis produced a "universal" strip whose bars moved when you scrolled *one* track, and which then restated — larger — what that track's own Effects lane already showed correctly. When it's timing you want, the Effects lane is the honest answer; when it's identity you want, this is.
+
+Layout:
+
+| Element | Size | Contents |
 |---|---|---|
-| Caption | 14 px | The word `Routing`, spanning the full width. |
-| One row per gated wire | 14 px + 3 px gap | A colour chip in the left gutter, then the wire's active spans as 3D-shaded tubes. |
+| Caption | measured width of `Layers:` + 12 px | Left of the first chip, on the first row only. |
+| Chip | 18 px tall, 6 px apart, wrapping | Solid colour swatch + name, on a 16 %-alpha wash of the same colour with a 55 %-alpha border. |
 
-Three details are worth spelling out, because each fixes a way the strip used to be unreadable or simply wrong:
+Details:
 
-- **The caption gets a band of its own.** It previously shared the ~40 px left gutter with the per-wire labels, so on a one-wire strip `Routing` and `Synth → Reverb` were drawn on top of each other and neither was legible.
-- **The wire's name rides on the tube**, like a clip name, at 10 px — that is the only place with room for it at a readable size. Text colour flips between black and white against the tube's own perceived brightness. A tube narrower than 34 px gets no label; **hovering any row tooltips the full name**, which is also the fallback when the tube is scrolled off-screen. The gutter carries a **colour chip** instead of text, matching the wire in the graph and the tube in the Effects lane.
-- **The horizontal axis really does match the piano roll now.** `RoutingStrip::setHorizontalView` existed but was never called, so the strip was permanently stuck on beats 0–16 at a 40 px gutter regardless of scroll or zoom, and it plotted node-**local** region beats as if they were absolute — so on any track with a start offset the tubes sat over the wrong beats. `MainContentComponent::syncRoutingStripView` now feeds it `PianoRollComponent::horizontalView()` from the **topmost** editor panel — the one physically underneath the strip, and the only one it can honestly claim alignment with, since panels scroll and zoom independently — and `collectGatedLinks` folds each owning node's `absoluteBeatOffset` into the spans it collects.
+- **One chip per distinct gated *thing*.** A group stays a single chip rather than being expanded into its member wires — the group is the identity the user chose when they made the layer, and expanding it is precisely what made this band look like a duplicate of everything else. Groups sort before wires, alphabetically within each, so a chip doesn't jump around when an unrelated track gains a layer.
+- **Group swatches carry a brighter inner bar.** Elsewhere in the app a group is a diamond; at 10 px a diamond is four grey pixels, so the swatch keeps the same "this is a bundle, not a wire" signal in a form that survives the size.
+- **The per-track spans survive as the tooltip.** Hovering a chip gives the full name, the group's member wires, and one line per region reading `Track  (start - end)` in **absolute** beats (`Node::absoluteBeatOffset` folded in) — the cross-track information the bars were reaching for, stated instead of drawn. Hovering the background explains what the band is.
+- **Names come from `NodeGraph::wireLabel()` / `gateLabel()`.** Three surfaces name wires — this band, the Effects lane's *Add layer* menu, and the graph's wire menus — and they must agree; keeping three copies is how the arrow ended up spelled `" > "` in one of them. `wireLabel()` renders `Source → Destination`, and appends plug names (`Voice In 2 → Signal Osc  (Gate → Gate)`) only when another wire would produce an identical label.
 
-The view is **polled** from `MainContentComponent::timerCallback` (30 Hz) rather than pushed, because `PianoRollComponent` has no scroll/zoom callback; `setHorizontalView` compares against the current values and returns without repainting when nothing moved, so an idle strip costs nothing.
-
-Clipped ends follow the same convention as the Effects lane: a rounded cap where the layer genuinely ends, a flat bright edge where it merely runs off the side of the view, so a clipped tube never reads as a short one.
+The band is **polled** from `MainContentComponent::timerCallback` (30 Hz) via `LayerLegend::refresh()`, which compares a string signature of what it would draw and repaints (and asks the host to re-lay-out, since a new chip can wrap onto a second row) only on a real change. Polling rather than pushing is deliberate: layers and groups are created and destroyed from the Effects lane, the graph's wire menus, project load, undo and redo, and requiring all of those to notify a band they otherwise know nothing about is the kind of coupling that goes stale. The poll is not gated on visibility — the band is hidden exactly when the project has no layers, so gating it would mean the first layer never brings it back.
 
 ---
 

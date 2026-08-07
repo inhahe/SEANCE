@@ -1,6 +1,7 @@
 #include "piano_roll_component.h"
 #include "music_theory.h"
 #include "track_nesting_menu.h"
+#include "dialog_helpers.h"
 #include "undo.h"
 #include <cmath>
 #include <set>
@@ -1580,18 +1581,6 @@ float PianoRollComponent::fxXToBeat(float x) const {
     return scrollBeat + ((x - gridX) / gridW) * visibleBeats - absOffset;
 }
 
-PianoRollComponent::HorizontalView PianoRollComponent::horizontalView() const {
-    HorizontalView v;
-    v.gridX = KEY_WIDTH;
-    v.gridW = std::max(1.0f, (float)getWidth() - KEY_WIDTH - SCROLLBAR_SIZE);
-    if (!node) return v;
-    v.totalBeats = graph.getTimelineBeats(*node) + node->absoluteBeatOffset;
-    v.visibleBeats = std::max(1.0f, v.totalBeats / std::max(state.hZoom, 0.1f));
-    v.scrollBeat = juce::jlimit(0.0f, std::max(0.0f, v.totalBeats - v.visibleBeats),
-                                state.hScroll);
-    return v;
-}
-
 float PianoRollComponent::fxBeatsPerPixel() const {
     if (!node) return 1.0f;
     float gridW = std::max(1.0f, (float)getWidth() - KEY_WIDTH - SCROLLBAR_SIZE);
@@ -1783,6 +1772,136 @@ void PianoRollComponent::paintFxLane(juce::Graphics& g) {
     g.drawHorizontalLine(top + h - 1, 0.0f, (float)getWidth());
 }
 
+// Scrollable "which wires are in this group?" checklist for the Effects lane's
+// "New group of wires..." dialog. Each row carries the wire's palette colour as
+// a solid swatch, matching the tube the group will draw and the tag on the wire
+// in the graph - picking wires by colour is how the user navigates a graph with
+// more cables than distinct names.
+namespace {
+
+class WireCheckRow : public juce::Component {
+public:
+    WireCheckRow(int linkId_, const juce::String& label, juce::Colour c)
+        : linkId(linkId_), colour(c) {
+        button.setButtonText(label);
+        button.onClick = [this] { if (onToggle) onToggle(); };
+        addAndMakeVisible(button);
+    }
+    std::function<void()> onToggle;
+    void resized() override { button.setBounds(18, 0, getWidth() - 18, getHeight()); }
+    void paint(juce::Graphics& g) override {
+        g.setColour(colour);
+        g.fillRoundedRectangle(2.0f, (float)getHeight() * 0.5f - 5.0f, 11.0f, 10.0f, 2.0f);
+        g.setColour(juce::Colours::black.withAlpha(0.6f));
+        g.drawRoundedRectangle(2.0f, (float)getHeight() * 0.5f - 5.0f, 11.0f, 10.0f, 2.0f, 1.0f);
+    }
+    bool isChecked() const { return button.getToggleState(); }
+    int  getLinkId() const { return linkId; }
+
+private:
+    int linkId;
+    juce::Colour colour;
+    juce::ToggleButton button;
+};
+
+// Contents of the "New Group of Wires" dialog. A DialogWindow rather than an
+// AlertWindow: AlertWindow puts WS_EX_APPWINDOW on its peer with no owner, so it
+// earns a second SEANCE button on the Windows taskbar (see CLAUDE.md's dialog
+// rule) - launchToolDialog() is the project's fix for that.
+class NewGroupContent : public juce::Component {
+public:
+    using Callback = std::function<void(std::vector<int>, juce::String)>;
+
+    NewGroupContent(const std::vector<std::pair<int, juce::String>>& wires,
+                    float beat, Callback cb)
+        : onCreate(std::move(cb)) {
+        blurb.setText("Tick every wire that should switch on and off together. "
+                      "A layer for the group is added at beat "
+                          + juce::String(beat, 2) + " of this track.",
+                      juce::dontSendNotification);
+        blurb.setJustificationType(juce::Justification::topLeft);
+        addAndMakeVisible(blurb);
+
+        for (const auto& [linkId, label] : wires) {
+            auto row = std::make_unique<WireCheckRow>(linkId, label,
+                                                      juce::Colour(getDistinctColor(linkId)));
+            list.addAndMakeVisible(row.get());
+            rows.push_back(std::move(row));
+        }
+        viewport.setViewedComponent(&list, false);
+        viewport.setScrollBarsShown(true, false);
+        addAndMakeVisible(viewport);
+
+        nameLabel.setText("Group name:", juce::dontSendNotification);
+        addAndMakeVisible(nameLabel);
+        nameEditor.setTextToShowWhenEmpty("optional", juce::Colours::grey);
+        addAndMakeVisible(nameEditor);
+
+        // Nothing ticked means nothing to group, so the button stays off until
+        // it would actually do something - with a tooltip saying why, per the
+        // "grayed-out controls must explain themselves" rule.
+        createBtn.setEnabled(false);
+        createBtn.setTooltip("Tick at least one wire first.");
+        createBtn.onClick = [this] {
+            std::vector<int> picked;
+            for (const auto& r : rows)
+                if (r->isChecked()) picked.push_back(r->getLinkId());
+            auto name = nameEditor.getText();
+            close();
+            if (onCreate) onCreate(std::move(picked), name);
+        };
+        cancelBtn.onClick = [this] { close(); };
+        addAndMakeVisible(createBtn);
+        addAndMakeVisible(cancelBtn);
+
+        for (const auto& r : rows)
+            r->onToggle = [this] {
+                bool any = false;
+                for (const auto& x : rows) any = any || x->isChecked();
+                createBtn.setEnabled(any);
+                createBtn.setTooltip(any ? juce::String()
+                                         : juce::String("Tick at least one wire first."));
+            };
+
+        setSize(420, juce::jlimit(160, 420, 150 + (int)rows.size() * rowH));
+    }
+
+    void resized() override {
+        auto r = getLocalBounds().reduced(10);
+        blurb.setBounds(r.removeFromTop(44));
+        auto buttons = r.removeFromBottom(30);
+        cancelBtn.setBounds(buttons.removeFromRight(90));
+        buttons.removeFromRight(8);
+        createBtn.setBounds(buttons.removeFromRight(90));
+        r.removeFromBottom(8);
+        auto nameRow = r.removeFromBottom(26);
+        nameLabel.setBounds(nameRow.removeFromLeft(90));
+        nameEditor.setBounds(nameRow);
+        r.removeFromBottom(8);
+        viewport.setBounds(r);
+        list.setSize(std::max(0, r.getWidth() - 12), (int)rows.size() * rowH);
+        for (int i = 0; i < (int)rows.size(); ++i)
+            rows[(size_t)i]->setBounds(0, i * rowH, list.getWidth(), rowH);
+    }
+
+private:
+    void close() {
+        if (auto* dw = findParentComponentOfClass<juce::DialogWindow>())
+            dw->exitModalState(0);
+    }
+
+    static constexpr int rowH = 22;
+    Callback onCreate;
+    juce::Label blurb, nameLabel;
+    juce::TextEditor nameEditor;
+    juce::Viewport viewport;
+    juce::Component list;
+    std::vector<std::unique_ptr<WireCheckRow>> rows;
+    juce::TextButton createBtn{"Create"}, cancelBtn{"Cancel"};
+};
+
+} // namespace
+
 void PianoRollComponent::showFxLaneMenu(juce::Point<float> pos) {
     if (!node) return;
     const int myId = node->id;
@@ -1827,7 +1946,26 @@ void PianoRollComponent::showFxLaneMenu(juce::Point<float> pos) {
         m.addItem(std::move(item));
     };
 
+    // Wire names come from graph.wireLabel() so this menu, the layer legend and
+    // the graph's own wire menus all spell a wire the same way - including the
+    // rule that two wires between the same pair of nodes get qualified with
+    // their plug names so the user isn't picking blind.
+    std::vector<std::pair<int, juce::String>> wires;   // linkId, label
+    for (auto& link : graph.links) {
+        auto label = graph.wireLabel(link.id);
+        if (label.isNotEmpty()) wires.emplace_back(link.id, label);
+    }
+
     juce::PopupMenu addMenu;
+    // Creating a group lives HERE, at the top of the list of things you can
+    // gate, because this menu is where the need for one is felt. It also exists
+    // on the wire's own right-click menu in the graph, but a user shaping layers
+    // in a piano roll shouldn't have to go find a cable to discover that groups
+    // are a thing.
+    if (!wires.empty()) {
+        addMenu.addItem(4, juce::String::fromUTF8("New group of wires\xe2\x80\xa6"));
+        addMenu.addSeparator();
+    }
     for (auto& grp : graph.effectGroups) {
         juce::String label = grp.name.empty() ? ("Group #" + juce::String(grp.id))
                                               : juce::String(grp.name);
@@ -1835,35 +1973,10 @@ void PianoRollComponent::showFxLaneMenu(juce::Point<float> pos) {
     }
     if (!graph.effectGroups.empty()) addMenu.addSeparator();
 
-    // Two wires between the same pair of nodes would otherwise produce two
-    // identical "A -> B" rows, leaving the user to pick blind. Build the plain
-    // labels first, then qualify only the ambiguous ones with their pin names -
-    // adding pins unconditionally would make every row noisy for no gain.
-    struct WireItem { int linkId; juce::String plain, srcPin, dstPin; };
-    std::vector<WireItem> wires;
-    const juce::String arrow = juce::String::fromUTF8("  \xe2\x86\x92  ");
-    for (auto& link : graph.links) {
-        WireItem w{ link.id, {}, {}, {} };
-        juce::String src, dst;
-        for (auto& n : graph.nodes) {
-            for (auto& pin : n.pinsOut)
-                if (pin.id == link.startPin) { src = n.name; w.srcPin = pin.name; }
-            for (auto& pin : n.pinsIn)
-                if (pin.id == link.endPin)   { dst = n.name; w.dstPin = pin.name; }
-        }
-        if (src.isEmpty() || dst.isEmpty()) continue;
-        w.plain = src + arrow + dst;
-        wires.push_back(std::move(w));
-    }
-    for (auto& w : wires) {
-        int sameLabel = 0;
-        for (auto& o : wires) if (o.plain == w.plain) ++sameLabel;
-        juce::String label = w.plain;
-        if (sameLabel > 1)
-            label = w.plain + "   (" + w.srcPin + arrow + w.dstPin + ")";
-        addSwatchItem(addMenu, 6000 + w.linkId, label, getDistinctColor(w.linkId));
-    }
-    if (addMenu.getNumItems() > 0)
+    for (auto& [linkId, label] : wires)
+        addSwatchItem(addMenu, 6000 + linkId, label, getDistinctColor(linkId));
+
+    if (!wires.empty())
         menu.addSubMenu("Add layer at beat " + juce::String(clickBeat, 2)
                             + juce::String::fromUTF8("\xe2\x80\xa6"), addMenu);
     else
@@ -1878,7 +1991,7 @@ void PianoRollComponent::showFxLaneMenu(juce::Point<float> pos) {
     // edge - right-clicking a layer at bar 30 popped the menu at the far left of
     // the window, nowhere near the thing being right-clicked.
     menu.showMenuAsync(juce::PopupMenu::Options().withMousePosition(),
-                       [this, myId, clickBeat, hitIdx](int result) {
+                       [this, myId, clickBeat, hitIdx, wires](int result) {
         refreshNode();
         if (!node || node->id != myId || result == 0) return;
 
@@ -1894,6 +2007,38 @@ void PianoRollComponent::showFxLaneMenu(juce::Point<float> pos) {
             return;
         } else if (result == 3) {
             if (onOpenHelpDoc) onOpenHelpDoc("layers-and-groups.html");
+            return;
+        } else if (result == 4) {
+            // Make a group and gate it here in one step. Splitting it ("group
+            // made - now go add a layer for it") is what made groups feel like a
+            // separate feature you had to already know about.
+            auto* content = new NewGroupContent(wires, clickBeat,
+                [this, myId, clickBeat](std::vector<int> picked, juce::String name) {
+                    refreshNode();
+                    if (picked.empty() || !node || node->id != myId) return;
+                    auto& grp = graph.addEffectGroup(name.toStdString());
+                    grp.linkIds = std::move(picked);
+                    EffectRegion region;
+                    region.groupId = grp.id;
+                    region.startBeat = clickBeat;
+                    region.endBeat = clickBeat + 4.0f;
+                    region.color = grp.color;
+                    node->effectRegions.push_back(region);
+                    graph.dirty = true;
+                    graph.commitSnapshot("New effect group");
+                    setFxLaneExpanded(true);   // land straight in edit mode
+                    if (onTimingChanged) onTimingChanged();
+                    resized();
+                    repaint();
+                });
+            juce::DialogWindow::LaunchOptions opt;
+            opt.dialogTitle = "New Group of Wires";
+            opt.content.setOwned(content);
+            opt.escapeKeyTriggersCloseButton = true;
+            opt.useNativeTitleBar = true;
+            opt.resizable = true;
+            opt.componentToCentreAround = this;
+            launchToolDialog(opt);   // modal, no separate taskbar entry
             return;
         } else if (result >= 5000 && result < 6000) {
             EffectRegion region;

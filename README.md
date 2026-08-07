@@ -121,7 +121,7 @@ This is how you'd put reverb on the chorus only without automating a dry/wet kno
 
 Sometimes you want to activate **multiple cables at once** — e.g., a reverb send AND a delay send AND a filter modulation, all gated together as one "chorus effects on" layer. That's what an Effect Group is: a named bundle of cables that activate together as one unit.
 
-To create a group: right-click any cable → Effect Group → New Group, give it a name, then right-click other cables → Effect Group → Add to <name>. Groups then show up alongside individual cables in the Effects lane's add menu, so one layer can gate the whole bundle — all cables in the group activate or mute as one.
+To create a group, right-click a track's Effects lane → **Add layer at beat N… → New group of wires…**. You get a colour-coded checklist of every cable in the project; tick the ones that belong together, name the bundle, and you get both the group and a layer gating it at that beat. (You can also build one from the graph: right-click a cable → Effect Group → New Group, then right-click other cables → Effect Group → Add to <name>.) Groups then show up alongside individual cables in the Effects lane's add menu, so one layer gates the whole bundle — all cables in the group activate or mute as one.
 
 Each group gets its own color, drawn on member wires as visual tags (circles for individual wire identity, diamonds for group membership) so you can see at a glance which routings belong to which groups.
 
@@ -334,7 +334,7 @@ A family of twelve effects built on the **discrete wavelet transform** rather th
 
 - **Cable-based routing.** Drag from any output pin to any compatible input pin. Audio (blue), MIDI (green), Param (orange, block-rate), and Signal (amber, audio-rate) cables are color-coded; pins light up bright yellow when you hover a valid drop target. See [Signals](#signals-the-four-pin-kinds) above.
 - **Implicit Signal ↔ Param conversion.** Either control-rate kind plugs into either control-rate input. The cable shows its source colour at the head and destination colour at the tail so the conversion is visible.
-- **Time-gated effect groups.** Make any cable active only during specific beat ranges, with smooth crossfaded edges. Group multiple cables so they activate together as one "layer." A routing strip above the piano roll shows which routings are live at which beats. See [Layers](#layers-time-gated-cables) and [Groups](#groups-effect-groups) above.
+- **Time-gated effect groups.** Make any cable active only during specific beat ranges, with smooth crossfaded edges. Group multiple cables so they activate together as one "layer." A layer legend above the piano roll names the colour of every gated cable and group in the project. See [Layers](#layers-time-gated-cables) and [Groups](#groups-effect-groups) above.
 
 ### MIDI
 

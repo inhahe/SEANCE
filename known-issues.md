@@ -2342,6 +2342,47 @@ note grid shifts automatically:
     repaints), and the owning node's `absoluteBeatOffset` is folded in at
     collection time. Verified in the GUI: a strip tube and the Effects-lane
     tube below it now share the same right edge to the pixel.
+- **...and then the routing strip was replaced outright by a layer legend**
+  (`routing_strip.cpp` -> `layer_legend.cpp`). Making the bars align with the
+  topmost panel fixed the arithmetic but not the concept, which the user named
+  immediately: *"the routing section looks redundant? as far as i can tell,
+  it's just a larger repeat of what's already shown in 'effects'. or at least
+  if it's universal, as in there's only one shown for all tracks, then the bars
+  shouldn't be sized and placed according to my region settings in the one open
+  track. in fact, they probably shouldn't even be bars, just colors associated
+  with labels saying what they are."* Correct on both counts, and the deeper
+  reason is that `PianoRollState::hZoom`/`hScroll` are **per-node**: panels
+  scroll and zoom independently, so there is no project-wide time axis and a
+  project-wide band cannot honestly draw bars at all. `LayerLegend` draws one
+  colour chip per distinct gated wire-or-group instead (groups are NOT expanded
+  into member wires - expanding them is what made the band look like a copy of
+  the Effects lane), wrapping to as many rows as the width needs. The per-track
+  spans survive as the chip's tooltip, in absolute beats. The band still earns
+  its place because a layer's only identity once drawn is a colour, and nothing
+  else in the app maps colour back to wire.
+- **Effect groups were undiscoverable.** *"i can't figure out how to make a
+  group of wires to use in the effect regions. it should be an option when i
+  right-click on any wire?"* - it already was (wire right-click -> `Effect
+  Group > New Group...`, GUI-verified before any code was written), so this was
+  a discoverability bug, not a missing feature: the flow only existed in the
+  graph, while the need for it is felt in the piano roll's Effects lane, and
+  the graph says "Effect Group" where the lane says "layer". The lane's
+  `Add layer at beat N...` submenu now leads with **New group of wires...**,
+  opening a colour-swatched checklist of every wire plus a name field, and
+  creates the group *and* a layer gating it in one action. Also fixed on the
+  way: the wire-naming logic was duplicated in three places (which is how one
+  copy ended up spelling the arrow `" > "`) and is now `NodeGraph::wireLabel()`
+  / `gateLabel()`.
+- **New dialogs must not use `juce::AlertWindow`.** The first cut of the
+  "New Group of Wires" dialog was an `AlertWindow` with a custom component,
+  copying the existing wire-menu group dialog. Checked with `GetWindowLongPtr`:
+  its peer came back `WS_EX_APPWINDOW`, no owner - i.e. a second SEANCE button
+  on the taskbar, exactly what CLAUDE.md's dialog rule forbids. Rebuilt as a
+  `DialogWindow` via `launchToolDialog()`, which yields `WS_EX_TOOLWINDOW` and
+  no taskbar entry (verified the same way). **The pre-existing "New Effect
+  Group" AlertWindow in `node_graph_component.cpp:5728` still has this bug**
+  and should be converted the same way. `cpp/build/uitest/winstyle.ps1` is the
+  check.
 - **Regions now track the track.** `TimeGateProcessor` compares against the
   owning node's *local* beat (`beat - absoluteBeatOffset`) instead of raw
   transport beats, so sliding a track's start position moves its layers

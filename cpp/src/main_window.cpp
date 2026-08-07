@@ -143,8 +143,8 @@ MainContentComponent::MainContentComponent() {
     setupHotkeyCallbacks();
 
     // Routing strip: shared timeline for link gates, above piano roll panels
-    routingStrip = std::make_unique<RoutingStrip>(graph, transport);
-    addAndMakeVisible(routingStrip.get());
+    layerLegend = std::make_unique<LayerLegend>(graph, transport);
+    addAndMakeVisible(layerLegend.get());
 
     // Transport buttons
     addAndMakeVisible(playBtn);
@@ -902,20 +902,19 @@ void MainContentComponent::resized() {
     // Wide enough for the current/total form, e.g. "0:00.0/15:30.0   Bar 1:1.0/20".
     positionLabel.setBounds(transport.getX() + x, transport.getY() + 2, 270, 28);
 
-    // Split: graph on top, editors on bottom, routing strip between them
+    // Split: graph on top, editors on bottom, layer legend between them
     if (!editorPanels.empty()) {
         auto editorArea = area.removeFromBottom(editorPanelHeight);
 
-        // Routing strip: collapsible, sized to its content
-        int routingH = routingStrip->getDesiredHeight();
-        if (routingH > 0) {
-            routingStrip->setBounds(editorArea.removeFromTop(routingH));
-            routingStrip->setVisible(true);
+        // Layer legend: hidden when nothing in the project is gated, otherwise
+        // as tall as it needs to be to flow every chip at this width.
+        int legendH = layerLegend->getDesiredHeight(editorArea.getWidth());
+        if (legendH > 0) {
+            layerLegend->setBounds(editorArea.removeFromTop(legendH));
+            layerLegend->setVisible(true);
         } else {
-            routingStrip->setVisible(false);
+            layerLegend->setVisible(false);
         }
-        // The panels' widths only become correct below, so push the strip's
-        // horizontal mapping after they're laid out (see syncRoutingStripView).
 
         // Lay out panels top-to-bottom using each panel's own heightPx.
         // The last panel absorbs whatever rounding/remainder is left so we
@@ -932,23 +931,9 @@ void MainContentComponent::resized() {
             panel->component->setBounds(editorArea.removeFromTop(h));
         }
     } else {
-        routingStrip->setVisible(false);
+        layerLegend->setVisible(false);
     }
     graphComponent->setBounds(area);
-    syncRoutingStripView();
-}
-
-void MainContentComponent::syncRoutingStripView() {
-    if (!routingStrip || !routingStrip->isVisible() || editorPanels.empty()) return;
-    // The topmost panel is the one the strip physically sits on, and panels
-    // scroll and zoom independently, so that's the only one it can honestly
-    // claim to be aligned with.
-    auto* top = editorPanels.front()->component.get();
-    if (!top) return;
-    top->refreshNode();
-    auto v = top->horizontalView();
-    routingStrip->setHorizontalView(v.scrollBeat, v.visibleBeats, v.totalBeats,
-                                    v.gridX, v.gridW);
 }
 
 void MainContentComponent::timerCallback() {
@@ -957,7 +942,16 @@ void MainContentComponent::timerCallback() {
     if (projectLoading && graphComponent)
         graphComponent->repaint();
 
-    syncRoutingStripView();
+    // The layer legend has no way to be told that a layer or effect group was
+    // added, removed or recoloured - that happens in the Effects lane, in the
+    // graph's wire menus, on project load and on undo - so it polls, and only
+    // asks for a re-layout when what it would draw actually changed (a new chip
+    // can wrap the band onto a second row, changing its height).
+    // Deliberately not gated on isVisible(): the band is hidden exactly when the
+    // project has no layers, so gating on it would mean the FIRST layer never
+    // brings it back.
+    if (layerLegend && layerLegend->refresh())
+        resized();
 
     // Power-state-aware autosave interval (#87): every ~5 seconds
     // (150 ticks at 30 Hz), check AC vs battery and adjust the

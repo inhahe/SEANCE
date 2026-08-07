@@ -208,8 +208,8 @@ target_sources(SEANCE PRIVATE
     src/effect_regions.h
     src/time_gate_processor.cpp
     src/time_gate_processor.h
-    src/routing_strip.cpp
-    src/routing_strip.h
+    src/layer_legend.cpp
+    src/layer_legend.h
     src/xy_pad.cpp
     src/xy_pad.h
     src/control_bank.cpp

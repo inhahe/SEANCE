@@ -6,7 +6,7 @@
 #include "transport.h"
 #include "plugin_host.h"
 #include "plugin_settings.h"
-#include "routing_strip.h"
+#include "layer_legend.h"
 #include "hotkey_manager.h"
 #include "project_file.h"
 #include "scripting.h"
@@ -123,7 +123,7 @@ public:
 private:
     std::unique_ptr<juce::MenuBarComponent> menuBar;
     std::unique_ptr<NodeGraphComponent> graphComponent;
-    std::unique_ptr<RoutingStrip> routingStrip;
+    std::unique_ptr<LayerLegend> layerLegend;
     std::unique_ptr<juce::StretchableLayoutResizerBar> splitter;
 
     // Transport bar components
@@ -179,7 +179,6 @@ private:
     int editorPanelHeight = 250;
     void openEditor(Node& node);
     void closeEditor(int nodeId);
-    void updateLayout();
     // Resize callback wired into each PianoRollComponent's resize handle.
     // `deltaPx` is the pixel delta from the drag (positive = handle moved
     // down, i.e. shrink). The matching panel's heightPx is adjusted by
@@ -190,13 +189,6 @@ private:
     // clamped to leave at least some graph area visible. Called whenever
     // a panel is added, removed, or resized.
     void recalcEditorPanelHeight();
-
-    // Feed the routing strip the horizontal beat mapping of the TOP editor
-    // panel - the one directly underneath it - so its tubes line up with that
-    // piano roll's grid. Polled from timerCallback because PianoRollComponent
-    // has no scroll/zoom callback; RoutingStrip::setHorizontalView ignores
-    // repeats, so an unchanged view costs nothing.
-    void syncRoutingStripView();
 
     bool projectDirty = false;
     // The embedded CPython interpreter is process-global; share the one

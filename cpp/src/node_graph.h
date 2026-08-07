@@ -1385,6 +1385,27 @@ public:
             if (g.id == id) return &g;
         return nullptr;
     }
+    const EffectGroup* findEffectGroup(int id) const {
+        for (auto& g : effectGroups)
+            if (g.id == id) return &g;
+        return nullptr;
+    }
+
+    // Human-readable name for a wire: "Source -> Destination" (a real UTF-8
+    // arrow). When another wire joins the SAME pair of nodes the two labels
+    // would be identical and the user would be picking blind, so - and only
+    // then - the plug names are appended: "Voice In 2 -> Signal Osc  (Gate ->
+    // Gate)". Returns an empty string if the link or either endpoint is gone.
+    //
+    // Shared because three surfaces name wires and they must agree: the Effects
+    // lane's "Add layer" menu, the layer legend above the editors, and the
+    // graph's own wire menus. Keeping three copies is how the arrow ended up
+    // spelled " > " in one of them.
+    juce::String wireLabel(int linkId) const;
+
+    // Name for whatever an EffectRegion gates - its group's name (or "Group #n"
+    // when unnamed), or wireLabel() for a single wire.
+    juce::String gateLabel(const EffectRegion& r) const;
 
     // Project markers (named beat positions)
     std::vector<Marker> markers;

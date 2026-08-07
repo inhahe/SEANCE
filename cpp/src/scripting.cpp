@@ -1610,15 +1610,32 @@ bool ScriptEngine::init() {
 
     initialized = true;
 
-    // Add our scripts directory to Python path
+    // Put the bundled helper modules (soundshop_music, soundshop_tools) on
+    // sys.path. Search order mirrors WaveformBank::load and openHelpDocFile:
+    // NEXT TO THE EXE first, because that is the shipping layout (CMake copies
+    // scripts/ there POST_BUILD, same as docs/ and resources/), then the dev
+    // tree so running straight out of cpp/build/... works, then a couple of
+    // working-directory guesses as a last resort.
+    //
+    // The exe-sibling entry is not optional: a packaged build has no
+    // <exe>/../../../scripts, and CWD is whatever launched the app (Explorer
+    // gives you the desktop, a file association gives you the project's
+    // folder), so without it a release build silently loses every helper
+    // module and `import soundshop_tools` fails for users but not for devs.
     PyRun_SimpleString(
         "import sys, os\n"
         "exe_dir = os.path.dirname(os.path.abspath(sys.executable))\n"
-        "scripts_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(exe_dir))), 'scripts')\n"
-        "if os.path.isdir(scripts_dir): sys.path.insert(0, scripts_dir)\n"
-        "# Also check relative to working directory\n"
-        "for p in ['scripts', '../scripts', '../../scripts', 'cpp/scripts']:\n"
-        "    if os.path.isdir(p): sys.path.insert(0, os.path.abspath(p))\n"
+        "cands = [os.path.join(exe_dir, 'scripts')]\n"
+        "# Dev tree: <repo>/cpp/scripts reached from the build output dir.\n"
+        "cands.append(os.path.join(os.path.dirname(os.path.dirname(\n"
+        "    os.path.dirname(exe_dir))), 'scripts'))\n"
+        "cands += ['scripts', '../scripts', '../../scripts', 'cpp/scripts']\n"
+        "# Reversed + insert(0) so the first candidate ends up first on sys.path.\n"
+        "for p in reversed(cands):\n"
+        "    if os.path.isdir(p):\n"
+        "        p = os.path.abspath(p)\n"
+        "        if p in sys.path: sys.path.remove(p)\n"
+        "        sys.path.insert(0, p)\n"
     );
 
     fprintf(stderr, "Python %s initialized\n", Py_GetVersion());

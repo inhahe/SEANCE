@@ -5,6 +5,51 @@ top. When something is fixed, delete the entry (git history is the archive).
 
 ---
 
+## UPSTREAM (JUCE 8.0.12), worked around: version resource never regenerates
+
+**Found:** 2026-08-07, bumping the version for the first release cut by
+`release.bat`. The exe kept reporting the old version in its file properties
+while Help → About reported the new one.
+
+`_juce_add_resources_rc` (`D:/JUCE-8.0.12/extras/Build/CMake/JUCEUtils.cmake:823`)
+generates `<target>_resources.rc` via
+
+```cmake
+add_custom_command(OUTPUT "${resource_rc_file}"
+    COMMAND juce::juceaide rcfile "${input_info_file}" "${resource_rc_file}"
+    ${dependency}          # <- only ever the app icon
+    VERBATIM)
+```
+
+`${dependency}` is `DEPENDS "${generated_icon}"` or empty. It never depends on
+`${input_info_file}`, the file that carries the version. So bumping
+`project(... VERSION ...)` rewrites `Info.txt` at configure time, the `.rc`
+output already exists, the build graph sees nothing stale, and the resource is
+never regenerated.
+
+The split is silent and asymmetric, which is what makes it dangerous:
+`JUCE_APPLICATION_VERSION_STRING` is a compile definition and updates
+immediately (About box correct), while `FILEVERSION`/`ProductVersion` keep the
+value from whenever the `.rc` was first generated. Left alone, every published
+exe would claim the wrong version in Explorer, and `release.bat`'s stale-build
+guard — which compares the exe's version resource against `CMakeLists.txt` —
+would reject perfectly good builds.
+
+**Workaround in place:** `cpp/CMakeLists.txt` (just after `juce_add_gui_app`)
+reads the generated `.rc` at configure time and deletes it when its embedded
+`FileVersion` doesn't match `PROJECT_VERSION`, forcing `juceaide` to run again
+on the next build. Configure only re-runs when `CMakeLists.txt` changes, which
+is exactly when the version can change, so this costs one regenerated text file
+and a relink on builds that actually bumped something. Verified: 0.1.0 → 0.2.0
+→ 0.10.0 each produced a matching `FILEVERSION`.
+
+**Proper fix (upstream):** add `DEPENDS "${input_info_file}"` to that custom
+command. Unlike the WASAPI fix this needs no local JUCE patch — the workaround
+lives entirely in our CMakeLists — so it survives a JUCE reinstall. Delete the
+block if JUCE ever fixes it.
+
+---
+
 ## BUG: Script Console edits create no undo step
 
 **Found:** 2026-08-07, while documenting the new `import soundshop` surface.

@@ -48,6 +48,7 @@ here.
 - [Opening a project from the command line](#opening-a-project-from-the-command-line)
 - [Asynchronous plugin loading](#asynchronous-plugin-loading)
 - [Dialogs and the Windows taskbar](#dialogs-and-the-windows-taskbar)
+- [Version number and releases](#version-number-and-releases)
 
 ---
 
@@ -2998,7 +2999,9 @@ Back-compat: the older single-layer Signal Shape scripts used the *same* `Layere
 
 *Tools → Script Console* opens an embedded CPython prompt whose one built-in module, `soundshop`, drives the **project**: nodes, links, clips, notes, markers, automation, tempo — plus the music-theory tables and the offline renderer documented below. This is a different surface from the [Script node](#script-signal--midi) and [MIDI Script](#script-program-reference-algorithmic-midi-languages), which run *inside* the audio graph per block or per sample; the Script Console runs once, on the message thread, on the open project, like a macro.
 
-Python is optional at build time (`HAS_PYTHON`) and probed at runtime, so a build without it still launches — the console just reports that Python is unavailable. `sys.path` is seeded with the app's `scripts/` directory, so the bundled helper modules (`soundshop_music`, `soundshop_tools`) are importable with no setup, and your own `.py` files dropped in there are too.
+Python is optional at build time (`HAS_PYTHON`) and probed at runtime, so a build without it still launches — the console just reports that Python is unavailable.
+
+`sys.path` is seeded with the app's `scripts/` directory, so the bundled helper modules (`soundshop_music`, `soundshop_tools`, `soundshop_signals`) are importable with no setup, and your own `.py` files dropped in there are too. The search order is **`scripts/` next to the exe first** (the shipping layout — CMake copies it there POST_BUILD alongside `docs/` and `resources/`), then `<exe>/../../../scripts` so running straight out of `cpp/build/…` picks up the source tree, then `scripts` / `../scripts` / `../../scripts` / `cpp/scripts` relative to the working directory as a last resort. The exe-sibling entry is what makes a released build work at all: a packaged install has no `../../../scripts`, and the working directory is whatever launched the app (Explorer hands you the desktop), so without it every helper-module import would fail for users while working fine in the dev tree.
 
 > **Script Console edits create no undo step.** Mutations made from a script are applied straight to the graph without a `commitSnapshot()`, so Ctrl+Z will not walk back a script's changes. Save before running a script that restructures a project. Tracked in `known-issues.md`.
 
@@ -4545,3 +4548,23 @@ windows too; `winstyle.ps1` covers visible ones). Expect:
 - native message box — `cls=#32770 APP=False owner=<main window hwnd>`
 
 Anything else with `APP=True` is a bug.
+
+---
+
+## Version number and releases
+
+**Where the version lives.** `project(SEANCE VERSION x.y.z ...)` on line 2 of `cpp/CMakeLists.txt` is the single source of truth. CMake passes it to `juce_add_gui_app` as `JUCE_VERSION`, which becomes both the `JUCE_APPLICATION_VERSION_STRING` compile definition (shown in **Help → About SEANCE**) and the exe's Win32 `FILEVERSION` resource (shown by Explorer's *Properties → Details*). `release.bat` reads the same line to choose its tag. One number, four consumers — there is deliberately no second copy anywhere in the source.
+
+**Checking which build you have.** Help → About SEANCE prints the version; so does right-clicking `SEANCE.exe` → Properties → Details. Quote it in bug reports.
+
+**Releases** live at [github.com/inhahe/seance/releases](https://github.com/inhahe/seance/releases), tagged `v<version>`, one `SEANCE-v<version>-win64.zip` per release containing `SEANCE.exe`, its runtime DLLs, and the `docs/` `resources/` `scripts/` folders the exe resolves relative to itself. Keeping the extracted folder intact matters: moving the exe out on its own costs the Help pages, the factory waveform library and Python scripting. The zip needs the [MSVC 2015–2022 x64 redistributable](https://aka.ms/vs/17/release/vc_redist.x64.exe), since SEANCE links the runtime dynamically.
+
+**Publishing** is `release.bat` in the project root (`--dry-run` stages and zips without touching GitHub). It refuses to publish when a release for the current version already exists, and refuses when the built exe's version resource disagrees with `CMakeLists.txt` — that mismatch means the version was bumped without a rebuild, which would otherwise ship the previous binary under a new number. It excludes the `.pdb` (~108 MB of symbols) and every per-machine file in the build output (`soundshop_*.xml` / `.cfg` / `.dat`, recent-file lists, logs), which would otherwise leak the developer's audio-device choice and plugin paths into a public download.
+
+### JUCE bug: the version resource does not track the version
+
+`_juce_add_resources_rc` (JUCE 8.0.12, `JUCEUtils.cmake:823`) generates `SEANCE_resources.rc` with a custom command whose `DEPENDS` lists the app icon and **not** the info file carrying the version. Bumping the version rewrites `Info.txt` at configure time, but the `.rc` already exists and the build graph sees nothing to redo, so it never regenerates.
+
+The failure is silent and asymmetric: the compile definition updates, so About shows the new version, while `FILEVERSION` keeps whatever it was the first time the file was generated. Every release would then ship an exe whose file properties claim the wrong version, and `release.bat`'s stale-build guard would reject correct builds.
+
+`cpp/CMakeLists.txt` works around it by deleting the generated `.rc` at configure time whenever its embedded `FileVersion` doesn't match `PROJECT_VERSION`, forcing `juceaide` to regenerate it on the next build. Configure only re-runs when `CMakeLists.txt` changes — precisely when the version can change — so the cost is one small regenerated file and a relink. The block is marked for removal if JUCE ever adds the missing `DEPENDS` upstream.

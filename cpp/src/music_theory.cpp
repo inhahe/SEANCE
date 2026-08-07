@@ -255,8 +255,17 @@ DegreeInfo MusicTheory::pitchToDegree(int pitch, int root, const std::vector<int
 int MusicTheory::degreeToPitch(int degree, int octave, int chromaticOffset,
                                 int root, const std::vector<int>& scale) {
     int sz = (int)scale.size();
+    if (sz <= 0) return root + octave * 12 + chromaticOffset;
     int degInScale = ((degree % sz) + sz) % sz;
-    int extraOctaves = degree / sz;
+    // Floor division, NOT C's truncation-toward-zero. Degree -1 is the last
+    // note of the octave below, so it has to land at extraOctaves -1; `degree /
+    // sz` would give 0 and put it an octave too high. (degree - degInScale) is
+    // always an exact multiple of sz, so this is the floor.
+    //
+    // Every in-app caller passes a degree in 0..sz-1, where the two agree -
+    // this only became reachable when soundshop.degree_to_note() let scripts
+    // pass an arbitrary degree.
+    int extraOctaves = (degree - degInScale) / sz;
     int semitone = scale[degInScale];
     return root + (octave + extraOctaves) * 12 + semitone + chromaticOffset;
 }

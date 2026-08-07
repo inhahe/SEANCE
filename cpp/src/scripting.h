@@ -5,10 +5,26 @@
 
 namespace SoundShop {
 
+struct Transport;
+
 class ScriptEngine {
 public:
     ScriptEngine();
     ~ScriptEngine();
+
+    // Register the app's live Transport so soundshop.render() bounces through
+    // the real tempo / time-signature maps.
+    //
+    // Why this isn't just read off NodeGraph: the tempo map and time-signature
+    // map live on MainContentComponent's Transport, not in the graph (the graph
+    // carries only a scalar `bpm`). A render that ignored them would silently
+    // disagree with File -> Export Audio on any project with a tempo ramp.
+    //
+    // MainContentComponent calls this once from its constructor. When nothing is
+    // registered - the self-test, or any headless use - render() falls back to a
+    // default Transport at graph.bpm, which is correct for a constant tempo.
+    static void setHostTransport(Transport* t);
+    static Transport* hostTransport();
 
     // Process-wide singleton. The embedded CPython interpreter is a global
     // resource (one Py_Initialize / Py_Finalize per process), so all callers -

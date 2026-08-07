@@ -414,7 +414,9 @@ This is one of the things that sets SEANCE apart from typical home DAWs. Three i
 
 ### Scripting
 
-- **Python scripting** for project manipulation — add nodes, place notes, automate parameters, generate musical structures programmatically. A built-in script console with run / load / save / recent-files history.
+- **Python scripting** for project manipulation — add nodes, place notes, automate parameters, generate musical structures programmatically. A built-in script console with run / load / save / recent-files history. See [REFERENCE.md → Script Console](REFERENCE.md#script-console-import-soundshop).
+- **A scriptable music-theory library** — scales, modes, key detection, degree analysis, snap-to-scale and *Change Key*, all reading the same tables the piano roll's Key / Mode / Scale controls use, so a script and the editor can never disagree.
+- **Render from a script** — bounce the project to a file or to raw float arrays, through the same renderer as *File → Export Audio*. With `write_wav` / `read_wav` you can synthesise a waveform in Python, drop it on a clip, and bounce the result without touching the GUI.
 - **WASM scripting** for real-time audio DSP. Write custom audio effects or instruments in C, Rust, Zig, or AssemblyScript, compile to WebAssembly, and load them as audio nodes with sample-accurate parameter input.
 
 ## Roadmap

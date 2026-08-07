@@ -42,32 +42,33 @@ def add_scale(node_idx, clip_idx, root, scale_type="major", octave=4,
 
     Args:
         root: Note name like "C", "D#", "Eb"
-        scale_type: "major", "minor", mode name, or extra scale name
+        scale_type: Any scale SEANCE knows - a key ("Major", "Harmonic Minor"),
+            a mode ("Dorian") or a fixed scale ("Blues", "Major Pentatonic").
+            Matching ignores case and separators, so "harmonic minor",
+            "Harmonic_Minor" and "HarmonicMinor" are the same. Run
+            soundshop.scale_names() for the full list.
         octave: Starting octave
         start_beat: Where to start placing notes
         note_duration: Duration of each note in beats
         ascending: Include ascending run
         descending: Include descending run
     """
-    # Get scale intervals
-    scale_type_lower = scale_type.lower()
-    if scale_type_lower in modes_dict:
-        intervals = build_table(root, modes_dict[scale_type_lower])
-    elif scale_type_lower in extra_scales:
-        root_midi = notes_dict.get(root, 0)
-        intervals = [(s + root_midi) % 12 for s in extra_scales[scale_type_lower]]
-    elif scale_type_lower in ('major', 'natural minor', 'harmonic minor', 'melodic minor'):
-        mode = {'major': 0, 'natural minor': 5, 'harmonic minor': 5, 'melodic minor': 5}
-        intervals = build_table(root, mode.get(scale_type_lower, 0))
-    else:
-        print(f"Unknown scale type: {scale_type}")
+    # Straight from the app's tables via the built-in module, so this offers
+    # exactly the scales the piano roll's Scale menu does. (It used to dispatch
+    # over a private copy in soundshop_music, where "harmonic minor" and
+    # "melodic minor" both silently resolved to plain natural minor.)
+    try:
+        pitches = ss.scale_pitches(root, scale_type, octave)
+    except ValueError as e:
+        print(f"Unknown scale type: {scale_type} ({e})")
+        return
+    if not pitches:
+        print(f"Scale {root} {scale_type} has no notes in octave {octave}")
         return
 
-    # Convert to MIDI pitches in the given octave
-    root_midi = notes_dict.get(root, 0) % 12
-    pitches = sorted(set((s % 12) + (octave + 1) * 12 for s in intervals))
-    # Add the octave note at the top
-    pitches.append(pitches[0] + 12)
+    # Add the octave note at the top, if it still fits on the keyboard.
+    if pitches[0] + 12 <= 127:
+        pitches.append(pitches[0] + 12)
 
     beat = start_beat
     notes_added = 0

@@ -2311,6 +2311,37 @@ note grid shifts automatically:
   the way MIDI tracks do. Verified in the GUI on a live `AudioTimeline`.
 - **The marker collision is gone** because the in-grid bar painter was deleted
   outright; layers no longer draw at y = 0 over marker flags and labels.
+- **Collapsed rows are flush.** Every tube was inset 1 px top and bottom, which
+  in a 7 px collapsed row left a 2 px gap between stacked tubes - more than a
+  quarter of the row height, so a three-layer ribbon read as three unrelated
+  slivers instead of one bundle of cables. The inset is now applied only while
+  expanded, where it does real work (telling you where one draggable tube ends
+  and the next begins).
+- **The routing strip above the editors was unreadable and misaligned**
+  (`routing_strip.cpp`), which is how this was reported: *"what's the green bar
+  at the very top of the midi track? i can't read what it says on the left of
+  it, the font is too small and maybe a bit distorted"*. Three separate
+  defects:
+  - The `Routing` caption and the per-wire label were both drawn into the same
+    ~40 px left gutter. With one gated wire the strip is 20 px tall, so the
+    caption (centred in the full height, y=10) landed inside the label's
+    y=3..13 band and the two overprinted - the "distortion". The caption now
+    has a full-width band of its own.
+  - Both texts were 8-9 px in a gutter far too narrow for `Src -> Dst`. The
+    wire name now rides **on the tube** at 10 px with brightness-matched
+    contrast, the gutter carries a colour chip instead of text, and every row
+    is tooltipped with the full name for tubes too short to label.
+  - `RoutingStrip::setHorizontalView` was **never called by anyone**, so the
+    axis was permanently pinned to beats 0-16 at a 40 px gutter regardless of
+    scroll or zoom - and `collectGatedLinks` fed it node-**local** region beats
+    as if they were absolute, so any track with a start offset plotted its
+    tubes over the wrong beats. `MainContentComponent::syncRoutingStripView`
+    now polls `PianoRollComponent::horizontalView()` off the topmost editor
+    panel each timer tick (the component has no scroll/zoom callback;
+    `setHorizontalView` ignores unchanged values, so an idle strip never
+    repaints), and the owning node's `absoluteBeatOffset` is folded in at
+    collection time. Verified in the GUI: a strip tube and the Effects-lane
+    tube below it now share the same right edge to the pixel.
 - **Regions now track the track.** `TimeGateProcessor` compares against the
   owning node's *local* beat (`beat - absoluteBeatOffset`) instead of raw
   transport beats, so sliding a track's start position moves its layers

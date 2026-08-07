@@ -914,6 +914,8 @@ void MainContentComponent::resized() {
         } else {
             routingStrip->setVisible(false);
         }
+        // The panels' widths only become correct below, so push the strip's
+        // horizontal mapping after they're laid out (see syncRoutingStripView).
 
         // Lay out panels top-to-bottom using each panel's own heightPx.
         // The last panel absorbs whatever rounding/remainder is left so we
@@ -933,6 +935,20 @@ void MainContentComponent::resized() {
         routingStrip->setVisible(false);
     }
     graphComponent->setBounds(area);
+    syncRoutingStripView();
+}
+
+void MainContentComponent::syncRoutingStripView() {
+    if (!routingStrip || !routingStrip->isVisible() || editorPanels.empty()) return;
+    // The topmost panel is the one the strip physically sits on, and panels
+    // scroll and zoom independently, so that's the only one it can honestly
+    // claim to be aligned with.
+    auto* top = editorPanels.front()->component.get();
+    if (!top) return;
+    top->refreshNode();
+    auto v = top->horizontalView();
+    routingStrip->setHorizontalView(v.scrollBeat, v.visibleBeats, v.totalBeats,
+                                    v.gridX, v.gridW);
 }
 
 void MainContentComponent::timerCallback() {
@@ -940,6 +956,8 @@ void MainContentComponent::timerCallback() {
     // each tick so the per-node "loading" spinner animates smoothly.
     if (projectLoading && graphComponent)
         graphComponent->repaint();
+
+    syncRoutingStripView();
 
     // Power-state-aware autosave interval (#87): every ~5 seconds
     // (150 ticks at 30 Hz), check AC vs battery and adjust the

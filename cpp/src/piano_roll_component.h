@@ -47,6 +47,21 @@ public:
     // reallocate when nodes are added, invalidating old pointers.
     void refreshNode() { node = graph.findNode(nodeId); }
 
+    // This panel's horizontal beat<->x mapping, in ABSOLUTE beats, so another
+    // component stacked above the editors (the RoutingStrip) can line its own
+    // time axis up with this one pixel for pixel. Same numbers fxBeatToX uses;
+    // `gridX` is where the grid starts (i.e. past the key ruler) and `gridW`
+    // how wide it is, both in this component's local coordinates - which are
+    // also the strip's, since they share the panel's x range.
+    struct HorizontalView {
+        float scrollBeat = 0.0f;   // absolute beat at gridX
+        float visibleBeats = 16.0f;// beats spanned by gridW
+        float totalBeats = 32.0f;  // absolute length of this track
+        float gridX = KEY_WIDTH;
+        float gridW = 1.0f;
+    };
+    HorizontalView horizontalView() const;
+
     // Wired by MainContentComponent: invoked when the user drags the
     // resize handle at the top of this panel. `deltaPx` is the cursor's
     // vertical delta since the last callback (positive = handle moved
@@ -59,6 +74,11 @@ public:
     // event is consumed before reaching the toolbar. Exposed publicly so
     // toolbarHeight() can shift the toolbar down by this amount.
     static constexpr int RESIZE_HANDLE_H = 6;
+
+    // Width of the piano-key ruler down the left edge; the beat grid starts
+    // here. Public because the RoutingStrip stacked above the editors has to
+    // reserve exactly the same gutter to keep its time axis aligned.
+    static constexpr float KEY_WIDTH = 40.0f;
 
     // Per-track header strip: a horizontal band just above the note grid that
     // shows the track as a clip-block sitting at its start beat. Drag it
@@ -106,8 +126,6 @@ private:
     Node* node = nullptr;   // refreshed via refreshNode(); never cache across calls
     Transport* transport = nullptr;
     PianoRollState state;
-
-    static constexpr float KEY_WIDTH = 40.0f;
 
     // Expression / automation lane
     enum ExprLane { ExprNone, ExprVelocity, ExprPitchBend, ExprSlide, ExprPressure, ExprAutomation };

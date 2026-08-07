@@ -1580,6 +1580,18 @@ float PianoRollComponent::fxXToBeat(float x) const {
     return scrollBeat + ((x - gridX) / gridW) * visibleBeats - absOffset;
 }
 
+PianoRollComponent::HorizontalView PianoRollComponent::horizontalView() const {
+    HorizontalView v;
+    v.gridX = KEY_WIDTH;
+    v.gridW = std::max(1.0f, (float)getWidth() - KEY_WIDTH - SCROLLBAR_SIZE);
+    if (!node) return v;
+    v.totalBeats = graph.getTimelineBeats(*node) + node->absoluteBeatOffset;
+    v.visibleBeats = std::max(1.0f, v.totalBeats / std::max(state.hZoom, 0.1f));
+    v.scrollBeat = juce::jlimit(0.0f, std::max(0.0f, v.totalBeats - v.visibleBeats),
+                                state.hScroll);
+    return v;
+}
+
 float PianoRollComponent::fxBeatsPerPixel() const {
     if (!node) return 1.0f;
     float gridW = std::max(1.0f, (float)getWidth() - KEY_WIDTH - SCROLLBAR_SIZE);
@@ -1707,8 +1719,13 @@ void PianoRollComponent::paintFxLane(juce::Graphics& g) {
         x2 = std::min(x2, gridX + gridW);
         if (x2 - x1 < 1.5f) x2 = x1 + 1.5f;
 
+        // Collapsed rows are flush - the tubes stack directly on top of each
+        // other so the ribbon reads as one solid bundle of cables, which is the
+        // whole job of the collapsed state. Expanded keeps a 1 px inset per row
+        // so each tube reads as a separate object you can grab and drag.
+        const float inset = fxLaneExpanded ? 1.0f : 0.0f;
         float y = (float)(top + FX_LANE_PAD) + (float)fxRowOf(region) * rowH;
-        juce::Rectangle<float> bar(x1, y + 1.0f, x2 - x1, rowH - 2.0f);
+        juce::Rectangle<float> bar(x1, y + inset, x2 - x1, rowH - inset * 2.0f);
         auto col = fxRegionColour(graph, region);
 
         // Tube shading: a vertical three-stop ramp (dark rim -> bright specular

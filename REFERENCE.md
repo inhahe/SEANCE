@@ -1889,9 +1889,13 @@ Rows stack one per distinct wire/group, in first-appearance order, so two layers
 | | Collapsed (default) | Expanded (edit mode) |
 |---|---|---|
 | Row height | 7 px — a thin read-only ribbon | 18 px — comfortable to click and drag |
+| Row spacing | **flush** — tubes stack with no gap | 1 px inset top and bottom, so each tube reads as a separate grabbable object |
 | Background | dark | slightly lighter, so "edit mode" is visible, not just inferable |
 | Labels | none (no room; colour + caption carry it) | group / destination-node name on tubes wider than 34 px |
 | Rows shown | one per layer | one per layer **plus a spare empty row** to right-click into |
+| Row guides | none | a faint line under each row, so empty rows read as droppable slots |
+
+The collapsed lane's rows being **flush** is the point of the collapsed state: with no gaps the stack reads as one solid bundle of cables you can take in at a glance, rather than a list of separate items. Gaps only earn their pixels in edit mode, where they tell you where one draggable tube ends and the next begins.
 
 **Enter edit mode** by left-clicking anywhere in the lane, by clicking the caption chevron, or via right-click → **Expand to edit**. Adding a layer from the menu also expands automatically, so you land straight in edit mode.
 
@@ -1961,9 +1965,26 @@ Per-group override: `EffectGroup::crossfadeSec`. Zero (the default) means "inher
 
 ### Routing strip
 
-A project-wide companion to the per-track Effects lane. Above the piano roll, a narrow strip appears when any layers exist *anywhere in the project*. Shows each gated wire as a horizontal "wire" bar with 3D shading, colored to match the wire/group. The horizontal axis matches the piano roll below — read across to see which wires are active at which beats. The strip auto-hides when there are no layers.
+A project-wide companion to the per-track Effects lane (`routing_strip.cpp`). A narrow band appears directly above the stack of editor panels whenever any layers exist *anywhere in the project*, and auto-hides when there are none.
 
-Where the Effects lane answers "what is gated **on this track**", the routing strip answers "what is gated **anywhere**" — including layers that live on a different track but gate a wire you're looking at.
+Where the Effects lane answers "what is gated **on this track**", the routing strip answers "what is gated **anywhere**" — including layers that live on a different track but gate a wire you're looking at. It is **read-only**; editing happens in the lane.
+
+Layout, top to bottom:
+
+| Band | Height | Contents |
+|---|---|---|
+| Caption | 14 px | The word `Routing`, spanning the full width. |
+| One row per gated wire | 14 px + 3 px gap | A colour chip in the left gutter, then the wire's active spans as 3D-shaded tubes. |
+
+Three details are worth spelling out, because each fixes a way the strip used to be unreadable or simply wrong:
+
+- **The caption gets a band of its own.** It previously shared the ~40 px left gutter with the per-wire labels, so on a one-wire strip `Routing` and `Synth → Reverb` were drawn on top of each other and neither was legible.
+- **The wire's name rides on the tube**, like a clip name, at 10 px — that is the only place with room for it at a readable size. Text colour flips between black and white against the tube's own perceived brightness. A tube narrower than 34 px gets no label; **hovering any row tooltips the full name**, which is also the fallback when the tube is scrolled off-screen. The gutter carries a **colour chip** instead of text, matching the wire in the graph and the tube in the Effects lane.
+- **The horizontal axis really does match the piano roll now.** `RoutingStrip::setHorizontalView` existed but was never called, so the strip was permanently stuck on beats 0–16 at a 40 px gutter regardless of scroll or zoom, and it plotted node-**local** region beats as if they were absolute — so on any track with a start offset the tubes sat over the wrong beats. `MainContentComponent::syncRoutingStripView` now feeds it `PianoRollComponent::horizontalView()` from the **topmost** editor panel — the one physically underneath the strip, and the only one it can honestly claim alignment with, since panels scroll and zoom independently — and `collectGatedLinks` folds each owning node's `absoluteBeatOffset` into the spans it collects.
+
+The view is **polled** from `MainContentComponent::timerCallback` (30 Hz) rather than pushed, because `PianoRollComponent` has no scroll/zoom callback; `setHorizontalView` compares against the current values and returns without repainting when nothing moved, so an idle strip costs nothing.
+
+Clipped ends follow the same convention as the Effects lane: a rounded cap where the layer genuinely ends, a flat bright edge where it merely runs off the side of the view, so a clipped tube never reads as a short one.
 
 ---
 

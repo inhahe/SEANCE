@@ -191,6 +191,13 @@ private:
     // a panel is added, removed, or resized.
     void recalcEditorPanelHeight();
 
+    // Feed the routing strip the horizontal beat mapping of the TOP editor
+    // panel - the one directly underneath it - so its tubes line up with that
+    // piano roll's grid. Polled from timerCallback because PianoRollComponent
+    // has no scroll/zoom callback; RoutingStrip::setHorizontalView ignores
+    // repeats, so an unchanged view costs nothing.
+    void syncRoutingStripView();
+
     bool projectDirty = false;
     // The embedded CPython interpreter is process-global; share the one
     // ScriptEngine instance with the static-shape baker (shape_expr.cpp).

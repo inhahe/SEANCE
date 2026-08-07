@@ -2373,16 +2373,39 @@ note grid shifts automatically:
   way: the wire-naming logic was duplicated in three places (which is how one
   copy ended up spelling the arrow `" > "`) and is now `NodeGraph::wireLabel()`
   / `gateLabel()`.
-- **New dialogs must not use `juce::AlertWindow`.** The first cut of the
-  "New Group of Wires" dialog was an `AlertWindow` with a custom component,
+- **Phantom taskbar buttons from dialogs - fixed app-wide.** The first cut of
+  the "New Group of Wires" dialog was an `AlertWindow` with a custom component,
   copying the existing wire-menu group dialog. Checked with `GetWindowLongPtr`:
   its peer came back `WS_EX_APPWINDOW`, no owner - i.e. a second SEANCE button
-  on the taskbar, exactly what CLAUDE.md's dialog rule forbids. Rebuilt as a
-  `DialogWindow` via `launchToolDialog()`, which yields `WS_EX_TOOLWINDOW` and
-  no taskbar entry (verified the same way). **The pre-existing "New Effect
-  Group" AlertWindow in `node_graph_component.cpp:5728` still has this bug**
-  and should be converted the same way. `cpp/build/uitest/winstyle.ps1` is the
-  check.
+  on the taskbar, exactly what CLAUDE.md's dialog rule forbids. That dialog was
+  rebuilt as a `DialogWindow` via `launchToolDialog()` (`WS_EX_TOOLWINDOW`, no
+  taskbar entry), but the same bug affected **every** `juce::AlertWindow` in the
+  app (~25 of them). All are now fixed at once by `SoundShop::AppLookAndFeel`
+  (`cpp/src/dialog_helpers.h`), installed from `main.cpp`'s `initialise()`: it
+  overrides `LookAndFeel::getAlertBoxWindowFlags()` to drop
+  `ComponentPeer::windowAppearsOnTaskbar`. Two traps found the hard way, both
+  documented at length in `dialog_helpers.h` - re-read them before touching this:
+  - **Do not override `getDesktopWindowStyleFlags()` on an `AlertWindow`
+    subclass.** That is the documented recipe for `TopLevelWindow`/`DialogWindow`
+    (it's what `ToolDialogWindow` does) but it silently fails for `AlertWindow`,
+    whose peer is created *during construction* - first by `TopLevelWindow`'s
+    ctor, then again via `AlertWindow::lookAndFeelChanged()` ->
+    `setDropShadowEnabled()` -> `addToDesktop()` - both before the subclass
+    vtable is live. The later flag change re-creates the peer out from under
+    `enterModalState()`'s `setVisible(true)` and **the dialog never appears at
+    all**. Measured: with such a subclass, the Song Length button produced no
+    window whatsoever and `EnumWindows` found nothing.
+  - **`AlertWindow` and `NativeMessageBox` number their buttons differently.**
+    `AlertWindow` uses `ResultCodeMappingMode::alertWindow` (button X reports
+    `(X + 1) % N`, so the first button is 1 and the last/escape is 0);
+    `NativeMessageBox::showAsync` uses a plain 0-based index. A name-for-name
+    swap compiles cleanly and silently inverts every `if (result == 1)`. Use
+    `SoundShop::showAlertAsync` / `showAlert` in `dialog_helpers.h`, which remap.
+  Checks: `cpp/build/uitest/winstyle.ps1`, or `enumall.ps1 -ProcId <pid>` which
+  also lists invisible windows. A fixed JUCE alert reads
+  `ex=0x180 TOOL=True APP=False`; a native message box reads
+  `cls=#32770 APP=False owner=<main hwnd>`; only the main window should be
+  `APP=True`.
 - **Regions now track the track.** `TimeGateProcessor` compares against the
   owning node's *local* beat (`beat - absoluteBeatOffset`) instead of raw
   transport beats, so sliding a track's start position moves its layers

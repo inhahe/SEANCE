@@ -1,9 +1,75 @@
 #pragma once
 #include <juce_gui_basics/juce_gui_basics.h>
+#include <functional>
 
 namespace juce { class AudioDeviceManager; }
 
 namespace SoundShop {
+
+// The app-wide LookAndFeel. Identical to LookAndFeel_V4 in every visual
+// respect - it exists for one non-visual override.
+//
+// Every juce::AlertWindow in the app (there are ~25: rename prompts, save-to-
+// library name boxes, export options, ...) creates its desktop peer from
+// LookAndFeel::getAlertBoxWindowFlags(), whose stock value includes
+// ComponentPeer::windowAppearsOnTaskbar. On Windows that becomes
+// WS_EX_APPWINDOW with no owner HWND, which the shell reads as a second
+// application and gives its own taskbar button - the thing CLAUDE.md's dialog
+// rule forbids. Dropping the flag here fixes all of them at once, with no
+// call-site changes.
+//
+// Why here and not on an AlertWindow subclass? Overriding
+// getDesktopWindowStyleFlags() on a subclass is the documented recipe for
+// TopLevelWindow (and is what ToolDialogWindow does for DialogWindow), but it
+// does NOT work for AlertWindow: AlertWindow's peer is created during
+// construction - TopLevelWindow's ctor, then again from
+// AlertWindow::lookAndFeelChanged() -> setDropShadowEnabled() -> addToDesktop()
+// - both of which run before the subclass vtable is live, so the peer is built
+// with the taskbar flag anyway. The later flag change then re-creates the peer
+// out from under enterModalState()'s setVisible(true), and the dialog never
+// appears at all. (Measured: with such a subclass, clicking the Song Length
+// button produced no window whatsoever, and EnumWindows found nothing.)
+// getAlertBoxWindowFlags() is the value AlertWindow actually reads, at the
+// point it reads it, so it's the extension point that works.
+class AppLookAndFeel final : public juce::LookAndFeel_V4 {
+public:
+    int getAlertBoxWindowFlags() override {
+        return juce::LookAndFeel_V4::getAlertBoxWindowFlags()
+             & ~juce::ComponentPeer::windowAppearsOnTaskbar;
+    }
+};
+
+// Make AppLookAndFeel the default look and feel. Call once, early in
+// JUCEApplication::initialise(), before any window exists. Returns a reference
+// to the singleton; the caller must call juce::LookAndFeel::setDefaultLookAndFeel(nullptr)
+// on shutdown before it is destroyed.
+juce::LookAndFeel& installAppLookAndFeel();
+
+// Native, owner-parented replacements for juce::AlertWindow::showAsync /
+// AlertWindow::show, for popups that are just a message and some buttons.
+//
+// Why not call juce::NativeMessageBox directly? **The result codes differ.**
+// AlertWindow numbers its buttons the way LookAndFeel::createAlertWindow wires
+// them - with N buttons, button X reports ((X + 1) % N), so the *first* button
+// is 1 and the *last* one (also escape / the close box) is 0.
+// NativeMessageBox::showAsync reports a plain 0-based index instead. Swapping
+// one name for the other at a call site therefore compiles cleanly and silently
+// inverts the meaning of every button. These wrappers do the remap, so a call
+// site can switch by changing `juce::AlertWindow::` to `SoundShop::` and leave
+// its `if (result == 1)` checks alone.
+//
+// The other half of the job: `owner` is passed through as the options'
+// associated component, which on Windows becomes the TaskDialog's hwndParent -
+// that's what stops the popup earning its own taskbar button. Pass a component
+// inside the main window.
+void showAlertAsync(juce::MessageBoxOptions opts,
+                    juce::Component* owner,
+                    std::function<void(int)> callback = {});
+
+// Blocking variant, for the handful of places that genuinely can't be async
+// (e.g. answering "may I quit?" from within a close request). Same result-code
+// convention as juce::AlertWindow::show.
+int showAlert(juce::MessageBoxOptions opts, juce::Component* owner);
 
 // Open the standard Audio Device Settings dialog (driver type / input /
 // output / sample rate / buffer size + MIDI input selection) as a taskbar-

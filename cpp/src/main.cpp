@@ -1,3 +1,4 @@
+#include "dialog_helpers.h"
 #include "main_window.h"
 #include "plugin_sandbox.h"
 #include "self_test.h"
@@ -78,11 +79,18 @@ public:
 
         initLogging();
 
+        // Must precede the first window: AlertWindow reads
+        // getAlertBoxWindowFlags() when it builds its peer, and this is what
+        // keeps every alert out of the Windows taskbar.
+        SoundShop::installAppLookAndFeel();
+
         mainWindow = std::make_unique<SoundShop::MainWindow>(getApplicationName());
     }
 
     void shutdown() override {
         mainWindow.reset();
+        // Drop the app look-and-feel before its static storage is torn down.
+        juce::LookAndFeel::setDefaultLookAndFeel(nullptr);
         juce::Logger::setCurrentLogger(nullptr);
         logger.reset();
     }

@@ -92,6 +92,40 @@ private:
     JUCE_DECLARE_NON_COPYABLE(ToolDialogWindow)
 };
 
+juce::LookAndFeel& installAppLookAndFeel() {
+    // Function-local static: outlives every window (destroyed after main
+    // returns) so no dialog can ever hold a dangling look-and-feel pointer.
+    static AppLookAndFeel lnf;
+    juce::LookAndFeel::setDefaultLookAndFeel(&lnf);
+    return lnf;
+}
+
+// AlertWindow numbers buttons ((X + 1) % N); NativeMessageBox uses a plain
+// 0-based index. Everything below funnels through here so call sites keep the
+// AlertWindow convention they were written against.
+static int toAlertWindowResult(int plainIndex, int numButtons) {
+    return numButtons > 0 ? (plainIndex + 1) % numButtons : 0;
+}
+
+void showAlertAsync(juce::MessageBoxOptions opts,
+                    juce::Component* owner,
+                    std::function<void(int)> callback) {
+    if (owner != nullptr)
+        opts = opts.withAssociatedComponent(owner);
+    const int n = opts.getNumButtons();
+    juce::NativeMessageBox::showAsync(
+        opts, [n, cb = std::move(callback)](int index) {
+            if (cb) cb(toAlertWindowResult(index, n));
+        });
+}
+
+int showAlert(juce::MessageBoxOptions opts, juce::Component* owner) {
+    if (owner != nullptr)
+        opts = opts.withAssociatedComponent(owner);
+    return toAlertWindowResult(juce::NativeMessageBox::show(opts),
+                               opts.getNumButtons());
+}
+
 juce::DialogWindow* launchAudioDeviceSettings(juce::AudioDeviceManager& dm,
                                               juce::Component* centreAround) {
     // JUCE's built-in selector covers driver type / input / output / sample

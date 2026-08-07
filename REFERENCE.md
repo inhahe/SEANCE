@@ -46,6 +46,7 @@ here.
 - [Ephemeral session (`--ephemeral`)](#ephemeral-session---ephemeral)
 - [Opening a project from the command line](#opening-a-project-from-the-command-line)
 - [Asynchronous plugin loading](#asynchronous-plugin-loading)
+- [Dialogs and the Windows taskbar](#dialogs-and-the-windows-taskbar)
 
 ---
 
@@ -1964,7 +1965,7 @@ Two ways to build one:
 
 The lane route exists because the graph route wasn't discoverable: groups are wanted while shaping layers in a piano roll, and requiring the user to go find a cable to learn that groups exist meant most never did. It also collapses "make the group" and "gate the group" into a single action — splitting them is what made groups feel like a separate feature you had to already know about. `Create` stays disabled (with a tooltip saying why) until at least one wire is ticked.
 
-The dialog is a `DialogWindow` launched through `launchToolDialog()`, not a `juce::AlertWindow`: AlertWindow's peer gets `WS_EX_APPWINDOW` with no owner, which earns a second SEANCE button on the Windows taskbar.
+The dialog is a `DialogWindow` launched through `launchToolDialog()` — see [Dialogs and the Windows taskbar](#dialogs-and-the-windows-taskbar).
 
 ### Crossfade duration
 
@@ -4369,3 +4370,57 @@ loading. To avoid silently dropping a not-yet-applied plugin's saved state,
 `writeProject` falls back to writing `node.pendingPluginState` when a plugin node
 has no live processor to query and no cached state — so an autosave mid-load
 preserves the plugin state read from the file.
+
+## Dialogs and the Windows taskbar
+
+<a name="dialogs-and-the-windows-taskbar"></a>**SEANCE must own exactly one
+Windows taskbar button — the main window.** A dialog that gets its own button
+looks to the user like a second copy of the app launched behind their back, and
+Alt-Tab / taskbar previews start showing two SEANCEs. The stock JUCE patterns get
+this wrong by default: a JUCE popup opened without an owner window is created
+with `WS_EX_APPWINDOW` and `owner=0`, which the shell reads as a separate
+application.
+
+There are three kinds of popup and each has one correct route:
+
+| Popup | Use | Why |
+|---|---|---|
+| Message + buttons ("Nothing to bounce", "Save before quitting?") | `SoundShop::showAlertAsync` / `showAlert` (`cpp/src/dialog_helpers.h`), or `juce::NativeMessageBox::showMessageBoxAsync(..., associatedComponent)` | Renders a native Windows `TaskDialog` whose `hwndParent` is the main window, so the OS never gives it a button |
+| Text/combo entry (rename, "Set start beat…", export options) | plain `juce::AlertWindow` — nothing special to do | `AppLookAndFeel` fixes these globally, see below |
+| Custom component (asset browser, "New group of wires") | `launchToolDialog()` / `launchManagedToolDialog()` (`dialog_helpers.h`) | Creates a `ToolDialogWindow`, which overrides `getDesktopWindowStyleFlags()` to yield `WS_EX_TOOLWINDOW` |
+
+**`AppLookAndFeel` fixes every `AlertWindow` at once.** `SoundShop::AppLookAndFeel`
+(`dialog_helpers.h`) is `LookAndFeel_V4` plus a single non-visual override:
+`getAlertBoxWindowFlags()` returns the stock flags minus
+`ComponentPeer::windowAppearsOnTaskbar`. `installAppLookAndFeel()` is called from
+`main.cpp`'s `initialise()` **before the first window exists**, and
+`shutdown()` clears the default look-and-feel again. Because every `AlertWindow`
+builds its peer from that value, all ~25 alerts in the app are fixed with zero
+call-site changes.
+
+Two things that look like they should work and don't:
+
+- **Overriding `getDesktopWindowStyleFlags()` on an `AlertWindow` subclass makes
+  the dialog invisible.** It's the right recipe for `DialogWindow` but not here:
+  `AlertWindow`'s peer is created *during construction* (`TopLevelWindow`'s ctor,
+  then again via `lookAndFeelChanged()` → `setDropShadowEnabled()` →
+  `addToDesktop()`), both before the subclass vtable is live. The flag change
+  then lands late and re-creates the peer out from under `enterModalState()`'s
+  `setVisible(true)`, and no window is ever shown. Use the look-and-feel hook,
+  which is the value `AlertWindow` actually reads at the moment it reads it.
+- **`AlertWindow` and `NativeMessageBox` number their buttons differently.**
+  `AlertWindow` reports button *X* of *N* as `(X + 1) % N` — first button 1, last
+  button (and Escape) 0 — while `NativeMessageBox::showAsync` reports a plain
+  0-based index. Swapping one call for the other compiles cleanly and silently
+  inverts every `if (result == 1)`. `showAlertAsync`/`showAlert` do the remap so
+  a call site can switch API without touching its result checks.
+
+**How to verify.** There is no compile-time check; test it. Run the app, open the
+dialog, and enumerate its windows with `cpp/build/uitest/enumall.ps1 -ProcId <pid>`
+(lists invisible windows too; `winstyle.ps1` covers visible ones). Expect:
+
+- main window — `ex=0x40100 TOOL=False APP=True` (it *should* have the button)
+- JUCE alert / tool dialog — `ex=0x180 TOOL=True APP=False`
+- native message box — `cls=#32770 APP=False owner=<main window hwnd>`
+
+Anything else with `APP=True` is a bug.

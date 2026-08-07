@@ -593,7 +593,7 @@ MainContentComponent::MainContentComponent() {
         int interval = autosaveIntervalSeconds;
         juce::MessageManager::callAsync([safe2, interval]() {
             if (!safe2) return;
-            juce::AlertWindow::showAsync(
+            showAlertAsync(
                 juce::MessageBoxOptions()
                     .withIconType(juce::MessageBoxIconType::InfoIcon)
                     .withTitle("Autosave on Laptop")
@@ -607,6 +607,7 @@ MainContentComponent::MainContentComponent() {
                         "You can change the interval (or turn autosave off entirely) "
                         "later from the Options menu.")
                     .withButton("OK"),
+                safe2.getComponent(),
                 [safe2](int) {
                     if (!safe2) return;
                     safe2->autosaveLaptopNoticeShown = true;
@@ -995,7 +996,7 @@ void MainContentComponent::timerCallback() {
             // Offer to add this new device
             juce::String name = dev.name;
             juce::String id = dev.identifier;
-            juce::AlertWindow::showAsync(
+            showAlertAsync(
                 juce::MessageBoxOptions()
                     .withIconType(juce::MessageBoxIconType::QuestionIcon)
                     .withTitle("MIDI device connected")
@@ -1003,6 +1004,7 @@ void MainContentComponent::timerCallback() {
                                  + "\n\nAdd it to the graph?")
                     .withButton("Add")
                     .withButton("Ignore"),
+                this,
                 [this, name, id](int result) {
                     if (result != 1) return;
                     auto& n = graph.addNode(name.toStdString(), NodeType::MidiInput,
@@ -1598,13 +1600,14 @@ void MainContentComponent::menuItemSelected(int menuItemID, int) {
         case 317: openHelpDoc("recording-audio.html"); break;
         case 318: openHelpDoc("wavelet-effects.html"); break;
         case 320:
-            juce::AlertWindow::showMessageBoxAsync(
+            juce::NativeMessageBox::showMessageBoxAsync(
                 juce::MessageBoxIconType::InfoIcon,
                 "About SoundShop",
                 "SoundShop2\n\n"
                 "A node-based DAW designed to be intuitive for people "
                 "without a musical background.\n\n"
-                "See Help > User Guide for documentation.");
+                "See Help > User Guide for documentation.",
+                this);
             break;
         case 50: openHotkeySettings(); break;
         case 51: {
@@ -3355,13 +3358,14 @@ void MainContentComponent::openHelpDoc(const juce::String& docRelativePath) {
                       .getParentDirectory();
     auto docFile = exeDir.getChildFile("docs").getChildFile(docRelativePath);
     if (!docFile.existsAsFile()) {
-        juce::AlertWindow::showMessageBoxAsync(
+        juce::NativeMessageBox::showMessageBoxAsync(
             juce::MessageBoxIconType::WarningIcon,
             "Help file not found",
             "Couldn't find the docs file:\n\n  " + docFile.getFullPathName()
             + "\n\nThe docs folder should sit alongside SoundShop.exe. "
             + "If you built from source, re-run the build to copy the docs, "
-            + "or browse the project's docs/ folder directly.");
+            + "or browse the project's docs/ folder directly.",
+            this);
         return;
     }
     // startAsProcess opens the file in its default OS handler - for .html
@@ -4377,11 +4381,20 @@ bool MainContentComponent::tryQuit() {
         return true;
     }
 
-    int result = juce::AlertWindow::showYesNoCancelBox(
-        juce::MessageBoxIconType::QuestionIcon,
-        "Unsaved Changes",
-        "You have unsaved changes. Save before quitting?",
-        "Save", "Don't Save", "Cancel");
+    // Spelled out as MessageBoxOptions rather than showYesNoCancelBox because
+    // the native yes/no/cancel helper doesn't take custom button labels, and
+    // "Save / Don't Save / Cancel" is a lot clearer here than "Yes / No /
+    // Cancel". Result codes still follow the AlertWindow convention
+    // (1 = Save, 2 = Don't Save, 0 = Cancel) - see showAlert().
+    int result = showAlert(
+        juce::MessageBoxOptions()
+            .withIconType(juce::MessageBoxIconType::QuestionIcon)
+            .withTitle("Unsaved Changes")
+            .withMessage("You have unsaved changes. Save before quitting?")
+            .withButton("Save")
+            .withButton("Don't Save")
+            .withButton("Cancel"),
+        this);
     if (result == 2) {                   // Don't Save
         // User explicitly threw their edits away - autosave AND undo
         // history go with them. (A clean save+quit instead would keep
@@ -5204,7 +5217,7 @@ void MainContentComponent::handleSharedHistoryOnOpen(const juce::String& project
         "- Ignore: start with a fresh undo history. The shared file "
         "stays untouched.";
 
-    juce::AlertWindow::showAsync(
+    showAlertAsync(
         juce::MessageBoxOptions()
             .withIconType(juce::MessageBoxIconType::QuestionIcon)
             .withTitle("Shared Undo History Found")
@@ -5212,6 +5225,7 @@ void MainContentComponent::handleSharedHistoryOnOpen(const juce::String& project
             .withButton("Use It")
             .withButton("Use a Copy")
             .withButton("Ignore"),
+        this,
         [safe, sidecar, capturedPath](int result) {
             if (!safe) return;
             if (result == 1) {
@@ -5256,7 +5270,7 @@ void MainContentComponent::offerSharedHistoryOnSaveAs(const juce::String& savedP
     juce::Component::SafePointer<MainContentComponent> safe(this);
     juce::String capturedPath = savedProjectPath;
 
-    juce::AlertWindow::showAsync(
+    showAlertAsync(
         juce::MessageBoxOptions()
             .withIconType(juce::MessageBoxIconType::QuestionIcon)
             .withTitle("Include Undo History?")
@@ -5272,6 +5286,7 @@ void MainContentComponent::offerSharedHistoryOnSaveAs(const juce::String& savedP
                 "saved privately on your machine either way.")
             .withButton("Yes, Include")
             .withButton("No Thanks"),
+        this,
         [safe, capturedPath](int result) {
             if (!safe) return;
             if (result != 1) return;
@@ -5366,13 +5381,14 @@ void MainContentComponent::tryRecoverAutosave() {
 
     juce::Component::SafePointer<MainContentComponent> safe(this);
     juce::String capturedOriginal = originalPath;
-    juce::AlertWindow::showAsync(
+    showAlertAsync(
         juce::MessageBoxOptions()
             .withIconType(juce::MessageBoxIconType::QuestionIcon)
             .withTitle("Recover Autosaved Version?")
             .withMessage(message)
             .withButton("Recover")
             .withButton("Discard"),
+        this,
         [safe, capturedOriginal](int result) {
             if (!safe) return;
             if (result != 1) {
@@ -6476,8 +6492,8 @@ void MainContentComponent::bounceToAudioTrack() {
     // contentEndBeats() accounts for track nesting offsets.
     float maxBeat = (float) graph.contentEndBeats();
     if (maxBeat <= 0) {
-        juce::AlertWindow::showMessageBoxAsync(juce::MessageBoxIconType::InfoIcon,
-            "Nothing to bounce", "Add some clips to the timeline first.");
+        juce::NativeMessageBox::showMessageBoxAsync(juce::MessageBoxIconType::InfoIcon,
+            "Nothing to bounce", "Add some clips to the timeline first.", this);
         return;
     }
     maxBeat += 4; // tail for reverb / release tails
@@ -6554,8 +6570,8 @@ void MainContentComponent::bounceToAudioTrack() {
 void MainContentComponent::createAudioTrackFromOutputCache(Node& outputNode) {
     auto& c = outputNode.cache;
     if (!c.valid || c.numSamples <= 0 || c.left.empty()) {
-        juce::AlertWindow::showMessageBoxAsync(juce::MessageBoxIconType::InfoIcon,
-            "No cached audio", "Play the song first, then click Capture.");
+        juce::NativeMessageBox::showMessageBoxAsync(juce::MessageBoxIconType::InfoIcon,
+            "No cached audio", "Play the song first, then click Capture.", this);
         return;
     }
 
@@ -6617,8 +6633,9 @@ void MainContentComponent::saveCaptureToDisk(const juce::File& file) {
 void MainContentComponent::createAudioTrackFromCapture() {
     auto buf = audioEngine.getCaptureBuffer();
     if (buf.getNumSamples() == 0) {
-        juce::AlertWindow::showMessageBoxAsync(juce::MessageBoxIconType::InfoIcon,
-            "Capture Empty", "No audio was captured. Make sure to play something while Capture is on.");
+        juce::NativeMessageBox::showMessageBoxAsync(juce::MessageBoxIconType::InfoIcon,
+            "Capture Empty", "No audio was captured. Make sure to play something while Capture is on.",
+            this);
         return;
     }
 

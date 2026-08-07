@@ -1876,6 +1876,8 @@ A **layer** is one time range during which one specific cable is active. Stored 
 
 Every piano roll has an **Effects lane**: a horizontal band directly above the `Start` track-header strip, in the same left-gutter/grid split as everything else in the editor (the caption `▸ Effects` sits over the keyboard column, the layers over the note grid).
 
+This covers **audio tracks as well as MIDI tracks** — both open the same editor, and nothing about layers is MIDI-specific: the lane, the gate in `TimeGateProcessor` and the `[FxRegion]` serialisation are all node-type agnostic. An audio track gates its sends exactly the way a MIDI track does.
+
 The lane is **always visible, even with no layers**, and says so — an empty one reads *"no effect layers — click to add one"*. This is deliberate: it is the feature's only signpost, and while layers were reachable only from a buried context submenu the feature was in practice undiscoverable.
 
 Layers render as **shaded tubes** — a rounded bar with a three-stop vertical gradient (dark rim → bright specular band in the upper third → dark rim) plus a top rim-light, so a layer reads as a cylinder lying on its side and is never confused with the flat rectangles used for notes, clips and markers. Each tube is colored to match its wire (or its effect group). A tube whose range runs off-screen gets a flat bright end cap instead of a rounded one, meaning "continues past here".
@@ -1900,8 +1902,8 @@ Rows stack one per distinct wire/group, in first-appearance order, so two layers
 Only while expanded:
 
 - **Move** — drag a tube's middle. The length is preserved; the start clamps at beat 0.
-- **Resize** — drag either end. The 5 px hot zone at each end shows a ↔ cursor. Each edge clamps against the other so a layer always keeps positive length (minimum = one snap step, or 1/16 beat with snap off).
-- **Snap** — drags quantise to the piano roll's current snap setting. Hold **Alt** for free positioning.
+- **Resize** — drag either end. The 5 px hot zone at each end shows a ↔ cursor. Each edge clamps against the other so a layer always keeps positive length (minimum = one pixel's worth of beats at the current zoom).
+- **Snap** — see below. Hold **Alt** while dragging for completely free positioning.
 - **Add** — right-click empty lane space → **Add layer at beat N…** → pick a group or a `Source → Destination` wire. The new layer starts at the clicked beat (snapped) and runs 4 beats. Every entry carries a **colour swatch** showing the exact colour of the tube it will create, since colour is the only identity a tube has once it is drawn. Two wires joining the same pair of nodes would otherwise produce identical rows, so those — and only those — are qualified with their pin names: `Voice In 2 → Signal Osc   (Gate → Gate)`.
 - **Delete** — right-click a tube → **Delete layer "name"**.
 
@@ -1910,6 +1912,29 @@ The menu opens **at the pointer**, and the same is true of the `Start` strip's t
 Elsewhere in the lane the cursor is a pointing hand — the single strongest cue that the whole band is interactive.
 
 Move and resize are **continuous gestures**: nothing is committed while dragging, and one undo step (`Move effect layer` / `Resize effect layer`) is pushed on release, and only if the range actually changed, so a plain click on a tube never litters the undo tree. Add and delete commit immediately.
+
+#### Directional ("magnetic tail") snapping
+
+Layer edges are positioned **to the pixel**, not quantised to the snap grid. A gate that has to open *just before* the note it gates is a completely ordinary thing to want, and hard quantisation makes it unexpressible — you can only land exactly on the beat or a whole snap step away from it.
+
+Free positioning alone, though, makes hitting a beat exactly annoying. So a grid marker is **sticky only on the side the drag is leaving it from**:
+
+```
+dragging right:   ...free approach...  |MARKER<- 6 px sticky ->   free again...
+dragging left:    ...free again   <- 6 px sticky ->MARKER|  ...free approach...
+```
+
+Slide up to a marker and you can stop a hair short of it; cross it and it holds the edge for 6 px, so an exact landing is easy. Snapping the approach side too would put "just before the beat" back out of reach, which is the whole point.
+
+Details:
+
+- **Radius is 6 px, not a fraction of a beat**, so the pull feels identical however far you are zoomed in. Zoomed out far enough that a snap step is under 6 px, the behaviour degenerates to ordinary quantisation — correct, since sub-step precision isn't visible on screen there anyway.
+- **Direction is taken from the live cursor with 1.5 px of hysteresis**, not from the total distance since mouse-down. Reversing mid-drag immediately flips which side is sticky, so you can always back out of a snap; deriving it from the total delta would strand you until you'd travelled back past your starting point.
+- **Both ends of a moving layer are magnetic.** Whichever edge actually caught a marker wins; if both did, the smaller correction wins. Snapping only the leading edge would leave a layer's end unalignable without arithmetic.
+- **The grid is evaluated in absolute beats**, matching the vertical grid lines drawn in the note grid. A track whose start offset isn't a whole snap step would otherwise snap to positions with no line under them.
+- **Snap: Off** (or holding **Alt**) disables the magnetism entirely.
+
+The maths is `SoundShop::magneticSnapBeat` in `effect_regions.h`, kept out of the component so the self-test can exercise it directly (`fxsnap:` assertions).
 
 #### Local beats
 

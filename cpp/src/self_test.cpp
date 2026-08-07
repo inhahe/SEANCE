@@ -1942,6 +1942,84 @@ void testTerrainData(Report& r, const juce::File& dir) {
             }
         }
 
+        // ---- directional magnetic snap for layer edges -----------------------
+        // Layer edges are pixel-precise; a grid marker only grabs an edge on the
+        // side the drag is LEAVING it from, so you can slide right up to a beat
+        // and stop just short of it, but land exactly on it once you cross.
+        // Measured by reinstating each plausible wrong implementation and
+        // rebuilding: the old hard quantiser (round-to-nearest, ignoring dir)
+        // fails 7 of these, and inverting the direction sense (floor/ceil
+        // swapped) fails 9. The dir==0 and snap-off checks survive both, since
+        // those are guard clauses rather than marker maths.
+        {
+            using SoundShop::magneticSnapBeat;
+            const float grid = 1.0f, pull = 0.1f;
+            auto near_ = [](float a, float b) { return std::abs(a - b) < 1e-4f; };
+
+            // Moving right, still short of beat 4: free, so "just before the
+            // downbeat" is reachable.
+            r.check(near_(magneticSnapBeat(3.94f, +1, grid, pull), 3.94f),
+                    "fxsnap: approaching a marker from the left leaves the edge free");
+            // Moving right, just past beat 4: the marker holds it.
+            r.check(near_(magneticSnapBeat(4.06f, +1, grid, pull), 4.0f),
+                    "fxsnap: departing a marker rightwards snaps back onto it");
+            // Moving right, well past: released again.
+            r.check(near_(magneticSnapBeat(4.30f, +1, grid, pull), 4.30f),
+                    "fxsnap: past the pull radius the edge is free again");
+
+            // Mirror image for leftward travel.
+            r.check(near_(magneticSnapBeat(4.06f, -1, grid, pull), 4.06f),
+                    "fxsnap: approaching a marker from the right leaves the edge free");
+            r.check(near_(magneticSnapBeat(3.94f, -1, grid, pull), 4.0f),
+                    "fxsnap: departing a marker leftwards snaps back onto it");
+            r.check(near_(magneticSnapBeat(3.70f, -1, grid, pull), 3.70f),
+                    "fxsnap: past the pull radius leftwards the edge is free again");
+
+            // The two remaining approach/departure pairs, at a non-integer grid,
+            // to prove nothing is hard-coded to whole beats.
+            r.check(near_(magneticSnapBeat(1.97f, +1, 0.25f, 0.05f), 1.97f),
+                    "fxsnap: quarter-beat grid, rightward approach stays free");
+            r.check(near_(magneticSnapBeat(2.03f, -1, 0.25f, 0.05f), 2.03f),
+                    "fxsnap: quarter-beat grid, leftward approach stays free");
+            r.check(near_(magneticSnapBeat(2.03f, +1, 0.25f, 0.05f), 2.0f),
+                    "fxsnap: quarter-beat grid, rightward departure snaps");
+            r.check(near_(magneticSnapBeat(1.97f, -1, 0.25f, 0.05f), 2.0f),
+                    "fxsnap: quarter-beat grid, leftward departure snaps");
+
+            // dir 0 (gesture hasn't moved yet) and snap-off are both no-ops -
+            // the latter is what Alt-drag and the "Snap: Off" button produce.
+            r.check(near_(magneticSnapBeat(4.02f, 0, grid, pull), 4.02f),
+                    "fxsnap: no travel direction yet means no snap");
+            r.check(near_(magneticSnapBeat(4.02f, +1, 0.0f, pull), 4.02f),
+                    "fxsnap: snapping off (Alt / Snap:Off) leaves the edge free");
+
+            // A pull radius wider than a grid step (zoomed out until a step is
+            // under 6 px) degenerates to "always snap to the departing marker",
+            // and crucially still never reaches past that marker's neighbour.
+            r.check(near_(magneticSnapBeat(3.5f, +1, grid, 2.0f), 3.0f)
+                    && near_(magneticSnapBeat(3.99f, +1, grid, 2.0f), 3.0f)
+                    && near_(magneticSnapBeat(3.5f, -1, grid, 2.0f), 4.0f),
+                    "fxsnap: an oversized pull radius never reaches past one grid step");
+
+            // The `snapped` out-flag has to distinguish "landed on the marker"
+            // from "left alone", including the case where the input already sat
+            // exactly on a marker so the returned value is unchanged either way.
+            // Moving a layer picks between its two edges with this flag; using
+            // "did the value change" instead makes a zero correction look like
+            // no snap, so the free edge always wins and the layer never aligns.
+            bool hit = true;
+            magneticSnapBeat(3.5f, +1, grid, 0.1f, &hit);
+            r.check(!hit, "fxsnap: out-flag is false when no marker catches the edge");
+            magneticSnapBeat(4.05f, +1, grid, 0.1f, &hit);
+            r.check(hit, "fxsnap: out-flag is true when a marker catches the edge");
+            hit = false;
+            magneticSnapBeat(4.0f, +1, grid, 0.1f, &hit);
+            r.check(hit, "fxsnap: an edge already on a marker still reports a snap");
+            hit = true;
+            magneticSnapBeat(4.05f, 0, grid, 0.1f, &hit);
+            r.check(!hit, "fxsnap: out-flag is false when snapping is disabled");
+        }
+
         // ---- hosted-plugin param automation lanes: round-trip + helpers ------
         // Plugin params have no Param row, so their recorded lanes live in
         // Node::pluginParamAutomation (normalized 0..1) and serialize via

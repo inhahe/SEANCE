@@ -1580,6 +1580,27 @@ float PianoRollComponent::fxXToBeat(float x) const {
     return scrollBeat + ((x - gridX) / gridW) * visibleBeats - absOffset;
 }
 
+float PianoRollComponent::fxBeatsPerPixel() const {
+    if (!node) return 1.0f;
+    float gridW = std::max(1.0f, (float)getWidth() - KEY_WIDTH - SCROLLBAR_SIZE);
+    float absTotalBeats = graph.getTimelineBeats(*node) + node->absoluteBeatOffset;
+    float visibleBeats = std::max(1.0f, absTotalBeats / std::max(state.hZoom, 0.1f));
+    return visibleBeats / gridW;
+}
+
+float PianoRollComponent::fxMagneticSnap(float localBeat, int dir, bool* snapped) const {
+    if (snapped) *snapped = false;
+    if (!node) return localBeat;
+    // Snap in ABSOLUTE beats: that's where the vertical grid lines the user is
+    // aiming at are drawn (see the beat-grid loop in paint()). A track whose
+    // offset isn't a whole grid step would otherwise snap to positions with no
+    // line under them.
+    const float absOffset = node->absoluteBeatOffset;
+    const float pull = FX_SNAP_PULL_PX * fxBeatsPerPixel();
+    return SoundShop::magneticSnapBeat(localBeat + absOffset, dir, state.snap, pull, snapped)
+           - absOffset;
+}
+
 // Resolve a region's display colour: explicit colour, else its group's, else a
 // palette entry keyed on the link id, else grey.
 static juce::Colour fxRegionColour(const NodeGraph& graph, const EffectRegion& r) {
@@ -2138,6 +2159,9 @@ void PianoRollComponent::mouseDown(const juce::MouseEvent& e) {
             fxDragStart0 = r.startBeat;
             fxDragEnd0 = r.endBeat;
             fxDragChanged = false;
+            // No direction yet, so the first few pixels of travel are unsnapped.
+            fxDragDir = 0;
+            fxDragDirLastX = e.position.x;
         }
         return;
     }
@@ -2456,31 +2480,65 @@ void PianoRollComponent::mouseDrag(const juce::MouseEvent& e) {
 
     // Effect-layer move/resize. Live-updates the region; one undo snapshot is
     // pushed on release (mouseUp), matching the track-retime gesture below.
-    // Snap unless Alt is held.
+    // Positions are pixel-precise, with a directional magnetic pull toward grid
+    // markers on the departing side only (fxMagneticSnap); Alt turns it off.
     if (fxDragMode != FxDrag::None) {
         if (fxDragIdx < 0 || fxDragIdx >= (int)node->effectRegions.size()) {
             fxDragMode = FxDrag::None;
             return;
         }
         auto& r = node->effectRegions[(size_t)fxDragIdx];
-        const float snap = (!e.mods.isAltDown() && state.snap > 0) ? state.snap : 0.0f;
-        auto quantize = [snap](float b) { return snap > 0 ? std::round(b / snap) * snap : b; };
+
+        // Track travel direction with hysteresis - see fxDragDir in the header
+        // for why it's derived from the live cursor, not the total delta.
+        if (e.position.x > fxDragDirLastX + FX_DIR_HYSTERESIS_PX) {
+            fxDragDir = +1; fxDragDirLastX = e.position.x;
+        } else if (e.position.x < fxDragDirLastX - FX_DIR_HYSTERESIS_PX) {
+            fxDragDir = -1; fxDragDirLastX = e.position.x;
+        }
+        // Alt = fully free, matching every other snap-bearing gesture here.
+        const int dir = e.mods.isAltDown() ? 0 : fxDragDir;
+        auto magnet = [this, dir](float b, bool* hit = nullptr) {
+            return fxMagneticSnap(b, dir, hit);
+        };
+
         const float delta = fxXToBeat(e.position.x) - fxDragGrabBeat;
         // A layer must keep a positive length, so each resize edge is clamped
-        // against the other one rather than being allowed to cross it.
-        const float minLen = snap > 0 ? snap : 0.0625f;
+        // against the other one rather than being allowed to cross it. The
+        // floor is one pixel's worth of beats rather than a grid step: edges are
+        // pixel-precise now, so a grid-sized minimum would be an arbitrary wall
+        // in the middle of the range the user can otherwise reach.
+        const float minLen = std::max(fxBeatsPerPixel(), 1.0e-4f);
 
         float newStart = r.startBeat, newEnd = r.endBeat;
         if (fxDragMode == FxDrag::Move) {
             const float len = fxDragEnd0 - fxDragStart0;
-            newStart = std::max(0.0f, quantize(fxDragStart0 + delta));
+            const float rawStart = fxDragStart0 + delta;
+            // Both ends of a moving layer are magnetic; whichever actually
+            // caught a marker wins, and if both did, the smaller correction.
+            // Snapping only the left edge would make the right edge unalignable
+            // without arithmetic, and a layer's end is just as musically
+            // meaningful as its start. Note the hitL/hitR flags rather than
+            // comparing the results to rawStart: a candidate that did NOT snap
+            // has a correction of exactly zero, so a nearest-correction test
+            // alone would let it beat the one that did.
+            bool hitL = false, hitR = false;
+            const float snapL = magnet(rawStart, &hitL);
+            const float snapR = magnet(rawStart + len, &hitR) - len;
+            if (hitL && hitR)
+                newStart = std::abs(snapL - rawStart) <= std::abs(snapR - rawStart)
+                         ? snapL : snapR;
+            else if (hitL) newStart = snapL;
+            else if (hitR) newStart = snapR;
+            else           newStart = rawStart;
+            newStart = std::max(0.0f, newStart);
             newEnd = newStart + len;
         } else if (fxDragMode == FxDrag::ResizeL) {
-            newStart = juce::jlimit(0.0f, fxDragEnd0 - minLen, quantize(fxDragStart0 + delta));
+            newStart = juce::jlimit(0.0f, fxDragEnd0 - minLen, magnet(fxDragStart0 + delta));
             newEnd = fxDragEnd0;
         } else { // ResizeR
             newStart = fxDragStart0;
-            newEnd = std::max(fxDragStart0 + minLen, quantize(fxDragEnd0 + delta));
+            newEnd = std::max(fxDragStart0 + minLen, magnet(fxDragEnd0 + delta));
         }
         if (newStart != r.startBeat || newEnd != r.endBeat) {
             r.startBeat = newStart;

@@ -175,9 +175,33 @@ private:
     // offset included) so a bar always sits above the notes it gates.
     float fxBeatToX(float localBeat) const;
     float fxXToBeat(float x) const;
+    // Beats spanned by one horizontal pixel, under the same mapping as the two
+    // functions above. Lets the magnetic-snap radius be expressed in pixels so
+    // the pull feels identical at every zoom level.
+    float fxBeatsPerPixel() const;
     // Hit test: index into node->effectRegions, or -1. `edgeOut` reports which
     // part was hit: -1 = left edge, 0 = body, +1 = right edge.
     int  fxRegionAt(juce::Point<float> pos, int* edgeOut = nullptr) const;
+
+    // Directional ("magnetic tail") snap for a layer edge being dragged: layer
+    // edges are pixel-precise, and a grid marker is sticky only on the side the
+    // drag is leaving it from. See SoundShop::magneticSnapBeat in
+    // effect_regions.h for the full rationale and diagram.
+    //
+    // `dir` is the drag's current travel direction (+1 right, -1 left, 0 = not
+    // yet moved -> no snap). `localBeat` is the candidate node-local beat;
+    // returns it snapped, or unchanged. The grid is evaluated in ABSOLUTE beats
+    // because that's where the vertical grid lines the user is aiming at are
+    // drawn - a track whose offset isn't a whole grid step would otherwise snap
+    // to invisible positions. The maths itself lives in SoundShop::
+    // magneticSnapBeat (effect_regions.h) so the self-test can reach it.
+    // `snapped` (optional) reports whether a marker actually caught the value -
+    // needed when two candidate edges compete, see the Move branch in mouseDrag.
+    float fxMagneticSnap(float localBeat, int dir, bool* snapped = nullptr) const;
+    // Radius (px) of the sticky zone on the departing side of a grid marker.
+    // 6 px is wide enough to land on reliably with a mouse but narrow enough
+    // that a deliberate 10 px nudge past a beat stays where you put it.
+    static constexpr float FX_SNAP_PULL_PX = 6.0f;
 
     enum class FxDrag { None, Move, ResizeL, ResizeR };
     FxDrag fxDragMode = FxDrag::None;
@@ -185,6 +209,15 @@ private:
     float  fxDragGrabBeat = 0.0f;   // beat under the cursor at mouseDown
     float  fxDragStart0 = 0.0f, fxDragEnd0 = 0.0f; // range at mouseDown
     bool   fxDragChanged = false;   // true once the range actually moved
+    // Travel direction of the gesture so far, with hysteresis: updated only once
+    // the cursor has moved at least FX_DIR_HYSTERESIS_PX from the last position
+    // that set it. Derived from the live cursor rather than from the total delta
+    // since mouseDown so that reversing mid-drag immediately flips which side of
+    // a marker is sticky - otherwise backing out of a snap would be impossible
+    // until you'd travelled past your starting point.
+    int    fxDragDir = 0;           // +1 right, -1 left, 0 = not moved yet
+    float  fxDragDirLastX = 0.0f;   // cursor x that last set fxDragDir
+    static constexpr float FX_DIR_HYSTERESIS_PX = 1.5f;
 
     float dragStartBeat = 0;
     int dragStartPitch = 0;

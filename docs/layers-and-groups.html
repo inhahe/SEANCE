@@ -31,6 +31,8 @@
 
 <p>Layers show up in the lane as coloured tubes, one row per wire or group, each tube spanning the beats where that routing is switched on.</p>
 
+<p>This works the same on <strong>audio tracks</strong> as on MIDI tracks — both open the same editor, and both have the Effects lane.</p>
+
 <h3>Making your first layer</h3>
 <ol>
   <li><strong>Click the Effects lane.</strong> It expands, giving you room to work. (You can also right-click it directly.)</li>
@@ -42,9 +44,17 @@
 <ul>
   <li><strong>Drag its middle</strong> to slide it earlier or later.</li>
   <li><strong>Drag either end</strong> to make it longer or shorter — the cursor turns into a ↔ arrow when you're on an end.</li>
-  <li>Drags snap to the piano roll's grid. Hold <strong>Alt</strong> to position freely.</li>
+  <li>You can put an edge <em>anywhere</em> — it isn't locked to the grid. But the grid lines are slightly magnetic, so landing exactly on a beat is easy. See below.</li>
   <li><strong>Right-click a tube</strong> to delete it.</li>
 </ul>
+
+<h3>Sticky beats</h3>
+
+<p>Layer edges move freely, pixel by pixel — you can park a gate a hair before a beat, which is often exactly what you want so the effect is already open when the note arrives.</p>
+
+<p>To stop that making beats hard to hit, each grid line grabs an edge <em>on the way out, not on the way in</em>. Slide toward a beat and nothing pulls at you, so you can stop just short of it. Slide <em>past</em> the beat and it holds on for a few pixels — let go there and you're exactly on it. Keep dragging and it lets go.</p>
+
+<p>Drag back the other way and the stickiness flips to the other side of the line, so you can always undo a snap by reversing. Hold <strong>Alt</strong> (or set Snap to <em>Off</em>) if you want no magnetism at all.</p>
 
 <p>When you're finished, collapse the lane back to its thin ribbon: press <strong>Escape</strong>, click the <strong>▾ Effects</strong> caption on the left, or right-click → <em>Done editing</em>.</p>
 

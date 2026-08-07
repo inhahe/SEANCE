@@ -5,6 +5,35 @@ top. When something is fixed, delete the entry (git history is the archive).
 
 ---
 
+## FLAKY (unidentified): one self-test failed once and never again
+
+**Found:** 2026-08-07, on the first `--self-test` run immediately after a
+rebuild (the Effects-lane magnetic-snap work).
+
+The summary read `PASSED: 1273 / FAILED: 1 / RESULT: FAILURES PRESENT`, but the
+`[FAIL]` line had already scrolled past the `tail -20` I was using, so **which**
+assertion failed was never captured. Every subsequent run — 12 of them, both
+against the reused `build/selftest_out` and against a freshly created output
+directory — reported `PASSED: 1274 / FAILED: 0`.
+
+So there is a test somewhere in the suite that fails roughly 1 run in 13 under
+some condition I could not reproduce. The post-build timing is the only thing
+that distinguished the failing run, which points at something environmental
+(antivirus still holding a just-written file, an audio-device probe racing
+device enumeration, a wall-clock/timing-sensitive assertion) rather than at the
+snap code — the snap assertions were among the 1273 that passed.
+
+*Proper fix:* make the suite self-reporting on failure rather than relying on
+scrollback. Two cheap changes: (1) have the runner re-print every `[FAIL]` line
+in the `=== Summary ===` block, so a truncated log still identifies the culprit;
+(2) log a wall-clock timestamp per test so a timing-sensitive one is obvious in
+the failing run. Then just run the suite in a loop until it trips again.
+
+**Do not treat this as benign.** A test that fails 1 run in 13 is either a real
+race in the code under test or a real race in the test, and both matter.
+
+---
+
 ## CLEANUP: delete the now-unused `cpp/third_party/rubberband` directory
 
 **Found:** 2026-08-05, finishing the Rubber Band removal.
@@ -2266,9 +2295,20 @@ note grid shifts automatically:
   you have already succeeded. Click to expand into an editor, Escape / the
   chevron caption / right-click -> *Done editing* to collapse.
 - **Direct manipulation**: layers render as shaded gradient tubes in their
-  wire/group colour and support drag-to-move and edge-drag-to-resize, snapped
-  to the grid (Alt overrides), committing one `commitSnapshot()` per gesture.
-  Right-click a tube to delete it.
+  wire/group colour and support drag-to-move and edge-drag-to-resize,
+  committing one `commitSnapshot()` per gesture. Right-click a tube to delete
+  it. Edges are **pixel-precise with directional ("magnetic tail") snapping**
+  (`SoundShop::magneticSnapBeat` in `effect_regions.h`): a grid marker is
+  sticky only on the side the drag is leaving it from, so you can stop a hair
+  short of a beat but still land exactly on it once you cross. The earlier
+  hard quantiser made "just before the beat" - the natural place for a gate
+  that has to be open by the time the note arrives - unexpressible. Alt still
+  overrides. Covered by `fxsnap:` assertions in `self_test.cpp` (measured: the
+  old quantiser fails 7 of them, an inverted direction sense fails 9).
+- **The lane is not MIDI-only.** Audio and MIDI timelines both open
+  `PianoRollComponent`, and the lane, `TimeGateProcessor` and the `[FxRegion]`
+  serialisation are all node-type agnostic, so audio tracks gate sends exactly
+  the way MIDI tracks do. Verified in the GUI on a live `AudioTimeline`.
 - **The marker collision is gone** because the in-grid bar painter was deleted
   outright; layers no longer draw at y = 0 over marker flags and labels.
 - **Regions now track the track.** `TimeGateProcessor` compares against the

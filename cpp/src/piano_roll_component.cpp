@@ -4059,6 +4059,7 @@ void PianoRollComponent::showEmptyMenu() {
                         if (lastClickBeat >= r.startBeat && lastClickBeat <= r.endBeat) {
                             node->effectRegions.erase(node->effectRegions.begin() + i);
                             graph.dirty = true;
+                            graph.commitSnapshot("Delete effect region");
                             break;
                         }
                     }
@@ -4075,6 +4076,7 @@ void PianoRollComponent::showEmptyMenu() {
                         region.color = grp->color;
                     node->effectRegions.push_back(region);
                     graph.dirty = true;
+                    graph.commitSnapshot("Add effect region");
                 } else if (result >= 6000) {
                     // Add effect region for an individual link
                     int linkId = result - 6000;
@@ -4087,6 +4089,7 @@ void PianoRollComponent::showEmptyMenu() {
                     region.color = getDistinctColor(linkId);
                     node->effectRegions.push_back(region);
                     graph.dirty = true;
+                    graph.commitSnapshot("Add effect region");
                 }
                 break;
         }

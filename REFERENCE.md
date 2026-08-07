@@ -1872,9 +1872,13 @@ Lets you mark a wire as **active only during certain beat ranges** — the routi
 
 A **layer** is one time range during which one specific cable is active. Stored on `Node::effectRegions`. Outside the region the wire is muted; at the region edges the wire crossfades to/from silence to prevent clicks.
 
-Create one via right-click on a wire → **Time-gate…**, then drag in the piano roll layer bar area to set start/end. The region is tied to that specific wire only.
+Create one by opening the track's piano roll, right-clicking at the beat where the layer should start, and choosing **Effect Regions →** *(a group, or a `Source > Destination` wire)*. The new layer starts at the clicked beat (snapped to the current grid) and runs **4 beats**. Right-click inside an existing layer to get **Effect Regions → Delete Effect Region at Cursor**. The region is tied to that specific wire (or group) only.
 
-Each layer is colored to match its wire (or its effect group) so you can read routing at a glance.
+Each layer is colored to match its wire (or its effect group) so you can read routing at a glance. Layers are drawn as flat stacked bars flush with the top of the piano-roll grid — bottom bar processes first, top bar last — each labelled with the group name or destination node name when the bar is wider than 40 px.
+
+> **Discoverability gap (open).** The `Effect Regions` submenu is the *only* entry point, it is not signposted anywhere in the graph view, and the submenu lists every wire in the project rather than only those reaching this track. There is also no drag-to-resize: a layer is fixed at 4 beats and can only be deleted and re-made. Tracked in `known-issues.md`.
+
+Layers are persisted per node as `[FxRegion]` sections inside the owning `[Node]` block (`linkId`, `groupId`, `start`, `end`, `color`), and are covered by undo — adding or deleting one commits a snapshot.
 
 ### Effect groups
 

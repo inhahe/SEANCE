@@ -533,6 +533,20 @@ bool ProjectFile::writeProject(std::ostream& f, NodeGraph& graph,
             writeInt(f, "lane", comp.takeLaneIdx);
             writeFloat(f, "crossfade", comp.crossfadeBeats);
         }
+
+        // Time-gated effect regions (the colored layer bars above the notes in
+        // the piano roll). These were historically not serialized at all, which
+        // meant a region vanished on save/load AND was silently wiped by any
+        // undo step (undo snapshots go through this same writer). Emitted per
+        // node so they ride along with the track they gate.
+        for (auto& region : node.effectRegions) {
+            f << "[FxRegion]\n";
+            writeInt(f, "linkId", region.linkId);
+            writeInt(f, "groupId", region.groupId);
+            writeFloat(f, "start", region.startBeat);
+            writeFloat(f, "end", region.endBeat);
+            writeInt(f, "color", (int)region.color);
+        }
     }
 
     // Save links
@@ -699,6 +713,8 @@ bool ProjectFile::readProject(std::istream& f, NodeGraph& graph, PluginHost* plu
                     curNode->takeLanes.back().clips.push_back({});
             } else if (section == "[Comp]") {
                 if (curNode) curNode->compSegments.push_back({});
+            } else if (section == "[FxRegion]") {
+                if (curNode) curNode->effectRegions.push_back({});
             } else if (section == "[Link]") {
                 graph.links.push_back({});
             } else if (section == "[Marker]") {
@@ -1089,6 +1105,14 @@ bool ProjectFile::readProject(std::istream& f, NodeGraph& graph, PluginHost* plu
             else if (key == "end") comp.endBeat = std::stof(val);
             else if (key == "lane") comp.takeLaneIdx = std::stoi(val);
             else if (key == "crossfade") comp.crossfadeBeats = std::stof(val);
+        }
+        else if (section == "[FxRegion]" && curNode && !curNode->effectRegions.empty()) {
+            auto& fr = curNode->effectRegions.back();
+            if (key == "linkId") fr.linkId = std::stoi(val);
+            else if (key == "groupId") fr.groupId = std::stoi(val);
+            else if (key == "start") fr.startBeat = std::stof(val);
+            else if (key == "end") fr.endBeat = std::stof(val);
+            else if (key == "color") fr.color = (uint32_t)std::stoll(val);
         }
         else if (section == "[Link]" && !graph.links.empty()) {
             auto& l = graph.links.back();

@@ -1744,6 +1744,91 @@ void testTerrainData(Report& r, const juce::File& dir) {
                     "autocascade: per-param bypass suppresses read");
         }
 
+        // ---- time-gated effect regions: save/load AND undo round-trip --------
+        // EffectRegion (the colored "layer" bars above the notes in the piano
+        // roll) was never emitted by writeProject. Because serializeForUndo
+        // shares that same writer, the omission had two compounding effects:
+        // a region silently vanished on save->reload, AND the very next undo
+        // step wiped every region in the project. Both paths are asserted here
+        // so a future writer refactor can't quietly drop them again.
+        // Measured with the serializer removed: regionsAfterSave = 0 and
+        // regionsAfterUndo = 0 (vs 2 and 2 fixed) - i.e. total loss, not a
+        // partial-fidelity bug.
+        {
+            NodeGraph g;
+            int outPin = 0, inPin = 0;
+            {
+                auto& src = g.addNode("MIDI Track", NodeType::MidiTimeline, {},
+                                      { Pin{0, "MIDI", PinKind::Midi, false} });
+                outPin = src.pinsOut[0].id;
+            }
+            {
+                auto& dst = g.addNode("Arpeggiator", NodeType::Effect,
+                                      { Pin{0, "MIDI", PinKind::Midi, true} }, {});
+                inPin = dst.pinsIn[0].id;
+            }
+            g.addLink(outPin, inPin);
+            const int linkId = g.links.empty() ? -1 : g.links[0].id;
+            const int groupId = g.addEffectGroup("Chorus section").id;
+
+            // Two regions on the source track: one gating a bare link, one
+            // gating a whole group. Non-default beats/colour so a "wrote the
+            // struct default back" bug can't pass either.
+            EffectRegion byLink;
+            byLink.linkId = linkId; byLink.startBeat = 8.5f; byLink.endBeat = 12.25f;
+            byLink.color = 0xFF3CB44B;
+            EffectRegion byGroup;
+            byGroup.groupId = groupId; byGroup.startBeat = 16.0f; byGroup.endBeat = 24.0f;
+            byGroup.color = 0xFF911EB4;
+            g.nodes[0].effectRegions = { byLink, byGroup };
+
+            auto checkRegions = [&](NodeGraph& gg, const char* what) {
+                const size_t n = gg.nodes.empty() ? 0 : gg.nodes[0].effectRegions.size();
+                r.checkVal(n == 2, juce::String("fxregion: both regions survive ") + what,
+                           (double)n);
+                if (n != 2) return;
+                auto& a = gg.nodes[0].effectRegions[0];
+                auto& b = gg.nodes[0].effectRegions[1];
+                r.check(a.linkId == linkId && a.groupId == -1,
+                        juce::String("fxregion: per-link region keeps its link id after ") + what);
+                r.check(std::abs(a.startBeat - 8.5f) < 1e-4f
+                        && std::abs(a.endBeat - 12.25f) < 1e-4f,
+                        juce::String("fxregion: per-link region keeps its beat range after ") + what);
+                r.check(a.color == 0xFF3CB44Bu,
+                        juce::String("fxregion: per-link region keeps its colour after ") + what);
+                r.check(b.groupId == groupId && b.linkId == -1,
+                        juce::String("fxregion: group region keeps its group id after ") + what);
+                r.check(std::abs(b.startBeat - 16.0f) < 1e-4f
+                        && std::abs(b.endBeat - 24.0f) < 1e-4f,
+                        juce::String("fxregion: group region keeps its beat range after ") + what);
+                r.check(b.color == 0xFF911EB4u,
+                        juce::String("fxregion: group region keeps its colour after ") + what);
+            };
+
+            // Save -> load.
+            {
+                std::ostringstream oss;
+                ProjectFile::writeProject(oss, g, nullptr, /*includeView*/false,
+                                          /*includeBlobs*/false);
+                NodeGraph g2;
+                std::istringstream iss(oss.str());
+                ProjectFile::readProject(iss, g2, nullptr);
+                checkRegions(g2, "a save/load round-trip");
+                r.check(g2.effectGroups.size() == 1
+                        && g2.effectGroups[0].id == groupId,
+                        "fxregion: the referenced effect group round-trips alongside it");
+            }
+
+            // Undo snapshot -> restore (the path that used to erase them).
+            {
+                std::string snap = ProjectFile::serializeForUndo(g);
+                NodeGraph g3;
+                std::istringstream iss(snap);
+                ProjectFile::readProject(iss, g3, nullptr);
+                checkRegions(g3, "an undo snapshot restore");
+            }
+        }
+
         // ---- hosted-plugin param automation lanes: round-trip + helpers ------
         // Plugin params have no Param row, so their recorded lanes live in
         // Node::pluginParamAutomation (normalized 0..1) and serialize via

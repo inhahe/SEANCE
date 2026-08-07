@@ -44,8 +44,12 @@ struct SFZInstrument {
 
     bool loadFromFile(const std::string& path);
 
-    // Find matching regions for a note-on event
-    std::vector<const SFZRegion*> findRegions(int midiNote, int velocity) const;
+    // Find matching regions for a note-on event, appending them to `out` (which
+    // is cleared first). Out-parameter rather than a return value because the
+    // only caller is a note-on handler on the audio thread, and returning a
+    // vector by value allocated on every note.
+    void findRegions(int midiNote, int velocity,
+                     std::vector<const SFZRegion*>& out) const;
 };
 
 // ==============================================================================
@@ -130,6 +134,26 @@ private:
     static constexpr int MAX_SFZ_VOICES = 32;
     SFZVoice sfzVoices[MAX_SFZ_VOICES];
 
+    // ---- audio-thread scratch (see scratchCapacityBytes) -------------------
+    // TSF renders interleaved stereo into `interleaved`; `regionMatches` holds
+    // the SFZ regions a note-on maps to. Both were locals, so both allocated on
+    // the audio thread - `interleaved` on literally every callback. Sized in
+    // prepareToPlay / loadFile; processBlock only ever writes into them.
+    std::vector<float>            interleaved;
+    std::vector<const SFZRegion*> regionMatches;
+
+public:
+    // Total bytes reserved by the audio-thread scratch above. The self-test
+    // asserts this doesn't grow across a render, which is how we prove
+    // processBlock is allocation-free without hooking global operator new
+    // (SEANCE hosts third-party VST3s, whose allocations a global hook would
+    // also catch).
+    size_t scratchCapacityBytes() const {
+        return interleaved.capacity() * sizeof(float)
+             + regionMatches.capacity() * sizeof(const SFZRegion*);
+    }
+
+private:
     void loadFile();
 };
 

@@ -4,6 +4,8 @@
 #include "granular_freeze.h"   // GrainFreezeVoice - shared freeze-mode reader
 #include "warp.h"              // WarpOp / WarpMethod - frame-scope shape bending
 #include "wavetable_frame.h"   // IWavetableFrame - cached frame for live re-bake
+#include "wavelet.h"           // WaveletFilter / WaveletWorkspace - scatter blend
+#include "fft_util.h"          // FFT / FFTLadder - AdditiveBank partial analysis
 #include <juce_audio_processors/juce_audio_processors.h>
 #include <vector>
 #include <string>
@@ -371,9 +373,30 @@ struct TraversalParams {
 
 class Traversal {
 public:
-    // Evaluate position at a given time (in beats)
-    std::vector<float> evaluate(const TraversalParams& params, int numDims,
-                                 double beatTime, double bpm, double sampleRate) const;
+    // Evaluate position at a given time (in beats) into `coord`, which is
+    // resized to numDims.
+    //
+    // This takes an out-parameter rather than returning a vector because the
+    // terrain synth calls it once per output SAMPLE - returning by value meant
+    // a heap allocation every sample, which is the single hottest allocation
+    // in the whole synth. Give `coord` capacity once (prepare() / reserve) and
+    // this is allocation-free: resizing to <= capacity is guaranteed by the
+    // standard not to reallocate.
+    void evaluate(std::vector<float>& coord,
+                  const TraversalParams& params, int numDims,
+                  double beatTime, double bpm, double sampleRate) const;
+
+    // Pre-size the physics scratch for up to `maxDims` dimensions so the
+    // Physics traversal mode doesn't allocate the first time it runs on the
+    // audio thread. Call from prepareToPlay().
+    void prepare(int maxDims) const {
+        physPos.reserve((size_t) std::max(0, maxDims));
+        physVel.reserve((size_t) std::max(0, maxDims));
+    }
+
+    size_t scratchCapacityBytes() const {
+        return (physPos.capacity() + physVel.capacity()) * sizeof(float);
+    }
 
 private:
     // Physics state (mutable for simulation stepping)
@@ -412,6 +435,14 @@ enum class TerrainSynthMode {
 // and more accurate to the wavetable, more CPU. 32 is a reasonable default
 // (covers up to ~3.5kHz of harmonics for a low A note at 110Hz).
 inline constexpr int kAdditiveBankMaxPartials = 64;
+
+// Expected upper bound on terrain dimensionality, used only to pre-reserve the
+// audio-thread coordinate scratch in prepareToPlay. It matches the 8 axes
+// TraversalParams carries for Lissajous mode, which is the most dimensions any
+// traversal can actually drive. This is a hint, not a limit: Terrain::dims is a
+// plain vector, so a terrain with more dimensions still works - its first block
+// grows the scratch once, and every block after that is allocation-free again.
+inline constexpr int kMaxTerrainDims = 8;
 
 // Classification of what kind of source feeds a TerrainSynthProcessor.
 // Different sources make different synthesis modes meaningful:
@@ -589,6 +620,22 @@ private:
     // to coord 0. Mirror of WavetableDoc::effectiveAxes(). For scatter this is
     // all dims (when traversable) or empty (single frame, normalized blend).
     std::vector<int> wtEffectiveAxes;
+
+    // Display names of the Position params, one per entry of wtEffectiveAxes:
+    // "Position" for a lone traversable axis, "Position 1".."Position K"
+    // otherwise (matching syncPositionParams()). Cached because four different
+    // audio-thread call sites used to rebuild these strings from scratch every
+    // time they needed a Position value - one of them per output SAMPLE, per
+    // axis. Rebuilt by rebuildPositionNames() wherever wtEffectiveAxes is set.
+    std::vector<std::string> wtPositionNames;
+    void rebuildPositionNames();
+
+    // Resolve the live Position params into `out`, indexed by GEOMETRIC axis
+    // (so it lines up with the frame positions stored on scatter dots and
+    // granular/inharmonic side-table entries). Axes with no Position param -
+    // i.e. inert single-cell axes - are left at `defaultVal`. `out` is resized
+    // to nDims; give it capacity first and this is allocation-free.
+    void fillPositionParams(std::vector<float>& out, int nDims, float defaultVal) const;
 
     // ---- Per-frame live morph re-bake (per-frame morph chains + #88) ----
     //
@@ -789,7 +836,7 @@ private:
     // while its other coordinates pin to the dot's center, and a multi-dot
     // scatter exposes one knob per dimension as before. Used by both the
     // block-start cycle blend and updateGranularWeights so they agree.
-    std::vector<float> scatterQueryPosition();
+    void scatterQueryPosition(std::vector<float>& qpos) const;
 
     // Compute per-granular-frame morph weights for an arbitrary Position
     // vector into `out` (resized to wtGranularFrames.size()). updateGranular-
@@ -808,9 +855,23 @@ private:
     // uses the N-linear hat-function product. computeGranularWeights and
     // computeInharmonicWeights are thin wrappers that gather their entries'
     // positions and call this, so the two layers morph identically.
+    //
+    // `entryCount` is passed separately because entryPositions is reused
+    // audio-thread scratch (granPositionsScratch / inhPositionsScratch) that
+    // only ever grows - it can hold more rows than there are live entries, so
+    // its .size() is not the entry count.
     void computeSideTableWeights(const std::vector<std::vector<float>>& entryPositions,
+                                 size_t entryCount,
                                  const std::vector<float>& pos,
                                  std::vector<float>& out);
+
+    // Reused row storage for the two gather-then-weight wrappers above, plus
+    // the Position query buffers they feed. Grow-only; see gatherEntryPositions.
+    std::vector<std::vector<float>> granPositionsScratch;
+    std::vector<std::vector<float>> inhPositionsScratch;
+    std::vector<float>              granPosScratch;
+    std::vector<float>              inhPosScratch;
+    std::vector<float>              scatterQposScratch;
 
     // Allocate (stealing the quietest if all busy) and start a voice for a
     // note-on. Returns the voice index, or -1 if none could be allocated.
@@ -948,6 +1009,65 @@ private:
     // node - see Node::reachesOutput). Sized to the block in processBlock;
     // never read across blocks. Avoids a per-block heap allocation.
     std::vector<float> auditionScratch;
+
+    // ---- audio-thread scratch (see scratchCapacityBytes) --------------------
+    //
+    // Everything below is reused in place by processBlock so the render loop
+    // never calls the allocator. malloc can block on a global lock, which
+    // shows up as a dropout; it's also an automatic fail under pluginval
+    // strictness 10. All of these are grown to their worst case in
+    // prepareToPlay / ensureScatterScratch and only ever resized DOWN inside
+    // processBlock (a resize to <= capacity is guaranteed not to reallocate).
+    //
+    // Traversal coordinate for the current sample, plus the two derived
+    // coordinates the SamplePerPoint path needs. These used to be
+    // `auto coord = traversal.evaluate(...)`, `auto pitchCoord = coord` and
+    // `auto coordB = pitchCoord` - i.e. up to three heap allocations per
+    // sample per voice, 16 voices deep.
+    std::vector<float> coordScratch;
+    std::vector<float> pitchCoordScratch;
+    std::vector<float> grainCoordScratch;
+    // coord[1..] for the grid-occupancy lookup (was a per-sample range-ctor).
+    std::vector<float> occCoordScratch;
+    // Wavetable Position param values, one per traversable axis, read ONCE per
+    // block instead of per sample. The old code rebuilt a std::string
+    // ("Position 3") and did a linear name scan over node.params for every
+    // axis of every sample.
+    std::vector<float> wtPositionScratch;
+
+    // Scatter-blend scratch (wavetable scatter mode, once per block).
+    std::vector<float> scatterWeights;   // per frame
+    std::vector<float> scatterDists;     // per frame
+    std::vector<float> scatterBlended;   // wavelet coefficient accumulator
+    std::vector<float> scatterCoeffs;    // per-frame DWT working buffer
+    WaveletFilter      scatterFilter;    // db2, fetched once (returns by value)
+    WaveletWorkspace   scatterWs;        // dwt/idwt scratch - the no-workspace
+                                         // overloads construct one per call
+    int scatterFilterReady = 0;          // 0 until scatterFilter is populated
+
+    // AdditiveBank partial analysis (refreshPartialBank, once per block in that
+    // mode). The FFT comes from a prebuilt ladder because the cycle length -
+    // and therefore the transform size - depends on the terrain, which a script
+    // reload can change mid-session; constructing an FFT per call rebuilt its
+    // twiddle and bit-reversal tables from scratch every block.
+    FFTLadder              pbFFTs;
+    std::vector<float>     pbCycle;   // the 1D cycle pulled out of the terrain
+    std::vector<FFT::cplx> pbSpec;    // its spectrum
+
+    // Grow the scatter scratch to fit `nFrames` frames of `ts` samples. Called
+    // from processBlock, but only ever allocates when the scatter table itself
+    // changed shape (a message-thread edit), never in steady state.
+    void ensureScatterScratch(int nFrames, int ts);
+
+public:
+    // Total bytes reserved by the audio-thread scratch above. Used by the
+    // self-test to assert that a parameter sweep doesn't grow any of it, which
+    // is how we prove processBlock is allocation-free without hooking global
+    // operator new (SEANCE hosts third-party VST3s, so a global hook would
+    // catch their allocations too).
+    size_t scratchCapacityBytes() const;
+
+private:
 
     // Snapshot of the incoming control-signal channels (buffer channels 2+:
     // the "Sig X/Y/.." coordinate drivers and the "Pressure" signal pin),

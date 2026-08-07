@@ -1,0 +1,188 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Wavelet Effects — SEANCE</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="wrap">
+<header>
+<h1>Wavelet Effects</h1>
+<nav>
+  <a href="index.html">Home</a>
+  <a href="graph-basics.html">Graph Basics</a>
+</nav>
+</header>
+
+<p>SEANCE has twelve effects that most DAWs simply don't have, all built on the same piece of maths: the <strong>wavelet transform</strong>. You don't need to know the maths to use them, but one idea explains what they're all good at.</p>
+
+<p>Most audio effects analyse sound by chopping it into fixed-length chunks and asking "which frequencies are in this chunk?" That works fine for a held note. It works badly for a drum hit, because a chunk long enough to see a bass note is long enough to blur an attack into mush. Wavelets ask a different question — they look at low frequencies with long chunks and high frequencies with short ones, automatically. The practical result is that these effects can <strong>work on the sustained part of a sound and leave the attack alone</strong>, or the exact opposite.</p>
+
+<p>You'll find them all in one run in the node right-click menu, under <em>Effects</em>, between <em>Ring Modulator</em> and <em>SMS</em>. Wire audio into one exactly like any other effect.</p>
+
+<h2>The two knobs they all share</h2>
+
+<p>Before the recipes, two controls that mean the same thing on nearly every node in the family:</p>
+
+<ul>
+  <li><strong>Mix</strong> — dry/wet blend. 0 = no effect at all, 1 = fully processed. If a wavelet effect sounds too extreme, the first thing to try is pulling Mix back to 0.3–0.5 and blending the original back underneath.</li>
+  <li><strong>Levels</strong> — how many frequency bands the sound is split into before processing. This is the "resolution" control, and it works from the top down: each extra level splits off another octave <em>below</em> the previous one. At 4 levels the bands land roughly at 12–24 kHz, 6–12 kHz, 3–6 kHz, 1.5–3 kHz, with everything below 1.5 kHz left over in one lump. Raise Levels to get finer control in the bass; lower it for a coarser, cheaper effect. 4 or 5 is a sensible default and you can usually leave it there.</li>
+</ul>
+
+<p>Every one of these effects also has a <strong>neutral setting</strong> — a knob position where it provably hands your audio back untouched, with no colouration at all. That matters when you're dialling one in: park it at neutral, start playback, then move one knob and listen to what changes. The neutral position of each node is listed in REFERENCE.md, and the most useful ones are called out below.</p>
+
+<h2>Recipe: make a drum loop drier and punchier</h2>
+
+<p>Use <strong>Transient/Sustain Split</strong>. It separates the <em>attack</em> of a sound — the stick, the pick, the consonant — from the <em>body</em> that rings on afterwards, and gives you a gain knob for each.</p>
+
+<ol>
+  <li>Add <em>Effects → Transient/Sustain Split</em> and wire your drums through it.</li>
+  <li>Start with <strong>Transient</strong> and <strong>Sustain</strong> both at 1.0 — this is the neutral setting, so you'll hear no change at all. Good; that's your baseline.</li>
+  <li>Pull <strong>Sustain</strong> down toward 0.4. The room and the ring disappear and the kit gets tight and close.</li>
+  <li>If the hits now feel small, push <strong>Transient</strong> up past 1.0 to bring the attacks back forward.</li>
+</ol>
+
+<p>Going the other way is just as useful: drop <strong>Transient</strong> to near zero on a guitar or a plucked synth and what's left is the soft pad that was hiding underneath it — a completely different instrument out of the same recording. <strong>Threshold</strong> decides where the line between "attack" and "body" is drawn; lower values count more of the sound as attack.</p>
+
+<h2>Recipe: clean up a noisy recording without killing the attack</h2>
+
+<p>Use <strong>Wavelet Denoiser</strong>. Ordinary noise gates and spectral cleaners have to pick a window length, and anything shorter than that window gets smeared — which is why de-noised drums often sound soft. This one doesn't have that problem.</p>
+
+<ol>
+  <li>Add <em>Effects → Wavelet Denoiser</em> after the noisy source.</li>
+  <li>Raise <strong>Threshold</strong> slowly from 0. The hiss drops away first.</li>
+  <li>Stop as soon as sustained notes start to sound clipped or gated at their tails — that's the point where you've started eating signal.</li>
+  <li>If you overshoot and it sounds unnatural, leave Threshold where it is and pull <strong>Mix</strong> down to about 0.7 instead. Blending a little of the original noise back in almost always sounds more natural than a perfectly silent background.</li>
+</ol>
+
+<p>Threshold = 0 is the neutral setting here.</p>
+
+<h2>Recipe: add a sub-octave to a bassline</h2>
+
+<p>Use <strong>Octave Shift</strong>. It moves pitch by whole octaves without resampling or time-stretching, so the timing and the attack stay exactly where they were.</p>
+
+<ol>
+  <li>Add <em>Effects → Octave Shift (wavelet)</em> after your bass.</li>
+  <li>Set <strong>Shift</strong> to −1 (one octave down). It's already the default.</li>
+  <li>Leave <strong>Mix</strong> around 0.4–0.5. You want the sub sitting <em>underneath</em> the original, not replacing it — that's why the default is halfway rather than fully wet.</li>
+</ol>
+
+<p>Shift = 0 turns the node off entirely. Note this one only does whole octaves; for musical intervals use Independent Pitch Shift (below) or the ordinary Pitch Shifter node.</p>
+
+<h2>Recipe: pitch a whole drum loop without it going soft</h2>
+
+<p>Use <strong>Independent Pitch Shift</strong>. Pitch-shifting a full loop with a normal shifter smears the hits and everything loses its punch. This node splits the transients out first, shifts only the melodic content, and puts the untouched hits back on top.</p>
+
+<ol>
+  <li>Add <em>Effects → Independent Pitch Shift</em>.</li>
+  <li>Set <strong>Semitones</strong> to whatever interval you want.</li>
+  <li>If the drums still feel like they've lost weight, raise <strong>Trans Gain</strong> above 1.0 to push the attacks back out in front.</li>
+  <li><strong>Threshold</strong> controls how much of the sound counts as "a transient" and therefore stays unshifted. Raise it if too much melodic content is being left behind at the original pitch.</li>
+</ol>
+
+<p>This node adds about 32 ms of delay (it needs to look at a chunk of sound to do the shift). SEANCE compensates for that automatically, so parallel paths stay in time — you don't have to do anything about it.</p>
+
+<h2>Recipe: make a synth talk</h2>
+
+<p>Use <strong>Wavelet Vocoder</strong>. The classic robot-voice trick: a pad or a saw takes on the shape of a voice.</p>
+
+<ol>
+  <li>Add <em>Effects → Wavelet Vocoder</em>.</li>
+  <li>Wire the sound you want to <em>hear</em> — a pad, a saw, a string section — into <strong>Audio In</strong>. This is the <em>carrier</em>.</li>
+  <li>Wire the sound you want it to <em>sound like</em> — a voice, a drum loop, anything with a strong rhythm or articulation — into the <strong>Modulator</strong> pin.</li>
+  <li>Play the carrier. It now follows the modulator's shape.</li>
+</ol>
+
+<p>Two things to know. Nothing wired into <strong>Modulator</strong> means the node just passes your audio through unchanged, so a silent-looking vocoder is usually an unwired one. And the output is <strong>mono</strong>, so put any stereo widening <em>after</em> this node, not before it.</p>
+
+<p><strong>Bands</strong> is the intelligibility knob: fewer bands is coarser and more robotic, more bands is clearer. The carrier matters more than people expect — a harmonically rich, continuous sound (saw waves, a bright pad) vocodes well; a sine wave barely works at all, because there's nothing in most of the bands for the modulator to shape.</p>
+
+<h2>Recipe: pitch a voice up without the chipmunk effect</h2>
+
+<p>Use <strong>Formant Pitch Shift</strong>. When you pitch a voice up normally, the resonances of the singer's throat move up too, and your brain reads that as "smaller person" — the chipmunk sound. This node moves the pitch and puts the original resonances back where they were.</p>
+
+<ol>
+  <li>Add <em>Effects → Formant Pitch Shift</em>.</li>
+  <li>Set <strong>Semitones</strong> to the interval you want.</li>
+  <li>Leave <strong>Formant Lock</strong> at 0.8 to start. 1.0 is full correction; 0 is no correction at all (a plain, chipmunky shift). A little natural shift usually sounds less processed than perfect correction.</li>
+</ol>
+
+<p>Sweeping <strong>Formant Lock</strong> on its own with Semitones at 0 is worth trying by itself — it morphs the apparent size of the singer without changing a note.</p>
+
+<h2>Recipe: lo-fi only the bass (or only the highs)</h2>
+
+<p>Use <strong>Wavelet Bitcrush</strong>. A normal bitcrusher grits up the whole sound at once. This one lets you pick which frequency bands get crushed.</p>
+
+<ol>
+  <li>Add <em>Effects → Wavelet Bitcrush</em>.</li>
+  <li>Set <strong>Bits</strong> to taste — 16 is neutral (no audible change), 4 is the default, 1–3 is destroyed.</li>
+  <li>Now pick the range with <strong>Band Lo</strong> and <strong>Band Hi</strong>. Band 0 is the lowest band, and the highest band that exists is <em>Levels − 1</em> — so with the default Levels of 4, only bands 0–3 do anything.</li>
+  <li>Band Lo 0 / Band Hi 1 gives crunchy bass under clean highs. Band Lo 2 / Band Hi 3 gives sizzle over a clean low end. The full range is normal all-over lo-fi.</li>
+</ol>
+
+<h2>Recipe: dissolve a sound into a sketch of itself</h2>
+
+<p>Use <strong>Wavelet Complexity</strong>. One knob: how much detail survives. Turn it down and the sound is progressively stripped back to only its strongest features.</p>
+
+<p>Set <strong>Complexity</strong> to 1.0 and nothing happens (that's neutral). Bring it down toward 0.1 and the sound thins into something rough and impressionistic. It's a great automation target — sweep it up across a build so a part gains detail as it arrives, or sweep it down to melt a sound into a texture rather than fading it out.</p>
+
+<h2>Recipe: swell into a hit before it happens</h2>
+
+<p>Use <strong>Asymmetric Filter</strong>. Every normal filter, hardware or software, can only react <em>after</em> something happens, because it can't see the future. This one processes a whole chunk of audio at once, so it can find the attacks first and then shape the sound <em>ahead</em> of them.</p>
+
+<ol>
+  <li>Add <em>Effects → Asymmetric Filter</em>.</li>
+  <li>Start with <strong>Pre Gain</strong> and <strong>Post Gain</strong> both at 1.0 — that's neutral, no change.</li>
+  <li>Raise <strong>Pre Gain</strong> to 2.0 or more: you get a swell rushing <em>into</em> every hit, the reverse-cymbal effect without any reversed audio.</li>
+  <li>Or drop <strong>Pre Gain</strong> below 1.0 for the opposite — the sound ducks out of the way just before each attack, which makes the attack land much harder.</li>
+  <li><strong>Post Gain</strong> shapes what happens behind each hit. Below 1.0 it tightens or gates the tail.</li>
+  <li><strong>Pre-Attack</strong> and <strong>Post-Decay</strong> set how long those two regions last, in milliseconds. Short pre-attack times give a sharp lift right on the edge of the hit; longer ones give a slow swell.</li>
+  <li>If it's picking up too much — every little tick counts as a hit — raise <strong>Sensitivity</strong>. Lower it to catch quieter hits too. It's measured relative to the loudest thing in each chunk, so it doesn't need re-dialling when the track gets louder or quieter.</li>
+</ol>
+
+<p>One limit worth knowing: the node can only look ahead as far as one chunk of audio, so very long Pre-Attack times get capped. If the top of the knob's range stops doing anything, that's why — a smaller audio buffer in <em>Settings → Audio Device…</em> means a shorter cap.</p>
+
+<h2>Recipe: even out a mix band by band, or tilt it brighter</h2>
+
+<p>Use <strong>Wavelet Multiband Comp</strong>. It compresses each frequency band separately, and because the bands come from the wavelet split rather than from crossover filters, they add back together perfectly — none of the phasey quality multiband processing often has.</p>
+
+<ol>
+  <li>Add <em>Effects → Wavelet Multiband Comp</em>.</li>
+  <li>Set <strong>Ratio</strong> to 1 first — neutral, no change — then raise it while listening.</li>
+  <li>Lower <strong>Threshold</strong> until the loudest bands start being pulled down.</li>
+  <li>Use <strong>Low Gain</strong> and <strong>High Gain</strong> as a tilt: Low −4 dB / High +4 dB brightens the whole thing, the reverse warms it.</li>
+  <li>For parallel ("New York") compression, crank Ratio and then pull <strong>Mix</strong> back to around 0.4.</li>
+</ol>
+
+<p>One thing this node doesn't have is attack/release timing — it levels each band per block rather than following an envelope, so it can't pump. For rhythmic pumping, use the ordinary <strong>Compressor</strong> node with a sidechain.</p>
+
+<h2>Recipe: a smooth, grainless wash</h2>
+
+<p>Use <strong>Wavelet Reverb (1/f)</strong>. It isn't a room simulator — there are no delay lines and no early reflections, just a mathematically self-similar tail. That gives it a very smooth, diffuse character that suits pads and textures.</p>
+
+<ul>
+  <li><strong>Color</strong> is the interesting knob: 0 is bright and hissy, 1 (the default) is natural, 2 is dark and rounded, 3 is very dark.</li>
+  <li><strong>Decay</strong> sets how much survives. Note the tail is short by design — under a fifth of a second — so this is a bloom, not a cathedral.</li>
+  <li>For an actual room, use the <a href="convolution.html">Convolution Filter</a> with a real impulse response instead.</li>
+</ul>
+
+<p>Pressing <strong>Stop</strong> cuts the tail immediately rather than letting it ring on.</p>
+
+<h2>If something sounds wrong</h2>
+
+<ul>
+  <li><strong>Nothing is happening.</strong> Check <strong>Mix</strong> isn't at 0, and check you're not sitting on the node's neutral setting (Ratio 1 on the compressor, Bits 16 on the bitcrush, Shift 0 on the octave shifter, Complexity 1.0, both gains at 1.0 on Transient Split and Asymmetric Filter). On the Vocoder, check the <strong>Modulator</strong> pin is actually wired — without it the node passes audio straight through.</li>
+  <li><strong>It's gone mono.</strong> The Vocoder outputs mono by design. Put any stereo processing after it.</li>
+  <li><strong>There's a faint clicking or a rough edge at extreme settings.</strong> These effects work a chunk of audio at a time, and very aggressive settings can leave a seam where the chunks meet. Back the offending knob off, or pull Mix down.</li>
+  <li><strong>The effect got quieter or louder than expected.</strong> Several of these change the total energy of the sound (the denoiser removes some, the transient split can add some). Put a Limiter before your Master Out while you experiment.</li>
+</ul>
+
+<p>For the exact parameter ranges, the frequency each band covers, which wavelet family each node uses, and the full list of neutral settings, see the <strong>Wavelet effects</strong> section of REFERENCE.md in the SEANCE project folder.</p>
+
+<footer>
+<a href="index.html">← Back to index</a>
+</footer>
+</div>
+</body>
+</html>

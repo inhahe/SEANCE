@@ -61,13 +61,19 @@ double NodeGraph::contentEndBeats() const {
     // Exact end of the last clip across all timeline nodes with clips, NOT
     // rounded up to a bar (so it can land mid-bar). Empty timelines are
     // skipped so a project with no clips returns 0 (= no end).
+    //
+    // Clip beats are node-local, so a track nested under another track (audio
+    // or MIDI) plays absoluteBeatOffset beats later than its clips claim. That
+    // offset has to be added here or the song would end -- and an export would
+    // stop -- before a nested track's tail had played.
     double maxEnd = 0.0;
     for (const auto& n : nodes) {
         if (n.type != NodeType::AudioTimeline &&
             n.type != NodeType::MidiTimeline) continue;
         if (n.clips.empty()) continue;
         for (const auto& c : n.clips)
-            maxEnd = std::max(maxEnd, (double) (c.startBeat + c.lengthBeats));
+            maxEnd = std::max(maxEnd,
+                (double) (n.absoluteBeatOffset + c.startBeat + c.lengthBeats));
     }
     return maxEnd;
 }
@@ -139,6 +145,17 @@ void NodeGraph::addLink(int outPin, int inPin) {
     dirty = true;
 }
 
+Node& NodeGraph::addAudioTrack(const std::string& name, Vec2 pos) {
+    auto& n = addNode(name, NodeType::AudioTimeline,
+        { Pin{0, "Audio In", PinKind::Audio, true} },   // recording / monitoring
+        { Pin{0, "Audio", PinKind::Audio, false} }, pos);
+    n.clips.push_back({"Clip 1", 0, 4, juce::Colours::forestgreen.getARGB()});
+    n.params.push_back({"Input Channel", -1.0f, -1.0f, 31.0f});  // -1 = none, 0-31 = channel
+    n.params.push_back({"Volume", 1.0f, 0.0f, 1.0f});
+    n.params.push_back({"Pan", 0.0f, -1.0f, 1.0f});
+    return n;
+}
+
 Node* NodeGraph::findNode(int id) {
     for (auto& n : nodes)
         if (n.id == id) return &n;
@@ -150,11 +167,14 @@ Node& NodeGraph::createGroup(const std::string& name, Vec2 pos) {
 }
 
 // Is `ancestorId` somewhere in `nodeId`'s parent chain? Used to refuse
-// parent/child links that would form a cycle. Depth-bounded so a pre-existing
-// corrupt cycle can't hang the walk.
+// parent/child links that would form a cycle. A `visited` set makes the walk
+// terminate on any pre-existing corrupt cycle (each node is examined at most
+// once), so there is no arbitrary cap on how deeply timelines/groups may nest.
 bool NodeGraph::isAncestorOf(int ancestorId, int nodeId) {
+    std::set<int> visited;
     int current = nodeId;
-    for (int depth = 0; current >= 0 && depth < 256; ++depth) {
+    while (current >= 0) {
+        if (!visited.insert(current).second) break; // already seen -> cycle
         auto* n = findNode(current);
         if (!n) break;
         if (n->parentGroupId == ancestorId) return true;
@@ -218,6 +238,17 @@ void NodeGraph::insertTime(float atBeat, float duration, int nodeId) {
         for (auto& param : node.params)
             for (auto& pt : param.automation.points)
                 if (pt.beat >= atBeat) pt.beat += duration;
+        // Time-gated effect layers live in the same local beat space as clips,
+        // so they have to ripple too - otherwise inserting a bar leaves every
+        // layer gating the wrong music.
+        for (auto& region : node.effectRegions) {
+            if (region.startBeat >= atBeat) {
+                region.startBeat += duration;
+                region.endBeat += duration;
+            } else if (region.endBeat > atBeat) {
+                region.endBeat += duration;   // straddles the insert: stretch it
+            }
+        }
     };
 
     if (nodeId >= 0) {
@@ -232,6 +263,12 @@ void NodeGraph::insertTime(float atBeat, float duration, int nodeId) {
         for (auto& m : markers)
             if (m.beat >= atBeat) m.beat += duration;
     }
+    // Markers just moved, so any child timeline anchored to a marker must have
+    // its groupBeatOffset (and the cascading absoluteBeatOffset cache) re-read.
+    // This is what makes anchored children ripple left/right when time is
+    // inserted upstream. Safe to call in single-node scope too: it only rewrites
+    // offsets for anchored nodes and recomputes the derived absolute cache.
+    resolveAnchors();
     dirty = true;
 }
 
@@ -249,6 +286,25 @@ void NodeGraph::deleteTime(float fromBeat, float toBeat, int nodeId) {
             // Shift points after the deleted range
             for (auto& pt : pts)
                 if (pt.beat >= toBeat) pt.beat -= duration;
+        }
+
+        // Time-gated effect layers ripple with the music they gate. A layer
+        // wholly inside the removed span disappears with it; one that straddles
+        // or trails the span is shortened / pulled back.
+        {
+            auto& regs = node.effectRegions;
+            regs.erase(std::remove_if(regs.begin(), regs.end(), [&](const EffectRegion& r) {
+                return r.startBeat >= fromBeat && r.endBeat <= toBeat;
+            }), regs.end());
+            for (auto& r : regs) {
+                auto pull = [&](float b) {
+                    if (b <= fromBeat) return b;
+                    if (b >= toBeat)   return b - duration;
+                    return fromBeat;            // inside the removed span
+                };
+                r.startBeat = pull(r.startBeat);
+                r.endBeat = std::max(r.startBeat, pull(r.endBeat));
+            }
         }
 
         if (node.type != NodeType::MidiTimeline && node.type != NodeType::AudioTimeline) return;
@@ -328,19 +384,29 @@ void NodeGraph::deleteTime(float fromBeat, float toBeat, int nodeId) {
         for (auto& m : markers)
             if (m.beat >= toBeat) m.beat -= duration;
     }
+    // Markers just moved/were removed, so re-resolve any child timeline anchored
+    // to a marker (this makes anchored children ripple left when time is cut
+    // upstream) and refresh the cascading absoluteBeatOffset cache. If a child
+    // was anchored to a marker that fell inside the deleted range, that marker
+    // is gone, resolveMarkerBeat returns <0, and the child keeps its last offset.
+    resolveAnchors();
     dirty = true;
 }
 
 float NodeGraph::getAbsoluteBeatOffset(int nodeId) {
+    // Sum groupBeatOffset up the parent chain. A `visited` set stops the walk if
+    // the chain is ever corrupt/cyclic (each node contributes at most once),
+    // which removes any need for an arbitrary nesting-depth cap - timelines can
+    // be nested arbitrarily deep.
     float total = 0;
+    std::set<int> visited;
     int current = nodeId;
-    int depth = 0;
-    while (current >= 0 && depth < 20) { // depth limit to prevent infinite loops
+    while (current >= 0) {
+        if (!visited.insert(current).second) break; // already seen -> cycle
         auto* node = findNode(current);
         if (!node) break;
         total += node->groupBeatOffset;
         current = node->parentGroupId;
-        depth++;
     }
     return total;
 }
@@ -360,7 +426,9 @@ void NodeGraph::resolveAnchors() {
 }
 
 void NodeGraph::setupDefaultGraph() {
-    nodes.reserve(16);
+    // (No reserve: `nodes` is a std::deque for stable element addresses - see
+    // the declaration comment in node_graph.h. deque has no reserve(), and
+    // needs none: it never reallocates existing elements.)
 
     // Seed the curated built-in morph chains into the project's asset library so
     // the morph picker (and the Asset Library panel) are never empty on a fresh
@@ -754,6 +822,60 @@ int buildVoicePreset(NodeGraph& graph, Vec2 pos, int preset) {
     }
 
     return containerId;
+}
+
+// ---------------------------------------------------------------------------
+// Wire / gate naming (see the declarations in node_graph.h)
+// ---------------------------------------------------------------------------
+
+juce::String NodeGraph::wireLabel(int linkId) const {
+    static const juce::String arrow = juce::String::fromUTF8(" \xe2\x86\x92 ");
+
+    // Resolve one link to (source node, source plug, dest node, dest plug).
+    auto endpoints = [this](const Link& l, juce::String& sN, juce::String& sP,
+                            juce::String& dN, juce::String& dP) {
+        for (const auto& n : nodes) {
+            for (const auto& p : n.pinsOut)
+                if (p.id == l.startPin) { sN = n.name; sP = p.name; }
+            for (const auto& p : n.pinsIn)
+                if (p.id == l.endPin)   { dN = n.name; dP = p.name; }
+        }
+        return sN.isNotEmpty() && dN.isNotEmpty();
+    };
+
+    const Link* self = nullptr;
+    for (const auto& l : links)
+        if (l.id == linkId) { self = &l; break; }
+    if (!self) return {};
+
+    juce::String sN, sP, dN, dP;
+    if (!endpoints(*self, sN, sP, dN, dP)) return {};
+    const juce::String plain = sN + arrow + dN;
+
+    // Qualify with plug names only when some OTHER wire produces the same plain
+    // label - adding them unconditionally makes every entry noisy for no gain.
+    for (const auto& l : links) {
+        if (l.id == linkId) continue;
+        juce::String oN, oP, oD, oDP;
+        if (!endpoints(l, oN, oP, oD, oDP)) continue;
+        if (oN + arrow + oD == plain)
+            return plain + "  (" + sP + arrow + dP + ")";
+    }
+    return plain;
+}
+
+juce::String NodeGraph::gateLabel(const EffectRegion& r) const {
+    if (r.groupId >= 0) {
+        if (auto* g = findEffectGroup(r.groupId))
+            return g->name.empty() ? ("Group #" + juce::String(g->id))
+                                   : juce::String(g->name);
+        return "(missing group)";
+    }
+    if (r.linkId >= 0) {
+        auto s = wireLabel(r.linkId);
+        return s.isEmpty() ? juce::String("(missing wire)") : s;
+    }
+    return "(unassigned)";
 }
 
 } // namespace SoundShop

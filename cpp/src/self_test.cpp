@@ -24,6 +24,7 @@
 #include "shape_expr.h"            // bakeShapeExpr (Builtin/Lua/Python/GLSL curve bakes)
 #include "builtin_synth.h"         // WaveExprParser - Builtin expression vocabulary
 #include "builtin_effects.h"       // ParametricEQProcessor - variable EQ band count
+#include "convolution_processor.h"  // ConvolutionProcessor - PDC latency reporting
 #include "voice_allocator.h"       // VoiceAllocator - per-voice polyphony policy
 #include "poly_voice_processor.h"   // PolyVoiceProcessor - end-to-end voice audio
 #include "signal_math.h"            // SignalMathProcessor - modular-kit math module
@@ -33,6 +34,16 @@
 #include "signal_filter.h"          // SignalFilterProcessor - modular-kit resonant filter
 #include "signal_noise.h"           // SignalNoiseProcessor - modular-kit gated noise
 #include "signal_oscillator.h"      // SignalOscillatorProcessor - Signal-driven oscillator
+#include "pitch_core.h"             // PhaseVocoderShifter - in-house pitch-shift core
+#include "pitch_shift_processor.h"  // PitchShiftProcessor - the Pitch Shift node
+#include "graph_processor.h"        // AudioTimelineProcessor - audio-clip playback
+#include "time_gate_processor.h"    // TimeGateProcessor - local-beat effect-layer gating
+#include "dialog_helpers.h"         // AppLookAndFeel / ToolDialogWindow - taskbar flags
+#include "multitrack_recorder.h"    // MultitrackRecorder - live input capture
+#include "pan_processor.h"          // PanProcessor - the mute/solo/record-mute chokepoint
+#include "soundfont_processor.h"    // SoundFontProcessor - .sf2 / .sfz instrument node
+#include "signal_shape_node.h"      // SignalShapeProcessor - the scriptable Signal node
+#include "midi_script_node.h"       // MidiScriptProcessor - algorithmic MIDI generator
 
 #include <juce_audio_formats/juce_audio_formats.h>
 #include <juce_graphics/juce_graphics.h>
@@ -46,6 +57,7 @@
 #include <sstream>
 #include <fstream>
 #include <set>
+#include <chrono>
 
 namespace SoundShop {
 namespace {
@@ -56,7 +68,7 @@ namespace {
 // ---------------------------------------------------------------------------
 struct Report {
     juce::String text;
-    int passed = 0, failed = 0;
+    int passed = 0, failed = 0, knownBugs = 0;
 
     void line(const juce::String& s) { text << s << "\n"; }
     void section(const juce::String& s) {
@@ -73,6 +85,34 @@ struct Report {
              << "  (measured " << juce::String(value, 5) << ")\n";
         if (cond) ++passed; else ++failed;
         return cond;
+    }
+    // Known-bug check ("expected failure").
+    //
+    // For behaviour that is genuinely wrong, is documented in known-issues.md,
+    // and is not being fixed in this change. The assertion is still evaluated
+    // and its measured value still recorded, but a failure is tallied
+    // separately from `failed` so it does not turn the suite red. A suite that
+    // is permanently red teaches people to ignore red, which costs more than
+    // the bug being tracked.
+    //
+    // The important half is the other branch: if a known-bug check ever
+    // PASSES, that is reported as a real failure. Either the bug got fixed and
+    // this call plus its known-issues.md entry should be deleted, or the test
+    // stopped actually testing anything. Both need a human.
+    bool knownBug(bool condIfFixed, const juce::String& what,
+                  double value, const juce::String& issue) {
+        if (condIfFixed) {
+            text << "  [FAIL] " << what
+                 << " -- KNOWN BUG NOW PASSES; remove the knownBug() call and the "
+                 << "'" << issue << "' entry in known-issues.md"
+                 << "  (measured " << juce::String(value, 5) << ")\n";
+            ++failed;
+            return false;
+        }
+        text << "  [KNOWN-BUG] " << what << " -- tracked as '" << issue
+             << "' in known-issues.md  (measured " << juce::String(value, 5) << ")\n";
+        ++knownBugs;
+        return true;
     }
     void note(const juce::String& s) { text << "  - " << s << "\n"; }
 };
@@ -1706,6 +1746,281 @@ void testTerrainData(Report& r, const juce::File& dir) {
                     "autocascade: per-param bypass suppresses read");
         }
 
+        // ---- time-gated effect regions: save/load AND undo round-trip --------
+        // EffectRegion (the colored "layer" bars above the notes in the piano
+        // roll) was never emitted by writeProject. Because serializeForUndo
+        // shares that same writer, the omission had two compounding effects:
+        // a region silently vanished on save->reload, AND the very next undo
+        // step wiped every region in the project. Both paths are asserted here
+        // so a future writer refactor can't quietly drop them again.
+        // Measured with the serializer removed: regionsAfterSave = 0 and
+        // regionsAfterUndo = 0 (vs 2 and 2 fixed) - i.e. total loss, not a
+        // partial-fidelity bug.
+        {
+            NodeGraph g;
+            int outPin = 0, inPin = 0;
+            {
+                auto& src = g.addNode("MIDI Track", NodeType::MidiTimeline, {},
+                                      { Pin{0, "MIDI", PinKind::Midi, false} });
+                outPin = src.pinsOut[0].id;
+            }
+            {
+                auto& dst = g.addNode("Arpeggiator", NodeType::Effect,
+                                      { Pin{0, "MIDI", PinKind::Midi, true} }, {});
+                inPin = dst.pinsIn[0].id;
+            }
+            g.addLink(outPin, inPin);
+            const int linkId = g.links.empty() ? -1 : g.links[0].id;
+            const int groupId = g.addEffectGroup("Chorus section").id;
+
+            // Two regions on the source track: one gating a bare link, one
+            // gating a whole group. Non-default beats/colour so a "wrote the
+            // struct default back" bug can't pass either.
+            EffectRegion byLink;
+            byLink.linkId = linkId; byLink.startBeat = 8.5f; byLink.endBeat = 12.25f;
+            byLink.color = 0xFF3CB44B;
+            EffectRegion byGroup;
+            byGroup.groupId = groupId; byGroup.startBeat = 16.0f; byGroup.endBeat = 24.0f;
+            byGroup.color = 0xFF911EB4;
+            g.nodes[0].effectRegions = { byLink, byGroup };
+
+            auto checkRegions = [&](NodeGraph& gg, const char* what) {
+                const size_t n = gg.nodes.empty() ? 0 : gg.nodes[0].effectRegions.size();
+                r.checkVal(n == 2, juce::String("fxregion: both regions survive ") + what,
+                           (double)n);
+                if (n != 2) return;
+                auto& a = gg.nodes[0].effectRegions[0];
+                auto& b = gg.nodes[0].effectRegions[1];
+                r.check(a.linkId == linkId && a.groupId == -1,
+                        juce::String("fxregion: per-link region keeps its link id after ") + what);
+                r.check(std::abs(a.startBeat - 8.5f) < 1e-4f
+                        && std::abs(a.endBeat - 12.25f) < 1e-4f,
+                        juce::String("fxregion: per-link region keeps its beat range after ") + what);
+                r.check(a.color == 0xFF3CB44Bu,
+                        juce::String("fxregion: per-link region keeps its colour after ") + what);
+                r.check(b.groupId == groupId && b.linkId == -1,
+                        juce::String("fxregion: group region keeps its group id after ") + what);
+                r.check(std::abs(b.startBeat - 16.0f) < 1e-4f
+                        && std::abs(b.endBeat - 24.0f) < 1e-4f,
+                        juce::String("fxregion: group region keeps its beat range after ") + what);
+                r.check(b.color == 0xFF911EB4u,
+                        juce::String("fxregion: group region keeps its colour after ") + what);
+            };
+
+            // Save -> load.
+            {
+                std::ostringstream oss;
+                ProjectFile::writeProject(oss, g, nullptr, /*includeView*/false,
+                                          /*includeBlobs*/false);
+                NodeGraph g2;
+                std::istringstream iss(oss.str());
+                ProjectFile::readProject(iss, g2, nullptr);
+                checkRegions(g2, "a save/load round-trip");
+                r.check(g2.effectGroups.size() == 1
+                        && g2.effectGroups[0].id == groupId,
+                        "fxregion: the referenced effect group round-trips alongside it");
+            }
+
+            // Undo snapshot -> restore (the path that used to erase them).
+            {
+                std::string snap = ProjectFile::serializeForUndo(g);
+                NodeGraph g3;
+                std::istringstream iss(snap);
+                ProjectFile::readProject(iss, g3, nullptr);
+                checkRegions(g3, "an undo snapshot restore");
+            }
+
+            // ---- the gate itself reads LOCAL beats, not transport beats -----
+            // Region beats are stored local to their node, exactly like clips
+            // and notes, so that sliding a track's start position carries its
+            // layers with it. TimeGateProcessor used to compare regions against
+            // the raw transport beat, so the layers moved *visually* with the
+            // track but fired at the old absolute beats *audibly*. Pushing the
+            // node four bars out and probing on both sides of the shift pins
+            // that down. Measured with `- beatOffset` removed from the gate:
+            // the "unshifted" probe reads 1.0 instead of 0.0 and the "slid
+            // along" probe reads 0.0 instead of 1.0 - i.e. the gate opens over
+            // exactly the wrong stretch of music, which is what the bug
+            // sounded like. (The two shut-side probes read 0.0 either way, so
+            // they are regression guards, not discriminators - the inverting
+            // pair is what actually catches this.)
+            {
+                Transport t;
+                t.bpm = 120.0; t.sampleRate = 44100.0;
+                g.nodes[0].effectRegions = { byLink };          // local beats 8.5 .. 12.25
+                g.nodes[0].absoluteBeatOffset = 16.0f;          // track slid 4 bars right
+
+                TimeGateProcessor gate(linkId, g.nodes[0], g, t);
+                gate.prepareToPlay(t.sampleRate, 64);
+
+                // Probe the gate at an absolute beat by running a block of DC
+                // through it: the surviving amplitude *is* the wet amount.
+                auto wetAt = [&](double absBeat) {
+                    t.positionSamples = (int64_t)t.beatsToSamples(absBeat);
+                    juce::AudioBuffer<float> buf(1, 64);
+                    for (int i = 0; i < 64; ++i) buf.setSample(0, i, 1.0f);
+                    juce::MidiBuffer midi;
+                    gate.processBlock(buf, midi);
+                    return buf.getSample(0, 0);
+                };
+
+                // Absolute 10.0 == local -6.0: nowhere near the region, but it
+                // IS inside the region's raw beat range - so this is the probe
+                // that fires if the gate forgets the offset.
+                r.checkVal(wetAt(10.0) < 1e-4f,
+                           "fxgate: a shifted track's layer is shut at its pre-slide beats",
+                           (double)wetAt(10.0));
+                // Absolute 22.0 == local 6.0: outside 8.5..12.25, so shut.
+                r.checkVal(wetAt(22.0) < 1e-4f,
+                           "fxgate: a shifted track's layer is shut ahead of its start beat",
+                           (double)wetAt(22.0));
+                // Absolute 26.0 == local 10.0: mid-region, well past the 50 ms
+                // crossfade (0.1 beat at 120 bpm), so fully open.
+                r.checkVal(wetAt(26.0) > 0.999f,
+                           "fxgate: a shifted track's layer opens at its slid-along beat",
+                           (double)wetAt(26.0));
+                // And it still shuts again past the region's local end.
+                r.checkVal(wetAt(30.0) < 1e-4f,
+                           "fxgate: the layer shuts again past its end beat",
+                           (double)wetAt(30.0));
+
+                g.nodes[0].absoluteBeatOffset = 0.0f;
+            }
+        }
+
+        // ---- insert/delete time ripples effect layers ------------------------
+        // Layers share the clip/note local beat space, so the arrangement-level
+        // "insert N beats here" / "delete this range" edits have to move them
+        // too. They originally didn't, which silently desynced every layer in
+        // the project from the music it was gating the moment a bar was added.
+        // Measured with both ripple passes disabled: 3 of these fail outright
+        // (straddle-stretch, post-insert slide, and the delete leaving 4 layers
+        // instead of 3) and the 3 delete-side position checks never even run,
+        // since they are guarded on that size.
+        {
+            NodeGraph g;
+            g.addNode("MIDI Track", NodeType::MidiTimeline, {},
+                      { Pin{0, "MIDI", PinKind::Midi, false} });
+            auto mk = [](float s, float e) {
+                EffectRegion r2; r2.linkId = 1; r2.startBeat = s; r2.endBeat = e; return r2;
+            };
+
+            // Insert 4 beats at beat 8: a layer entirely after the cut slides,
+            // one straddling it stretches, one entirely before is untouched.
+            g.nodes[0].effectRegions = { mk(0.0f, 4.0f), mk(6.0f, 10.0f), mk(12.0f, 16.0f) };
+            g.insertTime(8.0f, 4.0f);
+            auto& ins = g.nodes[0].effectRegions;
+            r.check(ins.size() == 3 && std::abs(ins[0].startBeat - 0.0f) < 1e-4f
+                    && std::abs(ins[0].endBeat - 4.0f) < 1e-4f,
+                    "fxripple: a layer entirely before an insert is left alone");
+            r.check(ins.size() == 3 && std::abs(ins[1].startBeat - 6.0f) < 1e-4f
+                    && std::abs(ins[1].endBeat - 14.0f) < 1e-4f,
+                    "fxripple: a layer straddling an insert stretches by the inserted length");
+            r.check(ins.size() == 3 && std::abs(ins[2].startBeat - 16.0f) < 1e-4f
+                    && std::abs(ins[2].endBeat - 20.0f) < 1e-4f,
+                    "fxripple: a layer after an insert slides by the inserted length");
+
+            // Delete beats 8..12: a layer wholly inside the deleted range is
+            // dropped, one overlapping is clamped to the cut point, one after
+            // pulls back by the deleted length.
+            g.nodes[0].effectRegions = { mk(0.0f, 4.0f), mk(9.0f, 11.0f),
+                                         mk(10.0f, 16.0f), mk(20.0f, 24.0f) };
+            g.deleteTime(8.0f, 12.0f);
+            auto& del = g.nodes[0].effectRegions;
+            r.checkVal(del.size() == 3,
+                       "fxripple: a layer wholly inside a deleted range is removed",
+                       (double)del.size());
+            if (del.size() == 3) {
+                r.check(std::abs(del[0].startBeat - 0.0f) < 1e-4f
+                        && std::abs(del[0].endBeat - 4.0f) < 1e-4f,
+                        "fxripple: a layer entirely before a delete is left alone");
+                r.check(std::abs(del[1].startBeat - 8.0f) < 1e-4f
+                        && std::abs(del[1].endBeat - 12.0f) < 1e-4f,
+                        "fxripple: a layer overlapping a delete is clamped to the cut point");
+                r.check(std::abs(del[2].startBeat - 16.0f) < 1e-4f
+                        && std::abs(del[2].endBeat - 20.0f) < 1e-4f,
+                        "fxripple: a layer after a delete pulls back by the deleted length");
+            }
+        }
+
+        // ---- directional magnetic snap for layer edges -----------------------
+        // Layer edges are pixel-precise; a grid marker only grabs an edge on the
+        // side the drag is LEAVING it from, so you can slide right up to a beat
+        // and stop just short of it, but land exactly on it once you cross.
+        // Measured by reinstating each plausible wrong implementation and
+        // rebuilding: the old hard quantiser (round-to-nearest, ignoring dir)
+        // fails 7 of these, and inverting the direction sense (floor/ceil
+        // swapped) fails 9. The dir==0 and snap-off checks survive both, since
+        // those are guard clauses rather than marker maths.
+        {
+            using SoundShop::magneticSnapBeat;
+            const float grid = 1.0f, pull = 0.1f;
+            auto near_ = [](float a, float b) { return std::abs(a - b) < 1e-4f; };
+
+            // Moving right, still short of beat 4: free, so "just before the
+            // downbeat" is reachable.
+            r.check(near_(magneticSnapBeat(3.94f, +1, grid, pull), 3.94f),
+                    "fxsnap: approaching a marker from the left leaves the edge free");
+            // Moving right, just past beat 4: the marker holds it.
+            r.check(near_(magneticSnapBeat(4.06f, +1, grid, pull), 4.0f),
+                    "fxsnap: departing a marker rightwards snaps back onto it");
+            // Moving right, well past: released again.
+            r.check(near_(magneticSnapBeat(4.30f, +1, grid, pull), 4.30f),
+                    "fxsnap: past the pull radius the edge is free again");
+
+            // Mirror image for leftward travel.
+            r.check(near_(magneticSnapBeat(4.06f, -1, grid, pull), 4.06f),
+                    "fxsnap: approaching a marker from the right leaves the edge free");
+            r.check(near_(magneticSnapBeat(3.94f, -1, grid, pull), 4.0f),
+                    "fxsnap: departing a marker leftwards snaps back onto it");
+            r.check(near_(magneticSnapBeat(3.70f, -1, grid, pull), 3.70f),
+                    "fxsnap: past the pull radius leftwards the edge is free again");
+
+            // The two remaining approach/departure pairs, at a non-integer grid,
+            // to prove nothing is hard-coded to whole beats.
+            r.check(near_(magneticSnapBeat(1.97f, +1, 0.25f, 0.05f), 1.97f),
+                    "fxsnap: quarter-beat grid, rightward approach stays free");
+            r.check(near_(magneticSnapBeat(2.03f, -1, 0.25f, 0.05f), 2.03f),
+                    "fxsnap: quarter-beat grid, leftward approach stays free");
+            r.check(near_(magneticSnapBeat(2.03f, +1, 0.25f, 0.05f), 2.0f),
+                    "fxsnap: quarter-beat grid, rightward departure snaps");
+            r.check(near_(magneticSnapBeat(1.97f, -1, 0.25f, 0.05f), 2.0f),
+                    "fxsnap: quarter-beat grid, leftward departure snaps");
+
+            // dir 0 (gesture hasn't moved yet) and snap-off are both no-ops -
+            // the latter is what Alt-drag and the "Snap: Off" button produce.
+            r.check(near_(magneticSnapBeat(4.02f, 0, grid, pull), 4.02f),
+                    "fxsnap: no travel direction yet means no snap");
+            r.check(near_(magneticSnapBeat(4.02f, +1, 0.0f, pull), 4.02f),
+                    "fxsnap: snapping off (Alt / Snap:Off) leaves the edge free");
+
+            // A pull radius wider than a grid step (zoomed out until a step is
+            // under 6 px) degenerates to "always snap to the departing marker",
+            // and crucially still never reaches past that marker's neighbour.
+            r.check(near_(magneticSnapBeat(3.5f, +1, grid, 2.0f), 3.0f)
+                    && near_(magneticSnapBeat(3.99f, +1, grid, 2.0f), 3.0f)
+                    && near_(magneticSnapBeat(3.5f, -1, grid, 2.0f), 4.0f),
+                    "fxsnap: an oversized pull radius never reaches past one grid step");
+
+            // The `snapped` out-flag has to distinguish "landed on the marker"
+            // from "left alone", including the case where the input already sat
+            // exactly on a marker so the returned value is unchanged either way.
+            // Moving a layer picks between its two edges with this flag; using
+            // "did the value change" instead makes a zero correction look like
+            // no snap, so the free edge always wins and the layer never aligns.
+            bool hit = true;
+            magneticSnapBeat(3.5f, +1, grid, 0.1f, &hit);
+            r.check(!hit, "fxsnap: out-flag is false when no marker catches the edge");
+            magneticSnapBeat(4.05f, +1, grid, 0.1f, &hit);
+            r.check(hit, "fxsnap: out-flag is true when a marker catches the edge");
+            hit = false;
+            magneticSnapBeat(4.0f, +1, grid, 0.1f, &hit);
+            r.check(hit, "fxsnap: an edge already on a marker still reports a snap");
+            hit = true;
+            magneticSnapBeat(4.05f, 0, grid, 0.1f, &hit);
+            r.check(!hit, "fxsnap: out-flag is false when snapping is disabled");
+        }
+
         // ---- hosted-plugin param automation lanes: round-trip + helpers ------
         // Plugin params have no Param row, so their recorded lanes live in
         // Node::pluginParamAutomation (normalized 0..1) and serialize via
@@ -2793,7 +3108,7 @@ void testWarp(Report& r) {
                         && std::abs(AHDSREnvelope::tensionWarp(1.0f,  0.7f) - 1.0f) < 1e-5f
                         && std::abs(AHDSREnvelope::tensionWarp(0.0f, -0.7f)) < 1e-5f
                         && std::abs(AHDSREnvelope::tensionWarp(1.0f, -0.7f) - 1.0f) < 1e-5f;
-        r.check(endpointsOk, "ahdsr tension: warp pins both endpoints for ±tension");
+        r.check(endpointsOk, "ahdsr tension: warp pins both endpoints for +/-tension");
 
         bool identityOk = true;
         for (int i = 0; i <= 10; ++i) {
@@ -2812,7 +3127,7 @@ void testWarp(Report& r) {
             return true;
         };
         r.check(monotonic(0.9f) && monotonic(-0.9f),
-                "ahdsr tension: warp is monotonic for strong ±tension");
+                "ahdsr tension: warp is monotonic for strong +/-tension");
 
         // T>0 ("slow start") must lag below the diagonal in the interior;
         // T<0 ("fast start") must lead above it.
@@ -3376,6 +3691,1370 @@ void testWarp(Report& r) {
         // An un-warped frame omits the ;warp: section (byte-clean round-trip).
         r.check(plain.encodeBody().find(";warp:") == std::string::npos,
                 "inharmonic: un-warped frame omits the ;warp: section");
+    }
+
+    // ---- Real-time-safe wavelet transform (shared WaveletWorkspace) ------
+    // The wavelet effect nodes run dwt()/idwt() on the audio thread. They used
+    // to allocate scratch inside the transform (two vectors per level per
+    // channel per block, plus a freshly-built filter bank) - a hard real-time
+    // violation. The scratch now lives in a caller-owned WaveletWorkspace that
+    // is sized once in prepareToPlay and reused across blocks.
+    //
+    // The risk that introduces is stale scratch: the workspace is generally
+    // LARGER than the current transform needs and still holds the previous
+    // block's data, so any read of an unwritten scratch slot would silently
+    // leak old audio into the new block. These tests pin that down.
+    {
+        auto makeChirp = [](int n, float k) {
+            std::vector<float> b((size_t)n);
+            for (int i = 0; i < n; ++i) {
+                float t = (float)i / (float)n;
+                b[(size_t)i] = std::sin(6.28318530718f * k * t * t) * (0.3f + 0.7f * t);
+            }
+            return b;
+        };
+        auto maxDiff = [](const std::vector<float>& a, const std::vector<float>& b) {
+            double d = 0.0;
+            size_t n = std::min(a.size(), b.size());
+            for (size_t i = 0; i < n; ++i) d = std::max(d, (double)std::abs(a[i] - b[i]));
+            return d;
+        };
+
+        const auto filt = getWaveletFilter("sym4");
+
+        // 1. A fresh workspace and the allocating convenience overload must
+        //    agree exactly - the overload just wraps a local workspace, so any
+        //    difference means the two paths have drifted apart.
+        {
+            std::vector<float> a = makeChirp(256, 9.0f), b = a;
+            WaveletWorkspace ws;
+            int la = dwt(a, 4, filt, ws);
+            int lb = dwt(b, 4, filt);
+            r.check(la == lb, "wavelet-ws: workspace dwt reports the same level count");
+            r.checkVal(maxDiff(a, b) == 0.0,
+                       "wavelet-ws: workspace dwt is bit-identical to the allocating overload",
+                       maxDiff(a, b));
+            idwt(a, la, filt, ws);
+            idwt(b, lb, filt);
+            r.checkVal(maxDiff(a, b) == 0.0,
+                       "wavelet-ws: workspace idwt is bit-identical to the allocating overload",
+                       maxDiff(a, b));
+        }
+
+        // 2. A workspace pre-sized far larger than the signal, and already
+        //    dirtied by a previous transform, must give the same answer as a
+        //    virgin one. This is the stale-scratch regression guard.
+        {
+            std::vector<float> ref = makeChirp(128, 5.0f), reuse = ref;
+
+            WaveletWorkspace fresh;
+            int lref = dwt(ref, 5, filt, fresh);
+            idwt(ref, lref, filt, fresh);
+
+            WaveletWorkspace dirty;
+            dirty.ensure(8192);                       // much bigger than needed
+            std::vector<float> junk = makeChirp(4096, 40.0f);
+            dwt(junk, 6, filt, dirty);                // leave real data in the scratch
+            int lre = dwt(reuse, 5, filt, dirty);
+            idwt(reuse, lre, filt, dirty);
+
+            r.check(lref == lre, "wavelet-ws: oversized dirty workspace gives the same level count");
+            r.checkVal(maxDiff(ref, reuse) == 0.0,
+                       "wavelet-ws: oversized dirty workspace leaks nothing into the result",
+                       maxDiff(ref, reuse));
+        }
+
+        // 3. The two synthesis conventions, pinned.
+        //
+        //    idwtPR is the true adjoint of the analysis, so it reconstructs
+        //    exactly. idwt is the legacy painter convention, which does NOT -
+        //    it loses well over half the energy. Every wavelet EFFECT node runs
+        //    "analyse real audio -> tweak coefficients -> resynthesise" and so
+        //    must use the PR inverse; using the legacy one made even a neutral
+        //    setting badly colour the signal. The legacy pair stays for the
+        //    wavelet painter / fractal terrain, which author coefficients by
+        //    hand and depend on its exact sound.
+        {
+            std::vector<float> x = makeChirp(512, 13.0f);
+
+            std::vector<float> pr = x;
+            WaveletWorkspace ws;
+            int l = dwt(pr, 4, filt, ws);
+            idwtPR(pr, l, filt, ws);
+            r.checkVal(maxDiff(x, pr) < 1e-4,
+                       "wavelet-pr: idwtPR(dwt(x)) reconstructs x exactly",
+                       maxDiff(x, pr));
+
+            std::vector<float> legacy = x;
+            int l2 = dwt(legacy, 4, filt, ws);
+            idwt(legacy, l2, filt, ws);
+            double ex = 0, ey = 0;
+            for (size_t i = 0; i < x.size(); ++i) {
+                ex += (double)x[i] * x[i];
+                ey += (double)legacy[i] * legacy[i];
+            }
+            r.checkVal(ey / ex < 0.75,
+                       "wavelet-pr: the legacy inverse is lossy (documented, frozen)",
+                       ey / ex);
+        }
+
+        // 4. WaveletFxScratch::load zero-pads to a power of two, keeps an
+        //    untouched dry copy, and stays correct when the block size shrinks
+        //    (the buffers are reused, so a shorter block must not expose the
+        //    tail of the longer one).
+        {
+            WaveletFxScratch s;
+            s.prepare(512);
+            std::vector<float> big = makeChirp(400, 7.0f);
+            int pad = s.load(big.data(), 400);
+            r.check(pad == 512, "wavelet-scratch: load pads 400 samples up to 512");
+            r.check((int)s.sig.size() == 512 && (int)s.dry.size() == 400,
+                    "wavelet-scratch: sig is the padded length, dry is the raw length");
+            bool tailZero = true;
+            for (int i = 400; i < 512; ++i) if (s.sig[(size_t)i] != 0.0f) tailZero = false;
+            r.check(tailZero, "wavelet-scratch: pad region is zeroed");
+
+            std::vector<float> small = makeChirp(100, 3.0f);
+            int pad2 = s.load(small.data(), 100);
+            r.check(pad2 == 128, "wavelet-scratch: a shorter block re-pads to 128");
+            r.check((int)s.sig.size() == 128 && (int)s.dry.size() == 100,
+                    "wavelet-scratch: buffers shrink to the new block, no stale tail");
+            bool tail2Zero = true;
+            for (int i = 100; i < 128; ++i) if (s.sig[(size_t)i] != 0.0f) tail2Zero = false;
+            r.check(tail2Zero, "wavelet-scratch: pad region is re-zeroed after a shrink");
+            bool dryMatches = true;
+            for (int i = 0; i < 100; ++i)
+                if (s.dry[(size_t)i] != small[(size_t)i]) dryMatches = false;
+            r.check(dryMatches, "wavelet-scratch: dry copy matches the input exactly");
+        }
+
+        // 5. The whole point: after prepare(), repeated blocks must not
+        //    reallocate. Capacity is the observable proxy - if any buffer grows
+        //    its capacity during steady-state processing, something in the path
+        //    is still allocating on the audio thread.
+        {
+            WaveletFxScratch s;
+            s.prepare(512);
+            std::vector<float> block = makeChirp(512, 11.0f);
+            s.load(block.data(), 512);               // first block sizes everything
+            const size_t capSig    = s.sig.capacity();
+            const size_t capDry    = s.dry.capacity();
+            const size_t capApprox = s.ws.approx.capacity();
+            const size_t capDetail = s.ws.detail.capacity();
+            const size_t capRecon  = s.ws.recon.capacity();
+            for (int b = 0; b < 32; ++b) {
+                s.useFilter("sym4");
+                s.load(block.data(), 512);
+                int l = dwt(s.sig, 5, filt, s.ws);
+                idwt(s.sig, l, filt, s.ws);
+            }
+            r.check(s.sig.capacity() == capSig && s.dry.capacity() == capDry,
+                    "wavelet-scratch: signal/dry buffers never reallocate in steady state");
+            r.check(s.ws.approx.capacity() == capApprox
+                    && s.ws.detail.capacity() == capDetail
+                    && s.ws.recon.capacity() == capRecon,
+                    "wavelet-scratch: transform scratch never reallocates in steady state");
+        }
+
+        // 6. The symptom that made the wrong inverse worth chasing: a wavelet
+        //    effect at neutral settings must pass audio through UNCHANGED.
+        //    One case per effect below.
+        {
+            const int N = 512;
+            auto fillSine = [&](juce::AudioBuffer<float>& b) {
+                b.setSize(2, N);
+                for (int c = 0; c < 2; ++c)
+                    for (int i = 0; i < N; ++i)
+                        b.getWritePointer(c)[i] =
+                            0.5f * std::sin(6.28318530718f * 8.0f * (float)i / (float)N);
+            };
+            auto maxAbsDiffBuf = [&](const juce::AudioBuffer<float>& a,
+                                     const juce::AudioBuffer<float>& b) {
+                double d = 0.0;
+                for (int c = 0; c < 2; ++c)
+                    for (int i = 0; i < N; ++i)
+                        d = std::max(d, (double)std::abs(a.getReadPointer(c)[i]
+                                                       - b.getReadPointer(c)[i]));
+                return d;
+            };
+
+            // Every wavelet effect, driven at its NEUTRAL setting - the
+            // parameter combination where it is mathematically an identity -
+            // and required to hand the input back.
+            //
+            // This is a stronger check than it looks. In every case below the
+            // neutral setting still runs the full forward DWT and inverse; only
+            // the between-transform coefficient surgery is a no-op. So each of
+            // these is really "the transform round-trip is lossless for this
+            // effect's filter and level count", which is exactly what was
+            // broken before the PR-inverse switch in 1d9a0c0 - the old inverse
+            // dropped over half the energy, making every "bypass" setting a
+            // heavy colouration.
+            //
+            // Deliberately NOT tested via Mix=0: that path never touches the
+            // wavelet code, so it would pass even with a completely broken
+            // transform. Every case here runs at Mix=1 (full wet).
+            //
+            // Each case is PAIRED with a non-vacuity check: the same processor,
+            // one parameter moved off neutral, asserting the output now differs
+            // materially. Without that pairing a unity assertion would sail
+            // through if processBlock did nothing at all - which is exactly the
+            // failure mode a "bypass is clean" test must not be blind to.
+            auto runOnce = [&](std::vector<Param>& params,
+                               std::function<std::unique_ptr<juce::AudioProcessor>(Node&)>& make) {
+                NodeGraph g;
+                int nId = g.addNode("neutral", NodeType::Effect, {}, {}).id;
+                Node& nd = *g.findNode(nId);
+                for (auto& p : params) nd.params.push_back(p);
+                auto proc = make(nd);
+                proc->prepareToPlay(48000.0, N);
+                juce::AudioBuffer<float> buf, dryRef;
+                fillSine(buf); fillSine(dryRef);
+                juce::MidiBuffer mb;
+                proc->processBlock(buf, mb);
+                return maxAbsDiffBuf(buf, dryRef);
+            };
+            auto checkNeutral = [&](const char* label,
+                                    std::vector<Param> params,
+                                    std::function<std::unique_ptr<juce::AudioProcessor>(Node&)> make,
+                                    const char* activeParam, float activeValue) {
+                const double neutral = runOnce(params, make);
+                r.checkVal(neutral < 1e-4,
+                           juce::String("wavelet-fx: ") + label, neutral);
+                // Same node, one knob off neutral: the effect has to bite.
+                for (auto& p : params) if (p.name == activeParam) p.value = activeValue;
+                const double active = runOnce(params, make);
+                r.checkVal(active > 1e-3,
+                           juce::String("wavelet-fx: ") + label
+                             + " - and NOT unity once " + activeParam + " moves off it",
+                           active);
+            };
+
+            // Transient Split with both gains at 1.0 sorts every coefficient
+            // into exactly one of two complementary streams, so summing them
+            // has to give the input back. This is the case that exposed the
+            // legacy inverse: it dropped well over half the energy, i.e. the
+            // "neutral" setting was a heavy, unavoidable colouration on the
+            // flagship wavelet effect.
+            checkNeutral("Transient Split at gains 1/1 is unity (no colouration)",
+                         { {"Transient", 1.0f, 0.0f, 2.0f},
+                           {"Sustain", 1.0f, 0.0f, 2.0f},
+                           {"Threshold", 0.3f, 0.0f, 1.0f},
+                           {"Levels", 4.0f, 1.0f, 8.0f} },
+                         [](Node& nd) { return std::make_unique<TransientSplitProcessor>(nd); },
+                         "Transient", 0.0f);
+
+            // Threshold 0 puts no coefficient below it, so nothing is shrunk.
+            checkNeutral("Denoiser at threshold 0 / full wet is unity",
+                         { {"Threshold", 0.0f, 0.0f, 1.0f},
+                           {"Levels", 4.0f, 1.0f, 8.0f},
+                           {"Mix", 1.0f, 0.0f, 1.0f} },
+                         [](Node& nd) { return std::make_unique<WaveletDenoiserProcessor>(nd); },
+                         "Threshold", 0.9f);
+
+            // Bits=16 is the finest quantisation the param allows: a step of
+            // 1/65536, so every coefficient survives rounding to within ~8e-6.
+            checkNeutral("Bitcrush at Bits=16 / full wet is unity",
+                         { {"Bits", 16.0f, 1.0f, 16.0f},
+                           {"Band Lo", 0.0f, 0.0f, 7.0f},
+                           {"Band Hi", 7.0f, 0.0f, 7.0f},
+                           {"Levels", 4.0f, 1.0f, 8.0f},
+                           {"Mix", 1.0f, 0.0f, 1.0f} },
+                         [](Node& nd) { return std::make_unique<WaveletBitcrushProcessor>(nd); },
+                         "Bits", 2.0f);
+
+            // Shift=0 means "don't move any band". Note this one short-circuits
+            // before the transform, so unlike its siblings it only proves the
+            // early-out, not the round-trip - which is the honest scope of the
+            // param's neutral position.
+            checkNeutral("Octave Shift at Shift=0 is unity",
+                         { {"Shift", 0.0f, -2.0f, 2.0f},
+                           {"Mix", 1.0f, 0.0f, 1.0f} },
+                         [](Node& nd) { return std::make_unique<OctaveShiftProcessor>(nd); },
+                         "Shift", -1.0f);
+
+            // Ratio=1 makes the gain computer an identity whatever the band
+            // peak is (dbReduction = dbOver * (1 - 1/1) = 0), and both tilt
+            // gains at 0 dB leave the per-band trim at unity.
+            checkNeutral("MB Comp at Ratio=1 / 0 dB tilt is unity",
+                         { {"Threshold", -20.0f, -60.0f, 0.0f},
+                           {"Ratio", 1.0f, 1.0f, 20.0f},
+                           {"Levels", 4.0f, 1.0f, 6.0f},
+                           {"Low Gain", 0.0f, -24.0f, 24.0f},
+                           {"High Gain", 0.0f, -24.0f, 24.0f},
+                           {"Mix", 1.0f, 0.0f, 1.0f} },
+                         [](Node& nd) { return std::make_unique<WaveletMultibandCompProcessor>(nd); },
+                         "Ratio", 20.0f);
+
+            // Complexity=1 keeps every coefficient (keep = padLen), so the
+            // partial_sort and the keep-mask select the whole set.
+            checkNeutral("Complexity at 1.0 (keep everything) is unity",
+                         { {"Complexity", 1.0f, 0.0f, 1.0f},
+                           {"Levels", 4.0f, 1.0f, 8.0f},
+                           {"Mix", 1.0f, 0.0f, 1.0f} },
+                         [](Node& nd) { return std::make_unique<WaveletComplexityProcessor>(nd); },
+                         "Complexity", 0.02f);
+
+            // Both gains at 1.0 flatten the asymmetric envelope: the pre-attack
+            // ramp becomes 1 + (1-1)*frac and the post-decay becomes
+            // 1 + (1-1)*(1-frac), so gainEnv stays 1 even where transients are
+            // detected. Detection still runs - this is not an early-out.
+            checkNeutral("Asymmetric Filter at gains 1/1 is unity",
+                         { {"Pre-Attack", 20.0f, 0.0f, 200.0f},
+                           {"Post-Decay", 50.0f, 0.0f, 500.0f},
+                           {"Pre Gain", 1.0f, 0.0f, 4.0f},
+                           {"Post Gain", 1.0f, 0.0f, 4.0f},
+                           {"Levels", 4.0f, 1.0f, 8.0f},
+                           {"Mix", 1.0f, 0.0f, 1.0f} },
+                         [](Node& nd) { return std::make_unique<AsymmetricFilterProcessor>(nd); },
+                         "Post Gain", 0.0f);
+
+            // The reverb's neutral is the least obvious of the set. It works
+            // on an 8192-sample tail buffer: each block shifts the tail left by
+            // n and writes the new input into the last n slots, transforms the
+            // whole tail, weights each band by 1/(band+1)^Color, inverts, and
+            // takes the last n samples back out. So with Color=0 (every weight
+            // = 1) and Decay=1 (the shift doesn't attenuate), the samples that
+            // come out are exactly the ones just written in - full wet, and
+            // still a complete 8192-point round-trip.
+            checkNeutral("Reverb at Decay=1 / Color=0 / full wet is unity",
+                         { {"Decay", 1.0f, 0.0f, 1.0f},
+                           {"Color", 0.0f, 0.0f, 3.0f},
+                           {"Levels", 5.0f, 1.0f, 8.0f},
+                           {"Mix", 1.0f, 0.0f, 1.0f} },
+                         [](Node& nd) { return std::make_unique<WaveletReverbProcessor>(nd); },
+                         "Color", 3.0f);
+
+            // The vocoder is the one effect with no neutral *parameter* - it
+            // imposes the modulator's per-band energy on the carrier, so there
+            // is no knob position that makes it an identity. Its identity is a
+            // property of the SIGNALS instead: feed the same audio as carrier
+            // (ch 0) and modulator (ch 2) and every band's scale factor is
+            // sqrt(modE/carE) = 1, so the carrier must come back untouched.
+            //
+            // Needs its own block because it wants >2 channels, and because it
+            // mono-ises (it copies ch0 over ch1), so only ch0 is comparable.
+            {
+                NodeGraph g;
+                int nId = g.addNode("vocoder", NodeType::Effect, {}, {}).id;
+                Node& nd = *g.findNode(nId);
+                nd.params.push_back({"Bands", 5.0f, 1.0f, 8.0f});
+                nd.params.push_back({"Mix",   1.0f, 0.0f, 1.0f});
+
+                WaveletVocoderProcessor proc(nd);
+                proc.prepareToPlay(48000.0, N);
+
+                juce::AudioBuffer<float> buf(3, N);
+                buf.clear();
+                for (int i = 0; i < N; ++i) {
+                    const float v =
+                        0.5f * std::sin(6.28318530718f * 8.0f * (float)i / (float)N);
+                    buf.getWritePointer(0)[i] = v;   // carrier
+                    buf.getWritePointer(2)[i] = v;   // modulator - identical
+                }
+                std::vector<float> dryRef(buf.getReadPointer(0),
+                                          buf.getReadPointer(0) + N);
+                juce::MidiBuffer mb;
+                proc.processBlock(buf, mb);
+
+                double d = 0.0;
+                for (int i = 0; i < N; ++i)
+                    d = std::max(d, (double)std::abs(buf.getReadPointer(0)[i]
+                                                   - dryRef[(size_t)i]));
+                r.checkVal(d < 1e-4,
+                           "wavelet-fx: Vocoder with modulator == carrier is unity", d);
+
+                // Non-vacuity for the above: a modulator with a *different*
+                // spectrum has to reshape the carrier. (The same sine eight
+                // octaves up, so its band energies land somewhere else.)
+                for (int i = 0; i < N; ++i) {
+                    buf.getWritePointer(0)[i] = dryRef[(size_t)i];
+                    buf.getWritePointer(2)[i] =
+                        0.5f * std::sin(6.28318530718f * 64.0f * (float)i / (float)N);
+                }
+                juce::MidiBuffer mb3;
+                proc.processBlock(buf, mb3);
+                double dActive = 0.0;
+                for (int i = 0; i < N; ++i)
+                    dActive = std::max(dActive, (double)std::abs(buf.getReadPointer(0)[i]
+                                                               - dryRef[(size_t)i]));
+                r.checkVal(dActive > 1e-3,
+                           "wavelet-fx: Vocoder - and NOT unity once the modulator "
+                           "differs from the carrier", dActive);
+
+                // And the documented "nothing plugged into the Signal input"
+                // behaviour: with no channel 2 there is no modulator, so the
+                // node must pass the carrier straight through rather than
+                // muting (scale would otherwise be sqrt(0/carE) = 0 per band).
+                juce::AudioBuffer<float> stereo(2, N);
+                for (int c = 0; c < 2; ++c)
+                    for (int i = 0; i < N; ++i)
+                        stereo.getWritePointer(c)[i] =
+                            0.5f * std::sin(6.28318530718f * 8.0f * (float)i / (float)N);
+                juce::AudioBuffer<float> stereoRef;
+                fillSine(stereoRef);
+                juce::MidiBuffer mb2;
+                proc.processBlock(stereo, mb2);
+                r.checkVal(maxAbsDiffBuf(stereo, stereoRef) < 1e-6,
+                           "wavelet-fx: Vocoder with no modulator connected is a "
+                           "passthrough, not silence",
+                           maxAbsDiffBuf(stereo, stereoRef));
+            }
+        }
+
+        // 7. The Wavelet Reverb's decay must not depend on the audio device's
+        //    buffer size. The tail is aged once per processBlock, so applying
+        //    the Decay knob verbatim each block attenuated a sample
+        //    tailLen/blockSize times over its life - 16 times at a 512-sample
+        //    buffer but 128 at a 64-sample one. At Decay = 0.7 that is 0.003
+        //    versus 1.4e-6: the same preset was an ambience on one machine and
+        //    silence on another. The fix derives the per-block coefficient from
+        //    the block size; this test is what pins it down.
+        //
+        //    Getting a clean reading here took three attempts, so the reasoning
+        //    is worth recording - the obvious tests all measure something else.
+        //
+        //    a) "Burst, then watch the tail fade during silence" fails because
+        //       this node does not ring. It emits only the LAST `n` samples of
+        //       the transformed tail, and those sit exactly on top of the freshly
+        //       written input, so once the input stops the content marches left
+        //       out of the readout window within a couple of hundred samples and
+        //       the output is gone long before any decay curve is visible.
+        //       (Confirmed: with Color = 0 the node is bit-exact unity, which is
+        //       another way of saying the readout window only ever contains the
+        //       new block.) What Decay actually controls is how heavily the older
+        //       content is faded BEFORE the transform, i.e. how much history
+        //       bleeds into the current output through the long wavelet basis
+        //       functions.
+        //    b) "Compare raw output level at two block sizes" fails because the
+        //       readout window is the region most distorted by the transform's
+        //       right-hand boundary, so level per sample is block-size dependent
+        //       no matter what the decay does - measured 2.4x between 64 and 512
+        //       with the decay behaving perfectly.
+        //    c) "Divide out (b) using each block size's own Decay = 1 run, under
+        //       a steady tone" fails because a sample is aged once per block, so
+        //       the attenuation profile along the buffer is a STAIRCASE whose
+        //       step is the per-block coefficient. Multiplied into a continuous
+        //       tone that staircase is a train of amplitude discontinuities, and
+        //       their broadband splatter swamps the decay: it made Decay = 0.9
+        //       measure LOUDER than Decay = 1.
+        //
+        //    What works is an impulse. The staircase then multiplies an almost
+        //    entirely zero buffer, so it generates no artefacts of its own, and
+        //    the single non-zero sample carries exactly the accumulated
+        //    attenuation for its age as it migrates out. Summing |output| and
+        //    dividing by the same run at Decay = 1 gives the mean attenuation
+        //    over the ages the readout can see - the quantity the bug corrupted,
+        //    with the boundary geometry of (b) cancelled by the self-ratio.
+        //
+        //    The `kSkip` window is essential and was the last thing to get
+        //    right. Summed over the impulse's WHOLE life the reading is
+        //    dominated by its first few hundred samples, when it is still inside
+        //    the readout window and has barely been aged at all - and a metric
+        //    dominated by un-aged output is blind to the ageing rate. Measured:
+        //    with the bug deliberately reinstated that version scored 0.927,
+        //    i.e. it passed more comfortably than the fixed code did (0.756).
+        //    Skipping the first 1024 samples restricts the measurement to ages
+        //    where Decay has actually had a chance to act.
+        //
+        //    Levels = 8 / Color = 3 widen the window into history: the level-8
+        //    db4 scaling function spans (8-1)*(2^8-1)+1 = 1786 samples, and
+        //    crushing the short detail bands (gains 1, 1/8, 1/27, ...) leaves
+        //    that long blur as the output.
+        //
+        //    Verified by reinstating the bug: this test reads 1.09 against the
+        //    fixed code and 122204 against the broken code, so the margin is
+        //    five orders of magnitude and the tolerance below is nowhere near
+        //    the limiting factor.
+        {
+            auto impulseLevel = [](int bs, float decay) {
+                NodeGraph g;
+                int nId = g.addNode("rev", NodeType::Effect, {}, {}).id;
+                Node& nd = *g.findNode(nId);
+                nd.params.push_back({"Decay",  decay, 0.0f, 1.0f});
+                nd.params.push_back({"Color",  3.0f, 0.0f, 3.0f}); // must be > 0:
+                nd.params.push_back({"Levels", 8.0f, 1.0f, 8.0f}); // at Color 0 the
+                nd.params.push_back({"Mix",    1.0f, 0.0f, 1.0f}); // node is unity
+                WaveletReverbProcessor proc(nd);
+                proc.prepareToPlay(48000.0, bs);
+
+                const int kTotal = 8192;   // one full traversal of the tail
+                const int kSkip  = 1024;   // ...but ignore the impulse's youth
+                juce::AudioBuffer<float> buf(2, bs);
+                juce::MidiBuffer mb;
+
+                double level = 0.0;
+                for (int s = 0; s < kTotal; s += bs) {
+                    buf.clear();
+                    if (s == 0)              // impulse at absolute sample 0, so
+                        for (int c = 0; c < 2; ++c)   // both runs age it over
+                            buf.getWritePointer(c)[0] = 1.0f;  // the same clock
+                    proc.processBlock(buf, mb);
+                    if (s < kSkip) continue;
+                    for (int i = 0; i < bs; ++i)
+                        level += std::abs((double)buf.getReadPointer(0)[i]);
+                }
+                return level;
+            };
+
+            const double open512 = impulseLevel(512, 1.0f);
+            const double open64  = impulseLevel(64,  1.0f);
+            // Non-vacuity first: if the node emitted nothing there would be
+            // nothing to compare and the ratio checks below would pass on 0/0.
+            r.checkVal(open512 > 1e-3 && open64 > 1e-3,
+                       "wavelet-fx: Reverb smears an impulse at Levels 8 / Color 3",
+                       juce::jmin(open512, open64));
+
+            const double att512 = impulseLevel(512, 0.9f) / juce::jmax(1e-12, open512);
+            const double att64  = impulseLevel(64,  0.9f) / juce::jmax(1e-12, open64);
+            // ...and the knob must actually attenuate, or a node that ignored
+            // Decay entirely would satisfy the block-size check trivially.
+            r.checkVal(att512 < 0.95,
+                       "wavelet-fx: Reverb's Decay knob attenuates the tail",
+                       att512);
+
+            const double ratio = att512 / juce::jmax(1e-12, att64);
+            // The tolerance is set by the design, not by the fix: the two runs
+            // approximate the same exponential with staircases of different step
+            // size (10% at 512 samples, 1.3% at 64), and the readout reaches
+            // 1786 + n samples back, so the range of ages being averaged differs
+            // by the block size too. Those leave a residual 9% (measured 1.086);
+            // the bug leaves 122204.
+            r.checkVal(ratio > 0.8 && ratio < 1.25,
+                       "wavelet-fx: Reverb decay is independent of the audio "
+                       "buffer size (512 vs 64 samples)", ratio);
+        }
+
+        // 8. The Asymmetric Filter must put its pre-attack region where the ms
+        //    knob says it is: immediately BEFORE the onset, on the time axis.
+        //
+        //    It used to lay the envelope out across the concatenated wavelet
+        //    coefficient array, which is not a time axis - one step in the
+        //    approximation band is 2^Levels samples and one step in the finest
+        //    detail band is 2 - and it indexed that array with onset positions
+        //    counted in finest-band coefficients. So a "20 ms pre-attack" was
+        //    neither 20 ms nor the same width in any two bands, and its low
+        //    indices landed in the approximation region at the START of the
+        //    block instead of next to the onset. Now the envelope is built in
+        //    samples and resampled onto each band by that band's stride.
+        //
+        //    Test signal: a quiet 200 Hz tone (something for the gain to act on)
+        //    plus one loud click at sample 700. The tone is low enough in
+        //    frequency to leave the finest detail band alone, so the click is
+        //    unambiguously the only onset. With Pre Gain = 4 and Post Gain = 1,
+        //    wet-minus-dry has to concentrate just before sample 700 and leave
+        //    the start of the block alone.
+        {
+            const int   kN     = 1024;
+            const int   kOnset = 700;
+            const float kPreMs = 5.0f;   // 240 samples at 48 kHz -> [460, 700)
+
+            NodeGraph g;
+            int nId = g.addNode("asym", NodeType::Effect, {}, {}).id;
+            Node& nd = *g.findNode(nId);
+            nd.params.push_back({"Pre-Attack", kPreMs, 0.0f, 100.0f});
+            nd.params.push_back({"Post-Decay",   1.0f, 0.0f, 200.0f});
+            nd.params.push_back({"Pre Gain",     4.0f, 0.0f,   4.0f});
+            nd.params.push_back({"Post Gain",    1.0f, 0.0f,   2.0f});
+            nd.params.push_back({"Sensitivity",  0.5f, 0.0f,   1.0f});
+            nd.params.push_back({"Levels",       4.0f, 1.0f,   8.0f});
+            nd.params.push_back({"Mix",          1.0f, 0.0f,   1.0f});
+            AsymmetricFilterProcessor proc(nd);
+            proc.prepareToPlay(48000.0, kN);
+
+            juce::AudioBuffer<float> buf(2, kN), dry(2, kN);
+            for (int c = 0; c < 2; ++c)
+                for (int i = 0; i < kN; ++i)
+                    dry.getWritePointer(c)[i] =
+                        0.2f * std::sin(6.28318530718f * 200.0f * (float)i / 48000.0f)
+                        + (i == kOnset ? 1.0f : 0.0f);
+            buf.makeCopyOf(dry);
+            juce::MidiBuffer mb;
+            proc.processBlock(buf, mb);
+
+            auto diffOver = [&](int a, int b) {
+                double d = 0.0;
+                for (int i = a; i < b; ++i)
+                    d += std::abs((double)buf.getReadPointer(0)[i]
+                                  - (double)dry.getReadPointer(0)[i]);
+                return d;
+            };
+            // The db4 basis at 4 levels has a support of (8-1)*(2^4-1)+1 = 106
+            // samples, so any change smears about that far either side of where
+            // it is applied. The two windows are 150 samples clear of the
+            // pre-attack region's edges, comfortably outside that.
+            const double inRegion  = diffOver(500, 800);
+            const double atBlockStart = diffOver(0, 310);
+            r.checkVal(inRegion > 1e-3,
+                       "wavelet-fx: Asymmetric Filter's pre-attack region "
+                       "changes the audio at all", inRegion);
+            const double leak = atBlockStart / juce::jmax(1e-12, inRegion);
+            // Verified by reinstating the bug: laying the envelope out along the
+            // coefficient array instead reads 0.28 here (against 0.00 for the
+            // fixed code), and its in-region figure collapses from 48.8 to 2.1 -
+            // so the old version was applying most of its gain nowhere near the
+            // onset it had just detected.
+            r.checkVal(leak < 0.05,
+                       "wavelet-fx: Asymmetric Filter's pre-attack lands before "
+                       "the onset, not at the start of the block", leak);
+        }
+    }
+
+    // ---- Wavelet effects: real-time CPU budget --------------------------
+    //
+    // Every wavelet effect is a node that can be placed many times in one
+    // graph, and the whole graph has to finish inside a single buffer period
+    // or the audio device underruns. So "does it run at all" is not the bar -
+    // each effect must run at a small FRACTION of real time on its own.
+    //
+    // The metric here is the realtime factor: seconds of audio produced per
+    // second of wall clock. 1.0x means the effect alone exactly consumes the
+    // entire audio budget (already unusable - there is no headroom for the
+    // rest of the graph, the UI, or a slower machine). We require 10x, i.e.
+    // no single effect may eat more than a tenth of one core's budget.
+    //
+    // This is deliberately a permanent test rather than a one-off benchmark:
+    // the wavelet suite is the part of SEANCE with no free competitor, it is
+    // the part most likely to be shipped as a plugin, and a plugin that
+    // cannot sustain realtime fails validation outright. A regression here
+    // (a stray allocation, an accidental O(n^2), a levels default bumped up)
+    // is otherwise invisible until a user hears crackling.
+    //
+    // The threshold is loose on purpose so it does not flake on a slow or
+    // loaded CI box; it is sized to catch order-of-magnitude problems, which
+    // is the failure mode that actually happens. The measured value is
+    // recorded for every effect so trends are visible in the report even
+    // when everything passes.
+    {
+        const int    BS     = 512;
+        const double SR     = 48000.0;
+        const int    BLOCKS = 100;              // ~1.07 s of stereo audio
+        const double MIN_RT = 10.0;             // must be >=10x realtime
+
+        // Source material: a tone plus noise, so transient detectors and
+        // threshold-based branches actually take their expensive paths
+        // rather than early-outing on silence.
+        // 3 channels: 0/1 are the stereo audio, 2 is a Signal-pin input. The
+        // Vocoder reads its modulator from channel 2 and returns immediately
+        // if the buffer has fewer than 3 channels, so a stereo-only buffer
+        // would "measure" it at ~200000x realtime while doing no work at all.
+        const int SRC_CH = 3;
+        juce::AudioBuffer<float> src(SRC_CH, BS);
+        {
+            juce::Random rng(20260805);
+            for (int c = 0; c < SRC_CH; ++c) {
+                float* d = src.getWritePointer(c);
+                for (int i = 0; i < BS; ++i)
+                    d[i] = 0.4f * std::sin(6.28318530718f * 220.0f * (float)i / (float)SR)
+                         + 0.1f * (rng.nextFloat() * 2.0f - 1.0f);
+            }
+        }
+
+        // Best of N repeats, not a single timing. Interference from other
+        // processes can only ever make a run SLOWER, never faster, so the
+        // maximum across repeats is a far more stable estimator of the true
+        // throughput than one sample or an average. Without this the whole
+        // suite drifts by ~2x depending on machine load, which would make an
+        // effect sitting near the threshold flake intermittently.
+        const int REPEATS = 3;
+        auto realtimeFactor = [&](juce::AudioProcessor& proc) {
+            juce::AudioBuffer<float> buf(SRC_CH, BS);
+            juce::MidiBuffer mb;
+            proc.prepareToPlay(SR, BS);
+
+            // Warm-up block, untimed: first-touch page faults and any lazy
+            // one-time setup would otherwise be charged to the measurement.
+            buf.makeCopyOf(src);
+            proc.processBlock(buf, mb);
+
+            double best = 0.0;
+            for (int rep = 0; rep < REPEATS; ++rep) {
+                auto t0 = std::chrono::steady_clock::now();
+                for (int b = 0; b < BLOCKS; ++b) {
+                    for (int c = 0; c < SRC_CH; ++c)
+                        buf.copyFrom(c, 0, src, c, 0, BS);   // memcpy, not a realloc
+                    proc.processBlock(buf, mb);
+                }
+                auto t1 = std::chrono::steady_clock::now();
+
+                double wall  = std::chrono::duration<double>(t1 - t0).count();
+                double audio = (double)(BLOCKS * BS) / SR;
+                best = std::max(best, wall > 1e-9 ? audio / wall : 1e9);
+            }
+            return best;
+        };
+
+        // Each effect is driven at a NON-neutral setting - several of them
+        // early-out at their default (e.g. Wavelet Pitch returns immediately
+        // when |Semitones| < 0.01), which would measure nothing at all.
+        struct ParamSpec { const char* name; float val, lo, hi; };
+        auto makeNode = [&](NodeGraph& g, std::initializer_list<ParamSpec> ps) -> Node& {
+            int nId = g.addNode("cpu", NodeType::Effect, {}, {}).id;
+            Node& nd = *g.findNode(nId);
+            for (auto& p : ps) nd.params.push_back({p.name, p.val, p.lo, p.hi});
+            return nd;
+        };
+
+        auto budget = [&](const char* label, juce::AudioProcessor& proc) {
+            double rt = realtimeFactor(proc);
+            r.checkVal(rt >= MIN_RT,
+                       juce::String("wavelet-cpu: ") + label
+                           + " runs >=10x realtime (x realtime)", rt);
+        };
+        // Same measurement, but for an effect whose slowness is a tracked bug.
+
+        { NodeGraph g; Node& nd = makeNode(g, {{"Transient",2.0f,0,2},{"Sustain",0.5f,0,2},
+                                               {"Threshold",0.3f,0,1},{"Levels",4.0f,1,8}});
+          TransientSplitProcessor p(nd);          budget("Transient Split", p); }
+        { NodeGraph g; Node& nd = makeNode(g, {{"Threshold",0.1f,0,1},{"Levels",4.0f,1,8},
+                                               {"Mix",1.0f,0,1}});
+          WaveletDenoiserProcessor p(nd);         budget("Denoiser", p); }
+        { NodeGraph g; Node& nd = makeNode(g, {{"Bits",4.0f,1,16},{"Band Lo",0.0f,0,7},
+                                               {"Band Hi",7.0f,0,7},{"Levels",4.0f,1,8},
+                                               {"Mix",1.0f,0,1}});
+          WaveletBitcrushProcessor p(nd);         budget("Bitcrush", p); }
+        { NodeGraph g; Node& nd = makeNode(g, {{"Shift",-1.0f,-2,2},{"Mix",0.5f,0,1}});
+          OctaveShiftProcessor p(nd);             budget("Octave Shift", p); }
+        { NodeGraph g; Node& nd = makeNode(g, {{"Threshold",-20.0f,-60,0},{"Ratio",4.0f,1,20},
+                                               {"Levels",4.0f,1,6},{"Low Gain",0.0f,-12,12},
+                                               {"High Gain",0.0f,-12,12},{"Mix",1.0f,0,1}});
+          WaveletMultibandCompProcessor p(nd);    budget("Multiband Comp", p); }
+        { NodeGraph g; Node& nd = makeNode(g, {{"Decay",0.7f,0,1},{"Color",1.0f,0,3},
+                                               {"Levels",5.0f,1,8},{"Mix",0.3f,0,1}});
+          WaveletReverbProcessor p(nd);           budget("Reverb (1/f)", p); }
+        { NodeGraph g; Node& nd = makeNode(g, {{"Semitones",7.0f,-24,24},{"Threshold",0.3f,0,1},
+                                               {"Trans Gain",1.0f,0,2},{"Levels",4.0f,1,8},
+                                               {"Mix",1.0f,0,1}});
+          IndependentPitchShiftProcessor p(nd);   budget("Ind. Pitch Shift", p); }
+        { NodeGraph g; Node& nd = makeNode(g, {{"Complexity",0.5f,0,1},{"Levels",4.0f,1,8},
+                                               {"Mix",1.0f,0,1}});
+          WaveletComplexityProcessor p(nd);       budget("Complexity", p); }
+        { NodeGraph g; Node& nd = makeNode(g, {{"Pre-Attack",20.0f,0,100},{"Post-Decay",50.0f,0,200},
+                                               {"Pre Gain",2.0f,0,4},{"Post Gain",0.5f,0,2},
+                                               {"Levels",4.0f,1,8},{"Mix",1.0f,0,1}});
+          AsymmetricFilterProcessor p(nd);        budget("Asymmetric Filter", p); }
+        { NodeGraph g; Node& nd = makeNode(g, {{"Min Hz",50.0f,20,5000},{"Max Hz",2000.0f,20,5000},
+                                               {"Detected Hz",0.0f,0,5000}});
+          WaveletPitchTrackerProcessor p(nd);     budget("Pitch Tracker", p); }
+        { NodeGraph g; Node& nd = makeNode(g, {{"Bands",5.0f,1,8},{"Mix",1.0f,0,1}});
+          WaveletVocoderProcessor p(nd);          budget("Vocoder", p); }
+        { NodeGraph g; Node& nd = makeNode(g, {{"Semitones",7.0f,-24,24},{"Formant Lock",0.8f,0,1},
+                                               {"Levels",5.0f,1,8},{"Mix",1.0f,0,1}});
+          FormantPitchShiftProcessor p(nd);       budget("Formant Pitch Shift", p); }
+    }
+
+    // ---- The two node-level pitch shifters, end to end ------------------
+    //
+    // Independent Pitch Shift and Formant Pitch Shift used to transpose by
+    // resampling INSIDE the current block: `srcPos = i * ratio`, reading source
+    // sample `i * ratio` to produce output sample `i`. For an upward shift that
+    // runs off the end of the block - at ratio 2 every output sample past the
+    // halfway point wanted a source sample that did not exist, and the code
+    // emitted silence for it. Each block was a correctly-shifted first half
+    // followed by a zeroed second half: a 50%-duty gate at the block rate
+    // (~94 Hz at 512/48k), measured here as a last-quarter energy fraction of
+    // 0.00000 against a healthy 0.25. Both now run on PhaseVocoderShifter.
+    //
+    // Two things are checked, and the continuity one is the reason this test
+    // drives many consecutive blocks rather than one big buffer: a single call
+    // cannot reveal block-rate structure.
+    {
+        const int BS = 512;
+        const double SR = 48000.0;
+        const double inHz = 440.0;
+
+        auto dominantHz = [&](const float* d, int n) {
+            double bestP = -1, bestF = 0;
+            for (double f = 100; f <= 4000; f += 1.0) {
+                double re = 0, im = 0;
+                for (int i = 0; i < n; ++i) {
+                    double a = 6.28318530718 * f * i / SR;
+                    re += d[i] * std::cos(a); im += d[i] * std::sin(a);
+                }
+                double p = re * re + im * im;
+                if (p > bestP) { bestP = p; bestF = f; }
+            }
+            return bestF;
+        };
+
+        // Drive a continuous 440 Hz tone through the node and return the
+        // steady-state output. `skipBlocks` must clear the node's reported
+        // latency, or the ramp-up is what gets measured.
+        auto runNode = [&](juce::AudioProcessor& proc, int keepBlocks) {
+            proc.prepareToPlay(SR, BS);
+            const int skipBlocks = proc.getLatencySamples() / BS + 4;
+            juce::AudioBuffer<float> buf(2, BS);
+            juce::MidiBuffer mb;
+            std::vector<float> out;
+            out.reserve((size_t)(keepBlocks * BS));
+            int phase = 0;
+            for (int b = 0; b < skipBlocks + keepBlocks; ++b) {
+                for (int c = 0; c < 2; ++c)
+                    for (int i = 0; i < BS; ++i)
+                        buf.getWritePointer(c)[i] =
+                            0.5f * (float)std::sin(6.28318530718 * inHz * (phase + i) / SR);
+                proc.processBlock(buf, mb);
+                if (b >= skipBlocks) {
+                    const float* d = buf.getReadPointer(0);
+                    out.insert(out.end(), d, d + BS);
+                }
+                phase += BS;
+            }
+            return out;
+        };
+
+        auto tailFraction = [&](const std::vector<float>& out) {
+            double tailE = 0, totalE = 0;
+            for (size_t b = 0; b * BS < out.size(); ++b)
+                for (int i = 0; i < BS; ++i) {
+                    double v = out[b * BS + (size_t)i];
+                    totalE += v * v;
+                    if (i >= (BS * 3) / 4) tailE += v * v;
+                }
+            return totalE > 1e-20 ? tailE / totalE : 0.0;
+        };
+
+        auto checkShifter = [&](const char* label, juce::AudioProcessor& proc) {
+            auto out = runNode(proc, 12);
+            double frac = tailFraction(out);
+            r.checkVal(std::abs(frac - 0.25) <= 0.06,
+                       juce::String("wavelet-fx: ") + label + " +12 spreads energy evenly "
+                       "across the block (last-quarter energy fraction, 0.25 = uniform)",
+                       frac);
+            double outHz = dominantHz(out.data(), (int)out.size());
+            double cents = 1200.0 * std::log2(outHz / (inHz * 2.0));
+            r.checkVal(std::abs(cents) <= 50.0,
+                       juce::String("wavelet-fx: ") + label + " +12 lands within 50 cents "
+                       "of 880 Hz (cents error)",
+                       cents);
+            r.checkVal(proc.getLatencySamples() > 0,
+                       juce::String("wavelet-fx: ") + label + " reports its pitch-shifter "
+                       "latency for PDC (samples)",
+                       proc.getLatencySamples());
+        };
+
+        {
+            NodeGraph g;
+            int nId = g.addNode("indps", NodeType::Effect, {}, {}).id;
+            Node& nd = *g.findNode(nId);
+            nd.params.push_back({"Semitones",  12.0f, -24.0f, 24.0f});
+            nd.params.push_back({"Threshold",   1.0f,   0.0f,  1.0f}); // all tonal
+            nd.params.push_back({"Trans Gain",  0.0f,   0.0f,  2.0f});
+            nd.params.push_back({"Levels",      4.0f,   1.0f,  8.0f});
+            nd.params.push_back({"Mix",         1.0f,   0.0f,  1.0f});
+            IndependentPitchShiftProcessor proc(nd);
+            checkShifter("Ind. Pitch Shift", proc);
+        }
+        {
+            NodeGraph g;
+            int nId = g.addNode("fps", NodeType::Effect, {}, {}).id;
+            Node& nd = *g.findNode(nId);
+            nd.params.push_back({"Semitones",    12.0f, -24.0f, 24.0f});
+            nd.params.push_back({"Formant Lock",  0.0f,   0.0f,  1.0f});
+            nd.params.push_back({"Levels",        5.0f,   1.0f,  8.0f});
+            nd.params.push_back({"Mix",           1.0f,   0.0f,  1.0f});
+            FormantPitchShiftProcessor proc(nd);
+            checkShifter("Formant Pitch Shift", proc);
+        }
+
+        // ---- The Pitch Shift node ---------------------------------------
+        //
+        // This node used to wrap Rubber Band and had NO test coverage at all.
+        // That mattered, because it was the only remaining user of the GPL v2
+        // `third_party/rubberband`, so whether the dependency could be deleted
+        // rested entirely on what the node actually delivered. Measuring it
+        // found that of its three params only Pitch worked: Time Ratio could
+        // not work in a live node (a processBlock must emit as many samples as
+        // it is handed, so a duration change has nowhere to go - at ratio 2 the
+        // surplus backed up forever, at ratio 0.5 it starved and zero-filled
+        // half the output), and Formant was never read at all, rendering
+        // bit-identical at 0 and 1. Both are gone; both remaining params work.
+        //
+        // Params are read BY NAME now, so these must match the names the
+        // node-creation site uses. The constants exist so a rename cannot
+        // silently desync them and leave everything reading defaults.
+        auto makePitchShiftNode = [&](NodeGraph& g, float semis, float formant) -> Node& {
+            int nId = g.addNode("ps", NodeType::Effect, {}, {}).id;
+            Node& nd = *g.findNode(nId);
+            nd.params.push_back({PitchShiftProcessor::kPitchParam, semis, -24.0f, 24.0f});
+            nd.params.push_back({PitchShiftProcessor::kFormantParam, formant, 0.0f, 1.0f});
+            return nd;
+        };
+
+        {
+            NodeGraph g;
+            Node& nd = makePitchShiftNode(g, 12.0f, 0.0f);
+            PitchShiftProcessor proc(nd);
+            auto out = runNode(proc, 12);
+            double outHz = dominantHz(out.data(), (int)out.size());
+            double cents = 1200.0 * std::log2(outHz / (inHz * 2.0));
+            r.checkVal(std::abs(cents) <= 50.0,
+                       "pitch-shift-node: +12 lands within 50 cents of 880 Hz "
+                       "(cents error)", cents);
+            r.checkVal(std::abs(tailFraction(out) - 0.25) <= 0.06,
+                       "pitch-shift-node: +12 spreads energy evenly across the block "
+                       "(last-quarter energy fraction, 0.25 = uniform)",
+                       tailFraction(out));
+            r.checkVal(proc.getLatencySamples() > 0,
+                       "pitch-shift-node: reports its latency so the graph can PDC it "
+                       "(samples)", (double)proc.getLatencySamples());
+        }
+
+        // The Formant knob used to be inert. It is now wired to the core's
+        // cepstral formant preservation, so the SAME comparison that once
+        // proved it dead (render at 0, render at 1, diff them) must now show a
+        // real difference. Keeping the test in this shape is deliberate: it is
+        // the direct regression guard against the knob going inert again.
+        {
+            auto render = [&](float formant) {
+                NodeGraph g;
+                Node& nd = makePitchShiftNode(g, 12.0f, formant);
+                PitchShiftProcessor proc(nd);
+                return runNode(proc, 12);
+            };
+            auto a = render(0.0f);
+            auto b = render(1.0f);
+            double maxDiff = 0.0;
+            const size_t nCmp = std::min(a.size(), b.size());
+            for (size_t i = 0; i < nCmp; ++i)
+                maxDiff = std::max(maxDiff, (double)std::abs(a[i] - b[i]));
+            r.checkVal(nCmp > 0 && maxDiff > 1e-4,
+                       "pitch-shift-node: the Formant knob is a LIVE control - Formant 0 "
+                       "and Formant 1 render audibly different output (max sample "
+                       "difference; this param was inert under Rubber Band)",
+                       maxDiff);
+        }
+
+        // A stale "Time Ratio" left over in an old project must not disturb
+        // anything. This is the payoff for reading params by name: the same
+        // node with a junk extra param renders bit-identically. Under the old
+        // by-index reading, an extra param would have re-pointed every later
+        // one and silently changed what the node did.
+        {
+            NodeGraph g1, g2;
+            Node& a = makePitchShiftNode(g1, 12.0f, 0.0f);
+            int nId = g2.addNode("ps2", NodeType::Effect, {}, {}).id;
+            Node& b = *g2.findNode(nId);
+            b.params.push_back({PitchShiftProcessor::kPitchParam, 12.0f, -24.0f, 24.0f});
+            b.params.push_back({"Time Ratio", 0.5f, 0.25f, 4.0f});   // the ghost
+            b.params.push_back({PitchShiftProcessor::kFormantParam, 0.0f, 0.0f, 1.0f});
+            PitchShiftProcessor pa(a), pb(b);
+            auto oa = runNode(pa, 12);
+            auto ob = runNode(pb, 12);
+            double maxDiff = 0.0;
+            const size_t nCmp = std::min(oa.size(), ob.size());
+            for (size_t i = 0; i < nCmp; ++i)
+                maxDiff = std::max(maxDiff, (double)std::abs(oa[i] - ob[i]));
+            r.checkVal(nCmp > 0 && maxDiff == 0.0,
+                       "pitch-shift-node: a leftover Time Ratio param from an old project "
+                       "changes nothing (max sample difference vs the same node without "
+                       "it)", maxDiff);
+        }
+    }
+
+    // ---- PhaseVocoderShifter: the in-house pitch-shift core -------------
+    //
+    // This is the replacement for both the block-chopping resamplers above and
+    // (eventually) the GPL Rubber Band dependency, so it is tested directly
+    // rather than only through the nodes that will consume it. The three
+    // obligations, in order of importance:
+    //
+    //   1. put the energy at the requested pitch, accurately enough that a
+    //      one-semitone shift is audibly one semitone (the specific thing the
+    //      old implementations could not do),
+    //   2. keep the level intact,
+    //   3. produce a continuous signal with no block-rate structure.
+    //
+    // Plus a capacity check, because this runs on the audio thread and the
+    // whole point of the design is that process() never allocates.
+    {
+        const double SR = 48000.0;
+        const int    BS = 512;
+        const double inHz = 440.0;
+
+        // Coarse DFT peak-pick, 1 Hz resolution over the musical range. Fine
+        // enough that the quantisation is ~4 cents at 440 Hz, well inside the
+        // tolerances below.
+        auto dominantHz = [&](const float* d, int n) {
+            double bestP = -1, bestF = 0;
+            for (double f = 100; f <= 4000; f += 1.0) {
+                double re = 0, im = 0;
+                for (int i = 0; i < n; ++i) {
+                    double a = 6.28318530718 * f * i / SR;
+                    re += d[i] * std::cos(a); im += d[i] * std::sin(a);
+                }
+                double p = re * re + im * im;
+                if (p > bestP) { bestP = p; bestF = f; }
+            }
+            return bestF;
+        };
+        auto rmsOf = [](const std::vector<float>& v) {
+            double s = 0;
+            for (float x : v) s += (double)x * x;
+            return v.empty() ? 0.0 : std::sqrt(s / (double)v.size());
+        };
+
+        // Drive a continuous sine through the shifter in BS-sized blocks and
+        // return the steady-state output, with the pipeline latency plus a
+        // safety margin discarded so the ramp-up is never measured.
+        auto runTone = [&](PhaseVocoderShifter& ps, int keepSamples) {
+            const int skip = ps.latencySamples() + 4 * ps.fftLength();
+            std::vector<float> out;
+            out.reserve((size_t)(skip + keepSamples + BS));
+            std::vector<float> in((size_t)BS), tmp((size_t)BS);
+            int phase = 0;
+            while ((int)out.size() < skip + keepSamples) {
+                for (int i = 0; i < BS; ++i)
+                    in[(size_t)i] = 0.5f * (float)std::sin(6.28318530718 * inHz * (phase + i) / SR);
+                ps.process(in.data(), tmp.data(), BS);
+                out.insert(out.end(), tmp.begin(), tmp.end());
+                phase += BS;
+            }
+            return std::vector<float>(out.begin() + skip, out.begin() + skip + keepSamples);
+        };
+
+        // 1. Pitch accuracy. 25 cents is a quarter of a semitone - tight enough
+        //    that no interval can be confused with its neighbour, and well
+        //    inside what a listener would call in tune.
+        for (float semis : {-12.0f, -7.0f, -1.0f, 0.0f, 1.0f, 7.0f, 12.0f}) {
+            PhaseVocoderShifter ps;
+            ps.prepare(11, 4);
+            ps.setPitchRatio(PhaseVocoderShifter::ratioForSemitones(semis));
+            auto out = runTone(ps, 4096);
+            double outHz  = dominantHz(out.data(), (int)out.size());
+            double expect = inHz * std::pow(2.0, semis / 12.0);
+            double cents  = 1200.0 * std::log2(outHz / expect);
+            r.checkVal(std::abs(cents) <= 25.0,
+                       juce::String("pitch-core: ") + juce::String(semis, 0)
+                           + " semitones lands within 25 cents of "
+                           + juce::String(expect, 1) + " Hz (cents error)",
+                       cents);
+        }
+
+        // 2. Level preservation. A phase vocoder redistributes energy between
+        //    bins, so exact unity is not the bar; 3 dB is. Unison is checked
+        //    tighter because there the overlap-add normalisation is the only
+        //    thing acting and any error in it shows up directly.
+        {
+            const double inLevel = 0.5 / std::sqrt(2.0);   // RMS of a 0.5 sine
+            for (float semis : {-12.0f, 0.0f, 12.0f}) {
+                PhaseVocoderShifter ps;
+                ps.prepare(11, 4);
+                ps.setPitchRatio(PhaseVocoderShifter::ratioForSemitones(semis));
+                auto out = runTone(ps, 4096);
+                double db = 20.0 * std::log10(std::max(1e-12, rmsOf(out) / inLevel));
+                double tol = (semis == 0.0f) ? 1.0 : 3.0;
+                r.checkVal(std::abs(db) <= tol,
+                           juce::String("pitch-core: ") + juce::String(semis, 0)
+                               + " semitones preserves level within "
+                               + juce::String(tol, 0) + " dB (dB change)",
+                           db);
+            }
+        }
+
+        // 3. No block-rate structure. This is the exact measurement that
+        //    condemned the old resamplers: they scored 0.00000 here because the
+        //    tail of every block was silence. A continuous effect scores ~0.25.
+        {
+            PhaseVocoderShifter ps;
+            ps.prepare(11, 4);
+            ps.setPitchRatio(2.0f);
+            auto out = runTone(ps, BS * 12);
+            double tailE = 0, totalE = 0;
+            for (int b = 0; b * BS < (int)out.size(); ++b) {
+                for (int i = 0; i < BS; ++i) {
+                    double e = (double)out[(size_t)(b * BS + i)] * out[(size_t)(b * BS + i)];
+                    totalE += e;
+                    if (i >= (BS * 3) / 4) tailE += e;
+                }
+            }
+            double frac = totalE > 1e-20 ? tailE / totalE : 0.0;
+            r.checkVal(std::abs(frac - 0.25) <= 0.05,
+                       "pitch-core: +12 semitones spreads energy evenly across the block "
+                       "(last-quarter energy fraction, 0.25 = uniform)",
+                       frac);
+        }
+
+        // 4. Block-size independence. process() is a sample-driven FIFO, so a
+        //    stream chopped into ragged blocks must produce the same samples as
+        //    the same stream in one call. Callers get arbitrary block sizes from
+        //    the host, and PDC assumes a fixed latency regardless.
+        {
+            const int TOTAL = 8192;
+            std::vector<float> in((size_t)TOTAL);
+            for (int i = 0; i < TOTAL; ++i)
+                in[(size_t)i] = 0.5f * (float)std::sin(6.28318530718 * inHz * i / SR);
+
+            PhaseVocoderShifter a, b;
+            a.prepare(11, 4); b.prepare(11, 4);
+            a.setPitchRatio(1.5f); b.setPitchRatio(1.5f);
+
+            std::vector<float> oneShot((size_t)TOTAL), ragged((size_t)TOTAL);
+            a.process(in.data(), oneShot.data(), TOTAL);
+
+            const int chunks[] = { 1, 7, 64, 333, 512, 1000 };
+            int pos = 0, ci = 0;
+            while (pos < TOTAL) {
+                int n = std::min(chunks[ci % 6], TOTAL - pos);
+                b.process(in.data() + pos, ragged.data() + pos, n);
+                pos += n; ++ci;
+            }
+            double maxDiff = 0;
+            for (int i = 0; i < TOTAL; ++i)
+                maxDiff = std::max(maxDiff, (double)std::abs(oneShot[(size_t)i] - ragged[(size_t)i]));
+            r.checkVal(maxDiff < 1e-6,
+                       "pitch-core: ragged block sizes give bit-comparable output to one "
+                       "big call (max sample difference)",
+                       maxDiff);
+        }
+
+        // 5. Allocation-freedom on the audio thread. Capacity is the observable
+        //    proxy: if any internal buffer grew, process() called the allocator.
+        //    Checked across a ratio change and a transient trigger too, since
+        //    those are the other things a caller does mid-stream.
+        {
+            PhaseVocoderShifter ps;
+            ps.prepare(11, 4);
+            ps.setPitchRatio(1.0f);
+            std::vector<float> in((size_t)BS, 0.0f), out((size_t)BS);
+            for (int i = 0; i < BS; ++i)
+                in[(size_t)i] = 0.25f * (float)std::sin(6.28318530718 * 220.0 * i / SR);
+            ps.process(in.data(), out.data(), BS);      // warm up, settle capacities
+
+            const size_t before = ps.capacityBytes();
+            for (int b = 0; b < 200; ++b) {
+                ps.setPitchRatio(1.0f + 0.5f * (float)((b % 5) - 2) * 0.4f);
+                if (b % 17 == 0) ps.triggerTransient();
+                ps.process(in.data(), out.data(), BS);
+            }
+            const size_t after = ps.capacityBytes();
+            r.checkVal(after == before,
+                       "pitch-core: 200 blocks with ratio changes and transient triggers "
+                       "allocate nothing (buffer capacity growth in bytes)",
+                       (double)after - (double)before);
+        }
+
+        // 6. Stability: no NaN/Inf, and silence in gives silence out. A phase
+        //    vocoder divides nothing, but atan2 on an all-zero bin and the phase
+        //    integrator are both places where garbage could creep in and then
+        //    persist forever in the accumulators.
+        {
+            PhaseVocoderShifter ps;
+            ps.prepare(11, 4);
+            ps.setPitchRatio(1.7f);
+            std::vector<float> in((size_t)BS, 0.0f), out((size_t)BS);
+            double worst = 0;
+            bool finite = true;
+            for (int b = 0; b < 40; ++b) {
+                ps.process(in.data(), out.data(), BS);
+                for (float x : out) {
+                    if (!std::isfinite(x)) finite = false;
+                    worst = std::max(worst, (double)std::abs(x));
+                }
+            }
+            r.check(finite, "pitch-core: silence in stays finite");
+            r.checkVal(worst < 1e-6,
+                       "pitch-core: silence in gives silence out (peak output)", worst);
+        }
+
+        // 7. CPU budget, same 10x-realtime bar the wavelet effects are held to.
+        //    Measured for a STEREO pair, because that is what a node actually
+        //    instantiates - a mono figure would flatter it by 2x. Best-of-3:
+        //    machine interference only ever makes a run slower, so the minimum
+        //    time is a far more stable estimator than a mean.
+        {
+            PhaseVocoderShifter l, rr;
+            l.prepare(11, 4); rr.prepare(11, 4);
+            l.setPitchRatio(1.5f); rr.setPitchRatio(1.5f);
+            std::vector<float> in((size_t)BS), outL((size_t)BS), outR((size_t)BS);
+            for (int i = 0; i < BS; ++i)
+                in[(size_t)i] = 0.3f * (float)std::sin(6.28318530718 * 330.0 * i / SR);
+
+            const int BLOCKS = 200;
+            l.process(in.data(), outL.data(), BS);      // warm-up, untimed
+            double best = 0.0;
+            for (int rep = 0; rep < 3; ++rep) {
+                auto t0 = std::chrono::steady_clock::now();
+                for (int b = 0; b < BLOCKS; ++b) {
+                    l.process(in.data(), outL.data(), BS);
+                    rr.process(in.data(), outR.data(), BS);
+                }
+                auto t1 = std::chrono::steady_clock::now();
+                double wall  = std::chrono::duration<double>(t1 - t0).count();
+                double audio = (double)(BLOCKS * BS) / SR;
+                best = std::max(best, wall > 1e-9 ? audio / wall : 1e9);
+            }
+            r.checkVal(best >= 10.0,
+                       "pitch-core: stereo pair runs at >=10x realtime (realtime factor)",
+                       best);
+        }
+
+        // 8. Formant preservation.
+        //
+        //    Plain pitch shifting scales the whole spectrum, envelope included,
+        //    so a voice shifted up an octave gets its formants dragged up too -
+        //    the chipmunk sound. Preservation is supposed to move the pitch and
+        //    leave the timbre alone.
+        //
+        //    Test signal is a crude voice: a 200 Hz pulse train (the excitation,
+        //    which carries the PITCH) through a fixed resonator at 1500 Hz (the
+        //    formant, which carries the TIMBRE). Shifting up an octave must move
+        //    the 200 Hz to 400 Hz in both modes; what distinguishes the modes is
+        //    whether the 1500 Hz resonance moves with it.
+        //
+        //    The statistic is the spectral centroid, which tracks where the
+        //    envelope sits without needing to resolve individual formants.
+        {
+            const int NSIG = 32768;
+
+            auto makeVoice = [&](std::vector<float>& dst) {
+                dst.assign((size_t)NSIG, 0.0f);
+                // Two-pole resonator at 1500 Hz, driven by a 200 Hz pulse train.
+                const double f0 = 1500.0, q = 12.0;
+                const double w = 6.28318530718 * f0 / SR;
+                const double rr2 = std::exp(-w / (2.0 * q));
+                const double a1 = -2.0 * rr2 * std::cos(w), a2 = rr2 * rr2;
+                double y1 = 0, y2 = 0;
+                const int period = (int)(SR / 200.0);
+                for (int i = 0; i < NSIG; ++i) {
+                    const double x = (i % period == 0) ? 1.0 : 0.0;
+                    const double y = x - a1 * y1 - a2 * y2;
+                    y2 = y1; y1 = y;
+                    dst[(size_t)i] = (float)(y * 0.3);
+                }
+            };
+
+            // Spectral centroid over 100 Hz - 8 kHz, magnitude-weighted.
+            auto centroidHz = [&](const std::vector<float>& v, int from, int count) {
+                const int N = 8192;
+                if (from + N > (int)v.size()) return 0.0;
+                FFT f(N);
+                std::vector<FFT::cplx> spec((size_t)N);
+                std::vector<float> win((size_t)N);
+                for (int i = 0; i < N; ++i)
+                    win[(size_t)i] = v[(size_t)(from + i)]
+                        * 0.5f * (1.0f - std::cos(6.28318530718f * (float)i / (float)N));
+                f.forwardReal(win.data(), spec.data());
+                double num = 0, den = 0;
+                const int kLo = (int)(100.0 * N / SR), kHi = (int)(8000.0 * N / SR);
+                for (int k = kLo; k <= kHi; ++k) {
+                    const double m = std::abs(spec[(size_t)k]);
+                    const double hz = (double)k * SR / N;
+                    num += m * hz; den += m;
+                }
+                (void)count;
+                return den > 0 ? num / den : 0.0;
+            };
+
+            std::vector<float> voice;
+            makeVoice(voice);
+
+            auto shiftVoice = [&](bool formant) {
+                PhaseVocoderShifter ps;
+                ps.prepare(11, 4, SR);
+                ps.setFormantPreserve(formant);
+                ps.setPitchRatio(2.0f);
+                std::vector<float> out((size_t)NSIG, 0.0f);
+                ps.process(voice.data(), out.data(), NSIG);
+                return out;
+            };
+
+            const int SKIP = 8192;               // past the ramp-up
+            const double cIn   = centroidHz(voice, SKIP, 0);
+            auto plain  = shiftVoice(false);
+            auto formed = shiftVoice(true);
+            const double cPlain = centroidHz(plain,  SKIP, 0);
+            const double cForm  = centroidHz(formed, SKIP, 0);
+
+            r.checkVal(cIn > 0 && cPlain / cIn >= 1.5,
+                       "pitch-core: WITHOUT formant preservation, +12 drags the spectral "
+                       "centroid up with the pitch (out/in centroid ratio, ~2 = formants "
+                       "moved an octave)",
+                       cIn > 0 ? cPlain / cIn : 0.0);
+            r.checkVal(cIn > 0 && cForm / cIn <= 1.25,
+                       "pitch-core: WITH formant preservation, +12 leaves the spectral "
+                       "centroid put (out/in centroid ratio, ~1 = timbre preserved)",
+                       cIn > 0 ? cForm / cIn : 0.0);
+            r.checkVal(cPlain > cForm * 1.3,
+                       "pitch-core: formant preservation makes a large, unambiguous "
+                       "difference (centroid ratio between the two modes)",
+                       cForm > 0 ? cPlain / cForm : 0.0);
+
+            // The pitch must still shift by the full octave in formant mode -
+            // an implementation that "preserves formants" by simply shifting
+            // less would pass the centroid test above and be useless.
+            {
+                PhaseVocoderShifter ps;
+                ps.prepare(11, 4, SR);
+                ps.setFormantPreserve(true);
+                ps.setPitchRatio(2.0f);
+                std::vector<float> in((size_t)BS), tmp((size_t)BS), out;
+                const int skip = ps.latencySamples() + 4 * ps.fftLength();
+                int phase = 0;
+                while ((int)out.size() < skip + 16384) {
+                    for (int i = 0; i < BS; ++i)
+                        in[(size_t)i] = 0.5f * (float)std::sin(6.28318530718 * inHz * (phase + i) / SR);
+                    ps.process(in.data(), tmp.data(), BS);
+                    out.insert(out.end(), tmp.begin(), tmp.end());
+                    phase += BS;
+                }
+                const double hz = dominantHz(out.data() + skip, 16384);
+                const double cents = 1200.0 * std::log2(hz / (inHz * 2.0));
+                r.checkVal(std::abs(cents) <= 25.0,
+                           "pitch-core: formant preservation still shifts the pitch a full "
+                           "octave (cents error vs 880 Hz)", cents);
+            }
+
+            // Formant mode costs two extra FFTs per frame, so it gets its own
+            // CPU measurement rather than inheriting the plain-mode figure.
+            {
+                PhaseVocoderShifter l, rr;
+                l.prepare(11, 4, SR); rr.prepare(11, 4, SR);
+                l.setFormantPreserve(true); rr.setFormantPreserve(true);
+                l.setPitchRatio(1.5f); rr.setPitchRatio(1.5f);
+                std::vector<float> in((size_t)BS), outL((size_t)BS), outR((size_t)BS);
+                for (int i = 0; i < BS; ++i)
+                    in[(size_t)i] = 0.3f * (float)std::sin(6.28318530718 * 330.0 * i / SR);
+                const int BLOCKS = 200;
+                l.process(in.data(), outL.data(), BS);   // warm-up, untimed
+                double best = 0.0;
+                for (int rep = 0; rep < 3; ++rep) {
+                    auto t0 = std::chrono::steady_clock::now();
+                    for (int b = 0; b < BLOCKS; ++b) {
+                        l.process(in.data(), outL.data(), BS);
+                        rr.process(in.data(), outR.data(), BS);
+                    }
+                    auto t1 = std::chrono::steady_clock::now();
+                    double wall = std::chrono::duration<double>(t1 - t0).count();
+                    best = std::max(best, wall > 1e-9 ? (double)(BLOCKS * BS) / SR / wall : 1e9);
+                }
+                r.checkVal(best >= 10.0,
+                           "pitch-core: stereo pair with formant preservation runs at "
+                           ">=10x realtime (realtime factor)", best);
+            }
+
+            // Allocation-freedom must hold in formant mode too - it adds two
+            // buffers, and they are sized in prepare() precisely so that
+            // toggling the flag mid-stream cannot allocate on the audio thread.
+            {
+                PhaseVocoderShifter ps;
+                ps.prepare(11, 4, SR);
+                std::vector<float> in((size_t)BS), out((size_t)BS);
+                for (int i = 0; i < BS; ++i)
+                    in[(size_t)i] = 0.2f * (float)std::sin(6.28318530718 * 220.0 * i / SR);
+                ps.process(in.data(), out.data(), BS);
+                const size_t before = ps.capacityBytes();
+                for (int b = 0; b < 200; ++b) {
+                    ps.setFormantPreserve((b / 10) % 2 == 0);   // toggle mid-stream
+                    ps.setPitchRatio(0.5f + 0.01f * (float)(b % 100));
+                    ps.process(in.data(), out.data(), BS);
+                }
+                const double grew = (double)ps.capacityBytes() - (double)before;
+                r.checkVal(grew == 0.0,
+                           "pitch-core: toggling formant preservation mid-stream allocates "
+                           "nothing (capacity growth, bytes)", grew);
+            }
+        }
     }
 
     // ---- Bucket C: whole-buffer spectral / wavelet warps ----------------
@@ -4802,6 +6481,1160 @@ void testAssetLibrary(Report& r) {
                    relDiff);
     }
 
+    // ---- TerrainSynth: processBlock is allocation-free -----------------------
+    // TerrainSynthProcessor::processBlock used to reach the allocator on almost
+    // every line of its hot loop: Traversal::evaluate returned a std::vector BY
+    // VALUE once per SAMPLE, the SamplePerPoint path copied that vector twice
+    // more per sample PER VOICE (pitchCoord / coordA / coordB), the grid
+    // occupancy lookup built a fresh coord vector per sample, and the Position
+    // params were addressed by rebuilding a std::string ("Position 3") and
+    // linear-scanning node.params for every axis of every sample. Per block
+    // there were more: the scatter blend allocated weights/dists/blended/coeffs,
+    // fetched the db2 filter by value, and called the dwt/idwt convenience
+    // overloads that construct a WaveletWorkspace internally - roughly 40
+    // allocations a block with eight frames.
+    //
+    // malloc can block on a global lock, which the user hears as a dropout, and
+    // it's an automatic fail under pluginval strictness 10 (which gates the
+    // planned plugin spin-offs). Total reserved scratch is the observable proxy:
+    // prepareToPlay sizes everything up front, so any growth across a sweep
+    // means processBlock reached the allocator. Paired with a non-vacuity check
+    // so the sweep can't pass by rendering silence.
+    {
+        Transport transport;
+        transport.sampleRate = 44100.0;
+        transport.bpm = 120.0;
+
+        // Four scatter dots along one axis, so the wavelet-domain blend runs
+        // with several contributing frames (the heaviest per-block path).
+        WavetableDoc doc;
+        doc.mode = WavetableMode::Scatter;
+        doc.scatterDims = 1;
+        doc.tableSize = 2048;                 // power of two -> wavelet morph on
+        for (int i = 0; i < 4; ++i) {
+            auto lw = std::make_unique<LayeredWaveform>();
+            lw->layers.push_back(WaveLayer{});
+            int fid = doc.addLibraryEntry(std::move(lw), "w" + std::to_string(i));
+            ScatterFrame sf;
+            sf.waveformId = fid;
+            sf.position = { i / 3.0f };
+            doc.scatterFrames.push_back(sf);
+        }
+
+        Node node;
+        node.id = 1;
+        node.type = NodeType::TerrainSynth;
+        node.name = "selftest-terrain-alloc";
+        node.script = doc.encode();
+        node.pinsIn.push_back(Pin{ 1, "MIDI", PinKind::Midi, true, 2 });
+        node.pinsIn.push_back(Pin{ 2, "Sig X", PinKind::Signal, true, 1 });
+        node.pinsOut.push_back(Pin{ 100, "Audio", PinKind::Audio, false, 2 });
+        node.params.push_back({ "Volume",     1.0f, 0.0f, 1.0f });
+        node.params.push_back({ "Synth Mode", 0.0f, 0.0f, 2.0f });
+        node.params.push_back({ "Position",   0.5f, 0.0f, 1.0f });
+        node.ahdsrEnvelope.attackMs  = 1.0f;
+        node.ahdsrEnvelope.holdMs    = 60000.0f;   // hold for the whole sweep
+        node.ahdsrEnvelope.decayMs   = 1.0f;
+        node.ahdsrEnvelope.sustain   = 1.0f;
+        node.ahdsrEnvelope.releaseMs = 1.0f;
+        node.ahdsrEnvelope.velocitySensitivity = 0.0f;
+        AHDSREnvelope::setDefaultCurves(node.ahdsrEnvelope);
+
+        const int maxBlock = 512;
+        TerrainSynthProcessor proc(node, transport);
+        proc.prepareToPlay(44100.0, maxBlock);
+
+        juce::AudioBuffer<float> buf(3, maxBlock);   // 2 audio + 1 Sig X
+        auto runBlock = [&](int len, bool noteOn) {
+            juce::AudioBuffer<float> view(buf.getArrayOfWritePointers(),
+                                          buf.getNumChannels(), len);
+            view.clear();
+            juce::MidiBuffer midi;
+            if (noteOn)
+                midi.addEvent(juce::MidiMessage::noteOn(1, 69, (juce::uint8)100), 0);
+            proc.processBlock(view, midi);
+        };
+
+        auto idxOf = [&](const char* nm) {
+            for (size_t i = 0; i < node.params.size(); ++i)
+                if (node.params[i].name == nm) return (int)i;
+            return -1;
+        };
+        const int posIdx  = idxOf("Position");
+        const int modeIdx = idxOf("Synth Mode");
+        r.check(posIdx >= 0 && modeIdx >= 0,
+                "terrain-alloc: Position / Synth Mode params present");
+
+        // Warm up: sound a note and let every lazily-sized buffer settle. Six
+        // voices so the per-voice scratch is exercised too, and all three Synth
+        // Modes because AdditiveBank is the only one that touches the partial
+        // analysis buffers - measuring `before` without visiting it would score
+        // its legitimate one-time sizing as a leak.
+        runBlock(maxBlock, true);
+        for (int nn = 60; nn < 66; ++nn) {
+            juce::AudioBuffer<float> view(buf.getArrayOfWritePointers(), 3, maxBlock);
+            view.clear();
+            juce::MidiBuffer midi;
+            midi.addEvent(juce::MidiMessage::noteOn(1, nn, (juce::uint8)100), 0);
+            proc.processBlock(view, midi);
+        }
+        for (int mode = 0; mode < 3; ++mode) {
+            node.params[(size_t)modeIdx].value = (float)mode;
+            for (int i = 0; i < 3; ++i) runBlock(maxBlock, false);
+        }
+
+        const size_t before = proc.scratchCapacityBytes();
+
+        // Sweep block length, Position and Synth Mode. Block length varies
+        // because a host is free to change it (480 is common), Position moves
+        // the scatter query so the blend recomputes, and Synth Mode switches
+        // between the Direct / AM-sine / Additive render paths.
+        const int lens[] = { 512, 480, 256, 64, 333, 512 };
+        for (int pass = 0; pass < 60; ++pass) {
+            node.params[(size_t)posIdx].value  = (pass % 11) / 10.0f;
+            node.params[(size_t)modeIdx].value = (float)(pass % 3);
+            runBlock(lens[pass % 6], false);
+        }
+        const size_t after = proc.scratchCapacityBytes();
+        r.checkVal(after == before,
+                   "terrain-alloc: 60 blocks sweeping Position / Synth Mode / "
+                   "block length allocate nothing (scratch capacity growth, bytes)",
+                   (double)after - (double)before);
+
+        // Non-vacuity: the synth must still be making sound at the end of the
+        // sweep, so the loop above was doing real work rather than bailing.
+        node.params[(size_t)modeIdx].value = 0.0f;   // Direct
+        runBlock(maxBlock, false);
+        double peak = 0;
+        for (int i = 0; i < maxBlock; ++i)
+            peak = std::max(peak, (double)std::abs(buf.getSample(0, i)));
+        r.checkVal(peak > 1e-3, "terrain-alloc: synth still audible after the sweep",
+                   peak);
+    }
+
+    // ---- SoundFontProcessor: loads its file, and renders without allocating --
+    //
+    // Two things are under test here, both found in the audio-thread allocation
+    // sweep (agent-todo item 3).
+    //
+    // 1. loadFile() stripped the script tag with substr(7), but "__sfz__:" is
+    //    EIGHT characters, so every path arrived with a leading ':' and neither
+    //    tsf_load_filename nor juce::File could find it. .sf2 and .sfz nodes
+    //    loaded nothing and rendered silence - the whole node type was dead.
+    //    The region-count assertion below is what pins the offset down.
+    // 2. processBlock allocated on every callback: `interleaved` was a local
+    //    std::vector sized to the block, and findRegions returned a fresh
+    //    std::vector<const SFZRegion*> by value on every note-on. Both are now
+    //    members sized in prepareToPlay / loadFile, so total reserved scratch is
+    //    the observable proxy - any growth across the sweep means the allocator
+    //    was reached from the audio thread.
+    //
+    // The instrument is built on the fly (a looping sine .wav plus a two-region
+    // .sfz) so the test carries no binary fixture and doesn't depend on a
+    // SoundFont being installed. SFZ rather than SF2 because SF2 has no
+    // human-writable text form.
+    {
+        auto sfDir = juce::File::getSpecialLocation(juce::File::tempDirectory)
+                         .getChildFile("seance_selftest_sfz");
+        sfDir.deleteRecursively();
+        sfDir.createDirectory();
+
+        const double sr = 44100.0;
+        const int    sampleLen = (int)sr;              // 1 s, looped
+        std::vector<float> tone((size_t)sampleLen);
+        for (int i = 0; i < sampleLen; ++i)
+            tone[(size_t)i] = 0.5f * std::sin(2.0 * juce::MathConstants<double>::pi
+                                              * 220.0 * i / sr);
+        auto wav = sfDir.getChildFile("tone.wav");
+        r.check(writeWavFloat(wav, tone, sr), "soundfont: test sample written");
+
+        // Two regions splitting the velocity range, so a note-on has to match
+        // exactly one and regionMatches is genuinely repopulated per note.
+        auto sfzFile = sfDir.getChildFile("inst.sfz");
+        sfzFile.replaceWithText(
+            "<group> loop_mode=loop_continuous loop_start=0 loop_end="
+            + juce::String(sampleLen - 1) + " ampeg_release=0.05\n"
+            "<region> sample=tone.wav lokey=0 hikey=127 pitch_keycenter=57 lovel=0 hivel=63\n"
+            "<region> sample=tone.wav lokey=0 hikey=127 pitch_keycenter=57 lovel=64 hivel=127\n");
+
+        Node node;
+        node.id   = 1;
+        node.type = NodeType::Instrument;
+        node.name = "selftest-sfz";
+        node.script = "__sfz__:" + sfzFile.getFullPathName().toStdString();
+        node.pinsIn .push_back(Pin{ 1, "MIDI",  PinKind::Midi,  true,  2 });
+        node.pinsOut.push_back(Pin{ 100, "Audio", PinKind::Audio, false, 2 });
+        node.params.push_back({ "Volume",   0.8f, 0.0f, 1.0f });
+        node.params.push_back({ "Vel Sens", 0.0f, 0.0f, 1.0f });
+
+        const int maxBlock = 512;
+        SoundFontProcessor proc(node);
+        r.check(proc.isSFZ(), "soundfont: .sfz path resolves from the node script "
+                              "(regression: substr(7) left a stray ':')");
+        proc.prepareToPlay(sr, maxBlock);
+
+        juce::AudioBuffer<float> buf(2, maxBlock);
+        auto runBlock = [&](int len, int noteOn, int noteOff) {
+            juce::AudioBuffer<float> view(buf.getArrayOfWritePointers(),
+                                          buf.getNumChannels(), len);
+            view.clear();
+            juce::MidiBuffer midi;
+            if (noteOn  >= 0) midi.addEvent(juce::MidiMessage::noteOn (1, noteOn,
+                                              (juce::uint8)100), 0);
+            if (noteOff >= 0) midi.addEvent(juce::MidiMessage::noteOff(1, noteOff), 0);
+            proc.processBlock(view, midi);
+        };
+
+        // Warm up: sound a note and render a few blocks so every lazily-sized
+        // buffer settles before the capacity snapshot.
+        runBlock(maxBlock, 57, -1);
+        for (int i = 0; i < 3; ++i) runBlock(maxBlock, -1, -1);
+
+        const size_t before = proc.scratchCapacityBytes();
+
+        // Sweep block length (480 is a common host size; 333 is deliberately
+        // awkward) with continuous note-on/note-off traffic, so both the render
+        // path and the per-note-on region match run every pass.
+        const int lens[] = { 512, 480, 256, 64, 333, 512 };
+        for (int pass = 0; pass < 60; ++pass) {
+            const int nn = 55 + (pass % 7);
+            runBlock(lens[pass % 6], nn, (pass % 3 == 0) ? 55 + ((pass + 3) % 7) : -1);
+        }
+        const size_t after = proc.scratchCapacityBytes();
+        r.checkVal(after == before,
+                   "soundfont: 60 blocks of note traffic at varying block lengths "
+                   "allocate nothing (scratch capacity growth, bytes)",
+                   (double)after - (double)before);
+
+        // Non-vacuity: the sampler must actually be producing sound, otherwise
+        // the sweep above proves nothing.
+        runBlock(maxBlock, 57, -1);
+        double peak = 0;
+        for (int i = 0; i < maxBlock; ++i)
+            peak = std::max(peak, (double)std::abs(buf.getSample(0, i)));
+        r.checkVal(peak > 1e-3, "soundfont: sampler audible after the sweep", peak);
+
+        sfDir.deleteRecursively();
+    }
+
+    // ---- SignalShapeProcessor renders without allocating --------------------
+    //
+    // The Signal Shape node's per-sample loop was the worst offender found in
+    // the allocation sweep (agent-todo item 3), because the cost scaled with the
+    // expression vocabulary rather than being one buffer:
+    //   - `std::vector<const float*> sigChans` built per block (and handed to
+    //     the block-mode runtime as ScriptBlockCtx::sig, so it had to outlive
+    //     the call anyway).
+    //   - `std::unordered_map<std::string,float> vars` CONSTRUCTED PER BLOCK:
+    //     a bucket array plus one node allocation for each of the ~12 fixed
+    //     variables and every s1..sN, then all of it freed at the end of the
+    //     block. Roughly 15 allocations per callback.
+    //   - `std::function<float(float)> shapeFn` constructed per block. It fits
+    //     MSVC's small-buffer optimisation today, but whether a std::function
+    //     heap-allocates is an implementation detail we shouldn't bet the audio
+    //     thread on.
+    //   - `ScriptVars sv` on the transport play edge, same map cost.
+    //   - the per-sample s-list binding rebuilt a `"s" + std::to_string(i+1)`
+    //     key for every input of every sample.
+    // All are now members; `vars` survives across blocks so operator[] only
+    // overwrites, and is rebuilt only when the s-list width changes.
+    //
+    // The capacity proxy counts `vars.bucket_count() + vars.size()`, so both a
+    // rehash and a single newly-inserted key (one node allocation) register.
+    {
+        Transport transport;
+        transport.sampleRate = 44100.0;
+        transport.bpm        = 120.0;
+        transport.playing    = true;
+
+        SignalShapeDoc doc = SignalShapeDoc::defaultLFO();
+        doc.expr             = "curve * 0.5 + s1 * 0.25 + gate * 0.25";
+        doc.triggerExpr      = "gate";      // exercises the trigger-eval path too
+        doc.signalInputCount = 2;
+        doc.layers.layers.push_back(WaveLayer{});   // a real shape to sample
+
+        Node node;
+        node.id     = 1;
+        node.type   = NodeType::SignalShape;
+        node.name   = "selftest-signalshape";
+        node.script = doc.encode();
+        node.pinsIn .push_back(Pin{ 1, "MIDI In", PinKind::Midi,   true,  2 });
+        node.pinsIn .push_back(Pin{ 2, "s1",      PinKind::Signal, true,  1 });
+        node.pinsIn .push_back(Pin{ 3, "s2",      PinKind::Signal, true,  1 });
+        node.pinsOut.push_back(Pin{ 100, "o1",    PinKind::Signal, false, 1 });
+        node.params.push_back({ "Rate",      2.0f, 0.0f, 20.0f });
+        node.params.push_back({ "Beat Sync", 0.0f, 0.0f, 1.0f });
+        node.params.push_back({ "Phase",     0.0f, 0.0f, 1.0f });
+        node.params.push_back({ "Output",    0.5f, 0.0f, 1.0f });
+
+        const int maxBlock = 512;
+        SignalShapeProcessor proc(node, transport);
+        proc.prepareToPlay(44100.0, maxBlock);
+
+        // 2 audio channels + 2 control channels (s1/s2 in, o1 out share them).
+        juce::AudioBuffer<float> buf(4, maxBlock);
+        int64_t pos = 0;
+        auto runBlock = [&](int len, bool noteOn) {
+            juce::AudioBuffer<float> view(buf.getArrayOfWritePointers(),
+                                          buf.getNumChannels(), len);
+            view.clear();
+            // Feed the control inputs something non-constant so s1/s2 actually
+            // move and the expression can't be folded away.
+            for (int ch = 2; ch < 4; ++ch)
+                for (int s = 0; s < len; ++s)
+                    view.setSample(ch, s, 0.5f + 0.4f * std::sin(0.01f * (s + ch)));
+            juce::MidiBuffer midi;
+            if (noteOn)
+                midi.addEvent(juce::MidiMessage::noteOn(1, 60, (juce::uint8)100), 0);
+            proc.processBlock(view, midi);
+            transport.positionSamples = (pos += len);
+        };
+
+        // Warm up: cross the play edge (which runs the start() hook and its own
+        // variable map) and let every lazily-sized buffer settle.
+        runBlock(maxBlock, true);
+        for (int i = 0; i < 3; ++i) runBlock(maxBlock, false);
+
+        const size_t before = proc.scratchCapacityBytes();
+
+        const int lens[] = { 512, 480, 256, 64, 333, 512 };
+        for (int pass = 0; pass < 60; ++pass) {
+            node.params[0].value = 0.5f + (pass % 9);       // Rate
+            node.params[1].value = (float)(pass % 2);       // Beat Sync
+            node.params[2].value = (pass % 7) / 7.0f;       // Phase
+            runBlock(lens[pass % 6], (pass % 5) == 0);
+        }
+        const size_t after = proc.scratchCapacityBytes();
+        r.checkVal(after == before,
+                   "signalshape: 60 blocks sweeping Rate / Beat Sync / Phase / "
+                   "block length allocate nothing (scratch capacity growth, bytes)",
+                   (double)after - (double)before);
+
+        // Non-vacuity: the node must be driving its output channel, and the
+        // output must actually vary - a stuck constant would pass a peak test
+        // while proving the expression never ran.
+        runBlock(maxBlock, true);
+        float lo = 1e9f, hi = -1e9f;
+        for (int s = 0; s < maxBlock; ++s) {
+            float v = buf.getSample(2, s);
+            lo = std::min(lo, v); hi = std::max(hi, v);
+        }
+        r.checkVal(hi - lo > 1e-4f,
+                   "signalshape: output still modulating after the sweep", hi - lo);
+    }
+
+    // ---- MidiScriptProcessor renders without allocating ---------------------
+    //
+    // Same shape as the Signal Shape node above (they're sibling scriptable
+    // nodes): `sigChans` and the `vars` binding map were both locals in
+    // processBlock, so every callback built and tore down a map with a node
+    // allocation per variable, and buildVars rebuilt a "s"+to_string(i+1) key
+    // for every input of every sample. Both are members now.
+    {
+        Transport transport;
+        transport.sampleRate = 44100.0;
+        transport.bpm        = 120.0;
+        transport.playing    = true;
+
+        MidiScriptDoc doc = MidiScriptDoc::defaultDoc();
+        // A program that actually emits, and that reads the signal inputs so
+        // the s-list binding isn't dead code. `note()` schedules a note-off,
+        // exercising pendingOffs across blocks too.
+        doc.program          = "(s1 > 0.6) ? note(48 + s2 * 12, 100, 0.05) : 0";
+        doc.signalInputCount = 2;
+
+        Node node;
+        node.id     = 1;
+        node.type   = NodeType::MidiScript;
+        node.name   = "selftest-midiscript";
+        node.script = doc.encode();
+        node.pinsIn .push_back(Pin{ 1, "MIDI In", PinKind::Midi,   true,  2 });
+        node.pinsIn .push_back(Pin{ 2, "s1",      PinKind::Signal, true,  1 });
+        node.pinsIn .push_back(Pin{ 3, "s2",      PinKind::Signal, true,  1 });
+        node.pinsOut.push_back(Pin{ 100, "MIDI Out", PinKind::Midi, false, 2 });
+
+        const int maxBlock = 512;
+        MidiScriptProcessor proc(node, transport);
+        proc.prepareToPlay(44100.0, maxBlock);
+
+        juce::AudioBuffer<float> buf(4, maxBlock);   // 2 audio + s1/s2 on 2..3
+        int64_t pos = 0;
+        int totalEmitted = 0;
+        auto runBlock = [&](int len) {
+            juce::AudioBuffer<float> view(buf.getArrayOfWritePointers(),
+                                          buf.getNumChannels(), len);
+            view.clear();
+            for (int ch = 2; ch < 4; ++ch)
+                for (int s = 0; s < len; ++s)
+                    view.setSample(ch, s, 0.5f + 0.45f * std::sin(0.02f * (s + 7 * ch)));
+            juce::MidiBuffer midi;
+            proc.processBlock(view, midi);
+            totalEmitted += midi.getNumEvents();
+            transport.positionSamples = (pos += len);
+        };
+
+        // Warm up: cross the play edge (start hook + its own bindings) and let
+        // the note scheduler reach steady state.
+        for (int i = 0; i < 4; ++i) runBlock(maxBlock);
+
+        const size_t before = proc.scratchCapacityBytes();
+        const int emittedBefore = totalEmitted;
+
+        const int lens[] = { 512, 480, 256, 64, 333, 512 };
+        for (int pass = 0; pass < 60; ++pass) runBlock(lens[pass % 6]);
+
+        const size_t after = proc.scratchCapacityBytes();
+        r.checkVal(after == before,
+                   "midiscript: 60 blocks at varying block lengths allocate "
+                   "nothing (scratch capacity growth, bytes)",
+                   (double)after - (double)before);
+
+        // Non-vacuity: the program has to have been emitting throughout, or the
+        // sweep never reached the interesting code.
+        r.checkVal(totalEmitted - emittedBefore > 0,
+                   "midiscript: program still emitting MIDI during the sweep",
+                   (double)(totalEmitted - emittedBefore));
+    }
+
+    // ---- ArpeggiatorProcessor renders without allocating --------------------
+    //
+    // The arpeggiator used to keep held notes in a std::set<int> (a tree-node
+    // allocation on the audio thread per note-on) and rebuild `seq` plus a
+    // `baseNotes` copy as processBlock locals every callback. Held notes are a
+    // std::bitset<128> now (MIDI pitch = bit index, and walking it already
+    // yields ascending order, so the sort went too) and `seq` is a member
+    // reserved to the worst case in prepareToPlay.
+    {
+        Node node;
+        node.id   = 1;
+        node.name = "selftest-arp";
+        node.params.push_back({ "Rate",    8.0f, 0.1f, 50.0f });
+        node.params.push_back({ "Pattern", 0.0f, 0.0f,  3.0f });
+        node.params.push_back({ "Octaves", 1.0f, 1.0f,  4.0f });
+
+        auto setParam = [&](const char* name, float v) {
+            for (auto& p : node.params) if (p.name == name) p.value = v;
+        };
+
+        const int maxBlock = 512;
+        ArpeggiatorProcessor proc(node);
+        proc.prepareToPlay(44100.0, maxBlock);
+
+        juce::AudioBuffer<float> buf(2, maxBlock);
+        int totalEmitted = 0;
+        // Re-asserts a chord of `held` notes (48, 49, ... ) each time it's
+        // asked to, so a stray note-off can never leave the arp idle - which
+        // would make the whole test vacuous.
+        auto runBlock = [&](int len, int held) {
+            juce::AudioBuffer<float> view(buf.getArrayOfWritePointers(), 2, len);
+            view.clear();
+            juce::MidiBuffer midi;
+            for (int i = 0; i < held; ++i)
+                midi.addEvent(juce::MidiMessage::noteOn(1, i, (juce::uint8)100), 0);
+            proc.processBlock(view, midi);
+            totalEmitted += midi.getNumEvents();
+        };
+
+        // Warm up on a small chord ON PURPOSE. If the reserve in prepareToPlay
+        // were ever removed, `seq` would settle at a handful of ints here and
+        // the wide chords below would then have to grow it - which is exactly
+        // what the capacity assertion is looking for. Warming up at the worst
+        // case instead would make this test pass vacuously.
+        for (int i = 0; i < 4; ++i) runBlock(maxBlock, 6);
+
+        const size_t before = proc.scratchCapacityBytes();
+        const int emittedBefore = totalEmitted;
+
+        const int lens[] = { 512, 480, 256, 64, 333, 512 };
+        for (int pass = 0; pass < 60; ++pass) {
+            // Sweep everything that changes the sequence length: the pattern
+            // (up-down roughly doubles it), the octave count (x4) and the rate.
+            setParam("Pattern", (float)(pass % 4));
+            setParam("Octaves", (float)(1 + pass % 4));
+            setParam("Rate",    4.0f + (float)(pass % 17));
+            // Ramp the held-note count all the way to a full 128-note keyboard,
+            // which with 4 octaves and the up-down pattern is the worst case
+            // prepareToPlay reserves for.
+            runBlock(lens[pass % 6], 2 + (pass * 128) / 60);
+        }
+
+        const size_t after = proc.scratchCapacityBytes();
+        r.checkVal(after == before,
+                   "arpeggiator: 60 blocks sweeping Pattern / Octaves / Rate up "
+                   "to a full 128-note chord allocate nothing (scratch capacity "
+                   "growth, bytes)",
+                   (double)after - (double)before);
+        // The reserve has to be big enough for that worst case, or the check
+        // above only proves the sequence never got long - not that it couldn't.
+        r.checkVal(before >= 128 * 4 * 2 * sizeof(int),
+                   "arpeggiator: prepareToPlay reserves the worst-case sequence "
+                   "(bytes)", (double)before);
+        r.checkVal(totalEmitted - emittedBefore > 0,
+                   "arpeggiator: still emitting notes during the sweep",
+                   (double)(totalEmitted - emittedBefore));
+    }
+
+    // ---- ParticleSynthProcessor renders without allocating ------------------
+    //
+    // The grain cloud grew by push_back with no reserve and no ceiling, so a
+    // high Density allocated on the audio thread mid-block. `grains` is now
+    // reserved to kMaxGrains and the spawn loop refuses to exceed it. The
+    // sweep deliberately drives Density to absurd values to hit that ceiling.
+    {
+        Node node;
+        node.id   = 1;
+        node.name = "selftest-particle";
+        node.params.push_back({ "Density",    30.0f, 1.0f, 5000.0f });
+        node.params.push_back({ "Spread",      7.0f, 0.0f,   24.0f });
+        node.params.push_back({ "Grain Size", 50.0f, 1.0f,  500.0f });
+        node.params.push_back({ "Attack",      0.1f, 0.0f,    1.0f });
+        node.params.push_back({ "Release",     0.3f, 0.0f,    1.0f });
+        node.params.push_back({ "Shape",       0.0f, 0.0f,    3.0f });
+        node.params.push_back({ "Volume",      0.5f, 0.0f,    1.0f });
+
+        auto setParam = [&](const char* name, float v) {
+            for (auto& p : node.params) if (p.name == name) p.value = v;
+        };
+
+        const int maxBlock = 512;
+        ParticleSynthProcessor proc(node);
+        proc.prepareToPlay(44100.0, maxBlock);
+
+        juce::AudioBuffer<float> buf(2, maxBlock);
+        float peak = 0.0f;
+        auto runBlock = [&](int len, bool noteOn) {
+            juce::AudioBuffer<float> view(buf.getArrayOfWritePointers(), 2, len);
+            view.clear();
+            juce::MidiBuffer midi;
+            if (noteOn)
+                midi.addEvent(juce::MidiMessage::noteOn(1, 60, (juce::uint8)110), 0);
+            proc.processBlock(view, midi);
+            for (int ch = 0; ch < 2; ++ch)
+                for (int s = 0; s < len; ++s)
+                    peak = std::max(peak, std::abs(view.getSample(ch, s)));
+        };
+
+        // Warm up at a LOW density on purpose: if the reserve in prepareToPlay
+        // were removed, the cloud would settle small here and the saturating
+        // sweep below would have to grow it - which is what we want to catch.
+        // Warming up already-saturated would make the assertion vacuous.
+        setParam("Density", 5.0f);
+        runBlock(maxBlock, true);
+        for (int i = 0; i < 3; ++i) runBlock(maxBlock, false);
+
+        const size_t before = proc.scratchCapacityBytes();
+        peak = 0.0f;
+
+        const int lens[] = { 512, 480, 256, 64, 333, 512 };
+        for (int pass = 0; pass < 60; ++pass) {
+            setParam("Density",    1.0f + (float)((pass * 397) % 5000));
+            setParam("Grain Size", 1.0f + (float)((pass * 73) % 500));
+            setParam("Spread",     (float)(pass % 25));
+            setParam("Shape",      (float)(pass % 4));
+            runBlock(lens[pass % 6], pass % 7 == 0);
+        }
+
+        const size_t after = proc.scratchCapacityBytes();
+        r.checkVal(after == before,
+                   "particlesynth: 60 blocks sweeping Density / Grain Size / "
+                   "Shape allocate nothing (scratch capacity growth, bytes)",
+                   (double)after - (double)before);
+        r.checkVal(proc.reservedGrainCount() >= ParticleSynthProcessor::kMaxGrains,
+                   "particlesynth: reserve covers the whole grain ceiling",
+                   (double)proc.reservedGrainCount());
+        r.checkVal(peak > 1e-4f,
+                   "particlesynth: cloud still audible during the sweep", peak);
+    }
+
+    // ---- SpectralGrainProcessor renders without allocating ------------------
+    //
+    // Same shape as the particle synth: activeGrains was an unbounded
+    // push_back. Reserved to kMaxActiveGrains with the ceiling enforced at the
+    // spawn site. Note this one is polyphonic, so the sweep holds several
+    // voices to multiply the spawn rate.
+    {
+        Node node;
+        node.id     = 1;
+        node.name   = "selftest-spectralgrain";
+        node.script = "__spectralgrain__:exp(-f/10)";
+        node.params.push_back({ "Density",    20.0f, 1.0f, 2000.0f });
+        node.params.push_back({ "Grain Size", 40.0f, 1.0f,  500.0f });
+        node.params.push_back({ "Volume",      0.5f, 0.0f,    1.0f });
+
+        auto setParam = [&](const char* name, float v) {
+            for (auto& p : node.params) if (p.name == name) p.value = v;
+        };
+
+        const int maxBlock = 512;
+        SpectralGrainProcessor proc(node);
+        proc.prepareToPlay(44100.0, maxBlock);
+
+        juce::AudioBuffer<float> buf(2, maxBlock);
+        float peak = 0.0f;
+        auto runBlock = [&](int len, bool chordOn) {
+            juce::AudioBuffer<float> view(buf.getArrayOfWritePointers(), 2, len);
+            view.clear();
+            juce::MidiBuffer midi;
+            if (chordOn)
+                for (int n : { 48, 55, 60, 64, 67, 72 })
+                    midi.addEvent(juce::MidiMessage::noteOn(1, n, (juce::uint8)110), 0);
+            proc.processBlock(view, midi);
+            for (int ch = 0; ch < 2; ++ch)
+                for (int s = 0; s < len; ++s)
+                    peak = std::max(peak, std::abs(view.getSample(ch, s)));
+        };
+
+        // Low-density warm-up for the same non-vacuity reason as the particle
+        // synth above: the saturating sweep must be what grows the cloud.
+        setParam("Density", 5.0f);
+        runBlock(maxBlock, true);
+        for (int i = 0; i < 3; ++i) runBlock(maxBlock, false);
+
+        const size_t before = proc.scratchCapacityBytes();
+        peak = 0.0f;
+
+        const int lens[] = { 512, 480, 256, 64, 333, 512 };
+        for (int pass = 0; pass < 60; ++pass) {
+            setParam("Density",    1.0f + (float)((pass * 397) % 2000));
+            setParam("Grain Size", 1.0f + (float)((pass * 73) % 500));
+            runBlock(lens[pass % 6], pass % 7 == 0);
+        }
+
+        const size_t after = proc.scratchCapacityBytes();
+        r.checkVal(after == before,
+                   "spectralgrain: 60 blocks sweeping Density / Grain Size "
+                   "allocate nothing (scratch capacity growth, bytes)",
+                   (double)after - (double)before);
+        r.checkVal(proc.reservedGrainCount() >= SpectralGrainProcessor::kMaxActiveGrains,
+                   "spectralgrain: reserve covers the whole grain ceiling",
+                   (double)proc.reservedGrainCount());
+        r.checkVal(peak > 1e-4f,
+                   "spectralgrain: cloud still audible during the sweep", peak);
+    }
+
+    // ---- Every built-in synth survives a transport Stop ----------------------
+    //
+    // Transport panic calls AudioProcessorGraph::reset(), which calls reset()
+    // on every processor. Four of the builtin_effects.h synths implemented that
+    // as `voices.clear()` - but their voice pool is only ever sized in the
+    // CONSTRUCTOR, so nothing ever refilled it. After a single press of Stop:
+    // allocVoice() found no free voice, fell through to its steal path, and
+    // returned voices[0] on an empty vector (out of bounds); the render loop
+    // then iterated zero voices. The synth went permanently silent and stayed
+    // that way for the rest of the session.
+    //
+    // This checks the two halves that matter for every one of them: panic
+    // really does silence a held note, AND the synth still plays afterwards.
+    //
+    // Verified by reinstating both defects. voices.clear() makes "still plays
+    // after a transport Stop" read exactly 0.00000 for FM / PD / Additive
+    // (against 0.19-0.43 for the fixed code). Dropping ParticleSynth's
+    // noteAmpEnv.hardReset() makes "actually silences a held note" read
+    // 0.39244 (against 0.00000) - its spawn loop is gated on the envelope, so
+    // clearing the grain list alone let the cloud regrow within a millisecond.
+    {
+        auto panicRoundTrip = [&r](const char* label, const char* script,
+                                   std::vector<Param> params,
+                                   auto&& makeProc) {
+            Node node;
+            node.id     = 1;
+            node.name   = "selftest-panic";
+            node.script = script;
+            node.params = std::move(params);
+
+            const int bs = 512;
+            auto proc = makeProc(node);
+            proc->prepareToPlay(44100.0, bs);
+            juce::AudioBuffer<float> buf(2, bs);
+
+            auto play = [&](int blocks, bool noteOn) {
+                float pk = 0.0f;
+                for (int b = 0; b < blocks; ++b) {
+                    buf.clear();
+                    juce::MidiBuffer midi;
+                    if (noteOn && b == 0)
+                        midi.addEvent(juce::MidiMessage::noteOn(1, 60, (juce::uint8)110), 0);
+                    proc->processBlock(buf, midi);
+                    for (int s = 0; s < bs; ++s)
+                        pk = std::max(pk, std::abs(buf.getSample(0, s)));
+                }
+                return pk;
+            };
+
+            const float before = play(10, true);
+            r.checkVal(before > 1e-4f,
+                       juce::String(label) + ": sounds before the transport Stop", before);
+
+            proc->reset();     // <- the transport-panic path
+
+            // The note is still HELD (no note-off was sent), so this is the
+            // case where panic has to do the work.
+            const float during = play(4, false);
+            r.checkVal(during < 1e-4f,
+                       juce::String(label) + ": transport Stop actually silences a held note",
+                       during);
+
+            const float after = play(10, true);
+            r.checkVal(after > 1e-4f,
+                       juce::String(label) + ": still plays after a transport Stop",
+                       after);
+        };
+
+        panicRoundTrip("panic/fmsynth", "",
+                       { { "Algorithm", 0.0f, 0.0f, 7.0f },
+                         { "Volume",    0.5f, 0.0f, 1.0f } },
+                       [](Node& n) { return std::make_unique<FMSynthProcessor>(n); });
+
+        panicRoundTrip("panic/pdsynth", "",
+                       { { "Volume", 0.5f, 0.0f, 1.0f } },
+                       [](Node& n) { return std::make_unique<PDSynthProcessor>(n); });
+
+        panicRoundTrip("panic/additive", "",
+                       { { "Partials", 16.0f, 1.0f, 64.0f },
+                         { "Volume",    0.5f, 0.0f,  1.0f } },
+                       [](Node& n) { return std::make_unique<AdditiveSynthProcessor>(n); });
+
+        panicRoundTrip("panic/particlesynth", "",
+                       { { "Density",    60.0f, 1.0f, 200.0f },
+                         { "Grain Size", 40.0f, 1.0f, 500.0f },
+                         { "Volume",      0.5f, 0.0f,   1.0f } },
+                       [](Node& n) { return std::make_unique<ParticleSynthProcessor>(n); });
+    }
+
+    // ---- Every built-in synth honours All Notes Off / All Sound Off ----------
+    //
+    // None of the synths in builtin_effects.h handled either message, though
+    // six other synth files do. GraphProcessor emits All Notes Off on all 16
+    // channels when the transport stops (graph_processor.cpp:94), and a
+    // controller's panic button or the end of a MIDI file send them too. A
+    // synth that ignores them never receives the matching note-off, so a held
+    // note sounds forever.
+    //
+    // Verified by deleting the handling again: every synth reads 0.17-0.51 for
+    // "All Sound Off cuts the note dead" (against 0.00000 fixed) and 0.13-0.30
+    // for "the note is gone once the release has run" - i.e. the note simply
+    // sustains forever, exactly as reported. The arpeggiator emits 4 more
+    // note-ons after the panic instead of 0.
+    //
+    // The two messages differ and both halves are checked:
+    //   All Sound Off (CC#120) - silent immediately.
+    //   All Notes Off (CC#123) - enters the RELEASE stage, so it must still be
+    //                            audible right after the message and silent
+    //                            once the release has run.
+    {
+        auto checkPanic = [&r](const char* label, std::vector<Param> params,
+                               auto&& makeProc) {
+            const int bs = 512;
+
+            // Plays 6 blocks with a note-on in the first, then sends `panic`,
+            // then reports (level in the 2 blocks right after, level once the
+            // release has had 60 blocks - 700 ms - to finish).
+            auto run = [&](const juce::MidiMessage& panic) {
+                Node node;
+                node.id     = 1;
+                node.name   = "selftest-allnotesoff";
+                node.params = params;
+                // Long, obvious release so "released but still ringing" and
+                // "cut dead" are far apart.
+                node.ahdsrEnvelope.releaseMs = 400.0f;
+
+                auto proc = makeProc(node);
+                proc->prepareToPlay(44100.0, bs);
+                juce::AudioBuffer<float> buf(2, bs);
+
+                auto blocks = [&](int n, const juce::MidiMessage* m) {
+                    float pk = 0.0f;
+                    for (int b = 0; b < n; ++b) {
+                        buf.clear();
+                        juce::MidiBuffer midi;
+                        if (m && b == 0) midi.addEvent(*m, 0);
+                        proc->processBlock(buf, midi);
+                        for (int s = 0; s < bs; ++s)
+                            pk = std::max(pk, std::abs(buf.getSample(0, s)));
+                    }
+                    return pk;
+                };
+
+                const auto on = juce::MidiMessage::noteOn(1, 60, (juce::uint8)110);
+                const float held = blocks(6, &on);
+                const float just = blocks(2, &panic);
+                // Run the 400 ms release out (60 blocks = 700 ms) and DISCARD
+                // that level - it is dominated by the start of the release,
+                // which is still near full volume. Only the level after it has
+                // finished says whether the note actually ended.
+                blocks(60, nullptr);
+                const float late = blocks(4, nullptr);
+                return std::array<float, 3>{ held, just, late };
+            };
+
+            const auto soundOff = run(juce::MidiMessage::allSoundOff(1));
+            r.checkVal(soundOff[0] > 1e-4f,
+                       juce::String(label) + ": sounds before All Sound Off", soundOff[0]);
+            r.checkVal(soundOff[1] < 1e-4f,
+                       juce::String(label) + ": All Sound Off cuts the note dead", soundOff[1]);
+
+            const auto notesOff = run(juce::MidiMessage::allNotesOff(1));
+            r.checkVal(notesOff[1] > 1e-4f,
+                       juce::String(label) + ": All Notes Off lets the note RELEASE "
+                       "rather than cutting it", notesOff[1]);
+            r.checkVal(notesOff[2] < 1e-4f,
+                       juce::String(label) + ": the note is gone once the release has run",
+                       notesOff[2]);
+        };
+
+        checkPanic("allnotesoff/fmsynth",
+                   { { "Algorithm", 0.0f, 0.0f, 7.0f }, { "Volume", 0.5f, 0.0f, 1.0f } },
+                   [](Node& n) { return std::make_unique<FMSynthProcessor>(n); });
+        checkPanic("allnotesoff/pdsynth",
+                   { { "Volume", 0.5f, 0.0f, 1.0f } },
+                   [](Node& n) { return std::make_unique<PDSynthProcessor>(n); });
+        checkPanic("allnotesoff/additive",
+                   { { "Partials", 16.0f, 1.0f, 64.0f }, { "Volume", 0.5f, 0.0f, 1.0f } },
+                   [](Node& n) { return std::make_unique<AdditiveSynthProcessor>(n); });
+        checkPanic("allnotesoff/particlesynth",
+                   { { "Density", 60.0f, 1.0f, 200.0f },
+                     { "Grain Size", 40.0f, 1.0f, 500.0f },
+                     { "Volume", 0.5f, 0.0f, 1.0f } },
+                   [](Node& n) { return std::make_unique<ParticleSynthProcessor>(n); });
+
+        // Spectral Grain needs its magnitude expression, so it can't go through
+        // the helper above (which builds a bare Node).
+        {
+            const int bs = 512;
+            auto run = [&](const juce::MidiMessage& panic) {
+                Node node;
+                node.id     = 1;
+                node.script = "__spectralgrain__:exp(-f/10)";
+                node.params = { { "Density",    80.0f, 1.0f, 200.0f },
+                                { "Grain Size", 40.0f, 1.0f, 200.0f },
+                                { "Volume",      0.8f, 0.0f,   1.0f } };
+                node.ahdsrEnvelope.releaseMs = 400.0f;
+
+                SpectralGrainProcessor proc(node);
+                proc.prepareToPlay(44100.0, bs);
+                juce::AudioBuffer<float> buf(2, bs);
+                auto blocks = [&](int n, const juce::MidiMessage* m) {
+                    float pk = 0.0f;
+                    for (int b = 0; b < n; ++b) {
+                        buf.clear();
+                        juce::MidiBuffer midi;
+                        if (m && b == 0) midi.addEvent(*m, 0);
+                        proc.processBlock(buf, midi);
+                        for (int s = 0; s < bs; ++s)
+                            pk = std::max(pk, std::abs(buf.getSample(0, s)));
+                    }
+                    return pk;
+                };
+                const auto on = juce::MidiMessage::noteOn(1, 60, (juce::uint8)110);
+                const float held = blocks(6, &on);
+                const float just = blocks(2, &panic);
+                // Run the 400 ms release out (60 blocks = 700 ms) and DISCARD
+                // that level - it is dominated by the start of the release,
+                // which is still near full volume. Only the level after it has
+                // finished says whether the note actually ended.
+                blocks(60, nullptr);
+                const float late = blocks(4, nullptr);
+                return std::array<float, 3>{ held, just, late };
+            };
+            const auto so = run(juce::MidiMessage::allSoundOff(1));
+            r.checkVal(so[0] > 1e-4f,
+                       "allnotesoff/spectralgrain: sounds before All Sound Off", so[0]);
+            r.checkVal(so[1] < 1e-4f,
+                       "allnotesoff/spectralgrain: All Sound Off cuts the note dead", so[1]);
+            const auto no = run(juce::MidiMessage::allNotesOff(1));
+            r.checkVal(no[1] > 1e-4f,
+                       "allnotesoff/spectralgrain: All Notes Off lets the note RELEASE "
+                       "rather than cutting it", no[1]);
+            r.checkVal(no[2] < 1e-4f,
+                       "allnotesoff/spectralgrain: the note is gone once the release has run",
+                       no[2]);
+        }
+
+        // The Arpeggiator is the worst case: it CLEARS the incoming MIDI buffer
+        // and emits its own, so a panic it ignores never reaches the synth
+        // downstream either - one stuck arp jams the whole chain.
+        {
+            Node node;
+            node.id = 1;
+            // Rate is notes per SECOND: at 16, a note lands every ~2756
+            // samples, i.e. roughly every 5th 512-sample block.
+            node.params = { { "Rate", 16.0f, 1.0f, 32.0f },
+                            { "Pattern", 0.0f, 0.0f, 4.0f },
+                            { "Octaves", 1.0f, 1.0f, 4.0f },
+                            { "Gate", 0.5f, 0.05f, 1.0f } };
+            ArpeggiatorProcessor proc(node);
+            proc.prepareToPlay(44100.0, 512);
+
+            auto countNoteOns = [&](int blocks, const juce::MidiMessage* m) {
+                int n = 0;
+                for (int b = 0; b < blocks; ++b) {
+                    juce::AudioBuffer<float> buf(2, 512);
+                    buf.clear();
+                    juce::MidiBuffer midi;
+                    if (m && b == 0) midi.addEvent(*m, 0);
+                    proc.processBlock(buf, midi);
+                    for (auto meta : midi)
+                        if (meta.getMessage().isNoteOn()) ++n;
+                }
+                return n;
+            };
+
+            const auto on = juce::MidiMessage::noteOn(1, 60, (juce::uint8)110);
+            const int running = countNoteOns(20, &on);
+            r.checkVal(running > 0,
+                       "allnotesoff/arpeggiator: arpeggiating before the panic",
+                       (double)running);
+            const auto panic = juce::MidiMessage::allNotesOff(1);
+            countNoteOns(1, &panic);
+            const int after = countNoteOns(20, nullptr);
+            r.checkVal(after == 0,
+                       "allnotesoff/arpeggiator: All Notes Off releases the stuck chord",
+                       (double)after);
+        }
+    }
+
+    // ---- SpectralGrain still plays after a transport Stop --------------------
+    //
+    // reset() (the transport-panic hook) used to be `voices.clear()`. Nothing
+    // ever refilled the pool - prepareToPlay only regenerates the grain bank -
+    // so afterwards allocVoice() fell through to its steal path and returned
+    // voices[0] on an EMPTY vector (out-of-bounds write into the freed-but-owned
+    // buffer), and the render loop then iterated zero voices, leaving the node
+    // permanently silent. Hitting Stop once bricked the node for the session.
+    {
+        Node node;
+        node.id     = 1;
+        node.name   = "selftest-spectralgrain-reset";
+        node.script = "__spectralgrain__:exp(-f/10)";
+        node.params.push_back({ "Density",    80.0f, 1.0f, 2000.0f });
+        node.params.push_back({ "Grain Size", 60.0f, 1.0f,  500.0f });
+        node.params.push_back({ "Volume",      0.8f, 0.0f,    1.0f });
+
+        const int bs = 512;
+        SpectralGrainProcessor proc(node);
+        proc.prepareToPlay(44100.0, bs);
+        juce::AudioBuffer<float> buf(2, bs);
+
+        // Runs `blocks` blocks, firing a note-on in the first, and returns the
+        // peak. 8 blocks at 44.1 kHz is ~93 ms, comfortably past the 12.5 ms
+        // first spawn at Density 80.
+        auto playPeak = [&](int blocks) {
+            float pk = 0.0f;
+            for (int b = 0; b < blocks; ++b) {
+                buf.clear();
+                juce::MidiBuffer midi;
+                if (b == 0)
+                    midi.addEvent(juce::MidiMessage::noteOn(1, 60, (juce::uint8)110), 0);
+                proc.processBlock(buf, midi);
+                for (int s = 0; s < bs; ++s)
+                    pk = std::max(pk, std::abs(buf.getSample(0, s)));
+            }
+            return pk;
+        };
+
+        const float beforeStop = playPeak(8);
+        r.checkVal(beforeStop > 1e-4f,
+                   "spectralgrain: note sounds before the transport Stop", beforeStop);
+
+        proc.reset();                     // <- the transport-panic path
+        r.checkVal(proc.activeVoiceCount() == 0,
+                   "spectralgrain: Stop silences every voice",
+                   (double)proc.activeVoiceCount());
+        r.checkVal(proc.activeGrainCount() == 0,
+                   "spectralgrain: Stop drops every in-flight grain",
+                   (double)proc.activeGrainCount());
+
+        const float afterStop = playPeak(8);
+        // Verified by reinstating the bug: it reads exactly 0.00000 (there are
+        // no voices left to render), against 0.33737 for the fixed code - so
+        // the margin is total, and 1e-4 only guards against denormal noise.
+        r.checkVal(afterStop > 1e-4f,
+                   "spectralgrain: node still plays after a transport Stop "
+                   "(reset must not empty the voice pool)", afterStop);
+    }
+
+    // ---- SpectralGrain advances each grain once per SAMPLE, not per voice ----
+    //
+    // activeGrains is one pool shared by all voices, but the render loop used
+    // to sit inside the per-voice loop, so every grain's read position was
+    // stepped once per ACTIVE VOICE. With V voices sounding, grains played V
+    // times too fast (V times shorter, and at V times the pitch ratio) and were
+    // summed V times.
+    //
+    // The observable that pins this down is grain LIFETIME, via the steady-state
+    // cloud size. Each voice spawns at `Density` grains/sec and each grain lives
+    // `Grain Size` seconds, so at equilibrium:
+    //
+    //     grains == voices x Density x GrainSize
+    //
+    // With the bug the lifetime is GrainSize/V instead, which cancels the V and
+    // pins the count at Density x GrainSize regardless of how many notes are
+    // held. So the single-voice case is IDENTICAL either way (that's the control
+    // below) and the polyphonic case differs by exactly the voice count.
+    {
+        auto steadyGrains = [](const std::vector<int>& notes, float grainMs) {
+            Node node;
+            node.id     = 1;
+            node.name   = "selftest-spectralgrain-rate";
+            node.script = "__spectralgrain__:exp(-f/10)";
+            node.params.push_back({ "Density",   100.0f, 1.0f, 2000.0f });
+            node.params.push_back({ "Grain Size", grainMs, 1.0f, 500.0f });
+            node.params.push_back({ "Volume",      0.5f, 0.0f,    1.0f });
+            // Long sustain so every voice is still held (and so still spawning)
+            // for the whole measurement.
+            node.ahdsrEnvelope.attackMs = 1.0f;
+            node.ahdsrEnvelope.decayMs  = 1.0f;
+            node.ahdsrEnvelope.sustain  = 1.0f;
+
+            const int bs = 512;
+            SpectralGrainProcessor proc(node);
+            proc.prepareToPlay(44100.0, bs);
+            juce::AudioBuffer<float> buf(2, bs);
+
+            // 40 blocks = ~465 ms, i.e. ~4.6 grain lifetimes: long past the
+            // point where spawning and expiry balance.
+            for (int b = 0; b < 40; ++b) {
+                buf.clear();
+                juce::MidiBuffer midi;
+                if (b == 0)
+                    for (int n : notes)
+                        midi.addEvent(juce::MidiMessage::noteOn(1, n, (juce::uint8)110), 0);
+                proc.processBlock(buf, midi);
+            }
+            return std::pair<double, double>{ (double)proc.activeGrainCount(),
+                                              (double)proc.activeVoiceCount() };
+        };
+
+        // All notes are 69 (A4) so every grain's rate is exactly 1.0 and the
+        // derivation above has no pitch term. Four note-ons on the same number
+        // still take four separate voice slots.
+        auto [g1, v1] = steadyGrains({ 69 },                 100.0f);
+        auto [g4, v4] = steadyGrains({ 69, 69, 69, 69 },     100.0f);
+
+        r.checkVal(v1 == 1.0 && v4 == 4.0,
+                   "spectralgrain: the rate test really is holding 1 vs 4 voices", v4);
+
+        // Density 100 x GrainSize 0.1 s = 10 grains per voice.
+        r.checkVal(g1 > 8.0 && g1 < 12.0,
+                   "spectralgrain: one voice holds Density x GrainSize grains", g1);
+        // Verified by reinstating the bug (grain positions stepped once per
+        // active voice): grains-per-voice reads 3.00 against 10.00 for the
+        // fixed code, i.e. the cloud stops growing with polyphony. 8..12 sits
+        // well clear of 3 while still allowing spawn-phase jitter.
+        const double perVoice = g4 / juce::jmax(1.0, v4);
+        r.checkVal(perVoice > 8.0 && perVoice < 12.0,
+                   "spectralgrain: grain lifetime is independent of how many "
+                   "voices are sounding (grains per voice, 4-note chord)", perVoice);
+
+        // ...and the same derivation is what proves Grain Size still means
+        // something past the FFT frame. kGrainFFTSize is 1024 samples = 23.2 ms
+        // at 44.1 kHz; grain length used to be clamped to it, so 50 ms and
+        // 100 ms produced IDENTICAL clouds (~2 grains each at Density 100).
+        // Now they scale with the knob: 100 x 0.05 = 5 and 100 x 0.1 = 10.
+        auto [gShort, vShort] = steadyGrains({ 69 }, 50.0f);
+        r.checkVal(gShort > 3.5 && gShort < 6.5,
+                   "spectralgrain: Grain Size 50 ms holds ~5 grains at Density 100",
+                   gShort);
+        const double sizeRatio = g1 / juce::jmax(1.0, gShort);
+        // Verified by reinstating the clamp: both sides then read 2.00 grains
+        // and this ratio reads exactly 1.00000 - the knob was completely inert
+        // above 23 ms. Fixed code reads 2.00000 (10.00 vs 5.00 grains).
+        r.checkVal(sizeRatio > 1.6,
+                   "spectralgrain: Grain Size keeps scaling past the FFT frame "
+                   "(100 ms vs 50 ms grain count ratio)", sizeRatio);
+    }
+
+    // ---- PitchDetectorProcessor renders without allocating ------------------
+    //
+    // The per-hop analysis copy was a local std::vector<float> sized to
+    // `window`, which is DERIVED from the Min Hz param - so turning that knob
+    // resized a heap buffer on the audio thread. It's a member sized once to
+    // kMaxWindow now. The sweep moves Min Hz across its whole range, which is
+    // exactly the motion that used to reallocate.
+    {
+        Node node;
+        node.id   = 1;
+        node.name = "selftest-pitchdetect";
+        node.params.push_back({ "Algorithm",    0.0f,   0.0f,     1.0f });
+        node.params.push_back({ "Hop",          0.0f,   0.0f,  8192.0f });
+        node.params.push_back({ "Mapping",      0.0f,   0.0f,     1.0f });
+        node.params.push_back({ "Min Hz",      50.0f,   5.0f,  1000.0f });
+        node.params.push_back({ "Max Hz",    2000.0f, 100.0f, 10000.0f });
+        node.params.push_back({ "Detected Hz",  0.0f,   0.0f, 20000.0f });
+
+        auto setParam = [&](const char* name, float v) {
+            for (auto& p : node.params) if (p.name == name) p.value = v;
+        };
+        auto getParam = [&](const char* name) {
+            for (auto& p : node.params) if (p.name == name) return p.value;
+            return 0.0f;
+        };
+
+        const double sr = 44100.0;
+        const int maxBlock = 512;
+        PitchDetectorProcessor proc(node);
+        proc.prepareToPlay(sr, maxBlock);
+
+        // 4 channels: audio in on 0/1, the normalized pitch comes out on 2.
+        juce::AudioBuffer<float> buf(4, maxBlock);
+        int64_t phasePos = 0;
+        float sigLo = 1.0f, sigHi = -1.0f;
+        auto runBlock = [&](int len, double hz) {
+            juce::AudioBuffer<float> view(buf.getArrayOfWritePointers(), 4, len);
+            view.clear();
+            for (int s = 0; s < len; ++s) {
+                float v = 0.4f * (float)std::sin(
+                    juce::MathConstants<double>::twoPi * hz * (double)(phasePos + s) / sr);
+                view.setSample(0, s, v);
+                view.setSample(1, s, v);
+            }
+            phasePos += len;
+            juce::MidiBuffer midi;
+            proc.processBlock(view, midi);
+            for (int s = 0; s < len; ++s) {
+                const float o = view.getSample(2, s);
+                sigLo = std::min(sigLo, o);
+                sigHi = std::max(sigHi, o);
+            }
+        };
+
+        // Warm up: fill the ring buffer at the widest window (lowest Min Hz)
+        // so every scratch buffer is at its final size before the snapshot.
+        setParam("Min Hz", 5.0f);
+        for (int i = 0; i < 64; ++i) runBlock(maxBlock, 440.0);
+
+        const size_t before = proc.scratchCapacityBytes();
+
+        const int lens[] = { 512, 480, 256, 64, 333, 512 };
+        for (int pass = 0; pass < 60; ++pass) {
+            setParam("Min Hz",    5.0f + (float)((pass * 37) % 400));
+            setParam("Max Hz",  800.0f + (float)((pass * 211) % 4000));
+            setParam("Algorithm", (float)(pass % 2));
+            setParam("Mapping",   (float)(pass % 2));
+            setParam("Hop",       (float)(64 << (pass % 5)));
+            runBlock(lens[pass % 6], 440.0);
+        }
+
+        const size_t after = proc.scratchCapacityBytes();
+        r.checkVal(after == before,
+                   "pitchdetect: 60 blocks sweeping Min Hz / Algorithm / Hop "
+                   "allocate nothing (scratch capacity growth, bytes)",
+                   (double)after - (double)before);
+
+        // Non-vacuity: the detector must actually have locked onto the 440 Hz
+        // tone at some point, or the expensive path never ran.
+        setParam("Min Hz",  50.0f);
+        setParam("Max Hz", 2000.0f);
+        setParam("Hop",      0.0f);
+        for (int i = 0; i < 32; ++i) runBlock(maxBlock, 440.0);
+        const float detected = getParam("Detected Hz");
+        r.checkVal(std::abs(detected - 440.0f) < 10.0f,
+                   "pitchdetect: locked onto the 440 Hz probe tone (Hz)", detected);
+        r.checkVal(sigHi > 1e-4f && sigHi <= 1.0f && sigLo >= 0.0f,
+                   "pitchdetect: normalized pitch emitted on the Signal output "
+                   "throughout the sweep (max)", sigHi);
+    }
+
     // ---- Song length: mid-bar content end plays in full (no bar-rounding) ----
     {
         // Bug: a MIDI track whose last clip ends mid-bar (e.g. at beat 1.0 of a
@@ -5251,6 +8084,139 @@ void testAssetLibrary(Report& r) {
         }
     }
 
+    // ---- convolution IR library round-trip ----------------------------------
+    {
+        // A Convolution Filter's impulse response can be published to the asset
+        // library as a ConvolutionIR asset and loaded back into any Convolution
+        // Filter. The payload is exactly the node-script encoding
+        // (ConvolutionProcessor::encodeIR), so publish -> decode reproduces the IR.
+
+        // Tag <-> kind round-trips through the stable string.
+        AssetKind k;
+        r.check(std::string(assetKindTag(AssetKind::ConvolutionIR)) == "convolution_ir" &&
+                    assetKindFromTag("convolution_ir", k) && k == AssetKind::ConvolutionIR,
+                "convlib: AssetKind <-> 'convolution_ir' tag round-trips");
+
+        std::vector<float> ir = { 1.0f, -0.5f, 0.25f, 0.0f, 0.125f, -0.0625f };
+        std::string payload = ConvolutionProcessor::encodeIR(ir);
+
+        NodeGraph g;
+        int idA = g.assets.add(AssetKind::ConvolutionIR, "Small Room", "", payload);
+        int idB = g.assets.add(AssetKind::ConvolutionIR, "Big Hall", "",
+                               ConvolutionProcessor::encodeIR({ 1.0f, 0.0f, 0.0f }));
+        r.check(idA != idB && idA >= AssetLibrary::kUserIdBase,
+                "convlib: two IRs get distinct user-space ids");
+
+        // Loading back reproduces the exact sample list.
+        const AssetEntry* e = g.assets.find(idA);
+        std::vector<float> back = e ? ConvolutionProcessor::decodeIR(e->payload)
+                                    : std::vector<float>{};
+        bool same = back.size() == ir.size();
+        for (size_t i = 0; same && i < ir.size(); ++i)
+            same = std::abs(back[i] - ir[i]) < 1e-6f;
+        r.check(same, "convlib: stored IR decodes back to the original samples");
+
+        // Survives a project save/load with kind + payload intact.
+        std::ostringstream oss;
+        ProjectFile::writeProject(oss, g, nullptr, false, true);
+        NodeGraph g2; std::istringstream iss(oss.str());
+        ProjectFile::readProject(iss, g2, nullptr);
+        const AssetEntry* le = g2.assets.find(idA);
+        r.check(le && le->kind == AssetKind::ConvolutionIR && le->payload == payload,
+                "convlib: ConvolutionIR asset survives save/load");
+    }
+
+    // ---- timeline nesting: no depth cap, cycle-safe --------------------------
+    {
+        // MIDI timelines can be nested as children of other timelines. The
+        // absolute beat offset is the sum of groupBeatOffset up the parent chain.
+        // The walk uses a visited-set loop detector (not an arbitrary depth cap),
+        // so nesting can go arbitrarily deep AND a corrupt cyclic chain can't hang.
+        NodeGraph g;
+        const int N = 64; // deliberately well past the old depth cap of 20
+        std::vector<int> ids;
+        ids.reserve(N);
+        for (int i = 0; i < N; ++i)
+            ids.push_back(g.addNode("tl", NodeType::MidiTimeline, {}, {}).id);
+        // Set offsets by id AFTER creating all nodes (addNode can reallocate the
+        // node vector, so never hold a Node& across an addNode call).
+        for (int id : ids)
+            if (auto* n = g.findNode(id)) n->groupBeatOffset = 2.0f;
+        // Chain them: ids[0] is the root, each subsequent node is a child of the
+        // previous one -> a 64-deep nest.
+        for (int i = 1; i < N; ++i)
+            g.addToGroup(ids[i - 1], ids[i]);
+
+        // Deepest node's absolute offset = 64 * 2.0 = 128 (the old cap would have
+        // truncated at 20 levels -> 40).
+        r.checkVal(std::abs(g.getAbsoluteBeatOffset(ids[N - 1]) - 128.0f) < 1e-3f,
+                   "nesting: 64-deep timeline chain sums the full offset (no cap)",
+                   g.getAbsoluteBeatOffset(ids[N - 1]));
+
+        // addToGroup refuses a cycle: making the root a child of the deepest node
+        // would close the loop, so it must be rejected and leave the root's parent
+        // unchanged (-1).
+        g.addToGroup(ids[N - 1], ids[0]);
+        const Node* root = g.findNode(ids[0]);
+        r.check(root && root->parentGroupId == -1,
+                "nesting: addToGroup refuses a cycle (deep descendant -> root)");
+
+        // Even a forcibly-corrupted cyclic chain must terminate (not hang). Force
+        // a 3-cycle by hand and confirm both chain walks return.
+        int a = g.addNode("a", NodeType::MidiTimeline, {}, {}).id;
+        int b = g.addNode("b", NodeType::MidiTimeline, {}, {}).id;
+        int c = g.addNode("c", NodeType::MidiTimeline, {}, {}).id;
+        if (auto* na = g.findNode(a)) { na->groupBeatOffset = 1.0f; na->parentGroupId = b; }
+        if (auto* nb = g.findNode(b)) { nb->groupBeatOffset = 1.0f; nb->parentGroupId = c; }
+        if (auto* nc = g.findNode(c)) { nc->groupBeatOffset = 1.0f; nc->parentGroupId = a; }
+        float cyc = g.getAbsoluteBeatOffset(a);   // must return, not spin forever
+        r.check(std::isfinite(cyc) && std::abs(cyc - 3.0f) < 1e-3f,
+                "nesting: cyclic parent chain terminates (each node counted once)");
+        r.check(!g.isAncestorOf(ids[0], a),
+                "nesting: isAncestorOf terminates on a cyclic chain");
+    }
+
+    // ---- anchored child ripples when time is inserted/cut upstream -----------
+    {
+        // A nested timeline whose start offset is anchored to a named marker must
+        // follow that marker when insert/deleteTime shifts it. insertTime and
+        // deleteTime call resolveAnchors() internally, so the child's
+        // groupBeatOffset (and cascading absoluteBeatOffset) re-read the marker's
+        // new beat with no explicit call from the UI/scripting layer.
+        NodeGraph g;
+        int parent = g.addNode("parent", NodeType::MidiTimeline, {}, {}).id;
+        int child  = g.addNode("child",  NodeType::MidiTimeline, {}, {}).id;
+        g.markers.push_back(Marker{1, "cue", 8.0f});
+        g.addToGroup(parent, child);
+        if (auto* c = g.findNode(child)) {
+            c->groupBeatOffset = 8.0f;   // starts at the marker
+            c->anchorMarker = "cue";     // bound to it
+        }
+        g.resolveAnchors();
+        r.checkVal(std::abs(g.findNode(child)->groupBeatOffset - 8.0f) < 1e-3f,
+                   "anchor: child starts at its anchored marker (beat 8)",
+                   g.findNode(child)->groupBeatOffset);
+
+        // Insert 4 beats at beat 2 (all-tracks scope). Marker "cue" moves 8 -> 12,
+        // and the anchored child must ripple right to follow it.
+        g.insertTime(2.0f, 4.0f, -1);
+        r.checkVal(std::abs(g.resolveMarkerBeat("cue") - 12.0f) < 1e-3f,
+                   "anchor: insertTime shifts the marker (8 -> 12)",
+                   g.resolveMarkerBeat("cue"));
+        r.checkVal(std::abs(g.findNode(child)->groupBeatOffset - 12.0f) < 1e-3f,
+                   "anchor: child offset ripples right with the marker (insert)",
+                   g.findNode(child)->groupBeatOffset);
+
+        // Cut 4 beats from beat 2. Marker "cue" moves 12 -> 8, child follows back.
+        g.deleteTime(2.0f, 6.0f, -1);
+        r.checkVal(std::abs(g.resolveMarkerBeat("cue") - 8.0f) < 1e-3f,
+                   "anchor: deleteTime shifts the marker back (12 -> 8)",
+                   g.resolveMarkerBeat("cue"));
+        r.checkVal(std::abs(g.findNode(child)->groupBeatOffset - 8.0f) < 1e-3f,
+                   "anchor: child offset ripples left with the marker (delete)",
+                   g.findNode(child)->groupBeatOffset);
+    }
+
     // ---- Spectrum Tap live-references a FrequencyGraph asset per bin --------
     {
         // encode/decode must carry the per-bin asset id alongside the cached
@@ -5348,6 +8314,71 @@ void testAssetLibrary(Report& r) {
             r.check(cv.size() == 1 && ids[0] == -1 &&
                         cv[0].expression == "exp(-f/3)",
                     "spectap: erased asset -> bin falls back to independent");
+        }
+
+        // Allocation-freedom on the audio thread. processBlock used to build
+        // three std::vectors sized by the bin count on EVERY callback
+        // (binParamIdx, sigOut, customTarget). They now live in rebuildBins(),
+        // which only runs when the bin count actually changes - and that
+        // changes the node's pin count, so it happens off the audio thread via
+        // a graph rebuild. Capacity is the observable proxy: any growth means
+        // processBlock reached the allocator.
+        {
+            NodeGraph g3;
+            int tapId = g3.addNode("tap", NodeType::Effect, {}, {}).id;
+            Node& nd = *g3.findNode(tapId);
+            // "Bin N: ..." params carry centre freq in minVal, bandwidth in maxVal.
+            const float centres[] = { 100.0f, 400.0f, 1200.0f, 4000.0f };
+            for (int i = 0; i < 4; ++i)
+                nd.params.push_back({ "Bin " + std::to_string(i + 1) + ": tap",
+                                      0.0f, centres[i], centres[i] * 0.5f });
+            nd.script = "__spectrumtap__";     // all bins in biquad mode
+
+            const double sr2 = 44100.0;
+            const int maxBlock = 1024;
+            SpectrumTapProcessor proc(nd);
+            proc.prepareToPlay(sr2, maxBlock);
+
+            // Channels: 0/1 audio passthrough, 2+ one Signal Out per bin.
+            juce::AudioBuffer<float> buf(2 + 4, maxBlock);
+            juce::MidiBuffer mb;
+            auto fill = [&](int len) {
+                for (int c = 0; c < buf.getNumChannels(); ++c)
+                    for (int i = 0; i < len; ++i)
+                        buf.setSample(c, i, c < 2
+                            ? 0.4f * (float)std::sin(6.28318530718 * 400.0 * i / sr2)
+                            : 0.0f);
+            };
+
+            fill(maxBlock);
+            proc.processBlock(buf, mb);        // warm up, settle capacities
+            const size_t before = proc.scratchCapacityBytes();
+
+            const int lens[] = { 1024, 512, 333, 64, 1024, 480 };
+            for (int pass = 0; pass < 30; ++pass) {
+                const int len = lens[pass % (int)(sizeof(lens)/sizeof(lens[0]))];
+                juce::AudioBuffer<float> view(buf.getArrayOfWritePointers(),
+                                              buf.getNumChannels(), len);
+                fill(len);
+                proc.processBlock(view, mb);
+            }
+            const size_t after = proc.scratchCapacityBytes();
+            r.checkVal(after == before,
+                       "spectap: 30 blocks of varying length allocate nothing "
+                       "(scratch capacity growth in bytes)",
+                       (double)after - (double)before);
+
+            // Non-vacuity: the bin straddling the 400 Hz tone must actually be
+            // reporting energy on its Signal Out channel, so the loop above did
+            // real work rather than bailing out early.
+            fill(maxBlock);
+            proc.processBlock(buf, mb);
+            double peak = 0;
+            for (int i = 0; i < maxBlock; ++i)
+                peak = std::max(peak, (double)std::abs(buf.getSample(2 + 1, i)));
+            r.checkVal(peak > 1e-3,
+                       "spectap: the 400 Hz bin reports energy for a 400 Hz tone",
+                       peak);
         }
     }
 
@@ -5700,6 +8731,72 @@ void testAssetLibrary(Report& r) {
                         "curveeq: zero curve silences the central region");
             }
 
+            // Allocation-freedom on the audio thread. Curve EQ used to build a
+            // whole FFT (twiddle + bit-reversal tables) and seven std::vectors
+            // on EVERY block, and re-evaluate the curve whenever the transform
+            // size changed - i.e. a dropout in the middle of an FFT Size drag,
+            // which is exactly when it is most audible.
+            //
+            // Capacity is the observable proxy: if any scratch buffer grew,
+            // processBlock reached the allocator. Sweeping FFT Size and Mix and
+            // feeding ragged block lengths covers everything a user gesture or
+            // a host can vary underneath it.
+            {
+                NodeGraph g;
+                int nId = g.addNode("ceq", NodeType::Effect, {}, {}).id;
+                Node& nd = *g.findNode(nId);
+                nd.params.push_back({"FFT Size", 11.0f, 8.0f, 12.0f});
+                nd.params.push_back({"Mix",       1.0f, 0.0f,  1.0f});
+                SpectralCurve c; c.expression = "1 - 0.5 * f";
+                nd.script = CurveEq::encode(c, -1);
+
+                const int maxBlock = 2048;
+                CurveEQProcessor proc(nd);
+                proc.prepareToPlay(sr, maxBlock);
+
+                juce::AudioBuffer<float> buf(2, maxBlock);
+                juce::MidiBuffer mb;
+                auto fill = [&](int len) {
+                    for (int ch = 0; ch < 2; ++ch)
+                        for (int i = 0; i < len; ++i)
+                            buf.setSample(ch, i, 0.25f * (float)std::sin(
+                                6.28318530718 * 440.0 * i / sr));
+                };
+
+                fill(maxBlock);
+                proc.processBlock(buf, mb);          // warm up, settle capacities
+                const size_t before = proc.scratchCapacityBytes();
+
+                const int lens[] = { 2048, 1024, 512, 777, 256, 2048, 333 };
+                for (int pass = 0; pass < 40; ++pass) {
+                    for (auto& p : nd.params) {
+                        if (p.name == "FFT Size") p.value = (float)(8 + (pass % 5));
+                        if (p.name == "Mix")      p.value = (float)(pass % 2);
+                    }
+                    const int len = lens[pass % (int)(sizeof(lens)/sizeof(lens[0]))];
+                    juce::AudioBuffer<float> view(buf.getArrayOfWritePointers(), 2, len);
+                    fill(len);
+                    proc.processBlock(view, mb);
+                }
+                const size_t after = proc.scratchCapacityBytes();
+                r.checkVal(after == before,
+                           "curveeq: 40 blocks sweeping FFT Size / Mix / block length "
+                           "allocate nothing (scratch capacity growth in bytes)",
+                           (double)after - (double)before);
+
+                // The whole point of the sweep is that it actually reached the
+                // different transform sizes - otherwise the check above passes
+                // vacuously. A block shorter than the selected FFT clamps down,
+                // so the smallest length must still produce audio.
+                juce::AudioBuffer<float> small(buf.getArrayOfWritePointers(), 2, 256);
+                fill(256);
+                proc.processBlock(small, mb);
+                double acc = 0;
+                for (int i = 0; i < 256; ++i) { float s = small.getSample(0, i); acc += s*s; }
+                r.check(std::sqrt(acc / 256) > 1e-4,
+                        "curveeq: still produces audio at the smallest swept block size");
+            }
+
             // ---- Signal EQ -------------------------------------------------
             // Same sine/RMS rig. The Signal EQ's response is a product of
             // peaking bells (one per point), shared across the Zero-latency
@@ -5767,6 +8864,244 @@ void testAssetLibrary(Report& r) {
                 r.checkVal(SignalEQProcessor::countPoints(*g.findNode(nId)) == 3,
                            "signaleq: countPoints counts contiguous points",
                            SignalEQProcessor::countPoints(*g.findNode(nId)));
+            }
+
+            // Allocation-freedom on the audio thread (same bug, same proxy, as
+            // the Curve EQ check above). Signal EQ is the harsher case: every
+            // point coordinate is signal-modulatable, so the per-bin gain table
+            // genuinely has to be rebuilt on the audio thread - it can't be
+            // precomputed at prepare time the way Curve EQ's can. The sweep
+            // therefore also moves the points and changes how many there are,
+            // which is what resizes both the band bank and the gain row.
+            {
+                NodeGraph g;
+                int nId = makeSignalEqNode(g, 1,
+                    {{200.0f, 3.0f}, {440.0f, -6.0f}, {5000.0f, 2.0f}});
+                Node& nd = *g.findNode(nId);
+
+                const int maxBlock = 2048;
+                SignalEQProcessor proc(nd);
+                proc.prepareToPlay(sr, maxBlock);
+
+                juce::AudioBuffer<float> buf(2, maxBlock);
+                juce::MidiBuffer mb;
+                auto fill = [&](int len) {
+                    for (int ch = 0; ch < 2; ++ch)
+                        for (int i = 0; i < len; ++i)
+                            buf.setSample(ch, i, 0.25f * (float)std::sin(
+                                6.28318530718 * 440.0 * i / sr));
+                };
+                auto setParam = [&](const char* name, float v) {
+                    for (auto& p : nd.params) if (p.name == name) p.value = v;
+                };
+
+                fill(maxBlock);
+                proc.processBlock(buf, mb);          // warm up, settle capacities
+                const size_t before = proc.scratchCapacityBytes();
+
+                const int lens[] = { 2048, 1024, 512, 777, 256, 2048, 333 };
+                for (int pass = 0; pass < 48; ++pass) {
+                    setParam("Mode",     (float)(pass % 3 == 2 ? 0 : 1));
+                    setParam("FFT Size", (float)(8 + (pass % 5)));
+                    setParam("Mix",      (float)(pass % 2));
+                    setParam("Width",    1.0f + (float)(pass % 12));
+                    // Move the points every pass: forces the gain table rebuild.
+                    setParam("P1 Freq",  120.0f + 40.0f * (float)(pass % 9));
+                    setParam("P2 Gain",  -12.0f + (float)(pass % 7));
+                    // Grow the point count up to the hard maximum and back down,
+                    // exercising the band-bank resize on the audio thread.
+                    const int wantPts = 1 + (pass % SignalEQProcessor::kMaxPoints);
+                    while (SignalEQProcessor::countPoints(nd) < wantPts) {
+                        std::string pfx = "P" + std::to_string(
+                            SignalEQProcessor::countPoints(nd) + 1) + " ";
+                        nd.params.push_back({pfx + "Freq", 1000.0f, 20.0f, 20000.0f});
+                        nd.params.push_back({pfx + "Gain",    0.0f, -24.0f,  24.0f});
+                    }
+                    while (SignalEQProcessor::countPoints(nd) > wantPts)
+                        nd.params.pop_back();
+
+                    const int len = lens[pass % (int)(sizeof(lens)/sizeof(lens[0]))];
+                    juce::AudioBuffer<float> view(buf.getArrayOfWritePointers(), 2, len);
+                    fill(len);
+                    proc.processBlock(view, mb);
+                }
+                const size_t after = proc.scratchCapacityBytes();
+                r.checkVal(after == before,
+                           "signaleq: 48 blocks sweeping Mode / FFT Size / Mix / point "
+                           "count / block length allocate nothing (capacity growth, bytes)",
+                           (double)after - (double)before);
+
+                // Guard against the check above passing vacuously: the smallest
+                // swept block must still come out as audio, in both engines.
+                for (int mode = 0; mode <= 1; ++mode) {
+                    setParam("Mode", (float)mode);
+                    juce::AudioBuffer<float> small(buf.getArrayOfWritePointers(), 2, 256);
+                    fill(256);
+                    proc.processBlock(small, mb);
+                    double acc = 0;
+                    for (int i = 0; i < 256; ++i) {
+                        float s = small.getSample(0, i); acc += s * s;
+                    }
+                    r.check(std::sqrt(acc / 256) > 1e-4,
+                            juce::String("signaleq: still produces audio at the smallest "
+                                         "swept block size (mode ") + juce::String(mode) + ")");
+                }
+            }
+
+            // ---- SMS (spectral modeling synthesis) -------------------------
+            // Splits the signal into deterministic (spectral peaks above
+            // Threshold) and stochastic (everything else) halves, each with its
+            // own gain. These are the node's first tests.
+            auto makeSmsNode = [&](NodeGraph& g, float threshold, float harmGain,
+                                   float noiseGain, float fftExp = 10.0f) -> int {
+                int nId = g.addNode("sms", NodeType::Effect, {}, {}).id;
+                Node& nd = *g.findNode(nId);
+                nd.params.push_back({"Threshold",     threshold, 0.0f,  1.0f});
+                nd.params.push_back({"Harmonic Gain", harmGain,  0.0f,  4.0f});
+                nd.params.push_back({"Noise Gain",    noiseGain, 0.0f,  4.0f});
+                nd.params.push_back({"FFT Size",      fftExp,    8.0f, 12.0f});
+                nd.params.push_back({"Mix",           1.0f,      0.0f,  1.0f});
+                return nId;
+            };
+
+            // (a) Threshold 0 puts EVERY bin in the deterministic half, so the
+            //     residual is exactly zero and the output must be the input
+            //     again at unity gain. This pins the whole round trip - window
+            //     -> FFT -> IFFT -> overlap-add -> normalise - and in
+            //     particular the normalisation: before it existed, Hann^2 at
+            //     50% overlap summed to 0.5*(1+cos^2), so this ratio came out
+            //     at 0.77 with a tremolo riding on it.
+            {
+                NodeGraph g;
+                int nId = makeSmsNode(g, 0.0f, 1.0f, 1.0f);
+                SMSProcessor proc(*g.findNode(nId));
+                proc.prepareToPlay(sr, N);
+                juce::AudioBuffer<float> buf; makeSine(buf);
+                juce::AudioBuffer<float> dryB; makeSine(dryB);
+                juce::MidiBuffer mb;
+                proc.processBlock(buf, mb);
+                double rWet = centralRMS(buf), rDry = centralRMS(dryB);
+                r.checkVal(rDry > 1e-3 && std::abs(rWet / rDry - 1.0) < 0.02,
+                           "sms: threshold 0 reproduces the input at unity gain",
+                           rDry > 1e-3 ? rWet / rDry : 0.0);
+            }
+
+            // (b) The actual claim of the node: keeping only the deterministic
+            //     half preserves a pure tone but throws away most of a noise
+            //     signal. Both are measured against their own dry level so the
+            //     OLA scaling above cancels out.
+            {
+                auto keepRatio = [&](bool noiseInput) {
+                    NodeGraph g;
+                    int nId = makeSmsNode(g, 0.85f, 1.0f, 0.0f);
+                    SMSProcessor proc(*g.findNode(nId));
+                    proc.prepareToPlay(sr, N);
+                    juce::AudioBuffer<float> buf(1, N);
+                    float* d = buf.getWritePointer(0);
+                    std::mt19937 rngLocal(9876);
+                    std::uniform_real_distribution<float> uni(-0.5f, 0.5f);
+                    for (int i = 0; i < N; ++i)
+                        d[i] = noiseInput ? uni(rngLocal)
+                                          : 0.5f * (float)std::sin(2.0 * 3.14159265358979
+                                                                   * 440.0 * i / sr);
+                    juce::AudioBuffer<float> dryB(1, N);
+                    dryB.copyFrom(0, 0, buf, 0, 0, N);
+                    juce::MidiBuffer mb;
+                    proc.processBlock(buf, mb);
+                    double rD = centralRMS(dryB);
+                    return rD > 1e-6 ? centralRMS(buf) / rD : 0.0;
+                };
+                const double tone  = keepRatio(false);
+                const double noise = keepRatio(true);
+                r.checkVal(tone > 3.0 * noise,
+                           "sms: harmonic-only keeps far more of a tone than of noise",
+                           noise > 1e-9 ? tone / noise : 0.0);
+            }
+
+            // (c) Regression: a block length that is not a power of two. The
+            //     old code clamped the transform size with `fftSize = n`, which
+            //     handed a non-power-of-two size to FFT; its bit-reversal table
+            //     is then indexed past its end, writing outside the spectrum
+            //     buffer. 480 samples is a perfectly ordinary host block size.
+            {
+                NodeGraph g;
+                int nId = makeSmsNode(g, 0.2f, 1.0f, 1.0f);
+                SMSProcessor proc(*g.findNode(nId));
+                proc.prepareToPlay(sr, 512);
+                juce::AudioBuffer<float> buf(1, 480);
+                float* d = buf.getWritePointer(0);
+                for (int i = 0; i < 480; ++i)
+                    d[i] = 0.5f * (float)std::sin(2.0 * 3.14159265358979 * 440.0 * i / sr);
+                juce::MidiBuffer mb;
+                proc.processBlock(buf, mb);
+                bool finite = true, nonZero = false;
+                for (int i = 0; i < 480; ++i) {
+                    const float s = buf.getSample(0, i);
+                    if (!std::isfinite(s)) finite = false;
+                    if (std::abs(s) > 1e-5f) nonZero = true;
+                }
+                r.check(finite && nonZero,
+                        "sms: non-power-of-two block (480) processes cleanly");
+            }
+
+            // (d) Allocation-freedom, same capacity-as-proxy check as the two
+            //     EQs. SMS built an FFT plus eight vectors PER FRAME, so a
+            //     single 2048-sample block at FFT Size 8 hit the allocator ~15
+            //     times over.
+            {
+                NodeGraph g;
+                int nId = makeSmsNode(g, 0.3f, 1.0f, 1.0f);
+                Node& nd = *g.findNode(nId);
+
+                const int maxBlock = 2048;
+                SMSProcessor proc(nd);
+                proc.prepareToPlay(sr, maxBlock);
+
+                juce::AudioBuffer<float> buf(2, maxBlock);
+                juce::MidiBuffer mb;
+                auto fill = [&](int len) {
+                    for (int ch = 0; ch < 2; ++ch)
+                        for (int i = 0; i < len; ++i)
+                            buf.setSample(ch, i, 0.25f * (float)std::sin(
+                                6.28318530718 * 440.0 * i / sr));
+                };
+                auto setParam = [&](const char* name, float v) {
+                    for (auto& p : nd.params) if (p.name == name) p.value = v;
+                };
+
+                fill(maxBlock);
+                proc.processBlock(buf, mb);          // warm up, settle capacities
+                const size_t before = proc.scratchCapacityBytes();
+
+                const int lens[] = { 2048, 1024, 512, 480, 777, 256, 2048, 333 };
+                for (int pass = 0; pass < 40; ++pass) {
+                    setParam("FFT Size",      (float)(8 + (pass % 5)));
+                    setParam("Threshold",     (float)(pass % 5) * 0.25f);
+                    setParam("Harmonic Gain", (float)(pass % 3));
+                    setParam("Noise Gain",    (float)(pass % 4) * 0.5f);
+                    setParam("Mix",           (float)(pass % 2));
+                    const int len = lens[pass % (int)(sizeof(lens)/sizeof(lens[0]))];
+                    juce::AudioBuffer<float> view(buf.getArrayOfWritePointers(), 2, len);
+                    fill(len);
+                    proc.processBlock(view, mb);
+                }
+                const size_t after = proc.scratchCapacityBytes();
+                r.checkVal(after == before,
+                           "sms: 40 blocks sweeping FFT Size / gains / block length "
+                           "allocate nothing (capacity growth, bytes)",
+                           (double)after - (double)before);
+
+                // Non-vacuity: the smallest swept block must still emit audio.
+                setParam("Harmonic Gain", 1.0f);
+                setParam("Noise Gain",    1.0f);
+                setParam("Mix",           1.0f);
+                juce::AudioBuffer<float> small(buf.getArrayOfWritePointers(), 2, 256);
+                fill(256);
+                proc.processBlock(small, mb);
+                double acc = 0;
+                for (int i = 0; i < 256; ++i) { float s = small.getSample(0, i); acc += s*s; }
+                r.check(std::sqrt(acc / 256) > 1e-4,
+                        "sms: still produces audio at the smallest swept block size");
             }
         }
     }
@@ -5871,6 +9206,39 @@ void testAssetLibrary(Report& r) {
                 "pdc: JUCE graph delay-compensates a parallel dry path against a latency node");
         r.checkVal(g.getLatencySamples() == kLat,
                    "pdc: graph reports the max-path latency", g.getLatencySamples());
+    }
+
+    // ---- convolution filter reports latency for PDC -------------------------
+    {
+        // The Convolution Filter has two algorithm paths chosen by IR length:
+        //   short IR  (< 1024 samples) -> direct time-domain, ZERO added latency
+        //   long IR  (>= 1024 samples) -> partitioned overlap-add FFT, which
+        //     buffers a full partition (512) before it can emit output.
+        // Only that artificial block-buffering delay is reported via
+        // setLatencySamples so the graph's PDC time-aligns the effect against
+        // parallel branches. The IR's own group delay is deliberately NOT
+        // reported (it's part of the intended filtering sound).
+        Node shortNode, longNode;
+
+        // Short IR: a 101-sample lowpass -> direct path.
+        auto shortIR = ConvolutionProcessor::generateLowpass(2000.0f, 50, 44100.0);
+        shortNode.script = ConvolutionProcessor::encodeIR(shortIR);
+        ConvolutionProcessor shortConv(shortNode);
+        shortConv.prepareToPlay(44100.0, 512);
+        r.checkVal(shortConv.getLatencySamples() == 0,
+                   "convolution: short IR (direct path) reports zero latency",
+                   shortConv.getLatencySamples());
+
+        // Long IR: 2000 samples of arbitrary content -> overlap-add path.
+        std::vector<float> longIR(2000, 0.0f);
+        longIR[0] = 1.0f;
+        longIR[1500] = 0.5f; // ensure >= 1024 so the FFT path is chosen
+        longNode.script = ConvolutionProcessor::encodeIR(longIR);
+        ConvolutionProcessor longConv(longNode);
+        longConv.prepareToPlay(44100.0, 512);
+        r.checkVal(longConv.getLatencySamples() == 512,
+                   "convolution: long IR (overlap-add path) reports 512-sample latency",
+                   longConv.getLatencySamples());
     }
 
     // ---- import / merge: dedup by content, id remap, name-clash suffix ------
@@ -6997,7 +10365,7 @@ void testSampleHold(Report& r) {
                 "sh: audio channels stay silent");
     }
 
-    // --- Random ±1: one trigger, ignores In, value in [-1,1], then held. ---
+    // --- Random +/-1: one trigger, ignores In, value in [-1,1], then held. ---
     {
         setSource(1.0f);
         proc.prepareToPlay(48000.0, N);
@@ -7809,6 +11177,442 @@ void testTransportPanic(Report& r) {
             "panic: reset() is >=100x quieter than the natural release tail");
 }
 
+// Audio tracks nest under other tracks exactly like MIDI tracks do
+// (TrackNestingMenu accepts AudioTimeline, MidiTimeline and Group). The
+// nesting offset is node-level: clip beats stay local and the cascading
+// absoluteBeatOffset shifts the whole track.
+//
+// Regression: AudioTimelineProcessor::processBlock used to read clip.startBeat
+// raw, so a nested audio track DREW at its offset position (the piano roll's
+// beatToX adds absoluteBeatOffset) but PLAYED at the un-offset one - a silent
+// audio/visual desync. The MIDI generator in the same file always applied the
+// offset, which is why only audio tracks were affected.
+void testAudioTrackNesting(Report& r, const juce::File& dir) {
+    r.section("Audio track nesting (clips play at the cascading parent offset)");
+
+    const double sr = 44100.0;
+    const int    N  = 512;
+
+    // 4 seconds of steady tone, so any block landing inside the clip has a
+    // clearly non-zero RMS no matter where in the clip it falls.
+    std::vector<float> samples((size_t)(sr * 4.0), 0.0f);
+    for (size_t i = 0; i < samples.size(); ++i)
+        samples[i] = 0.5f * (float)std::sin(2.0 * juce::MathConstants<double>::pi
+                                            * 440.0 * (double)i / sr);
+    auto wav = dir.getChildFile("nested_audio_track.wav");
+    if (!writeWavFloat(wav, samples, sr)) {
+        r.check(false, "audio-nest: could not write the test wav");
+        return;
+    }
+
+    // parent track (offset 8 beats) -> child audio track with one 4-beat clip
+    // at local beat 0. At 120 BPM a beat is 0.5 s, so the clip must sound over
+    // absolute beats 8..12 and be silent over 0..4.
+    NodeGraph g;
+    int parentId = g.addNode("parent", NodeType::MidiTimeline, {}, {}).id;
+    int childId  = g.addNode("child",  NodeType::AudioTimeline, {},
+                             { Pin{0, "Audio", PinKind::Audio, false} }).id;
+    // Set fields by id only after every addNode call - addNode can reallocate
+    // graph.nodes, so a Node& taken earlier would dangle.
+    if (auto* p = g.findNode(parentId)) p->groupBeatOffset = 8.0f;
+    g.addToGroup(parentId, childId);
+    {
+        Clip c{};
+        c.name = "clip";
+        c.startBeat = 0.0f;
+        c.lengthBeats = 4.0f;
+        c.audioFilePath = wav.getFullPathName().toStdString();
+        g.findNode(childId)->clips.push_back(c);
+    }
+    g.resolveAnchors();
+
+    r.checkVal(std::abs(g.findNode(childId)->absoluteBeatOffset - 8.0f) < 1e-3f,
+               "audio-nest: child audio track inherits the 8-beat parent offset",
+               g.findNode(childId)->absoluteBeatOffset);
+
+    Transport tr;
+    tr.bpm = 120.0;
+    tr.sampleRate = sr;
+    tr.tempoMap.setGlobalBpm(120.0);
+    tr.playing = true;
+
+    AudioTimelineProcessor proc(*g.findNode(childId), tr, g);
+    proc.prepareToPlay(sr, N);
+
+    auto rmsAtBeat = [&](double beat) {
+        tr.positionSamples = (int64_t)(beat * 60.0 / tr.bpm * sr);
+        juce::AudioBuffer<float> buf(2, N);
+        juce::MidiBuffer midi;
+        proc.processBlock(buf, midi);
+        double sum = 0.0;
+        for (int i = 0; i < N; ++i) { float s = buf.getSample(0, i); sum += (double)s * s; }
+        return (float)std::sqrt(sum / N);
+    };
+
+    const float atBeat2  = rmsAtBeat(2.0);   // where the clip would play un-nested
+    const float atBeat10 = rmsAtBeat(10.0);  // where it must actually play
+
+    r.check(atBeat10 > 1.0e-2f,
+            "audio-nest: nested clip sounds at its offset position (beat 10, RMS "
+            + juce::String(atBeat10, 4) + ")");
+    r.check(atBeat2 < 1.0e-6f,
+            "audio-nest: nothing plays at the un-offset position (beat 2, RMS "
+            + juce::String(atBeat2, 8) + ")");
+
+    // Song length has to include the offset too, or an export would stop
+    // before the nested track's tail (clip ends at local beat 4 -> absolute 12).
+    r.checkVal(std::abs(g.contentEndBeats() - 12.0) < 1e-6,
+               "audio-nest: contentEndBeats includes the nesting offset",
+               (float) g.contentEndBeats());
+
+    // Detaching folds the inherited offset away again: the same clip is back at
+    // beats 0..4, which is what "Clear parent" in the nesting menu relies on.
+    g.removeFromGroup(childId);
+    if (auto* c = g.findNode(childId)) c->groupBeatOffset = 0.0f;
+    g.resolveAnchors();
+    r.check(rmsAtBeat(2.0) > 1.0e-2f,
+            "audio-nest: un-nesting moves the clip back to beat 0");
+}
+
+// Records live input into two nested tracks at once and plays the result back.
+// Guards three things that were each broken independently:
+//   * the take lands where the playhead was, not at beat 0;
+//   * Clip::startBeat is stored node-local, so a take on a nested track does
+//     not double-count the nesting offset the processor adds back on;
+//   * every armed input gets its own file and its own clip.
+void testMultitrackRecording(Report& r, const juce::File& dir) {
+    r.section("Multitrack recording (per-input capture, nesting-correct placement)");
+
+    const double sr = 44100.0;
+    const int    N  = 512;
+    const int    blocks = 86;                      // ~1 s of capture
+    const int64_t expectedSamples = (int64_t) blocks * N;
+
+    // parent (offset 8) -> two armed audio tracks on inputs 0 and 1.
+    NodeGraph g;
+    int parentId = g.addNode("parent", NodeType::MidiTimeline, {}, {}).id;
+    int trackAId = g.addNode("micA", NodeType::AudioTimeline, {},
+                             { Pin{0, "Audio", PinKind::Audio, false} }).id;
+    int trackBId = g.addNode("micB", NodeType::AudioTimeline, {},
+                             { Pin{0, "Audio", PinKind::Audio, false} }).id;
+    // Fields by id only after the last addNode - addNode can reallocate nodes.
+    if (auto* p = g.findNode(parentId)) p->groupBeatOffset = 8.0f;
+    for (int id : { trackAId, trackBId }) {
+        auto* n = g.findNode(id);
+        n->recordArmed = true;
+        n->recordInputChannel = (id == trackAId ? 0 : 1);
+    }
+    g.addToGroup(parentId, trackAId);
+    g.addToGroup(parentId, trackBId);
+    g.resolveAnchors();
+
+    Transport tr;
+    tr.bpm = 120.0;
+    tr.sampleRate = sr;
+    tr.tempoMap.setGlobalBpm(120.0);
+    tr.playing = true;
+    tr.positionSamples = (int64_t)(10.0 * 60.0 / tr.bpm * sr);   // absolute beat 10
+
+    auto recDir = dir.getChildFile("recordings_selftest");
+    recDir.deleteRecursively();
+
+    MultitrackRecorder rec;
+    rec.startRecording(g, tr, sr, recDir.getFullPathName().toStdString());
+    r.check(rec.isRecording(), "record: both armed tracks started");
+    r.checkVal(rec.getActiveTrackCount() == 2,
+               "record: one capture stream per armed input",
+               (float) rec.getActiveTrackCount());
+
+    // Feed the two inputs distinct steady tones.
+    std::vector<float> chan0(N), chan1(N);
+    double phase = 0.0;
+    for (int b = 0; b < blocks; ++b) {
+        for (int i = 0; i < N; ++i, phase += 1.0) {
+            chan0[(size_t) i] = 0.5f * (float) std::sin(2.0 * juce::MathConstants<double>::pi
+                                                        * 440.0 * phase / sr);
+            chan1[(size_t) i] = 0.25f * (float) std::sin(2.0 * juce::MathConstants<double>::pi
+                                                         * 660.0 * phase / sr);
+        }
+        const float* in[2] = { chan0.data(), chan1.data() };
+        rec.processSamples(in, 2, N);
+    }
+
+    rec.stopRecording(g, tr, sr);
+    r.check(!rec.isRecording(), "record: stopped cleanly");
+    r.checkVal(rec.getDroppedSampleCount() == 0,
+               "record: no samples were dropped on the way to disk",
+               (float) rec.getDroppedSampleCount());
+
+    // Each track should have exactly one clip, on disk, at local beat 2
+    // (absolute beat 10 minus the 8-beat parent offset).
+    for (int id : { trackAId, trackBId }) {
+        auto* n = g.findNode(id);
+        juce::String who = juce::String(n->name) + ": ";
+        if (!r.check(n->clips.size() == 1, ("record: " + who + "got exactly one clip")))
+            continue;
+
+        const Clip& c = n->clips[0];
+        r.checkVal(std::abs(c.startBeat - 2.0f) < 1e-3f,
+                   ("record: " + who + "clip start is node-local (absolute 10 - offset 8)"),
+                   c.startBeat);
+        r.check(!c.audioFilePath.empty() && juce::File(c.audioFilePath).existsAsFile(),
+                ("record: " + who + "wav was written to disk"));
+        // 1 s at 120 BPM is 2 beats.
+        r.checkVal(std::abs(c.lengthBeats - 2.0f) < 0.05f,
+                   ("record: " + who + "clip length matches the captured duration"),
+                   c.lengthBeats);
+        r.check(!n->recordArmed, ("record: " + who + "disarmed after the take"));
+
+        juce::WavAudioFormat wavFormat;
+        std::unique_ptr<juce::AudioFormatReader> rd(
+            wavFormat.createReaderFor(new juce::FileInputStream(juce::File(c.audioFilePath)), true));
+        if (r.check(rd != nullptr, ("record: " + who + "wav is readable"))) {
+            r.checkVal(rd->lengthInSamples == expectedSamples,
+                       ("record: " + who + "every sample the callback saw reached the file"),
+                       (float) rd->lengthInSamples);
+        }
+    }
+
+    // Round trip: play the freshly recorded take back. It must sound at the
+    // absolute beat it was recorded at (10), not at the raw local beat (2).
+    auto rmsAtBeat = [&](int nodeId, double beat) {
+        AudioTimelineProcessor proc(*g.findNode(nodeId), tr, g);
+        proc.prepareToPlay(sr, N);
+        tr.positionSamples = (int64_t)(beat * 60.0 / tr.bpm * sr);
+        juce::AudioBuffer<float> buf(2, N);
+        juce::MidiBuffer midi;
+        proc.processBlock(buf, midi);
+        double sum = 0.0;
+        for (int i = 0; i < N; ++i) { float s = buf.getSample(0, i); sum += (double) s * s; }
+        return (float) std::sqrt(sum / N);
+    };
+
+    const float back = rmsAtBeat(trackAId, 10.5);
+    r.check(back > 1.0e-2f,
+            "record: the take plays back at the beat it was recorded at (RMS "
+            + juce::String(back, 4) + ")");
+    r.check(rmsAtBeat(trackAId, 2.5) < 1.0e-6f,
+            "record: the take does not also sound at the un-offset beat");
+
+    recDir.deleteRecursively();
+}
+
+// ensureInputTracks(): the "press Record and every live mic gets a track"
+// decision logic, plus the two-condition record mute that goes with it.
+//
+// The subtle one is re-use. A take disarms its track when it finishes, so
+// anything that decided "already covered?" by looking at recordArmed would
+// spawn a fresh duplicate track on every single record press. The check has to
+// be on the "Input Channel" param, which persists.
+// ===========================================================================
+// Dialogs stay off the Windows taskbar
+// ===========================================================================
+//
+// CLAUDE.md: a dialog must never earn its own taskbar button - the shell reads
+// an unowned WS_EX_APPWINDOW popup as a second copy of SEANCE. Every
+// juce::AlertWindow in the app (~25 of them) is kept off the taskbar by exactly
+// one line, installAppLookAndFeel() in main.cpp, which strips
+// ComponentPeer::windowAppearsOnTaskbar from LookAndFeel::getAlertBoxWindowFlags().
+//
+// That single line is the whole fix and nothing else references it, so deleting
+// it - or reordering it after an early return in initialise() - would silently
+// regress every alert in the app with no compile error and no visible symptom
+// until someone happened to look at their taskbar. Hence this test.
+//
+// It deliberately checks the *peer's actual style flags*, not just the
+// look-and-feel's return value. The value is only a request; what matters is
+// what AlertWindow built its window from, and the two came apart before (an
+// AlertWindow subclass overriding getDesktopWindowStyleFlags() never had its
+// override consulted, because the peer is created during construction). Reading
+// the peer is the only way to test the thing that actually reaches the OS.
+void testDialogTaskbarFlags(Report& r) {
+    r.section("Dialogs stay off the Windows taskbar");
+
+    const int taskbar = juce::ComponentPeer::windowAppearsOnTaskbar;
+
+    // The look-and-feel must already be installed by the time any test runs -
+    // main.cpp does it at the very top of initialise(), above the --self-test
+    // dispatch. If this fails, the install moved below an early return.
+    const int lnfFlags = juce::LookAndFeel::getDefaultLookAndFeel().getAlertBoxWindowFlags();
+    r.check((lnfFlags & taskbar) == 0,
+            "alert flags: the app look-and-feel strips windowAppearsOnTaskbar");
+
+    // End-to-end: a real AlertWindow, and the flags its real peer was built
+    // with. TopLevelWindow's constructor puts it on the desktop, so the peer
+    // exists immediately; it is never made visible, so nothing appears
+    // on screen during the test run.
+    juce::AlertWindow aw("Self-test", "Self-test", juce::MessageBoxIconType::NoIcon);
+    if (auto* peer = juce::ComponentPeer::getPeerFor(&aw)) {
+        // This is also what guards the assumption the whole fix rests on -
+        // that AlertWindow sources its flags from the look-and-feel. If a JUCE
+        // upgrade decoupled the two, the look-and-feel check above would still
+        // pass while every dialog silently regressed; this one would go red.
+        r.check((peer->getStyleFlags() & taskbar) == 0,
+                "alert flags: a live AlertWindow's peer has no taskbar flag");
+    } else {
+        r.check(false, "alert flags: AlertWindow created a desktop peer");
+    }
+
+    // The other dialog route: custom components go through the launch*ToolDialog
+    // helpers, whose ToolDialogWindow drops the same flag by overriding
+    // getDesktopWindowStyleFlags(). That override does work - but for a reason
+    // worth being humble about, which is why it is tested rather than reasoned
+    // about. A DialogWindow is put on the desktop by its base constructor too,
+    // with the *base* flags, so at that instant the override is no more visible
+    // than AlertWindow's is; what saves it is that ResizableWindow/DialogWindow
+    // re-apply the flags through several post-construction paths
+    // (lookAndFeelChanged(), setResizable(), setUsingNativeTitleBar(), ...), by
+    // which time the vtable is ToolDialogWindow's. It is genuinely redundant -
+    // deleting any single one of those calls leaves the behaviour correct
+    // (measured) - so this test exists to catch a JUCE upgrade removing the
+    // last of them, not to pin any particular one.
+    //
+    // launchManagedToolDialog is the non-modal variant, so this neither blocks
+    // nor leaves anything behind; it does briefly show a small window.
+    auto content = std::make_unique<juce::Component>();
+    content->setSize(120, 60);
+    juce::DialogWindow::LaunchOptions opts;
+    opts.content.setOwned(content.release());
+    opts.dialogTitle = "Self-test";
+    opts.useNativeTitleBar = false;
+    opts.resizable = false;
+    if (auto* dlg = launchManagedToolDialog(opts)) {
+        if (auto* peer = dlg->getPeer())
+            r.check((peer->getStyleFlags() & taskbar) == 0,
+                    "tool dialog: ToolDialogWindow's peer has no taskbar flag");
+        else
+            r.check(false, "tool dialog: dialog created a desktop peer");
+        dlg->setVisible(false);
+        delete dlg;   // launchManagedToolDialog hands lifetime to the caller
+    } else {
+        r.check(false, "tool dialog: launchManagedToolDialog returned a window");
+    }
+}
+
+void testAutoInputTracks(Report& r) {
+    r.section("Auto-created tracks for live audio inputs");
+
+    NodeGraph g;
+    int outId = g.addNode("Output", NodeType::Output,
+                          { Pin{0, "Audio In", PinKind::Audio, true} }, {}).id;
+    const int outPin = g.findNode(outId)->pinsIn[0].id;
+
+    // Placement is the only part that needs a canvas, so the test supplies a
+    // trivial stand-in and walks it right so we can see each call land.
+    float nextX = 0;
+    auto place = [&] { nextX += 100; return Vec2{nextX, 50}; };
+
+    std::vector<InputTrackSpec> specs = {
+        { 0, "Mic 1 (C615)" },
+        { 1, "Line In 2 (Focusrite)" },
+    };
+
+    auto created = ensureInputTracks(g, specs, outPin, place);
+    r.checkVal(created.size() == 2,
+               "auto-track: one track created per live input",
+               (float) created.size());
+
+    for (size_t i = 0; i < created.size(); ++i) {
+        auto* n = g.findNode(created[i]);
+        if (!r.check(n != nullptr, "auto-track: created node is findable")) continue;
+        juce::String who = juce::String(n->name) + ": ";
+        r.check(n->type == NodeType::AudioTimeline,
+                ("auto-track: " + who + "is an Audio Track"));
+        r.check(n->name == specs[i].trackName,
+                ("auto-track: " + who + "named after the device kind and channel"));
+        r.checkVal((int) paramByName(*n, "Input Channel", -1.0f) == specs[i].channel,
+                   ("auto-track: " + who + "Input Channel param points at the device channel"),
+                   paramByName(*n, "Input Channel", -1.0f));
+        r.check(n->recordArmed && n->recordInputChannel == specs[i].channel,
+                ("auto-track: " + who + "armed on that channel"));
+        // A track built for recording starts empty - the placeholder clip a
+        // hand-made Audio Track gets would just be a 4-beat block to delete.
+        r.check(n->clips.empty(), ("auto-track: " + who + "starts with no placeholder clip"));
+
+        // Wired to the output, so the take is audible next pass without the
+        // user dragging a cable.
+        bool wired = false;
+        for (auto& l : g.links)
+            if (!n->pinsOut.empty() && l.startPin == n->pinsOut[0].id && l.endPin == outPin)
+                wired = true;
+        r.check(wired, ("auto-track: " + who + "cabled to the output node"));
+    }
+
+    // Second press: the tracks exist but are disarmed (a take clears the flag).
+    // Nothing new must be created; the existing tracks must be re-armed.
+    const size_t nodesAfterFirst = g.nodes.size();
+    const size_t linksAfterFirst = g.links.size();
+    for (int id : created) g.findNode(id)->recordArmed = false;
+
+    auto again = ensureInputTracks(g, specs, outPin, place);
+    r.checkVal(again.empty(),
+               "auto-track: a second record press re-uses the tracks instead of duplicating",
+               (float) again.size());
+    r.checkVal(g.nodes.size() == nodesAfterFirst,
+               "auto-track: node count unchanged on re-use", (float) g.nodes.size());
+    r.checkVal(g.links.size() == linksAfterFirst,
+               "auto-track: no duplicate cable to the output", (float) g.links.size());
+    for (int id : created)
+        r.check(g.findNode(id)->recordArmed,
+                "auto-track: existing track re-armed for the new take");
+
+    // A name already taken gets a numeric suffix rather than two identical
+    // nodes the user cannot tell apart.
+    ensureInputTracks(g, { { 5, "Mic 1 (C615)" } }, outPin, place);
+    bool suffixed = false;
+    for (auto& n : g.nodes) if (n.name == "Mic 1 (C615) 2") suffixed = true;
+    r.check(suffixed, "auto-track: a clashing track name gets a numeric suffix");
+
+    // Channel -1 means "no input assigned" and must never make a track.
+    const size_t before = g.nodes.size();
+    ensureInputTracks(g, { { -1, "Nothing" } }, outPin, place);
+    r.checkVal(g.nodes.size() == before,
+               "auto-track: an unassigned input creates nothing", (float) g.nodes.size());
+
+    // --- the two-condition record mute -------------------------------------
+    // Silence a track only when BOTH it is mid-take AND the user has not asked
+    // to hear tracks while recording them.
+    auto rmsThroughPan = [&](int nodeId) {
+        PanProcessor pan(*g.findNode(nodeId), g);
+        pan.prepareToPlay(44100.0, 512);
+        juce::AudioBuffer<float> buf(2, 512);
+        juce::MidiBuffer midi;
+        for (int ch = 0; ch < 2; ++ch)
+            for (int i = 0; i < 512; ++i) buf.setSample(ch, i, 0.5f);
+        pan.processBlock(buf, midi);
+        double sum = 0;
+        for (int i = 0; i < 512; ++i) { float s = buf.getSample(0, i); sum += (double) s * s; }
+        return (float) std::sqrt(sum / 512);
+    };
+
+    const int trackId = created[0];
+    g.globalCrossfadeSec = 0.0f;   // no ramp, so one block shows the end state
+    g.findNode(trackId)->recordingNow = false;
+    g.playbackWhileRecording = false;
+    r.check(rmsThroughPan(trackId) > 0.4f,
+            "record-mute: a track that is not recording passes audio");
+
+    g.findNode(trackId)->recordingNow = true;
+    r.check(rmsThroughPan(trackId) < 1e-4f,
+            "record-mute: mid-take with playback-while-recording off, the track is silent");
+
+    g.playbackWhileRecording = true;
+    r.check(rmsThroughPan(trackId) > 0.4f,
+            "record-mute: mid-take with playback-while-recording on, the track is audible");
+
+    // Only the recording track is affected - its neighbours keep playing, so
+    // recording an overdub doesn't silence the song you are playing along to.
+    g.playbackWhileRecording = false;
+    r.check(rmsThroughPan(created[1]) > 0.4f,
+            "record-mute: a track that is not mid-take is unaffected");
+
+    // Belt-and-braces: replacing the graph (new project / undo) must be able to
+    // clear the flag, or a node could stay silent with nothing in the UI to say why.
+    MultitrackRecorder::clearRecordingFlags(g);
+    r.check(!g.findNode(trackId)->recordingNow,
+            "record-mute: clearRecordingFlags un-sticks a track left mid-take");
+}
+
 int runSelfTest(const juce::File& outDir) {
     outDir.createDirectory();
     Report r;
@@ -7843,10 +11647,17 @@ int runSelfTest(const juce::File& outDir) {
     testVoicePresets(r);
     testSignalOscPulse(r);
     testTransportPanic(r);
+    testAudioTrackNesting(r, outDir);
+    testMultitrackRecording(r, outDir);
+    testAutoInputTracks(r);
+    testDialogTaskbarFlags(r);
 
     r.section("Summary");
     r.line("  PASSED: " + juce::String(r.passed));
     r.line("  FAILED: " + juce::String(r.failed));
+    if (r.knownBugs > 0)
+        r.line("  KNOWN BUGS (tracked in known-issues.md, not counted as failures): "
+               + juce::String(r.knownBugs));
     r.line(r.failed == 0 ? "  RESULT: ALL TESTS PASSED" : "  RESULT: FAILURES PRESENT");
 
     auto reportFile = outDir.getChildFile("selftest_report.txt");

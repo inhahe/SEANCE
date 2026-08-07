@@ -65,6 +65,18 @@ ConvolutionEditorComponent::ConvolutionEditorComponent(NodeGraph& g, int nid,
                            "(room, hall, cabinet) to capture its acoustic character and apply it to any audio.");
     loadFileBtn.onClick = [this]() { loadFromFile(); };
 
+    addAndMakeVisible(saveToLibBtn);
+    saveToLibBtn.setTooltip(juce::String::fromUTF8(
+        "Save the current impulse response to this project's asset library so you can "
+        "reuse it in any other Convolution Filter. Stored copies live in "
+        "Edit \xe2\x86\x92 Asset Library \xe2\x86\x92 Convolution IRs."));
+    saveToLibBtn.onClick = [this]() { saveToLibrary(); };
+
+    addAndMakeVisible(loadFromLibBtn);
+    loadFromLibBtn.setTooltip("Load an impulse response you previously saved to the library. It's copied in "
+                              "as an independent IR you can then edit freely.");
+    loadFromLibBtn.onClick = [this]() { showLibraryBrowser(); };
+
     // Drawing mode toggle: control points (Catmull-Rom smoothed) vs
     // freehand (per-sample direct drawing). Control points is the default.
     addAndMakeVisible(modePointsBtn);
@@ -283,6 +295,12 @@ void ConvolutionEditorComponent::resized() {
     int by = getLocalBounds().getBottom() - 10 - (int)(getLocalBounds().getHeight() * 0.4f) - 32;
     lengthLbl.setBounds(bx, by, 60, 24);
     lengthSlider.setBounds(bx + 62, by, 200, 24);
+
+    // Library save/load sit to the right of the length slider (that row has room
+    // the crowded top button row does not).
+    int rx = getLocalBounds().getRight() - 10 - 120 - 6 - 120;
+    saveToLibBtn.setBounds(rx, by, 120, 24);
+    loadFromLibBtn.setBounds(rx + 126, by, 120, 24);
 }
 
 void ConvolutionEditorComponent::generateFromPreset() {
@@ -325,6 +343,84 @@ void ConvolutionEditorComponent::loadFromFile() {
             for (int i = 0; i < len; ++i) ir[i] = buf.getSample(0, i);
             sampleRate = reader->sampleRate;
             lengthSlider.setValue(len, juce::dontSendNotification);
+            updateFreqResponse();
+            commitIR();
+            if (onApply) onApply();
+            repaint();
+        });
+}
+
+void ConvolutionEditorComponent::saveToLibrary() {
+    // Publish the current IR as a ConvolutionIR asset. Prompt for a display name
+    // first (the node's name is a reasonable default).
+    juce::String dflt = "Impulse Response";
+    if (auto* nd = graph.findNode(nodeId))
+        if (!nd->name.empty()) dflt = juce::String(nd->name);
+
+    auto* aw = new juce::AlertWindow("Save IR to Library",
+        "Name for this impulse response:", juce::MessageBoxIconType::NoIcon, this);
+    aw->addTextEditor("name", dflt);
+    aw->addButton("Save", 1, juce::KeyPress(juce::KeyPress::returnKey));
+    aw->addButton("Cancel", 0, juce::KeyPress(juce::KeyPress::escapeKey));
+    aw->enterModalState(true, juce::ModalCallbackFunction::create(
+        [this, aw](int res) {
+            if (res == 1) {
+                auto name = aw->getTextEditorContents("name").trim().toStdString();
+                if (name.empty()) name = "Impulse Response";
+                graph.assets.add(AssetKind::ConvolutionIR, name, "",
+                                 ConvolutionProcessor::encodeIR(ir));
+                // The asset library is part of the project, so mark it dirty for
+                // the save prompt / autosave. (The convolution editor works in the
+                // dirty-flag model rather than per-edit undo snapshots.)
+                graph.dirty = true;
+            }
+            delete aw;
+        }), true);
+}
+
+void ConvolutionEditorComponent::showLibraryBrowser() {
+    // List every stored ConvolutionIR asset in a popup; picking one loads it as an
+    // independent copy (further edits here don't touch the stored asset).
+    auto stored = graph.assets.list(AssetKind::ConvolutionIR);
+    if (stored.empty()) {
+        juce::NativeMessageBox::showMessageBoxAsync(
+            juce::MessageBoxIconType::InfoIcon, "Library empty",
+            "No impulse responses have been saved to the library yet. Use "
+            "\"Save to Library\" to add the current one.", this);
+        return;
+    }
+
+    juce::PopupMenu menu;
+    // Map menu item id -> asset id (menu ids are 1-based, contiguous).
+    std::vector<int> assetIds;
+    for (const AssetEntry* e : stored) {
+        assetIds.push_back(e->id);
+        juce::String label = juce::String(e->name.empty() ? "(unnamed)" : e->name);
+        if (e->starred) label = juce::String::fromUTF8("\xe2\x98\x85 ") + label;
+        menu.addItem((int)assetIds.size(), label);
+    }
+
+    menu.showMenuAsync(
+        juce::PopupMenu::Options().withTargetComponent(&loadFromLibBtn),
+        [this, assetIds](int choice) {
+            if (choice < 1 || choice > (int)assetIds.size()) return;
+            const AssetEntry* e = graph.assets.find(assetIds[(size_t)choice - 1]);
+            if (!e || e->kind != AssetKind::ConvolutionIR) return;
+
+            std::vector<float> loaded = ConvolutionProcessor::decodeIR(e->payload);
+            if (loaded.empty()) return;
+            ir = std::move(loaded);
+
+            // Rebuild the control-point approximation so Points mode reflects the
+            // loaded IR (freehand/preview read `ir` directly).
+            controlPoints.clear();
+            int step = std::max(1, (int)ir.size() / 16);
+            for (int i = 0; i < (int)ir.size(); i += step) {
+                float x = (float)i / std::max(1.0f, (float)(ir.size() - 1));
+                controlPoints.push_back({x, ir[i]});
+            }
+
+            lengthSlider.setValue((double)ir.size(), juce::dontSendNotification);
             updateFreqResponse();
             commitIR();
             if (onApply) onApply();

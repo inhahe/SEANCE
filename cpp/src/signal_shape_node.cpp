@@ -153,6 +153,10 @@ SignalShapeProcessor::SignalShapeProcessor(Node& n, Transport& t)
     : node(n), transport(t)
 {
     reloadIfScriptChanged();
+    // Built here as well as in prepareToPlay so it's never null on the audio
+    // thread even if a caller renders without preparing first (the self-tests
+    // do; the graph always prepares).
+    shapeFn = [this](float pos) { return sampleShape(shapeSamples, pos); };
 }
 
 float SignalShapeProcessor::getParam(int idx, float def) const {
@@ -356,6 +360,44 @@ void SignalShapeProcessor::drainPendingNoteOffs(juce::MidiBuffer& midi, int numS
     }
 }
 
+void SignalShapeProcessor::prepareToPlay(double sr, int bs) {
+    sampleRate = sr;
+
+    // Pre-size the audio-thread scratch so processBlock never reaches the
+    // allocator. Everything here is grow-only afterwards: a bigger block or a
+    // wider s-list sizes up once on the first affected callback and then stays.
+    const int nSamples = juce::jmax(1, bs);
+    sigChans.reserve((size_t) juce::jmax(0, doc.signalInputCount));
+    if ((int) blockOut.size() < nSamples) blockOut.resize((size_t) nSamples, 0.0f);
+    for (auto& b : outBufs)
+        if ((int) b.size() < nSamples) b.resize((size_t) nSamples, 0.0f);
+
+    // The expression parser takes shape() as a std::function. Build it once
+    // rather than per block - it only captures `this`, and shapeSamples is a
+    // member, so a shape rebuild doesn't invalidate it.
+    shapeFn = [this](float pos) { return sampleShape(shapeSamples, pos); };
+
+    // Seed the variable maps with every key the program can bind so the first
+    // block doesn't pay for a map node per variable. varsSigCount is set to
+    // match, so the s-list rebuild in processBlock only fires if the doc
+    // actually changes the input count afterwards.
+    const int sigCount = juce::jmax(0, doc.signalInputCount);
+    vars.reserve(16 + (size_t) sigCount);
+    for (const char* k : { "curve", "x", "phase", "t", "beat", "bpm",
+                           "gate", "freq", "note", "vel", "rep", "rate" })
+        vars[k] = 0.0f;
+    sigVarNames.clear();
+    for (int i = 0; i < sigCount; ++i) {
+        sigVarNames.push_back("s" + std::to_string(i + 1));
+        vars[sigVarNames.back()] = 0.0f;
+    }
+    varsSigCount = sigCount;
+
+    startVars.reserve(8);
+    for (const char* k : { "bpm", "note", "vel", "gate", "freq", "rate" })
+        startVars[k] = 0.0f;
+}
+
 void SignalShapeProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::MidiBuffer& midi) {
     int numSamples = buf.getNumSamples();
     int numCh = buf.getNumChannels();
@@ -477,8 +519,11 @@ void SignalShapeProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mid
     // to 0 via the parser's "unknown identifier" fallback.
     // Read signal inputs from the pre-clear snapshot (ctrlIn), NOT the live
     // buffer (which we just cleared and will overwrite with outputs).
-    std::vector<const float*> sigChans;
-    sigChans.reserve(sigCount);
+    // `sigChans` is a member: clear() keeps the capacity, so once it has grown
+    // to the widest s-list this node has ever had, refilling it here never
+    // touches the allocator. It used to be a local, i.e. one allocation per
+    // block.
+    sigChans.clear();
     for (int i = 0; i < sigCount; ++i) {
         sigChans.push_back((i < ctrlIn.getNumChannels()) ? ctrlIn.getReadPointer(i)
                                                          : nullptr);
@@ -548,13 +593,15 @@ void SignalShapeProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mid
     // Raw-signal mode: the script fills the whole output buffer itself. The
     // trigger / phase / repeat / curve machinery below is bypassed entirely.
     if (runBlockMode && runtime) {
+        // resize (not assign) - growing to a size within capacity is guaranteed
+        // not to reallocate; assign carries no such guarantee.
         if ((int)blockOut.size() < numSamples)
-            blockOut.assign((size_t)juce::jmax(1, numSamples), 0.0f);
+            blockOut.resize((size_t)juce::jmax(1, numSamples), 0.0f);
 
         const float freqHz = (lastNoteOn >= 0)
                            ? 440.0f * std::pow(2.0f, (lastNoteOn - 69) / 12.0f) : 0.0f;
         if (playStart) {
-            ScriptVars sv;
+            ScriptVars& sv = startVars;   // member: reused, never reallocated
             sv["bpm"]  = (float)transport.bpm;
             sv["note"] = (float)lastNoteOn;
             sv["vel"]  = lastVelocity;
@@ -592,12 +639,15 @@ void SignalShapeProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mid
         const bool streamingNode = runtime->isStreaming();
         const int  numStreamOuts = juce::jmax(1, outChEnd - outChStart);
         if (streamingNode) {
-            if ((int)outBufs.size() != numStreamOuts)
-                outBufs.assign((size_t)numStreamOuts, std::vector<float>());
-            outPtrs.assign((size_t)numStreamOuts, nullptr);
+            // resize, not assign: outBufs only ever grows (shrinking would throw
+            // away buffers we'd have to reallocate on the next widening), and
+            // outPtrs is refilled below so its old contents don't matter.
+            if ((int)outBufs.size() < numStreamOuts)
+                outBufs.resize((size_t)numStreamOuts);
+            outPtrs.resize((size_t)numStreamOuts);
             for (int p = 0; p < numStreamOuts; ++p) {
                 if ((int)outBufs[(size_t)p].size() < numSamples)
-                    outBufs[(size_t)p].assign((size_t)juce::jmax(1, numSamples), 0.0f);
+                    outBufs[(size_t)p].resize((size_t)juce::jmax(1, numSamples), 0.0f);
                 else
                     std::fill_n(outBufs[(size_t)p].data(), numSamples, 0.0f);
                 outPtrs[(size_t)p] = outBufs[(size_t)p].data();
@@ -640,7 +690,7 @@ void SignalShapeProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mid
 
     // Per-sample start hook (Builtin start: / Lua start()) on the play edge.
     if (playStart && runtime) {
-        ScriptVars sv;
+        ScriptVars& sv = startVars;   // member: reused, never reallocated
         sv["bpm"]  = (float)transport.bpm;
         sv["note"] = (float)lastNoteOn;
         sv["vel"]  = lastVelocity;
@@ -657,12 +707,17 @@ void SignalShapeProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mid
     // the phase-locked `curve` variable. `pos` is treated as a 0..1 phase that
     // wraps - sampleShape() handles the modulo. Built once per block (cheap),
     // referenced by the parser only when the expression actually calls shape().
-    const std::vector<float>& tbl = shapeSamples;
-    std::function<float(float)> shapeFn =
-        [&tbl](float pos) { return sampleShape(tbl, pos); };
-
-    std::unordered_map<std::string, float> vars;
-    vars.reserve(16 + sigCount);
+    // Both `shapeFn` and `vars` are members - see the scratch block in the
+    // header for why. `vars` survives across blocks, so operator[] below only
+    // overwrites values; it's rebuilt only when the s-list width changes, so a
+    // shrunk input count can't leave a stale sN visible to an expression.
+    if (varsSigCount != sigCount) {
+        vars.clear();
+        sigVarNames.clear();
+        for (int i = 0; i < sigCount; ++i)
+            sigVarNames.push_back("s" + std::to_string(i + 1));
+        varsSigCount = sigCount;
+    }
 
     for (int s = 0; s < numSamples; ++s) {
         // Transport-synced phase: derive `phase` (and the run/repeat state) as a
@@ -719,9 +774,11 @@ void SignalShapeProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mid
         vars["vel"]   = lastVelocity;
         vars["rep"]   = (float)repeatsDone;
         vars["rate"]  = rate;
+        // Key names are cached (sigVarNames) rather than rebuilt as
+        // "s" + to_string(i+1) for every input of every sample.
         for (int i = 0; i < sigCount; ++i) {
             float v = sigChans[i] ? sigChans[i][s] : 0.0f;
-            vars["s" + std::to_string(i + 1)] = v;
+            vars[sigVarNames[(size_t) i]] = v;
         }
 
         // Trigger detection and per-sample phase integration apply only when we

@@ -4,6 +4,7 @@
 #include "wavelet.h"
 #include "pitch_detect.h"
 #include "fft_util.h"
+#include "pitch_core.h"     // PhaseVocoderShifter + LatencyDelay (pitch shifters)
 #include "builtin_synth.h"
 #include "curve_editor.h"   // SpectralCurve + CurveEq script helpers (Curve EQ)
 #include "warp.h"           // warpAmpValue + Waveshaper script helpers (Waveshaper FX)
@@ -12,15 +13,12 @@
 #include <vector>
 #include <random>
 #include <complex>
+#include <bitset>
 
 namespace SoundShop {
 
-// Helper: read a named param from the node, return def if not found.
-inline float paramByName(const Node& node, const char* name, float def) {
-    for (auto& p : node.params)
-        if (p.name == name) return p.value;
-    return def;
-}
+// paramByName() moved to node_graph.h, next to Node, so that processors which
+// do not want this whole header can still read their params by name.
 
 // Number of single-loop cycles a feedback delay takes to decay to -60 dB
 // (the standard "RT60" inaudibility threshold).  feedback is the linear
@@ -597,22 +595,40 @@ class ArpeggiatorProcessor : public juce::AudioProcessor {
 public:
     ArpeggiatorProcessor(Node& n) : node(n) {}
     const juce::String getName() const override { return "Arpeggiator"; }
-    void prepareToPlay(double sr, int) override { sampleRate = sr; }
+    void prepareToPlay(double sr, int) override {
+        sampleRate = sr;
+        // Worst case: 128 held notes x 4 octave copies, doubled by the up-down
+        // pattern's descending tail. Reserved once here so the per-block rebuild
+        // below never reaches the allocator.
+        seq.reserve(128 * 4 * 2);
+    }
     void releaseResources() override {}
     void processBlock(juce::AudioBuffer<float>& buf, juce::MidiBuffer& midi) override {
         float rate    = paramByName(node, "Rate", 8.0f); // notes per second
         int pattern   = (int)paramByName(node, "Pattern", 0.0f);
         int octaves   = juce::jlimit(1, 4, (int)paramByName(node, "Octaves", 1.0f));
 
-        // Collect held notes
+        // Collect held notes. A 128-bit mask rather than a std::set: MIDI notes
+        // are 0..127, so the set was allocating a tree node on the audio thread
+        // for every note-on and it bought nothing - walking the mask in index
+        // order already yields the ascending order the sequence builder wanted,
+        // which is why the separate baseNotes copy and std::sort are gone.
         for (auto metadata : midi) {
             auto msg = metadata.getMessage();
-            if (msg.isNoteOn()) heldNotes.insert(msg.getNoteNumber());
-            if (msg.isNoteOff()) heldNotes.erase(msg.getNoteNumber());
+            if (msg.isNoteOn())  heldNotes.set  ((size_t) msg.getNoteNumber());
+            if (msg.isNoteOff()) heldNotes.reset((size_t) msg.getNoteNumber());
+            // Panic (controller panic button, MIDI file end, transport stop):
+            // let go of every key. Without this the arp never sees the matching
+            // note-offs and keeps arpeggiating the stuck chord forever - and
+            // because it clears the incoming buffer and generates its own MIDI,
+            // the panic message never reaches the synth downstream either, so
+            // one stuck arp jams the whole chain. Both flavours mean "stop"
+            // here; the arp has no envelope to release, so they're identical.
+            if (bool rel = false; isMidiPanicMessage(msg, rel)) heldNotes.reset();
         }
         midi.clear(); // we'll generate our own MIDI output
 
-        if (heldNotes.empty()) {
+        if (heldNotes.none()) {
             if (lastNote >= 0) {
                 midi.addEvent(juce::MidiMessage::noteOff(1, lastNote), 0);
                 lastNote = -1;
@@ -620,22 +636,25 @@ public:
             return;
         }
 
-        // Build the note sequence
-        std::vector<int> seq;
-        std::vector<int> baseNotes(heldNotes.begin(), heldNotes.end());
-        std::sort(baseNotes.begin(), baseNotes.end());
+        // Build the note sequence. `seq` is a member reserved in prepareToPlay,
+        // and clear() keeps the capacity, so the rebuild is allocation-free.
+        seq.clear();
         for (int oct = 0; oct < octaves; ++oct)
-            for (int n : baseNotes) {
+            for (int n = 0; n < 128; ++n) {
+                if (!heldNotes.test((size_t) n)) continue;
                 int note = n + oct * 12;
                 if (note <= 127) seq.push_back(note);
             }
 
         if (pattern == 1) std::reverse(seq.begin(), seq.end());
         else if (pattern == 2) {
-            auto down = seq;
-            std::reverse(down.begin(), down.end());
-            if (down.size() > 2) { down.erase(down.begin()); down.pop_back(); }
-            seq.insert(seq.end(), down.begin(), down.end());
+            // Up-down: append the descending tail in place instead of copying
+            // the whole sequence into a scratch vector and reversing that. With
+            // more than two notes the turnaround notes aren't repeated, so the
+            // tail runs from the second-to-last element down to the second.
+            const int n = (int) seq.size();
+            if (n > 2) for (int i = n - 2; i >= 1; --i) seq.push_back(seq[(size_t) i]);
+            else       for (int i = n - 1; i >= 0; --i) seq.push_back(seq[(size_t) i]);
         }
 
         if (seq.empty()) return;
@@ -675,9 +694,16 @@ public:
 private:
     Node& node;
     double sampleRate = 44100, sampleCounter = 0;
-    std::set<int> heldNotes;
+    // Held notes as a 128-bit mask (MIDI pitch = bit index), and the generated
+    // sequence as a reserved member. Both replace per-block heap traffic; see
+    // processBlock. scratchCapacityBytes() lets the self-test assert it stays
+    // put across a render.
+    std::bitset<128> heldNotes;
+    std::vector<int> seq;
     int seqIdx = -1, lastNote = -1;
     std::mt19937 rng{42};
+public:
+    size_t scratchCapacityBytes() const { return seq.capacity() * sizeof(int); }
 };
 
 // ==============================================================================
@@ -697,7 +723,11 @@ public:
         bool includeThirds = paramByName(node, "Include Thirds", 0.0f) > 0.5f;
         float levelDecay   = paramByName(node, "Level Decay", 0.5f);
 
-        juce::MidiBuffer output;
+        // `output` is a member, not a local: swapWith below hands us the old
+        // input buffer's storage, and MidiBuffer::clear() keeps it allocated, so
+        // after the first few blocks this stops touching the allocator. As a
+        // local it was a fresh heap buffer on every callback.
+        output.clear();
         for (auto metadata : midi) {
             auto msg = metadata.getMessage();
             output.addEvent(msg, metadata.samplePosition); // pass original
@@ -773,6 +803,7 @@ public:
     void setStateInformation(const void*, int) override {}
 private:
     Node& node;
+    juce::MidiBuffer output;   // audio-thread scratch, see processBlock
 };
 
 // VelocityScaleProcessor was replaced by the more general
@@ -1304,11 +1335,23 @@ private:
 // ==============================================================================
 class FMSynthProcessor : public juce::AudioProcessor {
 public:
-    FMSynthProcessor(Node& n) : node(n) { voices.resize(16); }
+    // Polyphony. Fixed for the processor's lifetime - see reset().
+    static constexpr int kMaxVoices = 16;
+
+    FMSynthProcessor(Node& n) : node(n) { voices.assign(kMaxVoices, Voice{}); }
     const juce::String getName() const override { return "FM Synth"; }
     // Transport panic (Stop): drop every sounding voice so notes stop dead
     // instead of finishing their release tail.
-    void reset() override { voices.clear(); }
+    // Transport panic (Stop): silence every voice.
+    // NB: this RESETS the voices, it does NOT remove them. This used to be
+    // voices.clear(), which permanently emptied the pool - the pool is only
+    // ever sized in the constructor, so nothing refilled it. After one press of
+    // Stop, allocVoice() fell through to its steal path and dereferenced
+    // voices[0] on an empty vector (out of bounds), and the render loop then
+    // iterated zero voices, leaving the synth silent for the rest of the
+    // session. Anything that empties `voices` must also refill it; not
+    // emptying it is safer.
+    void reset() override { for (auto& v : voices) v = Voice{}; }
     void prepareToPlay(double sr, int) override { sampleRate = sr; }
     void releaseResources() override {}
 
@@ -1325,11 +1368,20 @@ public:
         // per operator, held in node.opEnvelopes - see below).
         struct OpParams { float ratio, level; };
         OpParams ops[4];
-        const char* opNames[] = {"Op1","Op2","Op3","Op4"};
+        // Param names are string literals, not built per block. This used to be
+        // `std::string p(opNames[i]); paramByName(node, (p + " Ratio").c_str())`
+        // - eight std::string constructions and eight concatenations on the
+        // audio thread every callback, purely to spell a name that never
+        // changes. "Op1 Ratio" is short enough for MSVC's small-string buffer so
+        // it probably wasn't reaching the heap in practice, but that's an
+        // implementation detail, and the whole dance was pointless anyway.
+        static constexpr const char* kRatioNames[] =
+            { "Op1 Ratio", "Op2 Ratio", "Op3 Ratio", "Op4 Ratio" };
+        static constexpr const char* kLevelNames[] =
+            { "Op1 Level", "Op2 Level", "Op3 Level", "Op4 Level" };
         for (int i = 0; i < 4; ++i) {
-            std::string p(opNames[i]);
-            ops[i].ratio = paramByName(node, (p+" Ratio").c_str(), (float)(i+1));
-            ops[i].level = paramByName(node, (p+" Level").c_str(), i==0?1.0f:0.5f);
+            ops[i].ratio = paramByName(node, kRatioNames[i], (float)(i+1));
+            ops[i].level = paramByName(node, kLevelNames[i], i==0?1.0f:0.5f);
         }
 
         // Per-operator AHDSR envelopes. node.opEnvelopes holds exactly 4 once
@@ -1364,6 +1416,19 @@ public:
                     if (v.active && v.held && v.note == msg.getNoteNumber())
                         { v.held = false; v.relTime = v.time;
                           for (int i = 0; i < 4; ++i) v.opEnvRt[i].noteOff(); }
+            } else if (bool rel = false; isMidiPanicMessage(msg, rel)) {
+                // Controller panic / MIDI file end / transport stop.
+                for (auto& v : voices) {
+                    if (!v.active) continue;
+                    v.held = false;
+                    if (rel) {                          // All Notes Off: release
+                        v.relTime = v.time;
+                        for (int i = 0; i < 4; ++i) v.opEnvRt[i].noteOff();
+                    } else {                            // All Sound Off: cut dead
+                        for (int i = 0; i < 4; ++i) v.opEnvRt[i].hardReset();
+                        v.active = false;
+                    }
+                }
             }
         }
         // Distribute MPE / per-note expression (pitch bend, channel + poly
@@ -1508,6 +1573,10 @@ private:
     };
     std::vector<Voice> voices;
     Voice& allocVoice() {
+        // Guarantee a pool before indexing it: returning voices[0] on an empty
+        // vector is out-of-bounds, and it is not obvious from the call site
+        // that `voices` is non-empty.
+        if (voices.empty()) voices.assign(kMaxVoices, Voice{});
         for (auto& v : voices) if (!v.active) return v;
         float oldest = -1; int idx = 0;
         for (int i = 0; i < (int)voices.size(); ++i)
@@ -1537,11 +1606,23 @@ private:
 // ==============================================================================
 class PDSynthProcessor : public juce::AudioProcessor {
 public:
-    PDSynthProcessor(Node& n) : node(n) { voices.resize(12); }
+    // Polyphony. Fixed for the processor's lifetime - see reset().
+    static constexpr int kMaxVoices = 12;
+
+    PDSynthProcessor(Node& n) : node(n) { voices.assign(kMaxVoices, Voice{}); }
     const juce::String getName() const override { return "PD Synth"; }
     // Transport panic (Stop): drop every sounding voice so notes stop dead
     // instead of finishing their release tail.
-    void reset() override { voices.clear(); }
+    // Transport panic (Stop): silence every voice.
+    // NB: this RESETS the voices, it does NOT remove them. This used to be
+    // voices.clear(), which permanently emptied the pool - the pool is only
+    // ever sized in the constructor, so nothing refilled it. After one press of
+    // Stop, allocVoice() fell through to its steal path and dereferenced
+    // voices[0] on an empty vector (out of bounds), and the render loop then
+    // iterated zero voices, leaving the synth silent for the rest of the
+    // session. Anything that empties `voices` must also refill it; not
+    // emptying it is safer.
+    void reset() override { for (auto& v : voices) v = Voice{}; }
     void prepareToPlay(double sr, int) override { sampleRate = sr; }
     void releaseResources() override {}
 
@@ -1579,6 +1660,14 @@ public:
                 for (auto& v : voices)
                     if (v.active && v.held && v.note == msg.getNoteNumber())
                         { v.held = false; v.ampEnv.noteOff(); }
+            } else if (bool rel = false; isMidiPanicMessage(msg, rel)) {
+                // Controller panic / MIDI file end / transport stop.
+                for (auto& v : voices) {
+                    if (!v.active) continue;
+                    v.held = false;
+                    if (rel) v.ampEnv.noteOff();       // All Notes Off: release
+                    else { v.ampEnv.hardReset(); v.active = false; }  // All Sound Off
+                }
             }
         }
         // Distribute MPE per-channel messages to voices (#78)
@@ -1700,6 +1789,10 @@ private:
     };
     std::vector<Voice> voices;
     Voice& allocVoice() {
+        // Guarantee a pool before indexing it: returning voices[0] on an empty
+        // vector is out-of-bounds, and it is not obvious from the call site
+        // that `voices` is non-empty.
+        if (voices.empty()) voices.assign(kMaxVoices, Voice{});
         for (auto& v : voices) if (!v.active) return v;
         float oldest = -1; int idx = 0;
         for (int i = 0; i < (int)voices.size(); ++i)
@@ -1728,12 +1821,33 @@ private:
 // ==============================================================================
 class ParticleSynthProcessor : public juce::AudioProcessor {
 public:
-    ParticleSynthProcessor(Node& n) : node(n) { grains.reserve(128); }
+    // Upper bound on simultaneously sounding grains. Reserved in the ctor and
+    // in prepareToPlay, and enforced in the spawn loop, so `grains` never
+    // reallocates on the audio thread. Public so the self-test can assert the
+    // reserve is actually big enough rather than just that it didn't move.
+    static constexpr size_t kMaxGrains = 1024;
+
+    ParticleSynthProcessor(Node& n) : node(n) { grains.reserve(kMaxGrains); }
     const juce::String getName() const override { return "Particle"; }
     // Transport panic (Stop): drop every in-flight grain so the particle
     // cloud stops dead instead of finishing its tails.
-    void reset() override { grains.clear(); }
-    void prepareToPlay(double sr, int) override { sampleRate = sr; }
+    // The note envelope has to be hard-reset too, not just the grain list: the
+    // spawn loop is gated on noteAmpEnv.isActive(), so clearing `grains` alone
+    // silenced the cloud for a fraction of a millisecond and then let it grow
+    // straight back - panic did nothing at all for a held note. (This synth
+    // ignores All Notes Off, so panic is the only thing that can stop it.)
+    void reset() override {
+        grains.clear();
+        noteActive = false;
+        noteAmpEnv.hardReset();
+        spawnTimer = 0.0f;
+    }
+    void prepareToPlay(double sr, int) override {
+        sampleRate = sr;
+        // Reserve the hard cap up front so the per-sample spawn loop below can
+        // push_back without ever hitting the audio thread's allocator.
+        grains.reserve(kMaxGrains);
+    }
     void releaseResources() override {}
 
     void processBlock(juce::AudioBuffer<float>& buf, juce::MidiBuffer& midi) override {
@@ -1767,6 +1881,16 @@ public:
             } else if (msg.isNoteOff() && msg.getNoteNumber() == heldNote) {
                 noteActive = false;
                 noteAmpEnv.noteOff();
+            } else if (bool rel = false; isMidiPanicMessage(msg, rel)) {
+                // Controller panic / MIDI file end / transport stop.
+                noteActive = false;
+                if (rel) {
+                    noteAmpEnv.noteOff();   // All Notes Off: cloud thins out
+                } else {                    // All Sound Off: cut dead
+                    noteAmpEnv.hardReset();
+                    grains.clear();
+                    spawnTimer = 0.0f;
+                }
             }
         }
 
@@ -1783,6 +1907,13 @@ public:
                 spawnTimer += dt;
                 while (spawnTimer >= spawnInterval) {
                     spawnTimer -= spawnInterval;
+                    // Hard cap: Density x Grain Size is unbounded, so without
+                    // this the push_back could grow past the reserved capacity
+                    // and allocate on the audio thread. Dropping the *newest*
+                    // grain (rather than stealing the oldest) keeps the already
+                    // sounding cloud intact - a runaway Density just stops
+                    // getting denser instead of turning into a stutter.
+                    if (grains.size() >= kMaxGrains) break;
                     Grain g;
                     float baseFreq = 440.0f * std::pow(2.0f, (heldNote - 69) / 12.0f);
                     // Randomize pitch
@@ -1841,9 +1972,10 @@ public:
             if (buf.getNumChannels() >= 1) buf.addSample(0, s, outL);
             if (buf.getNumChannels() >= 2) buf.addSample(1, s, outR);
         }
-
-        // Safety: cap grain count
-        if (grains.size() > 1024) grains.erase(grains.begin(), grains.begin() + 512);
+        // NB: there used to be a "safety: cap grain count" erase of the oldest
+        // 512 grains here. It can no longer fire - the spawn loop refuses to
+        // exceed kMaxGrains - and it was the wrong shape anyway (it cut off
+        // grains that were already sounding, mid-envelope).
     }
 
     // Tail = the note-level AHDSR release (grains keep spawning through it)
@@ -1885,6 +2017,17 @@ private:
     AHDSREnvelopeRuntime noteAmpEnv;
     AHDSREnvelope effectiveEnv;
     AHDSRCurveTables ampTables;
+
+public:
+    // Total bytes of audio-thread scratch this processor has reserved. The
+    // self-test warms the processor up, snapshots this, sweeps parameters and
+    // block sizes, and asserts it hasn't moved - a proxy for "processBlock
+    // never allocates". See known-issues.md.
+    size_t scratchCapacityBytes() const { return grains.capacity() * sizeof(Grain); }
+    // How many grains the reserve actually covers. The self-test asserts this
+    // reaches kMaxGrains, so "capacity didn't grow" can't pass just because the
+    // cloud stayed small.
+    size_t reservedGrainCount() const { return grains.capacity(); }
 };
 
 // ==============================================================================
@@ -1913,6 +2056,11 @@ public:
     void prepareToPlay(double sr, int bs) override {
         sampleRate = sr;
         blockSize = bs;
+        scratch.prepare(bs);
+        int pad = 1;
+        while (pad < bs) pad *= 2;
+        transSig.reserve((size_t)pad);
+        susSig.reserve((size_t)pad);
     }
     void releaseResources() override {}
 
@@ -1927,22 +2075,17 @@ public:
         float threshold = paramByName(node, "Threshold", 0.3f);
         int   levels    = juce::jlimit(1, 8, (int)paramByName(node, "Levels", 4.0f));
 
-        auto filt = getWaveletFilter("db4");
-
-        // Pad to next power of 2 for DWT.
-        int padLen = 1;
-        while (padLen < n) padLen *= 2;
+        const auto& filt = scratch.useFilter("db4");
+        auto& sig = scratch.sig;
 
         for (int c = 0; c < ch; ++c) {
             float* data = buf.getWritePointer(c);
 
-            // Copy into padded buffer.
-            std::vector<float> sig(padLen, 0.0f);
-            for (int i = 0; i < n; ++i) sig[i] = data[i];
-            std::vector<float> original = sig;
+            // Copy into the padded working buffer (zero-padded to a power of 2).
+            const int padLen = scratch.load(data, n);
 
             // Forward DWT.
-            int actualLevels = dwt(sig, levels, filt);
+            int actualLevels = dwt(sig, levels, filt, scratch.ws);
 
             // Threshold: large coefficients = transient, small = sustain.
             // Find the max coefficient magnitude for adaptive thresholding.
@@ -1951,8 +2094,9 @@ public:
             float thresh = threshold * maxCoeff;
 
             // Build transient-only coefficients (keep above threshold).
-            std::vector<float> transSig = sig;
-            std::vector<float> susSig = sig;
+            // These assignments reuse the reserved capacity - no allocation.
+            transSig = sig;
+            susSig   = sig;
             for (int i = 0; i < padLen; ++i) {
                 if (std::abs(sig[i]) >= thresh) {
                     susSig[i] = 0; // transient coefficient - zero out in sustain
@@ -1962,8 +2106,8 @@ public:
             }
 
             // Inverse DWT for both components.
-            idwt(transSig, actualLevels, filt);
-            idwt(susSig, actualLevels, filt);
+            idwtPR(transSig, actualLevels, filt, scratch.ws);
+            idwtPR(susSig, actualLevels, filt, scratch.ws);
 
             // Recombine with gain controls.
             for (int i = 0; i < n; ++i)
@@ -1988,6 +2132,8 @@ private:
     Node& node;
     double sampleRate = 44100;
     int blockSize = 512;
+    WaveletFxScratch scratch;
+    std::vector<float> transSig, susSig;   // per-component coefficient streams
 };
 
 // ==============================================================================
@@ -2009,7 +2155,7 @@ class WaveletDenoiserProcessor : public juce::AudioProcessor {
 public:
     WaveletDenoiserProcessor(Node& n) : node(n) {}
     const juce::String getName() const override { return "Denoiser"; }
-    void prepareToPlay(double sr, int) override { sampleRate = sr; }
+    void prepareToPlay(double sr, int bs) override { sampleRate = sr; scratch.prepare(bs); }
     void releaseResources() override {}
 
     void processBlock(juce::AudioBuffer<float>& buf, juce::MidiBuffer&) override {
@@ -2022,17 +2168,15 @@ public:
         int   levels    = juce::jlimit(1, 8, (int)paramByName(node, "Levels", 4.0f));
         float mix       = juce::jlimit(0.0f, 1.0f, paramByName(node, "Mix", 1.0f));
 
-        auto filt = getWaveletFilter("sym4");
-        int padLen = 1;
-        while (padLen < n) padLen *= 2;
+        const auto& filt = scratch.useFilter("sym4");
+        auto& sig = scratch.sig;
+        auto& dry = scratch.dry;
 
         for (int c = 0; c < ch; ++c) {
             float* data = buf.getWritePointer(c);
-            std::vector<float> sig(padLen, 0.0f);
-            for (int i = 0; i < n; ++i) sig[i] = data[i];
-            std::vector<float> dry(data, data + n);
+            const int padLen = scratch.load(data, n);
 
-            int actualLevels = dwt(sig, levels, filt);
+            int actualLevels = dwt(sig, levels, filt, scratch.ws);
 
             // Soft threshold: shrink coefficients toward zero.
             float maxCoeff = 0;
@@ -2050,7 +2194,7 @@ public:
                     sig[i] = (v > 0) ? v - thresh : v + thresh; // soft shrinkage
             }
 
-            idwt(sig, actualLevels, filt);
+            idwtPR(sig, actualLevels, filt, scratch.ws);
 
             for (int i = 0; i < n; ++i)
                 data[i] = dry[i] * (1.0f - mix) + sig[i] * mix;
@@ -2073,6 +2217,7 @@ public:
 private:
     Node& node;
     double sampleRate = 44100;
+    WaveletFxScratch scratch;
 };
 
 // ==============================================================================
@@ -2091,7 +2236,7 @@ class WaveletBitcrushProcessor : public juce::AudioProcessor {
 public:
     WaveletBitcrushProcessor(Node& n) : node(n) {}
     const juce::String getName() const override { return "Wavelet Bitcrush"; }
-    void prepareToPlay(double, int) override {}
+    void prepareToPlay(double, int bs) override { scratch.prepare(bs); }
     void releaseResources() override {}
 
     void processBlock(juce::AudioBuffer<float>& buf, juce::MidiBuffer&) override {
@@ -2106,19 +2251,17 @@ public:
         int   levels = juce::jlimit(1, 8, (int)paramByName(node, "Levels", 4.0f));
         float mix    = juce::jlimit(0.0f, 1.0f, paramByName(node, "Mix", 1.0f));
 
-        auto filt = getWaveletFilter("db2");
-        int padLen = 1;
-        while (padLen < n) padLen *= 2;
+        const auto& filt = scratch.useFilter("db2");
+        auto& sig = scratch.sig;
+        auto& dry = scratch.dry;
 
         float quantStep = 1.0f / (float)(1 << bits);
 
         for (int c = 0; c < ch; ++c) {
             float* data = buf.getWritePointer(c);
-            std::vector<float> sig(padLen, 0.0f);
-            for (int i = 0; i < n; ++i) sig[i] = data[i];
-            std::vector<float> dry(data, data + n);
+            const int padLen = scratch.load(data, n);
 
-            int actualLevels = dwt(sig, levels, filt);
+            int actualLevels = dwt(sig, levels, filt, scratch.ws);
 
             // Quantize coefficients in the selected band range.
             // Band 0 = coarsest detail (lowest freq), actualLevels-1 = finest.
@@ -2134,7 +2277,7 @@ public:
                 bandStart += bandLen;
             }
 
-            idwt(sig, actualLevels, filt);
+            idwtPR(sig, actualLevels, filt, scratch.ws);
             for (int i = 0; i < n; ++i)
                 data[i] = dry[i] * (1.0f - mix) + sig[i] * mix;
         }
@@ -2155,6 +2298,7 @@ public:
     void setStateInformation(const void*, int) override {}
 private:
     Node& node;
+    WaveletFxScratch scratch;
 };
 
 // ==============================================================================
@@ -2178,7 +2322,13 @@ class OctaveShiftProcessor : public juce::AudioProcessor {
 public:
     OctaveShiftProcessor(Node& n) : node(n) {}
     const juce::String getName() const override { return "Octave Shift"; }
-    void prepareToPlay(double sr, int) override { sampleRate = sr; }
+    void prepareToPlay(double sr, int bs) override {
+        sampleRate = sr;
+        scratch.prepare(bs);
+        int pad = 1;
+        while (pad < bs) pad *= 2;
+        shifted.reserve((size_t)pad);
+    }
     void releaseResources() override {}
 
     void processBlock(juce::AudioBuffer<float>& buf, juce::MidiBuffer&) override {
@@ -2191,22 +2341,21 @@ public:
         float mix = juce::jlimit(0.0f, 1.0f, paramByName(node, "Mix", 0.5f));
         if (shift == 0) return; // no change
 
-        auto filt = getWaveletFilter("db4");
-        int padLen = 1;
-        while (padLen < n) padLen *= 2;
+        const auto& filt = scratch.useFilter("db4");
+        auto& sig = scratch.sig;
+        auto& dry = scratch.dry;
 
         for (int c = 0; c < ch; ++c) {
             float* data = buf.getWritePointer(c);
-            std::vector<float> sig(padLen, 0.0f);
-            for (int i = 0; i < n; ++i) sig[i] = data[i];
-            std::vector<float> dry(data, data + n);
+            const int padLen = scratch.load(data, n);
 
             int levels = 6;
-            int actualLevels = dwt(sig, levels, filt);
+            int actualLevels = dwt(sig, levels, filt, scratch.ws);
 
             // Shift bands: positive shift = move coefficients to higher
             // bands (higher frequency = octave up); negative = lower.
-            std::vector<float> shifted(padLen, 0.0f);
+            // assign() re-zeroes without allocating (capacity is reserved).
+            shifted.assign((size_t)padLen, 0.0f);
             if (shift > 0) {
                 // Octave up: copy each band to the next-higher band.
                 // The finest detail band wraps / gets dropped; the
@@ -2250,7 +2399,7 @@ public:
                 }
             }
 
-            idwt(shifted, actualLevels, filt);
+            idwtPR(shifted, actualLevels, filt, scratch.ws);
             for (int i = 0; i < n; ++i)
                 data[i] = dry[i] * (1.0f - mix) + shifted[i] * mix;
         }
@@ -2272,6 +2421,8 @@ public:
 private:
     Node& node;
     double sampleRate = 44100;
+    WaveletFxScratch scratch;
+    std::vector<float> shifted;   // band-reassigned coefficient stream
 };
 
 // ==============================================================================
@@ -2294,7 +2445,7 @@ class WaveletMultibandCompProcessor : public juce::AudioProcessor {
 public:
     WaveletMultibandCompProcessor(Node& n) : node(n) {}
     const juce::String getName() const override { return "Wavelet MB Comp"; }
-    void prepareToPlay(double sr, int) override { sampleRate = sr; }
+    void prepareToPlay(double sr, int bs) override { sampleRate = sr; scratch.prepare(bs); }
     void releaseResources() override {}
 
     void processBlock(juce::AudioBuffer<float>& buf, juce::MidiBuffer&) override {
@@ -2311,17 +2462,15 @@ public:
         float mix      = juce::jlimit(0.0f, 1.0f, paramByName(node, "Mix", 1.0f));
 
         float threshLin = std::pow(10.0f, threshDb / 20.0f);
-        auto filt = getWaveletFilter("db4");
-        int padLen = 1;
-        while (padLen < n) padLen *= 2;
+        const auto& filt = scratch.useFilter("db4");
+        auto& sig = scratch.sig;
+        auto& dry = scratch.dry;
 
         for (int c = 0; c < ch; ++c) {
             float* data = buf.getWritePointer(c);
-            std::vector<float> sig(padLen, 0.0f);
-            for (int i = 0; i < n; ++i) sig[i] = data[i];
-            std::vector<float> dry(data, data + n);
+            const int padLen = scratch.load(data, n);
 
-            int actualLevels = dwt(sig, levels, filt);
+            int actualLevels = dwt(sig, levels, filt, scratch.ws);
 
             // Per-band compression: compute peak of each band, apply gain
             // reduction if peak exceeds threshold.
@@ -2352,7 +2501,7 @@ public:
                 bandStart += bandLen;
             }
 
-            idwt(sig, actualLevels, filt);
+            idwtPR(sig, actualLevels, filt, scratch.ws);
             for (int i = 0; i < n; ++i)
                 data[i] = dry[i] * (1.0f - mix) + sig[i] * mix;
         }
@@ -2374,95 +2523,7 @@ public:
 private:
     Node& node;
     double sampleRate = 44100;
-};
-
-// ==============================================================================
-// WAVELET SCALE-SHIFT PITCH SHIFTER
-//
-// Shifts pitch by modifying the CWT scalogram: shift all scales by a
-// factor corresponding to the desired pitch ratio, then reconstruct
-// via inverse CWT. Unlike time-domain pitch shifting (which introduces
-// time artifacts) or FFT-based shifting (which smears transients), the
-// wavelet approach preserves transient sharpness because the wavelet
-// basis naturally adapts its window size to frequency content.
-//
-// Params: Semitones (-24..+24), Mix
-// ==============================================================================
-class WaveletPitchShiftProcessor : public juce::AudioProcessor {
-public:
-    WaveletPitchShiftProcessor(Node& n) : node(n) {}
-    const juce::String getName() const override { return "Wavelet Pitch"; }
-    void prepareToPlay(double sr, int) override { sampleRate = sr; }
-    void releaseResources() override {}
-
-    void processBlock(juce::AudioBuffer<float>& buf, juce::MidiBuffer&) override {
-        applySignalModulations(node, buf);
-        const int n = buf.getNumSamples();
-        const int ch = std::min(2, buf.getNumChannels());
-        if (n == 0 || ch == 0) return;
-
-        float semitones = paramByName(node, "Semitones", 0.0f);
-        float mix       = juce::jlimit(0.0f, 1.0f, paramByName(node, "Mix", 1.0f));
-        if (std::abs(semitones) < 0.01f) return; // no shift
-
-        float ratio = std::pow(2.0f, semitones / 12.0f);
-
-        for (int c = 0; c < ch; ++c) {
-            float* data = buf.getWritePointer(c);
-            std::vector<float> sig(data, data + n);
-            std::vector<float> dry(data, data + n);
-
-            // Forward CWT.
-            auto result = cwt(sig, 2.0f, 64.0f, 24);
-
-            // Shift scales: multiply each scale value by 1/ratio so
-            // higher pitch = smaller scales. Rebuild the scalogram with
-            // shifted scale assignments.
-            CWTResult shifted = result;
-            std::fill(shifted.magnitude.begin(), shifted.magnitude.end(), 0.0f);
-            std::fill(shifted.phase.begin(), shifted.phase.end(), 0.0f);
-
-            for (int s = 0; s < result.numScales; ++s) {
-                // Target scale index after shift.
-                float targetScale = result.scales[s] / ratio;
-                // Find nearest scale in the grid.
-                int bestIdx = 0;
-                float bestDist = 1e9f;
-                for (int ss = 0; ss < result.numScales; ++ss) {
-                    float dist = std::abs(result.scales[ss] - targetScale);
-                    if (dist < bestDist) { bestDist = dist; bestIdx = ss; }
-                }
-                // Copy this scale's coefficients to the target position.
-                for (int t = 0; t < result.numSamples; ++t) {
-                    shifted.magnitude[bestIdx * n + t] += result.magnitude[s * n + t];
-                    shifted.phase[bestIdx * n + t] = result.phase[s * n + t];
-                }
-            }
-
-            // Inverse CWT.
-            auto recon = icwt(shifted);
-
-            for (int i = 0; i < n && i < (int)recon.size(); ++i)
-                data[i] = dry[i] * (1.0f - mix) + recon[i] * mix;
-        }
-    }
-
-    double getTailLengthSeconds() const override { return 0; }
-    bool acceptsMidi() const override { return true; }
-    bool producesMidi() const override { return true; }
-    bool isBusesLayoutSupported(const BusesLayout&) const override { return true; }
-    juce::AudioProcessorEditor* createEditor() override { return nullptr; }
-    bool hasEditor() const override { return false; }
-    int getNumPrograms() override { return 1; }
-    int getCurrentProgram() override { return 0; }
-    void setCurrentProgram(int) override {}
-    const juce::String getProgramName(int) override { return {}; }
-    void changeProgramName(int, const juce::String&) override {}
-    void getStateInformation(juce::MemoryBlock&) override {}
-    void setStateInformation(const void*, int) override {}
-private:
-    Node& node;
-    double sampleRate = 44100;
+    WaveletFxScratch scratch;
 };
 
 // ==============================================================================
@@ -2485,7 +2546,14 @@ public:
         tailBufR.resize(8192, 0.0f);
     }
     const juce::String getName() const override { return "Wavelet Reverb"; }
-    void prepareToPlay(double sr, int) override { sampleRate = sr; }
+    void prepareToPlay(double sr, int) override {
+        sampleRate = sr;
+        // Sized by the TAIL length, not the block length: this effect
+        // transforms the whole 8192-sample tail buffer every block, so that
+        // is what the workspace and the working copy have to hold.
+        scratch.prepare((int)tailBufL.size());
+        revSig.resize(tailBufL.size(), 0.0f);
+    }
     void releaseResources() override {}
     // Transport panic (Stop): zero the wavelet tail buffers so the reverb
     // smear stops immediately when the sound is cut.
@@ -2505,8 +2573,37 @@ public:
         int   levels = juce::jlimit(1, 8, (int)paramByName(node, "Levels", 5.0f));
         float mix    = juce::jlimit(0.0f, 1.0f, paramByName(node, "Mix", 0.3f));
 
-        auto filt = getWaveletFilter("db4");
+        const auto& filt = scratch.useFilter("db4");
         int tailLen = (int)tailBufL.size();
+        // Guard against processBlock running before prepareToPlay sized these.
+        if ((int)revSig.size() != tailLen) {
+            revSig.assign((size_t)tailLen, 0.0f);
+            scratch.prepare(tailLen);
+        }
+
+        // Per-block decay coefficient.
+        //
+        // `Decay` is defined as the attenuation a sample has accumulated by the
+        // time it has migrated all the way OUT of the tail buffer - decay^16 -
+        // NOT as a per-block multiplier. That distinction is the whole point:
+        // a sample is aged once per block and lives in the buffer for
+        // tailLen/n blocks, so applying `decay` verbatim each block made the
+        // audible tail length depend on the audio device's buffer size (16
+        // attenuations at 512 samples/block, 128 at 64 - the same knob position
+        // was a usable ambience on one device and effectively dry on another).
+        // Deriving the coefficient from n cancels that out exactly.
+        //
+        // kBufferDecays = 16 is picked so that at the common 512-sample buffer
+        // the exponent is exactly 1 and the coefficient comes out as plain
+        // `decay` - i.e. projects made before this fix sound unchanged, and
+        // every other buffer size now matches them instead of diverging.
+        // It is also sample-rate coherent: the total is decay^16 across the
+        // buffer whatever the rate, so the tail still fades to the same place
+        // by the point the hard buffer boundary cuts it off.
+        constexpr float kBufferDecays = 16.0f;
+        const float blockDecay = (decay >= 1.0f)
+            ? 1.0f
+            : std::pow(decay, kBufferDecays * (float)n / (float)tailLen);
 
         for (int c = 0; c < ch; ++c) {
             float* data = buf.getWritePointer(c);
@@ -2515,13 +2612,15 @@ public:
             // Add new input to the tail buffer (shift + accumulate).
             // Shift existing tail left by n samples and add new input.
             for (int i = 0; i < tailLen - n; ++i)
-                tail[i] = tail[i + n] * decay;
+                tail[i] = tail[i + n] * blockDecay;
             for (int i = 0; i < n && (tailLen - n + i) >= 0; ++i)
                 tail[tailLen - n + i] = data[i];
 
-            // DWT the tail buffer.
-            std::vector<float> sig = tail;
-            int actualLevels = dwt(sig, levels, filt);
+            // DWT the tail buffer. assign() into an already-correctly-sized
+            // vector copies without allocating.
+            auto& sig = revSig;
+            sig.assign(tail.begin(), tail.end());
+            int actualLevels = dwt(sig, levels, filt, scratch.ws);
 
             // Apply 1/f weighting: each band's gain = 1 / (band+1)^color
             int approxLen = tailLen;
@@ -2536,7 +2635,7 @@ public:
             }
 
             // IDWT to get the reverb tail.
-            idwt(sig, actualLevels, filt);
+            idwtPR(sig, actualLevels, filt, scratch.ws);
 
             // Mix into output.
             for (int i = 0; i < n; ++i)
@@ -2566,6 +2665,8 @@ private:
     Node& node;
     double sampleRate = 44100;
     std::vector<float> tailBufL, tailBufR;
+    WaveletFxScratch scratch;
+    std::vector<float> revSig;   // working copy of the tail being transformed
 };
 
 // ==============================================================================
@@ -2591,7 +2692,24 @@ class CurveEQProcessor : public juce::AudioProcessor {
 public:
     CurveEQProcessor(Node& n) : node(n) { decodeCurve(); }
     const juce::String getName() const override { return "Curve EQ"; }
-    void prepareToPlay(double sr, int) override { sampleRate = sr; decodeCurve(); }
+    void prepareToPlay(double sr, int maxBlock) override {
+        sampleRate = sr;
+        // Size every audio-thread buffer here, once, so processBlock never
+        // allocates. The transform size is min(2^12, block), so the ladder and
+        // the frame scratch only ever need to cover the largest block the host
+        // will hand us (capped at the param's own 4096 ceiling).
+        maxBlockSize = std::max(1, maxBlock);
+        const int maxFft = std::max(16, std::min(1 << 12, nextPow2AtMost(maxBlockSize)));
+        ffts.prepare(16, maxFft);
+        window.assign((size_t) maxFft, 0.0f);
+        work.assign((size_t) maxFft, {});
+        timeBuf.assign((size_t) maxFft, 0.0f);
+        dry.assign((size_t) maxBlockSize, 0.0f);
+        out.assign((size_t) maxBlockSize, 0.0f);
+        norm.assign((size_t) maxBlockSize, 0.0f);
+        windowN = -1;      // force the Hann window to be recomputed
+        decodeCurve();     // after `window` is sized - it bounds the gain table
+    }
     void releaseResources() override {}
 
     void processBlock(juce::AudioBuffer<float>& buf, juce::MidiBuffer&) override {
@@ -2608,34 +2726,34 @@ public:
         if (fftSize < 16) return;           // too small to filter meaningfully
         int halfBins = fftSize / 2 + 1;
 
-        ensureGains(halfBins);
+        // A block larger than prepareToPlay promised would overrun the scratch.
+        // Bail rather than allocate on the audio thread; the next correctly
+        // sized block resumes normally.
+        if (n > (int) dry.size() || fftSize > (int) window.size()) return;
 
-        FFT fft(fftSize);
-        std::vector<float> window(fftSize);
-        for (int i = 0; i < fftSize; ++i)
-            window[i] = 0.5f * (1.0f - std::cos(6.28318530718f * i / fftSize)); // Hann
+        const FFT* fft = ffts.forSize(fftSize);
+        if (!fft) return;
+        if (!ensureGains(fftSize)) return;
+        ensureWindow(fftSize);
 
         const int hop = std::max(1, fftSize / 4); // 75% overlap
 
         for (int c = 0; c < ch; ++c) {
             float* data = buf.getWritePointer(c);
-            std::vector<float> dry(data, data + n);
-            std::vector<float> out(n, 0.0f);
-            std::vector<float> norm(n, 0.0f);
+            std::copy(data, data + n, dry.begin());
+            std::fill(out.begin(), out.begin() + n, 0.0f);
+            std::fill(norm.begin(), norm.begin() + n, 0.0f);
 
             auto processFrame = [&](int start) {
-                std::vector<float> windowed(fftSize);
                 for (int i = 0; i < fftSize; ++i)
-                    windowed[i] = data[start + i] * window[i];
-                std::vector<std::complex<float>> spec;
-                fft.forwardReal(windowed, spec);
-                for (int k = 0; k < halfBins && k < (int)spec.size(); ++k)
-                    spec[k] *= gains[(size_t)k];       // magnitude scale, phase kept
-                std::vector<float> time;
-                fft.inverseReal(spec, time);
+                    timeBuf[(size_t) i] = data[start + i] * window[(size_t) i];
+                fft->forwardReal(timeBuf.data(), work.data());
+                for (int k = 0; k < halfBins; ++k)
+                    work[(size_t) k] *= (*gains)[(size_t) k]; // magnitude scale, phase kept
+                fft->inverseReal(work.data(), timeBuf.data());
                 for (int i = 0; i < fftSize; ++i) {
-                    out[start + i]  += time[i] * window[i];   // synthesis window
-                    norm[start + i] += window[i] * window[i];
+                    out[(size_t)(start + i)]  += timeBuf[(size_t) i] * window[(size_t) i];
+                    norm[(size_t)(start + i)] += window[(size_t) i] * window[(size_t) i];
                 }
             };
 
@@ -2646,8 +2764,9 @@ public:
             if (n >= fftSize && ((n - fftSize) % hop) != 0) processFrame(n - fftSize);
 
             for (int i = 0; i < n; ++i) {
-                float wet = norm[i] > 1e-6f ? out[i] / norm[i] : dry[i];
-                data[i] = dry[i] * (1.0f - mix) + wet * mix;
+                float wet = norm[(size_t) i] > 1e-6f ? out[(size_t) i] / norm[(size_t) i]
+                                                     : dry[(size_t) i];
+                data[i] = dry[(size_t) i] * (1.0f - mix) + wet * mix;
             }
         }
     }
@@ -2666,12 +2785,58 @@ public:
     void getStateInformation(juce::MemoryBlock&) override {}
     void setStateInformation(const void*, int) override {}
 
+    // Total bytes reserved by every audio-thread scratch buffer. The self-test
+    // watches this across a run of blocks: if it grows, processBlock reached
+    // the allocator, which is the bug this design exists to prevent. (Same
+    // capacity-as-proxy technique as PhaseVocoderShifter::capacityBytes.)
+    size_t scratchCapacityBytes() const {
+        size_t b = window.capacity() * sizeof(float)
+                 + work.capacity() * sizeof(FFT::cplx)
+                 + timeBuf.capacity() * sizeof(float)
+                 + dry.capacity() * sizeof(float)
+                 + out.capacity() * sizeof(float)
+                 + norm.capacity() * sizeof(float);
+        for (const auto& g : gainsBySizeLog2) b += g.capacity() * sizeof(float);
+        return b;
+    }
+
 private:
     Node& node;
     double sampleRate = 44100;
     SpectralCurve curve;
-    std::vector<float> gains;     // per-bin magnitude multiplier, sized halfBins
-    int gainsBins = -1;
+
+    // ---- audio-thread scratch, all sized in prepareToPlay ------------------
+    FFTLadder ffts;                       // one prebuilt FFT per usable size
+    std::vector<float> window;            // Hann, contents rebuilt on size change
+    std::vector<FFT::cplx> work;          // one frame's spectrum
+    std::vector<float> timeBuf;           // one frame, time domain
+    std::vector<float> dry, out, norm;    // block-length accumulators
+    int maxBlockSize = 0;
+    int windowN = -1;                     // fftSize `window` currently holds
+
+    // Per-bin magnitude multipliers, precomputed for every FFT size we can
+    // select. Evaluating the curve allocates, and the size we need is only
+    // known on the audio thread, so the whole table is built here instead -
+    // the curve cannot change without a prepareToPlay (editor edits rebuild
+    // the graph), so a precomputed table can never go stale.
+    std::vector<std::vector<float>> gainsBySizeLog2;
+    const std::vector<float>* gains = nullptr;   // the row for this block
+
+    // Largest power of two <= v (v >= 1).
+    static int nextPow2AtMost(int v) {
+        int p = 1;
+        while ((p << 1) > 0 && (p << 1) <= v) p <<= 1;
+        return p;
+    }
+
+    // Refill the Hann window when the transform size changes. Writes into the
+    // buffer prepareToPlay sized, so it never reallocates.
+    void ensureWindow(int fftSize) {
+        if (windowN == fftSize) return;
+        for (int i = 0; i < fftSize; ++i)
+            window[(size_t) i] = 0.5f * (1.0f - std::cos(6.28318530718f * i / fftSize));
+        windowN = fftSize;
+    }
 
     void decodeCurve() {
         int assetId = -1;
@@ -2679,14 +2844,31 @@ private:
             curve = SpectralCurve();
             curve.expression = "1";   // flat (unity) fallback
         }
-        gainsBins = -1;               // force gain recompute
+        rebuildGainTable();
     }
 
-    void ensureGains(int halfBins) {
-        if (gainsBins == halfBins && (int)gains.size() == halfBins) return;
-        gains = curve.evaluate(halfBins);
-        for (auto& g : gains) g = juce::jlimit(0.0f, 8.0f, g); // sane magnitude range
-        gainsBins = halfBins;
+    void rebuildGainTable() {
+        const int maxFft = std::max(16, (int) window.size());
+        const int maxExp = 12;
+        gainsBySizeLog2.assign((size_t) maxExp + 1, {});
+        for (int e = 4; e <= maxExp; ++e) {          // 16 .. 4096
+            const int sz = 1 << e;
+            if (sz > maxFft) break;
+            auto g = curve.evaluate(sz / 2 + 1);
+            for (auto& v : g) v = juce::jlimit(0.0f, 8.0f, v); // sane magnitude range
+            gainsBySizeLog2[(size_t) e] = std::move(g);
+        }
+    }
+
+    // Point `gains` at the precomputed row for this size. Returns false when
+    // the size has no row (shouldn't happen - the FFT lookup gates it first).
+    bool ensureGains(int fftSize) {
+        int e = 0;
+        while ((1 << e) < fftSize) ++e;
+        if (e >= (int) gainsBySizeLog2.size() || gainsBySizeLog2[(size_t) e].empty())
+            return false;
+        gains = &gainsBySizeLog2[(size_t) e];
+        return true;
     }
 };
 
@@ -2736,9 +2918,34 @@ public:
     SignalEQProcessor(Node& n) : node(n) {}
     const juce::String getName() const override { return "Signal EQ"; }
 
-    void prepareToPlay(double sr, int) override {
+    void prepareToPlay(double sr, int maxBlock) override {
         sampleRate = sr;
         for (auto& b : bands) b.reset();
+
+        // Size every audio-thread buffer here, once, so processBlock never
+        // reaches the allocator. The transform size is min(2^12, block), so the
+        // FFT ladder and the frame scratch only need to cover the largest block
+        // the host promised (capped at the FFT Size param's own 4096 ceiling).
+        maxBlockSize = std::max(1, maxBlock);
+        const int maxFft = std::max(16, std::min(1 << 12, nextPow2AtMost(maxBlockSize)));
+        ffts.prepare(16, maxFft);
+        window.assign((size_t) maxFft, 0.0f);
+        work.assign((size_t) maxFft, {});
+        timeBuf.assign((size_t) maxFft, 0.0f);
+        dry.assign((size_t) maxBlockSize, 0.0f);
+        out.assign((size_t) maxBlockSize, 0.0f);
+        norm.assign((size_t) maxBlockSize, 0.0f);
+        // Unlike Curve EQ the gain table can't be precomputed: every point
+        // coordinate is signal-modulatable, so the curve can change per block.
+        // Reserve the largest row instead and refill in place.
+        fftGains.reserve((size_t) (maxFft / 2 + 1));
+        fftGains.clear();
+        fftGainsBins = -1;
+        // Points are added/removed from the editor, but the resize lands on the
+        // audio thread via updateCoefficients - reserve the hard maximum so it
+        // is only ever a size change, never a reallocation.
+        bands.reserve((size_t) kMaxPoints);
+        windowN = -1;      // force the Hann window to be recomputed
     }
     void releaseResources() override {}
 
@@ -2755,24 +2962,7 @@ public:
         updateCoefficients();   // rebuild biquad bank from points + Width
 
         if (mode == 0) {
-            // ---- Zero-latency biquad cascade ----
-            for (int c = 0; c < ch; ++c) {
-                float* data = buf.getWritePointer(c);
-                for (int i = 0; i < n; ++i) {
-                    float x = data[i];
-                    float y = x;
-                    for (auto& b : bands) {
-                        auto& s = b.state[c];
-                        const auto& co = b.co;
-                        float out = co.b0 * y + co.b1 * s.x1 + co.b2 * s.x2
-                                  - co.a1 * s.y1 - co.a2 * s.y2;
-                        s.x2 = s.x1; s.x1 = y;
-                        s.y2 = s.y1; s.y1 = out;
-                        y = out;
-                    }
-                    data[i] = x * (1.0f - mix) + y * mix;
-                }
-            }
+            processBiquad(buf, ch, n, mix);   // zero-latency cascade
             return;
         }
 
@@ -2780,54 +2970,38 @@ public:
         int fftExp = juce::jlimit(8, 12, (int)paramByName(node, "FFT Size", 11.0f));
         int fftSize = 1 << fftExp;
         while (fftSize > n) fftSize /= 2;     // can't exceed the block
-        if (fftSize < 16) {                   // block too short to FFT -> fall back
-            for (int c = 0; c < ch; ++c) {
-                float* data = buf.getWritePointer(c);
-                for (int i = 0; i < n; ++i) {
-                    float x = data[i];
-                    float y = x;
-                    for (auto& b : bands) {
-                        auto& s = b.state[c];
-                        const auto& co = b.co;
-                        float out = co.b0 * y + co.b1 * s.x1 + co.b2 * s.x2
-                                  - co.a1 * s.y1 - co.a2 * s.y2;
-                        s.x2 = s.x1; s.x1 = y;
-                        s.y2 = s.y1; s.y1 = out;
-                        y = out;
-                    }
-                    data[i] = x * (1.0f - mix) + y * mix;
-                }
-            }
+        // Too short to FFT, or a block bigger than prepareToPlay promised (which
+        // would overrun the scratch): fall back to the biquad cascade rather
+        // than allocate. Same magnitude response, so the curve stays put.
+        if (fftSize < 16 || n > (int) dry.size() || fftSize > (int) window.size()) {
+            processBiquad(buf, ch, n, mix);
             return;
         }
-        int halfBins = fftSize / 2 + 1;
-        ensureFFTGains(halfBins, fftSize);
+        const int halfBins = fftSize / 2 + 1;
 
-        FFT fft(fftSize);
-        std::vector<float> window(fftSize);
-        for (int i = 0; i < fftSize; ++i)
-            window[i] = 0.5f * (1.0f - std::cos(6.28318530718f * i / fftSize)); // Hann
+        const FFT* fft = ffts.forSize(fftSize);
+        if (!fft) { processBiquad(buf, ch, n, mix); return; }
+        ensureFFTGains(halfBins, fftSize);
+        ensureWindow(fftSize);
+
         const int hop = std::max(1, fftSize / 4); // 75% overlap
 
         for (int c = 0; c < ch; ++c) {
             float* data = buf.getWritePointer(c);
-            std::vector<float> dry(data, data + n);
-            std::vector<float> out(n, 0.0f);
-            std::vector<float> norm(n, 0.0f);
+            std::copy(data, data + n, dry.begin());
+            std::fill(out.begin(), out.begin() + n, 0.0f);
+            std::fill(norm.begin(), norm.begin() + n, 0.0f);
 
             auto processFrame = [&](int start) {
-                std::vector<float> windowed(fftSize);
                 for (int i = 0; i < fftSize; ++i)
-                    windowed[i] = data[start + i] * window[i];
-                std::vector<std::complex<float>> spec;
-                fft.forwardReal(windowed, spec);
-                for (int k = 0; k < halfBins && k < (int)spec.size(); ++k)
-                    spec[k] *= fftGains[(size_t)k];      // magnitude scale, phase kept
-                std::vector<float> time;
-                fft.inverseReal(spec, time);
+                    timeBuf[(size_t) i] = data[start + i] * window[(size_t) i];
+                fft->forwardReal(timeBuf.data(), work.data());
+                for (int k = 0; k < halfBins; ++k)
+                    work[(size_t) k] *= fftGains[(size_t) k];  // magnitude scale, phase kept
+                fft->inverseReal(work.data(), timeBuf.data());
                 for (int i = 0; i < fftSize; ++i) {
-                    out[start + i]  += time[i] * window[i];
-                    norm[start + i] += window[i] * window[i];
+                    out[(size_t)(start + i)]  += timeBuf[(size_t) i] * window[(size_t) i];
+                    norm[(size_t)(start + i)] += window[(size_t) i] * window[(size_t) i];
                 }
             };
 
@@ -2836,8 +3010,9 @@ public:
             if (n >= fftSize && ((n - fftSize) % hop) != 0) processFrame(n - fftSize);
 
             for (int i = 0; i < n; ++i) {
-                float wet = norm[i] > 1e-6f ? out[i] / norm[i] : dry[i];
-                data[i] = dry[i] * (1.0f - mix) + wet * mix;
+                float wet = norm[(size_t) i] > 1e-6f ? out[(size_t) i] / norm[(size_t) i]
+                                                     : dry[(size_t) i];
+                data[i] = dry[(size_t) i] * (1.0f - mix) + wet * mix;
             }
         }
     }
@@ -2876,6 +3051,21 @@ public:
         return n;
     }
 
+    // Total bytes reserved by every audio-thread scratch buffer. The self-test
+    // watches this across a run of blocks: if it grows, processBlock reached the
+    // allocator, which is the bug this design exists to prevent. (Same
+    // capacity-as-proxy technique as PhaseVocoderShifter::capacityBytes.)
+    size_t scratchCapacityBytes() const {
+        return window.capacity() * sizeof(float)
+             + work.capacity() * sizeof(FFT::cplx)
+             + timeBuf.capacity() * sizeof(float)
+             + dry.capacity() * sizeof(float)
+             + out.capacity() * sizeof(float)
+             + norm.capacity() * sizeof(float)
+             + fftGains.capacity() * sizeof(float)
+             + bands.capacity() * sizeof(Band);
+    }
+
 private:
     Node& node;
     double sampleRate = 44100;
@@ -2889,9 +3079,57 @@ private:
     };
     std::vector<Band> bands;
 
+    // ---- audio-thread scratch, all sized in prepareToPlay ------------------
+    FFTLadder ffts;                       // one prebuilt FFT per usable size
+    std::vector<float> window;            // Hann, contents rebuilt on size change
+    std::vector<FFT::cplx> work;          // one frame's spectrum
+    std::vector<float> timeBuf;           // one frame, time domain
+    std::vector<float> dry, out, norm;    // block-length accumulators
+    int maxBlockSize = 0;
+    int windowN = -1;                     // fftSize `window` currently holds
+
     std::vector<float> fftGains;   // per-bin magnitude multiplier (FFT mode)
     int   fftGainsBins = -1;
     float fftGainsSig  = 0.0f;     // signature of last-built gains (cache key)
+
+    // Largest power of two <= v (v >= 1).
+    static int nextPow2AtMost(int v) {
+        int p = 1;
+        while ((p << 1) > 0 && (p << 1) <= v) p <<= 1;
+        return p;
+    }
+
+    // Refill the Hann window when the transform size changes. Writes into the
+    // buffer prepareToPlay sized, so it never reallocates.
+    void ensureWindow(int fftSize) {
+        if (windowN == fftSize) return;
+        for (int i = 0; i < fftSize; ++i)
+            window[(size_t) i] = 0.5f * (1.0f - std::cos(6.28318530718f * i / fftSize));
+        windowN = fftSize;
+    }
+
+    // Zero-latency RBJ peaking cascade. Also the fallback whenever the FFT path
+    // can't run (block too short, or bigger than prepareToPlay promised) - the
+    // magnitude response is identical by construction, so the curve is unchanged.
+    void processBiquad(juce::AudioBuffer<float>& buf, int ch, int n, float mix) {
+        for (int c = 0; c < ch; ++c) {
+            float* data = buf.getWritePointer(c);
+            for (int i = 0; i < n; ++i) {
+                float x = data[i];
+                float y = x;
+                for (auto& b : bands) {
+                    auto& s = b.state[c];
+                    const auto& co = b.co;
+                    float o = co.b0 * y + co.b1 * s.x1 + co.b2 * s.x2
+                            - co.a1 * s.y1 - co.a2 * s.y2;
+                    s.x2 = s.x1; s.x1 = y;
+                    s.y2 = s.y1; s.y1 = o;
+                    y = o;
+                }
+                data[i] = x * (1.0f - mix) + y * mix;
+            }
+        }
+    }
 
     // RBJ peaking-EQ coefficients for one point (freq, gainDb) with shared Q.
     Coeffs peakCoeffs(float freq, float gainDb, float Q) const {
@@ -2939,7 +3177,10 @@ private:
         if (fftGainsBins == halfBins && std::abs(sig - fftGainsSig) < 1e-9f
             && (int)fftGains.size() == halfBins) return;
 
-        fftGains.assign((size_t)halfBins, 1.0f);
+        // resize (not assign) into the capacity prepareToPlay reserved: growing
+        // to a size <= capacity is guaranteed not to reallocate, so this stays
+        // allocation-free even though the row length changes with FFT Size.
+        fftGains.resize((size_t)halfBins);
         const float kTwoPi = 6.28318530718f;
         for (int k = 0; k < halfBins; ++k) {
             float w = kTwoPi * (float)k / (float)fftSize;
@@ -2975,7 +3216,24 @@ class IndependentPitchShiftProcessor : public juce::AudioProcessor {
 public:
     IndependentPitchShiftProcessor(Node& n) : node(n) {}
     const juce::String getName() const override { return "Ind. Pitch Shift"; }
-    void prepareToPlay(double sr, int) override { sampleRate = sr; }
+    void prepareToPlay(double sr, int bs) override {
+        sampleRate = sr;
+        scratch.prepare(bs);
+        int pad = 1;
+        while (pad < bs) pad *= 2;
+        transSig.reserve((size_t)pad);
+        tonalSig.reserve((size_t)pad);
+        shifted.reserve((size_t)bs);
+        for (int c = 0; c < 2; ++c) {
+            shifter[c].prepare();
+            // The transient and dry paths bypass the shifter, so they must be
+            // delayed by hand to stay time-aligned with the shifted tonal path.
+            transDelay[c].prepare(shifter[c].latencySamples());
+            dryDelay[c].prepare(shifter[c].latencySamples());
+        }
+        // Report it so the graph's PDC aligns this node against its siblings.
+        setLatencySamples(shifter[0].latencySamples());
+    }
     void releaseResources() override {}
 
     void processBlock(juce::AudioBuffer<float>& buf, juce::MidiBuffer&) override {
@@ -2990,28 +3248,30 @@ public:
         int   levels    = juce::jlimit(1, 8, (int)paramByName(node, "Levels", 4.0f));
         float mix       = juce::jlimit(0.0f, 1.0f, paramByName(node, "Mix", 1.0f));
 
-        if (std::abs(semitones) < 0.01f) return;
+        // No early-out at 0 semitones: this node reports a fixed latency, so it
+        // must always produce output with that latency. Bypassing here would
+        // make the node jump forward 32 ms the moment Semitones crossed zero.
+        // The shifter is transparent at ratio 1 (measured -0.003 dB).
         float ratio = std::pow(2.0f, semitones / 12.0f);
 
-        auto filt = getWaveletFilter("db4");
-        int padLen = 1;
-        while (padLen < n) padLen *= 2;
+        const auto& filt = scratch.useFilter("db4");
+        auto& sig = scratch.sig;
+        auto& dry = scratch.dry;
 
         for (int c = 0; c < ch; ++c) {
             float* data = buf.getWritePointer(c);
-            std::vector<float> sig(padLen, 0.0f);
-            for (int i = 0; i < n; ++i) sig[i] = data[i];
-            std::vector<float> dry(data, data + n);
+            const int padLen = scratch.load(data, n);
 
-            int actualLevels = dwt(sig, levels, filt);
+            int actualLevels = dwt(sig, levels, filt, scratch.ws);
 
             // Separate: threshold-based split into transient + tonal.
             float maxCoeff = 0;
             for (auto v : sig) maxCoeff = std::max(maxCoeff, std::abs(v));
             float thresh = threshold * maxCoeff;
 
-            std::vector<float> transSig(padLen, 0.0f);
-            std::vector<float> tonalSig(padLen, 0.0f);
+            // assign() re-zeroes without allocating (capacity is reserved).
+            transSig.assign((size_t)padLen, 0.0f);
+            tonalSig.assign((size_t)padLen, 0.0f);
             int approxLen = padLen;
             for (int l = 0; l < actualLevels; ++l) approxLen /= 2;
             // Keep approximation in tonal.
@@ -3022,20 +3282,25 @@ public:
                 else tonalSig[i] = sig[i];
             }
 
-            // Reconstruct tonal, pitch-shift it via resampling.
-            idwt(tonalSig, actualLevels, filt);
-            // Simple pitch shift via resampling (linear interp).
-            std::vector<float> shifted(n, 0.0f);
-            for (int i = 0; i < n; ++i) {
-                float srcPos = (float)i * ratio;
-                int i0 = (int)srcPos;
-                float frac = srcPos - i0;
-                if (i0 + 1 < n) shifted[i] = tonalSig[i0] * (1.0f - frac) + tonalSig[i0 + 1] * frac;
-                else if (i0 < n) shifted[i] = tonalSig[i0];
-            }
+            // Reconstruct tonal, then pitch-shift it with the phase vocoder.
+            //
+            // This used to resample tonalSig within the block (srcPos = i*ratio),
+            // which changes DURATION as well as pitch: an octave up consumed the
+            // whole block but only filled half of it, so the tail of every block
+            // was silence - a hard gate at the block rate. Constant-duration
+            // shifting needs state that outlives the block, which is what the
+            // PhaseVocoderShifter holds. See "resampling pitch shifters chop each
+            // block on upward shifts" in known-issues.md for the measurements.
+            idwtPR(tonalSig, actualLevels, filt, scratch.ws);
+            shifted.assign((size_t)n, 0.0f);
+            shifter[c].setPitchRatio(ratio);
+            shifter[c].process(tonalSig.data(), shifted.data(), n);
 
-            // Reconstruct transients (unshifted).
-            idwt(transSig, actualLevels, filt);
+            // Reconstruct transients (unshifted), then delay them - and the dry
+            // copy - by the shifter's latency so all three paths line up.
+            idwtPR(transSig, actualLevels, filt, scratch.ws);
+            transDelay[c].process(transSig.data(), transSig.data(), n);
+            dryDelay[c].process(dry.data(), dry.data(), n);
 
             // Recombine.
             for (int i = 0; i < n; ++i)
@@ -3060,6 +3325,13 @@ public:
 private:
     Node& node;
     double sampleRate = 44100;
+    WaveletFxScratch scratch;
+    std::vector<float> transSig, tonalSig;  // threshold split of the coefficients
+    std::vector<float> shifted;             // pitch-shifted tonal part
+    PhaseVocoderShifter shifter[2];         // one per channel - sharing would
+                                            // cross-contaminate the phase
+                                            // accumulators and collapse stereo
+    LatencyDelay transDelay[2], dryDelay[2];
 };
 
 // ==============================================================================
@@ -3077,7 +3349,13 @@ class WaveletComplexityProcessor : public juce::AudioProcessor {
 public:
     WaveletComplexityProcessor(Node& n) : node(n) {}
     const juce::String getName() const override { return "Complexity"; }
-    void prepareToPlay(double, int) override {}
+    void prepareToPlay(double, int bs) override {
+        scratch.prepare(bs);
+        int pad = 1;
+        while (pad < bs) pad *= 2;
+        coeffs.reserve((size_t)pad);
+        kept.reserve((size_t)pad);
+    }
     void releaseResources() override {}
 
     void processBlock(juce::AudioBuffer<float>& buf, juce::MidiBuffer&) override {
@@ -3090,32 +3368,33 @@ public:
         int   levels     = juce::jlimit(1, 8, (int)paramByName(node, "Levels", 4.0f));
         float mix        = juce::jlimit(0.0f, 1.0f, paramByName(node, "Mix", 1.0f));
 
-        auto filt = getWaveletFilter("db4");
-        int padLen = 1;
-        while (padLen < n) padLen *= 2;
+        const auto& filt = scratch.useFilter("db4");
+        auto& sig = scratch.sig;
+        auto& dry = scratch.dry;
 
         for (int c = 0; c < ch; ++c) {
             float* data = buf.getWritePointer(c);
-            std::vector<float> sig(padLen, 0.0f);
-            for (int i = 0; i < n; ++i) sig[i] = data[i];
-            std::vector<float> dry(data, data + n);
+            const int padLen = scratch.load(data, n);
 
-            int actualLevels = dwt(sig, levels, filt);
+            int actualLevels = dwt(sig, levels, filt, scratch.ws);
 
             // Sort coefficients by magnitude and zero out the smallest.
+            // resize()/assign() against reserved capacity does not allocate.
             int keep = std::max(1, (int)(padLen * complexity));
-            std::vector<std::pair<float, int>> coeffs(padLen);
+            coeffs.resize((size_t)padLen);
             for (int i = 0; i < padLen; ++i)
-                coeffs[i] = {std::abs(sig[i]), i};
+                coeffs[(size_t)i] = {std::abs(sig[(size_t)i]), i};
             std::partial_sort(coeffs.begin(), coeffs.begin() + keep, coeffs.end(),
                 [](auto& a, auto& b) { return a.first > b.first; });
-            // Zero everything not in the top-keep set.
-            std::vector<bool> kept(padLen, false);
-            for (int i = 0; i < keep; ++i) kept[coeffs[i].second] = true;
+            // Zero everything not in the top-keep set. This is a uint8_t mask
+            // rather than std::vector<bool>: the bool specialisation is a
+            // bitset that cannot be reused without reallocating.
+            kept.assign((size_t)padLen, 0);
+            for (int i = 0; i < keep; ++i) kept[(size_t)coeffs[(size_t)i].second] = 1;
             for (int i = 0; i < padLen; ++i)
-                if (!kept[i]) sig[i] = 0;
+                if (!kept[(size_t)i]) sig[(size_t)i] = 0;
 
-            idwt(sig, actualLevels, filt);
+            idwtPR(sig, actualLevels, filt, scratch.ws);
             for (int i = 0; i < n; ++i)
                 data[i] = dry[i] * (1.0f - mix) + sig[i] * mix;
         }
@@ -3136,6 +3415,9 @@ public:
     void setStateInformation(const void*, int) override {}
 private:
     Node& node;
+    WaveletFxScratch scratch;
+    std::vector<std::pair<float, int>> coeffs;  // (magnitude, index) for the sort
+    std::vector<juce::uint8> kept;              // top-N mask; NOT vector<bool>
 };
 
 // ==============================================================================
@@ -3154,11 +3436,23 @@ private:
 // ==============================================================================
 class AdditiveSynthProcessor : public juce::AudioProcessor {
 public:
-    AdditiveSynthProcessor(Node& n) : node(n) { voices.resize(12); }
+    // Polyphony. Fixed for the processor's lifetime - see reset().
+    static constexpr int kMaxVoices = 12;
+
+    AdditiveSynthProcessor(Node& n) : node(n) { voices.assign(kMaxVoices, Voice{}); }
     const juce::String getName() const override { return "Additive"; }
     // Transport panic (Stop): drop every sounding voice so notes stop dead
     // instead of finishing their release tail.
-    void reset() override { voices.clear(); }
+    // Transport panic (Stop): silence every voice.
+    // NB: this RESETS the voices, it does NOT remove them. This used to be
+    // voices.clear(), which permanently emptied the pool - the pool is only
+    // ever sized in the constructor, so nothing refilled it. After one press of
+    // Stop, allocVoice() fell through to its steal path and dereferenced
+    // voices[0] on an empty vector (out of bounds), and the render loop then
+    // iterated zero voices, leaving the synth silent for the rest of the
+    // session. Anything that empties `voices` must also refill it; not
+    // emptying it is safer.
+    void reset() override { for (auto& v : voices) v = Voice{}; }
     void prepareToPlay(double sr, int) override { sampleRate = sr; }
     void releaseResources() override {}
 
@@ -3202,6 +3496,14 @@ public:
                 for (auto& v : voices)
                     if (v.active && v.held && v.note == msg.getNoteNumber())
                         { v.held = false; v.ampEnv.noteOff(); }
+            } else if (bool rel = false; isMidiPanicMessage(msg, rel)) {
+                // Controller panic / MIDI file end / transport stop.
+                for (auto& v : voices) {
+                    if (!v.active) continue;
+                    v.held = false;
+                    if (rel) v.ampEnv.noteOff();       // All Notes Off: release
+                    else { v.ampEnv.hardReset(); v.active = false; }  // All Sound Off
+                }
             }
         }
         distributeMpeMessages(midi, voices);
@@ -3285,6 +3587,10 @@ private:
     };
     std::vector<Voice> voices;
     Voice& allocVoice() {
+        // Guarantee a pool before indexing it: returning voices[0] on an empty
+        // vector is out-of-bounds, and it is not obvious from the call site
+        // that `voices` is non-empty.
+        if (voices.empty()) voices.assign(kMaxVoices, Voice{});
         for (auto& v : voices) if (!v.active) return v;
         float oldest = -1; int idx = 0;
         for (int i = 0; i < (int)voices.size(); ++i)
@@ -3312,7 +3618,16 @@ class AsymmetricFilterProcessor : public juce::AudioProcessor {
 public:
     AsymmetricFilterProcessor(Node& n) : node(n) {}
     const juce::String getName() const override { return "Asymmetric Filter"; }
-    void prepareToPlay(double sr, int) override { sampleRate = sr; }
+    void prepareToPlay(double sr, int bs) override {
+        sampleRate = sr;
+        scratch.prepare(bs);
+        int pad = 1;
+        while (pad < bs) pad *= 2;
+        // Worst case every coefficient in the finest band is a transient.
+        transients.reserve((size_t)pad / 2 + 1);
+        gainEnv.reserve((size_t)pad);
+        envPrefix.reserve((size_t)pad + 1);
+    }
     void releaseResources() override {}
 
     void processBlock(juce::AudioBuffer<float>& buf, juce::MidiBuffer&) override {
@@ -3327,21 +3642,30 @@ public:
         float postGain = paramByName(node, "Post Gain", 0.5f);
         int   levels   = juce::jlimit(1, 8, (int)paramByName(node, "Levels", 4.0f));
         float mix      = juce::jlimit(0.0f, 1.0f, paramByName(node, "Mix", 1.0f));
+        // Onset threshold as a fraction of the block's loudest detail
+        // coefficient. Program-adaptive rather than absolute, so it behaves the
+        // same on a quiet and a loud take. 0 makes everything an onset, 1 keeps
+        // only the single loudest. Defaults to the 0.5 that used to be hardcoded
+        // here, so projects saved before this param existed are unchanged.
+        float sens     = juce::jlimit(0.0f, 1.0f, paramByName(node, "Sensitivity", 0.5f));
 
-        int preSamples  = (int)(preMs * 0.001 * sampleRate);
-        int postSamples = (int)(postMs * 0.001 * sampleRate);
-
-        auto filt = getWaveletFilter("db4");
+        // The analysis window is one zero-padded block, so a pre/post region can
+        // never be longer than that however the knob is set. Clamping here is
+        // what makes that honest instead of silently wrapping into nonsense.
         int padLen = 1;
         while (padLen < n) padLen *= 2;
+        int preSamples  = juce::jlimit(1, padLen, (int)(preMs  * 0.001 * sampleRate));
+        int postSamples = juce::jlimit(1, padLen, (int)(postMs * 0.001 * sampleRate));
+
+        const auto& filt = scratch.useFilter("db4");
+        auto& sig = scratch.sig;
+        auto& dry = scratch.dry;
 
         for (int c = 0; c < ch; ++c) {
             float* data = buf.getWritePointer(c);
-            std::vector<float> sig(padLen, 0.0f);
-            for (int i = 0; i < n; ++i) sig[i] = data[i];
-            std::vector<float> dry(data, data + n);
+            scratch.load(data, n);
 
-            int actualLevels = dwt(sig, levels, filt);
+            int actualLevels = dwt(sig, levels, filt, scratch.ws);
 
             // Detect transients: find peaks in the finest detail level.
             int approxLen = padLen;
@@ -3350,17 +3674,34 @@ public:
             int finestStart = padLen / 2;
             int finestLen = padLen / 2;
 
-            // Find transient positions (peaks in finest detail).
-            std::vector<int> transients;
+            // Find transient positions (peaks in finest detail), stored as
+            // TIME positions in samples. The finest detail band has padLen/2
+            // coefficients spanning padLen samples, so its stride is 2 - that
+            // factor is the conversion out of coefficient index into a real
+            // sample offset, and it is what lets the ms knobs below mean
+            // something.
+            // clear() keeps the reserved capacity, so the push_backs below
+            // never reallocate on the audio thread.
+            transients.clear();
             float maxFine = 0;
             for (int i = finestStart; i < finestStart + finestLen; ++i)
                 maxFine = std::max(maxFine, std::abs(sig[i]));
-            float transThresh = maxFine * 0.5f;
+            float transThresh = maxFine * sens;
             for (int i = finestStart; i < finestStart + finestLen; ++i)
-                if (std::abs(sig[i]) > transThresh) transients.push_back(i - finestStart);
+                if (std::abs(sig[i]) > transThresh)
+                    transients.push_back((i - finestStart) * 2);
 
             // Build a gain envelope that's asymmetric around each transient.
-            std::vector<float> gainEnv(padLen, 1.0f);
+            //
+            // This is built along the TIME axis, in samples, NOT along the
+            // concatenated coefficient array. The two are not the same axis:
+            // one step in the approximation band is worth 2^Levels samples
+            // while one step in the finest detail band is worth 2, so an
+            // envelope laid out across the coefficient array puts the "20 ms
+            // before the onset" region in a different place - and at a
+            // different width - in every band, and drops its low indices into
+            // the approximation region rather than near the onset at all.
+            gainEnv.assign((size_t)padLen, 1.0f);
             for (int t : transients) {
                 // Pre-attack region: ramp up preGain before the transient
                 for (int i = std::max(0, t - preSamples); i < t; ++i) {
@@ -3374,11 +3715,39 @@ public:
                 }
             }
 
-            // Apply gain envelope to all coefficients.
+            // Resample the time-domain envelope onto each band by that band's
+            // stride, so one wall-clock millisecond covers the same wall-clock
+            // span everywhere. Each coefficient takes the MEAN of the envelope
+            // across the span of time it represents rather than a point sample:
+            // the coarse bands stride 2^Levels samples at a time, so point
+            // sampling would alias a short pre-attack ramp into them (or step
+            // straight over it). A prefix sum makes every one of those means an
+            // O(1) subtraction, in double because differencing two float
+            // running totals of a few thousand terms loses more precision than
+            // the neutral-setting unity test tolerates.
+            envPrefix.assign((size_t)padLen + 1, 0.0);
             for (int i = 0; i < padLen; ++i)
-                sig[i] *= gainEnv[i];
+                envPrefix[(size_t)i + 1] = envPrefix[(size_t)i] + (double)gainEnv[(size_t)i];
+            auto meanEnv = [this](int a, int b) {
+                return (float)((envPrefix[(size_t)b] - envPrefix[(size_t)a])
+                               / (double)(b - a));
+            };
 
-            idwt(sig, actualLevels, filt);
+            // Approximation band first, then the detail bands coarsest-first -
+            // the same layout dwt() writes and idwtPR() expects.
+            const int approxStride = padLen / approxLen;   // == 2^actualLevels
+            for (int i = 0; i < approxLen; ++i)
+                sig[(size_t)i] *= meanEnv(i * approxStride, (i + 1) * approxStride);
+            int bandStart = approxLen;
+            for (int band = 0; band < actualLevels; ++band) {
+                const int bandLen = approxLen << band;
+                const int stride  = padLen / bandLen;
+                for (int i = 0; i < bandLen; ++i)
+                    sig[(size_t)(bandStart + i)] *= meanEnv(i * stride, (i + 1) * stride);
+                bandStart += bandLen;
+            }
+
+            idwtPR(sig, actualLevels, filt, scratch.ws);
             for (int i = 0; i < n; ++i)
                 data[i] = dry[i] * (1.0f - mix) + sig[i] * mix;
         }
@@ -3403,6 +3772,10 @@ public:
 private:
     Node& node;
     double sampleRate = 44100;
+    WaveletFxScratch scratch;
+    std::vector<int>    transients; // onset positions, in SAMPLES not coefficients
+    std::vector<float>  gainEnv;    // asymmetric gain along the time axis
+    std::vector<double> envPrefix;  // running sum of gainEnv, for O(1) band means
 };
 
 // ==============================================================================
@@ -3429,7 +3802,7 @@ class WaveletPitchTrackerProcessor : public juce::AudioProcessor {
 public:
     WaveletPitchTrackerProcessor(Node& n) : node(n) {}
     const juce::String getName() const override { return "Pitch Tracker"; }
-    void prepareToPlay(double sr, int) override { sampleRate = sr; }
+    void prepareToPlay(double sr, int bs) override { sampleRate = sr; scratch.prepare(bs); }
     void releaseResources() override {}
 
     void processBlock(juce::AudioBuffer<float>& buf, juce::MidiBuffer&) override {
@@ -3440,18 +3813,14 @@ public:
         float minHz = std::max(20.0f, paramByName(node, "Min Hz", 50.0f));
         float maxHz = std::min(5000.0f, paramByName(node, "Max Hz", 2000.0f));
 
-        // Read mono input.
-        const float* input = buf.getReadPointer(0);
-        std::vector<float> sig(input, input + n);
+        // Read mono input. load() copies it into the scratch buffer and
+        // zero-pads to the next power of two, without allocating.
+        const int padLen = scratch.load(buf.getReadPointer(0), n);
+        auto& sig = scratch.sig;
 
-        // Pad to power of 2.
-        int padLen = 1;
-        while (padLen < n) padLen *= 2;
-        sig.resize(padLen, 0.0f);
-
-        auto filt = getWaveletFilter("db4");
+        const auto& filt = scratch.useFilter("db4");
         int levels = std::min(8, (int)(std::log2(padLen) - 2));
-        int actualLevels = dwt(sig, levels, filt);
+        int actualLevels = dwt(sig, levels, filt, scratch.ws);
 
         // Find the dominant wavelet level: the one with the highest energy.
         int approxLen = padLen;
@@ -3505,6 +3874,7 @@ public:
 private:
     Node& node;
     double sampleRate = 44100;
+    WaveletFxScratch scratch;
 };
 
 // ==============================================================================
@@ -3543,6 +3913,9 @@ public:
     void prepareToPlay(double sr, int) override {
         sampleRate = sr;
         ring.assign(kMaxWindow, 0.0f);
+        // Sized to the largest window the Min Hz floor can produce, so the
+        // per-hop copy below never resizes on the audio thread.
+        analysisWin.assign(kMaxWindow, 0.0f);
         writePos = 0;
         filled = 0;
         sinceHop = 0;
@@ -3589,7 +3962,11 @@ public:
         // Re-run detection once a hop has elapsed and the window is full.
         if (sinceHop >= hop && filled >= window) {
             sinceHop = 0;
-            std::vector<float> w(window);
+            // `analysisWin` is a member sized to kMaxWindow in prepareToPlay.
+            // It used to be a local sized to `window`, i.e. a heap allocation on
+            // the audio thread every hop (and `window` is derived from the Min
+            // Hz param, so turning that knob changed the size).
+            std::vector<float>& w = analysisWin;
             int start = ((writePos - window) % kMaxWindow + kMaxWindow) % kMaxWindow;
             for (int i = 0; i < window; ++i)
                 w[i] = ring[(start + i) % kMaxWindow];
@@ -3635,10 +4012,19 @@ private:
     Node& node;
     double sampleRate = 44100;
     std::vector<float> ring;
+    std::vector<float> analysisWin;   // per-hop analysis copy, see prepareToPlay
     int writePos = 0;
     int filled = 0;
     int sinceHop = 0;
     float lastNormalized = 0.0f;
+public:
+    // Total bytes of audio-thread scratch, watched by the self-test across a
+    // parameter sweep. `analysisWin` used to be a per-hop local vector, so any
+    // growth here means processBlock is back on the allocator.
+    size_t scratchCapacityBytes() const {
+        return ring.capacity() * sizeof(float)
+             + analysisWin.capacity() * sizeof(float);
+    }
 };
 
 // ==============================================================================
@@ -3659,7 +4045,13 @@ class WaveletVocoderProcessor : public juce::AudioProcessor {
 public:
     WaveletVocoderProcessor(Node& n) : node(n) {}
     const juce::String getName() const override { return "Wavelet Vocoder"; }
-    void prepareToPlay(double sr, int) override { sampleRate = sr; }
+    void prepareToPlay(double sr, int bs) override {
+        sampleRate = sr;
+        scratch.prepare(bs);
+        int pad = 1;
+        while (pad < bs) pad *= 2;
+        modulator.reserve((size_t)pad);
+    }
     void releaseResources() override {}
 
     void processBlock(juce::AudioBuffer<float>& buf, juce::MidiBuffer&) override {
@@ -3675,20 +4067,24 @@ public:
         bool hasModulator = buf.getNumChannels() > 2;
         if (!hasModulator) return; // no modulator -> passthrough
 
-        auto filt = getWaveletFilter("db4");
-        int padLen = 1;
-        while (padLen < n) padLen *= 2;
+        const auto& filt = scratch.useFilter("db4");
 
         float* carrierData = buf.getWritePointer(0);
         const float* modData = buf.getReadPointer(2);
-        std::vector<float> dry(carrierData, carrierData + n);
 
-        // Pad and DWT both signals.
-        std::vector<float> carrier(padLen, 0.0f), modulator(padLen, 0.0f);
-        for (int i = 0; i < n; ++i) { carrier[i] = carrierData[i]; modulator[i] = modData[i]; }
+        // load() fills scratch.sig (padded carrier) and scratch.dry (the
+        // unpadded original) in one pass, without allocating.
+        const int padLen = scratch.load(carrierData, n);
+        auto& carrier = scratch.sig;
+        auto& dry     = scratch.dry;
 
-        int actualLevels = dwt(carrier, bands, filt);
-        dwt(modulator, bands, filt);
+        // The modulator needs its own padded buffer; assign()+resize() against
+        // reserved capacity keeps it allocation-free.
+        modulator.assign(modData, modData + n);
+        modulator.resize((size_t)padLen, 0.0f);
+
+        int actualLevels = dwt(carrier, bands, filt, scratch.ws);
+        dwt(modulator, bands, filt, scratch.ws);
 
         // For each band: compute the modulator's energy, compute the
         // carrier's energy, scale carrier by modulator/carrier ratio.
@@ -3719,7 +4115,7 @@ public:
             bandStart += bandLen;
         }
 
-        idwt(carrier, actualLevels, filt);
+        idwtPR(carrier, actualLevels, filt, scratch.ws);
 
         for (int i = 0; i < n; ++i)
             carrierData[i] = dry[i] * (1.0f - mix) + carrier[i] * mix;
@@ -3744,6 +4140,8 @@ public:
 private:
     Node& node;
     double sampleRate = 44100;
+    WaveletFxScratch scratch;
+    std::vector<float> modulator;   // padded modulator (Signal pin) coefficients
 };
 
 // ==============================================================================
@@ -3751,9 +4149,11 @@ private:
 //
 // Pitch-shifts audio while preserving formants (the resonant
 // frequencies that make a voice sound like THAT voice, not a chipmunk).
-// Method: decompose into wavelet bands, pitch-shift each band via
-// resampling, but keep the spectral envelope (formant shape) by
-// scaling band gains back to their original levels after the shift.
+// Method: pitch-shift with the phase vocoder, then re-impose the ORIGINAL
+// per-wavelet-band energy envelope on the result. Shifting moves the formants
+// along with the pitch (that is the chipmunk effect); restoring the band
+// energies puts the spectral envelope back where it was while leaving the
+// pitch shifted.
 //
 // Params: Semitones (-24..+24), Formant Lock (0..1, how much formant
 //         to preserve - 0=no preservation, 1=full), Levels, Mix
@@ -3762,7 +4162,24 @@ class FormantPitchShiftProcessor : public juce::AudioProcessor {
 public:
     FormantPitchShiftProcessor(Node& n) : node(n) {}
     const juce::String getName() const override { return "Formant Pitch"; }
-    void prepareToPlay(double sr, int) override { sampleRate = sr; }
+    void prepareToPlay(double sr, int bs) override {
+        sampleRate = sr;
+        scratch.prepare(bs);
+        int pad = 1;
+        while (pad < bs) pad *= 2;
+        shifted.reserve((size_t)bs);
+        shiftPad.reserve((size_t)pad);
+        origEnergy.reserve(9);   // at most 8 levels + the approximation band
+        for (int c = 0; c < 2; ++c) {
+            shifter[c].prepare();
+            // The dry copy is both the wet/dry partner AND the source of the
+            // formant envelope, so it must be delayed to line up with the
+            // shifted signal - otherwise the envelope measured is the one from
+            // 32 ms earlier, and on speech that is a whole different phoneme.
+            dryDelay[c].prepare(shifter[c].latencySamples());
+        }
+        setLatencySamples(shifter[0].latencySamples());
+    }
     void releaseResources() override {}
 
     void processBlock(juce::AudioBuffer<float>& buf, juce::MidiBuffer&) override {
@@ -3776,25 +4193,36 @@ public:
         int   levels     = juce::jlimit(1, 8, (int)paramByName(node, "Levels", 5.0f));
         float mix        = juce::jlimit(0.0f, 1.0f, paramByName(node, "Mix", 1.0f));
 
-        if (std::abs(semitones) < 0.01f) return;
+        // No early-out at 0 semitones - see the note in Ind. Pitch Shift; this
+        // node reports a fixed latency and must always honour it.
         float ratio = std::pow(2.0f, semitones / 12.0f);
 
-        auto filt = getWaveletFilter("db4");
-        int padLen = 1;
-        while (padLen < n) padLen *= 2;
+        const auto& filt = scratch.useFilter("db4");
+        auto& sig = scratch.sig;
+        auto& dry = scratch.dry;
 
         for (int c = 0; c < ch; ++c) {
             float* data = buf.getWritePointer(c);
-            std::vector<float> sig(padLen, 0.0f);
-            for (int i = 0; i < n; ++i) sig[i] = data[i];
-            std::vector<float> dry(data, data + n);
+            const int padLen = scratch.load(data, n);
 
-            // 1. Measure per-band energy before shift (= formant envelope).
-            int actualLevels = dwt(sig, levels, filt);
+            // 1. Pitch-shift first, then delay the dry copy to match, so that
+            //    everything measured below is time-aligned with the shifted
+            //    signal it is going to be applied to.
+            shifted.assign((size_t)n, 0.0f);
+            shifter[c].setPitchRatio(ratio);
+            shifter[c].process(data, shifted.data(), n);
+            dryDelay[c].process(dry.data(), dry.data(), n);
+
+            // 2. Measure per-band energy of the (delayed) original = the formant
+            //    envelope we want to keep. sig currently holds the UNdelayed
+            //    input from load(), so refill it from the delayed dry.
+            for (int i = 0; i < n; ++i) sig[(size_t)i] = dry[(size_t)i];
+            for (int i = n; i < padLen; ++i) sig[(size_t)i] = 0.0f;
+            int actualLevels = dwt(sig, levels, filt, scratch.ws);
             int approxLen = padLen;
             for (int l = 0; l < actualLevels; ++l) approxLen /= 2;
 
-            std::vector<float> origEnergy(actualLevels + 1);
+            origEnergy.assign((size_t)actualLevels + 1, 0.0f);
             float aE = 0;
             for (int i = 0; i < approxLen; ++i) aE += sig[i] * sig[i];
             origEnergy[0] = aE / std::max(1, approxLen);
@@ -3808,22 +4236,11 @@ public:
                 bandStart += bandLen;
             }
 
-            // 2. Reconstruct and pitch-shift via resampling.
-            idwt(sig, actualLevels, filt);
-            std::vector<float> shifted(n, 0.0f);
-            for (int i = 0; i < n; ++i) {
-                float srcPos = (float)i * ratio;
-                int i0 = (int)srcPos;
-                float frac = srcPos - i0;
-                if (i0 + 1 < n) shifted[i] = sig[i0] * (1.0f - frac) + sig[i0 + 1] * frac;
-                else if (i0 < n) shifted[i] = sig[i0];
-            }
-
             // 3. Re-decompose the shifted signal and adjust band gains
             //    to match the original formant envelope.
-            std::vector<float> shiftPad(padLen, 0.0f);
-            for (int i = 0; i < n; ++i) shiftPad[i] = shifted[i];
-            dwt(shiftPad, levels, filt);
+            shiftPad.assign((size_t)padLen, 0.0f);
+            for (int i = 0; i < n; ++i) shiftPad[(size_t)i] = shifted[(size_t)i];
+            dwt(shiftPad, levels, filt, scratch.ws);
 
             // Scale each band to match original energy (= formant restoration).
             {
@@ -3849,7 +4266,7 @@ public:
                 bandStart += bandLen;
             }
 
-            idwt(shiftPad, actualLevels, filt);
+            idwtPR(shiftPad, actualLevels, filt, scratch.ws);
 
             for (int i = 0; i < n; ++i)
                 data[i] = dry[i] * (1.0f - mix) + shiftPad[i] * mix;
@@ -3872,6 +4289,12 @@ public:
 private:
     Node& node;
     double sampleRate = 44100;
+    WaveletFxScratch scratch;
+    std::vector<float> shifted;     // pitch-shifted time signal
+    std::vector<float> shiftPad;    // padded re-decomposition of `shifted`
+    std::vector<float> origEnergy;  // per-band energy = the formant envelope
+    PhaseVocoderShifter shifter[2]; // one per channel
+    LatencyDelay dryDelay[2];
 };
 
 // ==============================================================================
@@ -3890,15 +4313,41 @@ private:
 // ==============================================================================
 class SpectralGrainProcessor : public juce::AudioProcessor {
 public:
-    SpectralGrainProcessor(Node& n) : node(n) { voices.resize(8); }
+    // Ceiling on the simultaneously-sounding grain cloud across all voices.
+    // Doubles as the reserved capacity (see prepareToPlay) so spawning is
+    // allocation-free, and as a runaway guard on the Density param. Public so
+    // the self-test can assert the reserve is actually big enough.
+    static constexpr size_t kMaxActiveGrains = 1024;
+
+    // Polyphony. Fixed for the lifetime of the processor: the voice vector is
+    // indexed by ActiveGrain::voiceIdx, so it must never shrink.
+    static constexpr int kMaxVoices = 8;
+
+    SpectralGrainProcessor(Node& n) : node(n) { voices.assign(kMaxVoices, Voice{}); }
     const juce::String getName() const override { return "Spectral Grain"; }
-    // Transport panic (Stop): drop every voice and in-flight grain so the
-    // granular cloud stops dead instead of ringing out.
-    void reset() override { voices.clear(); activeGrains.clear(); }
+    // Transport panic (Stop): silence every voice and drop every in-flight
+    // grain so the granular cloud stops dead instead of ringing out.
+    // NB: this RESETS the voices, it does not remove them. An earlier version
+    // called voices.clear(), which permanently emptied the pool - prepareToPlay
+    // never refilled it, so the next note-on ran allocVoice()'s steal path and
+    // dereferenced voices[0] on an empty vector (UB), after which the node was
+    // silent for the rest of the session. Anything that empties `voices` must
+    // also be paired with a refill; simply not emptying it is safer.
+    void reset() override {
+        for (auto& v : voices) v = Voice{};
+        activeGrains.clear();
+    }
 
     void prepareToPlay(double sr, int) override {
         sampleRate = sr;
+        // Defensive: guarantee a full voice pool even if some future path
+        // resizes it. allocVoice() indexes this unconditionally.
+        if ((int)voices.size() != kMaxVoices) voices.assign(kMaxVoices, Voice{});
         regenerateGrains();
+        // Reserve to the hard cap so the spawn loop below never reallocates on
+        // the audio thread. The cap is enforced at the push_back, so capacity
+        // and size can never diverge.
+        activeGrains.reserve(kMaxActiveGrains);
     }
     void releaseResources() override {}
 
@@ -3915,8 +4364,16 @@ public:
         ampTables.prepare(effectiveEnv);
         float volume = paramByName(node, "Volume", 0.5f);
 
-        int grainSizeSamples = (int)(grainMs * 0.001f * (float)sampleRate);
-        grainSizeSamples = std::min(grainSizeSamples, (int)grainBank[0].size());
+        // Grain length is whatever the knob asks for. It is NOT clamped to the
+        // bank waveform's length: each bank entry is an inverse real FFT of a
+        // full spectrum, so it is exactly periodic with period kGrainFFTSize
+        // and the read below wraps through it seamlessly. Clamping here (which
+        // is what the code used to do) silently pinned every grain to
+        // kGrainFFTSize samples - 21 ms at 48 kHz - so the whole upper part of
+        // the Grain Size range did nothing at all, and a grain played above
+        // A4 ran off the end of the bank and died early, making grain duration
+        // depend on the note you played.
+        int grainSizeSamples = std::max(1, (int)(grainMs * 0.001f * (float)sampleRate));
         float spawnInterval = 1.0f / density;
         float dt = 1.0f / (float)sampleRate;
 
@@ -3936,13 +4393,37 @@ public:
                 for (auto& v : voices)
                     if (v.active && v.held && v.note == msg.getNoteNumber())
                         { v.held = false; v.ampEnv.noteOff(); }
+            } else if (bool rel = false; isMidiPanicMessage(msg, rel)) {
+                // Controller panic / MIDI file end / transport stop.
+                for (auto& v : voices) {
+                    if (!v.active) continue;
+                    v.held = false;
+                    if (rel) v.ampEnv.noteOff();       // All Notes Off: release
+                    else { v.ampEnv.hardReset(); v.active = false; }  // All Sound Off
+                }
             }
         }
         distributeMpeMessages(midi, voices);
 
+        // `activeGrains` is ONE pool shared by every voice, and each grain
+        // carries the index of the voice that spawned it. So the render is two
+        // passes per sample: first advance the voices and note each one's
+        // current gain, then walk the grain pool EXACTLY ONCE, scaling each
+        // grain by its owning voice's gain.
+        //
+        // The obvious-looking alternative - summing the pool inside the voice
+        // loop - is a bug: it advanced every grain's read position once per
+        // active voice, so with V voices sounding, every grain played V times
+        // too fast (V times shorter, V octaves-worth of pitch error) and was
+        // also summed V times. And because g.rate is baked from the SPAWNING
+        // voice's pitch, every voice rendered every other voice's grains at the
+        // wrong pitch, so a chord came out as one smeared pitch rather than
+        // distinct notes. It was also O(V*G) instead of O(G).
         for (int s = 0; s < numSamples; ++s) {
-            float out = 0;
-            for (auto& v : voices) {
+            float voiceGain[kMaxVoices] = {};
+
+            for (int vi = 0; vi < (int)voices.size(); ++vi) {
+                auto& v = voices[(size_t)vi];
                 if (!v.active) continue;
 
                 // Amplitude envelope from the shared runtime (velocity folded
@@ -3954,10 +4435,17 @@ public:
                 v.spawnTimer += dt;
                 while (v.spawnTimer >= spawnInterval && v.held) {
                     v.spawnTimer -= spawnInterval;
+                    // Hard cap: Density x block length is unbounded, so without
+                    // this the push_back could grow past the reserved capacity
+                    // and allocate on the audio thread (and a runaway density
+                    // could grow the cloud without limit). Dropping the newest
+                    // grain is inaudible next to the hundreds already sounding.
+                    if (activeGrains.size() >= kMaxActiveGrains) break;
                     ActiveGrain g;
                     g.grainIdx = rng() % grainBank.size();
                     g.pos = 0;
                     g.len = grainSizeSamples;
+                    g.voiceIdx = vi;
                     float baseFreq = 440.0f * std::pow(2.0f, (v.note - 69 + v.mpe.pitchBend) / 12.0f);
                     g.rate = baseFreq / 440.0f; // pitch ratio relative to A4
                     activeGrains.push_back(g);
@@ -3965,23 +4453,31 @@ public:
 
                 v.time += dt;
 
-                // Sum active grains for this voice
-                float voiceOut = 0;
-                for (auto it = activeGrains.begin(); it != activeGrains.end();) {
-                    auto& g = *it;
-                    int idx = (int)g.pos;
-                    if (idx >= g.len || idx >= (int)grainBank[g.grainIdx].size()) {
-                        it = activeGrains.erase(it);
-                        continue;
-                    }
-                    // Hann window
-                    float w = 0.5f * (1.0f - std::cos(6.28318f * g.pos / g.len));
-                    voiceOut += grainBank[g.grainIdx][idx] * w;
-                    g.pos += g.rate;
-                    ++it;
-                }
                 float pMul = 1.0f + node.aftertouchSensitivity * effectivePressure(v.mpe);
-                out += voiceOut * env * pMul;
+                voiceGain[vi] = env * pMul;
+            }
+
+            // Grains whose voice has gone silent read voiceGain == 0 here, so
+            // they contribute nothing and simply expire on their own length.
+            // (allocVoice() drops them outright when it recycles the slot, so a
+            // new note can never inherit the previous note's grains.)
+            float out = 0;
+            for (auto it = activeGrains.begin(); it != activeGrains.end();) {
+                auto& g = *it;
+                const auto& wave = grainBank[(size_t)g.grainIdx];
+                if ((int)g.pos >= g.len || wave.empty()) {
+                    it = activeGrains.erase(it);
+                    continue;
+                }
+                // The bank waveform is one period of the defined spectrum, so
+                // reading it modulo its length loops it seamlessly - that's what
+                // lets a grain be longer than the FFT frame without a click.
+                const int idx = (int)g.pos % (int)wave.size();
+                // Hann window, over the grain's OWN length (not the bank's)
+                float w = 0.5f * (1.0f - std::cos(6.28318f * g.pos / g.len));
+                out += wave[(size_t)idx] * w * voiceGain[g.voiceIdx];
+                g.pos += g.rate;
+                ++it;
             }
 
             if (activeGrains.size() > 1)
@@ -3992,8 +4488,10 @@ public:
                 buf.addSample(c, s, out);
         }
 
-        if (activeGrains.size() > 2048)
-            activeGrains.erase(activeGrains.begin(), activeGrains.begin() + 1024);
+        // NB: the old "safety" erase of the oldest 1024 grains that lived here
+        // can no longer fire - the spawn loop refuses to exceed kMaxActiveGrains
+        // (half that) - and it was the wrong shape anyway: it cut grains that
+        // were mid-envelope, which is audible as a click.
     }
 
     // Tail = AHDSR release + the longest grain still ringing out.
@@ -4076,12 +4574,25 @@ private:
         AHDSREnvelopeRuntime ampEnv;  // shared amplitude envelope runtime
     };
     std::vector<Voice> voices;
+    // Hands out a voice slot, recycling the oldest if all are busy. Any grains
+    // still tagged with the recycled slot are dropped first: grains outlive the
+    // voice that spawned them (that's what getTailLengthSeconds accounts for),
+    // so without this a new note would adopt the previous note's in-flight
+    // grains and re-amplify them under its own envelope.
     Voice& allocVoice() {
-        for (auto& v : voices) if (!v.active) return v;
-        float oldest = -1; int idx = 0;
+        int idx = -1;
         for (int i = 0; i < (int)voices.size(); ++i)
-            if (voices[i].time > oldest) { oldest = voices[i].time; idx = i; }
-        return voices[idx];
+            if (!voices[(size_t)i].active) { idx = i; break; }
+        if (idx < 0) {
+            float oldest = -1;
+            idx = 0;
+            for (int i = 0; i < (int)voices.size(); ++i)
+                if (voices[(size_t)i].time > oldest) { oldest = voices[(size_t)i].time; idx = i; }
+        }
+        activeGrains.erase(std::remove_if(activeGrains.begin(), activeGrains.end(),
+                                          [idx](const ActiveGrain& g) { return g.voiceIdx == idx; }),
+                           activeGrains.end());
+        return voices[(size_t)idx];
     }
 
     struct ActiveGrain {
@@ -4089,9 +4600,27 @@ private:
         float pos = 0;
         int len = 0;
         float rate = 1.0f;
+        int voiceIdx = 0;   // owning voice; indexes `voices` (and voiceGain[])
     };
     std::vector<ActiveGrain> activeGrains;
     std::mt19937 rng{1234};
+public:
+    size_t scratchCapacityBytes() const {
+        return activeGrains.capacity() * sizeof(ActiveGrain);
+    }
+    // See ParticleSynthProcessor::reservedGrainCount - same non-vacuity hook.
+    size_t reservedGrainCount() const { return activeGrains.capacity(); }
+    // How many grains are sounding right now. The self-test uses this to pin
+    // down grain LIFETIME (steady-state count == voices x Density x GrainSize),
+    // which is the observable that catches grains being advanced once per voice
+    // instead of once per sample.
+    size_t activeGrainCount() const { return activeGrains.size(); }
+    // Live voice count, for the same steady-state derivation.
+    int activeVoiceCount() const {
+        int n = 0;
+        for (const auto& v : voices) if (v.active) ++n;
+        return n;
+    }
 };
 
 // ==============================================================================
@@ -4117,7 +4646,26 @@ class SMSProcessor : public juce::AudioProcessor {
 public:
     SMSProcessor(Node& n) : node(n) {}
     const juce::String getName() const override { return "SMS"; }
-    void prepareToPlay(double sr, int) override { sampleRate = sr; }
+    void prepareToPlay(double sr, int maxBlock) override {
+        sampleRate = sr;
+        // Size every audio-thread buffer once, here, so processBlock never
+        // reaches the allocator. The transform size is min(2^12, block) rounded
+        // down to a power of two, so the ladder and the frame scratch only need
+        // to cover the largest block the host promised.
+        maxBlockSize = std::max(1, maxBlock);
+        const int maxFft = std::max(4, std::min(1 << 12, nextPow2AtMost(maxBlockSize)));
+        ffts.prepare(4, maxFft);
+        window.assign((size_t) maxFft, 0.0f);
+        windowed.assign((size_t) maxFft, 0.0f);
+        spectrum.assign((size_t) maxFft, {});
+        harmSpectrum.assign((size_t) maxFft, {});
+        harmonic.assign((size_t) maxFft, 0.0f);
+        mags.assign((size_t) (maxFft / 2 + 1), 0.0f);
+        dry.assign((size_t) maxBlockSize, 0.0f);
+        output.assign((size_t) maxBlockSize, 0.0f);
+        norm.assign((size_t) maxBlockSize, 0.0f);
+        windowN = -1;      // force the Hann window to be recomputed
+    }
     void releaseResources() override {}
 
     void processBlock(juce::AudioBuffer<float>& buf, juce::MidiBuffer&) override {
@@ -4132,68 +4680,94 @@ public:
         int   fftExp       = juce::jlimit(8, 12, (int)paramByName(node, "FFT Size", 10.0f));
         float mix          = juce::jlimit(0.0f, 1.0f, paramByName(node, "Mix", 1.0f));
 
+        // Round DOWN to the largest power of two that fits in the block. This
+        // used to clamp with `fftSize = n`, which handed a non-power-of-two
+        // size straight to FFT - whose bit-reversal table is then indexed past
+        // its end, corrupting the heap on any host block that isn't a power of
+        // two (480 samples is common). The ladder lookup below can't be fooled
+        // that way: a size it wasn't built for returns nullptr.
         int fftSize = 1 << fftExp;
-        if (fftSize > n) fftSize = n; // can't exceed block size
-        // Round down to power of 2 that fits.
         while (fftSize > n) fftSize /= 2;
         if (fftSize < 4) return;
 
-        int halfBins = fftSize / 2 + 1;
-        FFT fft(fftSize);
+        // A block larger than prepareToPlay promised would overrun the scratch.
+        // Bail (leaving the block dry) rather than allocate on the audio thread;
+        // the next correctly sized block resumes normally.
+        if (n > (int) dry.size() || fftSize > (int) window.size()) return;
+
+        const FFT* fft = ffts.forSize(fftSize);
+        if (!fft) return;
+
+        const int halfBins = fftSize / 2 + 1;
+        ensureWindow(fftSize);
 
         for (int c = 0; c < ch; ++c) {
             float* data = buf.getWritePointer(c);
-            std::vector<float> dry(data, data + n);
+            std::copy(data, data + n, dry.begin());
 
             // Process in overlapping frames (hop = fftSize/2).
-            std::vector<float> output(n, 0.0f);
-            std::vector<float> window(fftSize);
-            for (int i = 0; i < fftSize; ++i)
-                window[i] = 0.5f * (1.0f - std::cos(6.28318f * i / fftSize)); // Hann
+            std::fill(output.begin(), output.begin() + n, 0.0f);
+            std::fill(norm.begin(), norm.begin() + n, 0.0f);
 
-            int hop = fftSize / 2;
-            for (int frame = 0; frame + fftSize <= n; frame += hop) {
+            const int hop = fftSize / 2;
+
+            auto processFrame = [&](int frame) {
                 // Window the input.
-                std::vector<float> windowed(fftSize);
                 for (int i = 0; i < fftSize; ++i)
-                    windowed[i] = data[frame + i] * window[i];
+                    windowed[(size_t) i] = data[frame + i] * window[(size_t) i];
 
                 // Forward FFT.
-                std::vector<std::complex<float>> spectrum;
-                fft.forwardReal(windowed, spectrum);
+                fft->forwardReal(windowed.data(), spectrum.data());
 
                 // Find magnitude peaks.
                 float maxMag = 0;
-                std::vector<float> mags(halfBins);
                 for (int k = 0; k < halfBins; ++k) {
-                    mags[k] = std::abs(spectrum[k]);
-                    maxMag = std::max(maxMag, mags[k]);
+                    mags[(size_t) k] = std::abs(spectrum[(size_t) k]);
+                    maxMag = std::max(maxMag, mags[(size_t) k]);
                 }
-                float thresh = threshold * maxMag;
+                const float thresh = threshold * maxMag;
 
-                // Separate: peaks above threshold = deterministic.
-                std::vector<std::complex<float>> harmSpectrum(halfBins, {0,0});
-                for (int k = 0; k < halfBins; ++k) {
-                    if (mags[k] >= thresh)
-                        harmSpectrum[k] = spectrum[k];
-                }
+                // Separate: peaks above threshold = deterministic. inverseReal
+                // reads bins [0, halfBins) and fills the conjugate half itself,
+                // so only that range needs clearing.
+                for (int k = 0; k < halfBins; ++k)
+                    harmSpectrum[(size_t) k] = (mags[(size_t) k] >= thresh)
+                                                 ? spectrum[(size_t) k]
+                                                 : FFT::cplx{0.0f, 0.0f};
 
-                // IFFT harmonic part.
-                std::vector<float> harmonic;
-                fft.inverseReal(harmSpectrum, harmonic);
+                // IFFT harmonic part (clobbers harmSpectrum).
+                fft->inverseReal(harmSpectrum.data(), harmonic.data());
 
                 // Residual = original windowed - harmonic.
-                // Overlap-add both parts with gains.
-                for (int i = 0; i < fftSize && (frame + i) < n; ++i) {
-                    float h = harmonic[i] * harmonicGain;
-                    float r = (windowed[i] - harmonic[i]) * noiseGain;
-                    output[frame + i] += (h + r) * window[i]; // re-window for OLA
+                // Overlap-add both parts with gains, tracking the window power
+                // so the sum can be normalised below.
+                for (int i = 0; i < fftSize; ++i) {
+                    float h = harmonic[(size_t) i] * harmonicGain;
+                    float rr = (windowed[(size_t) i] - harmonic[(size_t) i]) * noiseGain;
+                    output[(size_t)(frame + i)] += (h + rr) * window[(size_t) i]; // re-window for OLA
+                    norm[(size_t)(frame + i)] += window[(size_t) i] * window[(size_t) i];
                 }
-            }
+            };
 
-            // Normalize OLA (Hann + 50% overlap = constant 1.0 after normalization).
-            for (int i = 0; i < n; ++i)
-                data[i] = dry[i] * (1.0f - mix) + output[i] * mix;
+            int frame = 0;
+            for (; frame + fftSize <= n; frame += hop) processFrame(frame);
+            // Cover the block tail so the end isn't left dry (skip if the last
+            // hop already landed exactly on n-fftSize).
+            if (n >= fftSize && ((n - fftSize) % hop) != 0) processFrame(n - fftSize);
+
+            // Normalise the overlap-add. Hann^2 at 50% overlap sums to
+            // 0.5*(1+cos^2), i.e. it ripples between 0.5 and 1.0 - so the old
+            // un-normalised version imposed an audible tremolo at the frame
+            // rate (~43 Hz at FFT Size 1024 / 44.1 kHz) and lost ~2.5 dB
+            // overall. Dividing by the accumulated window power makes the
+            // deterministic+stochastic round trip exactly unity at any hop.
+            // Samples no frame reached (the first/last partial window) keep the
+            // dry signal rather than fading to silence.
+            for (int i = 0; i < n; ++i) {
+                float wet = norm[(size_t) i] > 1e-6f ? output[(size_t) i] / norm[(size_t) i]
+                                                     : dry[(size_t) i];
+                data[i] = dry[(size_t) i] * (1.0f - mix) + wet * mix;
+            }
         }
     }
 
@@ -4210,9 +4784,53 @@ public:
     void changeProgramName(int, const juce::String&) override {}
     void getStateInformation(juce::MemoryBlock&) override {}
     void setStateInformation(const void*, int) override {}
+
+    // Total bytes reserved by every audio-thread scratch buffer. The self-test
+    // watches this across a run of blocks: if it grows, processBlock reached the
+    // allocator. (Same capacity-as-proxy technique as Curve EQ / Signal EQ.)
+    size_t scratchCapacityBytes() const {
+        return window.capacity() * sizeof(float)
+             + windowed.capacity() * sizeof(float)
+             + spectrum.capacity() * sizeof(FFT::cplx)
+             + harmSpectrum.capacity() * sizeof(FFT::cplx)
+             + harmonic.capacity() * sizeof(float)
+             + mags.capacity() * sizeof(float)
+             + dry.capacity() * sizeof(float)
+             + output.capacity() * sizeof(float)
+             + norm.capacity() * sizeof(float);
+    }
+
 private:
     Node& node;
     double sampleRate = 44100;
+
+    // ---- audio-thread scratch, all sized in prepareToPlay ------------------
+    FFTLadder ffts;                       // one prebuilt FFT per usable size
+    std::vector<float> window;            // Hann, contents rebuilt on size change
+    std::vector<float> windowed;          // one frame, windowed input
+    std::vector<FFT::cplx> spectrum;      // one frame's spectrum
+    std::vector<FFT::cplx> harmSpectrum;  // peaks-only copy of it
+    std::vector<float> harmonic;          // IFFT of the peaks-only spectrum
+    std::vector<float> mags;              // per-bin magnitudes
+    std::vector<float> dry, output, norm; // block-length accumulators
+    int maxBlockSize = 0;
+    int windowN = -1;                     // fftSize `window` currently holds
+
+    // Largest power of two <= v (v >= 1).
+    static int nextPow2AtMost(int v) {
+        int p = 1;
+        while ((p << 1) > 0 && (p << 1) <= v) p <<= 1;
+        return p;
+    }
+
+    // Refill the Hann window when the transform size changes. Writes into the
+    // buffer prepareToPlay sized, so it never reallocates.
+    void ensureWindow(int fftSize) {
+        if (windowN == fftSize) return;
+        for (int i = 0; i < fftSize; ++i)
+            window[(size_t) i] = 0.5f * (1.0f - std::cos(6.28318f * i / fftSize));
+        windowN = fftSize;
+    }
 };
 
 } // namespace SoundShop

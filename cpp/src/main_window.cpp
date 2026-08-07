@@ -143,8 +143,8 @@ MainContentComponent::MainContentComponent() {
     setupHotkeyCallbacks();
 
     // Routing strip: shared timeline for link gates, above piano roll panels
-    routingStrip = std::make_unique<RoutingStrip>(graph, transport);
-    addAndMakeVisible(routingStrip.get());
+    layerLegend = std::make_unique<LayerLegend>(graph, transport);
+    addAndMakeVisible(layerLegend.get());
 
     // Transport buttons
     addAndMakeVisible(playBtn);
@@ -174,78 +174,21 @@ MainContentComponent::MainContentComponent() {
     playBtn.onClick = [this]() { onPlay(); };
     stopBtn.onClick = [this]() { onStop(); };
     recordBtn.onClick = [this]() { onRecord(); };
-    // Set by findPlacement when the visible area was too crowded - tells the
-    // caller to fitAll() after the new node has been added so the refit
-    // includes it.
-    auto needsFitAfterPlacement = std::make_shared<bool>(false);
-    auto findPlacement = [this, needsFitAfterPlacement]() -> Vec2 {
-        *needsFitAfterPlacement = false;
-        // Place new tracks in the user's currently visible canvas rect.
-        // If no empty slot fits there, fit-all to expand the view and then
-        // place at the bottom of the (now wider) visible area.
-        const float nodeW = 200, nodeH = 80, padX = 30, padY = 20;
-        const float marginX = 40, marginY = 40;
-
-        // Compute visible canvas rect from the graph component's screen size.
-        auto screenW = (float)graphComponent->getWidth();
-        auto screenH = (float)graphComponent->getHeight();
-        auto tl = graphComponent->screenToCanvas({0.0f, 0.0f});
-        auto br = graphComponent->screenToCanvas({screenW, screenH});
-
-        // Collect existing timeline node positions for collision testing.
-        std::vector<Vec2> taken;
-        for (auto& n : graph.nodes)
-            if (n.type == NodeType::MidiTimeline || n.type == NodeType::AudioTimeline)
-                taken.push_back(n.pos);
-
-        auto isOccupied = [&](float x, float y) {
-            for (auto& t : taken)
-                if (std::abs(t.x - x) < nodeW && std::abs(t.y - y) < nodeH)
-                    return true;
-            return false;
-        };
-
-        // Walk slots inside the visible rect, column by column.
-        float startX = tl.x + marginX;
-        float startY = tl.y + marginY;
-        float endX   = br.x - marginX - nodeW;
-        float endY   = br.y - marginY - nodeH;
-        for (float x = startX; x <= endX; x += nodeW + padX) {
-            for (float y = startY; y <= endY; y += nodeH + padY) {
-                if (!isOccupied(x, y)) return {x, y};
-            }
-        }
-
-        // No empty slot in the visible area. Place the new node just below
-        // the bottom-most existing node, then signal the caller to fit-all
-        // *after* the node is added so the refit includes it.
-        float bottomMost = startY;
-        for (auto& t : taken)
-            if (t.y + nodeH > bottomMost) bottomMost = t.y + nodeH;
-        *needsFitAfterPlacement = true;
-        return {startX, bottomMost + padY};
-    };
-
-    addMidiBtn.onClick = [this, findPlacement, needsFitAfterPlacement]() {
-        auto pos = findPlacement();
+    addMidiBtn.onClick = [this]() {
+        bool needsFit = false;
+        auto pos = findFreeTimelineSlot(needsFit);
         auto& n = graph.addNode("MIDI Track", NodeType::MidiTimeline,
             {Pin{0, "MIDI In", PinKind::Midi, true}},
             {Pin{0, "MIDI", PinKind::Midi, false}}, pos);
         n.clips.push_back({"Clip 1", 0, 4, juce::Colours::cornflowerblue.getARGB()});
-        if (*needsFitAfterPlacement) graphComponent->fitAll();
+        if (needsFit) graphComponent->fitAll();
         graphComponent->repaint();
     };
-    addAudioBtn.onClick = [this, findPlacement, needsFitAfterPlacement]() {
-        auto pos = findPlacement();
-        auto& n = graph.addNode("Audio Track", NodeType::AudioTimeline,
-            {Pin{0, "Audio In", PinKind::Audio, true}},  // input pin for recording/monitoring
-            {Pin{0, "Audio", PinKind::Audio, false}}, pos);
-        n.clips.push_back({"Clip 1", 0, 4, juce::Colours::forestgreen.getARGB()});
-        // Recording params
-        n.params.push_back({"Input Channel", -1.0f, -1.0f, 31.0f}); // -1 = none, 0-31 = channel
-        n.params.push_back({"Volume", 1.0f, 0.0f, 1.0f});
-        n.params.push_back({"Pan", 0.0f, -1.0f, 1.0f});
-        if (*needsFitAfterPlacement) graphComponent->fitAll();
+    addAudioBtn.onClick = [this]() {
+        bool needsFit = false;
+        auto pos = findFreeTimelineSlot(needsFit);
+        graph.addAudioTrack("Audio Track", pos);
+        if (needsFit) graphComponent->fitAll();
         graphComponent->repaint();
     };
     fitAllBtn.onClick = [this]() { graphComponent->fitAll(); };
@@ -322,11 +265,10 @@ MainContentComponent::MainContentComponent() {
                        "(initially set to the full project length - drag the loop region in the routing strip to adjust).");
     loopBtn.onClick = [this]() {
         if (!graph.loopEnabled) {
-            // Enable loop: default to full project length
-            float maxBeat = 0;
-            for (auto& n : graph.nodes)
-                for (auto& c : n.clips)
-                    maxBeat = std::max(maxBeat, c.startBeat + c.lengthBeats);
+            // Enable loop: default to full project length. contentEndBeats()
+            // includes each track's cascading nesting offset, so a track nested
+            // under another one isn't cut out of the loop range.
+            float maxBeat = (float) graph.contentEndBeats();
             if (maxBeat <= 0) maxBeat = 4;
             graph.loopStartBeat = 0;
             graph.loopEndBeat = maxBeat;
@@ -651,7 +593,7 @@ MainContentComponent::MainContentComponent() {
         int interval = autosaveIntervalSeconds;
         juce::MessageManager::callAsync([safe2, interval]() {
             if (!safe2) return;
-            juce::AlertWindow::showAsync(
+            showAlertAsync(
                 juce::MessageBoxOptions()
                     .withIconType(juce::MessageBoxIconType::InfoIcon)
                     .withTitle("Autosave on Laptop")
@@ -665,6 +607,7 @@ MainContentComponent::MainContentComponent() {
                         "You can change the interval (or turn autosave off entirely) "
                         "later from the Options menu.")
                     .withButton("OK"),
+                safe2.getComponent(),
                 [safe2](int) {
                     if (!safe2) return;
                     safe2->autosaveLaptopNoticeShown = true;
@@ -960,17 +903,18 @@ void MainContentComponent::resized() {
     // Wide enough for the current/total form, e.g. "0:00.0/15:30.0   Bar 1:1.0/20".
     positionLabel.setBounds(transport.getX() + x, transport.getY() + 2, 270, 28);
 
-    // Split: graph on top, editors on bottom, routing strip between them
+    // Split: graph on top, editors on bottom, layer legend between them
     if (!editorPanels.empty()) {
         auto editorArea = area.removeFromBottom(editorPanelHeight);
 
-        // Routing strip: collapsible, sized to its content
-        int routingH = routingStrip->getDesiredHeight();
-        if (routingH > 0) {
-            routingStrip->setBounds(editorArea.removeFromTop(routingH));
-            routingStrip->setVisible(true);
+        // Layer legend: hidden when nothing in the project is gated, otherwise
+        // as tall as it needs to be to flow every chip at this width.
+        int legendH = layerLegend->getDesiredHeight(editorArea.getWidth());
+        if (legendH > 0) {
+            layerLegend->setBounds(editorArea.removeFromTop(legendH));
+            layerLegend->setVisible(true);
         } else {
-            routingStrip->setVisible(false);
+            layerLegend->setVisible(false);
         }
 
         // Lay out panels top-to-bottom using each panel's own heightPx.
@@ -988,7 +932,7 @@ void MainContentComponent::resized() {
             panel->component->setBounds(editorArea.removeFromTop(h));
         }
     } else {
-        routingStrip->setVisible(false);
+        layerLegend->setVisible(false);
     }
     graphComponent->setBounds(area);
 }
@@ -998,6 +942,17 @@ void MainContentComponent::timerCallback() {
     // each tick so the per-node "loading" spinner animates smoothly.
     if (projectLoading && graphComponent)
         graphComponent->repaint();
+
+    // The layer legend has no way to be told that a layer or effect group was
+    // added, removed or recoloured - that happens in the Effects lane, in the
+    // graph's wire menus, on project load and on undo - so it polls, and only
+    // asks for a re-layout when what it would draw actually changed (a new chip
+    // can wrap the band onto a second row, changing its height).
+    // Deliberately not gated on isVisible(): the band is hidden exactly when the
+    // project has no layers, so gating on it would mean the FIRST layer never
+    // brings it back.
+    if (layerLegend && layerLegend->refresh())
+        resized();
 
     // Power-state-aware autosave interval (#87): every ~5 seconds
     // (150 ticks at 30 Hz), check AC vs battery and adjust the
@@ -1041,7 +996,7 @@ void MainContentComponent::timerCallback() {
             // Offer to add this new device
             juce::String name = dev.name;
             juce::String id = dev.identifier;
-            juce::AlertWindow::showAsync(
+            showAlertAsync(
                 juce::MessageBoxOptions()
                     .withIconType(juce::MessageBoxIconType::QuestionIcon)
                     .withTitle("MIDI device connected")
@@ -1049,6 +1004,7 @@ void MainContentComponent::timerCallback() {
                                  + "\n\nAdd it to the graph?")
                     .withButton("Add")
                     .withButton("Ignore"),
+                this,
                 [this, name, id](int result) {
                     if (result != 1) return;
                     auto& n = graph.addNode(name.toStdString(), NodeType::MidiInput,
@@ -1421,6 +1377,9 @@ juce::PopupMenu MainContentComponent::getMenuForIndex(int idx, const juce::Strin
         menu.addSeparator();
         menu.addItem(32, "Reload Last Project on Startup", true, autoLoadLastProject);
         menu.addSeparator();
+        menu.addItem(42, "Auto-Create Tracks for Audio Inputs", true, autoCreateInputTracks);
+        menu.addItem(43, "Play Tracks Back While Recording Them", true, playbackWhileRecording);
+        menu.addSeparator();
         {
             juce::PopupMenu tuningMenu;
             for (int i = 0; i < (int)TuningSystem::COUNT; ++i)
@@ -1482,10 +1441,12 @@ juce::PopupMenu MainContentComponent::getMenuForIndex(int idx, const juce::Strin
         menu.addItem(309, "Trigger Node");
         menu.addItem(310, "MIDI Modulator");
         menu.addItem(311, "Convolution Filter");
+        menu.addItem(318, "Wavelet Effects");
         menu.addItem(313, "Script (Signal + MIDI)");
         menu.addItem(314, "Algorithmic MIDI");
         menu.addItem(315, "Voices (Polyphony)");
         menu.addItem(316, "Recording Automation");
+        menu.addItem(317, "Recording Audio");
         menu.addSeparator();
         menu.addItem(312, "Keyboard Shortcuts");
         menu.addSeparator();
@@ -1636,14 +1597,17 @@ void MainContentComponent::menuItemSelected(int menuItemID, int) {
         case 314: openHelpDoc("midi-script.html"); break;
         case 315: openHelpDoc("voices.html"); break;
         case 316: openHelpDoc("automation-recording.html"); break;
+        case 317: openHelpDoc("recording-audio.html"); break;
+        case 318: openHelpDoc("wavelet-effects.html"); break;
         case 320:
-            juce::AlertWindow::showMessageBoxAsync(
+            juce::NativeMessageBox::showMessageBoxAsync(
                 juce::MessageBoxIconType::InfoIcon,
                 "About SoundShop",
                 "SoundShop2\n\n"
                 "A node-based DAW designed to be intuitive for people "
                 "without a musical background.\n\n"
-                "See Help > User Guide for documentation.");
+                "See Help > User Guide for documentation.",
+                this);
             break;
         case 50: openHotkeySettings(); break;
         case 51: {
@@ -1691,6 +1655,12 @@ void MainContentComponent::menuItemSelected(int menuItemID, int) {
             break;
         case 31: showScriptConsole(); break;
         case 32: autoLoadLastProject = !autoLoadLastProject; savePreferences(); break;
+        case 42: autoCreateInputTracks = !autoCreateInputTracks; savePreferences(); break;
+        case 43:
+            playbackWhileRecording = !playbackWhileRecording;
+            applyRecordingPrefsToGraph();   // takes effect mid-take, not just next one
+            savePreferences();
+            break;
         case 33: graph.projectSampleRate = 0; audioEngine.setProjectSampleRate(0); break;
         case 34: graph.projectSampleRate = 44100; audioEngine.setProjectSampleRate(44100); break;
         case 35: graph.projectSampleRate = 48000; audioEngine.setProjectSampleRate(48000); break;
@@ -2967,13 +2937,37 @@ void MainContentComponent::onStop() {
         auto* node = graph.findNode(nodeId);
         if (node) audioEngine.getRecordingManager().stopRecording(*node, transport);
         recordBtn.setButtonText("Play & Record");
+        // Finishing a take adds clips/take lanes to the graph. That is a
+        // structural mutation like any other, so it gets its own undo step
+        // (and, via undo-tree growth, marks the project dirty).
+        graph.commitSnapshot("Record audio");
     }
     // Stop multi-track recording
     if (audioEngine.getMultitrackRecorder().isRecording()) {
-        audioEngine.getMultitrackRecorder().stopRecording(
-            graph, transport, audioEngine.getSampleRate());
+        auto& rec = audioEngine.getMultitrackRecorder();
+        rec.stopRecording(graph, transport, audioEngine.getSampleRate());
         recordBtn.setButtonText("Play & Record");
         audioEngine.getGraphProcessor().requestRebuild();
+        graph.commitSnapshot("Record audio");
+
+        // A take with gaps in it must never be handed over silently - the
+        // performance is gone and only the user can decide to redo it.
+        if (auto dropped = rec.getDroppedSampleCount(); dropped > 0) {
+            double secs = (double) dropped / audioEngine.getSampleRate();
+            juce::NativeMessageBox::showAsync(
+                juce::MessageBoxOptions()
+                    .withIconType(juce::MessageBoxIconType::WarningIcon)
+                    .withTitle("Recording dropped audio")
+                    .withMessage(
+                        "About " + juce::String(secs, 2) + " seconds of the take "
+                        "could not be written to disk in time, so the recording "
+                        "has gaps.\n\n"
+                        "This usually means the drive was too busy. Recording to a "
+                        "faster drive, or arming fewer tracks at once, should fix it.")
+                    .withButton("OK")
+                    .withAssociatedComponent(this),
+                nullptr);
+        }
     }
     // Stop MIDI recording
     if (audioEngine.isMidiRecording()) {
@@ -2986,6 +2980,29 @@ void MainContentComponent::onStop() {
     transport.playing = false;
     audioEngine.stop();
     playBtn.setButtonText("Play");
+}
+
+void MainContentComponent::finishTakeBeforeGraphSwap() {
+    // New/Open project throw graph.nodes away and rebuild it. Every recorder
+    // holds *node ids* into the graph that is about to disappear, so a take
+    // left running across the swap would finalize onto whichever node happened
+    // to inherit that id in the new project - dropping a stray clip on an
+    // unrelated track, and leaving it flagged mid-take (hence silent, via
+    // PanProcessor's record mute) with nothing in the UI to explain it.
+    //
+    // Stopping first is also just the honest behaviour: the take is written to
+    // disk and turned into a clip on the project it was actually recorded into,
+    // which the user can still save or undo, instead of being discarded.
+    if (audioEngine.getMultitrackRecorder().isRecording()
+        || audioEngine.getRecordingManager().isRecording()
+        || audioEngine.isMidiRecording()
+        || transport.playing)
+        onStop();
+
+    // Belt and braces for any path that got a node flagged without a matching
+    // stop (a failed take, a crash-recovery load). A stuck flag is silent audio
+    // with no visible cause, so it is worth clearing unconditionally.
+    MultitrackRecorder::clearRecordingFlags(graph);
 }
 
 void MainContentComponent::beginAutomationPass() {
@@ -3217,6 +3234,13 @@ void MainContentComponent::onRecord() {
         graphComponent->repaint();
     }
 
+    // Give every live input somewhere to land before we look for armed tracks,
+    // so a freshly plugged-in mic records on the very first press.
+    if (ensureInputTracksForRecording() > 0) {
+        audioEngine.getGraphProcessor().requestRebuild();
+        graphComponent->repaint();
+    }
+
     // Check if any Audio Tracks are armed for multi-track recording
     bool anyArmed = false;
     for (auto& n : graph.nodes)
@@ -3245,7 +3269,7 @@ void MainContentComponent::onRecord() {
         auto outputDir = juce::File::getSpecialLocation(juce::File::currentExecutableFile)
                              .getParentDirectory().getChildFile("recordings").getFullPathName().toStdString();
         audioEngine.getRecordingManager().startRecording(
-            *recordNode, 2, audioEngine.getSampleRate(), outputDir);
+            *recordNode, 2, audioEngine.getSampleRate(), outputDir, transport);
     }
 
     // Start playback
@@ -3254,6 +3278,7 @@ void MainContentComponent::onRecord() {
 }
 
 void MainContentComponent::newProject() {
+    finishTakeBeforeGraphSwap();
     editorPanels.clear();
     editorPanelHeight = 250;
     // Clearing + rebuilding the graph is a structural mutation the audio
@@ -3333,13 +3358,14 @@ void MainContentComponent::openHelpDoc(const juce::String& docRelativePath) {
                       .getParentDirectory();
     auto docFile = exeDir.getChildFile("docs").getChildFile(docRelativePath);
     if (!docFile.existsAsFile()) {
-        juce::AlertWindow::showMessageBoxAsync(
+        juce::NativeMessageBox::showMessageBoxAsync(
             juce::MessageBoxIconType::WarningIcon,
             "Help file not found",
             "Couldn't find the docs file:\n\n  " + docFile.getFullPathName()
             + "\n\nThe docs folder should sit alongside SoundShop.exe. "
             + "If you built from source, re-run the build to copy the docs, "
-            + "or browse the project's docs/ folder directly.");
+            + "or browse the project's docs/ folder directly.",
+            this);
         return;
     }
     // startAsProcess opens the file in its default OS handler - for .html
@@ -3493,6 +3519,7 @@ void MainContentComponent::upgradeLegacyNodes() {
 }
 
 void MainContentComponent::openProjectFile(const juce::String& path) {
+    finishTakeBeforeGraphSwap();
     editorPanels.clear();
     // Hold the graph mutation lock for the load + legacy-node fixup.
     // ProjectFile::load clears graph.nodes/links and rebuilds them from the
@@ -3671,10 +3698,8 @@ void MainContentComponent::freezeNodes(const std::vector<int>& nodeIds) {
     if (targets.empty()) return;
 
     // Project length in beats (+ a tail so release/reverb aren't chopped).
-    float maxBeat = 0;
-    for (auto& n : graph.nodes)
-        for (auto& c : n.clips)
-            maxBeat = std::max(maxBeat, c.startBeat + c.lengthBeats);
+    // contentEndBeats() accounts for track nesting offsets.
+    float maxBeat = (float) graph.contentEndBeats();
     if (maxBeat <= 0) maxBeat = 4;
     maxBeat += 4;
 
@@ -4007,10 +4032,9 @@ void MainContentComponent::importModFile() {
 }
 
 void MainContentComponent::exportAudio() {
-    float maxBeat = 0;
-    for (auto& n : graph.nodes)
-        for (auto& c : n.clips)
-            maxBeat = std::max(maxBeat, c.startBeat + c.lengthBeats);
+    // contentEndBeats() includes each track's cascading nesting offset, so a
+    // nested track's tail isn't chopped off the end of the render.
+    float maxBeat = (float) graph.contentEndBeats();
     if (maxBeat <= 0) maxBeat = 4;
     maxBeat += 4;
 
@@ -4289,6 +4313,7 @@ void MainContentComponent::openEditor(Node& node) {
             p->component->repaint();
         if (graphComponent) graphComponent->repaint();
     };
+    panel->component->onOpenHelpDoc = [this](juce::String rel) { openHelpDoc(rel); };
     addAndMakeVisible(panel->component.get());
     editorPanels.push_back(std::move(panel));
 
@@ -4356,11 +4381,20 @@ bool MainContentComponent::tryQuit() {
         return true;
     }
 
-    int result = juce::AlertWindow::showYesNoCancelBox(
-        juce::MessageBoxIconType::QuestionIcon,
-        "Unsaved Changes",
-        "You have unsaved changes. Save before quitting?",
-        "Save", "Don't Save", "Cancel");
+    // Spelled out as MessageBoxOptions rather than showYesNoCancelBox because
+    // the native yes/no/cancel helper doesn't take custom button labels, and
+    // "Save / Don't Save / Cancel" is a lot clearer here than "Yes / No /
+    // Cancel". Result codes still follow the AlertWindow convention
+    // (1 = Save, 2 = Don't Save, 0 = Cancel) - see showAlert().
+    int result = showAlert(
+        juce::MessageBoxOptions()
+            .withIconType(juce::MessageBoxIconType::QuestionIcon)
+            .withTitle("Unsaved Changes")
+            .withMessage("You have unsaved changes. Save before quitting?")
+            .withButton("Save")
+            .withButton("Don't Save")
+            .withButton("Cancel"),
+        this);
     if (result == 2) {                   // Don't Save
         // User explicitly threw their edits away - autosave AND undo
         // history go with them. (A clean save+quit instead would keep
@@ -4430,6 +4464,91 @@ void MainContentComponent::saveRecentProjects() {
 // Preferences
 // ==============================================================================
 
+// First free slot for a new timeline node, inside the user's currently visible
+// canvas rect. If nothing fits there, place below the bottom-most existing
+// track and set `needsFitAfterPlacement` so the caller can fitAll() *after*
+// adding the node (so the refit includes it).
+Vec2 MainContentComponent::findFreeTimelineSlot(bool& needsFitAfterPlacement) {
+    needsFitAfterPlacement = false;
+    const float nodeW = 200, nodeH = 80, padX = 30, padY = 20;
+    const float marginX = 40, marginY = 40;
+
+    auto screenW = (float) graphComponent->getWidth();
+    auto screenH = (float) graphComponent->getHeight();
+    auto tl = graphComponent->screenToCanvas({0.0f, 0.0f});
+    auto br = graphComponent->screenToCanvas({screenW, screenH});
+
+    std::vector<Vec2> taken;
+    for (auto& n : graph.nodes)
+        if (n.type == NodeType::MidiTimeline || n.type == NodeType::AudioTimeline)
+            taken.push_back(n.pos);
+
+    auto isOccupied = [&](float x, float y) {
+        for (auto& t : taken)
+            if (std::abs(t.x - x) < nodeW && std::abs(t.y - y) < nodeH)
+                return true;
+        return false;
+    };
+
+    float startX = tl.x + marginX;
+    float startY = tl.y + marginY;
+    float endX   = br.x - marginX - nodeW;
+    float endY   = br.y - marginY - nodeH;
+    for (float x = startX; x <= endX; x += nodeW + padX)
+        for (float y = startY; y <= endY; y += nodeH + padY)
+            if (!isOccupied(x, y)) return {x, y};
+
+    float bottomMost = startY;
+    for (auto& t : taken)
+        if (t.y + nodeH > bottomMost) bottomMost = t.y + nodeH;
+    needsFitAfterPlacement = true;
+    return {startX, bottomMost + padY};
+}
+
+// Make sure every live input channel on the audio device has an armed Audio
+// Track to record into. Called at the top of onRecord so plugging in a mic and
+// pressing record Just Works, with no prior knowledge that a track needs to
+// exist and be pointed at a channel by hand.
+//
+// Off => the old behaviour: only tracks the user explicitly armed via
+// "Record Here" are captured.
+int MainContentComponent::ensureInputTracksForRecording() {
+    if (!autoCreateInputTracks) return 0;
+
+    auto inputs = audioEngine.getAvailableInputs();
+    if (inputs.empty()) return 0;
+
+    std::vector<InputTrackSpec> specs;
+    specs.reserve(inputs.size());
+    for (const auto& in : inputs)
+        specs.push_back({ in.channel, in.trackName.toStdString() });
+
+    // Wire new tracks into the first Output node, if the project has one.
+    int outputPinId = -1;
+    for (auto& n : graph.nodes)
+        if (n.type == NodeType::Output && !n.pinsIn.empty()) {
+            outputPinId = n.pinsIn[0].id;
+            break;
+        }
+
+    bool needsFit = false;
+    auto created = ensureInputTracks(graph, specs, outputPinId,
+        [this, &needsFit]() {
+            bool thisOne = false;
+            auto pos = findFreeTimelineSlot(thisOne);
+            needsFit = needsFit || thisOne;
+            return pos;
+        });
+
+    if (!created.empty()) {
+        if (needsFit) graphComponent->fitAll();
+        graph.commitSnapshot(created.size() == 1
+            ? "Add track for audio input"
+            : "Add tracks for audio inputs");
+    }
+    return (int) created.size();
+}
+
 static juce::File getPreferencesFile() {
     return juce::File::getSpecialLocation(juce::File::currentExecutableFile)
                .getSiblingFile("soundshop_prefs.xml");
@@ -4453,6 +4572,16 @@ void MainContentComponent::loadPreferences() {
     autosaveIntervalSeconds = xml->getIntAttribute("autosaveIntervalSeconds", autoDefault);
     if (autosaveIntervalSeconds < 1) autosaveIntervalSeconds = 1;
     autosaveLaptopNoticeShown = xml->getBoolAttribute("autosaveLaptopNoticeShown", false);
+    autoCreateInputTracks = xml->getBoolAttribute("autoCreateInputTracks", true);
+    playbackWhileRecording = xml->getBoolAttribute("playbackWhileRecording", false);
+    applyRecordingPrefsToGraph();
+}
+
+// The audio thread reads the mute rule off NodeGraph (PanProcessor has the
+// graph, not the window), so any change to the preference has to be mirrored
+// there. Called from loadPreferences and from the Settings menu handler.
+void MainContentComponent::applyRecordingPrefsToGraph() {
+    graph.playbackWhileRecording = playbackWhileRecording;
 }
 
 void MainContentComponent::savePreferences() {
@@ -4462,6 +4591,8 @@ void MainContentComponent::savePreferences() {
     xml->setAttribute("autosaveEnabled", autosaveEnabled);
     xml->setAttribute("autosaveIntervalSeconds", autosaveIntervalSeconds);
     xml->setAttribute("autosaveLaptopNoticeShown", autosaveLaptopNoticeShown);
+    xml->setAttribute("autoCreateInputTracks", autoCreateInputTracks);
+    xml->setAttribute("playbackWhileRecording", playbackWhileRecording);
     xml->writeTo(getPreferencesFile());
 }
 
@@ -5086,7 +5217,7 @@ void MainContentComponent::handleSharedHistoryOnOpen(const juce::String& project
         "- Ignore: start with a fresh undo history. The shared file "
         "stays untouched.";
 
-    juce::AlertWindow::showAsync(
+    showAlertAsync(
         juce::MessageBoxOptions()
             .withIconType(juce::MessageBoxIconType::QuestionIcon)
             .withTitle("Shared Undo History Found")
@@ -5094,6 +5225,7 @@ void MainContentComponent::handleSharedHistoryOnOpen(const juce::String& project
             .withButton("Use It")
             .withButton("Use a Copy")
             .withButton("Ignore"),
+        this,
         [safe, sidecar, capturedPath](int result) {
             if (!safe) return;
             if (result == 1) {
@@ -5138,7 +5270,7 @@ void MainContentComponent::offerSharedHistoryOnSaveAs(const juce::String& savedP
     juce::Component::SafePointer<MainContentComponent> safe(this);
     juce::String capturedPath = savedProjectPath;
 
-    juce::AlertWindow::showAsync(
+    showAlertAsync(
         juce::MessageBoxOptions()
             .withIconType(juce::MessageBoxIconType::QuestionIcon)
             .withTitle("Include Undo History?")
@@ -5154,6 +5286,7 @@ void MainContentComponent::offerSharedHistoryOnSaveAs(const juce::String& savedP
                 "saved privately on your machine either way.")
             .withButton("Yes, Include")
             .withButton("No Thanks"),
+        this,
         [safe, capturedPath](int result) {
             if (!safe) return;
             if (result != 1) return;
@@ -5248,13 +5381,14 @@ void MainContentComponent::tryRecoverAutosave() {
 
     juce::Component::SafePointer<MainContentComponent> safe(this);
     juce::String capturedOriginal = originalPath;
-    juce::AlertWindow::showAsync(
+    showAlertAsync(
         juce::MessageBoxOptions()
             .withIconType(juce::MessageBoxIconType::QuestionIcon)
             .withTitle("Recover Autosaved Version?")
             .withMessage(message)
             .withButton("Recover")
             .withButton("Discard"),
+        this,
         [safe, capturedOriginal](int result) {
             if (!safe) return;
             if (result != 1) {
@@ -5389,16 +5523,16 @@ public:
 
         // If no Python interpreter is available, the console can't run anything.
         // Say so up front (rather than silently doing nothing on Run) and
-        // explain how to enable it — see CLAUDE.md's grayed-control rule.
+        // explain how to enable it - see CLAUDE.md's grayed-control rule.
         if (!ScriptEngine::pythonAvailable()) {
             outputEditor.setText(
                 "Python scripting is disabled: no Python interpreter was found.\n"
-                "SEANCE delay-loads Python, so it runs fine without it — but the\n"
+                "SEANCE delay-loads Python, so it runs fine without it - but the\n"
                 "Script Console, Python signal evaluation, and the Python shape\n"
                 "baker need a Python install. Install Python (matching this build's\n"
                 "version) so its DLL is on the system PATH, then restart SEANCE.");
             runBtn.setEnabled(false);
-            runBtn.setTooltip("Disabled — no Python interpreter was found. Install "
+            runBtn.setTooltip("Disabled - no Python interpreter was found. Install "
                               "Python and restart SEANCE to enable scripting.");
         }
 
@@ -6355,13 +6489,11 @@ void MainWindow::tryQuit() {
 
 void MainContentComponent::bounceToAudioTrack() {
     // Calculate project length from the last clip end + 4 beats of tail.
-    float maxBeat = 0;
-    for (auto& n : graph.nodes)
-        for (auto& c : n.clips)
-            maxBeat = std::max(maxBeat, c.startBeat + c.lengthBeats);
+    // contentEndBeats() accounts for track nesting offsets.
+    float maxBeat = (float) graph.contentEndBeats();
     if (maxBeat <= 0) {
-        juce::AlertWindow::showMessageBoxAsync(juce::MessageBoxIconType::InfoIcon,
-            "Nothing to bounce", "Add some clips to the timeline first.");
+        juce::NativeMessageBox::showMessageBoxAsync(juce::MessageBoxIconType::InfoIcon,
+            "Nothing to bounce", "Add some clips to the timeline first.", this);
         return;
     }
     maxBeat += 4; // tail for reverb / release tails
@@ -6438,8 +6570,8 @@ void MainContentComponent::bounceToAudioTrack() {
 void MainContentComponent::createAudioTrackFromOutputCache(Node& outputNode) {
     auto& c = outputNode.cache;
     if (!c.valid || c.numSamples <= 0 || c.left.empty()) {
-        juce::AlertWindow::showMessageBoxAsync(juce::MessageBoxIconType::InfoIcon,
-            "No cached audio", "Play the song first, then click Capture.");
+        juce::NativeMessageBox::showMessageBoxAsync(juce::MessageBoxIconType::InfoIcon,
+            "No cached audio", "Play the song first, then click Capture.", this);
         return;
     }
 
@@ -6501,8 +6633,9 @@ void MainContentComponent::saveCaptureToDisk(const juce::File& file) {
 void MainContentComponent::createAudioTrackFromCapture() {
     auto buf = audioEngine.getCaptureBuffer();
     if (buf.getNumSamples() == 0) {
-        juce::AlertWindow::showMessageBoxAsync(juce::MessageBoxIconType::InfoIcon,
-            "Capture Empty", "No audio was captured. Make sure to play something while Capture is on.");
+        juce::NativeMessageBox::showMessageBoxAsync(juce::MessageBoxIconType::InfoIcon,
+            "Capture Empty", "No audio was captured. Make sure to play something while Capture is on.",
+            this);
         return;
     }
 

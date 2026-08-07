@@ -78,26 +78,6 @@ if exist "%BASE%third_party\lua\lua.h" (
 echo.
 
 :: ============================================
-:: Rubber Band (pitch shifting / time stretching)
-:: ============================================
-if exist "%BASE%third_party\rubberband\rubberband\RubberBandStretcher.h" (
-    echo [OK] Rubber Band: Already downloaded
-) else (
-    echo [..] Downloading Rubber Band...
-    git clone --depth 1 https://github.com/breakfastquay/rubberband.git "%BASE%third_party\rubberband" 2>nul
-    if exist "%BASE%third_party\rubberband\rubberband\RubberBandStretcher.h" (
-        :: Fix include path issue
-        if not exist "%BASE%third_party\rubberband\src\common\system" mkdir "%BASE%third_party\rubberband\src\common\system"
-        copy "%BASE%third_party\rubberband\src\common\sysutils.h" "%BASE%third_party\rubberband\src\common\system\sysutils.h" >nul
-        echo [OK] Rubber Band: Downloaded
-    ) else (
-        echo [FAIL] Rubber Band: Download failed.
-        echo        Clone manually: git clone https://github.com/breakfastquay/rubberband third_party/rubberband
-    )
-)
-echo.
-
-:: ============================================
 :: libopus + libogg (for Opus export)
 :: ============================================
 if exist "%BASE%third_party\opus\include\opus.h" (

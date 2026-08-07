@@ -47,52 +47,21 @@ void spectralWarpBuffer(std::vector<float>& buf, WarpMethod method, float amount
         buf[(size_t)i] = (i < (int)timeOut.size()) ? timeOut[(size_t)i] : 0.0f;
 }
 
-// ---- Perfect-reconstruction DWT round trip (local to buffer_warp) ----------
+// ---- Perfect-reconstruction DWT round trip ---------------------------------
 //
-// We deliberately do NOT use wavelet.h's dwt()/idwt() here. That pair's synthesis
-// step convolves with the TIME-REVERSED filters (g0[j]=h0[N-1-j]); for multi-tap
-// orthogonal wavelets that is not the adjoint of the analysis, so idwt(dwt(x)) is
-// lossy (it does not reconstruct x). That has never mattered for the wavelet
-// PAINTER, which only ever idwt's hand-authored coefficients - the only consumer
-// of wavelet.h's idwt - so its convention must stay frozen for project
-// compatibility. A forward->warp->inverse round trip, however, requires true
-// perfect reconstruction. The correct orthonormal synthesis is the transpose of
-// the analysis: scatter with the SAME analysis filters h0/h1 (not reversed),
-// which gives A^T A = I exactly (periodic boundary) - so amount 0 is an exact
-// identity with no shift. We reuse getWaveletFilter() so the filter COEFFICIENTS
-// remain a single source of truth; only the (correct) synthesis convolution
-// lives here.
-static void dwtStepPR(std::vector<float>& data, int len, const WaveletFilter& f) {
-    int N = (int)f.h0.size();
-    std::vector<float> approx(len / 2), detail(len / 2);
-    for (int i = 0; i < len / 2; ++i) {
-        float a = 0.0f, d = 0.0f;
-        for (int j = 0; j < N; ++j) {
-            int idx = (2 * i + j) % len;
-            a += f.h0[j] * data[(size_t)idx];
-            d += f.h1[j] * data[(size_t)idx];
-        }
-        approx[(size_t)i] = a;
-        detail[(size_t)i] = d;
-    }
-    for (int i = 0; i < len / 2; ++i) {
-        data[(size_t)i]              = approx[(size_t)i];
-        data[(size_t)(len / 2 + i)]  = detail[(size_t)i];
-    }
-}
-static void idwtStepPR(std::vector<float>& data, int len, const WaveletFilter& f) {
-    int half = len / 2;
-    int N = (int)f.h0.size();
-    std::vector<float> result((size_t)len, 0.0f);
-    for (int i = 0; i < half; ++i) {
-        for (int j = 0; j < N; ++j) {
-            int idx = (2 * i + j) % len;            // adjoint: same filters, scatter
-            result[(size_t)idx] += f.h0[j] * data[(size_t)i]
-                                 + f.h1[j] * data[(size_t)(half + i)];
-        }
-    }
-    for (int i = 0; i < len; ++i) data[(size_t)i] = result[(size_t)i];
-}
+// A forward->warp->inverse round trip requires TRUE perfect reconstruction, so
+// this uses wavelet.h's dwtStep() paired with idwtStepPR() - the PR (adjoint)
+// synthesis, which scatters with the same analysis filters h0/h1 and therefore
+// satisfies A^T A = I exactly on a periodic boundary. Amount 0 is then an exact
+// identity with no shift.
+//
+// It must NOT use wavelet.h's plain idwtStep(): that is the frozen LEGACY
+// painter convention, which convolves with the time-reversed filters and is
+// lossy. See the convention note in wavelet.h for which to use when.
+//
+// (Both PR helpers used to be duplicated here as file-local statics. They now
+// live in wavelet.h so the effect nodes can share them, and so there is only
+// one copy of the maths to keep correct.)
 
 void waveletWarpBuffer(std::vector<float>& buf, WarpMethod method, float amount,
                        const std::string& filter, int levels) {
@@ -113,7 +82,7 @@ void waveletWarpBuffer(std::vector<float>& buf, WarpMethod method, float amount,
     int filterLen = (int)filt.h0.size();
     int len = n, done = 0;
     for (int l = 0; l < levels && len >= filterLen; ++l) {
-        dwtStepPR(coeffs, len, filt);
+        dwtStep(coeffs, len, filt);
         len /= 2;
         ++done;
     }

@@ -57,6 +57,17 @@
 
 <p>Mouse wheel scrolls horizontally; Ctrl+wheel zooms in toward the cursor up to 128×. When zoomed in far enough that each sample is at least 5 pixels wide, the editor switches to a sample-stems view where each individual sample shows as a vertical line with a dot at its tip, and a faint grid marks sample boundaries. This is the precise mode for surgical sample-level editing.</p>
 
+<h2>Saving and reusing IRs</h2>
+
+<p>Once you've built an IR you like — a hand-drawn filter, a tweaked preset, or a loaded room recording — you can stash it in the project's <strong>asset library</strong> so any other Convolution Filter can reuse it. Two buttons next to the IR Length slider handle this:</p>
+
+<ul>
+<li><strong>Save to Library</strong> — asks for a name (it suggests the node's name) and saves the current IR. It then appears under <em>Edit → Asset Library → Convolution IRs</em>, where you can rename, star, duplicate, or archive it like any other asset. It's stored in the project, so it travels with a save and with library Export/Import.</li>
+<li><strong>Load from Library</strong> — pops up a list of every IR you've saved; pick one and it drops into the editor as an independent copy you can keep editing. Editing it here never changes the saved version — to change the stored one, load it, edit, and Save to Library again (or duplicate it from the Asset Library panel).</li>
+</ul>
+
+<p>This is the easy way to build a personal collection of go-to cabinets, rooms, and custom filters and pull them up instantly instead of re-drawing or re-loading files each time.</p>
+
 <h2>Capturing real rooms</h2>
 
 <p>SEANCE has a built-in tool to capture impulse responses from real spaces — click <em>Tools → Capture Room IR…</em> in the menus. Place your microphone where the listener would sit, point your speakers into the room, and the tool plays a sine sweep through the speakers and records the room's response with the mic. The captured IR is automatically loaded into a new Convolution Filter node ready to use. See the Room IR Capture dialog's tooltips for the recording parameters.</p>

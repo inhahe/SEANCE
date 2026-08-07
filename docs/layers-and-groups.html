@@ -23,33 +23,76 @@
 
 <h2>Layers (effect regions)</h2>
 
-<p>A <strong>layer</strong> is a time range during which a specific cable is active. You can see layers as colored bars drawn above the notes in the piano roll, each bar representing one layer. Outside the bar, the wire is muted (with a short crossfade at the edges to prevent clicks — see Options → Crossfade Duration).</p>
+<p>A <strong>layer</strong> is a time range during which a specific cable is active. Outside that range the wire is muted, with a short crossfade at the edges so you don't hear a click (see Options → Crossfade Duration).</p>
 
-<p>To create a layer:</p>
+<h3>Where layers live: the Effects lane</h3>
+
+<p>Open a track's piano roll and look just above the note grid. Above the <em>Start</em> strip there's a thin band labelled <strong>▸ Effects</strong> on the left. That's the <strong>Effects lane</strong>, and it's where all of this happens. It's always there — if the track has no layers yet it just says <em>"no effect layers — click to add one"</em>.</p>
+
+<p>Layers show up in the lane as coloured tubes, one row per wire or group, each tube spanning the beats where that routing is switched on.</p>
+
+<p>This works the same on <strong>audio tracks</strong> as on MIDI tracks — both open the same editor, and both have the Effects lane.</p>
+
+<h3>Making your first layer</h3>
 <ol>
-  <li>Right-click on a wire in the graph, choose <em>Time-gate…</em></li>
-  <li>Drag in a piano roll layer bar area to set the start/end of the region</li>
-  <li>The region is tied to this specific wire, so it only affects that one connection</li>
+  <li><strong>Click the Effects lane.</strong> It expands, giving you room to work. (You can also right-click it directly.)</li>
+  <li><strong>Right-click at the beat where you want the effect to come in</strong>, and choose <em>Add layer at beat N…</em></li>
+  <li><strong>Pick what to gate</strong> — either an effect group, or a single wire listed as <em>Source → Destination</em>. For the reverb example above you'd pick <em>Synth → Reverb</em>. The little coloured square next to each entry is the colour the tube will be, so you can pick by colour once you know your project. If two wires run between the same pair of nodes, they're spelled out with the plugs they use, like <em>Voice In 2 → Signal Osc&nbsp;&nbsp;(Gate → Gate)</em>.</li>
 </ol>
 
-<p>Each layer has a color matching the wire (or group) it belongs to so you can tell at a glance which routing is being gated.</p>
+<p>You get a 4-beat tube in the wire's colour. Now shape it:</p>
+<ul>
+  <li><strong>Drag its middle</strong> to slide it earlier or later.</li>
+  <li><strong>Drag either end</strong> to make it longer or shorter — the cursor turns into a ↔ arrow when you're on an end.</li>
+  <li>You can put an edge <em>anywhere</em> — it isn't locked to the grid. But the grid lines are slightly magnetic, so landing exactly on a beat is easy. See below.</li>
+  <li><strong>Right-click a tube</strong> to delete it.</li>
+</ul>
+
+<h3>Sticky beats</h3>
+
+<p>Layer edges move freely, pixel by pixel — you can park a gate a hair before a beat, which is often exactly what you want so the effect is already open when the note arrives.</p>
+
+<p>To stop that making beats hard to hit, each grid line grabs an edge <em>on the way out, not on the way in</em>. Slide toward a beat and nothing pulls at you, so you can stop just short of it. Slide <em>past</em> the beat and it holds on for a few pixels — let go there and you're exactly on it. Keep dragging and it lets go.</p>
+
+<p>Drag back the other way and the stickiness flips to the other side of the line, so you can always undo a snap by reversing. Hold <strong>Alt</strong> (or set Snap to <em>Off</em>) if you want no magnetism at all.</p>
+
+<p>When you're finished, collapse the lane back to its thin ribbon: press <strong>Escape</strong>, click the <strong>▾ Effects</strong> caption on the left, or right-click → <em>Done editing</em>.</p>
+
+<p>Each layer is coloured to match the wire (or group) it gates, so you can tell at a glance which routing is being switched on and off.</p>
+
+<div class="tip">
+<strong>Layers belong to the track, not the timeline.</strong> If you slide a track's start position left or right in the <em>Start</em> strip, its layers slide with it and keep gating the same music. The same is true when you insert or delete time.
+</div>
 
 <h2>Effect groups</h2>
 
 <p>Sometimes you want to activate <em>multiple wires at once</em> — e.g., a reverb send AND a delay send AND a filter mod, all gated as one "chorus effects on" layer. That's what an <strong>Effect Group</strong> is: a named bag of wires that can be activated together.</p>
 
-<p>To create an effect group:</p>
+<h3>Making a group</h3>
+
+<p>The quickest way is from the same place you make layers:</p>
 <ol>
-  <li>Right-click a wire → <em>Effect Group → New Group…</em></li>
-  <li>Give it a name</li>
-  <li>Right-click other wires → <em>Effect Group → Add to [group name]</em></li>
+  <li><strong>Right-click the Effects lane</strong> at the beat where the bundle should come in, and choose <em>Add layer at beat N…</em></li>
+  <li>Pick the first entry, <strong><em>New group of wires…</em></strong></li>
+  <li>A list of every wire in your project appears, each with its colour square. <strong>Tick the ones that belong together</strong> — the reverb send, the delay send, the filter mod.</li>
+  <li>Type a name (optional, but "Chorus FX" beats "Group #3") and press <strong>Create</strong>.</li>
 </ol>
 
-<p>Now you can create a layer that references the group instead of a single wire, and all wires in the group activate/deactivate together. Each group gets its own color drawn on member wires (circles for wire identity, diamonds for group membership).</p>
+<p>You get the group <em>and</em> a layer for it, right where you clicked. Shape it like any other layer. All the wires in it now switch on and off together.</p>
 
-<h2>The routing strip</h2>
+<p>There's a second route, handy when you're already looking at the graph: right-click a wire → <em>Effect Group → New Group…</em>, then right-click each other wire → <em>Effect Group → Add to [group name]</em>.</p>
 
-<p>Above the piano roll, a narrow <strong>routing strip</strong> appears when any layers exist. It shows each gated wire as a horizontal "wire" bar with 3D shading, colored to match its wire/group. The horizontal axis matches the piano roll below, so you can see at a glance which wires are active at which beats across the whole project.</p>
+<p>Each group gets its own color drawn on member wires (circles for wire identity, diamonds for group membership).</p>
+
+<h2>The layer legend</h2>
+
+<p>Above the stack of track editors, a thin band labelled <strong>Layers:</strong> appears as soon as any layers exist anywhere in the project. It's a list of coloured chips — one per wire or group that's gated <em>anywhere</em>, no matter which track its layers live on.</p>
+
+<p>It exists because a layer, once drawn, is just a colour. A collapsed Effects lane is a stack of unlabelled tubes, and the graph marks gated wires with the same colours. The legend is the one place that says which colour is which.</p>
+
+<p>It deliberately isn't a timeline. Every piano roll scrolls and zooms on its own, so there's no shared time axis for a project-wide band to draw bars against — and a bar drawn on a borrowed axis just repeats, bigger, what that one track's Effects lane already shows. For <em>timing</em>, use the Effects lane; for <em>identity</em>, use the legend.</p>
+
+<p><strong>Hover a chip</strong> for the full story: its name, the wires inside it if it's a group, and every track that switches it on with the beats it covers.</p>
 
 <h2>Crossfade edges</h2>
 

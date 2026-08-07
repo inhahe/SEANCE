@@ -161,6 +161,26 @@ inline float effectivePressure(const MpeVoiceState& m) {
     return std::clamp(m.pressure + m.polyPressure, 0.0f, 1.0f);
 }
 
+// The two MIDI "stop everything" messages, distinguished.
+//
+// Returns true if `msg` is one of them, and sets `releaseNotes`:
+//   - **All Notes Off** (CC#123) -> true.  Means "let go of every key". Notes
+//     should enter their RELEASE stage and ring out naturally.
+//   - **All Sound Off** (CC#120) -> false. Means "be silent NOW". Voices should
+//     be cut dead with no release.
+// Anything else returns false and leaves `releaseNotes` untouched.
+//
+// Every MIDI-accepting synth needs to handle these: a controller's panic
+// button, a MIDF file's track end, and SEANCE's own transport stop (see
+// GraphProcessor, which emits All Notes Off on all 16 channels when the
+// transport stops) all send them. A synth that ignores them keeps sounding a
+// held note forever, because it will never receive the matching note-off.
+inline bool isMidiPanicMessage(const juce::MidiMessage& msg, bool& releaseNotes) {
+    if (msg.isAllNotesOff()) { releaseNotes = true;  return true; }
+    if (msg.isAllSoundOff()) { releaseNotes = false; return true; }
+    return false;
+}
+
 // Distribute MPE messages from `midi` into a voice array. Each voice
 // must have: bool active, int note, int mpeChannel, MpeVoiceState mpe.
 // `pitchBendRange` is the per-note PB range in semitones (48 default).

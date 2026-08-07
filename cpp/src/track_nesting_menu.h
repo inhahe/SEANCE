@@ -43,8 +43,12 @@ inline bool owns(int result) {
 }
 
 // Populate `menu` with the nesting items for `node`:
-//   - "Make child of >"  submenu of every other timeline/group track that
-//                        wouldn't form a cycle (descendants are excluded).
+//   - "Make child of >"  submenu of every other timeline/group track. Tracks
+//                        that would form a cycle (this track's own descendants)
+//                        are shown DISABLED with the reason inline rather than
+//                        hidden, so the user isn't left wondering why a track is
+//                        missing from the list (the "grayed-out controls must
+//                        explain themselves" rule).
 //   - "Clear parent"     (enabled only when currently nested).
 //   - "Set start beat..." (the child's offset, in beats, within its parent).
 inline void addItems(juce::PopupMenu& menu, NodeGraph& graph, const Node& node) {
@@ -57,7 +61,19 @@ inline void addItems(juce::PopupMenu& menu, NodeGraph& graph, const Node& node) 
         if (cand.type != NodeType::MidiTimeline && cand.type != NodeType::AudioTimeline
             && cand.type != NodeType::Group)
             continue;
-        if (graph.isAncestorOf(myId, cand.id)) continue; // would create a cycle
+        if (graph.isAncestorOf(myId, cand.id)) {
+            // `cand` is already nested somewhere inside this track, so making
+            // this track a child of `cand` would create a parent/child loop.
+            // Show it disabled with the reason baked into the label - PopupMenu
+            // items can't carry hover tooltips, so the explanation lives inline.
+            // id -1 => not selectable (JUCE asserts on id 0); owns()/handle()
+            // ignore it anyway since it's below kMakeChildBase.
+            parentSub.addItem(-1, juce::String(cand.name)
+                                  + "  \xe2\x80\x94 already inside this track",
+                              /*enabled*/ false, /*ticked*/ false);
+            anyCandidate = true;
+            continue;
+        }
         const bool isCurrentParent = (node.parentGroupId == cand.id);
         parentSub.addItem(kMakeChildBase + cand.id, juce::String(cand.name),
                           /*enabled*/ !isCurrentParent, /*ticked*/ isCurrentParent);
@@ -69,7 +85,10 @@ inline void addItems(juce::PopupMenu& menu, NodeGraph& graph, const Node& node) 
 
     menu.addItem(kClearParent, "Clear parent", node.parentGroupId >= 0, false);
     menu.addSeparator();
-    menu.addItem(kSetStartBeat, "Set start beat\xe2\x80\xa6");
+    // fromUTF8 is required: juce::String(const char*) routes through
+    // CharPointer_ASCII, which widens each byte to its own character, so a raw
+    // UTF-8 literal renders as mojibake ("Set start beat" + three junk glyphs).
+    menu.addItem(kSetStartBeat, juce::String::fromUTF8("Set start beat\xe2\x80\xa6"));
 }
 
 // Apply a chosen `result`. `refresh(desc)` is invoked after any data change so

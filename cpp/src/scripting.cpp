@@ -1,10 +1,10 @@
 // =============================================================================
-// Python embedding — OPTIONAL.
+// Python embedding - OPTIONAL.
 //
 // Everything that touches the CPython C API lives under HAS_PYTHON. When SEANCE
 // is built without Python (the find_package / hardcoded-path lookup in
 // CMakeLists.txt failed), this file compiles to stubs and Python scripting is
-// simply disabled — the build and the app still work.
+// simply disabled - the build and the app still work.
 //
 // Even WITH HAS_PYTHON, the Python DLL is delay-loaded on Windows, so it may be
 // absent at runtime. ScriptEngine::pythonAvailable() probes for it (and is the
@@ -54,7 +54,7 @@
 namespace SoundShop {
 
 // -----------------------------------------------------------------------------
-// pythonAvailable() — defined in ALL builds so callers (shape_expr.cpp, the UI
+// pythonAvailable() - defined in ALL builds so callers (shape_expr.cpp, the UI
 // combos) can gate Python-only features uniformly.
 // -----------------------------------------------------------------------------
 bool ScriptEngine::pythonAvailable() {
@@ -366,9 +366,10 @@ static PyObject* py_add_audio_track(PyObject*, PyObject* args) {
     if (!PyArg_ParseTuple(args, "|sff", &name, &x, &y)) return nullptr;
     if (!g_currentGraph) Py_RETURN_NONE;
 
-    auto& n = g_currentGraph->addNode(name, NodeType::AudioTimeline,
-        {}, {Pin{0, "Audio", PinKind::Audio, false}}, {x, y});
-    n.clips.push_back({"Clip 1", 0, 4, 0xFF66CC88});
+    // Same helper the toolbar and canvas menu use, so a scripted track is armable
+    // for recording like a hand-made one (it used to get neither the Audio In pin
+    // nor the recording params).
+    g_currentGraph->addAudioTrack(name, {x, y});
     g_currentGraph->dirty = true;
     return PyLong_FromLong((long)(g_currentGraph->nodes.size() - 1));
 }
@@ -915,7 +916,7 @@ void ScriptEngine::shutdown() {
 
 std::string ScriptEngine::run(const std::string& code, NodeGraph& graph, int activeNodeIdx) {
     if (!initialized && !init())
-        return "Python is not available — install Python (matching the build's "
+        return "Python is not available - install Python (matching the build's "
                "version) so its DLL can be found, then restart SEANCE. Python "
                "scripting is disabled until then.";
 
@@ -1141,7 +1142,7 @@ static std::string formatPythonError(int userLineOffset, int userLineCount) {
     return out;
 }
 
-// waveform(name, phase) — exposed to baked terrain/shape Python as a C builtin.
+// waveform(name, phase) - exposed to baked terrain/shape Python as a C builtin.
 // Reads one of the ~4000 factory single-cycle waveforms at a normalised phase in
 // [0,1) (wraps), linearly interpolated, returning the raw sample in [-1,1]. The
 // first argument is the waveform NAME (case-insensitive) or a numeric entry
@@ -1208,7 +1209,7 @@ static WarpMethod pyWarpMethodArg(PyObject* methodObj) {
     return (WarpMethod)(int)v;
 }
 
-// warpamp(method, x, amount) / warpphase(method, phase, amount) — the wavetable
+// warpamp(method, x, amount) / warpphase(method, phase, amount) - the wavetable
 // shape-bending warps as pure scalar functions, routed to the SAME
 // warpAmpValue/warpPhaseValue primitives the editor and synth voice use. `amount`
 // is the 0..1 morph knob (0 = identity); unknown method = identity.
@@ -1312,7 +1313,7 @@ static void registerWaveformBuiltin(PyObject* globals) {
 
 // Pure-Python preamble defining the `waveforms` mapping: waveforms["name"] ->
 // stable integer id, with the lookup cached so each name hashes through
-// _ss_wfindex() (and thus indexForName) only once — every later access, even
+// _ss_wfindex() (and thus indexForName) only once - every later access, even
 // from a hot per-cell loop, is a plain dict hit. Resolve once and reuse the
 // integer with waveform(id, phase) for the fastest path:
 //   W = waveforms["AKWF sin"]      # one C lookup

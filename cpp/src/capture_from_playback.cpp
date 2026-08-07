@@ -2847,14 +2847,12 @@ CaptureFromSongDialog::CaptureFromSongDialog(NodeGraph& g, Transport& t,
     };
 
     // ----- Kick off the offline render -----
-    // Figure out song length the same way doExportRender does: max(end
-    // of clip) over all timeline nodes; add a 4-beat tail so reverb /
+    // Figure out song length the same way doExportRender does: graph
+    // contentEndBeats() (max end of clip over all timeline nodes, including
+    // each track's cascading nesting offset); add a 4-beat tail so reverb /
     // release rings out. If the project has no clips, fall back to 4
     // beats so the user gets *something* (silent) to scrub.
-    float maxBeat = 0.0f;
-    for (const auto& n : graph.nodes)
-        for (const auto& c : n.clips)
-            maxBeat = std::max(maxBeat, c.startBeat + c.lengthBeats);
+    float maxBeat = (float) graph.contentEndBeats();
     if (maxBeat <= 0.0f) maxBeat = 4.0f;
     maxBeat += 4.0f;
 

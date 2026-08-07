@@ -2937,7 +2937,8 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
     fxMenu.addItem(228, "Wavelet Bitcrush");
     fxMenu.addItem(229, "Octave Shift (wavelet)");
     fxMenu.addItem(230, "Wavelet Multiband Comp");
-    fxMenu.addItem(231, "Wavelet Pitch Shift");
+    // 231 was "Wavelet Pitch Shift", removed as non-functional; use
+    // "Ind. Pitch Shift", which does the transient-preserving job it promised.
     fxMenu.addItem(232, "Wavelet Reverb (1/f)");
     fxMenu.addItem(233, "Independent Pitch Shift");
     fxMenu.addItem(234, "Wavelet Complexity");
@@ -3053,8 +3054,7 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
                 {Pin{0, "MIDI", PinKind::Midi, false}}, {p.x, p.y});
             n.clips.push_back({"Clip 1", 0, 4, juce::Colours::cornflowerblue.getARGB()});
         } else if (result == 2) {
-            graph.addNode("Audio Track", NodeType::AudioTimeline,
-                {}, {Pin{0, "Audio", PinKind::Audio, false}}, {p.x, p.y});
+            graph.addAudioTrack("Audio Track", {p.x, p.y});
         } else if (result == 3) {
             graph.addNode("Mixer", NodeType::Mixer,
                 {Pin{0, "In 1", PinKind::Audio, true}, Pin{0, "In 2", PinKind::Audio, true}},
@@ -3910,9 +3910,12 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
                 {Pin{0, "Audio In", PinKind::Audio, true}},
                 {Pin{0, "Audio Out", PinKind::Audio, false}}, {p.x, p.y});
             n.script = "__pitchshift__";
+            // Two params, both of which work. There used to be a third, Time
+            // Ratio, which could not work in a live node (a processBlock must
+            // emit as many samples as it is handed, so a duration change has
+            // nowhere to go) - it went with the Rubber Band dependency.
             n.params.push_back({"Pitch (semi)", 0.0f, -24.0f, 24.0f});
-            n.params.push_back({"Time Ratio",   1.0f, 0.25f,  4.0f});
-            n.params.push_back({"Formant",       1.0f, 0.0f,   1.0f});
+            n.params.push_back({"Formant",      0.0f,   0.0f,  1.0f});
         } else if (result >= 260 && result <= 269) {
             // Waveshaper (amplitude morph): one node per Bucket-A warp method.
             // The DSP is WaveshaperProcessor, which reads its method from the
@@ -4126,12 +4129,13 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
                     break;
                 }
                 case 235: makeEffect("Asymmetric Filter", "__asymfilter__", {
-                    {"Pre-Attack", 20.0f, 0.0f, 100.0f},
-                    {"Post-Decay", 50.0f, 0.0f, 200.0f},
-                    {"Pre Gain",    2.0f, 0.0f,   4.0f},
-                    {"Post Gain",   0.5f, 0.0f,   2.0f},
-                    {"Levels",      4.0f, 1.0f,   8.0f},
-                    {"Mix",         1.0f, 0.0f,   1.0f},
+                    {"Pre-Attack",  20.0f, 0.0f, 100.0f},
+                    {"Post-Decay",  50.0f, 0.0f, 200.0f},
+                    {"Pre Gain",     2.0f, 0.0f,   4.0f},
+                    {"Post Gain",    0.5f, 0.0f,   2.0f},
+                    {"Sensitivity",  0.5f, 0.0f,   1.0f},
+                    {"Levels",       4.0f, 1.0f,   8.0f},
+                    {"Mix",          1.0f, 0.0f,   1.0f},
                 }); break;
                 case 234: makeEffect("Complexity", "__waveletcomplexity__", {
                     {"Complexity", 0.5f, 0.0f, 1.0f},
@@ -4150,10 +4154,6 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
                     {"Color",  1.0f, 0.0f, 3.0f}, // 0=white 1=pink 2=brown
                     {"Levels", 5.0f, 1.0f, 8.0f},
                     {"Mix",    0.3f, 0.0f, 1.0f},
-                }); break;
-                case 231: makeEffect("Wavelet Pitch", "__waveletpitch__", {
-                    {"Semitones", 0.0f, -24.0f, 24.0f},
-                    {"Mix",       1.0f,   0.0f,  1.0f},
                 }); break;
                 case 230: makeEffect("Wavelet MB Comp", "__waveletmbcomp__", {
                     {"Threshold", -20.0f, -60.0f, 0.0f},
@@ -5647,7 +5647,8 @@ void NodeGraphComponent::showLinkMenu(int linkId) {
                 juce::String note = (dstKind == PinKind::Param)
                     ? " (resampled to " + rateTxt + ")"
                     : (dstKind == PinKind::Signal ? " (upsampled to every sample)" : "");
-                menu.addSectionHeader(shortName(srcKind) + " \xe2\x86\x92 "
+                menu.addSectionHeader(shortName(srcKind)
+                                      + juce::String::fromUTF8(" \xe2\x86\x92 ")
                                       + shortName(dstKind) + note);
             }
         }

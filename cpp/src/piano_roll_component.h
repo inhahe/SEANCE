@@ -60,6 +60,10 @@ public:
     // toolbarHeight() can shift the toolbar down by this amount.
     static constexpr int RESIZE_HANDLE_H = 6;
 
+    // Width of the piano-key ruler down the left edge; the beat grid starts
+    // here.
+    static constexpr float KEY_WIDTH = 40.0f;
+
     // Per-track header strip: a horizontal band just above the note grid that
     // shows the track as a clip-block sitting at its start beat. Drag it
     // left/right to set this track's time offset; right-click it to set/clear
@@ -67,10 +71,38 @@ public:
     // paint()/mouseDown() accounts for it automatically.
     static constexpr int TRACK_HEADER_H = 20;
 
+    // --- Effect Regions lane -------------------------------------------------
+    // A horizontal band directly ABOVE the "Start" track-header strip, showing
+    // this track's time-gated effect layers as stacked shaded tubes, one row per
+    // distinct wire/group, each drawn in that wire's (or group's) colour.
+    //
+    // It is ALWAYS visible - even with no regions - because the feature was
+    // previously reachable only through a buried piano-roll context submenu and
+    // was, in practice, undiscoverable (see known-issues.md). The lane is the
+    // affordance: an empty one reads "Effect Regions:  click to add a layer".
+    //
+    // Two sizes. Collapsed is a thin read-only ribbon that just says "these are
+    // the layers on this track". Clicking it expands the rows to a comfortable
+    // click/drag height for editing; the caption's chevron, Escape, or the
+    // context menu's Done item collapses it again.
+    //
+    // Region beats are LOCAL to the node, so a lane bar is positioned with the
+    // same `b + absoluteBeatOffset` mapping as the notes below it and therefore
+    // slides with the track when its start position moves.
+    static constexpr int FX_ROW_H_COLLAPSED = 7;
+    static constexpr int FX_ROW_H_EXPANDED  = 18;
+    static constexpr int FX_LANE_PAD        = 3;   // above + below the rows
+    static constexpr float FX_EDGE_GRAB     = 5.0f; // px hot zone for edge-resize
+
     // Wired by MainContentComponent: invoked after this track's time offset or
     // parent changes, so the host can repaint ALL editor panels (a parent's
     // move shifts its children, which live in other panels) and the node graph.
     std::function<void()> onTimingChanged;
+
+    // Called with a docs/<file> relative path to open a Help page in the
+    // browser. Mirrors NodeGraphComponent::onOpenHelpDoc; wired by
+    // MainContentComponent. Used by the Effect Regions lane's Help item.
+    std::function<void(juce::String)> onOpenHelpDoc;
 
 private:
     NodeGraph& graph;
@@ -78,8 +110,6 @@ private:
     Node* node = nullptr;   // refreshed via refreshNode(); never cache across calls
     Transport* transport = nullptr;
     PianoRollState state;
-
-    static constexpr float KEY_WIDTH = 40.0f;
 
     // Expression / automation lane
     enum ExprLane { ExprNone, ExprVelocity, ExprPitchBend, ExprSlide, ExprPressure, ExprAutomation };
@@ -127,6 +157,69 @@ private:
     bool isInTrackHeader(juce::Point<float> pos) const; // pos in component coords
     void showTrackHeaderMenu();
     void paintTrackHeader(juce::Graphics& g);
+
+    // --- Effect Regions lane (see the constants above for the concept) -------
+    bool fxLaneExpanded = false;
+
+    // Row assignment: each distinct (linkId, groupId) pair on this node gets its
+    // own stack row, in first-appearance order, so two regions gating the same
+    // wire share a row and never overlap vertically.
+    int  fxRowOf(const EffectRegion& r) const;
+    int  fxRowCount() const;            // >= 1 even when there are no regions
+    int  fxRowHeight() const { return fxLaneExpanded ? FX_ROW_H_EXPANDED : FX_ROW_H_COLLAPSED; }
+    int  fxLaneHeight() const;          // total band height, folded into toolbarHeight()
+    int  fxLaneTop() const { return toolbarHeight() - TRACK_HEADER_H - fxLaneHeight(); }
+    bool isInFxLane(juce::Point<float> pos) const;
+    void paintFxLane(juce::Graphics& g);
+    void showFxLaneMenu(juce::Point<float> pos);
+    void setFxLaneExpanded(bool shouldExpand);
+    // Screen-x <-> beat for the lane. Mirrors the grid mapping exactly (absolute
+    // offset included) so a bar always sits above the notes it gates.
+    float fxBeatToX(float localBeat) const;
+    float fxXToBeat(float x) const;
+    // Beats spanned by one horizontal pixel, under the same mapping as the two
+    // functions above. Lets the magnetic-snap radius be expressed in pixels so
+    // the pull feels identical at every zoom level.
+    float fxBeatsPerPixel() const;
+    // Hit test: index into node->effectRegions, or -1. `edgeOut` reports which
+    // part was hit: -1 = left edge, 0 = body, +1 = right edge.
+    int  fxRegionAt(juce::Point<float> pos, int* edgeOut = nullptr) const;
+
+    // Directional ("magnetic tail") snap for a layer edge being dragged: layer
+    // edges are pixel-precise, and a grid marker is sticky only on the side the
+    // drag is leaving it from. See SoundShop::magneticSnapBeat in
+    // effect_regions.h for the full rationale and diagram.
+    //
+    // `dir` is the drag's current travel direction (+1 right, -1 left, 0 = not
+    // yet moved -> no snap). `localBeat` is the candidate node-local beat;
+    // returns it snapped, or unchanged. The grid is evaluated in ABSOLUTE beats
+    // because that's where the vertical grid lines the user is aiming at are
+    // drawn - a track whose offset isn't a whole grid step would otherwise snap
+    // to invisible positions. The maths itself lives in SoundShop::
+    // magneticSnapBeat (effect_regions.h) so the self-test can reach it.
+    // `snapped` (optional) reports whether a marker actually caught the value -
+    // needed when two candidate edges compete, see the Move branch in mouseDrag.
+    float fxMagneticSnap(float localBeat, int dir, bool* snapped = nullptr) const;
+    // Radius (px) of the sticky zone on the departing side of a grid marker.
+    // 6 px is wide enough to land on reliably with a mouse but narrow enough
+    // that a deliberate 10 px nudge past a beat stays where you put it.
+    static constexpr float FX_SNAP_PULL_PX = 6.0f;
+
+    enum class FxDrag { None, Move, ResizeL, ResizeR };
+    FxDrag fxDragMode = FxDrag::None;
+    int    fxDragIdx = -1;          // index into node->effectRegions
+    float  fxDragGrabBeat = 0.0f;   // beat under the cursor at mouseDown
+    float  fxDragStart0 = 0.0f, fxDragEnd0 = 0.0f; // range at mouseDown
+    bool   fxDragChanged = false;   // true once the range actually moved
+    // Travel direction of the gesture so far, with hysteresis: updated only once
+    // the cursor has moved at least FX_DIR_HYSTERESIS_PX from the last position
+    // that set it. Derived from the live cursor rather than from the total delta
+    // since mouseDown so that reversing mid-drag immediately flips which side of
+    // a marker is sticky - otherwise backing out of a snap would be impossible
+    // until you'd travelled past your starting point.
+    int    fxDragDir = 0;           // +1 right, -1 left, 0 = not moved yet
+    float  fxDragDirLastX = 0.0f;   // cursor x that last set fxDragDir
+    static constexpr float FX_DIR_HYSTERESIS_PX = 1.5f;
 
     float dragStartBeat = 0;
     int dragStartPitch = 0;
@@ -273,7 +366,9 @@ private:
     // automatically accounts for the handle. The toolbar buttons are
     // laid out with a matching removeFromTop(RESIZE_HANDLE_H) at the
     // start of resized() so they sit below the handle, not under it.
-    int toolbarHeight() const { return (compactMode ? 28 : 82) + RESIZE_HANDLE_H + TRACK_HEADER_H; }
+    int toolbarHeight() const {
+        return (compactMode ? 28 : 82) + RESIZE_HANDLE_H + fxLaneHeight() + TRACK_HEADER_H;
+    }
     // Top y of the track-header strip (it occupies the bottom TRACK_HEADER_H of
     // the toolbar region, directly above the note grid).
     int trackHeaderTop() const { return toolbarHeight() - TRACK_HEADER_H; }

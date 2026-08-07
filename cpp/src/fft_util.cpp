@@ -36,9 +36,7 @@ FFT::FFT(int nIn) : n(nIn), logN(intLog2(nIn)) {
     }
 }
 
-void FFT::transform(std::vector<cplx>& data, bool inverse) const {
-    assert((int)data.size() == n);
-
+void FFT::transform(cplx* data, bool inverse) const {
     // Bit-reversal reorder (in place).
     for (int i = 0; i < n; ++i) {
         int j = bitRev[i];
@@ -65,33 +63,86 @@ void FFT::transform(std::vector<cplx>& data, bool inverse) const {
 
     if (inverse) {
         float inv = 1.0f / (float)n;
-        for (auto& c : data) c *= inv;
+        for (int i = 0; i < n; ++i) data[i] *= inv;
     }
 }
 
-void FFT::forward(std::vector<cplx>& data) const { transform(data, false); }
-void FFT::inverse(std::vector<cplx>& data) const { transform(data, true); }
+// ---- Allocation-free pointer API -------------------------------------------
+
+void FFT::forward(cplx* data) const { transform(data, false); }
+void FFT::inverse(cplx* data) const { transform(data, true); }
+
+void FFT::forwardReal(const float* in, cplx* work) const {
+    for (int i = 0; i < n; ++i) work[i] = cplx(in[i], 0.0f);
+    transform(work, false);
+}
+
+void FFT::inverseReal(cplx* work, float* out) const {
+    // Mirror the caller-written half-spectrum into the conjugate half. Bins 0
+    // and n/2 are their own mirrors, so they are left as the caller set them.
+    for (int k = 1; k < n / 2; ++k)
+        work[n - k] = std::conj(work[k]);
+    transform(work, true);
+    for (int i = 0; i < n; ++i) out[i] = work[i].real();
+}
+
+// ---- Allocating convenience API --------------------------------------------
+
+void FFT::forward(std::vector<cplx>& data) const {
+    assert((int)data.size() == n);
+    transform(data.data(), false);
+}
+
+void FFT::inverse(std::vector<cplx>& data) const {
+    assert((int)data.size() == n);
+    transform(data.data(), true);
+}
 
 void FFT::forwardReal(const std::vector<float>& in, std::vector<cplx>& out) const {
     assert((int)in.size() == n);
     std::vector<cplx> tmp(n);
-    for (int i = 0; i < n; ++i) tmp[i] = cplx(in[i], 0.0f);
-    forward(tmp);
+    forwardReal(in.data(), tmp.data());
     out.assign(tmp.begin(), tmp.begin() + (n / 2 + 1));
 }
 
 void FFT::inverseReal(const std::vector<cplx>& halfSpectrum, std::vector<float>& out) const {
     assert((int)halfSpectrum.size() == n / 2 + 1);
     std::vector<cplx> full(n);
-    full[0] = halfSpectrum[0];
-    full[n / 2] = halfSpectrum[n / 2];
-    for (int k = 1; k < n / 2; ++k) {
-        full[k] = halfSpectrum[k];
-        full[n - k] = std::conj(halfSpectrum[k]);
-    }
-    inverse(full);
+    for (int k = 0; k <= n / 2; ++k) full[k] = halfSpectrum[k];
     out.resize(n);
-    for (int i = 0; i < n; ++i) out[i] = full[i].real();
+    inverseReal(full.data(), out.data());
+}
+
+// ---------------------------------------------------------------------------
+// FFTLadder
+// ---------------------------------------------------------------------------
+
+void FFTLadder::prepare(int minSize, int maxSize) {
+    if (minSize < 2) minSize = 2;
+    if (maxSize < minSize) maxSize = minSize;
+    // Idempotent: prepareToPlay can run repeatedly with unchanged bounds (a
+    // device change that keeps the same block size), and rebuilding the whole
+    // ladder each time would be pure waste.
+    if (minSize == preparedMin && maxSize == preparedMax && !bySizeLog2.empty())
+        return;
+
+    const int maxExp = intLog2(maxSize);   // rounds up for non-powers of two
+    bySizeLog2.clear();
+    bySizeLog2.resize((size_t) maxExp + 1);
+    for (int e = 1; e <= maxExp; ++e) {
+        const int sz = 1 << e;
+        if (sz < minSize || sz > maxSize) continue;
+        bySizeLog2[(size_t) e] = std::make_unique<FFT>(sz);
+    }
+    preparedMin = minSize;
+    preparedMax = maxSize;
+}
+
+const FFT* FFTLadder::forSize(int n) const {
+    if (!isPow2(n)) return nullptr;
+    const int e = intLog2(n);
+    if (e < 0 || e >= (int) bySizeLog2.size()) return nullptr;
+    return bySizeLog2[(size_t) e].get();
 }
 
 } // namespace SoundShop

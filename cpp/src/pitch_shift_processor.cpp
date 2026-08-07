@@ -1,102 +1,61 @@
 #include "pitch_shift_processor.h"
 #include <cmath>
-#include <cstdio>
-
-#if HAS_RUBBERBAND
-#include "rubberband/RubberBandStretcher.h"
-using RubberBand::RubberBandStretcher;
-#endif
 
 namespace SoundShop {
 
 PitchShiftProcessor::PitchShiftProcessor(Node& n) : node(n) {}
 PitchShiftProcessor::~PitchShiftProcessor() = default;
 
-float PitchShiftProcessor::getParam(int idx, float def) const {
-    if (idx >= 0 && idx < (int)node.params.size())
-        return node.params[idx].value;
-    return def;
-}
-
 void PitchShiftProcessor::prepareToPlay(double sr, int bs) {
     sampleRate = sr;
-    blockSize = bs;
+    // The block size is deliberately unused: PhaseVocoderShifter is a
+    // sample-driven FIFO with no opinion about block boundaries, so it copes
+    // with any block size, including one that varies call to call.
+    juce::ignoreUnused(bs);
 
-#if HAS_RUBBERBAND
-    stretcher = std::make_unique<RubberBandStretcher>(
-        (size_t)sr, 2,
-        RubberBandStretcher::OptionProcessRealTime |
-        RubberBandStretcher::OptionPitchHighConsistency |
-        RubberBandStretcher::OptionFormantPreserved);
+    for (auto& s : shifter)
+        s.prepare(11, 4, sr);
 
-    stretcher->setMaxProcessSize(bs);
-    lastPitchSemitones = 0;
-    lastTimeRatio = 1.0f;
-    fprintf(stderr, "[PitchShift] Rubber Band initialized (%.0f Hz, %d samples)\n", sr, bs);
-#else
-    fprintf(stderr, "[PitchShift] Rubber Band not available\n");
-#endif
+    // Report the shifter's latency so the graph's PDC lines this node up against
+    // its siblings. The node is 100% wet, so unlike the wavelet shifters there
+    // is no internal dry path needing its own LatencyDelay.
+    setLatencySamples(shifter[0].latencySamples());
 }
 
 void PitchShiftProcessor::releaseResources() {
-#if HAS_RUBBERBAND
-    stretcher.reset();
-#endif
+    for (auto& s : shifter)
+        s.reset();
 }
 
 void PitchShiftProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::MidiBuffer&) {
-#if HAS_RUBBERBAND
-    if (!stretcher) return;
-    int numSamples = buf.getNumSamples();
-    int numChannels = std::min(buf.getNumChannels(), 2);
+    const int numSamples  = buf.getNumSamples();
+    const int numChannels = std::min(buf.getNumChannels(), 2);
+    if (numSamples <= 0 || numChannels <= 0) return;
 
-    // Read params
-    // 0 = Pitch (semitones, -24 to +24)
-    // 1 = Time ratio (0.5 = half speed, 2.0 = double speed)
-    // 2 = Formant preservation (0 = off, 1 = on)
-    float pitchSemitones = getParam(0, 0.0f);
-    float timeRatio = getParam(1, 1.0f);
-    timeRatio = juce::jlimit(0.25f, 4.0f, timeRatio);
+    // Params BY NAME. The old implementation read them by index, which is why
+    // removing one was hazardous: saved projects keep the param list they were
+    // saved with, so an old file would have landed Formant's value on the Pitch
+    // slot. By name, a stale param is simply ignored and a missing one falls
+    // back to its default.
+    const float semitones = paramByName(node, kPitchParam, 0.0f);
+    const bool  formant   = paramByName(node, kFormantParam, 0.0f) >= 0.5f;
+    const float ratio     = PhaseVocoderShifter::ratioForSemitones(semitones);
 
-    // Update stretcher if params changed
-    if (std::abs(pitchSemitones - lastPitchSemitones) > 0.01f) {
-        double pitchScale = std::pow(2.0, pitchSemitones / 12.0);
-        stretcher->setPitchScale(pitchScale);
-        lastPitchSemitones = pitchSemitones;
+    // No early-out at ratio 1. This is a fixed-latency node, so returning early
+    // would make the output jump forward by the full latency the moment the
+    // knob crossed zero - an audible click, and a phase discontinuity against
+    // every other path the graph has already delay-compensated.
+    for (int c = 0; c < numChannels; ++c) {
+        shifter[c].setPitchRatio(ratio);
+        shifter[c].setFormantPreserve(formant);
+        float* d = buf.getWritePointer(c);
+        shifter[c].process(d, d, numSamples);   // in-place: process() may alias
     }
-    if (std::abs(timeRatio - lastTimeRatio) > 0.01f) {
-        stretcher->setTimeRatio((double)timeRatio);
-        lastTimeRatio = timeRatio;
-    }
 
-    // Feed input
-    const float* inputs[2] = {
-        buf.getReadPointer(0),
-        numChannels > 1 ? buf.getReadPointer(1) : buf.getReadPointer(0)
-    };
-    stretcher->process(inputs, numSamples, false);
-
-    // Retrieve output
-    int available = (int)stretcher->available();
-    if (available > 0) {
-        int toRetrieve = std::min(available, numSamples);
-        float* outputs[2] = {
-            buf.getWritePointer(0),
-            numChannels > 1 ? buf.getWritePointer(1) : buf.getWritePointer(0)
-        };
-
-        // Clear buffer first
-        buf.clear();
-
-        stretcher->retrieve(outputs, toRetrieve);
-        // If we got fewer samples than the block size, the rest stays silent
-    } else {
-        buf.clear();
-    }
-#else
-    // No Rubber Band - pass through unchanged
-    (void)buf;
-#endif
+    // Mono input on a stereo buffer: mirror rather than leaving channel 1 with
+    // whatever stale content it held.
+    if (buf.getNumChannels() > 1 && numChannels == 1)
+        buf.copyFrom(1, 0, buf, 0, 0, numSamples);
 }
 
 } // namespace SoundShop

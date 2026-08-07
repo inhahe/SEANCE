@@ -111,7 +111,9 @@ Render modes (Synth Mode parameter on the Terrain Synth / Wavetable nodes):
 
 Most DAWs treat "which effects are active" as a fixed property of a track. SEANCE lets you make that time-varying: a specific cable can be **on** only during certain beat ranges and **off** otherwise.
 
-A layer is a colored bar drawn in the routing strip above the piano roll. You drag a region to set the start and end beats. Outside the region, the cable is muted with a smooth crossfade at the edges (configurable globally; default 50 ms) so you never hear a click when a layer turns on or off.
+Layers live in the **Effects lane**, a thin strip in every track's piano roll — audio and MIDI alike — sitting just above the Start slider. Click it to expand it into an editor, then right-click to add a layer for any cable or effect group. Each layer appears as a shaded tube in that cable's color, spanning the beats where the routing is switched on; drag its middle to move it and either end to lengthen or shorten it. Edges go wherever you put them, down to the pixel, but every beat line is slightly magnetic *on the way out*: you can stop a hair short of a beat, and once you cross one it holds on briefly so landing exactly on it is easy. Press Escape to collapse the lane again. Outside a layer the cable is muted with a smooth crossfade at the edges (configurable globally; default 50 ms) so you never hear a click when a layer turns on or off.
+
+Layers belong to the track, so sliding a track's start position — or inserting and deleting time — carries its layers with it and keeps them gating the same music.
 
 This is how you'd put reverb on the chorus only without automating a dry/wet knob, or activate a parallel filter chain on the bridge only, or have one synth speak only during the second verse.
 
@@ -119,7 +121,7 @@ This is how you'd put reverb on the chorus only without automating a dry/wet kno
 
 Sometimes you want to activate **multiple cables at once** — e.g., a reverb send AND a delay send AND a filter modulation, all gated together as one "chorus effects on" layer. That's what an Effect Group is: a named bundle of cables that activate together as one unit.
 
-To create a group: right-click any cable → Effect Group → New Group, give it a name, then right-click other cables → Effect Group → Add to <name>. Now you can create a single layer that references the group, and all cables in the group activate or mute as one.
+To create a group, right-click a track's Effects lane → **Add layer at beat N… → New group of wires…**. You get a colour-coded checklist of every cable in the project; tick the ones that belong together, name the bundle, and you get both the group and a layer gating it at that beat. (You can also build one from the graph: right-click a cable → Effect Group → New Group, then right-click other cables → Effect Group → Add to <name>.) Groups then show up alongside individual cables in the Effects lane's add menu, so one layer gates the whole bundle — all cables in the group activate or mute as one.
 
 Each group gets its own color, drawn on member wires as visual tags (circles for individual wire identity, diamonds for group membership) so you can see at a glance which routings belong to which groups.
 
@@ -158,6 +160,8 @@ SEANCE's convolution node has an editor with three ways to build an IR:
   - **Freehand** — draw individual sample values directly with the mouse. Good for sharp transients and surgical per-sample edits.
 - **Load a .wav** — pick any audio file as the IR. Use real cabinet IRs, real room reverbs, anything you have on disk.
 
+Any IR you build can be **saved to the project's asset library** (and loaded back into any other Convolution Filter) with the editor's **Save to Library** / **Load from Library** buttons — so a collection of room, cabinet, and EQ impulse responses is reusable across the whole project.
+
 The editor includes a **frequency response preview** that updates as you draw, so you can see what filter shape your time-domain IR is producing in the frequency domain. Mouse-wheel zoom (up to 128×) reveals individual samples as stems with sample-boundary grids when zoomed in enough.
 
 #### Room IR capture
@@ -174,7 +178,8 @@ For capturing real-world impulse responses, the **Room IR Capture** tool (Tools 
 - **MultiSampler.** Zone-based sampling instrument with N sample slots, each with configurable key range (low/high note), velocity range (low/high velocity), base note, fine-tune, gain, and pan. Multi-point linear envelopes for volume, pan, pitch, and filter with sustain/loop markers. Built-in state-variable filter (lowpass / highpass / bandpass) with envelope modulation. Replaces the old single-file Sampler — a one-zone MultiSampler covering 0-127 is exactly the old workflow, while multi-zone configs give you velocity-layered and key-split instruments. Legacy `__audio__:` projects auto-upgrade on load.
 - **FM Synth.** 4-operator frequency modulation synthesis with 8 selectable algorithms, per-operator frequency ratios, levels, and a full per-operator AHDSR envelope each (hold stage, per-segment curves, tension, velocity sensitivity — edited in a tabbed **Operator Envelopes** dialog), plus operator-4 self-feedback. Produces electric pianos, bells, metallic basses, evolving pads, and everything in between.
 - **Phase Distortion Synth.** Casio CZ-style synthesis: warps a sine wave's phase with a modulator function to produce subtractive-like sounds (sawtooth, square, pulse, resonant) without a traditional filter. "Depth" parameter + DCW envelope shape the harmonic content over time for filter-sweep-like timbral motion.
-- **Particle Cloud Synth.** Granular texture instrument that generates many overlapping short waveform bursts ("particles") with per-grain frequency randomization, stereo scatter, and mini-envelopes. Produces ambient pads, evolving textures, and glitchy effects. Controls: density, frequency spread, grain size, per-grain attack/release, waveform shape (sine/saw/square/noise).
+- **Particle Cloud Synth.** Granular texture instrument that generates many overlapping short waveform bursts ("particles") with per-grain frequency randomization, stereo scatter, and mini-envelopes. Produces ambient pads, evolving textures, and glitchy effects. Controls: density, frequency spread, grain size, per-grain attack/release, waveform shape (sine/saw/square/noise). See [REFERENCE](REFERENCE.md#granular-synths-particle-cloud-spectral-grain).
+- **Spectral Grain Synth.** The other granular instrument, built the opposite way round: instead of synthesising each grain from a waveform, you write a **magnitude spectrum** as an expression in the FFT bin index (default `exp(-f/10)`) and the node pre-renders a bank of sixteen grains — each an inverse FFT of that same spectrum with different random phases. Playback draws from the bank at random, so the timbre stays fixed while the phase relationships keep shifting: shimmering, never-quite-repeating textures out of a completely static spectral definition. 8-voice polyphonic, with Density and Grain Size the only two knobs. See [REFERENCE](REFERENCE.md#granular-synths-particle-cloud-spectral-grain).
 - **Drum synth.** Eight analog-style voice algorithms — **Kick** (pitched sine sweep), **Snare** (filtered noise), **Hi-Hat** (FM noise), **Clap**, **Tom**, **Cowbell**, **Rimshot**, **Cymbal** (with crash/ride/bell variants). Each voice gets its own MIDI note assignment via MIDI Learn and a four-knob synthesis row (pitch, decay, tone, level).
 - **SoundFont (SF2 / SFZ).** Load multi-sample patches with full preset / bank navigation. Hundreds of free SF2 packs available online for orchestral, piano, drums, ethnic instruments, etc. SF2 support is complete; SFZ uses a built-in basic loader, with full SFZ-spec compliance via the sfizz library on the roadmap.
 - **Terrain Synth.** The N-dimensional sample-array engine that powers the wavetable and sampler instruments — see the [Waveterrain](#waveterrain-terrain-synth) concept above. Can also be used directly with image (2D), audio file (1D), or math expression sources. Math-expression terrains are creatable at any dimensionality from 1D through 8D via the *N-D Terrain (custom expression)* menu item, with axis variables `x, y, z, w, v, u, s, t` corresponding to dimensions 1-8. The terrain visualizer's `+ Dim` / `- Dim` buttons also extend or contract dimensionality on an existing node, adding/removing Sig input pins and per-axis Center/Radius parameter knobs.
@@ -259,7 +264,7 @@ All built-in effects can be combined freely with cables — pre-effect, post-eff
 
 - **Echo / Delay** — repeating echoes with feedback. Configurable delay time, feedback amount, and number of repeats. Slap-back to ambient washes depending on settings.
 - **Convolution filter** — apply any impulse response (preset, hand-drawn, or loaded .wav) to any audio. Used for filters, real-room reverbs, guitar cabinet sims, EQ matching. See the [Convolution](#convolution) concept above.
-- **Pitch Shifter** — change pitch independently of speed via Rubber Band. Drop your vocals down an octave without slowing them down, or pitch up a sample without speeding it up.
+- **Pitch Shifter** — change pitch without changing speed. Drop your vocals down an octave without slowing them down, or pitch up a sample without speeding it up. A **Formant** switch keeps the timbre in place while the pitch moves, so a voice pitched up still sounds like the same person instead of a chipmunk.
 
 **Reverb and spatial**
 
@@ -267,6 +272,7 @@ All built-in effects can be combined freely with cables — pre-effect, post-eff
 - **Parametric EQ** — multi-band biquad EQ (starts at 4 bands; right-click the node to **Add EQ Band** / **Remove Last EQ Band**, 1–12 bands). Each band has selectable type (peak / low shelf / high shelf / highpass / lowpass), frequency, gain (dB), and Q. Uses the standard RBJ Audio EQ Cookbook coefficients. The low-CPU, surgical tool.
 - **Curve EQ** — draw an arbitrary frequency-response curve (gain multiplier vs. frequency) and the node applies it via a zero-latency overlap-add STFT, preserving phase. Double-click the node to open the curve editor. The response curve is a **Frequency Graph** library item, so the same shape can be published, linked, and live-shared with FFT wavetable frames and the Spectrum Tap. The draw-a-shape complement to the biquad Parametric EQ.
 - **Signal EQ** — a signal-*controllable* EQ built from **curve points**, where every point's frequency and gain is an individual param you can drive with a cable: wire an LFO to a point's frequency for a sweeping notch, an envelope follower to its gain for dynamic EQ, and so on. Each point is a peaking bell (shared Width/Q); double-click to drag points on a log-frequency/dB graph, double-click empty space to add a point, right-click a point to add a frequency/gain control input. Two engines selectable per node: **Zero-latency** (biquad cascade, minimum-phase) or **FFT exact** (phase-clean, same magnitude). 1–16 points. The moving-target complement to the static Parametric and Curve EQs.
+- **SMS (harmonic/noise split)** — splits a sound into its *harmonic* half (the strong spectral peaks: the pitch, the vowel, the bowed string) and its *noise* half (everything else: breath, bow scrape, consonants, cymbal wash), each with its own gain. Turn the noise up and the harmonics down to make a voice all breath and no pitch, or the reverse for an unnaturally pure tone. A single **Threshold** decides how loud a bin has to be, relative to the loudest one in that moment, to count as harmonic — so it stays put as the input level changes. Zero latency. See [SMS](REFERENCE.md#sms) in REFERENCE.md.
 
 **Dynamics**
 
@@ -279,6 +285,23 @@ All built-in effects can be combined freely with cables — pre-effect, post-eff
 - **Ring Modulator** — multiplies the input audio with an internal oscillator (sine, square, or triangle) to produce metallic, bell-like, inharmonic tones. Classic Dalek-voice / sci-fi sound design tool.
 - **Waveshaper (amplitude morph)** — a family of ten amplitude-domain waveshaping nodes, one per shaping curve: **Soft Clip**, **Hard Clip**, **Wavefold**, **Wavewrap**, **Rectify**, **Quantize (bitcrush)**, **Tube Saturate**, **Tape Saturate**, **Flip (invert)**, and **Chebyshev**. Each applies its curve sample-by-sample to the incoming audio, controlled by a single amount/drive knob (the knob is labelled per method — Drive / Fold / Wrap / Amount / Crush). They share the same `warpAmpValue` shaping primitives the wavetable synth uses for per-frame morphing, so a sound you shape inside a wavetable frame and a sound you shape on the wire come out identical. Add one from the node menu under **Waveshaper (amplitude morph)**.
 - **Mid/Side Encode + Decode** — utility pair for mastering. Encode splits stereo into Mid (center) + Side (width); Decode recombines them. Wire EQ or compression between them to process mid and side independently.
+
+**Wavelet effects**
+
+A family of twelve effects built on the **discrete wavelet transform** rather than the FFT — a class of processing that's essentially absent from commercial DAWs. An FFT has to pick one window length and lives with the compromise: long enough to resolve bass means long enough to smear a drum hit. A wavelet transform looks at low frequencies with long windows and high frequencies with short ones automatically, so these effects can be surgical about the sustained part of a sound while leaving the attack untouched. Every one of them has a **guaranteed-clean neutral setting**, verified by self-tests that run the full forward+inverse transform at full wet. See [Wavelet effects](REFERENCE.md#wavelet-effects) in REFERENCE.md for every parameter, the band↔frequency mapping, and the neutral setting of each node.
+
+- **Transient/Sustain Split** — separate the attack of a sound from its body and rebalance them independently. Drop the sustain for a bone-dry percussive version of anything; drop the transients for the pad hiding inside a plucked instrument.
+- **Wavelet Denoiser** — wavelet-shrinkage noise reduction that removes broadband hiss *without* smearing transients, which is the thing spectral gating can't do.
+- **Wavelet Bitcrush** — bit-reduction that only hits the frequency bands you pick. Crunchy lo-fi bass under clean highs, or sizzle on top of a clean low end.
+- **Octave Shift** — clean whole-octave shifting and sub-bass generation by moving energy between wavelet bands. No resampling, no time-stretch, so transients keep their timing.
+- **Wavelet Multiband Comp** — multiband dynamics where the bands are decomposition levels rather than crossover filters, so they sum back perfectly instead of phasing. Doubles as a spectral tilt.
+- **Wavelet Reverb (1/f)** — a fractal, self-similar ambience with no delay lines and no room model. A **Color** knob sweeps the tail from white through pink to brown.
+- **Independent Pitch Shift** — pitch-shifts only the tonal content and leaves transients where they were, so a drum loop can be pitched without going soft.
+- **Wavelet Complexity** — one "how much detail?" knob that keeps only the largest N wavelet coefficients, progressively dissolving a sound into a sketch of itself.
+- **Asymmetric Filter** — a filter that reacts *before* the transient. No causal filter can do this; working on a whole block in the wavelet domain removes the constraint, so you can swell into an attack or duck ahead of it.
+- **Wavelet Vocoder** — a vocoder whose bands are octave-wide wavelet levels instead of fixed FFT bins, so consonants stay crisp instead of being smeared to the length of a window.
+- **Formant Pitch Shift** — pitch shifting without the chipmunk effect: shifts the pitch, then puts the original spectral envelope back. Sweeping the **Formant Lock** knob on its own is a size/gender morph.
+- **Pitch Detector** — precise pitch-to-signal node: measures the fundamental of incoming audio (YIN or autocorrelation, your choice) and emits it as a 0..1 control signal across a frequency band you set, with log or linear mapping. Min Hz trades latency for low-frequency reach. Wire the output into any param to pitch-follow. (A legacy octave-resolution **Wavelet Pitch Tracker** node is kept for old projects.)
 
 **MIDI processors**
 
@@ -311,7 +334,7 @@ All built-in effects can be combined freely with cables — pre-effect, post-eff
 
 - **Cable-based routing.** Drag from any output pin to any compatible input pin. Audio (blue), MIDI (green), Param (orange, block-rate), and Signal (amber, audio-rate) cables are color-coded; pins light up bright yellow when you hover a valid drop target. See [Signals](#signals-the-four-pin-kinds) above.
 - **Implicit Signal ↔ Param conversion.** Either control-rate kind plugs into either control-rate input. The cable shows its source colour at the head and destination colour at the tail so the conversion is visible.
-- **Time-gated effect groups.** Make any cable active only during specific beat ranges, with smooth crossfaded edges. Group multiple cables so they activate together as one "layer." A routing strip above the piano roll shows which routings are live at which beats. See [Layers](#layers-time-gated-cables) and [Groups](#groups-effect-groups) above.
+- **Time-gated effect groups.** Make any cable active only during specific beat ranges, with smooth crossfaded edges. Group multiple cables so they activate together as one "layer." A layer legend above the piano roll names the colour of every gated cable and group in the project. See [Layers](#layers-time-gated-cables) and [Groups](#groups-effect-groups) above.
 
 ### MIDI
 
@@ -384,7 +407,7 @@ This is one of the things that sets SEANCE apart from typical home DAWs. Three i
 
 - **VST3 plugin hosting** on all platforms; **LV2** on all platforms; **AU** on macOS; **LADSPA** on Linux.
 - **Export to WAV, FLAC, OGG, Opus, M4A, WMA.** Choose format, channels (mono/stereo), sample rate, and format-specific options (bit depth, quality, or bitrate) upfront, then pick a filename.
-- **Pitch shifting / time stretching** via Rubber Band.
+- **Pitch shifting**, with optional formant preservation, via SEANCE's own phase vocoder — no third-party dependency.
 - **ASIO support** on Windows for low-latency hardware audio.
 - **Configurable project sample rate** with internal resampling.
 - **Audio bounce** to render an audio clip from any node in the graph.
@@ -398,35 +421,22 @@ This is one of the things that sets SEANCE apart from typical home DAWs. Three i
 
 A non-exhaustive list of planned and in-progress features. Things below are *planned*, not promised — order and scope may shift.
 
-### Wavelet-based audio (large planned area)
+### Wavelet-based audio
 
-Wavelets give you joint time + frequency resolution that traditional FFT-based effects can't match — sharp transients keep their attack while sustained tones get analyzed at high frequency resolution. This unlocks a whole class of effects that aren't widely available in commercial DAWs:
+The **effects half of this area has shipped** — twelve nodes, listed under [Built-in effects → Wavelet effects](#built-in-effects) above and specified in [REFERENCE.md](REFERENCE.md#wavelet-effects). The core DWT / IDWT (Daubechies + Symlet families) and a Morlet CWT are in place, and the *Wavelet Space* waveform editor lets you author a cycle by painting coefficients directly. What's left is mostly the **synthesis** side, where wavelets are used to store and generate waveforms rather than to process a signal:
 
-- **DWT / IDWT and CWT utilities** — the core forward/inverse wavelet transforms (Daubechies, Symlet, Biorthogonal families) plus continuous wavelet transform for non-dyadic scale operations.
 - **Wavetable mipmap pyramid** — anti-aliased wavetable pitch-up via wavelet-based oversampling.
 - **Wavelet-basis wavetable storage** — store wavetables in the wavelet domain for cheaper interpolation.
-- **Wavetable complexity knob** — sparsify wavelet coefficients to smoothly simplify a complex waveform.
+- **Wavetable complexity knob** — sparsify wavelet coefficients to smoothly simplify a complex *waveform*. (The audio-effect version of this, **Wavelet Complexity**, has shipped; this is the same idea applied inside a wavetable frame.)
 - **Self-similar / fractal wavetable generator** — build wavetables from fractal recursion.
 - **Wavelet-domain morphing** in scatter wavetables.
-- **Transient/sustain split node** — separate the attack from the body of any sound, route them independently.
-- **Octave-band wavelet multiband compressor** — compression with naturally-shaped octave bands instead of artificial crossovers.
-- **Wavelet shrinkage denoiser** — surgical noise reduction that preserves transients.
-- **Wavelet bitcrush** — bit-reduction artifacts that hit only at the frequencies you choose.
-- **Asymmetric / non-causal wavelet filters** — filters that anticipate transients ahead of where they happen.
-- **Self-similar / 1/f wavelet reverb** — fractal reverb tails.
-- **Scale-shift wavelet pitch shifter** — pitch shifting via wavelet scale modification rather than time stretching.
-- **Free dyadic octave shifter / sub-octave** — clean octave doubling and sub-bass generation.
-- **Independent transient + tonal pitch shifting** — keep drums punchy while pitching melodic content.
-- **Adaptive resolution wavelet pitch tracker** — pitch detection that handles vibrato and bends gracefully.
-- **Pitch Detector** — precise pitch-to-signal node: measures the fundamental of incoming audio (YIN or autocorrelation, your choice) and emits it as a 0..1 control signal across a frequency band you set, with log or linear mapping. Window/hop control trades latency for low-frequency reach. Wire the output into any param to pitch-follow.
-- **Formant-preserving pitch shift via wavelet packets** — vocal pitch shifting without the chipmunk effect.
-- **Wavelet-band vocoder** — vocoder using wavelet bands instead of fixed FFT bins.
+- **Biorthogonal wavelet families** — currently db1/Haar, db2, db4 and sym4 are implemented; biorthogonal filter banks would add linear-phase options.
+- **Scale-shift wavelet pitch shifter** — pitch shifting via true wavelet scale modification rather than time stretching. The shipped **Octave Shift** node approximates this by reassigning coefficients between bands, which is clean for whole octaves but not exact; a real scale-shift implementation would also handle non-octave intervals.
 
 ### Synthesis
 
 - **FM Synthesis instrument** — DX7-style multi-operator FM synth with selectable algorithms, per-operator frequency ratios, modulation indices, and envelopes. Produces electric pianos, bells, metallic basses, evolving pads. The most-requested synthesis type after subtractive and wavetable.
 - **Phase Distortion Synthesis instrument** — Casio CZ-style PD: warps a carrier sine's phase with a modulator shape to produce subtractive-like sounds (brass, filtered pads) through a fundamentally different mechanism. Niche but differentiating — most DAWs don't offer it.
-- **Spectral Modeling Synthesis (SMS)** — decomposes any sound into harmonic peaks (deterministic sinusoids) and noise (stochastic residual), then lets you manipulate each independently. Make a voice breathier without changing pitch, isolate transients, cross-synthesize tonal and noisy components from different sources. Builds on the existing FFT infrastructure.
 - **Particle / granular cloud synth** — a dedicated texture instrument that generates many overlapping short waveform bursts ("particles"), each with its own mini-envelope, frequency, and harmonic parameter. Produces ambient pads, evolving textures, and glitchy effects. Based on the iMS-20 particle generator concept.
 - **Spectral grain mode** — IFFT-to-windowed-grain spectral grain synthesis as a fourth Wavetable render mode alongside Direct, AM-sine, and Additive bank. Reuses the same cycle FFT that Additive bank already computes, but instead of summing partials it IFFTs slightly windowed chunks for granular textures.
 - **Inharmonic presets and ratio expression** for the Additive bank mode — Bell, Drum, Stretched Piano starting points plus a custom `ratio(f)` expression for designing your own inharmonic partial series.
@@ -444,6 +454,7 @@ Wavelets give you joint time + frequency resolution that traditional FFT-based e
 ### MIDI and recording
 
 - **Per-node recording** ("Record Here" mark) — arm individual nodes for MIDI capture instead of arming whole tracks, so anything in the graph can be recorded into.
+- **Multitrack live audio recording** — arm any number of Audio Tracks, each pointed at its own hardware input channel, and record them all at once while the song plays. Every take lands on the timeline as a normal audio clip at the beat you started from, backed by a 24-bit WAV, so it plays back with the song from then on and saves with the project. Takes have no length limit, and if the disk ever falls behind, the dropout is reported rather than silently swallowed. **You don't have to build the tracks first** — pressing record gives every live mic/line-in its own Audio Track automatically, named after the input (`Mic 1 (C615)`, `Line In 2 (Focusrite)`), placed where it fits and already cabled to the output; plug in a second mic and it just appears. The track you're recording into is muted while the take runs so you don't hear the old pass underneath, unless you ask to hear it. See [REFERENCE.md → Recording live audio](REFERENCE.md#recording-live-audio-mic--line-in).
 - **Trigger node v2** — multiple MIDI/Signal output pins, per-rule output assignment, signal-rule delay support, beats/ms unit picker.
 - **Trigger node enhancements** — note-off triggers (actions fire on note release, not just note-on), free-drawn Curve shape, and a threshold-trigger input (audio level → trigger bridge so loud audio events can fire triggers without MIDI).
 
@@ -522,7 +533,6 @@ Wavelets give you joint time + frequency resolution that traditional FFT-based e
 
 ### Optional dependencies (downloaded by setup script)
 
-- **Rubber Band** — pitch shifting / time stretching
 - **libopenmpt** — MOD / S3M / IT / XM import
 - **libopus + libogg** — Opus audio export
 - **wasm3** — WASM script nodes

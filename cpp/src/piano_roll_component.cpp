@@ -1,6 +1,7 @@
 #include "piano_roll_component.h"
 #include "music_theory.h"
 #include "track_nesting_menu.h"
+#include "dialog_helpers.h"
 #include "undo.h"
 #include <cmath>
 #include <set>
@@ -849,7 +850,11 @@ void PianoRollComponent::paint(juce::Graphics& g) {
         g.drawHorizontalLine(RESIZE_HANDLE_H - 1, 0.0f, (float)getWidth());
     }
 
-    // Per-track header strip (track name + parent/offset, drag to retime).
+    // Effect Regions lane, then the per-track header strip (track name +
+    // parent/offset, drag to retime). Both sit inside toolbarHeight(), the lane
+    // directly above the header so the header keeps its existing adjacency to
+    // the note grid.
+    paintFxLane(g);
     paintTrackHeader(g);
 
     auto area = getLocalBounds().toFloat();
@@ -1128,83 +1133,12 @@ void PianoRollComponent::paint(juce::Graphics& g) {
         }
     }
 
-    // Insert chain layers: flat-edged bars stacked flush at the top of the
-    // grid, representing the track's serial effect chain. Bottom layer
-    // processes first, top layer last. No rounded corners, no gaps - they
-    // look like stackable blocks.
-    if (!node->effectRegions.empty()) {
-        const float barH = 12.0f;
-        const float barY0 = 0.0f; // flush with top
-
-        // Assign each unique (linkId,groupId) pair its own layer row.
-        std::vector<std::pair<int,int>> seenPairs;
-        auto getRow = [&](int lid, int gid) -> int {
-            for (int i = 0; i < (int)seenPairs.size(); ++i)
-                if (seenPairs[i].first == lid && seenPairs[i].second == gid) return i;
-            seenPairs.push_back({lid, gid});
-            return (int)seenPairs.size() - 1;
-        };
-
-        for (const auto& region : node->effectRegions) {
-            float rx1 = beatToX(region.startBeat);
-            float rx2 = beatToX(region.endBeat);
-            if (rx2 < gridX || rx1 > gridX + gridW) continue;
-            rx1 = std::max(rx1, gridX);
-            rx2 = std::min(rx2, gridX + gridW);
-
-            int row = getRow(region.linkId, region.groupId);
-            float ry = barY0 + row * barH; // flush stacking, no gaps
-
-            uint32_t col = region.color;
-            if (col == 0) {
-                if (region.groupId >= 0) {
-                    if (auto* grp = graph.findEffectGroup(region.groupId))
-                        col = grp->color;
-                }
-                if (col == 0 && region.linkId >= 0)
-                    col = getDistinctColor(region.linkId);
-                if (col == 0)
-                    col = 0xFF808080;
-            }
-
-            auto barColor = juce::Colour((uint8_t)((col >> 16) & 0xFF),
-                                         (uint8_t)((col >> 8) & 0xFF),
-                                         (uint8_t)(col & 0xFF));
-
-            // Flat bar body - no rounded corners, stackable
-            g.setColour(barColor.withAlpha(0.70f));
-            g.fillRect(rx1, ry, rx2 - rx1, barH);
-            // Thin top/bottom edge lines for separation
-            g.setColour(barColor.brighter(0.4f));
-            g.drawHorizontalLine((int)ry, rx1, rx2);
-            g.drawHorizontalLine((int)(ry + barH), rx1, rx2);
-
-            // Label: effect name
-            if (rx2 - rx1 > 40.0f) {
-                juce::String label;
-                if (region.groupId >= 0) {
-                    if (auto* grp = graph.findEffectGroup(region.groupId))
-                        label = grp->name.empty() ? "" : juce::String(grp->name);
-                }
-                if (label.isEmpty() && region.linkId >= 0) {
-                    for (auto& link : graph.links) {
-                        if (link.id == region.linkId) {
-                            for (auto& n : graph.nodes)
-                                for (auto& pin : n.pinsIn)
-                                    if (pin.id == link.endPin) { label = n.name; break; }
-                            break;
-                        }
-                    }
-                }
-                if (label.isNotEmpty()) {
-                    g.setColour(juce::Colours::white.withAlpha(0.9f));
-                    g.setFont(juce::Font(juce::FontOptions(std::min(10.0f, barH - 2.0f))));
-                    g.drawText(label, rx1 + 4, (int)ry, (int)(rx2 - rx1 - 8), (int)barH,
-                               juce::Justification::centredLeft, false);
-                }
-            }
-        }
-    }
+    // Time-gated effect layers used to be drawn here, as flat bars flush with
+    // the top of the note grid. They now live in their own always-visible
+    // "Effect Regions" lane above the track-header strip (paintFxLane) - which
+    // makes the feature discoverable, gives it room to be edited by dragging,
+    // and stops the bars overpainting marker flags/labels, which are drawn at
+    // y = 0..12 in this same pass.
 
     // Playback cursor (absolute beat, no double-offset)
     if (transport && transport->playing) {
@@ -1549,6 +1483,592 @@ bool PianoRollComponent::isInTrackHeader(juce::Point<float> pos) const {
         && pos.x >= KEY_WIDTH && pos.x < (float)getWidth() - SCROLLBAR_SIZE;
 }
 
+// ===========================================================================
+// Effect Regions lane
+//
+// A band above the "Start" track-header strip listing this track's time-gated
+// effect layers as stacked shaded tubes. See the block comment on
+// FX_ROW_H_COLLAPSED in piano_roll_component.h for the design rationale.
+// ===========================================================================
+
+int PianoRollComponent::fxRowOf(const EffectRegion& r) const {
+    // First-appearance order over distinct (linkId, groupId) pairs. Two regions
+    // gating the same wire therefore share a row - they're the same layer, just
+    // active at different times - and can never overlap vertically.
+    if (!node) return 0;
+    int row = 0;
+    for (const auto& other : node->effectRegions) {
+        if (&other == &r) return row;
+        bool seenBefore = false;
+        for (const auto& earlier : node->effectRegions) {
+            if (&earlier == &other) break;
+            if (earlier.linkId == other.linkId && earlier.groupId == other.groupId) {
+                seenBefore = true;
+                break;
+            }
+        }
+        if (!seenBefore) {
+            if (other.linkId == r.linkId && other.groupId == r.groupId) return row;
+            ++row;
+        }
+    }
+    return row;
+}
+
+int PianoRollComponent::fxRowCount() const {
+    if (!node) return 1;
+    int distinct = 0;
+    for (size_t i = 0; i < node->effectRegions.size(); ++i) {
+        bool seenBefore = false;
+        for (size_t j = 0; j < i; ++j)
+            if (node->effectRegions[j].linkId  == node->effectRegions[i].linkId
+             && node->effectRegions[j].groupId == node->effectRegions[i].groupId) {
+                seenBefore = true;
+                break;
+            }
+        if (!seenBefore) ++distinct;
+    }
+    // Never zero: an empty lane is the discoverability affordance, and while
+    // expanded there's always one spare row to right-click into to add a layer.
+    return std::max(1, distinct);
+}
+
+int PianoRollComponent::fxLaneHeight() const {
+    int rows = fxRowCount();
+    if (fxLaneExpanded) rows += 1;      // spare row: right-click here to add
+    return rows * fxRowHeight() + FX_LANE_PAD * 2;
+}
+
+void PianoRollComponent::setFxLaneExpanded(bool shouldExpand) {
+    if (fxLaneExpanded == shouldExpand) return;
+    fxLaneExpanded = shouldExpand;
+    // The lane's height is part of toolbarHeight(), so the whole grid below it
+    // shifts. Re-lay-out (scrollbars are positioned from toolbarHeight()) and
+    // repaint the lot.
+    resized();
+    repaint();
+}
+
+bool PianoRollComponent::isInFxLane(juce::Point<float> pos) const {
+    return pos.y >= (float)fxLaneTop()
+        && pos.y < (float)(fxLaneTop() + fxLaneHeight())
+        && pos.x < (float)getWidth() - SCROLLBAR_SIZE;
+}
+
+float PianoRollComponent::fxBeatToX(float localBeat) const {
+    if (!node) return KEY_WIDTH;
+    float gridX = KEY_WIDTH;
+    float gridW = std::max(1.0f, (float)getWidth() - KEY_WIDTH - SCROLLBAR_SIZE);
+    float absOffset = node->absoluteBeatOffset;
+    float absTotalBeats = graph.getTimelineBeats(*node) + absOffset;
+    float visibleBeats = std::max(1.0f, absTotalBeats / std::max(state.hZoom, 0.1f));
+    float scrollBeat = juce::jlimit(0.0f, std::max(0.0f, absTotalBeats - visibleBeats),
+                                    state.hScroll);
+    // `+ absOffset` is what makes the lane slide with the track: regions are
+    // stored in node-local beats, exactly like clips and notes.
+    return gridX + ((localBeat + absOffset - scrollBeat) / visibleBeats) * gridW;
+}
+
+float PianoRollComponent::fxXToBeat(float x) const {
+    if (!node) return 0.0f;
+    float gridX = KEY_WIDTH;
+    float gridW = std::max(1.0f, (float)getWidth() - KEY_WIDTH - SCROLLBAR_SIZE);
+    float absOffset = node->absoluteBeatOffset;
+    float absTotalBeats = graph.getTimelineBeats(*node) + absOffset;
+    float visibleBeats = std::max(1.0f, absTotalBeats / std::max(state.hZoom, 0.1f));
+    float scrollBeat = juce::jlimit(0.0f, std::max(0.0f, absTotalBeats - visibleBeats),
+                                    state.hScroll);
+    return scrollBeat + ((x - gridX) / gridW) * visibleBeats - absOffset;
+}
+
+float PianoRollComponent::fxBeatsPerPixel() const {
+    if (!node) return 1.0f;
+    float gridW = std::max(1.0f, (float)getWidth() - KEY_WIDTH - SCROLLBAR_SIZE);
+    float absTotalBeats = graph.getTimelineBeats(*node) + node->absoluteBeatOffset;
+    float visibleBeats = std::max(1.0f, absTotalBeats / std::max(state.hZoom, 0.1f));
+    return visibleBeats / gridW;
+}
+
+float PianoRollComponent::fxMagneticSnap(float localBeat, int dir, bool* snapped) const {
+    if (snapped) *snapped = false;
+    if (!node) return localBeat;
+    // Snap in ABSOLUTE beats: that's where the vertical grid lines the user is
+    // aiming at are drawn (see the beat-grid loop in paint()). A track whose
+    // offset isn't a whole grid step would otherwise snap to positions with no
+    // line under them.
+    const float absOffset = node->absoluteBeatOffset;
+    const float pull = FX_SNAP_PULL_PX * fxBeatsPerPixel();
+    return SoundShop::magneticSnapBeat(localBeat + absOffset, dir, state.snap, pull, snapped)
+           - absOffset;
+}
+
+// Resolve a region's display colour: explicit colour, else its group's, else a
+// palette entry keyed on the link id, else grey.
+static juce::Colour fxRegionColour(const NodeGraph& graph, const EffectRegion& r) {
+    uint32_t col = r.color;
+    if (col == 0 && r.groupId >= 0)
+        for (const auto& grp : graph.effectGroups)
+            if (grp.id == r.groupId) { col = grp.color; break; }
+    if (col == 0 && r.linkId >= 0) col = getDistinctColor(r.linkId);
+    if (col == 0) col = 0xFF808080;
+    return juce::Colour((uint8_t)((col >> 16) & 0xFF),
+                        (uint8_t)((col >> 8) & 0xFF),
+                        (uint8_t)(col & 0xFF));
+}
+
+// Human-readable name for what a region gates: the group name, else the
+// destination node of the wire, else a fallback.
+static juce::String fxRegionLabel(NodeGraph& graph, const EffectRegion& r) {
+    if (r.groupId >= 0) {
+        if (auto* grp = graph.findEffectGroup(r.groupId))
+            return grp->name.empty() ? ("Group #" + juce::String(grp->id))
+                                     : juce::String(grp->name);
+        return "(missing group)";
+    }
+    if (r.linkId >= 0) {
+        for (auto& link : graph.links)
+            if (link.id == r.linkId)
+                for (auto& n : graph.nodes)
+                    for (auto& pin : n.pinsIn)
+                        if (pin.id == link.endPin) return juce::String(n.name);
+        return "(missing wire)";
+    }
+    return "(unassigned)";
+}
+
+int PianoRollComponent::fxRegionAt(juce::Point<float> pos, int* edgeOut) const {
+    if (edgeOut) *edgeOut = 0;
+    if (!node || !isInFxLane(pos)) return -1;
+    const float rowH = (float)fxRowHeight();
+    const float top = (float)fxLaneTop() + FX_LANE_PAD;
+    // Iterate backwards so the topmost-drawn region wins an overlap.
+    for (int i = (int)node->effectRegions.size() - 1; i >= 0; --i) {
+        const auto& r = node->effectRegions[(size_t)i];
+        float y = top + (float)fxRowOf(r) * rowH;
+        if (pos.y < y || pos.y >= y + rowH) continue;
+        float x1 = fxBeatToX(r.startBeat), x2 = fxBeatToX(r.endBeat);
+        if (pos.x < x1 - FX_EDGE_GRAB || pos.x > x2 + FX_EDGE_GRAB) continue;
+        if (edgeOut) {
+            // Edge zones are only offered while expanded - at 7 px tall a
+            // collapsed bar is too small to aim at, and the lane is read-only
+            // in that state anyway.
+            if (!fxLaneExpanded)                    *edgeOut = 0;
+            else if (pos.x <= x1 + FX_EDGE_GRAB)    *edgeOut = -1;
+            else if (pos.x >= x2 - FX_EDGE_GRAB)    *edgeOut = +1;
+            else                                    *edgeOut = 0;
+        }
+        return i;
+    }
+    return -1;
+}
+
+void PianoRollComponent::paintFxLane(juce::Graphics& g) {
+    if (!node) return;
+    const int top = fxLaneTop();
+    const int h = fxLaneHeight();
+    const float gridX = KEY_WIDTH;
+    const float gridW = std::max(1.0f, (float)getWidth() - KEY_WIDTH - SCROLLBAR_SIZE);
+    const float rowH = (float)fxRowHeight();
+
+    // Band background - a touch lighter when expanded so "I am in edit mode" is
+    // visible at a glance, not just inferable from the extra height.
+    g.setColour(fxLaneExpanded ? juce::Colour(34, 32, 44) : juce::Colour(23, 23, 30));
+    g.fillRect(0, top, getWidth(), h);
+
+    // Left-gutter caption over the keyboard column, mirroring "Start" below.
+    // The chevron is the collapse affordance and the whole gutter cell is its
+    // hit target (see mouseDown).
+    // Non-ASCII must go through fromUTF8: a bare narrow literal is decoded as
+    // Latin-1 here, which renders the chevron as three mojibake glyphs and eats
+    // the gutter width. Chevron and word are drawn as separate cells because
+    // "> Effects" as one string does not fit in KEY_WIDTH and JUCE silently
+    // ellipsises it to "Eff...".
+    g.setColour(fxLaneExpanded ? juce::Colour(190, 180, 220) : juce::Colour(120, 120, 140));
+    g.setFont(juce::Font(9.0f));
+    g.drawText(juce::String::fromUTF8(fxLaneExpanded ? "\xe2\x96\xbe" : "\xe2\x96\xb8"),
+               1, top, 8, h, juce::Justification::centredLeft);
+    g.drawText("Effects", 9, top, (int)gridX - 11, h, juce::Justification::centredRight);
+
+    // Row guides while expanded, so empty rows read as droppable slots rather
+    // than dead space.
+    if (fxLaneExpanded) {
+        g.setColour(juce::Colours::white.withAlpha(0.05f));
+        for (int rowIdx = 0; rowIdx < fxRowCount() + 1; ++rowIdx) {
+            float y = (float)(top + FX_LANE_PAD) + (float)rowIdx * rowH;
+            g.drawHorizontalLine((int)(y + rowH - 1), gridX, gridX + gridW);
+        }
+    }
+
+    for (const auto& region : node->effectRegions) {
+        float x1 = fxBeatToX(region.startBeat);
+        float x2 = fxBeatToX(region.endBeat);
+        if (x2 < gridX || x1 > gridX + gridW) continue;
+        const bool clipL = x1 < gridX, clipR = x2 > gridX + gridW;
+        x1 = std::max(x1, gridX);
+        x2 = std::min(x2, gridX + gridW);
+        if (x2 - x1 < 1.5f) x2 = x1 + 1.5f;
+
+        // Collapsed rows are flush - the tubes stack directly on top of each
+        // other so the ribbon reads as one solid bundle of cables, which is the
+        // whole job of the collapsed state. Expanded keeps a 1 px inset per row
+        // so each tube reads as a separate object you can grab and drag.
+        const float inset = fxLaneExpanded ? 1.0f : 0.0f;
+        float y = (float)(top + FX_LANE_PAD) + (float)fxRowOf(region) * rowH;
+        juce::Rectangle<float> bar(x1, y + inset, x2 - x1, rowH - inset * 2.0f);
+        auto col = fxRegionColour(graph, region);
+
+        // Tube shading: a vertical three-stop ramp (dark rim -> bright specular
+        // band in the upper third -> dark rim) reads as a cylinder lying on its
+        // side, which distinguishes a layer bar from the flat rectangles used
+        // everywhere else in the piano roll.
+        juce::ColourGradient tube(col.darker(0.75f), 0.0f, bar.getY(),
+                                  col.darker(0.55f), 0.0f, bar.getBottom(), false);
+        tube.addColour(0.32, col.brighter(0.55f));
+        tube.addColour(0.55, col);
+        g.setGradientFill(tube);
+        const float radius = std::min(bar.getHeight() * 0.5f, 5.0f);
+        g.fillRoundedRectangle(bar, radius);
+
+        // Rim light along the top edge completes the cylinder read.
+        g.setColour(juce::Colours::white.withAlpha(0.30f));
+        g.drawLine(bar.getX() + radius, bar.getY() + 0.75f,
+                   bar.getRight() - radius, bar.getY() + 0.75f, 1.0f);
+
+        // End caps. A clipped end gets a flat bright edge instead, signalling
+        // "this continues off-screen" rather than "it ends here".
+        g.setColour(col.brighter(0.7f).withAlpha(clipL ? 0.9f : 0.75f));
+        g.fillRect(bar.getX(), bar.getY(), clipL ? 2.0f : 1.5f, bar.getHeight());
+        g.setColour(col.brighter(0.7f).withAlpha(clipR ? 0.9f : 0.75f));
+        g.fillRect(bar.getRight() - (clipR ? 2.0f : 1.5f), bar.getY(),
+                   clipR ? 2.0f : 1.5f, bar.getHeight());
+
+        // Name only when expanded - a 7 px collapsed tube has no room, and the
+        // colour plus the gutter caption already say what the ribbon is.
+        if (fxLaneExpanded && bar.getWidth() > 34.0f) {
+            g.setColour(juce::Colours::white.withAlpha(0.95f));
+            g.setFont(juce::Font(std::min(10.0f, rowH - 6.0f)));
+            g.drawText(fxRegionLabel(graph, region),
+                       (int)bar.getX() + 5, (int)bar.getY(),
+                       (int)bar.getWidth() - 10, (int)bar.getHeight(),
+                       juce::Justification::centredLeft, false);
+        }
+    }
+
+    // Empty state. This is the entire reason the lane is always visible: with
+    // no layers there is otherwise nothing anywhere in the UI to tell you the
+    // feature exists.
+    if (node->effectRegions.empty()) {
+        g.setColour(juce::Colour(110, 105, 130));
+        g.setFont(juce::Font(std::min(10.0f, rowH - 1.0f)));
+        g.drawText(fxLaneExpanded
+                       ? juce::String("right-click to add an effect layer")
+                       : juce::String::fromUTF8("no effect layers \xe2\x80\x94 click to add one"),
+                   (int)gridX + 6, top, (int)gridW - 12, h,
+                   juce::Justification::centredLeft, false);
+    }
+
+    // Bottom hairline separating the lane from the track-header strip.
+    g.setColour(juce::Colour(0, 0, 0).withAlpha(0.5f));
+    g.drawHorizontalLine(top + h - 1, 0.0f, (float)getWidth());
+}
+
+// Scrollable "which wires are in this group?" checklist for the Effects lane's
+// "New group of wires..." dialog. Each row carries the wire's palette colour as
+// a solid swatch, matching the tube the group will draw and the tag on the wire
+// in the graph - picking wires by colour is how the user navigates a graph with
+// more cables than distinct names.
+namespace {
+
+class WireCheckRow : public juce::Component {
+public:
+    WireCheckRow(int linkId_, const juce::String& label, juce::Colour c)
+        : linkId(linkId_), colour(c) {
+        button.setButtonText(label);
+        button.onClick = [this] { if (onToggle) onToggle(); };
+        addAndMakeVisible(button);
+    }
+    std::function<void()> onToggle;
+    void resized() override { button.setBounds(18, 0, getWidth() - 18, getHeight()); }
+    void paint(juce::Graphics& g) override {
+        g.setColour(colour);
+        g.fillRoundedRectangle(2.0f, (float)getHeight() * 0.5f - 5.0f, 11.0f, 10.0f, 2.0f);
+        g.setColour(juce::Colours::black.withAlpha(0.6f));
+        g.drawRoundedRectangle(2.0f, (float)getHeight() * 0.5f - 5.0f, 11.0f, 10.0f, 2.0f, 1.0f);
+    }
+    bool isChecked() const { return button.getToggleState(); }
+    int  getLinkId() const { return linkId; }
+
+private:
+    int linkId;
+    juce::Colour colour;
+    juce::ToggleButton button;
+};
+
+// Contents of the "New Group of Wires" dialog. A DialogWindow rather than an
+// AlertWindow: AlertWindow puts WS_EX_APPWINDOW on its peer with no owner, so it
+// earns a second SEANCE button on the Windows taskbar (see CLAUDE.md's dialog
+// rule) - launchToolDialog() is the project's fix for that.
+class NewGroupContent : public juce::Component {
+public:
+    using Callback = std::function<void(std::vector<int>, juce::String)>;
+
+    NewGroupContent(const std::vector<std::pair<int, juce::String>>& wires,
+                    float beat, Callback cb)
+        : onCreate(std::move(cb)) {
+        blurb.setText("Tick every wire that should switch on and off together. "
+                      "A layer for the group is added at beat "
+                          + juce::String(beat, 2) + " of this track.",
+                      juce::dontSendNotification);
+        blurb.setJustificationType(juce::Justification::topLeft);
+        addAndMakeVisible(blurb);
+
+        for (const auto& [linkId, label] : wires) {
+            auto row = std::make_unique<WireCheckRow>(linkId, label,
+                                                      juce::Colour(getDistinctColor(linkId)));
+            list.addAndMakeVisible(row.get());
+            rows.push_back(std::move(row));
+        }
+        viewport.setViewedComponent(&list, false);
+        viewport.setScrollBarsShown(true, false);
+        addAndMakeVisible(viewport);
+
+        nameLabel.setText("Group name:", juce::dontSendNotification);
+        addAndMakeVisible(nameLabel);
+        nameEditor.setTextToShowWhenEmpty("optional", juce::Colours::grey);
+        addAndMakeVisible(nameEditor);
+
+        // Nothing ticked means nothing to group, so the button stays off until
+        // it would actually do something - with a tooltip saying why, per the
+        // "grayed-out controls must explain themselves" rule.
+        createBtn.setEnabled(false);
+        createBtn.setTooltip("Tick at least one wire first.");
+        createBtn.onClick = [this] {
+            std::vector<int> picked;
+            for (const auto& r : rows)
+                if (r->isChecked()) picked.push_back(r->getLinkId());
+            auto name = nameEditor.getText();
+            close();
+            if (onCreate) onCreate(std::move(picked), name);
+        };
+        cancelBtn.onClick = [this] { close(); };
+        addAndMakeVisible(createBtn);
+        addAndMakeVisible(cancelBtn);
+
+        for (const auto& r : rows)
+            r->onToggle = [this] {
+                bool any = false;
+                for (const auto& x : rows) any = any || x->isChecked();
+                createBtn.setEnabled(any);
+                createBtn.setTooltip(any ? juce::String()
+                                         : juce::String("Tick at least one wire first."));
+            };
+
+        setSize(420, juce::jlimit(160, 420, 150 + (int)rows.size() * rowH));
+    }
+
+    void resized() override {
+        auto r = getLocalBounds().reduced(10);
+        blurb.setBounds(r.removeFromTop(44));
+        auto buttons = r.removeFromBottom(30);
+        cancelBtn.setBounds(buttons.removeFromRight(90));
+        buttons.removeFromRight(8);
+        createBtn.setBounds(buttons.removeFromRight(90));
+        r.removeFromBottom(8);
+        auto nameRow = r.removeFromBottom(26);
+        nameLabel.setBounds(nameRow.removeFromLeft(90));
+        nameEditor.setBounds(nameRow);
+        r.removeFromBottom(8);
+        viewport.setBounds(r);
+        list.setSize(std::max(0, r.getWidth() - 12), (int)rows.size() * rowH);
+        for (int i = 0; i < (int)rows.size(); ++i)
+            rows[(size_t)i]->setBounds(0, i * rowH, list.getWidth(), rowH);
+    }
+
+private:
+    void close() {
+        if (auto* dw = findParentComponentOfClass<juce::DialogWindow>())
+            dw->exitModalState(0);
+    }
+
+    static constexpr int rowH = 22;
+    Callback onCreate;
+    juce::Label blurb, nameLabel;
+    juce::TextEditor nameEditor;
+    juce::Viewport viewport;
+    juce::Component list;
+    std::vector<std::unique_ptr<WireCheckRow>> rows;
+    juce::TextButton createBtn{"Create"}, cancelBtn{"Cancel"};
+};
+
+} // namespace
+
+void PianoRollComponent::showFxLaneMenu(juce::Point<float> pos) {
+    if (!node) return;
+    const int myId = node->id;
+    // Snap the click beat the same way note placement does, so a layer created
+    // here lines up with the grid the user can see.
+    const float snap = state.snap > 0 ? state.snap : 1.0f;
+    const float clickBeat = std::floor(fxXToBeat(pos.x) / snap) * snap;
+
+    int edge = 0;
+    const int hitIdx = fxRegionAt(pos, &edge);
+
+    juce::PopupMenu menu;
+    // "Layers" everywhere the user can read it - the struct is EffectRegion but
+    // README/REFERENCE/docs and every item below say "layer", and a menu that
+    // calls the same thing by two names reads like two different features.
+    menu.addSectionHeader("Effect Layers");
+
+    if (hitIdx >= 0) {
+        const auto& r = node->effectRegions[(size_t)hitIdx];
+        menu.addItem(1, "Delete layer \"" + fxRegionLabel(graph, r) + "\"");
+        menu.addSeparator();
+    }
+
+    // Add submenu: groups first, then individual wires, each with a colour swatch
+    // so the menu entry looks like the tube it will create - the user is picking
+    // a colour here as much as a name, and the tube carries no other identity.
+    auto swatch = [](uint32_t argb) {
+        auto d = std::make_unique<juce::DrawableRectangle>();
+        d->setRectangle(juce::Parallelogram<float>(juce::Rectangle<float>(0.0f, 0.0f, 12.0f, 12.0f)));
+        d->setFill(juce::FillType(juce::Colour((juce::uint8)((argb >> 16) & 0xFF),
+                                               (juce::uint8)((argb >> 8) & 0xFF),
+                                               (juce::uint8)(argb & 0xFF))));
+        d->setStrokeFill(juce::FillType(juce::Colours::black.withAlpha(0.6f)));
+        d->setStrokeThickness(1.0f);
+        return d;
+    };
+    auto addSwatchItem = [&swatch](juce::PopupMenu& m, int id, const juce::String& text,
+                                   uint32_t argb) {
+        juce::PopupMenu::Item item(text);
+        item.itemID = id;
+        item.image = swatch(argb);
+        m.addItem(std::move(item));
+    };
+
+    // Wire names come from graph.wireLabel() so this menu, the layer legend and
+    // the graph's own wire menus all spell a wire the same way - including the
+    // rule that two wires between the same pair of nodes get qualified with
+    // their plug names so the user isn't picking blind.
+    std::vector<std::pair<int, juce::String>> wires;   // linkId, label
+    for (auto& link : graph.links) {
+        auto label = graph.wireLabel(link.id);
+        if (label.isNotEmpty()) wires.emplace_back(link.id, label);
+    }
+
+    juce::PopupMenu addMenu;
+    // Creating a group lives HERE, at the top of the list of things you can
+    // gate, because this menu is where the need for one is felt. It also exists
+    // on the wire's own right-click menu in the graph, but a user shaping layers
+    // in a piano roll shouldn't have to go find a cable to discover that groups
+    // are a thing.
+    if (!wires.empty()) {
+        addMenu.addItem(4, juce::String::fromUTF8("New group of wires\xe2\x80\xa6"));
+        addMenu.addSeparator();
+    }
+    for (auto& grp : graph.effectGroups) {
+        juce::String label = grp.name.empty() ? ("Group #" + juce::String(grp.id))
+                                              : juce::String(grp.name);
+        addSwatchItem(addMenu, 5000 + grp.id, "Group: " + label, grp.color);
+    }
+    if (!graph.effectGroups.empty()) addMenu.addSeparator();
+
+    for (auto& [linkId, label] : wires)
+        addSwatchItem(addMenu, 6000 + linkId, label, getDistinctColor(linkId));
+
+    if (!wires.empty())
+        menu.addSubMenu("Add layer at beat " + juce::String(clickBeat, 2)
+                            + juce::String::fromUTF8("\xe2\x80\xa6"), addMenu);
+    else
+        menu.addItem(-1, "Add layer (no wires in this project yet)", false);
+
+    menu.addSeparator();
+    menu.addItem(2, fxLaneExpanded ? "Done editing (collapse)" : "Expand to edit");
+    menu.addItem(3, juce::String::fromUTF8("Help: Effect Layers\xe2\x80\xa6"));
+
+    // withMousePosition, NOT withTargetComponent(this): the target component is
+    // the whole piano roll, so JUCE parks the menu against that giant rectangle's
+    // edge - right-clicking a layer at bar 30 popped the menu at the far left of
+    // the window, nowhere near the thing being right-clicked.
+    menu.showMenuAsync(juce::PopupMenu::Options().withMousePosition(),
+                       [this, myId, clickBeat, hitIdx, wires](int result) {
+        refreshNode();
+        if (!node || node->id != myId || result == 0) return;
+
+        if (result == 1) {
+            if (hitIdx >= 0 && hitIdx < (int)node->effectRegions.size()) {
+                node->effectRegions.erase(node->effectRegions.begin() + hitIdx);
+                graph.dirty = true;
+                graph.commitSnapshot("Delete effect layer");
+                if (onTimingChanged) onTimingChanged();
+            }
+        } else if (result == 2) {
+            setFxLaneExpanded(!fxLaneExpanded);
+            return;
+        } else if (result == 3) {
+            if (onOpenHelpDoc) onOpenHelpDoc("layers-and-groups.html");
+            return;
+        } else if (result == 4) {
+            // Make a group and gate it here in one step. Splitting it ("group
+            // made - now go add a layer for it") is what made groups feel like a
+            // separate feature you had to already know about.
+            auto* content = new NewGroupContent(wires, clickBeat,
+                [this, myId, clickBeat](std::vector<int> picked, juce::String name) {
+                    refreshNode();
+                    if (picked.empty() || !node || node->id != myId) return;
+                    auto& grp = graph.addEffectGroup(name.toStdString());
+                    grp.linkIds = std::move(picked);
+                    EffectRegion region;
+                    region.groupId = grp.id;
+                    region.startBeat = clickBeat;
+                    region.endBeat = clickBeat + 4.0f;
+                    region.color = grp.color;
+                    node->effectRegions.push_back(region);
+                    graph.dirty = true;
+                    graph.commitSnapshot("New effect group");
+                    setFxLaneExpanded(true);   // land straight in edit mode
+                    if (onTimingChanged) onTimingChanged();
+                    resized();
+                    repaint();
+                });
+            juce::DialogWindow::LaunchOptions opt;
+            opt.dialogTitle = "New Group of Wires";
+            opt.content.setOwned(content);
+            opt.escapeKeyTriggersCloseButton = true;
+            opt.useNativeTitleBar = true;
+            opt.resizable = true;
+            opt.componentToCentreAround = this;
+            launchToolDialog(opt);   // modal, no separate taskbar entry
+            return;
+        } else if (result >= 5000 && result < 6000) {
+            EffectRegion region;
+            region.groupId = result - 5000;
+            region.startBeat = clickBeat;
+            region.endBeat = clickBeat + 4.0f;
+            if (auto* grp = graph.findEffectGroup(region.groupId)) region.color = grp->color;
+            node->effectRegions.push_back(region);
+            graph.dirty = true;
+            graph.commitSnapshot("Add effect layer");
+            setFxLaneExpanded(true);   // land straight in edit mode
+            if (onTimingChanged) onTimingChanged();
+        } else if (result >= 6000) {
+            EffectRegion region;
+            region.linkId = result - 6000;
+            region.startBeat = clickBeat;
+            region.endBeat = clickBeat + 4.0f;
+            region.color = getDistinctColor(region.linkId);
+            node->effectRegions.push_back(region);
+            graph.dirty = true;
+            graph.commitSnapshot("Add effect layer");
+            setFxLaneExpanded(true);
+            if (onTimingChanged) onTimingChanged();
+        }
+        // Adding or deleting can change the row count, hence the lane height.
+        resized();
+        repaint();
+    });
+}
+
 void PianoRollComponent::paintTrackHeader(juce::Graphics& g) {
     if (!node) return;
     float gridX = KEY_WIDTH;
@@ -1596,7 +2116,8 @@ void PianoRollComponent::paintTrackHeader(juce::Graphics& g) {
     juce::String label = juce::String(node->name);
     if (isChild) {
         auto* parent = graph.findNode(node->parentGroupId);
-        label += "  \xe2\x97\x82 child of " + juce::String(parent ? parent->name : "?");
+        label += juce::String::fromUTF8("  \xe2\x97\x82 child of ")
+               + juce::String(parent ? parent->name : "?");
     }
     if (node->groupBeatOffset != 0.0f || isChild)
         label += "   @" + juce::String(node->groupBeatOffset, 2) + " beats";
@@ -1621,7 +2142,8 @@ void PianoRollComponent::showTrackHeaderMenu() {
     // menu (see track_nesting_menu.h) so the two entry points never drift.
     TrackNestingMenu::addItems(menu, graph, *node);
 
-    menu.showMenuAsync(juce::PopupMenu::Options().withTargetComponent(this),
+    // withMousePosition for the same reason as the Effects-lane menu above.
+    menu.showMenuAsync(juce::PopupMenu::Options().withMousePosition(),
         [this, myId](int result) {
             if (result == 0) return;
             TrackNestingMenu::handle(result, graph, myId, this,
@@ -1672,6 +2194,35 @@ juce::String PianoRollComponent::getTooltip() {
     if (!node) return {};
 
     auto p = getMouseXYRelative().toFloat();
+
+    // Effect Regions lane. Explained in full here because the lane is the only
+    // signpost the feature has - see the block comment in the header.
+    if (isInFxLane(p)) {
+        int edge = 0;
+        const int idx = fxRegionAt(p, &edge);
+        if (idx >= 0) {
+            const auto& r = node->effectRegions[(size_t)idx];
+            juce::String t;
+            t << "Effect layer: " << fxRegionLabel(graph, r) << "\n"
+              << "Active from beat " << juce::String(r.startBeat, 2)
+              << " to " << juce::String(r.endBeat, 2)
+              << " (" << juce::String(r.endBeat - r.startBeat, 2) << " beats).";
+            if (fxLaneExpanded)
+                t << "\nDrag the middle to move it, an end to resize. "
+                     "Right-click to delete.";
+            else
+                t << "\nClick the lane to expand it for editing.";
+            return t;
+        }
+        if (fxLaneExpanded)
+            return "Effect Regions - time ranges in which a cable (or effect group) "
+                   "is switched on.\nRight-click to add a layer. Click the caption, "
+                   "or press Escape, when you're done editing.";
+        return "Effect Regions - time ranges in which a cable (or effect group) is "
+               "switched on, so an effect only applies to part of the track.\n"
+               "Click to expand this lane and edit them.";
+    }
+
     // Restrict to the note grid - skip the keyboard column, toolbar and the
     // two scrollbars so hovering chrome never shows a note tooltip.
     if (p.x < KEY_WIDTH || p.x > getWidth() - SCROLLBAR_SIZE) return {};
@@ -1732,6 +2283,48 @@ void PianoRollComponent::mouseDown(const juce::MouseEvent& e) {
     if (e.y < RESIZE_HANDLE_H && onResizeDrag) {
         resizingHeight = true;
         resizeLastY = e.getScreenY();
+        return;
+    }
+
+    // Effect Regions lane. Sits above the track-header strip, so it must be
+    // tested first (both are inside toolbarHeight()).
+    //
+    //   collapsed  - left-click anywhere expands into edit mode; right-click
+    //                opens the menu (and expands if you add something).
+    //   expanded   - left-drag a tube's middle to move it, an end to resize;
+    //                right-click a tube to delete it or empty space to add.
+    //                Clicking the left-gutter caption collapses again, as does
+    //                Escape and the menu's "Done editing" item.
+    if (isInFxLane(e.position)) {
+        if (e.mods.isRightButtonDown()) {
+            showFxLaneMenu(e.position);
+            return;
+        }
+        // Left-gutter caption cell is the expand/collapse toggle in both states.
+        if (e.position.x < KEY_WIDTH) {
+            setFxLaneExpanded(!fxLaneExpanded);
+            return;
+        }
+        if (!fxLaneExpanded) {
+            setFxLaneExpanded(true);
+            return;
+        }
+        int edge = 0;
+        const int idx = fxRegionAt(e.position, &edge);
+        if (idx >= 0) {
+            const auto& r = node->effectRegions[(size_t)idx];
+            fxDragIdx = idx;
+            fxDragMode = edge < 0 ? FxDrag::ResizeL
+                       : edge > 0 ? FxDrag::ResizeR
+                                  : FxDrag::Move;
+            fxDragGrabBeat = fxXToBeat(e.position.x);
+            fxDragStart0 = r.startBeat;
+            fxDragEnd0 = r.endBeat;
+            fxDragChanged = false;
+            // No direction yet, so the first few pixels of travel are unsnapped.
+            fxDragDir = 0;
+            fxDragDirLastX = e.position.x;
+        }
         return;
     }
 
@@ -2047,6 +2640,78 @@ void PianoRollComponent::mouseDrag(const juce::MouseEvent& e) {
         return;
     }
 
+    // Effect-layer move/resize. Live-updates the region; one undo snapshot is
+    // pushed on release (mouseUp), matching the track-retime gesture below.
+    // Positions are pixel-precise, with a directional magnetic pull toward grid
+    // markers on the departing side only (fxMagneticSnap); Alt turns it off.
+    if (fxDragMode != FxDrag::None) {
+        if (fxDragIdx < 0 || fxDragIdx >= (int)node->effectRegions.size()) {
+            fxDragMode = FxDrag::None;
+            return;
+        }
+        auto& r = node->effectRegions[(size_t)fxDragIdx];
+
+        // Track travel direction with hysteresis - see fxDragDir in the header
+        // for why it's derived from the live cursor, not the total delta.
+        if (e.position.x > fxDragDirLastX + FX_DIR_HYSTERESIS_PX) {
+            fxDragDir = +1; fxDragDirLastX = e.position.x;
+        } else if (e.position.x < fxDragDirLastX - FX_DIR_HYSTERESIS_PX) {
+            fxDragDir = -1; fxDragDirLastX = e.position.x;
+        }
+        // Alt = fully free, matching every other snap-bearing gesture here.
+        const int dir = e.mods.isAltDown() ? 0 : fxDragDir;
+        auto magnet = [this, dir](float b, bool* hit = nullptr) {
+            return fxMagneticSnap(b, dir, hit);
+        };
+
+        const float delta = fxXToBeat(e.position.x) - fxDragGrabBeat;
+        // A layer must keep a positive length, so each resize edge is clamped
+        // against the other one rather than being allowed to cross it. The
+        // floor is one pixel's worth of beats rather than a grid step: edges are
+        // pixel-precise now, so a grid-sized minimum would be an arbitrary wall
+        // in the middle of the range the user can otherwise reach.
+        const float minLen = std::max(fxBeatsPerPixel(), 1.0e-4f);
+
+        float newStart = r.startBeat, newEnd = r.endBeat;
+        if (fxDragMode == FxDrag::Move) {
+            const float len = fxDragEnd0 - fxDragStart0;
+            const float rawStart = fxDragStart0 + delta;
+            // Both ends of a moving layer are magnetic; whichever actually
+            // caught a marker wins, and if both did, the smaller correction.
+            // Snapping only the left edge would make the right edge unalignable
+            // without arithmetic, and a layer's end is just as musically
+            // meaningful as its start. Note the hitL/hitR flags rather than
+            // comparing the results to rawStart: a candidate that did NOT snap
+            // has a correction of exactly zero, so a nearest-correction test
+            // alone would let it beat the one that did.
+            bool hitL = false, hitR = false;
+            const float snapL = magnet(rawStart, &hitL);
+            const float snapR = magnet(rawStart + len, &hitR) - len;
+            if (hitL && hitR)
+                newStart = std::abs(snapL - rawStart) <= std::abs(snapR - rawStart)
+                         ? snapL : snapR;
+            else if (hitL) newStart = snapL;
+            else if (hitR) newStart = snapR;
+            else           newStart = rawStart;
+            newStart = std::max(0.0f, newStart);
+            newEnd = newStart + len;
+        } else if (fxDragMode == FxDrag::ResizeL) {
+            newStart = juce::jlimit(0.0f, fxDragEnd0 - minLen, magnet(fxDragStart0 + delta));
+            newEnd = fxDragEnd0;
+        } else { // ResizeR
+            newStart = fxDragStart0;
+            newEnd = std::max(fxDragStart0 + minLen, magnet(fxDragEnd0 + delta));
+        }
+        if (newStart != r.startBeat || newEnd != r.endBeat) {
+            r.startBeat = newStart;
+            r.endBeat = newEnd;
+            fxDragChanged = true;
+            graph.dirty = true;
+            repaint();
+        }
+        return;
+    }
+
     // Track-header retime drag: move the track's own start offset by however
     // many beats the cursor has travelled since mouseDown. Snap unless Alt is
     // held. No undo step here - one snapshot is pushed on mouseUp.
@@ -2204,6 +2869,21 @@ void PianoRollComponent::mouseUp(const juce::MouseEvent& e) {
     // rest of mouseUp would just be a no-op for it anyway.
     if (resizingHeight) {
         resizingHeight = false;
+        return;
+    }
+
+    // Commit an effect-layer move/resize: one undo step for the whole gesture,
+    // and only if the range actually changed (a plain click on a tube must not
+    // litter the undo tree with no-op steps).
+    if (fxDragMode != FxDrag::None) {
+        const bool wasResize = fxDragMode != FxDrag::Move;
+        fxDragMode = FxDrag::None;
+        fxDragIdx = -1;
+        if (fxDragChanged) {
+            fxDragChanged = false;
+            graph.commitSnapshot(wasResize ? "Resize effect layer" : "Move effect layer");
+            if (onTimingChanged) onTimingChanged();
+        }
         return;
     }
 
@@ -2451,6 +3131,16 @@ void PianoRollComponent::mouseMove(const juce::MouseEvent& e) {
     // would be misleading.
     if (e.y < RESIZE_HANDLE_H && onResizeDrag) {
         setMouseCursor(juce::MouseCursor::UpDownResizeCursor);
+        return;
+    }
+    // Effect Regions lane: a pointing hand says "this whole band is clickable"
+    // (the single most important cue for a feature nobody was finding), and the
+    // horizontal-resize arrow marks the drag-to-retime edges while expanded.
+    if (isInFxLane(e.position)) {
+        int edge = 0;
+        const bool overRegion = fxRegionAt(e.position, &edge) >= 0;
+        setMouseCursor(overRegion && edge != 0 ? juce::MouseCursor::LeftRightResizeCursor
+                                               : juce::MouseCursor::PointingHandCursor);
         return;
     }
     auto hit = findNoteAt(e.position);
@@ -3023,6 +3713,14 @@ bool PianoRollComponent::keyPressed(const juce::KeyPress& key) {
             case 'F': zoomToSelection(); return true;
         }
     }
+    // Escape leaves Effect Regions edit mode. This is the "I'm done" exit the
+    // lane needs; the caption chevron and the context menu's Done item are the
+    // other two. Only consumed when the lane is actually expanded, so Escape
+    // keeps its normal meaning otherwise.
+    if (key == juce::KeyPress::escapeKey && fxLaneExpanded) {
+        setFxLaneExpanded(false);
+        return true;
+    }
     if (key == juce::KeyPress::deleteKey || key == juce::KeyPress::backspaceKey) {
         deleteSelected();
         return true;
@@ -3559,55 +4257,15 @@ void PianoRollComponent::showEmptyMenu() {
     clipMenu.addItem(97, "Add Marker Here...");
     menu.addSubMenu("Clip", clipMenu);
 
-    // Effect regions: add/delete time-gated effect routing
-    {
-        juce::PopupMenu fxMenu;
-
-        // List groups first
-        for (auto& grp : graph.effectGroups) {
-            auto col = juce::Colour((uint8_t)((grp.color >> 16) & 0xFF),
-                                    (uint8_t)((grp.color >> 8) & 0xFF),
-                                    (uint8_t)(grp.color & 0xFF));
-            juce::String label = grp.name.empty()
-                ? "Group #" + juce::String(grp.id)
-                : juce::String(grp.name);
-            fxMenu.addItem(5000 + grp.id, "Group: " + label);
-        }
-
-        // Then list individual links (showing From -> To)
-        if (!graph.effectGroups.empty() && !graph.links.empty())
-            fxMenu.addSeparator();
-        for (auto& link : graph.links) {
-            juce::String src, dst;
-            for (auto& n : graph.nodes) {
-                for (auto& pin : n.pinsOut)
-                    if (pin.id == link.startPin) src = n.name;
-                for (auto& pin : n.pinsIn)
-                    if (pin.id == link.endPin) dst = n.name;
-            }
-            if (src.isEmpty() || dst.isEmpty()) continue;
-            fxMenu.addItem(6000 + link.id, src + " > " + dst);
-        }
-
-        // Delete region option (if cursor is on a region)
-        bool hasRegionAtCursor = false;
-        int regionIdxAtCursor = -1;
-        for (int i = 0; i < (int)node->effectRegions.size(); ++i) {
-            auto& r = node->effectRegions[i];
-            if (lastClickBeat >= r.startBeat && lastClickBeat <= r.endBeat) {
-                hasRegionAtCursor = true;
-                regionIdxAtCursor = i;
-                break;
-            }
-        }
-        if (hasRegionAtCursor) {
-            fxMenu.addSeparator();
-            fxMenu.addItem(5999, "Delete Effect Region at Cursor");
-        }
-
-        if (fxMenu.getNumItems() > 0)
-            menu.addSubMenu("Effect Regions", fxMenu);
-    }
+    // Time-gated effect layers used to be created from a submenu here. That was
+    // the feature's only entry point and, buried mid-menu with no visual trace
+    // anywhere else, nobody found it. They now live in the always-visible
+    // Effect Regions lane above the track-header strip, which owns both the
+    // display and the add/delete/move/resize interactions (see paintFxLane /
+    // showFxLaneMenu). This item just points at it so anyone who learned the
+    // old location isn't stranded.
+    menu.addItem(4999, juce::String::fromUTF8(
+        "Edit Effect Layers\xe2\x80\xa6 (opens the Effects lane above the grid)"));
 
     menu.addSeparator();
     menu.addItem(15, "Paste Notes", !clipboard.empty());
@@ -4052,41 +4710,10 @@ void PianoRollComponent::showEmptyMenu() {
                         if (i++ == result - 400) { state.activeCategory = "scale"; state.scaleName = name; break; }
                     }
                     syncScaleUI();
-                } else if (result == 5999) {
-                    // Delete effect region at cursor
-                    for (int i = 0; i < (int)node->effectRegions.size(); ++i) {
-                        auto& r = node->effectRegions[i];
-                        if (lastClickBeat >= r.startBeat && lastClickBeat <= r.endBeat) {
-                            node->effectRegions.erase(node->effectRegions.begin() + i);
-                            graph.dirty = true;
-                            break;
-                        }
-                    }
-                } else if (result >= 5000 && result < 5999) {
-                    // Add effect region for a group
-                    int groupId = result - 5000;
-                    float snap = state.snap > 0 ? state.snap : 1.0f;
-                    float beat = std::floor(lastClickBeat / snap) * snap;
-                    EffectRegion region;
-                    region.groupId = groupId;
-                    region.startBeat = beat;
-                    region.endBeat = beat + 4.0f;
-                    if (auto* grp = graph.findEffectGroup(groupId))
-                        region.color = grp->color;
-                    node->effectRegions.push_back(region);
-                    graph.dirty = true;
-                } else if (result >= 6000) {
-                    // Add effect region for an individual link
-                    int linkId = result - 6000;
-                    float snap = state.snap > 0 ? state.snap : 1.0f;
-                    float beat = std::floor(lastClickBeat / snap) * snap;
-                    EffectRegion region;
-                    region.linkId = linkId;
-                    region.startBeat = beat;
-                    region.endBeat = beat + 4.0f;
-                    region.color = getDistinctColor(linkId);
-                    node->effectRegions.push_back(region);
-                    graph.dirty = true;
+                } else if (result == 4999) {
+                    // Breadcrumb from the old "Effect Regions" submenu: expand
+                    // the lane, which is now where layers are created and edited.
+                    setFxLaneExpanded(true);
                 }
                 break;
         }

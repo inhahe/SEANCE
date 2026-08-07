@@ -278,6 +278,26 @@ public:
     // Input monitoring: hear audio input through the output
     std::atomic<bool> inputMonitoring{false};
 
+    // One live input channel on the current audio device, described well enough
+    // to name a track after it. Built by getAvailableInputs().
+    struct AudioInputSource {
+        int channel = -1;          // device input channel index (0-based)
+        juce::String deviceName;   // raw device name, e.g. "Microphone (2- C615)"
+        juce::String channelName;  // raw channel name, e.g. "Input 1"
+        juce::String kind;         // "Mic" / "Line In" / "Input" - see below
+        juce::String trackName;    // suggested node name, e.g. "Mic 1 (C615)"
+    };
+
+    // Every *active* input channel on the current device, in channel order.
+    // Empty when there is no device or no input is enabled.
+    //
+    // `kind` is inferred from the device and channel name text because no audio
+    // API on Windows reports "this jack is a microphone" directly - the only
+    // signal available is that Windows names the endpoints "Microphone (...)"
+    // and "Line In (...)". Unrecognised names fall back to a neutral "Input"
+    // rather than guessing wrong.
+    std::vector<AudioInputSource> getAvailableInputs() const;
+
     // Hotkey MIDI capture: when non-null, MIDI CC/note events are forwarded
     // here for hotkey assignment instead of being routed to instruments.
     std::function<void(int type, int channel, int number)> hotkeyMidiCapture;

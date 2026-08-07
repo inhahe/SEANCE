@@ -11,11 +11,6 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/libopenmpt_bin/lib/amd64/libo
 else()
     message(STATUS "  libopenmpt: NOT FOUND (MOD import disabled)")
 endif()
-if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/rubberband/rubberband/RubberBandStretcher.h")
-    message(STATUS "  Rubber Band: FOUND")
-else()
-    message(STATUS "  Rubber Band: NOT FOUND (pitch shift disabled)")
-endif()
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/opus/include/opus.h")
     message(STATUS "  libopus: FOUND")
 else()
@@ -54,6 +49,21 @@ juce_add_gui_app(SEANCE
     PRODUCT_NAME "SEANCE"
     COMPANY_NAME "SEANCE"
 )
+
+# Guard the dialog/taskbar rules (CLAUDE.md: a dialog must never earn its own
+# Windows taskbar button). The failure mode this catches is silent - an
+# AlertWindow subclass that overrides getDesktopWindowStyleFlags() compiles
+# cleanly and then simply never shows its window - so it is worth a build error.
+# Runs before SEANCE compiles, and on every build rather than only at configure
+# time, since the thing it inspects is source text.
+add_custom_target(seance_dialog_lint ALL
+    COMMAND ${CMAKE_COMMAND}
+            -DSEANCE_SRC_DIR=${CMAKE_CURRENT_SOURCE_DIR}/src
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/check_dialog_patterns.cmake
+    COMMENT "Checking dialog taskbar rules"
+    VERBATIM
+)
+add_dependencies(SEANCE seance_dialog_lint)
 
 target_sources(SEANCE PRIVATE
     src/main.cpp
@@ -182,6 +192,7 @@ target_sources(SEANCE PRIVATE
     src/mod_import.h
     src/fft_util.cpp
     src/fft_util.h
+    src/pitch_core.h
     src/wavetable_frame.h
     src/wavelet_frame.h
     src/wavelet_frame.cpp
@@ -212,8 +223,8 @@ target_sources(SEANCE PRIVATE
     src/effect_regions.h
     src/time_gate_processor.cpp
     src/time_gate_processor.h
-    src/routing_strip.cpp
-    src/routing_strip.h
+    src/layer_legend.cpp
+    src/layer_legend.h
     src/xy_pad.cpp
     src/xy_pad.h
     src/control_bank.cpp
@@ -340,43 +351,6 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/opus/CMakeLists.txt")
         third_party/opus/include
         third_party/ogg/include
     )
-endif()
-
-# Rubber Band Library (pitch shifting / time stretching)
-if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/rubberband/src")
-    file(GLOB_RECURSE RUBBERBAND_SOURCES
-        third_party/rubberband/src/common/*.cpp
-        third_party/rubberband/src/faster/*.cpp
-        third_party/rubberband/src/finer/*.cpp
-        third_party/rubberband/src/RubberBandStretcher.cpp
-        third_party/rubberband/src/RubberBandLiveShifter.cpp
-        third_party/rubberband/src/rubberband-c.cpp
-    )
-    # Exclude test files
-    list(FILTER RUBBERBAND_SOURCES EXCLUDE REGEX "test")
-    add_library(rubberband STATIC ${RUBBERBAND_SOURCES})
-    target_include_directories(rubberband PUBLIC
-        third_party/rubberband
-        third_party/rubberband/src
-        third_party/rubberband/src/ext/kissfft
-        third_party/rubberband/src/common
-    )
-    # Also compile KissFFT and BQ resampler sources
-    target_sources(rubberband PRIVATE
-        third_party/rubberband/src/ext/kissfft/kiss_fft.c
-        third_party/rubberband/src/ext/kissfft/kiss_fftr.c
-    )
-    target_compile_definitions(rubberband PRIVATE
-        USE_BUILTIN_FFT=1
-        HAVE_KISSFFT=1
-        USE_BQRESAMPLER=1
-        NOMINMAX
-        _USE_MATH_DEFINES
-        NO_THREADING=1
-    )
-    target_link_libraries(SEANCE PRIVATE rubberband)
-    target_include_directories(SEANCE PRIVATE third_party/rubberband)
-    target_compile_definitions(SEANCE PRIVATE HAS_RUBBERBAND=1)
 endif()
 
 # wasm3 (optional — builds without it, WASM scripts just won't load)

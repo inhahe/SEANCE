@@ -1,6 +1,7 @@
 #pragma once
 #include <string>
 #include <vector>
+#include <deque>
 #include <map>
 #include <memory>
 #include <functional>
@@ -834,7 +835,34 @@ struct Node {
     int recordInputChannel = -1;  // which audio input channel to record from (-1 = none)
     bool recordArmed = false;     // armed for recording
     bool inputMonitor = false;    // pass input through to output in real-time
+
+    // True only while a take is actually being captured into this track. Set by
+    // MultitrackRecorder::startRecording, cleared by stopRecording. Transient
+    // session state - never serialized, never part of an undo snapshot.
+    //
+    // Stored as the bare fact ("is recording") rather than as an already-
+    // combined mute so PanProcessor can apply NodeGraph::playbackWhileRecording
+    // fresh each block: flipping that preference mid-take then takes effect
+    // immediately instead of at the start of the next one.
+    bool recordingNow = false;
 };
+
+// Read a named param off a node, returning `def` when it is absent.
+//
+// Lives here, next to Node, rather than in builtin_effects.h, because every
+// processor that reads params needs it and not all of them want that header.
+//
+// Reading params BY NAME is the house rule; do not index node.params directly.
+// Indices are positional, so inserting or removing a param silently re-points
+// every later one - and saved projects keep whatever param list they were saved
+// with, so an old file loaded into new code lands on the wrong values rather
+// than failing loudly. PitchShiftProcessor read by index and that is precisely
+// what made deleting its dead Time Ratio param hazardous.
+inline float paramByName(const Node& node, const char* name, float def) {
+    for (auto& p : node.params)
+        if (p.name == name) return p.value;
+    return def;
+}
 
 // Resolve the effective automation record mode for one param, given the global
 // session mode. Global Off is a HARD GATE: nothing records regardless of node
@@ -1011,6 +1039,13 @@ public:
                   Vec2 pos = {0, 0});
     void addLink(int outPin, int inPin);
 
+    // The one place an Audio Track node is built. Every creation path goes
+    // through here so the recording params ("Input Channel" / "Volume" / "Pan")
+    // can never be missing - a track with no "Input Channel" param cannot be
+    // armed for recording at all, which is the bug the canvas right-click menu
+    // used to have while the toolbar button was fine.
+    Node& addAudioTrack(const std::string& name, Vec2 pos = {0, 0});
+
     // Group operations
     Node& createGroup(const std::string& name, Vec2 pos = {0, 0});
     void addToGroup(int groupId, int childId);
@@ -1020,9 +1055,12 @@ public:
     void resolveAnchors();
     float getAbsoluteBeatOffset(int nodeId); // cascading offset through parent chain
 
-    // Insert/delete time
-    void insertTime(float atBeat, float duration, int nodeId = -1); // -1 = all nodes
-    void deleteTime(float fromBeat, float toBeat, int nodeId = -1); // update groupBeatOffset from anchor markers
+    // Insert/delete time. Both shift clips/notes/CC/automation (and markers in
+    // all-tracks scope), then call resolveAnchors() so any child timeline
+    // anchored to a marker ripples with it and the absoluteBeatOffset cache is
+    // rebuilt. nodeId = -1 => all nodes.
+    void insertTime(float atBeat, float duration, int nodeId = -1);
+    void deleteTime(float fromBeat, float toBeat, int nodeId = -1);
     Node* findNode(int id);
 
     // Snapshot automation: write the current value of all armed params as
@@ -1067,7 +1105,30 @@ public:
                 p.autoWriteArmed = armed;
     }
 
-    std::vector<Node> nodes;
+    // DEQUE, NOT VECTOR - deliberate and load-bearing.
+    //
+    // Processors hold a `Node&` into this container and read it on the audio
+    // thread every block (see the mutationLock comment below and the "processors
+    // hold Node&" entry in known-issues.md). With std::vector, a single
+    // push_back that grew the vector move-constructed every Node into new
+    // storage and left every outstanding reference dangling - the mechanism
+    // behind three shipped crashes (SEANCE.exe .63000.dmp MOD import,
+    // .118460.dmp new MIDI timeline, and the reallocation half of .80308.dmp).
+    //
+    // std::deque guarantees that push_back/emplace_back do NOT invalidate
+    // references or pointers to existing elements (only iterators). So adding a
+    // node can no longer strand a live processor, structurally, for every
+    // processor at once - rather than relying on every call site remembering to
+    // take mutationLock.
+    //
+    // What this does NOT fix, so don't drop the other guards:
+    //   - erase() from the middle still shifts and invalidates references. That
+    //     path is separately protected (every erase site holds mutationLock, and
+    //     the node-count change triggers GraphProcessor::rebuildGraph).
+    //   - Torn reads of a Node's *fields* while the GUI thread mutates them are
+    //     unaffected; mutationLock still covers that.
+    // Also note deque has no reserve() - there is nothing to pre-size.
+    std::deque<Node> nodes;
     std::vector<Link> links;
     std::vector<int> openEditors;  // node IDs - never store Node*
 
@@ -1153,6 +1214,16 @@ public:
     // with recording disarmed (Off) and node/param overrides dormant. Set by the
     // transport-bar "Auto" control. See resolveArmMode().
     AutoArmMode autoArmGlobal = AutoArmMode::Off;
+
+    // Mirror of the app preference "Play Tracks Back While Recording Them".
+    // Lives here, not on MainContentComponent, because the consumer is
+    // PanProcessor on the audio thread, which is handed the graph but not the
+    // window. A track is silenced when it is recording (Node::recordingNow)
+    // AND this is false - the two-condition rule that keeps an open mic from
+    // being fed back into the speakers it is sitting next to. Session state,
+    // not project data: it is not serialized into the .ssp, it is pushed here
+    // from soundshop_prefs.xml by applyRecordingPrefsToGraph().
+    bool playbackWhileRecording = false;
 
     // Saved view state for the main node-graph component. Persisted to
     // the project file so reopening the project restores the user's
@@ -1314,6 +1385,27 @@ public:
             if (g.id == id) return &g;
         return nullptr;
     }
+    const EffectGroup* findEffectGroup(int id) const {
+        for (auto& g : effectGroups)
+            if (g.id == id) return &g;
+        return nullptr;
+    }
+
+    // Human-readable name for a wire: "Source -> Destination" (a real UTF-8
+    // arrow). When another wire joins the SAME pair of nodes the two labels
+    // would be identical and the user would be picking blind, so - and only
+    // then - the plug names are appended: "Voice In 2 -> Signal Osc  (Gate ->
+    // Gate)". Returns an empty string if the link or either endpoint is gone.
+    //
+    // Shared because three surfaces name wires and they must agree: the Effects
+    // lane's "Add layer" menu, the layer legend above the editors, and the
+    // graph's own wire menus. Keeping three copies is how the arrow ended up
+    // spelled " > " in one of them.
+    juce::String wireLabel(int linkId) const;
+
+    // Name for whatever an EffectRegion gates - its group's name (or "Group #n"
+    // when unnamed), or wireLabel() for a single wire.
+    juce::String gateLabel(const EffectRegion& r) const;
 
     // Project markers (named beat positions)
     std::vector<Marker> markers;

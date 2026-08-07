@@ -337,6 +337,15 @@ private:
     double sampleRate = 44100.0;
     int blockSize = 512;
 
+    // Scratch for processBlock's render pass. Members rather than locals
+    // because processBlock runs on the audio thread for every single callback:
+    // a local AudioBuffer would allocate and free the whole render buffer each
+    // time, and a local MidiBuffer would re-grow its storage on any block
+    // carrying events. Both are reused via setSize(avoidReallocating) / clear(),
+    // so they stop touching the allocator once the device block size settles.
+    juce::AudioBuffer<float> renderBuf;
+    juce::MidiBuffer renderMidi;
+
     // Plugin-delay-compensation upkeep. juce::AudioProcessorGraph already
     // inserts the compensating delay lines (it builds them from each member's
     // getLatencySamples() when the render sequence is prepared - see

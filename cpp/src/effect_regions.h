@@ -116,6 +116,50 @@ struct EffectRegion {
     uint32_t color = 0;     // ARGB, auto from link's effect node or group color
 };
 
+// Directional ("magnetic tail") snap used when dragging a layer edge.
+//
+// Layer edges are pixel-precise, not quantised: hard quantisation makes it
+// impossible to park a gate a hair before the beat it has to open on. Instead a
+// grid marker is sticky only on the side the drag is *leaving* it from:
+//
+//   dragging right:  ...free approach...|MARKER<-pull->  then free again
+//   dragging left:      free  <-pull->MARKER|...free approach...
+//
+// So you slide freely up to a marker and can stop just short of it, but once you
+// cross it the marker holds the edge for `pull` beats, making an exact landing
+// easy. Snapping the approach side as well would put the marker's own position
+// back out of reach from below, defeating the point.
+//
+//  absBeat - candidate position, in the same (absolute) space as the grid
+//  dir     - travel direction: +1 right, -1 left, 0 = not moving -> no snap
+//  grid    - grid step in beats; <= 0 means snapping is off -> no snap
+//  pull    - sticky radius in beats. It needs no clamp: the departing marker is
+//            by construction less than one grid step away, so the zone can never
+//            reach past its neighbour. A pull wider than a grid step (i.e.
+//            zoomed out until a step is under FX_SNAP_PULL_PX) therefore just
+//            degenerates into "always snap", which is the right behaviour when
+//            sub-step precision isn't visible on screen anyway.
+//  snapped - optional out-flag, true iff a marker actually caught the value.
+//            Callers with two competing candidate edges (a layer being moved)
+//            need this: comparing the returned value against the input to infer
+//            "did it snap" is both float-fragile and, worse, makes a zero
+//            correction indistinguishable from no snap at all, so the un-snapped
+//            candidate always wins the "smallest correction" contest.
+// Returns absBeat snapped to a marker, or unchanged.
+inline float magneticSnapBeat(float absBeat, int dir, float grid, float pull,
+                              bool* snapped = nullptr) {
+    if (snapped) *snapped = false;
+    if (dir == 0 || grid <= 0.0f || pull < 0.0f) return absBeat;
+    // The marker being departed from is the one behind the direction of travel:
+    // floor() when moving right, ceil() when moving left. Picking the marker
+    // *ahead* instead would snap the approach - exactly what we don't want.
+    const float marker = dir > 0 ? std::floor(absBeat / grid) * grid
+                                 : std::ceil (absBeat / grid) * grid;
+    if (std::abs(absBeat - marker) > pull) return absBeat;
+    if (snapped) *snapped = true;
+    return marker;
+}
+
 // Tag shapes drawn on wires in the graph view
 enum class WireTagShape {
     Circle,     // individual wire identity

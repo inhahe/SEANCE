@@ -451,14 +451,20 @@ void AudioTimelineProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::M
     double globalFadeBeats = std::max(0.0,
         (double)graph.globalCrossfadeSec * (double)transport.bpm / 60.0);
 
+    // Cascading group offset, same as the MIDI timeline path above. When this
+    // track is nested under another track (or a Group), every clip on it slides
+    // by the accumulated offset of the whole parent chain. Without this the
+    // clips would draw at the offset position but play at the un-offset one.
+    double nodeOffset = node.absoluteBeatOffset;
+
     for (auto& clip : node.clips) {
         if (clip.audioFilePath.empty()) continue;
 
         auto audio = getAudio(clip.audioFilePath);
         if (!audio || !audio->reader) continue;
 
-        double clipStart = clip.startBeat;
-        double clipEnd = clip.startBeat + clip.lengthBeats;
+        double clipStart = nodeOffset + clip.startBeat;
+        double clipEnd = clipStart + clip.lengthBeats;
         double maxEdgeFade = std::max(0.0, clip.lengthBeats * 0.5);
         double effFadeIn  = std::min(maxEdgeFade,
             std::max((double)clip.fadeInBeats,  globalFadeBeats));
@@ -740,8 +746,11 @@ std::unique_ptr<juce::AudioProcessor> GraphProcessor::createNodeProcessor(
         return std::make_unique<IndependentPitchShiftProcessor>(node);
     } else if (node.type == NodeType::Effect && node.script == "__waveletreverb__") {
         return std::make_unique<WaveletReverbProcessor>(node);
-    } else if (node.type == NodeType::Effect && node.script == "__waveletpitch__") {
-        return std::make_unique<WaveletPitchShiftProcessor>(node);
+    // NOTE: "__waveletpitch__" (Wavelet Pitch Shift) was removed -- it was
+    // non-functional in four independent ways (see known-issues.md). Old
+    // projects containing one fall through to PassthroughProcessor below, which
+    // is deliberate: the node emitted ~-58 dB of wrong-pitch noise, so nothing
+    // can meaningfully depend on its sound.
     } else if (node.type == NodeType::Effect && node.script == "__octaveshift__") {
         return std::make_unique<OctaveShiftProcessor>(node);
     } else if (node.type == NodeType::Effect && node.script == "__waveletbitcrush__") {
@@ -1479,11 +1488,23 @@ void GraphProcessor::processBlock(NodeGraph& graph, Transport& transport,
     if (panicRequested.exchange(false) && processorGraph)
         processorGraph->reset();
 
-    // Process the graph
-    juce::AudioBuffer<float> buf(numChannels, numSamples);
-    buf.clear();
-    juce::MidiBuffer midi;
-    processorGraph->processBlock(buf, midi);
+    // Process the graph.
+    //
+    // renderBuf and renderMidi are members, not locals: this is the single
+    // hottest path in the app (every audio callback, forever), and a local
+    // AudioBuffer allocates and frees numChannels * numSamples floats each
+    // time. setSize's last argument is avoidReallocating, so once the buffer
+    // has seen the host's largest block it never touches the allocator again;
+    // the block size only ever changes when the device does.
+    //
+    // juce::MidiBuffer likewise keeps its storage across clear(), so hoisting
+    // it out of the callback stops it re-growing for every block that carries
+    // events.
+    renderBuf.setSize(numChannels, numSamples, false, false, true);
+    renderBuf.clear();
+    renderMidi.clear();
+    processorGraph->processBlock(renderBuf, renderMidi);
+    juce::AudioBuffer<float>& buf = renderBuf;
 
     // Copy to output
     for (int c = 0; c < std::min(numChannels, buf.getNumChannels()); ++c)

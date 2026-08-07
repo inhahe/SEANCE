@@ -1,5 +1,6 @@
 #pragma once
 #include <vector>
+#include <string>
 #include <cstddef>
 #include <cmath>
 #include <algorithm>
@@ -112,12 +113,47 @@ inline WaveletFilter getWaveletFilter(const std::string& name) {
 // where L is the number of decomposition levels.
 // ==============================================================================
 
+// ------------------------------------------------------------------------
+// Scratch buffers for allocation-free DWT/IDWT.
+//
+// WHY THIS EXISTS: the transform needs two half-length temporaries for
+// analysis and one full-length temporary for synthesis. Allocating them
+// inside the transform means a `new`/`delete` pair per level per channel
+// per audio block - a hard real-time violation (malloc can block on a
+// global lock, so the audio thread can be preempted by any other thread
+// that happens to be allocating, causing dropouts). Every wavelet effect
+// node runs the transform on the audio thread, so the scratch has to be
+// hoisted out and reused.
+//
+// USAGE: hold a WaveletWorkspace as a member, call ensure(maxPaddedLen)
+// from prepareToPlay(), then pass it to the transform. After ensure() the
+// transform performs no allocation at all. The convenience overloads that
+// omit the workspace allocate a temporary one and are for OFFLINE callers
+// only (self-tests, analysis, wavetable baking) - never the audio thread.
+// ------------------------------------------------------------------------
+struct WaveletWorkspace {
+    std::vector<float> approx;   // analysis: low-band scratch  (len/2)
+    std::vector<float> detail;   // analysis: high-band scratch (len/2)
+    std::vector<float> recon;    // synthesis: accumulation scratch (len)
+
+    // Reserve enough scratch for transforms on signals up to `maxLen`
+    // samples. Call from prepareToPlay(). Safe to call repeatedly; vectors
+    // only ever grow, so the steady state is allocation-free.
+    void ensure(int maxLen) {
+        if ((int)recon.size()  < maxLen)     recon.resize(maxLen);
+        if ((int)approx.size() < maxLen / 2) approx.resize(maxLen / 2);
+        if ((int)detail.size() < maxLen / 2) detail.resize(maxLen / 2);
+    }
+};
+
 // Single-level decomposition: splits `data[0..len-1]` into approximation
 // (first half) and detail (second half) coefficients.
-inline void dwtStep(std::vector<float>& data, int len, const WaveletFilter& filt) {
+inline void dwtStep(std::vector<float>& data, int len, const WaveletFilter& filt,
+                    WaveletWorkspace& ws) {
     int filterLen = (int)filt.h0.size();
-    std::vector<float> approx(len / 2);
-    std::vector<float> detail(len / 2);
+    ws.ensure(len);   // no-op once prepareToPlay() has sized the workspace
+    std::vector<float>& approx = ws.approx;
+    std::vector<float>& detail = ws.detail;
     for (int i = 0; i < len / 2; ++i) {
         float a = 0, d = 0;
         for (int j = 0; j < filterLen; ++j) {
@@ -135,11 +171,43 @@ inline void dwtStep(std::vector<float>& data, int len, const WaveletFilter& filt
     }
 }
 
+// ---------------------------------------------------------------------------
+// TWO SYNTHESIS CONVENTIONS - pick deliberately.
+//
+// The ANALYSIS side (dwtStep) has only one form. The SYNTHESIS side has two,
+// and they are NOT interchangeable:
+//
+//   idwtStep   - LEGACY / painter convention. Scatters with the time-reversed
+//                filters g0[j]=h0[N-1-j], g1[j]=h1[N-1-j]. For multi-tap
+//                orthogonal wavelets this is NOT the adjoint of the analysis,
+//                so idwt(dwt(x)) does NOT reconstruct x - measured on a chirp
+//                it loses ~58% of the signal energy and is not a pure delay.
+//                It is kept, frozen, because the wavelet PAINTER and the
+//                terrain synth's fractal fill author coefficients BY HAND and
+//                never analyse first: for them this transform is a sound-design
+//                choice, and existing saved projects depend on it sounding
+//                exactly as it does. Do NOT "fix" it.
+//
+//   idwtStepPR - PERFECT-RECONSTRUCTION convention. Scatters with the SAME
+//                analysis filters h0/h1, which is the true transpose, giving
+//                A^T A = I exactly (periodic boundary). Use this for anything
+//                that analyses real audio, edits coefficients and resynthesises
+//                - every wavelet EFFECT node - because those must be a no-op at
+//                neutral settings.
+//
+// Rule of thumb: if you called dwt() on incoming audio, you must use the PR
+// inverse. If you built the coefficients yourself, you want the legacy one.
+// ---------------------------------------------------------------------------
+
 // Single-level reconstruction: merges approximation + detail back.
-inline void idwtStep(std::vector<float>& data, int len, const WaveletFilter& filt) {
+// LEGACY convention - see the note above. Lossy by design; frozen.
+inline void idwtStep(std::vector<float>& data, int len, const WaveletFilter& filt,
+                     WaveletWorkspace& ws) {
     int half = len / 2;
     int filterLen = (int)filt.g0.size();
-    std::vector<float> result(len, 0.0f);
+    ws.ensure(len);
+    float* result = ws.recon.data();
+    std::fill(result, result + len, 0.0f);
     // Upsample + convolve with reconstruction filters.
     for (int i = 0; i < half; ++i) {
         for (int j = 0; j < filterLen; ++j) {
@@ -153,11 +221,12 @@ inline void idwtStep(std::vector<float>& data, int len, const WaveletFilter& fil
 // Multi-level forward DWT. Decomposes `levels` times. The signal is
 // modified in place. Returns the number of levels actually computed
 // (may be less than requested if the signal is too short).
-inline int dwt(std::vector<float>& signal, int levels, const WaveletFilter& filt) {
+inline int dwt(std::vector<float>& signal, int levels, const WaveletFilter& filt,
+               WaveletWorkspace& ws) {
     int len = (int)signal.size();
     int done = 0;
     for (int l = 0; l < levels && len >= (int)filt.h0.size(); ++l) {
-        dwtStep(signal, len, filt);
+        dwtStep(signal, len, filt, ws);
         len /= 2;
         ++done;
     }
@@ -165,23 +234,144 @@ inline int dwt(std::vector<float>& signal, int levels, const WaveletFilter& filt
 }
 
 // Multi-level inverse DWT. Reconstructs from `levels` decomposition levels.
-inline void idwt(std::vector<float>& signal, int levels, const WaveletFilter& filt) {
+inline void idwt(std::vector<float>& signal, int levels, const WaveletFilter& filt,
+                 WaveletWorkspace& ws) {
     int minLen = (int)signal.size();
     for (int l = 0; l < levels; ++l) minLen /= 2;
     int len = minLen;
     for (int l = 0; l < levels; ++l) {
         len *= 2;
-        idwtStep(signal, len, filt);
+        idwtStep(signal, len, filt, ws);
     }
 }
 
+// --- Perfect-reconstruction synthesis (the adjoint of dwtStep) -------------
+// Identical to idwtStep except it scatters with h0/h1 instead of the
+// time-reversed g0/g1. That makes it the exact transpose of the analysis, so
+// idwtPR(dwt(x)) == x to float precision. See the convention note above.
+inline void idwtStepPR(std::vector<float>& data, int len, const WaveletFilter& filt,
+                       WaveletWorkspace& ws) {
+    int half = len / 2;
+    int filterLen = (int)filt.h0.size();
+    ws.ensure(len);
+    float* result = ws.recon.data();
+    std::fill(result, result + len, 0.0f);
+    for (int i = 0; i < half; ++i) {
+        for (int j = 0; j < filterLen; ++j) {
+            int idx = (2 * i + j) % len;
+            result[idx] += filt.h0[j] * data[i] + filt.h1[j] * data[half + i];
+        }
+    }
+    for (int i = 0; i < len; ++i) data[i] = result[i];
+}
+
+// Multi-level perfect-reconstruction inverse. Mirrors idwt()'s level walk.
+inline void idwtPR(std::vector<float>& signal, int levels, const WaveletFilter& filt,
+                   WaveletWorkspace& ws) {
+    int minLen = (int)signal.size();
+    for (int l = 0; l < levels; ++l) minLen /= 2;
+    int len = minLen;
+    for (int l = 0; l < levels; ++l) {
+        len *= 2;
+        idwtStepPR(signal, len, filt, ws);
+    }
+}
+
+// --- Offline convenience overloads -----------------------------------------
+// Identical maths, but each call spins up a throwaway workspace, so they
+// allocate. Fine for self-tests, wavetable baking and other message-thread
+// work; NEVER call these from an audio callback - hold a WaveletWorkspace
+// and use the overloads above instead.
+inline void dwtStep(std::vector<float>& data, int len, const WaveletFilter& filt) {
+    WaveletWorkspace ws; dwtStep(data, len, filt, ws);
+}
+inline void idwtStep(std::vector<float>& data, int len, const WaveletFilter& filt) {
+    WaveletWorkspace ws; idwtStep(data, len, filt, ws);
+}
+inline int dwt(std::vector<float>& signal, int levels, const WaveletFilter& filt) {
+    WaveletWorkspace ws; return dwt(signal, levels, filt, ws);
+}
+inline void idwt(std::vector<float>& signal, int levels, const WaveletFilter& filt) {
+    WaveletWorkspace ws; idwt(signal, levels, filt, ws);
+}
+inline void idwtStepPR(std::vector<float>& data, int len, const WaveletFilter& filt) {
+    WaveletWorkspace ws; idwtStepPR(data, len, filt, ws);
+}
+inline void idwtPR(std::vector<float>& signal, int levels, const WaveletFilter& filt) {
+    WaveletWorkspace ws; idwtPR(signal, levels, filt, ws);
+}
+
 // Convenience: decompose fully (max levels for the signal length).
-inline int dwtFull(std::vector<float>& signal, const WaveletFilter& filt) {
+inline int dwtFull(std::vector<float>& signal, const WaveletFilter& filt,
+                   WaveletWorkspace& ws) {
     int maxLevels = 0;
     int len = (int)signal.size();
     while (len >= (int)filt.h0.size()) { len /= 2; ++maxLevels; }
-    return dwt(signal, maxLevels, filt);
+    return dwt(signal, maxLevels, filt, ws);
 }
+inline int dwtFull(std::vector<float>& signal, const WaveletFilter& filt) {
+    WaveletWorkspace ws; return dwtFull(signal, filt, ws);
+}
+
+// ==============================================================================
+// WaveletFxScratch - everything a real-time wavelet effect needs to run its
+// per-block transform without allocating.
+//
+// The wavelet effect nodes all share one shape: zero-pad the block to a power
+// of two, keep a dry copy, DWT, mangle coefficients, IDWT, crossfade. Written
+// naively that costs a heap allocation for the filter bank (4 vectors rebuilt
+// by getWaveletFilter every block), two for the padded/dry buffers per channel,
+// and two per level inside each dwtStep/idwtStep - on the order of 35 malloc/
+// free pairs per block per node, i.e. thousands per second on the audio thread.
+//
+// Hold one of these per processor, call prepare() from prepareToPlay(), then
+// useFilter() + load() per channel. After prepare() the whole path is
+// allocation-free (buffers only ever grow, and the filter is rebuilt only if
+// the wavelet name actually changes - which for a fixed-family effect is never
+// after the first block).
+// ==============================================================================
+struct WaveletFxScratch {
+    WaveletWorkspace ws;                 // transform scratch
+    std::vector<float> sig;              // zero-padded working signal
+    std::vector<float> dry;              // untouched copy for the wet/dry mix
+
+    // Reserve for blocks up to `maxBlockSamples`. Cheap to call again with a
+    // bigger size if the host changes its buffer size.
+    void prepare(int maxBlockSamples) {
+        int pad = 1;
+        while (pad < maxBlockSamples) pad *= 2;
+        sig.reserve((size_t)pad);
+        dry.reserve((size_t)maxBlockSamples);
+        ws.ensure(pad);
+    }
+
+    // Cached filter bank. Rebuilds only when the requested family changes, so
+    // the steady-state cost is one short string compare.
+    const WaveletFilter& useFilter(const char* name) {
+        if (filterName != name) {
+            filter = getWaveletFilter(name);
+            filterName = name;
+        }
+        return filter;
+    }
+
+    // Fill `sig` with a zero-padded copy of src[0..n) (length becomes the next
+    // power of two >= n) and `dry` with a plain copy. Returns that padded
+    // length. No allocation once prepare() has reserved enough.
+    int load(const float* src, int n) {
+        int padLen = 1;
+        while (padLen < n) padLen *= 2;
+        sig.assign(src, src + n);
+        sig.resize((size_t)padLen, 0.0f);
+        dry.assign(src, src + n);
+        ws.ensure(padLen);
+        return padLen;
+    }
+
+private:
+    WaveletFilter filter;
+    std::string   filterName;   // empty => `filter` not built yet
+};
 
 // ==============================================================================
 // Continuous Wavelet Transform (CWT) - for non-dyadic scale operations
@@ -236,6 +426,15 @@ inline void morletWavelet(std::vector<float>& realOut, std::vector<float>& imagO
     }
 }
 
+// WARNING -- cwt()/icwt() currently have NO callers. Their only consumer was
+// Wavelet Pitch Shift, removed for being non-functional. They are kept as
+// scaffolding for a future rewrite, but DO NOT build on them as-is: icwt() is
+// not the inverse of cwt() (it discards the imaginary part and normalises by a
+// sum of 1/scale^2 weights instead of the Morlet admissibility constant, so
+// there is no unity-gain path even at ratio 1), and cwt() uses direct
+// time-domain convolution, which is ~7x too slow for real time. Both defects
+// and their remedies are written up in known-issues.md.
+//
 // Forward CWT: convolve the signal with the Morlet wavelet at each scale.
 // `minScale` and `maxScale` define the range; `numScales` logarithmically
 // spaced scales are computed within that range.

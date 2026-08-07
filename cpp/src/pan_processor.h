@@ -153,11 +153,16 @@ private:
     NodeGraph& graph;
     AudioCrossfader muteFader;
 
-    // True iff this node is muted directly OR muted because some other node
-    // is soloed and we're not. Recomputed every block - solo state changes
-    // come from the UI thread, so re-checking is cheap and avoids stale state.
+    // True iff this node is muted directly, muted because it is mid-take and
+    // the user has not asked to hear tracks while recording them, OR muted
+    // because some other node is soloed and we're not. Recomputed every block -
+    // all three inputs change from the UI thread, so re-checking is cheap and
+    // avoids stale state. Going through the mute path (rather than zeroing the
+    // buffer somewhere) means the record mute is declicked by muteFader like
+    // any other, so arming a take doesn't produce a click.
     bool currentlyMuted() const {
         if (node.muted) return true;
+        if (node.recordingNow && !graph.playbackWhileRecording) return true;
         for (auto& n : graph.nodes) if (n.soloed) return !node.soloed;
         return false;
     }

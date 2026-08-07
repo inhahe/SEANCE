@@ -156,6 +156,15 @@ public:
                              std::vector<bool>& outUseCustom,
                              std::vector<int>& outAssetIds);
 
+    // Total bytes reserved by the per-bin audio-thread scratch. The self-test
+    // watches this across a run of blocks: if it grows, processBlock reached
+    // the allocator. (Same capacity-as-proxy technique as the EQ / SMS nodes.)
+    size_t scratchCapacityBytes() const {
+        return binParamIdx.capacity() * sizeof(int)
+             + sigOut.capacity() * sizeof(float*)
+             + customTarget.capacity() * sizeof(float);
+    }
+
 private:
     Node& node;
     double sampleRate = 44100;
@@ -174,6 +183,15 @@ private:
     // rows for custom bins are filled; biquad rows are left empty.
     std::vector<std::vector<float>> binFftWeights;
     bool anyCustomBin = false;
+
+    // ---- audio-thread scratch, one entry per bin ---------------------------
+    // Sized in rebuildBins(), which in the normal case runs off the audio
+    // thread: adding or removing a bin changes the node's pin count, which
+    // rebuilds the audio graph and re-prepares this processor. processBlock
+    // only ever refills these, so it never reaches the allocator.
+    std::vector<int>    binParamIdx;   // param index backing each bin, or -1
+    std::vector<float*> sigOut;        // per-bin Signal Out channel, or null
+    std::vector<float>  customTarget;  // per-block FFT envelope target
 
     void rebuildBins();
     void rebuildBinFftWeights();

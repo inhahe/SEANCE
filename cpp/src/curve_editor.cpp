@@ -308,13 +308,13 @@ SpectralCurvePanel::SpectralCurvePanel(SpectralCurve& curve_,
                          "Language for the Equation. Built-in: `f` is the bin index "
                          "(0..N-1) over the curve. Lua / Python: `f` is the normalized "
                          "position 0..1, with full loops/variables (e.g. sum many "
-                         "harmonics). GLSL: a GPU compute shader — `f` is the normalized "
+                         "harmonics). GLSL: a GPU compute shader - `f` is the normalized "
                          "position 0..1, with native GLSL math and waveform(id,phase) for "
                          "the factory bank. Lua/Python/GLSL are baked into the curve when "
                          "you edit, not run live; multi-line bodies must end with `return`.")
                          + (shapeLangAvailable(ShapeLang::Python) ? ""
                             : "  (Python is greyed out because no Python interpreter "
-                              "was found — install Python and restart to enable it.)")
+                              "was found - install Python and restart to enable it.)")
                          + (shapeLangAvailable(ShapeLang::Glsl) ? ""
                             : "  (GLSL is greyed out because no OpenGL 4.3 compute "
                               "driver is available on this machine.)"));

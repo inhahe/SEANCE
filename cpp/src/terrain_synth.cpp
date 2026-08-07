@@ -52,34 +52,65 @@ int Terrain::coordToFlatIndex(const std::vector<int>& indices) const {
     return flat;
 }
 
+// N-linear interpolation over the 2^nd corners of the cell containing `coord`.
+//
+// This is THE hottest function in the synth - the render loop calls it once per
+// output sample per active voice (twice in graintable mode). It used to build a
+// fresh `std::vector<int> indices(nd)` inside the corner loop, i.e. 2^nd heap
+// allocations per call; a 2D terrain playing an eight-note chord was ~1.4
+// million allocations a second on the audio thread. Everything now lives on the
+// stack, and the flat index is accumulated directly instead of going through
+// coordToFlatIndex (which took a vector).
 float Terrain::sample(const std::vector<float>& coord) const {
     if (data.empty() || dims.empty()) return 0.0f;
-    int nd = (int)dims.size();
+    const int nd = (int)dims.size();
 
-    // N-linear interpolation
-    // For each dimension, compute the two neighboring indices and the fraction
-    int numCorners = 1 << nd; // 2^N corners of the interpolation hypercube
+    // 2^nd corners is already unusable well before 16 dimensions (65536 terms
+    // per sample), so this bound costs nothing real; the guard exists so the
+    // stack arrays below can never overflow no matter what a script builds.
+    static constexpr int kMaxSampleDims = 16;
+    if (nd > kMaxSampleDims) return 0.0f;
+
+    // Per-dimension: the two neighbouring indices, the interpolation fraction,
+    // and the flat-index stride. Stride matches coordToFlatIndex: it walks from
+    // the last dimension to the first with stride starting at 1, so dimension d
+    // has stride = product of dims[d+1 .. nd-1].
+    int   lo[kMaxSampleDims], hi[kMaxSampleDims], stride[kMaxSampleDims];
+    float frac[kMaxSampleDims];
+    int st = 1;
+    for (int d = nd - 1; d >= 0; --d) {
+        stride[d] = st;
+        st *= dims[d];
+    }
+    // `st` is now the product of every dimension, i.e. the flat size `dims`
+    // describes. at() is unchecked, so verify once here that the data actually
+    // matches rather than paying a bounds check on every corner. A mismatch
+    // means dims and data have desynced (a rebuild raced a script reload); the
+    // old code read out of bounds in that case.
+    if (st != (int)data.size()) return 0.0f;
+
+    for (int d = 0; d < nd; ++d) {
+        // Coordinates shorter than the terrain's dimensionality read as 0. The
+        // old code indexed coord[d] unconditionally, which was an out-of-bounds
+        // read for any such caller (e.g. sampleMipmap's 1D fallback on a
+        // multi-dimensional terrain).
+        const float c = (d < (int)coord.size()) ? coord[d] : 0.0f;
+        float pos = juce::jlimit(0.0f, (float)(dims[d] - 1), c * (dims[d] - 1));
+        lo[d]   = (int)pos;
+        hi[d]   = std::min(lo[d] + 1, dims[d] - 1);
+        frac[d] = pos - lo[d];
+    }
+
+    const int numCorners = 1 << nd;   // 2^N corners of the interpolation hypercube
     float result = 0.0f;
-
     for (int corner = 0; corner < numCorners; ++corner) {
         float weight = 1.0f;
-        std::vector<int> indices(nd);
+        int   flat   = 0;
         for (int d = 0; d < nd; ++d) {
-            float pos = coord[d] * (dims[d] - 1);
-            pos = juce::jlimit(0.0f, (float)(dims[d] - 1), pos);
-            int lo = (int)pos;
-            int hi = std::min(lo + 1, dims[d] - 1);
-            float frac = pos - lo;
-
-            if (corner & (1 << d)) {
-                indices[d] = hi;
-                weight *= frac;
-            } else {
-                indices[d] = lo;
-                weight *= (1.0f - frac);
-            }
+            if (corner & (1 << d)) { flat += hi[d] * stride[d]; weight *= frac[d]; }
+            else                   { flat += lo[d] * stride[d]; weight *= 1.0f - frac[d]; }
         }
-        result += at(coordToFlatIndex(indices)) * weight;
+        result += at(flat) * weight;
     }
     return result;
 }
@@ -1043,7 +1074,16 @@ void Terrain::buildMipmaps(int maxLevels) {
 }
 
 float Terrain::sampleMipmap(float phase01, float pitchRatio) const {
-    if (mipmaps.empty()) return sample({phase01}); // fallback
+    if (mipmaps.empty()) {
+        // Fallback: read the base terrain. Uses a thread_local buffer rather
+        // than `sample({phase01})` because the braced init-list built a
+        // std::vector on the heap, and this is called per sample per voice.
+        // thread_local (not a plain static) because several audio threads can
+        // be in here at once - a shared static would be a data race.
+        thread_local std::vector<float> oneD(1);
+        oneD[0] = phase01;
+        return sample(oneD);
+    }
     // Pick level: log2(pitchRatio) rounded down, clamped to available levels.
     int level = 0;
     if (pitchRatio > 1.0f)
@@ -1081,9 +1121,14 @@ void Terrain::fromWaveletBasis(int levels) {
 // Traversal - maps time to N-dimensional coordinate
 // ==============================================================================
 
-std::vector<float> Traversal::evaluate(const TraversalParams& params, int numDims,
-                                        double beatTime, double bpm, double sr) const {
-    std::vector<float> coord(numDims, 0.5f);
+void Traversal::evaluate(std::vector<float>& coord,
+                         const TraversalParams& params, int numDims,
+                         double beatTime, double bpm, double sr) const {
+    // Allocation-free once `coord` has capacity: resizing to <= capacity never
+    // reallocates, and every branch below writes elements in place rather than
+    // assigning a whole vector.
+    coord.resize((size_t) std::max(0, numDims));
+    std::fill(coord.begin(), coord.end(), 0.5f);
 
     switch (params.mode) {
     case TraversalMode::Linear: {
@@ -1127,8 +1172,11 @@ std::vector<float> Traversal::evaluate(const TraversalParams& params, int numDim
     case TraversalMode::Path: {
         if (params.pathPoints.empty()) break;
         if (params.pathPoints.size() == 1) {
-            coord = params.pathPoints[0].coord;
-            coord.resize(numDims, 0.5f);
+            // Element copy, not `coord = ...`: a whole-vector assign from a
+            // longer source reallocates, and this runs per sample.
+            const auto& pc = params.pathPoints[0].coord;
+            for (int d = 0; d < numDims; ++d)
+                coord[(size_t) d] = (d < (int) pc.size()) ? pc[(size_t) d] : 0.5f;
             break;
         }
         // Find position along path based on beat time (loop)
@@ -1181,7 +1229,8 @@ std::vector<float> Traversal::evaluate(const TraversalParams& params, int numDim
             }
         }
         lastPhysBeat = beatTime;
-        coord = physPos;
+        for (int d = 0; d < numDims && d < (int) physPos.size(); ++d)
+            coord[(size_t) d] = physPos[(size_t) d];
         break;
     }
 
@@ -1201,8 +1250,6 @@ std::vector<float> Traversal::evaluate(const TraversalParams& params, int numDim
         // TODO: expression-based traversal
         break;
     }
-
-    return coord;
 }
 
 // ==============================================================================
@@ -1510,6 +1557,7 @@ TerrainSynthProcessor::TerrainSynthProcessor(Node& n, Transport& t, ContentStore
             wtFrameCount = (int)wtScatterFrameSamples.size();
             wtNumDims = doc.scatterDims;
             wtEffectiveAxes = doc.effectiveAxes();
+            rebuildPositionNames();
             traversalParams.mode = TraversalMode::Linear;
             mode = TerrainSynthMode::SamplePerPoint;
         } else if (decoded && !doc.cellWaveformIds.empty()) {
@@ -1657,6 +1705,7 @@ TerrainSynthProcessor::TerrainSynthProcessor(Node& n, Transport& t, ContentStore
             wtFrameCount = nf;
             wtNumDims = doc.numDimensions();
             wtEffectiveAxes = doc.effectiveAxes();
+            rebuildPositionNames();
             // Per-frame live re-bake entries were registered per cell in the bake
             // loop above (each layered cell knows its own grid destination), so
             // multi-cell grids now re-bake every modulated frame independently -
@@ -1782,6 +1831,79 @@ TerrainSynthProcessor::TerrainSynthProcessor(Node& n, Transport& t, ContentStore
 void TerrainSynthProcessor::prepareToPlay(double sr, int bs) {
     sampleRate = sr;
     rebuildEnvCurves();
+
+    // Pre-size every audio-thread scratch buffer so processBlock never calls
+    // the allocator. See the scratch block in terrain_synth.h for why.
+    //
+    // Terrain::sample takes one coordinate per dimension. Terrains are at most
+    // kMaxTerrainDims dimensions, and the render loop only ever shrinks these,
+    // so reserving the maximum here covers every terrain the node can hold -
+    // including one swapped in later by a script reload.
+    const size_t maxDims = (size_t) kMaxTerrainDims;
+    coordScratch.reserve(maxDims);
+    pitchCoordScratch.reserve(maxDims);
+    grainCoordScratch.reserve(maxDims);
+    occCoordScratch.reserve(maxDims);
+    wtPositionScratch.reserve(maxDims);
+    traversal.prepare(kMaxTerrainDims);
+
+    // Audition-divert scratch is sized to the block, not the terrain.
+    auditionScratch.reserve((size_t) std::max(1, bs));
+
+    // db2 is the only filter the scatter blend uses, and getWaveletFilter
+    // returns by value (three vectors). Fetch it once here rather than per
+    // block.
+    if (!scatterFilterReady) {
+        scatterFilter = getWaveletFilter("db2");
+        scatterFilterReady = 1;
+    }
+
+    // AdditiveBank analyses a cycle whose length is the terrain's table size
+    // rounded down to a power of two. Build the whole practical range up front
+    // so refreshPartialBank never constructs an FFT on the audio thread - the
+    // size can change without a prepareToPlay when a script reload swaps the
+    // terrain, so a lazy rebuild-on-change would still allocate mid-stream.
+    pbFFTs.prepare(4, 1 << 16);
+
+    for (auto& v : voices) v.partialPhases.reserve(kAdditiveBankMaxPartials);
+}
+
+// Grow the scatter-blend scratch to fit `nFrames` frames of `ts` samples.
+// Only allocates when the scatter table changes shape (a message-thread edit
+// to the wavetable), so the steady-state audio path is allocation-free.
+void TerrainSynthProcessor::ensureScatterScratch(int nFrames, int ts) {
+    const size_t nf = (size_t) std::max(0, nFrames);
+    const size_t n  = (size_t) std::max(0, ts);
+    if (scatterWeights.size() < nf) scatterWeights.resize(nf);
+    if (scatterDists.size()   < nf) scatterDists.resize(nf);
+    if (scatterBlended.size() < n)  scatterBlended.resize(n);
+    if (scatterCoeffs.size()  < n)  scatterCoeffs.resize(n);
+    scatterWs.ensure((int) n);
+}
+
+size_t TerrainSynthProcessor::scratchCapacityBytes() const {
+    size_t bytes = 0;
+    auto add = [&bytes](const std::vector<float>& v) {
+        bytes += v.capacity() * sizeof(float);
+    };
+    add(coordScratch);      add(pitchCoordScratch); add(grainCoordScratch);
+    add(occCoordScratch);   add(wtPositionScratch); add(auditionScratch);
+    add(scatterWeights);    add(scatterDists);
+    add(scatterBlended);    add(scatterCoeffs);
+    add(scatterWs.approx);  add(scatterWs.detail);  add(scatterWs.recon);
+    add(pbCycle);
+    bytes += pbSpec.capacity() * sizeof(FFT::cplx);
+    bytes += granPosScratch.capacity() * sizeof(float);
+    bytes += inhPosScratch.capacity() * sizeof(float);
+    bytes += scatterQposScratch.capacity() * sizeof(float);
+    for (const auto& row : granPositionsScratch) bytes += row.capacity() * sizeof(float);
+    for (const auto& row : inhPositionsScratch)  bytes += row.capacity() * sizeof(float);
+    bytes += (granPositionsScratch.capacity() + inhPositionsScratch.capacity())
+             * sizeof(std::vector<float>);
+    bytes += traversal.scratchCapacityBytes();
+    for (const auto& v : voices)
+        bytes += v.partialPhases.capacity() * sizeof(float);
+    return bytes;
 }
 
 float TerrainSynthProcessor::getParam(int idx, float def) const {
@@ -1977,13 +2099,14 @@ void TerrainSynthProcessor::rebakeFramesIfNeeded(const Node& node) {
 // mode, and grid wavetables that are 2D ({tableSize, nFrames}) need their
 // slice extracted explicitly. We handle both cases here.
 void TerrainSynthProcessor::refreshPartialBank() {
-    // Decide what 1D cycle to analyse.
-    std::vector<float> cycle;
+    // Decide what 1D cycle to analyse. `cycle` and `spec` are members and the
+    // FFT comes from a prebuilt ladder, so this whole function is
+    // allocation-free once prepareToPlay has sized things - it runs once per
+    // block on the audio thread whenever the synth is in AdditiveBank mode.
+    std::vector<float>& cycle = pbCycle;
     {
         const auto& dims = terrain.getDimensions();
-        // The terrain exposes at(int) so we copy out into our own vector
-        // (this allocation happens once per block when in AdditiveBank
-        // mode - acceptable; the FFT below dominates the cost anyway).
+        // The terrain exposes at(int) so we copy out into our own buffer.
         int total = terrain.totalSize();
         if (dims.size() <= 1 || !isWavetable) {
             // 1D terrain - the whole thing IS the cycle (or whatever scatter
@@ -2001,18 +2124,16 @@ void TerrainSynthProcessor::refreshPartialBank() {
             // axis sliced here). Under the contiguous "Position 1..K" naming the
             // bare "Position" only exists when there's a single traversable axis,
             // so resolve by name from wtEffectiveAxes instead of assuming it.
-            std::string posName = "Position";
-            {
-                const int K = (int)wtEffectiveAxes.size();
-                for (int k = 0; k < K; ++k)
-                    if (wtEffectiveAxes[k] == 0) {
-                        posName = (K == 1) ? std::string("Position")
-                                : std::string("Position ") + std::to_string(k + 1);
-                        break;
-                    }
-            }
-            float pos = juce::jlimit(0.0f, 1.0f,
-                getParamByName(node, posName.c_str(), 0.5f));
+            // wtPositionNames is the cached name table - building the string
+            // here meant a heap allocation on every block.
+            float pos = 0.5f;
+            for (size_t k = 0; k < wtEffectiveAxes.size()
+                               && k < wtPositionNames.size(); ++k)
+                if (wtEffectiveAxes[k] == 0) {
+                    pos = juce::jlimit(0.0f, 1.0f,
+                        getParamByName(node, wtPositionNames[k], 0.5f));
+                    break;
+                }
             int fr = juce::jlimit(0, nFrames - 1, (int)std::round(pos * (nFrames - 1)));
             cycle.resize(tableSize);
             for (int i = 0; i < tableSize; ++i)
@@ -2038,17 +2159,25 @@ void TerrainSynthProcessor::refreshPartialBank() {
     if (partialBank.valid && partialBank.cycleHash == h) return;
     partialBank.cycleHash = h;
 
-    // FFT the cycle.
-    FFT fft(fftN);
-    std::vector<std::complex<float>> spec;
-    fft.forwardReal(cycle, spec);
-    // spec has fftN/2+1 bins. Bin k = k-th harmonic of the cycle (the cycle
-    // IS one period of the fundamental, so bin k is at frequency k*f0 when
-    // the wavetable is played at note frequency f0).
+    // FFT the cycle. The FFT object comes from a prebuilt ladder and the
+    // spectrum lives in a member: constructing an `FFT fft(fftN)` here built
+    // its twiddle and bit-reversal tables from scratch, and the vector overload
+    // of forwardReal sizes its output - two heap allocations every block in
+    // AdditiveBank mode.
+    const FFT* fft = pbFFTs.forSize(fftN);
+    if (!fft) { partialBank.valid = false; return; }
+    if ((int)pbSpec.size() < fftN) pbSpec.resize((size_t)fftN);
+    fft->forwardReal(cycle.data(), pbSpec.data());
+    const auto& spec = pbSpec;
+    // spec[0 .. fftN/2] is the half-spectrum. Bin k = k-th harmonic of the
+    // cycle (the cycle IS one period of the fundamental, so bin k is at
+    // frequency k*f0 when the wavetable is played at note frequency f0).
 
-    int K = std::min(kAdditiveBankMaxPartials, (int)spec.size());
-    partialBank.magnitude.assign(kAdditiveBankMaxPartials, 0.0f);
-    partialBank.phase    .assign(kAdditiveBankMaxPartials, 0.0f);
+    int K = std::min(kAdditiveBankMaxPartials, fftN / 2 + 1);
+    partialBank.magnitude.resize(kAdditiveBankMaxPartials);
+    partialBank.phase    .resize(kAdditiveBankMaxPartials);
+    std::fill(partialBank.magnitude.begin(), partialBank.magnitude.end(), 0.0f);
+    std::fill(partialBank.phase    .begin(), partialBank.phase    .end(), 0.0f);
     // Magnitudes are normalised by fftN so that summing them back as a
     // partial bank reproduces the cycle's amplitude (within rounding).
     // Factor of 2 because we're only keeping the positive-frequency half of
@@ -2063,20 +2192,38 @@ void TerrainSynthProcessor::refreshPartialBank() {
     partialBank.valid = true;
 }
 
-// Compute the per-granular-frame morph weight at the current Position.
-// Mirrors the cycle layer's morph math so a granular frame and a cycle
-// frame at the same wavetable position contribute equally to the output.
-//
-// Grid mode: N-linear interp weight of the current Position into the
-// granular frame's grid cell. Identical to the weighting Terrain::sample
-// applies to that cell - so the granular layer "stands in" for the cell's
-// share of the morph, while terrain.sample only delivers the (zero)
-// granular cell + the real contribution from neighbouring cycle cells.
-//
-// Scatter mode: Wendland RBF weight at the current Position, normalized
-// by the total RBF weight (identical to the cycle blend's normalization).
-std::vector<float> TerrainSynthProcessor::scatterQueryPosition() {
-    std::vector<float> qpos(std::max(1, wtScatterDims), 0.5f);
+// Rebuild the cached Position param names. Called from the script-reload paths
+// that set wtEffectiveAxes, never from the render loop.
+void TerrainSynthProcessor::rebuildPositionNames() {
+    const int K = (int) wtEffectiveAxes.size();
+    wtPositionNames.clear();
+    wtPositionNames.reserve((size_t) K);
+    for (int k = 0; k < K; ++k)
+        wtPositionNames.push_back(K == 1 ? std::string("Position")
+                                         : "Position " + std::to_string(k + 1));
+}
+
+void TerrainSynthProcessor::fillPositionParams(std::vector<float>& out, int nDims,
+                                               float defaultVal) const {
+    out.resize((size_t) std::max(1, nDims));
+    std::fill(out.begin(), out.end(), defaultVal);
+    const int K = (int) wtEffectiveAxes.size();
+    for (int k = 0; k < K && k < (int) wtPositionNames.size(); ++k) {
+        const int axis = wtEffectiveAxes[(size_t) k];
+        if (axis >= 0 && axis < (int) out.size())
+            out[(size_t) axis] = juce::jlimit(0.0f, 1.0f,
+                getParamByName(node, wtPositionNames[(size_t) k], defaultVal));
+    }
+}
+
+void TerrainSynthProcessor::scatterQueryPosition(std::vector<float>& qpos) const {
+    // Out-parameter rather than a return value so audio-thread callers can
+    // reuse their own scratch. Each caller passes a distinct member buffer -
+    // do NOT collapse these onto one shared scratch, the granular/inharmonic
+    // weight updates and the scatter blend hold their results across each
+    // other's calls.
+    qpos.resize((size_t) std::max(1, wtScatterDims));
+    std::fill(qpos.begin(), qpos.end(), 0.5f);
     // Default every axis to the dots' shared coordinate on that axis (read
     // from frame 0). For a NON-traversable axis every dot shares the same
     // value, so pinning the query there makes that axis contribute zero to all
@@ -2091,119 +2238,109 @@ std::vector<float> TerrainSynthProcessor::scatterQueryPosition() {
             qpos[(size_t)d] = p0[(size_t)d];
     }
     const int K = (int)wtEffectiveAxes.size();
-    for (int k = 0; k < K; ++k) {
+    for (int k = 0; k < K && k < (int) wtPositionNames.size(); ++k) {
         const int axis = wtEffectiveAxes[k];
-        std::string pname = (K == 1) ? std::string("Position")
-                          : std::string("Position ") + std::to_string(k + 1);
         if (axis >= 0 && axis < (int)qpos.size())
-            qpos[axis] = juce::jlimit(0.0f, 1.0f, getParamByName(node, pname.c_str(), 0.5f));
+            qpos[axis] = juce::jlimit(0.0f, 1.0f,
+                getParamByName(node, wtPositionNames[(size_t) k], 0.5f));
     }
 
-    // === TEMP SCATTER DIAGNOSTIC (throwaway) ===
-    // Log qpos + the node's Position params whenever the query moves, so we can
-    // see if the Position sliders actually reach the synth. Throttled to real
-    // changes to avoid hammering the disk every block.
-    {
-        static std::vector<float> sLast;
-        bool changed = (sLast.size() != qpos.size());
-        for (size_t i = 0; !changed && i < qpos.size(); ++i)
-            if (std::abs(sLast[i] - qpos[i]) > 0.005f) changed = true;
-        if (changed) {
-            sLast = qpos;
-            juce::String line;
-            line << "qpos=[";
-            for (size_t i = 0; i < qpos.size(); ++i)
-                line << juce::String(qpos[i], 3) << (i + 1 < qpos.size() ? "," : "");
-            line << "]  effAxes=[";
-            for (size_t i = 0; i < wtEffectiveAxes.size(); ++i)
-                line << wtEffectiveAxes[i] << (i + 1 < wtEffectiveAxes.size() ? "," : "");
-            line << "]  dims=" << wtScatterDims
-                 << "  frames=" << (int)wtScatterFramePositions.size()
-                 << "  params{";
-            for (const auto& p : node.params)
-                if (p.name.rfind("Position", 0) == 0)
-                    line << p.name << "=" << juce::String(p.value, 3)
-                         << (p.modulated ? "(mod)" : "") << " ";
-            line << "}\n";
-            juce::File f("D:/temp/scatter_diag.txt");
-            f.appendText(line);
-        }
-    }
-    // === END TEMP DIAGNOSTIC ===
-
-    return qpos;
+    // NOTE: this function runs on the AUDIO THREAD (processBlock calls it once
+    // per block for the scatter blend). Do not add logging here. A throwaway
+    // diagnostic used to live at this spot that opened and appended to
+    // "D:/temp/scatter_diag.txt" whenever the query moved by >0.005 - i.e.
+    // continuously for the whole duration of a Position drag. A file open+append
+    // takes milliseconds against an ~11 ms block budget, so it guaranteed
+    // dropouts exactly while the user was performing; it also kept its
+    // throttling state in a function-local `static`, shared without
+    // synchronisation across every TerrainSynth instance. If you need to see
+    // what the query is doing, capture it into a member and have the editor's
+    // timer read it on the message thread.
 }
 
+// Compute the per-granular-frame morph weight at the current Position.
+// Mirrors the cycle layer's morph math so a granular frame and a cycle
+// frame at the same wavetable position contribute equally to the output.
+//
+// Grid mode: N-linear interp weight of the current Position into the
+// granular frame's grid cell. Identical to the weighting Terrain::sample
+// applies to that cell - so the granular layer "stands in" for the cell's
+// share of the morph, while terrain.sample only delivers the (zero)
+// granular cell + the real contribution from neighbouring cycle cells.
+//
+// Scatter mode: Wendland RBF weight at the current Position, normalized
+// by the total RBF weight (identical to the cycle blend's normalization).
 void TerrainSynthProcessor::updateGranularWeights() {
     // Live Position from the named params -> the shared, all-voices weights.
     // `pos` is always GEOMETRIC-axis-indexed so it lines up with the granular
     // frames' stored positions (gp[d] / fp[d] use the geometric axis order).
-    std::vector<float> pos;
+    std::vector<float>& pos = granPosScratch;
     if (wtScatter) {
         // Scatter: Position params exist only for traversable axes
         // (wtEffectiveAxes); non-traversable axes pin to 0.5. See
         // scatterQueryPosition() for the full rationale.
-        pos = scatterQueryPosition();
+        scatterQueryPosition(pos);
     } else {
         // Grid: Position params exist only for traversable axes (numbered
         // contiguously); map the k-th param back to geometric axis
         // wtEffectiveAxes[k]. Inert axes keep 0 - the hat function special-cases
         // their single cell (dimSize<=1) and ignores the value.
-        pos.assign(std::max(1, wtNumDims), 0.0f);
-        const int K = (int)wtEffectiveAxes.size();
-        for (int k = 0; k < K; ++k) {
-            const int axis = wtEffectiveAxes[k];
-            std::string pname = (K == 1) ? std::string("Position")
-                              : std::string("Position ") + std::to_string(k + 1);
-            if (axis >= 0 && axis < (int)pos.size())
-                pos[axis] = juce::jlimit(0.0f, 1.0f, getParamByName(node, pname.c_str(), 0.0f));
-        }
+        fillPositionParams(pos, wtNumDims, 0.0f);
     }
     computeGranularWeights(pos, granWeights);
+}
+
+// Copy the side-table entries' positions into `dst` WITHOUT freeing the inner
+// vectors' storage. `dst` only ever grows, and each row is resized in place, so
+// after the first block with a given wavetable this is allocation-free - which
+// matters because both callers run once per block on the audio thread. The old
+// code built a fresh vector-of-vectors every time: one allocation per entry.
+// Returns the number of valid rows (dst may be longer; pass the count on).
+template <typename Entries>
+static size_t gatherEntryPositions(const Entries& entries,
+                                   std::vector<std::vector<float>>& dst) {
+    const size_t n = entries.size();
+    if (dst.size() < n) dst.resize(n);
+    size_t i = 0;
+    for (const auto& e : entries) {
+        auto& row = dst[i];
+        row.resize(e.position.size());
+        std::copy(e.position.begin(), e.position.end(), row.begin());
+        ++i;
+    }
+    return n;
 }
 
 void TerrainSynthProcessor::computeGranularWeights(const std::vector<float>& pos,
                                                    std::vector<float>& out) {
     // Gather the granular entries' positions and delegate to the shared kernel.
-    std::vector<std::vector<float>> positions;
-    positions.reserve(wtGranularFrames.size());
-    for (const auto& e : wtGranularFrames) positions.push_back(e.position);
-    computeSideTableWeights(positions, pos, out);
+    const size_t n = gatherEntryPositions(wtGranularFrames, granPositionsScratch);
+    computeSideTableWeights(granPositionsScratch, n, pos, out);
 }
 
 void TerrainSynthProcessor::updateInharmonicWeights() {
     // Same Position resolution as updateGranularWeights (which see) - geometric-
     // axis-indexed query so it lines up with the entries' stored positions.
-    std::vector<float> pos;
-    if (wtScatter) {
-        pos = scatterQueryPosition();
-    } else {
-        pos.assign(std::max(1, wtNumDims), 0.0f);
-        const int K = (int)wtEffectiveAxes.size();
-        for (int k = 0; k < K; ++k) {
-            const int axis = wtEffectiveAxes[k];
-            std::string pname = (K == 1) ? std::string("Position")
-                              : std::string("Position ") + std::to_string(k + 1);
-            if (axis >= 0 && axis < (int)pos.size())
-                pos[axis] = juce::jlimit(0.0f, 1.0f, getParamByName(node, pname.c_str(), 0.0f));
-        }
-    }
+    std::vector<float>& pos = inhPosScratch;
+    if (wtScatter) scatterQueryPosition(pos);
+    else           fillPositionParams(pos, wtNumDims, 0.0f);
     computeInharmonicWeights(pos, inhWeights);
 }
 
 void TerrainSynthProcessor::computeInharmonicWeights(const std::vector<float>& pos,
                                                      std::vector<float>& out) {
-    std::vector<std::vector<float>> positions;
-    positions.reserve(wtInharmonicFrames.size());
-    for (const auto& e : wtInharmonicFrames) positions.push_back(e.position);
-    computeSideTableWeights(positions, pos, out);
+    const size_t n = gatherEntryPositions(wtInharmonicFrames, inhPositionsScratch);
+    computeSideTableWeights(inhPositionsScratch, n, pos, out);
 }
 
 void TerrainSynthProcessor::computeSideTableWeights(
-        const std::vector<std::vector<float>>& entryPositions,
+        const std::vector<std::vector<float>>& entryPositions, size_t entryCount,
         const std::vector<float>& pos, std::vector<float>& out) {
-    out.assign(entryPositions.size(), 0.0f);
-    if (entryPositions.empty()) return;
+    // entryCount, not entryPositions.size(): entryPositions is reused scratch
+    // that only ever grows, so it can be longer than the live entry list.
+    out.resize(entryCount);
+    std::fill(out.begin(), out.end(), 0.0f);
+    if (entryCount == 0) return;
 
     if (wtScatter) {
         // Scatter blend. The normalisation denominator (totalW) sums over ALL
@@ -2234,7 +2371,7 @@ void TerrainSynthProcessor::computeSideTableWeights(
                 totalW += std::pow((dmin + 1e-6f) / (distTo(fp) + 1e-6f), p);
         const float invT = wtAbsoluteBlend ? 1.0f
                                            : (totalW > 1e-9f ? 1.0f / totalW : 0.0f);
-        for (size_t ei = 0; ei < entryPositions.size(); ++ei) {
+        for (size_t ei = 0; ei < entryCount; ++ei) {
             float dist = distTo(entryPositions[ei]);
             if (wtAbsoluteBlend) {
                 // Compact-support Wendland: raw weight as gain, silent past r.
@@ -2256,7 +2393,7 @@ void TerrainSynthProcessor::computeSideTableWeights(
     // terrain's N-linear interp applies to that grid cell. Terrain dims are
     // {tableSize, d0, d1, ...} so tdims[d+1] is the grid size in dimension d.
     const auto& tdims = terrain.getDimensions();
-    for (size_t ei = 0; ei < entryPositions.size(); ++ei) {
+    for (size_t ei = 0; ei < entryCount; ++ei) {
         const auto& gp = entryPositions[ei];
         float w = 1.0f;
         for (int d = 0; d < (int)gp.size() && (d + 1) < (int)tdims.size(); ++d) {
@@ -2719,13 +2856,16 @@ void TerrainSynthProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mi
     // using a Wendland C^2 RBF over the current Position. The per-sample
     // path then reads terrain.sample(phase) unchanged.
     if (isWavetable && wtScatter && !wtScatterFrameSamples.empty()) {
-        std::vector<float> qpos = scatterQueryPosition();
+        std::vector<float>& qpos = scatterQposScratch;
+        scatterQueryPosition(qpos);
         int nFrames = (int)wtScatterFrameSamples.size();
-        std::vector<float> weights(nFrames, 0.0f);
+        ensureScatterScratch(nFrames, (int) terrain.getData().size());
+        std::vector<float>& weights = scatterWeights;
+        std::fill(weights.begin(), weights.begin() + nFrames, 0.0f);
         float totalW = 0.0f;
         float r = std::max(1e-3f, wtScatterRadius);
         // Distance from the query to every frame (shared by both blend modes).
-        std::vector<float> dists((size_t)nFrames, 0.0f);
+        std::vector<float>& dists = scatterDists;
         float dmin = 1e30f;
         for (int fi = 0; fi < nFrames; ++fi) {
             const auto& fp = wtScatterFramePositions[fi];
@@ -2784,23 +2924,33 @@ void TerrainSynthProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mi
         // of 2 or if wavelet decomposition fails.
         bool useWaveletMorph = (ts >= 8) && ((ts & (ts - 1)) == 0);
         if (useWaveletMorph) {
-            auto filt = getWaveletFilter("db2");
+            // filt / ws / blended / coeffs are all members. getWaveletFilter
+            // returns three vectors BY VALUE, and the dwt/idwt overloads that
+            // omit a workspace construct one internally (three more vectors) -
+            // per frame. With eight frames that was ~40 allocations a block, on
+            // the audio thread. See ensureScatterScratch / prepareToPlay.
+            const WaveletFilter& filt = scatterFilter;
             int maxLevels = 4;
 
-            // Accumulate weighted wavelet coefficients.
-            std::vector<float> blended(ts, 0.0f);
+            // Accumulate weighted wavelet coefficients. resize() down to `ts`
+            // never reallocates (ensureScatterScratch already grew capacity).
+            std::vector<float>& blended = scatterBlended;
+            std::vector<float>& coeffs  = scatterCoeffs;
+            blended.resize((size_t) ts);
+            coeffs .resize((size_t) ts);
+            std::fill(blended.begin(), blended.end(), 0.0f);
             for (int fi = 0; fi < nFrames; ++fi) {
                 if (weights[fi] <= 0.0f) continue;
                 float w = weights[fi] * invT;
                 const auto& src = wtScatterFrameSamples[fi];
-                std::vector<float> coeffs(ts, 0.0f);
+                std::fill(coeffs.begin(), coeffs.end(), 0.0f);
                 int n = std::min((int)src.size(), ts);
                 for (int i = 0; i < n; ++i) coeffs[i] = src[i];
-                dwt(coeffs, maxLevels, filt);
+                dwt(coeffs, maxLevels, filt, scatterWs);
                 for (int i = 0; i < ts; ++i) blended[i] += w * coeffs[i];
             }
             // Inverse DWT to get the blended waveform.
-            idwt(blended, maxLevels, filt);
+            idwt(blended, maxLevels, filt, scatterWs);
             for (int i = 0; i < ts; ++i) tdata[i] = blended[i];
         } else {
             // Time-domain fallback (original behavior).
@@ -2836,10 +2986,33 @@ void TerrainSynthProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mi
                 anyAuditionVoice = true; break;
             }
         if (anyAuditionVoice) {
-            auditionScratch.assign((size_t)numSamples, 0.0f);
+            // resize + fill, not assign: assign carries no guarantee that it
+            // won't reallocate even when the new size fits the existing
+            // capacity, whereas resize does.
+            auditionScratch.resize((size_t)numSamples);
+            std::fill(auditionScratch.begin(), auditionScratch.end(), 0.0f);
         }
     }
     const bool collectAudition = divertAudition && anyAuditionVoice;
+
+    // Wavetable Position params, resolved ONCE for the whole block into
+    // wtPositionScratch[k] (k indexes wtEffectiveAxes, i.e. param order, NOT
+    // the geometric axis). These are plain node params - they cannot change
+    // mid-block - but the old code rebuilt a std::string ("Position 3") and
+    // ran a linear scan over node.params for every axis of every SAMPLE.
+    const int posParamCount = (int) wtEffectiveAxes.size();
+    if (isWavetable && !wtScatter) {
+        wtPositionScratch.resize((size_t) posParamCount);
+        for (int k = 0; k < posParamCount; ++k)
+            wtPositionScratch[(size_t) k] = (k < (int) wtPositionNames.size())
+                ? juce::jlimit(0.0f, 1.0f,
+                      getParamByName(node, wtPositionNames[(size_t) k], 0.0f))
+                : 0.0f;
+    }
+
+    // The per-sample coordinate. A member so the render loop never allocates;
+    // Traversal::evaluate resizes it in place.
+    std::vector<float>& coord = coordScratch;
 
     for (int s = 0; s < numSamples; ++s) {
         double currentBeat = beatPos + s * beatsPerSample;
@@ -2856,8 +3029,8 @@ void TerrainSynthProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mi
         modParams.centerY = juce::jlimit(0.0f, 1.0f, modParams.centerY + l1 * 0.1f);
 
         // Evaluate traversal position
-        auto coord = traversal.evaluate(modParams, nd, currentBeat,
-                                         transport.bpm, sampleRate);
+        traversal.evaluate(coord, modParams, nd, currentBeat,
+                           transport.bpm, sampleRate);
 
         // Wavetable mode: coord[1] is the frame position, driven by a
         // Position parameter (index 21) rather than the traversal. coord[0]
@@ -2880,14 +3053,10 @@ void TerrainSynthProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mi
                 // controls. Naming matches syncPositionParams(): "Position" for a
                 // lone traversable axis, "Position 1".."Position K" otherwise.
                 for (int d = 1; d < nd; ++d) coord[d] = 0.0f;
-                const int K = (int)wtEffectiveAxes.size();
-                for (int k = 0; k < K; ++k) {
+                for (int k = 0; k < posParamCount; ++k) {
                     const int axis = wtEffectiveAxes[k];
                     if (axis + 1 >= nd) continue;
-                    std::string pname = (K == 1) ? std::string("Position")
-                        : std::string("Position ") + std::to_string(k + 1);
-                    coord[axis + 1] = juce::jlimit(0.0f, 1.0f,
-                        getParamByName(node, pname.c_str(), 0.0f));
+                    coord[axis + 1] = wtPositionScratch[(size_t) k];
                 }
             }
         }
@@ -2936,8 +3105,10 @@ void TerrainSynthProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mi
         if (grainFreeze && !coord.empty())
             coord[0] = freezePosition;
 
-        if (s == numSamples / 2)
-            lastPosition = coord;
+        if (s == numSamples / 2) {
+            lastPosition.resize(coord.size());
+            std::copy(coord.begin(), coord.end(), lastPosition.begin());
+        }
 
         // Grid renormalization gain: divide the cycle sample by the fraction
         // of interpolation weight that lands on *filled* cells, so empty cells
@@ -2948,8 +3119,9 @@ void TerrainSynthProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mi
         float gridRenormGain = 1.0f;
         if (isWavetable && !wtScatter && !wtAbsoluteBlend && wtGridHasEmptyCells
             && wtGridOccupancy.totalSize() > 0 && (int)coord.size() >= 2) {
-            std::vector<float> occCoord(coord.begin() + 1, coord.end());
-            float occ = wtGridOccupancy.sample(occCoord);
+            occCoordScratch.resize(coord.size() - 1);
+            std::copy(coord.begin() + 1, coord.end(), occCoordScratch.begin());
+            float occ = wtGridOccupancy.sample(occCoordScratch);
             if (occ > 1e-4f) gridRenormGain = 1.0f / occ;
         }
 
@@ -2996,7 +3168,12 @@ void TerrainSynthProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mi
             float sample;
             if (mode == TerrainSynthMode::SamplePerPoint) {
                 float pitchScale = effFreq / 440.0f;
-                auto pitchCoord = coord;
+                // Member scratch, not `auto pitchCoord = coord`: this is inside
+                // the per-voice loop inside the per-sample loop, so a copy here
+                // is up to MAX_VOICES heap allocations for every output sample.
+                std::vector<float>& pitchCoord = pitchCoordScratch;
+                pitchCoord.resize(coord.size());
+                std::copy(coord.begin(), coord.end(), pitchCoord.begin());
                 if (!pitchCoord.empty())
                     pitchCoord[0] = std::fmod(pitchCoord[0] + v.phase, 1.0f);
 
@@ -3011,12 +3188,16 @@ void TerrainSynthProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mi
                     float grainPhase = std::fmod(v.phase * (float)sampleRate, (float)grainSizeSamples);
                     float crossfade = grainPhase / grainSizeSamples; // 0..1 within grain
 
-                    // Grain A: at current position
-                    auto coordA = pitchCoord;
-                    float sampleA = terrain.sample(coordA);
+                    // Grain A: at current position. Read pitchCoord directly -
+                    // the old `auto coordA = pitchCoord` copy was never
+                    // modified, so it was a pure per-sample-per-voice
+                    // allocation for nothing.
+                    float sampleA = terrain.sample(pitchCoord);
 
                     // Grain B: offset by half a grain
-                    auto coordB = pitchCoord;
+                    std::vector<float>& coordB = grainCoordScratch;
+                    coordB.resize(pitchCoord.size());
+                    std::copy(pitchCoord.begin(), pitchCoord.end(), coordB.begin());
                     float halfGrainNorm = grainSize * 0.5f * pitchScale /
                         std::max(1.0f, (float)terrain.totalSize() / (float)sampleRate);
                     if (!coordB.empty())
@@ -3310,7 +3491,12 @@ void TerrainSynthProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::Mi
                 // fundamental*k, k=1..K. Magnitudes/phases come from a
                 // (cached) FFT of the wavetable cycle.
                 if ((int)v.partialPhases.size() < kAdditiveBankMaxPartials)
-                    v.partialPhases.assign(kAdditiveBankMaxPartials, 0.0f);
+                    // resize + fill rather than assign: assign may
+                    // reallocate even when the size is unchanged, and
+                    // this runs on the audio thread.
+                    v.partialPhases.resize(kAdditiveBankMaxPartials);
+                    std::fill(v.partialPhases.begin(),
+                              v.partialPhases.end(), 0.0f);
 
                 sample = 0.0f;
                 // Anti-aliasing: silence any partial whose frequency exceeds

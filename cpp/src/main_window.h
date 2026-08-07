@@ -6,7 +6,7 @@
 #include "transport.h"
 #include "plugin_host.h"
 #include "plugin_settings.h"
-#include "routing_strip.h"
+#include "layer_legend.h"
 #include "hotkey_manager.h"
 #include "project_file.h"
 #include "scripting.h"
@@ -123,7 +123,7 @@ public:
 private:
     std::unique_ptr<juce::MenuBarComponent> menuBar;
     std::unique_ptr<NodeGraphComponent> graphComponent;
-    std::unique_ptr<RoutingStrip> routingStrip;
+    std::unique_ptr<LayerLegend> layerLegend;
     std::unique_ptr<juce::StretchableLayoutResizerBar> splitter;
 
     // Transport bar components
@@ -179,7 +179,6 @@ private:
     int editorPanelHeight = 250;
     void openEditor(Node& node);
     void closeEditor(int nodeId);
-    void updateLayout();
     // Resize callback wired into each PianoRollComponent's resize handle.
     // `deltaPx` is the pixel delta from the drag (positive = handle moved
     // down, i.e. shrink). The matching panel's heightPx is adjusted by
@@ -265,6 +264,36 @@ private:
     // and calls back to untick this). Off by default - it's an opt-in mode.
     bool autoFitGraph = false;
     void addToRecentProjects(const juce::String& path);
+
+    // Settings → "Auto-Create Tracks for Audio Inputs". When on (the default),
+    // pressing Play & Record makes sure every live input channel on the audio
+    // device has an armed Audio Track to record into, creating and wiring one
+    // where it doesn't - so a plugged-in mic just works without the user first
+    // knowing to build a track and set its Input Channel by hand. Turning it
+    // off restores purely explicit arming ("Record Here"). Persisted.
+    bool autoCreateInputTracks = true;
+
+    // Settings → "Play Tracks Back While Recording Them". Off by default: a
+    // track that is currently recording is muted, which is what stops a laptop
+    // mic from howling into its own speakers. Mirrored onto NodeGraph so the
+    // audio thread's PanProcessor can apply it per block. Persisted.
+    bool playbackWhileRecording = false;
+
+    // Push `playbackWhileRecording` down to the graph the audio thread reads.
+    void applyRecordingPrefsToGraph();
+
+    // Make sure every live audio input has an armed track to record into, per
+    // `autoCreateInputTracks`. Returns the number of tracks newly created.
+    int ensureInputTracksForRecording();
+
+    // Finalize any in-flight take before New/Open replace graph.nodes wholesale.
+    // The recorders address nodes by id, so a take running across the swap would
+    // land on an unrelated node in the new project and leave it stuck mid-take.
+    void finishTakeBeforeGraphSwap();
+
+    // First free slot in the visible canvas for a new timeline node. Sets
+    // `needsFitAfterPlacement` when it had to place below the visible area.
+    Vec2 findFreeTimelineSlot(bool& needsFitAfterPlacement);
     void loadRecentProjects();
     void saveRecentProjects();
     void openProjectFile(const juce::String& path);

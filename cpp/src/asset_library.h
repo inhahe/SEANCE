@@ -40,10 +40,15 @@ enum class AssetKind {
     Instrument,     // independent instrument (generator + owned ADHSR/articulation)
     AhdsrCurve,     // an AHDSR / envelope curve
     MorphAlgorithm, // a warp / morph algorithm (WarpOp chain)
-    FrequencyGraph  // a 1-D frequency-domain curve (SpectralCurve): EQ response,
+    FrequencyGraph, // a 1-D frequency-domain curve (SpectralCurve): EQ response,
                     // FFT magnitude/phase, Spectrum-Tap per-bin response, etc.
                     // Payload = SpectralCurve::encode() (source-preserving:
                     // formula+language OR drawn points OR freehand samples).
+    ConvolutionIR   // a convolution impulse response (time-domain sample list).
+                    // Payload = ConvolutionProcessor::encodeIR() i.e. the same
+                    // "__convolution__:<len>,<sample>,..." string stored on a
+                    // Convolution Filter node's script. Loaded back into any
+                    // Convolution Filter as an independent copy.
 };
 
 const char* assetKindTag(AssetKind k);          // stable string for serialization

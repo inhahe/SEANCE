@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.22)
-project(SEANCE VERSION 0.1.0 LANGUAGES C CXX)
+project(SEANCE VERSION 0.10.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -49,6 +49,45 @@ juce_add_gui_app(SEANCE
     PRODUCT_NAME "SEANCE"
     COMPANY_NAME "SEANCE"
 )
+
+# ------------------------------------------------------------------------------
+# Force the Windows version resource to track project(... VERSION ...).
+#
+# JUCE bug (8.0.12, _juce_add_resources_rc in JUCEUtils.cmake:823): the custom
+# command that runs `juceaide rcfile <info> <target>_resources.rc` declares a
+# DEPENDS on the app icon and nothing else - in particular NOT on the info file
+# that carries the version. So when you bump the version, CMake rewrites
+# Info.txt at configure time, but the .rc is already present and up to date as
+# far as the build graph is concerned, and never regenerates.
+#
+# The result is a silent split: JUCE_APPLICATION_VERSION_STRING (a compile
+# definition) picks up the new version, so Help > About is right, while the
+# exe's FILEVERSION resource keeps the OLD number forever. That is the number
+# Explorer's Properties dialog shows and the one release.bat checks to catch a
+# stale build - so left alone, this makes the release guard reject good builds
+# and, worse, makes every published exe claim the version it had the first time
+# the file was generated.
+#
+# Deleting the stale .rc at configure time makes the custom command run again on
+# the next build. Configure only re-runs when this file changes, which is
+# exactly when the version can change, so the cost is one tiny regenerated text
+# file and a relink on the builds that actually bumped something.
+#
+# Remove this block if JUCE ever adds `DEPENDS "${input_info_file}"` upstream.
+get_target_property(_seance_juce_gen_dir SEANCE JUCE_GENERATED_SOURCES_DIRECTORY)
+if(WIN32 AND _seance_juce_gen_dir)
+    set(_seance_rc "${_seance_juce_gen_dir}/SEANCE_resources.rc")
+    if(EXISTS "${_seance_rc}")
+        file(READ "${_seance_rc}" _seance_rc_text)
+        # juceaide writes: VALUE "FileVersion",  "x.y.z\0"
+        if(NOT _seance_rc_text MATCHES "\"FileVersion\",[ \t]*\"${PROJECT_VERSION}\\\\0\"")
+            message(STATUS
+                "Version changed to ${PROJECT_VERSION}: removing stale "
+                "SEANCE_resources.rc so juceaide regenerates it")
+            file(REMOVE "${_seance_rc}")
+        endif()
+    endif()
+endif()
 
 # Guard the dialog/taskbar rules (CLAUDE.md: a dialog must never earn its own
 # Windows taskbar button). The failure mode this catches is silent - an
@@ -513,6 +552,19 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/resources")
         COMMAND ${CMAKE_COMMAND} -E copy_directory
             "${CMAKE_CURRENT_SOURCE_DIR}/resources"
             "$<TARGET_FILE_DIR:SEANCE>/resources"
+    )
+endif()
+
+# Copy scripts/ (the bundled Python helper modules soundshop_music /
+# soundshop_tools, plus the wasm examples) alongside the built exe. ScriptEngine
+# looks here FIRST when seeding sys.path, so this is what makes
+# `import soundshop_tools` work in a packaged build — the dev-tree path it also
+# checks (<exe>/../../../scripts) exists only when running out of cpp/build/...
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/scripts")
+    add_custom_command(TARGET SEANCE POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+            "${CMAKE_CURRENT_SOURCE_DIR}/scripts"
+            "$<TARGET_FILE_DIR:SEANCE>/scripts"
     )
 endif()
 

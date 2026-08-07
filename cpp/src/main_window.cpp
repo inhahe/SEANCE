@@ -1612,8 +1612,13 @@ void MainContentComponent::menuItemSelected(int menuItemID, int) {
         case 320:
             juce::NativeMessageBox::showMessageBoxAsync(
                 juce::MessageBoxIconType::InfoIcon,
-                "About SoundShop",
-                "SoundShop2\n\n"
+                "About SEANCE",
+                // The version comes from project(SEANCE VERSION ...) in
+                // CMakeLists.txt via JUCE_VERSION, so it is the same number
+                // release.bat tags a GitHub release with and the same one in
+                // the exe's file properties. Shown here so a bug report can
+                // say which build it came from.
+                "SEANCE " JUCE_APPLICATION_VERSION_STRING "\n\n"
                 "A node-based DAW designed to be intuitive for people "
                 "without a musical background.\n\n"
                 "See Help > User Guide for documentation.",

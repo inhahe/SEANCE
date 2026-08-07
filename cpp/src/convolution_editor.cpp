@@ -66,9 +66,10 @@ ConvolutionEditorComponent::ConvolutionEditorComponent(NodeGraph& g, int nid,
     loadFileBtn.onClick = [this]() { loadFromFile(); };
 
     addAndMakeVisible(saveToLibBtn);
-    saveToLibBtn.setTooltip("Save the current impulse response to this project's asset library so you can "
-                            "reuse it in any other Convolution Filter. Stored copies live in "
-                            "Edit \xe2\x86\x92 Asset Library \xe2\x86\x92 Convolution IRs.");
+    saveToLibBtn.setTooltip(juce::String::fromUTF8(
+        "Save the current impulse response to this project's asset library so you can "
+        "reuse it in any other Convolution Filter. Stored copies live in "
+        "Edit \xe2\x86\x92 Asset Library \xe2\x86\x92 Convolution IRs."));
     saveToLibBtn.onClick = [this]() { saveToLibrary(); };
 
     addAndMakeVisible(loadFromLibBtn);

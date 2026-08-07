@@ -23,7 +23,14 @@ float TimeGateProcessor::computeWet(float beat) const {
     // single global value and have it apply everywhere).
     const float globalDefault = std::max(0.0f, graph.globalCrossfadeSec);
 
-    auto applyRegion = [&](const EffectRegion& region) {
+    // `beatOffset` is the owning node's absoluteBeatOffset. Region beats are
+    // stored LOCAL to their node, exactly like clips and notes, so that moving
+    // a track's start position slides its effect layers with it instead of
+    // leaving them stranded at fixed absolute beats. The gate therefore has to
+    // compare against local time too - without this, dragging a track two bars
+    // right made its layers fire two bars early.
+    auto applyRegion = [&](const EffectRegion& region, float beatOffset) {
+        const float localBeat = beat - beatOffset;
         bool applies = false;
         float crossfadeSec = globalDefault;
 
@@ -42,13 +49,13 @@ float TimeGateProcessor::computeWet(float beat) const {
         }
         if (!applies) return;
 
-        // Region is active if beat is inside [startBeat, endBeat].
+        // Region is active if the local beat is inside [startBeat, endBeat].
         // Crossfade ramps in at the start edge and out at the end edge.
-        if (beat < region.startBeat || beat > region.endBeat) return;
+        if (localBeat < region.startBeat || localBeat > region.endBeat) return;
         float crossfadeBeats = std::max(0.001f,
             crossfadeSec * (float)(transport.bpm / 60.0));
-        float fadeIn  = (beat - region.startBeat) / crossfadeBeats;
-        float fadeOut = (region.endBeat - beat) / crossfadeBeats;
+        float fadeIn  = (localBeat - region.startBeat) / crossfadeBeats;
+        float fadeOut = (region.endBeat - localBeat) / crossfadeBeats;
         float w = std::min(1.0f, std::min(fadeIn, fadeOut));
         wet = std::max(wet, w);
     };
@@ -58,7 +65,7 @@ float TimeGateProcessor::computeWet(float beat) const {
     // and `applies` rejects mismatches early.
     for (const auto& node : graph.nodes)
         for (const auto& region : node.effectRegions)
-            applyRegion(region);
+            applyRegion(region, node.absoluteBeatOffset);
 
     return wet;
 }

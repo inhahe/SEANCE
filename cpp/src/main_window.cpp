@@ -4297,6 +4297,7 @@ void MainContentComponent::openEditor(Node& node) {
             p->component->repaint();
         if (graphComponent) graphComponent->repaint();
     };
+    panel->component->onOpenHelpDoc = [this](juce::String rel) { openHelpDoc(rel); };
     addAndMakeVisible(panel->component.get());
     editorPanels.push_back(std::move(panel));
 
@@ -5494,16 +5495,16 @@ public:
 
         // If no Python interpreter is available, the console can't run anything.
         // Say so up front (rather than silently doing nothing on Run) and
-        // explain how to enable it — see CLAUDE.md's grayed-control rule.
+        // explain how to enable it - see CLAUDE.md's grayed-control rule.
         if (!ScriptEngine::pythonAvailable()) {
             outputEditor.setText(
                 "Python scripting is disabled: no Python interpreter was found.\n"
-                "SEANCE delay-loads Python, so it runs fine without it — but the\n"
+                "SEANCE delay-loads Python, so it runs fine without it - but the\n"
                 "Script Console, Python signal evaluation, and the Python shape\n"
                 "baker need a Python install. Install Python (matching this build's\n"
                 "version) so its DLL is on the system PATH, then restart SEANCE.");
             runBtn.setEnabled(false);
-            runBtn.setTooltip("Disabled — no Python interpreter was found. Install "
+            runBtn.setTooltip("Disabled - no Python interpreter was found. Install "
                               "Python and restart SEANCE to enable scripting.");
         }
 

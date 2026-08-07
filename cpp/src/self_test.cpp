@@ -37,6 +37,7 @@
 #include "pitch_core.h"             // PhaseVocoderShifter - in-house pitch-shift core
 #include "pitch_shift_processor.h"  // PitchShiftProcessor - the Pitch Shift node
 #include "graph_processor.h"        // AudioTimelineProcessor - audio-clip playback
+#include "time_gate_processor.h"    // TimeGateProcessor - local-beat effect-layer gating
 #include "multitrack_recorder.h"    // MultitrackRecorder - live input capture
 #include "pan_processor.h"          // PanProcessor - the mute/solo/record-mute chokepoint
 #include "soundfont_processor.h"    // SoundFontProcessor - .sf2 / .sfz instrument node
@@ -1827,6 +1828,118 @@ void testTerrainData(Report& r, const juce::File& dir) {
                 ProjectFile::readProject(iss, g3, nullptr);
                 checkRegions(g3, "an undo snapshot restore");
             }
+
+            // ---- the gate itself reads LOCAL beats, not transport beats -----
+            // Region beats are stored local to their node, exactly like clips
+            // and notes, so that sliding a track's start position carries its
+            // layers with it. TimeGateProcessor used to compare regions against
+            // the raw transport beat, so the layers moved *visually* with the
+            // track but fired at the old absolute beats *audibly*. Pushing the
+            // node four bars out and probing on both sides of the shift pins
+            // that down. Measured with `- beatOffset` removed from the gate:
+            // the "unshifted" probe reads 1.0 instead of 0.0 and the "slid
+            // along" probe reads 0.0 instead of 1.0 - i.e. the gate opens over
+            // exactly the wrong stretch of music, which is what the bug
+            // sounded like. (The two shut-side probes read 0.0 either way, so
+            // they are regression guards, not discriminators - the inverting
+            // pair is what actually catches this.)
+            {
+                Transport t;
+                t.bpm = 120.0; t.sampleRate = 44100.0;
+                g.nodes[0].effectRegions = { byLink };          // local beats 8.5 .. 12.25
+                g.nodes[0].absoluteBeatOffset = 16.0f;          // track slid 4 bars right
+
+                TimeGateProcessor gate(linkId, g.nodes[0], g, t);
+                gate.prepareToPlay(t.sampleRate, 64);
+
+                // Probe the gate at an absolute beat by running a block of DC
+                // through it: the surviving amplitude *is* the wet amount.
+                auto wetAt = [&](double absBeat) {
+                    t.positionSamples = (int64_t)t.beatsToSamples(absBeat);
+                    juce::AudioBuffer<float> buf(1, 64);
+                    for (int i = 0; i < 64; ++i) buf.setSample(0, i, 1.0f);
+                    juce::MidiBuffer midi;
+                    gate.processBlock(buf, midi);
+                    return buf.getSample(0, 0);
+                };
+
+                // Absolute 10.0 == local -6.0: nowhere near the region, but it
+                // IS inside the region's raw beat range - so this is the probe
+                // that fires if the gate forgets the offset.
+                r.checkVal(wetAt(10.0) < 1e-4f,
+                           "fxgate: a shifted track's layer is shut at its pre-slide beats",
+                           (double)wetAt(10.0));
+                // Absolute 22.0 == local 6.0: outside 8.5..12.25, so shut.
+                r.checkVal(wetAt(22.0) < 1e-4f,
+                           "fxgate: a shifted track's layer is shut ahead of its start beat",
+                           (double)wetAt(22.0));
+                // Absolute 26.0 == local 10.0: mid-region, well past the 50 ms
+                // crossfade (0.1 beat at 120 bpm), so fully open.
+                r.checkVal(wetAt(26.0) > 0.999f,
+                           "fxgate: a shifted track's layer opens at its slid-along beat",
+                           (double)wetAt(26.0));
+                // And it still shuts again past the region's local end.
+                r.checkVal(wetAt(30.0) < 1e-4f,
+                           "fxgate: the layer shuts again past its end beat",
+                           (double)wetAt(30.0));
+
+                g.nodes[0].absoluteBeatOffset = 0.0f;
+            }
+        }
+
+        // ---- insert/delete time ripples effect layers ------------------------
+        // Layers share the clip/note local beat space, so the arrangement-level
+        // "insert N beats here" / "delete this range" edits have to move them
+        // too. They originally didn't, which silently desynced every layer in
+        // the project from the music it was gating the moment a bar was added.
+        // Measured with both ripple passes disabled: 3 of these fail outright
+        // (straddle-stretch, post-insert slide, and the delete leaving 4 layers
+        // instead of 3) and the 3 delete-side position checks never even run,
+        // since they are guarded on that size.
+        {
+            NodeGraph g;
+            g.addNode("MIDI Track", NodeType::MidiTimeline, {},
+                      { Pin{0, "MIDI", PinKind::Midi, false} });
+            auto mk = [](float s, float e) {
+                EffectRegion r2; r2.linkId = 1; r2.startBeat = s; r2.endBeat = e; return r2;
+            };
+
+            // Insert 4 beats at beat 8: a layer entirely after the cut slides,
+            // one straddling it stretches, one entirely before is untouched.
+            g.nodes[0].effectRegions = { mk(0.0f, 4.0f), mk(6.0f, 10.0f), mk(12.0f, 16.0f) };
+            g.insertTime(8.0f, 4.0f);
+            auto& ins = g.nodes[0].effectRegions;
+            r.check(ins.size() == 3 && std::abs(ins[0].startBeat - 0.0f) < 1e-4f
+                    && std::abs(ins[0].endBeat - 4.0f) < 1e-4f,
+                    "fxripple: a layer entirely before an insert is left alone");
+            r.check(ins.size() == 3 && std::abs(ins[1].startBeat - 6.0f) < 1e-4f
+                    && std::abs(ins[1].endBeat - 14.0f) < 1e-4f,
+                    "fxripple: a layer straddling an insert stretches by the inserted length");
+            r.check(ins.size() == 3 && std::abs(ins[2].startBeat - 16.0f) < 1e-4f
+                    && std::abs(ins[2].endBeat - 20.0f) < 1e-4f,
+                    "fxripple: a layer after an insert slides by the inserted length");
+
+            // Delete beats 8..12: a layer wholly inside the deleted range is
+            // dropped, one overlapping is clamped to the cut point, one after
+            // pulls back by the deleted length.
+            g.nodes[0].effectRegions = { mk(0.0f, 4.0f), mk(9.0f, 11.0f),
+                                         mk(10.0f, 16.0f), mk(20.0f, 24.0f) };
+            g.deleteTime(8.0f, 12.0f);
+            auto& del = g.nodes[0].effectRegions;
+            r.checkVal(del.size() == 3,
+                       "fxripple: a layer wholly inside a deleted range is removed",
+                       (double)del.size());
+            if (del.size() == 3) {
+                r.check(std::abs(del[0].startBeat - 0.0f) < 1e-4f
+                        && std::abs(del[0].endBeat - 4.0f) < 1e-4f,
+                        "fxripple: a layer entirely before a delete is left alone");
+                r.check(std::abs(del[1].startBeat - 8.0f) < 1e-4f
+                        && std::abs(del[1].endBeat - 12.0f) < 1e-4f,
+                        "fxripple: a layer overlapping a delete is clamped to the cut point");
+                r.check(std::abs(del[2].startBeat - 16.0f) < 1e-4f
+                        && std::abs(del[2].endBeat - 20.0f) < 1e-4f,
+                        "fxripple: a layer after a delete pulls back by the deleted length");
+            }
         }
 
         // ---- hosted-plugin param automation lanes: round-trip + helpers ------
@@ -2916,7 +3029,7 @@ void testWarp(Report& r) {
                         && std::abs(AHDSREnvelope::tensionWarp(1.0f,  0.7f) - 1.0f) < 1e-5f
                         && std::abs(AHDSREnvelope::tensionWarp(0.0f, -0.7f)) < 1e-5f
                         && std::abs(AHDSREnvelope::tensionWarp(1.0f, -0.7f) - 1.0f) < 1e-5f;
-        r.check(endpointsOk, "ahdsr tension: warp pins both endpoints for ±tension");
+        r.check(endpointsOk, "ahdsr tension: warp pins both endpoints for +/-tension");
 
         bool identityOk = true;
         for (int i = 0; i <= 10; ++i) {
@@ -2935,7 +3048,7 @@ void testWarp(Report& r) {
             return true;
         };
         r.check(monotonic(0.9f) && monotonic(-0.9f),
-                "ahdsr tension: warp is monotonic for strong ±tension");
+                "ahdsr tension: warp is monotonic for strong +/-tension");
 
         // T>0 ("slow start") must lag below the diagonal in the interior;
         // T<0 ("fast start") must lead above it.
@@ -10173,7 +10286,7 @@ void testSampleHold(Report& r) {
                 "sh: audio channels stay silent");
     }
 
-    // --- Random ±1: one trigger, ignores In, value in [-1,1], then held. ---
+    // --- Random +/-1: one trigger, ignores In, value in [-1,1], then held. ---
     {
         setSource(1.0f);
         proc.prepareToPlay(48000.0, N);

@@ -111,7 +111,9 @@ Render modes (Synth Mode parameter on the Terrain Synth / Wavetable nodes):
 
 Most DAWs treat "which effects are active" as a fixed property of a track. SEANCE lets you make that time-varying: a specific cable can be **on** only during certain beat ranges and **off** otherwise.
 
-A layer is a colored bar drawn in the routing strip above the piano roll. You drag a region to set the start and end beats. Outside the region, the cable is muted with a smooth crossfade at the edges (configurable globally; default 50 ms) so you never hear a click when a layer turns on or off.
+Layers live in the **Effects lane**, a thin strip in every track's piano roll sitting just above the Start slider. Click it to expand it into an editor, then right-click to add a layer for any cable or effect group. Each layer appears as a shaded tube in that cable's color, spanning the beats where the routing is switched on; drag its middle to move it and either end to lengthen or shorten it. Press Escape to collapse the lane again. Outside a layer the cable is muted with a smooth crossfade at the edges (configurable globally; default 50 ms) so you never hear a click when a layer turns on or off.
+
+Layers belong to the track, so sliding a track's start position — or inserting and deleting time — carries its layers with it and keeps them gating the same music.
 
 This is how you'd put reverb on the chorus only without automating a dry/wet knob, or activate a parallel filter chain on the bridge only, or have one synth speak only during the second verse.
 
@@ -119,7 +121,7 @@ This is how you'd put reverb on the chorus only without automating a dry/wet kno
 
 Sometimes you want to activate **multiple cables at once** — e.g., a reverb send AND a delay send AND a filter modulation, all gated together as one "chorus effects on" layer. That's what an Effect Group is: a named bundle of cables that activate together as one unit.
 
-To create a group: right-click any cable → Effect Group → New Group, give it a name, then right-click other cables → Effect Group → Add to <name>. Now you can create a single layer that references the group, and all cables in the group activate or mute as one.
+To create a group: right-click any cable → Effect Group → New Group, give it a name, then right-click other cables → Effect Group → Add to <name>. Groups then show up alongside individual cables in the Effects lane's add menu, so one layer can gate the whole bundle — all cables in the group activate or mute as one.
 
 Each group gets its own color, drawn on member wires as visual tags (circles for individual wire identity, diamonds for group membership) so you can see at a glance which routings belong to which groups.
 

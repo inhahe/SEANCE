@@ -85,7 +85,10 @@ inline void addItems(juce::PopupMenu& menu, NodeGraph& graph, const Node& node) 
 
     menu.addItem(kClearParent, "Clear parent", node.parentGroupId >= 0, false);
     menu.addSeparator();
-    menu.addItem(kSetStartBeat, "Set start beat\xe2\x80\xa6");
+    // fromUTF8 is required: juce::String(const char*) routes through
+    // CharPointer_ASCII, which widens each byte to its own character, so a raw
+    // UTF-8 literal renders as mojibake ("Set start beat" + three junk glyphs).
+    menu.addItem(kSetStartBeat, juce::String::fromUTF8("Set start beat\xe2\x80\xa6"));
 }
 
 // Apply a chosen `result`. `refresh(desc)` is invoked after any data change so

@@ -5012,13 +5012,13 @@ WaveLayerEditor::WaveLayerEditor(WaveLayer* layerPtr, Callbacks cb, bool enableW
                                 "expressions. Lua / Python: full languages with loops and "
                                 "variables (e.g. sum many harmonics for additive synthesis). "
                                 "GLSL: a GPU compute shader with native GLSL math and "
-                                "waveform(id,phase) for the factory bank — the most capable "
+                                "waveform(id,phase) for the factory bank - the most capable "
                                 "waveshaping option. All are baked into the wavetable when you "
                                 "edit, not run live. Write a value in `x` (radians, 0..2*pi); "
                                 "multi-line bodies must end with `return`.")
                                 + (shapeLangAvailable(ShapeLang::Python) ? ""
                                    : "  (Python is greyed out because no Python interpreter "
-                                     "was found — install Python and restart to enable it.)")
+                                     "was found - install Python and restart to enable it.)")
                                 + (shapeLangAvailable(ShapeLang::Glsl) ? ""
                                    : "  (GLSL is greyed out because no OpenGL 4.3 compute "
                                      "driver is available on this machine.)"));
@@ -5874,7 +5874,7 @@ public:
 
     // Wireframe corner-count cap. The hypercube grows as 2^N edges and
     // becomes visually meaningless past about 6 dims (64 corners, 192
-    // edges) — taller wavetables still render and snap to the cube, the
+    // edges) - taller wavetables still render and snap to the cube, the
     // wireframe just stops adding further axes.
     static constexpr int kMaxRenderDims = 6;
 
@@ -5888,7 +5888,7 @@ public:
     // the available view (the old code computed a scale that fit only the
     // un-rotated [-0.5..+0.5] axis range), and edges of the wireframe
     // wouldn't extend to where dots near the corners actually drew.
-    // Mutable: paint state, not user-visible state — modified from const
+    // Mutable: paint state, not user-visible state - modified from const
     // helpers like screenToPosition / projectPoint indirectly.
     mutable float renderScale = 1.0f;
     mutable float renderCx = 0.0f;
@@ -6272,7 +6272,7 @@ public:
         // wavetable's actual N-dim cube (capped at kMaxRenderDims) and
         // every 1-bit-differ edge. Unrotated, a high-N cube projects
         // many edges on top of each other in 2D so it looks like a flat
-        // square — rotate via the orbit drag or sidebar sliders to see
+        // square - rotate via the orbit drag or sidebar sliders to see
         // the extra dims pull apart.
         drawHypercube(g, area, eyeSign);
 
@@ -9703,7 +9703,7 @@ LayeredWaveEditorComponent::LayeredWaveEditorComponent(NodeGraph& g, int nid, st
         setLibraryEntryName(currentLibraryId, nameEditor.getText().toStdString());
     };
     // Enter commits AND drops keyboard focus so the field visibly "quits editing"
-    // (the focus-loss re-commit is a harmless no-op — setLibraryEntryName early-
+    // (the focus-loss re-commit is a harmless no-op - setLibraryEntryName early-
     // outs when the name is unchanged). Clicking anywhere outside the field also
     // commits via onFocusLost.
     nameEditor.onReturnKey = [this, commitNameEdit]() {
@@ -9862,12 +9862,12 @@ std::unique_ptr<IWavetableFrame> LayeredWaveEditorComponent::makeFactoryFrame(
 }
 
 // ----------------------------------------------------------------------------
-// WaveformLibraryBrowser — unified modal picker for ALL selectable waveforms.
+// WaveformLibraryBrowser - unified modal picker for ALL selectable waveforms.
 // ----------------------------------------------------------------------------
 //
 // Lists the built-in single-cycle factory library AND the project's user-saved
 // Waveform assets in one place (the wave-shape library is far too large for a
-// flat dropdown — see agent-todo design refinement #2). Layout: a category list
+// flat dropdown - see agent-todo design refinement #2). Layout: a category list
 // down the left (built-in categories + a "★ User Library" pseudo-category), a
 // search box + "Starred only" + "Show user items" toggles across the top, the
 // filtered list in the middle, and a live cycle preview + Insert/Cancel below.
@@ -9891,7 +9891,7 @@ public:
     explicit WaveformLibraryBrowser(NodeGraph& graphRef) : bank(WaveformBank::get()) {
         bank.ensureLoaded();
         // Snapshot the user Waveform assets up-front (the dialog is modal, so the
-        // library can't change underneath us). Archived assets are excluded — the
+        // library can't change underneath us). Archived assets are excluded - the
         // picker shows only live entries, matching list()'s default.
         for (const AssetEntry* a : graphRef.assets.list(AssetKind::Waveform))
             userItems.push_back({ a->id, juce::String(a->name), a->starred,
@@ -9908,7 +9908,7 @@ public:
         starredToggle.setButtonText("Starred only");
         starredToggle.setTooltip("Show only starred waveforms: the hand-picked "
                                  "\"best of\" built-in shapes plus any of your "
-                                 "saved waveforms you've starred (★).");
+                                 "saved waveforms you've starred (the star icon).");
         starredToggle.onClick = [this] { rebuildCategories(); rebuildVisible(); };
 
         addAndMakeVisible(showUserToggle);

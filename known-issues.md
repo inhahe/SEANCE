@@ -2225,61 +2225,79 @@ Two doc surfaces described these sliders as if they existed
 (`REFERENCE.md` § "3D anaglyph viewport" and `docs/wavetables.html`); both were
 corrected to describe the shipping UI, and REFERENCE.md now points here.
 
-## Effect layers (time-gated wires) are practically undiscoverable
+## Effect layers: no entry point from the graph view, and an unfiltered add menu
 
-**Where:** `cpp/src/piano_roll_component.cpp` — menu built at ~line 3562
-(`Effect Regions` submenu), handled at ~line 4055; bars painted at ~line 1131.
-Model in `cpp/src/effect_regions.h`; the strip in `cpp/src/routing_strip.cpp`.
+**Where:** wire context menu in `cpp/src/node_graph_component.cpp:5672`
+(`Effect Group` submenu); the add menu in `cpp/src/piano_roll_component.cpp`
+`showFxLaneMenu`. Model in `cpp/src/effect_regions.h`.
 
-The feature works — a wire can be gated to a beat range, it crossfades at the
-edges, and the routing strip visualises it — but a user is very unlikely to
-ever find it. Concretely:
+The bulk of this entry has been **fixed** — see below for what shipped. Two
+gaps remain:
 
-1. **One hidden entry point.** The only way to create a layer is to open a
-   track's piano roll, right-click, and find **Effect Regions** buried in the
-   middle of a long context menu. Nothing in the graph view hints that wires
-   can be time-gated: the wire context menu has an `Effect Group` submenu
-   (`node_graph_component.cpp:5672`) that lets you *build a group* but never
-   mentions that groups exist in order to be gated, and offers no way to gate
-   anything. Someone who makes a group therefore reaches a dead end.
-2. **The submenu is unfiltered.** It lists **every link in the entire
-   project** as `Source > Destination`, including audio wires that have
-   nothing to do with the track whose piano roll is open. On a real graph this
-   is dozens of near-identical entries. It should list only wires reachable
-   from this track, and should probably lead with the effects downstream of it.
-3. **The affordance only appears after you've already succeeded.** The routing
-   strip auto-hides when there are no layers (`RoutingStrip::getDesiredHeight`
-   returns 0), so there is no empty-state prompt — the UI looks identical
-   whether or not the feature exists.
-4. **No direct manipulation.** A new layer is always exactly 4 beats from the
-   clicked beat. There is no drag to move or resize it; the only edit is
-   *Delete Effect Region at Cursor*. To change a range you delete and re-make
-   it, and re-clicking has to land inside the old bar to delete it.
-5. **The bars collide with markers.** Layer bars are drawn at `barY0 = 0.0f`,
-   flush with the top of the grid, and marker flags/labels are also drawn at
-   y = 0..12 in the same paint (`piano_roll_component.cpp:1110-1129`). Any
-   marker in a layered range is overpainted by the bar.
+1. **Nothing in the graph view hints that wires can be time-gated.** The wire
+   context menu has an `Effect Group` submenu that lets you *build a group*,
+   but never mentions that groups exist in order to be gated, and offers no way
+   to gate anything. Someone who makes a group there reaches a dead end and has
+   to independently discover the Effects lane in a track's piano roll.
+   *Proper fix:* add a **Time-gate this wire...** item to the wire context menu
+   that creates the region and jumps to the source track's piano roll with the
+   Effects lane expanded, so the feature is reachable from where the user is
+   already thinking about routing.
+2. **The add menu is unfiltered.** *Add layer at beat N...* lists **every link
+   in the entire project** as `Source > Destination`, including audio wires
+   that have nothing to do with the track whose piano roll is open. On a real
+   graph this is dozens of entries.
+   *Proper fix:* list only wires reachable from this track, leading with the
+   effects immediately downstream of it, and put the rest behind an "all
+   wires" submenu.
+   (The related *ambiguity* problem is fixed: entries now carry a colour swatch
+   matching the tube they create, and wires sharing a node pair are qualified
+   with their pin names - `Voice In 2 > Signal Osc  (Gate > Gate)` - so three
+   identical rows no longer force a blind pick. Only the length of the list is
+   still an issue.)
 
-**Proper fix:** (a) add a **Time-gate this wire…** item to the wire context
-menu in the graph view that creates the region and jumps to the source track's
-piano roll, so the feature is reachable from where the user is already thinking
-about routing; (b) filter the `Effect Regions` submenu to wires reachable from
-the current track; (c) give the routing strip a collapsed empty state with a
-one-line "no layers — right-click a wire to time-gate it" prompt instead of
-hiding entirely; (d) implement drag-move and edge-drag-resize on the layer
-bars, committing one undo step on drag end (this qualifies for the
-`LambdaCommand` fast path — see CLAUDE.md); (e) offset `barY0` below the marker
-lane, or move markers above the bars.
+**Fixed (2026-08):** the feature was rebuilt around a per-track **Effects
+lane** in the piano roll, sitting between the resize handle and the track
+header, its height folded into `PianoRollComponent::toolbarHeight()` so the
+note grid shifts automatically:
 
-Two real bugs found alongside this were **fixed**: `EffectRegion` was never
-serialized by `writeProject`, so layers vanished on save/load *and* were wiped
-by the next undo step (undo snapshots share that writer) — now emitted as
-`[FxRegion]` and covered by `fxregion:` assertions in `self_test.cpp`
-(measured 0 of 2 surviving before the fix, 2 of 2 after); and adding/deleting
-a region set `graph.dirty` without ever calling `commitSnapshot()`, so the edit
-was not undoable.
+- The lane is **always visible**, with an empty state reading *"no effect
+  layers - click to add one"*, so the affordance no longer appears only after
+  you have already succeeded. Click to expand into an editor, Escape / the
+  chevron caption / right-click -> *Done editing* to collapse.
+- **Direct manipulation**: layers render as shaded gradient tubes in their
+  wire/group colour and support drag-to-move and edge-drag-to-resize, snapped
+  to the grid (Alt overrides), committing one `commitSnapshot()` per gesture.
+  Right-click a tube to delete it.
+- **The marker collision is gone** because the in-grid bar painter was deleted
+  outright; layers no longer draw at y = 0 over marker flags and labels.
+- **Regions now track the track.** `TimeGateProcessor` compares against the
+  owning node's *local* beat (`beat - absoluteBeatOffset`) instead of raw
+  transport beats, so sliding a track's start position moves its layers
+  audibly and not just visually; `NodeGraph::insertTime`/`deleteTime` ripple
+  regions the same way they ripple clips and notes.
+- `EffectRegion` was never serialized by `writeProject`, so layers vanished on
+  save/load *and* were wiped by the next undo step (undo snapshots share that
+  writer). Now emitted as `[FxRegion]` and covered by `fxregion:` assertions in
+  `self_test.cpp` (measured 0 of 2 surviving before the fix, 2 of 2 after).
+- Adding/deleting a region set `graph.dirty` without ever calling
+  `commitSnapshot()`, so the edit was not undoable. Now snapshotted.
+- Both piano-roll context menus (the Effects lane and the track header) were
+  shown with `withTargetComponent(this)`. The target component is the *whole*
+  piano roll, so JUCE parked the menu against that rectangle's edge: right-
+  clicking a layer at bar 30 popped the menu at the far left of the window.
+  Now `withMousePosition()`, like every other menu in the file.
+- Several user-visible strings were raw non-ASCII narrow literals, which
+  `juce::String(const char*)` decodes as Latin-1: the lane caption rendered as
+  three mojibake glyphs plus a truncated *"Eff..."*, and `Set start beat...`
+  in the track-nesting menu showed junk after the words. All such literals now
+  go through `juce::String::fromUTF8`.
 
 `REFERENCE.md` § "Effect layers and groups" previously documented a creation
-path that does not exist ("right-click on a wire → **Time-gate…**, then drag in
-the piano roll layer bar area to set start/end" — there is no such menu item
-and no such drag); it now describes the shipping UI and links here.
+path that does not exist ("right-click on a wire -> **Time-gate...**, then drag
+in the piano roll layer bar area to set start/end"); it, `README.md` and
+`docs/layers-and-groups.html` now describe the shipping Effects lane.
+
+All of the above is covered by `fxregion:` / `fxgate:` / `fxripple:`
+assertions in `self_test.cpp`, each with the broken-code measurement recorded
+in a comment next to it.

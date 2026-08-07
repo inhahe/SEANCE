@@ -1866,19 +1866,61 @@ dead knob.
 
 ## Effect layers and groups
 
-Lets you mark a wire as **active only during certain beat ranges** — the routing itself becomes time-gated rather than always-on. Implemented in `effect_regions.h`, `time_gate_processor.cpp`, and surfaced in the piano roll as colored bars above the notes.
+Lets you mark a wire as **active only during certain beat ranges** — the routing itself becomes time-gated rather than always-on. Implemented in `effect_regions.h`, `time_gate_processor.cpp`, and surfaced in the piano roll's **Effects lane**.
 
 ### Layers (per-wire regions)
 
 A **layer** is one time range during which one specific cable is active. Stored on `Node::effectRegions`. Outside the region the wire is muted; at the region edges the wire crossfades to/from silence to prevent clicks.
 
-Create one by opening the track's piano roll, right-clicking at the beat where the layer should start, and choosing **Effect Regions →** *(a group, or a `Source > Destination` wire)*. The new layer starts at the clicked beat (snapped to the current grid) and runs **4 beats**. Right-click inside an existing layer to get **Effect Regions → Delete Effect Region at Cursor**. The region is tied to that specific wire (or group) only.
+### The Effects lane
 
-Each layer is colored to match its wire (or its effect group) so you can read routing at a glance. Layers are drawn as flat stacked bars flush with the top of the piano-roll grid — bottom bar processes first, top bar last — each labelled with the group name or destination node name when the bar is wider than 40 px.
+Every piano roll has an **Effects lane**: a horizontal band directly above the `Start` track-header strip, in the same left-gutter/grid split as everything else in the editor (the caption `▸ Effects` sits over the keyboard column, the layers over the note grid).
 
-> **Discoverability gap (open).** The `Effect Regions` submenu is the *only* entry point, it is not signposted anywhere in the graph view, and the submenu lists every wire in the project rather than only those reaching this track. There is also no drag-to-resize: a layer is fixed at 4 beats and can only be deleted and re-made. Tracked in `known-issues.md`.
+The lane is **always visible, even with no layers**, and says so — an empty one reads *"no effect layers — click to add one"*. This is deliberate: it is the feature's only signpost, and while layers were reachable only from a buried context submenu the feature was in practice undiscoverable.
 
-Layers are persisted per node as `[FxRegion]` sections inside the owning `[Node]` block (`linkId`, `groupId`, `start`, `end`, `color`), and are covered by undo — adding or deleting one commits a snapshot.
+Layers render as **shaded tubes** — a rounded bar with a three-stop vertical gradient (dark rim → bright specular band in the upper third → dark rim) plus a top rim-light, so a layer reads as a cylinder lying on its side and is never confused with the flat rectangles used for notes, clips and markers. Each tube is colored to match its wire (or its effect group). A tube whose range runs off-screen gets a flat bright end cap instead of a rounded one, meaning "continues past here".
+
+Rows stack one per distinct wire/group, in first-appearance order, so two layers gating the same wire share a row and can never overlap vertically. **The lane's height tracks the row count** — it grows and shrinks as layers are added and removed, and is folded into `toolbarHeight()` so the note grid below simply shifts.
+
+#### Two states
+
+| | Collapsed (default) | Expanded (edit mode) |
+|---|---|---|
+| Row height | 7 px — a thin read-only ribbon | 18 px — comfortable to click and drag |
+| Background | dark | slightly lighter, so "edit mode" is visible, not just inferable |
+| Labels | none (no room; colour + caption carry it) | group / destination-node name on tubes wider than 34 px |
+| Rows shown | one per layer | one per layer **plus a spare empty row** to right-click into |
+
+**Enter edit mode** by left-clicking anywhere in the lane, by clicking the caption chevron, or via right-click → **Expand to edit**. Adding a layer from the menu also expands automatically, so you land straight in edit mode.
+
+**Leave edit mode** three ways: click the caption cell (`▾ Effects`) in the left gutter, press **Escape**, or right-click → **Done editing (collapse)**.
+
+#### Editing
+
+Only while expanded:
+
+- **Move** — drag a tube's middle. The length is preserved; the start clamps at beat 0.
+- **Resize** — drag either end. The 5 px hot zone at each end shows a ↔ cursor. Each edge clamps against the other so a layer always keeps positive length (minimum = one snap step, or 1/16 beat with snap off).
+- **Snap** — drags quantise to the piano roll's current snap setting. Hold **Alt** for free positioning.
+- **Add** — right-click empty lane space → **Add layer at beat N…** → pick a group or a `Source → Destination` wire. The new layer starts at the clicked beat (snapped) and runs 4 beats. Every entry carries a **colour swatch** showing the exact colour of the tube it will create, since colour is the only identity a tube has once it is drawn. Two wires joining the same pair of nodes would otherwise produce identical rows, so those — and only those — are qualified with their pin names: `Voice In 2 → Signal Osc   (Gate → Gate)`.
+- **Delete** — right-click a tube → **Delete layer "name"**.
+
+The menu opens **at the pointer**, and the same is true of the `Start` strip's track-nesting menu below it.
+
+Elsewhere in the lane the cursor is a pointing hand — the single strongest cue that the whole band is interactive.
+
+Move and resize are **continuous gestures**: nothing is committed while dragging, and one undo step (`Move effect layer` / `Resize effect layer`) is pushed on release, and only if the range actually changed, so a plain click on a tube never litters the undo tree. Add and delete commit immediately.
+
+#### Local beats
+
+Region beats are stored **local to the node**, exactly like clips and notes, and both the lane's drawing and `TimeGateProcessor`'s gate apply the node's `absoluteBeatOffset`. Consequences:
+
+- Sliding a track's start position in the `Start` strip carries its layers along, visually *and* audibly.
+- `NodeGraph::insertTime` / `deleteTime` ripple layers with the music they gate: a layer wholly inside a deleted span is removed, one that straddles it is shortened, one after it is pulled back.
+
+#### Persistence and undo
+
+Layers are persisted per node as `[FxRegion]` sections inside the owning `[Node]` block (`linkId`, `groupId`, `start`, `end`, `color`). Note that undo snapshots share the project writer, so before this existed a layer was wiped by the *next undo step* as well as by save/reload; the round-trip is covered by `fxregion:` assertions in the self-test.
 
 ### Effect groups
 
@@ -1894,7 +1936,9 @@ Per-group override: `EffectGroup::crossfadeSec`. Zero (the default) means "inher
 
 ### Routing strip
 
-Above the piano roll, a narrow strip appears when any layers exist. Shows each gated wire as a horizontal "wire" bar with 3D shading, colored to match the wire/group. The horizontal axis matches the piano roll below — read across to see which wires are active at which beats. The strip auto-hides when there are no layers.
+A project-wide companion to the per-track Effects lane. Above the piano roll, a narrow strip appears when any layers exist *anywhere in the project*. Shows each gated wire as a horizontal "wire" bar with 3D shading, colored to match the wire/group. The horizontal axis matches the piano roll below — read across to see which wires are active at which beats. The strip auto-hides when there are no layers.
+
+Where the Effects lane answers "what is gated **on this track**", the routing strip answers "what is gated **anywhere**" — including layers that live on a different track but gate a wire you're looking at.
 
 ---
 

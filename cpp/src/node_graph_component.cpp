@@ -5647,7 +5647,8 @@ void NodeGraphComponent::showLinkMenu(int linkId) {
                 juce::String note = (dstKind == PinKind::Param)
                     ? " (resampled to " + rateTxt + ")"
                     : (dstKind == PinKind::Signal ? " (upsampled to every sample)" : "");
-                menu.addSectionHeader(shortName(srcKind) + " \xe2\x86\x92 "
+                menu.addSectionHeader(shortName(srcKind)
+                                      + juce::String::fromUTF8(" \xe2\x86\x92 ")
                                       + shortName(dstKind) + note);
             }
         }

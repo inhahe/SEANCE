@@ -238,6 +238,17 @@ void NodeGraph::insertTime(float atBeat, float duration, int nodeId) {
         for (auto& param : node.params)
             for (auto& pt : param.automation.points)
                 if (pt.beat >= atBeat) pt.beat += duration;
+        // Time-gated effect layers live in the same local beat space as clips,
+        // so they have to ripple too - otherwise inserting a bar leaves every
+        // layer gating the wrong music.
+        for (auto& region : node.effectRegions) {
+            if (region.startBeat >= atBeat) {
+                region.startBeat += duration;
+                region.endBeat += duration;
+            } else if (region.endBeat > atBeat) {
+                region.endBeat += duration;   // straddles the insert: stretch it
+            }
+        }
     };
 
     if (nodeId >= 0) {
@@ -275,6 +286,25 @@ void NodeGraph::deleteTime(float fromBeat, float toBeat, int nodeId) {
             // Shift points after the deleted range
             for (auto& pt : pts)
                 if (pt.beat >= toBeat) pt.beat -= duration;
+        }
+
+        // Time-gated effect layers ripple with the music they gate. A layer
+        // wholly inside the removed span disappears with it; one that straddles
+        // or trails the span is shortened / pulled back.
+        {
+            auto& regs = node.effectRegions;
+            regs.erase(std::remove_if(regs.begin(), regs.end(), [&](const EffectRegion& r) {
+                return r.startBeat >= fromBeat && r.endBeat <= toBeat;
+            }), regs.end());
+            for (auto& r : regs) {
+                auto pull = [&](float b) {
+                    if (b <= fromBeat) return b;
+                    if (b >= toBeat)   return b - duration;
+                    return fromBeat;            // inside the removed span
+                };
+                r.startBeat = pull(r.startBeat);
+                r.endBeat = std::max(r.startBeat, pull(r.endBeat));
+            }
         }
 
         if (node.type != NodeType::MidiTimeline && node.type != NodeType::AudioTimeline) return;

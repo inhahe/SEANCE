@@ -1,21 +1,64 @@
 """
 SoundShop Music Theory Module
-Cleaned up from notes_manipulation.py — preserves full versatility,
-fixes bugs, integrates with SoundShop's C API.
+
+Note spelling and note objects, on top of SEANCE's own music theory.
+
+WHERE THE THEORY COMES FROM. Every scale table, key detection and change-key
+result in this module is read out of the built-in `soundshop` module, which
+exposes the exact `MusicTheory` tables the piano roll's Key / Mode / Scale
+controls, the Analyze button and Change Key use. This file used to carry its own
+hand-written copy of all of that, and it had drifted: a different scale list,
+different names, and a key-detection ranking that disagreed with the app's - so
+a script and the piano roll could tell you different things about the same
+melody. There is now one table and one answer.
+
+WHAT THIS MODULE STILL ADDS, and why it isn't just `import soundshop`:
+
+  * Enharmonic SPELLING. `soundshop` speaks MIDI numbers and one canonical name
+    per pitch class ("C#", never "Db"). This module knows that the third of Eb
+    major is spelled G and the seventh is D, that "Cb4" is a real note one
+    semitone below C4, and that a key signature picks letters in order - the
+    stuff you need to print or parse notation rather than to compute pitches.
+  * The `Note` / `Notes` objects, which carry timing (beats / samples /
+    seconds), velocity and detune alongside the pitch, so a generated phrase can
+    be handed straight to soundshop_tools.add_notes().
+
+If you only need pitches, prefer `soundshop` directly - it's the source these
+tables are built from.
 """
 
 import re
 
+# The built-in module. This file lives on sys.path only inside SEANCE's embedded
+# interpreter, so a failure here means someone ran it in a plain CPython; say so
+# rather than silently falling back to a private copy of the tables, which is the
+# exact divergence this module was rewritten to remove.
+try:
+    import soundshop as _ss
+except ImportError as e:      # pragma: no cover - only reachable outside SEANCE
+    raise ImportError(
+        "soundshop_music requires SEANCE's built-in 'soundshop' module "
+        "(it reads the app's music-theory tables from it). Run this from the "
+        "Script Console, not from a standalone Python."
+    ) from e
+
 use_unicode_accidentals = False
 
-note_re = re.compile(r"([a-zA-Z])(♯|♯♯|♭|♭♭|#|##|b|bb|)(-1|[0-9]|)")
-noteoro_re = re.compile(r"([a-zA-Z](?:♯|♯♯|♭|♭♭|#|##|b|bb|)(?:-1|[0-9]|))|[Oo](-1|[0-9])")
+# Accidental alternatives are longest-first. Python's `|` takes the FIRST branch
+# that matches, not the longest, so listing "#" before "##" made the double
+# accidentals unreachable: "Fbb5" parsed as F-flat with no octave (F4-1 = 64)
+# instead of F-double-flat in octave 5 (75), and Note(61) printed as "B##3"
+# because "B##3" appeared to carry a single sharp.
+note_re = re.compile(r"([a-zA-Z])(♯♯|♯|♭♭|♭|##|#|bb|b|)(-1|[0-9]|)")
+noteoro_re = re.compile(r"([a-zA-Z](?:♯♯|♯|♭♭|♭|##|#|bb|b|)(?:-1|[0-9]|))|[Oo](-1|[0-9])")
 
 letters = "CDEFGAB"
-intervals = [2, 2, 1, 2, 2, 1, 1]  # W W H W W W H (major scale)
-# Fix: last interval should be 1 to complete the octave
-# C(2)D(2)E(1)F(2)G(2)A(2)B(1)C = 12 semitones
-intervals = [2, 2, 1, 2, 2, 2, 1]
+
+# The letter ladder: how many semitones from each letter to the next. Derived
+# from the app's major scale rather than written out, so the two can't disagree.
+# C(2)D(2)E(1)F(2)G(2)A(2)B(1)C = 12 semitones.
+_major = _ss.scale_intervals("Major")
+intervals = [b - a for a, b in zip(_major, _major[1:] + [12])]
 
 start_dict = {
     'A': '', 'Ab': 'b', 'B': '', 'Bb': 'b', 'C': '', 'C#': '#', 'Cb': 'b',
@@ -23,51 +66,40 @@ start_dict = {
     'G': '', 'Gb': 'b'
 }
 
-mode_names = ["Ionian", "Dorian", "Phrygian", "Lydian", "Mixolydian", "Aeolian", "Locrian"]
-modes_dict = dict(zip((m.lower() for m in mode_names), range(7)))
+# The seven modes, in the app's rotation order. The app labels index 0
+# "Ionian (Major)"; the bare "Ionian" is what scripts have always written here,
+# so strip the parenthetical and keep both spellings working.
+mode_names = [n.split(' (')[0] for n in _ss.scale_names("mode")]
+modes_dict = dict(zip((m.lower() for m in mode_names), range(len(mode_names))))
 
 notes_dict = {}      # "C4" -> midi number
 semitones_dict = {}  # midi number -> [list of note name strings]
 key_tables = {}      # key_name -> [7 mode dicts]
 
-extra_scales = {
-    'acoustic': [0, 2, 4, 6, 7, 9, 10],
-    'algerian': [0, 2, 3, 6, 7, 8, 11],
-    'augmented': [0, 3, 4, 7, 8, 11],
-    'bebop dominant': [0, 2, 4, 5, 7, 9, 10, 11],
-    'blues': [0, 3, 5, 6, 7, 10],
-    'chromatic': list(range(12)),
-    'double harmonic': [0, 1, 4, 5, 7, 8, 11],
-    'enigmatic': [0, 1, 4, 6, 8, 10, 11],
-    'flamenco': [0, 1, 4, 5, 7, 8, 11],
-    'half-diminished': [0, 2, 3, 5, 6, 8, 10],
-    'harmonic major': [0, 2, 4, 5, 7, 8, 11],
-    'harmonic minor': [0, 2, 3, 5, 7, 8, 11],
-    'harmonics': [0, 3, 4, 5, 7, 9],
-    'hirajoshi': [0, 4, 6, 7, 11],
-    'hungarian major': [0, 3, 4, 6, 7, 9, 10],
-    'hungarian minor': [0, 2, 3, 6, 7, 8, 11],
-    'in': [0, 1, 5, 7, 8],
-    'insen': [0, 1, 5, 7, 10],
-    'iwato': [0, 1, 5, 6, 10],
-    'melodic minor': [0, 2, 3, 5, 7, 9, 11],
-    'neapolitan major': [0, 1, 3, 5, 7, 9, 11],
-    'neapolitan minor': [0, 1, 3, 5, 7, 8, 11],
-    'octatonic (w-h)': [0, 2, 3, 5, 6, 8, 9, 11],
-    'octatonic (h-w)': [0, 1, 3, 4, 6, 7, 9, 10],
-    'pentatonic major': [0, 2, 4, 7, 9],
-    'pentatonic minor': [0, 3, 5, 7, 10],
-    'persian': [0, 1, 4, 5, 6, 8, 11],
-    'phrygian dominant': [0, 1, 4, 5, 7, 8, 10],
-    'prometheus': [0, 2, 4, 6, 9, 10],
-    'romani': [0, 2, 3, 6, 7, 8, 10],
-    'super locrian': [0, 1, 3, 4, 6, 8, 10],
-    'tritone': [0, 1, 4, 6, 7, 10],
-    'two-semitone tritone': [0, 1, 2, 6, 7, 8],
-    'ukrainian dorian': [0, 2, 3, 6, 7, 9, 10],
-    'whole tone': [0, 2, 4, 6, 8, 10],
-    'yo': [0, 3, 5, 7, 10],
-}
+
+def _build_scale_index():
+    """Every scale SEANCE knows, keyed by lowercase name -> semitone offsets.
+
+    Built from the app's three tables (keys, modes, fixed scales) at import
+    time, so adding a scale in music_theory.cpp makes it available here with no
+    edit to this file.
+    """
+    table = {}
+    for name in _ss.scale_names():
+        table[name.lower()] = _ss.scale_intervals(name)
+    # Aliases for spellings older scripts used before this module was wired to
+    # the app's tables. Same lists, different key.
+    for alias, real in (('pentatonic major', 'Major Pentatonic'),
+                        ('pentatonic minor', 'Minor Pentatonic'),
+                        ('ionian', 'Ionian (Major)'),
+                        ('minor', 'Natural Minor')):
+        table[alias] = _ss.scale_intervals(real)
+    return table
+
+
+# Named `extra_scales` for backwards compatibility; it is no longer "extra" -
+# it is now the app's complete scale list, modes and parent keys included.
+extra_scales = _build_scale_index()
 
 
 def convert_accidental(accidental, use_unicode=use_unicode_accidentals):
@@ -214,22 +246,30 @@ class Note:
             else:
                 raise ValueError(f"Unknown note: {note_str}")
 
-        # Resolve letter from MIDI number
+        # Resolve letter from MIDI number.
+        #
+        # A pitch has several legal spellings (60 is C4, B#3 and Dbb4) and
+        # semitones_dict lists them in ladder order, which puts B#3 first. Pick
+        # by how ordinary the accidental is instead: natural, then a single
+        # sharp, then a single flat, then the doubles. Without the ranking,
+        # Note(60) printed "B#3".
         if self.letter is None and self.midi is not None:
-            # Find the most common enharmonic spelling
-            if self.midi in semitones_dict:
-                candidates = semitones_dict[self.midi]
-                # Prefer natural notes, then sharps, then flats
-                for c in candidates:
-                    if isinstance(c, str):
-                        m = note_re.match(c)
-                        if m:
-                            self.letter = m.group(1)
-                            self.accidental = m.group(2) or ''
-                            oct_str = m.group(3)
-                            if oct_str:
-                                self.octave = int(oct_str)
-                            break
+            _ACC_RANK = {'': 0, '#': 1, 'b': 2, '##': 3, 'bb': 4}
+            best, best_rank = None, None
+            for c in semitones_dict.get(self.midi, []):
+                if not isinstance(c, str):
+                    continue
+                m = note_re.match(c)
+                if not m:
+                    continue
+                rank = _ACC_RANK.get(m.group(2), 5)
+                if best_rank is None or rank < best_rank:
+                    best, best_rank = m, rank
+            if best is not None:
+                self.letter = best.group(1)
+                self.accidental = best.group(2) or ''
+                if best.group(3):
+                    self.octave = int(best.group(3))
 
         # Build full note string
         self.note = (self.letter or '?') + (self.accidental or '') + str(self.octave)
@@ -330,7 +370,16 @@ def make_tables():
     """Build the global lookup tables."""
     global notes_dict, semitones_dict, key_tables
 
-    semi = -2
+    # Walk the letter ladder from below MIDI 0 up past 127, naming every
+    # spelling of every pitch on the way.
+    #
+    # The ladder starts on A two octaves below C-1, which is MIDI -3: from there
+    # B is -1 and C is 0, i.e. C-1 = 0 and C4 = 60, the standard MIDI mapping
+    # that soundshop.notenum() and the piano roll use. It used to start at -2,
+    # which put every named note one semitone sharp - Note("C4").midi was 61 and
+    # Note(60) printed as "B4". Nothing caught it because this table had no test
+    # and nothing else in the app agreed with it to disagree with.
+    semi = -3
     i = -2
     while semi < 129:
         interval = intervals[i % 7]
@@ -361,24 +410,34 @@ def make_tables():
         key_tables[key] = mode_tables
 
 
-def build_table(key, mode=0):
-    """Build a list of semitone values for a key and mode."""
+def pitch_class(key):
+    """Pitch class 0-11 of a key given as a name, a Note or a MIDI number.
+
+    Names go through this module's spelling table, so "Cb" is 11 and "B#" is 0.
+    """
     if isinstance(key, str):
         key_midi = notes_dict.get(key, 0)
     elif isinstance(key, Note):
         key_midi = key.midi
     else:
         key_midi = key
+    return (key_midi or 0) % 12
 
+
+def build_table(key, mode=0, scale="Major"):
+    """Pitch classes of a key + mode, in scale order starting at the root.
+
+    `mode` is a rotation degree (or a mode name); it is applied to `scale` the
+    same way the piano roll's Mode control applies to its Key control - see
+    soundshop.rotate_scale(). So build_table("D", 1) is D Dorian, and
+    build_table("D", 5, "Harmonic Minor") is the fifth mode of D harmonic minor.
+
+    Any scale SEANCE knows may be named: build_table("C", 0, "Blues").
+    """
     if isinstance(mode, str):
         mode = modes_dict.get(mode.lower(), 0)
-
-    table = []
-    semi = key_midi % 12
-    for i in (intervals[mode:] + intervals[:mode]):
-        table.append(semi)
-        semi = (semi + i) % 12
-    return table
+    root = pitch_class(key)
+    return [(root + s) % 12 for s in _ss.rotate_scale(scale, mode)]
 
 
 def build_notes(key, mode, accidental):
@@ -409,44 +468,43 @@ def get_notes(notes_str, key=None, mode=0, accidental=None):
     return [Note(n, key=key, mode=mode, accidental=accidental) for n in notes_str]
 
 
-def change_key(notes, key1=None, mode1=0, key2=None, mode2=0):
-    """Transpose notes from one key to another, preserving scale degrees."""
-    if isinstance(notes, str):
-        notes = notes.split()
+def change_key(notes, key1=None, mode1=0, key2=None, mode2=0,
+               scale1="Major", scale2="Major"):
+    """Re-derive notes from their scale degree in a new key.
+
+    This is the piano roll's Change Key button: C major -> D natural minor keeps
+    the SHAPE of the melody (each note keeps its degree and its accidental
+    relative to that degree) instead of sliding every pitch up two semitones.
+
+    Notes may be MIDI numbers, note-name strings or Note objects; the result is
+    a list of MIDI numbers. `mode1` / `mode2` are rotation degrees or mode names
+    applied to `scale1` / `scale2`, so any of SEANCE's scales can be either end
+    of the move.
+
+    Out-of-scale notes are carried across by their chromatic offset from the
+    nearest degree rather than left where they were - which is what the app
+    does, and what makes a chromatic passing tone survive the change.
+    """
+    pitches = shift_semitones(notes, 0)   # normalise everything to MIDI numbers
+    if not pitches:
+        return []
     if isinstance(mode1, str):
         mode1 = modes_dict.get(mode1.lower(), 0)
     if isinstance(mode2, str):
         mode2 = modes_dict.get(mode2.lower(), 0)
-
-    table1 = build_table(key1, mode1)
-    table2 = build_table(key2, mode2)
-
-    result = []
-    for note in notes:
-        if isinstance(note, Note):
-            semi = note.midi
-        elif isinstance(note, str):
-            semi = notes_dict.get(note, 0)
-        elif isinstance(note, int):
-            semi = note
-        else:
-            continue
-
-        octave, semi_mod = divmod(semi, 12)
-        if semi_mod in table1:
-            idx = table1.index(semi_mod)
-            if idx < len(table2):
-                result.append(octave * 12 + table2[idx])
-            else:
-                result.append(semi)  # can't map, keep original
-        else:
-            result.append(semi)  # not in source scale, keep original
-
-    return result
+    return _ss.change_key(pitches,
+                          pitch_class(key1), _ss.rotate_scale(scale1, mode1),
+                          pitch_class(key2), _ss.rotate_scale(scale2, mode2))
 
 
 def shift_semitones(notes, x):
-    """Shift all notes by x semitones."""
+    """Shift notes by x semitones, returning a list of MIDI numbers.
+
+    Accepts a space-separated string ("C4 E4 G4"), or any iterable of note-name
+    strings, Note objects and numbers. With x = 0 this is the module's
+    "give me plain MIDI numbers" normaliser, which is how change_key() and
+    detect_keys() accept all three spellings.
+    """
     result = []
     if isinstance(notes, str):
         notes = notes.split()
@@ -455,8 +513,8 @@ def shift_semitones(notes, x):
             semi = notes_dict.get(note, 0)
         elif isinstance(note, Note):
             semi = note.midi
-        elif isinstance(note, int):
-            semi = note
+        elif isinstance(note, (int, float)):
+            semi = int(note)
         else:
             continue
         result.append(semi + x)
@@ -469,44 +527,23 @@ def shift_octaves(notes, octaves):
 
 
 def detect_keys(pitches):
+    """Candidate keys for a set of notes, best fit first.
+
+    Returns a list of (root_name, scale_name, coverage) tuples. This is the same
+    ranking the piano roll's key detection shows - tightest fit first, then
+    simpler (smaller) scales - because it IS that ranking; see
+    soundshop.detect_key(), which returns the same matches as dicts with more
+    detail (category, scale size, notes matched).
+
+    Scale names are the app's own labels, so the major scale comes back as
+    "Major" (from the Key table) and "Ionian (Major)" (from the Mode table)
+    rather than the bare "Ionian" this module used to invent.
     """
-    Detect possible keys/modes for a set of MIDI pitches.
-    Returns list of (root_name, scale_name, coverage) sorted by best fit.
-    """
+    pitches = shift_semitones(pitches, 0)
     if not pitches:
         return []
-
-    pitch_classes = set(p % 12 for p in pitches)
-    num_input = len(pitch_classes)
-    results = []
-
-    note_names = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
-
-    # Check major scale modes
-    for root in range(12):
-        for mode_idx, mode_name in enumerate(mode_names):
-            scale_semis = set()
-            semi = root
-            for iv in (intervals[mode_idx:] + intervals[:mode_idx]):
-                scale_semis.add(semi % 12)
-                semi += iv
-            if pitch_classes.issubset(scale_semis):
-                coverage = num_input / len(scale_semis)
-                results.append((note_names[root], mode_name, coverage))
-
-    # Check extra scales
-    for scale_name, scale_intervals in extra_scales.items():
-        if len(scale_intervals) >= 12:
-            continue  # skip chromatic
-        for root in range(12):
-            scale_semis = set((s + root) % 12 for s in scale_intervals)
-            if pitch_classes.issubset(scale_semis):
-                coverage = num_input / len(scale_semis)
-                results.append((note_names[root], scale_name, coverage))
-
-    # Sort by coverage (best fit first), then scale size
-    results.sort(key=lambda x: (-x[2], x[1]))
-    return results
+    return [(m["root_name"], m["scale"], m["coverage"])
+            for m in _ss.detect_key(pitches, -1)]
 
 
 def merge_notes(*note_lists):

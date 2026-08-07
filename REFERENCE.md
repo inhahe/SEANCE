@@ -38,6 +38,7 @@ here.
 - [Trigger Node](#trigger-node)
 - [Analyzer / visualizer nodes (Spectrum Analyzer, Oscilloscope, Spectrogram)](#analyzer--visualizer-nodes-spectrum-analyzer-oscilloscope-spectrogram)
 - [Script (signal + MIDI)](#script-signal--midi)
+- [Script Console (`import soundshop`)](#script-console-import-soundshop)
 - [Control Bank](#control-bank)
 - [Shared AHDSR envelope](#shared-ahdsr-envelope)
 - [Voice container (per-voice polyphony)](#voice-container-per-voice-polyphony)
@@ -2990,6 +2991,101 @@ The trigger expression, when active, is always the built-in expression language 
 `node.script` carries the Script-node state in a multi-line key-value format prefixed with `__signalshape__:v1`. Keys include `expr` / `trigger` (Base64), `lang` (0=Built-in, 1=Lua, 2=Wasm), `rate` (0=per-sample, 1=per-block), `wasm` (Base64 `.wasm` path), `repeat`, `repeatN`, `freeRun` (0/1 — the phase-source toggle), and the I/O counts: `sigCount` (signal inputs), `outCount` (continuous outputs `o1`..`oP`, ≥1), `midiOut` (MIDI outputs, 0..16), `midiIn` (0/1 — whether the MIDI In pin exists), `paramKind` (0=Signal / 1=Param for all continuous pins), plus `layer`. For Lua the program source is stored in `expr` (the same key the built-in composition expression uses), so switching languages keeps your text. Expression strings are Base64-encoded so they can contain newlines / `=` / `|` without breaking the framing; the **whole layer stack** is encoded inline under the `layer=` key via `LayeredWaveform::encodeBody()` (`tableSize|layer1|layer2|…`). Multi-line scripts are serialised by `project_file.cpp` via the `scriptLines=N` form so the full payload round-trips through save/load. A missing `freeRun` / `lang` / `rate` / `outCount` / `midiOut` / `midiIn` / `paramKind` key (older projects) decodes to its default (`false` / Built-in / per-sample / `1` / `0` / `true` / `false`), so a pre-unification Signal Shape loads as a 1-continuous-output, 0-MIDI-output Script — identical behaviour.
 
 Back-compat: the older single-layer Signal Shape scripts used the *same* `LayeredWaveform::encodeBody()` payload under the same `layer=` key, so they decode straight into a one-element layer stack with no migration step. Legacy plain-expression scripts (`sin(x)`, `(1 - cos(x)) * 0.5`, etc.) from before the redesign load as a single Formula layer with the old expression in `formulaExpr` — the user sees their old curve preserved and can edit it as a layer just like any other shape.
+
+---
+
+## Script Console (`import soundshop`)
+
+*Tools → Script Console* opens an embedded CPython prompt whose one built-in module, `soundshop`, drives the **project**: nodes, links, clips, notes, markers, automation, tempo — plus the music-theory tables and the offline renderer documented below. This is a different surface from the [Script node](#script-signal--midi) and [MIDI Script](#script-program-reference-algorithmic-midi-languages), which run *inside* the audio graph per block or per sample; the Script Console runs once, on the message thread, on the open project, like a macro.
+
+Python is optional at build time (`HAS_PYTHON`) and probed at runtime, so a build without it still launches — the console just reports that Python is unavailable. `sys.path` is seeded with the app's `scripts/` directory, so the bundled helper modules (`soundshop_music`, `soundshop_tools`) are importable with no setup, and your own `.py` files dropped in there are too.
+
+> **Script Console edits create no undo step.** Mutations made from a script are applied straight to the graph without a `commitSnapshot()`, so Ctrl+Z will not walk back a script's changes. Save before running a script that restructures a project. Tracked in `known-issues.md`.
+
+### Conventions
+
+Three conventions hold across every theory function, stated once so the per-function notes stay short:
+
+- **A pitch** is a MIDI number (`60`) *or* a note name (`"C4"`). Anywhere a single pitch is accepted, a list of them is too, and the return keeps the shape you passed: `snap_to_scale(61, …)` gives an `int`, `snap_to_scale([61, 66], …)` gives a list.
+- **A root** is a pitch class `0`–`11`, any MIDI number (reduced mod 12), or a note name — `"D"`, `"Eb"`, `"F#3"` all mean the same root, the octave is ignored.
+- **A scale** is either a name from any of the three tables, matched **case- and separator-insensitively** (`"natural minor"`, `"Natural Minor"` and `"naturalminor"` are one scale), or an explicit list of semitone offsets from the root — so a script can use a scale SEANCE doesn't ship without leaving the API. `"Ionian"` and `"Minor"` are accepted as short forms of the displayed `"Ionian (Major)"` and `"Natural Minor"`.
+
+**Octave numbers are scientific pitch** (C4 = 60), the same as `notename()` and the piano roll's labels. `MusicTheory`'s internal `DegreeInfo` counts octaves from MIDI 0 instead (middle C = octave 5); the conversion happens at the binding boundary, so a script never meets the internal convention.
+
+**Scale degrees are 0-based** in this API (`0` = root, `2` = the third), and may run past the end of the scale or below zero to walk into other octaves — `degree_to_note(-1, 5, "C", "Major")` is the B below C5.
+
+### Music theory
+
+These call the **same `MusicTheory` tables** the piano roll's Key / Mode / Scale dropdowns, the *Analyze* button and *Change Key* use. That sharing is the point: before this existed, the only scriptable theory was `soundshop_music.py`'s own hand-written copy of the tables, which had already drifted from the app's (different scale list, different spellings, a different key-detection ranking), so a script and the piano roll could disagree about what "D Dorian" contains. There is now one table and one answer.
+
+| Function | Returns |
+|---|---|
+| `scale_names([category])` | Every scale name, or one table's. `category` is `'key'` (10 parent scales), `'mode'` (the 7 rotations of major) or `'scale'` (33 fixed scales); omitted gives all three, in the order the piano-roll menus present them. An unknown category raises `ValueError`. |
+| `scale_intervals(scale)` | Semitone offsets from the root: `scale_intervals("Dorian") → [0,2,3,5,7,9,10]`. Also the way to normalise a name into a list you can edit. |
+| `rotate_scale(scale, degree)` | The intervals of that mode of the scale — exactly how **Key + Mode combine** in the piano roll (the Key supplies the notes, the Mode picks which is "home"). `rotate_scale("Major", 1) == scale_intervals("Dorian")`. |
+| `scale_pitches(root, scale, octave=4, count=None)` | Ascending MIDI numbers, one octave of the scale from `root` in `octave` by default; `count` keeps walking up through further octaves. Pitches leaving 0..127 are **dropped, not clamped** (clamping would emit duplicates). |
+| `note_degree(pitch, root, scale)` | The *Analyze* result for one note: `{'degree', 'degree_name', 'octave', 'chromatic_offset', 'in_scale'}`. `degree` is 0-based, `octave` is scientific, `chromatic_offset` is the semitone distance from the nearest degree (0 when in scale), `in_scale` is that as a bool. |
+| `degree_to_note(degree, octave, root, scale, chromatic_offset=0)` | The inverse — a MIDI number. Negative degrees and degrees past the scale size resolve into neighbouring octaves. |
+| `snap_to_scale(pitch_or_list, root, scale)` | Nearest in-scale pitch(es). |
+| `transpose(pitch_or_list, semitones)` | Shifted pitch(es). **Not clamped** to 0..127 — a script that transposes off the keyboard should see that, not a silent pile of notes stacked on 127. |
+| `change_key(pitches, from_root, from_scale, to_root, to_scale)` | *Change Key*, callable: each pitch is re-derived from its scale degree in the new key, so `C Major → D Natural Minor` keeps the **shape** of the melody rather than sliding it two semitones. |
+| `detect_key(pitches, limit=10)` | Candidate keys, best fit first, with the same ranking the piano roll's detection UI shows (coverage desc → scale size asc → root asc → name asc). Each entry: `{'root', 'root_name', 'scale', 'category', 'scale_size', 'notes_matched', 'coverage'}`. `limit=-1` returns all. |
+| `is_black_key(pitch)` | `bool` — a piano-roll row question, so it stays scalar. |
+
+```python
+import soundshop as ss
+ss.scale_pitches("C", "Major", 4)                    # [60, 62, 64, 65, 67, 69, 71]
+ss.note_degree(64, "C", "Major")                     # degree 2, degree_name '3rd', octave 4
+ss.change_key([60,62,64,65,67], "C", "Major",
+                                "D", "Natural Minor") # [62, 64, 65, 67, 69]
+ss.detect_key([60,62,64,67,69])[0]['scale']          # 'Major Pentatonic'
+```
+
+### Offline render and raw audio data
+
+The missing half of "algorithmic music from a script": you could already place notes and wire nodes, but not *hear* the result without driving the GUI, and not synthesise a waveform in Python and get it into the project at all.
+
+| Function | Behaviour |
+|---|---|
+| `render(path, end_beat=None, sample_rate=48000, channels=2, bits=24, dither=True)` | Bounces the project to an audio file and returns `{'path', 'frames', 'channels', 'sample_rate', 'seconds'}`. `path` **must be absolute** (a relative path would land in the process CWD, which for a GUI app is not where the script author is looking) and its **extension picks the encoder**, the same mapping the export dialog uses. |
+| `render_samples(end_beat=None, sample_rate=48000, channels=2)` | The same render handed back as data instead of a file: `{'data': [array('f'), …one per channel], 'frames', 'channels', 'sample_rate'}`. For analysis — peak/RMS checks, regression tests, feeding a render back through `write_wav`. Never dithered: dither is a float→int artefact and this hands back the floats. |
+| `write_wav(path, data, sample_rate=48000, bits=24)` | Float samples you computed in Python → an audio file; returns the frame count. `data` is one channel (any sequence or buffer of numbers) or a list of channels. Absolute path, extension picks the encoder (`.flac` / `.ogg` work too — the name says wav because that's what you want 99% of the time and because `read_wav` is its inverse). |
+| `read_wav(path)` | Any format JUCE can decode → `{'data': [array('f'), …], 'sample_rate', 'channels', 'frames'}`. Missing file raises `FileNotFoundError`, undecodable file raises `ValueError`. |
+
+`channels` must be 1 or 2; `sample_rate` must be 8000–384000; both raise `ValueError` otherwise.
+
+**The default span matches *File → Export Audio* exactly**: everything that has content (`contentEndBeats()`, minimum 4 beats) plus **four beats of tail** so reverbs and releases finish. Pass `end_beat` to override.
+
+**A scripted bounce and a manual export of the same span are identical**, because both go through the one `renderGraphOffline()` in `audio_export.cpp` — the export dialog's `ExportTask` is now just a progress/cancel wrapper around it. The render uses the app's **live transport** when one exists, so tempo ramps and time-signature changes are honoured; headless (self-test) renders fall back to a default transport at the graph's BPM.
+
+**Bulk sample data crosses as `array.array('f')`, not lists of Python floats.** A three-minute stereo render is ~17M samples, which as boxed floats would cost hundreds of megabytes and seconds of allocation; `array('f')` is one buffer, and it is accepted straight back by `write_wav`. On input, anything supporting the buffer protocol with `'f'` or `'d'` items works (`array`, `memoryview`, a NumPy array if you have one), with a plain-sequence fallback for lists and tuples. Channels of unequal length are **zero-padded** rather than rejected, so building a stereo file from two independently generated lists needs no length bookkeeping.
+
+```python
+import soundshop as ss, math, array
+# Synthesise in Python, drop it on a clip, bounce the result.
+sr = 48000
+sine = array.array('f', (0.5 * math.sin(2*math.pi*440*i/sr) for i in range(sr)))
+ss.write_wav("D:/tmp/tone.wav", sine, sample_rate=sr)
+
+t = ss.add_audio_track("Tone")
+ss.add_clip(t, 0, 4)
+ss.set_audio_file(t, 0, "D:/tmp/tone.wav")
+ss.add_link(t, ss.find_node("Output"))
+
+peak = max(abs(v) for v in ss.render_samples(end_beat=4)['data'][0])
+ss.render("D:/tmp/mix.wav")
+```
+
+### Helper modules (`soundshop_music`, `soundshop_tools`)
+
+Two pure-Python modules ship in `scripts/` and layer convenience on top of the built-in module. **Both now read their theory from `soundshop`** — `soundshop_music` raises `ImportError` if the built-in module is missing rather than falling back to a private table, because a fallback would resurrect exactly the divergence described above.
+
+- **`soundshop_music`** — the note-*spelling* and *timing* layer that the C module deliberately doesn't have. `Note` / `Notes` objects carry enharmonic spelling (`"F##4"`, `"Bbb3"`), velocity, detune and beat position/duration/interval; `get_notes("C4 E4 G4")` parses a note string. Its `build_table`, `change_key`, `detect_keys`, `mode_names`, `modes_dict` and `extra_scales` are thin wrappers over `scale_intervals` / `rotate_scale` / `change_key` / `detect_key`, so they now agree with the piano roll. Legacy scale spellings (`"pentatonic major"`, `"pentatonic minor"`, `"ionian"`, `"minor"`) are aliased so older scripts keep working. `pitch_class(key)` normalises a name, `Note` or MIDI number to 0–11.
+- **`soundshop_tools`** — timeline-populating helpers: `add_scale`, `add_chord`, `add_chord_progression`, `add_arpeggio`, `add_rhythm`, `add_melody_from_degrees`, `add_notes`, `notes_to_timeline`, `print_project`. `add_scale` accepts **any** scale SEANCE knows (a key, a mode or a fixed scale, matched case- and separator-insensitively) because it calls `scale_pitches` directly; it previously dispatched over the private copy, where `"harmonic minor"` and `"melodic minor"` both silently resolved to plain natural minor.
+
+### Testing
+
+`--self-test` includes a *Script Console API* section that drives the **real interpreter** via `ScriptEngine::run()` rather than calling `MusicTheory::` directly — the bug class being guarded (a wrong `PyArg` format string, a keyword name that disagrees with the docstring, a stolen-vs-borrowed reference) exists only at that boundary, and a C++-level test would pass while `import soundshop` was broken. The script emits `PASS`/`FAIL` lines plus a `COUNT` sentinel, and the harness asserts the number of results equals the declared count, so a script that raises part-way can't report a truncated run as green. Coverage includes a genuinely end-to-end render: a 440 Hz sine is written with `write_wav`, attached with `set_audio_file`, wired to an Output node, and the result asserted **non-silent**, with `render()` and `render_samples()` required to agree to 1e-5. The section skips itself with a note in builds without Python.
 
 ---
 

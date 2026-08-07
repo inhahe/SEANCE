@@ -1,4 +1,6 @@
 #include "audio_export.h"
+#include "graph_processor.h"   // GraphProcessor, for renderGraphOffline
+#include "transport.h"
 #include <cstdio>
 
 #ifdef _WIN32
@@ -24,6 +26,73 @@
 #endif
 
 namespace SoundShop {
+
+bool renderGraphOffline(NodeGraph& graph,
+                        const Transport& tmpl,
+                        float endBeat,
+                        const ExportOptions& opts,
+                        juce::AudioBuffer<float>& out,
+                        const std::function<bool(double)>& progress) {
+    // Copy the tempo/time-signature maps but drive position ourselves - the
+    // render is independent of wherever the playhead happens to be sitting.
+    Transport off;
+    off.bpm = graph.bpm;
+    off.tempoMap = tmpl.tempoMap;
+    off.timeSigMap = tmpl.timeSigMap;
+    off.sampleRate = opts.sampleRate;
+    off.playing = true;
+
+    const double sr = opts.sampleRate;
+    const int blockSize = 512;
+    const double totalSeconds = off.tempoMap.beatsToSeconds(endBeat);
+    const int64_t totalSamples = (int64_t)(totalSeconds * sr);
+    if (totalSamples <= 0) return false;
+
+    GraphProcessor gp;
+    // prepare -> rebuild -> prepare: rebuildGraph instantiates the per-node
+    // processors, and the second prepare hands the new ones the sample rate and
+    // block size. (Same order the export dialog has always used.)
+    gp.prepare(graph, sr, blockSize);
+    gp.rebuildGraph(graph, off);
+    gp.prepare(graph, sr, blockSize);
+
+    // The graph processor always writes stereo; the mono downmix happens after.
+    juce::AudioBuffer<float> render(2, (int)totalSamples);
+    render.clear();
+
+    for (int64_t pos = 0; pos < totalSamples; pos += blockSize) {
+        const int thisBlock = (int)std::min((int64_t)blockSize, totalSamples - pos);
+        off.positionSamples = pos;
+        float* outPtrs[2] = {
+            render.getWritePointer(0, (int)pos),
+            render.getWritePointer(1, (int)pos)
+        };
+        gp.processBlock(graph, off, outPtrs, 2, thisBlock);
+        if (progress && !progress((double)pos / (double)totalSamples)) {
+            out = std::move(render);
+            return false;
+        }
+    }
+
+    if (opts.numChannels == 1) {
+        juce::AudioBuffer<float> mono(1, (int)totalSamples);
+        mono.copyFrom(0, 0, render, 0, 0, (int)totalSamples);
+        mono.addFrom(0, 0, render, 1, 0, (int)totalSamples);
+        mono.applyGain(0.5f);
+        render = std::move(mono);
+    }
+
+    // Dither belongs to the float->int conversion inside the writer, so it is
+    // only meaningful for the PCM formats. Callers that want the raw float
+    // render (soundshop.render_samples) pass dither = false.
+    if (opts.dither && (opts.format == ExportFormat::WAV
+                        || opts.format == ExportFormat::FLAC)) {
+        applyTPDFDither(render, opts.bitsPerSample);
+    }
+
+    out = std::move(render);
+    return true;
+}
 
 juce::String AudioExporter::getExtension(ExportFormat fmt) {
     switch (fmt) {

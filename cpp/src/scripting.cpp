@@ -39,7 +39,11 @@
 #include "waveform_bank.h"
 #include "warp.h"
 #include "buffer_warp.h"
+#include "transport.h"
+#include "audio_export.h"          // renderGraphOffline / AudioExporter (soundshop.render)
 #include <juce_core/juce_core.h>   // juce::Logger for full-traceback logging
+#include <juce_audio_formats/juce_audio_formats.h>  // read_wav
+#include <algorithm>
 #include <sstream>
 #include <cstdio>
 #include <cstring>
@@ -78,6 +82,15 @@ bool ScriptEngine::pythonAvailable() {
     return false;
 #endif
 }
+
+// -----------------------------------------------------------------------------
+// Host transport registration - defined in ALL builds (it has nothing to do with
+// the interpreter, and main_window.cpp calls it unconditionally).
+// -----------------------------------------------------------------------------
+static Transport* g_hostTransport = nullptr;
+
+void ScriptEngine::setHostTransport(Transport* t) { g_hostTransport = t; }
+Transport* ScriptEngine::hostTransport() { return g_hostTransport; }
 
 #ifdef HAS_PYTHON
 
@@ -673,10 +686,715 @@ static PyObject* py_notefreq(PyObject*, PyObject* args) {
     return PyFloat_FromDouble((double)midiNoteToFrequency(n, tuning, concert));
 }
 
+// =============================================================================
+// Music theory
+//
+// These expose the SAME MusicTheory tables the piano roll's Key / Mode / Scale
+// controls, the Analyze button and Change Key already use. That shared source is
+// the entire point. Before this existed the only scriptable theory was
+// cpp/scripts/soundshop_music.py, which carried its own hand-written copy of the
+// scale tables - and it had already drifted from the app's (different scale
+// list, different spellings, a different key-detection ranking), so a script and
+// the piano roll could disagree about what "D Dorian" contains. There is now one
+// table and one answer; soundshop_music.py reads its data from here.
+//
+// Two conventions, stated once:
+//
+//  * A SCALE argument is either a name from any of the three tables (matched
+//    case- and separator-insensitively, so "natural minor", "Natural Minor" and
+//    "naturalminor" are the same) or an explicit list of semitone offsets from
+//    the root - so a script can use a scale SEANCE doesn't ship without leaving
+//    the API.
+//  * A ROOT argument is a pitch class 0-11, any MIDI number (reduced mod 12), or
+//    a note name ("D", "Eb", "F#3" - the octave is ignored).
+//
+// OCTAVE numbers here are scientific pitch (C4 = 60), matching notename() and
+// the piano roll's labels. MusicTheory's internal DegreeInfo counts octaves from
+// MIDI 0 instead (middle C is octave 5); the conversion happens at this boundary
+// so a script never meets the internal convention.
+// =============================================================================
+
+// Lowercase and strip spaces/underscores/hyphens, for tolerant name lookup.
+static std::string normaliseScaleName(const std::string& s) {
+    std::string out;
+    for (char c : s) {
+        if (c == ' ' || c == '_' || c == '-') continue;
+        out += (char)std::tolower((unsigned char)c);
+    }
+    return out;
+}
+
+// Resolve a scale name across all three tables, in the order the piano-roll UI
+// presents them (keys, then modes, then fixed scales). Returns null if unknown.
+static const std::vector<int>* lookupScaleName(const std::string& name) {
+    const std::string want = normaliseScaleName(name);
+    const ScaleMap* tables[] = { &MusicTheory::keys(), &MusicTheory::modes(),
+                                 &MusicTheory::scales() };
+    for (auto* t : tables)
+        for (auto& entry : *t)
+            if (normaliseScaleName(entry.first) == want) return &entry.second;
+    // Short names the UI spells out. "Ionian" is displayed "Ionian (Major)", and
+    // "Minor" is what everyone calls the Natural Minor parent - accept both
+    // rather than making scripts reproduce the exact label.
+    if (want == "ionian") return findScale(MusicTheory::modes(), "Ionian (Major)");
+    if (want == "minor")  return findScale(MusicTheory::keys(), "Natural Minor");
+    return nullptr;
+}
+
+static bool pyScaleArg(PyObject* o, std::vector<int>& out) {
+    if (!o) { PyErr_SetString(PyExc_TypeError, "missing scale"); return false; }
+    if (PyUnicode_Check(o)) {
+        const char* s = PyUnicode_AsUTF8(o);
+        if (auto* v = lookupScaleName(s ? s : "")) { out = *v; return true; }
+        PyErr_Format(PyExc_ValueError,
+                     "unknown scale '%s' - see soundshop.scale_names()", s ? s : "");
+        return false;
+    }
+    PyObject* seq = PySequence_Fast(
+        o, "scale must be a name or a sequence of semitone offsets");
+    if (!seq) return false;
+    out.clear();
+    const Py_ssize_t n = PySequence_Fast_GET_SIZE(seq);
+    for (Py_ssize_t i = 0; i < n; ++i) {
+        long v = PyLong_AsLong(PySequence_Fast_GET_ITEM(seq, i));
+        if (v == -1 && PyErr_Occurred()) { Py_DECREF(seq); return false; }
+        out.push_back((int)v);
+    }
+    Py_DECREF(seq);
+    if (out.empty()) {
+        PyErr_SetString(PyExc_ValueError, "scale must have at least one degree");
+        return false;
+    }
+    return true;
+}
+
+static bool pyRootArg(PyObject* o, int& out) {
+    int n = 0;
+    if (!pyPitchToInt(o, n)) return false;
+    out = ((n % 12) + 12) % 12;
+    return true;
+}
+
+// A sequence of pitches, each a MIDI number or a note name, so ["C4", 62] works.
+static bool pyPitchListArg(PyObject* o, std::vector<int>& out) {
+    PyObject* seq = PySequence_Fast(
+        o, "expected a sequence of MIDI numbers or note names");
+    if (!seq) return false;
+    out.clear();
+    const Py_ssize_t n = PySequence_Fast_GET_SIZE(seq);
+    for (Py_ssize_t i = 0; i < n; ++i) {
+        int p = 0;
+        if (!pyPitchToInt(PySequence_Fast_GET_ITEM(seq, i), p)) { Py_DECREF(seq); return false; }
+        out.push_back(p);
+    }
+    Py_DECREF(seq);
+    return true;
+}
+
+static PyObject* intVectorToPy(const std::vector<int>& v) {
+    PyObject* list = PyList_New((Py_ssize_t)v.size());
+    if (!list) return nullptr;
+    for (size_t i = 0; i < v.size(); ++i)
+        PyList_SET_ITEM(list, (Py_ssize_t)i, PyLong_FromLong(v[i]));
+    return list;
+}
+
+// Apply `fn` to a pitch argument that may be a single pitch or a sequence of
+// them, returning the same shape. Every pitch-transforming helper uses this, so
+// snap_to_scale(60, ...) and snap_to_scale(["C4", "E4"], ...) both read
+// naturally and a script never has to remember which one takes a list.
+static PyObject* mapPitchArg(PyObject* o, int (*fn)(int, void*), void* ctx) {
+    if (PyUnicode_Check(o) || PyLong_Check(o) || PyFloat_Check(o)) {
+        int p = 0;
+        if (!pyPitchToInt(o, p)) return nullptr;
+        return PyLong_FromLong(fn(p, ctx));
+    }
+    std::vector<int> in;
+    if (!pyPitchListArg(o, in)) return nullptr;
+    for (auto& p : in) p = fn(p, ctx);
+    return intVectorToPy(in);
+}
+
+// scale_names([category]) -> ["Major", "Natural Minor", ...]
+static PyObject* py_scale_names(PyObject*, PyObject* args) {
+    const char* cat = nullptr;
+    if (!PyArg_ParseTuple(args, "|z", &cat)) return nullptr;
+    const std::string c = cat ? normaliseScaleName(cat) : "";
+    if (!c.empty() && c != "key" && c != "mode" && c != "scale") {
+        PyErr_Format(PyExc_ValueError,
+                     "unknown category '%s' (expected 'key', 'mode' or 'scale')", cat);
+        return nullptr;
+    }
+    PyObject* list = PyList_New(0);
+    if (!list) return nullptr;
+    auto emit = [&](const ScaleMap& m) {
+        for (auto& entry : m) {
+            PyObject* s = PyUnicode_FromString(entry.first.c_str());
+            PyList_Append(list, s);
+            Py_DECREF(s);
+        }
+    };
+    if (c.empty() || c == "key")   emit(MusicTheory::keys());
+    if (c.empty() || c == "mode")  emit(MusicTheory::modes());
+    if (c.empty() || c == "scale") emit(MusicTheory::scales());
+    return list;
+}
+
+// scale_intervals("Dorian") -> [0, 2, 3, 5, 7, 9, 10]
+static PyObject* py_scale_intervals(PyObject*, PyObject* args) {
+    PyObject* o = nullptr;
+    if (!PyArg_ParseTuple(args, "O", &o)) return nullptr;
+    std::vector<int> iv;
+    if (!pyScaleArg(o, iv)) return nullptr;
+    return intVectorToPy(iv);
+}
+
+// rotate_scale(scale, degree) -> intervals of that mode of the scale.
+// This is exactly how Key and Mode combine in the piano roll: the Key supplies
+// the seven notes, the Mode picks which of them is "home".
+//   rotate_scale("Major", 1) == scale_intervals("Dorian")
+static PyObject* py_rotate_scale(PyObject*, PyObject* args) {
+    PyObject* o = nullptr; int degree = 0;
+    if (!PyArg_ParseTuple(args, "Oi", &o, &degree)) return nullptr;
+    std::vector<int> iv;
+    if (!pyScaleArg(o, iv)) return nullptr;
+    return intVectorToPy(MusicTheory::rotateScale(iv, degree));
+}
+
+// scale_pitches(root, scale, [octave=4, count=None]) -> MIDI numbers, ascending.
+// Defaults to one octave of the scale starting at `root` in `octave`; `count`
+// keeps walking up through further octaves. Pitches that leave 0..127 are
+// dropped rather than clamped (clamping would emit duplicates).
+static PyObject* py_scale_pitches(PyObject*, PyObject* args) {
+    PyObject *rootO = nullptr, *scaleO = nullptr, *countO = nullptr;
+    int octave = 4;
+    if (!PyArg_ParseTuple(args, "OO|iO", &rootO, &scaleO, &octave, &countO)) return nullptr;
+    int root = 0;
+    if (!pyRootArg(rootO, root)) return nullptr;
+    std::vector<int> iv;
+    if (!pyScaleArg(scaleO, iv)) return nullptr;
+    long count = (long)iv.size();
+    if (countO && countO != Py_None) {
+        count = PyLong_AsLong(countO);
+        if (count == -1 && PyErr_Occurred()) return nullptr;
+        if (count < 0) {
+            PyErr_SetString(PyExc_ValueError, "count must be >= 0");
+            return nullptr;
+        }
+    }
+    std::vector<int> out;
+    for (long i = 0; i < count; ++i) {
+        const int p = MusicTheory::degreeToPitch((int)i, octave + 1, 0, root, iv);
+        if (p >= 0 && p <= 127) out.push_back(p);
+    }
+    return intVectorToPy(out);
+}
+
+// note_degree(pitch, root, scale) -> dict describing where the note sits in the
+// scale. This is the analysis the piano roll's Analyze button runs, and the data
+// Change Key transposes through, so a script can reproduce either.
+static PyObject* py_note_degree(PyObject*, PyObject* args) {
+    PyObject *pitchO = nullptr, *rootO = nullptr, *scaleO = nullptr;
+    if (!PyArg_ParseTuple(args, "OOO", &pitchO, &rootO, &scaleO)) return nullptr;
+    int pitch = 0, root = 0;
+    if (!pyPitchToInt(pitchO, pitch)) return nullptr;
+    if (!pyRootArg(rootO, root)) return nullptr;
+    std::vector<int> iv;
+    if (!pyScaleArg(scaleO, iv)) return nullptr;
+    const DegreeInfo d = MusicTheory::pitchToDegree(pitch, root, iv);
+    PyObject* dict = PyDict_New();
+    if (!dict) return nullptr;
+    auto put = [&](const char* k, PyObject* v) {
+        if (v) { PyDict_SetItemString(dict, k, v); Py_DECREF(v); }
+    };
+    put("degree", PyLong_FromLong(d.degree));          // 0-based index into the scale
+    put("degree_name", PyUnicode_FromString(
+            d.degree >= 0 && d.degree < 7 ? MusicTheory::DEGREE_NAMES[d.degree] : ""));
+    put("octave", PyLong_FromLong(d.octave - 1));      // -> scientific pitch
+    put("chromatic_offset", PyLong_FromLong(d.chromaticOffset));
+    put("in_scale", PyBool_FromLong(d.chromaticOffset == 0));
+    return dict;
+}
+
+// degree_to_note(degree, octave, root, scale, [chromatic_offset=0]) -> MIDI
+// number. The inverse of note_degree(); degree is 0-based and may exceed the
+// scale size to walk into higher octaves.
+static PyObject* py_degree_to_note(PyObject*, PyObject* args) {
+    int degree = 0, octave = 4, offset = 0;
+    PyObject *rootO = nullptr, *scaleO = nullptr;
+    if (!PyArg_ParseTuple(args, "iiOO|i", &degree, &octave, &rootO, &scaleO, &offset))
+        return nullptr;
+    int root = 0;
+    if (!pyRootArg(rootO, root)) return nullptr;
+    std::vector<int> iv;
+    if (!pyScaleArg(scaleO, iv)) return nullptr;
+    return PyLong_FromLong(
+        MusicTheory::degreeToPitch(degree, octave + 1, offset, root, iv));
+}
+
+// snap_to_scale(pitches, root, scale) -> nearest in-scale pitch(es).
+struct SnapCtx { int root; const std::vector<int>* scale; };
+static PyObject* py_snap_to_scale(PyObject*, PyObject* args) {
+    PyObject *pitchO = nullptr, *rootO = nullptr, *scaleO = nullptr;
+    if (!PyArg_ParseTuple(args, "OOO", &pitchO, &rootO, &scaleO)) return nullptr;
+    SnapCtx ctx{};
+    std::vector<int> iv;
+    if (!pyRootArg(rootO, ctx.root)) return nullptr;
+    if (!pyScaleArg(scaleO, iv)) return nullptr;
+    ctx.scale = &iv;
+    return mapPitchArg(pitchO, [](int p, void* c) {
+        auto* s = (SnapCtx*)c;
+        return MusicTheory::snapToScale(p, s->root, *s->scale);
+    }, &ctx);
+}
+
+// transpose(pitches, semitones) -> shifted pitch(es). Not clamped to 0..127 -
+// a script that transposes off the keyboard should see that, not a silent pile
+// of notes stacked on pitch 127.
+static PyObject* py_transpose(PyObject*, PyObject* args) {
+    PyObject* pitchO = nullptr; int semis = 0;
+    if (!PyArg_ParseTuple(args, "Oi", &pitchO, &semis)) return nullptr;
+    return mapPitchArg(pitchO, [](int p, void* c) { return p + *(int*)c; }, &semis);
+}
+
+// change_key(pitches, from_root, from_scale, to_root, to_scale) -> pitch(es)
+// re-derived from their scale degree in the new key. This is the piano roll's
+// Change Key, callable from a script: C Major -> D Natural Minor keeps the shape
+// of the melody instead of just sliding it up two semitones.
+struct ChangeKeyCtx {
+    int fromRoot, toRoot;
+    const std::vector<int>* fromScale;
+    const std::vector<int>* toScale;
+};
+static PyObject* py_change_key(PyObject*, PyObject* args) {
+    PyObject *pitchO = nullptr, *r1 = nullptr, *s1 = nullptr, *r2 = nullptr, *s2 = nullptr;
+    if (!PyArg_ParseTuple(args, "OOOOO", &pitchO, &r1, &s1, &r2, &s2)) return nullptr;
+    ChangeKeyCtx ctx{};
+    std::vector<int> from, to;
+    if (!pyRootArg(r1, ctx.fromRoot)) return nullptr;
+    if (!pyScaleArg(s1, from)) return nullptr;
+    if (!pyRootArg(r2, ctx.toRoot)) return nullptr;
+    if (!pyScaleArg(s2, to)) return nullptr;
+    ctx.fromScale = &from;
+    ctx.toScale = &to;
+    return mapPitchArg(pitchO, [](int p, void* c) {
+        auto* k = (ChangeKeyCtx*)c;
+        const DegreeInfo d = MusicTheory::pitchToDegree(p, k->fromRoot, *k->fromScale);
+        return MusicTheory::degreeToPitch(d.degree, d.octave, d.chromaticOffset,
+                                          k->toRoot, *k->toScale);
+    }, &ctx);
+}
+
+// detect_key(pitches, [limit=10]) -> candidate keys, best fit first. Same ranking
+// the piano roll's key-detection UI shows.
+static PyObject* py_detect_key(PyObject*, PyObject* args) {
+    PyObject* pitchO = nullptr; int limit = 10;
+    if (!PyArg_ParseTuple(args, "O|i", &pitchO, &limit)) return nullptr;
+    std::vector<int> pitches;
+    if (!pyPitchListArg(pitchO, pitches)) return nullptr;
+    const auto matches = MusicTheory::detectKeys(pitches);
+    PyObject* list = PyList_New(0);
+    if (!list) return nullptr;
+    int n = 0;
+    for (const auto& m : matches) {
+        if (limit >= 0 && n++ >= limit) break;
+        PyObject* dict = PyDict_New();
+        if (!dict) { Py_DECREF(list); return nullptr; }
+        auto put = [&](const char* k, PyObject* v) {
+            if (v) { PyDict_SetItemString(dict, k, v); Py_DECREF(v); }
+        };
+        put("root", PyLong_FromLong(m.root));
+        put("root_name", PyUnicode_FromString(MusicTheory::NOTE_NAMES[m.root]));
+        put("scale", PyUnicode_FromString(m.scaleName.c_str()));
+        put("category", PyUnicode_FromString(m.category.c_str()));
+        put("scale_size", PyLong_FromLong(m.scaleSize));
+        put("notes_matched", PyLong_FromLong(m.notesMatched));
+        put("coverage", PyFloat_FromDouble((double)m.coverage));
+        PyList_Append(list, dict);
+        Py_DECREF(dict);
+    }
+    return list;
+}
+
+// is_black_key(pitch) -> bool (a piano-roll row question, so it stays scalar).
+static PyObject* py_is_black_key(PyObject*, PyObject* args) {
+    PyObject* o = nullptr;
+    if (!PyArg_ParseTuple(args, "O", &o)) return nullptr;
+    int p = 0;
+    if (!pyPitchToInt(o, p)) return nullptr;
+    return PyBool_FromLong(MusicTheory::isBlackKey(p));
+}
+
+// =============================================================================
+// Offline render and raw audio-file data
+//
+// The missing half of "algorithmic music from a script": you could already
+// place notes and wire nodes, but not hear the result without driving the GUI,
+// and not synthesise a waveform in Python and get it into the project at all.
+//
+//   render()        - bounce the project through the SAME renderGraphOffline()
+//                     that File -> Export Audio uses, so a scripted bounce and a
+//                     manual export of the same span are bit-identical.
+//   render_samples()- the same render handed back as float arrays instead of a
+//                     file, for analysis (peak/RMS checks, regression tests).
+//   write_wav()     - float samples you computed in Python -> an audio file,
+//                     which set_audio_file() can then drop onto a clip.
+//   read_wav()      - any audio file JUCE can decode -> float arrays.
+//
+// Bulk sample data crosses as array.array('f') rather than lists of Python
+// floats: a three-minute stereo render is ~17M samples, which as boxed floats
+// would cost hundreds of megabytes and seconds of allocation. array('f') is one
+// buffer, and it is accepted straight back by write_wav().
+// =============================================================================
+
+// Build an array.array('f') from raw floats. Returns a new reference, or null
+// with a Python error set.
+static PyObject* floatsToPyArray(const float* data, size_t count) {
+    PyObject* mod = PyImport_ImportModule("array");
+    if (!mod) return nullptr;
+    // array('f', <bytes>) reinterprets the bytes as machine floats.
+    PyObject* arr = PyObject_CallMethod(mod, "array", "sy#", "f",
+                                        (const char*)data,
+                                        (Py_ssize_t)(count * sizeof(float)));
+    Py_DECREF(mod);
+    return arr;
+}
+
+// Read one channel of float samples from any Python object: the buffer protocol
+// fast path (array('f'), array('d'), a numpy array, memoryview) or, failing
+// that, plain iteration over a list/tuple of numbers.
+static bool pySamplesArg(PyObject* o, std::vector<float>& out) {
+    if (PyObject_CheckBuffer(o)) {
+        Py_buffer view;
+        if (PyObject_GetBuffer(o, &view, PyBUF_C_CONTIGUOUS | PyBUF_FORMAT) == 0) {
+            const char* fmt = view.format ? view.format : "";
+            if (view.buf && view.itemsize == (Py_ssize_t)sizeof(float) && std::strchr(fmt, 'f')) {
+                const size_t n = (size_t)(view.len / (Py_ssize_t)sizeof(float));
+                out.assign((const float*)view.buf, (const float*)view.buf + n);
+                PyBuffer_Release(&view);
+                return true;
+            }
+            if (view.buf && view.itemsize == (Py_ssize_t)sizeof(double) && std::strchr(fmt, 'd')) {
+                const size_t n = (size_t)(view.len / (Py_ssize_t)sizeof(double));
+                const double* d = (const double*)view.buf;
+                out.resize(n);
+                for (size_t i = 0; i < n; ++i) out[i] = (float)d[i];
+                PyBuffer_Release(&view);
+                return true;
+            }
+            PyBuffer_Release(&view);
+        } else {
+            PyErr_Clear();
+        }
+    }
+    PyObject* seq = PySequence_Fast(o, "samples must be a sequence of numbers");
+    if (!seq) return false;
+    const Py_ssize_t n = PySequence_Fast_GET_SIZE(seq);
+    out.resize((size_t)n);
+    for (Py_ssize_t i = 0; i < n; ++i) {
+        const double v = PyFloat_AsDouble(PySequence_Fast_GET_ITEM(seq, i));
+        if (v == -1.0 && PyErr_Occurred()) { Py_DECREF(seq); return false; }
+        out[(size_t)i] = (float)v;
+    }
+    Py_DECREF(seq);
+    return true;
+}
+
+// The default render span, matching File -> Export Audio exactly: everything
+// that has content, plus four beats of tail so reverbs and releases finish.
+static float defaultRenderEndBeat(NodeGraph& g) {
+    float maxBeat = (float)g.contentEndBeats();
+    if (maxBeat <= 0) maxBeat = 4;
+    return maxBeat + 4;
+}
+
+// Shared body of render() and render_samples().
+static bool scriptRender(PyObject* endBeatO, int sampleRate, int channels,
+                         int bits, bool dither, ExportFormat fmt,
+                         juce::AudioBuffer<float>& buf) {
+    if (!g_currentGraph) {
+        PyErr_SetString(PyExc_RuntimeError, "no project is open");
+        return false;
+    }
+    if (sampleRate < 8000 || sampleRate > 384000) {
+        PyErr_SetString(PyExc_ValueError, "sample_rate must be between 8000 and 384000");
+        return false;
+    }
+    if (channels != 1 && channels != 2) {
+        PyErr_SetString(PyExc_ValueError, "channels must be 1 (mono) or 2 (stereo)");
+        return false;
+    }
+    double endBeat = defaultRenderEndBeat(*g_currentGraph);
+    if (endBeatO && endBeatO != Py_None) {
+        endBeat = PyFloat_AsDouble(endBeatO);
+        if (endBeat == -1.0 && PyErr_Occurred()) return false;
+    }
+    if (endBeat <= 0) {
+        PyErr_SetString(PyExc_ValueError, "end_beat must be greater than 0");
+        return false;
+    }
+
+    ExportOptions opts;
+    opts.format = fmt;
+    opts.sampleRate = sampleRate;
+    opts.numChannels = channels;
+    opts.bitsPerSample = bits;
+    opts.dither = dither;
+
+    // Prefer the app's live transport so tempo ramps are honoured; a default one
+    // at the graph's BPM is correct whenever there is no tempo map (headless,
+    // self-test). See ScriptEngine::setHostTransport.
+    Transport fallback;
+    fallback.bpm = g_currentGraph->bpm;
+    Transport* host = ScriptEngine::hostTransport();
+
+    if (!renderGraphOffline(*g_currentGraph, host ? *host : fallback,
+                            (float)endBeat, opts, buf)) {
+        PyErr_SetString(PyExc_RuntimeError,
+                        "render produced no samples (end_beat too short?)");
+        return false;
+    }
+    return true;
+}
+
+// render(path, end_beat=None, sample_rate=48000, channels=2, bits=24, dither=True)
+static PyObject* py_render(PyObject*, PyObject* args, PyObject* kwargs) {
+    static const char* kw[] = { "path", "end_beat", "sample_rate", "channels",
+                                "bits", "dither", nullptr };
+    const char* path = nullptr;
+    PyObject* endBeatO = nullptr;
+    int sampleRate = 48000, channels = 2, bits = 24, dither = 1;
+    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "s|Oiiip", (char**)kw,
+                                     &path, &endBeatO, &sampleRate, &channels,
+                                     &bits, &dither))
+        return nullptr;
+
+    // Relative paths would land in whatever the process CWD happens to be,
+    // which for a GUI app is not where the script author is looking.
+    if (!juce::File::isAbsolutePath(juce::String::fromUTF8(path))) {
+        PyErr_SetString(PyExc_ValueError, "path must be absolute");
+        return nullptr;
+    }
+    juce::File file(juce::String::fromUTF8(path));
+    // The extension picks the encoder, the same mapping the export dialog uses.
+    const ExportFormat fmt = AudioExporter::formatFromExtension(file.getFileName());
+
+    juce::AudioBuffer<float> buf;
+    if (!scriptRender(endBeatO, sampleRate, channels, bits, dither != 0, fmt, buf))
+        return nullptr;
+
+    ExportOptions opts;
+    opts.format = fmt;
+    opts.sampleRate = sampleRate;
+    opts.numChannels = channels;
+    opts.bitsPerSample = bits;
+    opts.dither = dither != 0;   // already applied to buf; kept for the writer's info
+    if (!AudioExporter::exportToFile(file, buf, opts)) {
+        PyErr_Format(PyExc_OSError, "could not write '%s'", path);
+        return nullptr;
+    }
+
+    PyObject* dict = PyDict_New();
+    if (!dict) return nullptr;
+    auto put = [&](const char* k, PyObject* v) {
+        if (v) { PyDict_SetItemString(dict, k, v); Py_DECREF(v); }
+    };
+    put("path", PyUnicode_FromString(file.getFullPathName().toRawUTF8()));
+    put("frames", PyLong_FromLong(buf.getNumSamples()));
+    put("channels", PyLong_FromLong(buf.getNumChannels()));
+    put("sample_rate", PyLong_FromLong(sampleRate));
+    put("seconds", PyFloat_FromDouble((double)buf.getNumSamples() / (double)sampleRate));
+    return dict;
+}
+
+// render_samples(end_beat=None, sample_rate=48000, channels=2) -> dict with
+// 'data' = list of one array('f') per channel. Never dithered: dither is a
+// float->int artefact, and this hands back the floats.
+static PyObject* py_render_samples(PyObject*, PyObject* args, PyObject* kwargs) {
+    static const char* kw[] = { "end_beat", "sample_rate", "channels", nullptr };
+    PyObject* endBeatO = nullptr;
+    int sampleRate = 48000, channels = 2;
+    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "|Oii", (char**)kw,
+                                     &endBeatO, &sampleRate, &channels))
+        return nullptr;
+
+    juce::AudioBuffer<float> buf;
+    if (!scriptRender(endBeatO, sampleRate, channels, 32, false,
+                      ExportFormat::WAV, buf))
+        return nullptr;
+
+    PyObject* data = PyList_New(0);
+    if (!data) return nullptr;
+    for (int c = 0; c < buf.getNumChannels(); ++c) {
+        PyObject* arr = floatsToPyArray(buf.getReadPointer(c), (size_t)buf.getNumSamples());
+        if (!arr) { Py_DECREF(data); return nullptr; }
+        PyList_Append(data, arr);
+        Py_DECREF(arr);
+    }
+    PyObject* dict = PyDict_New();
+    if (!dict) { Py_DECREF(data); return nullptr; }
+    auto put = [&](const char* k, PyObject* v) {
+        if (v) { PyDict_SetItemString(dict, k, v); Py_DECREF(v); }
+    };
+    put("frames", PyLong_FromLong(buf.getNumSamples()));
+    put("channels", PyLong_FromLong(buf.getNumChannels()));
+    put("sample_rate", PyLong_FromLong(sampleRate));
+    put("data", data);   // steals the reference created above
+    return dict;
+}
+
+// write_wav(path, data, sample_rate=48000, bits=24)
+//
+// `data` is either one channel (any sequence/buffer of numbers) or a list of
+// channels. Values are the usual -1..1 float domain. The file extension picks
+// the encoder, so '.flac' / '.ogg' also work - the name says wav because that's
+// what you want 99% of the time and because read_wav() is its inverse.
+static PyObject* py_write_wav(PyObject*, PyObject* args, PyObject* kwargs) {
+    static const char* kw[] = { "path", "data", "sample_rate", "bits", nullptr };
+    const char* path = nullptr;
+    PyObject* dataO = nullptr;
+    int sampleRate = 48000, bits = 24;
+    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "sO|ii", (char**)kw,
+                                     &path, &dataO, &sampleRate, &bits))
+        return nullptr;
+
+    if (!juce::File::isAbsolutePath(juce::String::fromUTF8(path))) {
+        PyErr_SetString(PyExc_ValueError, "path must be absolute");
+        return nullptr;
+    }
+    juce::File file(juce::String::fromUTF8(path));
+    if (sampleRate < 8000 || sampleRate > 384000) {
+        PyErr_SetString(PyExc_ValueError, "sample_rate must be between 8000 and 384000");
+        return nullptr;
+    }
+
+    // Distinguish "one channel of numbers" from "a list of channels" by looking
+    // at the first element: a nested sequence/buffer means multi-channel. A
+    // bare buffer object (array('f')) is always one channel.
+    std::vector<std::vector<float>> channels;
+    bool nested = false;
+    if (!PyObject_CheckBuffer(dataO) && PySequence_Check(dataO) && !PyUnicode_Check(dataO)) {
+        if (PySequence_Size(dataO) > 0) {
+            PyObject* first = PySequence_GetItem(dataO, 0);
+            if (first) {
+                nested = PyObject_CheckBuffer(first)
+                         || (PySequence_Check(first) && !PyUnicode_Check(first));
+                Py_DECREF(first);
+            }
+        }
+    }
+    if (nested) {
+        PyObject* seq = PySequence_Fast(dataO, "data must be a sequence of channels");
+        if (!seq) return nullptr;
+        const Py_ssize_t nch = PySequence_Fast_GET_SIZE(seq);
+        for (Py_ssize_t c = 0; c < nch; ++c) {
+            channels.emplace_back();
+            if (!pySamplesArg(PySequence_Fast_GET_ITEM(seq, c), channels.back())) {
+                Py_DECREF(seq);
+                return nullptr;
+            }
+        }
+        Py_DECREF(seq);
+    } else {
+        channels.emplace_back();
+        if (!pySamplesArg(dataO, channels.back())) return nullptr;
+    }
+
+    if (channels.empty()) {
+        PyErr_SetString(PyExc_ValueError, "data has no channels");
+        return nullptr;
+    }
+    size_t frames = 0;
+    for (auto& c : channels) frames = std::max(frames, c.size());
+    if (frames == 0) {
+        PyErr_SetString(PyExc_ValueError, "data has no samples");
+        return nullptr;
+    }
+    // Short channels are zero-padded rather than rejected, so building a stereo
+    // file from two independently-generated lists doesn't need length bookkeeping.
+    juce::AudioBuffer<float> buf((int)channels.size(), (int)frames);
+    buf.clear();
+    for (size_t c = 0; c < channels.size(); ++c)
+        if (!channels[c].empty())
+            buf.copyFrom((int)c, 0, channels[c].data(), (int)channels[c].size());
+
+    ExportOptions opts;
+    opts.format = AudioExporter::formatFromExtension(file.getFileName());
+    opts.sampleRate = sampleRate;
+    opts.numChannels = (int)channels.size();
+    opts.bitsPerSample = bits;
+    opts.dither = false;   // the caller's data is authoritative; don't add noise
+    if (!AudioExporter::exportToFile(file, buf, opts)) {
+        PyErr_Format(PyExc_OSError, "could not write '%s'", path);
+        return nullptr;
+    }
+    return PyLong_FromLong((long)frames);
+}
+
+// read_wav(path) -> dict with 'data' = one array('f') per channel, plus
+// 'sample_rate', 'channels', 'frames'. Any format JUCE can decode, not just WAV.
+static PyObject* py_read_wav(PyObject*, PyObject* args) {
+    const char* path = nullptr;
+    if (!PyArg_ParseTuple(args, "s", &path)) return nullptr;
+    juce::File file(juce::String::fromUTF8(path));
+    if (!file.existsAsFile()) {
+        PyErr_Format(PyExc_FileNotFoundError, "no such file: '%s'", path);
+        return nullptr;
+    }
+    juce::AudioFormatManager fm;
+    fm.registerBasicFormats();
+    std::unique_ptr<juce::AudioFormatReader> reader(fm.createReaderFor(file));
+    if (!reader) {
+        PyErr_Format(PyExc_ValueError, "could not decode '%s'", path);
+        return nullptr;
+    }
+    const int nch = (int)reader->numChannels;
+    const int frames = (int)reader->lengthInSamples;
+    juce::AudioBuffer<float> buf(juce::jmax(1, nch), juce::jmax(1, frames));
+    buf.clear();
+    if (frames > 0) reader->read(&buf, 0, frames, 0, true, true);
+
+    PyObject* data = PyList_New(0);
+    if (!data) return nullptr;
+    for (int c = 0; c < nch; ++c) {
+        PyObject* arr = floatsToPyArray(buf.getReadPointer(c), (size_t)frames);
+        if (!arr) { Py_DECREF(data); return nullptr; }
+        PyList_Append(data, arr);
+        Py_DECREF(arr);
+    }
+    PyObject* dict = PyDict_New();
+    if (!dict) { Py_DECREF(data); return nullptr; }
+    auto put = [&](const char* k, PyObject* v) {
+        if (v) { PyDict_SetItemString(dict, k, v); Py_DECREF(v); }
+    };
+    put("sample_rate", PyFloat_FromDouble(reader->sampleRate));
+    put("channels", PyLong_FromLong(nch));
+    put("frames", PyLong_FromLong(frames));
+    put("data", data);
+    return dict;
+}
+
 static PyMethodDef soundshopMethods[] = {
     {"notenum", py_notenum, METH_VARARGS, "Note name to MIDI number: notenum('C4') or notenum('C', 4) -> 60; passthrough for ints"},
     {"notename", py_notename, METH_VARARGS, "MIDI number to note name: notename(60) -> 'C4'"},
     {"notefreq", py_notefreq, METH_VARARGS, "Note to frequency (Hz) using the project tuning: notefreq('C4') or notefreq(60) or notefreq('C', 4)"},
+    // ---- Music theory (same tables as the piano roll's Key/Mode/Scale UI) ----
+    {"scale_names", py_scale_names, METH_VARARGS, "Scale names: scale_names(['key'|'mode'|'scale']) -> list of str (all three tables if no category)"},
+    {"scale_intervals", py_scale_intervals, METH_VARARGS, "Semitone offsets of a scale: scale_intervals('Dorian') -> [0,2,3,5,7,9,10]"},
+    {"rotate_scale", py_rotate_scale, METH_VARARGS, "Mode of a scale: rotate_scale('Major', 1) -> Dorian's intervals. How Key+Mode combine"},
+    {"scale_pitches", py_scale_pitches, METH_VARARGS, "MIDI numbers of a scale: scale_pitches(root, scale, [octave=4, count=None])"},
+    {"note_degree", py_note_degree, METH_VARARGS, "Analyse a note: note_degree(pitch, root, scale) -> {degree, degree_name, octave, chromatic_offset, in_scale}"},
+    {"degree_to_note", py_degree_to_note, METH_VARARGS, "Inverse of note_degree: degree_to_note(degree, octave, root, scale, [chromatic_offset=0]) -> MIDI number"},
+    {"snap_to_scale", py_snap_to_scale, METH_VARARGS, "Nearest in-scale pitch(es): snap_to_scale(pitch_or_list, root, scale)"},
+    {"transpose", py_transpose, METH_VARARGS, "Shift pitch(es) by semitones: transpose(pitch_or_list, semitones)"},
+    {"change_key", py_change_key, METH_VARARGS, "Re-derive pitches from their scale degree in a new key: change_key(pitches, from_root, from_scale, to_root, to_scale)"},
+    {"detect_key", py_detect_key, METH_VARARGS, "Candidate keys for a set of pitches, best fit first: detect_key(pitches, [limit=10])"},
+    {"is_black_key", py_is_black_key, METH_VARARGS, "Is this pitch a black key? is_black_key(pitch) -> bool"},
+    // ---- Offline render and raw audio data ----
+    {"render", (PyCFunction)py_render, METH_VARARGS | METH_KEYWORDS, "Bounce the project to an audio file (same renderer as File > Export Audio): render(path, end_beat=None, sample_rate=48000, channels=2, bits=24, dither=True) -> dict"},
+    {"render_samples", (PyCFunction)py_render_samples, METH_VARARGS | METH_KEYWORDS, "Bounce the project to float arrays: render_samples(end_beat=None, sample_rate=48000, channels=2) -> {'data': [array('f'), ...], ...}"},
+    {"write_wav", (PyCFunction)py_write_wav, METH_VARARGS | METH_KEYWORDS, "Write float samples to an audio file: write_wav(path, data, sample_rate=48000, bits=24) -> frames. data = one channel or a list of channels"},
+    {"read_wav", py_read_wav, METH_VARARGS, "Read an audio file into float arrays: read_wav(path) -> {'data': [array('f'), ...], 'sample_rate', 'channels', 'frames'}"},
     {"this_node", py_this_node, METH_NOARGS, "Get active node index (-1 if not in track context)"},
     {"get_node_count", py_get_node_count, METH_NOARGS, "Get number of nodes"},
     {"get_node_names", py_get_node_names, METH_NOARGS, "Get list of node names"},

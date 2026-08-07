@@ -11613,6 +11613,286 @@ void testAutoInputTracks(Report& r) {
             "record-mute: clearRecordingFlags un-sticks a track left mid-take");
 }
 
+// ---------------------------------------------------------------------------
+// Script Console API: music theory + offline render / raw audio data.
+//
+// These are the two things the older `soundshop` project could do from Python
+// and SEANCE could not: ask the app's music theory questions, and bounce the
+// project to a WAV. Both are now bindings on the embedded `soundshop` module
+// (see the two banner comments in scripting.cpp).
+//
+// The checks run through the REAL interpreter via ScriptEngine::run() rather
+// than calling the C++ underneath directly, because the entire class of bug
+// this guards against lives exactly at that boundary: a wrong PyArg format
+// string, a keyword name that doesn't match its docstring, a stolen-vs-borrowed
+// reference. Testing MusicTheory:: directly would pass while `import soundshop`
+// was broken.
+//
+// Protocol: the Python side prints one "PASS<tab>name" or "FAIL<tab>name" line
+// per check and C++ replays them into the report, so a failure names the exact
+// assertion instead of "the script test failed". A trailing COUNT line catches
+// a script that died half way through - without it, an exception at check 3
+// would quietly report 2 passes and look green.
+// ---------------------------------------------------------------------------
+void testScriptingApi(Report& r, const juce::File& outDir) {
+    r.section("Script Console API (music theory, offline render, wav data)");
+
+    if (!ScriptEngine::pythonAvailable()) {
+        r.note("Python unavailable in this build - script API checks skipped");
+        return;
+    }
+    auto& eng = ScriptEngine::instance();
+    if (!r.check(eng.init(), "script-api: embedded interpreter initialises")) return;
+
+    // A minimal sounding project: an Output node for the renderer to collect
+    // from, plus (built by the script itself) an Audio Track whose clip points
+    // at a WAV the script generated. That makes the render check end-to-end -
+    // write_wav -> set_audio_file -> renderGraphOffline -> render_samples - so a
+    // silent result means a real routing regression, not an empty graph.
+    NodeGraph g;
+    g.bpm = 120;
+    g.addNode("Output", NodeType::Output,
+              { Pin{0, "Audio In", PinKind::Audio, true} }, {});
+
+    // Forward slashes so the path needs no escaping inside the Python source,
+    // and Windows accepts them either way.
+    const std::string outPath =
+        outDir.getFullPathName().replaceCharacter('\\', '/').toStdString();
+
+    const std::string code = "OUT = \"" + outPath + "\"\n" + R"PY(
+import math, os, array
+import soundshop as ss
+
+_count = [0]
+
+def chk(name, fn):
+    _count[0] += 1
+    try:
+        ok = bool(fn())
+    except Exception as e:
+        print("FAIL\t%s [%s: %s]" % (name, type(e).__name__, e))
+        return
+    print(("PASS\t" if ok else "FAIL\t") + name)
+
+def raises(exc, fn):
+    try:
+        fn()
+    except exc:
+        return True
+    except Exception:
+        return False
+    return False
+
+# ---------------- music theory ----------------
+
+chk("scale_names covers keys, modes and fixed scales",
+    lambda: all(n in ss.scale_names() for n in ("Major", "Dorian", "Blues")))
+chk("scale_names('mode') is the seven modes of the major scale",
+    lambda: len(ss.scale_names("mode")) == 7)
+chk("scale_names rejects an unknown category",
+    lambda: raises(ValueError, lambda: ss.scale_names("chord")))
+chk("scale_intervals('Major') matches the app's table",
+    lambda: ss.scale_intervals("Major") == [0, 2, 4, 5, 7, 9, 11])
+chk("scale name lookup ignores case and separators",
+    lambda: ss.scale_intervals("natural minor") == ss.scale_intervals("Natural_Minor")
+            == [0, 2, 3, 5, 7, 8, 10])
+chk("'Minor' and 'Ionian' resolve to their spelled-out labels",
+    lambda: ss.scale_intervals("Minor") == ss.scale_intervals("Natural Minor")
+            and ss.scale_intervals("Ionian") == ss.scale_intervals("Ionian (Major)"))
+chk("a scale can be given as explicit semitone offsets",
+    lambda: ss.scale_intervals([0, 3, 7]) == [0, 3, 7])
+chk("an unknown scale name is a ValueError, not a silent default",
+    lambda: raises(ValueError, lambda: ss.scale_intervals("Klingon Lydian")))
+chk("rotate_scale('Major', 1) is Dorian - how Key + Mode combine",
+    lambda: ss.rotate_scale("Major", 1) == ss.scale_intervals("Dorian"))
+chk("rotate_scale('Major', 5) is Aeolian",
+    lambda: ss.rotate_scale("Major", 5) == ss.scale_intervals("Aeolian"))
+chk("scale_pitches(C major, octave 4) is C4..B4",
+    lambda: ss.scale_pitches("C", "Major", 4) == [60, 62, 64, 65, 67, 69, 71])
+chk("root accepts a note name, a pitch class and a MIDI number alike",
+    lambda: ss.scale_pitches("C", "Major", 4) == ss.scale_pitches(0, "Major", 4)
+            == ss.scale_pitches(60, "Major", 4))
+chk("scale_pitches count walks on into the next octave",
+    lambda: ss.scale_pitches("C", "Major", 4, 8)[7] == 72)
+chk("note_degree calls E4 the 3rd of C major",
+    lambda: ss.note_degree(64, "C", "Major")["degree"] == 2
+            and ss.note_degree(64, "C", "Major")["degree_name"] == "3rd")
+chk("note_degree reports scientific octaves (C4 = 60 -> octave 4)",
+    lambda: ss.note_degree(60, "C", "Major")["octave"] == 4)
+chk("note_degree flags an out-of-scale note and its offset",
+    lambda: ss.note_degree(61, "C", "Major")["in_scale"] is False
+            and ss.note_degree(61, "C", "Major")["chromatic_offset"] == 1)
+chk("degree_to_note inverts note_degree across four octaves",
+    lambda: all(ss.degree_to_note(d["degree"], d["octave"], "C", "Major",
+                                  d["chromatic_offset"]) == p
+                for p, d in ((p, ss.note_degree(p, "C", "Major"))
+                             for p in range(36, 85))))
+chk("degree_to_note walks below the root without jumping an octave",
+    lambda: ss.degree_to_note(-1, 4, "C", "Major") == 59
+            and ss.degree_to_note(-7, 4, "C", "Major") == 48)
+chk("degree_to_note is strictly increasing across three octaves of degrees",
+    lambda: (lambda v: v == sorted(v) and len(set(v)) == len(v) and v[0] == 48)(
+        [ss.degree_to_note(d, 4, "C", "Major") for d in range(-7, 15)]))
+chk("snap_to_scale pulls C#4 down into C major",
+    lambda: ss.snap_to_scale(61, "C", "Major") == 60)
+chk("snap_to_scale keeps the shape of its argument (list in, list out)",
+    lambda: ss.snap_to_scale([61, 66], "C", "Major") == [60, 65])
+chk("transpose works on a single pitch and on a list",
+    lambda: ss.transpose(60, 12) == 72 and ss.transpose([60, 62], -2) == [58, 60])
+chk("change_key keeps the melody's shape (C major -> D natural minor)",
+    lambda: ss.change_key([60, 62, 64, 65, 67], "C", "Major", "D", "Natural Minor")
+            == [62, 64, 65, 67, 69])
+chk("change_key into the same key is a no-op",
+    lambda: ss.change_key([60, 62, 64, 65, 67, 69, 71], "C", "Major", "C", "Major")
+            == [60, 62, 64, 65, 67, 69, 71])
+chk("pitches may be given as note names",
+    lambda: ss.transpose(["C4", "E4"], 0) == [60, 64])
+chk("detect_key names C Major Pentatonic as the tightest fit",
+    lambda: ss.detect_key([60, 62, 64, 67, 69], 1)[0]["root"] == 0
+            and ss.detect_key([60, 62, 64, 67, 69], 1)[0]["scale"] == "Major Pentatonic"
+            and ss.detect_key([60, 62, 64, 67, 69], 1)[0]["coverage"] == 1.0)
+chk("detect_key honours its limit",
+    lambda: len(ss.detect_key([60, 64, 67], 3)) == 3)
+chk("is_black_key agrees with the piano roll",
+    lambda: ss.is_black_key(61) is True and ss.is_black_key(60) is False)
+
+# ---------------- raw audio data ----------------
+
+SR = 48000
+HALF = SR // 2
+sine = array.array('f', (0.5 * math.sin(2 * math.pi * 440.0 * i / SR) for i in range(HALF)))
+wav = OUT + "/script_api_sine.wav"
+
+written = ss.write_wav(wav, sine, sample_rate=SR, bits=24)
+chk("write_wav reports the number of frames it wrote", lambda: written == HALF)
+chk("write_wav rejects a relative path (a GUI app's CWD is not the script's)",
+    lambda: raises(ValueError, lambda: ss.write_wav("relative.wav", sine)))
+chk("read_wav on a missing file raises FileNotFoundError",
+    lambda: raises(FileNotFoundError, lambda: ss.read_wav(OUT + "/no_such_file.wav")))
+
+back = ss.read_wav(wav)
+chk("read_wav round-trips sample rate, channel count and length",
+    lambda: back["sample_rate"] == SR and back["channels"] == 1
+            and back["frames"] == HALF)
+chk("bulk samples cross as array('f'), not boxed floats",
+    lambda: back["data"][0].typecode == "f")
+chk("a 24-bit write/read round trip is sample-accurate",
+    lambda: max(abs(a - b) for a, b in zip(sine, back["data"][0])) < 1e-5)
+
+stereo = OUT + "/script_api_stereo.wav"
+left = array.array('f', [0.25] * 100)
+right = array.array('f', [-0.25] * 60)
+n2 = ss.write_wav(stereo, [left, right], sample_rate=SR, bits=24)
+b2 = ss.read_wav(stereo)
+chk("write_wav takes a list of channels and zero-pads the short one",
+    lambda: n2 == 100 and b2["channels"] == 2 and b2["frames"] == 100
+            and abs(b2["data"][1][10] + 0.25) < 1e-5
+            and abs(b2["data"][1][80]) < 1e-5)
+chk("write_wav also accepts a plain list of numbers",
+    lambda: ss.write_wav(OUT + "/script_api_list.wav", [0.0, 0.5, -0.5, 0.0],
+                         sample_rate=SR) == 4)
+
+# ---------------- offline render ----------------
+
+ss.set_bpm(120)
+track = ss.add_audio_track("Bounce")
+ss.set_audio_file(track, 0, wav)
+ss.add_link(track, 0)          # node 0 is the Output the test pre-built
+
+chk("render_samples rejects a channel count it can't produce",
+    lambda: raises(ValueError, lambda: ss.render_samples(end_beat=1, channels=3)))
+chk("render_samples rejects an impossible sample rate",
+    lambda: raises(ValueError, lambda: ss.render_samples(end_beat=1, sample_rate=10)))
+
+rs = ss.render_samples(end_beat=1.0, sample_rate=SR, channels=2)
+chk("render length follows the tempo (1 beat at 120 BPM = 0.5 s)",
+    lambda: rs["frames"] == HALF and rs["channels"] == 2 and rs["sample_rate"] == SR)
+chk("render_samples returns one array('f') per channel",
+    lambda: len(rs["data"]) == 2 and rs["data"][0].typecode == "f")
+chk("the bounce actually contains the clip's audio",
+    lambda: max(abs(v) for v in rs["data"][0]) > 0.1)
+
+rendered = OUT + "/script_api_render.wav"
+info = ss.render(rendered, end_beat=1.0, sample_rate=SR, channels=2, bits=24,
+                 dither=False)
+chk("render writes a decodable file matching its reported frame count",
+    lambda: os.path.isfile(rendered) and info["frames"] == HALF
+            and ss.read_wav(rendered)["frames"] == HALF)
+chk("render reports the span in seconds",
+    lambda: abs(info["seconds"] - 0.5) < 1e-6)
+chk("render() and render_samples() come out of the same renderer",
+    lambda: max(abs(a - b) for a, b in
+                zip(rs["data"][0], ss.read_wav(rendered)["data"][0])) < 1e-5)
+chk("the default render span covers the content plus a tail",
+    lambda: ss.render_samples(sample_rate=SR)["frames"] == (4 + 4) * SR // 2)
+
+# ---------------- the shipped helper modules read the same tables ----------------
+#
+# cpp/scripts/soundshop_music.py used to carry a hand-written copy of the scale
+# tables that had drifted from the app's. It now derives everything from the
+# bindings above; these checks are what keeps it that way.
+
+import soundshop_music as sm
+import soundshop_tools as tools     # noqa: F401 - must at least import cleanly
+
+chk("soundshop_music's scale index comes from the app's tables",
+    lambda: sm.extra_scales["blues"] == ss.scale_intervals("Blues")
+            and sm.extra_scales["harmonic minor"] == ss.scale_intervals("Harmonic Minor")
+            and sm.extra_scales["pentatonic major"] == ss.scale_intervals("Major Pentatonic"))
+chk("soundshop_music knows every scale SEANCE does",
+    lambda: all(n.lower() in sm.extra_scales for n in ss.scale_names()))
+chk("soundshop_music's mode list is the app's, minus the '(Major)' label",
+    lambda: sm.mode_names[0] == "Ionian" and sm.mode_names[1] == "Dorian"
+            and sm.modes_dict["ionian"] == 0 and sm.modes_dict["aeolian"] == 5)
+chk("soundshop_music.build_table is a rotation of the app's scale",
+    lambda: sm.build_table("D", 1) == [(2 + s) % 12 for s in ss.rotate_scale("Major", 1)])
+chk("build_table can now reach non-major parent scales too",
+    lambda: sm.build_table("C", 0, "Harmonic Minor") == ss.scale_intervals("Harmonic Minor"))
+chk("soundshop_music.change_key delegates to the app's Change Key",
+    lambda: sm.change_key([60, 62, 64, 65, 67], "C", 0, "D", 5)
+            == ss.change_key([60, 62, 64, 65, 67], "C", "Major", "D", "Natural Minor"))
+chk("soundshop_music.change_key still takes note-name strings",
+    lambda: sm.change_key("C4 E4 G4", "C", 0, "C", 5) == [60, 63, 67])
+chk("soundshop_music.detect_keys delegates to the app's ranking",
+    lambda: sm.detect_keys([60, 62, 64, 67, 69])[0] == ("C", "Major Pentatonic", 1.0))
+chk("soundshop_music note names agree with the app's MIDI numbering",
+    lambda: all(sm.Note(n).midi == ss.notenum(n)
+                for n in ("C-1", "C0", "C4", "A4", "G9", "F#3", "Eb5")))
+chk("soundshop_music spells a MIDI number the ordinary way",
+    lambda: str(sm.Note(60)) == "C4" and str(sm.Note(61)) == "C#4"
+            and str(sm.Note(63)) == "D#4")
+chk("the enharmonic spellings this module exists for still resolve",
+    lambda: sm.Note("Eb4").midi == 63 and sm.Note("Cb4").midi == 59
+            and sm.Note("B#3").midi == 60 and sm.Note("Fbb5").midi == 75)
+chk("soundshop_music.pitch_class handles names, Notes and MIDI numbers",
+    lambda: sm.pitch_class("Eb") == 3 and sm.pitch_class(63) == 3
+            and sm.pitch_class(sm.Note("Eb4")) == 3)
+
+print("COUNT\t%d" % _count[0])
+)PY";
+
+    const juce::String out = juce::String::fromUTF8(eng.run(code, g).c_str());
+
+    juce::StringArray lines;
+    lines.addLines(out);
+    int seen = 0, declared = -1;
+    for (const auto& ln : lines) {
+        if (ln.startsWith("PASS\t") || ln.startsWith("FAIL\t")) {
+            ++seen;
+            r.check(ln.startsWith("PASS\t"), "script-api: " + ln.fromFirstOccurrenceOf("\t", false, false));
+        } else if (ln.startsWith("COUNT\t")) {
+            declared = ln.fromFirstOccurrenceOf("\t", false, false).getIntValue();
+        }
+    }
+
+    // Without these two, a script that raised on line 1 would report zero
+    // checks and the suite would still be green.
+    if (!r.check(declared >= 0, "script-api: the test script ran to completion"))
+        r.note("script output was: " + out.substring(0, 3000));
+    else
+        r.check(seen == declared, "script-api: every check reported a result");
+}
+
 int runSelfTest(const juce::File& outDir) {
     outDir.createDirectory();
     Report r;
@@ -11651,6 +11931,7 @@ int runSelfTest(const juce::File& outDir) {
     testMultitrackRecording(r, outDir);
     testAutoInputTracks(r);
     testDialogTaskbarFlags(r);
+    testScriptingApi(r, outDir);
 
     r.section("Summary");
     r.line("  PASSED: " + juce::String(r.passed));

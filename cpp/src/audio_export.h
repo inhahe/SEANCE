@@ -1,10 +1,14 @@
 #pragma once
 #include <juce_audio_formats/juce_audio_formats.h>
+#include <functional>
 #include <string>
 #include <vector>
 #include <random>
 
 namespace SoundShop {
+
+class NodeGraph;
+struct Transport;
 
 // Supported export formats
 enum class ExportFormat {
@@ -51,6 +55,38 @@ inline void applyTPDFDither(juce::AudioBuffer<float>& buf, int targetBits) {
         }
     }
 }
+
+// Render the whole node graph offline into `out`, from beat 0 to `endBeat`.
+//
+// This is the ONE rendering routine behind both `File -> Export Audio...` and
+// the Script Console's `soundshop.render()` / `soundshop.render_samples()`.
+// They deliberately share it: a script that bounces a stem and a user who
+// exports the same span must get bit-identical audio, and two copies of the
+// block loop would drift the moment one of them learned about a new node type.
+//
+//   graph     - the project. Not modified. (The live audio thread may be walking
+//               it concurrently; both callers already accept that - see the
+//               `mutationLock` note in node_graph.h.)
+//   tmpl      - supplies bpm and the tempo / time-signature maps. Its position
+//               and playing state are ignored: an offline render always starts
+//               at beat 0 with `playing = true`.
+//   endBeat   - length in beats, converted to seconds through tmpl's tempo map,
+//               so tempo ramps are honoured.
+//   opts      - sampleRate, numChannels (1 = mono downmix), bitsPerSample and
+//               dither are applied here; `format` matters only later, to
+//               AudioExporter::exportToFile.
+//   out       - resized and filled with opts.numChannels channels.
+//   progress  - optional, called once per block with 0..1. Return false to
+//               cancel; this then returns false and `out` holds a partial render.
+//
+// A fresh GraphProcessor and a copied Transport are used, so live playback is
+// never disturbed. Returns false if endBeat yields no samples, or on cancel.
+bool renderGraphOffline(NodeGraph& graph,
+                        const Transport& tmpl,
+                        float endBeat,
+                        const ExportOptions& opts,
+                        juce::AudioBuffer<float>& out,
+                        const std::function<bool(double)>& progress = {});
 
 class AudioExporter {
 public:

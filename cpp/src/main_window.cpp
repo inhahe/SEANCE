@@ -111,6 +111,11 @@ static bool isVirtualOrControlPort(const juce::String& name) {
 // ==============================================================================
 
 MainContentComponent::MainContentComponent() {
+    // Let soundshop.render() bounce through the live tempo / time-signature
+    // maps, which live here rather than in NodeGraph. Without this a scripted
+    // render would silently ignore tempo ramps that File > Export Audio honours.
+    ScriptEngine::setHostTransport(&transport);
+
     // Menu bar
     menuBar = std::make_unique<juce::MenuBarComponent>(this);
     addAndMakeVisible(menuBar.get());
@@ -618,6 +623,9 @@ MainContentComponent::MainContentComponent() {
 }
 
 MainContentComponent::~MainContentComponent() {
+    // `transport` is about to die; the ScriptEngine outlives us (it's a process
+    // singleton holding the one CPython interpreter), so drop the pointer.
+    ScriptEngine::setHostTransport(nullptr);
     stopAutosaveWorker();
     audioEngine.shutdown();
 }
@@ -1447,6 +1455,7 @@ juce::PopupMenu MainContentComponent::getMenuForIndex(int idx, const juce::Strin
         menu.addItem(315, "Voices (Polyphony)");
         menu.addItem(316, "Recording Automation");
         menu.addItem(317, "Recording Audio");
+        menu.addItem(319, "Script Console (Python)");
         menu.addSeparator();
         menu.addItem(312, "Keyboard Shortcuts");
         menu.addSeparator();
@@ -1599,6 +1608,7 @@ void MainContentComponent::menuItemSelected(int menuItemID, int) {
         case 316: openHelpDoc("automation-recording.html"); break;
         case 317: openHelpDoc("recording-audio.html"); break;
         case 318: openHelpDoc("wavelet-effects.html"); break;
+        case 319: openHelpDoc("script-console.html"); break;
         case 320:
             juce::NativeMessageBox::showMessageBoxAsync(
                 juce::MessageBoxIconType::InfoIcon,
@@ -4197,70 +4207,29 @@ void MainContentComponent::doExportRender(const juce::File& file, const ExportOp
         ExportTask(NodeGraph& g, Transport& liveTransport,
                    const juce::File& f, const ExportOptions& o, float mb)
             : ThreadWithProgressWindow("Exporting audio...", true, true),
-              graph(g), file(f), opts(o), maxBeat(mb)
-        {
-            offTransport.bpm = g.bpm;
-            offTransport.tempoMap = liveTransport.tempoMap;
-            offTransport.timeSigMap = liveTransport.timeSigMap;
-            offTransport.sampleRate = o.sampleRate;
-            offTransport.playing = true;
-        }
+              graph(g), liveTransport(liveTransport), file(f), opts(o), maxBeat(mb) {}
 
         void run() override {
-            double sr = opts.sampleRate;
-            int blockSize = 512;
-            double totalSeconds = offTransport.tempoMap.beatsToSeconds(maxBeat);
-            int64_t totalSamples = (int64_t)(totalSeconds * sr);
-            if (totalSamples <= 0) return;
-
-            setStatusMessage("Building audio graph...");
-
-            GraphProcessor offGP;
-            offGP.prepare(graph, sr, blockSize);
-            offGP.rebuildGraph(graph, offTransport);
-            offGP.prepare(graph, sr, blockSize);
-
-            // Always render in stereo - graph processor outputs stereo
-            juce::AudioBuffer<float> renderBuf(2, (int)totalSamples);
-            renderBuf.clear();
-
             setStatusMessage("Rendering audio...");
 
-            for (int64_t pos = 0; pos < totalSamples; pos += blockSize) {
-                if (threadShouldExit()) return;
-
-                int thisBlock = (int)std::min((int64_t)blockSize, totalSamples - pos);
-                offTransport.positionSamples = pos;
-                float* outPtrs[2] = {
-                    renderBuf.getWritePointer(0, (int)pos),
-                    renderBuf.getWritePointer(1, (int)pos)
-                };
-                offGP.processBlock(graph, offTransport, outPtrs, 2, thisBlock);
-                setProgress((double)pos / (double)totalSamples);
-            }
-
-            // Mix down to mono if requested
-            if (opts.numChannels == 1) {
-                setStatusMessage("Mixing to mono...");
-                juce::AudioBuffer<float> monoBuf(1, (int)totalSamples);
-                monoBuf.copyFrom(0, 0, renderBuf, 0, 0, (int)totalSamples);
-                monoBuf.addFrom(0, 0, renderBuf, 1, 0, (int)totalSamples);
-                monoBuf.applyGain(0.5f);
-                renderBuf = std::move(monoBuf);
-            }
-
-            // Apply TPDF dithering for PCM formats
-            if (opts.dither && (opts.format == ExportFormat::WAV
-                                || opts.format == ExportFormat::FLAC)) {
-                applyTPDFDither(renderBuf, opts.bitsPerSample);
-            }
+            // The block loop itself lives in renderGraphOffline (audio_export.cpp)
+            // so the Script Console's soundshop.render() produces identical audio.
+            // All this wrapper adds is the progress window and cancellation.
+            juce::AudioBuffer<float> renderBuf;
+            if (!renderGraphOffline(graph, liveTransport, maxBeat, opts, renderBuf,
+                                    [this](double p) {
+                                        if (threadShouldExit()) return false;
+                                        setProgress(p);
+                                        return true;
+                                    }))
+                return;   // nothing to render, or the user cancelled
 
             setStatusMessage("Writing file...");
             exportSuccess = AudioExporter::exportToFile(file, renderBuf, opts);
         }
 
         NodeGraph& graph;
-        Transport offTransport;
+        Transport& liveTransport;
         juce::File file;
         ExportOptions opts;
         float maxBeat;

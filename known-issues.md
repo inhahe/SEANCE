@@ -5,6 +5,40 @@ top. When something is fixed, delete the entry (git history is the archive).
 
 ---
 
+## BUG: Script Console edits create no undo step
+
+**Found:** 2026-08-07, while documenting the new `import soundshop` surface.
+
+Every mutation a Script Console script makes — `add_midi_track`, `add_note`,
+`add_link`, `set_bpm`, `insert_time`, `clear_automation`, all of it — writes
+straight into `g_currentGraph` and returns. Neither entry point calls
+`commitSnapshot()`:
+
+- `ScriptConsoleComponent::runScript` (`main_window.cpp:5544`) — reads the
+  editor text, `engine.run(code, graph, activeNodeIdx)`, shows the output.
+- `MainContentComponent::runScriptFile` (`main_window.cpp:5662`) — same via
+  `scriptEngine.run(code, graph)`, plus recent-files bookkeeping.
+
+Consequences: Ctrl+Z after a script does not walk back what the script did (it
+reverts to whatever the previous snapshot was, which may be *older* than the
+script's starting state, so undo is actively misleading rather than merely
+absent), and `projectDirty` — which is inferred from undo-tree growth — can
+stay false after a script has rewritten the project, so quitting won't prompt
+to save.
+
+**Proper fix:** wrap both call sites — snapshot before the run so the
+pre-script state is a restore point, then `commitSnapshot("Run script: <name>")`
+after a successful run. One step per run, not per API call: a script that
+places 500 notes should be one Ctrl+Z, and the snapshot path is the right
+mechanism for a bulk structural change (see CLAUDE.md → *Undo Strategy*). The
+pre-run snapshot matters because a script can fail half-way, leaving the
+project mutated by the calls that already ran.
+
+Documented as a caveat in REFERENCE.md → *Script Console* and in
+`docs/script-console.html` until it's fixed.
+
+---
+
 ## FLAKY (unidentified): one self-test failed once and never again
 
 **Found:** 2026-08-07, on the first `--self-test` run immediately after a

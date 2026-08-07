@@ -1,0 +1,149 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Script Console — SEANCE</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="wrap">
+<header>
+<h1>Script Console</h1>
+<nav>
+  <a href="index.html">Home</a>
+  <a href="graph-basics.html">Graph Basics</a>
+  <a href="piano-roll.html">Piano Roll</a>
+  <a href="midi-script.html">Algorithmic MIDI</a>
+</nav>
+</header>
+
+<p>The <strong>Script Console</strong> (<em>Tools → Script Console</em>) is a Python prompt that edits your <em>project</em>: it can add nodes, wire them together, place notes, move markers, write automation — and, when you're done, bounce the whole thing to a WAV file without you touching the transport. Think of it as a macro recorder you type into rather than a live instrument.</p>
+
+<div class="tip">
+<strong>This is not the same thing as the <a href="signal-shape.html">Script node</a>.</strong> The Script node runs <em>inside</em> the audio graph, once per sample or per block, making sound in real time. The Script Console runs <em>once</em>, on your project file, like a batch edit. Different job, different language, different page.
+</div>
+
+<p>Everything lives in one module:</p>
+
+<pre>import soundshop as ss</pre>
+
+<h2>Your first script</h2>
+
+<p>Open <em>Tools → Script Console</em>, paste this, and press <strong>Run</strong>:</p>
+
+<pre>import soundshop as ss
+
+track = ss.add_midi_track("Melody")
+clip  = ss.add_clip(track, 0, 4)
+
+beat = 0
+for pitch in ss.scale_pitches("C", "Major", 4):
+    ss.add_note(track, clip, pitch, beat, 0.5)
+    beat += 0.5</pre>
+
+<p>A new MIDI track appears with a C major scale written into it. Two things to notice:</p>
+
+<ul>
+  <li><code>scale_pitches("C", "Major", 4)</code> gave you <code>[60, 62, 64, 65, 67, 69, 71]</code> — the same seven notes the piano roll would highlight if you picked C / Major in its Key and Scale menus. It's <em>literally</em> the same table, so the script and the editor can't disagree.</li>
+  <li>Positions are in <strong>beats</strong>, not seconds or samples. <code>0.5</code> is an eighth note. Change the tempo afterwards and everything still lines up.</li>
+</ul>
+
+<p>Wire the track to a synth by hand, or from the script: <code>ss.add_link(track, ss.find_node("Output"))</code>.</p>
+
+<h2>Letting SEANCE do the music theory</h2>
+
+<p>You don't have to know what a Dorian mode is to use one. Ask:</p>
+
+<pre>ss.scale_names()          # every scale SEANCE knows
+ss.scale_names("mode")    # just the seven modes
+ss.scale_intervals("Dorian")   # [0, 2, 3, 5, 7, 9, 10]</pre>
+
+<p>Names are forgiving — <code>"natural minor"</code>, <code>"Natural Minor"</code> and <code>"naturalminor"</code> all work. So do note <em>names</em> anywhere a pitch is expected: <code>ss.add_note(track, clip, "C4", 0, 1)</code> is the same as writing <code>60</code>.</p>
+
+<p>A few things worth knowing about:</p>
+
+<ul>
+  <li><strong>Snap something into a scale.</strong> <code>ss.snap_to_scale([61, 66, 70], "C", "Major")</code> nudges each note to the nearest one that belongs. Handy after a random-note generator.</li>
+  <li><strong>Change key without wrecking the melody.</strong> <code>ss.change_key(pitches, "C", "Major", "D", "Natural Minor")</code> works out what <em>role</em> each note played (first note of the scale, third, fifth…) and finds the note playing the same role in the new key. That's different from just shifting everything up two semitones — it's what the piano roll's <em>Change Key</em> button does.</li>
+  <li><strong>Ask what key something is in.</strong> <code>ss.detect_key([60, 62, 64, 67, 69])</code> returns candidates best-fit-first; the top one here is C Major Pentatonic with <code>coverage</code> 1.0 (every note fits).</li>
+  <li><strong>Analyse one note.</strong> <code>ss.note_degree(64, "C", "Major")</code> tells you it's the 3rd, in octave 4, and in the scale.</li>
+</ul>
+
+<p>Octave numbers are the ordinary ones: middle C is <strong>C4 = 60</strong>, the same as the labels down the side of the piano roll.</p>
+
+<h2>Bouncing to a file</h2>
+
+<p>When the project sounds right, render it:</p>
+
+<pre>ss.render("D:/music/take1.wav")</pre>
+
+<p>That's the same renderer as <em>File → Export Audio</em> — same result, same default span (everything with content, plus four beats of tail so reverbs finish). Pass <code>end_beat=32</code> to bounce a specific length, or <code>sample_rate=</code> / <code>channels=</code> / <code>bits=</code> to change the format. The file extension picks the encoder, so <code>.flac</code> works too.</p>
+
+<div class="tip">
+<strong>Paths must be absolute.</strong> <code>"take1.wav"</code> would land in whatever folder SEANCE happens to think it's running from, which is never where you're looking. Write the whole path.
+</div>
+
+<p>You get back a small summary you can print or check:</p>
+
+<pre>info = ss.render("D:/music/take1.wav")
+print(info["seconds"], "seconds,", info["frames"], "frames")</pre>
+
+<p>If you want the audio as <em>numbers</em> rather than a file — to check the peak level, compare two takes, or feed it somewhere else — use <code>render_samples()</code>:</p>
+
+<pre>r = ss.render_samples(end_beat=8)
+peak = max(abs(v) for v in r["data"][0])
+print("left channel peak:", peak)</pre>
+
+<h2>Making a sound from scratch</h2>
+
+<p>The last piece: you can compute a waveform in Python and put it <em>into</em> the project. <code>write_wav</code> takes plain numbers in the usual −1…+1 range and writes an audio file; <code>set_audio_file</code> drops that file onto a clip.</p>
+
+<pre>import soundshop as ss, math, array
+
+sr = 48000
+tone = array.array('f', (0.5 * math.sin(2*math.pi*440*i/sr) for i in range(sr)))
+ss.write_wav("D:/music/tone.wav", tone, sample_rate=sr)
+
+t = ss.add_audio_track("Tone")
+c = ss.add_clip(t, 0, 4)
+ss.set_audio_file(t, c, "D:/music/tone.wav")
+ss.add_link(t, ss.find_node("Output"))</pre>
+
+<p>Press play and you'll hear a one-second 440 Hz tone. Anything you can compute — a chirp, shaped noise, a resynthesis, an impulse response for the <a href="convolution.html">Convolution Filter</a> — can get into a project this way. <code>read_wav("…")</code> goes the other direction, handing you an existing file's samples to analyse or mangle.</p>
+
+<p>For a stereo file, pass a list of channels instead of one: <code>ss.write_wav(path, [left, right])</code>. If one channel is shorter than the other it's padded with silence rather than rejected.</p>
+
+<div class="tip">
+<strong>Why <code>array('f')</code> and not a plain list?</strong> You can pass a list — it works fine for short things. But a three-minute stereo render is about seventeen million numbers, and Python lists of that size cost hundreds of megabytes. <code>array('f')</code> (and NumPy arrays, if you have NumPy) are single blocks of memory, so SEANCE hands renders back in that form and takes them back the same way.
+</div>
+
+<h2>Shortcuts for common jobs</h2>
+
+<p>Two helper modules ship with SEANCE and are importable straight away:</p>
+
+<pre>import soundshop_tools as tools
+
+tools.add_scale(track, clip, "D", "Dorian", octave=4, ascending=True, descending=True)
+tools.add_chord_progression(track, clip, "C", [("I", 4), ("V", 4), ("vi", 4), ("IV", 4)])
+tools.add_arpeggio(track, clip, "C4 E4 G4", pattern="updown", repeats=4)
+tools.add_rhythm(track, clip, 36, "x..x..x.")   # kick pattern
+tools.print_project()                            # what's in this project?</pre>
+
+<p><code>soundshop_music</code> is the other one — it's about <em>writing notes down</em>: <code>Note</code> and <code>Notes</code> objects that carry a spelling (<code>"Bb3"</code>, <code>"F#4"</code>), a velocity, a length in beats. <code>tools.notes_to_timeline("Melody", "C4 E4 G4 C5")</code> parses a note string and drops it on a track by name.</p>
+
+<h2>Things to watch out for</h2>
+
+<ul>
+  <li><strong>Ctrl+Z does not undo a script.</strong> Script Console edits go straight into the project without creating an undo step. Save before you run something that restructures things.</li>
+  <li><strong>The console is optional.</strong> SEANCE can be built without Python; if yours was, <em>Tools → Script Console</em> tells you so rather than pretending.</li>
+  <li><strong>Your own modules work.</strong> Drop a <code>.py</code> file next to the bundled ones in SEANCE's <code>scripts/</code> folder and <code>import</code> it like any other.</li>
+</ul>
+
+<p>The complete list of functions, with exact arguments, return values and edge cases, is in the <strong>Script Console</strong> section of REFERENCE.md in the SEANCE project folder.</p>
+
+<footer>
+See also: <a href="midi-script.html">Algorithmic MIDI</a> for generating notes in real time from inside the graph, and <a href="piano-roll.html">Piano Roll</a> for the Key / Scale / Analyze / Change Key controls this API mirrors.
+</footer>
+</div>
+</body>
+</html>

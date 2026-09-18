@@ -1,0 +1,19 @@
+iridescence / thin-film interference,or diffraction. 
+
+need a writeup of the entire scene description language (including meshes, camera film, light sources and their spectral envelopes, fog, iridescence, fluorescence, mirrors/semi-mirrors/glossiness, transparency, translucence, material color/spectral envelopes, scene scale (relevant to diffraction if nothing else; or is that already handled by specifying everything in physical length units?))
+
+also a writeup of CLI options
+
+can we find spectral envelopes for any commmon materials? 
+
+provide ways of mapping skins to meshes? can we also get skins with spectral envelopes somehow defined for their various colors?
+
+
+
+
+
+
+
+
+
+

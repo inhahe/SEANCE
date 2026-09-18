@@ -548,3 +548,15 @@ For the full feature reference — exact button labels, dialog semantics, edge c
 For a deeper architectural overview — the data model, save/load lifecycle, undo strategy, and the rules for adding new features — see [`CLAUDE.md`](CLAUDE.md).
 
 For the WASM scripting layer specifically, see [`cpp/scripts/wasm_examples/README.md`](cpp/scripts/wasm_examples/README.md).
+
+
+## License
+
+The code in this repository is MIT licensed - see [LICENSE](LICENSE).
+
+**Distributing binaries is a separate question.** This project links JUCE,
+which is offered under either the GPL or a paid commercial licence. The MIT
+grant above covers *this* source code; it does not and cannot relicense JUCE.
+If you distribute a compiled build, that combined work must satisfy JUCE's
+terms - in practice either releasing the binary under the GPL, or holding a
+JUCE commercial licence. Building it yourself for your own use is unaffected.

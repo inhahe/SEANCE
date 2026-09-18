@@ -77,3 +77,22 @@ desktop.ini
 
 # Unrelated project sitting in this directory (has its own .git)
 cservice-znc-module/
+
+# Local-only. We publish straight from this directory now instead of copying an
+# allowlisted subset into D:\github (copy_to_seance.bat). These were also purged
+# from history: private notes, local build/launch scripts, saved projects and
+# the machine-specific plugin config.
+CLAUDE.md
+.orchestrator_history
+agent-todo.md
+build.bat
+cpp/build.bat
+release.bat
+seance.bat
+dumpdir.bat
+copy_to_seance.bat
+distribute.bat.old
+*.ssp
+soundshop_plugins.cfg
+todo.txt
+todo.disk-*.txt

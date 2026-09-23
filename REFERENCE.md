@@ -47,6 +47,7 @@ here.
 - [Ephemeral session (`--ephemeral`)](#ephemeral-session---ephemeral)
 - [Opening a project from the command line](#opening-a-project-from-the-command-line)
 - [Asynchronous plugin loading](#asynchronous-plugin-loading)
+- [Plugin Preset Recorder (companion tool)](#plugin-preset-recorder-companion-tool)
 - [Dialogs and the Windows taskbar](#dialogs-and-the-windows-taskbar)
 - [Version number and releases](#version-number-and-releases)
 
@@ -4469,6 +4470,34 @@ loading. To avoid silently dropping a not-yet-applied plugin's saved state,
 `writeProject` falls back to writing `node.pendingPluginState` when a plugin node
 has no live processor to query and no cached state — so an autosave mid-load
 preserves the plugin state read from the file.
+
+## Plugin Preset Recorder (companion tool)
+
+`PresetRecorder/` is a separate program (own CMake project, own exe) that records
+a short FLAC of every preset of every plugin SEANCE can see, and lets you browse
+and audition the recordings. Its user guide is
+[`PresetRecorder/README.md`](PresetRecorder/README.md); how it works is in
+[`PresetRecorder/design.md`](PresetRecorder/design.md). What it relies on from
+SEANCE:
+
+- **`soundshop_plugins.cfg`** — SEANCE's plugin settings, written by
+  *Settings → Plugin Settings* into SEANCE's working directory (the SoundShop2
+  folder when started by `seance.bat`, the exe's folder when the exe is
+  double-clicked). `[ScanDirs]` lists the plugin folders; `[Blocked]` is the
+  skip list (the blocklist): plugins whose scan failed are added automatically,
+  and the dialog's right-click *Block* adds more. The tool searches the same
+  folders SEANCE does (the listed ones plus each format's default locations) and
+  skips `[Blocked]` entries unless the user unskips them *in the tool*.
+- **`soundshop_plugins_cache.dat`** — read only to put names and companies on
+  blocked entries.
+- The tool **never writes** either file; its unskip choices live in its own
+  settings (`%APPDATA%\PresetRecorder`).
+- It compiles two SEANCE sources directly: `cpp/src/plugin_settings.cpp` (so the
+  `.cfg` format and SEANCE's default folders can't drift apart) and
+  `cpp/src/dialog_helpers.cpp` (taskbar-correct dialogs). Keep both free of
+  SEANCE-internal dependencies; if the `.cfg` format changes, rebuild the tool.
+- It hosts the same plugin formats as SEANCE (VST3 and LV2, AU on macOS; no
+  VST2), each plugin in its own worker process.
 
 ## Dialogs and the Windows taskbar
 

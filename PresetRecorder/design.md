@@ -1,0 +1,294 @@
+# PresetRecorder - design
+
+A companion tool to SEANCE (SoundShop2): it records a short FLAC preview of every
+preset of every plugin SoundShop2 can see, and lets you browse and audition the
+recordings. It is a separate program with its own CMake project; it shares two
+source files with SEANCE (see *Code shared with SEANCE*). User-facing
+documentation is in `README.md`.
+
+## Process model
+
+```
+PresetRecorder.exe (GUI)                        PresetRecorder.exe --worker job-N.json
+  Controller ── JobRunner ──CreateProcess──►      Worker.cpp: load ONE plugin, scan or record it
+     ▲              │                                  │
+     │              └──polls job-N.log ◄───────────────┘ appends JSON-lines events
+     └── Catalog, Manifest, Settings
+```
+
+The GUI never loads a plugin. Every scan and every recording runs in a worker
+process (the same exe with `--worker <job file>`), one plugin per worker, a few
+workers at a time (`At a time` setting). Plugins crash, hang, pop up
+activation dialogs and leak; isolating them means any of that costs one plugin,
+never the run. The pieces:
+
+- **WorkerProcess** (`WorkerProcess.h/.cpp`) - on Windows, `CreateProcessW` with no
+  inherited handles, `BELOW_NORMAL_PRIORITY_CLASS` (auditioning in the GUI stays
+  glitch-free while plugins render flat out), and a job object with
+  `KILL_ON_JOB_CLOSE | DIE_ON_UNHANDLED_EXCEPTION` (no orphaned workers if the GUI
+  dies; no Windows Error Reporting dialog parking a crashed worker). Falls back to
+  `juce::ChildProcess` elsewhere.
+- **Event log** (`EventLogWriter/Reader` in `Util.h`) - the worker appends one JSON
+  object per line through a raw `FILE_APPEND_DATA` handle shared for writing; the
+  GUI re-reads new complete lines every 100 ms. Because the log is on disk,
+  everything a worker said survives it crashing, and the crash handler
+  (`Worker.cpp`) can append a last `crash` event through the same handle without
+  touching the heap.
+- **JobRunner** (`JobRunner.h/.cpp`) - queue + N running workers + watchdog:
+  - no event for `Load timeout` (before `loaded`) or `Preset timeout` (after) →
+    the worker is killed ("timed out");
+  - a render worker that dies or is killed after a `begin` without its `done` →
+    that preset is reported lost (`crashed`/`timeout`) and the plugin is re-queued
+    at the *front* with `skipKeys` = every preset already finished + the lost one.
+    After `maxAttempts` (6) deaths the plugin is given up on;
+  - the elapsed-time arithmetic is signed and wrap-safe (`millisecondsSince`) -
+    an unsigned `now - lastActivity` with `now` read before pumping events once
+    killed every worker instantly.
+- **Controller** (`Controller.h/.cpp`) - everything on the message thread: owns
+  Settings, SeanceConfig, Catalog, Manifest and JobRunner; turns Scan / Record /
+  Stop into jobs; merges worker events into the manifest; broadcasts changes.
+  Slow preparation (decoding the song excerpt, indexing `.vstpreset` files) runs on
+  a detached thread and comes back via `callAsync`, guarded by a `WeakReference`
+  and a run-generation counter so a Stop in the meantime wins.
+
+## Inputs from SoundShop2
+
+`SeanceConfig` reads SEANCE's own files, never writes them:
+
+| File | Used for |
+|---|---|
+| `soundshop_plugins.cfg` `[ScanDirs]` | the plugin folders to search |
+| `soundshop_plugins.cfg` `[Blocked]` | SEANCE's skip list |
+| `soundshop_plugins_cache.dat` (JUCE XML part) | names/companies for skip-list entries |
+
+SEANCE opens these relative to its working directory, so their location depends
+on how SEANCE was started. `SeanceConfig::findCandidates()` looks in every
+ancestor of the tool's exe (the tool lives inside the SoundShop2 folder, where
+`seance.bat` starts SEANCE), in `cpp/build/SEANCE_artefacts/{Release,Debug}` of each
+(double-click launches), and in the current directory; the newest file wins. The
+user can pick a file explicitly (setting `seanceConfig`).
+
+The search path per format is exactly SEANCE's `PluginHost::scanForPlugins`
+merge: SEANCE's folders + `format->getDefaultLocationsToSearch()`. The formats are
+SEANCE's: VST3 + LV2 (+ AU on macOS). VST2 is off in both (needs the
+discontinued VST2 SDK).
+
+## Catalog and scanning
+
+`Catalog` (GUI side) holds one `PluginFile` per fileOrIdentifier - the unit
+SEANCE's skip list works in - with state `pending / scanning / scanned /
+scanFailed / skipped` and the `PluginDescription`s found inside. `enumerate()`
+lists files (VST3: directory walk; LV2: lilv TTL parsing - neither runs plugin
+code) plus every skip-list entry, and returns the files that need a scan.
+
+Scan results are cached in `%APPDATA%\PresetRecorder\plugin_cache.xml`, keyed by
+`identifierKey()` (normalised, lower-cased path on Windows) and the file's
+modification time (for a bundle: the newest of the bundle folder, its binary and
+its moduleinfo.json, since installers often replace the inner binary only).
+Failures are cached too, except timeouts (an unanswered activation dialog deserves
+another try). "Rescan all" clears the cache.
+
+`getRecordablePlugins()` returns scanned, non-skipped plugin types sorted by
+company/name and assigns each a unique **base name** `"<Company> - <Plugin>"`;
+clashes (the same plugin as VST3 and LV2, or two installs) get `" [FORMAT]"`, then
+`" (2)"`. Comparison is case-insensitive because Windows file names are.
+
+## Skip list
+
+A skip-list entry is skipped unless its key is in the tool's own `unskipped`
+setting. SEANCE's file is never changed. The Skip List tab shows the entries as a
+tristate checkbox tree (All → company → entry; tick = record anyway) with details
+from `Catalog::describeSkipEntry`, which names an entry **without loading it**, in
+this order: the tool's own scan of it, SEANCE's scan cache, the file itself
+(`PluginFileInfo`: VST3 `moduleinfo.json` vendor/classes, the Windows version
+resource via `GetFileVersionInfo`, a vendor-named parent folder), and finally
+another install of the same plugin by name (the 32-bit `Podolski.vst3` is named
+after the 64-bit `Podolski(x64).vst3`). `PluginFileInfo` also reads the PE header,
+because the usual reason for being on the list is a 32-bit binary a 64-bit host
+can't load.
+
+## Recording one plugin (worker)
+
+1. Build the input: instruments get a phrase (`PreviewInput`: held C3,
+   C4-E4-G4-C5 arpeggio, C-major chord; drum-like plugins - category/name contains
+   "drum", "percussion", "808"... - a two-bar GM groove on channel 10; or the
+   user's MIDI file, program changes stripped, capped at 60 s). Effects get the
+   song excerpt, prepared once per run by the GUI as a 32-bit float WAV at the
+   render rate. An "effect" with no audio input that takes MIDI is played the
+   phrase instead.
+2. `createPluginInstance` from the worker thread (JUCE creates it on the message
+   thread and waits). Everything that touches a plugin's controller -
+   bus setup, `prepareToPlay`, preset changes, `reset`, deletion - is marshalled
+   with `MessageManager::callSync`; only `processBlock` runs on the worker
+   thread, like a host's audio thread. `setNonRealtime(true)` (offline bounce).
+   Buses: stereo main out (and stereo main in for effects) if the plugin accepts
+   it, otherwise its own layout.
+3. Presets, in order (`enumeratePresets`):
+   - the plugin's program list (VST3 unit program list / program-change
+     parameter; LV2 presets) when it has more than one program - keys
+     `program:<i>`;
+   - `.vstpreset` files for this plugin's class ID (next section) - keys
+     `vstpreset:<path>`;
+   - if neither, one `default` recording of the plugin as loaded (named after its
+     single program if it has a meaningful name).
+   Names come from the plugin; some (u-he) only publish "Program 0"... names.
+4. Per preset (skipping `skipKeys`, and existing files when *Keep existing* is on):
+   apply on the message thread (`setCurrentProgram` / `VST3Client::setPreset`) +
+   `reset()`, wait `settleMs` wall-clock (async preset loaders), process
+   `preRollSeconds` of silence with all-notes/sound-off (a VST3 program change
+   reaches the processor with the next block), then render: the playhead reports
+   4/4 at `tempoBpm` and "playing"; after the input, keep going until 0.3 s below
+   `silenceThresholdDb` or `maxTailSeconds`. Then: drop the plugin's latency from
+   the front, trim trailing near-silence (never inside the input span), fade out
+   20 ms if the tail was cut, turn the whole take down if it peaked over 0 dBFS
+   (FLAC is fixed-point) and say so, replace NaN/inf with silence and say so, mark
+   "silent" below -90 dBFS. A take whose 16-bit fingerprint matches an earlier take
+   of the same worker attempt is noted "sounds identical to <preset>" (plugins
+   often fill unused program slots with one init patch - u-he's Zebrify does).
+   The reported `peakDb` is the plugin's own output peak, before any turn-down.
+5. Write FLAC via `<name>.flac.partial` → rename (the GUI deletes stale
+   `.partial` files at run start/stop), then emit `done`.
+6. After `end`, `std::_Exit` - no JUCE shutdown, no DLL unloading (some plugins
+   crash there, and everything is on disk).
+
+### `.vstpreset` files
+
+`Vst3PresetIndex` (built by the GUI once per run, handed to workers as JSON) maps
+the 32-hex-char class ID in each `.vstpreset` header to files, from the VST3 SDK's
+standard folders (`Documents\VST3 Presets`, `%PROGRAMDATA%\VST3 Presets`,
+`Common Files\VST3 Presets`; macOS/Linux equivalents) plus each VST3 bundle's
+`Contents/Resources`. A worker learns its plugin's class ID from the header of the
+plugin's own state saved via `VST3Client::getPreset()`, so the ID format matches by
+construction; `setPreset` checks the ID again when loading. Display names are the
+path below the plugin-named folder: `.../Plugin/Bass/Deep.vstpreset` → `Bass - Deep`.
+Plugin-proprietary preset formats (.h2p, .fxp, .nki, ...) can't be loaded from
+outside the plugin and are out of scope.
+
+## Output
+
+```
+<output folder>/
+  Instruments/<Company> - <Plugin> - <Preset>.flac
+  Effects/<Company> - <Plugin> - <Preset>.flac
+  Effect input (dry).flac        the exact excerpt every effect was fed
+  manifest.json
+```
+
+Name parts go through `sanitiseFileNamePart` (Windows-illegal characters,
+trailing dots/spaces, reserved device names, length caps: company 60, plugin 80,
+preset 100). Preset names are made unique within a plugin (`" (2)"`) before
+anything is skipped, so a preset's file name doesn't depend on which presets are
+recorded in a given attempt.
+
+`manifest.json` - written only by the GUI (`Manifest`), read by the Browse tab:
+
+```
+{ tool, version, saved, dryInput,
+  plugins: [ { id, name, company, format, version, category, path, kind,
+               baseName, status, error, lastRun,
+               presets: [ { key, name, source, file, status, note,
+                            seconds, peakDb, recordedAt } ] } ] }
+```
+
+Plugin `status`: `ok | partial | failed | recording | not recorded`. Preset
+`status`: `ok | silent | failed | crashed | timeout | pending | not recorded`.
+`id` is `PluginDescription::createIdentifierString()`. A `presets` event from a
+worker rebuilds the plugin's preset list in enumeration order, carrying earlier
+results over by key; presets beyond the per-plugin limit stay listed as `not
+recorded`.
+
+## Worker protocol
+
+Job file (JSON, written by `JobRunner::launch`):
+
+| field | scan | render |
+|---|---|---|
+| `type` | `"scan"` | `"render"` |
+| `eventLog`, `skipKeys` | added per attempt | added per attempt |
+| `format`, `fileOrId`, `resultFile` (XML of descriptions) | ✓ | |
+| `searchPath` (lets LV2 resolve URIs from extra folders) | ✓ | ✓ |
+| `plugin` (PluginDescription XML), `pluginId`, `baseName`, `outputRoot`, `subfolder`, `instrument`, `settings` (RenderSettings), `effectInput`, `midiFile`, `presetIndex` | | ✓ |
+
+Events: `hello`, `loading`, `loaded {inputs, outputs, latency, classId, input}`,
+`presets {list:[{key,name,source,file}], limit}`, `begin {key,index,count}`,
+`done {key,file,status,seconds,peakDb,note}`, `skip {key,file,reason}`,
+`fail {key,reason}`, `error {message}`, `scanned {count}`, `crash {what,code}`,
+`end {code}`. Exit codes: `WorkerExitCode` in `Worker.h`.
+
+## GUI
+
+`MainComponent` (tabs) over one `Controller` and one `Player`:
+
+- **Record** (`RecordTab`) - sources (SoundShop2 cfg, output folder, effect song +
+  excerpt, instrument phrase / MIDI file), render settings, Scan / Rescan all /
+  Record all / Record selected / Stop, progress (per worker), a sortable
+  multi-select table of every plugin file/type with live status, and the log.
+  Settings controls are disabled during a run and say so in their tooltips.
+- **Browse & Listen** (`BrowseTab`) - manifest-driven plugin list → preset list;
+  selecting a preset plays it (arrow keys audition), Space toggles, details show
+  the plugin's path on disk with Show in Explorer / Copy path, and "Dry input"
+  plays the unprocessed excerpt. Refreshes from a manifest signature on a timer
+  rather than on every controller message.
+- **Skip List** (`SkipListTab`) - the tristate tree described above.
+- **Player** - `AudioDeviceManager` + `AudioTransportSource` (resamples to the
+  device) + `AudioThumbnail`; device state persisted.
+
+Dialogs follow SEANCE's taskbar rule (no second taskbar button): message boxes
+via `SoundShop::showAlertAsync`, the audio-device dialog via
+`SoundShop::launchAudioDeviceSettings`, file choosers parented to the window.
+SEANCE's dialog lint (`cpp/cmake/check_dialog_patterns.cmake`) runs over this
+tool's sources on every build.
+
+## Settings and scratch files
+
+- `%APPDATA%\PresetRecorder\PresetRecorder.settings` - JUCE PropertiesFile (XML):
+  `seanceConfig`, `outputDir`, `inputSong`, `songStart`, `songLength`,
+  `useMidiFile`, `midiFile`, `render` (RenderSettings JSON), `parallelWorkers`,
+  `loadTimeout`, `presetTimeout`, `unskipped` (newline-separated keys), `volume`,
+  `audioDevice`, `tab`, `windowState`.
+- `%APPDATA%\PresetRecorder\plugin_cache.xml` - scan cache.
+- `%APPDATA%\PresetRecorder\PresetRecorder.log` - the log (rotated at 4 MB).
+- `%TEMP%\PresetRecorder\run-*` - per-session scratch: job files, event logs, scan
+  results, the float excerpt, the preset index. Folders over a day old are removed
+  at startup.
+
+## Code shared with SEANCE
+
+Compiled from `../cpp/src`, never copied (see `CMakeLists.txt`):
+
+- `plugin_settings.cpp/.h` (+ `plugin_host.h` for its include) - SEANCE's parser
+  for `soundshop_plugins.cfg` and its default scan folders, so the format and the
+  defaults can't drift.
+- `dialog_helpers.cpp/.h` - AppLookAndFeel and taskbar-correct dialogs.
+
+SEANCE headers are included as `"cpp/src/..."` from the SoundShop2 root rather than
+by putting `cpp/src` on the include path, so SEANCE's ~150 header names can't
+shadow this tool's. Both shared headers carry a note that PresetRecorder compiles
+them; keep them free of SEANCE-internal dependencies.
+
+## Testing the failure paths
+
+No installed plugin is guaranteed to crash or hang, so the worker has a fault
+injection hook: start the GUI with the environment variable
+`PRESETRECORDER_FAULT_TEST` set to `;`-separated `crash:<preset key>` /
+`hang:<preset key>` entries (e.g. `crash:program:1;hang:program:2`). Workers
+inherit it; on reaching that preset a worker dereferences null (exercising the
+crash handler → `crash` event → JobRunner restart) or sleeps forever (exercising
+the preset timeout). With a small *Preset timeout* and *Presets per plugin* = 3,
+every plugin should end `partial` with presets `ok`, `crashed`, `timeout`.
+
+Other checks worth repeating after changes: Stop mid-run (no worker processes
+left, no `.partial` files, rows "stopped"); Record again with *Keep existing
+recordings* (only missing presets recorded); an unskipped 32-bit skip-list entry
+(scan fails with the 32-bit message); an iLok plugin without a licence (load
+timeout, then the run continues).
+
+## Known limitations
+
+- Presets stored only in a plugin's own format (u-he .h2p, Serum .fxp, Kontakt
+  .nki, ...) aren't reachable from a host; such plugins get their program list
+  (u-he: 128 slots named "Program 0"...) or a single default recording.
+- iLok/PACE-protected plugins without a licence show an activation dialog in their
+  worker and time out (Load timeout), unless you choose "Try" in the dialog.
+- VST2 isn't supported (as in SEANCE).
+- Sample-based instruments whose content isn't installed record as `silent`.

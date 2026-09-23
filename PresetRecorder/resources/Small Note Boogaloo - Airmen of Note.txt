@@ -1,0 +1,36 @@
+Effect input song bundled with PresetRecorder
+=============================================
+
+File:        Small Note Boogaloo - Airmen of Note.mp3  (unmodified download)
+Title:       Small Note Boogaloo
+Composer:    Master Sgt. Ben Patterson (composition and arrangement)
+Performers:  The United States Air Force Band, Airmen of Note (jazz big band)
+Recording:   United States Air Force
+Length:      6:41, 44.1 kHz stereo MP3, 128 kb/s
+SHA-256:     7ed607e64d830a505dc366b65d5e92491d817e349487e9f383e08dd71a90bc41
+
+License:     PUBLIC DOMAIN. A work of the U.S. federal government (composed,
+             arranged, performed and recorded by U.S. Air Force personnel as
+             part of their official duties), so not subject to copyright in the
+             United States (17 U.S.C. 105). The Air Force Band publishes it on
+             its "Public Domain Music" page.
+
+Downloaded:  2026-09-23 from Wikimedia Commons
+  File page: https://commons.wikimedia.org/wiki/File:Small_Note_Boogaloo_-_Airmen_of_Note_-_United_States_Air_Force_Band.mp3
+  Direct:    https://upload.wikimedia.org/wikipedia/commons/b/b2/Small_Note_Boogaloo_-_Airmen_of_Note_-_United_States_Air_Force_Band.mp3
+  Original:  https://www.music.af.mil/Multimedia/Music/Public-Domain-Music/
+
+Why this song: a full big-band mix - drums, walking bass, piano and a horn
+section - so every kind of effect has something to act on: transients for
+compressors and gates, low end for EQs and saturators, sustained brass for
+reverbs, delays and modulation, a wide stereo image for imaging tools.
+
+Default excerpt used for effect recordings (changeable in the Record tab):
+  start 207.55 s, length 4.0 s - a dense full-ensemble passage (both the bass
+  and the cymbals/brass present, no quiet gaps), starting just before a strong
+  ensemble hit at 207.58 s and ending before the section change at ~212 s.
+  Tempo: ~130 BPM (measured), which is the default host tempo reported to
+  tempo-synced plugins.
+
+If this file is missing, PresetRecorder offers to download it again from the
+"Direct" URL above.

@@ -2,6 +2,10 @@
 #include <juce_gui_basics/juce_gui_basics.h>
 #include <functional>
 
+// Also compiled into PresetRecorder (../../PresetRecorder) for the same
+// taskbar-correct dialogs. Keep this file and dialog_helpers.cpp free of
+// SEANCE-internal dependencies (JUCE only).
+
 namespace juce { class AudioDeviceManager; }
 
 namespace SoundShop {

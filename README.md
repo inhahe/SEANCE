@@ -247,6 +247,8 @@ nothing collides, and suffixes name clashes ("Bass" → "Bass 2"). See
 
 Loaded plugins are scanned and indexed at startup (cached so subsequent launches are fast); plugin scan directories are configurable via Settings → Plugin Settings, and plugins that crash during scan are automatically blocklisted so the next scan skips them.
 
+**Hear what you have:** the [Plugin Preset Recorder](PresetRecorder/README.md) is a separate companion program (in `PresetRecorder/`) that records a few seconds of every preset of every plugin in those folders to FLAC - instruments play a short phrase, effects process the same public-domain song - into `Instruments` and `Effects` folders named *company - plugin - preset*, and lets you click through and audition them. It respects the blocklist (with a checkbox tree to unskip plugins for its own use) and never changes SEANCE's settings; each plugin runs in its own process, so a crashing plugin can't stop the run. See [REFERENCE.md → Plugin Preset Recorder](REFERENCE.md#plugin-preset-recorder-companion-tool).
+
 Opening a project that hosts plugins never freezes the UI: the nodes appear instantly and each plugin instantiates in the background, one at a time, with a per-node loading badge (spinner while loading, dim ring while queued, an error mark if it fails to load). Saving is briefly disabled until every plugin finishes loading.
 
 ### Built-in effects

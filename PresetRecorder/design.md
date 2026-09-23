@@ -40,7 +40,9 @@ never the run. The pieces:
   - a render worker that dies or is killed after a `begin` without its `done` →
     that preset is reported lost (`crashed`/`timeout`) and the plugin is re-queued
     at the *front* with `skipKeys` = every preset already finished + the lost one.
-    After `maxAttempts` (6) deaths the plugin is given up on;
+    The plugin is given up on after `maxFruitlessAttempts` (3) deaths in a row
+    that finished no preset - so a big bank with the odd crashing preset still
+    gets through - or `maxAttempts` (100) deaths in total as a backstop;
   - the elapsed-time arithmetic is signed and wrap-safe (`millisecondsSince`) -
     an unsigned `now - lastActivity` with `now` read before pumping events once
     killed every worker instantly.

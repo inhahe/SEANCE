@@ -18,7 +18,10 @@ namespace PresetRecorder {
 //   - A render worker that dies or is killed part-way through a plugin is
 //     restarted for the same plugin, skipping the preset it was on (and every
 //     preset already finished), so one bad preset costs one preset, not the
-//     rest of the plugin. After maxAttempts deaths the plugin is given up on.
+//     rest of the plugin. A plugin is only given up on after
+//     maxFruitlessAttempts deaths in a row that didn't finish a single preset
+//     (a big bank with the odd crashing preset still gets through), or after
+//     maxAttempts deaths in total as a backstop.
 class JobRunner : private juce::Timer
 {
 public:
@@ -33,6 +36,7 @@ public:
         juce::String fileOrId;       // scan jobs
         juce::StringArray skipKeys;  // presets not to attempt (finished or fatal in earlier attempts)
         int attempt = 0;
+        int fruitlessAttempts = 0;   // consecutive earlier attempts that died without finishing a preset
         int uid = 0;
     };
 
@@ -42,9 +46,10 @@ public:
         virtual void jobStarted(const Job&) {}
         virtual void jobEvent(const Job&, const juce::var& event) = 0;
         // A preset was in progress when its worker died ("crashed") or was
-        // killed for making no progress ("timeout").
+        // killed for making no progress ("timeout"). `willRetry`: the plugin is
+        // being restarted without that preset.
         virtual void jobPresetLost(const Job&, const juce::String& key, const juce::String& status,
-                                   const juce::String& reason) = 0;
+                                   const juce::String& reason, bool willRetry) = 0;
         // The job is over for good (including all retries). `timedOut`: the
         // last attempt was killed for making no progress (as opposed to crashing
         // or failing).
@@ -68,7 +73,8 @@ public:
     struct RunningInfo { juce::String label, status; int done = 0, total = 0; };
     std::vector<RunningInfo> getRunningInfo() const;
 
-    static constexpr int maxAttempts = 6;
+    static constexpr int maxFruitlessAttempts = 3;
+    static constexpr int maxAttempts = 100;
 
 private:
     struct Running

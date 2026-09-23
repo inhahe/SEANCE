@@ -113,6 +113,13 @@ void JobRunner::pump(Running& r)
                 r.total = juce::jmin((int) ev["limit"], list->size());
                 for (auto& p : *list)
                     r.presetNames[p["key"].toString()] = p["name"].toString();
+
+                // A retry silently skips what earlier attempts finished or
+                // lost; count those as done for the progress display.
+                r.done = 0;
+                for (int i = 0; i < r.total; ++i)
+                    if (r.job.skipKeys.contains(list->getReference(i)["key"].toString()))
+                        ++r.done;
             }
         }
         else if (type == "begin")
@@ -175,20 +182,29 @@ void JobRunner::finish(Running& r)
 
     if (r.job.type == Job::Type::render && r.currentKey.isNotEmpty())
     {
-        listener.jobPresetLost(r.job, r.currentKey, r.timedOut ? "timeout" : "crashed", reason);
+        const int fruitless = r.finishedKeys.isEmpty() ? r.job.fruitlessAttempts + 1 : 0;
+        const bool retry = fruitless < maxFruitlessAttempts && r.job.attempt + 1 < maxAttempts;
 
-        if (r.job.attempt + 1 < maxAttempts)
+        listener.jobPresetLost(r.job, r.currentKey, r.timedOut ? "timeout" : "crashed", reason, retry);
+
+        if (retry)
         {
-            Job retry = r.job;
-            ++retry.attempt;
-            retry.skipKeys.addArray(r.finishedKeys);
-            retry.skipKeys.addIfNotAlreadyThere(r.currentKey);
-            queue.push_front(std::move(retry)); // carry on with this plugin first
+            Job next = r.job;
+            ++next.attempt;
+            next.fruitlessAttempts = fruitless;
+            next.skipKeys.addArray(r.finishedKeys);
+            next.skipKeys.addIfNotAlreadyThere(r.currentKey);
+            queue.push_front(std::move(next)); // carry on with this plugin first
             return;
         }
 
-        listener.jobFinished(r.job, false, "gave up after " + juce::String(maxAttempts)
-                                           + " crashes/timeouts; the last: " + reason, r.timedOut);
+        listener.jobFinished(r.job, false,
+                             fruitless >= maxFruitlessAttempts
+                                 ? "gave up after " + juce::String(fruitless)
+                                       + " crashes/timeouts in a row without finishing a preset; the last: " + reason
+                                 : "gave up after " + juce::String(r.job.attempt + 1)
+                                       + " crashes/timeouts; the last: " + reason,
+                             r.timedOut);
         return;
     }
 

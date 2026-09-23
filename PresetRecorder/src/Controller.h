@@ -83,7 +83,7 @@ private:
     void jobStarted(const JobRunner::Job&) override;
     void jobEvent(const JobRunner::Job&, const juce::var& event) override;
     void jobPresetLost(const JobRunner::Job&, const juce::String& key, const juce::String& status,
-                       const juce::String& reason) override;
+                       const juce::String& reason, bool willRetry) override;
     void jobFinished(const JobRunner::Job&, bool ok, const juce::String& error, bool timedOut) override;
     void allJobsFinished() override;
     void timerCallback() override;

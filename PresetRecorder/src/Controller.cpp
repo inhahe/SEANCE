@@ -680,7 +680,7 @@ void Controller::jobEvent(const JobRunner::Job& job, const juce::var& ev)
 }
 
 void Controller::jobPresetLost(const JobRunner::Job& job, const juce::String& key,
-                               const juce::String& status, const juce::String& reason)
+                               const juce::String& status, const juce::String& reason, bool willRetry)
 {
     if (auto* result = manifest.find(job.pluginId))
     {
@@ -699,7 +699,7 @@ void Controller::jobPresetLost(const JobRunner::Job& job, const juce::String& ke
         manifest.markDirty();
 
         log("  " + job.label + ": preset \"" + p->name + "\" - " + reason
-            + (job.attempt + 1 < JobRunner::maxAttempts ? "; restarting the plugin without it." : "."));
+            + (willRetry ? "; restarting the plugin without it." : "."));
     }
 
     sendChangeMessage();

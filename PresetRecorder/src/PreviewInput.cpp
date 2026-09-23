@@ -133,6 +133,19 @@ bool loadMidiFilePhrase(const juce::File& file, PreviewPhrase& phrase, juce::Str
             merged.addEvent(juce::MidiMessage::noteOff(on.getChannel(), on.getNoteNumber()), end);
         }
 
+    // ...and the file may have had the sustain pedal down or the pitch bent at
+    // that point (the release got cut off, or the file just ends that way).
+    // Let go of both, so the take's tail can end and the next preset starts clean.
+    juce::SortedSet<int> channels;
+    for (int i = 0; i < merged.getNumEvents(); ++i)
+        channels.add(merged.getEventPointer(i)->message.getChannel());
+    for (int ch : channels)
+        if (ch >= 1 && ch <= 16)
+        {
+            merged.addEvent(juce::MidiMessage::controllerEvent(ch, 64, 0), end);
+            merged.addEvent(juce::MidiMessage::pitchWheel(ch, 8192), end);
+        }
+
     merged.updateMatchedPairs();
 
     bool hasNotes = false;

@@ -37,15 +37,20 @@ never the run. The pieces:
 - **JobRunner** (`JobRunner.h/.cpp`) - queue + N running workers + watchdog:
   - no event for `Load timeout` (before `loaded`) or `Preset timeout` (after) →
     the worker is killed ("timed out");
-  - a render worker that dies or is killed after a `begin` without its `done` →
-    that preset is reported lost (`crashed`/`timeout`) and the plugin is re-queued
-    at the *front* with `skipKeys` = every preset already finished + the lost one.
+  - a render worker that dies or is killed after loading its plugin is replaced:
+    the plugin is re-queued at the *front* with `skipKeys` = every preset already
+    finished, plus - if a `begin` had no `done` - the preset in progress, which is
+    reported lost (`crashed`/`timeout`). A death between presets loses nothing.
     The plugin is given up on after `maxFruitlessAttempts` (3) deaths in a row
     that finished no preset - so a big bank with the odd crashing preset still
     gets through - or `maxAttempts` (100) deaths in total as a backstop;
   - the elapsed-time arithmetic is signed and wrap-safe (`millisecondsSince`) -
     an unsigned `now - lastActivity` with `now` read before pumping events once
-    killed every worker instantly.
+    killed every worker instantly;
+  - a worker is killed once (`killRequested`); `TerminateProcess` is asynchronous,
+    so the runner waits at most 500 ms and then just re-checks on later ticks;
+  - failures reported as `transient` (killed for no progress, or the worker
+    couldn't be started) are never cached.
 - **Controller** (`Controller.h/.cpp`) - everything on the message thread: owns
   Settings, SeanceConfig, Catalog, Manifest and JobRunner; turns Scan / Record /
   Stop into jobs; merges worker events into the manifest; broadcasts changes.
@@ -87,13 +92,20 @@ Scan results are cached in `%APPDATA%\PresetRecorder\plugin_cache.xml`, keyed by
 `identifierKey()` (normalised, lower-cased path on Windows) and the file's
 modification time (for a bundle: the newest of the bundle folder, its binary and
 its moduleinfo.json, since installers often replace the inner binary only).
-Failures are cached too, except timeouts (an unanswered activation dialog deserves
-another try). "Rescan all" clears the cache.
+A clean scan that finds nothing loadable (a 32-bit plugin) is cached too; scans that
+crash, hang or can't run are not - a crash on unload or an unanswered activation
+dialog isn't a verdict on the plugin, so those files are simply scanned again next
+time. "Rescan all" clears the cache. The scan worker takes its own reference to the
+plugin binary (`LoadLibraryW`) before JUCE's `findAllTypesForFile`, because JUCE
+unloads the module (plugin exit function, DLL detach) before returning its results.
 
 `getRecordablePlugins()` returns scanned, non-skipped plugin types sorted by
 company/name and assigns each a unique **base name** `"<Company> - <Plugin>"`;
 clashes (the same plugin as VST3 and LV2, or two installs) get `" [FORMAT]"`, then
-`" (2)"`. Comparison is case-insensitive because Windows file names are.
+`" (2)"`. Comparison is case-insensitive because Windows file names are. A `" - "`
+inside a company or plugin name becomes `"-"`, so the first two `" - "` of any
+file name are the separators and two plugins' files can never share a name
+(`A - Verb` + preset `Plate - X` vs `A - Verb - Plate` + preset `X`).
 
 ## Skip list
 
@@ -122,9 +134,11 @@ can't load.
    thread and waits). Everything that touches a plugin's controller -
    bus setup, `prepareToPlay`, preset changes, `reset`, deletion - is marshalled
    with `MessageManager::callSync`; only `processBlock` runs on the worker
-   thread, like a host's audio thread. `setNonRealtime(true)` (offline bounce).
-   Buses: stereo main out (and stereo main in for effects) if the plugin accepts
-   it, otherwise its own layout.
+   thread, like a host's audio thread; an exception thrown by plugin code on the
+   message thread is carried back and rethrown on the worker thread.
+   `setNonRealtime(true)` (offline bounce). Buses: stereo main out (and stereo
+   main in for effects) if the plugin accepts it, otherwise its own layout. The
+   instance and its playhead are never deleted (see step 6).
 3. Presets, in order (`enumeratePresets`):
    - the plugin's program list (VST3 unit program list / program-change
      parameter; LV2 presets) when it has more than one program - keys
@@ -134,11 +148,15 @@ can't load.
    - if neither, one `default` recording of the plugin as loaded (named after its
      single program if it has a meaningful name).
    Names come from the plugin; some (u-he) only publish "Program 0"... names.
-4. Per preset (skipping `skipKeys`, and existing files when *Keep existing* is on):
-   apply on the message thread (`setCurrentProgram` / `VST3Client::setPreset`) +
-   `reset()`, wait `settleMs` wall-clock (async preset loaders), process
-   `preRollSeconds` of silence with all-notes/sound-off (a VST3 program change
-   reaches the processor with the next block), then render: the playhead reports
+4. Per preset (skipping `skipKeys`, and - with *Keep existing* - presets the job's
+   `recorded` map says are recorded and whose file still exists): apply on the
+   message thread (`setCurrentProgram` / `VST3Client::setPreset`) + `reset()`,
+   wait `settleMs` wall-clock (async preset loaders), process `preRollSeconds` of
+   silence starting with sustain-off, reset-all-controllers, centred pitch bend
+   and all-notes/sound-off (a VST3 program change reaches the processor with the
+   next block), then render, logging a `tick` every 2 s so a slow-but-progressing
+   take isn't mistaken for a hang. An exception anywhere in a preset becomes a
+   `fail` for that preset and the loop continues. The render: the playhead reports
    4/4 at `tempoBpm` and "playing"; after the input, keep going until 0.3 s below
    `silenceThresholdDb` or `maxTailSeconds`. Then: drop the plugin's latency from
    the front, trim trailing near-silence (never inside the input span), fade out
@@ -150,8 +168,10 @@ can't load.
    The reported `peakDb` is the plugin's own output peak, before any turn-down.
 5. Write FLAC via `<name>.flac.partial` → rename (the GUI deletes stale
    `.partial` files at run start/stop), then emit `done`.
-6. After `end`, `std::_Exit` - no JUCE shutdown, no DLL unloading (some plugins
-   crash there, and everything is on disk).
+6. After `end`, `TerminateProcess` - no JUCE shutdown and no DLL unload code
+   (`std::_Exit` would be `ExitProcess`, which still runs every DLL's
+   `DLL_PROCESS_DETACH`). The plugin is never deleted, so a plugin that crashes or
+   hangs on teardown can't turn finished work into a failure.
 
 ### `.vstpreset` files
 
@@ -177,10 +197,15 @@ outside the plugin and are out of scope.
 ```
 
 Name parts go through `sanitiseFileNamePart` (Windows-illegal characters,
-trailing dots/spaces, reserved device names, length caps: company 60, plugin 80,
-preset 100). Preset names are made unique within a plugin (`" (2)"`) before
-anything is skipped, so a preset's file name doesn't depend on which presets are
-recorded in a given attempt.
+trailing dots/spaces, reserved device names; company ≤ 40 and plugin ≤ 60
+characters, and the preset part shrinks so the whole name stays within ~150,
+under Windows' 260-character path limit with a typical folder). File names are
+**stable per preset key**: the GUI sends each render job a `recorded` map (key →
+file, from the manifest, existing files only); `assignFileNames` gives those
+presets their existing names and every other preset a name no recording of the
+plugin uses (`" (2)"`...). So a changed preset list - a new `.vstpreset`, a
+toggled source, a plugin update - can neither skip a preset because another one's
+file has its name nor overwrite another preset's recording.
 
 `manifest.json` - written only by the GUI (`Manifest`), read by the Browse tab:
 
@@ -209,13 +234,13 @@ Job file (JSON, written by `JobRunner::launch`):
 | `eventLog`, `skipKeys` | added per attempt | added per attempt |
 | `format`, `fileOrId`, `resultFile` (XML of descriptions) | ✓ | |
 | `searchPath` (lets LV2 resolve URIs from extra folders) | ✓ | ✓ |
-| `plugin` (PluginDescription XML), `pluginId`, `baseName`, `outputRoot`, `subfolder`, `instrument`, `settings` (RenderSettings), `effectInput`, `midiFile`, `presetIndex` | | ✓ |
+| `plugin` (PluginDescription XML), `pluginId`, `baseName`, `outputRoot`, `subfolder`, `instrument`, `settings` (RenderSettings), `effectInput`, `midiFile`, `presetIndex`, `recorded` (key → file) | | ✓ |
 
 Events: `hello`, `loading`, `loaded {inputs, outputs, latency, classId, input}`,
 `presets {list:[{key,name,source,file}], limit}`, `begin {key,index,count}`,
 `done {key,file,status,seconds,peakDb,note}`, `skip {key,file,reason}`,
-`fail {key,reason}`, `error {message}`, `scanned {count}`, `crash {what,code}`,
-`end {code}`. Exit codes: `WorkerExitCode` in `Worker.h`.
+`fail {key,reason}`, `tick` (heartbeat during a take), `error {message}`,
+`scanned {count}`, `crash {what,code}`, `end {code}`. Exit codes: `WorkerExitCode` in `Worker.h`.
 
 ## GUI
 
@@ -251,8 +276,13 @@ tool's sources on every build.
 - `%APPDATA%\PresetRecorder\plugin_cache.xml` - scan cache.
 - `%APPDATA%\PresetRecorder\PresetRecorder.log` - the log (rotated at 4 MB).
 - `%TEMP%\PresetRecorder\run-*` - per-session scratch: job files, event logs, scan
-  results, the float excerpt, the preset index. Folders over a day old are removed
-  at startup.
+  results, and per recording run (suffixed with the run's generation number, so
+  a stopped run's preparation thread can't overwrite a newer run's files) the
+  float excerpt, the dry excerpt and the preset index. Folders over a day old are
+  removed at startup.
+- A named `InterProcessLock` per output folder is held for the length of a
+  recording run, so two copies of the tool can't record into (or clean
+  `.partial` files out of) the same folder.
 
 ## Code shared with SEANCE
 

@@ -91,10 +91,10 @@ public:
 
     void setScanning(const juce::String& fileOrId);
     void applyScanResult(const juce::String& fileOrId, const juce::Array<juce::PluginDescription>& types);
-    // `remember`: cache the failure so the file isn't retried until it changes
-    // (or "Rescan all"). Crashes are remembered; timeouts aren't - they are
-    // often a dialog nobody answered, and deserve another go next time.
-    void applyScanFailure(const juce::String& fileOrId, const juce::String& reason, bool remember);
+    // A scan that crashed, hung or couldn't run. Not cached: the file is
+    // scanned again next time (a clean scan that finds nothing loadable - a
+    // 32-bit plugin - goes through applyScanResult and is cached).
+    void applyScanFailure(const juce::String& fileOrId, const juce::String& reason);
 
     // Every plugin that can be recorded, sorted by company then name, with
     // collision-free base names assigned.

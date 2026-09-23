@@ -107,8 +107,10 @@ void WorkerProcess::kill()
 {
     if (isRunning())
     {
+        // Asynchronous; a short wait covers the usual case without stalling the
+        // UI thread on a process stuck in a driver. Callers re-check isRunning().
         TerminateProcess((HANDLE) processHandle, 0x40010004u /* DBG_TERMINATE_PROCESS: "killed" */);
-        WaitForSingleObject((HANDLE) processHandle, 5000);
+        WaitForSingleObject((HANDLE) processHandle, 500);
     }
 }
 

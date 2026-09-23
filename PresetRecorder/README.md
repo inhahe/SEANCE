@@ -67,7 +67,7 @@ SoundShop2's plugin list exactly the way SoundShop2 does.
 | At a time | 2-4 | How many plugins are recorded in parallel (one process each). |
 | Load timeout | 90 s | A plugin that takes longer to load is stopped and marked failed. Plugins waiting on an activation/registration dialog end up here. |
 | Preset timeout | 60 s | A single preset taking longer is abandoned; the plugin carries on with its next preset. |
-| Keep existing recordings | on | Presets that already have a file are skipped, so an interrupted run just continues when started again. |
+| Keep existing recordings | on | Presets that were already recorded (and whose file is still there) are skipped, so an interrupted run just continues when started again. Each preset keeps its file name from run to run. |
 | Presets built into the plugin | on | The plugin's own preset list (VST3 program list, LV2 presets). |
 | .vstpreset files | on | `.vstpreset` files from the standard VST3 preset folders, matched to the plugin by its ID. |
 
@@ -166,6 +166,8 @@ Plugin Preset Recordings\
   **silent**; the Browse tab shows these greyed out.
 - Nothing is lost by stopping: with *Keep existing recordings* on, the next run
   resumes where the last one stopped.
+- Two copies of the tool can run at once, but not record into the same folder;
+  the second one says so in its log.
 
 ## Files it keeps
 

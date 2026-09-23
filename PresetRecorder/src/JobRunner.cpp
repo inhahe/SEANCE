@@ -68,7 +68,7 @@ void JobRunner::launch(Job job)
 
     if (! writeJsonFile(jobFile, spec))
     {
-        listener.jobFinished(job, false, "can't write the job file " + jobFile.getFullPathName(), false);
+        listener.jobFinished(job, false, "can't write the job file " + jobFile.getFullPathName(), true);
         return;
     }
 
@@ -81,7 +81,7 @@ void JobRunner::launch(Job job)
     juce::String error;
     if (! r->process.start(getExeFile(), { "--worker", jobFile.getFullPathName() }, error))
     {
-        listener.jobFinished(r->job, false, error, false);
+        listener.jobFinished(r->job, false, error, true);
         return;
     }
 
@@ -180,12 +180,18 @@ void JobRunner::finish(Running& r)
                + (r.crashWhat.isNotEmpty() ? r.crashWhat : describeExitCode(code.value_or(0xFFFFFFFFu)));
     }
 
-    if (r.job.type == Job::Type::render && r.currentKey.isNotEmpty())
+    // A render worker that got as far as loading its plugin carries on in a new
+    // worker without whatever it was doing: the preset in progress, if any, is
+    // reported lost and skipped; if it died between presets (or right after the
+    // last one), nothing is lost and the retry just skips what's finished.
+    if (r.job.type == Job::Type::render && r.loaded)
     {
+        const bool lostPreset = r.currentKey.isNotEmpty();
         const int fruitless = r.finishedKeys.isEmpty() ? r.job.fruitlessAttempts + 1 : 0;
         const bool retry = fruitless < maxFruitlessAttempts && r.job.attempt + 1 < maxAttempts;
 
-        listener.jobPresetLost(r.job, r.currentKey, r.timedOut ? "timeout" : "crashed", reason, retry);
+        if (lostPreset)
+            listener.jobPresetLost(r.job, r.currentKey, r.timedOut ? "timeout" : "crashed", reason, retry);
 
         if (retry)
         {
@@ -193,7 +199,8 @@ void JobRunner::finish(Running& r)
             ++next.attempt;
             next.fruitlessAttempts = fruitless;
             next.skipKeys.addArray(r.finishedKeys);
-            next.skipKeys.addIfNotAlreadyThere(r.currentKey);
+            if (lostPreset)
+                next.skipKeys.addIfNotAlreadyThere(r.currentKey);
             queue.push_front(std::move(next)); // carry on with this plugin first
             return;
         }
@@ -208,10 +215,7 @@ void JobRunner::finish(Running& r)
         return;
     }
 
-    if (r.job.type == Job::Type::render && r.loaded)
-        listener.jobFinished(r.job, false, reason + " (between presets)", r.timedOut);
-    else
-        listener.jobFinished(r.job, false, (r.job.type == Job::Type::render ? "while loading: " : "") + reason, r.timedOut);
+    listener.jobFinished(r.job, false, (r.job.type == Job::Type::render ? "while loading: " : "") + reason, r.timedOut);
 }
 
 // Milliseconds since `then`. Signed and wrap-safe: the counter is a uint32, and
@@ -229,13 +233,16 @@ void JobRunner::timerCallback()
         auto& r = *running[i];
         pump(r);
 
-        if (r.process.isRunning())
+        if (r.process.isRunning() && ! r.killRequested)
         {
             if (r.ended)
             {
                 // Workers exit straight after "end"; one that lingers is stuck in shutdown.
                 if (millisecondsSince(r.endSeenAt) > 10000)
+                {
+                    r.killRequested = true;
                     r.process.kill();
+                }
             }
             else
             {
@@ -243,15 +250,19 @@ void JobRunner::timerCallback()
                 if ((double) millisecondsSince(r.lastActivity) > limit * 1000.0)
                 {
                     r.timedOut = true;
+                    r.killRequested = true;
                     r.process.kill();
                 }
             }
+        }
 
-            if (r.process.isRunning())
-            {
-                ++i;
-                continue;
-            }
+        // Still alive (including one we've asked to die that hasn't yet): check
+        // again next tick. TerminateProcess is asynchronous, and waiting for it
+        // here would stall the UI.
+        if (r.process.isRunning())
+        {
+            ++i;
+            continue;
         }
 
         auto finished = std::move(running[i]);

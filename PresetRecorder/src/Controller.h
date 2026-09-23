@@ -84,15 +84,18 @@ private:
     void jobEvent(const JobRunner::Job&, const juce::var& event) override;
     void jobPresetLost(const JobRunner::Job&, const juce::String& key, const juce::String& status,
                        const juce::String& reason, bool willRetry) override;
-    void jobFinished(const JobRunner::Job&, bool ok, const juce::String& error, bool timedOut) override;
+    void jobFinished(const JobRunner::Job&, bool ok, const juce::String& error, bool transient) override;
     void allJobsFinished() override;
     void timerCallback() override;
 
     void startScan(bool forceRescan, std::function<void()> then);
     void finishScan();
     void startRecording(const juce::StringArray& pluginIds);
-    void queueRenderJobs(const std::vector<PluginEntry>& plugins, const juce::File& effectInput,
-                         const juce::String& effectInputError, const juce::File& presetIndex);
+    void queueRenderJobs(const std::vector<PluginEntry>& plugins, const RenderSettings& render,
+                         const juce::File& effectInput, const juce::String& effectInputError,
+                         const juce::File& presetIndex);
+    bool lockOutputFolder(const juce::File& dir);
+    void unlockOutputFolder();
     void mergePresetList(PluginResult& result, const juce::var& event, const juce::StringArray& keepKeys);
     void removePartialFiles();
     void applyTimeoutsAndParallelism();
@@ -116,6 +119,10 @@ private:
 
     juce::StringArray logLines;
     juce::File logFile;
+
+    // Held for the length of a recording run, so a second copy of the tool
+    // can't record into (and clean .partial files out of) the same folder.
+    std::unique_ptr<juce::InterProcessLock> outputLock;
 
     JUCE_DECLARE_WEAK_REFERENCEABLE(Controller)
 };

@@ -303,6 +303,25 @@ void Controller::recordPlugins(const juce::StringArray& pluginIds)
         startRecording(pluginIds);
 }
 
+bool Controller::lockOutputFolder(const juce::File& dir)
+{
+    const auto name = "PresetRecorder-output-"
+                    + juce::String::toHexString(dir.getFullPathName().toLowerCase().hashCode64());
+    auto lock = std::make_unique<juce::InterProcessLock>(name);
+    if (! lock->enter(0))
+        return false;
+
+    outputLock = std::move(lock);
+    return true;
+}
+
+void Controller::unlockOutputFolder()
+{
+    if (outputLock != nullptr)
+        outputLock->exit();
+    outputLock.reset();
+}
+
 void Controller::removePartialFiles()
 {
     for (auto* sub : { Manifest::instrumentsFolder, Manifest::effectsFolder })
@@ -337,6 +356,15 @@ void Controller::startRecording(const juce::StringArray& pluginIds)
     if (! outDir.createDirectory())
     {
         log("Can't create the output folder " + outDir.getFullPathName());
+        phase = Phase::idle;
+        sendChangeMessage();
+        return;
+    }
+
+    if (! lockOutputFolder(outDir))
+    {
+        log("Another copy of PresetRecorder is recording into " + outDir.getFullPathName()
+            + " - wait for it to finish, or choose another folder.");
         phase = Phase::idle;
         sendChangeMessage();
         return;
@@ -381,6 +409,13 @@ void Controller::startRecording(const juce::StringArray& pluginIds)
     const auto scratch = getSessionScratchDir();
     const auto dryFile = outDir.getChildFile(kDryInputName);
     const int generation = ++runGeneration;
+
+    // Per-run names: a preparation thread from a run that was stopped keeps
+    // going until it's done, and must not overwrite this run's files.
+    const auto tag = "-" + juce::String(generation);
+    const auto inputFile = scratch.getChildFile("effect_input" + tag + ".wav");
+    const auto dryScratch = scratch.getChildFile("dry_input" + tag + ".flac");
+    const auto indexFileName = "vst3_presets" + tag + ".json";
     juce::WeakReference<Controller> weak(this);
 
     log("Preparing: " + juce::String((int) chosen.size()) + " plugin(s) to record"
@@ -392,21 +427,17 @@ void Controller::startRecording(const juce::StringArray& pluginIds)
     std::thread([=]
     {
         juce::String inputError;
-        juce::File inputFile;
+        bool haveInput = false;
 
         if (needEffectInput)
         {
             juce::AudioBuffer<float> excerpt;
             if (prepareSongExcerpt(song, songStart, songLength, render.sampleRate, excerpt, inputError))
             {
-                inputFile = scratch.getChildFile("effect_input.wav");
-                if (! writeAudioFile(inputFile, excerpt, 2, render.sampleRate, 32, inputError))
-                    inputFile = juce::File();
-                else
-                {
-                    juce::String ignored;
-                    writeAudioFile(dryFile, excerpt, 2, render.sampleRate, render.bitDepth, ignored);
-                }
+                haveInput = writeAudioFile(inputFile, excerpt, 2, render.sampleRate, 32, inputError);
+                juce::String ignored;
+                if (haveInput)
+                    writeAudioFile(dryScratch, excerpt, 2, render.sampleRate, render.bitDepth, ignored);
             }
         }
 
@@ -416,7 +447,7 @@ void Controller::startRecording(const juce::StringArray& pluginIds)
         {
             const auto index = Vst3PresetIndex::build(presetRoots);
             numPresetFiles = index.numFiles;
-            indexFile = scratch.getChildFile("vst3_presets.json");
+            indexFile = scratch.getChildFile(indexFileName);
             if (! writeJsonFile(indexFile, index.toVar()))
                 indexFile = juce::File();
         }
@@ -432,20 +463,23 @@ void Controller::startRecording(const juce::StringArray& pluginIds)
             if (needEffectInput && inputError.isNotEmpty())
                 c->log("Effect input problem: " + inputError + " - effects will be skipped this run.");
 
-            c->queueRenderJobs(chosen, inputFile, inputError, indexFile);
+            // Only the current run puts its dry excerpt next to the recordings.
+            if (haveInput && dryScratch.existsAsFile())
+                dryScratch.copyFileTo(dryFile);
+
+            c->queueRenderJobs(chosen, render, haveInput ? inputFile : juce::File(), inputError, indexFile);
         });
     }).detach();
 }
 
-void Controller::queueRenderJobs(const std::vector<PluginEntry>& plugins, const juce::File& effectInput,
-                                 const juce::String& effectInputError, const juce::File& presetIndex)
+void Controller::queueRenderJobs(const std::vector<PluginEntry>& plugins, const RenderSettings& render,
+                                 const juce::File& effectInput, const juce::String& effectInputError,
+                                 const juce::File& presetIndex)
 {
     phase = Phase::recording;
 
     if (effectInput.existsAsFile())
         manifest.dryInputFile = kDryInputName;
-
-    const auto render = settings.getRenderSettings();
 
     juce::String midiFile;
     if (settings.getUseMidiFile())
@@ -486,6 +520,14 @@ void Controller::queueRenderJobs(const std::vector<PluginEntry>& plugins, const 
 
         result.status = "recording";
 
+        // What this plugin already has recorded: the worker keeps those file
+        // names, skips those presets when "Keep existing recordings" is on, and
+        // never gives another preset a name one of them uses.
+        auto* recorded = new juce::DynamicObject();
+        for (auto& q : result.presets)
+            if (q.hasAudio() && q.file.isNotEmpty() && manifest.getRoot().getChildFile(q.file).existsAsFile())
+                recorded->setProperty(q.key, q.file);
+
         auto xml = p.desc.createXml();
 
         JobRunner::Job job;
@@ -503,6 +545,7 @@ void Controller::queueRenderJobs(const std::vector<PluginEntry>& plugins, const 
                                 { "effectInput", effectInput.getFullPathName() },
                                 { "midiFile", midiFile },
                                 { "presetIndex", presetIndex.getFullPathName() },
+                                { "recorded", juce::var(recorded) },
                                 { "searchPath", searchPathFor(catalog, p.desc.pluginFormatName) } });
         runner.add(std::move(job));
         ++queued;
@@ -551,6 +594,7 @@ void Controller::stop()
 
     manifest.save();
     removePartialFiles();
+    unlockOutputFolder();
     phase = Phase::idle;
     log("Stopped.");
     sendChangeMessage();
@@ -705,7 +749,7 @@ void Controller::jobPresetLost(const JobRunner::Job& job, const juce::String& ke
     sendChangeMessage();
 }
 
-void Controller::jobFinished(const JobRunner::Job& job, bool ok, const juce::String& error, bool timedOut)
+void Controller::jobFinished(const JobRunner::Job& job, bool ok, const juce::String& error, bool transient)
 {
     if (job.type == JobRunner::Job::Type::scan)
     {
@@ -741,7 +785,11 @@ void Controller::jobFinished(const JobRunner::Job& job, bool ok, const juce::Str
         }
         else
         {
-            catalog.applyScanFailure(job.fileOrId, error.isNotEmpty() ? error : juce::String("scan failed"), ! timedOut);
+            // Not remembered: crashes and timeouts get another go on the next scan
+            // (a crash on unload or an unanswered dialog isn't a verdict on the
+            // plugin). Only a clean scan that finds nothing loadable is cached.
+            juce::ignoreUnused(transient);
+            catalog.applyScanFailure(job.fileOrId, error.isNotEmpty() ? error : juce::String("scan failed"));
             log("  " + job.label + ": scan failed - " + (error.isNotEmpty() ? error : juce::String("unknown reason")));
         }
 
@@ -807,6 +855,7 @@ void Controller::allJobsFinished()
     phase = Phase::idle;
     manifest.save();
     removePartialFiles();
+    unlockOutputFolder();
 
     const auto elapsed = (juce::Time::getCurrentTime() - runStarted).inSeconds();
     log("Finished: " + juce::String(runPluginsDone) + " plugin(s), " + juce::String(runPresetsRecorded)

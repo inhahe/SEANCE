@@ -54,6 +54,7 @@ private:
     void timerCallback() override;
 
     const PluginResult* selectedPlugin() const;
+    const PluginResult* pluginAtRow(int row) const;
     const PresetResult* selectedPreset() const;
     void pluginSelectionChanged();
     void updatePresetHeader();
@@ -91,6 +92,7 @@ private:
     juce::String playingPluginId, playingPresetKey;
     bool dryPlaying = false;
     juce::String lastManifestSignature;
+    juce::File shownRoot;   // the output folder `visible` was built from
 };
 
 } // namespace PresetRecorder

@@ -198,7 +198,8 @@ RecordTab::RecordTab(Controller& c, Player& p) : controller(c), player(p)
     headline.setFont(Theme::font(13.0f, true));
     workerInfo.setFont(Theme::font(12.0f));
     workerInfo.setColour(juce::Label::textColourId, Theme::dimText);
-    workerInfo.setJustificationType(juce::Justification::topLeft);
+    workerInfo.setJustificationType(juce::Justification::centredLeft);
+    workerInfo.setMinimumHorizontalScale(0.7f);
 
     auto& header = table.getHeader();
     header.addColumn("Company", colCompany, 140, 60, 400);
@@ -317,28 +318,37 @@ void RecordTab::resized()
     area.removeFromTop(6);
     settingsHeader.setBounds(area.removeFromTop(24));
 
-    auto pair = [&](juce::Rectangle<int>& row, juce::Label& label, juce::Component& comp, int labelWidth, int compWidth)
-    {
-        label.setBounds(row.removeFromLeft(labelWidth));
-        row.removeFromLeft(4);
-        comp.setBounds(row.removeFromLeft(compWidth).reduced(0, 1));
-        row.removeFromLeft(14);
+    // The render settings flow into as many rows as the window's width needs,
+    // each row's first label lined up with the form above.
+    struct Pair { juce::Label* label; juce::Component* comp; int labelWidth, compWidth; };
+    const Pair pairs[] = {
+        { &rateLabel, &rateBox, 90, 110 },          { &bitsLabel, &bitsBox, 70, 90 },
+        { &tempoLabel, &tempo, 50, 150 },           { &tailLabel, &tail, 64, 130 },
+        { &settleLabel, &settle, 76, 150 },         { &limitLabel, &limit, 120, 150 },
+        { &workersLabel, &workers, 70, 110 },       { &loadTimeoutLabel, &loadTimeout, 90, 130 },
+        { &presetTimeoutLabel, &presetTimeout, 100, 130 },
     };
 
     r = area.removeFromTop(rowH);
     area.removeFromTop(4);
-    pair(r, rateLabel, rateBox, labelW, 110);
-    pair(r, bitsLabel, bitsBox, 70, 90);
-    pair(r, tempoLabel, tempo, 50, 150);
-    pair(r, tailLabel, tail, 64, 130);
-    pair(r, settleLabel, settle, 76, 150);
+    bool rowStart = true;
 
-    r = area.removeFromTop(rowH);
-    area.removeFromTop(4);
-    pair(r, limitLabel, limit, labelW, 150);
-    pair(r, workersLabel, workers, 70, 110);
-    pair(r, loadTimeoutLabel, loadTimeout, 90, 130);
-    pair(r, presetTimeoutLabel, presetTimeout, 100, 130);
+    for (auto& p : pairs)
+    {
+        if (! rowStart && r.getWidth() < p.labelWidth + 4 + p.compWidth)
+        {
+            r = area.removeFromTop(rowH);
+            area.removeFromTop(4);
+            rowStart = true;
+        }
+
+        const int lw = rowStart ? labelW : p.labelWidth;
+        p.label->setBounds(r.removeFromLeft(lw));
+        r.removeFromLeft(4);
+        p.comp->setBounds(r.removeFromLeft(p.compWidth).reduced(0, 1));
+        r.removeFromLeft(14);
+        rowStart = false;
+    }
 
     r = area.removeFromTop(rowH);
     area.removeFromTop(8);
@@ -358,10 +368,11 @@ void RecordTab::resized()
     progressBar.setBounds(r.reduced(0, 3));
 
     headline.setBounds(area.removeFromTop(20));
-    workerInfo.setBounds(area.removeFromTop(34));
+    workerInfo.setBounds(area.removeFromTop(18));
     area.removeFromTop(4);
 
-    auto logArea = area.removeFromBottom(juce::jmax(110, area.getHeight() * 32 / 100));
+    // Table over log; on a short window the log gives way first.
+    auto logArea = area.removeFromBottom(juce::jlimit(60, 220, area.getHeight() / 3));
     area.removeFromBottom(8);
     table.setBounds(area);
     logView.setBounds(logArea);
@@ -640,7 +651,8 @@ void RecordTab::timerCallback()
     const auto progress = controller.getProgress();
     progressValue = controller.isBusy() ? progress.fraction : 0.0;
     headline.setText(progress.headline, juce::dontSendNotification);
-    workerInfo.setText(progress.workers.joinIntoString("\n"), juce::dontSendNotification);
+    workerInfo.setText(progress.workers.joinIntoString("     |     "), juce::dontSendNotification);
+    workerInfo.setTooltip(progress.workers.joinIntoString("\n"));
 
     if (rowsDirty)
     {

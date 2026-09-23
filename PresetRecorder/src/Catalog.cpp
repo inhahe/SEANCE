@@ -196,7 +196,7 @@ void Catalog::applyScanResult(const juce::String& fileOrId, const juce::Array<ju
     cache[f->key] = e;
 }
 
-void Catalog::applyScanFailure(const juce::String& fileOrId, const juce::String& reason, bool remember)
+void Catalog::applyScanFailure(const juce::String& fileOrId, const juce::String& reason)
 {
     auto* f = findFile(fileOrId);
     if (f == nullptr)
@@ -205,19 +205,7 @@ void Catalog::applyScanFailure(const juce::String& fileOrId, const juce::String&
     f->types.clear();
     f->state = PluginFile::State::scanFailed;
     f->error = reason;
-
-    if (! remember)
-    {
-        cache.erase(f->key);
-        return;
-    }
-
-    CacheEntry e;
-    e.format = f->format;
-    e.fileOrId = f->fileOrId;
-    e.modTime = modTimeOf(f->fileOrId);
-    e.failure = reason;
-    cache[f->key] = e;
+    cache.erase(f->key);
 }
 
 std::vector<PluginEntry> Catalog::getRecordablePlugins() const
@@ -258,9 +246,15 @@ std::vector<PluginEntry> Catalog::getRecordablePlugins() const
     auto plainName = [](const PluginEntry& e)
     {
         // Short enough to leave room for the preset name under Windows' 260-
-        // character path limit (see assignFileNames in Worker.cpp).
-        return sanitiseFileNamePart(e.desc.manufacturerName, 40, "Unknown") + " - "
-             + sanitiseFileNamePart(e.desc.name, 60, "Plugin");
+        // character path limit (see assignFileNames in Worker.cpp). A " - "
+        // inside the company or plugin name becomes "-": the first two " - " in
+        // a file name must be the separators, or "A - Verb" + preset "Plate - X"
+        // and "A - Verb - Plate" + preset "X" would both be "A - Verb - Plate - X".
+        auto part = [](const juce::String& text, int maxChars, const char* fallback)
+        {
+            return sanitiseFileNamePart(text, maxChars, fallback).replace(" - ", "-");
+        };
+        return part(e.desc.manufacturerName, 40, "Unknown") + " - " + part(e.desc.name, 60, "Plugin");
     };
 
     for (auto& e : out)

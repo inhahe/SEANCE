@@ -50,10 +50,11 @@ public:
         // being restarted without that preset.
         virtual void jobPresetLost(const Job&, const juce::String& key, const juce::String& status,
                                    const juce::String& reason, bool willRetry) = 0;
-        // The job is over for good (including all retries). `timedOut`: the
-        // last attempt was killed for making no progress (as opposed to crashing
-        // or failing).
-        virtual void jobFinished(const Job&, bool ok, const juce::String& error, bool timedOut) = 0;
+        // The job is over for good (including all retries). `transient`: the
+        // failure may well not happen next time - the worker was killed for
+        // making no progress (an unanswered dialog), or couldn't be started -
+        // so it shouldn't be remembered (e.g. in the scan cache).
+        virtual void jobFinished(const Job&, bool ok, const juce::String& error, bool transient) = 0;
         virtual void allJobsFinished() = 0;
     };
 
@@ -87,6 +88,7 @@ private:
         bool loaded = false;
         bool ended = false;
         bool timedOut = false;
+        bool killRequested = false;
         int endCode = -1;
         juce::String currentKey, currentName;
         juce::StringArray finishedKeys;

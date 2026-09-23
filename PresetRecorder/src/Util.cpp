@@ -90,7 +90,9 @@ juce::String sanitiseFileNamePart(const juce::String& text, int maxChars, const 
     }
 
     // Collapse whitespace, then trim what Windows refuses at the end of a name.
-    auto collapsed = juce::StringArray::fromTokens(cleaned, " \t", "").joinIntoString(" ");
+    auto tokens = juce::StringArray::fromTokens(cleaned, " \t", "");
+    tokens.removeEmptyStrings();
+    auto collapsed = tokens.joinIntoString(" ");
     auto trimEnd = [](juce::String s)
     {
         s = s.trim();

@@ -260,9 +260,14 @@ void BrowseTab::changeListenerCallback(juce::ChangeBroadcaster* source)
     {
         updateTransportButtons();
         presetListBox.repaint();
+        return;
     }
-    // Controller changes are picked up by the timer, so a busy recording run
-    // doesn't rebuild the lists dozens of times a second.
+
+    // Most controller changes are picked up by the timer, so a busy recording
+    // run doesn't rebuild the lists dozens of times a second - but a different
+    // output folder means a different manifest, and the list must follow at once.
+    if (controller.getManifest().getRoot() != shownRoot)
+        refresh();
 }
 
 void BrowseTab::timerCallback()
@@ -284,8 +289,21 @@ void BrowseTab::timerCallback()
     }
 }
 
+// The manifest entry a plugin-list row shows, or nullptr if the row (or the
+// index it holds) is out of date.
+const PluginResult* BrowseTab::pluginAtRow(int row) const
+{
+    const auto& plugins = controller.getManifest().getPlugins();
+    if (! juce::isPositiveAndBelow(row, (int) visible.size()))
+        return nullptr;
+
+    const auto index = (size_t) visible[(size_t) row];
+    return index < plugins.size() ? &plugins[index] : nullptr;
+}
+
 void BrowseTab::refresh()
 {
+    shownRoot = controller.getManifest().getRoot();
     folderLabel.setText("Recordings in: " + controller.getOutputDir().getFullPathName(), juce::dontSendNotification);
 
     const auto search = matchText(searchBox);
@@ -374,10 +392,8 @@ const PresetResult* BrowseTab::selectedPreset() const
 
 void BrowseTab::pluginSelectionChanged()
 {
-    const int row = pluginListBox.getSelectedRow();
-    auto& plugins = controller.getManifest().getPlugins();
-    const auto newId = juce::isPositiveAndBelow(row, (int) visible.size())
-                     ? plugins[(size_t) visible[(size_t) row]].id : juce::String();
+    auto* rowPlugin = pluginAtRow(pluginListBox.getSelectedRow());
+    const auto newId = rowPlugin != nullptr ? rowPlugin->id : juce::String();
 
     if (newId != selectedPluginId)
     {
@@ -544,10 +560,11 @@ int BrowseTab::PluginList::getNumRows()
 
 void BrowseTab::PluginList::paintListBoxItem(int row, juce::Graphics& g, int w, int h, bool selected)
 {
-    if (! juce::isPositiveAndBelow(row, (int) owner.visible.size()))
+    auto* entry = owner.pluginAtRow(row);
+    if (entry == nullptr)
         return;
 
-    const auto& p = owner.controller.getManifest().getPlugins()[(size_t) owner.visible[(size_t) row]];
+    const auto& p = *entry;
     g.fillAll(selected ? Theme::rowSelected : (row % 2 != 0 ? Theme::rowAlt : Theme::panel));
 
     const int n = p.countWithAudio();
@@ -572,10 +589,8 @@ void BrowseTab::PluginList::selectedRowsChanged(int)
 
 juce::String BrowseTab::PluginList::getTooltipForRow(int row)
 {
-    if (! juce::isPositiveAndBelow(row, (int) owner.visible.size()))
-        return {};
-    const auto& p = owner.controller.getManifest().getPlugins()[(size_t) owner.visible[(size_t) row]];
-    return p.path;
+    auto* entry = owner.pluginAtRow(row);
+    return entry != nullptr ? entry->path : juce::String();
 }
 
 int BrowseTab::PresetList::getNumRows()

@@ -3,12 +3,14 @@
 #include "Settings.h"
 #include "PresetSources.h"
 #include "PreviewInput.h"
+#include "PluginFileInfo.h"
 #include <juce_audio_processors/juce_audio_processors.h>
 #include <juce_events/juce_events.h>
 #include <atomic>
 #include <csignal>
 #include <cstdlib>
 #include <exception>
+#include <set>
 #include <thread>
 
 #if JUCE_WINDOWS
@@ -71,16 +73,28 @@ static LONG WINAPI unhandledExceptionFilter(EXCEPTION_POINTERS* info)
 }
 #endif
 
+// Ends the worker without running any unload code. std::_Exit is ExitProcess
+// in a desktop app, which still calls every loaded DLL's DLL_PROCESS_DETACH -
+// plugin code - whereas TerminateProcess runs none. Everything worth keeping
+// is on disk and in the event log by the time this is called.
+[[noreturn]] static void terminateWorker(int code)
+{
+   #if JUCE_WINDOWS
+    TerminateProcess(GetCurrentProcess(), (UINT) code);
+   #endif
+    std::_Exit(code);
+}
+
 static void onAbortSignal(int)
 {
     writeCrashEvent("abort() called", 3);
-    std::_Exit(3);
+    terminateWorker(3);
 }
 
 static void onTerminate()
 {
     writeCrashEvent("std::terminate (an exception escaped)", 0xE06D7363ul);
-    std::_Exit((int) 0xE06D7363ul);
+    terminateWorker((int) 0xE06D7363ul);
 }
 
 static void installCrashHandlers()
@@ -118,9 +132,21 @@ static void injectFaultIfRequested(const juce::String& presetKey)
 //==============================================================================
 // Helpers
 
-static bool onMessageThread(std::function<void()> fn)
+// Runs `fn` on the message thread and waits. An exception thrown there (by
+// plugin code) is carried back and rethrown on the calling thread, where the
+// per-preset handler can deal with it - left on the message thread it would
+// never complete the call and the worker would hang until the watchdog.
+static void onMessageThread(std::function<void()> fn)
 {
-    return juce::MessageManager::callSync(std::move(fn));
+    std::exception_ptr error;
+    juce::MessageManager::callSync([&fn, &error]
+    {
+        try { fn(); }
+        catch (...) { error = std::current_exception(); }
+    });
+
+    if (error != nullptr)
+        std::rethrow_exception(error);
 }
 
 static juce::AudioPluginFormat* findFormat(juce::AudioPluginFormatManager& fm, const juce::String& name)
@@ -301,24 +327,39 @@ static std::vector<Preset> enumeratePresets(juce::AudioPluginInstance& instance,
     return presets;
 }
 
-static void assignFileNames(std::vector<Preset>& presets, const juce::String& baseName)
+// `recorded`: preset key -> file name of the recordings this plugin already has
+// (from the manifest). A preset that has one keeps its file name; every other
+// preset gets a name that no recording of this plugin uses, so a change in the
+// preset list (a new .vstpreset, a toggled source, a plugin update) can never
+// make one preset's recording be taken for - or overwritten by - another's.
+static void assignFileNames(std::vector<Preset>& presets, const juce::String& baseName,
+                            const std::map<juce::String, juce::String>& recorded)
 {
-    std::map<juce::String, int> taken;
+    std::set<juce::String> taken;
+    for (auto& [key, file] : recorded)
+        taken.insert(file.toLowerCase());
+
+    for (auto& p : presets)
+        if (auto it = recorded.find(p.key); it != recorded.end())
+            p.fileName = it->second;
 
     for (auto& p : presets)
     {
+        if (p.fileName.isNotEmpty())
+            continue;
+
         // Keep the whole name within ~150 characters: with a typical output
         // folder that stays under Windows' 260-character path limit (JUCE
         // doesn't use long-path syntax). Long preset names give way first.
         const int presetRoom = juce::jlimit(24, 100, 150 - baseName.length() - 3);
         const auto stem = baseName + " - " + sanitiseFileNamePart(p.name, presetRoom, "Preset");
-        auto name = stem;
+        auto name = stem + ".flac";
 
         for (int n = 2; taken.count(name.toLowerCase()) > 0; ++n)
-            name = stem + " (" + juce::String(n) + ")";
+            name = stem + " (" + juce::String(n) + ").flac";
 
-        taken[name.toLowerCase()] = 1;
-        p.fileName = name + ".flac";
+        taken.insert(name.toLowerCase());
+        p.fileName = name;
     }
 }
 
@@ -376,10 +417,17 @@ static juce::uint64 fingerprint(const juce::AudioBuffer<float>& audio)
     return h;
 }
 
-static void allNotesOff(juce::MidiBuffer& midi)
+// Sent at the start of every preset's pre-roll: silence anything the previous
+// preset left sounding and put the controllers back where a fresh plugin has
+// them - a MIDI file can leave the sustain pedal down or the pitch bent, and
+// All Notes Off alone doesn't lift the pedal.
+static void resetMidiState(juce::MidiBuffer& midi)
 {
     for (int ch = 1; ch <= 16; ++ch)
     {
+        midi.addEvent(juce::MidiMessage::controllerEvent(ch, 64, 0), 0);   // sustain off
+        midi.addEvent(juce::MidiMessage::controllerEvent(ch, 121, 0), 0);  // reset all controllers
+        midi.addEvent(juce::MidiMessage::pitchWheel(ch, 8192), 0);         // centre pitch bend
         midi.addEvent(juce::MidiMessage::allNotesOff(ch), 0);
         midi.addEvent(juce::MidiMessage::allSoundOff(ch), 0);
     }
@@ -387,7 +435,7 @@ static void allNotesOff(juce::MidiBuffer& midi)
 
 static bool renderPreset(juce::AudioPluginInstance& plugin, const RenderInput& input,
                          const RenderSettings& s, RenderPlayHead& playHead,
-                         RenderOutput& result, juce::String& error)
+                         RenderOutput& result, juce::String& error, EventLogWriter& log)
 {
     juce::ScopedNoDenormals noDenormals;
 
@@ -418,7 +466,7 @@ static bool renderPreset(juce::AudioPluginInstance& plugin, const RenderInput& i
         block.clear();
         midi.clear();
         if (pos == 0)
-            allNotesOff(midi);
+            resetMidiState(midi);
         plugin.processBlock(block, midi);
     }
 
@@ -436,9 +484,18 @@ static bool renderPreset(juce::AudioPluginInstance& plugin, const RenderInput& i
     juce::int64 quietRun = 0;
     size_t nextMidi = 0;
     bool reachedSilence = false;
+    auto lastHeartbeat = juce::Time::getMillisecondCounter();
 
     while (pos < hardEnd)
     {
+        // A long take on a heavy plugin can outlast the preset timeout while
+        // making perfectly good progress; say so every couple of seconds.
+        if (juce::Time::getMillisecondCounter() - lastHeartbeat > 2000)
+        {
+            log.event("tick");
+            lastHeartbeat = juce::Time::getMillisecondCounter();
+        }
+
         block.clear();
         midi.clear();
 
@@ -578,8 +635,31 @@ static int runScanJob(const juce::var& job, EventLogWriter& log)
 
     loadExtraLv2Folders(*format, job["searchPath"].toString());
 
+    // Without module info, JUCE loads the plugin module, reads it and unloads it
+    // again (the plugin's exit function and DLL unload code) before handing back
+    // the results, so a plugin that misbehaves on unload would lose a perfectly
+    // good scan. An extra reference of our own keeps the DLL from actually
+    // unloading, and the worker then ends with TerminateProcess, which runs no
+    // unload code at all. A bundle WITH Contents/Resources/moduleinfo.json is
+    // described from that file without running any plugin code - pinning it
+    // would load it for nothing (and copy-protected plugins then put up their
+    // activation dialog in the middle of a scan).
+   #if JUCE_WINDOWS
+    juce::File binary;
+    if (format->getName() == "VST3"
+        && ! juce::File(fileOrId).getChildFile("Contents/Resources/moduleinfo.json").existsAsFile())
+        binary = PluginFileInfo::inspect(fileOrId).binary;
+   #endif
+
     juce::OwnedArray<juce::PluginDescription> found;
-    onMessageThread([&] { format->findAllTypesForFile(found, fileOrId); });
+    onMessageThread([&]
+    {
+       #if JUCE_WINDOWS
+        if (binary.existsAsFile())
+            LoadLibraryW(binary.getFullPathName().toWideCharPointer()); // never freed, on purpose
+       #endif
+        format->findAllTypesForFile(found, fileOrId);
+    });
 
     juce::XmlElement root("SCAN_RESULT");
     for (auto* d : found)
@@ -655,6 +735,13 @@ static int runRenderJob(const juce::var& job, EventLogWriter& log)
             return workerBadJob;
         }
 
+        if (std::abs(rate - settings.sampleRate) > 0.5)
+        {
+            log.event("error", { { "message", "the effect input is at " + juce::String(rate) + " Hz but the recording is at "
+                                              + juce::String(settings.sampleRate) + " Hz" } });
+            return workerBadJob;
+        }
+
         if (excerpt.getNumChannels() < 2)
         {
             excerpt.setSize(2, excerpt.getNumSamples(), true);
@@ -672,21 +759,27 @@ static int runRenderJob(const juce::var& job, EventLogWriter& log)
     log.event("loading", { { "name", desc.name } });
 
     juce::String loadError;
-    auto instance = fm.createPluginInstance(desc, settings.sampleRate, settings.blockSize, loadError);
+    auto created = fm.createPluginInstance(desc, settings.sampleRate, settings.blockSize, loadError);
 
-    if (instance == nullptr)
+    if (created == nullptr)
     {
         log.event("error", { { "message", "the plugin could not be loaded"
                                           + (loadError.isNotEmpty() ? ": " + loadError : juce::String()) } });
         return workerLoadFailed;
     }
 
-    RenderPlayHead playHead(settings.tempoBpm, settings.sampleRate);
+    // The plugin, and the transport it reads, are deliberately never deleted:
+    // the process ends straight after the job (startWorker), and tearing a
+    // plugin down - on the message thread, or worse during an exception unwind
+    // on this one - is the last thing that could crash once the recordings are
+    // safely on disk.
+    auto* instance = created.release();
+    auto* playHead = new RenderPlayHead(settings.tempoBpm, settings.sampleRate);
 
     onMessageThread([&]
     {
         configureBuses(*instance, instrument);
-        instance->setPlayHead(&playHead);
+        instance->setPlayHead(playHead);
         instance->setNonRealtime(true);
         instance->prepareToPlay(settings.sampleRate, settings.blockSize);
     });
@@ -694,7 +787,6 @@ static int runRenderJob(const juce::var& job, EventLogWriter& log)
     if (instance->getMainBusNumOutputChannels() <= 0)
     {
         log.event("error", { { "message", "the plugin has no audio output, so there is nothing to record" } });
-        onMessageThread([&] { instance->releaseResources(); instance.reset(); });
         return workerNoOutput;
     }
 
@@ -723,6 +815,12 @@ static int runRenderJob(const juce::var& job, EventLogWriter& log)
     }
 
     // ---- Presets -------------------------------------------------------------------
+    // The recordings this plugin already has, per the manifest: key -> file name.
+    std::map<juce::String, juce::String> recorded;
+    if (auto* obj = job["recorded"].getDynamicObject())
+        for (auto& prop : obj->getProperties())
+            recorded[prop.name.toString()] = prop.value.toString().fromLastOccurrenceOf("/", false, false);
+
     std::vector<Preset> presets;
     juce::String classId;
     onMessageThread([&]
@@ -730,7 +828,7 @@ static int runRenderJob(const juce::var& job, EventLogWriter& log)
         presets = enumeratePresets(*instance, desc, settings,
                                    juce::File(job["presetIndex"].toString()), classId);
     });
-    assignFileNames(presets, baseName);
+    assignFileNames(presets, baseName, recorded);
 
     const int limit = settings.maxPresetsPerPlugin > 0 ? settings.maxPresetsPerPlugin : (int) presets.size();
 
@@ -762,7 +860,9 @@ static int runRenderJob(const juce::var& job, EventLogWriter& log)
         if (skipKeys.contains(p.key))
             continue;
 
-        if (settings.skipExisting && target.existsAsFile() && target.getSize() > 0)
+        // "Keep existing recordings" goes by the preset, not the file name: only
+        // a preset the manifest says was recorded, and whose file is still there.
+        if (settings.skipExisting && recorded.count(p.key) > 0 && target.existsAsFile())
         {
             log.event("skip", { { "key", p.key }, { "file", relative }, { "reason", "already recorded" } });
             continue;
@@ -771,78 +871,83 @@ static int runRenderJob(const juce::var& job, EventLogWriter& log)
         log.event("begin", { { "key", p.key }, { "index", i }, { "count", juce::jmin(limit, (int) presets.size()) } });
         injectFaultIfRequested(p.key);
 
-        // Apply the preset on the message thread (VST3 controllers expect it there).
-        bool applied = true;
-        onMessageThread([&]
+        // One misbehaving preset - an exception from the plugin, a failed write -
+        // costs that preset only. (Crashes and hangs are the GUI's job: it
+        // restarts the plugin without the preset.)
+        try
         {
-            switch (p.kind)
+            // Apply the preset on the message thread (VST3 controllers expect it there).
+            bool applied = true;
+            onMessageThread([&]
             {
-                case Preset::Kind::program: instance->setCurrentProgram(p.program); break;
-                case Preset::Kind::file:    applied = loadVst3PresetFile(*instance, p.file); break;
-                case Preset::Kind::current: break;
+                switch (p.kind)
+                {
+                    case Preset::Kind::program: instance->setCurrentProgram(p.program); break;
+                    case Preset::Kind::file:    applied = loadVst3PresetFile(*instance, p.file); break;
+                    case Preset::Kind::current: break;
+                }
+                instance->reset();
+            });
+
+            if (! applied)
+            {
+                log.event("fail", { { "key", p.key }, { "reason", "the plugin refused this preset file" } });
+                continue;
             }
-            instance->reset();
-        });
 
-        if (! applied)
-        {
-            log.event("fail", { { "key", p.key }, { "reason", "the plugin refused this preset file" } });
-            continue;
-        }
+            // Some plugins apply presets asynchronously (on their own threads or on
+            // the message thread). Give them a moment; this thread just waits.
+            if (settings.settleMs > 0)
+                juce::Thread::sleep((int) settings.settleMs);
 
-        // Some plugins apply presets asynchronously (on their own threads or on
-        // the message thread). Give them a moment; this thread just waits.
-        if (settings.settleMs > 0)
-            juce::Thread::sleep((int) settings.settleMs);
+            RenderOutput out;
+            juce::String error;
+            if (! renderPreset(*instance, input, settings, *playHead, out, error, log))
+            {
+                log.event("fail", { { "key", p.key }, { "reason", error } });
+                continue;
+            }
 
-        RenderOutput out;
-        juce::String error;
-        if (! renderPreset(*instance, input, settings, playHead, out, error))
-        {
-            log.event("fail", { { "key", p.key }, { "reason", error } });
-            continue;
-        }
+            if (! writeAudioFile(target, out.audio, out.numChannels, settings.sampleRate, settings.bitDepth, error))
+            {
+                log.event("fail", { { "key", p.key }, { "reason", error } });
+                continue;
+            }
 
-        if (! writeAudioFile(target, out.audio, out.numChannels, settings.sampleRate, settings.bitDepth, error))
-        {
-            log.event("fail", { { "key", p.key }, { "reason", error } });
-            continue;
-        }
-
-        const bool silent = out.peak < juce::Decibels::decibelsToGain(-90.0f);
-        auto note = out.note;
-        if (silent)
-        {
-            note = "no sound came out"
-                 + juce::String(instrument ? " (the preset may need samples or content that isn't installed, or respond only to other notes)"
-                                           : " (the plugin may be muted, in demo mode, or expect a sidechain)")
-                 + (note.isNotEmpty() ? "; " + note : juce::String());
-        }
-        else
-        {
-            const auto fp = fingerprint(out.audio);
-            if (auto it = takesByFingerprint.find(fp); it != takesByFingerprint.end())
-                note = "sounds identical to \"" + it->second + "\"" + (note.isNotEmpty() ? "; " + note : juce::String());
+            const bool silent = out.peak < juce::Decibels::decibelsToGain(-90.0f);
+            auto note = out.note;
+            if (silent)
+            {
+                note = "no sound came out"
+                     + juce::String(instrument ? " (the preset may need samples or content that isn't installed, or respond only to other notes)"
+                                               : " (the plugin may be muted, in demo mode, or expect a sidechain)")
+                     + (note.isNotEmpty() ? "; " + note : juce::String());
+            }
             else
-                takesByFingerprint[fp] = p.name;
+            {
+                const auto fp = fingerprint(out.audio);
+                if (auto it = takesByFingerprint.find(fp); it != takesByFingerprint.end())
+                    note = "sounds identical to \"" + it->second + "\"" + (note.isNotEmpty() ? "; " + note : juce::String());
+                else
+                    takesByFingerprint[fp] = p.name;
+            }
+
+            log.event("done", { { "key", p.key },
+                                { "file", relative },
+                                { "status", silent ? "silent" : "ok" },
+                                { "seconds", out.audio.getNumSamples() / settings.sampleRate },
+                                { "peakDb", gainToDb(out.peak) },
+                                { "note", note } });
         }
-
-        log.event("done", { { "key", p.key },
-                            { "file", relative },
-                            { "status", silent ? "silent" : "ok" },
-                            { "seconds", out.audio.getNumSamples() / settings.sampleRate },
-                            { "peakDb", gainToDb(out.peak) },
-                            { "note", note } });
+        catch (const std::exception& e)
+        {
+            log.event("fail", { { "key", p.key }, { "reason", juce::String("the plugin threw an exception: ") + e.what() } });
+        }
+        catch (...)
+        {
+            log.event("fail", { { "key", p.key }, { "reason", "the plugin threw an exception" } });
+        }
     }
-
-    // Release the plugin before reporting the end: a plugin that crashes on
-    // release is still "done" as far as the recordings go, and the GUI knows
-    // that from the preset events.
-    onMessageThread([&]
-    {
-        instance->releaseResources();
-        instance.reset();
-    });
 
     return workerOk;
 }
@@ -899,7 +1004,7 @@ void startWorker(const juce::File& jobFile)
         // Exit right here rather than shutting JUCE down: unloading some
         // plugins' DLLs crashes or hangs, and everything worth keeping is on
         // disk already.
-        std::_Exit(code);
+        terminateWorker(code);
     }).detach();
 }
 

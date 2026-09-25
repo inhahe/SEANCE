@@ -334,6 +334,15 @@ int runPluginSandboxChild(const std::string& pipeName) {
                     break;
                 }
                 case SandboxCommand::LoadPlugin: {
+                    // NOTE for whoever wires the sandbox into the graph (#85 -
+                    // nothing constructs a SandboxedPluginProxy yet): this child
+                    // has its own LV2 world, which knows only the standard LV2
+                    // folders, so an LV2 plugin from one of the user's plugin
+                    // folders won't resolve here. The payload should carry the
+                    // plugin folders (register them the way
+                    // PluginHost::registerPluginFolders does) - and ideally the
+                    // parent's PluginDescription, rather than re-describing the
+                    // plugin with findAllTypesForFile below.
                     auto bar = payload.find('|');
                     std::string path = (bar != std::string::npos) ? payload.substr(0, bar) : payload;
                     // Try loading via the format manager.

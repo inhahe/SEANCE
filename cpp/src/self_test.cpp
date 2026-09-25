@@ -44,6 +44,8 @@
 #include "soundfont_processor.h"    // SoundFontProcessor - .sf2 / .sfz instrument node
 #include "signal_shape_node.h"      // SignalShapeProcessor - the scriptable Signal node
 #include "midi_script_node.h"       // MidiScriptProcessor - algorithmic MIDI generator
+#include "plugin_host.h"            // PluginHost::registerPluginFolders - LV2 after a restart
+#include "plugin_settings.h"        // userPluginFolders / pluginSearchPath
 
 #include <juce_audio_formats/juce_audio_formats.h>
 #include <juce_graphics/juce_graphics.h>
@@ -58,6 +60,7 @@
 #include <fstream>
 #include <set>
 #include <chrono>
+#include <cstdlib>          // _putenv_s / setenv - testPluginFolders
 
 namespace SoundShop {
 namespace {
@@ -11893,6 +11896,229 @@ print("COUNT\t%d" % _count[0])
         r.check(seen == declared, "script-api: every check reported a result");
 }
 
+// ===========================================================================
+// Version number
+// ===========================================================================
+//
+// CLAUDE.md: the version lives in cpp/CMakeLists.txt's project(VERSION) and
+// nowhere else. getApplicationVersion() - what the seance.log banner prints -
+// was once a hardcoded "0.2.0" that the banner kept showing whatever the real
+// version was, so check it reports the CMake one.
+void testAppVersion(Report& r) {
+    r.section("Version number");
+    auto* app = juce::JUCEApplicationBase::getInstance();
+    r.check(app != nullptr && app->getApplicationVersion() == JUCE_APPLICATION_VERSION_STRING,
+            "the app reports the version in cpp/CMakeLists.txt (" JUCE_APPLICATION_VERSION_STRING
+            "), which the seance.log banner prints");
+}
+
+// ===========================================================================
+// Plugin folders: which folders each format searches, and LV2 plugins that
+// live outside the standard LV2 folders
+// ===========================================================================
+//
+// The scan cache keeps an LV2 plugin as nothing but its URI, and JUCE resolves
+// a URI only among the bundles its LV2 world has loaded - in a fresh process,
+// just the standard LV2 folders. So an LV2 plugin in one of the user's own
+// plugin folders loaded in the session that scanned it and then failed after
+// every restart ("Unable to locate plugin with the requested URI") until
+// MainContentComponent started calling PluginHost::registerPluginFolders.
+// Each PluginHost owns its own LV2 world, so a new PluginHost is a faithful
+// stand-in for a restart.
+//
+// Needs a real LV2 plugin in a non-standard folder: the build puts
+// test_plugins/lv2_gain there, as <exe dir>/selftest_plugins.
+namespace {
+
+// A plugin format with a chosen name and chosen default locations, so the
+// handling of defaults can be tested without touching the user's real
+// plugin folders. Only the name and the defaults are ever consulted.
+struct FolderTestFormat : juce::AudioPluginFormat {
+    juce::String name, defaults;
+    FolderTestFormat(juce::String n, juce::String d) : name(std::move(n)), defaults(std::move(d)) {}
+
+    juce::String getName() const override { return name; }
+    juce::FileSearchPath getDefaultLocationsToSearch() override { return juce::FileSearchPath(defaults); }
+
+    void findAllTypesForFile(juce::OwnedArray<juce::PluginDescription>&, const juce::String&) override {}
+    bool fileMightContainThisPluginType(const juce::String&) override { return false; }
+    juce::String getNameOfPluginFromIdentifier(const juce::String& id) override { return id; }
+    bool pluginNeedsRescanning(const juce::PluginDescription&) override { return false; }
+    bool doesPluginStillExist(const juce::PluginDescription&) override { return false; }
+    bool canScanForPlugins() const override { return false; }
+    bool isTrivialToScan() const override { return true; }
+    juce::StringArray searchPathsForPlugins(const juce::FileSearchPath&, bool, bool) override { return {}; }
+    bool requiresUnblockedMessageThreadDuringCreation(const juce::PluginDescription&) const override { return false; }
+
+protected:
+    void createPluginInstance(const juce::PluginDescription&, double, int,
+                              PluginCreationCallback callback) override {
+        callback(nullptr, "FolderTestFormat creates no plugins");
+    }
+};
+
+void setTestEnvVar(const char* name, const juce::String& value) {
+   #if JUCE_WINDOWS
+    _putenv_s(name, value.toRawUTF8());   // "" removes it
+   #else
+    if (value.isEmpty()) unsetenv(name); else setenv(name, value.toRawUTF8(), 1);
+   #endif
+}
+
+bool searchPathHas(const juce::FileSearchPath& path, const juce::File& dir) {
+    for (int i = 0; i < path.getNumPaths(); ++i)
+        if (path.getRawString(i).equalsIgnoreCase(dir.getFullPathName()))
+            return true;
+    return false;
+}
+
+} // namespace
+
+void testPluginFolders(Report& r, const juce::File& outDir) {
+    r.section("Plugin folders: what each format searches; LV2 plugins after a restart");
+
+    const auto pluginDir = juce::File::getSpecialLocation(juce::File::currentExecutableFile)
+                               .getParentDirectory().getChildFile("selftest_plugins");
+    const auto bundle = pluginDir.getChildFile("seance_selftest_gain.lv2");
+    if (!bundle.getChildFile("manifest.ttl").existsAsFile()) {
+        r.note("SKIPPED - " + bundle.getFullPathName() + " is missing. The build puts it "
+               "there (CMake target seance_selftest_gain); release packages leave it out.");
+        return;
+    }
+
+    // A folder without an LV2 bundle - a loose file and a subfolder with no
+    // manifest.ttl, which is all a VST3 or VST2 folder looks like to lilv.
+    const auto work = outDir.getChildFile("plugin_folders");
+    work.deleteRecursively();
+    const auto noBundles = work.getChildFile("no_bundles");
+    noBundles.getChildFile("Instrument.vst3").createDirectory();
+    noBundles.getChildFile("Effect.dll").replaceWithText("not a plugin");
+
+    const std::vector<std::string> folders {
+        noBundles.getFullPathName().toStdString(),
+        pluginDir.getFullPathName().toStdString(),
+        "relative\\folder",
+    };
+
+    // ---- Which folders each format gets ------------------------------------
+    juce::AudioPluginFormatManager formats;
+    juce::addDefaultFormatsToManager(formats);
+    juce::AudioPluginFormat* lv2 = nullptr;
+    juce::AudioPluginFormat* vst3 = nullptr;
+    for (auto* f : formats.getFormats()) {
+        if (f->getName() == "LV2") lv2 = f;
+        if (f->getName() == "VST3") vst3 = f;
+    }
+    if (!r.check(lv2 != nullptr && vst3 != nullptr, "folders: the build hosts LV2 and VST3"))
+        return;
+
+    const auto lv2Folders = userPluginFolders(*lv2, folders);
+    r.check(searchPathHas(lv2Folders, pluginDir),
+            "folders: LV2 searches a plugin folder holding an LV2 bundle");
+    r.check(!searchPathHas(lv2Folders, noBundles),
+            "folders: LV2 skips a plugin folder holding no LV2 bundle - lilv would log "
+            "three manifest.ttl errors for every file and folder in it");
+    r.check(lv2Folders.getNumPaths() == 1,
+            "folders: LV2 gets nothing else (a relative folder entry is ignored)");
+
+    const auto vst3Folders = userPluginFolders(*vst3, folders);
+    r.check(vst3Folders.getNumPaths() == 2 && searchPathHas(vst3Folders, noBundles)
+                && searchPathHas(vst3Folders, pluginDir),
+            "folders: VST3 searches every absolute plugin folder - the bundle filter is LV2's alone");
+
+    const auto lv2Defaults = lv2->getDefaultLocationsToSearch();
+    const auto lv2Search = pluginSearchPath(*lv2, folders);
+    bool defaultsThenUser = lv2Search.getNumPaths() == lv2Defaults.getNumPaths() + lv2Folders.getNumPaths();
+    for (int i = 0; defaultsThenUser && i < lv2Defaults.getNumPaths(); ++i)
+        defaultsThenUser = lv2Search.getRawString(i) == lv2Defaults.getRawString(i);
+    r.check(defaultsThenUser && searchPathHas(lv2Search, pluginDir),
+            "folders: a scan searches LV2's standard folders, then the user's LV2 folders");
+
+    // A user folder that is also one of the format's standard folders is left
+    // out - it's searched anyway, and lilv logs a warning per plugin for a
+    // folder it loads twice. JUCE writes the LV2 standard folders with %VAR%s
+    // (for lilv to expand), so write this one that way too. The stand-in is
+    // named "LV2" so the bundle filter applies as well: pluginDir passes that,
+    // so only the defaults check can drop it.
+    const char* envName = "SEANCE_SELFTEST_PLUGIN_DIR";
+    setTestEnvVar(envName, pluginDir.getFullPathName());
+    if (r.check(juce::SystemStats::getEnvironmentVariable(envName, {}) == pluginDir.getFullPathName(),
+                "folders: (test setup) set an environment variable")) {
+        FolderTestFormat pluginDirIsDefault("LV2", juce::String("%") + envName + "%");
+        r.check(userPluginFolders(pluginDirIsDefault, folders).getNumPaths() == 0,
+                "folders: a user folder that is also a standard folder (written as %VAR%) is left out");
+        FolderTestFormat otherDefault("LV2", work.getChildFile("elsewhere").getFullPathName());
+        r.check(searchPathHas(userPluginFolders(otherDefault, folders), pluginDir),
+                "folders: ...and kept when it isn't one");
+    }
+    setTestEnvVar(envName, {});
+
+    // ---- An LV2 plugin in a user folder, across a restart --------------------
+    const auto cacheFile = work.getChildFile("plugin_cache.txt");
+    const std::string cachePath = cacheFile.getFullPathName().toStdString();
+    constexpr double rate = 48000.0;
+    constexpr int block = 256;
+
+    {   // The session that found it.
+        PluginHost host;
+        const bool found = host.loadPluginFile(bundle.getFullPathName().toStdString());
+        const auto& list = host.getAvailablePlugins();
+        if (!r.check(found && list.size() == 1 && list[0].format == "LV2",
+                     "restart: the self-test bundle is found as one LV2 plugin"))
+            return;
+        r.check(list[0].fileOrId == "urn:seance:selftest:gain",
+                "restart: it is identified by its URI - all the scan cache keeps of it");
+        r.check(host.loadPlugin(0, rate, block) != nullptr,
+                "restart: it loads in the session that found it");
+        host.saveScanCache(cachePath);
+    }
+
+    {   // After a restart, without registering the folders: the bug. This is
+        // the test's premise - if the plugin loads here, the check after it
+        // proves nothing.
+        PluginHost host;
+        host.loadScanCache(cachePath);
+        r.check(host.getAvailablePlugins().size() == 1,
+                "restart: the scan cache brings the plugin back");
+        r.check(host.loadPlugin(0, rate, block) == nullptr,
+                "restart: without registerPluginFolders it can't be found (JUCE: \"Unable to "
+                "locate plugin with the requested URI\") - the bug this guards against");
+    }
+
+    {   // After a restart, as MainContentComponent does it at startup.
+        PluginHost host;
+        host.loadScanCache(cachePath);
+        host.registerPluginFolders(folders);
+        auto loaded = host.loadPlugin(0, rate, block);
+        if (r.check(loaded != nullptr,
+                    "restart: after registerPluginFolders (as at startup) it loads")) {
+            auto& plugin = *loaded->instance;
+            const int channels = std::max({ 1, plugin.getTotalNumInputChannels(),
+                                            plugin.getTotalNumOutputChannels() });
+            juce::AudioBuffer<float> buffer(channels, block);
+            buffer.clear();
+            std::vector<float> in((size_t) block);
+            for (int i = 0; i < block; ++i) {
+                in[(size_t) i] = 0.25f * (float) std::sin(juce::MathConstants<double>::twoPi * 440.0 * i / rate);
+                buffer.setSample(0, i, in[(size_t) i]);
+            }
+            juce::MidiBuffer midi;
+            plugin.processBlock(buffer, midi);
+
+            // Least-squares gain of output against input.
+            double num = 0, den = 0;
+            for (int i = 0; i < block; ++i) {
+                num += (double) buffer.getSample(0, i) * in[(size_t) i];
+                den += (double) in[(size_t) i] * in[(size_t) i];
+            }
+            const double gain = den > 0 ? num / den : 0.0;
+            r.checkVal(std::abs(gain - 0.5) < 1e-4,
+                       "restart: ...and its own code runs - the output is the input at the "
+                       "plugin's default gain of 0.5", gain);
+        }
+    }
+}
+
 int runSelfTest(const juce::File& outDir) {
     outDir.createDirectory();
     Report r;
@@ -11932,6 +12158,8 @@ int runSelfTest(const juce::File& outDir) {
     testAutoInputTracks(r);
     testDialogTaskbarFlags(r);
     testScriptingApi(r, outDir);
+    testPluginFolders(r, outDir);
+    testAppVersion(r);
 
     r.section("Summary");
     r.line("  PASSED: " + juce::String(r.passed));

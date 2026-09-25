@@ -5,6 +5,55 @@ top. When something is fixed, delete the entry (git history is the archive).
 
 ---
 
+## Projects remember a plugin only by its position in the plugin list
+
+**Found:** 2026-09-25, while fixing LV2 plugins in custom folders not loading
+after a restart.
+
+A plugin node is saved as `pluginIndex`: its position in
+`PluginHost::availablePlugins`, the list the last *Scan Now* produced
+(`project_file.cpp` writes it, and both load paths - the async loader in
+`main_window.cpp` and `ProjectFile::load` for crash recovery - hand it straight
+to `PluginHost::loadPlugin`). Nothing else about the plugin is saved. Anything
+that changes the list between saving a project and opening it - a rescan after
+installing or removing a plugin, a folder added to `[ScanDirs]`, a plugin
+blocked - silently loads a *different* plugin into the node and feeds it the
+saved state of the old one.
+
+**Proper fix:** save the plugin's identity (format, `fileOrIdentifier`, name,
+uid - what `PluginDescription::createIdentifierString` covers), look it up on
+load, and keep `pluginIndex` only as the fallback for old projects.
+
+---
+
+## Blocked plugins are still loaded by *Scan Now*, and shift the plugin list
+
+**Found:** 2026-09-25, same investigation.
+
+`PluginHost::scanForPlugins` applies the `[Blocked]` list *after* scanning: the
+`PluginDirectoryScanner` loads every plugin in the folders, blocked ones
+included, and only then are the blocked ones left out of `availablePlugins`. Two
+consequences:
+
+- A plugin blocked because it misbehaves when loaded (hangs, crashes, pops up a
+  licence dialog) still does so on every *Scan Now*. The blocklist only hides it.
+- Blocked plugins that load fine stay in the `KnownPluginList` the scanner
+  filled (`knownPlugins`), and the scan cache saves both lists. `loadPlugin(i)`
+  and `getPluginDetail(i)` take the plugin *description* from
+  `knownPlugins->getTypes()[i]` but the *info* from `availablePlugins[i]`, so
+  every index after such a plugin is off by one: choosing a plugin loads its
+  neighbour. (A blocked plugin whose load fails doesn't do this - a failed scan
+  never reaches `knownPlugins`. The usual case, a 32-bit plugin, is harmless.)
+
+**Proper fix:** hand the blocklist to the scan up front -
+`knownPlugins->addToBlacklist()` for each entry, which JUCE's scanner honours by
+not loading the plugin at all - so blocked plugins are neither loaded nor
+listed and the two lists can't diverge; repair existing caches on load by
+matching `fileOrIdentifier`. Worth doing together with the entry above, which
+touches the same lookup.
+
+---
+
 ## UPSTREAM (JUCE 8.0.12), worked around: version resource never regenerates
 
 **Found:** 2026-08-07, bumping the version for the first release cut by

@@ -37,6 +37,15 @@ public:
     void scanForPlugins(const std::vector<std::string>& dirs = {},
                         const std::set<std::string>& blocked = {});
 
+    // Make the plugins in the user's plugin folders loadable without a scan.
+    // Call once at startup, before any plugin is instantiated, with the
+    // [ScanDirs] list (Scan Now does the same for the folders it scans).
+    // Without it an LV2 plugin living in one of those folders - rather than a
+    // standard LV2 folder - loads in the session it was scanned in, and fails
+    // with "Unable to locate plugin with the requested URI" after a restart.
+    // Message thread only.
+    void registerPluginFolders(const std::vector<std::string>& dirs);
+
     // Load a single plugin file directly
     bool loadPluginFile(const std::string& path);
 

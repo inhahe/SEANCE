@@ -23,7 +23,10 @@ class StderrLogger : public juce::Logger {
 class SoundShopApplication : public juce::JUCEApplication {
 public:
     const juce::String getApplicationName() override { return "SEANCE"; }
-    const juce::String getApplicationVersion() override { return "0.2.0"; }
+    // The version is cpp/CMakeLists.txt's project(VERSION) and nothing else
+    // (CLAUDE.md, Versioning). This was once a hardcoded "0.2.0", so every
+    // seance.log banner claimed 0.2.0 while the exe and About box were on 0.10.
+    const juce::String getApplicationVersion() override { return JUCE_APPLICATION_VERSION_STRING; }
     bool moreThanOneInstanceAllowed() override { return true; }
 
     void initialise(const juce::String& commandLine) override {

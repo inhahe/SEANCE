@@ -76,4 +76,61 @@ void PluginSettings::load(const std::string& path) {
     if (scanDirs.empty()) addDefaultDirs();
 }
 
+// True if `dir` holds at least one LV2 bundle: a subfolder with a manifest.ttl.
+static bool containsLv2Bundle(const juce::File& dir) {
+    for (const auto& entry : juce::RangedDirectoryIterator(dir, false, "*", juce::File::findDirectories))
+        if (entry.getFile().getChildFile("manifest.ttl").existsAsFile())
+            return true;
+    return false;
+}
+
+// One of a format's default locations as a real folder. The formats give their
+// defaults in the form their own library wants - JUCE's LV2 ones are
+// "%APPDATA%\LV2" and "~/.lv2", which lilv expands itself - and juce::File
+// doesn't expand %VAR%, so do that here. (File does resolve a leading ~.)
+static juce::File defaultLocation(const juce::String& raw) {
+    juce::String path;
+    for (int pos = 0;;) {
+        const int start = raw.indexOfChar(pos, '%');
+        const int end = start < 0 ? -1 : raw.indexOfChar(start + 1, '%');
+        if (end < 0) { path << raw.substring(pos); break; }
+        path << raw.substring(pos, start)
+             << juce::SystemStats::getEnvironmentVariable(raw.substring(start + 1, end), {});
+        pos = end + 1;
+    }
+    return juce::File::isAbsolutePath(path) ? juce::File(path) : juce::File();
+}
+
+juce::FileSearchPath userPluginFolders(juce::AudioPluginFormat& format,
+                                       const std::vector<std::string>& folders) {
+    const auto defaults = format.getDefaultLocationsToSearch();
+    const bool lv2 = format.getName() == "LV2";
+
+    juce::FileSearchPath result;
+    for (auto& f : folders) {
+        const juce::String folder(f);
+        if (!juce::File::isAbsolutePath(folder)) continue;  // a relative entry has no meaning here
+        const juce::File dir(folder);
+
+        bool isDefault = false;
+        for (int i = 0; i < defaults.getNumPaths() && !isDefault; ++i)
+            isDefault = defaultLocation(defaults.getRawString(i)) == dir;
+        if (isDefault) continue;                            // see the header comment
+
+        if (lv2 && !containsLv2Bundle(dir)) continue;       // see the header comment
+
+        result.addIfNotAlreadyThere(dir);
+    }
+    return result;
+}
+
+juce::FileSearchPath pluginSearchPath(juce::AudioPluginFormat& format,
+                                      const std::vector<std::string>& folders) {
+    auto path = format.getDefaultLocationsToSearch();
+    const auto extra = userPluginFolders(format, folders);
+    for (int i = 0; i < extra.getNumPaths(); ++i)
+        path.add(extra[i]);
+    return path;
+}
+
 } // namespace SoundShop

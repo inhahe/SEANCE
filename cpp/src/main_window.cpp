@@ -412,6 +412,10 @@ MainContentComponent::MainContentComponent() {
 
     // Load prefs, plugin cache, recent projects (audio engine deferred to timer)
     pluginSettings.load("soundshop_plugins.cfg");
+    // Before anything can instantiate a plugin (the deferred project load, crash
+    // recovery): LV2 plugins in the user's folders only resolve by URI once
+    // their bundles are registered - see PluginHost::registerPluginFolders.
+    audioEngine.getPluginHost().registerPluginFolders(pluginSettings.scanDirs);
     loadRecentProjects();
     loadPreferences();
     if (graphComponent) graphComponent->setAutoFitView(autoFitGraph);

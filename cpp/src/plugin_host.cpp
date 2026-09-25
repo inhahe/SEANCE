@@ -1,4 +1,5 @@
 #include "plugin_host.h"
+#include "plugin_settings.h"   // pluginSearchPath, userPluginFolders
 #include <juce_audio_processors/juce_audio_processors.h>
 #include <cstdio>
 #include <fstream>
@@ -12,6 +13,24 @@ PluginHost::PluginHost() {
 }
 
 PluginHost::~PluginHost() = default;
+
+void PluginHost::registerPluginFolders(const std::vector<std::string>& dirs) {
+    // Only LV2 needs this. VST3 (and LADSPA) plugins are loaded straight from
+    // the file path stored in their description, and AU from the system
+    // registry, but an LV2 plugin is identified by URI and JUCE resolves that
+    // URI only among the bundles its LV2 world has loaded - at construction,
+    // just the standard LV2 folders. Searching the user's other folders loads
+    // their bundles as well (lilv reads the manifests; no plugin code runs),
+    // which is all this needs - not the list of URIs the search returns.
+    // userPluginFolders leaves the standard folders out, since loading a
+    // folder a second time logs a warning for every plugin in it.
+    for (auto* format : formatManager.getFormats()) {
+        if (format->getName() != "LV2") continue;
+        const auto folders = userPluginFolders(*format, dirs);
+        if (folders.getNumPaths() > 0)
+            format->searchPathsForPlugins(folders, true, false);
+    }
+}
 
 void PluginHost::addPluginPaths() {
     // Common VST3 paths on Windows
@@ -36,10 +55,9 @@ void PluginHost::scanForPlugins(const std::vector<std::string>& dirs,
         // Search the user-configured dirs AND this format's own default install
         // locations. Merging both matters for formats like LV2 whose standard
         // paths (e.g. the Windows/Linux LV2 dirs) aren't in the user list — a
-        // VST3-only user dir list would otherwise hide every LV2 plugin.
-        juce::FileSearchPath searchPaths = format->getDefaultLocationsToSearch();
-        for (auto& d : dirs)
-            searchPaths.addIfNotAlreadyThere(juce::File(d));
+        // VST3-only user dir list would otherwise hide every LV2 plugin. (LV2
+        // only gets the user dirs that hold an LV2 bundle; see userPluginFolders.)
+        const juce::FileSearchPath searchPaths = pluginSearchPath(*format, dirs);
 
         juce::File deadPluginsFile; // could persist this to skip known-bad files
         juce::PluginDirectoryScanner scanner(

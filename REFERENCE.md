@@ -46,6 +46,7 @@ here.
 - [Terrain-synth self-test (`--self-test`)](#terrain-synth-self-test---self-test)
 - [Ephemeral session (`--ephemeral`)](#ephemeral-session---ephemeral)
 - [Opening a project from the command line](#opening-a-project-from-the-command-line)
+- [Plugin folders and scanning](#plugin-folders-and-scanning)
 - [Asynchronous plugin loading](#asynchronous-plugin-loading)
 - [Plugin Preset Recorder (companion tool)](#plugin-preset-recorder-companion-tool)
 - [Dialogs and the Windows taskbar](#dialogs-and-the-windows-taskbar)
@@ -4416,6 +4417,62 @@ just as they are for an auto-loaded project. Parsed in `main.cpp::initialise`
 
 ---
 
+## Plugin folders and scanning
+
+<a name="plugin-folders-and-scanning"></a>**Where the settings live.**
+*Settings → Plugin Settings* edits `soundshop_plugins.cfg` in SEANCE's working
+directory (the SoundShop2 folder when started by `seance.bat`, the exe's folder
+when the exe is double-clicked): `[ScanDirs]` is the folder list, `[Blocked]` the
+skip list. With no file, or an empty folder list, SEANCE uses its built-in
+defaults — the usual VST3/VST2 install folders, which *Reset Defaults* restores.
+*Scan Now* saves the file and writes what it found to
+`soundshop_plugins_cache.dat` beside it; later starts read the plugin list from
+that cache instead of scanning.
+
+**Which folders each format searches** (`pluginSearchPath` and
+`userPluginFolders` in `cpp/src/plugin_settings.cpp`):
+
+- Each format first searches its own standard locations — VST3:
+  `%LOCALAPPDATA%\Programs\Common\VST3` and `%COMMONPROGRAMFILES%\VST3`; LV2:
+  `%APPDATA%\LV2` and `%COMMONPROGRAMFILES%\LV2` — then the `[ScanDirs]` folders.
+  A listed folder that is already one of the standard ones isn't searched twice,
+  and relative entries are ignored.
+- **LV2 only gets the `[ScanDirs]` folders that hold an LV2 bundle** (a subfolder
+  containing a `manifest.ttl`). JUCE's LV2 library, lilv, treats every entry of
+  a folder it is given as a bundle, and for each one that isn't it writes three
+  `failed to open file …/manifest.ttl` errors: handed the usual VST3/VST2 folders,
+  that was about a hundred lines of `seance.log` per scan. lilv can only find
+  plugins in such subfolders anyway, so the filter changes which folders it
+  reads, never which plugins it finds.
+
+**LV2 plugins outside the standard LV2 folders.** A VST3 plugin is loaded from
+the file path saved in the scan cache, but an LV2 plugin is saved as just its
+URI, and JUCE finds a URI only among the bundles lilv has read — at startup,
+only those in the standard LV2 folders. So when the main window is created,
+before anything can load a plugin, SEANCE calls
+`PluginHost::registerPluginFolders` with the `[ScanDirs]` list, which reads the
+bundles in your own LV2 folders (their `.ttl` files — no plugin code runs).
+Before this, an LV2 plugin in one of your own folders worked in the session that
+scanned it and failed after every restart: `Unable to locate plugin with the
+requested URI` in `seance.log` and a **Failed** badge on its node. Only your own
+folders are read: lilv has already read the standard ones, and it logs a warning
+for every plugin in a folder it reads twice. If none of your folders holds an
+LV2 bundle, which is the usual case, startup doesn't touch LV2 at all.
+
+**What *Scan Now* still logs:** a scan has to re-read the LV2 folders to find
+newly installed plugins, so lilv logs one `Reloading plugin <uri>` warning for
+each LV2 plugin it had already read — one line per installed LV2 plugin per
+scan, and harmless.
+
+**Tested by** `testPluginFolders` in `self_test.cpp` (`SEANCE.exe --self-test
+<dir>`). It checks which folders each format gets and simulates a restart with
+fresh `PluginHost`s (each has its own LV2 world). The plugin it restarts with is
+a real one-line LV2 gain plugin, `cpp/test_plugins/lv2_gain`, which the build
+copies to `selftest_plugins/` beside the exe, outside every standard LV2
+folder. `release.bat` doesn't package that folder.
+
+---
+
 ## Asynchronous plugin loading
 
 <a name="asynchronous-plugin-loading"></a>Opening a project that hosts VST3/AU
@@ -4582,9 +4639,9 @@ Anything else with `APP=True` is a bug.
 
 ## Version number and releases
 
-**Where the version lives.** `project(SEANCE VERSION x.y.z ...)` on line 2 of `cpp/CMakeLists.txt` is the single source of truth. CMake passes it to `juce_add_gui_app` as `JUCE_VERSION`, which becomes both the `JUCE_APPLICATION_VERSION_STRING` compile definition (shown in **Help → About SEANCE**) and the exe's Win32 `FILEVERSION` resource (shown by Explorer's *Properties → Details*). `release.bat` reads the same line to choose its tag. One number, four consumers — there is deliberately no second copy anywhere in the source.
+**Where the version lives.** `project(SEANCE VERSION x.y.z ...)` on line 2 of `cpp/CMakeLists.txt` is the single source of truth. CMake passes it to `juce_add_gui_app` as `JUCE_VERSION`, which becomes both the `JUCE_APPLICATION_VERSION_STRING` compile definition (shown in **Help → About SEANCE**, and on the first line of `seance.log` through `getApplicationVersion()`) and the exe's Win32 `FILEVERSION` resource (shown by Explorer's *Properties → Details*). `release.bat` reads the same line to choose its tag. One number and every consumer reads it from there — there is deliberately no second copy anywhere in the source. (`getApplicationVersion()` in `main.cpp` used to be one: a hardcoded `"0.2.0"`, which the log banner printed until 0.10.2. `testAppVersion` in the self-test now guards against that.)
 
-**Checking which build you have.** Help → About SEANCE prints the version; so does right-clicking `SEANCE.exe` → Properties → Details. Quote it in bug reports.
+**Checking which build you have.** Help → About SEANCE prints the version; so do right-clicking `SEANCE.exe` → Properties → Details and the first line of `seance.log`. Quote it in bug reports.
 
 **Releases** live at [github.com/inhahe/seance/releases](https://github.com/inhahe/seance/releases), tagged `v<version>`, one `SEANCE-v<version>-win64.zip` per release containing `SEANCE.exe`, its runtime DLLs, and the `docs/` `resources/` `scripts/` folders the exe resolves relative to itself. Keeping the extracted folder intact matters: moving the exe out on its own costs the Help pages, the factory waveform library and Python scripting. The zip needs the [MSVC 2015–2022 x64 redistributable](https://aka.ms/vs/17/release/vc_redist.x64.exe), since SEANCE links the runtime dynamically.
 

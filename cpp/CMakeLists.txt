@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.22)
-project(SEANCE VERSION 0.10.0 LANGUAGES C CXX)
+project(SEANCE VERSION 0.10.2 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -581,3 +581,28 @@ if(SEANCE_PYTHON_DLL)
             "$<TARGET_FILE_DIR:SEANCE>"
     )
 endif()
+
+# ------------------------------------------------------------------------------
+# Self-test LV2 plugin (test_plugins/lv2_gain): a tiny C gain plugin that
+# testLv2PluginFolders() in self_test.cpp loads from a folder that is NOT a
+# standard LV2 location, to prove LV2 plugins in the user's plugin folders still
+# load after a restart - there's no way to test that without a real plugin.
+# Built into <exe dir>/selftest_plugins/, which release.bat doesn't package
+# (it only takes the exe, top-level DLLs, docs/, resources/ and scripts/).
+# ------------------------------------------------------------------------------
+add_library(seance_selftest_gain MODULE test_plugins/lv2_gain/seance_selftest_gain.c)
+target_include_directories(seance_selftest_gain PRIVATE
+    "${JUCE_DIR}/modules/juce_audio_processors_headless/format_types/LV2_SDK/lv2")
+set_target_properties(seance_selftest_gain PROPERTIES PREFIX "")
+configure_file(test_plugins/lv2_gain/manifest.ttl.in
+               "${CMAKE_CURRENT_BINARY_DIR}/seance_selftest_gain/manifest.ttl" @ONLY)
+add_dependencies(SEANCE seance_selftest_gain)
+set(_seance_selftest_bundle "$<TARGET_FILE_DIR:SEANCE>/selftest_plugins/seance_selftest_gain.lv2")
+add_custom_command(TARGET SEANCE POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${_seance_selftest_bundle}"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "$<TARGET_FILE:seance_selftest_gain>"
+        "${CMAKE_CURRENT_BINARY_DIR}/seance_selftest_gain/manifest.ttl"
+        "${CMAKE_CURRENT_SOURCE_DIR}/test_plugins/lv2_gain/seance_selftest_gain.ttl"
+        "${_seance_selftest_bundle}/"
+)

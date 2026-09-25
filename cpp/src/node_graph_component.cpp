@@ -2370,8 +2370,11 @@ juce::String NodeGraphComponent::getTooltip() {
         if (node->pluginLoadState == PluginLoadState::Loading)
             return "Loading plugin... instantiating and restoring its saved state.";
         if (node->pluginLoadState == PluginLoadState::Failed)
-            return "Plugin failed to load. It may be missing, blocklisted, or "
-                   "incompatible. The node is kept so you can replace the plugin.";
+            return (node->pluginLoadError.empty()
+                        ? juce::String("Plugin failed to load.")
+                        : juce::String::fromUTF8(node->pluginLoadError.c_str()))
+                   + "\nThe node is kept, with its settings, so the plugin can load again "
+                     "once that's fixed (reopen the project), or be replaced.";
         // A node showing the red script-error badge explains it here so the
         // user knows the script didn't compile and where to fix it.
         if (getNodeScriptError && getNodeScriptError(node->id))
@@ -2996,10 +2999,14 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
     sigMenu.addItem(142, "Spectrogram");
     menu.addSubMenu("Signal Shape", sigMenu);
 
-    // Plugin instruments/effects
+    // Plugin instruments/effects. The menu keeps its own copy of the list:
+    // item 1000+i means the plugin that was at row i when the menu opened,
+    // whatever blocking or scanning does to the host's list meanwhile.
     auto* host = graph.pluginHost;
+    std::vector<PluginInfo> pluginChoices;
     if (host) {
-        auto& plugins = host->getAvailablePlugins();
+        pluginChoices = host->getAvailablePlugins();
+        auto& plugins = pluginChoices;
         if (!plugins.empty()) {
             menu.addSeparator();
             juce::PopupMenu piMenu, pfxMenu;
@@ -3017,7 +3024,7 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
     }
 
     auto pos = canvasPos;
-    menu.showMenuAsync(juce::PopupMenu::Options(), [this, pos](int result) {
+    menu.showMenuAsync(juce::PopupMenu::Options(), [this, pos, pluginChoices](int result) {
         if (result <= 0) return;
 
         // Remember how many nodes existed before this creation so we can stamp
@@ -4288,20 +4295,9 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
                 {Pin{0, "In", PinKind::Audio, true}},
                 {Pin{0, "Out", PinKind::Audio, false}}, {p.x, p.y});
         } else if (result >= 1000 && graph.pluginHost) {
-            int idx = result - 1000;
-            auto& plugins = graph.pluginHost->getAvailablePlugins();
-            if (idx < (int)plugins.size()) {
-                auto& pi = plugins[idx];
-                std::vector<Pin> ins, outs;
-                if (pi.hasMidiInput) ins.push_back({0, "MIDI In", PinKind::Midi, true});
-                if (pi.hasAudioInput) ins.push_back({0, "Audio In", PinKind::Audio, true, pi.numAudioInputChannels});
-                if (pi.hasAudioOutput) outs.push_back({0, "Audio Out", PinKind::Audio, false, pi.numAudioOutputChannels});
-                if (pi.hasMidiOutput) outs.push_back({0, "MIDI Out", PinKind::Midi, false});
-                auto type = pi.isInstrument ? NodeType::Instrument : NodeType::Effect;
-                auto& n = graph.addNode(pi.name, type, ins, outs, {p.x, p.y});
-                auto loaded = graph.pluginHost->loadPlugin(idx, 44100.0, 512);
-                if (loaded) { n.plugin = std::move(loaded); n.pluginIndex = idx; }
-            }
+            const int idx = result - 1000;
+            if (idx < (int)pluginChoices.size())
+                graph.addPluginNode(*graph.pluginHost, pluginChoices[(size_t)idx], {p.x, p.y});
         }
 
         // If we're inside a Voice container's inner view, any node just created
@@ -4546,7 +4542,7 @@ void NodeGraphComponent::showNodeMenu(Node& node) {
         menu.addItem(4, "Show Plugin UI");
         menu.addItem(7, "Presets...");
         menu.addItem(8, "MIDI Map...");
-        if (node.pluginIndex >= 0)
+        if (node.pluginDescription.fileOrIdentifier.isNotEmpty())
             menu.addItem(6, "Plugin Info...");
         // "MPE mode" for a hosted plugin: a user-asserted flag telling SEANCE
         // this plugin is itself running in MPE mode. MPE capability can't be
@@ -4654,12 +4650,12 @@ void NodeGraphComponent::showNodeMenu(Node& node) {
     // (one-shot per-sound decay, no sustain stage), and the sample/region-file
     // players (SoundFont, SFZ, Sfizz, MultiSampler) - are NOT offered this
     // editor, because a generic AHDSR can't subsume what they already have.
-    // Raw plugin-hosting Instruments (pluginIndex >= 0) have their envelope
+    // Raw plugin-hosting Instruments (isPluginNode()) have their envelope
     // inside the plugin.
     bool isTonalSynth = false;
     if (node.type == NodeType::TerrainSynth) {
         isTonalSynth = true;
-    } else if (node.type == NodeType::Instrument && node.pluginIndex < 0) {
+    } else if (node.type == NodeType::Instrument && !node.isPluginNode()) {
         auto isScript = [&](const char* tag) {
             return node.script.rfind(tag, 0) == 0;
         };
@@ -4676,7 +4672,7 @@ void NodeGraphComponent::showNodeMenu(Node& node) {
     // FM synth: 4 per-operator AHDSR envelopes (one per operator), edited in
     // a single tabbed dialog. FM is excluded from the generic single-envelope
     // item above because its amplitude shape is per-operator, not node-global.
-    if (node.type == NodeType::Instrument && node.pluginIndex < 0 &&
+    if (node.type == NodeType::Instrument && !node.isPluginNode() &&
         node.script.rfind("__fmsynth__", 0) == 0)
         menu.addItem(182, "Operator Envelopes (AHDSR)...");
 

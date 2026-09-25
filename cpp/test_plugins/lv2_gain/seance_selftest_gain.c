@@ -1,20 +1,23 @@
 /*
-    SEANCE self-test LV2 plugin: a mono gain.
+    SEANCE self-test LV2 plugins: two mono gains in one bundle.
 
     Built by cpp/CMakeLists.txt into <exe dir>/selftest_plugins/ and used only
-    by testLv2PluginFolders() in self_test.cpp, which needs a real LV2 plugin
-    living in a folder that is NOT a standard LV2 location - there is no other
-    way to test that such plugins still load after a restart. release.bat does
-    not package selftest_plugins/, so this never ships.
+    by the self-tests (testPluginFolders, testPluginIdentity in self_test.cpp),
+    which need real LV2 plugins living in a folder that is NOT a standard LV2
+    location, and two of them to tell apart. release.bat does not package
+    selftest_plugins/, so these never ship.
 
-    Ports: 0 = gain (control in, default 0.5), 1 = audio in, 2 = audio out.
-    The non-unity default lets the test prove the plugin's own code ran.
+    Ports: 0 = gain (control in), 1 = audio in, 2 = audio out. The gain's
+    default lives in seance_selftest_gain.ttl: 0.5 for "SEANCE Self-Test Gain",
+    0.25 for "SEANCE Self-Test Gain B" - so the output level proves both that
+    the plugin's own code ran and which of the two it was.
 */
 
 #include <lv2/core/lv2.h>
 #include <stdlib.h>
 
-#define SELFTEST_GAIN_URI "urn:seance:selftest:gain"
+#define SELFTEST_GAIN_URI   "urn:seance:selftest:gain"
+#define SELFTEST_GAIN_B_URI "urn:seance:selftest:gain-b"
 
 typedef struct {
     const float* gain;
@@ -58,18 +61,12 @@ static void cleanup(LV2_Handle instance)
     free(instance);
 }
 
-static const LV2_Descriptor descriptor = {
-    SELFTEST_GAIN_URI,
-    instantiate,
-    connect_port,
-    NULL, /* activate */
-    run,
-    NULL, /* deactivate */
-    cleanup,
-    NULL  /* extension_data */
+static const LV2_Descriptor descriptors[] = {
+    { SELFTEST_GAIN_URI,   instantiate, connect_port, NULL, run, NULL, cleanup, NULL },
+    { SELFTEST_GAIN_B_URI, instantiate, connect_port, NULL, run, NULL, cleanup, NULL },
 };
 
 LV2_SYMBOL_EXPORT const LV2_Descriptor* lv2_descriptor(uint32_t index)
 {
-    return index == 0 ? &descriptor : NULL;
+    return index < sizeof descriptors / sizeof descriptors[0] ? &descriptors[index] : NULL;
 }

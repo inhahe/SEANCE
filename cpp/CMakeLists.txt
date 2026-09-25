@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.22)
-project(SEANCE VERSION 0.10.2 LANGUAGES C CXX)
+project(SEANCE VERSION 0.10.4 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -583,10 +583,12 @@ if(SEANCE_PYTHON_DLL)
 endif()
 
 # ------------------------------------------------------------------------------
-# Self-test LV2 plugin (test_plugins/lv2_gain): a tiny C gain plugin that
-# testLv2PluginFolders() in self_test.cpp loads from a folder that is NOT a
-# standard LV2 location, to prove LV2 plugins in the user's plugin folders still
-# load after a restart - there's no way to test that without a real plugin.
+# Self-test LV2 plugins (test_plugins/lv2_gain): one tiny C gain, built as two
+# plugins with different default gains, that the self-tests (testPluginFolders,
+# testPluginIdentity in self_test.cpp) load from a folder that is NOT a standard
+# LV2 location - to prove LV2 plugins in the user's plugin folders still load
+# after a restart, and that a project gets back exactly the plugin it saved.
+# There's no way to test either without real plugins.
 # Built into <exe dir>/selftest_plugins/, which release.bat doesn't package
 # (it only takes the exe, top-level DLLs, docs/, resources/ and scripts/).
 # ------------------------------------------------------------------------------

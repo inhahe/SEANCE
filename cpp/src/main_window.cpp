@@ -416,6 +416,9 @@ MainContentComponent::MainContentComponent() {
     // recovery): LV2 plugins in the user's folders only resolve by URI once
     // their bundles are registered - see PluginHost::registerPluginFolders.
     audioEngine.getPluginHost().registerPluginFolders(pluginSettings.scanDirs);
+    // ...and the host must know the skip list, which it keeps out of the
+    // plugin menus and refuses to load.
+    audioEngine.getPluginHost().setBlockedPlugins(pluginSettings.blockedPlugins);
     loadRecentProjects();
     loadPreferences();
     if (graphComponent) graphComponent->setAutoFitView(autoFitGraph);
@@ -721,8 +724,9 @@ void MainContentComponent::beginAsyncPluginLoad() {
     {
         std::lock_guard<std::recursive_mutex> graphLk(graph.mutationLock);
         for (auto& n : graph.nodes) {
-            if (n.pluginIndex >= 0 && !n.plugin) {
+            if (n.isPluginNode() && !n.plugin) {
                 n.pluginLoadState = PluginLoadState::Pending;
+                n.pluginLoadError.clear();
                 pluginLoadQueue.push_back(n.id);
             }
         }
@@ -750,26 +754,32 @@ void MainContentComponent::processNextPluginLoad() {
         pluginLoadQueue.erase(pluginLoadQueue.begin());
 
         // Snapshot what we need under the lock, mark the node Loading.
-        int pluginIndex = -1;
+        juce::PluginDescription savedPlugin;
+        int legacyIndex = -1;
+        std::string nodeName;
         std::string pendingState;
         {
             std::lock_guard<std::recursive_mutex> graphLk(graph.mutationLock);
             Node* n = graph.findNode(nodeId);
-            if (!n || n->pluginIndex < 0 || n->plugin) continue; // gone / already loaded
-            pluginIndex = n->pluginIndex;
+            if (!n || !n->isPluginNode() || n->plugin) continue; // gone / already loaded
+            savedPlugin = n->pluginDescription;
+            legacyIndex = n->legacyPluginIndex;
+            nodeName = n->name;
             pendingState = n->pendingPluginState;
             n->pluginLoadState = PluginLoadState::Loading;
         }
         if (graphComponent) graphComponent->repaint();
 
-        // Heavy: instantiate + restore state. No graph lock held here.
-        auto loaded = audioEngine.getPluginHost().loadPlugin(
-            pluginIndex, audioEngine.getSampleRate(), audioEngine.getBlockSize());
-        if (loaded && loaded->instance && !pendingState.empty()) {
+        // Heavy: find the node's plugin by its identity, instantiate it and
+        // restore its state. No graph lock held here.
+        auto load = audioEngine.getPluginHost().loadNodePlugin(
+            savedPlugin, legacyIndex, nodeName,
+            audioEngine.getSampleRate(), audioEngine.getBlockSize());
+        if (load.plugin && load.plugin->instance && !pendingState.empty()) {
             juce::MemoryBlock stateData;
             stateData.fromBase64Encoding(pendingState);
             if (stateData.getSize() > 0)
-                loaded->instance->setStateInformation(
+                load.plugin->instance->setStateInformation(
                     stateData.getData(), (int)stateData.getSize());
         }
 
@@ -778,16 +788,26 @@ void MainContentComponent::processNextPluginLoad() {
             std::lock_guard<std::recursive_mutex> graphLk(graph.mutationLock);
             Node* n = graph.findNode(nodeId);
             if (n) {
-                if (loaded) {
-                    n->plugin = std::move(loaded);
+                // Whatever resolution found is the node's plugin from now on
+                // (a legacy row now identified, a plugin found at a new
+                // location), even if it then failed to start.
+                if (load.resolved.fileOrIdentifier.isNotEmpty()) {
+                    n->pluginDescription = load.resolved;
+                    n->legacyPluginIndex = -1;
+                }
+                if (load.plugin) {
+                    n->plugin = std::move(load.plugin);
                     n->pendingPluginState.clear();
                     n->pluginLoadState = PluginLoadState::Ready;
                 } else {
                     n->pluginLoadState = PluginLoadState::Failed;
+                    n->pluginLoadError = load.error;
                 }
             }
         }
-        // (On failure loadPlugin already logged to stderr; we continue anyway.)
+        if (!load.error.empty())
+            fprintf(stderr, "Plugin for node '%s' not loaded: %s\n",
+                    nodeName.c_str(), load.error.c_str());
         audioEngine.getGraphProcessor().requestRebuild();
         if (graphComponent) graphComponent->repaint();
 
@@ -2436,7 +2456,7 @@ void MainContentComponent::showPluginUI(int nodeId) {
 
     // Wavelet-space painter for nodes authored with a DWT coefficient grid.
     if (node && (node->type == NodeType::Instrument || node->type == NodeType::TerrainSynth)
-        && !node->plugin && node->pluginIndex < 0
+        && !node->plugin && !node->isPluginNode()
         && node->script.rfind("__waveletpaint__:", 0) == 0) {
         auto* editor = new WaveletPainterComponent(graph, node->id, [this]() {
             audioEngine.getGraphProcessor().requestRebuild();
@@ -2500,7 +2520,7 @@ void MainContentComponent::showPluginUI(int nodeId) {
     // legacy `__spectral__:` format open the same editor; the editor
     // converts legacy data to the new format on save.
     if (node && (node->type == NodeType::Instrument || node->type == NodeType::TerrainSynth)
-        && !node->plugin && node->pluginIndex < 0
+        && !node->plugin && !node->isPluginNode()
         && (node->script.rfind("__spectral__:", 0) == 0
             || node->script.rfind("__spectral2__:", 0) == 0)) {
         auto* editor = new SpectralEditorComponent(graph, node->id, [this]() {
@@ -2529,7 +2549,7 @@ void MainContentComponent::showPluginUI(int nodeId) {
     // wavetable gate below: the wrapped body is itself a __wavetable5__ encode,
     // so without this earlier gate a frame synth would open as a full wavetable.
     if (node && (node->type == NodeType::Instrument || node->type == NodeType::TerrainSynth)
-        && !node->plugin && node->pluginIndex < 0
+        && !node->plugin && !node->isPluginNode()
         && node->script.rfind("__framesynth__:", 0) == 0) {
         auto* editor = new LayeredWaveEditorComponent(graph, node->id, [this]() {
             audioEngine.getGraphProcessor().requestRebuild();
@@ -2565,7 +2585,7 @@ void MainContentComponent::showPluginUI(int nodeId) {
     //                   node fell through to the generic visualizer with no
     //                   way to reopen the wavetable editor.
     if (node && (node->type == NodeType::Instrument || node->type == NodeType::TerrainSynth)
-        && !node->plugin && node->pluginIndex < 0
+        && !node->plugin && !node->isPluginNode()
         && (node->script.rfind("__layered__:", 0) == 0
             || node->script.rfind("__wavetable__:", 0) == 0
             || node->script.rfind("__wavetable2__:", 0) == 0
@@ -2609,7 +2629,7 @@ void MainContentComponent::showPluginUI(int nodeId) {
 
     // Unified synth visualizer (both Instrument and TerrainSynth use TerrainSynthProcessor)
     if (node && (node->type == NodeType::Instrument || node->type == NodeType::TerrainSynth)
-        && !node->plugin && node->pluginIndex < 0) {
+        && !node->plugin && !node->isPluginNode()) {
         auto* proc = dynamic_cast<TerrainSynthProcessor*>(
             audioEngine.getGraphProcessor().getProcessorForNode(nodeId));
         if (proc) {
@@ -2645,9 +2665,11 @@ void MainContentComponent::showPluginUI(int nodeId) {
 
 void MainContentComponent::showPluginInfo(int nodeId) {
     auto* node = graph.findNode(nodeId);
-    if (!node || node->pluginIndex < 0) return;
+    // A node from an old project whose plugin was never identified has
+    // nothing to describe (its Failed badge says why); the menu hides this.
+    if (!node || node->pluginDescription.fileOrIdentifier.isEmpty()) return;
 
-    auto detail = audioEngine.getPluginHost().getPluginDetail(node->pluginIndex);
+    auto detail = audioEngine.getPluginHost().getPluginDetail(node->pluginDescription);
     auto& info = detail.info;
 
     juce::String text;
@@ -4650,7 +4672,7 @@ void MainContentComponent::performAutosave() {
     //     for plugins that may have just been added
     std::vector<int> dirtyPluginNodeIds;
     for (auto& n : graph.nodes) {
-        if (n.pluginIndex >= 0 && n.pluginStateDirty)
+        if (n.isPluginNode() && n.pluginStateDirty)
             dirtyPluginNodeIds.push_back(n.id);
     }
 
@@ -4711,7 +4733,7 @@ void MainContentComponent::performAutosave() {
     // file from a previous tick is still correct).
     for (int nid : dirtyPluginNodeIds) {
         auto* n = graph.findNode(nid);
-        if (!n || n->pluginIndex < 0) continue;
+        if (!n || !n->isPluginNode()) continue;
         if (n->pluginStateDirty) {
             // The Full path didn't already query this plugin (or there
             // was no Full path). Query now and refresh the cache.
@@ -4914,7 +4936,7 @@ void MainContentComponent::discardAutosave() {
 void MainContentComponent::applyPerPluginOverrides() {
     auto& gp = audioEngine.getGraphProcessor();
     for (auto& n : graph.nodes) {
-        if (n.pluginIndex < 0) continue;
+        if (!n.isPluginNode()) continue;
         auto file = getPluginStateFile(n.id);
         if (!file.existsAsFile()) continue;
         auto base64 = file.loadFileAsString().toStdString();
@@ -4946,7 +4968,7 @@ void MainContentComponent::cleanupOrphanPluginFiles() {
     auto files = dir.findChildFiles(juce::File::findFiles, false, "autosave-plugin-*.dat");
     std::set<int> currentPluginNodeIds;
     for (auto& n : graph.nodes)
-        if (n.pluginIndex >= 0) currentPluginNodeIds.insert(n.id);
+        if (n.isPluginNode()) currentPluginNodeIds.insert(n.id);
     for (auto& f : files) {
         // Extract nodeId from filename like "autosave-plugin-42.dat".
         auto stem = f.getFileNameWithoutExtension();
@@ -5749,6 +5771,14 @@ void MainContentComponent::showScriptConsoleForNode(int nodeId) {
 // Plugin Settings Dialog
 // ==============================================================================
 
+// Scan Now's dead man's pedal (see PluginHost::scanForPlugins): it names the
+// plugin being loaded while a scan runs, so after a crash the next scan can
+// skip and block the culprit. Beside soundshop_plugins.cfg, and ".dat" like
+// the cache so release.bat's per-machine-file filter keeps it out of packages.
+static juce::File scanPedalFile() {
+    return juce::File::getCurrentWorkingDirectory().getChildFile("soundshop_plugins_scanning.dat");
+}
+
 class PluginSettingsComponent : public juce::Component,
                                  public juce::ListBoxModel {
 public:
@@ -5775,7 +5805,10 @@ public:
         addDirBtn.setTooltip("Add the path in the text field below to the list of directories scanned for plugins");
         removeDirBtn.setTooltip("Remove the selected directory from the scan list");
         resetDirsBtn.setTooltip("Replace the scan list with the OS default plugin directories (Program Files/VST3, /Library/Audio/Plug-Ins, etc.)");
-        scanBtn.setTooltip("Walk the listed directories now and load any new plugins. Plugins that crash during scan are automatically blocklisted.");
+        scanBtn.setTooltip("Look for plugins in these folders and in each plugin format's standard folders. "
+                           "Every plugin found is loaded briefly to identify it - except blocked ones, "
+                           "which aren't loaded at all. A plugin that fails to load, or that crashes "
+                           "SEANCE during a scan, is blocked automatically (a crasher on the next scan).");
         dirInput.setTooltip("Type or paste a directory path here, then click Add");
         statusLabel.setText(juce::String((int)host.getAvailablePlugins().size()) + " plugins",
                             juce::dontSendNotification);
@@ -5801,44 +5834,50 @@ public:
             dirList.updateContent();
         };
         scanBtn.onClick = [this]() {
-            this->host.scanForPlugins(this->settings.scanDirs, this->settings.blockedPlugins);
+            this->host.scanForPlugins(this->settings.scanDirs, this->settings.blockedPlugins,
+                                      scanPedalFile());
+            // Block what failed to load, and what crashed SEANCE last scan.
             for (auto& f : this->host.failedPlugins)
                 this->settings.blockedPlugins.insert(f);
+            this->host.setBlockedPlugins(this->settings.blockedPlugins);
             this->settings.save("soundshop_plugins.cfg");
             this->host.saveScanCache("soundshop_plugins_cache.dat");
             statusLabel.setText(juce::String((int)this->host.getAvailablePlugins().size()) + " plugins found",
                                 juce::dontSendNotification);
             pluginList.updateContent();
+            updateAddButton();
         };
 
         pluginListModel.host = &host;
         pluginListModel.settings = &settings;
         pluginListModel.graph = &graph;
         pluginListModel.listBox = &pluginList;
+        pluginListModel.onSelectionChanged = [this] { updateAddButton(); };
         pluginList.setModel(&pluginListModel);
         pluginList.setRowHeight(22);
         pluginList.updateContent();
         addAndMakeVisible(addToGraphBtn);
         addToGraphBtn.setButtonText("Add to Graph");
-        addToGraphBtn.setTooltip("Create a new node in the graph for the selected plugin and load it");
         addToGraphBtn.onClick = [this]() {
-            int row = pluginList.getSelectedRow();
-            auto& plugins = this->host.getAvailablePlugins();
-            if (row >= 0 && row < (int)plugins.size()) {
-                auto& pi = plugins[row];
-                std::vector<Pin> ins, outs;
-                if (pi.hasMidiInput) ins.push_back({0, "MIDI In", PinKind::Midi, true});
-                if (pi.hasAudioInput) ins.push_back({0, "Audio In", PinKind::Audio, true, pi.numAudioInputChannels});
-                if (pi.hasAudioOutput) outs.push_back({0, "Audio Out", PinKind::Audio, false, pi.numAudioOutputChannels});
-                if (pi.hasMidiOutput) outs.push_back({0, "MIDI Out", PinKind::Midi, false});
-                auto type = pi.isInstrument ? NodeType::Instrument : NodeType::Effect;
-                auto& n = this->graph.addNode(pi.name, type, ins, outs, {100, 100});
-                auto loaded = this->host.loadPlugin(row, 44100.0, 512);
-                if (loaded) { n.plugin = std::move(loaded); n.pluginIndex = row; }
-            }
+            const auto row = pluginListModel.rowAt(pluginList.getSelectedRow());
+            if (row.available)
+                this->graph.addPluginNode(this->host, *row.available, {100, 100});
         };
+        updateAddButton();
 
         setSize(650, 500);
+    }
+
+    // Enabled only for a plugin that can be added; otherwise the tooltip says
+    // what's in the way.
+    void updateAddButton() {
+        const auto row = pluginListModel.rowAt(pluginList.getSelectedRow());
+        addToGraphBtn.setEnabled(row.available != nullptr);
+        addToGraphBtn.setTooltip(
+            row.available != nullptr   ? "Create a new node in the graph for the selected plugin and load it"
+            : !row.blockedId.empty()   ? "The selected plugin is blocked, so it can't be added. Right-click it "
+                                         "and choose Unblock first."
+                                       : "Select a plugin in the list first.");
     }
 
     void resized() override {
@@ -5886,67 +5925,118 @@ private:
     juce::Label statusLabel;
     juce::ListBox pluginList{"Plugins"};
 
-    // Plugin list model
+    // Plugin list model. Rows: the available plugins, then every blocked
+    // entry - a blocked plugin isn't scanned at all, so without its own row
+    // it could never be unblocked from here.
     struct PluginListModel : public juce::ListBoxModel {
         PluginHost* host = nullptr;
         PluginSettings* settings = nullptr;
         NodeGraph* graph = nullptr;
         juce::ListBox* listBox = nullptr;
+        std::function<void()> onSelectionChanged;
+
+        // A row is an available plugin, or a blocked identifier, or neither.
+        struct Row {
+            const PluginInfo* available = nullptr;
+            std::string blockedId;
+        };
+        Row rowAt(int row) const {
+            Row r;
+            if (!host || row < 0) return r;
+            auto& plugins = host->getAvailablePlugins();
+            if (row < (int)plugins.size()) {
+                r.available = &plugins[(size_t)row];
+                return r;
+            }
+            row -= (int)plugins.size();
+            if (settings && row < (int)settings->blockedPlugins.size()) {
+                auto it = settings->blockedPlugins.begin();
+                std::advance(it, row);
+                r.blockedId = *it;
+            }
+            return r;
+        }
+
+        // A blocked entry reads as its plugin's name if SEANCE described it
+        // before it was blocked, else as the file (or LV2 URI) itself.
+        juce::String blockedLabel(const std::string& id) const {
+            if (auto* pi = host ? host->findDescribed(id) : nullptr)
+                return pi->name + "  (" + pi->manufacturer + ")  [" + pi->format + "]";
+            const auto s = juce::String::fromUTF8(id.c_str());
+            return juce::File::isAbsolutePath(s) ? juce::File(s).getFileName() : s;
+        }
 
         int getNumRows() override {
-            return host ? (int)host->getAvailablePlugins().size() : 0;
+            if (!host) return 0;
+            return (int)host->getAvailablePlugins().size()
+                   + (settings ? (int)settings->blockedPlugins.size() : 0);
         }
         void paintListBoxItem(int row, juce::Graphics& g, int w, int h, bool selected) override {
             if (selected) g.fillAll(juce::Colour(50, 70, 100));
-            if (!host) return;
-            auto& plugins = host->getAvailablePlugins();
-            if (row >= 0 && row < (int)plugins.size()) {
-                auto& pi = plugins[row];
-                bool blocked = settings && settings->isBlocked(pi.fileOrId);
-                g.setColour(blocked ? juce::Colour(130, 80, 80) : juce::Colours::white);
-                g.setFont(12.0f);
+            const auto r = rowAt(row);
+            g.setFont(12.0f);
+            if (r.available) {
+                auto& pi = *r.available;
+                g.setColour(juce::Colours::white);
                 auto label = pi.name + "  (" + pi.manufacturer + ")  [" + pi.format + "]";
                 if (pi.hasAudioInput) label += "  audio in:" + std::to_string(pi.numAudioInputChannels);
                 if (pi.hasAudioOutput) label += "  audio out:" + std::to_string(pi.numAudioOutputChannels);
                 if (pi.numMidiInputPorts > 0) label += "  midi in:" + std::to_string(pi.numMidiInputPorts);
                 if (pi.numMidiOutputPorts > 0) label += "  midi out:" + std::to_string(pi.numMidiOutputPorts);
                 if (pi.isInstrument) label += "  [Instrument]";
-                if (blocked) label += "  [BLOCKED]";
                 g.drawText(label, 4, 0, w - 8, h, juce::Justification::centredLeft);
+            } else if (!r.blockedId.empty()) {
+                g.setColour(juce::Colour(130, 80, 80));
+                g.drawText(blockedLabel(r.blockedId) + "  [BLOCKED]", 4, 0, w - 8, h,
+                           juce::Justification::centredLeft);
             }
+        }
+        juce::String getTooltipForRow(int row) override {
+            const auto r = rowAt(row);
+            if (r.available)
+                return juce::String::fromUTF8(r.available->fileOrId.c_str());
+            if (!r.blockedId.empty())
+                return "Blocked: SEANCE doesn't load this plugin at all, not even to scan it. It "
+                       "failed or crashed when it was scanned, or it was blocked here. Right-click "
+                       "to unblock it (then Scan Now if it doesn't reappear by name).\n"
+                       + juce::String::fromUTF8(r.blockedId.c_str());
+            return {};
+        }
+        void selectedRowsChanged(int) override {
+            if (onSelectionChanged) onSelectionChanged();
         }
         void listBoxItemClicked(int row, const juce::MouseEvent& e) override {
             if (!e.mods.isRightButtonDown() || !host) return;
-            auto& plugins = host->getAvailablePlugins();
-            if (row < 0 || row >= (int)plugins.size()) return;
-            auto& pi = plugins[row];
-            bool blocked = settings && settings->isBlocked(pi.fileOrId);
+            const auto r = rowAt(row);
+            if (!r.available && r.blockedId.empty()) return;
+            const bool blocked = r.available == nullptr;
+            // Copies: (un)blocking rebuilds the list the row points into.
+            const PluginInfo pi = blocked ? PluginInfo{} : *r.available;
+            const std::string id = blocked ? r.blockedId : pi.fileOrId;
 
             juce::PopupMenu menu;
-            menu.addSectionHeader(pi.name);
-            menu.addItem(1, "Add to Graph");
+            menu.addSectionHeader(blocked ? blockedLabel(id) : juce::String(pi.name));
+            menu.addItem(1, blocked ? "Add to Graph (blocked - unblock it first)" : "Add to Graph",
+                         !blocked);
             menu.addItem(2, "Copy Path");
             menu.addSeparator();
             menu.addItem(3, blocked ? "Unblock" : "Block");
 
-            menu.showMenuAsync(juce::PopupMenu::Options(), [this, row, pi, blocked](int result) {
-                if (result == 1 && graph) {
-                    std::vector<Pin> ins, outs;
-                    if (pi.hasMidiInput) ins.push_back({0, "MIDI In", PinKind::Midi, true});
-                    if (pi.hasAudioInput) ins.push_back({0, "Audio In", PinKind::Audio, true, pi.numAudioInputChannels});
-                    if (pi.hasAudioOutput) outs.push_back({0, "Audio Out", PinKind::Audio, false, pi.numAudioOutputChannels});
-                    if (pi.hasMidiOutput) outs.push_back({0, "MIDI Out", PinKind::Midi, false});
-                    auto type = pi.isInstrument ? NodeType::Instrument : NodeType::Effect;
-                    auto& n = graph->addNode(pi.name, type, ins, outs, {100, 100});
-                    auto loaded = host->loadPlugin(row, 44100.0, 512);
-                    if (loaded) { n.plugin = std::move(loaded); n.pluginIndex = row; }
+            menu.showMenuAsync(juce::PopupMenu::Options(), [this, pi, id, blocked](int result) {
+                if (result == 1 && graph && !blocked) {
+                    graph->addPluginNode(*host, pi, {100, 100});
                 } else if (result == 2) {
-                    juce::SystemClipboard::copyTextToClipboard(pi.fileOrId);
+                    juce::SystemClipboard::copyTextToClipboard(juce::String::fromUTF8(id.c_str()));
                 } else if (result == 3 && settings) {
-                    if (blocked) settings->blockedPlugins.erase(pi.fileOrId);
-                    else settings->blockedPlugins.insert(pi.fileOrId);
+                    if (blocked) settings->blockedPlugins.erase(id);
+                    else settings->blockedPlugins.insert(id);
+                    host->setBlockedPlugins(settings->blockedPlugins);
                     settings->save("soundshop_plugins.cfg");
-                    if (listBox) listBox->repaint();
+                    if (listBox) {
+                        listBox->updateContent();
+                        listBox->repaint();
+                    }
+                    if (onSelectionChanged) onSelectionChanged();
                 }
             });
         }

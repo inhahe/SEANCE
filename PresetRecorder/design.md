@@ -66,7 +66,7 @@ never the run. The pieces:
 |---|---|
 | `soundshop_plugins.cfg` `[ScanDirs]` | the plugin folders to search |
 | `soundshop_plugins.cfg` `[Blocked]` | SEANCE's skip list |
-| `soundshop_plugins_cache.dat` (JUCE XML part) | names/companies for skip-list entries |
+| `soundshop_plugins_cache.dat` (JUCE XML part) | names/companies for skip-list entries - only those SEANCE described before they were blocked, since SEANCE 0.10.4 doesn't scan blocked plugins; the rest show by file name |
 
 SEANCE opens these relative to its working directory, so their location depends
 on how SEANCE was started. `SeanceConfig::findCandidates()` looks in every

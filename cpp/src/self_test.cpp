@@ -11972,13 +11972,65 @@ bool searchPathHas(const juce::FileSearchPath& path, const juce::File& dir) {
     return false;
 }
 
+// The two self-test plugins (cpp/test_plugins/lv2_gain), told apart by their
+// default gain.
+constexpr const char* kSelfTestGainA = "urn:seance:selftest:gain";     // gain 0.5
+constexpr const char* kSelfTestGainB = "urn:seance:selftest:gain-b";   // gain 0.25
+
+juce::File selfTestPluginDir() {
+    return juce::File::getSpecialLocation(juce::File::currentExecutableFile)
+               .getParentDirectory().getChildFile("selftest_plugins");
+}
+
+// For PluginHost::scanFolders: LV2 plugins in `dir` and nothing else - never
+// the user's own plugin folders, whose plugins a scan would load.
+PluginHost::SearchPathFn lv2FolderOnly(const juce::File& dir) {
+    return [dir](juce::AudioPluginFormat& format) {
+        return format.getName() == "LV2" ? juce::FileSearchPath(dir.getFullPathName())
+                                         : juce::FileSearchPath();
+    };
+}
+
+const PluginInfo* findListed(const PluginHost& host, const char* fileOrId) {
+    for (auto& p : host.getAvailablePlugins())
+        if (p.fileOrId == fileOrId)
+            return &p;
+    return nullptr;
+}
+
+// A mono plugin's gain: least squares of its output against a 440 Hz sine
+// fed through one block. -1 when there's no plugin to measure.
+double measuredGain(const PluginHost::LoadedPlugin* loaded) {
+    if (loaded == nullptr || !loaded->instance) return -1.0;
+    auto& plugin = *loaded->instance;
+    constexpr double rate = 48000.0;
+    constexpr int block = 256;   // no more than any self-test prepares with
+    const int channels = std::max({ 1, plugin.getTotalNumInputChannels(),
+                                    plugin.getTotalNumOutputChannels() });
+    juce::AudioBuffer<float> buffer(channels, block);
+    buffer.clear();
+    std::vector<float> in((size_t) block);
+    for (int i = 0; i < block; ++i) {
+        in[(size_t) i] = 0.25f * (float) std::sin(juce::MathConstants<double>::twoPi * 440.0 * i / rate);
+        buffer.setSample(0, i, in[(size_t) i]);
+    }
+    juce::MidiBuffer midi;
+    plugin.processBlock(buffer, midi);
+
+    double num = 0, den = 0;
+    for (int i = 0; i < block; ++i) {
+        num += (double) buffer.getSample(0, i) * in[(size_t) i];
+        den += (double) in[(size_t) i] * in[(size_t) i];
+    }
+    return den > 0 ? num / den : 0.0;
+}
+
 } // namespace
 
 void testPluginFolders(Report& r, const juce::File& outDir) {
     r.section("Plugin folders: what each format searches; LV2 plugins after a restart");
 
-    const auto pluginDir = juce::File::getSpecialLocation(juce::File::currentExecutableFile)
-                               .getParentDirectory().getChildFile("selftest_plugins");
+    const auto pluginDir = selfTestPluginDir();
     const auto bundle = pluginDir.getChildFile("seance_selftest_gain.lv2");
     if (!bundle.getChildFile("manifest.ttl").existsAsFile()) {
         r.note("SKIPPED - " + bundle.getFullPathName() + " is missing. The build puts it "
@@ -12056,19 +12108,17 @@ void testPluginFolders(Report& r, const juce::File& outDir) {
     // ---- An LV2 plugin in a user folder, across a restart --------------------
     const auto cacheFile = work.getChildFile("plugin_cache.txt");
     const std::string cachePath = cacheFile.getFullPathName().toStdString();
-    constexpr double rate = 48000.0;
-    constexpr int block = 256;
+    juce::PluginDescription gainA;
 
-    {   // The session that found it.
+    {   // The session that scanned it.
         PluginHost host;
-        const bool found = host.loadPluginFile(bundle.getFullPathName().toStdString());
-        const auto& list = host.getAvailablePlugins();
-        if (!r.check(found && list.size() == 1 && list[0].format == "LV2",
-                     "restart: the self-test bundle is found as one LV2 plugin"))
+        host.scanFolders(lv2FolderOnly(pluginDir), {});
+        const auto* a = findListed(host, kSelfTestGainA);
+        if (!r.check(a != nullptr && a->format == "LV2",
+                     "restart: a scan of the folder finds the self-test LV2 plugin"))
             return;
-        r.check(list[0].fileOrId == "urn:seance:selftest:gain",
-                "restart: it is identified by its URI - all the scan cache keeps of it");
-        r.check(host.loadPlugin(0, rate, block) != nullptr,
+        gainA = a->description;
+        r.check(host.loadPlugin(gainA, 48000.0, 256) != nullptr,
                 "restart: it loads in the session that found it");
         host.saveScanCache(cachePath);
     }
@@ -12078,9 +12128,9 @@ void testPluginFolders(Report& r, const juce::File& outDir) {
         // proves nothing.
         PluginHost host;
         host.loadScanCache(cachePath);
-        r.check(host.getAvailablePlugins().size() == 1,
+        r.check(findListed(host, kSelfTestGainA) != nullptr,
                 "restart: the scan cache brings the plugin back");
-        r.check(host.loadPlugin(0, rate, block) == nullptr,
+        r.check(host.loadPlugin(gainA, 48000.0, 256) == nullptr,
                 "restart: without registerPluginFolders it can't be found (JUCE: \"Unable to "
                 "locate plugin with the requested URI\") - the bug this guards against");
     }
@@ -12089,33 +12139,294 @@ void testPluginFolders(Report& r, const juce::File& outDir) {
         PluginHost host;
         host.loadScanCache(cachePath);
         host.registerPluginFolders(folders);
-        auto loaded = host.loadPlugin(0, rate, block);
+        auto loaded = host.loadPlugin(gainA, 48000.0, 256);
         if (r.check(loaded != nullptr,
                     "restart: after registerPluginFolders (as at startup) it loads")) {
-            auto& plugin = *loaded->instance;
-            const int channels = std::max({ 1, plugin.getTotalNumInputChannels(),
-                                            plugin.getTotalNumOutputChannels() });
-            juce::AudioBuffer<float> buffer(channels, block);
-            buffer.clear();
-            std::vector<float> in((size_t) block);
-            for (int i = 0; i < block; ++i) {
-                in[(size_t) i] = 0.25f * (float) std::sin(juce::MathConstants<double>::twoPi * 440.0 * i / rate);
-                buffer.setSample(0, i, in[(size_t) i]);
-            }
-            juce::MidiBuffer midi;
-            plugin.processBlock(buffer, midi);
-
-            // Least-squares gain of output against input.
-            double num = 0, den = 0;
-            for (int i = 0; i < block; ++i) {
-                num += (double) buffer.getSample(0, i) * in[(size_t) i];
-                den += (double) in[(size_t) i] * in[(size_t) i];
-            }
-            const double gain = den > 0 ? num / den : 0.0;
+            const double gain = measuredGain(loaded.get());
             r.checkVal(std::abs(gain - 0.5) < 1e-4,
                        "restart: ...and its own code runs - the output is the input at the "
                        "plugin's default gain of 0.5", gain);
         }
+    }
+}
+
+// ===========================================================================
+// Plugin identity: a project names its plugin, blocked plugins aren't
+// loaded, and a plugin-list row loads the plugin it shows
+// ===========================================================================
+//
+// Projects used to save a hosted plugin as its row in the plugin list, and the
+// list was two lists in parallel - the rows the menus showed, and the JUCE
+// descriptions that loaded - which disagreed after a working plugin was
+// blocked, and after every restart (reloading the cache reversed one of them).
+// Blocking only hid a plugin: every Scan Now still loaded it. Now each row
+// carries its own description, a project saves the description
+// (Node::pluginDescription) and PluginHost::resolvePlugin matches it against
+// the list on open, and the scan gets the blocklist up front.
+//
+// Uses both self-test plugins - A at gain 0.5, B at 0.25 - so the output
+// level says which one really loaded.
+const char* const kLifecycleIssue = "Hosted plugins are lost at the next audio-graph rebuild, and on undo";
+
+void testPluginIdentity(Report& r, const juce::File& outDir) {
+    r.section("Plugin identity: projects name their plugin; blocked plugins aren't loaded");
+
+    const auto pluginDir = selfTestPluginDir();
+    if (!pluginDir.getChildFile("seance_selftest_gain.lv2/manifest.ttl").existsAsFile()) {
+        r.note("SKIPPED - no self-test LV2 plugins in " + pluginDir.getFullPathName()
+               + ". The build puts them there; release packages leave them out.");
+        return;
+    }
+    const auto work = outDir.getChildFile("plugin_identity");
+    work.deleteRecursively();
+    work.createDirectory();
+    const auto scan = lv2FolderOnly(pluginDir);
+    const std::vector<std::string> folders { pluginDir.getFullPathName().toStdString() };
+    const std::string uriA = kSelfTestGainA, uriB = kSelfTestGainB;
+    auto closeTo = [](double measured, double wanted) { return std::abs(measured - wanted) < 1e-4; };
+    auto rowOf = [](const PluginHost& host, const std::string& uri) {
+        const auto& list = host.getAvailablePlugins();
+        for (size_t i = 0; i < list.size(); ++i)
+            if (list[i].fileOrId == uri) return (int) i;
+        return -1;
+    };
+    // Every listed self-test plugin loads the plugin its row shows.
+    auto rowsLoadTheirOwn = [&](PluginHost& host) {
+        int checked = 0;
+        for (auto& row : host.getAvailablePlugins()) {
+            if (row.fileOrId != uriA && row.fileOrId != uriB) continue;   // this machine's own LV2s
+            auto p = host.loadPlugin(row.description, 48000.0, 256);
+            if (!closeTo(measuredGain(p.get()), row.fileOrId == uriA ? 0.5 : 0.25)) return false;
+            ++checked;
+        }
+        return checked > 0;
+    };
+
+    // ---- Scanning: the blocklist goes in up front --------------------------
+    {
+        PluginHost host;
+        host.scanFolders(scan, { uriB });
+        r.check(findListed(host, kSelfTestGainA) != nullptr, "scan: finds the self-test plugins");
+        r.check(host.findDescribed(uriB) == nullptr && host.failedPlugins.empty(),
+                "scan: a blocked plugin isn't even scanned (the scanner is handed the "
+                "blocklist), and isn't reported as failing");
+    }
+    {
+        const auto pedal = work.getChildFile("scanning.dat");
+        pedal.replaceWithText(juce::String(kSelfTestGainB) + "\n");   // SEANCE died loading B
+        PluginHost host;
+        host.scanFolders(scan, {}, pedal);
+        r.check(host.findDescribed(uriB) == nullptr && host.failedPlugins.count(uriB) == 1,
+                "scan: a plugin SEANCE crashed on during the last scan is skipped, and reported "
+                "so Scan Now blocks it");
+        r.check(!pedal.exists(),
+                "scan: ...and the crash record is cleared, so unblocking the plugin later works");
+        r.check(findListed(host, kSelfTestGainA) != nullptr, "scan: the other plugins still are scanned");
+    }
+
+    // ---- The list and what loads stay in step ------------------------------
+    PluginHost host;
+    host.scanFolders(scan, {});
+    if (!r.check(findListed(host, kSelfTestGainA) && findListed(host, kSelfTestGainB),
+                 "list: both self-test plugins are listed"))
+        return;
+    const auto descA = findListed(host, kSelfTestGainA)->description;
+    const auto descB = findListed(host, kSelfTestGainB)->description;
+    r.check(rowsLoadTheirOwn(host), "list: each row loads the plugin it shows");
+
+    host.setBlockedPlugins({ uriA });
+    r.check(!findListed(host, kSelfTestGainA) && findListed(host, kSelfTestGainB),
+            "blocking: a blocked plugin leaves the list at once");
+    r.check(rowsLoadTheirOwn(host),
+            "blocking: the rows left still load their own plugins (the old code shifted every "
+            "later row onto its neighbour)");
+    {
+        std::string why;
+        r.check(host.loadPlugin(descA, 48000.0, 256, &why) == nullptr
+                    && why.find("blocked") != std::string::npos,
+                "blocking: a blocked plugin is refused even when asked for directly, and says why");
+    }
+    host.setBlockedPlugins({});
+    r.check(findListed(host, kSelfTestGainA) != nullptr,
+            "blocking: unblocking brings it straight back, without a rescan");
+
+    const auto cachePath = work.getChildFile("plugin_cache.txt").getFullPathName().toStdString();
+    host.saveScanCache(cachePath);
+    {
+        PluginHost restarted;
+        restarted.loadScanCache(cachePath);
+        restarted.registerPluginFolders(folders);
+        bool sameOrder = restarted.getAvailablePlugins().size() == host.getAvailablePlugins().size();
+        for (size_t i = 0; sameOrder && i < host.getAvailablePlugins().size(); ++i)
+            sameOrder = restarted.getAvailablePlugins()[i].fileOrId == host.getAvailablePlugins()[i].fileOrId;
+        r.check(sameOrder, "cache: a restart brings the list back in the same order");
+        r.check(rowsLoadTheirOwn(restarted),
+                "cache: ...and each row still loads the plugin it shows (the old reload loaded "
+                "the plugin in the mirror-image row)");
+    }
+
+    // ---- A project names its plugin ----------------------------------------
+    // Save a graph whose node hosts B; open it where the list is the other
+    // way round (the cache's plugins reversed).
+    NodeGraph saved;
+    const int nodeId = saved.addPluginNode(host, *findListed(host, kSelfTestGainB), {0.0f, 0.0f}).id;
+    const std::string text = ProjectFile::serializeForUndo(saved);   // the project writer minus plugin state
+    r.check(text.find("pluginDescription=<PLUGIN") != std::string::npos
+                && text.find("pluginIndex=") == std::string::npos,
+            "project: a plugin node is saved with its plugin's description, not a list row");
+
+    const auto reversedCache = work.getChildFile("plugin_cache_reversed.txt");
+    {
+        const auto cacheText = juce::File(cachePath).loadFileAsString();
+        const int xmlStart = cacheText.indexOf("JUCE_XML") + 8, xmlEnd = cacheText.lastIndexOf("END_XML");
+        juce::XmlElement reversedRoot("KNOWNPLUGINS");
+        if (auto xml = juce::parseXML(cacheText.substring(xmlStart, xmlEnd).trim()))
+            for (auto* e : xml->getChildIterator())
+                reversedRoot.prependChildElement(new juce::XmlElement(*e));
+        reversedCache.replaceWithText(cacheText.substring(0, xmlStart) + "\n"
+                                      + reversedRoot.toString() + "\nEND_XML\n");
+    }
+    PluginHost reversed;
+    reversed.loadScanCache(reversedCache.getFullPathName().toStdString());
+    reversed.registerPluginFolders(folders);
+    r.check(rowOf(reversed, uriB) >= 0 && rowOf(reversed, uriB) != rowOf(host, uriB),
+            "project: (setup) the list it's opened with has B in another row");
+
+    // Opening with a host instantiates the plugins there and then, as crash
+    // recovery does; the normal open's async loader makes the same call.
+    auto open = [&](const std::string& projectText, NodeGraph& into) -> const Node* {
+        ProjectFile::loadFromString(projectText, into, &reversed);
+        return into.findNode(nodeId);
+    };
+    {
+        NodeGraph opened;
+        const auto* n = open(text, opened);
+        const double g = n ? measuredGain(n->plugin.get()) : -1.0;
+        r.checkVal(closeTo(g, 0.25),
+                   "project: opened with the list in another order, the node gets its own plugin "
+                   "back (B, gain 0.25)", g);
+    }
+
+    // ---- Old projects: only a list row -------------------------------------
+    // The same project as an older SEANCE wrote it: "pluginIndex=<row>"
+    // instead of the description, with the node named as given.
+    auto oldStyle = [&](const std::string& nodeName, int row) {
+        std::istringstream in(text);
+        std::ostringstream out;
+        std::string line, section;
+        while (std::getline(in, line)) {
+            if (!line.empty() && line[0] == '[') section = line;
+            if (line.rfind("pluginDescription=", 0) == 0)
+                line = "pluginIndex=" + std::to_string(row);
+            else if (section == "[Node]" && line.rfind("name=", 0) == 0)
+                line = "name=" + nodeName;
+            out << line << "\n";
+        }
+        return out.str();
+    };
+    const int rowA = rowOf(reversed, uriA);
+    {
+        NodeGraph opened;
+        const auto* n = open(oldStyle("SEANCE Self-Test Gain B", rowA), opened);
+        const double g = n ? measuredGain(n->plugin.get()) : -1.0;
+        r.checkVal(closeTo(g, 0.25),
+                   "old project: the node's name identifies its plugin, not the row (which now "
+                   "holds A)", g);
+        const auto resaved = ProjectFile::serializeForUndo(opened);
+        r.check(resaved.find("pluginDescription=") != std::string::npos
+                    && resaved.find("pluginIndex=") == std::string::npos,
+                "old project: once identified, the node saves its plugin's description");
+    }
+    {
+        NodeGraph opened;
+        const auto* n = open(oldStyle("SEANCE Self-Test Gain B 2", rowA), opened);
+        const double g = n ? measuredGain(n->plugin.get()) : -1.0;
+        r.checkVal(closeTo(g, 0.25),
+                   "old project: a numbered node name (\"... B 2\", a second copy) counts too", g);
+    }
+    {
+        NodeGraph opened;
+        const auto* n = open(oldStyle("Renamed by the user", rowA), opened);
+        const double g = n ? measuredGain(n->plugin.get()) : -1.0;
+        r.checkVal(closeTo(g, 0.5), "old project: a renamed node falls back to its row (A)", g);
+    }
+    {
+        NodeGraph opened;
+        const auto* n = open(oldStyle("Renamed by the user", 99), opened);
+        r.check(n && !n->plugin && n->pluginLoadState == PluginLoadState::Failed
+                    && !n->pluginLoadError.empty(),
+                "old project: a plugin that can't be identified fails, with a reason");
+        r.check(ProjectFile::serializeForUndo(opened).find("pluginIndex=99") != std::string::npos,
+                "old project: ...and keeps its row when saved, so nothing is lost");
+    }
+
+    // ---- Resolution --------------------------------------------------------
+    {
+        auto moved = descB;
+        moved.fileOrIdentifier = "urn:seance:selftest:moved-elsewhere";
+        const auto res = reversed.resolvePlugin(moved);
+        r.check(res.found && res.description.fileOrIdentifier == kSelfTestGainB,
+                "resolve: the same plugin at another location (same format, format id and name) "
+                "is matched - moved, reinstalled or updated");
+    }
+    {
+        auto missing = descB;
+        missing.name = "No Such Plugin";
+        missing.fileOrIdentifier = "urn:seance:selftest:missing";
+        missing.uniqueId = missing.deprecatedUid = 12345;
+        const auto res = reversed.resolvePlugin(missing);
+        r.check(!res.found && res.problem.find("No Such Plugin") != std::string::npos,
+                "resolve: a plugin that's nowhere fails with a reason that names it");
+    }
+    {
+        auto foreign = descB;
+        foreign.pluginFormatName = "NoSuchFormat";
+        const auto res = reversed.resolvePlugin(foreign);
+        r.check(!res.found && res.problem.find("can't host") != std::string::npos,
+                "resolve: a plugin of a format this build can't host fails, saying so");
+    }
+    {
+        PluginHost unscanned;   // no plugin list at all: another computer's project
+        unscanned.registerPluginFolders(folders);
+        const auto res = unscanned.resolvePlugin(descB);
+        auto p = res.found ? unscanned.loadPlugin(res.description, 48000.0, 256) : nullptr;
+        const double g = measuredGain(p.get());
+        r.checkVal(closeTo(g, 0.25),
+                   "resolve: a plugin missing from the list but installed where the project "
+                   "says still loads", g);
+    }
+    {
+        reversed.setBlockedPlugins({ uriB });
+        const auto res = reversed.resolvePlugin(descB);
+        r.check(!res.found && res.problem.find("blocked") != std::string::npos,
+                "resolve: a blocked plugin is refused, and the reason says so");
+        reversed.setBlockedPlugins({});
+    }
+
+    // ---- Known bug: plugin instances don't outlive a rebuild or an undo ----
+    {
+        NodeGraph g;
+        const int id = g.addPluginNode(host, *findListed(host, kSelfTestGainA), {0.0f, 0.0f}).id;
+        Transport transport;
+        GraphProcessor gp;
+        gp.prepare(g, 48000.0, 256);
+        gp.rebuildGraph(g, transport);
+        const bool first = dynamic_cast<juce::AudioPluginInstance*>(gp.getProcessorForNode(id)) != nullptr;
+        gp.rebuildGraph(g, transport);
+        const bool second = dynamic_cast<juce::AudioPluginInstance*>(gp.getProcessorForNode(id)) != nullptr;
+        r.check(first, "lifecycle: the audio graph hosts a plugin node's plugin");
+        r.knownBug(second, "lifecycle: ...and still does after the graph is rebuilt",
+                   second ? 1.0 : 0.0, kLifecycleIssue);
+    }
+    {
+        NodeGraph g;
+        const int id = g.addPluginNode(host, *findListed(host, kSelfTestGainA), {0.0f, 0.0f}).id;
+        ProjectFile::loadFromString(ProjectFile::serializeForUndo(g), g, nullptr);   // an undo
+        const auto* n = g.findNode(id);
+        r.check(n && n->pluginDescription.fileOrIdentifier == kSelfTestGainA,
+                "lifecycle: an undo keeps the node's plugin identity");
+        const bool kept = n && n->plugin != nullptr;
+        r.knownBug(kept, "lifecycle: ...and its plugin", kept ? 1.0 : 0.0, kLifecycleIssue);
     }
 }
 
@@ -12159,6 +12470,7 @@ int runSelfTest(const juce::File& outDir) {
     testDialogTaskbarFlags(r);
     testScriptingApi(r, outDir);
     testPluginFolders(r, outDir);
+    testPluginIdentity(r, outDir);
     testAppVersion(r);
 
     r.section("Summary");

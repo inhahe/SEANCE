@@ -5,3 +5,8 @@
     a lv2:Plugin ;
     lv2:binary <seance_selftest_gain@CMAKE_SHARED_MODULE_SUFFIX@> ;
     rdfs:seeAlso <seance_selftest_gain.ttl> .
+
+<urn:seance:selftest:gain-b>
+    a lv2:Plugin ;
+    lv2:binary <seance_selftest_gain@CMAKE_SHARED_MODULE_SUFFIX@> ;
+    rdfs:seeAlso <seance_selftest_gain.ttl> .

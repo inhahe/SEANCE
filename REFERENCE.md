@@ -47,6 +47,7 @@ here.
 - [Ephemeral session (`--ephemeral`)](#ephemeral-session---ephemeral)
 - [Opening a project from the command line](#opening-a-project-from-the-command-line)
 - [Plugin folders and scanning](#plugin-folders-and-scanning)
+- [How a project remembers its plugins](#how-a-project-remembers-its-plugins)
 - [Asynchronous plugin loading](#asynchronous-plugin-loading)
 - [Plugin Preset Recorder (companion tool)](#plugin-preset-recorder-companion-tool)
 - [Dialogs and the Windows taskbar](#dialogs-and-the-windows-taskbar)
@@ -4420,7 +4421,7 @@ just as they are for an auto-loaded project. Parsed in `main.cpp::initialise`
 ## Plugin folders and scanning
 
 <a name="plugin-folders-and-scanning"></a>**Where the settings live.**
-*Settings → Plugin Settings* edits `soundshop_plugins.cfg` in SEANCE's working
+*Plugins → Plugin Settings…* edits `soundshop_plugins.cfg` in SEANCE's working
 directory (the SoundShop2 folder when started by `seance.bat`, the exe's folder
 when the exe is double-clicked): `[ScanDirs]` is the folder list, `[Blocked]` the
 skip list. With no file, or an empty folder list, SEANCE uses its built-in
@@ -4445,6 +4446,42 @@ that cache instead of scanning.
   plugins in such subfolders anyway, so the filter changes which folders it
   reads, never which plugins it finds.
 
+**What a scan does with each plugin.** *Scan Now* loads every plugin it finds,
+briefly, to read what it is (name, maker, inputs and outputs) — except blocked
+ones:
+
+- **A blocked plugin isn't loaded at all.** The `[Blocked]` list goes to JUCE's
+  scanner as its blacklist, which skips a listed file before loading it. (Until
+  0.10.4 blocking only hid a plugin from the menus and every scan still loaded
+  it, so a plugin blocked for hanging, crashing or popping up a licence dialog
+  did that again on every scan.)
+- **A plugin that fails to load is blocked** when the scan ends — typically a
+  32-bit plugin, which a 64-bit program can't load at all. Only that scan's
+  failures count: an unblocked plugin that loads now isn't blocked again for
+  having failed earlier.
+- **A plugin that crashes SEANCE mid-scan is blocked by the next scan.** While
+  it scans, SEANCE keeps the identifier of the plugin it's loading in
+  `soundshop_plugins_scanning.dat` beside the `.cfg` (JUCE's "dead man's
+  pedal"). If SEANCE dies, the file survives; the next *Scan Now* skips the
+  plugin it names, blocks it, and deletes the file. (Before 0.10.4 nothing
+  recorded it: the *Scan Now* tooltip promised crashing plugins got blocked, but
+  a crashing plugin took SEANCE down on every scan.)
+- The resulting list is in name order.
+
+**Blocked plugins in the dialog.** The plugin list shows every blocked entry
+after the available plugins, in dark red with `[BLOCKED]` — by name if SEANCE
+described the plugin before it was blocked, otherwise by file name (or LV2 URI);
+hovering a row shows why it's blocked and its full path. Right-click →
+*Unblock* (*Block* on an available plugin). A plugin described before it was
+blocked comes straight back when unblocked; one blocked without ever being
+scanned (a failed or crashed scan) reappears at the next *Scan Now*. *Add to
+Graph* is disabled while a blocked row is selected, and its tooltip says why.
+Blocked plugins are left out of every plugin menu, and SEANCE refuses to load
+one from anywhere, projects included (see
+[How a project remembers its plugins](#how-a-project-remembers-its-plugins)).
+(Before 0.10.4 a blocked plugin dropped out of the list at the next scan, and
+then only editing the `.cfg` could unblock it.)
+
 **LV2 plugins outside the standard LV2 folders.** A VST3 plugin is loaded from
 the file path saved in the scan cache, but an LV2 plugin is saved as just its
 URI, and JUCE finds a URI only among the bundles lilv has read — at startup,
@@ -4466,10 +4503,73 @@ scan, and harmless.
 
 **Tested by** `testPluginFolders` in `self_test.cpp` (`SEANCE.exe --self-test
 <dir>`). It checks which folders each format gets and simulates a restart with
-fresh `PluginHost`s (each has its own LV2 world). The plugin it restarts with is
-a real, minimal LV2 gain plugin, `cpp/test_plugins/lv2_gain`, which the build
-copies to `selftest_plugins/` beside the exe, outside every standard LV2
-folder. `release.bat` doesn't package that folder.
+fresh `PluginHost`s (each has its own LV2 world). The plugins it uses are real,
+minimal LV2 gains, `cpp/test_plugins/lv2_gain`, which the build copies to
+`selftest_plugins/` beside the exe, outside every standard LV2 folder.
+`release.bat` doesn't package that folder. Scanning with a blocklist and after a
+crash is tested in `testPluginIdentity`, below.
+
+---
+
+## How a project remembers its plugins
+
+<a name="how-a-project-remembers-its-plugins"></a>A plugin node saves its
+plugin's full JUCE description — format, file path (or LV2 URI), the format's
+own id for the plugin (a VST3's class id), name, maker, version, channel counts —
+as one line of XML in its `[Node]` section: `pluginDescription=<PLUGIN
+name="…" format="VST3" …/>` (`Node::pluginDescription`). Opening the project
+matches that against the plugin list (`PluginHost::resolvePlugin`), taking the
+first of:
+
+1. exactly the saved plugin (same format, file or URI, and ids);
+2. the same plugin somewhere else — same format, format id and name: moved,
+   reinstalled or updated;
+3. the same format, name and maker (an update that changed the id);
+4. the saved description itself, if the plugin isn't in the list but is still
+   installed where the project says — a project from another computer, or one
+   opened before any scan.
+
+Blocked plugins never match. A node whose plugin turns up somewhere new records
+the new location, which the next save stores. When nothing matches, the node
+gets the **Failed** badge, and its tooltip names the plugin and says why: not in
+the list and not installed at the saved location, blocked, a format this
+computer can't host, or JUCE's own error when the plugin was found but wouldn't
+start. The node keeps its saved plugin state either way — saving writes back
+what was read — so nothing is lost; reopen the project once the plugin is back.
+
+**Why.** Until 0.10.4 a project saved only the plugin's row in the plugin list
+(`pluginIndex=<n>`), and SEANCE kept that list as two lists side by side — the
+rows the menus showed, and the JUCE descriptions it loaded from — which
+disagreed in two ways:
+
+- reloading the scan cache at startup reversed the second list (JUCE's
+  `KnownPluginList::addType` inserts at the front), so after a restart a menu
+  row, or a project's saved row, loaded the plugin in the *mirror-image* row;
+- a blocked plugin that loads fine stayed in the second list but left the
+  first, shifting every later row onto its neighbour.
+
+On top of that, any change to the list between saving and opening a project — a
+rescan after installing or removing a plugin, a new folder, a blocked plugin —
+moved the rows anyway. Now every row carries its own description
+(`PluginInfo::description`): there is no second list, and nothing saves a row.
+The cache file keeps its old layout (PresetRecorder reads its XML half) but is
+read and written in document order, never through `addType`.
+
+**Old projects** — a `pluginIndex` and no description — are identified by the
+node's name, which is the plugin's name unless the node was renamed (a numbered
+repeat such as "Serum 2" counts); failing that, by the saved row in today's
+list, which is still right if the list hasn't changed. Once identified, the node
+saves the description like any other. A node that can't be identified keeps its
+`pluginIndex`, so saving loses nothing.
+
+**Tested by** `testPluginIdentity` in `self_test.cpp`, with both self-test
+plugins: "SEANCE Self-Test Gain" at gain 0.5 and "SEANCE Self-Test Gain B" at
+0.25, so the output level shows which one really loaded. It covers scanning with
+a blocklist and with a crash record, every row loading its own plugin (after
+blocking, and across a cache reload), a project opened with the list reversed,
+old projects by name, numbered name and row, each resolution rule, and the
+refusals. Its two `lifecycle:` checks are known bugs — see known-issues.md,
+*Hosted plugins are lost at the next audio-graph rebuild, and on undo*.
 
 ---
 
@@ -4491,8 +4591,11 @@ instantiating anything while holding `NodeGraph::mutationLock`. The graph is
 painted right away. Then `MainContentComponent::beginAsyncPluginLoad()` marks
 every not-yet-loaded plugin node **Pending**, pushes its id onto a FIFO queue,
 and `processNextPluginLoad()` walks the queue one node per `callAsync` tick: the
-node flips to **Loading**, the heavy `loadPlugin` + `setStateInformation` runs
-**off** the graph lock, then the result is published **under** the lock
+node flips to **Loading**, the heavy part runs **off** the graph lock — finding
+the node's plugin by its identity and instantiating it
+(`PluginHost::loadNodePlugin`, see
+[How a project remembers its plugins](#how-a-project-remembers-its-plugins)),
+then `setStateInformation` — and the result is published **under** the lock
 (`node.plugin` set, `pendingPluginState` cleared) and the audio graph is rebuilt.
 The loader never holds a `Node*` across the heavy call — it re-looks-up by id —
 so the queue is safe even if you add/remove nodes mid-load. Opening a second
@@ -4508,8 +4611,10 @@ top-right):
 - **Pending** — a dim grey hollow ring: queued, waiting its turn.
 - **Loading** — an animated aqua arc spinner (driven by the 30 Hz UI timer):
   instantiating now.
-- **Failed** — an amber "x" disc: the plugin couldn't be instantiated (missing,
-  blocklisted, or incompatible). The node is kept so you can replace the plugin.
+- **Failed** — an amber "x" disc: the plugin couldn't be found or started. The
+  tooltip names the plugin and says why (not installed, blocked, a format this
+  computer can't host, or the plugin's own error). The node is kept, with its
+  saved plugin state, so the plugin can load again later or be replaced.
 - **Ready / none** — no badge.
 
 Each state has a hover tooltip explaining it. The spinner only animates (and the
@@ -4538,7 +4643,7 @@ and audition the recordings. Its user guide is
 SEANCE:
 
 - **`soundshop_plugins.cfg`** — SEANCE's plugin settings, written by
-  *Settings → Plugin Settings* into SEANCE's working directory (the SoundShop2
+  *Plugins → Plugin Settings…* into SEANCE's working directory (the SoundShop2
   folder when started by `seance.bat`, the exe's folder when the exe is
   double-clicked). `[ScanDirs]` lists the plugin folders; `[Blocked]` is the
   skip list (the blocklist): plugins whose scan failed are added automatically,
@@ -4547,7 +4652,9 @@ SEANCE:
   [Plugin folders and scanning](#plugin-folders-and-scanning)) — and skips
   `[Blocked]` entries unless the user unskips them *in the tool*.
 - **`soundshop_plugins_cache.dat`** — read only to put names and companies on
-  blocked entries.
+  blocked entries. Since SEANCE 0.10.4 blocked plugins aren't scanned, so the
+  cache names one only if SEANCE described it before it was blocked; the rest
+  show by file name.
 - The tool **never writes** either file; its unskip choices live in its own
   settings (`%APPDATA%\PresetRecorder`).
 - It compiles two SEANCE sources directly: `cpp/src/plugin_settings.cpp` (so the

@@ -575,7 +575,22 @@ struct Node {
     bool mpeEnabled = false;
     int mpePitchBendRange = 48;       // semitones, must match synth setting
     std::shared_ptr<PluginHost::LoadedPlugin> plugin; // hosted VST3/AU plugin
-    int pluginIndex = -1; // index into PluginHost::availablePlugins, -1 = none
+    // Which third-party plugin this node hosts: its full JUCE description
+    // (format, file or LV2 URI, the format's own id, name, maker, ...). It is
+    // what a project saves for the node ("pluginDescription") and what
+    // PluginHost::resolvePlugin matches against the plugin list when the
+    // project opens, so the node gets its own plugin back however the list
+    // has changed since. Empty fileOrIdentifier: not a plugin node.
+    juce::PluginDescription pluginDescription;
+    // Projects saved before plugin identities were recorded give only the
+    // plugin's row in that day's plugin list ("pluginIndex"). Kept - and
+    // written back - until the plugin is identified (see
+    // PluginHost::resolveLegacyIndex), so saving a project whose plugin can't
+    // be found yet loses nothing. -1 = none.
+    int legacyPluginIndex = -1;
+    bool isPluginNode() const {
+        return pluginDescription.fileOrIdentifier.isNotEmpty() || legacyPluginIndex >= 0;
+    }
     std::string pendingPluginState; // base64-encoded state to restore after plugin loads
 
     // Automation lanes for hosted-plugin (VST3/AU) parameters, keyed by plugin
@@ -623,6 +638,9 @@ struct Node {
     // badge and the serial background loader after a project open. See
     // MainContentComponent::beginAsyncPluginLoad.
     PluginLoadState pluginLoadState = PluginLoadState::None;
+    // Why the plugin didn't load (Failed only): a sentence naming the plugin,
+    // which the Failed badge's tooltip shows. Transient, like the state.
+    std::string pluginLoadError;
 
     // Group - contains child node IDs
     std::vector<int> childNodeIds;  // IDs of nodes inside this group
@@ -1037,6 +1055,13 @@ public:
     Node& addNode(const std::string& name, NodeType type,
                   std::vector<Pin> ins, std::vector<Pin> outs,
                   Vec2 pos = {0, 0});
+
+    // A node hosting the third-party plugin `info` describes, with pins from
+    // its I/O, named after it and recording its identity
+    // (Node::pluginDescription). Instantiates the plugin; if that fails the
+    // node is kept, marked Failed with the reason. Every "add a plugin" menu
+    // goes through here.
+    Node& addPluginNode(PluginHost& host, const PluginInfo& info, Vec2 pos);
     void addLink(int outPin, int inPin);
 
     // The one place an Audio Track node is built. Every creation path goes

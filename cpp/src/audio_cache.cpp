@@ -139,8 +139,13 @@ uint64_t AudioCacheManager::computeNodeHash(const Node& node, const NodeGraph& g
         h = hashCombine(h, hashString(node.script));
     }
 
-    // Hash plugin index and state
-    h = hashCombine(h, (uint64_t)(node.pluginIndex + 1));
+    // Hash the hosted plugin's identity and state. A node without a plugin
+    // contributes 0, exactly as it did when this hashed a list row (-1 + 1),
+    // so render caches of built-in nodes stay valid.
+    h = hashCombine(h, node.isPluginNode()
+        ? hashString(node.pluginDescription.createIdentifierString().toStdString())
+              ^ (uint64_t)(node.legacyPluginIndex + 1)
+        : (uint64_t)0);
     if (!node.pendingPluginState.empty())
         h = hashCombine(h, hashString(node.pendingPluginState));
 

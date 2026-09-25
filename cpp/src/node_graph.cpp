@@ -135,6 +135,34 @@ Node& NodeGraph::addNode(const std::string& name, NodeType type,
     return nodes.back();
 }
 
+Node& NodeGraph::addPluginNode(PluginHost& host, const PluginInfo& info, Vec2 pos) {
+    std::vector<Pin> ins, outs;
+    if (info.hasMidiInput) ins.push_back({0, "MIDI In", PinKind::Midi, true});
+    if (info.hasAudioInput) ins.push_back({0, "Audio In", PinKind::Audio, true, info.numAudioInputChannels});
+    if (info.hasAudioOutput) outs.push_back({0, "Audio Out", PinKind::Audio, false, info.numAudioOutputChannels});
+    if (info.hasMidiOutput) outs.push_back({0, "MIDI Out", PinKind::Midi, false});
+    const auto type = info.isInstrument ? NodeType::Instrument : NodeType::Effect;
+
+    // Instantiate before the node exists, then add the node and attach its
+    // plugin under one hold of the graph lock. The audio thread rebuilds its
+    // graph when the node count changes; a rebuild that caught the new node
+    // before its plugin was attached would build the node without it, and no
+    // later count change would come along to correct that.
+    std::string error;
+    auto loaded = host.loadPlugin(info.description, 44100.0, 512, &error);
+
+    std::lock_guard<std::recursive_mutex> lk(mutationLock);
+    auto& n = addNode(info.name, type, ins, outs, pos);
+    n.pluginDescription = info.description;
+    if (loaded) {
+        n.plugin = std::move(loaded);
+    } else {
+        n.pluginLoadState = PluginLoadState::Failed;
+        n.pluginLoadError = error;
+    }
+    return n;
+}
+
 void NodeGraph::addLink(int outPin, int inPin) {
     // Same reallocation race as addNode: a push_back that grows `links` can
     // tear the audio thread's iteration in rebuildGraph. Lock it.

@@ -281,7 +281,19 @@ bool ProjectFile::writeProject(std::ostream& f, NodeGraph& graph,
         }
         if (node.aftertouchSensitivity != 0.5f)
             writeFloat(f, "aftertouchSensitivity", node.aftertouchSensitivity);
-        writeInt(f, "pluginIndex", node.pluginIndex);
+        // Which plugin the node hosts: its full JUCE description, on one line
+        // (XML attributes - JUCE escapes any newline in them). A node from a
+        // project saved before plugin identities were recorded, whose plugin
+        // hasn't been identified yet, keeps its old list row instead. See
+        // Node::pluginDescription.
+        if (node.pluginDescription.fileOrIdentifier.isNotEmpty()) {
+            if (auto xml = node.pluginDescription.createXml())
+                writeStr(f, "pluginDescription",
+                         xml->toString(juce::XmlElement::TextFormat().singleLine().withoutHeader())
+                             .toStdString());
+        } else if (node.legacyPluginIndex >= 0) {
+            writeInt(f, "pluginIndex", node.legacyPluginIndex);
+        }
         if (node.panLaw != PanLaw::EqualPower) writeInt(f, "panLaw", (int)node.panLaw);
         if (node.pan != 0.0f) writeFloat(f, "pan", node.pan);
         if (node.spatialX != 0.0f) writeFloat(f, "spatialX", node.spatialX);
@@ -294,7 +306,7 @@ bool ProjectFile::writeProject(std::ostream& f, NodeGraph& graph,
         // save - typical case is most plugins have nothing to re-query.
         // ProjectFile::save (the user-facing save path, gp != nullptr) and
         // the slow autosave path both share this cache.
-        if (gp && node.pluginIndex >= 0) {
+        if (gp && node.isPluginNode()) {
             if (node.pluginStateDirty || node.cachedPluginStateBase64.empty()) {
                 auto* proc = gp->getProcessorForNode(node.id);
                 if (proc) {
@@ -856,7 +868,7 @@ bool ProjectFile::readProject(std::istream& f, NodeGraph& graph, PluginHost* plu
                         "midiInputSourceId", "envAttackCurve",
                         "envDecayCurve", "envReleaseCurve", "envAtkPt",
                         "envDecPt", "envRelPt", "ahdsrEnvelope",
-                        "aftertouchSensitivity", "pluginIndex", "pluginState",
+                        "aftertouchSensitivity", "pluginIndex", "pluginDescription", "pluginState",
                         "panLaw", "pan", "spatialX", "spatialY", "spatialZ",
                         "performanceMode", "perfReleaseMode", "perfVelocity",
                         "mpeEnabled", "mpePitchBendRange", "parentGroupId",
@@ -946,7 +958,11 @@ bool ProjectFile::readProject(std::istream& f, NodeGraph& graph, PluginHost* plu
                 try { curNode->aftertouchSensitivity = std::stof(val); }
                 catch (...) {}
             }
-            else if (key == "pluginIndex") curNode->pluginIndex = std::stoi(val);
+            else if (key == "pluginIndex") curNode->legacyPluginIndex = std::stoi(val);
+            else if (key == "pluginDescription") {
+                if (auto xml = juce::parseXML(juce::String::fromUTF8(val.c_str())))
+                    curNode->pluginDescription.loadFromXml(*xml);
+            }
             else if (key == "pluginState") curNode->pendingPluginState = val;
             else if (key == "panLaw") curNode->panLaw = (PanLaw)std::stoi(val);
             else if (key == "pan") curNode->pan = std::stof(val);
@@ -1318,27 +1334,40 @@ bool ProjectFile::readProject(std::istream& f, NodeGraph& graph, PluginHost* plu
     }
     graph.activeEditorNodeId = pendingActiveEditorId;
 
-    // Reload plugins based on pluginIndex and restore state
+    // Instantiate the plugins here when given a host - the crash-recovery
+    // path. (A normal open passes none and MainContentComponent's async loader
+    // does this instead, one plugin per tick. Both find each node's plugin by
+    // its identity through PluginHost::loadNodePlugin.)
     if (pluginHost) {
         for (auto& n : graph.nodes) {
-            if (n.pluginIndex >= 0) {
-                auto loaded = pluginHost->loadPlugin(n.pluginIndex, 48000.0, 480);
-                if (loaded) {
-                    // Restore saved plugin state
-                    if (!n.pendingPluginState.empty() && loaded->instance) {
-                        juce::MemoryBlock stateData;
-                        stateData.fromBase64Encoding(n.pendingPluginState);
-                        if (stateData.getSize() > 0)
-                            loaded->instance->setStateInformation(
-                                stateData.getData(), (int)stateData.getSize());
-                    }
-                    n.plugin = std::move(loaded);
-                    fprintf(stderr, "  Reloaded plugin '%s' for node '%s'\n",
-                            n.plugin->info.name.c_str(), n.name.c_str());
-                } else {
-                    fprintf(stderr, "  Failed to reload plugin index %d for node '%s'\n",
-                            n.pluginIndex, n.name.c_str());
+            if (!n.isPluginNode()) continue;
+            auto load = pluginHost->loadNodePlugin(n.pluginDescription, n.legacyPluginIndex,
+                                                   n.name, 48000.0, 480);
+            // Whatever resolution found is the node's plugin from now on (a
+            // legacy row now identified, a plugin found at a new location),
+            // even if it then failed to start.
+            if (load.resolved.fileOrIdentifier.isNotEmpty()) {
+                n.pluginDescription = load.resolved;
+                n.legacyPluginIndex = -1;
+            }
+            if (load.plugin) {
+                // Restore saved plugin state
+                if (!n.pendingPluginState.empty() && load.plugin->instance) {
+                    juce::MemoryBlock stateData;
+                    stateData.fromBase64Encoding(n.pendingPluginState);
+                    if (stateData.getSize() > 0)
+                        load.plugin->instance->setStateInformation(
+                            stateData.getData(), (int)stateData.getSize());
                 }
+                n.plugin = std::move(load.plugin);
+                n.pendingPluginState.clear();
+                fprintf(stderr, "  Reloaded plugin '%s' for node '%s'\n",
+                        n.plugin->info.name.c_str(), n.name.c_str());
+            } else {
+                n.pluginLoadState = PluginLoadState::Failed;
+                n.pluginLoadError = load.error;
+                fprintf(stderr, "  Plugin for node '%s' not loaded: %s\n",
+                        n.name.c_str(), load.error.c_str());
             }
         }
     }

@@ -239,6 +239,13 @@ private:
     std::vector<int> pluginLoadQueue;     // node IDs still to load (FIFO)
     void beginAsyncPluginLoad();          // mark plugin nodes Pending, kick off the queue
     void processNextPluginLoad();         // load one queued plugin, then schedule the next
+    // Plugins the audio graph let go of (GraphProcessor::retireStalePlugins):
+    // close their editor windows, keep their state for undo if asked
+    // (NodeGraph::retiredPluginStates), and destroy them on this thread.
+    void disposeRetiredPlugins(bool keepStates);
+    // After replacing the whole project: release all of the old project's
+    // plugins at once, keeping no state.
+    void releaseOldProjectPlugins();
 
     int saveFlashFrames = 0; // countdown for "Saved!" title flash
 

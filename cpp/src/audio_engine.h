@@ -16,7 +16,8 @@ namespace SoundShop {
 
 class AudioEngine : public juce::AudioIODeviceCallback,
                     public juce::MidiInputCallback,
-                    public juce::ChangeListener {
+                    public juce::ChangeListener,
+                    private juce::AsyncUpdater {
 public:
     AudioEngine();
     ~AudioEngine();
@@ -167,6 +168,10 @@ public:
 
 private:
     static AudioEngine* sInstance;
+
+    // The live graph's rebuild, on the message thread: the audio callback
+    // only notices one is due (GraphProcessor::onRebuildDue).
+    void handleAsyncUpdate() override;
 
     std::unique_ptr<juce::AudioDeviceManager> deviceManager;
     std::unique_ptr<juce::AudioFormatManager> formatManager;

@@ -30,8 +30,22 @@ AudioEngine::AudioEngine() {
     // clears the slot only if we're still the registered instance, so
     // teardown of a transient engine in a test won't null out a real one.
     sInstance = this;
+    // The live graph is the one that hosts the project's plugins (see
+    // GraphProcessor::setHostsPlugins)...
+    graphProcessor.setHostsPlugins(true);
+    // ...and is rebuilt on the message thread (see onRebuildDue).
+    graphProcessor.onRebuildDue = [this] { triggerAsyncUpdate(); };
+}
+
+void AudioEngine::handleAsyncUpdate() {
+    if (graph == nullptr || transport == nullptr) return;
+    // Holding the graph lock keeps the audio callback (a try-lock) out for
+    // the length of the rebuild; it plays silence meanwhile.
+    std::lock_guard<std::recursive_mutex> lk(graph->mutationLock);
+    graphProcessor.rebuildNow(*graph, *transport);
 }
 AudioEngine::~AudioEngine() {
+    cancelPendingUpdate();
     shutdown();
     if (sInstance == this) sInstance = nullptr;
 }

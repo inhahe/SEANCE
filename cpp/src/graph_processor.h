@@ -274,8 +274,21 @@ public:
     double getSampleRate() const { return sampleRate; }
     int getBlockSize() const { return blockSize; }
 
-    // Force a rebuild on the next audio callback (thread-safe)
+    // Ask for a rebuild (thread-safe). The next audio callback notices; the
+    // live graph then rebuilds on the message thread (see onRebuildDue).
     void requestRebuild() { rebuildRequested = true; }
+
+    // Where the rebuild happens. JUCE's AudioProcessorGraph may only be changed
+    // on the message thread: rebuilding on the audio thread raced the graph's
+    // own follow-up work there, corrupting it (an access violation in
+    // NodeStates::applySettings). With this set - the live graph (AudioEngine)
+    // - processBlock that finds a rebuild due plays silence and calls it, and
+    // the owner calls rebuildNow() on the message thread holding the graph's
+    // mutationLock. Unset - offline renders, a voice's inner graph -
+    // processBlock rebuilds in place, as it always has.
+    std::function<void()> onRebuildDue;
+    bool rebuildDue(const NodeGraph& graph) const;
+    void rebuildNow(NodeGraph& graph, Transport& transport);
 
     // Request an immediate "panic": on the next audio callback, reset every
     // processor in the graph so all trailing sound (synth release tails,
@@ -301,6 +314,53 @@ public:
 
     // Get the AudioProcessor for a given node ID (returns null if not in graph)
     juce::AudioProcessor* getProcessorForNode(int nodeId);
+
+    // The node's own processor. Differs from getProcessorForNode for a node
+    // built with a pan stage after it, where that returns the pan.
+    juce::AudioProcessor* getNodeOwnProcessor(int nodeId);
+
+    // ---- Hosted plugins ----------------------------------------------------
+    // A hosted plugin's instance lives inside the JUCE graph node that hosts
+    // it: JUCE owns it from the moment addNode takes it, and can't hand it
+    // back. So that graph node is kept through every rebuild for as long as
+    // its plugin node still holds the LoadedPlugin that handed the instance
+    // over (an undo restore carries it across - NodeGraph::restoreSnapshot).
+    // Once that stops being so - the node was deleted, its project replaced,
+    // or it was given a fresh instance - the graph node is taken out of the
+    // graph with the plugin still alive, and "retired" here for the message
+    // thread to dispose of: closing its editor window, asking it for its
+    // state and destroying it don't belong on the audio thread.
+    struct RetiredPlugin {
+        int nodeId = -1;
+        juce::PluginDescription description;
+        juce::AudioProcessorGraph::Node::Ptr node;   // keeps the plugin alive until dropped
+    };
+
+    // Retire every hosted plugin whose node no longer holds it. Each rebuild
+    // starts with this (on the audio thread). Call it too - on the message
+    // thread, holding the graph's mutationLock - right after replacing the
+    // whole project, so none of the old project's plugins stays in the graph
+    // on behalf of a new node that merely has the same id and plugin. Off the
+    // audio thread the removal must be `sync`: the plugin can be destroyed as
+    // soon as takeRetiredPlugins hands it over.
+    void retireStalePlugins(NodeGraph& graph,
+                            juce::AudioProcessorGraph::UpdateKind update
+                                = juce::AudioProcessorGraph::UpdateKind::sync);
+
+    // Hand over the retired plugins; dropping the returned list destroys them.
+    // Message thread, holding the graph's mutationLock.
+    std::vector<RetiredPlugin> takeRetiredPlugins();
+
+    // Lock-free check, so a UI timer can see there's nothing to take without
+    // taking the lock.
+    bool hasRetiredPlugins() const { return retiredPending.load(); }
+
+    // Whether this graph takes hosted plugin instances - only the live audio
+    // engine's does. A plugin instance can be in one graph only, and an
+    // offline render's graph (export, bounce, capture) or a voice's inner
+    // graph would destroy one it took when it's done with it. Graphs that
+    // don't host plugins build plugin nodes silent (PassthroughProcessor).
+    void setHostsPlugins(bool hosts) { hostsPlugins = hosts; }
 
     // Snapshot of every node's own audio latency in samples, keyed by stable
     // node id (settled after the last graph prepare; a missing id means 0 - the
@@ -447,6 +507,21 @@ private:
     std::unordered_map<int, juce::AudioProcessorGraph::NodeID> nodeMap;
     std::unordered_map<int, juce::AudioProcessorGraph::NodeID> nodeInputMap;
     juce::AudioProcessorGraph::NodeID outputNodeId;
+
+    // Hosted plugins living in processorGraph, by node id (see
+    // retireStalePlugins). `owner` is the node's LoadedPlugin that handed the
+    // instance over: the graph node is kept only while the node still holds
+    // that very object, so a different project's node with the same id - or
+    // a fresh instance - never inherits it.
+    struct HostedPlugin {
+        juce::AudioProcessorGraph::NodeID graphId;
+        std::weak_ptr<PluginHost::LoadedPlugin> owner;
+        juce::PluginDescription description;
+    };
+    std::map<int, HostedPlugin> hostedPlugins;
+    std::vector<RetiredPlugin> retired;        // guarded by the graph's mutationLock
+    std::atomic<bool> retiredPending { false };
+    bool hostsPlugins = false;                 // see setHostsPlugins
     AutomationManager automation;
     AudioCacheManager cacheManager;
 

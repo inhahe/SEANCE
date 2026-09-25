@@ -1062,6 +1062,26 @@ public:
     // node is kept, marked Failed with the reason. Every "add a plugin" menu
     // goes through here.
     Node& addPluginNode(PluginHost& host, const PluginInfo& info, Vec2 pos);
+
+    // Undo/redo: replace the graph with a snapshot (ProjectFile::serializeForUndo
+    // text). A snapshot carries no plugin instances and no plugin state, so each
+    // plugin node's live plugin, state and load status are kept for the restored
+    // node with the same id when it still names the same plugin. Returns the ids
+    // of plugin nodes that came back without their plugin (undoing a plugin
+    // node's deletion, redoing its creation): the caller loads those again, with
+    // their state from retiredPluginStates.
+    std::vector<int> restoreSnapshot(const std::string& text);
+
+    // The state each plugin had when its node went away during this session
+    // (deleted, or undone), by node id, so that undoing that brings the plugin
+    // back as it was. Filled from GraphProcessor's retired plugins by the main
+    // window; taken when a restored node's plugin loads. Not saved; cleared when
+    // another project is opened.
+    struct RetiredPluginState {
+        juce::PluginDescription description;
+        std::string state;   // base64, as a project's pluginState
+    };
+    std::map<int, RetiredPluginState> retiredPluginStates;
     void addLink(int outPin, int inPin);
 
     // The one place an Audio Track node is built. Every creation path goes

@@ -48,6 +48,8 @@ here.
 - [Opening a project from the command line](#opening-a-project-from-the-command-line)
 - [Plugin folders and scanning](#plugin-folders-and-scanning)
 - [How a project remembers its plugins](#how-a-project-remembers-its-plugins)
+- [Hosted plugins across edits and undo](#hosted-plugins-across-edits-and-undo)
+- [Where the audio graph is rebuilt](#where-the-audio-graph-is-rebuilt)
 - [Asynchronous plugin loading](#asynchronous-plugin-loading)
 - [Plugin Preset Recorder (companion tool)](#plugin-preset-recorder-companion-tool)
 - [Dialogs and the Windows taskbar](#dialogs-and-the-windows-taskbar)
@@ -168,7 +170,7 @@ All graph mutations (add/remove node, add/remove link, clip add) must hold `Node
 
 SEANCE compensates for per-node processing latency so a processed branch stays time-aligned with parallel/dry branches when they re-converge. This is **handled by JUCE's `juce::AudioProcessorGraph`**, which SEANCE uses as its render engine: when the graph builds its render sequence it reads each node's `getLatencySamples()`, computes the maximum-latency path to every mix point, and inserts compensating delay lines on the shorter branches. Both hosted third-party plugins (added straight to the graph in `graph_processor.cpp`, their `getLatencySamples()` read automatically) and any built-in processor that reports a latency are covered for free. The graph itself reports the total path latency via its own `getLatencySamples()`.
 
-JUCE only recomputes this when the graph is **rebuilt**, so SEANCE must rebuild whenever a node's latency changes *at runtime* (e.g. a plugin switching modes, or a future built-in toggling a high-quality latency-bearing mode). `GraphProcessor` registers a `LatencyChangeListener` (`graph_processor.h`) as an `AudioProcessorListener` on every node during `rebuildGraph`; its `audioProcessorChanged` checks `details.latencyChanged` and sets the `rebuildRequested` flag, so the next block rebuilds the render sequence and re-derives the compensation. (Re-adding the listener on each rebuild is safe — `AudioProcessor::addListener` dedups.) A `pdc:` self-test in `self_test.cpp` guards this by wiring a latency-reporting node against a parallel dry path through a real `AudioProcessorGraph` and asserting the dry path is delayed to match (and that the graph reports the max-path latency).
+JUCE only recomputes this when the graph is **rebuilt**, so SEANCE must rebuild whenever a node's latency changes *at runtime* (e.g. a plugin switching modes, or a future built-in toggling a high-quality latency-bearing mode). `GraphProcessor` registers a `LatencyChangeListener` (`graph_processor.h`) as an `AudioProcessorListener` on every node during `rebuildGraph`; its `audioProcessorChanged` checks `details.latencyChanged` and sets the `rebuildRequested` flag, so the graph is rebuilt (see [Where the audio graph is rebuilt](#where-the-audio-graph-is-rebuilt)) and the compensation re-derived. (Re-adding the listener on each rebuild is safe — `AudioProcessor::addListener` dedups.) A `pdc:` self-test in `self_test.cpp` guards this by wiring a latency-reporting node against a parallel dry path through a real `AudioProcessorGraph` and asserting the dry path is delayed to match (and that the graph reports the max-path latency).
 
 Because PDC works, latency-bearing DSP designs are now viable in SEANCE. The shipping **Curve EQ** is still zero-latency by construction (a deliberate simplicity choice, not a PDC limitation); a latency-bearing high-quality EQ mode is a noted backlog item.
 
@@ -935,7 +937,7 @@ A **Formula** layer has a small language dropdown next to its expression field w
 
 For **Python** bakes the overlay message is `Type: message (line N)` — the exception class (e.g. `ZeroDivisionError`, `SyntaxError`), its message, and the line number **in your source** (the bake wraps your code in generated scaffolding, but the reported line is remapped back to the line you actually typed, 1-based; an error that lands inside the generated wrapper is reported without a line number). The full Python traceback (the un-remapped, scaffolded form) is written to `seance.log` so the on-screen message stays short. **GLSL** bakes are likewise compiled on demand (the offline headless GL 4.3 compute context — never a per-keystroke check) and the driver's compile/link info log is shown verbatim, except that its line numbers are remapped the same way: an error inside your body reports your source line, not the line inside the generated compute shader (both the NVIDIA `0(L)` and AMD/Intel/Mesa `0:L:` log formats are handled; numbers that fall inside the wrapper are left as-is). The raw un-remapped GLSL log is also written to `seance.log`. For the **built-in** language a lightweight structural check catches unbalanced parentheses, unterminated string literals, and out-of-grammar characters with a line number, but — by design — does not flag unknown identifiers (they evaluate to `0`, matching the tolerant runtime).
 
-**Serialization.** The chosen language is saved alongside the expression (`builtin`/`lua`/`python`/`glsl`). Projects written before a given language existed decode as Built-in (older files never wrote `glsl`). For a **wavetable Formula layer** the baked cycle is now **embedded** in the encoded layer as a `bake=<count>;<s0>;<s1>;…` field (`;`-separated so it survives the comma-split layer parser; written only for non-Built-in languages — Built-in evaluates live and needs no embed). This is a deliberate departure from "store only the source text": the layered codec is decoded **on the audio thread** (a graph rebuild reconstructs the Terrain Synth / Signal Shape processor inside the audio callback), and re-running Lua/Python/GLSL there to reproduce the cycle would touch the message-thread-only interpreters — which corrupts the CPython interpreter and crashes deep in `python3xx.dll`. Embedding the baked cycle means the audio thread renders from data, never an interpreter (`WaveLayer::rebakeFormula()` additionally refuses to bake off the message thread as a safety net). Projects saved before this change have no `bake=` field; they are detected (`LayeredWaveform::decodedNeedsBakeEmbed`) and re-baked + re-encoded on the message thread at load (`migrateLayeredScriptEmbedBake` in `openProjectFile`, plus the Signal-Shape sibling loop) so the embed is present before the graph goes live. (Spectral magnitude/phase and AHDSR segment curves are still re-baked on load via `SpectralCurve::rebake()` — they are not decoded on the audio thread, so they keep the source-only form.) See `known-issues.md` ("Python interpreter run on the audio thread").
+**Serialization.** The chosen language is saved alongside the expression (`builtin`/`lua`/`python`/`glsl`). Projects written before a given language existed decode as Built-in (older files never wrote `glsl`). For a **wavetable Formula layer** the baked cycle is now **embedded** in the encoded layer as a `bake=<count>;<s0>;<s1>;…` field (`;`-separated so it survives the comma-split layer parser; written only for non-Built-in languages — Built-in evaluates live and needs no embed). This is a deliberate departure from "store only the source text": the layered codec can be decoded **off the message thread** (a graph rebuild reconstructs the Terrain Synth / Signal Shape processor, and a Voice container's per-voice graph can rebuild on the audio thread, capture from playback on its own thread), and re-running Lua/Python/GLSL there to reproduce the cycle would touch the message-thread-only interpreters — which corrupts the CPython interpreter and crashes deep in `python3xx.dll`. Embedding the baked cycle means the audio thread renders from data, never an interpreter (`WaveLayer::rebakeFormula()` additionally refuses to bake off the message thread as a safety net). Projects saved before this change have no `bake=` field; they are detected (`LayeredWaveform::decodedNeedsBakeEmbed`) and re-baked + re-encoded on the message thread at load (`migrateLayeredScriptEmbedBake` in `openProjectFile`, plus the Signal-Shape sibling loop) so the embed is present before the graph goes live. (Spectral magnitude/phase and AHDSR segment curves are still re-baked on load via `SpectralCurve::rebake()` — they are not decoded on the audio thread, so they keep the source-only form.) See `known-issues.md` ("Python interpreter run on the audio thread").
 
 ### Python is optional (runtime detection & graceful disable)
 
@@ -1062,7 +1064,7 @@ Most frames are layered-waveform single cycles. Two specialized frame types are 
     - **Wire format.** Both persist as **optional trailing header ints** in the `__wavetable2__` granular body, appended after `windowLen`: `…<windowStart+1>;<windowLen+1>;<grainCount>;<fftSize>;<s0,s1,…>`. They're plain positive ints (no `+1` bias — `grainCount ≥ 2`, `fftSize ≥ 0` are already non-negative). A frame saved before these fields existed simply lacks the tokens and decodes to the defaults (`grainCount = 4`, `fftSize = 0` = auto), so old projects sound identical. Decode clamps `grainCount` to [2, 16] and `fftSize` to `0` or [256, 8192].
   - **Preview button auditions the frame being edited.** The editor's **Preview**/Stop button (a bottom-left button row, the same label and placement as every other frame editor and capture dialog) routes through the owning synth node's audition queue and plays a held note (A4) at the **edited frame's wavetable Position** — not wherever the live Position knob currently sits. So pressing Preview in the "waveform 2" editor plays waveform 2, even though the synth's default Position would otherwise select waveform 1. This is implemented as a per-voice Position override carried on the audition note-on: the audition voice computes its own granular morph weights from the edited frame's normalized grid/scatter coordinate, while concurrent real MIDI/timeline notes keep following the live Position. In scatter mode the override reproduces the natural blend *at that dot's position* (i.e. exactly what you'd hear by moving Position to the dot), so neighbouring frames still contribute as they would in normal playback.
     - **Unplaced (library-only) frames also audition.** A freshly-captured single frame lands in the **Library** but isn't placed into any grid cell / scatter dot, so it has no Position and isn't in the synth's placed-frame table. To make its Preview button audible (and faithful), the audition note-on carries the **frame's actual PCM + grain params directly** (`AuditionEvent::granularFrame`, a shared copy of the on-screen bytes). When present, the voice renders *only* that frame — full envelope/Volume path, bypassing both the cycle terrain and the placed-frame morph — so the capture you just grabbed plays immediately and exactly as edited, with no wait for the ~150 ms graph rebuild. The same CrossfadeLoop reader serves both the placed-frame morph and this direct path, so audition and playback stay identical.
-    - **Audition survives a graph rebuild (live edits while playing).** Resizing the freeze-window band — or changing grain length / count / FFT size / crossfade / pitch / freeze mode — while Preview is held used to **stop the preview** until you pressed Start again. The reason: every wavetable edit fires a debounced (~150 ms) `onNodeEdited → requestRebuild → GraphProcessor::rebuildGraph`, which calls `processorGraph->clear()` and **destroys every live voice**, including the held audition note. The momentary `pendingAudition` queue is **edge-triggered** (consumed once), so nothing re-established the note in the fresh post-rebuild processor. Fixed with a **level-triggered** held-audition channel: `Node::heldAudition` (a `shared_ptr<AuditionEvent>`, guarded by `auditionMutex`) means "a voice should be sounding with this data" for as long as it's non-null. `TerrainSynthProcessor` **reconciles** it each block (`heldAuditionActive` / `heldAuditionPitch` per processor): a fresh processor sees `heldAuditionActive == false` and re-arms the note from `heldAudition`, so the audition seamlessly continues across the rebuild. The editor's `applyEdit()` wrapper **re-publishes the snapshot on every audible edit** while playing (sharing the source PCM `shared_ptr` rather than deep-copying the multi-MB buffer), so the re-armed post-rebuild voice reflects the **new** band / grain / mode — you hear the change instead of silence. Stop (or closing the editor, via `stopPlay()` in the destructor) clears `heldAudition`, releasing the held note. This is separate from and additive to `pendingAudition`, which is still used for momentary piano-roll note clicks. In the **fallback** (engine-preview) Preview path there is no graph rebuild and the preview atomics were already live-updated by `pushPreview*()`, so `applyEdit()` is a cheap no-op there (the freeze-mode change still goes straight to the engine preview).
+    - **Audition survives a graph rebuild (live edits while playing).** Resizing the freeze-window band — or changing grain length / count / FFT size / crossfade / pitch / freeze mode — while Preview is held used to **stop the preview** until you pressed Start again. The reason: every wavetable edit fires a debounced (~150 ms) `onNodeEdited → requestRebuild → GraphProcessor::rebuildGraph`, which recreates every built-in processor and **destroys every live voice**, including the held audition note. The momentary `pendingAudition` queue is **edge-triggered** (consumed once), so nothing re-established the note in the fresh post-rebuild processor. Fixed with a **level-triggered** held-audition channel: `Node::heldAudition` (a `shared_ptr<AuditionEvent>`, guarded by `auditionMutex`) means "a voice should be sounding with this data" for as long as it's non-null. `TerrainSynthProcessor` **reconciles** it each block (`heldAuditionActive` / `heldAuditionPitch` per processor): a fresh processor sees `heldAuditionActive == false` and re-arms the note from `heldAudition`, so the audition seamlessly continues across the rebuild. The editor's `applyEdit()` wrapper **re-publishes the snapshot on every audible edit** while playing (sharing the source PCM `shared_ptr` rather than deep-copying the multi-MB buffer), so the re-armed post-rebuild voice reflects the **new** band / grain / mode — you hear the change instead of silence. Stop (or closing the editor, via `stopPlay()` in the destructor) clears `heldAudition`, releasing the held note. This is separate from and additive to `pendingAudition`, which is still used for momentary piano-roll note clicks. In the **fallback** (engine-preview) Preview path there is no graph rebuild and the preview atomics were already live-updated by `pushPreview*()`, so `applyEdit()` is a cheap no-op there (the freeze-mode change still goes straight to the engine preview).
     - **Preview is audible even when the synth node isn't wired to an Output.** A freshly-added synth node (or one you've disconnected) has no audio path to the speakers, so its rendered audition would normally dead-end in the graph and you'd hear nothing. To keep the preview reliable, `GraphProcessor::rebuildGraph` flags each node's `reachesOutput` (an audio-link reachability walk back from every Output node), and when a synth node *can't* reach output its audition voices are diverted to the `AudioEngine` **audition-monitor bus** — a side buffer the audio callback sums straight into the device output, independent of graph wiring. When the node *is* routed to output, the audition stays in the normal graph path so it still flows through your downstream effects/pan exactly like a played note. Only the editor-Preview audition is diverted; ordinary MIDI/timeline notes on an unrouted node remain (correctly) silent.
   - **Song capture dialog (`CaptureFromSongDialog`).** The **"From project song…"** entry pre-renders the whole project to PCM offline, then exposes the **same region / N-waveform selection model** as the mic/file dialog (two draggable start/end handles, **Waveforms to slice out**, per-waveform **Window length** (ms) window with a **Fit width to selection** button, **Preview waveform** index picker, Gain, Freeze, Grain length, Crossfade, and the embedded-pitch picker — all documented under "all sources" below) **plus a full-song Play / Pause / Stop transport**. The capture model is identical to the file dialog's: `buildFrames(n)` slices the region into N banded `GranularFrame`s using the shared `bandStartForIndex()` geometry, and **Capture waveforms** adds them to the Library. What's unique is how the transport reconciles with the region audition:
     - **Play** = full-fidelity playback of the rendered song with a moving **playhead** (a thin vertical line) anchored at the **region start** (`setPreviewMode(SongPlay)` / `setPreviewSongPosSamples`). The playhead is drawn **only while Playing**; the region handles are left alone (not view-pegged) so the playhead can sweep freely.
@@ -1726,7 +1728,7 @@ __generate__:<langInt>[:<modeInt>[:<passes>]]|<dim0>,<dim1>,…,<dimN-1>|<base64
 - **Content-store reference (current):** `#<32-hex-hash>` — a reference into the project's content-addressed blob store ([Content store](#content-store) below). The actual bytes live once in the store, keyed by a hash of the grid's canonical `.npy` payload. The leading `#` is unambiguous because it appears in neither the base64 alphabet nor anywhere else in the pipe-delimited layout.
 - **Legacy inline blob:** the final bipolar `[-1,1]` floats (`product(dims)` of them), gzip-compressed (level 9) then base64-encoded — bit-exact. Projects written before the content store embedded the blob directly here, and still load.
 
-**Why bake for every language, not just Python?** `TerrainSynthProcessor`'s constructor runs during **graph rebuild on the audio thread**. The embedded Python interpreter is illegal there (single GIL-held interpreter, message-thread only), so a Python generator *cannot* re-run on load — it must be baked. Rather than special-case Python, **all** languages bake: this also removes a latent glitch where a large Builtin/Lua grid would re-run its per-cell loop on the audio thread during every load/undo and stall audio. Generation always happens exactly once, on the message thread, at Generate time. (The one-time cost is unavoidable regardless — the data has to be computed once either way.)
+**Why bake for every language, not just Python?** `TerrainSynthProcessor`'s constructor runs during a **graph rebuild, which can happen off the message thread** (a Voice container's per-voice graph rebuilds on the audio thread; capture from playback renders on its own thread). The embedded Python interpreter is illegal there (single GIL-held interpreter, message-thread only), so a Python generator *cannot* re-run on load — it must be baked. Rather than special-case Python, **all** languages bake: this also removes a latent glitch where a large Builtin/Lua grid would re-run its per-cell loop on the audio thread during every load/undo and stall audio. Generation always happens exactly once, on the message thread, at Generate time. (The one-time cost is unavoidable regardless — the data has to be computed once either way.)
 
 **Backward compatibility.** Old projects whose tag has **no 4th field** still load: for Builtin/Lua the constructor falls back to regenerating from the program (safe, deterministic); a Python **or GLSL** node with no baked data can't regenerate on the audio thread (CPython and the GL context are both message-thread-only), so it loads as a flat grid until re-generated via Edit Source. Inline-blob (legacy) and `#hash` (current) 4th fields both decode. New saves always write the `#hash` form.
 
@@ -4568,8 +4570,103 @@ plugins: "SEANCE Self-Test Gain" at gain 0.5 and "SEANCE Self-Test Gain B" at
 a blocklist and with a crash record, every row loading its own plugin (after
 blocking, and across a cache reload), a project opened with the list reversed,
 old projects by name, numbered name and row, each resolution rule, and the
-refusals. Its two `lifecycle:` checks are known bugs — see known-issues.md,
-*Hosted plugins are lost at the next audio-graph rebuild, and on undo*.
+refusals.
+
+---
+
+## Hosted plugins across edits and undo
+
+<a name="hosted-plugins-across-edits-and-undo"></a>A hosted plugin's instance
+lives in the audio graph's node for it: JUCE takes it over when the plugin is
+added and can't hand it back. The audio graph is rebuilt on every structural
+edit — a node or cable added or removed, a plugin finishing loading — and each
+rebuild keeps that node, only reconnecting it, for as long as the plugin node
+still holds the plugin (`GraphProcessor::retireStalePlugins`). So a plugin keeps
+its one instance, with all its settings and its open editor window, through any
+number of edits.
+
+**Undo and redo** restore the graph from a snapshot, which holds no plugins and
+no plugin state. `NodeGraph::restoreSnapshot` carries each plugin node's live
+plugin, saved state and load status over to the restored node with the same id,
+as long as it names the same plugin — so undoing a cable change leaves the plugin
+alone.
+
+**Deleting a plugin node** — or undoing its creation — takes its plugin out of
+the audio graph still alive, and the main window disposes of it on the message
+thread rather than the audio thread (`disposeRetiredPlugins`): it closes the
+plugin's editor window, keeps the plugin's state by node id, and destroys it.
+Undoing the deletion brings the node back without a plugin; it loads again
+through the normal loader, which applies the kept state, so the plugin returns
+as it was. Kept states last for the session: they aren't saved, so an undo
+history reloaded after a restart brings a deleted plugin back with its default
+state.
+
+**Opening or creating a project** releases every plugin of the old one at once,
+keeping no state (`releaseOldProjectPlugins`) — so a node of the new project
+that happens to have the same id and plugin can't inherit the old instance.
+
+**A plugin node without its plugin** — still loading, or failed (see its badge)
+— is silent, or for an effect passes its input straight through.
+
+**Only the live audio graph hosts plugins** (`GraphProcessor::setHostsPlugins`,
+set by the audio engine). A plugin instance can be in one graph only, so the
+separate graphs that offline renders build — Export, Freeze, Bounce to Audio
+Track, capture from playback — render plugin nodes without their plugins, the
+same way: silent, or an effect's input passed through; and so is a plugin node
+inside a Voice container, whose voices each build their own inner graph. That's a known gap (see
+known-issues.md, *Export, freeze, bounce and capture leave out hosted
+plugins*); before 0.10.6 an offline render could also take a just-loaded plugin
+away from the live graph and destroy it when done.
+
+**Before 0.10.6** each rebuild began by clearing the audio graph, which deleted
+every plugin in it: a plugin lasted only until the next structural edit, or
+until the next plugin of the same project finished loading, and its node then
+carried on as a built-in without any sign — an instrument as SEANCE's own synth,
+an effect as a pass-through. Undo lost plugins the same way. An instrument
+plugin node without its plugin also played the built-in synth and was given the
+built-in synths' Pressure input pin, which stayed on the node and was saved with
+the project — opening a project did that to every instrument plugin node, since
+the graph is built before the plugins finish loading. Plugin editor windows were
+never closed when their plugin was destroyed. And crash recovery pushed the
+newest plugin states (the `autosave-plugin-*.dat` files) into the plugins of the
+project loaded before the recovery, instead of the recovered ones.
+
+**Tested by** `testPluginLifecycle` in `self_test.cpp`, with the self-test gain
+plugin set to 0.8 so its settings can be followed: the same instance through
+repeated rebuilds and through an undo; retired alive when its node goes, then
+back with gain 0.8 on redo; released when another project with a
+same-id-same-plugin node is opened; and a plugin instrument that didn't load
+built silent, without a Pressure pin.
+
+---
+
+## Where the audio graph is rebuilt
+
+<a name="where-the-audio-graph-is-rebuilt"></a>`GraphProcessor::rebuildGraph`
+turns the node graph into a JUCE `AudioProcessorGraph` whenever nodes or cables
+are added or removed, or something asks for it (`requestRebuild` — an edit, a
+latency change). JUCE only supports changing such a graph on the message
+thread, so the live graph is rebuilt there: an audio callback that finds a
+rebuild due plays silence for that block and asks for it
+(`GraphProcessor::onRebuildDue`), and `AudioEngine` rebuilds on the message
+thread holding the graph lock, which keeps the callback — a try-lock — out
+until it's done (`GraphProcessor::rebuildNow`). The rebuild makes all its
+changes without updating the JUCE graph, then brings it up to date once
+(`AudioProcessorGraph::rebuild()`).
+
+**Before 0.10.6** the live graph rebuilt itself on the audio thread. JUCE then
+finished each change on the message thread, and that could run while the next
+rebuild was already changing the graph, corrupting it — a crash in
+`NodeStates::applySettings`, reproduced by adding two plugins a couple of
+seconds apart. Until JUCE caught up, the old processors also kept playing,
+though they could hold references into nodes that had moved since.
+
+Graphs other than the live one still rebuild where they run: the offline
+renders' own graphs (on the message thread, or capture from playback's thread),
+and a Voice container's per-voice graphs when their own rebuild falls due on the
+audio thread (rare — a latency change inside the voice). Those make their
+changes the same batched way, so JUCE's follow-up work starts only after the
+last change. **Tested by** `testGraphRebuildThread` in `self_test.cpp`.
 
 ---
 
@@ -4602,7 +4699,7 @@ so the queue is safe even if you add/remove nodes mid-load. Opening a second
 project while the first is still loading rebuilds the queue without starting a
 duplicate loader chain. (The **autosave crash-recovery** path still loads plugins
 synchronously, because it immediately applies per-plugin override blobs that need
-the live processors.)
+the live processors — the freshly loaded ones, not yet in the audio graph.)
 
 **Per-node loading badge.** While a project's plugins resolve, each plugin node
 shows a small badge at its **top-left** corner (the script-error badge owns the
@@ -4614,7 +4711,9 @@ top-right):
 - **Failed** — an amber "x" disc: the plugin couldn't be found or started. The
   tooltip names the plugin and says why (not installed, blocked, a format this
   computer can't host, or the plugin's own error). The node is kept, with its
-  saved plugin state, so the plugin can load again later or be replaced.
+  saved plugin state, so the plugin can load again later or be replaced; until
+  then it's silent (an effect passes its input through). Undo doesn't retry a
+  failed plugin; reopening the project does.
 - **Ready / none** — no badge.
 
 Each state has a hover tooltip explaining it. The spinner only animates (and the

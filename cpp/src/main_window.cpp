@@ -533,9 +533,12 @@ MainContentComponent::MainContentComponent() {
         // graph.nodes/links and rebuilds them from the snapshot text, which
         // is the same kind of batch mutation as MOD import. Same race risk
         // (see mutationLock comment in node_graph.h), same fix.
+        // restoreSnapshot, not a plain loadFromString: it keeps each plugin
+        // node's live plugin, which the snapshot text doesn't carry.
+        std::vector<int> pluginsToReload;
         {
             std::lock_guard<std::recursive_mutex> graphLk(graph.mutationLock);
-            ProjectFile::loadFromString(snap, graph, nullptr);
+            pluginsToReload = graph.restoreSnapshot(snap);
         }
         // Drop editor panels whose underlying node no longer exists in the
         // restored state. Surviving panels keep their state and just
@@ -555,6 +558,11 @@ MainContentComponent::MainContentComponent() {
         if (graphComponent) graphComponent->repaint();
         for (auto& panel : editorPanels)
             if (panel->component) panel->component->repaint();
+        // Plugin nodes that came back without their plugin (undoing a plugin
+        // node's deletion, redoing its creation) load it again, with the state
+        // it had when the node went (see processNextPluginLoad).
+        if (!pluginsToReload.empty())
+            beginAsyncPluginLoad();
     };
     graph.undoTree.onTreeChanged = [this]() {
         // Lazy-fill: any step pushed without a snapshot gets one captured
@@ -724,7 +732,10 @@ void MainContentComponent::beginAsyncPluginLoad() {
     {
         std::lock_guard<std::recursive_mutex> graphLk(graph.mutationLock);
         for (auto& n : graph.nodes) {
-            if (n.isPluginNode() && !n.plugin) {
+            // Not a node whose plugin already failed to load: trying again
+            // on every undo would only fail again (or be slow doing it).
+            // Reopening the project retries.
+            if (n.isPluginNode() && !n.plugin && n.pluginLoadState != PluginLoadState::Failed) {
                 n.pluginLoadState = PluginLoadState::Pending;
                 n.pluginLoadError.clear();
                 pluginLoadQueue.push_back(n.id);
@@ -775,6 +786,20 @@ void MainContentComponent::processNextPluginLoad() {
         auto load = audioEngine.getPluginHost().loadNodePlugin(
             savedPlugin, legacyIndex, nodeName,
             audioEngine.getSampleRate(), audioEngine.getBlockSize());
+        // A node brought back by undo/redo has no plugin state of its own (a
+        // snapshot carries none). Use the state its plugin had when the node
+        // went, if it's the same plugin - taking any retired plugins first,
+        // in case that plugin is still waiting there.
+        if (load.plugin && pendingState.empty()) {
+            disposeRetiredPlugins(true);
+            auto it = graph.retiredPluginStates.find(nodeId);
+            if (it != graph.retiredPluginStates.end()
+                && it->second.description.pluginFormatName == load.resolved.pluginFormatName
+                && it->second.description.isDuplicateOf(load.resolved)) {
+                pendingState = it->second.state;
+                graph.retiredPluginStates.erase(it);
+            }
+        }
         if (load.plugin && load.plugin->instance && !pendingState.empty()) {
             juce::MemoryBlock stateData;
             stateData.fromBase64Encoding(pendingState);
@@ -821,6 +846,44 @@ void MainContentComponent::processNextPluginLoad() {
     projectLoading = false;
     menuItemsChanged();
     if (graphComponent) graphComponent->repaint();
+}
+
+void MainContentComponent::disposeRetiredPlugins(bool keepStates) {
+    // Plugins the audio graph let go of - their node deleted, undone, or its
+    // project replaced - arrive still alive (GraphProcessor::retireStalePlugins).
+    // Here, on the message thread: close each one's editor window before its
+    // editor can outlive it, keep its state if asked, then let it be destroyed.
+    std::vector<GraphProcessor::RetiredPlugin> retired;
+    {
+        std::lock_guard<std::recursive_mutex> graphLk(graph.mutationLock);
+        retired = audioEngine.getGraphProcessor().takeRetiredPlugins();
+    }
+    for (auto& rp : retired) {
+        auto* proc = rp.node != nullptr ? rp.node->getProcessor() : nullptr;
+        if (proc == nullptr) continue;
+        pluginWindows.closeWindowFor(proc);
+        if (keepStates) {
+            juce::MemoryBlock state;
+            proc->getStateInformation(state);
+            if (state.getSize() > 0)
+                graph.retiredPluginStates[rp.nodeId] = { rp.description,
+                                                         state.toBase64Encoding().toStdString() };
+        }
+    }
+    // `retired` drops the last references as it goes out of scope.
+}
+
+void MainContentComponent::releaseOldProjectPlugins() {
+    // Right after the whole project was replaced: release every plugin the old
+    // project had, now, and keep no state for undo - that history went with it.
+    // Without this, a node of the new project with the same id and plugin as
+    // one of the old could hold on to the old plugin until the next rebuild.
+    {
+        std::lock_guard<std::recursive_mutex> graphLk(graph.mutationLock);
+        audioEngine.getGraphProcessor().retireStalePlugins(graph);
+    }
+    disposeRetiredPlugins(false);
+    graph.retiredPluginStates.clear();
 }
 
 bool MainContentComponent::keyPressed(const juce::KeyPress& key) {
@@ -974,6 +1037,12 @@ void MainContentComponent::timerCallback() {
     // each tick so the per-node "loading" spinner animates smoothly.
     if (projectLoading && graphComponent)
         graphComponent->repaint();
+
+    // Plugins the audio graph let go of since the last tick (a plugin node
+    // deleted or undone) - see disposeRetiredPlugins. The lock-free check
+    // keeps the graph lock out of the ordinary tick.
+    if (audioEngine.getGraphProcessor().hasRetiredPlugins())
+        disposeRetiredPlugins(true);
 
     // The layer legend has no way to be told that a layer or effect group was
     // added, removed or recoloured - that happens in the Effects lane, in the
@@ -3382,6 +3451,7 @@ void MainContentComponent::newProject() {
             yPos += 50;
         }
     }
+    releaseOldProjectPlugins();
 
     ProjectFile::currentPath.clear();
     projectDirty = false;
@@ -3607,6 +3677,7 @@ void MainContentComponent::openProjectFile(const juce::String& path) {
             }
         }
     }
+    releaseOldProjectPlugins();
 
     auto editorIds = graph.openEditors;
     graph.openEditors.clear();
@@ -4952,8 +5023,12 @@ void MainContentComponent::applyPerPluginOverrides() {
         // is already loaded by ProjectFile::load at this point, so we
         // call setStateInformation on its live instance to override
         // whatever ProjectFile::load applied from the file's [Node]
-        // pluginState entry.
-        auto* proc = gp.getProcessorForNode(n.id);
+        // pluginState entry. That instance hasn't reached the audio graph
+        // yet (the next rebuild takes it): the graph's processor for this
+        // node id still belongs to the project loaded before the recovery.
+        juce::AudioProcessor* proc = (n.plugin && n.plugin->instance)
+                                         ? n.plugin->instance.get()
+                                         : gp.getProcessorForNode(n.id);
         if (!proc) continue;
         juce::MemoryBlock stateData;
         stateData.fromBase64Encoding(base64);
@@ -5416,6 +5491,8 @@ void MainContentComponent::tryRecoverAutosave() {
                 safe->applyPerPluginOverrides();
                 safe->cleanupOrphanPluginFiles();
             }
+            // The recovered project replaces whatever loaded at startup.
+            safe->releaseOldProjectPlugins();
             ProjectFile::currentPath = capturedOriginal.toStdString();
             safe->projectDirty = true;
             safe->graph.dirty = true;

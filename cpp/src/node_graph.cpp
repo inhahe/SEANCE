@@ -154,6 +154,8 @@ Node& NodeGraph::addPluginNode(PluginHost& host, const PluginInfo& info, Vec2 po
     std::lock_guard<std::recursive_mutex> lk(mutationLock);
     auto& n = addNode(info.name, type, ins, outs, pos);
     n.pluginDescription = info.description;
+    // A deleted node's id can be handed out again; its kept state isn't this one's.
+    retiredPluginStates.erase(n.id);
     if (loaded) {
         n.plugin = std::move(loaded);
     } else {
@@ -161,6 +163,61 @@ Node& NodeGraph::addPluginNode(PluginHost& host, const PluginInfo& info, Vec2 po
         n.pluginLoadError = error;
     }
     return n;
+}
+
+// For carrying a node's plugin across an undo restore: the same identity - or,
+// for a node from an old project whose plugin isn't identified yet, the same
+// legacy row.
+static bool namesSamePlugin(const juce::PluginDescription& a, int legacyA,
+                            const juce::PluginDescription& b, int legacyB) {
+    if (a.fileOrIdentifier.isNotEmpty() || b.fileOrIdentifier.isNotEmpty())
+        return a.pluginFormatName == b.pluginFormatName && a.isDuplicateOf(b);
+    return legacyA == legacyB;
+}
+
+std::vector<int> NodeGraph::restoreSnapshot(const std::string& text) {
+    std::lock_guard<std::recursive_mutex> lk(mutationLock);
+
+    struct Carried {
+        juce::PluginDescription description;
+        int legacyIndex = -1;
+        std::shared_ptr<PluginHost::LoadedPlugin> plugin;
+        std::string pendingState, cachedState;
+        bool stateDirty = true;
+        PluginLoadState loadState = PluginLoadState::None;
+        std::string loadError;
+    };
+    std::map<int, Carried> carried;
+    for (auto& n : nodes)
+        if (n.isPluginNode())
+            carried[n.id] = { n.pluginDescription, n.legacyPluginIndex, n.plugin,
+                              n.pendingPluginState, n.cachedPluginStateBase64,
+                              n.pluginStateDirty, n.pluginLoadState, n.pluginLoadError };
+
+    ProjectFile::loadFromString(text, *this, nullptr);
+
+    std::vector<int> reload;
+    for (auto& n : nodes) {
+        if (!n.isPluginNode()) continue;
+        auto it = carried.find(n.id);
+        if (it == carried.end()
+            || !namesSamePlugin(it->second.description, it->second.legacyIndex,
+                                n.pluginDescription, n.legacyPluginIndex)) {
+            reload.push_back(n.id);
+            continue;
+        }
+        auto& c = it->second;
+        n.plugin = std::move(c.plugin);
+        n.pendingPluginState = std::move(c.pendingState);
+        n.cachedPluginStateBase64 = std::move(c.cachedState);
+        n.pluginStateDirty = c.stateDirty;
+        n.pluginLoadState = c.loadState;
+        n.pluginLoadError = std::move(c.loadError);
+    }
+    // Plugins not carried over (their node is gone from this state) are
+    // released with `carried`; one already in the audio graph is retired from
+    // there at the next rebuild (GraphProcessor::retireStalePlugins).
+    return reload;
 }
 
 void NodeGraph::addLink(int outPin, int inPin) {

@@ -5,38 +5,69 @@ top. When something is fixed, delete the entry (git history is the archive).
 
 ---
 
-## Hosted plugins are lost at the next audio-graph rebuild, and on undo
+## Adding a node from the canvas menu or Plugin Settings records no undo step
 
-**Found:** 2026-09-25, while making projects save their plugins' identities.
-The two `lifecycle:` known-bug checks in `testPluginIdentity` (self-test)
-measure it with a real plugin.
+**Found:** 2026-09-25, testing undo of hosted plugins in the running app.
 
-`GraphProcessor::rebuildGraph` hands a plugin node's instance to the JUCE
-`AudioProcessorGraph` (`std::move(node.plugin->instance)`), and starts every
-rebuild with `processorGraph->clear()`, which deletes every processor in the
-graph. So the rebuild after the one that took a plugin in deletes it, and -
-`node.plugin->instance` being empty by then - builds the node as a built-in
-instead: the built-in synth for an instrument, a pass-through for an effect.
-Rebuilds happen on every node or cable count change and after each plugin of
-an opening project finishes loading, so in practice a hosted plugin lasts until
-the next structural edit, or until the next plugin in the same project loads.
-Nothing shows it: the node keeps `node.plugin` (holding only the plugin's info
-now), so it has no badge, and saving writes the plugin state cached before the
-loss, if any.
+The canvas's add-node menu (`NodeGraphComponent`, the `showMenuAsync` handler
+that creates the chosen node) commits an undo snapshot for only a few of its
+branches ("Add instrument", "Import video terrain", "Generate terrain"); every
+other node type - and every plugin, from the canvas's plugin submenus or from
+Plugin Settings' *Add to Graph* (both through `NodeGraph::addPluginNode`) - is
+added with no `commitSnapshot`. The node itself is fine, but the undo history
+doesn't know it arrived: the next undo returns to the snapshot from before it,
+taking the new node away along with whatever that undo was meant to reverse.
+Seen live: three plugins added via *Add to Graph*, one deleted, then Undo -
+all three were gone (the deletion's previous snapshot predates them).
 
-Undo loses plugins by a second route: a snapshot restore
-(`ProjectFile::loadFromString`) rebuilds `graph.nodes` from text, destroying
-each node's `LoadedPlugin`, and nothing instantiates the plugins again. The
-nodes keep their plugin identity (`Node::pluginDescription`), just no plugin.
+**Proper fix:** commit once at the end of the canvas menu handler whenever it
+created nodes (`graph.nodes.size() > nodeCountBefore` - `commitSnapshot` de-dups
+against the branches that already commit), and after *Add to Graph* in the
+Plugin Settings dialog (button and right-click menu).
 
-**Proper fix:** keep plugin instances alive across both.
-- Rebuild: remove and re-add everything *except* the graph nodes hosting a
-  live plugin, and reconnect those like the rest. (JUCE can't hand a processor
-  back once a graph node owns it, so such a node must never be removed while
-  its plugin lives.)
-- Undo: carry each node's `LoadedPlugin` over by node id when the restored node
-  names the same plugin, and queue the async loader for plugin nodes that come
-  back without one (undoing a delete).
+---
+
+## Plugin list shows "()" for a plugin with no maker
+
+**Found:** 2026-09-25. Cosmetic.
+
+The Plugin Settings list (and a blocked entry's label) prints
+`name  (maker)  [format]`; a plugin that doesn't name its maker - the self-test
+LV2 plugins, some LV2 plugins in general - shows an empty `()`. Leave the
+parentheses out when `manufacturer` is empty.
+
+---
+
+## Export, freeze, bounce and capture leave out hosted plugins
+
+**Found:** 2026-09-25, while making hosted plugins survive audio-graph rebuilds.
+
+Offline rendering builds its own `GraphProcessor` from the node graph: *Export
+Audio* and the scripting `render()` (`renderGraphOffline` in
+`audio_export.cpp`), *Freeze* (`MainContentComponent::freezeNodes`), *Bounce to
+Audio Track* (`bounceToAudioTrack`) and capturing from playback
+(`capture_from_playback.cpp`, on a background thread). A plugin instance can be
+in one JUCE graph only, and the live audio engine's graph holds it, so every
+offline render builds a hosted-plugin node without its plugin: silent, or an
+effect passing its input straight through. Until 0.10.6 an instrument plugin
+node rendered as SEANCE's built-in synth instead - and an offline graph could
+take a plugin that had just loaded and wasn't in the live graph yet, then
+destroy it when the render finished. Only the live graph takes plugins now
+(`GraphProcessor::setHostsPlugins`), which stops that, but the renders still
+lack the plugins. A plugin node inside a Voice container is silent for the
+same reason: each voice builds its own inner graph, and those host no plugins
+(before 0.10.6 the first voice's graph took the plugin and the other voices
+played the built-in synth).
+
+**Proper fix:** render through the live plugins. Either pause the audio
+callback and render through the live `GraphProcessor` itself (the same
+instances in the same state; reset them afterwards), or give the offline graph
+its own instance of each plugin carrying the live one's current state
+(`getStateInformation` into a fresh instance). The second keeps playback going
+during a render, but loads every plugin again, and some plugins (licensing,
+single-instance) can't be loaded twice. Capture from playback also reads the
+graph from a background thread without the graph lock; that wants fixing in the
+same change.
 
 ---
 

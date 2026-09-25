@@ -11999,10 +11999,8 @@ const PluginInfo* findListed(const PluginHost& host, const char* fileOrId) {
 }
 
 // A mono plugin's gain: least squares of its output against a 440 Hz sine
-// fed through one block. -1 when there's no plugin to measure.
-double measuredGain(const PluginHost::LoadedPlugin* loaded) {
-    if (loaded == nullptr || !loaded->instance) return -1.0;
-    auto& plugin = *loaded->instance;
+// fed through one block.
+double measuredGainOf(juce::AudioProcessor& plugin) {
     constexpr double rate = 48000.0;
     constexpr int block = 256;   // no more than any self-test prepares with
     const int channels = std::max({ 1, plugin.getTotalNumInputChannels(),
@@ -12023,6 +12021,11 @@ double measuredGain(const PluginHost::LoadedPlugin* loaded) {
         den += (double) in[(size_t) i] * in[(size_t) i];
     }
     return den > 0 ? num / den : 0.0;
+}
+
+// The same for a loaded plugin; -1 when there's no plugin to measure.
+double measuredGain(const PluginHost::LoadedPlugin* loaded) {
+    return loaded != nullptr && loaded->instance ? measuredGainOf(*loaded->instance) : -1.0;
 }
 
 } // namespace
@@ -12166,8 +12169,6 @@ void testPluginFolders(Report& r, const juce::File& outDir) {
 //
 // Uses both self-test plugins - A at gain 0.5, B at 0.25 - so the output
 // level says which one really loaded.
-const char* const kLifecycleIssue = "Hosted plugins are lost at the next audio-graph rebuild, and on undo";
-
 void testPluginIdentity(Report& r, const juce::File& outDir) {
     r.section("Plugin identity: projects name their plugin; blocked plugins aren't loaded");
 
@@ -12402,31 +12403,227 @@ void testPluginIdentity(Report& r, const juce::File& outDir) {
                 "resolve: a blocked plugin is refused, and the reason says so");
         reversed.setBlockedPlugins({});
     }
+}
 
-    // ---- Known bug: plugin instances don't outlive a rebuild or an undo ----
-    {
-        NodeGraph g;
-        const int id = g.addPluginNode(host, *findListed(host, kSelfTestGainA), {0.0f, 0.0f}).id;
-        Transport transport;
-        GraphProcessor gp;
-        gp.prepare(g, 48000.0, 256);
-        gp.rebuildGraph(g, transport);
-        const bool first = dynamic_cast<juce::AudioPluginInstance*>(gp.getProcessorForNode(id)) != nullptr;
-        gp.rebuildGraph(g, transport);
-        const bool second = dynamic_cast<juce::AudioPluginInstance*>(gp.getProcessorForNode(id)) != nullptr;
-        r.check(first, "lifecycle: the audio graph hosts a plugin node's plugin");
-        r.knownBug(second, "lifecycle: ...and still does after the graph is rebuilt",
-                   second ? 1.0 : 0.0, kLifecycleIssue);
+// ===========================================================================
+// The live audio graph is rebuilt on the message thread
+// ===========================================================================
+//
+// JUCE's AudioProcessorGraph may only be changed on the message thread. The
+// live graph used to rebuild itself on the audio thread, which raced the JUCE
+// graph's own follow-up work on the message thread and corrupted it (a crash
+// in NodeStates::applySettings, reproduced by adding two plugins in quick
+// succession). Now the audio callback that finds a rebuild due plays silence
+// and asks for it (GraphProcessor::onRebuildDue); AudioEngine rebuilds on the
+// message thread (rebuildNow) holding the graph lock.
+void testGraphRebuildThread(Report& r) {
+    r.section("The live audio graph is rebuilt on the message thread");
+
+    NodeGraph graph;
+    Transport transport;
+    GraphProcessor gp;
+    bool asked = false;
+    gp.onRebuildDue = [&asked] { asked = true; };   // as AudioEngine sets it
+    gp.prepare(graph, 48000.0, 256);
+    const int id = graph.addNode("Effect", NodeType::Effect,
+                                 { Pin{0, "In", PinKind::Audio, true} },
+                                 { Pin{0, "Out", PinKind::Audio, false} }, {0.0f, 0.0f}).id;
+
+    std::vector<float> left(256, 1.0f), right(256, 1.0f);
+    float* outs[2] = { left.data(), right.data() };
+    gp.processBlock(graph, transport, outs, 2, 256);   // the audio callback
+    bool silent = true;
+    for (int i = 0; i < 256; ++i)
+        silent = silent && left[(size_t) i] == 0.0f && right[(size_t) i] == 0.0f;
+    r.check(asked && gp.rebuildDue(graph) && gp.getNodeOwnProcessor(id) == nullptr,
+            "rebuild thread: the audio callback doesn't rebuild the live graph - it asks "
+            "for the rebuild");
+    r.check(silent, "rebuild thread: ...and plays silence meanwhile, rather than the old "
+                    "processors");
+
+    gp.rebuildNow(graph, transport);                    // AudioEngine, message thread
+    r.check(!gp.rebuildDue(graph) && gp.getNodeOwnProcessor(id) != nullptr,
+            "rebuild thread: the message thread then rebuilds it");
+}
+
+// ===========================================================================
+// Plugin lifecycle: a hosted plugin outlives graph rebuilds and undo
+// ===========================================================================
+//
+// The JUCE graph owns a hosted plugin from the moment it's added, and every
+// rebuild used to begin by clearing the graph - so the rebuild after the one
+// that took a plugin in (any cable or node change) deleted it, and the node
+// went on as a built-in: the stock synth for an instrument, a pass-through for
+// an effect. Undo lost plugins as well: a snapshot restore rebuilds the nodes
+// from text, which carries no plugins. Now GraphProcessor keeps a plugin's
+// graph node while its node still holds it, NodeGraph::restoreSnapshot carries
+// each node's plugin across an undo, and a plugin whose node went away is
+// retired alive for the message thread, which keeps its state so an undo can
+// bring it back as it was (MainContentComponent::disposeRetiredPlugins and
+// processNextPluginLoad - simulated here, as they need the window).
+void testPluginLifecycle(Report& r, const juce::File&) {
+    r.section("Plugin lifecycle: hosted plugins outlive rebuilds and undo");
+
+    const auto pluginDir = selfTestPluginDir();
+    if (!pluginDir.getChildFile("seance_selftest_gain.lv2/manifest.ttl").existsAsFile()) {
+        r.note("SKIPPED - no self-test LV2 plugins in " + pluginDir.getFullPathName()
+               + ". The build puts them there; release packages leave them out.");
+        return;
     }
+    PluginHost host;
+    host.scanFolders(lv2FolderOnly(pluginDir), {});
+    const auto* listedA = findListed(host, kSelfTestGainA);
+    if (!r.check(listedA != nullptr, "lifecycle: (setup) the self-test plugin is listed"))
+        return;
+    const PluginInfo infoA = *listedA;
+    auto closeTo = [](double measured, double wanted) { return std::abs(measured - wanted) < 1e-4; };
+    auto hosted = [](GraphProcessor& gp, int id) {
+        return dynamic_cast<juce::AudioPluginInstance*>(gp.getProcessorForNode(id));
+    };
+
+    Transport transport;
+    NodeGraph g;
+    GraphProcessor gp;
+    gp.setHostsPlugins(true);   // as the audio engine's live graph does
+    gp.prepare(g, 48000.0, 256);
+    const std::string before = ProjectFile::serializeForUndo(g);   // undoing the node's creation returns here
+    const int id = g.addPluginNode(host, infoA, {0.0f, 0.0f}).id;
+    const std::string after = ProjectFile::serializeForUndo(g);
+
+    // ---- Rebuilds ----------------------------------------------------------
+    gp.rebuildGraph(g, transport);
+    auto* plugin = hosted(gp, id);
+    gp.rebuildGraph(g, transport);
+    gp.rebuildGraph(g, transport);
+    r.check(plugin != nullptr, "rebuild: the audio graph hosts the node's plugin");
+    r.check(plugin != nullptr && hosted(gp, id) == plugin,
+            "rebuild: ...and still the same instance after more rebuilds (the second rebuild "
+            "used to delete it)");
+    if (plugin == nullptr) return;
+
+    // A setting to follow: gain from its default 0.5 to 0.8 (0..2, normalised 0.4).
+    if (auto* gainParam = plugin->getParameters()[0])
+        gainParam->setValueNotifyingHost(0.4f);
+    r.checkVal(closeTo(measuredGainOf(*plugin), 0.8),
+               "(setup) the plugin's gain is set to 0.8", measuredGainOf(*plugin));
+
+    // ---- Undo of an edit that keeps the node --------------------------------
+    auto reload = g.restoreSnapshot(after);
+    gp.rebuildGraph(g, transport);
+    const auto* node = g.findNode(id);
+    r.check(reload.empty() && node != nullptr && node->plugin != nullptr,
+            "undo: a restored plugin node keeps its plugin - nothing to load again");
+    r.check(hosted(gp, id) == plugin && !gp.hasRetiredPlugins(),
+            "undo: ...the very same instance, still in the audio graph");
+    r.checkVal(closeTo(measuredGainOf(*plugin), 0.8), "undo: ...with its settings (gain 0.8)",
+               measuredGainOf(*plugin));
+
+    // ---- Undo of the node's creation: the node goes -------------------------
+    reload = g.restoreSnapshot(before);
+    gp.rebuildGraph(g, transport);
+    r.check(g.findNode(id) == nullptr && gp.getProcessorForNode(id) == nullptr,
+            "gone: the plugin leaves the audio graph with its node");
+    auto retiredList = gp.takeRetiredPlugins();
+    const bool retiredAlive = retiredList.size() == 1 && retiredList[0].nodeId == id
+                              && retiredList[0].node != nullptr
+                              && retiredList[0].node->getProcessor() == plugin;
+    r.check(retiredAlive,
+            "gone: ...retired alive, for the message thread to dispose of (not destroyed on "
+            "the audio thread)");
+    if (retiredAlive) {   // what disposeRetiredPlugins does with it
+        juce::MemoryBlock state;
+        plugin->getStateInformation(state);
+        g.retiredPluginStates[id] = { retiredList[0].description,
+                                      state.toBase64Encoding().toStdString() };
+    }
+    retiredList.clear();   // destroys it
+    plugin = nullptr;
+
+    // ---- Redo: the node comes back, and its plugin as it was ----------------
+    reload = g.restoreSnapshot(after);
+    r.check(reload.size() == 1 && reload[0] == id,
+            "back: the plugin node returns without its plugin, listed for loading");
     {
-        NodeGraph g;
-        const int id = g.addPluginNode(host, *findListed(host, kSelfTestGainA), {0.0f, 0.0f}).id;
-        ProjectFile::loadFromString(ProjectFile::serializeForUndo(g), g, nullptr);   // an undo
-        const auto* n = g.findNode(id);
-        r.check(n && n->pluginDescription.fileOrIdentifier == kSelfTestGainA,
-                "lifecycle: an undo keeps the node's plugin identity");
-        const bool kept = n && n->plugin != nullptr;
-        r.knownBug(kept, "lifecycle: ...and its plugin", kept ? 1.0 : 0.0, kLifecycleIssue);
+        const auto* back = g.findNode(id);
+        auto load = back ? host.loadNodePlugin(back->pluginDescription, back->legacyPluginIndex,
+                                               back->name, 48000.0, 256)
+                         : PluginHost::NodeLoad{};
+        auto kept = g.retiredPluginStates.find(id);
+        if (load.plugin && kept != g.retiredPluginStates.end()) {   // what processNextPluginLoad does
+            juce::MemoryBlock state;
+            state.fromBase64Encoding(kept->second.state);
+            load.plugin->instance->setStateInformation(state.getData(), (int) state.getSize());
+        }
+        const double gain = load.plugin ? measuredGainOf(*load.plugin->instance) : -1.0;
+        r.checkVal(closeTo(gain, 0.8),
+                   "back: ...which loads with the settings it had when it went (gain 0.8, not "
+                   "the default 0.5)", gain);
+    }
+
+    // ---- Another project, a node with the same id and plugin ----------------
+    {
+        NodeGraph project;
+        GraphProcessor projectGp;
+        projectGp.setHostsPlugins(true);
+        projectGp.prepare(project, 48000.0, 256);
+        const int sameId = project.addPluginNode(host, infoA, {0.0f, 0.0f}).id;
+        projectGp.rebuildGraph(project, transport);
+        auto* old = hosted(projectGp, sameId);
+        // Open "another project" holding the same node: nodes replaced, plugin
+        // not loaded yet - then what MainContentComponent does after a load.
+        ProjectFile::loadFromString(ProjectFile::serializeForUndo(project), project, nullptr);
+        projectGp.retireStalePlugins(project);
+        auto list = projectGp.takeRetiredPlugins();
+        r.check(old != nullptr && list.size() == 1 && list[0].node->getProcessor() == old,
+                "project: opening another project lets go of the old one's plugins, even for "
+                "a node with the same id and plugin");
+        projectGp.rebuildGraph(project, transport);
+        auto* stand = projectGp.getNodeOwnProcessor(sameId);
+        r.check(stand != nullptr && dynamic_cast<PassthroughProcessor*>(stand) != nullptr,
+                "project: ...and until the node's own plugin loads, it passes audio straight "
+                "through - no stand-in built-in");
+    }
+
+    // ---- An offline render leaves the plugin alone ---------------------------
+    {
+        NodeGraph offGraph;
+        const int offId = offGraph.addPluginNode(host, infoA, {0.0f, 0.0f}).id;
+        {
+            GraphProcessor offline;   // an export's graph - it hosts no plugins
+            offline.prepare(offGraph, 48000.0, 256);
+            offline.rebuildGraph(offGraph, transport);
+        }                             // ...and is gone again
+        const auto* n = offGraph.findNode(offId);
+        r.check(n != nullptr && n->plugin != nullptr && n->plugin->instance != nullptr,
+                "offline: an export's graph leaves a just-loaded plugin to the live graph (it "
+                "used to take it, and destroy it when the export finished)");
+    }
+
+    // ---- A plugin instrument that didn't load --------------------------------
+    {
+        NodeGraph missing;
+        GraphProcessor missingGp;
+        missingGp.prepare(missing, 48000.0, 256);
+        auto& n = missing.addNode("Missing Synth", NodeType::Instrument,
+                                  { Pin{0, "MIDI In", PinKind::Midi, true} },
+                                  { Pin{0, "Audio Out", PinKind::Audio, false, 2} }, {0.0f, 0.0f});
+        n.pluginDescription = infoA.description;
+        n.pluginDescription.name = "Missing Synth";
+        n.pluginDescription.fileOrIdentifier = "urn:seance:selftest:not-installed";
+        n.pluginDescription.isInstrument = true;
+        n.pluginLoadState = PluginLoadState::Failed;
+        const int missingId = n.id;
+        missingGp.rebuildGraph(missing, transport);
+        const auto* built = missing.findNode(missingId);
+        bool pressurePin = false;
+        for (auto& pin : built->pinsIn)
+            if (pin.name == "Pressure") pressurePin = true;
+        r.check(dynamic_cast<PassthroughProcessor*>(missingGp.getNodeOwnProcessor(missingId)) != nullptr,
+                "no plugin: an instrument whose plugin didn't load is silent - no longer the "
+                "built-in synth standing in");
+        r.check(!pressurePin,
+                "no plugin: ...and isn't given the built-in synths' Pressure pin (which used to "
+                "be added for good, and saved)");
     }
 }
 
@@ -12471,6 +12668,8 @@ int runSelfTest(const juce::File& outDir) {
     testScriptingApi(r, outDir);
     testPluginFolders(r, outDir);
     testPluginIdentity(r, outDir);
+    testPluginLifecycle(r, outDir);
+    testGraphRebuildThread(r);
     testAppVersion(r);
 
     r.section("Summary");

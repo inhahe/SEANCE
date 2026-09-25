@@ -32,6 +32,7 @@
 #include "signal_filter.h"
 #include "poly_voice_processor.h"
 #include <algorithm>
+#include <set>
 #include <cmath>
 #include <cstring>
 #include <fstream>
@@ -766,8 +767,68 @@ std::unique_ptr<juce::AudioProcessor> GraphProcessor::createNodeProcessor(
     return std::make_unique<PassthroughProcessor>(node);
 }
 
+void GraphProcessor::retireStalePlugins(NodeGraph& graph,
+                                        juce::AudioProcessorGraph::UpdateKind update) {
+    for (auto it = hostedPlugins.begin(); it != hostedPlugins.end();) {
+        const Node* node = graph.findNode(it->first);
+        const auto owner = it->second.owner.lock();
+        const bool live = node != nullptr && owner != nullptr && node->plugin == owner
+                          && !owner->instance   // a fresh instance replaces this one
+                          && node->voiceContainerId == buildScope
+                          && processorGraph->getNodeForId(it->second.graphId) != nullptr;
+        if (live) {
+            ++it;
+            continue;
+        }
+        if (auto graphNode = processorGraph->removeNode(it->second.graphId, update)) {
+            if (auto* p = graphNode->getProcessor())
+                p->removeListener(&latencyListener);
+            retired.push_back({ it->first, it->second.description, graphNode });
+            retiredPending.store(true);
+        }
+        it = hostedPlugins.erase(it);
+    }
+}
+
+std::vector<GraphProcessor::RetiredPlugin> GraphProcessor::takeRetiredPlugins() {
+    std::vector<RetiredPlugin> out;
+    out.swap(retired);
+    retiredPending.store(false);
+    return out;
+}
+
 void GraphProcessor::rebuildGraph(NodeGraph& graph, Transport& transport) {
-    processorGraph->clear();
+    // Every change below is made without updating the JUCE graph, which is
+    // then brought up to date once, at the end (processorGraph->rebuild()):
+    // updating on each change cost a full render-sequence rebuild per node and
+    // connection, and - off the message thread - queued the graph's follow-up
+    // work there while this was still changing the graph.
+    const auto noUpdate = juce::AudioProcessorGraph::UpdateKind::none;
+    auto addGraphNode = [this, noUpdate](std::unique_ptr<juce::AudioProcessor> p) {
+        return processorGraph->addNode(std::move(p), std::nullopt, noUpdate);
+    };
+    auto addGraphConnection = [this, noUpdate](const juce::AudioProcessorGraph::Connection& c) {
+        return processorGraph->addConnection(c, noUpdate);
+    };
+
+    // Hosted plugins whose node still holds them stay in the graph, only
+    // disconnected; the rest are retired (see retireStalePlugins). Everything
+    // else is rebuilt from scratch. `none` below: the output node added next
+    // is a sync update, before anything renders again.
+    retireStalePlugins(graph, juce::AudioProcessorGraph::UpdateKind::none);
+    {
+        std::set<juce::uint32> keep;
+        for (auto& kv : hostedPlugins)
+            keep.insert(kv.second.graphId.uid);
+        std::vector<juce::AudioProcessorGraph::NodeID> others;
+        for (auto* graphNode : processorGraph->getNodes())
+            if (!keep.count(graphNode->nodeID.uid))
+                others.push_back(graphNode->nodeID);
+        for (auto id : others)
+            processorGraph->removeNode(id, juce::AudioProcessorGraph::UpdateKind::none);
+        for (auto& kv : hostedPlugins)
+            processorGraph->disconnectNode(kv.second.graphId, juce::AudioProcessorGraph::UpdateKind::none);
+    }
     latencyListener.beginRebuild(); // forget old processor->nodeId mappings (pointers are stale)
     nodeMap.clear();
     nodeInputMap.clear();
@@ -792,7 +853,7 @@ void GraphProcessor::rebuildGraph(NodeGraph& graph, Transport& transport) {
     };
 
     // Add an audio output node (graph sink)
-    auto outNode = processorGraph->addNode(
+    auto outNode = addGraphNode(
         std::make_unique<juce::AudioProcessorGraph::AudioGraphIOProcessor>(
             juce::AudioProcessorGraph::AudioGraphIOProcessor::audioOutputNode));
     outputNodeId = outNode->nodeID;
@@ -845,7 +906,7 @@ void GraphProcessor::rebuildGraph(NodeGraph& graph, Transport& transport) {
             if (proc) {
                 proc->enableAllBuses();
                 widenForControl(*proc, node);
-                auto graphNode = processorGraph->addNode(std::move(proc));
+                auto graphNode = addGraphNode(std::move(proc));
                 if (graphNode) {
                     nodeMap[node.id] = graphNode->nodeID;
                     nodeInputMap[node.id] = graphNode->nodeID;
@@ -864,7 +925,10 @@ void GraphProcessor::rebuildGraph(NodeGraph& graph, Transport& transport) {
         // to "Pressure" in place below - same pin id, so old cables survive.)
         auto isTonalSynthNodeForPin = [](const Node& n) {
             if (n.type == NodeType::TerrainSynth) return true;
-            if (n.type == NodeType::Instrument && !n.plugin) {
+            // isPluginNode, not `plugin`: a plugin node whose plugin is still
+            // loading, or failed to, is no built-in synth either - it used to
+            // be taken for one here and be given a Pressure pin for good.
+            if (n.type == NodeType::Instrument && !n.isPluginNode()) {
                 auto isScript = [&](const char* tag) {
                     return n.script.rfind(tag, 0) == 0;
                 };
@@ -955,16 +1019,29 @@ void GraphProcessor::rebuildGraph(NodeGraph& graph, Transport& transport) {
             // patch clones summed inside. Built like any audio-producing node
             // (gets MIDI in, stereo out, and a trailing pan below).
             proc = std::make_unique<PolyVoiceProcessor>(node, graph, transport);
-        } else if (node.plugin && node.plugin->instance) {
-            // Real plugin - transfer ownership to the graph
-            auto graphNode = processorGraph->addNode(std::move(node.plugin->instance));
-            if (graphNode) {
-                nodeMap[node.id] = graphNode->nodeID;
-                nodeInputMap[node.id] = graphNode->nodeID;
-                // Store the graph node ID so we can retrieve the processor later
-                node.plugin->graphNodeId = graphNode->nodeID.uid;
+        } else if (hostsPlugins && node.plugin
+                   && (node.plugin->instance || hostedPlugins.count(node.id))) {
+            // Hosted plugin. A fresh instance from PluginHost goes into the
+            // JUCE graph, which owns it from here on (see retireStalePlugins);
+            // one already there stays where it is, just reconnected.
+            juce::AudioProcessorGraph::NodeID graphId;
+            if (node.plugin->instance) {
+                auto graphNode = addGraphNode(std::move(node.plugin->instance));
+                if (!graphNode) continue;
+                graphId = graphNode->nodeID;
+                hostedPlugins[node.id] = { graphId, node.plugin, node.pluginDescription };
+            } else {
+                graphId = hostedPlugins[node.id].graphId;
             }
+            nodeMap[node.id] = graphId;
+            nodeInputMap[node.id] = graphId;
+            node.plugin->graphNodeId = (int) graphId.uid;
             continue;
+        } else if (node.isPluginNode()) {
+            // A plugin node without its plugin - still loading, or it failed
+            // to (the node's badge says which): silence, or for an effect its
+            // input passed straight through. Never a stand-in built-in synth.
+            proc = std::make_unique<PassthroughProcessor>(node);
         } else {
             proc = createNodeProcessor(node, transport, graph);
         }
@@ -972,7 +1049,7 @@ void GraphProcessor::rebuildGraph(NodeGraph& graph, Transport& transport) {
         if (proc) {
             proc->enableAllBuses();
             widenForControl(*proc, node);
-            auto graphNode = processorGraph->addNode(std::move(proc));
+            auto graphNode = addGraphNode(std::move(proc));
             if (graphNode) {
                 // Insert a pan processor after audio-producing nodes
                 if (node.type != NodeType::Output) {
@@ -989,12 +1066,12 @@ void GraphProcessor::rebuildGraph(NodeGraph& graph, Transport& transport) {
                     if (numCtrlOuts > 0)
                         panProc->setPlayConfigDetails(2 + numCtrlOuts, 2 + numCtrlOuts,
                                                       sampleRate, blockSize);
-                    auto panNode = processorGraph->addNode(std::move(panProc));
+                    auto panNode = addGraphNode(std::move(panProc));
                     if (panNode) {
                         // Chain: node -> pan -> (downstream will connect to panNode)
-                        processorGraph->addConnection({{graphNode->nodeID, 0}, {panNode->nodeID, 0}});
-                        processorGraph->addConnection({{graphNode->nodeID, 1}, {panNode->nodeID, 1}});
-                        processorGraph->addConnection({
+                        addGraphConnection({{graphNode->nodeID, 0}, {panNode->nodeID, 0}});
+                        addGraphConnection({{graphNode->nodeID, 1}, {panNode->nodeID, 1}});
+                        addGraphConnection({
                             {graphNode->nodeID, juce::AudioProcessorGraph::midiChannelIndex},
                             {panNode->nodeID, juce::AudioProcessorGraph::midiChannelIndex}});
                         // Wire control channels (Signal/Param outputs) through
@@ -1005,7 +1082,7 @@ void GraphProcessor::rebuildGraph(NodeGraph& graph, Transport& transport) {
                         // processor because downstream connections go through
                         // nodeMap[node.id] = panNode.
                         for (int i = 0; i < numCtrlOuts; ++i) {
-                            processorGraph->addConnection({{graphNode->nodeID, 2 + i},
+                            addGraphConnection({{graphNode->nodeID, 2 + i},
                                                            {panNode->nodeID, 2 + i}});
                         }
                         nodeMap[node.id] = panNode->nodeID;       // downstream pulls audio from pan
@@ -1029,19 +1106,19 @@ void GraphProcessor::rebuildGraph(NodeGraph& graph, Transport& transport) {
     // ADDS the RPN and never touches the note stream, so a non-MPE plugin -
     // which ignores the unknown RPN - is byte-for-byte unaffected. Built-in
     // synths read MPE channels natively and don't need the handshake, so this
-    // is gated on node.plugin. Injecting at the plugin's graph input (rather
+    // is gated on a live hosted plugin. Injecting at the plugin's graph input (rather
     // than on a cable) also bypasses the cable-level MIDI-Learn CC filter that
     // could otherwise strip the RPN's CC 6/38/100/101 bytes.
     for (auto& node : graph.nodes) {
         if (!node.mpeEnabled) continue;
-        if (!node.plugin) continue;
+        if (!hostedPlugins.count(node.id)) continue;   // a live hosted plugin only
         auto it = nodeInputMap.find(node.id);
         if (it == nodeInputMap.end()) continue;
         auto cfgProc = std::make_unique<MpeConfigProcessor>(node, transport);
         cfgProc->enableAllBuses();
-        auto cfgNode = processorGraph->addNode(std::move(cfgProc));
+        auto cfgNode = addGraphNode(std::move(cfgProc));
         if (cfgNode) {
-            processorGraph->addConnection({
+            addGraphConnection({
                 {cfgNode->nodeID, juce::AudioProcessorGraph::midiChannelIndex},
                 {it->second, juce::AudioProcessorGraph::midiChannelIndex}});
         }
@@ -1143,11 +1220,11 @@ void GraphProcessor::rebuildGraph(NodeGraph& graph, Transport& transport) {
                     if (srcNumCtrlOuts > 0)
                         gateProc->setPlayConfigDetails(2 + srcNumCtrlOuts, 2 + srcNumCtrlOuts,
                                                        sampleRate, blockSize);
-                    auto gateNode = processorGraph->addNode(std::move(gateProc));
+                    auto gateNode = addGraphNode(std::move(gateProc));
                     if (gateNode) {
-                        processorGraph->addConnection({{effectiveSrc, 0}, {gateNode->nodeID, 0}});
-                        processorGraph->addConnection({{effectiveSrc, 1}, {gateNode->nodeID, 1}});
-                        processorGraph->addConnection({
+                        addGraphConnection({{effectiveSrc, 0}, {gateNode->nodeID, 0}});
+                        addGraphConnection({{effectiveSrc, 1}, {gateNode->nodeID, 1}});
+                        addGraphConnection({
                             {effectiveSrc, juce::AudioProcessorGraph::midiChannelIndex},
                             {gateNode->nodeID, juce::AudioProcessorGraph::midiChannelIndex}});
                         // Forward control channels (Signal/Param outputs)
@@ -1155,7 +1232,7 @@ void GraphProcessor::rebuildGraph(NodeGraph& graph, Transport& transport) {
                         // only silences channels 0+1 outside active regions;
                         // control channels pass through.
                         for (int i = 0; i < srcNumCtrlOuts; ++i) {
-                            processorGraph->addConnection({{effectiveSrc, 2 + i},
+                            addGraphConnection({{effectiveSrc, 2 + i},
                                                            {gateNode->nodeID, 2 + i}});
                         }
                         effectiveSrc = gateNode->nodeID;
@@ -1171,12 +1248,12 @@ void GraphProcessor::rebuildGraph(NodeGraph& graph, Transport& transport) {
             if (srcNumCtrlOuts > 0)
                 gainProc->setPlayConfigDetails(2 + srcNumCtrlOuts, 2 + srcNumCtrlOuts,
                                                sampleRate, blockSize);
-            auto gainNode = processorGraph->addNode(std::move(gainProc));
+            auto gainNode = addGraphNode(std::move(gainProc));
             if (gainNode) {
                 // Route: src -> gain -> dst
-                processorGraph->addConnection({{srcGraphId, 0}, {gainNode->nodeID, 0}});
-                processorGraph->addConnection({{srcGraphId, 1}, {gainNode->nodeID, 1}});
-                processorGraph->addConnection({
+                addGraphConnection({{srcGraphId, 0}, {gainNode->nodeID, 0}});
+                addGraphConnection({{srcGraphId, 1}, {gainNode->nodeID, 1}});
+                addGraphConnection({
                     {srcGraphId, juce::AudioProcessorGraph::midiChannelIndex},
                     {gainNode->nodeID, juce::AudioProcessorGraph::midiChannelIndex}});
                 // Forward control channels too. GainProcessor scales every
@@ -1186,7 +1263,7 @@ void GraphProcessor::rebuildGraph(NodeGraph& graph, Transport& transport) {
                 // downstream connections from a control-source pin still see
                 // their data.
                 for (int i = 0; i < srcNumCtrlOuts; ++i) {
-                    processorGraph->addConnection({{srcGraphId, 2 + i},
+                    addGraphConnection({{srcGraphId, 2 + i},
                                                    {gainNode->nodeID, 2 + i}});
                 }
                 effectiveSrc = gainNode->nodeID;
@@ -1226,11 +1303,11 @@ void GraphProcessor::rebuildGraph(NodeGraph& graph, Transport& transport) {
                 }
                 break;
             }
-            processorGraph->addConnection({{effectiveSrc, srcSignalCh}, {dstGraphId, signalChIdx}});
+            addGraphConnection({{effectiveSrc, srcSignalCh}, {dstGraphId, signalChIdx}});
         } else {
             // Audio + MIDI: connect as before
-            processorGraph->addConnection({{effectiveSrc, 0}, {dstGraphId, 0}});
-            processorGraph->addConnection({{effectiveSrc, 1}, {dstGraphId, 1}});
+            addGraphConnection({{effectiveSrc, 0}, {dstGraphId, 0}});
+            addGraphConnection({{effectiveSrc, 1}, {dstGraphId, 1}});
 
             // Multi-output MIDI: a Script (unified SignalShape), MidiScript or
             // WASM Script node with >1 MIDI output pin tags each emitted event
@@ -1269,10 +1346,10 @@ void GraphProcessor::rebuildGraph(NodeGraph& graph, Transport& transport) {
                 } else {
                     auto filt = std::make_unique<MidiChannelFilterProcessor>(thisMidiOutIdx + 1);
                     filt->enableAllBuses();
-                    auto filtNode = processorGraph->addNode(std::move(filt));
+                    auto filtNode = addGraphNode(std::move(filt));
                     midiSrcId = filtNode->nodeID;
                     midiOutFilters[key] = midiSrcId;
-                    processorGraph->addConnection({
+                    addGraphConnection({
                         {effectiveSrc, juce::AudioProcessorGraph::midiChannelIndex},
                         {midiSrcId, juce::AudioProcessorGraph::midiChannelIndex}});
                 }
@@ -1288,7 +1365,7 @@ void GraphProcessor::rebuildGraph(NodeGraph& graph, Transport& transport) {
             bool dstIsHostedPlugin = false;
             if (srcKind == PinKind::Midi) {
                 for (auto& dn : graph.nodes)
-                    if (dn.id == dstNodeId) { dstIsHostedPlugin = (dn.plugin != nullptr); break; }
+                    if (dn.id == dstNodeId) { dstIsHostedPlugin = hostedPlugins.count(dn.id) > 0; break; }
             }
 
             // Multi-MIDI-input destination: a SignalShape / MidiScript / Script
@@ -1324,11 +1401,11 @@ void GraphProcessor::rebuildGraph(NodeGraph& graph, Transport& transport) {
                     if (dn.id == dstNodeId) { dstNodePtr = &dn; break; }
                 auto adapter = std::make_unique<MidiTuningAdapterProcessor>(*dstNodePtr, transport);
                 adapter->enableAllBuses();
-                auto adapterNode = processorGraph->addNode(std::move(adapter));
-                processorGraph->addConnection({
+                auto adapterNode = addGraphNode(std::move(adapter));
+                addGraphConnection({
                     {midiSrcId, juce::AudioProcessorGraph::midiChannelIndex},
                     {adapterNode->nodeID, juce::AudioProcessorGraph::midiChannelIndex}});
-                processorGraph->addConnection({
+                addGraphConnection({
                     {adapterNode->nodeID, juce::AudioProcessorGraph::midiChannelIndex},
                     {dstGraphId, juce::AudioProcessorGraph::midiChannelIndex}});
             } else {
@@ -1342,16 +1419,16 @@ void GraphProcessor::rebuildGraph(NodeGraph& graph, Transport& transport) {
                     } else {
                         auto stamp = std::make_unique<MidiChannelStampProcessor>(thisMidiInIdx + 1);
                         stamp->enableAllBuses();
-                        auto stampNode = processorGraph->addNode(std::move(stamp));
+                        auto stampNode = addGraphNode(std::move(stamp));
                         stampId = stampNode->nodeID;
                         midiInStamps[key] = stampId;
                     }
-                    processorGraph->addConnection({
+                    addGraphConnection({
                         {midiSrcId, juce::AudioProcessorGraph::midiChannelIndex},
                         {stampId,   juce::AudioProcessorGraph::midiChannelIndex}});
                     midiFinalSrc = stampId;
                 }
-                processorGraph->addConnection({
+                addGraphConnection({
                     {midiFinalSrc, juce::AudioProcessorGraph::midiChannelIndex},
                     {dstGraphId,   juce::AudioProcessorGraph::midiChannelIndex}});
             }
@@ -1422,6 +1499,10 @@ void GraphProcessor::rebuildGraph(NodeGraph& graph, Transport& transport) {
                 mp.connected = (connectedEndPins.count(mp.pinId) > 0);
     }
 
+    // Bring the JUCE graph up to date, once: immediately on the message
+    // thread, else queued to it - after every change has been made.
+    processorGraph->rebuild();
+
     lastNodeCount = (int)graph.nodes.size();
     lastLinkCount = (int)graph.links.size();
 
@@ -1464,12 +1545,38 @@ void GraphProcessor::rebuildGraph(NodeGraph& graph, Transport& transport) {
     }
 }
 
+bool GraphProcessor::rebuildDue(const NodeGraph& graph) const {
+    return rebuildRequested.load()
+           || (int)graph.nodes.size() != lastNodeCount
+           || (int)graph.links.size() != lastLinkCount;
+}
+
+void GraphProcessor::rebuildNow(NodeGraph& graph, Transport& transport) {
+    if (!rebuildDue(graph)) return;
+    rebuildRequested = false;
+    rebuildGraph(graph, transport);
+    if (sampleRate > 0)
+        processorGraph->prepareToPlay(sampleRate, blockSize);
+    // Record settled latencies AFTER prepare so the latencyChanged
+    // notification that prepareToPlay emits converges to a no-op instead
+    // of re-flagging a rebuild (which would loop forever).
+    latencyListener.commitLatencies();
+}
+
 void GraphProcessor::processBlock(NodeGraph& graph, Transport& transport,
                                    float* const* outputData, int numChannels, int numSamples) {
     // Check if graph needs rebuilding
-    if (rebuildRequested.exchange(false) ||
-        (int)graph.nodes.size() != lastNodeCount ||
-        (int)graph.links.size() != lastLinkCount) {
+    if (rebuildDue(graph)) {
+        if (onRebuildDue) {
+            // The live graph: rebuilt on the message thread (see onRebuildDue).
+            // Nothing is rendered until then - the current processors may hold
+            // references into nodes that have moved since the change.
+            for (int c = 0; c < numChannels; ++c)
+                juce::FloatVectorOperations::clear(outputData[c], numSamples);
+            onRebuildDue();
+            return;
+        }
+        rebuildRequested = false;
         rebuildGraph(graph, transport);
         if (sampleRate > 0)
             processorGraph->prepareToPlay(sampleRate, numSamples);
@@ -1549,6 +1656,14 @@ juce::AudioProcessor* GraphProcessor::getProcessorForNode(int nodeId) {
     if (!processorGraph) return nullptr;
     auto it = nodeMap.find(nodeId);
     if (it == nodeMap.end()) return nullptr;
+    auto graphNode = processorGraph->getNodeForId(it->second);
+    return graphNode ? graphNode->getProcessor() : nullptr;
+}
+
+juce::AudioProcessor* GraphProcessor::getNodeOwnProcessor(int nodeId) {
+    if (!processorGraph) return nullptr;
+    auto it = nodeInputMap.find(nodeId);
+    if (it == nodeInputMap.end()) return nullptr;
     auto graphNode = processorGraph->getNodeForId(it->second);
     return graphNode ? graphNode->getProcessor() : nullptr;
 }

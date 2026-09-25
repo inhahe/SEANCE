@@ -49,11 +49,13 @@ void Controller::log(const juce::String& line)
         onLogLine(stamped);
 }
 
-static juce::String searchPathFor(Catalog& catalog, const juce::String& formatName)
+// For a worker's "extraFolders": the SoundShop2 folders its brand-new LV2
+// format hasn't read (it reads the standard ones itself as it's created).
+static juce::String extraFoldersFor(Catalog& catalog, const juce::String& formatName)
 {
     for (auto* f : catalog.getFormats().getFormats())
         if (f->getName() == formatName)
-            return catalog.getSearchPath(*f).toString();
+            return catalog.getUserFolders(*f).toString();
     return {};
 }
 
@@ -238,7 +240,7 @@ void Controller::startScan(bool forceRescan, std::function<void()> then)
                                 { "format", req.format },
                                 { "fileOrId", req.fileOrId },
                                 { "resultFile", resultFile.getFullPathName() },
-                                { "searchPath", searchPathFor(catalog, req.format) } });
+                                { "extraFolders", extraFoldersFor(catalog, req.format) } });
 
         catalog.setScanning(req.fileOrId);
         runner.add(std::move(job));
@@ -546,7 +548,7 @@ void Controller::queueRenderJobs(const std::vector<PluginEntry>& plugins, const 
                                 { "midiFile", midiFile },
                                 { "presetIndex", presetIndex.getFullPathName() },
                                 { "recorded", juce::var(recorded) },
-                                { "searchPath", searchPathFor(catalog, p.desc.pluginFormatName) } });
+                                { "extraFolders", extraFoldersFor(catalog, p.desc.pluginFormatName) } });
         runner.add(std::move(job));
         ++queued;
     }

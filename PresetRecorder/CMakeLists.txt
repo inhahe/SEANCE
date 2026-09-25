@@ -8,7 +8,7 @@ cmake_minimum_required(VERSION 3.22)
 # The version below is the single source of truth for the tool's version: it
 # feeds JUCE_APPLICATION_VERSION_STRING (window title / About) and the exe's
 # file-version resource. Bump it whenever you rebuild after a change.
-project(PresetRecorder VERSION 1.0.1 LANGUAGES C CXX)
+project(PresetRecorder VERSION 1.0.2 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -16,9 +16,10 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # SEANCE's own sources live one level up, in ../cpp/src. Two small, self-
 # contained files are compiled straight into this tool (see design.md,
 # "Code shared with SEANCE"):
-#   plugin_settings.cpp - parses soundshop_plugins.cfg and owns SEANCE's default
-#                         scan folders, so the tool reads the plugin list and
-#                         skip list exactly the way SEANCE does.
+#   plugin_settings.cpp - parses soundshop_plugins.cfg, owns SEANCE's default
+#                         scan folders and decides where each plugin format
+#                         looks, so the tool reads the plugin list and skip
+#                         list, and searches, exactly the way SEANCE does.
 #   dialog_helpers.cpp  - taskbar-correct dialogs (no second taskbar button).
 set(SEANCE_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/..")
 set(SEANCE_SRC "${SEANCE_ROOT}/cpp/src")

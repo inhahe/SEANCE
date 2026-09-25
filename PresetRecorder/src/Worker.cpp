@@ -159,11 +159,13 @@ static juce::AudioPluginFormat* findFormat(juce::AudioPluginFormatManager& fm, c
 
 // LV2 plugins are identified by URI and only resolve once their bundle has been
 // loaded into the LV2 world. JUCE's LV2 format loads its default folders by
-// itself; SoundShop2's extra folders have to be loaded by searching them.
-static void loadExtraLv2Folders(juce::AudioPluginFormat& format, const juce::String& searchPath)
+// itself; SoundShop2's extra folders have to be loaded by searching them. The
+// job carries only those (Catalog::getUserFolders): searching a folder the
+// world has already read logs a "Reloading plugin" warning per plugin in it.
+static void loadExtraLv2Folders(juce::AudioPluginFormat& format, const juce::String& extraFolders)
 {
-    if (format.getName() == "LV2" && searchPath.isNotEmpty())
-        onMessageThread([&] { format.searchPathsForPlugins(juce::FileSearchPath(searchPath), true, false); });
+    if (format.getName() == "LV2" && extraFolders.isNotEmpty())
+        onMessageThread([&] { format.searchPathsForPlugins(juce::FileSearchPath(extraFolders), true, false); });
 }
 
 //==============================================================================
@@ -633,7 +635,7 @@ static int runScanJob(const juce::var& job, EventLogWriter& log)
         return workerBadJob;
     }
 
-    loadExtraLv2Folders(*format, job["searchPath"].toString());
+    loadExtraLv2Folders(*format, job["extraFolders"].toString());
 
     // Without module info, JUCE loads the plugin module, reads it and unloads it
     // again (the plugin's exit function and DLL unload code) before handing back
@@ -754,7 +756,7 @@ static int runRenderJob(const juce::var& job, EventLogWriter& log)
     juce::addDefaultFormatsToManager(fm);
 
     if (auto* format = findFormat(fm, desc.pluginFormatName))
-        loadExtraLv2Folders(*format, job["searchPath"].toString());
+        loadExtraLv2Folders(*format, job["extraFolders"].toString());
 
     log.event("loading", { { "name", desc.name } });
 

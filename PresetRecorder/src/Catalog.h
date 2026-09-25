@@ -78,6 +78,11 @@ public:
     // exactly what SEANCE's PluginHost::scanForPlugins searches.
     juce::FileSearchPath getSearchPath(juce::AudioPluginFormat& format) const;
 
+    // Just the SoundShop2 folders from that, without the format's default
+    // locations: what a new LV2 format hasn't read yet (it reads the defaults
+    // itself as it's created). SEANCE registers the same list at startup.
+    juce::FileSearchPath getUserFolders(juce::AudioPluginFormat& format) const;
+
     struct ScanRequest { juce::String format, fileOrId; };
 
     // Rebuilds the file list from the scan folders and the skip list and returns
@@ -116,6 +121,7 @@ private:
         juce::String failure;
     };
 
+    std::vector<std::string> seanceFolders() const;
     PluginFile& addOrGet(const juce::String& format, const juce::String& fileOrId);
     juce::String guessFormat(const juce::String& fileOrId);
     static juce::int64 modTimeOf(const juce::String& fileOrId);

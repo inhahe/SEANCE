@@ -4467,7 +4467,7 @@ scan, and harmless.
 **Tested by** `testPluginFolders` in `self_test.cpp` (`SEANCE.exe --self-test
 <dir>`). It checks which folders each format gets and simulates a restart with
 fresh `PluginHost`s (each has its own LV2 world). The plugin it restarts with is
-a real one-line LV2 gain plugin, `cpp/test_plugins/lv2_gain`, which the build
+a real, minimal LV2 gain plugin, `cpp/test_plugins/lv2_gain`, which the build
 copies to `selftest_plugins/` beside the exe, outside every standard LV2
 folder. `release.bat` doesn't package that folder.
 
@@ -4542,15 +4542,17 @@ SEANCE:
   folder when started by `seance.bat`, the exe's folder when the exe is
   double-clicked). `[ScanDirs]` lists the plugin folders; `[Blocked]` is the
   skip list (the blocklist): plugins whose scan failed are added automatically,
-  and the dialog's right-click *Block* adds more. The tool searches the same
-  folders SEANCE does (the listed ones plus each format's default locations) and
-  skips `[Blocked]` entries unless the user unskips them *in the tool*.
+  and the dialog's right-click *Block* adds more. The tool searches exactly the
+  folders SEANCE's *Scan Now* does — it calls the same `pluginSearchPath` (see
+  [Plugin folders and scanning](#plugin-folders-and-scanning)) — and skips
+  `[Blocked]` entries unless the user unskips them *in the tool*.
 - **`soundshop_plugins_cache.dat`** — read only to put names and companies on
   blocked entries.
 - The tool **never writes** either file; its unskip choices live in its own
   settings (`%APPDATA%\PresetRecorder`).
 - It compiles two SEANCE sources directly: `cpp/src/plugin_settings.cpp` (so the
-  `.cfg` format and SEANCE's default folders can't drift apart) and
+  `.cfg` format, SEANCE's default folders and where each format searches can't
+  drift apart) and
   `cpp/src/dialog_helpers.cpp` (taskbar-correct dialogs). Keep both free of
   SEANCE-internal dependencies; if the `.cfg` format changes, rebuild the tool.
 - It hosts the same plugin formats as SEANCE (VST3 and LV2, AU on macOS; no

@@ -75,17 +75,27 @@ ancestor of the tool's exe (the tool lives inside the SoundShop2 folder, where
 (double-click launches), and in the current directory; the newest file wins. The
 user can pick a file explicitly (setting `seanceConfig`).
 
-The search path per format is SEANCE's `PluginHost::scanForPlugins` merge:
-SEANCE's folders + `format->getDefaultLocationsToSearch()` - with one filter:
-LV2 only gets the SEANCE folders that contain an LV2 bundle (a subfolder with a
-`manifest.ttl`). lilv, JUCE's LV2 library, treats *every* entry of a folder it is
-given as a bundle and prints three `failed to open file .../manifest.ttl` errors
-to stderr for each one that isn't; handed SEANCE's VST3 and VST2 folders, that was
-~100 lines of console noise at every enumeration (startup, each scan, each skip-
-list change). lilv can only find plugins in subfolders with a `manifest.ttl`, so
-the filter changes nothing but the noise. (SEANCE's own *Scan Now* does the
-unfiltered merge, but its stderr goes to `seance.log`.) The formats are SEANCE's:
-VST3 + LV2 (+ AU on macOS). VST2 is off in both (needs the discontinued VST2 SDK).
+The search path per format comes from SEANCE's own functions in
+`plugin_settings.cpp` (compiled in, see *Code shared with SEANCE*), the ones
+SEANCE's *Scan Now* uses, so the two can't drift: `pluginSearchPath` =
+`format->getDefaultLocationsToSearch()` followed by `userPluginFolders` - SEANCE's
+folders minus those defaults, and for LV2 only the folders that contain an LV2
+bundle (a subfolder with a `manifest.ttl`). lilv, JUCE's LV2 library, treats
+*every* entry of a folder it is given as a bundle and prints three `failed to
+open file .../manifest.ttl` errors to stderr for each one that isn't; handed
+SEANCE's VST3 and VST2 folders, that was ~100 lines of console noise at every
+enumeration (startup, each scan, each skip-list change). lilv can only find
+plugins in subfolders with a `manifest.ttl`, so the filter changes nothing but
+the noise. The formats are SEANCE's: VST3 + LV2 (+ AU on macOS). VST2 is off in
+both (needs the discontinued VST2 SDK).
+
+lilv has a second kind of noise: reading a folder it has already read logs a
+`Reloading plugin <uri>` warning for every plugin in it - and a new LV2 format
+has already read the default folders as it was created. So no LV2 world is ever
+given a folder twice: `enumerate()` uses a brand-new `AudioPluginFormatManager`
+each time and searches only `getUserFolders()` with its LV2 format (the search
+returns every plugin the world has read, defaults included); workers get only
+those folders too (`extraFolders` in the job).
 
 ## Catalog and scanning
 
@@ -240,7 +250,7 @@ Job file (JSON, written by `JobRunner::launch`):
 | `type` | `"scan"` | `"render"` |
 | `eventLog`, `skipKeys` | added per attempt | added per attempt |
 | `format`, `fileOrId`, `resultFile` (XML of descriptions) | ✓ | |
-| `searchPath` (lets LV2 resolve URIs from extra folders) | ✓ | ✓ |
+| `extraFolders` (SEANCE's folders beyond the defaults; lets LV2 resolve URIs from them) | ✓ | ✓ |
 | `plugin` (PluginDescription XML), `pluginId`, `baseName`, `outputRoot`, `subfolder`, `instrument`, `settings` (RenderSettings), `effectInput`, `midiFile`, `presetIndex`, `recorded` (key → file) | | ✓ |
 
 Events: `hello`, `loading`, `loaded {inputs, outputs, latency, classId, input}`,
@@ -296,8 +306,9 @@ tool's sources on every build.
 Compiled from `../cpp/src`, never copied (see `CMakeLists.txt`):
 
 - `plugin_settings.cpp/.h` (+ `plugin_host.h` for its include) - SEANCE's parser
-  for `soundshop_plugins.cfg` and its default scan folders, so the format and the
-  defaults can't drift.
+  for `soundshop_plugins.cfg`, its default scan folders, and `pluginSearchPath` /
+  `userPluginFolders` (where each format looks), so the format, the defaults and
+  the search can't drift.
 - `dialog_helpers.cpp/.h` - AppLookAndFeel and taskbar-correct dialogs.
 
 SEANCE headers are included as `"cpp/src/..."` from the SoundShop2 root rather than

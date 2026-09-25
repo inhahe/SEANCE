@@ -1,5 +1,6 @@
 #include "Catalog.h"
 #include "Util.h"
+#include "cpp/src/plugin_settings.h" // pluginSearchPath / userPluginFolders - SEANCE's own
 
 namespace PresetRecorder {
 
@@ -10,43 +11,25 @@ Catalog::Catalog()
     juce::addDefaultFormatsToManager(formatManager);
 }
 
-// True if `dir` holds at least one LV2 bundle: a subfolder with a manifest.ttl.
-static bool containsLv2Bundle(const juce::File& dir)
+std::vector<std::string> Catalog::seanceFolders() const
 {
-    for (const auto& entry : juce::RangedDirectoryIterator(dir, false, "*", juce::File::findDirectories))
-        if (entry.getFile().getChildFile("manifest.ttl").existsAsFile())
-            return true;
-
-    return false;
+    std::vector<std::string> folders;
+    for (auto& d : seance.scanDirs)
+        folders.push_back(d.toStdString());
+    return folders;
 }
 
+// Both are SEANCE's own functions (cpp/src/plugin_settings.h), so the tool
+// searches exactly where SEANCE does - including leaving LV2 only the folders
+// that hold an LV2 bundle, which keeps lilv's manifest.ttl errors out.
 juce::FileSearchPath Catalog::getSearchPath(juce::AudioPluginFormat& format) const
 {
-    // Same merge SEANCE does in PluginHost::scanForPlugins: the format's own
-    // default locations plus every folder in SoundShop2's list...
-    auto path = format.getDefaultLocationsToSearch();
+    return SoundShop::pluginSearchPath(format, seanceFolders());
+}
 
-    for (auto& d : seance.scanDirs)
-    {
-        if (! juce::File::isAbsolutePath(d))
-            continue;
-
-        const juce::File dir(d);
-
-        // ...except that LV2 only gets the folders that actually contain an LV2
-        // bundle. lilv, JUCE's LV2 library, treats EVERY entry of a folder it's
-        // given as a bundle and prints three "failed to open file .../manifest.ttl"
-        // errors for each one that isn't - so handing it SoundShop2's VST3/VST2
-        // folders filled the console with noise. It can only ever find plugins
-        // in subfolders that have a manifest.ttl, so this finds exactly what the
-        // unfiltered search would have, quietly.
-        if (format.getName() == "LV2" && ! containsLv2Bundle(dir))
-            continue;
-
-        path.addIfNotAlreadyThere(dir);
-    }
-
-    return path;
+juce::FileSearchPath Catalog::getUserFolders(juce::AudioPluginFormat& format) const
+{
+    return SoundShop::userPluginFolders(format, seanceFolders());
 }
 
 PluginFile& Catalog::addOrGet(const juce::String& format, const juce::String& fileOrId)
@@ -124,9 +107,20 @@ std::vector<Catalog::ScanRequest> Catalog::enumerate(bool forceRescan)
 {
     files.clear();
 
-    for (auto* format : formatManager.getFormats())
+    // New formats for every enumeration. lilv (JUCE's LV2 library) reads the
+    // standard LV2 folders when an LV2 format is created, and only notices a
+    // bundle installed after that by reading its folder again - which logs a
+    // "Reloading plugin" warning for every plugin it had already read. A new
+    // format reads each folder once: the standard ones as it's created,
+    // SoundShop2's when searched (its search returns every plugin it has read).
+    // The other formats keep no such state and get the whole search path.
+    juce::AudioPluginFormatManager fresh;
+    juce::addDefaultFormatsToManager(fresh);
+
+    for (auto* format : fresh.getFormats())
     {
-        auto ids = format->searchPathsForPlugins(getSearchPath(*format), true, false);
+        const auto path = format->getName() == "LV2" ? getUserFolders(*format) : getSearchPath(*format);
+        auto ids = format->searchPathsForPlugins(path, true, false);
         ids.sortNatural();
 
         for (auto& id : ids)

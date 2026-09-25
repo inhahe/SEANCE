@@ -280,7 +280,7 @@ PluginHost::Resolution PluginHost::resolveLegacyIndex(int index, const std::stri
     return r;
 }
 
-std::unique_ptr<PluginHost::LoadedPlugin> PluginHost::loadPlugin(
+std::unique_ptr<juce::AudioPluginInstance> PluginHost::instantiate(
         const juce::PluginDescription& desc, double sampleRate, int blockSize,
         std::string* error) {
     if (isBlocked(desc)) {
@@ -299,6 +299,15 @@ std::unique_ptr<PluginHost::LoadedPlugin> PluginHost::loadPlugin(
                      + (errorMsg.isNotEmpty() ? ": " + errorMsg.toStdString() : std::string("."));
         return nullptr;
     }
+    return instance;
+}
+
+std::unique_ptr<PluginHost::LoadedPlugin> PluginHost::loadPlugin(
+        const juce::PluginDescription& desc, double sampleRate, int blockSize,
+        std::string* error) {
+    auto instance = instantiate(desc, sampleRate, blockSize, error);
+    if (!instance)
+        return nullptr;
 
     // Enable all buses and prepare the plugin
     instance->enableAllBuses();

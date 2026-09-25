@@ -30,17 +30,26 @@ namespace SoundShop {
 // note and drives that voice's VoiceInProcessor (the inner "Voice In" puck),
 // which emits the note into its clone and exposes Pitch/Gate/Velocity signals.
 //
-// v1 scope (M1): fixed N, steal-oldest, RMS voice-free, no hosted plugins inside
-// a voice (one Node, N processor clones - the plugin instance can only move into
-// one), no nested containers.
+// Hosted plugins inside a voice: a plugin instance can be in one graph only, so
+// each voice plays its own copy of each plugin inside the container, from
+// `copies` (see plugin_copies.h) - the live graph's pool, whose copies follow
+// the node's own "master" instance, or an offline render's. Without a pool (or
+// a copy for a voice) the plugin is silent in that voice.
+//
+// v1 scope (M1): fixed N, steal-oldest, RMS voice-free, no nested containers.
 class PolyVoiceProcessor : public juce::AudioProcessor {
 public:
-    PolyVoiceProcessor(Node& containerNode, NodeGraph& graph, Transport& transport);
+    PolyVoiceProcessor(Node& containerNode, NodeGraph& graph, Transport& transport,
+                       std::shared_ptr<PluginCopies> copies = nullptr);
 
     const juce::String getName() const override { return containerNode.name; }
     void prepareToPlay(double sr, int bs) override;
     void releaseResources() override {}
     void processBlock(juce::AudioBuffer<float>& buf, juce::MidiBuffer& midi) override;
+    // The transport's panic (GraphProcessor::requestPanic) resets every
+    // processor in the main graph; this passes it on into every voice, so the
+    // voices' tails - a plugin's reverb inside a voice - stop too.
+    void reset() override;
 
     double getTailLengthSeconds() const override { return 0; }
     bool acceptsMidi() const override { return true; }
@@ -60,6 +69,7 @@ private:
     Node& containerNode;
     NodeGraph& graph;
     Transport& transport;
+    std::shared_ptr<PluginCopies> pluginCopies;
     int containerId = -1;
 
     double sampleRate = 44100.0;

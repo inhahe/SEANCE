@@ -4,9 +4,10 @@
 namespace SoundShop {
 
 PolyVoiceProcessor::PolyVoiceProcessor(Node& containerNode_, NodeGraph& graph_,
-                                       Transport& transport_)
+                                       Transport& transport_,
+                                       std::shared_ptr<PluginCopies> copies)
     : containerNode(containerNode_), graph(graph_), transport(transport_),
-      containerId(containerNode_.id) {
+      pluginCopies(std::move(copies)), containerId(containerNode_.id) {
     // One MIDI input bus, one stereo output bus. enableAllBuses() in rebuildGraph
     // plus widenForControl set the channel layout; default stereo out here.
     setPlayConfigDetails(0, 2, sampleRate, blockSize);
@@ -30,6 +31,7 @@ void PolyVoiceProcessor::buildVoices() {
         Voice v;
         v.gp = std::make_unique<GraphProcessor>();
         v.gp->setBuildScope(containerId);
+        v.gp->setPluginCopies(pluginCopies, i);   // this voice's copy of each plugin
         // prepare() sets the GraphProcessor's sampleRate/blockSize members that
         // widenForControl reads during rebuildGraph; it also prepares the (still
         // empty) graph - harmless. rebuildGraph then populates the inner subgraph
@@ -51,6 +53,16 @@ void PolyVoiceProcessor::prepareToPlay(double sr, int bs) {
     sampleRate = sr;
     blockSize = bs;
     buildVoices();
+}
+
+void PolyVoiceProcessor::reset() {
+    for (auto& v : voices) {
+        if (v.gp && v.gp->getGraph())
+            v.gp->getGraph()->reset();
+        if (v.voiceIn)
+            v.voiceIn->reset();
+    }
+    alloc.allNotesOff();
 }
 
 void PolyVoiceProcessor::processBlock(juce::AudioBuffer<float>& buf,

@@ -613,9 +613,14 @@ void NodeGraphComponent::drawNode(juce::Graphics& g, Node& node) {
     // = animated blue spinner ("instantiating now"); Failed = amber "x" disc.
     // Ready/None draw nothing. The MainContentComponent 30Hz timer repaints us
     // while loading so the spinner animates. Tooltip explains each state.
+    // A plugin inside a Voice container whose copies didn't all load (some
+    // voices silent) shows the Failed badge too.
+    const bool voiceCopiesFailed = !node.pluginVoiceError.empty()
+                                   && node.pluginLoadState != PluginLoadState::Pending
+                                   && node.pluginLoadState != PluginLoadState::Loading;
     if (node.pluginLoadState == PluginLoadState::Pending ||
         node.pluginLoadState == PluginLoadState::Loading ||
-        node.pluginLoadState == PluginLoadState::Failed) {
+        node.pluginLoadState == PluginLoadState::Failed || voiceCopiesFailed) {
         float r = std::max(6.0f, 8.0f * zoom);
         auto tl = canvasToScreen(bounds.getTopLeft());
         juce::Rectangle<float> disc(tl.x - r, tl.y - r, r * 2, r * 2);
@@ -2375,6 +2380,8 @@ juce::String NodeGraphComponent::getTooltip() {
                         : juce::String::fromUTF8(node->pluginLoadError.c_str()))
                    + "\nThe node is kept, with its settings, so the plugin can load again "
                      "once that's fixed (reopen the project), or be replaced.";
+        if (!node->pluginVoiceError.empty())
+            return juce::String::fromUTF8(node->pluginVoiceError.c_str());
         // A node showing the red script-error badge explains it here so the
         // user knows the script didn't compile and where to fix it.
         if (getNodeScriptError && getNodeScriptError(node->id))
@@ -3012,14 +3019,17 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
             juce::PopupMenu piMenu, pfxMenu;
             for (int i = 0; i < (int)plugins.size(); ++i) {
                 auto& pi = plugins[i];
-                auto label = pi.name + " (" + pi.manufacturer + ")";
+                auto label = pi.manufacturer.empty() ? pi.name
+                                                     : pi.name + " (" + pi.manufacturer + ")";
                 if (pi.isInstrument)
                     piMenu.addItem(1000 + i, label);
                 else
                     pfxMenu.addItem(1000 + i, label);
             }
-            menu.addSubMenu("Plugin Instruments", piMenu);
-            menu.addSubMenu("Plugin Effects", pfxMenu);
+            // Only a kind there are plugins of: an empty submenu would show
+            // greyed out, with no way to say why.
+            if (piMenu.getNumItems() > 0) menu.addSubMenu("Plugin Instruments", piMenu);
+            if (pfxMenu.getNumItems() > 0) menu.addSubMenu("Plugin Effects", pfxMenu);
         }
     }
 
@@ -3030,6 +3040,32 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
         // Remember how many nodes existed before this creation so we can stamp
         // any newly-created top-level nodes into the current scope (below).
         const size_t nodeCountBefore = graph.nodes.size();
+
+        // However this ends - several branches return early, having opened the
+        // new node's window - what it made is finished here:
+        //  - If we're inside a Voice container's inner view, any node just
+        //    created belongs to that container's patch. Stamp newly-added
+        //    top-level nodes into the current scope (skip ones a handler already
+        //    tagged, e.g. the Voice-container branch's own inner pucks) - before
+        //    the audio graph is rebuilt around them, which happens after this
+        //    returns: a plugin made here must never go to the main graph. Only
+        //    nodes made before this returns; the file-chooser branches create
+        //    their node later, at the top level (an acceptable M1 limitation -
+        //    you can drag them in later).
+        //  - Adding them is one undo step. (Branches that commit their own
+        //    step first leave commitSnapshot nothing new to record.)
+        struct FinishAdding {
+            std::function<void()> finish;
+            ~FinishAdding() { finish(); }
+        };
+        FinishAdding finishAdding { [this, nodeCountBefore] {
+            if (graph.nodes.size() <= nodeCountBefore) return;
+            if (viewScope != -1)
+                for (size_t i = nodeCountBefore; i < graph.nodes.size(); ++i)
+                    if (graph.nodes[i].voiceContainerId == -1)
+                        graph.nodes[i].voiceContainerId = viewScope;
+            graph.commitSnapshot("Add " + graph.nodes[nodeCountBefore].name);
+        } };
 
         auto p = juce::Point<float>{pos.x, pos.y};
 
@@ -3217,6 +3253,7 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
                             {Pin{0, "Audio Out", PinKind::Audio, false}},
                             {canvasPos.x, canvasPos.y});
                         n.script = file.getFullPathName().toStdString();
+                        graph.commitSnapshot("Add " + name);
                         repaint();
                     }
                 });
@@ -3330,10 +3367,8 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
             n.params.push_back({"Pan",     0.0f, -1.0f, 1.0f});
             n.params.push_back({"Vibrato", 1.0f,  0.0f, 1.0f});
 
-            // Commit the new node before opening its editor so undo/redo and
-            // save/load see a consistent graph.
-            graph.commitSnapshot("Add instrument");
-
+            // Its undo step is committed as this handler returns (finishAdding),
+            // before the editor can make any edit of its own.
             auto nodeId = n.id;
             auto* editor = new LayeredWaveEditorComponent(graph, nodeId, [this]() {
                 if (onNodeEdited) onNodeEdited();
@@ -3745,6 +3780,7 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
                     // lanes and Signal cables can target them.
                     n.params.push_back({"Volume", 0.5f,  0.0f, 1.0f});
                     n.params.push_back({"Pan",    0.0f, -1.0f, 1.0f});
+                    graph.commitSnapshot("Add " + name);
                     repaint();
                 });
             return;
@@ -3776,6 +3812,7 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
                     n.params.push_back({"Vel Sens", 1.0f,  0.0f,   1.0f});
                     if (result == 104)
                         n.params.push_back({"Preset", 0.0f, 0.0f, 127.0f});
+                    graph.commitSnapshot("Add " + name);
                     repaint();
                 });
             return;
@@ -4300,17 +4337,8 @@ void NodeGraphComponent::showBackgroundMenu(juce::Point<float> canvasPos) {
                 graph.addPluginNode(*graph.pluginHost, pluginChoices[(size_t)idx], {p.x, p.y});
         }
 
-        // If we're inside a Voice container's inner view, any node just created
-        // belongs to that container's patch. Stamp newly-added top-level nodes
-        // into the current scope (skip ones a handler already tagged, e.g. the
-        // Voice-container branch's own inner pucks). Synchronous branches only;
-        // async file-chooser branches create their node later and land at the
-        // top level (an acceptable M1 limitation - you can drag them in later).
-        if (viewScope != -1) {
-            for (size_t i = nodeCountBefore; i < graph.nodes.size(); ++i)
-                if (graph.nodes[i].voiceContainerId == -1)
-                    graph.nodes[i].voiceContainerId = viewScope;
-        }
+        // The new nodes join the viewed scope and become an undo step as
+        // finishAdding goes (above).
         repaint();
     });
 }
@@ -4541,7 +4569,13 @@ void NodeGraphComponent::showNodeMenu(Node& node) {
     if (node.plugin || node.type == NodeType::Instrument || node.type == NodeType::Effect) {
         menu.addItem(4, "Show Plugin UI");
         menu.addItem(7, "Presets...");
-        menu.addItem(8, "MIDI Map...");
+        // A plugin inside a Voice container plays as a copy per voice; MIDI
+        // Learn only drives plugins in the main graph. (Menu items can't show
+        // tooltips, so the item says why it's unavailable.)
+        if (node.isPluginNode() && node.voiceContainerId >= 0)
+            menu.addItem(8, "MIDI Map... (not for a plugin inside a Voice container)", false);
+        else
+            menu.addItem(8, "MIDI Map...");
         if (node.pluginDescription.fileOrIdentifier.isNotEmpty())
             menu.addItem(6, "Plugin Info...");
         // "MPE mode" for a hosted plugin: a user-asserted flag telling SEANCE
@@ -4882,6 +4916,7 @@ void NodeGraphComponent::showNodeMenu(Node& node) {
             for (auto& p : node->pinsOut) dup.pinsOut.push_back({graph.allocId(), p.name, p.kind, false, p.channels});
             dup.params = node->params;
             dup.clips = node->clips;
+            graph.commitSnapshot("Duplicate " + node->name);
         } else if (result == 3) {
             bool already = false;
             for (int edId : graph.openEditors)
@@ -5383,7 +5418,7 @@ void NodeGraphComponent::showNodeMenu(Node& node) {
                             // callback iterating graph.nodes/links (see the
                             // mutationLock comment in deleteNodeAndDescendants).
                             {
-                                std::lock_guard<std::recursive_mutex> graphLk(graph.mutationLock);
+                                std::lock_guard<GraphMutex> graphLk(graph.mutationLock);
                                 graph.links.erase(std::remove_if(graph.links.begin(), graph.links.end(),
                                     [&downPinIds](const Link& l) {
                                         for (int pid : downPinIds)
@@ -5392,6 +5427,7 @@ void NodeGraphComponent::showNodeMenu(Node& node) {
                                     }), graph.links.end());
                                 graph.nodes.erase(std::remove_if(graph.nodes.begin(), graph.nodes.end(),
                                     [downId](const Node& nn) { return nn.id == downId; }), graph.nodes.end());
+                                graph.nodesInvalidated();
                             }
                             graph.dirty = true;
                             graph.commitSnapshot("Merge convolutions");
@@ -5451,7 +5487,7 @@ bool NodeGraphComponent::keyPressed(const juce::KeyPress& key) {
 void NodeGraphComponent::deleteSelectedLink() {
     if (selectedLinkId < 0) return;
     {
-        std::lock_guard<std::recursive_mutex> graphLk(graph.mutationLock);
+        std::lock_guard<GraphMutex> graphLk(graph.mutationLock);
         graph.links.erase(std::remove_if(graph.links.begin(), graph.links.end(),
             [this](auto& l) { return l.id == selectedLinkId; }), graph.links.end());
     }
@@ -5536,7 +5572,7 @@ void NodeGraphComponent::deleteNodeAndDescendants(int rootId) {
     // function; commitSnapshot only serializes (reads) the graph and never
     // takes mutationLock, so holding it across the snapshot is deadlock-free
     // and additionally prevents an audio-thread rebuild mid-serialization.
-    std::lock_guard<std::recursive_mutex> graphLk(graph.mutationLock);
+    std::lock_guard<GraphMutex> graphLk(graph.mutationLock);
 
     graph.links.erase(std::remove_if(graph.links.begin(), graph.links.end(),
         [&](auto& l) { return pinIds.count(l.startPin) || pinIds.count(l.endPin); }),
@@ -5560,6 +5596,7 @@ void NodeGraphComponent::deleteNodeAndDescendants(int rootId) {
     // Drop all victims from graph.nodes in one pass.
     graph.nodes.erase(std::remove_if(graph.nodes.begin(), graph.nodes.end(),
         [&](auto& n) { return victims.count(n.id) > 0; }), graph.nodes.end());
+    graph.nodesInvalidated();
 
     // Detach any surviving node whose parent was just deleted (the track-of-
     // track parenting case: a child track's parent is a plain timeline, not a
@@ -5694,7 +5731,7 @@ void NodeGraphComponent::showLinkMenu(int linkId) {
 
         if (result == 1) {
             {
-                std::lock_guard<std::recursive_mutex> graphLk(graph.mutationLock);
+                std::lock_guard<GraphMutex> graphLk(graph.mutationLock);
                 graph.links.erase(std::remove_if(graph.links.begin(), graph.links.end(),
                     [linkId](auto& l) { return l.id == linkId; }), graph.links.end());
             }

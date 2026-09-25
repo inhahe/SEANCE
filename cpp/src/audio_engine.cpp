@@ -31,17 +31,49 @@ AudioEngine::AudioEngine() {
     // teardown of a transient engine in a test won't null out a real one.
     sInstance = this;
     // The live graph is the one that hosts the project's plugins (see
-    // GraphProcessor::setHostsPlugins)...
+    // GraphProcessor::setHostsPlugins); the plugins inside its Voice
+    // containers play copies, one per voice...
     graphProcessor.setHostsPlugins(true);
-    // ...and is rebuilt on the message thread (see onRebuildDue).
+    voiceCopies = std::make_shared<PluginCopies>(PluginCopies::Use::voices);
+    graphProcessor.setPluginCopies(voiceCopies);
+    // ...and it is rebuilt on the message thread (see onRebuildDue).
     graphProcessor.onRebuildDue = [this] { triggerAsyncUpdate(); };
+}
+
+void AudioEngine::updateVoiceCopies() {
+    if (graph == nullptr) return;
+    const double rate = graphProcessor.getSampleRate() > 0 ? graphProcessor.getSampleRate()
+                                                           : getProjectSampleRate();
+    const int block = graphProcessor.getBlockSize() > 0 ? graphProcessor.getBlockSize() : blockSize;
+    voiceCopies->update(*graph, pluginHost, &graphProcessor, rate > 0 ? rate : 48000.0,
+                        block > 0 ? block : 512);
+    const auto problems = voiceCopies->problems();
+    for (auto& n : graph->nodes) {
+        if (!n.isPluginNode() || n.voiceContainerId < 0) continue;
+        auto it = problems.find(n.id);
+        n.pluginVoiceError = it == problems.end()
+            ? std::string()
+            : "The voices play copies of this plugin, one each, and they didn't all load: "
+              + it->second + " Voices without one are silent.";
+    }
+}
+
+std::shared_ptr<PluginCopies> AudioEngine::makeRenderCopies(double renderRate, int renderBlock) {
+    auto copies = std::make_shared<PluginCopies>(PluginCopies::Use::render);
+    if (graph != nullptr)
+        copies->update(*graph, pluginHost, &graphProcessor, renderRate, renderBlock);
+    return copies;
 }
 
 void AudioEngine::handleAsyncUpdate() {
     if (graph == nullptr || transport == nullptr) return;
+    if (!graphProcessor.rebuildDue(*graph)) return;
+    // Copies first, without the lock - loading plugins takes time, and the
+    // audio callback can go on playing meanwhile.
+    updateVoiceCopies();
     // Holding the graph lock keeps the audio callback (a try-lock) out for
     // the length of the rebuild; it plays silence meanwhile.
-    std::lock_guard<std::recursive_mutex> lk(graph->mutationLock);
+    std::lock_guard<GraphMutex> lk(graph->mutationLock);
     graphProcessor.rebuildNow(*graph, *transport);
 }
 AudioEngine::~AudioEngine() {
@@ -353,8 +385,12 @@ bool AudioEngine::ensureAudioInputEnabled() {
 void AudioEngine::setProjectSampleRate(double sr) {
     projectSampleRate = sr;
     double graphRate = getProjectSampleRate();
-    if (graph)
+    if (graph) {
+        // Re-preparing rebuilds what's inside each Voice container and
+        // re-prepares every processor: not while the audio callback is in them.
+        std::lock_guard<GraphMutex> lk(graph->mutationLock);
         graphProcessor.prepare(*graph, graphRate, blockSize);
+    }
     resamplePhase = 0.0;
     fprintf(stderr, "Project sample rate: %.0f Hz (device: %.0f Hz)\n", graphRate, sampleRate);
 }
@@ -522,8 +558,15 @@ void AudioEngine::audioDeviceIOCallbackWithContext(
     // restore - to be added at those sites). If we can't acquire
     // immediately the block is silent, which is barely audible against
     // a multi-second import and dramatically better than a crash.
-    std::unique_lock<std::recursive_mutex> graphLk(graph->mutationLock, std::try_to_lock);
-    if (!graphLk.owns_lock()) return;
+    //
+    // An offline render holds the lock one block at a time for as long as it
+    // runs (Export, Freeze, capture from playback...); then this waits for
+    // the render's block to end, for up to a quarter of this callback's own
+    // length, rather than being shut out for the whole render (graph_mutex.h).
+    const auto patience = std::chrono::microseconds(
+        sampleRate > 0 ? (juce::int64) (250000.0 * numSamples / sampleRate) : 0);
+    if (!graph->mutationLock.tryLockForAudio(patience)) return;
+    std::unique_lock<GraphMutex> graphLk(graph->mutationLock, std::adopt_lock);
 
     double graphRate = getProjectSampleRate();
     bool needsResample = (std::abs(graphRate - sampleRate) > 1.0);

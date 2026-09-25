@@ -832,6 +832,7 @@ void GraphProcessor::rebuildGraph(NodeGraph& graph, Transport& transport) {
     latencyListener.beginRebuild(); // forget old processor->nodeId mappings (pointers are stale)
     nodeMap.clear();
     nodeInputMap.clear();
+    playedCopies.clear();
 
     // Helper: widen a built-in processor so it physically has enough audio
     // channels to carry audio-rate control signals. Channels 0+1 are the audio
@@ -1017,8 +1018,9 @@ void GraphProcessor::rebuildGraph(NodeGraph& graph, Transport& transport) {
         } else if (node.type == NodeType::VoiceContainer) {
             // A polyphonic instrument: one node on the main canvas, N inner
             // patch clones summed inside. Built like any audio-producing node
-            // (gets MIDI in, stereo out, and a trailing pan below).
-            proc = std::make_unique<PolyVoiceProcessor>(node, graph, transport);
+            // (gets MIDI in, stereo out, and a trailing pan below). The plugins
+            // inside it play the copies this graph was given, one per voice.
+            proc = std::make_unique<PolyVoiceProcessor>(node, graph, transport, pluginCopies);
         } else if (hostsPlugins && node.plugin
                    && (node.plugin->instance || hostedPlugins.count(node.id))) {
             // Hosted plugin. A fresh instance from PluginHost goes into the
@@ -1038,9 +1040,21 @@ void GraphProcessor::rebuildGraph(NodeGraph& graph, Transport& transport) {
             node.plugin->graphNodeId = (int) graphId.uid;
             continue;
         } else if (node.isPluginNode()) {
-            // A plugin node without its plugin - still loading, or it failed
-            // to (the node's badge says which): silence, or for an effect its
-            // input passed straight through. Never a stand-in built-in synth.
+            // A plugin this graph doesn't host: an offline render's copy of it,
+            // or this voice's (see setPluginCopies). Wired like the hosted
+            // plugin it stands for - no pan stage after it.
+            if (auto copy = pluginCopies ? pluginCopies->find(node.id, copySlot) : nullptr) {
+                auto graphNode = addGraphNode(std::make_unique<PluginCopyProcessor>(copy));
+                if (!graphNode) continue;
+                nodeMap[node.id] = graphNode->nodeID;
+                nodeInputMap[node.id] = graphNode->nodeID;
+                playedCopies[node.id] = std::move(copy);
+                continue;
+            }
+            // None - the plugin is still loading, or it failed to (the node's
+            // badge says which), or its copy didn't load: silence, or for an
+            // effect its input passed straight through. Never a stand-in
+            // built-in synth.
             proc = std::make_unique<PassthroughProcessor>(node);
         } else {
             proc = createNodeProcessor(node, transport, graph);
@@ -1106,12 +1120,12 @@ void GraphProcessor::rebuildGraph(NodeGraph& graph, Transport& transport) {
     // ADDS the RPN and never touches the note stream, so a non-MPE plugin -
     // which ignores the unknown RPN - is byte-for-byte unaffected. Built-in
     // synths read MPE channels natively and don't need the handshake, so this
-    // is gated on a live hosted plugin. Injecting at the plugin's graph input (rather
+    // is gated on a live hosted plugin (or its copy). Injecting at the plugin's graph input (rather
     // than on a cable) also bypasses the cable-level MIDI-Learn CC filter that
     // could otherwise strip the RPN's CC 6/38/100/101 bytes.
     for (auto& node : graph.nodes) {
         if (!node.mpeEnabled) continue;
-        if (!hostedPlugins.count(node.id)) continue;   // a live hosted plugin only
+        if (!playsPlugin(node.id)) continue;   // a plugin playing here only
         auto it = nodeInputMap.find(node.id);
         if (it == nodeInputMap.end()) continue;
         auto cfgProc = std::make_unique<MpeConfigProcessor>(node, transport);
@@ -1365,7 +1379,7 @@ void GraphProcessor::rebuildGraph(NodeGraph& graph, Transport& transport) {
             bool dstIsHostedPlugin = false;
             if (srcKind == PinKind::Midi) {
                 for (auto& dn : graph.nodes)
-                    if (dn.id == dstNodeId) { dstIsHostedPlugin = hostedPlugins.count(dn.id) > 0; break; }
+                    if (dn.id == dstNodeId) { dstIsHostedPlugin = playsPlugin(dn.id); break; }
             }
 
             // Multi-MIDI-input destination: a SignalShape / MidiScript / Script
@@ -1499,9 +1513,13 @@ void GraphProcessor::rebuildGraph(NodeGraph& graph, Transport& transport) {
                 mp.connected = (connectedEndPins.count(mp.pinId) > 0);
     }
 
-    // Bring the JUCE graph up to date, once: immediately on the message
-    // thread, else queued to it - after every change has been made.
-    processorGraph->rebuild();
+    // Bring the JUCE graph up to date, once, after every change has been made:
+    // on the message thread, immediately. Anywhere else JUCE would queue the
+    // update to the message thread, where it could run while this thread is
+    // already rendering the graph (an offline render's thread): leave it to
+    // the prepareToPlay every caller makes next, which does it at once, here.
+    if (juce::MessageManager::existsAndIsCurrentThread())
+        processorGraph->rebuild();
 
     lastNodeCount = (int)graph.nodes.size();
     lastLinkCount = (int)graph.links.size();
@@ -1586,6 +1604,11 @@ void GraphProcessor::processBlock(NodeGraph& graph, Transport& transport,
         latencyListener.commitLatencies();
     }
 
+    // An offline render's plugin copies follow their automation lanes (the
+    // live graph's plugins are driven from the UI timer).
+    if (!hostsPlugins && copySlot < 0 && !playedCopies.empty())
+        applyPluginAutomation(graph, transport.positionBeats());
+
     // Transport "panic" (see requestPanic): wipe every processor's internal
     // state so all trailing sound is cut at once. AudioProcessorGraph::reset()
     // walks every node and calls reset() on its processor; our built-in synths
@@ -1642,6 +1665,40 @@ void GraphProcessor::processBlock(NodeGraph& graph, Transport& transport,
                 for (int c = 0; c < numChannels; ++c)
                     outputData[c][s] += sample;
             }
+        }
+    }
+}
+
+juce::AudioProcessor* GraphProcessor::hostedPluginOf(const Node& node) const {
+    auto it = hostedPlugins.find(node.id);
+    if (it == hostedPlugins.end() || node.plugin == nullptr
+        || it->second.owner.lock() != node.plugin)
+        return nullptr;
+    auto graphNode = processorGraph->getNodeForId(it->second.graphId);
+    return graphNode != nullptr ? graphNode->getProcessor() : nullptr;
+}
+
+void GraphProcessor::applyPluginAutomation(NodeGraph& graph, double beat) {
+    // As MainContentComponent::timerCallback's read pass drives the live
+    // graph's plugins: native Param lanes, scaled to 0..1 by the param's range,
+    // and the plugin-parameter lanes, already 0..1. Nothing records here.
+    for (auto& [nodeId, copy] : playedCopies) {
+        const Node* node = graph.findNode(nodeId);
+        if (node == nullptr || node->ignoreAutomation || !copy->plugin) continue;
+        const auto& params = copy->plugin->getParameters();
+        for (int pi = 0; pi < (int) node->params.size() && pi < params.size(); ++pi) {
+            const auto& p = node->params[(size_t) pi];
+            if (p.bypassAutomation || p.automation.points.empty()) continue;
+            const float val = p.automation.evaluate((float) beat);
+            if (val < -0.5f) continue;   // the lane's "no value" sentinel
+            const float normalized = (val - p.minVal) / std::max(0.001f, p.maxVal - p.minVal);
+            params[pi]->setValue(juce::jlimit(0.0f, 1.0f, normalized));
+        }
+        for (const auto& [idx, lane] : node->pluginParamAutomation) {
+            if (lane.points.empty() || idx < 0 || idx >= params.size()) continue;
+            const float val = lane.evaluate((float) beat);
+            if (val >= -0.5f)
+                params[idx]->setValue(juce::jlimit(0.0f, 1.0f, val));
         }
     }
 }

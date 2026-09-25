@@ -1,6 +1,7 @@
 #pragma once
 #include <juce_audio_formats/juce_audio_formats.h>
 #include <functional>
+#include <memory>
 #include <string>
 #include <vector>
 #include <random>
@@ -8,6 +9,7 @@
 namespace SoundShop {
 
 class NodeGraph;
+class PluginCopies;
 struct Transport;
 
 // Supported export formats
@@ -64,9 +66,9 @@ inline void applyTPDFDither(juce::AudioBuffer<float>& buf, int targetBits) {
 // exports the same span must get bit-identical audio, and two copies of the
 // block loop would drift the moment one of them learned about a new node type.
 //
-//   graph     - the project. Not modified. (The live audio thread may be walking
-//               it concurrently; both callers already accept that - see the
-//               `mutationLock` note in node_graph.h.)
+//   graph     - the project. Read block by block, holding its lock - taking
+//               turns with the live audio and the UI (graph_mutex.h) - since
+//               Export calls this on its own thread while the app runs on.
 //   tmpl      - supplies bpm and the tempo / time-signature maps. Its position
 //               and playing state are ignored: an offline render always starts
 //               at beat 0 with `playing = true`.
@@ -75,6 +77,10 @@ inline void applyTPDFDither(juce::AudioBuffer<float>& buf, int targetBits) {
 //   opts      - sampleRate, numChannels (1 = mono downmix), bitsPerSample and
 //               dither are applied here; `format` matters only later, to
 //               AudioExporter::exportToFile.
+//   plugins   - the render's copies of the project's plugins (plugin_copies.h),
+//               loaded on the message thread beforehand with
+//               AudioEngine::makeRenderCopies(opts.sampleRate,
+//               kOfflineRenderBlockSize). Null: plugin nodes render silent.
 //   out       - resized and filled with opts.numChannels channels.
 //   progress  - optional, called once per block with 0..1. Return false to
 //               cancel; this then returns false and `out` holds a partial render.
@@ -85,8 +91,13 @@ bool renderGraphOffline(NodeGraph& graph,
                         const Transport& tmpl,
                         float endBeat,
                         const ExportOptions& opts,
+                        std::shared_ptr<PluginCopies> plugins,
                         juce::AudioBuffer<float>& out,
                         const std::function<bool(double)>& progress = {});
+
+// The block size renderGraphOffline renders in - what its plugin copies are
+// prepared for.
+constexpr int kOfflineRenderBlockSize = 512;
 
 class AudioExporter {
 public:

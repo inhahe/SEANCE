@@ -75,6 +75,19 @@ void UndoTree::setRootSnapshot(std::string snapshotText) {
         nodes[0].snapshotText = std::move(snapshotText);
 }
 
+void UndoTree::reset(std::string rootSnapshot) {
+    nodes.clear();
+    nextId = 0;
+    UndoNode root;
+    root.id = nextId++;
+    root.parentId = -1;
+    root.description = "Initial state";
+    root.snapshotText = std::move(rootSnapshot);
+    nodes.push_back(std::move(root));
+    currentNodeId = 0;
+    if (onTreeChanged) onTreeChanged();
+}
+
 bool UndoTree::currentSnapshotIsEmpty() const {
     return nodes[currentNodeId].snapshotText.empty();
 }

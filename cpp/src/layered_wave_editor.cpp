@@ -4006,7 +4006,7 @@ void syncWarpParamsForNode(NodeGraph& graph, int nodeId, const WavetableDoc& doc
         }
         for (int pid : pinsToDrop) {
             {
-                std::lock_guard<std::recursive_mutex> graphLk(graph.mutationLock);
+                std::lock_guard<GraphMutex> graphLk(graph.mutationLock);
                 graph.links.erase(std::remove_if(graph.links.begin(), graph.links.end(),
                     [&](const Link& l) { return l.startPin == pid || l.endPin == pid; }),
                     graph.links.end());
@@ -4134,7 +4134,7 @@ void reconcilePerLayerWarpParams(NodeGraph& graph, int nodeId, int frameId,
         }
         for (int pid : pinsToDrop) {
             {
-                std::lock_guard<std::recursive_mutex> graphLk(graph.mutationLock);
+                std::lock_guard<GraphMutex> graphLk(graph.mutationLock);
                 graph.links.erase(std::remove_if(graph.links.begin(), graph.links.end(),
                     [&](const Link& l) { return l.startPin == pid || l.endPin == pid; }),
                     graph.links.end());
@@ -11272,7 +11272,7 @@ void LayeredWaveEditorComponent::syncPositionModPins(Node& nd,
         nd.modPins.erase(std::remove_if(nd.modPins.begin(), nd.modPins.end(),
             [pinId](const Node::ModPin& mp) { return mp.pinId == pinId; }), nd.modPins.end());
         {
-            std::lock_guard<std::recursive_mutex> graphLk(graph.mutationLock);
+            std::lock_guard<GraphMutex> graphLk(graph.mutationLock);
             graph.links.erase(std::remove_if(graph.links.begin(), graph.links.end(),
                 [pinId](const auto& l) { return l.endPin == pinId; }), graph.links.end());
         }

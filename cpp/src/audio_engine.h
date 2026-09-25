@@ -146,6 +146,30 @@ public:
     // Graph processing
     GraphProcessor& getGraphProcessor() { return graphProcessor; }
 
+    // The copies the Voice containers' plugins play, one per voice (see
+    // plugin_copies.h). Kept up to date before each live rebuild.
+    PluginCopies& getVoiceCopies() { return *voiceCopies; }
+
+    // Make every voice's copy of the plugin in node `nodeId` (inside a Voice
+    // container) match its master again - after a preset was picked from
+    // SEANCE's menu, or the plugin's window was closed. Message thread.
+    void syncVoiceCopies(int nodeId) { voiceCopies->syncFromMaster(nodeId); }
+
+    // Load the voice copies the graph needs and don't exist yet, and note on
+    // each plugin node inside a Voice container whether all of them could be
+    // (Node::pluginVoiceError). Each live rebuild does this first; call it too
+    // after loading plugins that should play at once. Message thread, holding
+    // no graph lock.
+    void updateVoiceCopies();
+
+    // An offline render's own copies of the project's plugins (plugin_copies.h):
+    // one of every plugin node, with its settings as they are now, and one per
+    // voice of each plugin inside a Voice container - prepared for the render's
+    // `sampleRate` and `blockSize`. Hand it to the render's GraphProcessor
+    // (setPluginCopies); its problems() are the plugins the render goes without.
+    // Message thread: loading every plugin again can take a moment.
+    std::shared_ptr<PluginCopies> makeRenderCopies(double sampleRate, int blockSize);
+
     // Recording
     RecordingManager& getRecordingManager() { return recordingManager; }
     MultitrackRecorder& getMultitrackRecorder() { return multitrackRecorder; }
@@ -177,6 +201,7 @@ private:
     std::unique_ptr<juce::AudioFormatManager> formatManager;
     PluginHost pluginHost;
     GraphProcessor graphProcessor;
+    std::shared_ptr<PluginCopies> voiceCopies;   // see getVoiceCopies
     RecordingManager recordingManager;
     MultitrackRecorder multitrackRecorder;
     NodeGraph* graph = nullptr;

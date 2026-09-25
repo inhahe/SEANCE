@@ -65,6 +65,14 @@ public:
     // first user edit has something to undo back to.
     void setRootSnapshot(std::string snapshotText);
 
+    // Start a fresh history: only a root holding `rootSnapshot` - a new
+    // project, or one opened without a history of its own, whose first edit
+    // mustn't undo back into the project before it. The callbacks stay.
+    void reset(std::string rootSnapshot);
+
+    // The step the graph is at. Stable until reset() or restoreFrom().
+    int currentStep() const { return currentNodeId; }
+
     // True iff the currently-selected undo node has no snapshot text.
     // Used by the app's onTreeChanged callback to decide whether to lazily
     // serialize and fill in the snapshot - exec()/pushDone() typically push

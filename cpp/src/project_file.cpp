@@ -308,7 +308,15 @@ bool ProjectFile::writeProject(std::ostream& f, NodeGraph& graph,
         // the slow autosave path both share this cache.
         if (gp && node.isPluginNode()) {
             if (node.pluginStateDirty || node.cachedPluginStateBase64.empty()) {
-                auto* proc = gp->getProcessorForNode(node.id);
+                // The node's own plugin: in the audio graph - or held by the node,
+                // for one inside a Voice container (the master its voices'
+                // copies follow) or one the graph hasn't taken in yet.
+                juce::AudioProcessor* proc =
+                    node.plugin && node.plugin->instance ? node.plugin->instance.get()
+                    : node.plugin ? gp->hostedPluginOf(node) : nullptr;
+                // One no graph plays hasn't taken its last knob moves in yet.
+                if (proc && node.plugin && proc == node.plugin->instance.get())
+                    PluginCopies::catchUp(*proc);
                 if (proc) {
                     juce::MemoryBlock stateData;
                     proc->getStateInformation(stateData);
@@ -661,6 +669,7 @@ bool ProjectFile::load(const std::string& path, NodeGraph& graph, PluginHost* pl
 bool ProjectFile::readProject(std::istream& f, NodeGraph& graph, PluginHost* pluginHost) {
     // Clear existing
     graph.nodes.clear();
+    graph.nodesInvalidated();
     graph.links.clear();
     graph.openEditors.clear();
     // The loop region is only serialized when enabled (writeProject omits the
@@ -1359,6 +1368,7 @@ bool ProjectFile::readProject(std::istream& f, NodeGraph& graph, PluginHost* plu
                         load.plugin->instance->setStateInformation(
                             stateData.getData(), (int)stateData.getSize());
                 }
+                load.plugin->nodeId = n.id;
                 n.plugin = std::move(load.plugin);
                 n.pendingPluginState.clear();
                 fprintf(stderr, "  Reloaded plugin '%s' for node '%s'\n",

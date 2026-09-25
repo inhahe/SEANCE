@@ -128,7 +128,7 @@ Node& NodeGraph::addNode(const std::string& name, NodeType type,
     // that already hold the lock (setupDefaultGraph, project/MOD load) nest
     // safely.
     {
-        std::lock_guard<std::recursive_mutex> lk(mutationLock);
+        std::lock_guard<GraphMutex> lk(mutationLock);
         nodes.push_back(std::move(node));
     }
     dirty = true;
@@ -151,12 +151,13 @@ Node& NodeGraph::addPluginNode(PluginHost& host, const PluginInfo& info, Vec2 po
     std::string error;
     auto loaded = host.loadPlugin(info.description, 44100.0, 512, &error);
 
-    std::lock_guard<std::recursive_mutex> lk(mutationLock);
+    std::lock_guard<GraphMutex> lk(mutationLock);
     auto& n = addNode(info.name, type, ins, outs, pos);
     n.pluginDescription = info.description;
     // A deleted node's id can be handed out again; its kept state isn't this one's.
     retiredPluginStates.erase(n.id);
     if (loaded) {
+        loaded->nodeId = n.id;
         n.plugin = std::move(loaded);
     } else {
         n.pluginLoadState = PluginLoadState::Failed;
@@ -176,11 +177,12 @@ static bool namesSamePlugin(const juce::PluginDescription& a, int legacyA,
 }
 
 std::vector<int> NodeGraph::restoreSnapshot(const std::string& text) {
-    std::lock_guard<std::recursive_mutex> lk(mutationLock);
+    std::lock_guard<GraphMutex> lk(mutationLock);
 
     struct Carried {
         juce::PluginDescription description;
         int legacyIndex = -1;
+        int voiceContainerId = -1;
         std::shared_ptr<PluginHost::LoadedPlugin> plugin;
         std::string pendingState, cachedState;
         bool stateDirty = true;
@@ -190,8 +192,8 @@ std::vector<int> NodeGraph::restoreSnapshot(const std::string& text) {
     std::map<int, Carried> carried;
     for (auto& n : nodes)
         if (n.isPluginNode())
-            carried[n.id] = { n.pluginDescription, n.legacyPluginIndex, n.plugin,
-                              n.pendingPluginState, n.cachedPluginStateBase64,
+            carried[n.id] = { n.pluginDescription, n.legacyPluginIndex, n.voiceContainerId,
+                              n.plugin, n.pendingPluginState, n.cachedPluginStateBase64,
                               n.pluginStateDirty, n.pluginLoadState, n.pluginLoadError };
 
     ProjectFile::loadFromString(text, *this, nullptr);
@@ -200,9 +202,13 @@ std::vector<int> NodeGraph::restoreSnapshot(const std::string& text) {
     for (auto& n : nodes) {
         if (!n.isPluginNode()) continue;
         auto it = carried.find(n.id);
+        // Only to a node in the same place: the live graph plays a plugin
+        // outside any Voice container, while inside one it's the master its
+        // voices' copies follow - held by the node, never given to a graph.
         if (it == carried.end()
             || !namesSamePlugin(it->second.description, it->second.legacyIndex,
-                                n.pluginDescription, n.legacyPluginIndex)) {
+                                n.pluginDescription, n.legacyPluginIndex)
+            || it->second.voiceContainerId != n.voiceContainerId) {
             reload.push_back(n.id);
             continue;
         }
@@ -216,7 +222,9 @@ std::vector<int> NodeGraph::restoreSnapshot(const std::string& text) {
     }
     // Plugins not carried over (their node is gone from this state) are
     // released with `carried`; one already in the audio graph is retired from
-    // there at the next rebuild (GraphProcessor::retireStalePlugins).
+    // there at the next rebuild (GraphProcessor::retireStalePlugins), and a
+    // Voice container's master tells PluginHost::LoadedPlugin::onRelease as it
+    // goes.
     return reload;
 }
 
@@ -224,7 +232,7 @@ void NodeGraph::addLink(int outPin, int inPin) {
     // Same reallocation race as addNode: a push_back that grows `links` can
     // tear the audio thread's iteration in rebuildGraph. Lock it.
     {
-        std::lock_guard<std::recursive_mutex> lk(mutationLock);
+        std::lock_guard<GraphMutex> lk(mutationLock);
         links.push_back({newId(), outPin, inPin});
     }
     dirty = true;
@@ -610,7 +618,7 @@ bool removeParamModPin(NodeGraph& graph, int nodeId, int paramIndex) {
                 [pinId](const Pin& p) { return p.id == pinId; }),
             nd->pinsIn.end());
         {
-            std::lock_guard<std::recursive_mutex> lk(graph.mutationLock);
+            std::lock_guard<GraphMutex> lk(graph.mutationLock);
             graph.links.erase(
                 std::remove_if(graph.links.begin(), graph.links.end(),
                     [pinId](const auto& l) { return l.endPin == pinId; }),
@@ -640,7 +648,7 @@ int pruneOrphanModPins(NodeGraph& graph, int nodeId) {
     };
     auto dropPinAndLinks = [&](int pinId) {
         {
-            std::lock_guard<std::recursive_mutex> lk(graph.mutationLock);
+            std::lock_guard<GraphMutex> lk(graph.mutationLock);
             graph.links.erase(std::remove_if(graph.links.begin(), graph.links.end(),
                 [&](const Link& l) { return l.startPin == pinId || l.endPin == pinId; }),
                 graph.links.end());

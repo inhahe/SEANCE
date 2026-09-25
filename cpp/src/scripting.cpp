@@ -41,6 +41,7 @@
 #include "buffer_warp.h"
 #include "transport.h"
 #include "audio_export.h"          // renderGraphOffline / AudioExporter (soundshop.render)
+#include "audio_engine.h"          // AudioEngine::makeRenderCopies (soundshop.render)
 #include <juce_core/juce_core.h>   // juce::Logger for full-traceback logging
 #include <juce_audio_formats/juce_audio_formats.h>  // read_wav
 #include <algorithm>
@@ -1148,11 +1149,23 @@ static bool scriptRender(PyObject* endBeatO, int sampleRate, int channels,
     fallback.bpm = g_currentGraph->bpm;
     Transport* host = ScriptEngine::hostTransport();
 
+    // The render's own copies of the project's plugins, as Export makes them
+    // (scripts run on the message thread, where plugins are made). Headless -
+    // no audio engine - the plugin nodes render silent.
+    std::shared_ptr<PluginCopies> copies;
+    if (auto* eng = AudioEngine::getInstance(); eng && eng->getGraph() == g_currentGraph)
+        copies = eng->makeRenderCopies(sampleRate, kOfflineRenderBlockSize);
+
     if (!renderGraphOffline(*g_currentGraph, host ? *host : fallback,
-                            (float)endBeat, opts, buf)) {
+                            (float)endBeat, opts, copies, buf)) {
         PyErr_SetString(PyExc_RuntimeError,
                         "render produced no samples (end_beat too short?)");
         return false;
+    }
+    if (copies) {
+        const auto note = copies->describeProblems("The render");
+        if (note.isNotEmpty())
+            PySys_FormatStderr("%s\n", note.toRawUTF8());   // (WriteStderr stops at 1000 bytes)
     }
     return true;
 }
@@ -1544,13 +1557,14 @@ static PyMethodDef soundshopMethods[] = {
         for (auto& p : nodes[nodeIdx].pinsOut) pinIds.push_back(p.id);
         // Guard the structural edit against the audio callback iterating
         // graph.nodes/links (see node_graph.h mutationLock comment).
-        std::lock_guard<std::recursive_mutex> graphLk(g_currentGraph->mutationLock);
+        std::lock_guard<GraphMutex> graphLk(g_currentGraph->mutationLock);
         links.erase(std::remove_if(links.begin(), links.end(),
             [&pinIds](const Link& l) {
                 for (int pid : pinIds) if (l.startPin == pid || l.endPin == pid) return true;
                 return false;
             }), links.end());
         nodes.erase(nodes.begin() + nodeIdx);
+        g_currentGraph->nodesInvalidated();
         (void)nodeId;
         Py_RETURN_NONE;
     }, METH_VARARGS, "Remove node: (node_idx)"},

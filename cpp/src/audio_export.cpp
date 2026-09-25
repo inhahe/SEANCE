@@ -31,6 +31,7 @@ bool renderGraphOffline(NodeGraph& graph,
                         const Transport& tmpl,
                         float endBeat,
                         const ExportOptions& opts,
+                        std::shared_ptr<PluginCopies> plugins,
                         juce::AudioBuffer<float>& out,
                         const std::function<bool(double)>& progress) {
     // Copy the tempo/time-signature maps but drive position ourselves - the
@@ -43,18 +44,26 @@ bool renderGraphOffline(NodeGraph& graph,
     off.playing = true;
 
     const double sr = opts.sampleRate;
-    const int blockSize = 512;
+    const int blockSize = kOfflineRenderBlockSize;
     const double totalSeconds = off.tempoMap.beatsToSeconds(endBeat);
     const int64_t totalSamples = (int64_t)(totalSeconds * sr);
     if (totalSamples <= 0) return false;
 
+    // For as long as this runs, the audio callback waits its turn for the
+    // graph lock rather than going silent (graph_mutex.h).
+    GraphMutex::RenderSession session(graph.mutationLock);
     GraphProcessor gp;
-    // prepare -> rebuild -> prepare: rebuildGraph instantiates the per-node
-    // processors, and the second prepare hands the new ones the sample rate and
-    // block size. (Same order the export dialog has always used.)
-    gp.prepare(graph, sr, blockSize);
-    gp.rebuildGraph(graph, off);
-    gp.prepare(graph, sr, blockSize);
+    gp.setPluginCopies(std::move(plugins));
+    {
+        // prepare -> rebuild -> prepare: rebuildGraph instantiates the per-node
+        // processors, and the second prepare hands the new ones the sample rate
+        // and block size (and builds each Voice container's voices). Both read
+        // and write the nodes: hold the lock.
+        std::lock_guard<GraphMutex> lk(graph.mutationLock);
+        gp.prepare(graph, sr, blockSize);
+        gp.rebuildGraph(graph, off);
+        gp.prepare(graph, sr, blockSize);
+    }
 
     // The graph processor always writes stereo; the mono downmix happens after.
     juce::AudioBuffer<float> render(2, (int)totalSamples);
@@ -67,7 +76,11 @@ bool renderGraphOffline(NodeGraph& graph,
             render.getWritePointer(0, (int)pos),
             render.getWritePointer(1, (int)pos)
         };
-        gp.processBlock(graph, off, outPtrs, 2, thisBlock);
+        graph.mutationLock.lockForRenderBlock();
+        {
+            std::unique_lock<GraphMutex> lk(graph.mutationLock, std::adopt_lock);
+            gp.processBlock(graph, off, outPtrs, 2, thisBlock);
+        }
         if (progress && !progress((double)pos / (double)totalSamples)) {
             out = std::move(render);
             return false;

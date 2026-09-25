@@ -4,6 +4,7 @@
 #include "automation.h"
 #include "melody_player.h"
 #include "audio_cache.h"
+#include "plugin_copies.h"
 #include <juce_audio_processors/juce_audio_processors.h>
 #include <juce_audio_formats/juce_audio_formats.h>
 #include <unordered_map>
@@ -359,8 +360,36 @@ public:
     // engine's does. A plugin instance can be in one graph only, and an
     // offline render's graph (export, bounce, capture) or a voice's inner
     // graph would destroy one it took when it's done with it. Graphs that
-    // don't host plugins build plugin nodes silent (PassthroughProcessor).
+    // don't host plugins play copies of them (setPluginCopies); a plugin node
+    // with no copy is built silent (PassthroughProcessor).
     void setHostsPlugins(bool hosts) { hostsPlugins = hosts; }
+
+    // Where this graph finds copies of the plugins it doesn't host (see
+    // plugin_copies.h): an offline render's pool, with `slot` -1; in a voice's
+    // inner graph, the pool its Voice container was given, with `slot` the
+    // voice's index. The live graph has a Use::voices pool, which it hands to
+    // each Voice container it builds. Set before rebuildGraph.
+    void setPluginCopies(std::shared_ptr<PluginCopies> copies, int slot = -1) {
+        pluginCopies = std::move(copies);
+        copySlot = slot;
+    }
+    const std::shared_ptr<PluginCopies>& getPluginCopies() const { return pluginCopies; }
+
+    // `node`'s own plugin instance, if this graph hosts it - else null.
+    // Message thread (the graph's hosted plugins change on it).
+    juce::AudioProcessor* hostedPluginOf(const Node& node) const;
+
+    // Whether the node is played by a plugin here: hosted, or a copy.
+    bool playsPlugin(int nodeId) const {
+        return hostedPlugins.count(nodeId) > 0 || playedCopies.count(nodeId) > 0;
+    }
+
+    // Drive the plugin copies' parameters from their nodes' automation lanes
+    // at `beat` - what the UI timer does for the live graph's plugins
+    // (MainContentComponent::timerCallback), here for an offline render's.
+    // processBlock does this itself in a render's graph; Freeze and Bounce,
+    // which render the JUCE graph directly, call it for each block.
+    void applyPluginAutomation(NodeGraph& graph, double beat);
 
     // Snapshot of every node's own audio latency in samples, keyed by stable
     // node id (settled after the last graph prepare; a missing id means 0 - the
@@ -522,6 +551,12 @@ private:
     std::vector<RetiredPlugin> retired;        // guarded by the graph's mutationLock
     std::atomic<bool> retiredPending { false };
     bool hostsPlugins = false;                 // see setHostsPlugins
+
+    // Plugin copies (see setPluginCopies), and the ones the last rebuild put
+    // in this graph, by node id.
+    std::shared_ptr<PluginCopies> pluginCopies;
+    int copySlot = -1;
+    std::map<int, std::shared_ptr<PluginCopies::Copy>> playedCopies;
     AutomationManager automation;
     AudioCacheManager cacheManager;
 

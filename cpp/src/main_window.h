@@ -203,6 +203,18 @@ private:
     void showPluginInfo(int nodeId);
     void showPluginPresets(int nodeId);
     void showMidiMap(int nodeId);
+    // A plugin node's own plugin: where it plays in the live audio graph - or,
+    // inside a Voice container (whose voices play copies of it: plugin_copies.h)
+    // or loaded and not taken into the graph yet, still held by its node. Null
+    // while it isn't loaded.
+    juce::AudioProcessor* pluginProcessorOf(int nodeId);
+    // The user closed a plugin's window: a Voice container's voices take on
+    // what was changed there.
+    void pluginWindowClosed(int nodeId);
+    // After an offline render (Export, Freeze, Bounce): name the plugins it
+    // went without, whose copies didn't load. `what` begins the message
+    // ("The export").
+    void reportRenderCopyProblems(const PluginCopies& copies, const juce::String& what);
     void freezeNode(int nodeId);
     // Batch freeze: render the graph ONCE and capture each listed node's own
     // output into its cache via a per-node tap. Freezing N nodes this way costs
@@ -237,6 +249,10 @@ private:
     // true (greying out Save/Save As) until the queue drains.
     bool projectLoading = false;
     std::vector<int> pluginLoadQueue;     // node IDs still to load (FIFO)
+    // The undo step the project file on disk matches: set on save, on a new
+    // or opened project, and when a persisted history is restored. Any other
+    // step is an unsaved change (the undo tree's onTreeChanged).
+    int savedUndoStep = 0;
     void beginAsyncPluginLoad();          // mark plugin nodes Pending, kick off the queue
     void processNextPluginLoad();         // load one queued plugin, then schedule the next
     // Plugins the audio graph let go of (GraphProcessor::retireStalePlugins):

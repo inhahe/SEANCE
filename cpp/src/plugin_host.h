@@ -111,6 +111,21 @@ public:
         bool editorOpen = false;
         bool prepared = false;
         int graphNodeId = -1; // JUCE graph node ID when in graph
+        int nodeId = -1;      // the node it belongs to, once attached to one
+
+        // `instance` normally moves into the live audio graph soon after the
+        // plugin loads, and leaves it through GraphProcessor's retirement.
+        // A plugin inside a Voice container keeps it for good, though - it's
+        // the master its voices' copies follow (see plugin_copies.h) - and
+        // goes with its node: deleted, undone, its project replaced. onRelease
+        // is told first, while the instance is still alive, so the main window
+        // can close the plugin's window and keep its state for an undo. Set by
+        // the main window; message thread.
+        static inline std::function<void(LoadedPlugin&)> onRelease;
+        ~LoadedPlugin() {
+            if (instance && onRelease)
+                onRelease(*this);
+        }
     };
 
     // Which plugin a project's saved description should load now:
@@ -144,6 +159,13 @@ public:
     std::unique_ptr<LoadedPlugin> loadPlugin(const juce::PluginDescription& desc,
                                              double sampleRate, int blockSize,
                                              std::string* error = nullptr);
+
+    // Just the instance, not yet prepared or configured - for a copy of a
+    // plugin that's already loaded (PluginCopies). Blocked plugins are refused.
+    // Message thread.
+    std::unique_ptr<juce::AudioPluginInstance> instantiate(const juce::PluginDescription& desc,
+                                                           double sampleRate, int blockSize,
+                                                           std::string* error = nullptr);
 
     // resolvePlugin / resolveLegacyIndex + loadPlugin, for a node being
     // opened: `plugin` on success; `resolved` is the plugin the node should

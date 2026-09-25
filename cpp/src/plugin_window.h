@@ -1,14 +1,17 @@
 #pragma once
 #include <juce_gui_basics/juce_gui_basics.h>
 #include <juce_audio_processors/juce_audio_processors.h>
+#include <functional>
 
 namespace SoundShop {
 
 // Window that hosts a plugin's native editor UI
 class PluginWindow : public juce::DocumentWindow {
 public:
-    PluginWindow(juce::AudioProcessor& processor, const juce::String& name)
-        : DocumentWindow(name, juce::Colours::darkgrey, DocumentWindow::closeButton) {
+    PluginWindow(juce::AudioProcessor& processor, const juce::String& name,
+                 std::function<void()> closed = {})
+        : DocumentWindow(name, juce::Colours::darkgrey, DocumentWindow::closeButton),
+          onClosed(std::move(closed)) {
 
         if (auto* editor = processor.createEditorIfNeeded()) {
             setContentOwned(editor, true);
@@ -22,7 +25,12 @@ public:
 
     void closeButtonPressed() override {
         setVisible(false);
+        if (onClosed) onClosed();
     }
+
+    // Called when the user closes the window (it's only hidden: the editor
+    // stays alive for the next Show Plugin UI).
+    std::function<void()> onClosed;
 
     // Check if this window is for a given processor
     bool isForProcessor(juce::AudioProcessor* proc) const {
@@ -38,17 +46,20 @@ private:
 // Manages open plugin windows
 class PluginWindowManager {
 public:
-    void showWindowFor(juce::AudioProcessor& processor, const juce::String& name) {
+    // `closed`: see PluginWindow::onClosed.
+    void showWindowFor(juce::AudioProcessor& processor, const juce::String& name,
+                       std::function<void()> closed = {}) {
         // Check if already open
         for (auto& w : windows) {
             if (w->isForProcessor(&processor)) {
+                if (closed) w->onClosed = std::move(closed);
                 w->setVisible(true);
                 w->toFront(true);
                 return;
             }
         }
         // Create new
-        windows.push_back(std::make_unique<PluginWindow>(processor, name));
+        windows.push_back(std::make_unique<PluginWindow>(processor, name, std::move(closed)));
     }
 
     void closeWindowFor(juce::AudioProcessor* processor) {

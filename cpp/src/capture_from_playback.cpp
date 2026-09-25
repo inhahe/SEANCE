@@ -2325,15 +2325,25 @@ static void writeSongCache(NodeGraph& graph,
 // doExportRender, factored into a juce::Thread so the dialog stays
 // interactive (showing a progress strip in the wave area) while the
 // render proceeds, instead of blocking under a modal progress window.
+//
+// The project stays open to edits meanwhile, so the render holds the graph
+// lock for each block it renders - giving way between blocks to the UI and
+// the audio callback (graph_mutex.h) - and stops if an edit took nodes away
+// or added or removed any (`projectChanged`): its processors were built for
+// the nodes as they were. The dialog then starts it over.
 class CaptureFromSongDialog::RenderJob : public juce::Thread {
 public:
+    static constexpr int kBlockSize = 512;
+
     RenderJob(NodeGraph& graphRef,
               Transport& liveTransport,
               double targetSampleRate,
-              float maxBeatIn)
+              float maxBeatIn,
+              std::shared_ptr<PluginCopies> pluginCopies)
         : juce::Thread("CaptureSongRender"),
           graph(graphRef),
-          maxBeat(maxBeatIn)
+          maxBeat(maxBeatIn),
+          copies(std::move(pluginCopies))
     {
         offTransport.bpm        = graphRef.bpm;
         offTransport.tempoMap   = liveTransport.tempoMap;
@@ -2344,7 +2354,7 @@ public:
     }
 
     void run() override {
-        const int blockSize = 512;
+        const int blockSize = kBlockSize;
         const double totalSeconds = offTransport.tempoMap.beatsToSeconds(maxBeat);
         const int64_t totalSamples = (int64_t)(totalSeconds * sampleRate);
         if (totalSamples <= 0) {
@@ -2352,10 +2362,29 @@ public:
             return;
         }
 
+        auto& lock = graph.mutationLock;
+        GraphMutex::RenderSession session(lock);   // the audio callback waits its turn
+        const auto stop = [this] { return threadShouldExit(); };
+
+        // Build the graph - it reads and writes the nodes - noting what it was
+        // built for.
         GraphProcessor offGP;
-        offGP.prepare(graph, sampleRate, blockSize);
-        offGP.rebuildGraph(graph, offTransport);
-        offGP.prepare(graph, sampleRate, blockSize);
+        offGP.setPluginCopies(copies);
+        uint64_t builtFor = 0;
+        size_t nodesBuilt = 0, linksBuilt = 0;
+        if (!lock.lockForRenderBlock(stop)) {
+            done.store(true);
+            return;
+        }
+        {
+            std::unique_lock<GraphMutex> lk(lock, std::adopt_lock);
+            builtFor = graph.nodeStorageVersion.load();
+            nodesBuilt = graph.nodes.size();
+            linksBuilt = graph.links.size();
+            offGP.prepare(graph, sampleRate, blockSize);
+            offGP.rebuildGraph(graph, offTransport);
+            offGP.prepare(graph, sampleRate, blockSize);
+        }
 
         // Stereo intermediate buffer (graph processor outputs stereo);
         // we mono-mix into `pcm` block by block to keep peak memory low.
@@ -2363,7 +2392,14 @@ public:
         auto pcm = std::make_shared<std::vector<float>>((size_t)totalSamples, 0.0f);
 
         for (int64_t pos = 0; pos < totalSamples; pos += blockSize) {
-            if (threadShouldExit()) {
+            if (!lock.lockForRenderBlock(stop)) {   // told to stop while waiting
+                done.store(true);
+                return;
+            }
+            std::unique_lock<GraphMutex> lk(lock, std::adopt_lock);
+            if (graph.nodeStorageVersion.load() != builtFor
+                || graph.nodes.size() != nodesBuilt || graph.links.size() != linksBuilt) {
+                projectChanged.store(true);
                 done.store(true);
                 return;
             }
@@ -2375,6 +2411,7 @@ public:
                 stereo.getWritePointer(1)
             };
             offGP.processBlock(graph, offTransport, outPtrs, 2, thisBlock);
+            lk.unlock();
 
             const float* l = stereo.getReadPointer(0);
             const float* r = stereo.getReadPointer(1);
@@ -2393,9 +2430,14 @@ public:
     Transport  offTransport;
     double     sampleRate = 0.0;
     float      maxBeat;
+    // The render's copies of the project's plugins, made on the message
+    // thread before it starts (plugin_copies.h). Destroyed with the job, on
+    // the message thread.
+    std::shared_ptr<PluginCopies> copies;
 
     std::atomic<double> progress { 0.0 };
     std::atomic<bool>   done     { false };
+    std::atomic<bool>   projectChanged { false };   // stopped by an edit: start over
     std::shared_ptr<std::vector<float>> result;
 };
 
@@ -2877,8 +2919,8 @@ CaptureFromSongDialog::CaptureFromSongDialog(NodeGraph& g, Transport& t,
         // renderJob==null+songPcm non-null and route through
         // onRenderComplete on the first tick.
     } else {
-        renderJob = std::make_unique<RenderJob>(graph, transport, targetSampleRate, maxBeat);
-        renderJob->startThread(juce::Thread::Priority::normal);
+        renderMaxBeat = maxBeat;
+        startRender();
     }
 
     // Sync the engine's audition freeze-mode and crossfade length to
@@ -3049,6 +3091,26 @@ void CaptureFromSongDialog::resized() {
     waveRect = r;
 }
 
+void CaptureFromSongDialog::startRender() {
+    // (Re)start the render: stop any earlier one, then load the render's own
+    // copies of the project's plugins - here, on the message thread, where
+    // plugins are made - and render on the job's thread.
+    if (renderJob) {
+        renderJob->signalThreadShouldExit();
+        renderJob->stopThread(2000);
+        renderJob.reset();
+    }
+    std::shared_ptr<PluginCopies> copies;
+    if (auto* eng = AudioEngine::getInstance()) {
+        juce::MouseCursor::showWaitCursor();
+        copies = eng->makeRenderCopies(songSampleRate, RenderJob::kBlockSize);
+        juce::MouseCursor::hideWaitCursor();
+    }
+    renderJob = std::make_unique<RenderJob>(graph, transport, songSampleRate, renderMaxBeat,
+                                            std::move(copies));
+    renderJob->startThread(juce::Thread::Priority::normal);
+}
+
 void CaptureFromSongDialog::timerCallback() {
     // Render-completion handoff. Cheap to poll once per frame.
     // Two flavours:
@@ -3056,9 +3118,13 @@ void CaptureFromSongDialog::timerCallback() {
     //   - cache hit: songPcm was filled in the constructor and there's
     //     no RenderJob; route through the same completion path so the
     //     "Paused, audition running" state engages.
+    // A render an edit stopped (RenderJob::projectChanged) starts over.
     if (!renderReady) {
         if (renderJob && renderJob->done.load()) {
-            onRenderComplete();
+            if (renderJob->projectChanged.load())
+                startRender();
+            else
+                onRenderComplete();
         } else if (!renderJob && songPcm && !songPcm->empty()) {
             onRenderComplete();
         }
@@ -3095,6 +3161,17 @@ void CaptureFromSongDialog::onRenderComplete() {
         songPcm = renderJob->result;
         writeSongCache(graph, songPcm, songSampleRate);
         playheadSamplePos = 0;
+        // Plugins whose copy didn't load were left out of it: say which.
+        if (renderJob->copies) {
+            const auto text = renderJob->copies->describeProblems("The rendered song");
+            if (text.isNotEmpty())
+                showAlertAsync(juce::MessageBoxOptions()
+                                   .withIconType(juce::MessageBoxIconType::WarningIcon)
+                                   .withTitle("Plugins left out")
+                                   .withMessage(text)
+                                   .withButton("OK"),
+                               this);
+        }
     }
     if (songPcm && !songPcm->empty()) {
         if (auto* eng = AudioEngine::getInstance())

@@ -186,6 +186,7 @@ MainContentComponent::MainContentComponent() {
             {Pin{0, "MIDI In", PinKind::Midi, true}},
             {Pin{0, "MIDI", PinKind::Midi, false}}, pos);
         n.clips.push_back({"Clip 1", 0, 4, juce::Colours::cornflowerblue.getARGB()});
+        graph.commitSnapshot("Add MIDI Track");
         if (needsFit) graphComponent->fitAll();
         graphComponent->repaint();
     };
@@ -193,6 +194,7 @@ MainContentComponent::MainContentComponent() {
         bool needsFit = false;
         auto pos = findFreeTimelineSlot(needsFit);
         graph.addAudioTrack("Audio Track", pos);
+        graph.commitSnapshot("Add Audio Track");
         if (needsFit) graphComponent->fitAll();
         graphComponent->repaint();
     };
@@ -433,7 +435,7 @@ MainContentComponent::MainContentComponent() {
         auto file = juce::File(startup);
         if (file.existsAsFile()) {
             {
-                std::lock_guard<std::recursive_mutex> graphLk(graph.mutationLock);
+                std::lock_guard<GraphMutex> graphLk(graph.mutationLock);
                 ProjectFile::load(startup.toStdString(), graph, nullptr);
                 rehydrateNodeCaches(startup);
             }
@@ -450,7 +452,7 @@ MainContentComponent::MainContentComponent() {
             // makes the invariant "all batch graph mutations hold this
             // lock" hold even if the device starts unusually early.
             {
-                std::lock_guard<std::recursive_mutex> graphLk(graph.mutationLock);
+                std::lock_guard<GraphMutex> graphLk(graph.mutationLock);
                 ProjectFile::load(recentProjects[0].toStdString(), graph, nullptr);
                 rehydrateNodeCaches(recentProjects[0]);
             }
@@ -496,6 +498,26 @@ MainContentComponent::MainContentComponent() {
     }
 
     audioEngine.setGraph(&graph, &transport);
+    // The canvas's Add Node menu offers the scanned plugins (Plugin
+    // Instruments / Plugin Effects) from here. Unset, as it was until 0.10.9,
+    // those submenus never appeared.
+    graph.pluginHost = &audioEngine.getPluginHost();
+
+    // A plugin that goes with its node while it still holds its instance - a
+    // Voice container's master, which its voices' copies follow (plugin_copies.h)
+    // - first closes its window, before the editor can outlive it, and leaves its
+    // state behind for an undo that brings the node back, as a plugin retired
+    // from the audio graph does (disposeRetiredPlugins).
+    PluginHost::LoadedPlugin::onRelease = [this](PluginHost::LoadedPlugin& lp) {
+        pluginWindows.closeWindowFor(lp.instance.get());
+        if (lp.nodeId < 0) return;
+        PluginCopies::catchUp(*lp.instance);   // not played: take its knob moves in
+        juce::MemoryBlock state;
+        lp.instance->getStateInformation(state);
+        if (state.getSize() > 0)
+            graph.retiredPluginStates[lp.nodeId] = { lp.info.description,
+                                                     state.toBase64Encoding().toStdString() };
+    };
 
     // Per-plugin dirty tracking (#86): when AutomationManager pushes a
     // value into a plugin parameter, mark that node's plugin state cache
@@ -537,7 +559,7 @@ MainContentComponent::MainContentComponent() {
         // node's live plugin, which the snapshot text doesn't carry.
         std::vector<int> pluginsToReload;
         {
-            std::lock_guard<std::recursive_mutex> graphLk(graph.mutationLock);
+            std::lock_guard<GraphMutex> graphLk(graph.mutationLock);
             pluginsToReload = graph.restoreSnapshot(snap);
         }
         // Drop editor panels whose underlying node no longer exists in the
@@ -565,6 +587,13 @@ MainContentComponent::MainContentComponent() {
             beginAsyncPluginLoad();
     };
     graph.undoTree.onTreeChanged = [this]() {
+        // Any step other than the one the project was saved at is a change
+        // the file doesn't have - an undo or redo included (restoring a
+        // snapshot goes through the project loader, which marks the graph
+        // clean). Landing back on the saved step doesn't clear it: changes
+        // the history doesn't hold (a plugin's own window) may remain.
+        if (graph.undoTree.currentStep() != savedUndoStep)
+            projectDirty = true;
         // Lazy-fill: any step pushed without a snapshot gets one captured
         // from the post-state right now. Cheap (graph-only serializer,
         // typically <10 ms) and only fires when the current snapshot slot
@@ -638,6 +667,8 @@ MainContentComponent::MainContentComponent() {
 }
 
 MainContentComponent::~MainContentComponent() {
+    // The graph's plugins go after this; nothing's left to keep their state for.
+    PluginHost::LoadedPlugin::onRelease = nullptr;
     // `transport` is about to die; the ScriptEngine outlives us (it's a process
     // singleton holding the one CPython interpreter), so drop the pointer.
     ScriptEngine::setHostTransport(nullptr);
@@ -730,7 +761,7 @@ void MainContentComponent::beginAsyncPluginLoad() {
     bool wasLoading = projectLoading;
     pluginLoadQueue.clear();
     {
-        std::lock_guard<std::recursive_mutex> graphLk(graph.mutationLock);
+        std::lock_guard<GraphMutex> graphLk(graph.mutationLock);
         for (auto& n : graph.nodes) {
             // Not a node whose plugin already failed to load: trying again
             // on every undo would only fail again (or be slow doing it).
@@ -770,7 +801,7 @@ void MainContentComponent::processNextPluginLoad() {
         std::string nodeName;
         std::string pendingState;
         {
-            std::lock_guard<std::recursive_mutex> graphLk(graph.mutationLock);
+            std::lock_guard<GraphMutex> graphLk(graph.mutationLock);
             Node* n = graph.findNode(nodeId);
             if (!n || !n->isPluginNode() || n->plugin) continue; // gone / already loaded
             savedPlugin = n->pluginDescription;
@@ -810,7 +841,7 @@ void MainContentComponent::processNextPluginLoad() {
 
         // Publish under the lock so the audio thread sees a consistent node.
         {
-            std::lock_guard<std::recursive_mutex> graphLk(graph.mutationLock);
+            std::lock_guard<GraphMutex> graphLk(graph.mutationLock);
             Node* n = graph.findNode(nodeId);
             if (n) {
                 // Whatever resolution found is the node's plugin from now on
@@ -821,6 +852,7 @@ void MainContentComponent::processNextPluginLoad() {
                     n->legacyPluginIndex = -1;
                 }
                 if (load.plugin) {
+                    load.plugin->nodeId = nodeId;
                     n->plugin = std::move(load.plugin);
                     n->pendingPluginState.clear();
                     n->pluginLoadState = PluginLoadState::Ready;
@@ -855,7 +887,7 @@ void MainContentComponent::disposeRetiredPlugins(bool keepStates) {
     // editor can outlive it, keep its state if asked, then let it be destroyed.
     std::vector<GraphProcessor::RetiredPlugin> retired;
     {
-        std::lock_guard<std::recursive_mutex> graphLk(graph.mutationLock);
+        std::lock_guard<GraphMutex> graphLk(graph.mutationLock);
         retired = audioEngine.getGraphProcessor().takeRetiredPlugins();
     }
     for (auto& rp : retired) {
@@ -879,7 +911,7 @@ void MainContentComponent::releaseOldProjectPlugins() {
     // Without this, a node of the new project with the same id and plugin as
     // one of the old could hold on to the old plugin until the next rebuild.
     {
-        std::lock_guard<std::recursive_mutex> graphLk(graph.mutationLock);
+        std::lock_guard<GraphMutex> graphLk(graph.mutationLock);
         audioEngine.getGraphProcessor().retireStalePlugins(graph);
     }
     disposeRetiredPlugins(false);
@@ -2716,6 +2748,16 @@ void MainContentComponent::showPluginUI(int nodeId) {
         return;
     }
 
+    // A plugin node: its plugin's own window - the one playing in the audio
+    // graph, or for one inside a Voice container the master its voices follow,
+    // which then copy what was changed when the window is closed.
+    if (node && node->isPluginNode()) {
+        if (auto* proc = pluginProcessorOf(nodeId))
+            pluginWindows.showWindowFor(*proc, node->name,
+                                        [this, nodeId] { pluginWindowClosed(nodeId); });
+        return;
+    }
+
     // Regular plugin UI
     auto& gp = audioEngine.getGraphProcessor();
     auto& nodeMap = gp.getNodeMap();
@@ -2730,6 +2772,35 @@ void MainContentComponent::showPluginUI(int nodeId) {
 
     auto name = node ? node->name : "Plugin";
     pluginWindows.showWindowFor(*graphNode->getProcessor(), name);
+}
+
+juce::AudioProcessor* MainContentComponent::pluginProcessorOf(int nodeId) {
+    auto* node = graph.findNode(nodeId);
+    if (node == nullptr || !node->plugin) return nullptr;
+    // Still with its node: a Voice container's master, or loaded and not
+    // taken into the audio graph yet.
+    if (node->plugin->instance) return node->plugin->instance.get();
+    return audioEngine.getGraphProcessor().hostedPluginOf(*node);
+}
+
+void MainContentComponent::pluginWindowClosed(int nodeId) {
+    // Whatever was changed in the window, the voices of a Voice container
+    // that holds this plugin get it too (knob moves reached them already).
+    audioEngine.syncVoiceCopies(nodeId);
+    if (auto* n = graph.findNode(nodeId))
+        n->pluginStateDirty = true;
+}
+
+void MainContentComponent::reportRenderCopyProblems(const PluginCopies& copies,
+                                                    const juce::String& what) {
+    const auto text = copies.describeProblems(what);
+    if (text.isEmpty()) return;
+    showAlertAsync(juce::MessageBoxOptions()
+                       .withIconType(juce::MessageBoxIconType::WarningIcon)
+                       .withTitle("Plugins left out")
+                       .withMessage(text)
+                       .withButton("OK"),
+                   this);
 }
 
 void MainContentComponent::showPluginInfo(int nodeId) {
@@ -2820,7 +2891,7 @@ void MainContentComponent::showPluginInfo(int nodeId) {
 }
 
 void MainContentComponent::showPluginPresets(int nodeId) {
-    auto* proc = audioEngine.getGraphProcessor().getProcessorForNode(nodeId);
+    auto* proc = pluginProcessorOf(nodeId);
     if (!proc) return;
 
     int numPresets = proc->getNumPrograms();
@@ -2836,11 +2907,16 @@ void MainContentComponent::showPluginPresets(int nodeId) {
     if (numPresets == 0)
         menu.addItem(-1, "(no presets)", false);
 
-    menu.showMenuAsync(juce::PopupMenu::Options(), [proc, nodeId, this](int result) {
-        if (result > 0) {
-            proc->setCurrentProgram(result - 1);
-            graph.dirty = true;
-        }
+    menu.showMenuAsync(juce::PopupMenu::Options(), [nodeId, this](int result) {
+        if (result <= 0) return;
+        // Looked up again: the plugin may have gone while the menu was open.
+        auto* p = pluginProcessorOf(nodeId);
+        if (!p) return;
+        p->setCurrentProgram(result - 1);
+        graph.dirty = true;
+        if (auto* n = graph.findNode(nodeId))
+            n->pluginStateDirty = true;
+        audioEngine.syncVoiceCopies(nodeId);   // a Voice container's voices too
     });
 }
 
@@ -3396,8 +3472,9 @@ void MainContentComponent::newProject() {
     // try-lock). Pair the lock here, matching the project-load path. See the
     // mutationLock comment in node_graph.h.
     {
-        std::lock_guard<std::recursive_mutex> graphLk(graph.mutationLock);
+        std::lock_guard<GraphMutex> graphLk(graph.mutationLock);
         graph.nodes.clear();
+        graph.nodesInvalidated();
         graph.links.clear();
         graph.openEditors.clear();
         graph.setupDefaultGraph();
@@ -3411,7 +3488,7 @@ void MainContentComponent::newProject() {
     {
         // Same structural-mutation lock as the clear/rebuild above: addNode()
         // below can reallocate graph.nodes while the audio callback iterates.
-        std::lock_guard<std::recursive_mutex> graphLk(graph.mutationLock);
+        std::lock_guard<GraphMutex> graphLk(graph.mutationLock);
 
         auto devices = juce::MidiInput::getAvailableDevices();
         // Resolve the default MIDI track's MIDI input PIN ID up front. Pin IDs
@@ -3454,10 +3531,16 @@ void MainContentComponent::newProject() {
     releaseOldProjectPlugins();
 
     ProjectFile::currentPath.clear();
-    projectDirty = false;
-    graph.dirty = false;
     discardAutosave();
     discardUndoTreePersist();
+    // A new undo history too: undoing past the new project's first edit used
+    // to bring the previous project back. And no shared-history file of the
+    // previous project's for this one to write to once it's saved.
+    graph.historyFilePath.clear();
+    graph.undoTree.reset(ProjectFile::serializeForUndo(graph));
+    savedUndoStep = graph.undoTree.currentStep();
+    projectDirty = false;
+    graph.dirty = false;
     lastAutosaveAttemptMs = juce::Time::getMillisecondCounterHiRes();
     resized();
     graphComponent->fitAll();
@@ -3643,12 +3726,15 @@ void MainContentComponent::openProjectFile(const juce::String& path) {
     // the original with no indication. We warn after the load completes.
     FactoryRefResolutionScope factoryRefScope;
     {
-        std::lock_guard<std::recursive_mutex> graphLk(graph.mutationLock);
+        std::lock_guard<GraphMutex> graphLk(graph.mutationLock);
         // Pass nullptr for the plugin host so ProjectFile::load does NOT
         // instantiate plugins synchronously on this (locked, message-thread)
         // critical path. Plugin nodes are parsed with their pendingPluginState
         // intact; beginAsyncPluginLoad() (below) instantiates them serially off
         // the lock so the nodes appear immediately and the UI stays responsive.
+        // The project names its own shared-history file, if it has one; one
+        // without mustn't go on writing to the previous project's.
+        graph.historyFilePath.clear();
         ProjectFile::load(path.toStdString(), graph, nullptr);
         rehydrateNodeCaches(path);
         upgradeLegacyNodes();
@@ -3688,11 +3774,17 @@ void MainContentComponent::openProjectFile(const juce::String& path) {
     addToRecentProjects(path);
     // Loading a clean project on top of whatever was in memory invalidates
     // any autosave that was tracking the previous state. The undo history
-    // also no longer applies - its snapshots described the old graph.
-    projectDirty = false;
-    graph.dirty = false;
+    // also no longer applies - its snapshots described the old graph - so a
+    // fresh one starts from the project as loaded (a history bundled with the
+    // project replaces it below, if the user takes it:
+    // handleSharedHistoryOnOpen). Until 0.10.9 only the persisted copy went,
+    // and undo could walk back into the previous project.
     discardAutosave();
     discardUndoTreePersist();
+    graph.undoTree.reset(ProjectFile::serializeForUndo(graph));
+    savedUndoStep = graph.undoTree.currentStep();
+    projectDirty = false;
+    graph.dirty = false;
     lastAutosaveAttemptMs = juce::Time::getMillisecondCounterHiRes();
     // Restore the saved pan/zoom from the loaded project (or fit-all if
     // none was persisted). Replaces the unconditional fitAll() that used
@@ -3837,12 +3929,23 @@ void MainContentComponent::freezeNodes(const std::vector<int>& nodeIds) {
         n->cache.enabled = false;
     }
 
+    // The render plays its own copy of every plugin (plugin_copies.h).
+    juce::MouseCursor::showWaitCursor();
+    auto copies = audioEngine.makeRenderCopies(sr, blockSize);
+
+    // Rendering reads the graph block by block, holding its lock; for as
+    // long as it does, the audio callback waits its turn (graph_mutex.h).
+    GraphMutex::RenderSession session(graph.mutationLock);
     GraphProcessor offlineGP;
-    offlineGP.prepare(graph, sr, blockSize);
-    offlineGP.rebuildGraph(graph, offlineTransport);
+    offlineGP.setPluginCopies(copies);
+    {
+        std::lock_guard<GraphMutex> lk(graph.mutationLock);
+        offlineGP.prepare(graph, sr, blockSize);
+        offlineGP.rebuildGraph(graph, offlineTransport);
+    }
 
     auto* jg = offlineGP.getGraph();
-    if (!jg) return;
+    if (!jg) { juce::MouseCursor::hideWaitCursor(); return; }
     const auto& nodeMap = offlineGP.getNodeMap();
 
     // Add one tap per target, wired as an extra fan-out from the target's output
@@ -3868,12 +3971,15 @@ void MainContentComponent::freezeNodes(const std::vector<int>& nodeIds) {
 
         taps.push_back({ id, tapRaw });
     }
-    if (taps.empty()) return;
+    if (taps.empty()) { juce::MouseCursor::hideWaitCursor(); return; }
 
     // Re-prepare so the newly-added taps are folded into the render sequence.
     // prepare() does NOT rebuild the graph, so the taps and their connections
-    // survive.
-    offlineGP.prepare(graph, sr, blockSize);
+    // survive. (It does build each Voice container's voices, from the nodes.)
+    {
+        std::lock_guard<GraphMutex> lk(graph.mutationLock);
+        offlineGP.prepare(graph, sr, blockSize);
+    }
 
     // Single offline render of the whole project. Each tap accumulates its
     // node's output as the render proceeds.
@@ -3884,8 +3990,12 @@ void MainContentComponent::freezeNodes(const std::vector<int>& nodeIds) {
         buf.setSize(2, thisBlock, false, false, true);
         buf.clear();
         juce::MidiBuffer midi;
+        graph.mutationLock.lockForRenderBlock();
+        std::unique_lock<GraphMutex> lk(graph.mutationLock, std::adopt_lock);
+        offlineGP.applyPluginAutomation(graph, offlineTransport.positionBeats());
         jg->processBlock(buf, midi);
     }
+    juce::MouseCursor::hideWaitCursor();
 
     // Move each tap's captured PCM into its node's cache and mark it frozen.
     auto& cm = offlineGP.getCacheManager();
@@ -3913,6 +4023,7 @@ void MainContentComponent::freezeNodes(const std::vector<int>& nodeIds) {
     projectDirty = true;
     // Apply the freezes to the live graph immediately.
     audioEngine.getGraphProcessor().requestRebuild();
+    reportRenderCopyProblems(*copies, "The freeze");
 }
 
 void MainContentComponent::rehydrateNodeCaches(const juce::String& projectPath) {
@@ -4019,6 +4130,7 @@ void MainContentComponent::saveProject(std::function<void()> onSaved) {
     addToRecentProjects(ProjectFile::currentPath);
     projectDirty = false;
     graph.dirty = false;
+    savedUndoStep = graph.undoTree.currentStep();
     saveFlashFrames = 60; // ~2 seconds at 30Hz
     // Explicit user save supersedes any crash-recovery autosave on disk.
     discardAutosave();
@@ -4051,6 +4163,7 @@ void MainContentComponent::saveProjectAs(std::function<void()> onSaved) {
             addToRecentProjects(file.getFullPathName());
             projectDirty = false;
             graph.dirty = false;
+            savedUndoStep = graph.undoTree.currentStep();
             saveFlashFrames = 60;
             discardAutosave();
             lastAutosaveAttemptMs = juce::Time::getMillisecondCounterHiRes();
@@ -4089,7 +4202,7 @@ void MainContentComponent::importModFile() {
             // import work.
             ModImporter::ImportResult result;
             {
-                std::lock_guard<std::recursive_mutex> graphLk(graph.mutationLock);
+                std::lock_guard<GraphMutex> graphLk(graph.mutationLock);
                 result = ModImporter::import(file.getFullPathName().toStdString(), graph);
             }
 
@@ -4303,13 +4416,21 @@ void MainContentComponent::exportAudioWithBeat(float maxBeat) {
 }
 
 void MainContentComponent::doExportRender(const juce::File& file, const ExportOptions& opts, float maxBeat) {
+    // The render plays its own copy of every plugin (plugin_copies.h), loaded
+    // here: plugins are made on the message thread.
+    juce::MouseCursor::showWaitCursor();
+    auto copies = audioEngine.makeRenderCopies(opts.sampleRate, kOfflineRenderBlockSize);
+    juce::MouseCursor::hideWaitCursor();
+
     // Run the entire render + encode on a background thread with a progress
     // bar so the UI stays responsive and the user can cancel.
     struct ExportTask : juce::ThreadWithProgressWindow {
         ExportTask(NodeGraph& g, Transport& liveTransport,
-                   const juce::File& f, const ExportOptions& o, float mb)
+                   const juce::File& f, const ExportOptions& o, float mb,
+                   std::shared_ptr<PluginCopies> c)
             : ThreadWithProgressWindow("Exporting audio...", true, true),
-              graph(g), liveTransport(liveTransport), file(f), opts(o), maxBeat(mb) {}
+              graph(g), liveTransport(liveTransport), file(f), opts(o), maxBeat(mb),
+              copies(std::move(c)) {}
 
         void run() override {
             setStatusMessage("Rendering audio...");
@@ -4318,7 +4439,7 @@ void MainContentComponent::doExportRender(const juce::File& file, const ExportOp
             // so the Script Console's soundshop.render() produces identical audio.
             // All this wrapper adds is the progress window and cancellation.
             juce::AudioBuffer<float> renderBuf;
-            if (!renderGraphOffline(graph, liveTransport, maxBeat, opts, renderBuf,
+            if (!renderGraphOffline(graph, liveTransport, maxBeat, opts, copies, renderBuf,
                                     [this](double p) {
                                         if (threadShouldExit()) return false;
                                         setProgress(p);
@@ -4335,15 +4456,17 @@ void MainContentComponent::doExportRender(const juce::File& file, const ExportOp
         juce::File file;
         ExportOptions opts;
         float maxBeat;
+        std::shared_ptr<PluginCopies> copies;
         bool exportSuccess = false;
     };
 
-    ExportTask task(graph, transport, file, opts, maxBeat);
+    ExportTask task(graph, transport, file, opts, maxBeat, copies);
 
     if (task.runThread() && task.exportSuccess) {
         saveFlashFrames = 90;
         if (auto* win = dynamic_cast<juce::DocumentWindow*>(getTopLevelComponent()))
             win->setName("Exported!");
+        reportRenderCopyProblems(*copies, "The export");
     }
 }
 
@@ -4808,8 +4931,10 @@ void MainContentComponent::performAutosave() {
         if (n->pluginStateDirty) {
             // The Full path didn't already query this plugin (or there
             // was no Full path). Query now and refresh the cache.
-            auto* proc = gp.getProcessorForNode(nid);
+            auto* proc = pluginProcessorOf(nid);
             if (!proc) continue;
+            if (n->plugin && proc == n->plugin->instance.get())
+                PluginCopies::catchUp(*proc);   // not played: take its knob moves in
             juce::MemoryBlock stateData;
             proc->getStateInformation(stateData);
             if (stateData.getSize() == 0) continue;
@@ -5034,6 +5159,7 @@ void MainContentComponent::applyPerPluginOverrides() {
         stateData.fromBase64Encoding(base64);
         if (stateData.getSize() > 0)
             proc->setStateInformation(stateData.getData(), (int)stateData.getSize());
+        audioEngine.syncVoiceCopies(n.id);   // a Voice container's voices too
     }
 }
 
@@ -5237,6 +5363,8 @@ void MainContentComponent::handleSharedHistoryOnOpen(const juce::String& project
         if (!safe) return;
         if (loadUndoTreeFromFile(sidecar, safe->graph)) {
             safe->undoTreeDirty = false;
+            safe->savedUndoStep = safe->graph.undoTree.currentStep();
+            safe->projectDirty = false;
             if (safe->graphComponent) safe->graphComponent->repaint();
         }
     };
@@ -5254,6 +5382,8 @@ void MainContentComponent::handleSharedHistoryOnOpen(const juce::String& project
                 if (copyFile.existsAsFile()) {
                     if (loadUndoTreeFromFile(copyFile, graph)) {
                         undoTreeDirty = false;
+                        savedUndoStep = graph.undoTree.currentStep();
+                        projectDirty = false;
                         // Detach the graph from the bundled sidecar: the
                         // user's edits go to their private copy, not the
                         // shared file.
@@ -5406,6 +5536,7 @@ void MainContentComponent::tryRestoreUndoTree() {
         graph.undoTree.onLoadSnapshot(snap);
     // Don't mark dirty for persistence - we just read this from disk.
     undoTreeDirty = false;
+    savedUndoStep = graph.undoTree.currentStep();
 }
 
 void MainContentComponent::tryRecoverAutosave() {
@@ -5481,7 +5612,7 @@ void MainContentComponent::tryRecoverAutosave() {
             // already running, so the audio callback is actively iterating
             // graph.nodes and would otherwise race with the load.
             {
-                std::lock_guard<std::recursive_mutex> graphLk(safe->graph.mutationLock);
+                std::lock_guard<GraphMutex> graphLk(safe->graph.mutationLock);
                 ProjectFile::load(getAutosaveFile().getFullPathName().toStdString(),
                                   safe->graph, &safe->audioEngine.getPluginHost());
                 safe->upgradeLegacyNodes();
@@ -5937,8 +6068,10 @@ public:
         addToGraphBtn.setButtonText("Add to Graph");
         addToGraphBtn.onClick = [this]() {
             const auto row = pluginListModel.rowAt(pluginList.getSelectedRow());
-            if (row.available)
-                this->graph.addPluginNode(this->host, *row.available, {100, 100});
+            if (!row.available) return;
+            const PluginInfo pi = *row.available;
+            this->graph.addPluginNode(this->host, pi, {100, 100});
+            this->graph.commitSnapshot("Add " + pi.name);
         };
         updateAddButton();
 
@@ -6034,11 +6167,20 @@ private:
             return r;
         }
 
+        // "Name  (Maker)  [format]" - without the "()" for a plugin that
+        // doesn't name its maker.
+        static juce::String describe(const PluginInfo& pi) {
+            juce::String s = juce::String::fromUTF8(pi.name.c_str());
+            if (!pi.manufacturer.empty())
+                s += "  (" + juce::String::fromUTF8(pi.manufacturer.c_str()) + ")";
+            return s + "  [" + juce::String::fromUTF8(pi.format.c_str()) + "]";
+        }
+
         // A blocked entry reads as its plugin's name if SEANCE described it
         // before it was blocked, else as the file (or LV2 URI) itself.
         juce::String blockedLabel(const std::string& id) const {
             if (auto* pi = host ? host->findDescribed(id) : nullptr)
-                return pi->name + "  (" + pi->manufacturer + ")  [" + pi->format + "]";
+                return describe(*pi);
             const auto s = juce::String::fromUTF8(id.c_str());
             return juce::File::isAbsolutePath(s) ? juce::File(s).getFileName() : s;
         }
@@ -6055,11 +6197,11 @@ private:
             if (r.available) {
                 auto& pi = *r.available;
                 g.setColour(juce::Colours::white);
-                auto label = pi.name + "  (" + pi.manufacturer + ")  [" + pi.format + "]";
-                if (pi.hasAudioInput) label += "  audio in:" + std::to_string(pi.numAudioInputChannels);
-                if (pi.hasAudioOutput) label += "  audio out:" + std::to_string(pi.numAudioOutputChannels);
-                if (pi.numMidiInputPorts > 0) label += "  midi in:" + std::to_string(pi.numMidiInputPorts);
-                if (pi.numMidiOutputPorts > 0) label += "  midi out:" + std::to_string(pi.numMidiOutputPorts);
+                auto label = describe(pi);
+                if (pi.hasAudioInput) label += "  audio in:" + juce::String(pi.numAudioInputChannels);
+                if (pi.hasAudioOutput) label += "  audio out:" + juce::String(pi.numAudioOutputChannels);
+                if (pi.numMidiInputPorts > 0) label += "  midi in:" + juce::String(pi.numMidiInputPorts);
+                if (pi.numMidiOutputPorts > 0) label += "  midi out:" + juce::String(pi.numMidiOutputPorts);
                 if (pi.isInstrument) label += "  [Instrument]";
                 g.drawText(label, 4, 0, w - 8, h, juce::Justification::centredLeft);
             } else if (!r.blockedId.empty()) {
@@ -6102,6 +6244,7 @@ private:
             menu.showMenuAsync(juce::PopupMenu::Options(), [this, pi, id, blocked](int result) {
                 if (result == 1 && graph && !blocked) {
                     graph->addPluginNode(*host, pi, {100, 100});
+                    graph->commitSnapshot("Add " + pi.name);
                 } else if (result == 2) {
                     juce::SystemClipboard::copyTextToClipboard(juce::String::fromUTF8(id.c_str()));
                 } else if (result == 3 && settings) {
@@ -6659,10 +6802,21 @@ void MainContentComponent::bounceToAudioTrack() {
     offlineTransport.sampleRate = sr;
     offlineTransport.playing = true;
 
+    // The render plays its own copy of every plugin (plugin_copies.h).
+    juce::MouseCursor::showWaitCursor();
+    auto copies = audioEngine.makeRenderCopies(sr, blk);
+
+    // Rendering reads the graph block by block, holding its lock; for as
+    // long as it does, the audio callback waits its turn (graph_mutex.h).
+    GraphMutex::RenderSession session(graph.mutationLock);
     GraphProcessor offlineGP;
-    offlineGP.prepare(graph, sr, blk);
-    offlineGP.rebuildGraph(graph, offlineTransport);
-    offlineGP.prepare(graph, sr, blk);
+    offlineGP.setPluginCopies(copies);
+    {
+        std::lock_guard<GraphMutex> lk(graph.mutationLock);
+        offlineGP.prepare(graph, sr, blk);
+        offlineGP.rebuildGraph(graph, offlineTransport);
+        offlineGP.prepare(graph, sr, blk);
+    }
 
     juce::AudioBuffer<float> result(2, (int)totalSamples);
     result.clear();
@@ -6674,12 +6828,18 @@ void MainContentComponent::bounceToAudioTrack() {
         juce::AudioBuffer<float> buf(2, thisBlock);
         buf.clear();
         juce::MidiBuffer midi;
-        if (auto* g = offlineGP.getGraph())
-            g->processBlock(buf, midi);
+        {
+            graph.mutationLock.lockForRenderBlock();
+            std::unique_lock<GraphMutex> lk(graph.mutationLock, std::adopt_lock);
+            offlineGP.applyPluginAutomation(graph, offlineTransport.positionBeats());
+            if (auto* g = offlineGP.getGraph())
+                g->processBlock(buf, midi);
+        }
 
         for (int ch = 0; ch < 2; ++ch)
             result.copyFrom(ch, (int)pos, buf, ch, 0, thisBlock);
     }
+    juce::MouseCursor::hideWaitCursor();
 
     // Save to disk
     juce::File captureDir = juce::File::getCurrentWorkingDirectory().getChildFile("captures");
@@ -6710,6 +6870,7 @@ void MainContentComponent::bounceToAudioTrack() {
 
     juce::Logger::writeToLog("Bounced to: " + outFile.getFullPathName()
         + " (" + juce::String(totalSeconds, 1) + "s)");
+    reportRenderCopyProblems(*copies, "The bounce");
 }
 
 void MainContentComponent::createAudioTrackFromOutputCache(Node& outputNode) {

@@ -834,6 +834,9 @@ private:
     class RenderJob;
     std::unique_ptr<RenderJob> renderJob;
     bool renderReady = false;
+    float renderMaxBeat = 0.0f;   // the song's length, for a render started over
+    // Start (or start over) the render, at songSampleRate for renderMaxBeat.
+    void startRender();
 
     void onRenderComplete();
     // (Re)publish the Preview-waveform-selected slice of the region as the

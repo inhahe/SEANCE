@@ -756,7 +756,7 @@ bool SpectrumTapComponent::syncBinPins() {
         int pinId = nd->pinsOut[posInPinsOut].id;
         nd->pinsOut.erase(nd->pinsOut.begin() + posInPinsOut);
         {
-            std::lock_guard<std::recursive_mutex> graphLk(graph.mutationLock);
+            std::lock_guard<GraphMutex> graphLk(graph.mutationLock);
             graph.links.erase(
                 std::remove_if(graph.links.begin(), graph.links.end(),
                     [pinId](const auto& l) { return l.startPin == pinId; }),

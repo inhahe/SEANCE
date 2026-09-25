@@ -86,6 +86,16 @@
   <li><strong>Pressure / Timbre</strong> — two extra <a href="pin-kinds.html">control signals</a> that carry <em>per-note expression</em>. <strong>Pressure</strong> (0..1, resting at 0) follows how hard you lean on a held note; <strong>Timbre</strong> (0..1, resting at the centre 0.5) follows the "slide" axis of an expressive controller. Wire them into a filter cutoff, a volume, a wavetable position — anything — and that one note brightens or swells as you press, independently of every other note you're holding.</li>
 </ol>
 
+<h2>Plugins inside a voice</h2>
+
+<p>A plugin (VST3 or LV2) works inside a container like any synth or effect: add it from the right-click menu's <strong>Plugin Instruments</strong> or <strong>Plugin Effects</strong> while you're inside the container, and wire it up. Every voice plays <em>its own copy</em> of the plugin, so each note gets an independent instance.</p>
+
+<ul>
+  <li><strong>You edit one copy — the node's own.</strong> Double-click the node (or right-click → <strong>Show Plugin UI</strong>) to open its window as usual. Turning a knob there turns it in every voice at once. Other changes — picking a preset, loading a sample into a sampler plugin — reach the voices when you close the window (or at once, if the plugin announces them). That copy's settings are the ones saved with your project.</li>
+  <li><strong>It costs memory per voice.</strong> Eight voices means eight copies of the plugin, plus the one you edit — and a moment to load them when you add the plugin or raise the voice count. CPU is only spent on voices that are sounding.</li>
+  <li><strong>If some copies can't load</strong> (a plugin that refuses to run more than once, say), the voices without one are silent and the node shows an amber <strong>x</strong> — hover over it for the reason.</li>
+</ul>
+
 <h2>Expressive, per-note playing (MPE)</h2>
 
 <p>If you play a Voice container from an <strong>MPE controller</strong> (a Roli Seaboard, a LinnStrument, an MPE-capable keyboard, etc.), each note you hold gets its <em>own</em> pitch bend, pressure, and timbre — so you can bend one note of a chord while the others stay put, or swell a single voice with finger pressure. SEANCE routes each expression message to the right voice automatically; you just patch the <strong>Pressure</strong> and <strong>Timbre</strong> outputs of VoiceIn into whatever you want them to control.</p>
@@ -201,7 +211,8 @@
 <ul>
   <li>The voice count is fixed when you create the container (default 8) — there's no live slider yet.</li>
   <li>You can't put a Voice container inside another Voice container.</li>
-  <li>Adding a node that opens a file picker (a hosted plugin, a SoundFont, a WASM module) lands it at the top level even if you're scoped inside a container — drag it in afterward, or recreate it inside.</li>
+  <li>Adding a node that opens a file picker (a sampler, a SoundFont, a WASM module) lands it at the top level even if you're scoped inside a container — drag it in afterward, or recreate it inside. So does a plugin added from <strong>Plugins → Plugin Settings… → Add to Graph</strong>; add plugins from the right-click menu instead.</li>
+  <li>A plugin inside a container can't be automated or MIDI-mapped yet: automation lanes and <strong>MIDI Map…</strong> only reach plugins outside containers.</li>
 </ul>
 
 <footer>

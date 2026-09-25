@@ -46,6 +46,9 @@
 #include "midi_script_node.h"       // MidiScriptProcessor - algorithmic MIDI generator
 #include "plugin_host.h"            // PluginHost::registerPluginFolders - LV2 after a restart
 #include "plugin_settings.h"        // userPluginFolders / pluginSearchPath
+#include "plugin_copies.h"          // PluginCopies - plugins in renders and Voice containers
+#include "audio_export.h"           // renderGraphOffline - an export's plugin copies
+#include "graph_mutex.h"            // GraphMutex - renders sharing the graph lock
 
 #include <juce_audio_formats/juce_audio_formats.h>
 #include <juce_graphics/juce_graphics.h>
@@ -60,6 +63,8 @@
 #include <fstream>
 #include <set>
 #include <chrono>
+#include <thread>
+#include <atomic>
 #include <cstdlib>          // _putenv_s / setenv - testPluginFolders
 
 namespace SoundShop {
@@ -12627,6 +12632,483 @@ void testPluginLifecycle(Report& r, const juce::File&) {
     }
 }
 
+// ===========================================================================
+// Plugin copies: renders and Voice containers play their own
+// ===========================================================================
+//
+// A plugin instance can be in one audio graph only, and the live graph holds
+// each plugin node's own. Before 0.10.9 every other graph built plugin nodes
+// silent: Export, a script's render(), Freeze, Bounce and capture from playback
+// went without the project's plugins, and a plugin inside a Voice container
+// played in no voice. Now they play copies (plugin_copies.h) - a render's,
+// loaded with each plugin's settings as the render starts, and a Voice
+// container's, one per voice, following the node's own instance (the master)
+// as its knobs move.
+void testPluginCopies(Report& r, const juce::File& outDir) {
+    r.section("Plugin copies: renders and Voice containers play their own");
+
+    const auto pluginDir = selfTestPluginDir();
+    if (!pluginDir.getChildFile("seance_selftest_gain.lv2/manifest.ttl").existsAsFile()) {
+        r.note("SKIPPED - no self-test LV2 plugins in " + pluginDir.getFullPathName()
+               + ". The build puts them there; release packages leave them out.");
+        return;
+    }
+    PluginHost host;
+    host.scanFolders(lv2FolderOnly(pluginDir), {});
+    const auto* listedA = findListed(host, kSelfTestGainA);
+    if (!r.check(listedA != nullptr, "copies: (setup) the self-test plugin is listed"))
+        return;
+    const PluginInfo infoA = *listedA;
+    auto closeTo = [](double measured, double wanted, double tolerance = 1e-4) {
+        return std::abs(measured - wanted) < tolerance;
+    };
+    // The self-test gain runs 0..2: gain = 2 * the normalised value.
+    auto setGain = [](juce::AudioProcessor& p, float normalised) {
+        if (auto* param = p.getParameters()[0]) param->setValueNotifyingHost(normalised);
+    };
+    auto audioPin = [](NodeGraph& g, int nodeId, bool input) {
+        const auto* n = g.findNode(nodeId);
+        if (n == nullptr) return -1;
+        for (auto& p : input ? n->pinsIn : n->pinsOut)
+            if (p.kind == PinKind::Audio) return p.id;
+        return -1;
+    };
+    Transport transport;
+
+    // ---- A render's copy ----------------------------------------------------
+    {
+        NodeGraph g;
+        GraphProcessor live;
+        live.setHostsPlugins(true);   // as the audio engine's graph
+        live.prepare(g, 48000.0, 256);
+        const int id = g.addPluginNode(host, infoA, {0.0f, 0.0f}).id;
+        live.rebuildGraph(g, transport);
+        auto* plugin = dynamic_cast<juce::AudioPluginInstance*>(live.getProcessorForNode(id));
+        if (!r.check(plugin != nullptr, "render copy: (setup) the live graph hosts the plugin"))
+            return;
+        setGain(*plugin, 0.4f);   // 0.8
+        measuredGainOf(*plugin);  // the audio callback plays it - taking the change in
+
+        auto copies = std::make_shared<PluginCopies>(PluginCopies::Use::render);
+        copies->update(g, host, &live, 48000.0, 256);
+        auto copy = copies->find(id, -1);
+        r.check(copy != nullptr && copy->plugin != nullptr && copy->plugin.get() != plugin,
+                "render copy: a render gets an instance of the plugin of its own");
+        const double copyGain = copy ? measuredGainOf(*copy->plugin) : -1.0;
+        r.checkVal(closeTo(copyGain, 0.8),
+                   "render copy: ...with the live plugin's settings (gain 0.8, not the default 0.5)",
+                   copyGain);
+        r.check(dynamic_cast<juce::AudioPluginInstance*>(live.getProcessorForNode(id)) == plugin,
+                "render copy: ...while the live one stays in the live graph");
+
+        GraphProcessor offline;
+        offline.setPluginCopies(copies);
+        offline.prepare(g, 48000.0, 256);
+        offline.rebuildGraph(g, transport);
+        offline.prepare(g, 48000.0, 256);
+        auto* standIn = dynamic_cast<PluginCopyProcessor*>(offline.getNodeOwnProcessor(id));
+        r.check(standIn != nullptr && copy && &standIn->plugin() == copy->plugin.get()
+                    && offline.playsPlugin(id),
+                "render copy: the render's graph plays the copy (it used to build the node silent)");
+        const double standInGain = standIn ? measuredGainOf(*standIn) : -1.0;
+        r.checkVal(closeTo(standInGain, 0.8), "render copy: ...sounding just like the plugin",
+                   standInGain);
+    }
+
+    // ---- Export: renderGraphOffline ------------------------------------------
+    {
+        const double sr = 48000.0;
+        std::vector<float> tone((size_t) (sr * 2.0));
+        for (size_t i = 0; i < tone.size(); ++i)
+            tone[i] = 0.25f * (float) std::sin(juce::MathConstants<double>::twoPi * 440.0
+                                               * (double) i / sr);
+        const auto wav = outDir.getChildFile("plugin_copies_tone.wav");
+        if (!r.check(writeWavFloat(wav, tone, sr), "render: (setup) the test tone is written"))
+            return;
+
+        // Tone -> gain plugin -> Output.
+        NodeGraph g;
+        const int trackId = g.addNode("Tone", NodeType::AudioTimeline, {},
+                                      { Pin{0, "Audio", PinKind::Audio, false} }).id;
+        const int pluginId = g.addPluginNode(host, infoA, {200.0f, 0.0f}).id;
+        const int outId = g.addNode("Output", NodeType::Output,
+                                    { Pin{0, "In", PinKind::Audio, true} }, {}).id;
+        {
+            Clip c{};
+            c.name = "tone";
+            c.startBeat = 0.0f;
+            c.lengthBeats = 4.0f;   // 2 s at 120 BPM
+            c.audioFilePath = wav.getFullPathName().toStdString();
+            g.findNode(trackId)->clips.push_back(c);
+        }
+        g.addLink(audioPin(g, trackId, false), audioPin(g, pluginId, true));
+        g.addLink(audioPin(g, pluginId, false), audioPin(g, outId, true));
+
+        GraphProcessor live;
+        live.setHostsPlugins(true);
+        live.prepare(g, sr, 256);
+        live.rebuildGraph(g, transport);
+        auto* plugin = dynamic_cast<juce::AudioPluginInstance*>(live.getProcessorForNode(pluginId));
+        if (!r.check(plugin != nullptr, "render: (setup) the live graph hosts the plugin"))
+            return;
+
+        Transport tmpl;
+        tmpl.bpm = 120.0;
+        tmpl.tempoMap.setGlobalBpm(120.0);
+        ExportOptions opts;
+        opts.sampleRate = (int) sr;
+        opts.numChannels = 2;
+        opts.dither = false;
+        // The mono plugin feeds the left channel. Its RMS over the middle
+        // second, past any start-up and before the clip ends.
+        auto renderLeft = [&](std::shared_ptr<PluginCopies> copies) {
+            juce::AudioBuffer<float> out;
+            if (!renderGraphOffline(g, tmpl, 4.0f, opts, std::move(copies), out)) return -1.0;
+            const int from = (int) (sr * 0.5), count = (int) sr;
+            return out.getNumSamples() >= from + count ? (double) out.getRMSLevel(0, from, count)
+                                                       : -1.0;
+        };
+        auto copiesNow = [&] {   // what AudioEngine::makeRenderCopies makes
+            auto c = std::make_shared<PluginCopies>(PluginCopies::Use::render);
+            c->update(g, host, &live, sr, kOfflineRenderBlockSize);
+            return c;
+        };
+
+        // (Each change followed by a block the audio callback would play.)
+        setGain(*plugin, 0.4f);   // 0.8
+        measuredGainOf(*plugin);
+        const double at08 = renderLeft(copiesNow());
+        setGain(*plugin, 0.8f);   // 1.6
+        measuredGainOf(*plugin);
+        const double at16 = renderLeft(copiesNow());
+        r.check(at08 > 1e-3, "render: an export through a plugin isn't silent (left RMS "
+                                 + juce::String(at08, 5) + ")");
+        r.checkVal(at08 > 0 && closeTo(at16 / at08, 2.0, 0.02),
+                   "render: ...and plays it with its settings as the export starts (gain 0.8, "
+                   "then 1.6: twice as loud)",
+                   at08 > 0 ? at16 / at08 : -1.0);
+
+        // A plugin-parameter automation lane drives the copy during a render,
+        // as the UI timer drives the live plugin during playback.
+        g.findNode(pluginId)->pluginParamAutomation[0].points.push_back({0.0f, 0.25f});   // 0.5
+        const double automated = renderLeft(copiesNow());   // the live plugin is still at 1.6
+        r.checkVal(at08 > 0 && closeTo(automated / at08, 0.5 / 0.8, 0.02),
+                   "render: ...and follows its automation (a lane holding gain 0.5)",
+                   at08 > 0 ? automated / at08 : -1.0);
+    }
+
+    // ---- A Voice container: a copy per voice, following the master -----------
+    {
+        NodeGraph g;
+        int containerId;
+        {
+            auto& c = g.addNode("Voice", NodeType::VoiceContainer,
+                                {Pin{0, "MIDI", PinKind::Midi, true}},
+                                {Pin{0, "Audio", PinKind::Audio, false}}, {0.0f, 0.0f});
+            c.voicePolyphony = 3;
+            containerId = c.id;
+        }
+        int viPitch, viGate, viVel;
+        {
+            auto& vi = g.addNode("Voice In", NodeType::VoiceIn, {},
+                {Pin{0, "MIDI",     PinKind::Midi,   false},
+                 Pin{0, "Pitch",    PinKind::Signal, false, 1},
+                 Pin{0, "Gate",     PinKind::Signal, false, 1},
+                 Pin{0, "Velocity", PinKind::Signal, false, 1}}, {-200.0f, 0.0f});
+            vi.voiceContainerId = containerId;
+            viPitch = vi.pinsOut[1].id;
+            viGate  = vi.pinsOut[2].id;
+            viVel   = vi.pinsOut[3].id;
+        }
+        int oscPitch, oscGate, oscVel, oscAudio;
+        {
+            auto& s = g.addNode("Signal Osc", NodeType::Instrument,
+                {Pin{0, "Pitch",    PinKind::Signal, true, 1},
+                 Pin{0, "Gate",     PinKind::Signal, true, 1},
+                 Pin{0, "Velocity", PinKind::Signal, true, 1}},
+                {Pin{0, "Audio", PinKind::Audio, false}}, {0.0f, 0.0f});
+            s.voiceContainerId = containerId;
+            s.script = "__signalosc__";
+            s.params.push_back({"Waveform", 0.0f, 0.0f, 3.0f});
+            s.params.push_back({"Volume",   0.5f, 0.0f, 1.0f});
+            s.ahdsrEnvelope.attackMs  = 2.0f;
+            s.ahdsrEnvelope.decayMs   = 20.0f;
+            s.ahdsrEnvelope.sustain   = 0.8f;
+            s.ahdsrEnvelope.releaseMs = 40.0f;
+            oscPitch = s.pinsIn[0].id;
+            oscGate  = s.pinsIn[1].id;
+            oscVel   = s.pinsIn[2].id;
+            oscAudio = s.pinsOut[0].id;
+        }
+        const int pid = g.addPluginNode(host, infoA, {100.0f, 0.0f}).id;
+        g.findNode(pid)->voiceContainerId = containerId;   // made inside the container's view
+        int voAudio;
+        {
+            auto& vo = g.addNode("Voice Out", NodeType::VoiceOut,
+                                 {Pin{0, "Audio", PinKind::Audio, true}}, {}, {200.0f, 0.0f});
+            vo.voiceContainerId = containerId;
+            voAudio = vo.pinsIn[0].id;
+        }
+        g.addLink(viPitch, oscPitch);
+        g.addLink(viGate,  oscGate);
+        g.addLink(viVel,   oscVel);
+        g.addLink(oscAudio, audioPin(g, pid, true));
+        g.addLink(audioPin(g, pid, false), voAudio);
+
+        auto* master = g.findNode(pid)->plugin ? g.findNode(pid)->plugin->instance.get() : nullptr;
+        if (!r.check(master != nullptr, "voices: (setup) the plugin inside the container loaded"))
+            return;
+
+        const double sr = 44100.0;
+        const int bs = 512;
+        auto voices = std::make_shared<PluginCopies>(PluginCopies::Use::voices);
+        voices->update(g, host, nullptr, sr, bs);
+        std::set<const juce::AudioPluginInstance*> distinct;
+        for (int k = 0; k < 3; ++k)
+            if (auto c = voices->find(pid, k)) distinct.insert(c->plugin.get());
+        r.check(voices->size() == 3 && distinct.size() == 3 && !distinct.count(master),
+                "voices: every voice gets a copy of its own (3 voices, 3 copies), besides the "
+                "master the node keeps");
+
+        {
+            GraphProcessor live;
+            live.setHostsPlugins(true);
+            live.setPluginCopies(voices);
+            live.prepare(g, sr, bs);
+            live.rebuildGraph(g, transport);
+            live.prepare(g, sr, bs);
+            r.check(g.findNode(pid)->plugin->instance.get() == master && !live.playsPlugin(pid),
+                    "voices: the live graph never takes the master in - it stays with its node");
+        }
+
+        {
+            PolyVoiceProcessor poly(*g.findNode(containerId), g, transport, voices);
+            poly.setPlayConfigDetails(0, 2, sr, bs);
+            poly.prepareToPlay(sr, bs);
+            // Left-channel RMS over the last four of `blocks` blocks.
+            auto run = [&](const juce::MidiBuffer& first, int blocks) {
+                juce::AudioBuffer<float> out(2, bs);
+                double sum = 0.0;
+                int counted = 0;
+                for (int i = 0; i < blocks; ++i) {
+                    juce::MidiBuffer midi;
+                    if (i == 0) midi = first;
+                    poly.processBlock(out, midi);
+                    if (i >= blocks - 4) {
+                        for (int s = 0; s < bs; ++s)
+                            sum += (double) out.getSample(0, s) * out.getSample(0, s);
+                        counted += bs;
+                    }
+                }
+                return counted > 0 ? std::sqrt(sum / counted) : 0.0;
+            };
+            juce::MidiBuffer noteOn;
+            noteOn.addEvent(juce::MidiMessage::noteOn(1, 69, (juce::uint8) 110), 0);
+            const double atDefault = run(noteOn, 16);   // the plugin at its default gain, 0.5
+            setGain(*master, 0.5f);                    // 1.0, as if dragged in its window
+            const double atOne = run({}, 6);
+            r.check(atDefault > 1e-3, "voices: a note plays through the plugin inside its voice "
+                                          "(RMS " + juce::String(atDefault, 5) + ")");
+            r.checkVal(atDefault > 0 && closeTo(atOne / atDefault, 2.0, 0.05),
+                       "voices: a knob moved on the master moves in every voice at once (gain "
+                       "0.5 -> 1.0: twice as loud)",
+                       atDefault > 0 ? atOne / atDefault : -1.0);
+
+            // A change the master doesn't announce (setValue, as a plugin's own
+            // preset load may not) reaches the voices when its whole state is
+            // copied - as when its window closes. The master plays in no graph,
+            // so its state has to catch up with the change first (catchUp).
+            if (auto* param = master->getParameters()[0]) param->setValue(0.75f);   // 1.5
+            const double unannounced = run({}, 6);
+            voices->syncFromMaster(pid);
+            const double synced = run({}, 6);
+            r.checkVal(atDefault > 0 && closeTo(unannounced / atDefault, 2.0, 0.05),
+                       "voices: (a change the master doesn't announce stays with the master...)",
+                       atDefault > 0 ? unannounced / atDefault : -1.0);
+            r.checkVal(atDefault > 0 && closeTo(synced / atDefault, 3.0, 0.08),
+                       "voices: ...until the master's whole state is copied to the voices (gain "
+                       "1.5)",
+                       atDefault > 0 ? synced / atDefault : -1.0);
+        }
+
+        // Rebuilding keeps the copies: an edit doesn't load every voice's again.
+        {
+            auto firstCopy = voices->find(pid, 0);
+            voices->update(g, host, nullptr, sr, bs);
+            r.check(firstCopy != nullptr && voices->find(pid, 0) == firstCopy,
+                    "voices: the copies outlive a rebuild - no loading them again on every edit");
+        }
+
+        // Fewer voices: the spare copy is let go of, and destroyed once no
+        // graph plays it.
+        {
+            std::weak_ptr<PluginCopies::Copy> third = voices->find(pid, 2);
+            auto still = std::make_unique<PolyVoiceProcessor>(*g.findNode(containerId), g,
+                                                              transport, voices);
+            still->setPlayConfigDetails(0, 2, sr, bs);
+            still->prepareToPlay(sr, bs);   // 3 voices, playing all three copies
+            g.findNode(containerId)->voicePolyphony = 2;
+            voices->update(g, host, nullptr, sr, bs);
+            r.check(voices->size() == 2 && !third.expired(),
+                    "voices: with fewer voices the spare copy is let go of - but kept while "
+                    "voices built before still play it");
+            still.reset();
+            voices->releaseUnused();
+            r.check(third.expired(), "voices: ...and destroyed once nothing plays it");
+        }
+
+        // A plugin blocked in Plugin Settings: its copies don't load, the node
+        // says why - and they load again once it's unblocked.
+        {
+            NodeGraph blockedGraph;
+            const int cid = blockedGraph.addNode("Voice", NodeType::VoiceContainer,
+                                                 {Pin{0, "MIDI", PinKind::Midi, true}},
+                                                 {Pin{0, "Audio", PinKind::Audio, false}}).id;
+            blockedGraph.findNode(cid)->voicePolyphony = 2;
+            const int bp = blockedGraph.addPluginNode(host, infoA, {0.0f, 0.0f}).id;
+            blockedGraph.findNode(bp)->voiceContainerId = cid;
+            PluginCopies pool(PluginCopies::Use::voices);
+            host.setBlockedPlugins({ kSelfTestGainA });
+            pool.update(blockedGraph, host, nullptr, sr, bs);
+            const auto problems = pool.problems();
+            r.check(pool.size() == 0 && problems.count(bp)
+                        && problems.at(bp).find("blocked") != std::string::npos,
+                    "voices: a blocked plugin's copies don't load, and the node is told why");
+            host.setBlockedPlugins({});
+            pool.update(blockedGraph, host, nullptr, sr, bs);
+            r.check(pool.size() == 2 && pool.problems().empty(),
+                    "voices: ...and load once it's unblocked");
+        }
+
+        // Undo carries the master across to the restored node in the same place -
+        // not to one outside the container, which the live graph would play.
+        {
+            const std::string inside = ProjectFile::serializeForUndo(g);
+            auto kept = g.restoreSnapshot(inside);
+            r.check(kept.empty() && g.findNode(pid) && g.findNode(pid)->plugin
+                        && g.findNode(pid)->plugin->instance.get() == master,
+                    "voices: undo keeps the master for the node inside the container");
+            g.findNode(pid)->voiceContainerId = -1;
+            const std::string outside = ProjectFile::serializeForUndo(g);
+            g.findNode(pid)->voiceContainerId = containerId;
+            auto reload = g.restoreSnapshot(outside);
+            r.check(reload.size() == 1 && reload[0] == pid && g.findNode(pid)->plugin == nullptr,
+                    "voices: ...but a node brought back outside it loads its plugin afresh");
+        }
+    }
+}
+
+// A new project, or one opened without a history of its own, starts a fresh
+// undo history (UndoTree::reset). Until 0.10.9 New / Open Project only deleted
+// the persisted copy, so undoing past the new project's first edit restored
+// the previous project's graph.
+void testUndoHistoryReset(Report& r) {
+    r.section("Undo history: a new or opened project starts a fresh one");
+
+    UndoTree tree;
+    std::string loaded;
+    int changes = 0;
+    tree.onLoadSnapshot = [&](const std::string& s) { loaded = s; };
+    tree.onTreeChanged = [&] { ++changes; };
+    tree.setRootSnapshot("old project");
+    tree.pushSnapshot("old project, edited", "Edit");
+    tree.pushSnapshot("old project, edited twice", "Edit");
+
+    const int before = changes;
+    tree.reset("new project");
+    r.check(!tree.canUndo() && !tree.canRedo() && tree.currentStep() == 0
+                && tree.currentSnapshot() == "new project",
+            "undo history: reset leaves only the new project's state - nothing to undo into");
+    r.check(changes == before + 1,
+            "undo history: ...tells the app (onTreeChanged), which persists it and tracks unsaved "
+            "changes from it");
+
+    tree.pushSnapshot("new project, edited", "Add Mixer");
+    tree.doUndo();
+    r.check(loaded == "new project" && !tree.canUndo(),
+            "undo history: undoing the new project's first edit returns to the new project, not "
+            "the old one");
+    tree.doRedo();
+    r.check(loaded == "new project, edited" && tree.currentStep() != 0,
+            "undo history: ...and redo still works; the step it's at moves (the unsaved-changes "
+            "tracking follows it)");
+}
+
+// The graph lock an offline render shares, block by block, with the UI and
+// the audio callback (graph_mutex.h).
+void testGraphMutex(Report& r) {
+    r.section("Graph lock: an offline render takes turns with the UI and the audio callback");
+
+    GraphMutex m;
+    {
+        m.lock();
+        m.lock();   // recursive, as batch edits nest
+        bool otherGot = true;
+        std::thread([&] { otherGot = m.try_lock(); if (otherGot) m.unlock(); }).join();
+        m.unlock();
+        bool stillHeld = true;
+        std::thread([&] { stillHeld = !m.try_lock(); if (!stillHeld) m.unlock(); }).join();
+        m.unlock();
+        bool freed = false;
+        std::thread([&] { freed = m.try_lock(); if (freed) m.unlock(); }).join();
+        r.check(!otherGot && stillHeld && freed,
+                "graph lock: still a recursive mutex (held until the last unlock)");
+    }
+
+    // A render on its own thread holding the lock block after block, each block
+    // ~0.3 ms of work.
+    std::atomic<bool> stop { false };
+    std::atomic<int> blocks { 0 };
+    std::thread render([&] {
+        GraphMutex::RenderSession session(m);
+        while (!stop.load()) {
+            if (!m.lockForRenderBlock([&] { return stop.load(); })) break;
+            const auto until = std::chrono::steady_clock::now() + std::chrono::microseconds(300);
+            while (std::chrono::steady_clock::now() < until) {}
+            ++blocks;
+            m.unlock();
+        }
+    });
+    while (blocks.load() < 20) std::this_thread::yield();
+
+    const auto t0 = std::chrono::steady_clock::now();
+    { std::lock_guard<GraphMutex> lk(m); }   // an edit on the UI thread
+    const double uiWaitMs = std::chrono::duration<double, std::milli>(
+                                std::chrono::steady_clock::now() - t0).count();
+    int got = 0;
+    for (int i = 0; i < 20; ++i) {   // the audio callback, every ~2 ms
+        if (m.tryLockForAudio(std::chrono::microseconds(2500))) { ++got; m.unlock(); }
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    stop.store(true);
+    render.join();
+
+    r.checkVal(uiWaitMs < 250.0,
+               "graph lock: an edit gets in between a render's blocks (ms waited)", uiWaitMs);
+    r.checkVal(got >= 16,
+               "graph lock: ...and so does the audio callback, waiting its turn instead of "
+               "going silent (of 20 tries)", got);
+
+    // With no render running, the audio callback's try doesn't wait at all.
+    std::atomic<bool> held { false }, release { false };
+    std::thread holder([&] {
+        std::lock_guard<GraphMutex> lk(m);
+        held.store(true);
+        while (!release.load()) std::this_thread::yield();
+    });
+    while (!held.load()) std::this_thread::yield();
+    const auto t1 = std::chrono::steady_clock::now();
+    const bool gotWhileHeld = m.tryLockForAudio(std::chrono::microseconds(50000));
+    const double triedMs = std::chrono::duration<double, std::milli>(
+                               std::chrono::steady_clock::now() - t1).count();
+    release.store(true);
+    holder.join();
+    if (gotWhileHeld) m.unlock();
+    r.check(!gotWhileHeld && triedMs < 25.0,
+            "graph lock: an edit holding it outside any render still leaves the audio callback "
+            "silent at once, as before (no waiting)");
+}
+
 int runSelfTest(const juce::File& outDir) {
     outDir.createDirectory();
     Report r;
@@ -12669,7 +13151,10 @@ int runSelfTest(const juce::File& outDir) {
     testPluginFolders(r, outDir);
     testPluginIdentity(r, outDir);
     testPluginLifecycle(r, outDir);
+    testPluginCopies(r, outDir);
     testGraphRebuildThread(r);
+    testGraphMutex(r);
+    testUndoHistoryReset(r);
     testAppVersion(r);
 
     r.section("Summary");

@@ -118,6 +118,20 @@ Internally:
    voice/master gain. Idle voices are skipped, so CPU scales with *active*
    polyphony, not N.
 
+5. **Hosted plugins inside a voice** *(landed 0.10.9)*. A plugin instance can be
+   in one graph only, so each voice plays its own **copy** of each plugin inside
+   the container (`PluginCopies`, `plugin_copies.h`): the audio engine loads
+   them on the message thread before each live rebuild and keeps them across
+   rebuilds; `PolyVoiceProcessor` hands the pool to voice *i*'s inner
+   `GraphProcessor` with slot *i*, which plays copy *i* through a non-owning
+   `PluginCopyProcessor`. The node's own instance is the **master** — never
+   played, its window the one the user edits, its state the one saved — and the
+   copies follow it: parameter changes forwarded live, whole state copied on
+   program / non-parameter changes, a preset pick, or its window closing. Offline
+   renders make their own copies the same way. See REFERENCE.md, *Plugins in
+   renders and Voice containers*. Before 0.10.9 the inner graphs hosted no
+   plugins, and a plugin inside a container was silent.
+
 ## Visual model: drill-in with breadcrumb
 
 - **Collapsed by default** on the main canvas: one node, MIDI-in left, audio-out

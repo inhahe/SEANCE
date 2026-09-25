@@ -203,7 +203,7 @@ void ControlBankComponent::removeSlider(int idx) {
     if (idx < (int)nd->pinsOut.size()) {
         const int pinId = nd->pinsOut[(size_t)idx].id;
         {
-            std::lock_guard<std::recursive_mutex> graphLk(graph.mutationLock);
+            std::lock_guard<GraphMutex> graphLk(graph.mutationLock);
             graph.links.erase(std::remove_if(graph.links.begin(), graph.links.end(),
                 [pinId](const Link& l) {
                     return l.startPin == pinId || l.endPin == pinId;

@@ -17,6 +17,8 @@
 #include "warp.h"            // WarpOp (granular element warp on audition frames)
 #include "content_store.h"   // content-addressed side-store for baked blobs
 #include "asset_library.h"   // project-level asset stores (waveforms, instruments, ...)
+#include "graph_mutex.h"     // NodeGraph::mutationLock's type
+#include <atomic>
 
 namespace SoundShop {
 
@@ -642,6 +644,12 @@ struct Node {
     // which the Failed badge's tooltip shows. Transient, like the state.
     std::string pluginLoadError;
 
+    // A plugin inside a Voice container plays one copy of itself per voice
+    // (see plugin_copies.h). When a copy couldn't be loaded, why - a sentence
+    // naming the plugin - and the voices without one are silent. The node's
+    // badge shows it as a failure. Transient; empty when every voice has one.
+    std::string pluginVoiceError;
+
     // Group - contains child node IDs
     std::vector<int> childNodeIds;  // IDs of nodes inside this group
     int parentGroupId = -1;         // -1 = top-level (not in any group)
@@ -1066,17 +1074,19 @@ public:
     // Undo/redo: replace the graph with a snapshot (ProjectFile::serializeForUndo
     // text). A snapshot carries no plugin instances and no plugin state, so each
     // plugin node's live plugin, state and load status are kept for the restored
-    // node with the same id when it still names the same plugin. Returns the ids
-    // of plugin nodes that came back without their plugin (undoing a plugin
-    // node's deletion, redoing its creation): the caller loads those again, with
-    // their state from retiredPluginStates.
+    // node with the same id when it still names the same plugin, in the same
+    // place (inside the same Voice container, or none). Returns the ids of plugin
+    // nodes that came back without their plugin (undoing a plugin node's
+    // deletion, redoing its creation): the caller loads those again, with their
+    // state from retiredPluginStates.
     std::vector<int> restoreSnapshot(const std::string& text);
 
     // The state each plugin had when its node went away during this session
     // (deleted, or undone), by node id, so that undoing that brings the plugin
-    // back as it was. Filled from GraphProcessor's retired plugins by the main
-    // window; taken when a restored node's plugin loads. Not saved; cleared when
-    // another project is opened.
+    // back as it was. Filled by the main window - from GraphProcessor's retired
+    // plugins, and from a Voice container's master copy as it goes with its node
+    // (PluginHost::LoadedPlugin::onRelease); taken when a restored node's plugin
+    // loads. Not saved; cleared when another project is opened.
     struct RetiredPluginState {
         juce::PluginDescription description;
         std::string state;   // base64, as a project's pluginState
@@ -1221,7 +1231,21 @@ public:
     // that nesting; recursive_mutex lets the same thread re-enter. The audio
     // thread never owns the lock, so its try_lock still fails (and goes silent)
     // whenever any GUI thread is mid-mutation.
-    mutable std::recursive_mutex mutationLock;
+    //
+    // Offline renders hold it too, one block at a time (they read the graph
+    // just as the audio callback does); GraphMutex is the recursive mutex plus
+    // what keeps a render from shutting the audio callback and the UI out -
+    // see graph_mutex.h.
+    mutable GraphMutex mutationLock;
+
+    // Bumped (holding mutationLock) whenever Node objects are destroyed or
+    // replaced: a node deleted, the whole graph cleared for a project load, a
+    // new project or an undo restore. A Node& taken before a bump may no longer
+    // refer to a node - so a render that holds its processors across blocks,
+    // letting go of the lock in between (capture from playback), checks this
+    // before each block and starts over if it moved.
+    std::atomic<uint64_t> nodeStorageVersion { 0 };
+    void nodesInvalidated() { nodeStorageVersion.fetch_add(1, std::memory_order_acq_rel); }
 
     float editorPanelHeight = 250.0f;
     int activeEditorNodeId = -1; // node ID of the currently focused editor

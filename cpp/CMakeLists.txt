@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.22)
-project(SEANCE VERSION 0.10.6 LANGUAGES C CXX)
+project(SEANCE VERSION 0.10.10 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -138,6 +138,9 @@ target_sources(SEANCE PRIVATE
     src/poly_voice_processor.h
     src/plugin_host.cpp
     src/plugin_host.h
+    src/plugin_copies.cpp
+    src/plugin_copies.h
+    src/graph_mutex.h
     src/plugin_settings.cpp
     src/plugin_settings.h
     src/project_file.cpp

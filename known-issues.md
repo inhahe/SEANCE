@@ -5,69 +5,77 @@ top. When something is fixed, delete the entry (git history is the archive).
 
 ---
 
-## Adding a node from the canvas menu or Plugin Settings records no undo step
+## BUG: Duplicate copies only a node's name, pins, parameters and clips
 
-**Found:** 2026-09-25, testing undo of hosted plugins in the running app.
+**Found:** 2026-09-25, auditing the ways a node is added (for their undo steps).
 
-The canvas's add-node menu (`NodeGraphComponent`, the `showMenuAsync` handler
-that creates the chosen node) commits an undo snapshot for only a few of its
-branches ("Add instrument", "Import video terrain", "Generate terrain"); every
-other node type - and every plugin, from the canvas's plugin submenus or from
-Plugin Settings' *Add to Graph* (both through `NodeGraph::addPluginNode`) - is
-added with no `commitSnapshot`. The node itself is fine, but the undo history
-doesn't know it arrived: the next undo returns to the snapshot from before it,
-taking the new node away along with whatever that undo was meant to reverse.
-Seen live: three plugins added via *Add to Graph*, one deleted, then Undo -
-all three were gone (the deletion's previous snapshot predates them).
+The node menu's *Duplicate* (`NodeGraphComponent::showNodeMenu`, `result == 2`)
+builds the copy by hand: name, type, pins (fresh ids), `params`, `clips`.
+Everything else is left at its default - `script`, so a duplicated FM Synth,
+wavetable, Script or effect node comes out as the default Terrain Synth / a
+pass-through; `pluginDescription`, so a duplicated plugin node is no plugin node
+at all (a stand-in synth or pass-through); `voiceContainerId`, so a node
+duplicated inside a Voice container lands at the top level; the envelope, pan,
+MPE settings, automation lanes, freeze state and the rest. (It does commit an
+undo step since 0.10.9.)
 
-**Proper fix:** commit once at the end of the canvas menu handler whenever it
-created nodes (`graph.nodes.size() > nodeCountBefore` - `commitSnapshot` de-dups
-against the branches that already commit), and after *Add to Graph* in the
-Plugin Settings dialog (button and right-click menu).
-
----
-
-## Plugin list shows "()" for a plugin with no maker
-
-**Found:** 2026-09-25. Cosmetic.
-
-The Plugin Settings list (and a blocked entry's label) prints
-`name  (maker)  [format]`; a plugin that doesn't name its maker - the self-test
-LV2 plugins, some LV2 plugins in general - shows an empty `()`. Leave the
-parentheses out when `manufacturer` is empty.
+**Proper fix:** copy the whole node the way undo snapshots do - serialize it
+(`ProjectFile`'s node writer) and read it back as a new node with fresh node and
+pin ids - and for a plugin node, load a new instance of its plugin with the
+original's current state (the async loader, with the state as
+`pendingPluginState`), rather than listing fields by hand.
 
 ---
 
-## Export, freeze, bounce and capture leave out hosted plugins
+## FEATURE GAP: automation lanes and MIDI Learn don't reach a plugin inside a Voice container
 
-**Found:** 2026-09-25, while making hosted plugins survive audio-graph rebuilds.
+**Found:** 2026-09-25, making plugins play inside Voice containers (0.10.9).
 
-Offline rendering builds its own `GraphProcessor` from the node graph: *Export
-Audio* and the scripting `render()` (`renderGraphOffline` in
-`audio_export.cpp`), *Freeze* (`MainContentComponent::freezeNodes`), *Bounce to
-Audio Track* (`bounceToAudioTrack`) and capturing from playback
-(`capture_from_playback.cpp`, on a background thread). A plugin instance can be
-in one JUCE graph only, and the live audio engine's graph holds it, so every
-offline render builds a hosted-plugin node without its plugin: silent, or an
-effect passing its input straight through. Until 0.10.6 an instrument plugin
-node rendered as SEANCE's built-in synth instead - and an offline graph could
-take a plugin that had just loaded and wasn't in the live graph yet, then
-destroy it when the render finished. Only the live graph takes plugins now
-(`GraphProcessor::setHostsPlugins`), which stops that, but the renders still
-lack the plugins. A plugin node inside a Voice container is silent for the
-same reason: each voice builds its own inner graph, and those host no plugins
-(before 0.10.6 the first voice's graph took the plugin and the other voices
-played the built-in synth).
+A plugin inside a Voice container plays as one copy per voice, following the
+node's own instance - the master (REFERENCE.md, *Plugins inside a voice*). Knob
+moves in the master's window reach every voice, but the two host-driven paths
+to a plugin's parameters only know the main graph:
 
-**Proper fix:** render through the live plugins. Either pause the audio
-callback and render through the live `GraphProcessor` itself (the same
-instances in the same state; reset them afterwards), or give the offline graph
-its own instance of each plugin carrying the live one's current state
-(`getStateInformation` into a fresh instance). The second keeps playback going
-during a render, but loads every plugin again, and some plugins (licensing,
-single-instance) can't be loaded twice. Capture from playback also reads the
-graph from a background thread without the graph lock; that wants fixing in the
-same change.
+- **Automation.** The UI timer's read pass (`MainContentComponent::timerCallback`)
+  finds a node's plugin with `GraphProcessor::getProcessorForNode`, which a
+  plugin inside a container isn't in; recording from the plugin's window relies
+  on `GraphProcessor::LatencyChangeListener`, attached only to the main graph's
+  processors. So such a plugin has no automation lanes, and lanes carried over
+  from elsewhere don't play (offline renders apply lanes to main-graph copies
+  only - `GraphProcessor::applyPluginAutomation`, skipped for voices).
+- **MIDI Learn.** CC mappings are applied through the main graph's node map
+  (`AutomationManager::processMidiCC`); the node menu disables *MIDI Map...* for
+  such a plugin, with the reason in the item.
+
+**Proper fix:** route both through the master - apply lane values and learned
+CCs to the master's parameters and forward them to the copies
+(`PluginCopies` already forwards the master's `audioProcessorParameterChanged`;
+`setValue` on the master doesn't notify, so forward explicitly or use
+`setValueNotifyingHost`), record from the master's parameter events, and let
+the offline renders' voice copies read the lanes per voice the same way.
+
+---
+
+## Render caches don't notice changes made inside a plugin's own window
+
+**Found:** 2026-09-25, while making offline renders play hosted plugins.
+
+`AudioCacheManager::computeNodeHash` folds a plugin node's *identity* (and any
+unapplied `pendingPluginState`) into the hash, not the plugin's current state -
+there's no cheap general way to see inside a plugin. So a render cache keyed by
+that hash stays "valid" after a knob is turned in the plugin's window: an
+auto-cached node downstream of the plugin, and the Output node's cached song
+that capture from playback reuses (`trySongCache`), can replay audio from
+before the change. Freezes are explicit, so they're unaffected. It mattered
+little while offline renders left plugins out entirely (0.10.6 and before);
+now they play them, so a stale cache is audible.
+
+**Proper fix:** hash a plugin's state - `getStateInformation` is too slow to call
+per hash, but `Node::pluginStateDirty` / the autosave's per-plugin state cache
+already track changes; a per-plugin state generation counter bumped on every
+parameter/state notification (the main graph's `LatencyChangeListener` hears
+parameter changes; `PluginCopies` hears a master's) and folded into the hash
+would do it.
 
 ---
 

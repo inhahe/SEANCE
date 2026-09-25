@@ -10,15 +10,41 @@ Catalog::Catalog()
     juce::addDefaultFormatsToManager(formatManager);
 }
 
+// True if `dir` holds at least one LV2 bundle: a subfolder with a manifest.ttl.
+static bool containsLv2Bundle(const juce::File& dir)
+{
+    for (const auto& entry : juce::RangedDirectoryIterator(dir, false, "*", juce::File::findDirectories))
+        if (entry.getFile().getChildFile("manifest.ttl").existsAsFile())
+            return true;
+
+    return false;
+}
+
 juce::FileSearchPath Catalog::getSearchPath(juce::AudioPluginFormat& format) const
 {
     // Same merge SEANCE does in PluginHost::scanForPlugins: the format's own
-    // default locations plus every folder in SoundShop2's list.
+    // default locations plus every folder in SoundShop2's list...
     auto path = format.getDefaultLocationsToSearch();
 
     for (auto& d : seance.scanDirs)
-        if (juce::File::isAbsolutePath(d))
-            path.addIfNotAlreadyThere(juce::File(d));
+    {
+        if (! juce::File::isAbsolutePath(d))
+            continue;
+
+        const juce::File dir(d);
+
+        // ...except that LV2 only gets the folders that actually contain an LV2
+        // bundle. lilv, JUCE's LV2 library, treats EVERY entry of a folder it's
+        // given as a bundle and prints three "failed to open file .../manifest.ttl"
+        // errors for each one that isn't - so handing it SoundShop2's VST3/VST2
+        // folders filled the console with noise. It can only ever find plugins
+        // in subfolders that have a manifest.ttl, so this finds exactly what the
+        // unfiltered search would have, quietly.
+        if (format.getName() == "LV2" && ! containsLv2Bundle(dir))
+            continue;
+
+        path.addIfNotAlreadyThere(dir);
+    }
 
     return path;
 }

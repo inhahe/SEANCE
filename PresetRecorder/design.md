@@ -75,10 +75,17 @@ ancestor of the tool's exe (the tool lives inside the SoundShop2 folder, where
 (double-click launches), and in the current directory; the newest file wins. The
 user can pick a file explicitly (setting `seanceConfig`).
 
-The search path per format is exactly SEANCE's `PluginHost::scanForPlugins`
-merge: SEANCE's folders + `format->getDefaultLocationsToSearch()`. The formats are
-SEANCE's: VST3 + LV2 (+ AU on macOS). VST2 is off in both (needs the
-discontinued VST2 SDK).
+The search path per format is SEANCE's `PluginHost::scanForPlugins` merge:
+SEANCE's folders + `format->getDefaultLocationsToSearch()` - with one filter:
+LV2 only gets the SEANCE folders that contain an LV2 bundle (a subfolder with a
+`manifest.ttl`). lilv, JUCE's LV2 library, treats *every* entry of a folder it is
+given as a bundle and prints three `failed to open file .../manifest.ttl` errors
+to stderr for each one that isn't; handed SEANCE's VST3 and VST2 folders, that was
+~100 lines of console noise at every enumeration (startup, each scan, each skip-
+list change). lilv can only find plugins in subfolders with a `manifest.ttl`, so
+the filter changes nothing but the noise. (SEANCE's own *Scan Now* does the
+unfiltered merge, but its stderr goes to `seance.log`.) The formats are SEANCE's:
+VST3 + LV2 (+ AU on macOS). VST2 is off in both (needs the discontinued VST2 SDK).
 
 ## Catalog and scanning
 

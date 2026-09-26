@@ -105,8 +105,9 @@ public:
     // setValueNotifyingHost: nothing is to hear of it (the automation recorder
     // would take it for the user's). False if node `nodeId` isn't a master
     // this pool follows. Any thread: the audio callback applies learned CCs -
-    // holding the graph lock, so the master can't go meanwhile.
-    bool setParameter(int nodeId, int index, float value);
+    // holding the graph lock, so the master can't go meanwhile. `changed`, if
+    // given, says whether the master's value was a different one.
+    bool setParameter(int nodeId, int index, float value, bool* changed = nullptr);
 
     // The masters' parameter events - knobs in their windows grabbed (kind 0),
     // let go (1) and moved (2, `value` normalised) - for the automation

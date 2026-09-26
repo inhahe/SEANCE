@@ -1,5 +1,6 @@
 #include "automation.h"
 #include "plugin_copies.h"
+#include <cmath>
 #include <cstdio>
 
 namespace SoundShop {
@@ -36,7 +37,8 @@ void AutomationManager::applyValues(const std::vector<AutomationValue>& values,
 void AutomationManager::processMidiCC(const juce::MidiBuffer& midi,
                                         juce::AudioProcessorGraph& graph,
                                         const std::unordered_map<int, juce::AudioProcessorGraph::NodeID>& nodeMap,
-                                        PluginCopies* voices) {
+                                        PluginCopies* voices,
+                                        std::vector<std::pair<int, int>>* changed) {
     std::lock_guard<std::mutex> lock(ccMutex);
 
     for (auto metadata : midi) {
@@ -56,8 +58,11 @@ void AutomationManager::processMidiCC(const juce::MidiBuffer& midi,
                 auto it = nodeMap.find(mapping.nodeId);
                 if (it == nodeMap.end()) {
                     // A plugin inside a Voice container: its master and every voice's copy.
-                    if (voices != nullptr)
-                        voices->setParameter(mapping.nodeId, mapping.paramIdx, normalized);
+                    bool moved = false;
+                    if (voices != nullptr
+                        && voices->setParameter(mapping.nodeId, mapping.paramIdx, normalized, &moved)
+                        && moved && changed != nullptr)
+                        changed->push_back({ mapping.nodeId, mapping.paramIdx });
                     continue;
                 }
 
@@ -67,7 +72,10 @@ void AutomationManager::processMidiCC(const juce::MidiBuffer& midi,
                 auto* proc = graphNode->getProcessor();
                 auto& params = proc->getParameters();
                 if (mapping.paramIdx >= 0 && mapping.paramIdx < (int)params.size()) {
-                    params[mapping.paramIdx]->setValue(normalized);
+                    auto* param = params[mapping.paramIdx];
+                    if (changed != nullptr && std::abs(param->getValue() - normalized) > 1.0e-5f)
+                        changed->push_back({ mapping.nodeId, mapping.paramIdx });
+                    param->setValue(normalized);
                 }
             }
         }

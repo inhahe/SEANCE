@@ -1629,7 +1629,8 @@ void MainContentComponent::menuItemSelected(int menuItemID, int) {
     if (menuItemID >= 60 && menuItemID < 60 + (int)recentProjects.size()) {
         auto path = recentProjects[menuItemID - 60];
         if (juce::File(path).existsAsFile())
-            openProjectFile(path);
+            settleUnsavedChanges("opening another project",
+                                 [this, path] { openProjectFile(path); });
         else {
             recentProjects.erase(recentProjects.begin() + (menuItemID - 60));
             saveRecentProjects();
@@ -3391,10 +3392,23 @@ void MainContentComponent::processPluginParamEvents() {
     // 1=gestureEnd 2=parameterChanged. Many plugins never send gestures and only
     // fire parameterChanged - in that case Touch arms on the first change and ends
     // via the idle timeout in timerCallback (keyed off lastChangeMs).
-    // Always drain BOTH queues (plugin gesture events + learned-CC touches) so
-    // neither grows unbounded, but only act on them while the transport rolls.
+    // Always drain BOTH queues (plugin gesture events + learned-CC changes) so
+    // neither grows unbounded; recording acts on them only while the
+    // transport rolls, but a learned CC's change is a plugin change whenever.
     auto events = audioEngine.drainPluginParamEvents();
-    auto ccTouchedEarly = audioEngine.drainCcRecTouched();
+    auto ccChanges = audioEngine.drainLearnedCcChanges();
+    // A learned MIDI control moved a plugin's setting: an unsaved change, one
+    // the autosave must take in, and one render caches made before don't have
+    // (notePluginStateChanged). It was set on the audio thread, which marks
+    // nothing - before 0.10.12 nothing did, so the autosave could miss it.
+    {
+        std::set<int> moved;
+        for (const auto& c : ccChanges)
+            moved.insert(c.nodeId);
+        for (int id : moved)
+            if (auto* n = graph.findNode(id))
+                notePluginStateChanged(*n);
+    }
     if (!transport.playing) return;
 
     const double nowMs = juce::Time::getMillisecondCounterHiRes();
@@ -3435,7 +3449,9 @@ void MainContentComponent::processPluginParamEvents() {
     // AudioEngine's dedicated capture queue instead of drainParamEvents. Treat each
     // touch like a gesture-less parameterChanged: arm Touch/Latch and let the timer
     // sample the (already CC-driven) live value + end Touch on the idle timeout.
-    for (auto& [nodeId, paramIdx] : ccTouchedEarly) {
+    for (const auto& c : ccChanges) {
+        if (!c.whilePlaying) continue;   // a move before playback began
+        const int nodeId = c.nodeId, paramIdx = c.paramIdx;
         auto* node = graph.findNode(nodeId);
         if (!node || !node->plugin) continue; // learned CC only reaches plugin params
         AutoArmMode m = resolveArmModeNode(graph.autoArmGlobal, *node);
@@ -3551,7 +3567,47 @@ void MainContentComponent::onRecord() {
     recordBtn.setButtonText("Recording...");
 }
 
+namespace {
+// The unsaved-changes question: "...Save before `doing`?" with Save / Don't
+// Save / Cancel, which showAlert / showAlertAsync report as 1 / 2 / 0.
+juce::MessageBoxOptions unsavedChangesQuestion(const juce::String& doing) {
+    return juce::MessageBoxOptions()
+        .withIconType(juce::MessageBoxIconType::QuestionIcon)
+        .withTitle("Unsaved Changes")
+        .withMessage("You have unsaved changes. Save before " + doing + "?")
+        .withButton("Save")
+        .withButton("Don't Save")
+        .withButton("Cancel");
+}
+} // namespace
+
+void MainContentComponent::settleUnsavedChanges(const juce::String& doing,
+                                                std::function<void()> then) {
+    // A plugin window still open may hold changes nothing else shows.
+    checkPluginWindows();
+    if (!projectDirty && !graph.dirty) {
+        then();
+        return;
+    }
+    juce::Component::SafePointer<MainContentComponent> safe(this);
+    showAlertAsync(unsavedChangesQuestion(doing), this, [safe, then](int result) {
+        if (safe == nullptr) return;
+        if (result == 2) {                   // Don't Save
+            then();
+            return;
+        }
+        if (result != 1) return;             // Cancel (or the box closed)
+        // Save first; go on once it's saved. Save As's file chooser, for a
+        // project never saved, is async - cancelling it goes nowhere.
+        safe->saveProject(then);
+    });
+}
+
 void MainContentComponent::newProject() {
+    settleUnsavedChanges("starting a new project", [this] { startNewProject(); });
+}
+
+void MainContentComponent::startNewProject() {
     finishTakeBeforeGraphSwap();
     editorPanels.clear();
     editorPanelHeight = 250;
@@ -3672,6 +3728,10 @@ void MainContentComponent::showMidiDeviceWizard() {
 }
 
 void MainContentComponent::openProject() {
+    settleUnsavedChanges("opening another project", [this] { chooseProjectToOpen(); });
+}
+
+void MainContentComponent::chooseProjectToOpen() {
     auto chooser = std::make_shared<juce::FileChooser>("Open Project", juce::File(), "*.ssp");
     chooser->launchAsync(juce::FileBrowserComponent::openMode, [this, chooser](const juce::FileChooser& fc) {
         auto file = fc.getResult();
@@ -4669,16 +4729,9 @@ bool MainContentComponent::tryQuit() {
     // the native yes/no/cancel helper doesn't take custom button labels, and
     // "Save / Don't Save / Cancel" is a lot clearer here than "Yes / No /
     // Cancel". Result codes still follow the AlertWindow convention
-    // (1 = Save, 2 = Don't Save, 0 = Cancel) - see showAlert().
-    int result = showAlert(
-        juce::MessageBoxOptions()
-            .withIconType(juce::MessageBoxIconType::QuestionIcon)
-            .withTitle("Unsaved Changes")
-            .withMessage("You have unsaved changes. Save before quitting?")
-            .withButton("Save")
-            .withButton("Don't Save")
-            .withButton("Cancel"),
-        this);
+    // (1 = Save, 2 = Don't Save, 0 = Cancel) - see showAlert(). The same
+    // question New and Open ask (settleUnsavedChanges).
+    int result = showAlert(unsavedChangesQuestion("quitting"), this);
     if (result == 2) {                   // Don't Save
         // User explicitly threw their edits away - autosave AND undo
         // history go with them. (A clean save+quit instead would keep

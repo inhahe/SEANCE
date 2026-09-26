@@ -139,6 +139,10 @@ capture from playback).
 
 ## Undo
 
+Replacing the project (New, Open, a recent project) or quitting first settles
+unsaved changes: Save / Don't Save / Cancel (`settleUnsavedChanges`; quitting's
+own synchronous `tryQuit`).
+
 A branching undo tree (`undo.*`) fed two ways: `commitSnapshot` (the whole graph
 serialized without plugin state — the default for anything structural) and
 `exec()` with a `LambdaCommand` (a small in-place inverse, for frequent
@@ -161,10 +165,13 @@ Render caches (`AudioCacheManager`): a node's cached audio stands while the hash
 of what made it does (`computeNodeHash` — its settings, clips, upstream nodes,
 a plugin's identity, lanes and `pluginStateGeneration`, a Voice container's inner
 patch). Every hash follows `updateDeterminism`, whose `onBeforeHashing` hook lets
-the main window check plugin windows still open first. A cache is stamped with
-the hash of the project it was made from: the playback capture with the hash
-as playback began (dropped if it changed by Stop), a render's with the hash as
-it started.
+the main window check plugin windows still open first. The song's own hash
+(`songHash`) adds what it plays at (tempo map, time signatures, tuning). The
+Output node's cached song - the last playback's recording, or capture from
+playback's render - is stamped with the song's hash as it was made (a playback
+edited during it gets none), and counts as the song only if it starts at the
+song's start and is one straight run of the transport for the render's length
+(`straightSamples`, which the audio engine counts as it records).
 
 ## Testing, versioning, release
 

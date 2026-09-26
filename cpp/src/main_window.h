@@ -84,8 +84,16 @@ public:
     void syncAutoButton();       // refresh the transport Auto button label + colour
     bool recPrevPlaying = false; // edge-detect play<->stop transitions in timer
 
-    // File operations
+    // File operations. newProject, openProject and the Recent Projects list
+    // replace the project only once its unsaved changes are settled
+    // (settleUnsavedChanges): until 0.10.12 only quitting asked.
     void newProject();
+    void startNewProject();   // replace the project with a new one, now
+    // If the project has unsaved changes, ask Save / Don't Save / Cancel -
+    // "...before `doing`?" - and `then` go on: once saved (Save As may ask
+    // where first), at once, or not at all. At once if there's nothing to
+    // save. Changes in a plugin window still open count (checkPluginWindows).
+    void settleUnsavedChanges(const juce::String& doing, std::function<void()> then);
     void showMidiDeviceWizard();
     // Open a documentation file (relative path within docs/ folder, e.g.
     // "layers.html") in the OS's default browser. Resolves the path
@@ -93,6 +101,7 @@ public:
     // copies the docs/ tree.
     void openHelpDoc(const juce::String& docRelativePath);
     void openProject();
+    void chooseProjectToOpen();   // the file chooser, then openProjectFile
     // onSaved fires after a successful save (sync if a current path exists,
     // async after the file chooser if not). Cancelled file chooser -> never
     // fires. Used by tryQuit() to defer the actual app exit until the save

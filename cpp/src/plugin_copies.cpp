@@ -271,7 +271,7 @@ void PluginCopies::syncFromMaster(int nodeId) {
         c->plugin->setStateInformation(state.getData(), (int) state.getSize());
 }
 
-bool PluginCopies::setParameter(int nodeId, int index, float value) {
+bool PluginCopies::setParameter(int nodeId, int index, float value, bool* changed) {
     std::shared_ptr<PluginHost::LoadedPlugin> owner;   // keeps the master alive meanwhile
     juce::AudioProcessor* master = nullptr;
     std::vector<std::shared_ptr<Copy>> targets;
@@ -289,6 +289,11 @@ bool PluginCopies::setParameter(int nodeId, int index, float value) {
         if (index >= 0 && index < params.size())
             params[index]->setValue(value);
     };
+    if (changed != nullptr) {
+        const auto& params = master->getParameters();
+        *changed = index >= 0 && index < params.size()
+                   && std::abs(params[index]->getValue() - value) > 1.0e-5f;
+    }
     set(*master);
     for (auto& c : targets)
         if (c && c->plugin) set(*c->plugin);

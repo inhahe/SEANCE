@@ -49,6 +49,7 @@
 #include "plugin_copies.h"          // PluginCopies - plugins in renders and Voice containers
 #include "audio_export.h"           // renderGraphOffline - an export's plugin copies
 #include "graph_mutex.h"            // GraphMutex - renders sharing the graph lock
+#include "audio_engine.h"           // AudioEngine - playback's recording (testPlaybackRecording)
 
 #include <juce_audio_formats/juce_audio_formats.h>
 #include <juce_graphics/juce_graphics.h>
@@ -13478,6 +13479,138 @@ void testRenderCacheHash(Report& r) {
 }
 
 // ===========================================================================
+// Playback's recording, as the song capture from playback renders
+// ===========================================================================
+//
+// Every playback is recorded, and Stop puts the recording in the Output node's
+// cache, which capture from playback reuses instead of rendering the song
+// (trySongCache) - but only if it is the song: stamped with the song's hash as
+// it was when playback began, one straight run from the song's start
+// (straightSamples), long enough. Until 0.10.12 a recording begun mid-song,
+// stopped early or looped passed for the song, and so did one made at another
+// tempo (the hash didn't see the tempo).
+
+namespace {
+// Stands in for an audio device, so a self-test can start the audio engine
+// (audioDeviceAboutToStart) and run its audio callback itself.
+class SelfTestAudioDevice : public juce::AudioIODevice {
+public:
+    SelfTestAudioDevice(double rateIn, int blockIn)
+        : juce::AudioIODevice("Self-test", "Self-test"), rate(rateIn), block(blockIn) {}
+    juce::StringArray getOutputChannelNames() override { return { "L", "R" }; }
+    juce::StringArray getInputChannelNames() override { return {}; }
+    juce::Array<double> getAvailableSampleRates() override { return { rate }; }
+    juce::Array<int> getAvailableBufferSizes() override { return { block }; }
+    int getDefaultBufferSize() override { return block; }
+    juce::String open(const juce::BigInteger&, const juce::BigInteger&, double, int) override { return {}; }
+    void close() override {}
+    bool isOpen() override { return true; }
+    void start(juce::AudioIODeviceCallback*) override {}
+    void stop() override {}
+    bool isPlaying() override { return true; }
+    juce::String getLastError() override { return {}; }
+    int getCurrentBufferSizeSamples() override { return block; }
+    double getCurrentSampleRate() override { return rate; }
+    int getCurrentBitDepth() override { return 32; }
+    juce::BigInteger getActiveOutputChannels() const override {
+        juce::BigInteger channels;
+        channels.setRange(0, 2, true);
+        return channels;
+    }
+    juce::BigInteger getActiveInputChannels() const override { return {}; }
+    int getOutputLatencyInSamples() override { return 0; }
+    int getInputLatencyInSamples() override { return 0; }
+
+private:
+    double rate;
+    int block;
+};
+} // namespace
+
+void testPlaybackRecording(Report& r) {
+    r.section("Playback's recording: taken for the song only when it is the song");
+
+    NodeGraph g;
+    const int outId = g.addNode("Master Out", NodeType::Output,
+                                { Pin{0, "In", PinKind::Audio, true} }, {}).id;
+    Transport t;
+    t.bpm = 120.0;
+    t.tempoMap.setGlobalBpm(120.0);
+    constexpr double rate = 48000.0;   // one beat at 120 BPM: 24000 samples
+    constexpr int block = 512;
+    AudioEngine engine;   // no device of its own: init() isn't called
+    engine.setGraph(&g, &t);
+    SelfTestAudioDevice device(rate, block);
+    engine.audioDeviceAboutToStart(&device);
+    std::vector<float> left((size_t) block), right((size_t) block);
+    float* outs[2] = { left.data(), right.data() };
+    const juce::AudioIODeviceCallbackContext context;
+    // Play `blocks` blocks (the graph isn't built here - no message loop - so
+    // they're silent: it's the recording's bookkeeping that's tested), with
+    // `during` done half-way; then Stop, which files the recording.
+    auto playFor = [&](int blocks, const std::function<void()>& during = {}) {
+        engine.play();
+        for (int i = 0; i < blocks; ++i) {
+            if (during && i == blocks / 2) during();
+            engine.audioDeviceIOCallbackWithContext(nullptr, 0, outs, 2, block, context);
+        }
+        engine.stop();
+        return g.findNode(outId)->cache;
+    };
+
+    const auto straight = playFor(20);
+    r.check(straight.valid && straight.startSample == 0 && straight.numSamples == 20 * block
+                && straight.straightSamples == straight.numSamples,
+            "recording: played from the start, it's one straight run of the song, all of it");
+    r.check(straight.sampleRate == rate,
+            "recording: ...at the device's rate, which its samples are at");
+    r.check(straight.inputHash != 0
+                && straight.inputHash == engine.getGraphProcessor().getCacheManager().songHash(g, t),
+            "recording: ...stamped with the song's hash");
+
+    t.loopEnabled = true;
+    t.loopStartBeat = 0.0;
+    t.loopEndBeat = 1.0;
+    const auto looped = playFor(80);   // 40960 samples: past the loop's 24000
+    r.checkVal(looped.straightSamples >= 24000 && looped.straightSamples < looped.numSamples,
+               "recording: looped back, it's the song only up to the loop's end (samples)",
+               (double) looped.straightSamples);
+
+    t.loopStartBeat = 2.0;   // playback starts at the loop's start: beat 2
+    t.loopEndBeat = 64.0;
+    engine.rewindToStart();
+    const auto midSong = playFor(10);
+    r.check(midSong.startSample == 48000,
+            "recording: begun at beat 2, it says so (it used to be filed a block late) - the "
+            "dialog won't take it for the song from its start");
+    t.loopEnabled = false;
+
+    const auto edited = playFor(10, [&] { t.tempoMap.setGlobalBpm(90.0); });
+    r.check(edited.valid && edited.inputHash == 0,
+            "recording: one the song was edited during (the tempo, here) isn't stamped as the "
+            "song - it's part one, part the other");
+    t.tempoMap.setGlobalBpm(120.0);
+
+    // The song's hash sees what the song plays at, which no node's does.
+    auto& mgr = engine.getGraphProcessor().getCacheManager();
+    const uint64_t base = mgr.songHash(g, t);
+    auto differs = [&](const std::function<void()>& change, const std::function<void()>& undo) {
+        change();
+        const bool d = mgr.songHash(g, t) != base;
+        undo();
+        return d && mgr.songHash(g, t) == base;
+    };
+    r.check(base != 0
+                && differs([&] { t.tempoMap.setGlobalBpm(100.0); }, [&] { t.tempoMap.setGlobalBpm(120.0); })
+                && differs([&] { t.timeSigMap.setGlobal(3, 4); }, [&] { t.timeSigMap.setGlobal(4, 4); })
+                && differs([&] { t.tuningSystem = TuningSystem::JustIntonation; },
+                           [&] { t.tuningSystem = TuningSystem::Equal12; })
+                && differs([&] { t.concertPitch = 432.0f; }, [&] { t.concertPitch = 440.0f; }),
+            "song hash: another tempo, time signature, tuning or concert pitch is another song (a "
+            "recording at the old tempo used to pass)");
+}
+
+// ===========================================================================
 // Plugins: duplicated, driven inside a Voice container, saved as they are
 // ===========================================================================
 //
@@ -13601,10 +13734,20 @@ void testPluginHostControl(Report& r) {
             live.getAutomation().addCCMapping({ 1, 20, pid, 0, 0.0f, 1.0f });
             juce::MidiBuffer cc;
             cc.addEvent(juce::MidiMessage::controllerEvent(1, 20, 127), 0);
-            live.getAutomation().processMidiCC(cc, *live.getGraph(), live.getNodeMap(), voices.get());
+            std::vector<std::pair<int, int>> changed;
+            live.getAutomation().processMidiCC(cc, *live.getGraph(), live.getNodeMap(), voices.get(),
+                                               &changed);
             r.check(allAre(1.0f),
                     "voices: a learned MIDI CC moves the plugin in every voice (MIDI Map wasn't "
                     "offered for it)");
+            r.check(changed.size() == 1 && changed[0].first == pid && changed[0].second == 0,
+                    "voices: ...and is reported as a change to the plugin (the autosave used to "
+                    "miss what a learned CC did)");
+            changed.clear();
+            live.getAutomation().processMidiCC(cc, *live.getGraph(), live.getNodeMap(), voices.get(),
+                                               &changed);
+            r.check(changed.empty(),
+                    "voices: ...but not one that leaves the parameter where it was");
         }
 
         // A knob in the master's window, grabbed, moved and let go.
@@ -13634,6 +13777,27 @@ void testPluginHostControl(Report& r) {
             followed = followed && c && closeTo(gainOf(*c->plugin)->getValue(), 0.1, 1e-4);
         r.check(followed, "voices: in an offline render its automation lanes drive every voice's "
                           "copy (voices went without them)");
+    }
+
+    // ---- A learned CC on a plugin in the main graph: reported when it moves it --
+    {
+        NodeGraph g;
+        GraphProcessor live;
+        live.setHostsPlugins(true);
+        live.prepare(g, 48000.0, 256);
+        const int id = g.addPluginNode(host, info, {0.0f, 0.0f}).id;
+        live.rebuildGraph(g, transport);
+        auto& am = live.getAutomation();
+        am.addCCMapping({ 1, 21, id, 0, 0.0f, 1.0f });
+        juce::MidiBuffer cc;
+        cc.addEvent(juce::MidiMessage::controllerEvent(1, 21, 100), 0);
+        std::vector<std::pair<int, int>> changed;
+        am.processMidiCC(cc, *live.getGraph(), live.getNodeMap(), nullptr, &changed);
+        r.check(changed.size() == 1 && changed[0].first == id && changed[0].second == 0,
+                "learned CC: a CC that moves a plugin's parameter is reported as a change to it");
+        changed.clear();
+        am.processMidiCC(cc, *live.getGraph(), live.getNodeMap(), nullptr, &changed);
+        r.check(changed.empty(), "learned CC: ...and the same value again isn't");
     }
 
     // ---- An explicit save: each plugin's settings as they are -----------------
@@ -13712,6 +13876,7 @@ int runSelfTest(const juce::File& outDir) {
     testDuplicateNode(r);
     testVoiceContainerContents(r);
     testRenderCacheHash(r);
+    testPlaybackRecording(r);
     testPluginHostControl(r);
     testAppVersion(r);
 

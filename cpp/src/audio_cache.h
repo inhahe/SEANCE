@@ -32,6 +32,14 @@ public:
     // them in Node::pluginStateGeneration, which the hash includes).
     std::function<void()> onBeforeHashing;
 
+    // The hash of the whole song as it sounds: the Output node's (everything
+    // that feeds it), with what the song plays at - its tempo and time
+    // signature changes, tuning, concert pitch, the effect-group crossfade.
+    // What the Output node's cached song is stamped with (playback's
+    // recording, capture from playback's render). 0 if it can't be cached
+    // (no Output node, a live input upstream). Message thread.
+    uint64_t songHash(NodeGraph& graph, const Transport& transport);
+
     // Check if cache is valid for a node; if hash changed, invalidate
     bool isCacheValid(Node& node, const NodeGraph& graph);
 
@@ -54,6 +62,11 @@ private:
     static uint64_t hashFloat(float f) {
         uint32_t bits;
         std::memcpy(&bits, &f, 4);
+        return bits;
+    }
+    static uint64_t hashDouble(double d) {
+        uint64_t bits;
+        std::memcpy(&bits, &d, 8);
         return bits;
     }
     static uint64_t hashString(const std::string& s) {

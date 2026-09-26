@@ -218,6 +218,13 @@ private:
     // The Output node's render hash as the output capture began (play): stop
     // stamps the capture with it only if the project is unchanged by then.
     uint64_t captureStartHash = 0;
+    // The straight run the capture is on (captureStraightSamples): where the
+    // next block has to start to carry it on, and whether it still does.
+    int64_t captureRunNext = 0;
+    bool captureStraight = false;
+    // What processMidiCC reports it changed, per callback (audio thread; kept
+    // so it doesn't allocate each time).
+    std::vector<std::pair<int, int>> ccChangedScratch;
     RecordingManager recordingManager;
     MultitrackRecorder multitrackRecorder;
     NodeGraph* graph = nullptr;
@@ -279,19 +286,26 @@ public:
         std::atomic<int> lastChannel{-1};
     } midiLearn;
 
-    // MIDI-Learn CC recording capture. When a learned CC arrives DURING PLAYBACK,
-    // the audio thread stashes its target (nodeId, paramIdx) here; the UI timer
-    // drains it (drainCcRecTouched) to arm the automation recorder, exactly as if
-    // the user had dragged that knob. A learned CC drives its target plugin param
-    // via AudioProcessorParameter::setValue on the audio thread, which does not
-    // notify listeners - so the plugin knob-drag listener never sees it, hence
-    // this dedicated capture path. Bounded so a stalled UI can't grow it unbounded.
-    std::mutex ccRecMutex;
-    std::vector<std::pair<int,int>> ccRecTouched;
-    std::vector<std::pair<int,int>> drainCcRecTouched() {
-        std::lock_guard<std::mutex> lk(ccRecMutex);
-        std::vector<std::pair<int,int>> out;
-        out.swap(ccRecTouched);
+    // The plugin parameters learned MIDI CCs have moved, for the UI timer: a
+    // learned CC drives its target plugin param via
+    // AudioProcessorParameter::setValue on the audio thread, which notifies no
+    // listener - so the plugin knob-drag listener never sees it, hence this
+    // dedicated path. The timer marks the plugin changed (an unsaved change the
+    // autosave must take in, whenever it happens) and, for a move made
+    // `whilePlaying`, arms the automation recorder exactly as if the user had
+    // dragged that knob. Only a CC that gave the parameter another value counts.
+    // Bounded so a stalled UI can't grow it unbounded.
+    struct LearnedCcChange {
+        int nodeId;
+        int paramIdx;
+        bool whilePlaying;
+    };
+    std::mutex ccChangeMutex;
+    std::vector<LearnedCcChange> learnedCcChanges;
+    std::vector<LearnedCcChange> drainLearnedCcChanges() {
+        std::lock_guard<std::mutex> lk(ccChangeMutex);
+        std::vector<LearnedCcChange> out;
+        out.swap(learnedCcChanges);
         return out;
     }
 
@@ -447,8 +461,13 @@ public:
     // the UI thread reads them only after capture is stopped. No lock needed.
     std::atomic<bool> outputCaptureEnabled{false};
     std::vector<float> captureL, captureR;
-    double captureSampleRate = 44100.0;
+    double captureSampleRate = 44100.0;   // the device's: what the samples are at
     int64_t captureStartSample = 0; // transport position when capture started
+    // How many of the samples, from the start, followed one straight run of
+    // the transport (its position carrying on block after block - no loop,
+    // seek, restart or held song end). Only that much of the recording is the
+    // song as a render of it would play it (Node::AudioCache::straightSamples).
+    int64_t captureStraightSamples = 0;
 
     void startOutputCapture();
     void stopOutputCapture();

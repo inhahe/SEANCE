@@ -273,7 +273,19 @@ unsaved (and the render caches made before it stale — see
 [Node freeze and caching](#node-freeze-and-caching)). A preset picked from
 SEANCE's *Presets…* menu counts at once. **Before 0.10.11** nothing a plugin's
 window changed marked the project unsaved: quitting with no other edits didn't
-ask, and the changes were lost.
+ask, and the changes were lost. A plugin setting a learned MIDI control moves
+counts too (see [MIDI Learn](#midi-learn-cc-mapping)).
+
+**New and Open ask first.** *File → New Project* (Ctrl+N), *File → Open
+Project…* (Ctrl+O) and a project picked from *Recent Projects* replace the
+project only after asking about unsaved changes, as quitting does: *"You have
+unsaved changes. Save before starting a new project?"* (or *opening another
+project*) with **Save** — which saves (asking where, for a project never
+saved) and then goes on; cancelling that file chooser goes nowhere — **Don't
+Save** and **Cancel** (`MainContentComponent::settleUnsavedChanges`). Open asks
+before its file chooser appears. **Before 0.10.12** only quitting asked: New,
+Open and the recent list replaced the project at once, and New also discarded
+the autosave and the saved undo history.
 
 ### Graph mutation threading
 
@@ -323,15 +335,44 @@ of its inner patch, and a learned MIDI CC inside it makes it non-deterministic,
 as one outside does. The cache this matters most for is the Output node's
 recording of the last playback, which capture from playback reuses instead of
 rendering again: **before 0.10.11** a change in a plugin's window, or anywhere
-inside a Voice container, left that recording passing for current. That
-recording is stamped with the project's hash **as the playback began**
-(`AudioEngine::play`) and kept only if the hash is the same at Stop — an edit
-during the playback leaves it part one project, part another — and the
-dialog's own render is stamped with the hash as it started (its plugins are
-copies taken then), not as it finished. `testRenderCacheHash` covers the hash:
-a plugin's change count, lanes and muting each change the song's hash, a
-built-in's doesn't depend on the count, and a change inside a Voice container
-does - as a learned CC inside it makes the song uncacheable.
+inside a Voice container, left that recording passing for current.
+
+**When capture from playback takes a recording for the song.** The dialog
+renders the song from its start to 4 beats past its last note; a cached song
+(`trySongCache`) stands in for that render only if it *is* that render:
+
+- **The same song.** It's stamped with the song's hash
+  (`AudioCacheManager::songHash`: the Output node's hash — everything feeding
+  it — plus what the song plays at, which no node's hash sees: its tempo and
+  time-signature changes, tuning, concert pitch and the effect-group
+  crossfade), and the song's hash now must match. Playback's recording is
+  stamped with the hash as the playback **began** (`AudioEngine::play`), and
+  only if it's the same at Stop — an edit during the playback leaves it part
+  one song, part another; the dialog's own render with the hash as it
+  **started** (its plugins are copies taken then).
+- **The song from its start, straight through, long enough.** The audio engine
+  counts how much of a recording, from its start, is one straight run of the
+  transport — each block carrying on from the last, no loop back, restart or
+  playhead held at the song's end while its tail rings out
+  (`Node::AudioCache::straightSamples`). The recording has to begin at the
+  song's start and run straight for the render's whole length; a render of the
+  dialog's own is straight by definition. Otherwise the dialog renders.
+
+**Before 0.10.12** a recording begun mid-song, stopped early, looped, or made at
+another tempo passed for the song: the dialog showed a few seconds of music, or
+bar 10 as bar 1, or the old tempo. The recording also said it began a block
+later than it did, and gave the project's sample rate for samples at the
+device's. (The **Capture** button still bounces whatever the last playback
+recorded — that's "what you just heard".)
+
+`testRenderCacheHash` covers the node hash: a plugin's change count, lanes and
+muting each change the song's hash, a built-in's doesn't depend on the count,
+and a change inside a Voice container does - as a learned CC inside it makes
+the song uncacheable. `testPlaybackRecording` drives the audio engine through a
+stand-in device: a straight recording from the start (at the device's rate,
+stamped with the song's hash), one that looped back, one begun at beat 2, one
+the tempo changed during, and the song hash's tempo, time signature, tuning and
+concert pitch.
 
 **Persistence.** Manual freezes survive save/reload. On save, each frozen node's PCM is written to a sibling `soundshop_cache/node_<id>.cache` file (node-id-keyed, so freezes never collide), and the cache **metadata** (enabled/valid/useDisk/hash/sampleRate/numSamples, plus the auto-cache preference) is serialized into the project file (`project_file.cpp`, gated on `includeBlobs` so undo snapshots omit the heavy payload but keep the preference). On load, `MainContentComponent::rehydrateNodeCaches` points the cache manager at that folder and re-attaches each freeze to its file **lazily** — the audio thread pages the samples in on first playback. If a cache file is missing (project copied without its `soundshop_cache` folder), the freeze is dropped so the node renders live rather than playing silence.
 
@@ -571,6 +612,8 @@ Every MIDI Timeline node has a MIDI In pin on its left side. Wire an input node'
 Right-click any knob/slider → **MIDI Learn** → move the controller's knob → mapping captured. Stored per-project in `project_file.cpp` so mappings persist across save/load.
 
 For a hosted plugin, right-click its node → **MIDI Map…** lists the plugin's parameters; right-click one → *Learn*, then move a control. A plugin inside a Voice container maps its master's parameters, and a mapped control moves the parameter in every voice at once (`AutomationManager::processMidiCC` → `PluginCopies::setParameter`). **Before 0.10.11** *MIDI Map…* wasn't offered for a plugin inside a container.
+
+**A learned control's move is a change to the plugin.** The CC is applied on the audio thread, which marks nothing, so `processMidiCC` reports each parameter it gave a different value and the audio engine passes them to the UI timer (`AudioEngine::drainLearnedCcChanges`): the project has unsaved changes, the autosave asks the plugin for its settings again, and render caches made before don't hold (`notePluginStateChanged`). A CC that leaves the parameter where it was doesn't count. **Before 0.10.12** nothing noticed: the autosave kept its last look at the plugin, so crash recovery brought it back without the moves, and quitting didn't ask.
 
 **Filtering rule**: a CC that has been learned to a control is **removed from the cable stream** so it only affects the mapped control. Notes, pitch bend, aftertouch, and unmapped CCs pass through cables normally. The MIDI Modulator's outgoing CCs are *not* subject to this filter — see the [MIDI Modulator](#midi-modulator) section.
 
@@ -4711,7 +4754,9 @@ what was read — so nothing is lost; reopen the project once the plugin is back
 *Save As*, taking a shared history — asks every plugin for them afresh
 (`ProjectFile::pluginStateNow`); the background autosave asks only the plugins
 it knows have changed (`Node::pluginStateDirty`, which only the autosave
-clears) and otherwise keeps its last answer. **Before 0.10.11** an explicit save
+clears: set by host automation, a preset from SEANCE's menu, a learned MIDI
+control's move, and the plugin's window closing with its settings changed) and
+otherwise keeps its last answer. **Before 0.10.11** an explicit save
 used the autosave's last answer too, so a change made in a plugin's window that
 nothing had noticed yet — the window still open — was saved as it had been
 before.

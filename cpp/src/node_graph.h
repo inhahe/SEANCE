@@ -835,9 +835,17 @@ struct Node {
         double sampleRate = 0;
         int64_t startSample = 0;
         int64_t numSamples = 0;
+        // How much of it, from its start, is one straight run of the song - the
+        // part capture from playback may take for a render of it
+        // (trySongCache). All of a render; of a recording of playback, up to
+        // its first loop, seek, restart or held song end.
+        int64_t straightSamples = 0;
 
         void invalidate() { valid = false; }
-        void clear() { left.clear(); right.clear(); valid = false; numSamples = 0; inputHash = 0; }
+        void clear() {
+            left.clear(); right.clear(); valid = false;
+            numSamples = 0; straightSamples = 0; inputHash = 0;
+        }
 
         bool hasCachedAudio() const {
             return valid && (numSamples > 0 || (!diskPath.empty() && useDisk));

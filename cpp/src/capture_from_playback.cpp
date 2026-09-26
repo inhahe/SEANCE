@@ -2246,28 +2246,32 @@ static Node* findOutputNode(NodeGraph& graph) {
     return nullptr;
 }
 
+// The song's hash now (AudioCacheManager::songHash; 0: it can't be cached).
+static uint64_t songHash(NodeGraph& graph, const Transport& transport) {
+    auto* eng = AudioEngine::getInstance();
+    return eng != nullptr ? eng->getGraphProcessor().getCacheManager().songHash(graph, transport)
+                          : 0;
+}
+
 // Try to satisfy the song-render request from the Output node's existing
-// cache. If the cache is present and the project's hash matches what the
-// cache was produced from, build a mono PCM buffer from cache.left/right
-// and return it. Returns nullptr on any miss (no cache, hash mismatch,
-// empty samples, sample-rate mismatch with the engine's device rate).
+// cache - the last playback's recording (AudioEngine::stop), or this dialog's
+// last render (writeSongCache). Only if it *is* the song this dialog would
+// render: the song's hash is what the cache was stamped with, and it's one
+// straight run from the song's start (no loop, seek or restart in it), at
+// least `neededSamples` long - the render's length. Then its first
+// `neededSamples`, mono. Returns nullptr on any miss.
 static std::shared_ptr<std::vector<float>>
-trySongCache(NodeGraph& graph, double expectedSampleRate, double& sampleRateOut) {
+trySongCache(NodeGraph& graph, const Transport& transport, double expectedSampleRate,
+             int64_t neededSamples, double& sampleRateOut) {
     Node* out = findOutputNode(graph);
-    if (!out) return nullptr;
+    if (!out || neededSamples <= 0) return nullptr;
     auto& c = out->cache;
     if (!c.valid || c.numSamples <= 0 || c.left.empty()) return nullptr;
 
-    auto* eng = AudioEngine::getInstance();
-    if (!eng) return nullptr;
-    auto& mgr = eng->getGraphProcessor().getCacheManager();
-
-    // Make sure deterministic flags reflect current graph state, then
-    // recompute the project hash. A 0 hash means the project isn't
-    // cacheable (live MIDI CC bindings somewhere upstream); in that
-    // case we never trust the cache - it would be stale by definition.
-    mgr.updateDeterminism(graph);
-    const uint64_t h = mgr.computeNodeHash(*out, graph);
+    // A 0 hash means the song isn't cacheable (live MIDI CC bindings
+    // somewhere upstream); in that case we never trust the cache - it would be
+    // stale by definition.
+    const uint64_t h = songHash(graph, transport);
     if (h == 0 || h != c.inputHash) return nullptr;
 
     // Sample-rate mismatch (e.g. user swapped audio device between
@@ -2276,26 +2280,22 @@ trySongCache(NodeGraph& graph, double expectedSampleRate, double& sampleRateOut)
     // complexity for a corner case - just re-render.
     if (std::abs(c.sampleRate - expectedSampleRate) > 0.5) return nullptr;
 
+    // The song from its start, all of what the render would have: before
+    // 0.10.12 a recording of playback begun mid-song, stopped early, or
+    // looped was taken for the song all the same.
+    if (c.startSample != 0 || std::min(c.straightSamples, c.numSamples) < neededSamples)
+        return nullptr;
+
     // Build mono PCM by averaging the cached stereo channels.
-    auto pcm = std::make_shared<std::vector<float>>((size_t)c.numSamples, 0.0f);
-    const bool hasR = (int64_t)c.right.size() >= c.numSamples;
-    for (int64_t i = 0; i < c.numSamples; ++i) {
+    auto pcm = std::make_shared<std::vector<float>>((size_t) neededSamples, 0.0f);
+    const bool hasR = (int64_t) c.right.size() >= neededSamples;
+    for (int64_t i = 0; i < neededSamples; ++i) {
         const float l = c.left[(size_t)i];
         const float r = hasR ? c.right[(size_t)i] : l;
         (*pcm)[(size_t)i] = 0.5f * (l + r);
     }
     sampleRateOut = c.sampleRate;
     return pcm;
-}
-
-// The Output node's render hash now (0: the project can't be cached).
-static uint64_t songHash(NodeGraph& graph) {
-    Node* out = findOutputNode(graph);
-    auto* eng = AudioEngine::getInstance();
-    if (!out || !eng) return 0;
-    auto& mgr = eng->getGraphProcessor().getCacheManager();
-    mgr.updateDeterminism(graph);
-    return mgr.computeNodeHash(*out, graph);
 }
 
 // Stash the freshly-rendered song PCM into the Output node's cache so a
@@ -2318,6 +2318,7 @@ static void writeSongCache(NodeGraph& graph,
     c.right = *pcm;
     c.sampleRate = sampleRate;
     c.numSamples = (int64_t)pcm->size();
+    c.straightSamples = c.numSamples;   // a render is one straight run
     c.startSample = 0;
     c.useDisk = false;
     c.diskPath.clear();
@@ -2918,7 +2919,9 @@ CaptureFromSongDialog::CaptureFromSongDialog(NodeGraph& g, Transport& t,
     // inline here - the JUCE component isn't fully laid out yet at
     // constructor time.
     double cachedSr = 0.0;
-    if (auto cached = trySongCache(graph, targetSampleRate, cachedSr)) {
+    const int64_t songSamples =   // as RenderJob::run renders it
+        (int64_t) (transport.tempoMap.beatsToSeconds(maxBeat) * targetSampleRate);
+    if (auto cached = trySongCache(graph, transport, targetSampleRate, songSamples, cachedSr)) {
         songPcm = std::move(cached);
         songSampleRate = cachedSr;
         // No renderJob - timerCallback's "render done?" branch will see
@@ -3112,10 +3115,10 @@ void CaptureFromSongDialog::startRender() {
         copies = eng->makeRenderCopies(songSampleRate, RenderJob::kBlockSize);
         juce::MouseCursor::hideWaitCursor();
     }
-    // What the render plays: the project as it is now, its plugins' copies
-    // just taken. Its result is stamped with this, not with the project as it
-    // is when it finishes (the project stays open to edits meanwhile).
-    renderStartHash = songHash(graph);
+    // What the render plays: the song as it is now, its plugins' copies just
+    // taken. Its result is stamped with this, not with the song as it is when
+    // it finishes (the project stays open to edits meanwhile).
+    renderStartHash = songHash(graph, transport);
     renderJob = std::make_unique<RenderJob>(graph, transport, songSampleRate, renderMaxBeat,
                                             std::move(copies));
     renderJob->startThread(juce::Thread::Priority::normal);

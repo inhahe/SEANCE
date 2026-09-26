@@ -34,6 +34,7 @@ AudioEngine::AudioEngine() {
     // GraphProcessor::setHostsPlugins); the plugins inside its Voice
     // containers play copies, one per voice...
     graphProcessor.setHostsPlugins(true);
+    ccChangedScratch.reserve(256);
     voiceCopies = std::make_shared<PluginCopies>(PluginCopies::Use::voices);
     graphProcessor.setPluginCopies(voiceCopies);
     // ...and it is rebuilt on the message thread (see onRebuildDue).
@@ -604,9 +605,11 @@ void AudioEngine::audioDeviceIOCallbackWithContext(
             // Apply CC mappings via the existing buffer-based helper.
             juce::MidiBuffer ccBuf;
             for (auto& [id, msg] : events) ccBuf.addEvent(msg, 0);
+            ccChangedScratch.clear();
             graphProcessor.getAutomation().processMidiCC(
                 ccBuf, *graphProcessor.getGraph(), graphProcessor.getNodeMap(),
-                voiceCopies.get());   // and plugins inside Voice containers
+                voiceCopies.get(),   // and plugins inside Voice containers
+                &ccChangedScratch);
 
             auto ccMappings = graphProcessor.getAutomation().getCCMappings();
             auto isCCMapped = [&](int ch, int cc) {
@@ -615,19 +618,15 @@ void AudioEngine::audioDeviceIOCallbackWithContext(
                 return false;
             };
 
-            // Capture learned-CC targets for automation recording. Only while
-            // playing (recording is a playback-time activity); the UI timer drains
-            // and decides whether Auto is armed. See AudioEngine::drainCcRecTouched.
-            if (playing.load()) {
-                std::lock_guard<std::mutex> lk(ccRecMutex);
-                for (auto& [id, msg] : events) {
-                    if (!msg.isController()) continue;
-                    int ch = msg.getChannel(), cc = msg.getControllerNumber();
-                    for (auto& m : ccMappings)
-                        if (m.midiChannel == ch && m.ccNumber == cc
-                            && ccRecTouched.size() < 4096)
-                            ccRecTouched.push_back({ m.nodeId, m.paramIdx });
-                }
+            // The plugin settings learned CCs changed, for the UI timer: the
+            // plugin's changed (always), and a move during playback may be
+            // recorded. See AudioEngine::drainLearnedCcChanges.
+            if (!ccChangedScratch.empty()) {
+                const bool rolling = playing.load();
+                std::lock_guard<std::mutex> lk(ccChangeMutex);
+                for (const auto& [nodeId, paramIdx] : ccChangedScratch)
+                    if (learnedCcChanges.size() < 4096)
+                        learnedCcChanges.push_back({ nodeId, paramIdx, rolling });
             }
 
             for (auto& [id, msg] : events) {
@@ -718,6 +717,10 @@ void AudioEngine::audioDeviceIOCallbackWithContext(
         }
     };
 
+    // How far the transport moves in this block while playing, at the project
+    // rate - what a straight run of it advances (the output capture below).
+    int64_t blockAdvance = numSamples;
+
     if (!needsResample) {
         // Same rate - no resampling needed. Clear the audition-monitor bus
         // before the graph runs (synth nodes accumulate into it during
@@ -746,6 +749,7 @@ void AudioEngine::audioDeviceIOCallbackWithContext(
         double ratio = graphRate / sampleRate;
         int projectSamples = (int)std::ceil(numSamples * ratio) + 2;
         projectSamples = std::min(projectSamples, (int)projectBufL.size());
+        blockAdvance = projectSamples;
 
         // Clear project buffers
         std::memset(projectBufL.data(), 0, projectSamples * sizeof(float));
@@ -1050,12 +1054,29 @@ void AudioEngine::audioDeviceIOCallbackWithContext(
     {
         bool isPlaying = playing.load();
         if (isPlaying) {
+            // Where this block was played from: what the graph read.
+            // `positionSamples` has moved on since, for the next block.
+            const int64_t blockStart = transport->positionSamples;
             if (captureL.empty()) {
-                captureSampleRate = getSampleRate();
-                captureStartSample = positionSamples;
+                // The device's rate - what these samples are at (the project's
+                // is the graph's, which the output is resampled from).
+                captureSampleRate = sampleRate;
+                captureStartSample = blockStart;
+                captureStraightSamples = 0;
+                captureRunNext = blockStart;
+                captureStraight = true;
                 size_t reserve = (size_t)(captureSampleRate * 60.0);
                 captureL.reserve(reserve);
                 captureR.reserve(reserve);
+            }
+            // Still one straight run of the song if this block carries on from
+            // the last - not after a loop, a restart, or the playhead held at
+            // the song's end while its tail rings out.
+            if (captureStraight && blockStart == captureRunNext) {
+                captureStraightSamples += numSamples;
+                captureRunNext = blockStart + blockAdvance;
+            } else {
+                captureStraight = false;
             }
             for (int s = 0; s < numSamples; ++s) {
                 captureL.push_back(numOutputChannels > 0 ? outputChannelData[0][s] : 0.0f);
@@ -1268,17 +1289,9 @@ void AudioEngine::keyboardNoteOff(int midiNote) {
 void AudioEngine::play() {
     // A new capture of the output about to begin (the callback starts one when
     // it holds none - a paused playback resuming carries on the one it has):
-    // the project as it begins, for stop to compare with.
-    if (graph != nullptr && captureL.empty()) {
-        captureStartHash = 0;
-        for (auto& n : graph->nodes)
-            if (n.type == NodeType::Output) {
-                auto& mgr = graphProcessor.getCacheManager();
-                mgr.updateDeterminism(*graph);
-                captureStartHash = mgr.computeNodeHash(n, *graph);
-                break;
-            }
-    }
+    // the song as it begins, for stop to compare with.
+    if (graph != nullptr && transport != nullptr && captureL.empty())
+        captureStartHash = graphProcessor.getCacheManager().songHash(*graph, *transport);
     playing = true;
     songPlayCount = 0;
     endTailSamplesRemaining = -1;
@@ -1294,34 +1307,47 @@ void AudioEngine::stop() {
     // (or the Capture button) can access it without re-rendering. This
     // runs on the UI thread after the audio thread has seen playing=false
     // and stopped appending to the capture buffers.
-    if (graph && !captureL.empty()) {
-        for (auto& n : graph->nodes) {
-            if (n.type == NodeType::Output) {
-                n.cache.left = std::move(captureL);
-                n.cache.right = std::move(captureR);
-                n.cache.sampleRate = captureSampleRate;
-                n.cache.startSample = captureStartSample;
-                n.cache.numSamples = (int64_t)n.cache.left.size();
-                n.cache.useDisk = false;
-                n.cache.diskPath.clear();
-                // Stamp the cache with the project's input hash so the
-                // capture-from-song dialog can recognise this rendering
-                // as fresh on next open and skip its offline render.
-                // updateDeterminism mutates flags on all nodes but is
-                // benign (it just walks ccMappings + upstream); a 0
-                // hash means the project isn't cacheable, in which
-                // case we leave inputHash at 0 and the dialog will
-                // re-render from scratch. Only if the project is as it
-                // was when the capture began, though: an edit during
-                // playback - a plugin's knob, a note - left the capture
-                // partly one project and partly the other.
-                auto& mgr = graphProcessor.getCacheManager();
-                mgr.updateDeterminism(*graph);
-                const uint64_t now = mgr.computeNodeHash(n, *graph);
-                n.cache.inputHash = now == captureStartHash ? now : 0;
-                n.cache.valid = true;
-                break;
-            }
+    if (graph != nullptr) {
+        // The audio callback records holding the graph lock: once this has it,
+        // a block that was still being recorded as `playing` went false is in.
+        std::vector<float> left, right;
+        int64_t start = 0, straight = 0;
+        double rate = 0.0;
+        {
+            std::lock_guard<GraphMutex> lk(graph->mutationLock);
+            left = std::move(captureL);
+            right = std::move(captureR);
+            start = captureStartSample;
+            straight = captureStraightSamples;
+            rate = captureSampleRate;
+            captureL.clear();
+            captureR.clear();
+        }
+        Node* out = nullptr;
+        for (auto& n : graph->nodes)
+            if (n.type == NodeType::Output) { out = &n; break; }
+        if (out != nullptr && !left.empty()) {
+            auto& c = out->cache;
+            c.left = std::move(left);
+            c.right = std::move(right);
+            c.sampleRate = rate;
+            c.startSample = start;
+            c.numSamples = (int64_t) c.left.size();
+            c.straightSamples = std::min(straight, c.numSamples);
+            c.useDisk = false;
+            c.diskPath.clear();
+            // Stamp the cache with the song's hash so the capture-from-song
+            // dialog can recognise this recording as the song on next open and
+            // skip its offline render (trySongCache, which also wants it to be
+            // one straight run from the start, long enough). A 0 hash means
+            // the project isn't cacheable, and the dialog renders. Only if the
+            // song is as it was when the capture began, though: an edit during
+            // playback - a plugin's knob, a note, the tempo - left the capture
+            // partly one song and partly another.
+            const uint64_t now = transport != nullptr
+                ? graphProcessor.getCacheManager().songHash(*graph, *transport) : 0;
+            c.inputHash = now == captureStartHash ? now : 0;
+            c.valid = true;
         }
     }
     captureL.clear();

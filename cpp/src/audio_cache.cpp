@@ -199,6 +199,33 @@ uint64_t AudioCacheManager::computeNodeHash(const Node& node, const NodeGraph& g
     return h;
 }
 
+uint64_t AudioCacheManager::songHash(NodeGraph& graph, const Transport& transport) {
+    const Node* out = nullptr;
+    for (auto& n : graph.nodes)
+        if (n.type == NodeType::Output) { out = &n; break; }
+    if (out == nullptr) return 0;
+    updateDeterminism(graph);
+    uint64_t h = computeNodeHash(*out, graph);
+    if (h == 0) return 0;
+    // What the song plays at, which the nodes' hashes don't know: a render at
+    // another tempo, or in another tuning, isn't this song.
+    for (const auto& p : transport.tempoMap.getPoints()) {
+        h = hashCombine(h, hashDouble(p.beatPosition));
+        h = hashCombine(h, hashDouble(p.bpm));
+        h = hashCombine(h, hashDouble(p.endBpm));
+        h = hashCombine(h, hashDouble(p.endBeat));
+    }
+    for (const auto& s : transport.timeSigMap.sigs) {
+        h = hashCombine(h, hashDouble(s.beatPosition));
+        h = hashCombine(h, (uint64_t) (uint32_t) s.numerator);
+        h = hashCombine(h, (uint64_t) (uint32_t) s.denominator);
+    }
+    h = hashCombine(h, (uint64_t) transport.tuningSystem);
+    h = hashCombine(h, hashFloat(transport.concertPitch));
+    h = hashCombine(h, hashFloat(graph.globalCrossfadeSec));
+    return h != 0 ? h : 1;   // 0 means "can't be cached"
+}
+
 bool AudioCacheManager::isCacheValid(Node& node, const NodeGraph& graph) {
     if (!node.cache.deterministic) return false;
     if (!node.cache.autoCache && !node.cache.enabled) return false;

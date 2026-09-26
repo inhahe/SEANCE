@@ -40,11 +40,13 @@ public:
 
     // Process incoming MIDI CC and apply mapped parameters, reaching a plugin
     // inside a Voice container as applyValues does. Audio thread, holding the
-    // graph lock.
+    // graph lock. `changed`, if given, gets (node id, parameter) for each
+    // parameter a CC gave a different value - it's the caller's to clear.
     void processMidiCC(const juce::MidiBuffer& midi,
                        juce::AudioProcessorGraph& graph,
                        const std::unordered_map<int, juce::AudioProcessorGraph::NodeID>& nodeMap,
-                       PluginCopies* voices = nullptr);
+                       PluginCopies* voices = nullptr,
+                       std::vector<std::pair<int, int>>* changed = nullptr);
 
     // CC mappings - thread-safe access
     void addCCMapping(const CCMapping& mapping);
@@ -63,9 +65,9 @@ public:
     // by the application; if unset, dirty marking is skipped.
     //
     // Only fires from applyValues (message-thread automation push), NOT
-    // from processMidiCC (audio thread - graph lookups would be unsafe
-    // there). The autosave path's periodic "force-dirty all" pass catches
-    // changes that processMidiCC made between automation passes.
+    // from processMidiCC (audio thread): that reports what it changed
+    // instead, which the audio engine passes to the UI timer
+    // (AudioEngine::drainLearnedCcChanges).
     std::function<void(int nodeId)> onPluginParamChanged;
 
 private:

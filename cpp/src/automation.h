@@ -9,6 +9,8 @@
 
 namespace SoundShop {
 
+class PluginCopies;
+
 // A parameter automation value to apply
 struct AutomationValue {
     int nodeId;      // our node ID
@@ -28,15 +30,21 @@ struct CCMapping {
 
 class AutomationManager {
 public:
-    // Apply automation values to plugins in the graph
+    // Apply automation values to plugins in the graph - or, for a node that
+    // isn't in it, a plugin inside a Voice container: its master and every
+    // voice's copy (`voices`, the live graph's pool; may be null).
     void applyValues(const std::vector<AutomationValue>& values,
                      juce::AudioProcessorGraph& graph,
-                     const std::unordered_map<int, juce::AudioProcessorGraph::NodeID>& nodeMap);
+                     const std::unordered_map<int, juce::AudioProcessorGraph::NodeID>& nodeMap,
+                     PluginCopies* voices = nullptr);
 
-    // Process incoming MIDI CC and apply mapped parameters
+    // Process incoming MIDI CC and apply mapped parameters, reaching a plugin
+    // inside a Voice container as applyValues does. Audio thread, holding the
+    // graph lock.
     void processMidiCC(const juce::MidiBuffer& midi,
                        juce::AudioProcessorGraph& graph,
-                       const std::unordered_map<int, juce::AudioProcessorGraph::NodeID>& nodeMap);
+                       const std::unordered_map<int, juce::AudioProcessorGraph::NodeID>& nodeMap,
+                       PluginCopies* voices = nullptr);
 
     // CC mappings - thread-safe access
     void addCCMapping(const CCMapping& mapping);

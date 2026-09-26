@@ -100,7 +100,9 @@ public:
 
     // Transport
     bool isPlaying() const { return playing.load(); }
-    void play() { playing = true; songPlayCount = 0; endTailSamplesRemaining = -1; }
+    // Start playback, or resume it. A playback that starts a new capture of
+    // the output (see stop) notes the project's render hash as it starts.
+    void play();
     void stop();
     void pause() { playing = false; }
 
@@ -155,6 +157,17 @@ public:
     // SEANCE's menu, or the plugin's window was closed. Message thread.
     void syncVoiceCopies(int nodeId) { voiceCopies->syncFromMaster(nodeId); }
 
+    // The hosted plugins' parameter events since the last call - knobs in
+    // their windows grabbed, moved, let go - for the automation recorder: the
+    // live graph's plugins' (GraphProcessor::drainParamEvents) and the Voice
+    // containers' masters' (PluginCopies::drainParamEvents). Message thread.
+    std::vector<GraphProcessor::ParamEvent> drainPluginParamEvents() {
+        auto events = graphProcessor.drainParamEvents();
+        auto masters = voiceCopies->drainParamEvents();
+        events.insert(events.end(), masters.begin(), masters.end());
+        return events;
+    }
+
     // Load the voice copies the graph needs and don't exist yet, and note on
     // each plugin node inside a Voice container whether all of them could be
     // (Node::pluginVoiceError). Each live rebuild does this first; call it too
@@ -202,6 +215,9 @@ private:
     PluginHost pluginHost;
     GraphProcessor graphProcessor;
     std::shared_ptr<PluginCopies> voiceCopies;   // see getVoiceCopies
+    // The Output node's render hash as the output capture began (play): stop
+    // stamps the capture with it only if the project is unchanged by then.
+    uint64_t captureStartHash = 0;
     RecordingManager recordingManager;
     MultitrackRecorder multitrackRecorder;
     NodeGraph* graph = nullptr;

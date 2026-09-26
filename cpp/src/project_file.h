@@ -36,6 +36,23 @@ public:
                              bool includeBlobs = true);
     static bool readProject(std::istream& in, NodeGraph& graph, PluginHost* pluginHost);
 
+    // One node's [Node] block with its pins, params, clips and the rest, as
+    // writeProject writes each (`gp` and `includeBlobs` as for it). readNode
+    // reads one back: every saved field, with the ids as written. It's how
+    // Duplicate copies a node (NodeGraph::duplicateNode). readNode is false if
+    // there's no [Node] block.
+    static void writeNode(std::ostream& out, Node& node, GraphProcessor* gp,
+                          bool includeBlobs);
+    static bool readNode(std::istream& in, Node& out);
+
+    // A plugin node's settings as they are now, base64: asked of its plugin -
+    // in `gp`'s graph, or still held by the node (a Voice container's master,
+    // or one not taken into the graph yet) - or, with no plugin to ask, the
+    // last ones known (the autosave's cache, then the ones it's waiting to be
+    // given). Refreshes that cache (Node::cachedPluginStateBase64). Empty if
+    // there are none. Message thread.
+    static std::string pluginStateNow(Node& node, GraphProcessor* gp);
+
     // Convenience: serialize the graph to a string with NO plugin state.
     // This is the "fast" serializer used by commitSnapshot(). Excluding
     // plugin state keeps it cheap regardless of how many plugins are loaded -

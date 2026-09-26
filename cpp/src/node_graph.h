@@ -22,6 +22,8 @@
 
 namespace SoundShop {
 
+class GraphProcessor;
+
 // Simple 2D point (replaces Vec2)
 struct Vec2 {
     float x = 0, y = 0;
@@ -622,19 +624,30 @@ struct Node {
     std::map<int, PluginParamRec> pluginParamRec;
 
     // Per-plugin dirty tracking for the slow autosave path (#86). When a
-    // plugin's parameters change via host automation, MIDI Learn CC, or
-    // any other host-driven path, this flag is set so the next autosave
+    // plugin's parameters change via host automation or another host-driven
+    // path on the message thread, this flag is set so the next autosave
     // re-queries getStateInformation. When clear, the saver reuses the
     // cached base64 string instead - avoiding the expensive query for
     // plugins whose state hasn't changed since the last save. Defaults
     // to true so a freshly loaded plugin gets queried at least once.
     //
-    // Limitation: changes made by the user inside the plugin's own UI
-    // can't be detected here (no general-purpose API to listen for them
-    // across plugin formats). Mitigation: a periodic "force-dirty all"
-    // tick in the autosave path bounds staleness to a known interval.
+    // Changes made in the plugin's own window are caught by comparing its
+    // settings when the window closes (or is checked while still open) with
+    // those it opened with (MainContentComponent::checkPluginWindow); a
+    // learned MIDI CC's aren't (it's applied on the audio thread). An
+    // explicit save doesn't depend on this flag: it asks every plugin afresh
+    // (ProjectFile::pluginStateNow).
     bool pluginStateDirty = true;
     std::string cachedPluginStateBase64;
+
+    // Counts the changes to the plugin's settings SEANCE knows of: its window
+    // closed - or checked while still open - with settings other than it
+    // opened with, a preset picked from SEANCE's menu
+    // (MainContentComponent::notePluginStateChanged). Render caches fold it
+    // into their hash (AudioCacheManager::computeNodeHash): the settings
+    // themselves are too slow to read for every hash. Transient - a loaded or
+    // restored node starts at 0, as its render caches do.
+    uint32_t pluginStateGeneration = 0;
 
     // Transient async-load state (NOT serialized). Drives the per-node loading
     // badge and the serial background loader after a project open. See
@@ -1093,6 +1106,38 @@ public:
     };
     std::map<int, RetiredPluginState> retiredPluginStates;
     void addLink(int outPin, int inPin);
+
+    // A name for a new node called `wanted`: that, or - when nodes already
+    // have it - numbered ("Synth 2"). addNode names every node with it.
+    std::string uniqueNodeName(const std::string& wanted) const;
+
+    // Node `rootId` and everything inside it: a Group's members
+    // (Node::childNodeIds), a Voice container's inner patch (the nodes whose
+    // voiceContainerId is it) - all the way down. What Delete deletes and
+    // Duplicate copies. The root first, then the rest in graph order; empty if
+    // there's no such node.
+    std::vector<int> nodeWithContents(int rootId);
+
+    // Duplicate: a copy of node `nodeId` and everything inside it
+    // (nodeWithContents), `offset` from the original. Every saved setting -
+    // each node is written as a project file writes it and read back
+    // (ProjectFile::writeNode / readNode) - with ids of its own and the cables
+    // between the copied nodes. The copy goes where the original is (its
+    // group, its Voice container) and is named as a new node of that name
+    // would be. Not copied: cables to nodes outside it, effect layers gating
+    // those, MIDI Learn mappings, a freeze. A plugin node's copy has no plugin
+    // yet - its pendingPluginState holds the original's settings as they are
+    // now (ProjectFile::pluginStateNow, through `gp`) for the plugin loader to
+    // give a new instance (MainContentComponent::beginAsyncPluginLoad).
+    // Adds the nodes holding the graph lock; takes no undo step. Returns the
+    // copy's id, or -1 if there's no such node.
+    int duplicateNode(int nodeId, Vec2 offset, GraphProcessor* gp);
+
+    // Remove the nodes inside a Voice container that doesn't exist, with
+    // their cables: an inner patch left behind by deleting its container
+    // before 0.10.11, which nothing could show or play. Returns how many went.
+    // Hold the graph lock (a project load does).
+    int removeStrandedVoiceNodes();
 
     // The one place an Audio Track node is built. Every creation path goes
     // through here so the recording params ("Input Channel" / "Volume" / "Pan")

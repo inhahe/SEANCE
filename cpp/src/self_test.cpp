@@ -2037,7 +2037,12 @@ void testTerrainData(Report& r, const juce::File& dir) {
         // node-scope resolver, and lane recorder are testable here.
         {
             NodeGraph g;
-            auto& n = g.addNode("vst", NodeType::Effect, {}, {});
+            // With pins and a param, as every plugin node has pins: the lanes'
+            // lines then come after [PinIn]/[PinOut]/[Param] blocks, which the
+            // loader didn't read them in before 0.10.11.
+            auto& n = g.addNode("vst", NodeType::Effect, { Pin{0, "Audio In", PinKind::Audio, true} },
+                                { Pin{0, "Audio Out", PinKind::Audio, false} });
+            n.params.push_back({"Mix", 0.5f, 0.0f, 1.0f});
             // Param 4: a two-point sweep; param 9: a single point.
             n.pluginParamAutomation[4].points = { {0.0f, 0.10f}, {8.0f, 0.90f} };
             n.pluginParamAutomation[9].points = { {2.0f, 0.50f} };
@@ -13109,6 +13114,555 @@ void testGraphMutex(Report& r) {
             "silent at once, as before (no waiting)");
 }
 
+// ===========================================================================
+// Duplicate copies the whole node
+// ===========================================================================
+//
+// NodeGraph::duplicateNode: every saved setting (each node written as a
+// project file writes it and read back), with ids of its own - and for a group
+// or a Voice container, everything inside it, with the cables between. Until
+// 0.10.11 Duplicate copied a node's name, pins, parameters and clips only: a
+// duplicated FM Synth came out as the default synth, a plugin node as no
+// plugin node, a node inside a Voice container at the top level.
+void testDuplicateNode(Report& r) {
+    r.section("Duplicate: the whole node, with everything inside it");
+
+    NodeGraph g;
+    int fmId;
+    std::vector<int> fmPins;
+    {
+        auto& fm = g.addNode("FM Synth", NodeType::Instrument,
+                             { Pin{0, "MIDI In", PinKind::Midi, true},
+                               Pin{0, "Set: Ratio", PinKind::Signal, true, 1} },
+                             { Pin{0, "Audio Out", PinKind::Audio, false} }, {100.0f, 100.0f});
+        fm.script = "__fmsynth__";
+        fm.params.push_back({"Ratio", 2.0f, 0.5f, 8.0f});
+        fm.params.back().automation.points.push_back({0.0f, 1.0f});
+        fm.params.back().automation.points.push_back({4.0f, 3.0f});
+        fm.modPins.push_back({0, fm.pinsIn[1].id, 0.5f, Node::ModPin::Mode::Absolute});
+        fm.ahdsrEnvelope.attackMs = 123.0f;
+        fm.opEnvelopes.resize(4);
+        fm.opEnvelopes[2].releaseMs = 777.0f;
+        fm.pan = -0.4f;
+        fm.mpeEnabled = true;
+        fm.mpePitchBendRange = 24;
+        fm.armMode = AutoArmMode::Latch;
+        fm.pluginParamAutomation[3].points.push_back({1.0f, 0.25f});
+        fmId = fm.id;
+        fmPins = { fm.pinsIn[0].id, fm.pinsIn[1].id, fm.pinsOut[0].id };
+    }
+    const int outId = g.addNode("Master Out", NodeType::Output,
+                                { Pin{0, "In", PinKind::Audio, true} }, {}).id;
+    g.addLink(fmPins[2], g.findNode(outId)->pinsIn[0].id);
+    const size_t linksBefore = g.links.size();
+
+    // ---- One node ----
+    const int copyId = g.duplicateNode(fmId, {50.0f, 50.0f}, nullptr);
+    const Node* orig = g.findNode(fmId);
+    const Node* copy = g.findNode(copyId);
+    if (!r.check(copy != nullptr && copyId != fmId, "one node: Duplicate makes a new node"))
+        return;
+    r.check(copy->type == NodeType::Instrument && copy->script == "__fmsynth__",
+            "one node: ...of the same kind - its script comes too (a duplicated FM Synth used "
+            "to come out as the default synth)");
+    r.check(copy->name == "FM Synth 2",
+            "one node: ...named as a new node of that name would be ('" + juce::String(copy->name) + "')");
+    r.check(copy->pos.x == orig->pos.x + 50.0f && copy->pos.y == orig->pos.y + 50.0f,
+            "one node: ...beside the original");
+    r.check(copy->params.size() == 1 && copy->params[0].value == 2.0f
+                && copy->params[0].automation.points.size() == 2,
+            "one node: ...with its parameters and their automation lanes");
+    r.check(copy->ahdsrEnvelope.encode() == orig->ahdsrEnvelope.encode()
+                && copy->opEnvelopes.size() == 4 && copy->opEnvelopes[2].releaseMs == 777.0f,
+            "one node: ...its envelopes");
+    r.check(copy->pan == -0.4f && copy->mpeEnabled && copy->mpePitchBendRange == 24
+                && copy->armMode == AutoArmMode::Latch,
+            "one node: ...its pan, MPE and automation-recording settings");
+    r.check(copy->pluginParamAutomation.count(3) == 1
+                && copy->pluginParamAutomation.at(3).points.size() == 1,
+            "one node: ...and its plugin-parameter lanes");
+    bool freshPins = copy->pinsIn.size() == 2 && copy->pinsOut.size() == 1;
+    for (const auto* pins : { &copy->pinsIn, &copy->pinsOut })
+        for (const auto& p : *pins)
+            freshPins = freshPins && std::find(fmPins.begin(), fmPins.end(), p.id) == fmPins.end();
+    r.check(freshPins, "one node: ...with pins of its own (new ids)");
+    r.check(copy->modPins.size() == 1 && copy->modPins[0].pinId == copy->pinsIn[1].id
+                && copy->modPins[0].mode == Node::ModPin::Mode::Absolute,
+            "one node: ...its modulation pin bound to its own pin, not the original's");
+    r.check(g.links.size() == linksBefore,
+            "one node: ...and no cables - the original's stay the original's");
+
+    // ---- A group: its members come, with the cables between them ----
+    // Group "Verse", itself in group "Section", holds two tracks: Bass -> Echo
+    // is a cable inside it, Bass -> Master Out one out of it.
+    const int sectionId = g.createGroup("Section", {0.0f, 400.0f}).id;
+    const int verseId = g.createGroup("Verse", {0.0f, 500.0f}).id;
+    auto track = [&](const char* name, float x) {
+        return g.addNode(name, NodeType::MidiTimeline, { Pin{0, "MIDI In", PinKind::Midi, true} },
+                         { Pin{0, "MIDI", PinKind::Midi, false} }, {x, 500.0f}).id;
+    };
+    const int bassId = track("Bass", 100.0f), echoId = track("Echo", 300.0f);
+    g.addToGroup(sectionId, verseId);
+    g.addToGroup(verseId, bassId);
+    g.addToGroup(verseId, echoId);
+    g.addLink(g.findNode(bassId)->pinsOut[0].id, g.findNode(echoId)->pinsIn[0].id);
+    const int insideLink = g.links.back().id;
+    g.addLink(g.findNode(bassId)->pinsOut[0].id, g.findNode(outId)->pinsIn[0].id);
+    const int outsideLink = g.links.back().id;
+    {
+        auto& bass = *g.findNode(bassId);
+        EffectRegion byInside, byOutside, byGroup;
+        byInside.linkId = insideLink;
+        byOutside.linkId = outsideLink;
+        byGroup.groupId = 7;
+        bass.effectRegions = { byInside, byOutside, byGroup };
+        bass.clips.push_back({"Riff", 0.0f, 4.0f, 0xFF00FF00u});
+        bass.clips.back().notes.push_back({0.0f, 40, 1.0f});
+    }
+    g.findNode(verseId)->modImportSavedSong = true;   // as a MOD import's root group
+    const size_t nodesBefore = g.nodes.size();
+    const size_t linksBefore2 = g.links.size();
+    const int verseCopy = g.duplicateNode(verseId, {50.0f, 50.0f}, nullptr);
+    const Node* vc = g.findNode(verseCopy);
+    r.check(vc != nullptr && g.nodes.size() == nodesBefore + 3,
+            "group: Duplicate copies a group with its members (3 nodes)");
+    int bassCopy = -1, echoCopy = -1;
+    if (vc != nullptr)
+        for (int m : vc->childNodeIds)
+            if (const Node* n = g.findNode(m)) {
+                if (n->name == "Bass") bassCopy = m;
+                if (n->name == "Echo") echoCopy = m;
+            }
+    r.check(bassCopy >= 0 && echoCopy >= 0 && bassCopy != bassId && echoCopy != echoId
+                && g.findNode(bassCopy)->parentGroupId == verseCopy
+                && g.findNode(echoCopy)->parentGroupId == verseCopy,
+            "group: ...the copies are the copy's members (named as they were)");
+    r.check(bassCopy >= 0 && g.findNode(bassCopy)->clips.size() == 1
+                && g.findNode(bassCopy)->clips[0].notes.size() == 1,
+            "group: ...with their clips and notes");
+    const Link* copiedCable = nullptr;
+    for (const auto& l : g.links)
+        if (bassCopy >= 0 && echoCopy >= 0 && l.startPin == g.findNode(bassCopy)->pinsOut[0].id
+            && l.endPin == g.findNode(echoCopy)->pinsIn[0].id)
+            copiedCable = &l;
+    r.check(g.links.size() == linksBefore2 + 1 && copiedCable != nullptr,
+            "group: ...the cable between its members is copied, the one out of it isn't");
+    r.check(bassCopy >= 0 && copiedCable != nullptr
+                && g.findNode(bassCopy)->effectRegions.size() == 1
+                && g.findNode(bassCopy)->effectRegions[0].linkId == copiedCable->id,
+            "group: ...an effect layer gating the copied cable gates the copy's; ones gating the "
+            "original's cables (or a group of them) aren't copied");
+    r.check(vc != nullptr && !vc->modImportSavedSong && g.findNode(verseId)->modImportSavedSong,
+            "group: ...the song settings a MOD import put aside stay the original's to put back");
+    const auto& sectionMembers = g.findNode(sectionId)->childNodeIds;
+    r.check(vc != nullptr && vc->parentGroupId == sectionId
+                && std::find(sectionMembers.begin(), sectionMembers.end(), verseCopy) != sectionMembers.end(),
+            "group: ...the copy joins the group the original is in");
+    r.check(g.findNode(verseId)->childNodeIds == std::vector<int>{ bassId, echoId },
+            "group: ...and the original keeps its own members");
+
+    // ---- A Voice container: its inner patch comes ----
+    int containerId, oscId;
+    {
+        auto& c = g.addNode("Voice", NodeType::VoiceContainer, { Pin{0, "MIDI", PinKind::Midi, true} },
+                            { Pin{0, "Audio", PinKind::Audio, false} }, {600.0f, 100.0f});
+        c.voicePolyphony = 5;
+        containerId = c.id;
+    }
+    auto inner = [&](const char* name, NodeType type, std::vector<Pin> ins, std::vector<Pin> outs,
+                     float x) {
+        auto& n = g.addNode(name, type, std::move(ins), std::move(outs), {x, 0.0f});
+        n.voiceContainerId = containerId;
+        return n.id;
+    };
+    const int viId = inner("Voice In", NodeType::VoiceIn, {}, { Pin{0, "MIDI", PinKind::Midi, false} }, -200.0f);
+    oscId = inner("FM Synth", NodeType::Instrument, { Pin{0, "MIDI", PinKind::Midi, true} },
+                  { Pin{0, "Audio", PinKind::Audio, false} }, 0.0f);
+    g.findNode(oscId)->script = "__fmsynth__";
+    const int voId = inner("Voice Out", NodeType::VoiceOut, { Pin{0, "Audio", PinKind::Audio, true} }, {}, 200.0f);
+    g.addLink(g.findNode(viId)->pinsOut[0].id, g.findNode(oscId)->pinsIn[0].id);
+    g.addLink(g.findNode(oscId)->pinsOut[0].id, g.findNode(voId)->pinsIn[0].id);
+    r.check(g.nodeWithContents(containerId).size() == 4
+                && g.nodeWithContents(containerId).front() == containerId,
+            "container: what's inside a Voice container is its inner patch (what Delete deletes "
+            "and Duplicate copies)");
+    const size_t linksBefore3 = g.links.size();
+    const int containerCopy = g.duplicateNode(containerId, {50.0f, 50.0f}, nullptr);
+    std::vector<const Node*> copiedInner;
+    for (const auto& n : g.nodes)
+        if (n.voiceContainerId == containerCopy) copiedInner.push_back(&n);
+    r.check(containerCopy >= 0 && copiedInner.size() == 3
+                && g.findNode(containerCopy)->voicePolyphony == 5,
+            "container: Duplicate copies a Voice container with its inner patch");
+    bool samePlaces = copiedInner.size() == 3;
+    for (const auto* n : copiedInner)
+        for (int id : { viId, oscId, voId })
+            if (g.findNode(id)->name == n->name)
+                samePlaces = samePlaces && g.findNode(id)->pos.x == n->pos.x
+                             && g.findNode(id)->pos.y == n->pos.y;
+    r.check(samePlaces, "container: ...laid out inside as the original is (only the container "
+                        "moves over)");
+    r.check(g.links.size() == linksBefore3 + 2, "container: ...wired as the original is (2 cables)");
+    const int oscCopy = g.duplicateNode(oscId, {50.0f, 50.0f}, nullptr);
+    r.check(oscCopy >= 0 && g.findNode(oscCopy)->voiceContainerId == containerId,
+            "container: a node duplicated inside a Voice container stays in it (it used to land "
+            "at the top level)");
+
+    // ---- What the project file holds ----
+    NodeGraph loaded;
+    ProjectFile::loadFromString(ProjectFile::serializeForUndo(g), loaded, nullptr);
+    r.check(loaded.nodes.size() == g.nodes.size() && loaded.links.size() == g.links.size()
+                && loaded.findNode(copyId) != nullptr
+                && loaded.findNode(copyId)->script == "__fmsynth__",
+            "save/load: the copies save and load like any node");
+
+    // ---- A plugin node's copy, undone before its plugin loaded, then redone ----
+    {
+        NodeGraph u;
+        int pid;
+        {
+            auto& p = u.addNode("Some Synth", NodeType::Instrument, {},
+                                { Pin{0, "Audio Out", PinKind::Audio, false} });
+            p.pluginDescription.pluginFormatName = "LV2";
+            p.pluginDescription.fileOrIdentifier = "urn:seance:selftest:not-loaded";
+            p.pendingPluginState = "c2V0dGluZ3M=";   // its settings, waiting for the plugin
+            pid = p.id;
+        }
+        const std::string before = ProjectFile::serializeForUndo(u);
+        const int copyOfPlugin = u.duplicateNode(pid, {50.0f, 50.0f}, nullptr);
+        r.check(copyOfPlugin >= 0 && u.findNode(copyOfPlugin)->pendingPluginState == "c2V0dGluZ3M=",
+                "plugin: the copy of a plugin node whose plugin hasn't loaded gets the settings "
+                "it's waiting for");
+        const std::string after = ProjectFile::serializeForUndo(u);
+        u.restoreSnapshot(before);   // undo
+        auto kept = u.retiredPluginStates.find(copyOfPlugin);
+        r.check(kept != u.retiredPluginStates.end() && kept->second.state == "c2V0dGluZ3M=",
+                "plugin: undone before its plugin loaded, it keeps them for a redo");
+        const auto reload = u.restoreSnapshot(after);   // redo
+        r.check(std::find(reload.begin(), reload.end(), copyOfPlugin) != reload.end(),
+                "plugin: ...which loads it again - taking them from there");
+    }
+}
+
+// ===========================================================================
+// A Voice container's inner patch goes with it
+// ===========================================================================
+//
+// Deleting a Voice container used to leave its inner patch behind - nodes
+// nothing could show or play, loaded (plugins and all) and saved with the
+// project ever after. Delete now takes it with the container
+// (NodeGraph::nodeWithContents), and a project holding such a leftover loses it
+// as it loads (NodeGraph::removeStrandedVoiceNodes).
+void testVoiceContainerContents(Report& r) {
+    r.section("Voice container: its inner patch goes with it");
+
+    NodeGraph g;
+    const int keepId = g.addNode("Master Out", NodeType::Output,
+                                 { Pin{0, "In", PinKind::Audio, true} }, {}).id;
+    auto container = [&](const char* name) {
+        const int cid = g.addNode(name, NodeType::VoiceContainer, { Pin{0, "MIDI", PinKind::Midi, true} },
+                                  { Pin{0, "Audio", PinKind::Audio, false} }).id;
+        auto& vi = g.addNode("Voice In", NodeType::VoiceIn, {}, { Pin{0, "MIDI", PinKind::Midi, false} });
+        vi.voiceContainerId = cid;
+        const int viOut = vi.pinsOut[0].id;
+        auto& vo = g.addNode("Voice Out", NodeType::VoiceOut, { Pin{0, "Audio", PinKind::Audio, true} }, {});
+        vo.voiceContainerId = cid;
+        g.addLink(viOut, vo.pinsIn[0].id);
+        return cid;
+    };
+    const int goneId = container("Gone");
+    const int keptId = container("Kept");
+    g.addLink(g.findNode(keptId)->pinsOut[0].id, g.findNode(keepId)->pinsIn[0].id);
+
+    // Delete as it was before 0.10.11: the container alone.
+    {
+        std::lock_guard<GraphMutex> lk(g.mutationLock);
+        g.nodes.erase(std::remove_if(g.nodes.begin(), g.nodes.end(),
+                                     [goneId](const Node& n) { return n.id == goneId; }),
+                      g.nodes.end());
+        g.nodesInvalidated();
+    }
+    NodeGraph loaded;
+    ProjectFile::loadFromString(ProjectFile::serializeForUndo(g), loaded, nullptr);
+    int strandedLeft = 0, keptInner = 0;
+    for (const auto& n : loaded.nodes) {
+        if (n.voiceContainerId == goneId) ++strandedLeft;
+        if (n.voiceContainerId == keptId) ++keptInner;
+    }
+    r.check(strandedLeft == 0,
+            "stranded: a project holding the inner patch of a deleted Voice container loads without it");
+    r.check(keptInner == 2 && loaded.findNode(keptId) != nullptr && loaded.findNode(keepId) != nullptr
+                && loaded.links.size() == 2,
+            "stranded: ...and with everything else - another container's inner patch, the cables "
+            "not to the leftovers");
+}
+
+// ===========================================================================
+// Render caches: a plugin's settings, and a Voice container's inner patch
+// ===========================================================================
+//
+// A render cache (the Output's recording of the last playback, which capture
+// from playback reuses) stands while the hash of what made it does. That hash
+// had nothing of a plugin's settings but its identity, and nothing of a Voice
+// container's inner patch, so a change in either went unnoticed.
+void testRenderCacheHash(Report& r) {
+    r.section("Render caches: a plugin's settings and a Voice container's inner patch count");
+
+    AudioCacheManager mgr;
+    int checks = 0;
+    mgr.onBeforeHashing = [&checks] { ++checks; };
+
+    // A plugin node (none loaded - it's the node's record that counts) -> Output.
+    NodeGraph g;
+    int pid;
+    {
+        auto& p = g.addNode("Some Synth", NodeType::Instrument, {},
+                            { Pin{0, "Audio Out", PinKind::Audio, false} });
+        p.pluginDescription.pluginFormatName = "LV2";
+        p.pluginDescription.fileOrIdentifier = "urn:seance:selftest:hash-only";
+        p.pluginDescription.name = "Hash Only";
+        pid = p.id;
+    }
+    const int outId = g.addNode("Master Out", NodeType::Output,
+                                { Pin{0, "In", PinKind::Audio, true} }, {}).id;
+    g.addLink(g.findNode(pid)->pinsOut[0].id, g.findNode(outId)->pinsIn[0].id);
+    auto songHash = [&](NodeGraph& graph, int out) {
+        mgr.updateDeterminism(graph);
+        return mgr.computeNodeHash(*graph.findNode(out), graph);
+    };
+
+    const uint64_t h0 = songHash(g, outId);
+    r.check(h0 != 0 && checks == 1,
+            "hash: (before hashing, the app gets to note changes in plugin windows still open)");
+    g.findNode(pid)->pluginStateGeneration++;
+    const uint64_t h1 = songHash(g, outId);
+    r.check(h1 != h0, "hash: a change to a plugin's settings changes the song's hash - a cache "
+                      "made before it no longer passes for current");
+    g.findNode(pid)->pluginParamAutomation[0].points.push_back({0.0f, 0.3f});
+    const uint64_t h2 = songHash(g, outId);
+    r.check(h2 != h1, "hash: ...as does a lane of its parameters' automation");
+    g.findNode(pid)->ignoreAutomation = true;
+    r.check(songHash(g, outId) != h2, "hash: ...and muting its lanes");
+    {
+        auto& fx = g.addNode("Reverb", NodeType::Effect, {}, {});
+        fx.script = "__reverb__";
+        const uint64_t before = mgr.computeNodeHash(fx, g);
+        fx.pluginStateGeneration++;
+        r.check(mgr.computeNodeHash(fx, g) == before,
+                "hash: (a built-in node's hash is as it was - all its settings are in the project)");
+    }
+
+    // A Voice container -> Output, with a synth inside.
+    NodeGraph v;
+    const int cid = v.addNode("Voice", NodeType::VoiceContainer, { Pin{0, "MIDI", PinKind::Midi, true} },
+                              { Pin{0, "Audio", PinKind::Audio, false} }).id;
+    int synthId;
+    {
+        auto& s = v.addNode("FM Synth", NodeType::Instrument, {}, { Pin{0, "Audio", PinKind::Audio, false} });
+        s.voiceContainerId = cid;
+        s.script = "__fmsynth__";
+        s.params.push_back({"Volume", 0.5f, 0.0f, 1.0f});
+        synthId = s.id;
+    }
+    const int vOut = v.addNode("Master Out", NodeType::Output,
+                               { Pin{0, "In", PinKind::Audio, true} }, {}).id;
+    v.addLink(v.findNode(cid)->pinsOut[0].id, v.findNode(vOut)->pinsIn[0].id);
+    const uint64_t c0 = songHash(v, vOut);
+    v.findNode(synthId)->params[0].value = 0.9f;
+    const uint64_t c1 = songHash(v, vOut);
+    r.check(c0 != 0 && c1 != c0,
+            "hash: a change inside a Voice container changes the song's hash (it went unnoticed)");
+    v.ccMappings.push_back({ 1, 20, synthId, 0 });
+    r.check(songHash(v, vOut) == 0,
+            "hash: ...and a learned MIDI CC inside it makes the song uncacheable, as one outside does");
+}
+
+// ===========================================================================
+// Plugins: duplicated, driven inside a Voice container, saved as they are
+// ===========================================================================
+//
+// Duplicate gives a plugin node's copy a plugin of its own, loaded with the
+// original's settings. A plugin inside a Voice container - one copy per voice,
+// following the master (plugin_copies.h) - follows its automation lanes and
+// learned MIDI CCs in every voice, in playback and in offline renders, and its
+// window's knob moves reach the automation recorder: until 0.10.11 all of that
+// only knew the main graph. And an explicit save stores each plugin's settings
+// as they are, not the autosave's last look at them.
+void testPluginHostControl(Report& r) {
+    r.section("Plugins: duplicated, driven inside a Voice container, saved as they are");
+
+    const auto pluginDir = selfTestPluginDir();
+    if (!pluginDir.getChildFile("seance_selftest_gain.lv2/manifest.ttl").existsAsFile()) {
+        r.note("SKIPPED - no self-test LV2 plugins in " + pluginDir.getFullPathName()
+               + ". The build puts them there; release packages leave them out.");
+        return;
+    }
+    PluginHost host;
+    host.scanFolders(lv2FolderOnly(pluginDir), {});
+    const auto* listed = findListed(host, kSelfTestGainA);
+    if (!r.check(listed != nullptr, "plugins: (setup) the self-test plugin is listed"))
+        return;
+    const PluginInfo info = *listed;
+    auto closeTo = [](double measured, double wanted, double tolerance = 1e-3) {
+        return std::abs(measured - wanted) < tolerance;
+    };
+    // The self-test gain runs 0..2: gain = 2 * the normalised value.
+    auto gainOf = [](juce::AudioProcessor& p) { return p.getParameters()[0]; };
+    // A plugin loaded with base64 `state`, as the plugin loader loads one.
+    auto gainLoadedWith = [&](const std::string& state) {
+        auto load = host.loadNodePlugin(info.description, -1, "check", 48000.0, 256);
+        if (!load.plugin || !load.plugin->instance) return -1.0;
+        juce::MemoryBlock block;
+        block.fromBase64Encoding(state);
+        load.plugin->instance->setStateInformation(block.getData(), (int) block.getSize());
+        return measuredGainOf(*load.plugin->instance);
+    };
+    Transport transport;
+
+    // ---- Duplicate: a plugin of its own, with the original's settings -----
+    {
+        NodeGraph g;
+        GraphProcessor live;   // as the audio engine's graph
+        live.setHostsPlugins(true);
+        live.prepare(g, 48000.0, 256);
+        const int id = g.addPluginNode(host, info, {0.0f, 0.0f}).id;
+        live.rebuildGraph(g, transport);
+        auto* plugin = live.getProcessorForNode(id);
+        if (!r.check(plugin != nullptr, "duplicate: (setup) the live graph hosts the plugin"))
+            return;
+        gainOf(*plugin)->setValueNotifyingHost(0.4f);   // gain 0.8
+        measuredGainOf(*plugin);                        // played - taking the change in
+        const int copyId = g.duplicateNode(id, {50.0f, 50.0f}, &live);
+        const Node* copy = g.findNode(copyId);
+        r.check(copy != nullptr && copy->isPluginNode()
+                    && copy->pluginDescription.isDuplicateOf(g.findNode(id)->pluginDescription),
+                "duplicate: a plugin node's copy hosts the same plugin (it used to be no plugin "
+                "node at all)");
+        r.check(copy != nullptr && copy->plugin == nullptr && !copy->pendingPluginState.empty(),
+                "duplicate: ...waiting for an instance of its own, with the original's settings "
+                "to give it");
+        const double gain = copy != nullptr ? gainLoadedWith(copy->pendingPluginState) : -1.0;
+        r.checkVal(closeTo(gain, 0.8),
+                   "duplicate: ...its settings as they are now (gain 0.8, not the default 0.5)", gain);
+        r.check(live.getProcessorForNode(id) == plugin,
+                "duplicate: ...while the original plays on, its instance where it was");
+    }
+
+    // ---- A plugin inside a Voice container ------------------------------------
+    {
+        NodeGraph g;
+        const int cid = g.addNode("Voice", NodeType::VoiceContainer,
+                                  { Pin{0, "MIDI", PinKind::Midi, true} },
+                                  { Pin{0, "Audio", PinKind::Audio, false} }).id;
+        g.findNode(cid)->voicePolyphony = 3;
+        const int pid = g.addPluginNode(host, info, {0.0f, 0.0f}).id;
+        g.findNode(pid)->voiceContainerId = cid;
+        auto* master = g.findNode(pid)->plugin ? g.findNode(pid)->plugin->instance.get() : nullptr;
+        if (!r.check(master != nullptr, "voices: (setup) the plugin inside the container loaded"))
+            return;
+        auto voices = std::make_shared<PluginCopies>(PluginCopies::Use::voices);
+        voices->update(g, host, nullptr, 48000.0, 256);
+        // The master's value and every voice copy's, all `want`.
+        auto allAre = [&](float want) {
+            bool ok = closeTo(gainOf(*master)->getValue(), want, 1e-4);
+            int copies = 0;
+            for (int k = 0; k < 3; ++k)
+                if (auto c = voices->find(pid, k)) {
+                    ++copies;
+                    ok = ok && closeTo(gainOf(*c->plugin)->getValue(), want, 1e-4);
+                }
+            return ok && copies == 3;
+        };
+        voices->drainParamEvents();   // anything loading reported
+
+        r.check(voices->setParameter(pid, 0, 0.75f) && allAre(0.75f),
+                "voices: a change of the host's reaches the master and every voice's copy at once");
+        r.check(voices->drainParamEvents().empty(),
+                "voices: ...without the automation recorder taking it for the user's");
+        r.check(!voices->setParameter(cid, 0, 0.5f),
+                "voices: (only for a plugin the pool follows - not the container)");
+
+        {
+            GraphProcessor live;
+            live.setHostsPlugins(true);
+            live.setPluginCopies(voices);
+            live.prepare(g, 48000.0, 256);
+            live.rebuildGraph(g, transport);
+            int told = 0;
+            live.getAutomation().onPluginParamChanged = [&told, pid](int nodeId) {
+                if (nodeId == pid) ++told;
+            };
+            // The UI timer's automation read pass.
+            live.applyAutomation({ AutomationValue{ pid, 0, 0.25f } });
+            r.check(allAre(0.25f) && told == 1,
+                    "voices: an automation lane's value reaches every voice (the read pass found "
+                    "no plugin to set)");
+            // MIDI Learn: CC 20 on channel 1, mapped to the gain.
+            live.getAutomation().addCCMapping({ 1, 20, pid, 0, 0.0f, 1.0f });
+            juce::MidiBuffer cc;
+            cc.addEvent(juce::MidiMessage::controllerEvent(1, 20, 127), 0);
+            live.getAutomation().processMidiCC(cc, *live.getGraph(), live.getNodeMap(), voices.get());
+            r.check(allAre(1.0f),
+                    "voices: a learned MIDI CC moves the plugin in every voice (MIDI Map wasn't "
+                    "offered for it)");
+        }
+
+        // A knob in the master's window, grabbed, moved and let go.
+        gainOf(*master)->beginChangeGesture();
+        gainOf(*master)->setValueNotifyingHost(0.5f);
+        gainOf(*master)->endChangeGesture();
+        bool grabbed = false, moved = false, letGo = false;
+        for (const auto& e : voices->drainParamEvents()) {
+            if (e.nodeId != pid || e.paramIdx != 0) continue;
+            grabbed = grabbed || e.kind == 0;
+            moved = moved || (e.kind == 2 && closeTo(e.value, 0.5, 1e-4));
+            letGo = letGo || e.kind == 1;
+        }
+        r.check(grabbed && moved && letGo,
+                "voices: the master's window's knob moves reach the automation recorder");
+
+        // An offline render: the lanes drive every voice's copy.
+        g.findNode(pid)->pluginParamAutomation[0].points.push_back({0.0f, 0.1f});
+        auto renderCopies = std::make_shared<PluginCopies>(PluginCopies::Use::render);
+        renderCopies->update(g, host, nullptr, 48000.0, 256);
+        GraphProcessor offline;
+        offline.setPluginCopies(renderCopies);
+        offline.applyPluginAutomation(g, 0.0);
+        const auto rendered = renderCopies->copiesOfNode(pid);
+        bool followed = rendered.size() == 3;
+        for (const auto& c : rendered)
+            followed = followed && c && closeTo(gainOf(*c->plugin)->getValue(), 0.1, 1e-4);
+        r.check(followed, "voices: in an offline render its automation lanes drive every voice's "
+                          "copy (voices went without them)");
+    }
+
+    // ---- An explicit save: each plugin's settings as they are -----------------
+    {
+        NodeGraph g;
+        const int id = g.addPluginNode(host, info, {0.0f, 0.0f}).id;
+        Node& n = *g.findNode(id);
+        auto* instance = n.plugin->instance.get();   // not taken into a graph
+        // The autosave's last look at it, before a change made in its window.
+        juce::MemoryBlock before;
+        PluginCopies::catchUp(*instance);
+        instance->getStateInformation(before);
+        n.cachedPluginStateBase64 = before.toBase64Encoding().toStdString();
+        n.pluginStateDirty = false;
+        gainOf(*instance)->setValueNotifyingHost(0.6f);   // gain 1.2
+        GraphProcessor gp;
+        std::ostringstream out;
+        ProjectFile::writeProject(out, g, &gp, /*includeView*/ false, /*includeBlobs*/ false);
+        std::string saved;
+        std::istringstream lines(out.str());
+        for (std::string line; std::getline(lines, line);)
+            if (line.rfind("pluginState=", 0) == 0) saved = line.substr(12);
+        const double gain = saved.empty() ? -1.0 : gainLoadedWith(saved);
+        r.checkVal(closeTo(gain, 1.2),
+                   "save: an explicit save stores a plugin's settings as they are - not the "
+                   "autosave's last look at them (gain 1.2, not the 0.5 from before)", gain);
+    }
+}
+
 int runSelfTest(const juce::File& outDir) {
     outDir.createDirectory();
     Report r;
@@ -13155,6 +13709,10 @@ int runSelfTest(const juce::File& outDir) {
     testGraphRebuildThread(r);
     testGraphMutex(r);
     testUndoHistoryReset(r);
+    testDuplicateNode(r);
+    testVoiceContainerContents(r);
+    testRenderCacheHash(r);
+    testPluginHostControl(r);
     testAppVersion(r);
 
     r.section("Summary");

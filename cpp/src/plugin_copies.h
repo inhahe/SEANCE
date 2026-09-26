@@ -33,7 +33,11 @@ class GraphProcessor;
 //     that follows it - a knob moved in the master's window moves in every
 //     copy at once, and the master's whole state is copied again when it
 //     reports a program or other non-parameter change, when a preset is picked
-//     from SEANCE's menu, and when its window is closed (syncFromMaster).
+//     from SEANCE's menu, and when its window is closed (syncFromMaster). The
+//     host's own changes to its parameters - automation lanes, learned MIDI
+//     CCs - are made on the master and every copy at once (setParameter), and
+//     the master's knob moves are queued for the automation recorder
+//     (drainParamEvents).
 //
 // Copies are loaded on the message thread - where plugins have to be made -
 // before the graph that plays them is built, and handed to it through
@@ -95,6 +99,28 @@ public:
     // Message thread.
     void syncFromMaster(int nodeId);
 
+    // A change of the host's to a Voice container plugin's parameter - an
+    // automation lane's value, a learned MIDI CC - made in every voice at
+    // once: on the master and all its copies. setValue, not
+    // setValueNotifyingHost: nothing is to hear of it (the automation recorder
+    // would take it for the user's). False if node `nodeId` isn't a master
+    // this pool follows. Any thread: the audio callback applies learned CCs -
+    // holding the graph lock, so the master can't go meanwhile.
+    bool setParameter(int nodeId, int index, float value);
+
+    // The masters' parameter events - knobs in their windows grabbed (kind 0),
+    // let go (1) and moved (2, `value` normalised) - for the automation
+    // recorder, as GraphProcessor::drainParamEvents has the live graph's
+    // plugins'. Queued from whatever thread the plugin reports on; drained,
+    // and cleared, by the UI timer.
+    struct ParamEvent { int nodeId; int paramIdx; int kind; float value; };
+    std::vector<ParamEvent> drainParamEvents();
+
+    // Every copy of plugin node `nodeId` the pool holds: an offline render's
+    // main graph's (slot -1) and each voice's. For driving their parameters
+    // (GraphProcessor::applyPluginAutomation). Any thread.
+    std::vector<std::shared_ptr<Copy>> copiesOfNode(int nodeId) const;
+
     // A plugin instance no graph plays - a Voice container's master, or one
     // loaded and not taken into the live graph yet - takes a parameter change
     // in only when it next processes audio: JUCE's LV2 host moves it into the
@@ -138,12 +164,17 @@ private:
     std::map<int, Master> masters;           // Use::voices: node id -> its master
     std::set<int> mastersChanged;            // whole-state changes to copy (message thread)
     std::map<int, Failure> failures;         // node id -> why a copy didn't load
+    std::vector<ParamEvent> paramEvents;     // the masters', for the recorder (drainParamEvents)
 
     std::vector<std::shared_ptr<Copy>> copiesOf(int nodeId) const;   // mtx held
     int masterNodeOf(const juce::AudioProcessor* p) const;           // mtx held
 
+    void queueEvent(int nodeId, int index, int kind, float value);   // mtx held
+
     // AudioProcessorListener (masters only)
     void audioProcessorParameterChanged(juce::AudioProcessor*, int index, float value) override;
+    void audioProcessorParameterChangeGestureBegin(juce::AudioProcessor*, int index) override;
+    void audioProcessorParameterChangeGestureEnd(juce::AudioProcessor*, int index) override;
     void audioProcessorChanged(juce::AudioProcessor*, const ChangeDetails&) override;
 
     void handleAsyncUpdate() override;   // copies whole states on the message thread

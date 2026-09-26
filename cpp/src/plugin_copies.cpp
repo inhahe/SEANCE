@@ -271,6 +271,47 @@ void PluginCopies::syncFromMaster(int nodeId) {
         c->plugin->setStateInformation(state.getData(), (int) state.getSize());
 }
 
+bool PluginCopies::setParameter(int nodeId, int index, float value) {
+    std::shared_ptr<PluginHost::LoadedPlugin> owner;   // keeps the master alive meanwhile
+    juce::AudioProcessor* master = nullptr;
+    std::vector<std::shared_ptr<Copy>> targets;
+    {
+        std::lock_guard<std::mutex> lk(mtx);
+        auto it = masters.find(nodeId);
+        if (it == masters.end()) return false;
+        owner = it->second.owner.lock();
+        if (!owner || owner->instance.get() != it->second.processor) return false;
+        master = it->second.processor;
+        targets = copiesOf(nodeId);
+    }
+    auto set = [index, value](juce::AudioProcessor& p) {
+        const auto& params = p.getParameters();
+        if (index >= 0 && index < params.size())
+            params[index]->setValue(value);
+    };
+    set(*master);
+    for (auto& c : targets)
+        if (c && c->plugin) set(*c->plugin);
+    return true;
+}
+
+std::vector<PluginCopies::ParamEvent> PluginCopies::drainParamEvents() {
+    std::lock_guard<std::mutex> lk(mtx);
+    std::vector<ParamEvent> out;
+    out.swap(paramEvents);
+    return out;
+}
+
+std::vector<std::shared_ptr<PluginCopies::Copy>> PluginCopies::copiesOfNode(int nodeId) const {
+    std::lock_guard<std::mutex> lk(mtx);
+    return copiesOf(nodeId);
+}
+
+void PluginCopies::queueEvent(int nodeId, int index, int kind, float value) {
+    if (paramEvents.size() < 4096)   // bounded, should the UI stall
+        paramEvents.push_back({ nodeId, index, kind, value });
+}
+
 void PluginCopies::releaseUnused() {
     std::vector<std::shared_ptr<Copy>> done;
     bool more = false;
@@ -312,12 +353,25 @@ void PluginCopies::audioProcessorParameterChanged(juce::AudioProcessor* p, int i
         const int nodeId = masterNodeOf(p);
         if (nodeId < 0) return;
         targets = copiesOf(nodeId);
+        queueEvent(nodeId, index, 2, value);   // for the automation recorder
     }
     for (auto& c : targets) {
         const auto& params = c->plugin->getParameters();
         if (index >= 0 && index < params.size())
             params[index]->setValue(value);
     }
+}
+
+void PluginCopies::audioProcessorParameterChangeGestureBegin(juce::AudioProcessor* p, int index) {
+    std::lock_guard<std::mutex> lk(mtx);
+    if (const int nodeId = masterNodeOf(p); nodeId >= 0)
+        queueEvent(nodeId, index, 0, 0.0f);
+}
+
+void PluginCopies::audioProcessorParameterChangeGestureEnd(juce::AudioProcessor* p, int index) {
+    std::lock_guard<std::mutex> lk(mtx);
+    if (const int nodeId = masterNodeOf(p); nodeId >= 0)
+        queueEvent(nodeId, index, 1, 0.0f);
 }
 
 void PluginCopies::audioProcessorChanged(juce::AudioProcessor* p, const ChangeDetails& details) {

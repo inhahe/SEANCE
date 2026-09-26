@@ -124,6 +124,356 @@ bool ProjectFile::exportAssets(const std::string& path, const AssetLibrary& lib,
     return true;
 }
 
+std::string ProjectFile::pluginStateNow(Node& node, GraphProcessor* gp) {
+    // The node's own plugin: in the audio graph - or held by the node, for
+    // one inside a Voice container (the master its voices' copies follow) or
+    // one the graph hasn't taken in yet.
+    juce::AudioProcessor* proc =
+        node.plugin && node.plugin->instance ? node.plugin->instance.get()
+        : node.plugin && gp ? gp->hostedPluginOf(node) : nullptr;
+    if (proc) {
+        // One no graph plays hasn't taken its last knob moves in yet.
+        if (node.plugin && proc == node.plugin->instance.get())
+            PluginCopies::catchUp(*proc);
+        juce::MemoryBlock stateData;
+        proc->getStateInformation(stateData);
+        if (stateData.getSize() > 0) {
+            // Not pluginStateDirty: that says whether the autosave's copy is
+            // behind, and only the autosave writes that copy.
+            node.cachedPluginStateBase64 = stateData.toBase64Encoding().toStdString();
+            return node.cachedPluginStateBase64;
+        }
+    }
+    if (!node.cachedPluginStateBase64.empty())
+        return node.cachedPluginStateBase64;
+    // No plugin to ask: it hasn't finished loading (or didn't load). The
+    // settings it's waiting to be given, read from the file - otherwise a save
+    // mid-load would drop them. See MainContentComponent::beginAsyncPluginLoad.
+    return node.pendingPluginState;
+}
+
+// One [Node] block and its sub-sections - see writeProject.
+void ProjectFile::writeNode(std::ostream& f, Node& node, GraphProcessor* gp,
+                            bool includeBlobs) {
+    f << "\n[Node]\n";
+    writeInt(f, "id", node.id);
+    writeStr(f, "name", node.name);
+    writeInt(f, "type", (int)node.type);
+    writeFloat(f, "posX", node.pos.x);
+    writeFloat(f, "posY", node.pos.y);
+    if (node.muted) writeInt(f, "muted", 1);
+    if (node.soloed) writeInt(f, "soloed", 1);
+    // Automation record override (record axis) + wholesale ignore (read
+    // axis) for this node. Only emitted when non-default. armMode absent
+    // => Inherit; ignoreAuto absent => false.
+    if (node.armMode != AutoArmMode::Inherit) writeInt(f, "armMode", (int)node.armMode);
+    if (node.ignoreAutomation) writeInt(f, "ignoreAuto", 1);
+    // node.script can be multi-line for some node types - most notably
+    // MultiSampler, whose encode() produces dozens of lines (one per
+    // zone field). The old `writeStr(f, "script", val)` form wrote
+    // `script=<val>\n` raw, so any `\n` inside val terminated the
+    // line and the load-side `getline` recovered only the first line
+    // (just the `__multisampler__:` prefix). On round-trip this
+    // wiped the entire MultiSampler payload, producing silent MOD
+    // playback after restart. The fix: detect multi-line scripts and
+    // write them in a length-prefixed `scriptLines=N\n<line>...` form,
+    // matching the pattern writeProject uses for `signalScript`.
+    if (node.script.find('\n') != std::string::npos) {
+        auto lines = juce::StringArray::fromLines(node.script);
+        // Trim a possible empty trailing line so round-trips are stable
+        // (StringArray::fromLines yields one extra empty element when
+        // the source string ends with '\n').
+        while (!lines.isEmpty() && lines.getReference(lines.size() - 1).isEmpty())
+            lines.remove(lines.size() - 1);
+        writeInt(f, "scriptLines", lines.size());
+        for (auto& ln : lines)
+            f << ln.toStdString() << "\n";
+    } else {
+        writeStr(f, "script", node.script);
+    }
+    if (!node.midiInputSourceId.empty())
+        writeStr(f, "midiInputSourceId", node.midiInputSourceId);
+    // Shared AHDSR envelope. One line — encode() returns a single line with
+    // no newlines and length-prefixed curve fields, so it survives writeStr
+    // round-trip regardless of curve content. Saved unconditionally because
+    // it carries sensible defaults (linear ramps, 5ms / 0ms / 200ms / 0.7 /
+    // 300ms / velSens=1) — we want those defaults to persist exactly across
+    // save/load rather than relying on the constructor at load time.
+    writeStr(f, "ahdsrEnvelope", node.ahdsrEnvelope.encode());
+    // Live reference to a project asset-library AHDSR curve (-1 = none).
+    if (node.ahdsrAssetId >= 0) writeInt(f, "ahdsrAssetId", node.ahdsrAssetId);
+    // Additional per-component AHDSR envelopes (FM operators etc.). Saved
+    // only when present so non-FM nodes stay clean. Count first, then one
+    // encoded line per envelope keyed opEnvelope0..N.
+    if (!node.opEnvelopes.empty()) {
+        writeInt(f, "opEnvelopeCount", (int)node.opEnvelopes.size());
+        for (size_t i = 0; i < node.opEnvelopes.size(); ++i)
+            writeStr(f, "opEnvelope" + std::to_string(i),
+                     node.opEnvelopes[i].encode());
+    }
+    if (node.aftertouchSensitivity != 0.5f)
+        writeFloat(f, "aftertouchSensitivity", node.aftertouchSensitivity);
+    // Which plugin the node hosts: its full JUCE description, on one line
+    // (XML attributes - JUCE escapes any newline in them). A node from a
+    // project saved before plugin identities were recorded, whose plugin
+    // hasn't been identified yet, keeps its old list row instead. See
+    // Node::pluginDescription.
+    if (node.pluginDescription.fileOrIdentifier.isNotEmpty()) {
+        if (auto xml = node.pluginDescription.createXml())
+            writeStr(f, "pluginDescription",
+                     xml->toString(juce::XmlElement::TextFormat().singleLine().withoutHeader())
+                         .toStdString());
+    } else if (node.legacyPluginIndex >= 0) {
+        writeInt(f, "pluginIndex", node.legacyPluginIndex);
+    }
+    if (node.panLaw != PanLaw::EqualPower) writeInt(f, "panLaw", (int)node.panLaw);
+    if (node.pan != 0.0f) writeFloat(f, "pan", node.pan);
+    if (node.spatialX != 0.0f) writeFloat(f, "spatialX", node.spatialX);
+    if (node.spatialY != 0.0f) writeFloat(f, "spatialY", node.spatialY);
+    if (node.spatialZ != 0.0f) writeFloat(f, "spatialZ", node.spatialZ);
+    // The plugin's settings, as they are now (pluginStateNow asks the plugin
+    // afresh). Only a save passes `gp` - an explicit one: a plugin changes in
+    // its own window without SEANCE necessarily hearing of it, so the
+    // autosave's per-plugin cache (#86) may be behind, and was, before 0.10.11:
+    // saving with a plugin's window still open wrote the settings from before
+    // the window's changes.
+    if (gp && node.isPluginNode()) {
+        const auto state = pluginStateNow(node, gp);
+        if (!state.empty())
+            writeStr(f, "pluginState", state);
+    }
+    if (node.performanceMode) {
+        writeInt(f, "performanceMode", 1);
+        writeInt(f, "perfReleaseMode", node.performanceReleaseMode);
+        writeInt(f, "perfVelocity", node.performanceVelocity ? 1 : 0);
+    }
+    // Oscilloscope display settings - written only when non-default to keep
+    // files lean (only __oscilloscope__ nodes ever change these from default).
+    if (!node.scopeTriggered) writeInt(f, "scopeTriggered", 0);
+    if (node.scopeTrigLevel != 0.0f) writeFloat(f, "scopeTrigLevel", node.scopeTrigLevel);
+    if (!node.scopeTrigRising) writeInt(f, "scopeTrigRising", 0);
+    if (node.mpeEnabled) {
+        writeInt(f, "mpeEnabled", 1);
+        writeInt(f, "mpePitchBendRange", node.mpePitchBendRange);
+    }
+    writeInt(f, "parentGroupId", node.parentGroupId);
+    writeFloat(f, "groupBeatOffset", node.groupBeatOffset);
+    if (!node.anchorMarker.empty())
+        writeStr(f, "anchorMarker", node.anchorMarker);
+    writeInt(f, "groupExpanded", node.groupExpanded ? 1 : 0);
+    // Voice container (per-voice polyphony) - see poly-voice-architecture.md
+    if (node.voiceContainerId != -1)
+        writeInt(f, "voiceContainerId", node.voiceContainerId);
+    if (node.type == NodeType::VoiceContainer) {
+        writeInt(f, "voicePolyphony", node.voicePolyphony);
+        writeInt(f, "voiceStealMode", node.voiceStealMode);
+        writeFloat(f, "voiceGlideMs", node.voiceGlideMs);
+        writeInt(f, "voiceUnison", node.voiceUnison);
+        writeFloat(f, "voiceUnisonDetune", node.voiceUnisonDetune);
+        writeFloat(f, "voiceUnisonSpread", node.voiceUnisonSpread);
+    }
+    // Save child IDs as comma-separated
+    if (!node.childNodeIds.empty()) {
+        std::string ids;
+        for (int i = 0; i < (int)node.childNodeIds.size(); ++i) {
+            if (i > 0) ids += ",";
+            ids += std::to_string(node.childNodeIds[i]);
+        }
+        writeStr(f, "childNodeIds", ids);
+    }
+    // MOD-import song-setting restore stash (only meaningful on the
+    // import's root group node; harmless/absent on others).
+    if (node.modImportSavedSong) {
+        writeInt(f, "modImportSavedSong", 1);
+        writeInt(f, "modImportPrevRepeatMode", node.modImportPrevRepeatMode);
+        writeInt(f, "modImportPrevRepeatCount", node.modImportPrevRepeatCount);
+        writeFloat(f, "modImportPrevSongLength", (float)node.modImportPrevSongLength);
+        writeInt(f, "modImportPrevLoopEnabled", node.modImportPrevLoopEnabled ? 1 : 0);
+        writeFloat(f, "modImportPrevLoopStart", (float)node.modImportPrevLoopStart);
+        writeFloat(f, "modImportPrevLoopEnd", (float)node.modImportPrevLoopEnd);
+    }
+    // Audio cache / freeze state. The auto-cache toggle is a user preference
+    // (default true) so persist it whenever it's off, regardless of whether
+    // a cache exists. The freeze payload itself (enabled/valid/on-disk PCM)
+    // is only persisted on real saves - undo snapshots pass includeBlobs
+    // =false and must not carry freeze state (reparsing a snapshot must not
+    // touch the disk cache). The PCM lives in a sibling soundshop_cache/
+    // file named by node id; here we persist only the metadata needed to
+    // re-attach it on load (see rehydrateNodeCaches). saveProject runs
+    // saveToDisk before this, so a frozen node arrives here with
+    // useDisk=true and its buffers already flushed.
+    if (!node.cache.autoCache) writeInt(f, "cacheAuto", 0);
+    // Require useDisk: only freezes actually backed by a soundshop_cache/
+    // file are re-attachable on load. This also excludes the Output node's
+    // memory-only stop-capture cache (never flushed to disk - see
+    // saveProject), which is transient session state, not a saved freeze.
+    if (includeBlobs && node.cache.hasCachedAudio() && node.cache.useDisk) {
+        writeInt(f, "cacheEnabled", node.cache.enabled ? 1 : 0);
+        writeInt(f, "cacheValid", 1);
+        writeInt(f, "cacheUseDisk", node.cache.useDisk ? 1 : 0);
+        writeStr(f, "cacheHash", std::to_string(node.cache.inputHash));
+        writeFloat(f, "cacheSampleRate", (float)node.cache.sampleRate);
+        writeStr(f, "cacheStartSample", std::to_string(node.cache.startSample));
+        writeStr(f, "cacheNumSamples", std::to_string(node.cache.numSamples));
+    }
+
+    for (auto& pin : node.pinsIn) {
+        f << "[PinIn]\n";
+        writeInt(f, "id", pin.id);
+        writeStr(f, "name", pin.name);
+        writeInt(f, "kind", (int)pin.kind);
+        writeInt(f, "channels", pin.channels);
+    }
+    for (auto& pin : node.pinsOut) {
+        f << "[PinOut]\n";
+        writeInt(f, "id", pin.id);
+        writeStr(f, "name", pin.name);
+        writeInt(f, "kind", (int)pin.kind);
+        writeInt(f, "channels", pin.channels);
+    }
+    for (auto& param : node.params) {
+        f << "[Param]\n";
+        writeStr(f, "name", param.name);
+        writeFloat(f, "value", param.modulated ? param.baseValue : param.value);
+        writeFloat(f, "min", param.minVal);
+        writeFloat(f, "max", param.maxVal);
+        writeStr(f, "format", param.format);
+        // Warp-slot key (unified warp/morph). Only emitted for warp params so
+        // ordinary params stay unchanged; absent => -1 (not a warp param).
+        if (param.warpSlot >= 0) writeInt(f, "warpSlot", param.warpSlot);
+        // Warp scope: which chain the slot indexes. Only emitted for per-
+        // layer warp params (>=0); absent => -1 (frame-scope / not a warp).
+        // Also used as the layer index for layer-field (phase/amp) params.
+        if (param.warpLayer >= 0) writeInt(f, "warpLayer", param.warpLayer);
+        // Per-layer field key (0=phase, 1=amplitude). Only emitted for
+        // layer-field modulation params; absent => -1 (not a layer field).
+        if (param.layerField >= 0) writeInt(f, "layerField", param.layerField);
+        // Owning wavetable frame (library id) for warp / layer-field params.
+        // Only emitted when set (>=0); absent => -1 (legacy whole-node, the
+        // pre-per-frame layout). Lets two frames carry the same warp op
+        // without their modulation params colliding on (warpLayer,warpSlot).
+        if (param.warpFrameId >= 0) writeInt(f, "warpFrameId", param.warpFrameId);
+        // Automation record override (record axis) + lane bypass (read axis).
+        // Only emitted when non-default so ordinary params round-trip
+        // unchanged. armMode absent => Inherit; bypassAuto absent => false.
+        if (param.armMode != AutoArmMode::Inherit) writeInt(f, "armMode", (int)param.armMode);
+        if (param.bypassAutomation) writeInt(f, "bypassAuto", 1);
+        for (auto& ap : param.automation.points)
+            f << "auto=" << ap.beat << "," << ap.value << "\n";
+    }
+    // Signal modulation pin bindings (#88). The pins themselves are
+    // already serialized in the [PinIn] block above; the modPin
+    // entries just record which param each one drives.
+    for (auto& mp : node.modPins) {
+        f << "modPin=" << mp.paramIndex << "," << mp.pinId
+          << "," << mp.depth
+          << "," << (mp.mode == Node::ModPin::Mode::Absolute ? 1 : 0) << "\n";
+    }
+    // Recorded automation for hosted-plugin params (node-scope, since plugin
+    // params have no [Param] block). One line per point: pluginAuto=<paramIdx>,
+    // <beat>,<normValue>. Values are normalized 0..1. Emitted only for lanes
+    // that actually hold points, so plain plugin nodes stay unchanged.
+    for (auto& kv : node.pluginParamAutomation) {
+        for (auto& ap : kv.second.points)
+            f << "pluginAuto=" << kv.first << "," << ap.beat << "," << ap.value << "\n";
+    }
+    for (auto& clip : node.clips) {
+        f << "[Clip]\n";
+        writeStr(f, "name", clip.name);
+        writeFloat(f, "start", clip.startBeat);
+        writeFloat(f, "length", clip.lengthBeats);
+        writeInt(f, "color", (int)clip.color);
+        writeInt(f, "channels", clip.channels);
+        writeInt(f, "waveformView", clip.waveformView);
+        writeInt(f, "clipKeyRoot", clip.keyRoot);
+        writeStr(f, "clipKeyType", clip.keyType);
+        writeInt(f, "hasCustomKey", clip.hasCustomKey ? 1 : 0);
+        for (auto& note : clip.notes) {
+            f << "[Note]\n";
+            writeFloat(f, "offset", note.offset);
+            writeInt(f, "pitch", note.pitch);
+            writeFloat(f, "duration", note.duration);
+            writeInt(f, "velocity", note.velocity);
+            writeInt(f, "degree", note.degree);
+            writeInt(f, "octave", note.octave);
+            writeInt(f, "chromatic", note.chromaticOffset);
+            writeFloat(f, "detune", note.detune);
+            if (note.exactOffset.den > 0) {
+                writeInt(f, "exactOffsetNum", note.exactOffset.num);
+                writeInt(f, "exactOffsetDen", note.exactOffset.den);
+            }
+            if (note.exactDuration.den > 0) {
+                writeInt(f, "exactDurNum", note.exactDuration.num);
+                writeInt(f, "exactDurDen", note.exactDuration.den);
+            }
+            // MPE expression curves
+            for (auto& p : note.expression.pitchBend)
+                f << "exPB=" << p.time << "," << p.value << "\n";
+            for (auto& p : note.expression.slide)
+                f << "exSL=" << p.time << "," << p.value << "\n";
+            for (auto& p : note.expression.pressure)
+                f << "exPR=" << p.time << "," << p.value << "\n";
+        }
+        for (auto& cc : clip.ccEvents) {
+            f << "[CC]\n";
+            writeFloat(f, "offset", cc.offset);
+            writeInt(f, "controller", cc.controller);
+            writeInt(f, "value", cc.value);
+            writeInt(f, "channel", cc.channel);
+        }
+        // Audio clip fields
+        if (!clip.audioFilePath.empty())
+            writeStr(f, "audioFile", clip.audioFilePath);
+        writeFloat(f, "slipOffset", clip.slipOffset);
+        writeFloat(f, "fadeIn", clip.fadeInBeats);
+        writeFloat(f, "fadeOut", clip.fadeOutBeats);
+        writeFloat(f, "gain", clip.gainDb);
+    }
+
+    // Take lanes
+    for (auto& lane : node.takeLanes) {
+        f << "[TakeLane]\n";
+        writeStr(f, "name", lane.name);
+        writeFloat(f, "timeOffset", lane.timeOffsetSamples);
+        writeInt(f, "muted", lane.muted ? 1 : 0);
+        for (auto& clip : lane.clips) {
+            f << "[TakeClip]\n";
+            writeStr(f, "name", clip.name);
+            writeFloat(f, "start", clip.startBeat);
+            writeFloat(f, "length", clip.lengthBeats);
+            writeInt(f, "color", (int)clip.color);
+            writeInt(f, "channels", clip.channels);
+            if (!clip.audioFilePath.empty())
+                writeStr(f, "audioFile", clip.audioFilePath);
+            writeFloat(f, "slipOffset", clip.slipOffset);
+            writeFloat(f, "gain", clip.gainDb);
+        }
+    }
+
+    // Comp segments
+    for (auto& comp : node.compSegments) {
+        f << "[Comp]\n";
+        writeFloat(f, "start", comp.startBeat);
+        writeFloat(f, "end", comp.endBeat);
+        writeInt(f, "lane", comp.takeLaneIdx);
+        writeFloat(f, "crossfade", comp.crossfadeBeats);
+    }
+
+    // Time-gated effect regions (the colored layer bars above the notes in
+    // the piano roll). These were historically not serialized at all, which
+    // meant a region vanished on save/load AND was silently wiped by any
+    // undo step (undo snapshots go through this same writer). Emitted per
+    // node so they ride along with the track they gate.
+    for (auto& region : node.effectRegions) {
+        f << "[FxRegion]\n";
+        writeInt(f, "linkId", region.linkId);
+        writeInt(f, "groupId", region.groupId);
+        writeFloat(f, "start", region.startBeat);
+        writeFloat(f, "end", region.endBeat);
+        writeInt(f, "color", (int)region.color);
+    }
+}
+
 bool ProjectFile::writeProject(std::ostream& f, NodeGraph& graph,
                                GraphProcessor* gp, bool includeView,
                                bool includeBlobs) {
@@ -222,352 +572,8 @@ bool ProjectFile::writeProject(std::ostream& f, NodeGraph& graph,
     for (auto& l : graph.links) maxId = std::max(maxId, l.id);
 
     // Save nodes
-    for (auto& node : graph.nodes) {
-        f << "\n[Node]\n";
-        writeInt(f, "id", node.id);
-        writeStr(f, "name", node.name);
-        writeInt(f, "type", (int)node.type);
-        writeFloat(f, "posX", node.pos.x);
-        writeFloat(f, "posY", node.pos.y);
-        if (node.muted) writeInt(f, "muted", 1);
-        if (node.soloed) writeInt(f, "soloed", 1);
-        // Automation record override (record axis) + wholesale ignore (read
-        // axis) for this node. Only emitted when non-default. armMode absent
-        // => Inherit; ignoreAuto absent => false.
-        if (node.armMode != AutoArmMode::Inherit) writeInt(f, "armMode", (int)node.armMode);
-        if (node.ignoreAutomation) writeInt(f, "ignoreAuto", 1);
-        // node.script can be multi-line for some node types - most notably
-        // MultiSampler, whose encode() produces dozens of lines (one per
-        // zone field). The old `writeStr(f, "script", val)` form wrote
-        // `script=<val>\n` raw, so any `\n` inside val terminated the
-        // line and the load-side `getline` recovered only the first line
-        // (just the `__multisampler__:` prefix). On round-trip this
-        // wiped the entire MultiSampler payload, producing silent MOD
-        // playback after restart. The fix: detect multi-line scripts and
-        // write them in a length-prefixed `scriptLines=N\n<line>...` form,
-        // matching the existing pattern used for `signalScript` above.
-        if (node.script.find('\n') != std::string::npos) {
-            auto lines = juce::StringArray::fromLines(node.script);
-            // Trim a possible empty trailing line so round-trips are stable
-            // (StringArray::fromLines yields one extra empty element when
-            // the source string ends with '\n').
-            while (!lines.isEmpty() && lines.getReference(lines.size() - 1).isEmpty())
-                lines.remove(lines.size() - 1);
-            writeInt(f, "scriptLines", lines.size());
-            for (auto& ln : lines)
-                f << ln.toStdString() << "\n";
-        } else {
-            writeStr(f, "script", node.script);
-        }
-        if (!node.midiInputSourceId.empty())
-            writeStr(f, "midiInputSourceId", node.midiInputSourceId);
-        // Shared AHDSR envelope. One line — encode() returns a single line with
-        // no newlines and length-prefixed curve fields, so it survives writeStr
-        // round-trip regardless of curve content. Saved unconditionally because
-        // it carries sensible defaults (linear ramps, 5ms / 0ms / 200ms / 0.7 /
-        // 300ms / velSens=1) — we want those defaults to persist exactly across
-        // save/load rather than relying on the constructor at load time.
-        writeStr(f, "ahdsrEnvelope", node.ahdsrEnvelope.encode());
-        // Live reference to a project asset-library AHDSR curve (-1 = none).
-        if (node.ahdsrAssetId >= 0) writeInt(f, "ahdsrAssetId", node.ahdsrAssetId);
-        // Additional per-component AHDSR envelopes (FM operators etc.). Saved
-        // only when present so non-FM nodes stay clean. Count first, then one
-        // encoded line per envelope keyed opEnvelope0..N.
-        if (!node.opEnvelopes.empty()) {
-            writeInt(f, "opEnvelopeCount", (int)node.opEnvelopes.size());
-            for (size_t i = 0; i < node.opEnvelopes.size(); ++i)
-                writeStr(f, "opEnvelope" + std::to_string(i),
-                         node.opEnvelopes[i].encode());
-        }
-        if (node.aftertouchSensitivity != 0.5f)
-            writeFloat(f, "aftertouchSensitivity", node.aftertouchSensitivity);
-        // Which plugin the node hosts: its full JUCE description, on one line
-        // (XML attributes - JUCE escapes any newline in them). A node from a
-        // project saved before plugin identities were recorded, whose plugin
-        // hasn't been identified yet, keeps its old list row instead. See
-        // Node::pluginDescription.
-        if (node.pluginDescription.fileOrIdentifier.isNotEmpty()) {
-            if (auto xml = node.pluginDescription.createXml())
-                writeStr(f, "pluginDescription",
-                         xml->toString(juce::XmlElement::TextFormat().singleLine().withoutHeader())
-                             .toStdString());
-        } else if (node.legacyPluginIndex >= 0) {
-            writeInt(f, "pluginIndex", node.legacyPluginIndex);
-        }
-        if (node.panLaw != PanLaw::EqualPower) writeInt(f, "panLaw", (int)node.panLaw);
-        if (node.pan != 0.0f) writeFloat(f, "pan", node.pan);
-        if (node.spatialX != 0.0f) writeFloat(f, "spatialX", node.spatialX);
-        if (node.spatialY != 0.0f) writeFloat(f, "spatialY", node.spatialY);
-        if (node.spatialZ != 0.0f) writeFloat(f, "spatialZ", node.spatialZ);
-        // Save plugin state as base64. Per-plugin dirty tracking (#86):
-        // only call getStateInformation when the cache is stale, otherwise
-        // reuse the cached base64 string. This avoids the expensive query
-        // for plugins whose parameters haven't changed since the last
-        // save - typical case is most plugins have nothing to re-query.
-        // ProjectFile::save (the user-facing save path, gp != nullptr) and
-        // the slow autosave path both share this cache.
-        if (gp && node.isPluginNode()) {
-            if (node.pluginStateDirty || node.cachedPluginStateBase64.empty()) {
-                // The node's own plugin: in the audio graph - or held by the node,
-                // for one inside a Voice container (the master its voices'
-                // copies follow) or one the graph hasn't taken in yet.
-                juce::AudioProcessor* proc =
-                    node.plugin && node.plugin->instance ? node.plugin->instance.get()
-                    : node.plugin ? gp->hostedPluginOf(node) : nullptr;
-                // One no graph plays hasn't taken its last knob moves in yet.
-                if (proc && node.plugin && proc == node.plugin->instance.get())
-                    PluginCopies::catchUp(*proc);
-                if (proc) {
-                    juce::MemoryBlock stateData;
-                    proc->getStateInformation(stateData);
-                    if (stateData.getSize() > 0) {
-                        node.cachedPluginStateBase64 =
-                            stateData.toBase64Encoding().toStdString();
-                        node.pluginStateDirty = false;
-                    }
-                }
-            }
-            if (!node.cachedPluginStateBase64.empty())
-                writeStr(f, "pluginState", node.cachedPluginStateBase64);
-            else if (!node.pendingPluginState.empty())
-                // Plugin hasn't finished loading yet (async load in progress), so
-                // there's no live processor to query and no cached state. Fall
-                // back to the state we read from the file but haven't applied
-                // yet - otherwise an autosave mid-load would silently drop the
-                // plugin's saved state. See MainContentComponent::beginAsyncPluginLoad.
-                writeStr(f, "pluginState", node.pendingPluginState);
-        }
-        if (node.performanceMode) {
-            writeInt(f, "performanceMode", 1);
-            writeInt(f, "perfReleaseMode", node.performanceReleaseMode);
-            writeInt(f, "perfVelocity", node.performanceVelocity ? 1 : 0);
-        }
-        // Oscilloscope display settings - written only when non-default to keep
-        // files lean (only __oscilloscope__ nodes ever change these from default).
-        if (!node.scopeTriggered) writeInt(f, "scopeTriggered", 0);
-        if (node.scopeTrigLevel != 0.0f) writeFloat(f, "scopeTrigLevel", node.scopeTrigLevel);
-        if (!node.scopeTrigRising) writeInt(f, "scopeTrigRising", 0);
-        if (node.mpeEnabled) {
-            writeInt(f, "mpeEnabled", 1);
-            writeInt(f, "mpePitchBendRange", node.mpePitchBendRange);
-        }
-        writeInt(f, "parentGroupId", node.parentGroupId);
-        writeFloat(f, "groupBeatOffset", node.groupBeatOffset);
-        if (!node.anchorMarker.empty())
-            writeStr(f, "anchorMarker", node.anchorMarker);
-        writeInt(f, "groupExpanded", node.groupExpanded ? 1 : 0);
-        // Voice container (per-voice polyphony) - see poly-voice-architecture.md
-        if (node.voiceContainerId != -1)
-            writeInt(f, "voiceContainerId", node.voiceContainerId);
-        if (node.type == NodeType::VoiceContainer) {
-            writeInt(f, "voicePolyphony", node.voicePolyphony);
-            writeInt(f, "voiceStealMode", node.voiceStealMode);
-            writeFloat(f, "voiceGlideMs", node.voiceGlideMs);
-            writeInt(f, "voiceUnison", node.voiceUnison);
-            writeFloat(f, "voiceUnisonDetune", node.voiceUnisonDetune);
-            writeFloat(f, "voiceUnisonSpread", node.voiceUnisonSpread);
-        }
-        // Save child IDs as comma-separated
-        if (!node.childNodeIds.empty()) {
-            std::string ids;
-            for (int i = 0; i < (int)node.childNodeIds.size(); ++i) {
-                if (i > 0) ids += ",";
-                ids += std::to_string(node.childNodeIds[i]);
-            }
-            writeStr(f, "childNodeIds", ids);
-        }
-        // MOD-import song-setting restore stash (only meaningful on the
-        // import's root group node; harmless/absent on others).
-        if (node.modImportSavedSong) {
-            writeInt(f, "modImportSavedSong", 1);
-            writeInt(f, "modImportPrevRepeatMode", node.modImportPrevRepeatMode);
-            writeInt(f, "modImportPrevRepeatCount", node.modImportPrevRepeatCount);
-            writeFloat(f, "modImportPrevSongLength", (float)node.modImportPrevSongLength);
-            writeInt(f, "modImportPrevLoopEnabled", node.modImportPrevLoopEnabled ? 1 : 0);
-            writeFloat(f, "modImportPrevLoopStart", (float)node.modImportPrevLoopStart);
-            writeFloat(f, "modImportPrevLoopEnd", (float)node.modImportPrevLoopEnd);
-        }
-        // Audio cache / freeze state. The auto-cache toggle is a user preference
-        // (default true) so persist it whenever it's off, regardless of whether
-        // a cache exists. The freeze payload itself (enabled/valid/on-disk PCM)
-        // is only persisted on real saves - undo snapshots pass includeBlobs
-        // =false and must not carry freeze state (reparsing a snapshot must not
-        // touch the disk cache). The PCM lives in a sibling soundshop_cache/
-        // file named by node id; here we persist only the metadata needed to
-        // re-attach it on load (see rehydrateNodeCaches). saveProject runs
-        // saveToDisk before this, so a frozen node arrives here with
-        // useDisk=true and its buffers already flushed.
-        if (!node.cache.autoCache) writeInt(f, "cacheAuto", 0);
-        // Require useDisk: only freezes actually backed by a soundshop_cache/
-        // file are re-attachable on load. This also excludes the Output node's
-        // memory-only stop-capture cache (never flushed to disk - see
-        // saveProject), which is transient session state, not a saved freeze.
-        if (includeBlobs && node.cache.hasCachedAudio() && node.cache.useDisk) {
-            writeInt(f, "cacheEnabled", node.cache.enabled ? 1 : 0);
-            writeInt(f, "cacheValid", 1);
-            writeInt(f, "cacheUseDisk", node.cache.useDisk ? 1 : 0);
-            writeStr(f, "cacheHash", std::to_string(node.cache.inputHash));
-            writeFloat(f, "cacheSampleRate", (float)node.cache.sampleRate);
-            writeStr(f, "cacheStartSample", std::to_string(node.cache.startSample));
-            writeStr(f, "cacheNumSamples", std::to_string(node.cache.numSamples));
-        }
-
-        for (auto& pin : node.pinsIn) {
-            f << "[PinIn]\n";
-            writeInt(f, "id", pin.id);
-            writeStr(f, "name", pin.name);
-            writeInt(f, "kind", (int)pin.kind);
-            writeInt(f, "channels", pin.channels);
-        }
-        for (auto& pin : node.pinsOut) {
-            f << "[PinOut]\n";
-            writeInt(f, "id", pin.id);
-            writeStr(f, "name", pin.name);
-            writeInt(f, "kind", (int)pin.kind);
-            writeInt(f, "channels", pin.channels);
-        }
-        for (auto& param : node.params) {
-            f << "[Param]\n";
-            writeStr(f, "name", param.name);
-            writeFloat(f, "value", param.modulated ? param.baseValue : param.value);
-            writeFloat(f, "min", param.minVal);
-            writeFloat(f, "max", param.maxVal);
-            writeStr(f, "format", param.format);
-            // Warp-slot key (unified warp/morph). Only emitted for warp params so
-            // ordinary params stay unchanged; absent => -1 (not a warp param).
-            if (param.warpSlot >= 0) writeInt(f, "warpSlot", param.warpSlot);
-            // Warp scope: which chain the slot indexes. Only emitted for per-
-            // layer warp params (>=0); absent => -1 (frame-scope / not a warp).
-            // Also used as the layer index for layer-field (phase/amp) params.
-            if (param.warpLayer >= 0) writeInt(f, "warpLayer", param.warpLayer);
-            // Per-layer field key (0=phase, 1=amplitude). Only emitted for
-            // layer-field modulation params; absent => -1 (not a layer field).
-            if (param.layerField >= 0) writeInt(f, "layerField", param.layerField);
-            // Owning wavetable frame (library id) for warp / layer-field params.
-            // Only emitted when set (>=0); absent => -1 (legacy whole-node, the
-            // pre-per-frame layout). Lets two frames carry the same warp op
-            // without their modulation params colliding on (warpLayer,warpSlot).
-            if (param.warpFrameId >= 0) writeInt(f, "warpFrameId", param.warpFrameId);
-            // Automation record override (record axis) + lane bypass (read axis).
-            // Only emitted when non-default so ordinary params round-trip
-            // unchanged. armMode absent => Inherit; bypassAuto absent => false.
-            if (param.armMode != AutoArmMode::Inherit) writeInt(f, "armMode", (int)param.armMode);
-            if (param.bypassAutomation) writeInt(f, "bypassAuto", 1);
-            for (auto& ap : param.automation.points)
-                f << "auto=" << ap.beat << "," << ap.value << "\n";
-        }
-        // Signal modulation pin bindings (#88). The pins themselves are
-        // already serialized in the [PinIn] block above; the modPin
-        // entries just record which param each one drives.
-        for (auto& mp : node.modPins) {
-            f << "modPin=" << mp.paramIndex << "," << mp.pinId
-              << "," << mp.depth
-              << "," << (mp.mode == Node::ModPin::Mode::Absolute ? 1 : 0) << "\n";
-        }
-        // Recorded automation for hosted-plugin params (node-scope, since plugin
-        // params have no [Param] block). One line per point: pluginAuto=<paramIdx>,
-        // <beat>,<normValue>. Values are normalized 0..1. Emitted only for lanes
-        // that actually hold points, so plain plugin nodes stay unchanged.
-        for (auto& kv : node.pluginParamAutomation) {
-            for (auto& ap : kv.second.points)
-                f << "pluginAuto=" << kv.first << "," << ap.beat << "," << ap.value << "\n";
-        }
-        for (auto& clip : node.clips) {
-            f << "[Clip]\n";
-            writeStr(f, "name", clip.name);
-            writeFloat(f, "start", clip.startBeat);
-            writeFloat(f, "length", clip.lengthBeats);
-            writeInt(f, "color", (int)clip.color);
-            writeInt(f, "channels", clip.channels);
-            writeInt(f, "waveformView", clip.waveformView);
-            writeInt(f, "clipKeyRoot", clip.keyRoot);
-            writeStr(f, "clipKeyType", clip.keyType);
-            writeInt(f, "hasCustomKey", clip.hasCustomKey ? 1 : 0);
-            for (auto& note : clip.notes) {
-                f << "[Note]\n";
-                writeFloat(f, "offset", note.offset);
-                writeInt(f, "pitch", note.pitch);
-                writeFloat(f, "duration", note.duration);
-                writeInt(f, "velocity", note.velocity);
-                writeInt(f, "degree", note.degree);
-                writeInt(f, "octave", note.octave);
-                writeInt(f, "chromatic", note.chromaticOffset);
-                writeFloat(f, "detune", note.detune);
-                if (note.exactOffset.den > 0) {
-                    writeInt(f, "exactOffsetNum", note.exactOffset.num);
-                    writeInt(f, "exactOffsetDen", note.exactOffset.den);
-                }
-                if (note.exactDuration.den > 0) {
-                    writeInt(f, "exactDurNum", note.exactDuration.num);
-                    writeInt(f, "exactDurDen", note.exactDuration.den);
-                }
-                // MPE expression curves
-                for (auto& p : note.expression.pitchBend)
-                    f << "exPB=" << p.time << "," << p.value << "\n";
-                for (auto& p : note.expression.slide)
-                    f << "exSL=" << p.time << "," << p.value << "\n";
-                for (auto& p : note.expression.pressure)
-                    f << "exPR=" << p.time << "," << p.value << "\n";
-            }
-            for (auto& cc : clip.ccEvents) {
-                f << "[CC]\n";
-                writeFloat(f, "offset", cc.offset);
-                writeInt(f, "controller", cc.controller);
-                writeInt(f, "value", cc.value);
-                writeInt(f, "channel", cc.channel);
-            }
-            // Audio clip fields
-            if (!clip.audioFilePath.empty())
-                writeStr(f, "audioFile", clip.audioFilePath);
-            writeFloat(f, "slipOffset", clip.slipOffset);
-            writeFloat(f, "fadeIn", clip.fadeInBeats);
-            writeFloat(f, "fadeOut", clip.fadeOutBeats);
-            writeFloat(f, "gain", clip.gainDb);
-        }
-
-        // Take lanes
-        for (auto& lane : node.takeLanes) {
-            f << "[TakeLane]\n";
-            writeStr(f, "name", lane.name);
-            writeFloat(f, "timeOffset", lane.timeOffsetSamples);
-            writeInt(f, "muted", lane.muted ? 1 : 0);
-            for (auto& clip : lane.clips) {
-                f << "[TakeClip]\n";
-                writeStr(f, "name", clip.name);
-                writeFloat(f, "start", clip.startBeat);
-                writeFloat(f, "length", clip.lengthBeats);
-                writeInt(f, "color", (int)clip.color);
-                writeInt(f, "channels", clip.channels);
-                if (!clip.audioFilePath.empty())
-                    writeStr(f, "audioFile", clip.audioFilePath);
-                writeFloat(f, "slipOffset", clip.slipOffset);
-                writeFloat(f, "gain", clip.gainDb);
-            }
-        }
-
-        // Comp segments
-        for (auto& comp : node.compSegments) {
-            f << "[Comp]\n";
-            writeFloat(f, "start", comp.startBeat);
-            writeFloat(f, "end", comp.endBeat);
-            writeInt(f, "lane", comp.takeLaneIdx);
-            writeFloat(f, "crossfade", comp.crossfadeBeats);
-        }
-
-        // Time-gated effect regions (the colored layer bars above the notes in
-        // the piano roll). These were historically not serialized at all, which
-        // meant a region vanished on save/load AND was silently wiped by any
-        // undo step (undo snapshots go through this same writer). Emitted per
-        // node so they ride along with the track they gate.
-        for (auto& region : node.effectRegions) {
-            f << "[FxRegion]\n";
-            writeInt(f, "linkId", region.linkId);
-            writeInt(f, "groupId", region.groupId);
-            writeFloat(f, "start", region.startBeat);
-            writeFloat(f, "end", region.endBeat);
-            writeInt(f, "color", (int)region.color);
-        }
-    }
+    for (auto& node : graph.nodes)
+        writeNode(f, node, gp, includeBlobs);
 
     // Save links
     for (auto& link : graph.links) {
@@ -666,95 +672,80 @@ bool ProjectFile::load(const std::string& path, NodeGraph& graph, PluginHost* pl
     return ok;
 }
 
-bool ProjectFile::readProject(std::istream& f, NodeGraph& graph, PluginHost* pluginHost) {
-    // Clear existing
-    graph.nodes.clear();
-    graph.nodesInvalidated();
-    graph.links.clear();
-    graph.openEditors.clear();
-    // The loop region is only serialized when enabled (writeProject omits the
-    // keys otherwise), so reset it here: parsing a snapshot or file that has no
-    // loop keys must yield "no loop", not inherit a stale loop from the graph's
-    // prior state. Without this, undo/redo of a "disable loop" edit wouldn't
-    // stick (the redo snapshot has no keys, so loopEnabled would stay true).
-    graph.loopEnabled = false;
-    graph.loopStartBeat = 0;
-    graph.loopEndBeat = 0;
+namespace {
 
-    std::vector<int> pendingEditorIds;
-    int pendingActiveEditorId = -1;
+std::string valueOf(const std::string& line) {
+    auto pos = line.find('=');
+    if (pos == std::string::npos) return "";
+    return line.substr(pos + 1);
+}
 
-    std::string line, section;
-    Node* curNode = nullptr;
-    Clip* curClip = nullptr;
-    std::string curBlobHash;   // [Blob] section: hash read before its bytes line
-    AssetEntry curAsset;       // [AssetStore] section: built up, committed on payload
-    int maxId = 0;
+std::string keyOf(const std::string& line) {
+    auto pos = line.find('=');
+    if (pos == std::string::npos) return line;
+    return line.substr(0, pos);
+}
 
-    auto getValue = [](const std::string& line) -> std::string {
-        auto pos = line.find('=');
-        if (pos == std::string::npos) return "";
-        return line.substr(pos + 1);
-    };
-    auto getKey = [](const std::string& line) -> std::string {
-        auto pos = line.find('=');
-        if (pos == std::string::npos) return line;
-        return line.substr(0, pos);
-    };
+bool isNodeSection(const std::string& section) {
+    return section == "[Node]" || section == "[PinIn]" || section == "[PinOut]"
+        || section == "[Param]" || section == "[Clip]" || section == "[Note]"
+        || section == "[CC]" || section == "[TakeLane]" || section == "[TakeClip]"
+        || section == "[Comp]" || section == "[FxRegion]";
+}
 
-    while (std::getline(f, line)) {
-        if (line.empty()) continue;
+// Reads [Node] blocks: the node's own keys and its sub-sections - [PinIn],
+// [PinOut], [Param] (with the modPin lines after them), [Clip] with its
+// [Note]s and [CC]s, [TakeLane], [TakeClip], [Comp], [FxRegion]. Shared by
+// readProject, for a whole project, and readNode, for one node (Duplicate).
+class NodeReader {
+public:
+    Node* node = nullptr;   // the node being read (begin), or none yet
+    Clip* clip = nullptr;   // its clip being read
+    int maxId = 0;          // the highest node or pin id read
 
-        // Section header
-        if (line[0] == '[') {
-            section = line;
-            if (section == "[Node]") {
-                graph.nodes.push_back({});
-                curNode = &graph.nodes.back();
-                curClip = nullptr;
-            } else if (section == "[PinIn]") {
-                if (curNode) curNode->pinsIn.push_back({});
-            } else if (section == "[PinOut]") {
-                if (curNode) curNode->pinsOut.push_back({});
-            } else if (section == "[Param]") {
-                if (curNode) curNode->params.push_back({});
-            } else if (section == "[Clip]") {
-                if (curNode) {
-                    curNode->clips.push_back({});
-                    curClip = &curNode->clips.back();
-                }
-            } else if (section == "[Note]") {
-                if (curClip) curClip->notes.push_back({});
-            } else if (section == "[CC]") {
-                if (curClip) curClip->ccEvents.push_back({});
-            } else if (section == "[TakeLane]") {
-                if (curNode) curNode->takeLanes.push_back({});
-            } else if (section == "[TakeClip]") {
-                if (curNode && !curNode->takeLanes.empty())
-                    curNode->takeLanes.back().clips.push_back({});
-            } else if (section == "[Comp]") {
-                if (curNode) curNode->compSegments.push_back({});
-            } else if (section == "[FxRegion]") {
-                if (curNode) curNode->effectRegions.push_back({});
-            } else if (section == "[Link]") {
-                graph.links.push_back({});
-            } else if (section == "[Marker]") {
-                graph.markers.push_back({});
-            } else if (section == "[CCMap]") {
-                graph.ccMappings.push_back({});
-            } else if (section == "[Waveform]") {
-                graph.waveformLibrary.push_back({});
-            } else if (section == "[EffectGroup]") {
-                graph.effectGroups.push_back({});
-            } else if (section == "[AssetStore]") {
-                curAsset = AssetEntry{};   // staged, committed when payload arrives
+    // A [Node] header: `n` is the node its lines go to from here.
+    void begin(Node& n) {
+        node = &n;
+        clip = nullptr;
+    }
+
+    // A section header: true if it's one of a node's sub-sections (the caller
+    // handles [Node] itself, with begin).
+    bool openSection(const std::string& section) {
+        if (section == "[PinIn]") {
+            if (node) node->pinsIn.push_back({});
+        } else if (section == "[PinOut]") {
+            if (node) node->pinsOut.push_back({});
+        } else if (section == "[Param]") {
+            if (node) node->params.push_back({});
+        } else if (section == "[Clip]") {
+            if (node) {
+                node->clips.push_back({});
+                clip = &node->clips.back();
             }
-            continue;
+        } else if (section == "[Note]") {
+            if (clip) clip->notes.push_back({});
+        } else if (section == "[CC]") {
+            if (clip) clip->ccEvents.push_back({});
+        } else if (section == "[TakeLane]") {
+            if (node) node->takeLanes.push_back({});
+        } else if (section == "[TakeClip]") {
+            if (node && !node->takeLanes.empty())
+                node->takeLanes.back().clips.push_back({});
+        } else if (section == "[Comp]") {
+            if (node) node->compSegments.push_back({});
+        } else if (section == "[FxRegion]") {
+            if (node) node->effectRegions.push_back({});
+        } else {
+            return false;
         }
+        return true;
+    }
 
-        auto key = getKey(line);
-        auto val = getValue(line);
-
+    // One key=value line of `section`: true if it was the node's to read.
+    // Multi-line values (scriptLines) read on from `f`.
+    bool readLine(const std::string& section, const std::string& key,
+                  const std::string& val, std::istream& f) {
         // Signal modulation pin bindings (#88): "modPin=paramIdx,pinId,depth[,mode]"
         // (mode 0=Modulate, 1=Absolute; optional for back-compat -> Modulate).
         //
@@ -767,7 +758,7 @@ bool ProjectFile::readProject(std::istream& f, NodeGraph& graph, PluginHost* plu
         // vanished, so reopening a project lost all its pins. Handle it here, ahead
         // of the section dispatch, so it's recognised regardless of section - which
         // fixes both newly-saved and already-saved (old) projects.
-        if (key == "modPin" && curNode) {
+        if (key == "modPin" && node) {
             Node::ModPin mp;
             auto c1 = val.find(',');
             auto c2 = (c1 == std::string::npos) ? std::string::npos
@@ -784,82 +775,57 @@ bool ProjectFile::readProject(std::istream& f, NodeGraph& graph, PluginHost* plu
                 } else {
                     mp.depth = std::stof(val.substr(c2 + 1));
                 }
-                curNode->modPins.push_back(mp);
+                node->modPins.push_back(mp);
             }
-            continue;
+            return true;
         }
 
-        if (section == "[Project]") {
-            if (key == "bpm") graph.bpm = std::stof(val);
-            else if (key == "timeSigNum") graph.timeSignatureNum = std::stoi(val);
-            else if (key == "timeSigDen") graph.timeSignatureDen = std::stoi(val);
-            else if (key == "loopEnabled") graph.loopEnabled = (val == "1");
-            else if (key == "loopStart") graph.loopStartBeat = std::stof(val);
-            else if (key == "loopEnd") graph.loopEndBeat = std::stof(val);
-            else if (key == "projectSampleRate") graph.projectSampleRate = std::stof(val);
-            else if (key == "tuningSystem") graph.tuningSystem = (TuningSystem)std::stoi(val);
-            else if (key == "concertPitch") graph.concertPitch = std::stof(val);
-            else if (key == "globalCrossfadeSec") graph.globalCrossfadeSec = std::stof(val);
-            else if (key == "metronomeEnabled") graph.metronomeEnabled = (val == "1");
-            else if (key == "songLengthBeats") graph.songLengthBeats = std::stof(val);
-            else if (key == "songRepeatMode") {
-                int m = std::stoi(val);
-                graph.songRepeatMode = (m == 1 ? NodeGraph::SongRepeat::Forever
-                                       : m == 2 ? NodeGraph::SongRepeat::NTimes
-                                       :          NodeGraph::SongRepeat::None);
+        // pluginAuto=<paramIdx>,<beat>,<normValue> - one recorded point on a
+        // hosted-plugin param lane (see writeNode). Written, like modPin, after
+        // the node's [PinIn]/[PinOut]/[Param] blocks, so it's read here, in
+        // whatever section is current: until 0.10.11 only the [Node] branch
+        // knew the key, so every plugin node - they all have pins - lost its
+        // lanes on load and on every undo.
+        if (key == "pluginAuto" && node) {
+            auto c1 = val.find(',');
+            auto c2 = (c1 == std::string::npos) ? std::string::npos
+                                                : val.find(',', c1 + 1);
+            if (c1 != std::string::npos && c2 != std::string::npos) {
+                try {
+                    int idx = std::stoi(val.substr(0, c1));
+                    float beat = std::stof(val.substr(c1 + 1, c2 - c1 - 1));
+                    float v = std::stof(val.substr(c2 + 1));
+                    node->pluginParamAutomation[idx].points.push_back({ beat, v });
+                } catch (...) {}
             }
-            else if (key == "songRepeatCount") graph.songRepeatCount = std::max(1, std::stoi(val));
-            else if (key == "historyFile") graph.historyFilePath = val;
-            else if (key == "viewZoom") graph.viewZoom = std::stof(val);
-            else if (key == "viewPanX") graph.viewPanX = std::stof(val);
-            else if (key == "viewPanY") graph.viewPanY = std::stof(val);
-            else if (key == "signalScriptLines") {
-                int numLines = std::stoi(val);
-                graph.signalScript.clear();
-                for (int sl = 0; sl < numLines && std::getline(f, line); ++sl) {
-                    if (!graph.signalScript.empty()) graph.signalScript += "\n";
-                    graph.signalScript += line;
-                }
-            }
+            return true;
         }
-        else if (section == "[Node]" && curNode) {
-            if (key == "id") { curNode->id = std::stoi(val); maxId = std::max(maxId, curNode->id); }
-            else if (key == "name") curNode->name = val;
-            else if (key == "type") curNode->type = (NodeType)std::stoi(val);
-            else if (key == "posX") curNode->pos.x = std::stof(val);
-            else if (key == "posY") curNode->pos.y = std::stof(val);
-            else if (key == "muted") curNode->muted = (val == "1");
-            else if (key == "soloed") curNode->soloed = (val == "1");
-            else if (key == "armMode") curNode->armMode = (AutoArmMode)std::stoi(val);
-            else if (key == "ignoreAuto") curNode->ignoreAutomation = (val == "1");
-            else if (key == "pluginAuto") {
-                // pluginAuto=<paramIdx>,<beat>,<normValue> - one recorded point on
-                // a hosted-plugin param lane (see writeProject).
-                auto c1 = val.find(',');
-                auto c2 = (c1 == std::string::npos) ? std::string::npos
-                                                    : val.find(',', c1 + 1);
-                if (c1 != std::string::npos && c2 != std::string::npos) {
-                    try {
-                        int idx = std::stoi(val.substr(0, c1));
-                        float beat = std::stof(val.substr(c1 + 1, c2 - c1 - 1));
-                        float v = std::stof(val.substr(c2 + 1));
-                        curNode->pluginParamAutomation[idx].points.push_back({ beat, v });
-                    } catch (...) {}
-                }
-            }
+
+        if (!isNodeSection(section))
+            return false;
+        if (section == "[Node]" && node) {
+            if (key == "id") { node->id = std::stoi(val); maxId = std::max(maxId, node->id); }
+            else if (key == "name") node->name = val;
+            else if (key == "type") node->type = (NodeType)std::stoi(val);
+            else if (key == "posX") node->pos.x = std::stof(val);
+            else if (key == "posY") node->pos.y = std::stof(val);
+            else if (key == "muted") node->muted = (val == "1");
+            else if (key == "soloed") node->soloed = (val == "1");
+            else if (key == "armMode") node->armMode = (AutoArmMode)std::stoi(val);
+            else if (key == "ignoreAuto") node->ignoreAutomation = (val == "1");
             else if (key == "scriptLines") {
                 // New multi-line-safe format (see writeProject above).
                 int n = 0;
                 try { n = std::stoi(val); } catch (...) { n = 0; }
-                std::string buf;
+                std::string buf, line;
                 for (int li = 0; li < n && std::getline(f, line); ++li) {
                     if (!buf.empty()) buf += "\n";
                     buf += line;
                 }
-                curNode->script = std::move(buf);
+                node->script = std::move(buf);
             }
             else if (key == "script") {
-                curNode->script = val;
+                node->script = val;
                 // Backward-compatibility recovery for the silent-MOD-playback
                 // bug: pre-fix saves wrote multi-line scripts (notably
                 // MultiSampler) as plain `script=<first-line>` followed by
@@ -901,12 +867,12 @@ bool ProjectFile::readProject(std::istream& f, NodeGraph& graph, PluginHost* plu
                     while (std::getline(f, peek)) {
                         if (peek.empty()) { savePos = f.tellg(); continue; }
                         if (peek[0] == '[') break;       // new [Section]
-                        std::string pk = getKey(peek);
+                        std::string pk = keyOf(peek);
                         if (kNodeKeys.count(pk)) break;  // back to node keys
                         // Looks like a multisampler doc continuation line -
                         // append to script.
-                        curNode->script += "\n";
-                        curNode->script += peek;
+                        node->script += "\n";
+                        node->script += peek;
                         savePos = f.tellg();
                     }
                     // Rewind to before the line that broke the loop so the
@@ -915,7 +881,7 @@ bool ProjectFile::readProject(std::istream& f, NodeGraph& graph, PluginHost* plu
                     else f.clear(); // EOF is fine, just clear flag
                 }
             }
-            else if (key == "midiInputSourceId") curNode->midiInputSourceId = val;
+            else if (key == "midiInputSourceId") node->midiInputSourceId = val;
             // Legacy per-node envelope fields (envAttackCurve / envDecayCurve /
             // envReleaseCurve and the envAtkPt / envDecPt / envRelPt point
             // lists) were replaced by the shared ahdsrEnvelope. They're still
@@ -934,10 +900,10 @@ bool ProjectFile::readProject(std::istream& f, NodeGraph& graph, PluginHost* plu
                 // hard-fail the load on one bad field.
                 AHDSREnvelope tmp;
                 if (AHDSREnvelope::decode(val, tmp))
-                    curNode->ahdsrEnvelope = std::move(tmp);
+                    node->ahdsrEnvelope = std::move(tmp);
             }
             else if (key == "ahdsrAssetId") {
-                try { curNode->ahdsrAssetId = std::stoi(val); } catch (...) {}
+                try { node->ahdsrAssetId = std::stoi(val); } catch (...) {}
             }
             // Additional per-component AHDSR envelopes (FM operators etc.).
             // opEnvelopeCount is written first and pre-sizes the vector; the
@@ -947,91 +913,91 @@ bool ProjectFile::readProject(std::istream& f, NodeGraph& graph, PluginHost* plu
             else if (key == "opEnvelopeCount") {
                 try {
                     int n = std::stoi(val);
-                    if (n > 0 && n <= 64 && (int)curNode->opEnvelopes.size() < n)
-                        curNode->opEnvelopes.resize(n);
+                    if (n > 0 && n <= 64 && (int)node->opEnvelopes.size() < n)
+                        node->opEnvelopes.resize(n);
                 } catch (...) {}
             }
             else if (key.rfind("opEnvelope", 0) == 0 && key != "opEnvelopeCount") {
                 try {
                     int idx = std::stoi(key.substr(std::string("opEnvelope").size()));
                     if (idx >= 0 && idx < 64) {
-                        if ((int)curNode->opEnvelopes.size() <= idx)
-                            curNode->opEnvelopes.resize(idx + 1);
+                        if ((int)node->opEnvelopes.size() <= idx)
+                            node->opEnvelopes.resize(idx + 1);
                         AHDSREnvelope tmp;
                         if (AHDSREnvelope::decode(val, tmp))
-                            curNode->opEnvelopes[idx] = std::move(tmp);
+                            node->opEnvelopes[idx] = std::move(tmp);
                     }
                 } catch (...) {}
             }
             else if (key == "aftertouchSensitivity") {
-                try { curNode->aftertouchSensitivity = std::stof(val); }
+                try { node->aftertouchSensitivity = std::stof(val); }
                 catch (...) {}
             }
-            else if (key == "pluginIndex") curNode->legacyPluginIndex = std::stoi(val);
+            else if (key == "pluginIndex") node->legacyPluginIndex = std::stoi(val);
             else if (key == "pluginDescription") {
                 if (auto xml = juce::parseXML(juce::String::fromUTF8(val.c_str())))
-                    curNode->pluginDescription.loadFromXml(*xml);
+                    node->pluginDescription.loadFromXml(*xml);
             }
-            else if (key == "pluginState") curNode->pendingPluginState = val;
-            else if (key == "panLaw") curNode->panLaw = (PanLaw)std::stoi(val);
-            else if (key == "pan") curNode->pan = std::stof(val);
-            else if (key == "spatialX") curNode->spatialX = std::stof(val);
-            else if (key == "spatialY") curNode->spatialY = std::stof(val);
-            else if (key == "spatialZ") curNode->spatialZ = std::stof(val);
-            else if (key == "performanceMode") curNode->performanceMode = (val == "1");
-            else if (key == "perfReleaseMode") curNode->performanceReleaseMode = std::stoi(val);
-            else if (key == "perfVelocity") curNode->performanceVelocity = (val == "1");
-            else if (key == "scopeTriggered") curNode->scopeTriggered = (val == "1");
-            else if (key == "scopeTrigLevel") curNode->scopeTrigLevel = std::stof(val);
-            else if (key == "scopeTrigRising") curNode->scopeTrigRising = (val == "1");
-            else if (key == "mpeEnabled") curNode->mpeEnabled = (val == "1");
-            else if (key == "mpePitchBendRange") curNode->mpePitchBendRange = std::stoi(val);
-            else if (key == "parentGroupId") curNode->parentGroupId = std::stoi(val);
-            else if (key == "groupBeatOffset") curNode->groupBeatOffset = std::stof(val);
-            else if (key == "anchorMarker") curNode->anchorMarker = val;
-            else if (key == "groupExpanded") curNode->groupExpanded = (val == "1");
-            else if (key == "voiceContainerId") curNode->voiceContainerId = std::stoi(val);
-            else if (key == "voicePolyphony") curNode->voicePolyphony = std::stoi(val);
-            else if (key == "voiceStealMode") curNode->voiceStealMode = std::stoi(val);
-            else if (key == "voiceGlideMs") curNode->voiceGlideMs = std::stof(val);
-            else if (key == "voiceUnison") curNode->voiceUnison = std::stoi(val);
-            else if (key == "voiceUnisonDetune") curNode->voiceUnisonDetune = std::stof(val);
-            else if (key == "voiceUnisonSpread") curNode->voiceUnisonSpread = std::stof(val);
-            else if (key == "modImportSavedSong") curNode->modImportSavedSong = (val == "1");
-            else if (key == "modImportPrevRepeatMode") curNode->modImportPrevRepeatMode = std::stoi(val);
-            else if (key == "modImportPrevRepeatCount") curNode->modImportPrevRepeatCount = std::stoi(val);
-            else if (key == "modImportPrevSongLength") curNode->modImportPrevSongLength = std::stof(val);
-            else if (key == "modImportPrevLoopEnabled") curNode->modImportPrevLoopEnabled = (val == "1");
-            else if (key == "modImportPrevLoopStart") curNode->modImportPrevLoopStart = std::stof(val);
-            else if (key == "modImportPrevLoopEnd") curNode->modImportPrevLoopEnd = std::stof(val);
+            else if (key == "pluginState") node->pendingPluginState = val;
+            else if (key == "panLaw") node->panLaw = (PanLaw)std::stoi(val);
+            else if (key == "pan") node->pan = std::stof(val);
+            else if (key == "spatialX") node->spatialX = std::stof(val);
+            else if (key == "spatialY") node->spatialY = std::stof(val);
+            else if (key == "spatialZ") node->spatialZ = std::stof(val);
+            else if (key == "performanceMode") node->performanceMode = (val == "1");
+            else if (key == "perfReleaseMode") node->performanceReleaseMode = std::stoi(val);
+            else if (key == "perfVelocity") node->performanceVelocity = (val == "1");
+            else if (key == "scopeTriggered") node->scopeTriggered = (val == "1");
+            else if (key == "scopeTrigLevel") node->scopeTrigLevel = std::stof(val);
+            else if (key == "scopeTrigRising") node->scopeTrigRising = (val == "1");
+            else if (key == "mpeEnabled") node->mpeEnabled = (val == "1");
+            else if (key == "mpePitchBendRange") node->mpePitchBendRange = std::stoi(val);
+            else if (key == "parentGroupId") node->parentGroupId = std::stoi(val);
+            else if (key == "groupBeatOffset") node->groupBeatOffset = std::stof(val);
+            else if (key == "anchorMarker") node->anchorMarker = val;
+            else if (key == "groupExpanded") node->groupExpanded = (val == "1");
+            else if (key == "voiceContainerId") node->voiceContainerId = std::stoi(val);
+            else if (key == "voicePolyphony") node->voicePolyphony = std::stoi(val);
+            else if (key == "voiceStealMode") node->voiceStealMode = std::stoi(val);
+            else if (key == "voiceGlideMs") node->voiceGlideMs = std::stof(val);
+            else if (key == "voiceUnison") node->voiceUnison = std::stoi(val);
+            else if (key == "voiceUnisonDetune") node->voiceUnisonDetune = std::stof(val);
+            else if (key == "voiceUnisonSpread") node->voiceUnisonSpread = std::stof(val);
+            else if (key == "modImportSavedSong") node->modImportSavedSong = (val == "1");
+            else if (key == "modImportPrevRepeatMode") node->modImportPrevRepeatMode = std::stoi(val);
+            else if (key == "modImportPrevRepeatCount") node->modImportPrevRepeatCount = std::stoi(val);
+            else if (key == "modImportPrevSongLength") node->modImportPrevSongLength = std::stof(val);
+            else if (key == "modImportPrevLoopEnabled") node->modImportPrevLoopEnabled = (val == "1");
+            else if (key == "modImportPrevLoopStart") node->modImportPrevLoopStart = std::stof(val);
+            else if (key == "modImportPrevLoopEnd") node->modImportPrevLoopEnd = std::stof(val);
             else if (key == "childNodeIds") {
                 // Parse comma-separated IDs
                 std::istringstream ss(val);
                 std::string token;
                 while (std::getline(ss, token, ','))
-                    if (!token.empty()) curNode->childNodeIds.push_back(std::stoi(token));
+                    if (!token.empty()) node->childNodeIds.push_back(std::stoi(token));
             }
             // Audio cache / freeze metadata (see writeProject). The on-disk PCM
             // is re-attached after load by rehydrateNodeCaches, which resolves
             // diskPath against the loaded file's soundshop_cache/ folder and
             // drops the freeze if the file is gone. deterministic is left to
             // AudioCacheManager::updateDeterminism (it depends on live CC maps).
-            else if (key == "cacheAuto") curNode->cache.autoCache = (val == "1");
-            else if (key == "cacheEnabled") curNode->cache.enabled = (val == "1");
-            else if (key == "cacheValid") curNode->cache.valid = (val == "1");
-            else if (key == "cacheUseDisk") curNode->cache.useDisk = (val == "1");
-            else if (key == "cacheHash") { try { curNode->cache.inputHash = std::stoull(val); } catch (...) {} }
-            else if (key == "cacheSampleRate") { try { curNode->cache.sampleRate = std::stod(val); } catch (...) {} }
-            else if (key == "cacheStartSample") { try { curNode->cache.startSample = std::stoll(val); } catch (...) {} }
-            else if (key == "cacheNumSamples") { try { curNode->cache.numSamples = std::stoll(val); } catch (...) {} }
+            else if (key == "cacheAuto") node->cache.autoCache = (val == "1");
+            else if (key == "cacheEnabled") node->cache.enabled = (val == "1");
+            else if (key == "cacheValid") node->cache.valid = (val == "1");
+            else if (key == "cacheUseDisk") node->cache.useDisk = (val == "1");
+            else if (key == "cacheHash") { try { node->cache.inputHash = std::stoull(val); } catch (...) {} }
+            else if (key == "cacheSampleRate") { try { node->cache.sampleRate = std::stod(val); } catch (...) {} }
+            else if (key == "cacheStartSample") { try { node->cache.startSample = std::stoll(val); } catch (...) {} }
+            else if (key == "cacheNumSamples") { try { node->cache.numSamples = std::stoll(val); } catch (...) {} }
             // NOTE: "modPin=" lines are parsed earlier (before the section
             // dispatch) because they are written after the [Param] blocks, so
             // the active section is "[Param]" — not "[Node]" — when they're
             // read. See the hoisted handler near the top of this loop.
         }
-        else if ((section == "[PinIn]" || section == "[PinOut]") && curNode) {
-            auto& pins = (section == "[PinIn]") ? curNode->pinsIn : curNode->pinsOut;
-            if (pins.empty()) continue;
+        else if ((section == "[PinIn]" || section == "[PinOut]") && node) {
+            auto& pins = (section == "[PinIn]") ? node->pinsIn : node->pinsOut;
+            if (pins.empty()) return true;
             auto& pin = pins.back();
             pin.isInput = (section == "[PinIn]");
             if (key == "id") { pin.id = std::stoi(val); maxId = std::max(maxId, pin.id); }
@@ -1039,8 +1005,8 @@ bool ProjectFile::readProject(std::istream& f, NodeGraph& graph, PluginHost* plu
             else if (key == "kind") pin.kind = (PinKind)std::stoi(val);
             else if (key == "channels") pin.channels = std::stoi(val);
         }
-        else if (section == "[Param]" && curNode && !curNode->params.empty()) {
-            auto& p = curNode->params.back();
+        else if (section == "[Param]" && node && !node->params.empty()) {
+            auto& p = node->params.back();
             if (key == "name") p.name = val;
             else if (key == "value") p.value = std::stof(val);
             else if (key == "min") p.minVal = std::stof(val);
@@ -1059,31 +1025,31 @@ bool ProjectFile::readProject(std::istream& f, NodeGraph& graph, PluginHost* plu
                                                     std::stof(val.substr(comma + 1))});
             }
         }
-        else if (section == "[Clip]" && curClip) {
-            if (key == "name") curClip->name = val;
-            else if (key == "start") curClip->startBeat = std::stof(val);
-            else if (key == "length") curClip->lengthBeats = std::stof(val);
-            else if (key == "color") curClip->color = (uint32_t)std::stoul(val);
-            else if (key == "channels") curClip->channels = std::stoi(val);
-            else if (key == "waveformView") curClip->waveformView = std::stoi(val);
-            else if (key == "clipKeyRoot") curClip->keyRoot = std::stoi(val);
-            else if (key == "clipKeyType") curClip->keyType = val;
-            else if (key == "hasCustomKey") curClip->hasCustomKey = (val == "1");
-            else if (key == "audioFile") curClip->audioFilePath = val;
-            else if (key == "slipOffset") curClip->slipOffset = std::stof(val);
-            else if (key == "fadeIn") curClip->fadeInBeats = std::stof(val);
-            else if (key == "fadeOut") curClip->fadeOutBeats = std::stof(val);
-            else if (key == "gain") curClip->gainDb = std::stof(val);
+        else if (section == "[Clip]" && clip) {
+            if (key == "name") clip->name = val;
+            else if (key == "start") clip->startBeat = std::stof(val);
+            else if (key == "length") clip->lengthBeats = std::stof(val);
+            else if (key == "color") clip->color = (uint32_t)std::stoul(val);
+            else if (key == "channels") clip->channels = std::stoi(val);
+            else if (key == "waveformView") clip->waveformView = std::stoi(val);
+            else if (key == "clipKeyRoot") clip->keyRoot = std::stoi(val);
+            else if (key == "clipKeyType") clip->keyType = val;
+            else if (key == "hasCustomKey") clip->hasCustomKey = (val == "1");
+            else if (key == "audioFile") clip->audioFilePath = val;
+            else if (key == "slipOffset") clip->slipOffset = std::stof(val);
+            else if (key == "fadeIn") clip->fadeInBeats = std::stof(val);
+            else if (key == "fadeOut") clip->fadeOutBeats = std::stof(val);
+            else if (key == "gain") clip->gainDb = std::stof(val);
         }
-        else if (section == "[CC]" && curClip && !curClip->ccEvents.empty()) {
-            auto& cc = curClip->ccEvents.back();
+        else if (section == "[CC]" && clip && !clip->ccEvents.empty()) {
+            auto& cc = clip->ccEvents.back();
             if (key == "offset") cc.offset = std::stof(val);
             else if (key == "controller") cc.controller = std::stoi(val);
             else if (key == "value") cc.value = std::stoi(val);
             else if (key == "channel") cc.channel = std::stoi(val);
         }
-        else if (section == "[Note]" && curClip && !curClip->notes.empty()) {
-            auto& n = curClip->notes.back();
+        else if (section == "[Note]" && clip && !clip->notes.empty()) {
+            auto& n = clip->notes.back();
             if (key == "offset") n.offset = std::stof(val);
             else if (key == "pitch") n.pitch = std::stoi(val);
             else if (key == "duration") n.duration = std::stof(val);
@@ -1106,38 +1072,136 @@ bool ProjectFile::readProject(std::istream& f, NodeGraph& graph, PluginHost* plu
                 }
             }
         }
-        else if (section == "[TakeLane]" && curNode && !curNode->takeLanes.empty()) {
-            auto& lane = curNode->takeLanes.back();
+        else if (section == "[TakeLane]" && node && !node->takeLanes.empty()) {
+            auto& lane = node->takeLanes.back();
             if (key == "name") lane.name = val;
             else if (key == "timeOffset") lane.timeOffsetSamples = std::stof(val);
             else if (key == "muted") lane.muted = (val == "1");
         }
-        else if (section == "[TakeClip]" && curNode && !curNode->takeLanes.empty()
-                 && !curNode->takeLanes.back().clips.empty()) {
-            auto& clip = curNode->takeLanes.back().clips.back();
-            if (key == "name") clip.name = val;
-            else if (key == "start") clip.startBeat = std::stof(val);
-            else if (key == "length") clip.lengthBeats = std::stof(val);
-            else if (key == "color") clip.color = (uint32_t)std::stoul(val);
-            else if (key == "channels") clip.channels = std::stoi(val);
-            else if (key == "audioFile") clip.audioFilePath = val;
-            else if (key == "slipOffset") clip.slipOffset = std::stof(val);
-            else if (key == "gain") clip.gainDb = std::stof(val);
+        else if (section == "[TakeClip]" && node && !node->takeLanes.empty()
+                 && !node->takeLanes.back().clips.empty()) {
+            auto& take = node->takeLanes.back().clips.back();
+            if (key == "name") take.name = val;
+            else if (key == "start") take.startBeat = std::stof(val);
+            else if (key == "length") take.lengthBeats = std::stof(val);
+            else if (key == "color") take.color = (uint32_t)std::stoul(val);
+            else if (key == "channels") take.channels = std::stoi(val);
+            else if (key == "audioFile") take.audioFilePath = val;
+            else if (key == "slipOffset") take.slipOffset = std::stof(val);
+            else if (key == "gain") take.gainDb = std::stof(val);
         }
-        else if (section == "[Comp]" && curNode && !curNode->compSegments.empty()) {
-            auto& comp = curNode->compSegments.back();
+        else if (section == "[Comp]" && node && !node->compSegments.empty()) {
+            auto& comp = node->compSegments.back();
             if (key == "start") comp.startBeat = std::stof(val);
             else if (key == "end") comp.endBeat = std::stof(val);
             else if (key == "lane") comp.takeLaneIdx = std::stoi(val);
             else if (key == "crossfade") comp.crossfadeBeats = std::stof(val);
         }
-        else if (section == "[FxRegion]" && curNode && !curNode->effectRegions.empty()) {
-            auto& fr = curNode->effectRegions.back();
+        else if (section == "[FxRegion]" && node && !node->effectRegions.empty()) {
+            auto& fr = node->effectRegions.back();
             if (key == "linkId") fr.linkId = std::stoi(val);
             else if (key == "groupId") fr.groupId = std::stoi(val);
             else if (key == "start") fr.startBeat = std::stof(val);
             else if (key == "end") fr.endBeat = std::stof(val);
             else if (key == "color") fr.color = (uint32_t)std::stoll(val);
+        }
+        return true;
+    }
+};
+
+} // namespace
+
+bool ProjectFile::readProject(std::istream& f, NodeGraph& graph, PluginHost* pluginHost) {
+    // Clear existing
+    graph.nodes.clear();
+    graph.nodesInvalidated();
+    graph.links.clear();
+    graph.openEditors.clear();
+    // The loop region is only serialized when enabled (writeProject omits the
+    // keys otherwise), so reset it here: parsing a snapshot or file that has no
+    // loop keys must yield "no loop", not inherit a stale loop from the graph's
+    // prior state. Without this, undo/redo of a "disable loop" edit wouldn't
+    // stick (the redo snapshot has no keys, so loopEnabled would stay true).
+    graph.loopEnabled = false;
+    graph.loopStartBeat = 0;
+    graph.loopEndBeat = 0;
+
+    std::vector<int> pendingEditorIds;
+    int pendingActiveEditorId = -1;
+
+    std::string line, section;
+    NodeReader nodeReader;     // the [Node] blocks
+    std::string curBlobHash;   // [Blob] section: hash read before its bytes line
+    AssetEntry curAsset;       // [AssetStore] section: built up, committed on payload
+    int maxId = 0;             // links' ids; the nodes' are nodeReader.maxId
+
+    while (std::getline(f, line)) {
+        if (line.empty()) continue;
+
+        // Section header
+        if (line[0] == '[') {
+            section = line;
+            if (section == "[Node]") {
+                graph.nodes.push_back({});
+                nodeReader.begin(graph.nodes.back());
+            } else if (nodeReader.openSection(section)) {
+                // one of the node's own sub-sections
+            } else if (section == "[Link]") {
+                graph.links.push_back({});
+            } else if (section == "[Marker]") {
+                graph.markers.push_back({});
+            } else if (section == "[CCMap]") {
+                graph.ccMappings.push_back({});
+            } else if (section == "[Waveform]") {
+                graph.waveformLibrary.push_back({});
+            } else if (section == "[EffectGroup]") {
+                graph.effectGroups.push_back({});
+            } else if (section == "[AssetStore]") {
+                curAsset = AssetEntry{};   // staged, committed when payload arrives
+            }
+            continue;
+        }
+
+        auto key = keyOf(line);
+        auto val = valueOf(line);
+
+        // The node's own lines - its keys, its pins, params, clips and the
+        // rest (and its modPin lines, whatever section they come in).
+        if (nodeReader.readLine(section, key, val, f))
+            continue;
+
+        if (section == "[Project]") {
+            if (key == "bpm") graph.bpm = std::stof(val);
+            else if (key == "timeSigNum") graph.timeSignatureNum = std::stoi(val);
+            else if (key == "timeSigDen") graph.timeSignatureDen = std::stoi(val);
+            else if (key == "loopEnabled") graph.loopEnabled = (val == "1");
+            else if (key == "loopStart") graph.loopStartBeat = std::stof(val);
+            else if (key == "loopEnd") graph.loopEndBeat = std::stof(val);
+            else if (key == "projectSampleRate") graph.projectSampleRate = std::stof(val);
+            else if (key == "tuningSystem") graph.tuningSystem = (TuningSystem)std::stoi(val);
+            else if (key == "concertPitch") graph.concertPitch = std::stof(val);
+            else if (key == "globalCrossfadeSec") graph.globalCrossfadeSec = std::stof(val);
+            else if (key == "metronomeEnabled") graph.metronomeEnabled = (val == "1");
+            else if (key == "songLengthBeats") graph.songLengthBeats = std::stof(val);
+            else if (key == "songRepeatMode") {
+                int m = std::stoi(val);
+                graph.songRepeatMode = (m == 1 ? NodeGraph::SongRepeat::Forever
+                                       : m == 2 ? NodeGraph::SongRepeat::NTimes
+                                       :          NodeGraph::SongRepeat::None);
+            }
+            else if (key == "songRepeatCount") graph.songRepeatCount = std::max(1, std::stoi(val));
+            else if (key == "historyFile") graph.historyFilePath = val;
+            else if (key == "viewZoom") graph.viewZoom = std::stof(val);
+            else if (key == "viewPanX") graph.viewPanX = std::stof(val);
+            else if (key == "viewPanY") graph.viewPanY = std::stof(val);
+            else if (key == "signalScriptLines") {
+                int numLines = std::stoi(val);
+                graph.signalScript.clear();
+                for (int sl = 0; sl < numLines && std::getline(f, line); ++sl) {
+                    if (!graph.signalScript.empty()) graph.signalScript += "\n";
+                    graph.signalScript += line;
+                }
+            }
         }
         else if (section == "[Link]" && !graph.links.empty()) {
             auto& l = graph.links.back();
@@ -1239,7 +1303,14 @@ bool ProjectFile::readProject(std::istream& f, NodeGraph& graph, PluginHost* plu
     }
 
     // Restore nextId so new IDs don't conflict
-    graph.setNextId(maxId + 1);
+    graph.setNextId(std::max(maxId, nodeReader.maxId) + 1);
+
+    // Nodes left inside a Voice container that's gone - deleting a container
+    // before 0.10.11 left its inner patch behind, where nothing could show or
+    // play it. They go now, with their cables.
+    if (const int stranded = graph.removeStrandedVoiceNodes())
+        fprintf(stderr, "Removed %d node(s) left behind by a deleted Voice container.\n",
+                stranded);
 
     // Re-seed the code-owned built-in morph chains. They are deliberately NOT
     // serialized (writeProject skips them), so a loaded file - and every undo
@@ -1388,6 +1459,28 @@ bool ProjectFile::readProject(std::istream& f, NodeGraph& graph, PluginHost* plu
 
     graph.dirty = false;
     return true;
+}
+
+bool ProjectFile::readNode(std::istream& f, Node& out) {
+    NodeReader reader;
+    std::string line, section;
+    bool started = false;
+    while (std::getline(f, line)) {
+        if (line.empty()) continue;
+        if (line[0] == '[') {
+            section = line;
+            if (section == "[Node]") {
+                if (started) break;   // one node only
+                reader.begin(out);
+                started = true;
+            } else {
+                reader.openSection(section);
+            }
+            continue;
+        }
+        reader.readLine(section, keyOf(line), valueOf(line), f);
+    }
+    return started;
 }
 
 std::string ProjectFile::serializeForUndo(NodeGraph& graph) {

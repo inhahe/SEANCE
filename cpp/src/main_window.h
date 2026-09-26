@@ -208,9 +208,35 @@ private:
     // or loaded and not taken into the graph yet, still held by its node. Null
     // while it isn't loaded.
     juce::AudioProcessor* pluginProcessorOf(int nodeId);
-    // The user closed a plugin's window: a Voice container's voices take on
-    // what was changed there.
+    // The user closed a plugin's window: what was changed there counts
+    // (checkPluginWindow), and a Voice container's voices take it on.
     void pluginWindowClosed(int nodeId);
+
+    // Changes made in a plugin's own window. SEANCE hears of some (a knob's
+    // moves, for automation) but not all - a plugin needn't report a setting
+    // that isn't a parameter - so the plugin's settings are fingerprinted when
+    // its window opens and compared when it closes, when the project is about
+    // to be closed with it still open, and before a render cache is trusted
+    // (AudioCacheManager::onBeforeHashing). A difference is a change:
+    // notePluginStateChanged.
+    struct WatchedPluginWindow {
+        std::weak_ptr<PluginHost::LoadedPlugin> plugin;   // the instance it was opened for
+        uint64_t stateHash = 0;
+        size_t stateSize = 0;
+    };
+    std::map<int, WatchedPluginWindow> watchedPluginWindows;   // by node id
+
+    // The autosave's per-plugin files were deleted (discardAutosave): its next
+    // run writes every plugin's, changed or not.
+    bool rewriteAllPluginFiles = true;
+    void watchPluginWindow(int nodeId);
+    bool checkPluginWindow(int nodeId);   // true if its settings changed since
+    void checkPluginWindows();            // every open one
+    // A plugin's settings changed where SEANCE's own records don't show it: the
+    // project has unsaved changes, the autosave asks the plugin again
+    // (pluginStateDirty), and render caches made before don't hold
+    // (Node::pluginStateGeneration).
+    void notePluginStateChanged(Node& node);
     // After an offline render (Export, Freeze, Bounce): name the plugins it
     // went without, whose copies didn't load. `what` begins the message
     // ("The export").

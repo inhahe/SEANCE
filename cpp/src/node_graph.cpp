@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cmath>
 #include <set>
+#include <sstream>
 
 namespace SoundShop {
 
@@ -108,13 +109,7 @@ Node& NodeGraph::addNode(const std::string& name, NodeType type,
                           Vec2 pos) {
     Node node;
     node.id = newId();
-
-    // Auto-number if a node with this exact name already exists
-    int count = 0;
-    for (auto& n : nodes)
-        if (n.name == name || (n.name.rfind(name + " ", 0) == 0))
-            count++;
-    node.name = count > 0 ? name + " " + std::to_string(count + 1) : name;
+    node.name = uniqueNodeName(name);
 
     node.type = type;
     node.pos = pos;
@@ -219,13 +214,186 @@ std::vector<int> NodeGraph::restoreSnapshot(const std::string& text) {
         n.pluginStateDirty = c.stateDirty;
         n.pluginLoadState = c.loadState;
         n.pluginLoadError = std::move(c.loadError);
+        carried.erase(it);
     }
+    // A node that goes before its plugin had loaded - a duplicate undone at
+    // once, say - keeps the settings it was waiting to be given, for an undo
+    // that brings it back (the plugin loader takes them from here).
+    for (auto& [id, c] : carried)
+        if (!c.plugin && !c.pendingState.empty())
+            retiredPluginStates[id] = { c.description, c.pendingState };
     // Plugins not carried over (their node is gone from this state) are
     // released with `carried`; one already in the audio graph is retired from
     // there at the next rebuild (GraphProcessor::retireStalePlugins), and a
     // Voice container's master tells PluginHost::LoadedPlugin::onRelease as it
     // goes.
     return reload;
+}
+
+std::string NodeGraph::uniqueNodeName(const std::string& wanted) const {
+    // Numbered after how many nodes already have the name, or a numbered one.
+    int count = 0;
+    for (auto& n : nodes)
+        if (n.name == wanted || (n.name.rfind(wanted + " ", 0) == 0))
+            count++;
+    return count > 0 ? wanted + " " + std::to_string(count + 1) : wanted;
+}
+
+std::vector<int> NodeGraph::nodeWithContents(int rootId) {
+    if (findNode(rootId) == nullptr) return {};
+    std::set<int> inside { rootId };
+    std::vector<int> todo { rootId };
+    while (!todo.empty()) {
+        const int id = todo.back();
+        todo.pop_back();
+        const Node* n = findNode(id);
+        if (n == nullptr) continue;
+        if (n->type == NodeType::Group)
+            for (int member : n->childNodeIds)
+                if (inside.insert(member).second) todo.push_back(member);
+        if (n->type == NodeType::VoiceContainer)
+            for (const auto& m : nodes)
+                if (m.voiceContainerId == id && inside.insert(m.id).second)
+                    todo.push_back(m.id);
+    }
+    std::vector<int> out { rootId };
+    for (const auto& n : nodes)
+        if (n.id != rootId && inside.count(n.id)) out.push_back(n.id);
+    return out;
+}
+
+int NodeGraph::duplicateNode(int nodeId, Vec2 offset, GraphProcessor* gp) {
+    const auto ids = nodeWithContents(nodeId);
+    if (ids.empty()) return -1;
+    const Node* root = findNode(nodeId);
+    const int scope = root->voiceContainerId;   // the view the original is shown in
+    const int parent = root->parentGroupId;
+
+    // Each node through the project writer and back: every saved setting, and
+    // nothing that's only this session's (meters, recording, auditions, the
+    // plugin load status) - nor a freeze, which is the original's
+    // (includeBlobs false). A plugin's settings aren't asked for twice: the
+    // writer leaves them out without a `gp`, and they're taken here instead.
+    std::vector<Node> copies;
+    for (int id : ids) {
+        Node* src = findNode(id);
+        std::ostringstream out;
+        ProjectFile::writeNode(out, *src, nullptr, /*includeBlobs*/ false);
+        std::istringstream in(out.str());
+        Node copy;
+        ProjectFile::readNode(in, copy);
+        if (src->isPluginNode())
+            copy.pendingPluginState = ProjectFile::pluginStateNow(*src, gp);
+        copies.push_back(std::move(copy));
+    }
+
+    // Ids of their own - the nodes', the pins', and the cables' between them.
+    std::map<int, int> newNodeId, newPinId, newLinkId;
+    for (auto& c : copies)
+        newNodeId[c.id] = newId();
+    for (auto& c : copies)
+        for (auto* pins : { &c.pinsIn, &c.pinsOut })
+            for (auto& p : *pins) {
+                const int to = newId();
+                newPinId[p.id] = to;
+                p.id = to;
+            }
+    auto mapped = [](const std::map<int, int>& m, int id, int otherwise) {
+        auto it = m.find(id);
+        return it != m.end() ? it->second : otherwise;
+    };
+    std::vector<Link> cables;
+    for (const auto& l : links) {
+        if (!newPinId.count(l.startPin) || !newPinId.count(l.endPin)) continue;
+        Link cable = l;
+        cable.id = newId();
+        cable.startPin = newPinId[l.startPin];
+        cable.endPin = newPinId[l.endPin];
+        newLinkId[l.id] = cable.id;
+        cables.push_back(cable);
+    }
+
+    int copyId = -1;
+    for (auto& c : copies) {
+        const bool isRoot = c.id == nodeId;
+        c.id = newNodeId[c.id];
+        if (isRoot) copyId = c.id;
+        for (auto& mp : c.modPins)
+            mp.pinId = mapped(newPinId, mp.pinId, -1);
+        // Inside the copy, its members are the copies. The copy itself goes
+        // into the original's group (below) and Voice container.
+        std::vector<int> members;
+        for (int m : c.childNodeIds)
+            if (newNodeId.count(m)) members.push_back(newNodeId[m]);
+        c.childNodeIds = std::move(members);
+        if (!isRoot) c.parentGroupId = mapped(newNodeId, c.parentGroupId, -1);
+        c.voiceContainerId = mapped(newNodeId, c.voiceContainerId, c.voiceContainerId);
+        // An effect layer gates a cable: one of the copy's - or one of the
+        // original's, which is no business of the copy's (it isn't wired to
+        // it), and neither is a layer gating a group of cables.
+        auto& layers = c.effectRegions;
+        layers.erase(std::remove_if(layers.begin(), layers.end(),
+                                    [&](const EffectRegion& r) { return !newLinkId.count(r.linkId); }),
+                     layers.end());
+        for (auto& r : layers)
+            r.linkId = newLinkId[r.linkId];
+        // The song settings a MOD import put aside are the original's to put back.
+        c.modImportSavedSong = false;
+        // Shown beside the original, `offset` from it; an inner patch shown
+        // inside a copied container stays where it was in there.
+        if (c.voiceContainerId == scope) {
+            c.pos.x += offset.x;
+            c.pos.y += offset.y;
+        }
+        if (isRoot) c.name = uniqueNodeName(c.name);
+        // A deleted node's id can be handed out again; its kept state isn't this one's.
+        retiredPluginStates.erase(c.id);
+    }
+
+    {
+        std::lock_guard<GraphMutex> lk(mutationLock);
+        for (auto& c : copies)
+            nodes.push_back(std::move(c));
+        for (auto& cable : cables)
+            links.push_back(cable);
+        if (parent >= 0)
+            if (auto* group = findNode(parent))
+                group->childNodeIds.push_back(copyId);
+    }
+    resolveAnchors();   // the copies' absoluteBeatOffset
+    dirty = true;
+    return copyId;
+}
+
+int NodeGraph::removeStrandedVoiceNodes() {
+    std::set<int> gone;
+    for (bool more = true; more;) {   // a container inside a stranded one is stranded too
+        more = false;
+        for (const auto& n : nodes) {
+            if (n.voiceContainerId < 0 || gone.count(n.id)) continue;
+            const Node* c = findNode(n.voiceContainerId);
+            if (c == nullptr || c->type != NodeType::VoiceContainer || gone.count(c->id)) {
+                gone.insert(n.id);
+                more = true;
+            }
+        }
+    }
+    if (gone.empty()) return 0;
+    std::set<int> pins;
+    for (const auto& n : nodes) {
+        if (!gone.count(n.id)) continue;
+        for (auto& p : n.pinsIn) pins.insert(p.id);
+        for (auto& p : n.pinsOut) pins.insert(p.id);
+    }
+    links.erase(std::remove_if(links.begin(), links.end(),
+                               [&](const Link& l) { return pins.count(l.startPin) || pins.count(l.endPin); }),
+                links.end());
+    nodes.erase(std::remove_if(nodes.begin(), nodes.end(),
+                               [&](const Node& n) { return gone.count(n.id) > 0; }),
+                nodes.end());
+    nodesInvalidated();
+    dirty = true;
+    return (int) gone.size();
 }
 
 void NodeGraph::addLink(int outPin, int inPin) {

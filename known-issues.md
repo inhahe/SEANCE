@@ -5,77 +5,74 @@ top. When something is fixed, delete the entry (git history is the archive).
 
 ---
 
-## BUG: Duplicate copies only a node's name, pins, parameters and clips
+## BUG: capture from playback can reuse a partial or misplaced recording as "the song"
 
-**Found:** 2026-09-25, auditing the ways a node is added (for their undo steps).
+**Found:** 2026-09-25, making render caches notice plugin changes (0.10.11).
 
-The node menu's *Duplicate* (`NodeGraphComponent::showNodeMenu`, `result == 2`)
-builds the copy by hand: name, type, pins (fresh ids), `params`, `clips`.
-Everything else is left at its default - `script`, so a duplicated FM Synth,
-wavetable, Script or effect node comes out as the default Terrain Synth / a
-pass-through; `pluginDescription`, so a duplicated plugin node is no plugin node
-at all (a stand-in synth or pass-through); `voiceContainerId`, so a node
-duplicated inside a Voice container lands at the top level; the envelope, pan,
-MPE settings, automation lanes, freeze state and the rest. (It does commit an
-undo step since 0.10.9.)
+Every playback is recorded, and Stop puts the recording in the Output node's
+cache (`AudioEngine::stop`); the capture-from-playback dialog then uses it as the
+rendered song instead of rendering (`trySongCache`, capture_from_playback.cpp)
+whenever the project's hash is unchanged. Since 0.10.11 an edit during the
+playback (a plugin's settings included) voids that - the capture is stamped with
+the hash as playback began, and kept only if the project is the same at Stop.
+But the dialog doesn't check that the recording *is* the song:
 
-**Proper fix:** copy the whole node the way undo snapshots do - serialize it
-(`ProjectFile`'s node writer) and read it back as a new node with fresh node and
-pin ids - and for a plugin node, load a new instance of its plugin with the
-original's current state (the async loader, with the state as
-`pendingPluginState`), rather than listing fields by hand.
+- **Started mid-song** - playback from bar 10 records from bar 10
+  (`cache.startSample`, which `trySongCache` ignores), so the dialog's song
+  starts at bar 10 while treating it as bar 1.
+- **Stopped early** - a few seconds of playback give a few seconds of "song".
+- **Not straight through** - a loop region, a seek, or playing on after the song
+  ended (the audio callback stops by itself there without flushing the capture,
+  so the next playback appends to it) records the same music twice or out of
+  order.
 
----
-
-## FEATURE GAP: automation lanes and MIDI Learn don't reach a plugin inside a Voice container
-
-**Found:** 2026-09-25, making plugins play inside Voice containers (0.10.9).
-
-A plugin inside a Voice container plays as one copy per voice, following the
-node's own instance - the master (REFERENCE.md, *Plugins inside a voice*). Knob
-moves in the master's window reach every voice, but the two host-driven paths
-to a plugin's parameters only know the main graph:
-
-- **Automation.** The UI timer's read pass (`MainContentComponent::timerCallback`)
-  finds a node's plugin with `GraphProcessor::getProcessorForNode`, which a
-  plugin inside a container isn't in; recording from the plugin's window relies
-  on `GraphProcessor::LatencyChangeListener`, attached only to the main graph's
-  processors. So such a plugin has no automation lanes, and lanes carried over
-  from elsewhere don't play (offline renders apply lanes to main-graph copies
-  only - `GraphProcessor::applyPluginAutomation`, skipped for voices).
-- **MIDI Learn.** CC mappings are applied through the main graph's node map
-  (`AutomationManager::processMidiCC`); the node menu disables *MIDI Map...* for
-  such a plugin, with the reason in the item.
-
-**Proper fix:** route both through the master - apply lane values and learned
-CCs to the master's parameters and forward them to the copies
-(`PluginCopies` already forwards the master's `audioProcessorParameterChanged`;
-`setValue` on the master doesn't notify, so forward explicitly or use
-`setValueNotifyingHost`), record from the master's parameter events, and let
-the offline renders' voice copies read the lanes per voice the same way.
+**Proper fix:** have the audio callback note whether the capture is one straight
+run (each block's position following on from the last) and where it began, and
+let `trySongCache` use it only if it began at 0, ran straight, and reached the
+length the dialog would render (`renderMaxBeat`) - otherwise render. The
+**Capture** button's instant bounce of the last playback ("what you just
+heard") can go on using any recording.
 
 ---
 
-## Render caches don't notice changes made inside a plugin's own window
+## BUG: New Project and Open Project throw away unsaved changes without asking
 
-**Found:** 2026-09-25, while making offline renders play hosted plugins.
+**Found:** 2026-09-25, while making changes in plugin windows count as unsaved
+(0.10.11).
 
-`AudioCacheManager::computeNodeHash` folds a plugin node's *identity* (and any
-unapplied `pendingPluginState`) into the hash, not the plugin's current state -
-there's no cheap general way to see inside a plugin. So a render cache keyed by
-that hash stays "valid" after a knob is turned in the plugin's window: an
-auto-cached node downstream of the plugin, and the Output node's cached song
-that capture from playback reuses (`trySongCache`), can replay audio from
-before the change. Freezes are explicit, so they're unaffected. It mattered
-little while offline renders left plugins out entirely (0.10.6 and before);
-now they play them, so a stale cache is audible.
+Only quitting asks about unsaved changes (`MainContentComponent::tryQuit`:
+Save / Don't Save / Cancel). **File → New Project** (`newProject`, Ctrl+N) and
+**File → Open Project...** (`openProject` → `openProjectFile`, Ctrl+O, and the
+recent-projects list) replace the project at once - and `newProject` also
+discards the autosave and the persisted undo history - so everything since the
+last save is gone without a word.
 
-**Proper fix:** hash a plugin's state - `getStateInformation` is too slow to call
-per hash, but `Node::pluginStateDirty` / the autosave's per-plugin state cache
-already track changes; a per-plugin state generation counter bumped on every
-parameter/state notification (the main graph's `LatencyChangeListener` hears
-parameter changes; `PluginCopies` hears a master's) and folded into the hash
-would do it.
+**Proper fix:** one "settle unsaved changes, then go on" step shared by quitting,
+New and Open: `checkPluginWindows()`, then if the project is dirty the same
+Save / Don't Save / Cancel prompt; Save runs `saveProject(then)` (which may go
+through Save As's async chooser), Don't Save goes on, Cancel stops. Put it at
+the user-facing entry points (the menu items, the hotkeys, the recent list),
+before Open's file chooser appears, not inside `openProjectFile`, which the
+startup load also uses.
+
+---
+
+## Autosave can miss a plugin change made by a learned MIDI CC
+
+**Found:** 2026-09-25, correcting the `Node::pluginStateDirty` comments, which
+described a periodic "force-dirty all" autosave pass that doesn't exist.
+
+The background autosave re-asks a plugin for its settings only when the plugin
+is marked changed (`Node::pluginStateDirty`): by host automation, a preset from
+SEANCE's menu, or its window closing with different settings (0.10.11). A
+learned MIDI CC sets the parameter on the audio thread
+(`AutomationManager::processMidiCC`), which marks nothing, so crash recovery can
+bring such a plugin back with its settings from before the CC moves. An explicit
+save isn't affected - it asks every plugin afresh (`ProjectFile::pluginStateNow`).
+
+**Proper fix:** have the audio callback note the node ids its learned CCs
+touched (always, not only while recording, as `ccRecTouched` does), and the UI
+timer set `pluginStateDirty` for them.
 
 ---
 

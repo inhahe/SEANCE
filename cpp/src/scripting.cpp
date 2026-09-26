@@ -1548,13 +1548,20 @@ static PyMethodDef soundshopMethods[] = {
         if (!g_currentGraph || nodeIdx < 0 || nodeIdx >= (int)g_currentGraph->nodes.size()) {
             PyErr_SetString(PyExc_IndexError, "Node index out of range"); return nullptr;
         }
-        int nodeId = g_currentGraph->nodes[nodeIdx].id;
-        // Remove links connected to this node's pins.
         auto& nodes = g_currentGraph->nodes;
         auto& links = g_currentGraph->links;
-        std::vector<int> pinIds;
-        for (auto& p : nodes[nodeIdx].pinsIn) pinIds.push_back(p.id);
-        for (auto& p : nodes[nodeIdx].pinsOut) pinIds.push_back(p.id);
+        // A Voice container goes with its inner patch, which nothing can show
+        // or play without it (a group's members stay, as nodes of their own).
+        const Node& victim = nodes[nodeIdx];
+        const std::vector<int> ids = victim.type == NodeType::VoiceContainer
+                                         ? g_currentGraph->nodeWithContents(victim.id)
+                                         : std::vector<int> { victim.id };
+        std::vector<int> pinIds;   // their cables go too
+        for (auto& n : nodes) {
+            if (std::find(ids.begin(), ids.end(), n.id) == ids.end()) continue;
+            for (auto& p : n.pinsIn) pinIds.push_back(p.id);
+            for (auto& p : n.pinsOut) pinIds.push_back(p.id);
+        }
         // Guard the structural edit against the audio callback iterating
         // graph.nodes/links (see node_graph.h mutationLock comment).
         std::lock_guard<GraphMutex> graphLk(g_currentGraph->mutationLock);
@@ -1563,11 +1570,12 @@ static PyMethodDef soundshopMethods[] = {
                 for (int pid : pinIds) if (l.startPin == pid || l.endPin == pid) return true;
                 return false;
             }), links.end());
-        nodes.erase(nodes.begin() + nodeIdx);
+        nodes.erase(std::remove_if(nodes.begin(), nodes.end(),
+            [&ids](const Node& n) { return std::find(ids.begin(), ids.end(), n.id) != ids.end(); }),
+            nodes.end());
         g_currentGraph->nodesInvalidated();
-        (void)nodeId;
         Py_RETURN_NONE;
-    }, METH_VARARGS, "Remove node: (node_idx)"},
+    }, METH_VARARGS, "Remove node: (node_idx). A Voice container goes with the nodes inside it."},
     {"set_song_length", [](PyObject*, PyObject* args) -> PyObject* {
         float beats;
         if (!PyArg_ParseTuple(args, "f", &beats)) return nullptr;

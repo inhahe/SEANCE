@@ -2288,23 +2288,29 @@ trySongCache(NodeGraph& graph, double expectedSampleRate, double& sampleRateOut)
     return pcm;
 }
 
+// The Output node's render hash now (0: the project can't be cached).
+static uint64_t songHash(NodeGraph& graph) {
+    Node* out = findOutputNode(graph);
+    auto* eng = AudioEngine::getInstance();
+    if (!out || !eng) return 0;
+    auto& mgr = eng->getGraphProcessor().getCacheManager();
+    mgr.updateDeterminism(graph);
+    return mgr.computeNodeHash(*out, graph);
+}
+
 // Stash the freshly-rendered song PCM into the Output node's cache so a
 // subsequent dialog open (or a Capture-button bounce from the cache) can
 // skip the render. The cache stores stereo; we duplicate mono into both
-// channels. Skips silently if hashing the project produces 0 (a non-
-// deterministic graph can't safely be cached - any sample we store now
+// channels. `h` is the project's hash as the render started - what it
+// rendered, whatever was changed since (songHash). Skips silently if that's 0
+// (a non-deterministic graph can't safely be cached - any sample we store now
 // might disagree with a future render).
 static void writeSongCache(NodeGraph& graph,
                             const std::shared_ptr<std::vector<float>>& pcm,
-                            double sampleRate) {
+                            double sampleRate, uint64_t h) {
     if (!pcm || pcm->empty()) return;
     Node* out = findOutputNode(graph);
     if (!out) return;
-    auto* eng = AudioEngine::getInstance();
-    if (!eng) return;
-    auto& mgr = eng->getGraphProcessor().getCacheManager();
-    mgr.updateDeterminism(graph);
-    const uint64_t h = mgr.computeNodeHash(*out, graph);
     if (h == 0) return;  // non-deterministic - don't cache
 
     auto& c = out->cache;
@@ -3106,6 +3112,10 @@ void CaptureFromSongDialog::startRender() {
         copies = eng->makeRenderCopies(songSampleRate, RenderJob::kBlockSize);
         juce::MouseCursor::hideWaitCursor();
     }
+    // What the render plays: the project as it is now, its plugins' copies
+    // just taken. Its result is stamped with this, not with the project as it
+    // is when it finishes (the project stays open to edits meanwhile).
+    renderStartHash = songHash(graph);
     renderJob = std::make_unique<RenderJob>(graph, transport, songSampleRate, renderMaxBeat,
                                             std::move(copies));
     renderJob->startThread(juce::Thread::Priority::normal);
@@ -3159,7 +3169,7 @@ void CaptureFromSongDialog::onRenderComplete() {
     //      to harvest here.
     if (renderJob && renderJob->result) {
         songPcm = renderJob->result;
-        writeSongCache(graph, songPcm, songSampleRate);
+        writeSongCache(graph, songPcm, songSampleRate, renderStartHash);
         playheadSamplePos = 0;
         // Plugins whose copy didn't load were left out of it: say which.
         if (renderJob->copies) {

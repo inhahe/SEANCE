@@ -29,6 +29,7 @@
 #include <juce_audio_utils/juce_audio_utils.h>
 #include <fstream>
 #include <sstream>
+#include <string_view>
 #ifdef _WIN32
 #define NOMINMAX
 #include <Windows.h>
@@ -143,6 +144,10 @@ MainContentComponent::MainContentComponent() {
     graphComponent->getNodeLatencies = [this]() {
         return audioEngine.getGraphProcessor().snapshotNodeLatencies();
     };
+    // Duplicate: a plugin node's copy takes its original's current settings
+    // from the live graph, then loads a plugin of its own in the background.
+    graphComponent->getGraphProcessor = [this]() { return &audioEngine.getGraphProcessor(); };
+    graphComponent->onPluginNodesAdded = [this]() { beginAsyncPluginLoad(); };
 
     // Hotkey system: register callbacks and load saved bindings
     setupHotkeyCallbacks();
@@ -523,13 +528,21 @@ MainContentComponent::MainContentComponent() {
     // value into a plugin parameter, mark that node's plugin state cache
     // stale so the next slow autosave re-queries getStateInformation.
     // Only fires from the message-thread automation path; processMidiCC
-    // (audio thread) does NOT call this - the periodic force-dirty pass
-    // catches changes that route through MIDI CC mappings.
+    // (audio thread) does NOT call this, so the autosave can be behind on a
+    // change a learned CC made. (An explicit save asks every plugin afresh -
+    // ProjectFile::pluginStateNow.)
     audioEngine.getGraphProcessor().getAutomation().onPluginParamChanged =
         [this](int nodeId) {
             if (auto* n = graph.findNode(nodeId))
                 n->pluginStateDirty = true;
         };
+
+    // Before a render cache is trusted (the Output's recording of the last
+    // playback, which capture from playback reuses): a plugin window still
+    // open may have changed its plugin's settings unannounced.
+    audioEngine.getGraphProcessor().getCacheManager().onBeforeHashing = [this]() {
+        checkPluginWindows();
+    };
 
     // Crash detection (must run before tryRecoverAutosave is scheduled and
     // before the autosave worker can touch the dir): note whether a session
@@ -916,6 +929,7 @@ void MainContentComponent::releaseOldProjectPlugins() {
     }
     disposeRetiredPlugins(false);
     graph.retiredPluginStates.clear();
+    watchedPluginWindows.clear();   // their windows went with their plugins
 }
 
 bool MainContentComponent::keyPressed(const juce::KeyPress& key) {
@@ -1281,8 +1295,11 @@ void MainContentComponent::timerCallback() {
             // processor for every plugin param currently writing. Read axis:
             // drive muted-unless-ignored plugin params from their lane. Both use
             // normalized (0..1) values - what AudioProcessorParameter wants.
+            // For a plugin inside a Voice container that's the master, whose
+            // window the user works in; applyAutomation sets a value on it and
+            // on every voice's copy.
             if (node.plugin) {
-                auto* proc = audioEngine.getGraphProcessor().getProcessorForNode(node.id);
+                auto* proc = pluginProcessorOf(node.id);
                 int nParams = proc ? (int)proc->getParameters().size() : 0;
 
                 // Record: writing plugin params sampled from the processor.
@@ -2752,9 +2769,13 @@ void MainContentComponent::showPluginUI(int nodeId) {
     // graph, or for one inside a Voice container the master its voices follow,
     // which then copy what was changed when the window is closed.
     if (node && node->isPluginNode()) {
-        if (auto* proc = pluginProcessorOf(nodeId))
+        if (auto* proc = pluginProcessorOf(nodeId)) {
             pluginWindows.showWindowFor(*proc, node->name,
                                         [this, nodeId] { pluginWindowClosed(nodeId); });
+            // A plugin without an editor opens no window, which never closes.
+            if (proc->hasEditor())
+                watchPluginWindow(nodeId);
+        }
         return;
     }
 
@@ -2784,11 +2805,71 @@ juce::AudioProcessor* MainContentComponent::pluginProcessorOf(int nodeId) {
 }
 
 void MainContentComponent::pluginWindowClosed(int nodeId) {
-    // Whatever was changed in the window, the voices of a Voice container
-    // that holds this plugin get it too (knob moves reached them already).
+    // Whatever was changed in the window counts - an unsaved change, one
+    // render caches made before don't have.
+    checkPluginWindow(nodeId);
+    watchedPluginWindows.erase(nodeId);
+    // And the voices of a Voice container that holds this plugin get it too
+    // (knob moves reached them already).
     audioEngine.syncVoiceCopies(nodeId);
     if (auto* n = graph.findNode(nodeId))
         n->pluginStateDirty = true;
+}
+
+namespace {
+// A fingerprint of a plugin's settings: its state's hash and size. One no graph
+// plays (`heldByNode`) takes its last knob moves in first.
+std::pair<uint64_t, size_t> fingerprintOf(juce::AudioProcessor& plugin, bool heldByNode) {
+    if (heldByNode) PluginCopies::catchUp(plugin);
+    juce::MemoryBlock state;
+    plugin.getStateInformation(state);
+    const std::string_view bytes(static_cast<const char*>(state.getData()), state.getSize());
+    return { (uint64_t) std::hash<std::string_view>{}(bytes), state.getSize() };
+}
+} // namespace
+
+void MainContentComponent::watchPluginWindow(int nodeId) {
+    auto* node = graph.findNode(nodeId);
+    auto* proc = pluginProcessorOf(nodeId);
+    if (node == nullptr || proc == nullptr) return;
+    // Already watched - brought to the front again: it's still what it was
+    // when first opened that a change is measured from.
+    auto it = watchedPluginWindows.find(nodeId);
+    if (it != watchedPluginWindows.end() && it->second.plugin.lock() == node->plugin) return;
+    const auto [hash, size] = fingerprintOf(*proc, proc == node->plugin->instance.get());
+    watchedPluginWindows[nodeId] = { node->plugin, hash, size };
+}
+
+bool MainContentComponent::checkPluginWindow(int nodeId) {
+    auto it = watchedPluginWindows.find(nodeId);
+    if (it == watchedPluginWindows.end()) return false;
+    auto* node = graph.findNode(nodeId);
+    auto* proc = pluginProcessorOf(nodeId);
+    // The node, or its plugin, is gone - the window went with it.
+    if (node == nullptr || proc == nullptr || it->second.plugin.lock() != node->plugin) {
+        watchedPluginWindows.erase(it);
+        return false;
+    }
+    const auto [hash, size] = fingerprintOf(*proc, proc == node->plugin->instance.get());
+    if (hash == it->second.stateHash && size == it->second.stateSize) return false;
+    it->second.stateHash = hash;
+    it->second.stateSize = size;
+    notePluginStateChanged(*node);
+    return true;
+}
+
+void MainContentComponent::checkPluginWindows() {
+    std::vector<int> ids;
+    for (const auto& [id, watched] : watchedPluginWindows)
+        ids.push_back(id);
+    for (int id : ids)
+        checkPluginWindow(id);
+}
+
+void MainContentComponent::notePluginStateChanged(Node& node) {
+    ++node.pluginStateGeneration;
+    node.pluginStateDirty = true;
+    projectDirty = true;
 }
 
 void MainContentComponent::reportRenderCopyProblems(const PluginCopies& copies,
@@ -2915,7 +2996,7 @@ void MainContentComponent::showPluginPresets(int nodeId) {
         p->setCurrentProgram(result - 1);
         graph.dirty = true;
         if (auto* n = graph.findNode(nodeId))
-            n->pluginStateDirty = true;
+            notePluginStateChanged(*n);
         audioEngine.syncVoiceCopies(nodeId);   // a Voice container's voices too
     });
 }
@@ -3083,7 +3164,13 @@ private:
 };
 
 void MainContentComponent::showMidiMap(int nodeId) {
-    auto* proc = audioEngine.getGraphProcessor().getProcessorForNode(nodeId);
+    // A plugin node's own plugin - for one inside a Voice container, the
+    // master, whose mapped parameters move in every voice's copy too
+    // (AutomationManager::processMidiCC).
+    const auto* mapped = graph.findNode(nodeId);
+    auto* proc = mapped && mapped->isPluginNode()
+                     ? pluginProcessorOf(nodeId)
+                     : audioEngine.getGraphProcessor().getProcessorForNode(nodeId);
     if (!proc) return;
 
     auto* comp = new MidiMapComponent(nodeId, proc,
@@ -3215,7 +3302,7 @@ void MainContentComponent::beginAutomationPass() {
         node.pluginParamRec.clear();
         if (node.plugin
             && resolveArmModeNode(graph.autoArmGlobal, node) == AutoArmMode::Write) {
-            if (auto* proc = audioEngine.getGraphProcessor().getProcessorForNode(node.id)) {
+            if (auto* proc = pluginProcessorOf(node.id)) {
                 int n = (int)proc->getParameters().size();
                 for (int i = 0; i < n; ++i) {
                     auto& rec = node.pluginParamRec[i];
@@ -3296,7 +3383,8 @@ void MainContentComponent::handleParamGesture(int nodeId, int paramIdx, bool beg
 }
 
 void MainContentComponent::processPluginParamEvents() {
-    // Drain queued hosted-plugin knob events (see GraphProcessor::drainParamEvents)
+    // Drain queued hosted-plugin knob events (see AudioEngine::drainPluginParamEvents:
+    // the live graph's plugins' and the Voice containers' masters')
     // and flip per-plugin-param writing flags, mirroring handleParamGesture for
     // native params. Draining always happens so the queue can't grow unbounded;
     // events only take effect while the transport is rolling. kind: 0=gestureBegin
@@ -3305,7 +3393,7 @@ void MainContentComponent::processPluginParamEvents() {
     // via the idle timeout in timerCallback (keyed off lastChangeMs).
     // Always drain BOTH queues (plugin gesture events + learned-CC touches) so
     // neither grows unbounded, but only act on them while the transport rolls.
-    auto events = audioEngine.getGraphProcessor().drainParamEvents();
+    auto events = audioEngine.drainPluginParamEvents();
     auto ccTouchedEarly = audioEngine.drainCcRecTouched();
     if (!transport.playing) return;
 
@@ -4566,6 +4654,8 @@ void MainContentComponent::recalcEditorPanelHeight() {
 }
 
 bool MainContentComponent::tryQuit() {
+    // A plugin window still open may hold changes nothing else shows.
+    checkPluginWindows();
     if (!projectDirty && !graph.dirty) {
         // Clean exit with nothing to save - any leftover autosave is stale
         // (it would only exist if we crashed on a previous run and the user
@@ -4864,9 +4954,15 @@ void MainContentComponent::performAutosave() {
     //     mutations): we need to refresh autosave.ssp so its [Node] entries
     //     reflect the current topology, plus capture any plugin states
     //     for plugins that may have just been added
+    //
+    // A plugin's file is written when it may be behind (pluginStateDirty) -
+    // and every plugin's, once the files were deleted (discardAutosave, e.g.
+    // by an explicit save): until 0.10.11 only changed plugins got theirs
+    // back, so crash recovery after a save brought every unchanged plugin
+    // back at its default settings.
     std::vector<int> dirtyPluginNodeIds;
     for (auto& n : graph.nodes) {
-        if (n.isPluginNode() && n.pluginStateDirty)
+        if (n.isPluginNode() && (n.pluginStateDirty || rewriteAllPluginFiles))
             dirtyPluginNodeIds.push_back(n.id);
     }
 
@@ -4928,22 +5024,17 @@ void MainContentComponent::performAutosave() {
     for (int nid : dirtyPluginNodeIds) {
         auto* n = graph.findNode(nid);
         if (!n || !n->isPluginNode()) continue;
-        if (n->pluginStateDirty) {
-            // The Full path didn't already query this plugin (or there
-            // was no Full path). Query now and refresh the cache.
-            auto* proc = pluginProcessorOf(nid);
-            if (!proc) continue;
-            if (n->plugin && proc == n->plugin->instance.get())
-                PluginCopies::catchUp(*proc);   // not played: take its knob moves in
-            juce::MemoryBlock stateData;
-            proc->getStateInformation(stateData);
-            if (stateData.getSize() == 0) continue;
-            n->cachedPluginStateBase64 = stateData.toBase64Encoding().toStdString();
-            n->pluginStateDirty = false;
-        }
-        if (!n->cachedPluginStateBase64.empty())
-            job.writes.push_back({ getPluginStateFile(nid), n->cachedPluginStateBase64 });
+        // Its settings now if they may have changed since last taken (or
+        // never were) - asked of the plugin, or, with none loaded yet, the
+        // ones it's waiting for - else the last ones taken.
+        const std::string state = n->pluginStateDirty || n->cachedPluginStateBase64.empty()
+                                      ? ProjectFile::pluginStateNow(*n, &gp)
+                                      : n->cachedPluginStateBase64;
+        if (state.empty()) continue;
+        n->pluginStateDirty = false;
+        job.writes.push_back({ getPluginStateFile(nid), state });
     }
+    rewriteAllPluginFiles = false;
 
     if (job.writes.empty()) return;
     enqueueAutosaveJob(std::move(job));
@@ -5120,8 +5211,10 @@ void MainContentComponent::discardAutosave() {
             f2.deleteFile();
     }
     // Force the next slow autosave to do a Full save since we just
-    // wiped the autosave.ssp file.
+    // wiped the autosave.ssp file - and to write every plugin's file again,
+    // changed or not (their files went too).
     autosaveTicksSinceFullSave = kAutosaveTicksBetweenFullSaves;
+    rewriteAllPluginFiles = true;
     // Note: this deliberately does NOT delete the undo tree. The undo
     // tree persists across clean save+quit so the next session can
     // continue undoing past the last save point. It's only thrown away

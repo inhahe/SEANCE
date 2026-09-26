@@ -605,7 +605,8 @@ void AudioEngine::audioDeviceIOCallbackWithContext(
             juce::MidiBuffer ccBuf;
             for (auto& [id, msg] : events) ccBuf.addEvent(msg, 0);
             graphProcessor.getAutomation().processMidiCC(
-                ccBuf, *graphProcessor.getGraph(), graphProcessor.getNodeMap());
+                ccBuf, *graphProcessor.getGraph(), graphProcessor.getNodeMap(),
+                voiceCopies.get());   // and plugins inside Voice containers
 
             auto ccMappings = graphProcessor.getAutomation().getCCMappings();
             auto isCCMapped = [&](int ch, int cc) {
@@ -1264,6 +1265,25 @@ void AudioEngine::keyboardNoteOff(int midiNote) {
 // Output Capture - record the final mix to memory
 // ==============================================================================
 
+void AudioEngine::play() {
+    // A new capture of the output about to begin (the callback starts one when
+    // it holds none - a paused playback resuming carries on the one it has):
+    // the project as it begins, for stop to compare with.
+    if (graph != nullptr && captureL.empty()) {
+        captureStartHash = 0;
+        for (auto& n : graph->nodes)
+            if (n.type == NodeType::Output) {
+                auto& mgr = graphProcessor.getCacheManager();
+                mgr.updateDeterminism(*graph);
+                captureStartHash = mgr.computeNodeHash(n, *graph);
+                break;
+            }
+    }
+    playing = true;
+    songPlayCount = 0;
+    endTailSamplesRemaining = -1;
+}
+
 void AudioEngine::stop() {
     playing = false;
     // Cut all trailing sound immediately (synth releases, reverb/echo tails,
@@ -1291,10 +1311,14 @@ void AudioEngine::stop() {
                 // benign (it just walks ccMappings + upstream); a 0
                 // hash means the project isn't cacheable, in which
                 // case we leave inputHash at 0 and the dialog will
-                // re-render from scratch.
+                // re-render from scratch. Only if the project is as it
+                // was when the capture began, though: an edit during
+                // playback - a plugin's knob, a note - left the capture
+                // partly one project and partly the other.
                 auto& mgr = graphProcessor.getCacheManager();
                 mgr.updateDeterminism(*graph);
-                n.cache.inputHash = mgr.computeNodeHash(n, *graph);
+                const uint64_t now = mgr.computeNodeHash(n, *graph);
+                n.cache.inputHash = now == captureStartHash ? now : 0;
                 n.cache.valid = true;
                 break;
             }

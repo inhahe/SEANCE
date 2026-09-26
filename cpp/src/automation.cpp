@@ -1,14 +1,22 @@
 #include "automation.h"
+#include "plugin_copies.h"
 #include <cstdio>
 
 namespace SoundShop {
 
 void AutomationManager::applyValues(const std::vector<AutomationValue>& values,
                                      juce::AudioProcessorGraph& graph,
-                                     const std::unordered_map<int, juce::AudioProcessorGraph::NodeID>& nodeMap) {
+                                     const std::unordered_map<int, juce::AudioProcessorGraph::NodeID>& nodeMap,
+                                     PluginCopies* voices) {
     for (auto& av : values) {
         auto it = nodeMap.find(av.nodeId);
-        if (it == nodeMap.end()) continue;
+        if (it == nodeMap.end()) {
+            // A plugin inside a Voice container: its master and every voice's copy.
+            if (voices != nullptr && voices->setParameter(av.nodeId, av.paramIdx, av.value)
+                && onPluginParamChanged)
+                onPluginParamChanged(av.nodeId);
+            continue;
+        }
 
         auto graphNode = graph.getNodeForId(it->second);
         if (!graphNode || !graphNode->getProcessor()) continue;
@@ -27,7 +35,8 @@ void AutomationManager::applyValues(const std::vector<AutomationValue>& values,
 
 void AutomationManager::processMidiCC(const juce::MidiBuffer& midi,
                                         juce::AudioProcessorGraph& graph,
-                                        const std::unordered_map<int, juce::AudioProcessorGraph::NodeID>& nodeMap) {
+                                        const std::unordered_map<int, juce::AudioProcessorGraph::NodeID>& nodeMap,
+                                        PluginCopies* voices) {
     std::lock_guard<std::mutex> lock(ccMutex);
 
     for (auto metadata : midi) {
@@ -45,7 +54,12 @@ void AutomationManager::processMidiCC(const juce::MidiBuffer& midi,
                     (mapping.maxValue - mapping.minValue) * (val / 127.0f);
 
                 auto it = nodeMap.find(mapping.nodeId);
-                if (it == nodeMap.end()) continue;
+                if (it == nodeMap.end()) {
+                    // A plugin inside a Voice container: its master and every voice's copy.
+                    if (voices != nullptr)
+                        voices->setParameter(mapping.nodeId, mapping.paramIdx, normalized);
+                    continue;
+                }
 
                 auto graphNode = graph.getNodeForId(it->second);
                 if (!graphNode || !graphNode->getProcessor()) continue;

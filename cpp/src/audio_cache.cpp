@@ -41,6 +41,12 @@ bool AudioCacheManager::isNodeDeterministic(const Node& node, const NodeGraph& g
     for (auto& m : graph.ccMappings)
         if (m.nodeId == node.id) return false;
 
+    // A Voice container plays its inner patch: it's as deterministic as that.
+    if (node.type == NodeType::VoiceContainer)
+        for (auto& inner : graph.nodes)
+            if (inner.voiceContainerId == node.id && !isNodeDeterministic(inner, graph, visited))
+                return false;
+
     // Check upstream nodes recursively
     auto upIds = getUpstreamNodeIds(node, graph);
     for (int uid : upIds) {
@@ -56,6 +62,7 @@ bool AudioCacheManager::isNodeDeterministic(const Node& node, const NodeGraph& g
 }
 
 void AudioCacheManager::updateDeterminism(NodeGraph& graph) {
+    if (onBeforeHashing) onBeforeHashing();
     for (auto& node : graph.nodes) {
         std::unordered_set<int> visited;
         node.cache.deterministic = isNodeDeterministic(node, graph, visited);
@@ -148,6 +155,29 @@ uint64_t AudioCacheManager::computeNodeHash(const Node& node, const NodeGraph& g
         : (uint64_t)0);
     if (!node.pendingPluginState.empty())
         h = hashCombine(h, hashString(node.pendingPluginState));
+    if (node.isPluginNode()) {
+        // The changes its settings have had since it loaded - in its window,
+        // from a preset (Node::pluginStateGeneration). The settings themselves
+        // are too slow to read for every hash.
+        h = hashCombine(h, (uint64_t) node.pluginStateGeneration);
+        // Its parameters' automation lanes, which a render plays - unless muted.
+        for (auto& [idx, lane] : node.pluginParamAutomation) {
+            h = hashCombine(h, (uint64_t) (uint32_t) idx);
+            for (auto& ap : lane.points) {
+                h = hashCombine(h, hashFloat(ap.beat));
+                h = hashCombine(h, hashFloat(ap.value));
+            }
+        }
+        h = hashCombine(h, (uint64_t) node.ignoreAutomation);
+        for (auto& p : node.params)
+            h = hashCombine(h, (uint64_t) p.bypassAutomation);
+    }
+
+    // A Voice container plays its inner patch: each inner node's hash too.
+    if (node.type == NodeType::VoiceContainer)
+        for (auto& inner : graph.nodes)
+            if (inner.voiceContainerId == node.id)
+                h = hashCombine(h, computeNodeHash(inner, graph));
 
     // Hash performance mode settings
     h = hashCombine(h, (uint64_t)node.performanceMode);

@@ -4569,13 +4569,7 @@ void NodeGraphComponent::showNodeMenu(Node& node) {
     if (node.plugin || node.type == NodeType::Instrument || node.type == NodeType::Effect) {
         menu.addItem(4, "Show Plugin UI");
         menu.addItem(7, "Presets...");
-        // A plugin inside a Voice container plays as a copy per voice; MIDI
-        // Learn only drives plugins in the main graph. (Menu items can't show
-        // tooltips, so the item says why it's unavailable.)
-        if (node.isPluginNode() && node.voiceContainerId >= 0)
-            menu.addItem(8, "MIDI Map... (not for a plugin inside a Voice container)", false);
-        else
-            menu.addItem(8, "MIDI Map...");
+        menu.addItem(8, "MIDI Map...");
         if (node.pluginDescription.fileOrIdentifier.isNotEmpty())
             menu.addItem(6, "Plugin Info...");
         // "MPE mode" for a hosted plugin: a user-asserted flag telling SEANCE
@@ -4910,13 +4904,22 @@ void NodeGraphComponent::showNodeMenu(Node& node) {
             // import in one shot).
             deleteNodeAndDescendants(nodeId);
         } else if (result == 2) {
-            auto& dup = graph.addNode(node->name, node->type, {}, {},
-                {node->pos.x + 50, node->pos.y + 50});
-            for (auto& p : node->pinsIn) dup.pinsIn.push_back({graph.allocId(), p.name, p.kind, true, p.channels});
-            for (auto& p : node->pinsOut) dup.pinsOut.push_back({graph.allocId(), p.name, p.kind, false, p.channels});
-            dup.params = node->params;
-            dup.clips = node->clips;
-            graph.commitSnapshot("Duplicate " + node->name);
+            // The whole node - with everything in it, for a group or a Voice
+            // container - as the project file saves it, with ids of its own
+            // (NodeGraph::duplicateNode). A copied plugin loads in the
+            // background, with its original's settings.
+            const std::string name = node->name;
+            const int copyId = graph.duplicateNode(nodeId, {50.0f, 50.0f},
+                                                   getGraphProcessor ? getGraphProcessor() : nullptr);
+            if (copyId < 0) return;
+            graph.commitSnapshot("Duplicate " + name);
+            if (onNodeEdited) onNodeEdited();
+            bool plugins = false;
+            for (int id : graph.nodeWithContents(copyId))
+                if (auto* n = graph.findNode(id); n != nullptr && n->isPluginNode())
+                    plugins = true;
+            if (plugins && onPluginNodesAdded) onPluginNodesAdded();
+            repaint();
         } else if (result == 3) {
             bool already = false;
             for (int edId : graph.openEditors)
@@ -5527,24 +5530,14 @@ void NodeGraphComponent::deleteNodeAndDescendants(int rootId) {
     const double rmLoopStart        = root->modImportPrevLoopStart;
     const double rmLoopEnd          = root->modImportPrevLoopEnd;
 
-    // Collect every node to delete: the root plus, if it's a Group, every
-    // descendant via childNodeIds (recursively, so a group-of-groups
-    // cascades fully). Set guards against accidental cycles in malformed
-    // childNodeIds data.
-    std::set<int> victims;
-    std::vector<int> stack { rootId };
-    while (!stack.empty()) {
-        int id = stack.back();
-        stack.pop_back();
-        if (!victims.insert(id).second) continue;
-        auto* n = graph.findNode(id);
-        if (!n) continue;
-        if (n->type == NodeType::Group) {
-            for (int childId : n->childNodeIds)
-                if (!victims.count(childId))
-                    stack.push_back(childId);
-        }
-    }
+    // Collect every node to delete: the root and everything inside it - a
+    // Group's members, recursively, and a Voice container's inner patch
+    // (NodeGraph::nodeWithContents, which Duplicate copies by too). Deleting a
+    // container used to leave its inner patch behind, where nothing could show
+    // or play it.
+    const auto contents = graph.nodeWithContents(rootId);
+    const std::set<int> victims(contents.begin(), contents.end());
+    const bool rootIsContainer = root->type == NodeType::VoiceContainer;
 
     // Gather all pin IDs across the victim set so we can sweep matching
     // links in one pass instead of N passes. Also remember whether any
@@ -5631,9 +5624,9 @@ void NodeGraphComponent::deleteNodeAndDescendants(int rootId) {
     }
 
     graph.dirty = true;
-    graph.commitSnapshot(victims.size() > 1
-        ? "Delete group (" + std::to_string(victims.size()) + " nodes)"
-        : "Delete node");
+    graph.commitSnapshot(victims.size() <= 1 ? std::string("Delete node")
+        : std::string(rootIsContainer ? "Delete Voice container (" : "Delete group (")
+              + std::to_string(victims.size()) + " nodes)");
 }
 
 void NodeGraphComponent::showLinkMenu(int linkId) {

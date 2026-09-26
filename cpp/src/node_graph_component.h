@@ -112,6 +112,13 @@ public:
     // returns an empty map before the audio graph has been built.
     std::function<std::unordered_map<int, int>()> getNodeLatencies;
 
+    // Duplicate: the live audio graph, which the copy of a plugin node reads
+    // its original's current settings from (NodeGraph::duplicateNode); then
+    // onPluginNodesAdded, for the plugin loader to give each copy a plugin of
+    // its own (MainContentComponent::beginAsyncPluginLoad). Wired by main_window.
+    std::function<GraphProcessor*()> getGraphProcessor;
+    std::function<void()> onPluginNodesAdded;
+
     // Convert between screen and canvas coordinates
     juce::Point<float> screenToCanvas(juce::Point<float> screen) const;
     juce::Point<float> canvasToScreen(juce::Point<float> canvas) const;

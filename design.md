@@ -85,6 +85,14 @@ from playback) can tell.
 **Voice containers**: a node's `voiceContainerId` puts it inside a container's
 per-note patch rather than the main graph.
 
+**What's inside a node**: `NodeGraph::nodeWithContents` — a Group's members, a
+Voice container's inner patch, recursively. Delete removes, and Duplicate copies,
+exactly that set. Duplicate (`NodeGraph::duplicateNode`) copies each node through
+the project writer and reader (`ProjectFile::writeNode` / `readNode`), so a copy
+has every saved field and nothing session-only; ids, cables between the copies,
+group membership and effect layers are remapped. A node whose container is gone
+is removed when a project loads (`removeStrandedVoiceNodes`).
+
 ## The audio graph
 
 `GraphProcessor::rebuildGraph` turns the node graph into a JUCE
@@ -118,7 +126,16 @@ capture from playback).
   settings; a Voice container plays one copy per voice, following the node's own
   instance (the "master": never played, its window the one edited, its state the
   one saved). Copies are made on the message thread before the graph that plays
-  them is built.
+  them is built. The host's own changes to a master's parameters (automation
+  lanes, learned MIDI CCs) are set on it and every copy at once
+  (`PluginCopies::setParameter`), and its window's knob events are queued for the
+  automation recorder like the live graph's plugins'.
+- **Changes SEANCE isn't told of**: a plugin needn't report every change made in
+  its window, so the main window fingerprints a plugin's state when its window
+  opens and compares when it closes, before quitting, and before a render cache
+  is trusted (`checkPluginWindow`). A change marks the project unsaved and bumps
+  `Node::pluginStateGeneration`, which render-cache hashes include. An explicit
+  save asks every plugin for its state afresh (`ProjectFile::pluginStateNow`).
 
 ## Undo
 
@@ -135,9 +152,19 @@ is in `CLAUDE.md`. A new or opened project starts a fresh history
 
 Projects are `.ssp` text files (`ProjectFile`); frozen audio is stored beside
 them in `soundshop_cache/`; baked blobs live in the content store. Autosave
-writes the graph and, separately, each changed plugin's state; after a crash the
-next start offers to recover them. `--ephemeral` redirects all of that to a
-throwaway folder for testing.
+writes the graph and, separately, each changed plugin's state - every plugin's,
+after its files were deleted (an explicit save); after a crash the next start
+offers to recover them. `--ephemeral` redirects all of that to a throwaway
+folder for testing.
+
+Render caches (`AudioCacheManager`): a node's cached audio stands while the hash
+of what made it does (`computeNodeHash` — its settings, clips, upstream nodes,
+a plugin's identity, lanes and `pluginStateGeneration`, a Voice container's inner
+patch). Every hash follows `updateDeterminism`, whose `onBeforeHashing` hook lets
+the main window check plugin windows still open first. A cache is stamped with
+the hash of the project it was made from: the playback capture with the hash
+as playback began (dropped if it changed by Stop), a render's with the hash as
+it started.
 
 ## Testing, versioning, release
 

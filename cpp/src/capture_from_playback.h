@@ -835,6 +835,10 @@ private:
     std::unique_ptr<RenderJob> renderJob;
     bool renderReady = false;
     float renderMaxBeat = 0.0f;   // the song's length, for a render started over
+    // The Output node's render hash as the render started, which its result
+    // is stamped with (writeSongCache): it's the project as it was then that
+    // the render plays - its plugins are copies taken then.
+    uint64_t renderStartHash = 0;
     // Start (or start over) the render, at songSampleRate for renderMaxBeat.
     void startRender();
 

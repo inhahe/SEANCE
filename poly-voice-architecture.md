@@ -130,7 +130,11 @@ Internally:
    program / non-parameter changes, a preset pick, or its window closing. Offline
    renders make their own copies the same way. See REFERENCE.md, *Plugins in
    renders and Voice containers*. Before 0.10.9 the inner graphs hosted no
-   plugins, and a plugin inside a container was silent.
+   plugins, and a plugin inside a container was silent. *(0.10.11)* Automation
+   lanes and learned MIDI CCs set a value on the master and every copy at once
+   (`PluginCopies::setParameter`; an offline render applies the lanes to each
+   voice's copy), and the master's window's knob moves reach the automation
+   recorder.
 
 ## Visual model: drill-in with breadcrumb
 

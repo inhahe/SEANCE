@@ -185,6 +185,60 @@ along with whatever that undo was meant to reverse. (The *Plugin Instruments* /
 kind - didn't appear at all before 0.10.9: the canvas never got the plugin
 list, `NodeGraph::pluginHost`.)
 
+### Duplicating and deleting a node
+
+**Duplicate** (right-click a node) copies the **whole node**: each node is
+written the way a project file writes it and read back
+(`ProjectFile::writeNode` / `readNode`, from `NodeGraph::duplicateNode`), so the
+copy has every saved setting — script (what kind of synth or effect it is),
+parameters and their automation lanes, envelopes, pan, MPE, record/read
+automation settings, clips, take lanes, plugin-parameter lanes — with node and
+pin ids of its own (a modulation pin's binding follows its pin). It's placed
+50 px right and down of the original, named as a new node of that name would be
+(*FM Synth* → *FM Synth 2*), and goes **where the original is**: into the same
+group, and inside the same Voice container. It is one undo step.
+
+- **A group or a Voice container comes with everything inside it** — a group's
+  members (recursively), a container's inner patch (`NodeGraph::nodeWithContents`)
+  — plus the **cables between the copied nodes**. A copied container's inner
+  patch is laid out inside it just as the original's is; only the container
+  moves over.
+- **Not copied:** cables to nodes outside the copy; effect layers gating those
+  cables, or a group of cables (a layer gating a copied cable gates the copy's);
+  MIDI Learn mappings; a freeze; a MOD import's put-aside song settings (they're
+  the original's to restore when it's deleted).
+- **A plugin node's copy** gets a plugin instance of its own, with the
+  original's settings **as they are now** (asked of the plugin —
+  `ProjectFile::pluginStateNow` — as the copy is made), loaded in the background
+  like a project's plugins (`MainContentComponent::beginAsyncPluginLoad`; the
+  node shows the loading badge meanwhile). Undo the duplicate before its plugin
+  has loaded and a redo still gives it those settings
+  (`NodeGraph::restoreSnapshot` keeps them in `retiredPluginStates`).
+
+**Before 0.10.11** Duplicate copied only a node's name, pins, parameters and
+clips: a duplicated FM Synth, wavetable, Script or effect came out as the
+default Terrain Synth or a pass-through, a plugin node as no plugin node at all,
+a node inside a Voice container at the top level — and envelopes, pan, MPE and
+automation lanes were lost.
+
+**Delete** removes a node **with everything inside it** — the same
+`nodeWithContents`: a group's members and a Voice container's inner patch — and
+their cables, as one undo step. **Before 0.10.11** deleting a Voice container
+left its inner patch behind: nodes nothing could show (they're drawn only inside
+their container) or play, whose plugins still loaded with the project and were
+saved with it. A project holding such a leftover loses it when it opens
+(`NodeGraph::removeStrandedVoiceNodes`, from `ProjectFile::readProject`; the log
+says how many nodes went). A script's `soundshop.remove_node` removes a Voice
+container's inner patch with it too (a group's members stay, as nodes of their
+own).
+
+**Tested by** `testDuplicateNode` (one node's every setting and fresh ids, a
+group with its members and inner cable, a Voice container with its inner patch,
+a node inside a container staying there, save/load of the copies, and a plugin
+node's copy undone before its plugin loaded), `testVoiceContainerContents` (a
+deleted container's leftovers dropped on load) and `testPluginHostControl` (a
+plugin node's copy loading with its original's current settings).
+
 ### Undo history and unsaved changes
 
 **A new project, or one you open, starts a fresh undo history**
@@ -208,6 +262,18 @@ doesn't record (inside a plugin's own window) may remain. **Before 0.10.9** an
 undo or redo left the project marked *saved* — restoring a snapshot goes through
 the project loader, which marks the graph clean — so quitting after an undo
 could lose the edits since the last save without asking.
+
+**Changes made in a plugin's own window count too.** A plugin needn't tell its
+host about every change (a setting that isn't a parameter, a preset loaded from
+its own browser), so SEANCE fingerprints the plugin's settings — a hash of its
+state — when its window opens, and compares when the window closes; before
+quitting, and before a cached render is trusted, it compares for windows still
+open (`MainContentComponent::checkPluginWindow`). A difference marks the project
+unsaved (and the render caches made before it stale — see
+[Node freeze and caching](#node-freeze-and-caching)). A preset picked from
+SEANCE's *Presets…* menu counts at once. **Before 0.10.11** nothing a plugin's
+window changed marked the project unsaved: quitting with no other edits didn't
+ask, and the changes were lost.
 
 ### Graph mutation threading
 
@@ -243,6 +309,29 @@ Any node (except the **Output** sink) can be **frozen** — SEANCE renders its o
 **Batch freeze (arm-then-render).** Freezing N nodes one at a time costs N full-project renders. Instead you can **arm** any number of nodes and freeze them all in **one** pass: right-click a node → **Arm for batch freeze** (toggles; re-selecting it is **Disarm from batch freeze**). Armed nodes show a bold amber **ARMED** tag at their title's top-right. Once at least one node is armed, every node's menu also offers **Freeze N armed node(s) (one pass)**, which renders the project a single time and captures each armed node through its own tap simultaneously (`MainContentComponent::freezeNodes`; single-node freeze is just `freezeNodes({id})`). Arming is **transient** — it is never saved, and a reload starts with nothing armed (`Node::armedForFreeze`, not serialized).
 
 **Auto-cache (automatic memoization).** Separate from manual freeze, each node has an **auto-cache** flag (on by default, right-click → **Disable/Enable auto-cache**). When a node is **deterministic** (no live/unpredictable inputs — no live MIDI, no hardware, nothing whose output can't be reproduced from saved state), the graph processor may transparently reuse a cached render keyed by an **input hash** (`AudioCacheManager::computeNodeHash`), re-rendering only when the hash changes. A node that isn't deterministic shows a small **orange dot** instead of a FROZEN/ARMED tag. Disabling auto-cache forces the node to always render live.
+
+**What the hash sees of plugins and Voice containers.** A hosted plugin's
+settings are too slow to read for every hash, so a plugin node's hash takes its
+plugin's identity, its parameter-automation lanes (and whether they're muted),
+and how many changes SEANCE knows its settings have had
+(`Node::pluginStateGeneration`): a change found by comparing the plugin's
+settings with those its window opened with (see
+[Undo history and unsaved changes](#undo-history-and-unsaved-changes)) — which
+happens, for windows still open, before every hash (`AudioCacheManager::onBeforeHashing`)
+— or a preset picked from *Presets…*. A Voice container's hash takes each node
+of its inner patch, and a learned MIDI CC inside it makes it non-deterministic,
+as one outside does. The cache this matters most for is the Output node's
+recording of the last playback, which capture from playback reuses instead of
+rendering again: **before 0.10.11** a change in a plugin's window, or anywhere
+inside a Voice container, left that recording passing for current. That
+recording is stamped with the project's hash **as the playback began**
+(`AudioEngine::play`) and kept only if the hash is the same at Stop — an edit
+during the playback leaves it part one project, part another — and the
+dialog's own render is stamped with the hash as it started (its plugins are
+copies taken then), not as it finished. `testRenderCacheHash` covers the hash:
+a plugin's change count, lanes and muting each change the song's hash, a
+built-in's doesn't depend on the count, and a change inside a Voice container
+does - as a learned CC inside it makes the song uncacheable.
 
 **Persistence.** Manual freezes survive save/reload. On save, each frozen node's PCM is written to a sibling `soundshop_cache/node_<id>.cache` file (node-id-keyed, so freezes never collide), and the cache **metadata** (enabled/valid/useDisk/hash/sampleRate/numSamples, plus the auto-cache preference) is serialized into the project file (`project_file.cpp`, gated on `includeBlobs` so undo snapshots omit the heavy payload but keep the preference). On load, `MainContentComponent::rehydrateNodeCaches` points the cache manager at that folder and re-attaches each freeze to its file **lazily** — the audio thread pages the samples in on first playback. If a cache file is missing (project copied without its `soundshop_cache` folder), the freeze is dropped so the node renders live rather than playing silence.
 
@@ -420,9 +509,13 @@ Dragging a knob **inside a hosted plugin's own editor window** during playback *
 
 Under the hood SEANCE listens for the plugin's own `AudioProcessorListener` gesture/value callbacks (queued off the audio thread, drained by the UI timer), samples the live normalized value each tick, and writes back on playback via `setValue` — which does **not** notify listeners, so playback can't feed back into the recorder.
 
+The lanes are saved with the project, and taken by undo snapshots, as `pluginAuto=<param>,<beat>,<value>` lines after the node's pin and parameter sections — which is where the loader reads them, like `modPin=` lines. **Before 0.10.11** it knew the key only in the node's own section, so a plugin node's lanes (every plugin node has pins) were dropped when the project was opened, and by every undo or redo.
+
 **Caveat — gesture-less plugins.** Some plugins move a parameter without sending `begin/endChangeGesture` (only a bare value-change). Touch still works for these: it arms on the first change and ends after a short (~250 ms) idle gap instead of on gesture-release. Latch and Write are unaffected (they run to Stop). If a particular plugin's Touch captures feel clipped, use **Latch** or a per-node **Write** override instead.
 
 **MIDI-learned CC moves are captured too.** If you've MIDI-Learned a hardware CC to a plugin parameter (right-click the knob → MIDI Learn), moving that controller during playback records into automation exactly like dragging the plugin knob directly — arm Touch/Latch/Write, play, twist the physical knob, stop, and it replays. Because the learned CC is applied on the audio thread (bypassing the plugin's listener callbacks), SEANCE captures the matched CC target separately and samples the resulting live value each tick. The same gesture-less Touch caveat applies (arms on the first CC move, ends on the ~250 ms idle gap).
+
+**A plugin inside a Voice container** records and plays back the same way. Its window is the master's (see [Plugins inside a voice](#plugins-inside-a-voice)), so the recorder hears the master's knobs (`PluginCopies::drainParamEvents`, merged with the live graph's by `AudioEngine::drainPluginParamEvents`) and samples the master's values; playback sets each lane's value on the master and on every voice's copy at once (`PluginCopies::setParameter`, from `GraphProcessor::applyAutomation`), and an offline render applies the lanes to every voice's copy too. **Before 0.10.11** neither reached such a plugin: it could have no lanes, and lanes it had didn't play.
 
 ---
 
@@ -476,6 +569,8 @@ Every MIDI Timeline node has a MIDI In pin on its left side. Wire an input node'
 ### MIDI Learn (CC mapping)
 
 Right-click any knob/slider → **MIDI Learn** → move the controller's knob → mapping captured. Stored per-project in `project_file.cpp` so mappings persist across save/load.
+
+For a hosted plugin, right-click its node → **MIDI Map…** lists the plugin's parameters; right-click one → *Learn*, then move a control. A plugin inside a Voice container maps its master's parameters, and a mapped control moves the parameter in every voice at once (`AutomationManager::processMidiCC` → `PluginCopies::setParameter`). **Before 0.10.11** *MIDI Map…* wasn't offered for a plugin inside a container.
 
 **Filtering rule**: a CC that has been learned to a control is **removed from the cable stream** so it only affects the mapped control. Notes, pitch bend, aftertouch, and unmapped CCs pass through cables normally. The MIDI Modulator's outgoing CCs are *not* subject to this filter — see the [MIDI Modulator](#midi-modulator) section.
 
@@ -3653,10 +3748,13 @@ parameter, when you pick a preset from *Presets…*, and when you close its
 window. So the plugin's memory is taken once per voice, plus once for the
 master; each voice's CPU only while it sounds. How the copies are made and kept
 is in [Plugins in renders and Voice containers](#plugins-in-renders-and-voice-containers).
-*MIDI Map…* isn't offered for a plugin inside a container (MIDI Learn drives
-plugins in the main graph only; the menu item says so), and automation lanes
-don't reach it — see `known-issues.md`. Before 0.10.9 a plugin inside a
-container was silent: the voices' inner graphs host no plugins.
+Its **automation lanes** and **MIDI Learn** mappings (*MIDI Map…*) work as they
+do for a plugin at the top level, in every voice at once: a lane's value or a
+learned control's is set on the master and on each voice's copy, and knobs moved
+in its window are recorded (see
+[Hosted VST3/AU plugin knobs](#hosted-vst3au-plugin-knobs)). Before 0.10.11
+neither reached it. Before 0.10.9 a plugin inside a container was silent: the
+voices' inner graphs host no plugins.
 
 ### The engine — `PolyVoiceProcessor`
 
@@ -4608,6 +4706,23 @@ computer can't host, or JUCE's own error when the plugin was found but wouldn't
 start. The node keeps its saved plugin state either way — saving writes back
 what was read — so nothing is lost; reopen the project once the plugin is back.
 
+**Its settings.** Beside the description the node saves the plugin's settings
+(`pluginState=`, its `getStateInformation`, base64). An explicit save — *Save*,
+*Save As*, taking a shared history — asks every plugin for them afresh
+(`ProjectFile::pluginStateNow`); the background autosave asks only the plugins
+it knows have changed (`Node::pluginStateDirty`, which only the autosave
+clears) and otherwise keeps its last answer. **Before 0.10.11** an explicit save
+used the autosave's last answer too, so a change made in a plugin's window that
+nothing had noticed yet — the window still open — was saved as it had been
+before.
+
+An explicit save deletes the autosave (the project file now has it all), and
+the next autosave writes **every** plugin's settings again — its last answer
+for a plugin that hasn't changed (`rewriteAllPluginFiles`). **Before 0.10.11**
+it wrote only the plugins changed since, so after a save, crash recovery —
+which takes plugin settings from those files — brought every other plugin back
+at its default settings.
+
 **Why.** Until 0.10.4 a project saved only the plugin's row in the plugin list
 (`pluginIndex=<n>`), and SEANCE kept that list as two lists side by side — the
 rows the menus showed, and the JUCE descriptions it loaded from — which
@@ -4738,9 +4853,10 @@ own buses that it doesn't own, so the copy can outlive the graph):
   cursor), and they're destroyed when it ends. The render plays them wired just
   like the live plugins, MPE handshake and tuning adapter included, and with the
   plugins' **automation lanes**: the plugin-parameter lanes and any Param lanes
-  on the node are applied at the start of every render block
-  (`GraphProcessor::applyPluginAutomation`, 512 samples) — in playback the UI
-  timer applies them to the live plugins (about 30 times a second).
+  on the node are applied at the start of every render block to every copy of
+  it the render has, each voice's included (`GraphProcessor::applyPluginAutomation`,
+  512 samples; before 0.10.11 the voices' copies went without) — in playback the
+  UI timer applies them to the live plugins (about 30 times a second).
 - **A Voice container** plays each plugin inside it once per voice, from the
   audio engine's pool (`AudioEngine::getVoiceCopies`): the node's own instance is
   the master (see [Plugins inside a voice](#plugins-inside-a-voice)). Before
@@ -4765,6 +4881,14 @@ reports as not a parameter (`nonParameterStateChanged`), has its whole state
 copied to every copy on the message thread (`PluginCopies::syncFromMaster`), as
 do picking a preset from *Presets…* and closing its window (which catches a
 change the plugin didn't report).
+
+**The host's own changes** — an automation lane's value in playback, a learned
+MIDI CC — are set on the master and every copy at once
+(`PluginCopies::setParameter`: from the UI timer, and from the audio callback
+for a CC, which holds the graph lock so the master can't go meanwhile). They're
+set with `setValue`, which tells no listener, so the automation recorder doesn't
+take them for the user's. The master's own knob events — grabbed, moved, let go
+— are queued for the recorder (`PluginCopies::drainParamEvents`).
 
 **The master plays in no graph**, so a change made in its window reaches its own
 state only when it next processes audio: JUCE's LV2 host moves a parameter into
@@ -4803,7 +4927,11 @@ voice at once, and an unannounced change reaches them when the master's state is
 copied (catching up first); the copies survive a rebuild, the spare goes with
 fewer voices once nothing plays it, a blocked plugin's copies fail with the
 reason and load once it's unblocked; and undo keeps the master only for a node
-restored in the same place.
+restored in the same place. `testPluginHostControl` covers the host's changes:
+a value set on the master and every voice's copy without the recorder hearing
+it, an automation lane's value and a learned CC reaching every voice, the
+master's knob events reaching the recorder, and an offline render's lanes
+driving every voice's copy.
 
 ---
 

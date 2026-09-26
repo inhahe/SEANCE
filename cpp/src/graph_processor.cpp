@@ -1604,9 +1604,11 @@ void GraphProcessor::processBlock(NodeGraph& graph, Transport& transport,
         latencyListener.commitLatencies();
     }
 
-    // An offline render's plugin copies follow their automation lanes (the
-    // live graph's plugins are driven from the UI timer).
-    if (!hostsPlugins && copySlot < 0 && !playedCopies.empty())
+    // An offline render's plugin copies follow their automation lanes - its
+    // main graph drives them all, the voices' too (the live graph's plugins
+    // are driven from the UI timer).
+    if (!hostsPlugins && copySlot < 0 && pluginCopies
+        && pluginCopies->getUse() == PluginCopies::Use::render)
         applyPluginAutomation(graph, transport.positionBeats());
 
     // Transport "panic" (see requestPanic): wipe every processor's internal
@@ -1681,31 +1683,40 @@ juce::AudioProcessor* GraphProcessor::hostedPluginOf(const Node& node) const {
 void GraphProcessor::applyPluginAutomation(NodeGraph& graph, double beat) {
     // As MainContentComponent::timerCallback's read pass drives the live
     // graph's plugins: native Param lanes, scaled to 0..1 by the param's range,
-    // and the plugin-parameter lanes, already 0..1. Nothing records here.
-    for (auto& [nodeId, copy] : playedCopies) {
-        const Node* node = graph.findNode(nodeId);
-        if (node == nullptr || node->ignoreAutomation || !copy->plugin) continue;
-        const auto& params = copy->plugin->getParameters();
-        for (int pi = 0; pi < (int) node->params.size() && pi < params.size(); ++pi) {
-            const auto& p = node->params[(size_t) pi];
-            if (p.bypassAutomation || p.automation.points.empty()) continue;
-            const float val = p.automation.evaluate((float) beat);
-            if (val < -0.5f) continue;   // the lane's "no value" sentinel
-            const float normalized = (val - p.minVal) / std::max(0.001f, p.maxVal - p.minVal);
-            params[pi]->setValue(juce::jlimit(0.0f, 1.0f, normalized));
-        }
-        for (const auto& [idx, lane] : node->pluginParamAutomation) {
-            if (lane.points.empty() || idx < 0 || idx >= params.size()) continue;
-            const float val = lane.evaluate((float) beat);
-            if (val >= -0.5f)
-                params[idx]->setValue(juce::jlimit(0.0f, 1.0f, val));
+    // and the plugin-parameter lanes, already 0..1 - on every copy of the node
+    // the pool holds (a plugin inside a Voice container has one per voice).
+    // Nothing records here.
+    if (!pluginCopies) return;
+    for (auto& node : graph.nodes) {
+        if (!node.isPluginNode() || node.ignoreAutomation) continue;
+        bool lanes = !node.pluginParamAutomation.empty();
+        for (const auto& p : node.params)
+            lanes = lanes || !p.automation.points.empty();
+        if (!lanes) continue;
+        for (const auto& copy : pluginCopies->copiesOfNode(node.id)) {
+            if (!copy || !copy->plugin) continue;
+            const auto& params = copy->plugin->getParameters();
+            for (int pi = 0; pi < (int) node.params.size() && pi < params.size(); ++pi) {
+                const auto& p = node.params[(size_t) pi];
+                if (p.bypassAutomation || p.automation.points.empty()) continue;
+                const float val = p.automation.evaluate((float) beat);
+                if (val < -0.5f) continue;   // the lane's "no value" sentinel
+                const float normalized = (val - p.minVal) / std::max(0.001f, p.maxVal - p.minVal);
+                params[pi]->setValue(juce::jlimit(0.0f, 1.0f, normalized));
+            }
+            for (const auto& [idx, lane] : node.pluginParamAutomation) {
+                if (lane.points.empty() || idx < 0 || idx >= params.size()) continue;
+                const float val = lane.evaluate((float) beat);
+                if (val >= -0.5f)
+                    params[idx]->setValue(juce::jlimit(0.0f, 1.0f, val));
+            }
         }
     }
 }
 
 void GraphProcessor::applyAutomation(const std::vector<AutomationValue>& values) {
     if (!processorGraph) return;
-    automation.applyValues(values, *processorGraph, nodeMap);
+    automation.applyValues(values, *processorGraph, nodeMap, pluginCopies.get());
     automation.setLatestValues(values);
 }
 

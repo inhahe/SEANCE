@@ -2,6 +2,7 @@
 #include "node_graph.h"
 #include "transport.h"
 #include <juce_audio_formats/juce_audio_formats.h>
+#include <functional>
 #include <string>
 #include <unordered_set>
 
@@ -21,8 +22,15 @@ public:
     bool isNodeDeterministic(const Node& node, const NodeGraph& graph,
                               std::unordered_set<int>& visited);
 
-    // Update determinism flags for all nodes
+    // Update determinism flags for all nodes. Every hash taken for a render
+    // cache comes after one (message thread), so it first calls
+    // onBeforeHashing, if set.
     void updateDeterminism(NodeGraph& graph);
+
+    // Called at the start of updateDeterminism: for the app to note plugin
+    // settings changed in a window that's still open (the main window counts
+    // them in Node::pluginStateGeneration, which the hash includes).
+    std::function<void()> onBeforeHashing;
 
     // Check if cache is valid for a node; if hash changed, invalidate
     bool isCacheValid(Node& node, const NodeGraph& graph);

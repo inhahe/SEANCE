@@ -386,9 +386,11 @@ public:
 
     // Drive the plugin copies' parameters from their nodes' automation lanes
     // at `beat` - what the UI timer does for the live graph's plugins
-    // (MainContentComponent::timerCallback), here for an offline render's.
-    // processBlock does this itself in a render's graph; Freeze and Bounce,
-    // which render the JUCE graph directly, call it for each block.
+    // (MainContentComponent::timerCallback), here for an offline render's:
+    // every copy its pool holds, the main graph's and each voice's of a plugin
+    // inside a Voice container. processBlock does this itself in a render's
+    // main graph; Freeze and Bounce, which render the JUCE graph directly,
+    // call it for each block.
     void applyPluginAutomation(NodeGraph& graph, double beat);
 
     // Snapshot of every node's own audio latency in samples, keyed by stable
@@ -401,8 +403,9 @@ public:
     // A hosted-plugin parameter event captured from a plugin's own editor. kind:
     // 0=gestureBegin 1=gestureEnd 2=parameterChanged; value carries the normalized
     // value for kind 2. Queued by the listener (off the audio/plugin thread),
-    // drained by the UI timer via drainParamEvents().
-    struct ParamEvent { int nodeId; int paramIdx; int kind; float value; };
+    // drained by the UI timer via drainParamEvents(). The same as a Voice
+    // container's masters' (PluginCopies::drainParamEvents).
+    using ParamEvent = PluginCopies::ParamEvent;
 
     // Drain queued hosted-plugin parameter events (knob-drags the user made in a
     // plugin's own editor). Thread-safe; called by the UI timer to feed
@@ -416,6 +419,9 @@ public:
 
     // Automation
     AutomationManager& getAutomation() { return automation; }
+    // Set plugin parameters - the node's in this graph, or for a plugin
+    // inside a Voice container its master and every voice's copy (the live
+    // graph's pool, PluginCopies::setParameter).
     void applyAutomation(const std::vector<AutomationValue>& values);
     const std::unordered_map<int, juce::AudioProcessorGraph::NodeID>& getNodeMap() const { return nodeMap; }
     juce::AudioProcessorGraph* getGraph() { return processorGraph.get(); }
